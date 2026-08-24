@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import itertools
 from typing import Literal
 
 import torch
@@ -21,7 +22,6 @@ from helion._compiler.cross_loop_scheduler import add_ordered_action_events
 from helion._compiler.cross_loop_scheduler import build_baseline_worker_schedule
 from helion._compiler.cross_loop_scheduler import build_cross_loop_schedule
 from helion._compiler.cross_loop_scheduler import canonicalize_ready_events
-from helion._compiler.cross_loop_scheduler import canonicalize_task_readiness
 from helion._compiler.cross_loop_scheduler import choose_counted_events
 from helion._compiler.cross_loop_scheduler import derive_local_triggers
 from helion._compiler.cross_loop_scheduler import instantiate_event_graph
@@ -30,23 +30,18 @@ from helion._compiler.cross_loop_scheduler import order_local_contributors_by_ke
 from helion._compiler.cross_loop_scheduler import place_ordered_action_consumers
 from helion._compiler.cross_loop_scheduler import validate_worker_schedule
 from helion._compiler.tile_dependency import AllocationRegion
-from helion._compiler.tile_dependency import EventContribution
 from helion._compiler.tile_dependency import ExecutionScope
 from helion._compiler.tile_dependency import InstantiatedActionDomain
 from helion._compiler.tile_dependency import InstantiatedTaskFamily
-from helion._compiler.tile_dependency import KeyedEvent
 from helion._compiler.tile_dependency import LogicalTaskAxis
 from helion._compiler.tile_dependency import TaskFamily
 from helion._compiler.tile_dependency import TileAccess
-from helion._compiler.tile_dependency import TileDependencyGraph
 from helion._compiler.tile_dependency import TileDependencyKind
 from helion._compiler.tile_dependency import allocation_regions_may_overlap
 from helion._compiler.tile_dependency import build_tile_dependency_graph
-from helion._compiler.tile_dependency import dependency_predecessor_sets
 from helion._compiler.tile_dependency import instantiate_action_domains
 from helion._compiler.tile_dependency import instantiate_action_relations
-from helion._compiler.tile_dependency import predecessor_task_ids
-from helion._compiler.tile_dependency import prove_uniform_task_partition
+from helion._compiler.tile_dependency import instantiate_root_predecessor_sets
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -483,6 +478,40 @@ def _access(
     )
 
 
+def _root_predecessors(
+    plan,
+    task_families: tuple[InstantiatedTaskFamily, ...],
+    pair: tuple[int, int] = (0, 1),
+) -> tuple[frozenset[int], ...] | None:
+    return instantiate_root_predecessor_sets(
+        plan,
+        task_families=task_families,
+    )[pair]
+
+
+def _one_dimensional_families(
+    *,
+    producer_count: int = 8,
+    consumer_count: int = 8,
+    producer_block: int = 16,
+    consumer_block: int = 16,
+) -> tuple[InstantiatedTaskFamily, InstantiatedTaskFamily]:
+    return (
+        InstantiatedTaskFamily(
+            (10,),
+            (10,),
+            ((10, producer_count),),
+            ((10, producer_block),),
+        ),
+        InstantiatedTaskFamily(
+            (20,),
+            (20,),
+            ((20, consumer_count),),
+            ((20, consumer_block),),
+        ),
+    )
+
+
 class TestCrossLoopDependencies(TestCase):
     @skipIfNotCUDA()
     def test_device_ir_scopes_preserve_nested_producer_and_consumer_axes(
@@ -573,6 +602,26 @@ class TestCrossLoopDependencies(TestCase):
                 producer_coordinates[producer_scope.local_axis_order[0]],
                 consumer_coordinates[consumer_width_axis],
             )
+
+        producer_action_graph = add_ordered_action_events(
+            instantiate_event_graph(
+                producer_graph.tile_dependency_graph,
+                producer_families,
+            ),
+            producer_graph.tile_dependency_graph,
+            axis_geometry=producer_axis_geometry,
+        )
+        producer_event = next(
+            event
+            for event in producer_action_graph.events
+            if any(
+                contribution.producer_scope_id == producer_scope.scope_id
+                for contribution in event.contributions
+            )
+        )
+        self.assertEqual(producer_event.key_count, 8)
+        self.assertEqual(producer_event.expected_arrivals, (1,) * 8)
+        self.assertEqual(producer_event.uses[0].consumer_scope_id, None)
 
         consumer_graph = streamed_singleton_reduction.bind((x,)).host_function.device_ir
         assert consumer_graph.tile_dependency_graph is not None
@@ -701,14 +750,6 @@ class TestCrossLoopDependencies(TestCase):
         )
 
         self.assertEqual(len(graph.task_families), 4)
-        self.assertEqual(
-            tuple(event.producer_root for event in graph.events),
-            (0, 1, 2),
-        )
-        self.assertEqual(
-            tuple(use.consumer_root for use in graph.waits),
-            (1, 2, 3),
-        )
         configured = instantiate_event_graph(
             graph,
             tuple(
@@ -768,22 +809,6 @@ class TestCrossLoopDependencies(TestCase):
             [[10], [20], [30], [40]],
         )
 
-        root_zero_events = graph.events_contributed_by(0)
-        self.assertEqual(len(root_zero_events), 1)
-        self.assertEqual(
-            {
-                use.consumer_root
-                for use in graph.uses_for_event(root_zero_events[0].event_id)
-            },
-            {1, 2},
-        )
-        self.assertEqual(
-            {
-                graph.event(use.event_id).producer_root
-                for use in graph.waits_for_root(3)
-            },
-            {1, 2},
-        )
         configured = instantiate_event_graph(
             graph,
             tuple(
@@ -843,14 +868,6 @@ class TestCrossLoopDependencies(TestCase):
             [[10], [20], [30]],
         )
 
-        required_events = tuple(
-            graph.event(use.event_id) for use in graph.waits_for_root(2)
-        )
-        self.assertEqual(len(required_events), 2)
-        self.assertEqual(
-            {(event.producer_root, event.is_family_done) for event in required_events},
-            {(0, True), (1, False)},
-        )
         configured = instantiate_event_graph(
             graph,
             tuple(
@@ -983,7 +1000,6 @@ class TestCrossLoopDependencies(TestCase):
             events=(
                 InstantiatedKeyedEvent(
                     event_id=0,
-                    source_event_ids=(0,),
                     key_count=2,
                     contributions=(
                         InstantiatedEventContribution(
@@ -999,8 +1015,6 @@ class TestCrossLoopDependencies(TestCase):
                     uses=(
                         InstantiatedEventUse(
                             consumer_root=1,
-                            consumer_access_id=None,
-                            placement="root_entry",
                             required_keys_by_task=(
                                 frozenset((0,)),
                                 frozenset((1,)),
@@ -1056,7 +1070,6 @@ class TestCrossLoopDependencies(TestCase):
         event = CountedEventPlan(
             contributors=(
                 CountedEventContribution(
-                    source_event_ids=(3,),
                     producer_root=0,
                     task_to_key=(0, 0),
                 ),
@@ -1082,7 +1095,6 @@ class TestCrossLoopDependencies(TestCase):
             events=(
                 InstantiatedKeyedEvent(
                     event_id=0,
-                    source_event_ids=(0,),
                     key_count=2,
                     contributions=(
                         InstantiatedEventContribution(
@@ -1093,8 +1105,6 @@ class TestCrossLoopDependencies(TestCase):
                     uses=tuple(
                         InstantiatedEventUse(
                             consumer_root=root,
-                            consumer_access_id=None,
-                            placement="root_entry",
                             required_keys_by_task=(
                                 frozenset((0,)),
                                 frozenset((1,)),
@@ -1105,12 +1115,9 @@ class TestCrossLoopDependencies(TestCase):
                 ),
             ),
         )
-        dependency_graph = TileDependencyGraph((), (), (), (), ())
-
         (selected,) = choose_counted_events(
             event_graph,
             (),
-            dependency_graph,
             excluded_direct_roots=frozenset((1,)),
         )
 
@@ -1127,7 +1134,6 @@ class TestCrossLoopDependencies(TestCase):
             events=(
                 InstantiatedKeyedEvent(
                     event_id=0,
-                    source_event_ids=(3,),
                     key_count=2,
                     contributions=(
                         InstantiatedEventContribution(
@@ -1143,8 +1149,6 @@ class TestCrossLoopDependencies(TestCase):
                     uses=(
                         InstantiatedEventUse(
                             consumer_root=1,
-                            consumer_access_id=None,
-                            placement="root_entry",
                             required_keys_by_task=(
                                 frozenset((0,)),
                                 frozenset((1,)),
@@ -1222,7 +1226,6 @@ class TestCrossLoopDependencies(TestCase):
             events=(
                 InstantiatedKeyedEvent(
                     event_id=0,
-                    source_event_ids=(0,),
                     key_count=3,
                     contributions=(
                         InstantiatedEventContribution(
@@ -1237,8 +1240,6 @@ class TestCrossLoopDependencies(TestCase):
                     uses=(
                         InstantiatedEventUse(
                             consumer_root=1,
-                            consumer_access_id=None,
-                            placement="root_entry",
                             required_keys_by_task=(
                                 frozenset((0, 1)),
                                 frozenset((1, 2)),
@@ -1300,19 +1301,9 @@ class TestCrossLoopDependencies(TestCase):
             [[10], [20]],
         )
 
-        self.assertEqual(plan.events[0].granularity, "root")
-        self.assertTrue(plan.events[0].is_family_done)
-        self.assertEqual(plan.events[0].contributors, (EventContribution(0),))
-
-    def test_multi_contributor_event_has_no_unique_producer(self) -> None:
-        event = KeyedEvent(
-            event_id=0,
-            contributors=(EventContribution(0), EventContribution(1)),
-            granularity="task",
-        )
-
-        with self.assertRaisesRegex(ValueError, "no unique producer root"):
-            _ = event.producer_root
+        (event,) = instantiate_event_graph(plan, _one_dimensional_families()).events
+        self.assertTrue(event.is_family_done)
+        self.assertEqual(event.family_done_root, 0)
 
     def test_multidimensional_storage_offset_falls_back_to_root(self) -> None:
         plan = build_tile_dependency_graph(
@@ -1338,7 +1329,21 @@ class TestCrossLoopDependencies(TestCase):
             [[10, 11], [20, 21]],
         )
 
-        self.assertEqual(plan.events[0].granularity, "root")
+        families = (
+            InstantiatedTaskFamily(
+                (10, 11),
+                (10, 11),
+                ((10, 4), (11, 4)),
+                ((10, 1), (11, 1)),
+            ),
+            InstantiatedTaskFamily(
+                (20, 21),
+                (20, 21),
+                ((20, 3), (21, 3)),
+                ((20, 1), (21, 1)),
+            ),
+        )
+        self.assertIsNone(_root_predecessors(plan, families))
 
     def test_one_dimensional_storage_offset_remains_task_ready(self) -> None:
         plan = build_tile_dependency_graph(
@@ -1364,9 +1369,16 @@ class TestCrossLoopDependencies(TestCase):
             [[10], [20]],
         )
 
-        predecessor_map = plan.edges[0].readiness[0].predecessor_map
-        assert predecessor_map is not None
-        self.assertEqual(predecessor_map.axes[0].consumer_offset, 32)
+        self.assertEqual(
+            _root_predecessors(
+                plan,
+                _one_dimensional_families(
+                    producer_count=8,
+                    consumer_count=4,
+                ),
+            ),
+            tuple(frozenset((task + 2,)) for task in range(4)),
+        )
 
     def test_repeated_task_to_key_map_uses_one_periodic_segment(self) -> None:
         segments = _compress_task_to_key(tuple(range(8)) * 4)
@@ -1452,23 +1464,9 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(len(plan.edges), 1)
         edge = plan.edges[0]
         self.assertTrue(edge.is_raw_only)
-        self.assertTrue(edge.is_task_ready)
         self.assertEqual(
-            [(event.producer_root, event.granularity) for event in plan.events],
-            [(0, "task")],
-        )
-        self.assertEqual(len(plan.waits), 1)
-        self.assertEqual(plan.waits[0].consumer_access_id, 1)
-        self.assertEqual(plan.waits[0].event_id, plan.events[0].event_id)
-        self.assertEqual(plan.waits[0].placement, "root_entry")
-        predecessor_map = edge.readiness[0].predecessor_map
-        assert predecessor_map is not None
-        self.assertEqual(
-            [
-                (axis.producer_block_id, axis.consumer_block_id)
-                for axis in predecessor_map.axes
-            ],
-            [(10, 20)],
+            _root_predecessors(plan, _one_dimensional_families()),
+            tuple(frozenset((task,)) for task in range(8)),
         )
 
     def test_aligned_in_place_update_is_task_ready(self) -> None:
@@ -1491,14 +1489,9 @@ class TestCrossLoopDependencies(TestCase):
                 )
             ),
         )
-        self.assertTrue(edge.is_task_ready)
         self.assertEqual(
-            [requirement.consumer_access_id for requirement in edge.readiness],
-            [1, 2],
-        )
-        self.assertEqual(
-            [(event.producer_root, event.granularity) for event in plan.events],
-            [(0, "task")],
+            _root_predecessors(plan, _one_dimensional_families()),
+            tuple(frozenset((task,)) for task in range(8)),
         )
 
     def test_aligned_write_after_read_is_task_ready(self) -> None:
@@ -1515,8 +1508,10 @@ class TestCrossLoopDependencies(TestCase):
             edge.kinds,
             frozenset((TileDependencyKind.WRITE_AFTER_READ,)),
         )
-        self.assertTrue(edge.is_task_ready)
-        self.assertEqual(plan.events[0].granularity, "task")
+        self.assertEqual(
+            _root_predecessors(plan, _one_dimensional_families()),
+            tuple(frozenset((task,)) for task in range(8)),
+        )
 
     def test_unproven_write_hazard_falls_back_to_root(self) -> None:
         plan = build_tile_dependency_graph(
@@ -1533,10 +1528,11 @@ class TestCrossLoopDependencies(TestCase):
             [[10], [20]],
         )
 
-        edge = plan.edges[0]
-        self.assertFalse(edge.is_task_ready)
-        self.assertEqual(edge.readiness[0].granularity, "root")
-        self.assertEqual(plan.events[0].granularity, "root")
+        relation = _root_predecessors(plan, _one_dimensional_families())
+        self.assertEqual(
+            relation,
+            tuple(frozenset(range(8)) for _ in range(8)),
+        )
 
     def test_reversed_mapping_falls_back_to_root(self) -> None:
         plan = build_tile_dependency_graph(
@@ -1553,13 +1549,11 @@ class TestCrossLoopDependencies(TestCase):
             [[10], [20]],
         )
 
-        edge = plan.edges[0]
-        self.assertFalse(edge.is_task_ready)
-        self.assertEqual(edge.readiness[0].granularity, "root")
-        self.assertIsNone(edge.readiness[0].predecessor_map)
-        self.assertEqual(plan.events[0].granularity, "root")
-        self.assertEqual(plan.waits[0].consumer_access_id, 1)
-        self.assertEqual(plan.waits[0].placement, "access")
+        relation = _root_predecessors(plan, _one_dimensional_families())
+        self.assertEqual(
+            relation,
+            tuple(frozenset(range(8)) for _ in range(8)),
+        )
 
     def test_batch_axis_is_part_of_task_mapping(self) -> None:
         plan = build_tile_dependency_graph(
@@ -1588,26 +1582,27 @@ class TestCrossLoopDependencies(TestCase):
             [[10, 11], [20, 21]],
         )
 
-        edge = plan.edges[0]
-        self.assertTrue(edge.is_task_ready)
-        predecessor_map = edge.readiness[0].predecessor_map
-        assert predecessor_map is not None
-        self.assertEqual(
-            [
-                (axis.producer_block_id, axis.consumer_block_id)
-                for axis in predecessor_map.axes
-            ],
-            [(10, 20), (11, 21)],
-        )
-        self.assertEqual(
-            predecessor_task_ids(
-                predecessor_map,
-                consumer_coordinates={20: 1, 21: 2},
-                block_sizes={10: 1, 11: 1, 20: 1, 21: 1},
-                producer_axis_order=(11, 10),
-                producer_axis_counts={10: 2, 11: 4},
+        families = (
+            InstantiatedTaskFamily(
+                (10, 11),
+                (11, 10),
+                ((10, 2), (11, 4)),
+                ((10, 1), (11, 1)),
             ),
-            frozenset((6,)),
+            InstantiatedTaskFamily(
+                (20, 21),
+                (21, 20),
+                ((20, 2), (21, 4)),
+                ((20, 1), (21, 1)),
+            ),
+        )
+        relation = _root_predecessors(plan, families)
+        assert relation is not None
+        consumer_task = 1 + 2 * 2
+        (producer_task,) = relation[consumer_task]
+        self.assertEqual(
+            families[0].task_coordinates(producer_task),
+            {10: 1, 11: 2},
         )
 
     def test_size_one_view_dimensions_are_normalized(self) -> None:
@@ -1639,16 +1634,23 @@ class TestCrossLoopDependencies(TestCase):
             [[10, 11], [20, 21]],
         )
 
-        edge = plan.edges[0]
-        self.assertTrue(edge.is_task_ready)
-        predecessor_map = edge.readiness[0].predecessor_map
-        assert predecessor_map is not None
+        families = (
+            InstantiatedTaskFamily(
+                (10, 11),
+                (10, 11),
+                ((10, 32), (11, 8)),
+                ((10, 1), (11, 16)),
+            ),
+            InstantiatedTaskFamily(
+                (20, 21),
+                (20, 21),
+                ((20, 32), (21, 8)),
+                ((20, 1), (21, 16)),
+            ),
+        )
         self.assertEqual(
-            [
-                (axis.producer_block_id, axis.consumer_block_id)
-                for axis in predecessor_map.axes
-            ],
-            [(10, 20), (11, 21)],
+            _root_predecessors(plan, families),
+            tuple(frozenset((task,)) for task in range(256)),
         )
 
     def test_nontrivial_reshape_still_falls_back_to_root(self) -> None:
@@ -1678,8 +1680,27 @@ class TestCrossLoopDependencies(TestCase):
             [[10, 11], [20]],
         )
 
-        self.assertFalse(plan.edges[0].is_task_ready)
-        self.assertEqual(plan.edges[0].readiness[0].granularity, "root")
+        families = (
+            InstantiatedTaskFamily(
+                (10, 11),
+                (10, 11),
+                ((10, 32), (11, 8)),
+                ((10, 1), (11, 16)),
+            ),
+            InstantiatedTaskFamily(
+                (20,),
+                (20,),
+                ((20, 256),),
+                ((20, 16),),
+            ),
+        )
+        relation = _root_predecessors(plan, families)
+        assert relation is not None
+        self.assertEqual(len(relation), 256)
+        self.assertEqual(
+            frozenset().union(*relation),
+            frozenset(range(256)),
+        )
 
     def test_unequal_tiles_map_to_every_overlapping_producer(self) -> None:
         plan = build_tile_dependency_graph(
@@ -1689,21 +1710,20 @@ class TestCrossLoopDependencies(TestCase):
             ),
             [[10], [20]],
         )
-        predecessor_map = plan.edges[0].readiness[0].predecessor_map
-        assert predecessor_map is not None
-
         self.assertEqual(
-            predecessor_task_ids(
-                predecessor_map,
-                consumer_coordinates={20: 1},
-                block_sizes={10: 16, 20: 64},
-                producer_axis_order=(10,),
-                producer_axis_counts={10: 8},
+            _root_predecessors(
+                plan,
+                _one_dimensional_families(
+                    producer_count=8,
+                    consumer_count=2,
+                    producer_block=16,
+                    consumer_block=64,
+                ),
             ),
-            frozenset((4, 5, 6, 7)),
+            (frozenset((0, 1, 2, 3)), frozenset((4, 5, 6, 7))),
         )
 
-    def test_uniform_partition_uses_coordinates_not_flattened_pid_runs(self) -> None:
+    def test_root_relation_uses_coordinates_not_flattened_pid_runs(self) -> None:
         plan = build_tile_dependency_graph(
             (
                 _access(
@@ -1739,41 +1759,33 @@ class TestCrossLoopDependencies(TestCase):
             ),
             [[10, 11], [20, 21]],
         )
-        predecessor_maps = tuple(
-            requirement.predecessor_map
-            for requirement in plan.edges[0].readiness
-            if requirement.predecessor_map is not None
+        families = (
+            InstantiatedTaskFamily(
+                (10, 11),
+                (11, 10),
+                ((10, 2), (11, 16)),
+                ((10, 1), (11, 16)),
+            ),
+            InstantiatedTaskFamily(
+                (20, 21),
+                (21, 20),
+                ((20, 2), (21, 4)),
+                ((20, 1), (21, 32)),
+            ),
+        )
+        relation = _root_predecessors(plan, families)
+        assert relation is not None
+        self.assertEqual(len(relation), 8)
+        self.assertEqual({len(predecessors) for predecessors in relation}, {4})
+        self.assertEqual(frozenset().union(*relation), frozenset(range(32)))
+        self.assertTrue(
+            all(
+                left.isdisjoint(right)
+                for left, right in itertools.combinations(relation, 2)
+            )
         )
 
-        partition = prove_uniform_task_partition(
-            predecessor_maps,
-            consumer_axis_order=(21, 20),
-            consumer_axis_counts={20: 2, 21: 4},
-            producer_axis_order=(11, 10),
-            producer_axis_counts={10: 2, 11: 16},
-            block_sizes={10: 1, 11: 16, 20: 1, 21: 32},
-        )
-
-        assert partition is not None
-        self.assertEqual(partition.producer_tasks, 32)
-        self.assertEqual(partition.consumer_tasks, 8)
-        self.assertEqual(partition.fanin, 4)
-        self.assertEqual(
-            [
-                (axis.producer_block_id, axis.consumer_block_id, axis.scale)
-                for axis in partition.outer_axes
-            ],
-            [(10, 20, 1)],
-        )
-        self.assertEqual(partition.partition_producer_block_id, 11)
-        self.assertEqual(partition.partition_consumer_block_id, 21)
-        self.assertEqual(partition.partition_consumer_stride, 2)
-        self.assertEqual(
-            [(segment.begin, segment.length) for segment in partition.segments],
-            [(0, 2), (8, 2)],
-        )
-
-    def test_allocation_overlap_relation_matches_affine_predecessors(self) -> None:
+    def test_allocation_overlap_relation_is_authoritative(self) -> None:
         plan = build_tile_dependency_graph(
             (
                 _access(
@@ -1823,39 +1835,26 @@ class TestCrossLoopDependencies(TestCase):
                 block_sizes_items=((20, 1), (21, 32)),
             ),
         )
-        edge = plan.edges[0]
-        actual = dependency_predecessor_sets(
-            edge,
-            task_families=families,
-            access_by_id={access.access_id: access for access in plan.accesses},
-        )
+        actual = _root_predecessors(plan, families)
         assert actual is not None
+        for consumer_task, predecessors in enumerate(actual):
+            coordinates = families[1].task_coordinates(consumer_task)
+            batch = coordinates[20]
+            group = coordinates[21]
+            self.assertEqual(
+                predecessors,
+                frozenset(
+                    batch + producer_group * 2
+                    for producer_group in (
+                        2 * group,
+                        2 * group + 1,
+                        8 + 2 * group,
+                        9 + 2 * group,
+                    )
+                ),
+            )
 
-        predecessor_maps = tuple(
-            requirement.predecessor_map
-            for requirement in edge.readiness
-            if requirement.predecessor_map is not None
-        )
-        expected: list[frozenset[int]] = []
-        for consumer_task in range(families[1].task_count):
-            predecessors: set[int] = set()
-            for predecessor_map in predecessor_maps:
-                mapped = predecessor_task_ids(
-                    predecessor_map,
-                    consumer_coordinates=families[1].task_coordinates(consumer_task),
-                    block_sizes={
-                        **families[0].block_sizes,
-                        **families[1].block_sizes,
-                    },
-                    producer_axis_order=families[0].logical_axis_order,
-                    producer_axis_counts=families[0].axis_counts,
-                )
-                assert mapped is not None
-                predecessors.update(mapped)
-            expected.append(frozenset(predecessors))
-        self.assertEqual(actual, tuple(expected))
-
-    def test_uniform_partition_accepts_non_power_of_two_fanin(self) -> None:
+    def test_root_relation_accepts_non_power_of_two_fanin(self) -> None:
         plan = build_tile_dependency_graph(
             (
                 _access(0, root=0, kind="store", shape=(96,), block_ids=(10,)),
@@ -1863,26 +1862,20 @@ class TestCrossLoopDependencies(TestCase):
             ),
             [[10], [20]],
         )
-        predecessor_map = plan.edges[0].readiness[0].predecessor_map
-        assert predecessor_map is not None
-
-        partition = prove_uniform_task_partition(
-            (predecessor_map,),
-            consumer_axis_order=(20,),
-            consumer_axis_counts={20: 2},
-            producer_axis_order=(10,),
-            producer_axis_counts={10: 6},
-            block_sizes={10: 16, 20: 48},
-        )
-
-        assert partition is not None
-        self.assertEqual(partition.fanin, 3)
         self.assertEqual(
-            [(segment.begin, segment.length) for segment in partition.segments],
-            [(0, 3)],
+            _root_predecessors(
+                plan,
+                _one_dimensional_families(
+                    producer_count=6,
+                    consumer_count=2,
+                    producer_block=16,
+                    consumer_block=48,
+                ),
+            ),
+            (frozenset((0, 1, 2)), frozenset((3, 4, 5))),
         )
 
-    def test_uniform_partition_accepts_compact_partial_domains(
+    def test_root_relation_accepts_overlapping_and_partial_domains(
         self,
     ) -> None:
         overlapping = build_tile_dependency_graph(
@@ -1899,20 +1892,22 @@ class TestCrossLoopDependencies(TestCase):
             ),
             [[10], [20]],
         )
-        overlapping_maps = tuple(
-            requirement.predecessor_map
-            for requirement in overlapping.edges[0].readiness
-            if requirement.predecessor_map is not None
-        )
-        self.assertIsNone(
-            prove_uniform_task_partition(
-                overlapping_maps,
-                consumer_axis_order=(20,),
-                consumer_axis_counts={20: 4},
-                producer_axis_order=(10,),
-                producer_axis_counts={10: 8},
-                block_sizes={10: 16, 20: 32},
-            )
+        self.assertEqual(
+            _root_predecessors(
+                overlapping,
+                _one_dimensional_families(
+                    producer_count=8,
+                    consumer_count=4,
+                    producer_block=16,
+                    consumer_block=32,
+                ),
+            ),
+            (
+                frozenset((0, 1, 2)),
+                frozenset((2, 3, 4)),
+                frozenset((4, 5, 6)),
+                frozenset((6, 7)),
+            ),
         )
 
         identity = build_tile_dependency_graph(
@@ -1922,20 +1917,20 @@ class TestCrossLoopDependencies(TestCase):
             ),
             [[10], [20]],
         )
-        identity_map = identity.edges[0].readiness[0].predecessor_map
-        assert identity_map is not None
-        prefix = prove_uniform_task_partition(
-            (identity_map,),
-            consumer_axis_order=(20,),
-            consumer_axis_counts={20: 3},
-            producer_axis_order=(10,),
-            producer_axis_counts={10: 8},
-            block_sizes={10: 16, 20: 32},
+        prefix = _root_predecessors(
+            identity,
+            _one_dimensional_families(
+                producer_count=8,
+                consumer_count=3,
+                producer_block=16,
+                consumer_block=32,
+            ),
         )
         assert prefix is not None
-        self.assertEqual(prefix.producer_tasks, 8)
-        self.assertEqual(prefix.participating_producer_tasks, 6)
-        self.assertFalse(prefix.covers_producer_domain)
+        self.assertEqual(
+            prefix, (frozenset((0, 1)), frozenset((2, 3)), frozenset((4, 5)))
+        )
+        self.assertEqual(frozenset().union(*prefix), frozenset(range(6)))
 
         suffix = build_tile_dependency_graph(
             (
@@ -1950,20 +1945,18 @@ class TestCrossLoopDependencies(TestCase):
             ),
             [[10], [20]],
         )
-        suffix_map = suffix.edges[0].readiness[0].predecessor_map
-        assert suffix_map is not None
-        suffix_partition = prove_uniform_task_partition(
-            (suffix_map,),
-            consumer_axis_order=(20,),
-            consumer_axis_counts={20: 3},
-            producer_axis_order=(10,),
-            producer_axis_counts={10: 8},
-            block_sizes={10: 16, 20: 32},
+        suffix_relation = _root_predecessors(
+            suffix,
+            _one_dimensional_families(
+                producer_count=8,
+                consumer_count=3,
+                producer_block=16,
+                consumer_block=32,
+            ),
         )
-        assert suffix_partition is not None
         self.assertEqual(
-            suffix_partition.producer_key_by_task,
-            (None, None, 0, 0, 1, 1, 2, 2),
+            suffix_relation,
+            (frozenset((2, 3)), frozenset((4, 5)), frozenset((6, 7))),
         )
 
     def test_tile_id_indices_use_scalar_extent(self) -> None:
@@ -1986,18 +1979,17 @@ class TestCrossLoopDependencies(TestCase):
             ),
             [[10], [20]],
         )
-        predecessor_map = plan.edges[0].readiness[0].predecessor_map
-        assert predecessor_map is not None
-
         self.assertEqual(
-            predecessor_task_ids(
-                predecessor_map,
-                consumer_coordinates={20: 2},
-                block_sizes={10: 128, 20: 128},
-                producer_axis_order=(10,),
-                producer_axis_counts={10: 4},
+            _root_predecessors(
+                plan,
+                _one_dimensional_families(
+                    producer_count=4,
+                    consumer_count=4,
+                    producer_block=128,
+                    consumer_block=128,
+                ),
             ),
-            frozenset((2,)),
+            tuple(frozenset((task,)) for task in range(4)),
         )
 
     def test_multiple_stores_fall_back_to_root(self) -> None:
@@ -2010,8 +2002,10 @@ class TestCrossLoopDependencies(TestCase):
             [[10], [20]],
         )
 
-        edge = plan.edges[0]
-        self.assertFalse(edge.is_task_ready)
+        self.assertEqual(
+            _root_predecessors(plan, _one_dimensional_families()),
+            tuple(frozenset((task,)) for task in range(8)),
+        )
 
     def test_masked_store_falls_back_to_root(self) -> None:
         plan = build_tile_dependency_graph(
@@ -2022,7 +2016,10 @@ class TestCrossLoopDependencies(TestCase):
             [[10], [20]],
         )
 
-        self.assertEqual(plan.edges[0].readiness[0].granularity, "root")
+        self.assertEqual(
+            _root_predecessors(plan, _one_dimensional_families()),
+            tuple(frozenset((task,)) for task in range(8)),
+        )
 
     def test_nonzero_or_dynamic_grid_start_falls_back_to_root(self) -> None:
         plan = build_tile_dependency_graph(
@@ -2034,8 +2031,7 @@ class TestCrossLoopDependencies(TestCase):
             noncanonical_task_origin_block_ids=frozenset((10,)),
         )
 
-        self.assertEqual(plan.events[0].granularity, "root")
-        self.assertEqual(plan.waits[0].placement, "access")
+        self.assertIsNone(_root_predecessors(plan, _one_dimensional_families()))
 
     def test_tracks_latest_writer_and_intervening_readers(self) -> None:
         task_families = tuple(
@@ -2160,11 +2156,19 @@ class TestCrossLoopDependencies(TestCase):
             [(edge.producer_root, edge.consumer_root) for edge in plan.edges],
             [(0, 1), (0, 2)],
         )
-        self.assertEqual(len(plan.events), 1)
-        self.assertEqual(plan.events[0].granularity, "task")
+        configured = instantiate_event_graph(
+            plan,
+            (
+                InstantiatedTaskFamily((0,), (0,), ((0, 8),), ((0, 16),)),
+                InstantiatedTaskFamily((1,), (1,), ((1, 8),), ((1, 16),)),
+                InstantiatedTaskFamily((2,), (2,), ((2, 8),), ((2, 16),)),
+            ),
+        )
+        (event,) = configured.events_contributed_by(0)
+        self.assertFalse(event.is_family_done)
         self.assertEqual(
-            [(wait.consumer_root, wait.event_id) for wait in plan.waits],
-            [(1, 0), (2, 0)],
+            {use.consumer_root for use in event.uses},
+            {1, 2},
         )
 
     def test_mixed_accesses_retain_their_strongest_readiness(self) -> None:
@@ -2186,17 +2190,15 @@ class TestCrossLoopDependencies(TestCase):
         )
 
         self.assertEqual(len(plan.edges), 2)
-        self.assertEqual(
-            [(event.producer_root, event.granularity) for event in plan.events],
-            [(0, "task"), (0, "root")],
-        )
-        self.assertEqual(
-            [
-                (wait.consumer_root, wait.consumer_access_id, wait.placement)
-                for wait in plan.waits
-            ],
-            [(1, 1, "root_entry"), (1, 3, "access")],
-        )
+        (event,) = instantiate_event_graph(
+            plan,
+            (
+                InstantiatedTaskFamily((0,), (0,), ((0, 8),), ((0, 16),)),
+                InstantiatedTaskFamily((1,), (1,), ((1, 8),), ((1, 16),)),
+            ),
+        ).events
+        self.assertTrue(event.is_family_done)
+        self.assertEqual(event.family_done_root, 0)
 
     def test_mixed_exact_and_unknown_accesses_use_root_completion(self) -> None:
         dependency_plan = build_tile_dependency_graph(
@@ -2291,7 +2293,6 @@ class TestCrossLoopDependencies(TestCase):
         )
 
         self.assertEqual(schedule.task_ready_edges, frozenset())
-        self.assertEqual(schedule.task_waits_by_root, {})
         self.assertEqual(schedule.root_completion_edges, frozenset(((0, 1),)))
 
     def test_root_completion_path_elides_redundant_exact_task_wait(self) -> None:
@@ -2357,7 +2358,6 @@ class TestCrossLoopDependencies(TestCase):
             frozenset(((0, 1), (1, 2), (2, 3))),
         )
         self.assertEqual(schedule.task_ready_edges, frozenset())
-        self.assertEqual(schedule.task_waits_by_root, {})
 
     def test_worker_schedule_derives_access_ready_overlap(self) -> None:
         dependency_plan = build_tile_dependency_graph(
@@ -2469,18 +2469,6 @@ class TestCrossLoopDependencies(TestCase):
             "preordered_edges": frozenset(),
             "physical_worker_limit": 8,
         }
-
-        task_ready_graph = canonicalize_task_readiness(
-            instantiate_event_graph(dependency_plan, task_families),
-            dependency_plan,
-        )
-        root_two_event = next(
-            event
-            for event in task_ready_graph.events
-            if any(use.consumer_root == 2 for use in event.uses)
-        )
-        self.assertEqual(root_two_event.expected_arrivals, (4,))
-        self.assertEqual(root_two_event.uses[0].placement, "root_entry")
 
         schedule = build_cross_loop_schedule(**kwargs, requested_worker_count=6)
 
@@ -2619,7 +2607,6 @@ class TestCrossLoopDependencies(TestCase):
             events=(
                 InstantiatedKeyedEvent(
                     event_id=0,
-                    source_event_ids=(0,),
                     key_count=4,
                     contributions=(
                         InstantiatedEventContribution(
@@ -2630,8 +2617,6 @@ class TestCrossLoopDependencies(TestCase):
                     uses=(
                         InstantiatedEventUse(
                             consumer_root=1,
-                            consumer_access_id=1,
-                            placement="access",
                             required_keys_by_task=tuple(
                                 frozenset((action,)) for action in range(4)
                             ),
@@ -2692,7 +2677,6 @@ class TestCrossLoopDependencies(TestCase):
 
         self.assertEqual(schedule.task_ready_edges, frozenset(((0, 2), (1, 2))))
         self.assertEqual(schedule.root_completion_edges, frozenset())
-        self.assertEqual(schedule.task_waits_by_root, {})
         self.assertEqual(len(schedule.counted_events), 1)
         event = schedule.counted_events[0]
         self.assertEqual(event.uses[0].consumer_root, 2)
@@ -3220,6 +3204,22 @@ class TestCrossLoopDependencies(TestCase):
 class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_nested_producer_actions_publish_readiness(self) -> None:
+        x = torch.arange(2 * 64, device=DEVICE, dtype=torch.float32).reshape(2, 64)
+        code, out = code_and_output(
+            nested_store_chain,
+            (x,),
+            pid_type="persistent_blocked",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+
+        torch.testing.assert_close(out, (x + 1) * 2)
+        self.assertIn("tile_dependency_keyed_event_wait", code)
+        self.assertNotIn("tile_dependency_root_completion", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_cartesian_unequal_tiles_choose_proven_readiness(self) -> None:
         for batch, width, producer_width, consumer_width in (
             (2, 64, 16, 32),
@@ -3497,7 +3497,6 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         assert bound.host_function is not None
         dependency_plan = bound.host_function.device_ir.tile_dependency_graph
         assert dependency_plan is not None
-        self.assertEqual(dependency_plan.events[0].granularity, "root")
 
         code, out = code_and_output(
             offset_affine_chain,
@@ -3699,20 +3698,16 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                     )
                     downstream_edges = dependency_plan.edges_between(1, 2)
                     self.assertEqual(len(downstream_edges), 2)
-                    self.assertEqual(
-                        {wait.placement for wait in dependency_plan.waits_for_root(2)},
-                        {"access"},
-                    )
-                    nested_block_ids = {
-                        axis.consumer_block_id
+                    nested_scope_ids = {
+                        scope.scope_id
                         for edge in downstream_edges
-                        for requirement in edge.readiness
-                        if requirement.predecessor_map is not None
-                        for axis in requirement.predecessor_map.axes
-                        if axis.consumer_block_id
-                        not in bound.host_function.device_ir.grid_block_ids[2]
+                        for dependency in edge.access_dependencies
+                        for scope in dependency_plan.scopes_for_access(
+                            dependency.consumer_access_id
+                        )
+                        if not scope.is_root
                     }
-                    self.assertEqual(len(nested_block_ids), 1)
+                    self.assertEqual(len(nested_scope_ids), 1)
                 worker_config = {}
                 if not reverse_groups and group_size == 32:
                     producer_tasks = batch * (2 * intermediate // block_sizes[1])

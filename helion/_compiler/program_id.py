@@ -396,7 +396,6 @@ if TYPE_CHECKING:
     from .cute.cute_mma import _Tcgen05SchedPipelinePlan
     from .cute.device_state import CuteTcgen05MatmulPlan
     from .inductor_lowering import CodegenState
-    from .tile_dependency import EventUse
 
 NUM_SM_VAR = "_NUM_SM"
 NUM_XCD_VAR = "_NUM_XCDS"
@@ -806,7 +805,6 @@ class ForEachProgramID(ProgramIDs):
             ),
         )
         root_completion_edges = set(cross_loop_schedule.root_completion_edges)
-        task_waits_by_root = cross_loop_schedule.task_waits_by_root
         family_done_event_plans = tuple(
             plan
             for plan in cross_loop_schedule.counted_events
@@ -867,18 +865,6 @@ class ForEachProgramID(ProgramIDs):
         device_function.preamble.extend(
             strategy._persistent_setup_statements(total_expr)
         )
-        task_event_roots = sorted(
-            {
-                dependency_plan.event(wait.event_id).producer_root
-                for waits in task_waits_by_root.values()
-                for wait in waits
-            }
-        )
-        task_event_offsets: dict[int, int] = {}
-        task_event_count = 0
-        for root in task_event_roots:
-            task_event_offsets[root] = task_event_count
-            task_event_count += static_task_counts[root]
         counted_event_offsets: dict[CountedEventPlan, int] = {}
         counted_event_counter_count = 0
         for plan in all_counted_event_plans:
@@ -910,7 +896,6 @@ class ForEachProgramID(ProgramIDs):
             state_count += count
             return offset
 
-        task_event_state_offset = reserve_state(task_event_count)
         counted_event_state_offset = reserve_state(counted_event_counter_count)
         root_completion_state_offset = reserve_state(
             len(root_completion_producer_roots) * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
@@ -933,7 +918,6 @@ class ForEachProgramID(ProgramIDs):
             return f"{state_arg} + ({static_state_base}) + {offset}"
 
         epoch_arg = state_arg
-        task_event_arg = state_section(task_event_state_offset)
         counted_event_arg = state_section(counted_event_state_offset)
         root_completion_counter_arg = state_section(root_completion_state_offset)
 
@@ -1003,15 +987,21 @@ class ForEachProgramID(ProgramIDs):
         root_physical_axis_order: list[tuple[int, ...]] = []
         root_logical_axis_order: list[tuple[int, ...]] = []
         root_axis_counts: list[dict[int, int]] = []
-        block_sizes: dict[int, int] = {}
         for family in instantiated_task_families:
             root_physical_axis_order.append(family.physical_axis_order)
             root_logical_axis_order.append(family.logical_axis_order)
             root_counts = family.axis_counts
-            axis_block_sizes = family.block_sizes
             root_axis_counts.append(root_counts)
-            block_sizes.update(axis_block_sizes)
-        counted_events_by_producer: dict[
+        root_events_by_producer: dict[
+            int,
+            list[
+                tuple[
+                    CountedEventPlan,
+                    CountedEventContribution,
+                ]
+            ],
+        ] = {}
+        action_events_by_scope: dict[
             int,
             list[
                 tuple[
@@ -1022,9 +1012,18 @@ class ForEachProgramID(ProgramIDs):
         ] = {}
         for plan in all_counted_event_plans:
             for contributor in plan.contributors:
-                counted_events_by_producer.setdefault(
-                    contributor.producer_root, []
-                ).append((plan, contributor))
+                if contributor.producer_scope_id is None:
+                    root_events_by_producer.setdefault(
+                        contributor.producer_root, []
+                    ).append((plan, contributor))
+                else:
+                    action_events_by_scope.setdefault(
+                        contributor.producer_scope_id, []
+                    ).append((plan, contributor))
+        action_event_roots = {
+            cross_loop_schedule.event_graph.action_domain(scope_id).root
+            for scope_id in action_events_by_scope
+        }
         ordered_local_events: set[CountedEventPlan] = set()
         for plan in counted_event_plans:
             if plan.local_use is None or plan.graph_event_index is None:
@@ -1033,7 +1032,9 @@ class ForEachProgramID(ProgramIDs):
             if len(event.contributions) != 1:
                 continue
             contribution = event.contributions[0]
-            if any(len(keys) != 1 for keys in contribution.keys_by_task):
+            if contribution.producer_scope_id is not None or any(
+                len(keys) != 1 for keys in contribution.keys_by_task
+            ):
                 continue
             tasks_by_key: list[list[int]] = [[] for _ in range(event.key_count)]
             for task, keys in enumerate(contribution.keys_by_task):
@@ -1297,6 +1298,11 @@ class ForEachProgramID(ProgramIDs):
                 split_iteration_offsets=boundaries,
                 stage_waits=tuple(stage_waits),
             )
+            scheduled_root_body = body_with_action_publications(
+                use.consumer_root,
+                scheduled_root_body,
+                consumer_coordinates,
+            )
             return self._outline_cross_loop_region(
                 device_function,
                 name_hint=f"tile_dependency_root_{use.consumer_root}",
@@ -1423,21 +1429,15 @@ class ForEachProgramID(ProgramIDs):
                 device_function,
                 root=on_ready_root,
                 logical_pid=consumer_logical_pid,
-                body=case_bodies[on_ready_root],
+                body=body_with_action_publications(
+                    on_ready_root,
+                    case_bodies[on_ready_root],
+                    consumer_coordinates,
+                ),
                 extra_argument_names=consumer_extra_arguments,
             )
             consumer_publications: list[ast.stmt] = []
-            if on_ready_root in task_event_offsets:
-                assert task_event_arg is not None
-                consumer_publications.append(
-                    statement_from_string(
-                        f"tl.atomic_xchg({task_event_arg} + "
-                        f"{task_event_offsets[on_ready_root]} + "
-                        f"{consumer_task}, {epoch_var}, "
-                        "sem='release', scope='gpu')"
-                    )
-                )
-            for nested_event, nested_contributor in counted_events_by_producer.get(
+            for nested_event, nested_contributor in root_events_by_producer.get(
                 on_ready_root, ()
             ):
                 consumer_publications.extend(
@@ -1488,6 +1488,107 @@ class ForEachProgramID(ProgramIDs):
                     orelse=[],
                 )
             ]
+
+        def body_with_action_publications(
+            root: int,
+            body: list[ast.stmt],
+            producer_coordinates: dict[int, str],
+        ) -> list[ast.stmt]:
+            """Publish nested action events without moving the owning strand."""
+            from .tile_dependency import tile_action_scope_id
+
+            scope_ids = {
+                scope_id
+                for scope_id in action_events_by_scope
+                if cross_loop_schedule.event_graph.action_domain(scope_id).root == root
+            }
+            if not scope_ids:
+                return body
+            emitted_scope_ids: set[int] = set()
+
+            def rewrite(loop: ast.For) -> list[ast.stmt] | None:
+                scope_id = tile_action_scope_id(loop)
+                if scope_id not in scope_ids:
+                    return None
+                if scope_id in emitted_scope_ids:
+                    raise AssertionError(
+                        "one action scope must identify one lowered loop"
+                    )
+                domain = cross_loop_schedule.event_graph.action_domain(scope_id)
+                if (
+                    len(domain.nested_axis_order) != 1
+                    or not isinstance(loop.target, ast.Name)
+                    or not isinstance(loop.iter, ast.Call)
+                    or len(loop.iter.args) < 2
+                ):
+                    raise AssertionError(
+                        "nested action publication requires one range-like loop axis"
+                    )
+                nested_axis = domain.nested_axis_order[0]
+                begin = ast.unparse(loop.iter.args[0])
+                step = (
+                    ast.unparse(loop.iter.args[2]) if len(loop.iter.args) >= 3 else "1"
+                )
+                action_coordinates = {
+                    **producer_coordinates,
+                    nested_axis: f"(({loop.target.id}) - ({begin})) // ({step})",
+                }
+                strand_task = logical_task_from_coordinates(root, action_coordinates)
+                local_action_terms: list[str] = []
+                multiplier = 1
+                for axis in domain.nested_axis_order:
+                    count = domain.axis_counts[axis]
+                    if count != 1:
+                        coordinate = action_coordinates[axis]
+                        local_action_terms.append(
+                            f"({coordinate})"
+                            if multiplier == 1
+                            else f"({coordinate}) * {multiplier}"
+                        )
+                    multiplier *= count
+                local_action = " + ".join(local_action_terms) or "0"
+                action = (
+                    f"({strand_task}) * {domain.actions_per_strand} + ({local_action})"
+                )
+
+                publications: list[ast.stmt] = []
+                for plan, contributor in action_events_by_scope[scope_id]:
+                    key, membership = task_to_key_expression(
+                        action,
+                        contributor.task_to_key_segments,
+                    )
+                    publications.append(
+                        create(
+                            ast.If,
+                            test=expr_from_string(membership),
+                            body=emit_counted_event_for_key(plan, key),
+                            orelse=[],
+                        )
+                    )
+
+                cloned = cast("ast.For", _clone_ast_value(loop))
+                computation = _ast_fingerprint(cloned.body)
+                cloned.body.extend(
+                    [
+                        self._cross_loop_publication_barrier(device_function),
+                        *publications,
+                    ]
+                )
+                if (
+                    _ast_fingerprint(cloned.body[: -len(publications) - 1])
+                    != computation
+                ):
+                    raise AssertionError(
+                        "nested action publication changed the loop computation"
+                    )
+                emitted_scope_ids.add(scope_id)
+                return [cloned]
+
+            result = _clone_opaque_statements_with_loop_rewrite(body, rewrite)
+            if emitted_scope_ids != scope_ids:
+                missing = sorted(scope_ids - emitted_scope_ids)
+                raise AssertionError(f"missing nested producer action scopes {missing}")
+            return result
 
         def scheduled_logical_task_expression(
             root: int,
@@ -1576,12 +1677,12 @@ class ForEachProgramID(ProgramIDs):
         ) -> list[ast.stmt]:
             body: list[ast.stmt] = []
             has_task_scheduling = root in ordered_action_events_by_consumer
-            producer_events = tuple(counted_events_by_producer.get(root, ()))
+            producer_events = tuple(root_events_by_producer.get(root, ()))
             scheduled_local_task = local_task
             scheduled_logical_pid = logical_pid
             scheduled_event_task = local_task
             scheduled_coordinates: dict[int, str] | None = None
-            if producer_events:
+            if producer_events or root in action_event_roots:
                 has_task_scheduling = True
             if (
                 logical_task_expr := scheduled_logical_task_expression(
@@ -1646,27 +1747,6 @@ class ForEachProgramID(ProgramIDs):
                         prefix="tile_dependency_keyed_event_wait",
                     )
                 )
-            if root in task_waits_by_root:
-                has_task_scheduling = True
-                assert dependency_plan is not None and task_event_arg is not None
-                for wait in task_waits_by_root[root]:
-                    producer_root = dependency_plan.event(wait.event_id).producer_root
-                    if wait.placement != "root_entry":
-                        raise AssertionError("nested waits require an action event")
-                    body.extend(
-                        self._emit_root_admission_task_wait(
-                            wait=wait,
-                            device_function=device_function,
-                            task_event_arg=task_event_arg,
-                            task_event_offset=task_event_offsets[producer_root],
-                            epoch_var=epoch_var,
-                            consumer_coordinates=scheduled_coordinates,
-                            consumer_axis_counts=root_axis_counts[root],
-                            producer_axis_order=root_logical_axis_order[producer_root],
-                            producer_axis_counts=root_axis_counts[producer_root],
-                            block_sizes=block_sizes,
-                        )
-                    )
             action_event_uses = ordered_action_events_by_consumer.get(root, ())
             if action_event_uses:
                 if len(action_event_uses) != 1:
@@ -1686,21 +1766,16 @@ class ForEachProgramID(ProgramIDs):
                     device_function,
                     root=root,
                     logical_pid=scheduled_logical_pid,
-                    body=case_bodies[root],
+                    body=body_with_action_publications(
+                        root,
+                        case_bodies[root],
+                        scheduled_coordinates,
+                    ),
                     extra_argument_names=extra_argument_names,
                     noinline=force_noinline,
                 )
             body.append(opaque_call)
             publications: list[ast.stmt] = []
-            if root in task_event_offsets:
-                assert task_event_arg is not None
-                publications.append(
-                    statement_from_string(
-                        f"tl.atomic_xchg({task_event_arg} + "
-                        f"{task_event_offsets[root]} + ({scheduled_event_task}), "
-                        f"{epoch_var}, sem='release', scope='gpu')"
-                    )
-                )
             if publications or producer_events:
                 has_task_scheduling = True
                 body.append(self._cross_loop_publication_barrier(device_function))
@@ -2068,115 +2143,6 @@ class ForEachProgramID(ProgramIDs):
                 return None
             result.append((numel, block))
         return result
-
-    @staticmethod
-    def _emit_root_admission_task_wait(
-        *,
-        wait: EventUse,
-        device_function: DeviceFunction,
-        task_event_arg: str,
-        task_event_offset: int,
-        epoch_var: str,
-        consumer_coordinates: dict[int, str],
-        consumer_axis_counts: dict[int, int],
-        producer_axis_order: tuple[int, ...],
-        producer_axis_counts: dict[int, int],
-        block_sizes: dict[int, int],
-    ) -> list[ast.stmt]:
-        """Wait for the exact producer tasks required by one consumer task."""
-        return ForEachProgramID._emit_task_wait(
-            wait=wait,
-            device_function=device_function,
-            task_event_arg=task_event_arg,
-            task_event_offset=task_event_offset,
-            epoch_var=epoch_var,
-            consumer_coordinates=consumer_coordinates,
-            consumer_axis_counts=consumer_axis_counts,
-            producer_axis_order=producer_axis_order,
-            producer_axis_counts=producer_axis_counts,
-            block_sizes=block_sizes,
-        )
-
-    @staticmethod
-    def _emit_task_wait(
-        *,
-        wait: EventUse,
-        device_function: DeviceFunction,
-        task_event_arg: str,
-        task_event_offset: int,
-        epoch_var: str,
-        consumer_coordinates: dict[int, str],
-        consumer_axis_counts: dict[int, int],
-        producer_axis_order: tuple[int, ...],
-        producer_axis_counts: dict[int, int],
-        block_sizes: dict[int, int],
-    ) -> list[ast.stmt]:
-        """Wait for exact producer tasks from explicit consumer coordinates."""
-        predecessor_map = wait.predecessor_map
-        assert predecessor_map is not None
-
-        predecessor_coordinates: dict[int, str] = {}
-        predecessor_loops: list[tuple[str, str, str]] = []
-        for axis in predecessor_map.axes:
-            consumer_coordinate = consumer_coordinates[axis.consumer_block_id]
-            consumer_block = (
-                1 if axis.consumer_is_scalar else block_sizes[axis.consumer_block_id]
-            )
-            producer_block = (
-                1 if axis.producer_is_scalar else block_sizes[axis.producer_block_id]
-            )
-            producer_count = producer_axis_counts[axis.producer_block_id]
-            if (
-                consumer_block == producer_block
-                and axis.consumer_offset == axis.producer_offset
-                and consumer_axis_counts.get(axis.consumer_block_id) == producer_count
-            ):
-                predecessor_coordinates[axis.producer_block_id] = consumer_coordinate
-                continue
-
-            begin = (
-                f"(({consumer_coordinate}) * {consumer_block} + {axis.consumer_offset})"
-            )
-            end = f"(({begin}) + {consumer_block - 1})"
-            first = (
-                f"tl.maximum(0, (({begin}) - {axis.producer_offset}) // "
-                f"{producer_block})"
-            )
-            last = (
-                f"tl.minimum({producer_count - 1}, "
-                f"(({end}) - {axis.producer_offset}) // {producer_block})"
-            )
-            coordinate = device_function.new_var(
-                "tile_dependency_predecessor", dce=True
-            )
-            predecessor_coordinates[axis.producer_block_id] = coordinate
-            predecessor_loops.append((coordinate, first, last))
-
-        producer_task_terms: list[str] = []
-        multiplier = 1
-        for block_id in producer_axis_order:
-            coordinate = predecessor_coordinates[block_id]
-            producer_task_terms.append(f"({coordinate}) * {multiplier}")
-            multiplier *= producer_axis_counts[block_id]
-        producer_task = " + ".join(producer_task_terms) or "0"
-        body: list[ast.stmt] = ForEachProgramID._wait_for_counter(
-            device_function=device_function,
-            counter=(f"{task_event_arg} + {task_event_offset} + ({producer_task})"),
-            target=f"tl.cast({epoch_var}, tl.uint32)",
-            prefix="tile_dependency_task_wait",
-        )
-        for coordinate, first, last in reversed(predecessor_loops):
-            body = [
-                create(
-                    ast.For,
-                    target=create(ast.Name, id=coordinate, ctx=ast.Store()),
-                    iter=expr_from_string(f"tl.range({first}, ({last}) + 1)"),
-                    body=body,
-                    orelse=[],
-                    type_comment=None,
-                )
-            ]
-        return body
 
     @staticmethod
     def _wait_for_counter(

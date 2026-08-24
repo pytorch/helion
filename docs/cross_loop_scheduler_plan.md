@@ -3558,10 +3558,17 @@ Completed in the current scheduler checkpoint:
 - Added generic nested-consumer keyed events and schedule-derived milestone
   quotienting with nonuniform arrival counts.
 - Made `tile_dependency.py` instantiate one canonical predecessor relation per
-  root pair by unioning every allocation hazard. Root keyed events now consume
-  that relation instead of rerunning the legacy pairwise affine proof in the
-  scheduler; the old semantic event IDs are retained only as temporary
-  provenance for lowering and diagnostics.
+  allocation hazard and identify every hazard independently. Root and nested
+  keyed events consume those relations instead of rerunning a second pairwise
+  affine proof in the scheduler.
+- Deleted the legacy semantic root-event graph, affine predecessor maps,
+  uniform-partition proof, task-readiness builder, exact task-event buffers,
+  and raw per-task polling path. Configured allocation-overlap relations and
+  their keyed-event quotient are now the single source of dependency truth.
+- Track schedule coverage by hazard identity rather than root pair. This lets
+  exact action events and family completion coexist for different regions or
+  program points between the same roots without treating an unrelated exact
+  path as proof that a coarse edge was covered.
 - Recompute dependency coverage from the counted events and waits that will
   actually be emitted. Redundant fine-grained uses are removed only after the
   selected root-completion order proves them unnecessary.
@@ -3573,6 +3580,11 @@ Completed in the current scheduler checkpoint:
 - Deleted `AccessCohortPlan`, `_derive_access_cohorts`,
   `place_access_ready_consumers`, access-marker discovery, cohort counter
   allocation, cohort lowering, and the access-specific event placement mode.
+- Generalized event contributions to root or nested producer scopes and added
+  mechanical publication at stable nested-loop scope boundaries. Nested
+  actions remain on their owning non-preemptive task strand; worker placement
+  still applies only to outer root tasks. A focused nested-producer streaming
+  test now lowers to keyed waits and publications without root completion.
 - Reproduced Qwen's 64/32 and Gemma's 36/4 loop segmentation through stable
   action scopes. The saved lowerings are
   `/tmp/qwen3_ordered_action_lowered.py` and
@@ -3580,21 +3592,27 @@ Completed in the current scheduler checkpoint:
 - Revalidated Qwen at 77.86 microseconds (253 registers, no spills, 17,408
   bytes shared) and Gemma at 72.27 microseconds versus 80.17 microseconds for
   separate Helion (203 registers, no spills, 34,816 bytes shared).
-- Focused validation passes 78 dependency tests plus 15 subtests, and 14 loop-
-  dependency tests with 4 expected skips.
+- The last fully green pre-publication checkpoint passed 78 dependency tests
+  plus 15 subtests, and 14 loop-dependency tests with 4 expected skips. The
+  current nested-publication checkpoint has one intentionally exposed failing
+  streaming assertion: a consumer that finishes a nested reduction and then
+  performs a root-scope scalar read conservatively falls back to family
+  completion even when the preceding nested waits already cover that read.
 
 Remaining work, in order:
 
-1. Finish deleting the residual semantic root-event and affine predecessor
-   representations now that configured root events use the canonical overlap
-   relation. Remove the unused task-readiness builder and collapse the two
-   remaining predecessor-signature canonicalizers only after differential
-   shape tests establish equivalent relations.
-2. Generalize event endpoints, liveness, and validation so nested producer
-   publications are first-class while outer strand placement remains
-   unchanged.
-3. Add the publication/codegen safety gates above, then validate natural
-   RMSNorm-to-matmul streaming.
+1. Make action program points and same-strand dominance explicit. For each
+   later hazard, prove whether the union of readiness acquired by preceding
+   actions in the same strand contains its exact predecessor set. Only this
+   proof may suppress the later wait or family-completion fallback. This is
+   the generic replacement for the remaining singleton-reduction failure and
+   is required for natural RMSNorm-to-matmul streaming.
+2. Extend progress/liveness validation over those program-order edges,
+   especially before permitting a locally triggered root whose strand later
+   blocks at a nested wait.
+3. Finish the nested publication/codegen safety gates above: guarantee one
+   publication per logical action, preserve reaching-definition order, and
+   publish only after configured pipeline work is complete.
 4. Generalize the current conservative one-nested-axis renderer only when an
    exact relation produces representable segments; unsupported cases continue
    to lift safely.

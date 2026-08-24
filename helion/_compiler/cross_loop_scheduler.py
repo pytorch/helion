@@ -2,21 +2,16 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
-from typing import Literal
 
 from .. import exc
-from .tile_dependency import EventUse
 from .tile_dependency import InstantiatedActionDomain
 from .tile_dependency import InstantiatedTaskFamily
 from .tile_dependency import TileDependency
 from .tile_dependency import TileDependencyGraph
 from .tile_dependency import TileDependencyKind
-from .tile_dependency import UniformTaskPartition
-from .tile_dependency import dependency_predecessor_sets
 from .tile_dependency import instantiate_action_domains
 from .tile_dependency import instantiate_action_relations
 from .tile_dependency import instantiate_root_predecessor_sets
-from .tile_dependency import prove_uniform_task_partition
 
 CROSS_LOOP_NUM_WORKERS_CONFIG = "cross_loop_num_workers"
 CROSS_LOOP_NUM_WORKERS_DEFAULT = 0
@@ -603,7 +598,7 @@ def worker_count_breakpoints(
     result = {family.task_count for family in event_graph.task_families}
     for event in event_graph.events:
         required_tasks_by_root: dict[int, set[int]] = {}
-        contributors_by_key = event.contributor_tasks_by_key
+        contributors_by_key = event_graph.contributor_tasks_by_key(event)
         for key in range(event.key_count):
             for root, task in contributors_by_key[key]:
                 required_tasks_by_root.setdefault(root, set()).add(task)
@@ -714,9 +709,8 @@ class InstantiatedEventUse:
     """Concrete event-key requirements at one consumer program point."""
 
     consumer_root: int
-    consumer_access_id: int | None
-    placement: Literal["root_entry", "access"]
     required_keys_by_task: tuple[frozenset[int], ...]
+    dependency_ids: frozenset[int] = frozenset()
     consumer_scope_id: int | None = None
 
 
@@ -725,34 +719,39 @@ class InstantiatedKeyedEvent:
     """One configuration-specific event with independent contributions/uses."""
 
     event_id: int
-    source_event_ids: tuple[int, ...]
     key_count: int
     contributions: tuple[InstantiatedEventContribution, ...]
     uses: tuple[InstantiatedEventUse, ...]
     family_done_root: int | None = None
 
     @property
-    def contributor_tasks_by_key(
+    def contributor_actions_by_key(
         self,
-    ) -> tuple[frozenset[tuple[int, int]], ...]:
-        """Return the producer task instances contributing to every key."""
-        contributors: list[set[tuple[int, int]]] = [
+    ) -> tuple[frozenset[tuple[int, int | None, int]], ...]:
+        """Return the producer action instances contributing to every key."""
+        contributors: list[set[tuple[int, int | None, int]]] = [
             set() for _ in range(self.key_count)
         ]
         for contribution in self.contributions:
-            for producer_task, keys in enumerate(contribution.keys_by_task):
+            for producer_action, keys in enumerate(contribution.keys_by_task):
                 for key in keys:
                     if not 0 <= key < self.key_count:
                         raise ValueError(
                             f"event key {key} is outside [0, {self.key_count})"
                         )
-                    contributors[key].add((contribution.producer_root, producer_task))
+                    contributors[key].add(
+                        (
+                            contribution.producer_root,
+                            contribution.producer_scope_id,
+                            producer_action,
+                        )
+                    )
         return tuple(frozenset(tasks) for tasks in contributors)
 
     @property
     def expected_arrivals(self) -> tuple[int, ...]:
         """Derive arrival counts from producer relations."""
-        return tuple(len(tasks) for tasks in self.contributor_tasks_by_key)
+        return tuple(len(actions) for actions in self.contributor_actions_by_key)
 
     @property
     def is_family_done(self) -> bool:
@@ -793,6 +792,22 @@ class InstantiatedEventGraph:
             domain for domain in self.action_domains if domain.scope_id == scope_id
         )
 
+    def contributor_tasks_by_key(
+        self,
+        event: InstantiatedKeyedEvent,
+    ) -> tuple[frozenset[tuple[int, int]], ...]:
+        """Project event-producing actions onto their non-preemptive strands."""
+        result: list[set[tuple[int, int]]] = [set() for _ in range(event.key_count)]
+        for key, actions in enumerate(event.contributor_actions_by_key):
+            for root, scope_id, action in actions:
+                task = (
+                    action
+                    if scope_id is None
+                    else self.action_domain(scope_id).strand_task(action)
+                )
+                result[key].add((root, task))
+        return tuple(frozenset(tasks) for tasks in result)
+
 
 @dataclasses.dataclass(frozen=True)
 class TaskToKeySegment:
@@ -810,10 +825,9 @@ class TaskToKeySegment:
 class CountedEventContribution:
     """One root's contributions to a keyed readiness event."""
 
-    source_event_ids: tuple[int, ...]
     producer_root: int
     task_to_key: tuple[int | None, ...]
-    partition: UniformTaskPartition | None = None
+    producer_scope_id: int | None = None
 
     @property
     def task_to_key_segments(self) -> tuple[TaskToKeySegment, ...]:
@@ -837,7 +851,7 @@ class CountedEventUse:
 
     consumer_root: int
     key_by_task: tuple[int, ...]
-    consumer_access_id: int | None = None
+    dependency_ids: frozenset[int] = frozenset()
     consumer_scope_id: int | None = None
 
     @property
@@ -866,14 +880,6 @@ class CountedEventPlan:
         if self.local_trigger_use is None:
             return None
         return self.uses[self.local_trigger_use]
-
-    @property
-    def source_event_ids(self) -> tuple[int, ...]:
-        return tuple(
-            event_id
-            for contributor in self.contributors
-            for event_id in contributor.source_event_ids
-        )
 
     @property
     def key_count(self) -> int:
@@ -921,22 +927,8 @@ class CountedEventPlan:
         return self.contributors[0]
 
     @property
-    def event_id(self) -> int:
-        event_ids = self.single_contributor.source_event_ids
-        if len(event_ids) != 1:
-            raise ValueError("keyed event has no source event")
-        return event_ids[0]
-
-    @property
     def producer_root(self) -> int:
         return self.single_contributor.producer_root
-
-    @property
-    def partition(self) -> UniformTaskPartition:
-        partition = self.single_contributor.partition
-        if partition is None:
-            raise ValueError("keyed event has no uniform partition")
-        return partition
 
 
 def place_ordered_action_consumers(
@@ -983,24 +975,30 @@ def place_ordered_action_consumers(
         ):
             continue
 
-        contributors_by_key = event.contributor_tasks_by_key
-        predecessors_by_action: list[frozenset[tuple[int, int]]] = []
+        contributor_actions_by_key = event.contributor_actions_by_key
+        contributor_tasks_by_key = event_graph.contributor_tasks_by_key(event)
+        predecessors_by_action: list[frozenset[tuple[int, int | None, int]]] = []
         readiness_by_strand: list[list[int]] = [[] for _ in range(domain.strand_count)]
         ancestor_placements: set[tuple[int, int]] = set()
         valid = True
         for action, required_keys in enumerate(use.required_keys_by_task):
-            predecessors = frozenset(
+            predecessor_actions = frozenset(
                 predecessor
                 for key in required_keys
-                for predecessor in contributors_by_key[key]
+                for predecessor in contributor_actions_by_key[key]
             )
-            predecessors_by_action.append(predecessors)
-            if not predecessors:
+            predecessors_by_action.append(predecessor_actions)
+            if not predecessor_actions:
                 valid = False
                 break
+            predecessor_tasks = frozenset(
+                predecessor
+                for key in required_keys
+                for predecessor in contributor_tasks_by_key[key]
+            )
             ancestors = frozenset(
                 ancestor
-                for predecessor in predecessors
+                for predecessor in predecessor_tasks
                 for ancestor in _static_ancestors(
                     predecessor,
                     worker_schedule=result,
@@ -1084,8 +1082,8 @@ def place_ordered_action_consumers(
         if len(boundaries) <= 2:
             continue
 
-        key_by_signature: dict[frozenset[tuple[int, int]], int] = {}
-        ordered_signatures: list[frozenset[tuple[int, int]]] = []
+        key_by_signature: dict[frozenset[tuple[int, int | None, int]], int] = {}
+        ordered_signatures: list[frozenset[tuple[int, int | None, int]]] = []
         key_by_action = [-1] * domain.action_count
         for strand_task in range(domain.strand_count):
             strand_begin = strand_task * domain.actions_per_strand
@@ -1114,24 +1112,27 @@ def place_ordered_action_consumers(
         if not valid or any(key < 0 for key in key_by_action):
             continue
 
-        contribution_keys: dict[int, list[int | None]] = {}
+        contribution_keys: dict[tuple[int, int | None], list[int | None]] = {}
         for key, signature in enumerate(ordered_signatures):
-            for producer_root, producer_task in signature:
-                task_to_key = contribution_keys.get(producer_root)
+            for producer_root, producer_scope_id, producer_action in signature:
+                contribution_id = (producer_root, producer_scope_id)
+                task_to_key = contribution_keys.get(contribution_id)
                 if task_to_key is None:
+                    action_count = (
+                        event_graph.task_families[producer_root].task_count
+                        if producer_scope_id is None
+                        else event_graph.action_domain(producer_scope_id).action_count
+                    )
                     new_task_to_key: list[int | None] = [
-                        None
-                        for _ in range(
-                            event_graph.task_families[producer_root].task_count
-                        )
+                        None for _ in range(action_count)
                     ]
-                    contribution_keys[producer_root] = new_task_to_key
+                    contribution_keys[contribution_id] = new_task_to_key
                     task_to_key = new_task_to_key
-                previous = task_to_key[producer_task]
+                previous = task_to_key[producer_action]
                 if previous is not None and previous != key:
                     valid = False
                     break
-                task_to_key[producer_task] = key
+                task_to_key[producer_action] = key
             if not valid:
                 break
         if not valid:
@@ -1142,17 +1143,25 @@ def place_ordered_action_consumers(
             CountedEventPlan(
                 contributors=tuple(
                     CountedEventContribution(
-                        source_event_ids=event.source_event_ids,
                         producer_root=producer_root,
-                        task_to_key=tuple(contribution_keys[producer_root]),
+                        task_to_key=tuple(
+                            contribution_keys[(producer_root, producer_scope_id)]
+                        ),
+                        producer_scope_id=producer_scope_id,
                     )
-                    for producer_root in sorted(contribution_keys)
+                    for producer_root, producer_scope_id in sorted(
+                        contribution_keys,
+                        key=lambda item: (
+                            item[0],
+                            -1 if item[1] is None else item[1],
+                        ),
+                    )
                 ),
                 uses=(
                     CountedEventUse(
                         consumer_root=consumer_root,
                         key_by_task=tuple(key_by_action),
-                        consumer_access_id=use.consumer_access_id,
+                        dependency_ids=use.dependency_ids,
                         consumer_scope_id=use.consumer_scope_id,
                     ),
                 ),
@@ -1170,7 +1179,6 @@ class CrossLoopSchedule:
     worker_schedule: WorkerSchedule
     local_triggers: tuple[LocalTrigger, ...]
     task_ready_edges: frozenset[tuple[int, int]]
-    task_waits_by_root: dict[int, tuple[EventUse, ...]]
     counted_events: tuple[CountedEventPlan, ...]
     worker_limit: int
 
@@ -1189,6 +1197,7 @@ class CrossLoopSchedule:
 
 def lower_family_done_events(
     event_graph: InstantiatedEventGraph,
+    dependency_graph: TileDependencyGraph,
     edges: frozenset[tuple[int, int]],
 ) -> tuple[InstantiatedEventGraph, tuple[CountedEventPlan, ...]]:
     """Represent selected whole-family waits as canonical one-key events.
@@ -1215,11 +1224,16 @@ def lower_family_done_events(
         selected_uses = tuple(
             InstantiatedEventUse(
                 consumer_root=consumer_root,
-                consumer_access_id=None,
-                placement="root_entry",
                 required_keys_by_task=tuple(
                     frozenset((0,))
                     for _ in range(event_graph.task_families[consumer_root].task_count)
+                ),
+                dependency_ids=frozenset(
+                    dependency.dependency_id
+                    for dependency in dependency_graph.edges_between(
+                        producer_root, consumer_root
+                    )
+                    for dependency in dependency.access_dependencies
                 ),
             )
             for consumer_root in sorted(consumer_roots)
@@ -1229,7 +1243,6 @@ def lower_family_done_events(
             producer = event_graph.task_families[producer_root]
             family_event = InstantiatedKeyedEvent(
                 event_id=len(events),
-                source_event_ids=(),
                 key_count=1,
                 contributions=(
                     InstantiatedEventContribution(
@@ -1251,7 +1264,6 @@ def lower_family_done_events(
             CountedEventPlan(
                 contributors=(
                     CountedEventContribution(
-                        source_event_ids=family_event.source_event_ids,
                         producer_root=producer_root,
                         task_to_key=tuple(
                             0
@@ -1265,6 +1277,7 @@ def lower_family_done_events(
                     CountedEventUse(
                         consumer_root=use.consumer_root,
                         key_by_task=tuple(0 for _ in use.required_keys_by_task),
+                        dependency_ids=use.dependency_ids,
                     )
                     for use in selected_uses
                 ),
@@ -1277,7 +1290,6 @@ def lower_family_done_events(
 def lower_counted_events(
     event_graph: InstantiatedEventGraph,
     local_triggers: tuple[LocalTrigger, ...],
-    dependency_graph: TileDependencyGraph | None = None,
 ) -> tuple[CountedEventPlan, ...]:
     """Adapt semantic events to the scalar-key counter representation.
 
@@ -1305,44 +1317,11 @@ def lower_counted_events(
             task_to_key = tuple(
                 next(iter(keys)) if keys else None for keys in contribution.keys_by_task
             )
-            partition = None
-            if dependency_graph is not None and len(event.uses) == 1:
-                use = event.uses[0]
-                semantic_waits = tuple(
-                    wait
-                    for wait in dependency_graph.waits_for_root(use.consumer_root)
-                    if wait.event_id in event.source_event_ids
-                    and dependency_graph.event(wait.event_id).producer_root
-                    == contribution.producer_root
-                    and wait.placement == "root_entry"
-                    and wait.predecessor_map is not None
-                )
-                if semantic_waits:
-                    producer = event_graph.task_families[contribution.producer_root]
-                    consumer = event_graph.task_families[use.consumer_root]
-                    candidate = prove_uniform_task_partition(
-                        tuple(
-                            wait.predecessor_map
-                            for wait in semantic_waits
-                            if wait.predecessor_map is not None
-                        ),
-                        consumer_axis_order=consumer.logical_axis_order,
-                        consumer_axis_counts=consumer.axis_counts,
-                        producer_axis_order=producer.logical_axis_order,
-                        producer_axis_counts=producer.axis_counts,
-                        block_sizes={**producer.block_sizes, **consumer.block_sizes},
-                    )
-                    if (
-                        candidate is not None
-                        and candidate.producer_key_by_task == task_to_key
-                    ):
-                        partition = candidate
             contributions.append(
                 CountedEventContribution(
-                    source_event_ids=event.source_event_ids,
                     producer_root=contribution.producer_root,
                     task_to_key=task_to_key,
-                    partition=partition,
+                    producer_scope_id=contribution.producer_scope_id,
                 )
             )
         if not lowerable:
@@ -1351,10 +1330,8 @@ def lower_counted_events(
         uses: list[CountedEventUse] = []
         use_indices: list[int] = []
         for use_index, use in enumerate(event.uses):
-            if (
-                use.consumer_scope_id is not None
-                or use.placement != "root_entry"
-                or any(len(keys) != 1 for keys in use.required_keys_by_task)
+            if use.consumer_scope_id is not None or any(
+                len(keys) != 1 for keys in use.required_keys_by_task
             ):
                 continue
             uses.append(
@@ -1363,7 +1340,7 @@ def lower_counted_events(
                     key_by_task=tuple(
                         next(iter(keys)) for keys in use.required_keys_by_task
                     ),
-                    consumer_access_id=use.consumer_access_id,
+                    dependency_ids=use.dependency_ids,
                 )
             )
             use_indices.append(use_index)
@@ -1426,7 +1403,6 @@ def choose_local_triggers(
 def choose_counted_events(
     event_graph: InstantiatedEventGraph,
     local_triggers: tuple[LocalTrigger, ...],
-    dependency_graph: TileDependencyGraph,
     *,
     excluded_direct_roots: frozenset[int] = frozenset(),
 ) -> tuple[CountedEventPlan, ...]:
@@ -1441,11 +1417,7 @@ def choose_counted_events(
         (trigger.event_index, trigger.use_index) for trigger in local_triggers
     }
     selected: list[CountedEventPlan] = []
-    for event in lower_counted_events(
-        event_graph,
-        local_triggers,
-        dependency_graph,
-    ):
+    for event in lower_counted_events(event_graph, local_triggers):
         retained_use_indices = tuple(
             use_index
             for use_index, use in enumerate(event.uses)
@@ -1560,25 +1532,19 @@ def instantiate_event_graph(
         dependency_graph,
         task_families=task_families,
     )
-    source_event_ids_by_pair: dict[tuple[int, int], set[int]] = {}
-    for use in dependency_graph.waits:
-        semantic_event = dependency_graph.event(use.event_id)
-        if len(semantic_event.contributors) != 1:
-            continue
-        source_event_ids_by_pair.setdefault(
-            (semantic_event.producer_root, use.consumer_root), set()
-        ).add(use.event_id)
-
+    dependency_ids_by_pair = {
+        pair: frozenset(
+            dependency.dependency_id
+            for edge in dependency_graph.edges_between(*pair)
+            for dependency in edge.access_dependencies
+        )
+        for pair in root_relations
+    }
     exact_uses_by_producer: dict[int, list[InstantiatedEventUse]] = {}
-    exact_source_events: dict[int, set[int]] = {}
     family_done_consumers: dict[int, set[int]] = {}
-    family_done_source_events: dict[int, set[int]] = {}
     for (producer_root, consumer_root), predecessors in sorted(root_relations.items()):
         producer = task_families[producer_root]
         complete_producer_domain = frozenset(range(producer.task_count))
-        source_event_ids = tuple(
-            sorted(source_event_ids_by_pair.get((producer_root, consumer_root), ()))
-        )
         if (
             predecessors is None
             or producer.task_count == 1
@@ -1586,25 +1552,19 @@ def instantiate_event_graph(
             or all(tasks == complete_producer_domain for tasks in predecessors)
         ):
             family_done_consumers.setdefault(producer_root, set()).add(consumer_root)
-            family_done_source_events.setdefault(producer_root, set()).update(
-                source_event_ids
-            )
             continue
 
         exact_uses_by_producer.setdefault(producer_root, []).append(
             InstantiatedEventUse(
                 consumer_root=consumer_root,
-                consumer_access_id=None,
-                placement="root_entry",
                 required_keys_by_task=predecessors,
+                dependency_ids=dependency_ids_by_pair[(producer_root, consumer_root)],
             )
         )
-        exact_source_events.setdefault(producer_root, set()).update(source_event_ids)
 
     result = [
         InstantiatedKeyedEvent(
             event_id=event_id,
-            source_event_ids=tuple(sorted(exact_source_events.get(producer_root, ()))),
             key_count=task_families[producer_root].task_count,
             contributions=(
                 InstantiatedEventContribution(
@@ -1624,9 +1584,6 @@ def instantiate_event_graph(
         result.append(
             InstantiatedKeyedEvent(
                 event_id=len(result),
-                source_event_ids=tuple(
-                    sorted(family_done_source_events.get(producer_root, ()))
-                ),
                 key_count=1,
                 contributions=(
                     InstantiatedEventContribution(
@@ -1639,12 +1596,13 @@ def instantiate_event_graph(
                 uses=tuple(
                     InstantiatedEventUse(
                         consumer_root=consumer_root,
-                        consumer_access_id=None,
-                        placement="root_entry",
                         required_keys_by_task=tuple(
                             frozenset((0,))
                             for _ in range(task_families[consumer_root].task_count)
                         ),
+                        dependency_ids=dependency_ids_by_pair[
+                            (producer_root, consumer_root)
+                        ],
                     )
                     for consumer_root in sorted(consumer_roots)
                 ),
@@ -1661,13 +1619,12 @@ def add_ordered_action_events(
     *,
     axis_geometry: dict[int, tuple[int, int]],
 ) -> InstantiatedEventGraph:
-    """Add exact nested consumer actions to the configured keyed-event DAG.
+    """Add exact nested action relations to the configured keyed-event DAG.
 
     This pass is a predecessor-signature quotient over allocation-derived
     action relations. It has no knowledge of FFN, attention, reductions, or
-    operation kinds. Nested producer publication is enabled separately once
-    its completion point can be emitted safely; until then, only root-scope
-    producers contribute to these additional events.
+    operation kinds. Nested actions remain checkpoints on their owning outer
+    strand rather than independently movable tasks.
     """
     action_domains = instantiate_action_domains(
         dependency_graph,
@@ -1698,8 +1655,10 @@ def add_ordered_action_events(
         ).append(relation.predecessors_by_consumer_action)
 
     events = list(event_graph.events)
+    original_event_count = len(events)
+    action_covered_dependency_ids: set[int] = set()
     for consumer_scope in dependency_graph.execution_scopes:
-        if consumer_scope.is_root or not consumer_scope.segmentable:
+        if not consumer_scope.is_root and not consumer_scope.segmentable:
             continue
         consumer_domain = domain_by_scope.get(consumer_scope.scope_id)
         if consumer_domain is None:
@@ -1711,63 +1670,93 @@ def add_ordered_action_events(
                 int,
                 int,
                 int,
+                int,
                 tuple[frozenset[int], ...],
             ]
         ] = []
-        complete = True
+        edges_by_producer: dict[int, list[TileDependency]] = {}
         for edge in dependency_graph.edges:
-            for access_dependency in edge.access_dependencies:
-                consumer_scopes = dependency_graph.scope_ids_by_access[
-                    access_dependency.consumer_access_id
+            if edge.consumer_root == consumer_scope.root:
+                edges_by_producer.setdefault(edge.producer_root, []).append(edge)
+        for _producer_root, pair_edges in sorted(edges_by_producer.items()):
+            pair_dependencies: list[
+                tuple[
+                    TileDependencyKind,
+                    int,
+                    int,
+                    int,
+                    int,
+                    tuple[frozenset[int], ...],
                 ]
-                if consumer_scope.scope_id not in consumer_scopes:
-                    continue
-                producer_scopes = dependency_graph.scope_ids_by_access[
-                    access_dependency.producer_access_id
-                ]
-                if not producer_scopes:
-                    complete = False
-                    break
-                for producer_scope_id in producer_scopes:
-                    producer_scope = scope_by_id[producer_scope_id]
-                    producer_domain = domain_by_scope.get(producer_scope_id)
-                    relation_key = (
-                        access_dependency.kind,
-                        access_dependency.producer_access_id,
-                        access_dependency.consumer_access_id,
-                        producer_scope_id,
-                        consumer_scope.scope_id,
-                    )
-                    proved_relations = relations_by_key.get(relation_key)
-                    if (
-                        not producer_scope.is_root
-                        or producer_domain is None
-                        or not proved_relations
-                    ):
-                        complete = False
-                        break
-                    matching_dependencies.extend(
-                        (
+            ] = []
+            for edge in pair_edges:
+                for access_dependency in edge.access_dependencies:
+                    consumer_scopes = dependency_graph.scope_ids_by_access[
+                        access_dependency.consumer_access_id
+                    ]
+                    if consumer_scope.scope_id not in consumer_scopes:
+                        continue
+                    producer_scopes = dependency_graph.scope_ids_by_access[
+                        access_dependency.producer_access_id
+                    ]
+                    if not producer_scopes:
+                        continue
+                    dependency_relations: list[
+                        tuple[
+                            TileDependencyKind,
+                            int,
+                            int,
+                            int,
+                            int,
+                            tuple[frozenset[int], ...],
+                        ]
+                    ] = []
+                    dependency_is_complete = True
+                    for producer_scope_id in producer_scopes:
+                        producer_scope = scope_by_id[producer_scope_id]
+                        producer_domain = domain_by_scope.get(producer_scope_id)
+                        relation_key = (
                             access_dependency.kind,
                             access_dependency.producer_access_id,
                             access_dependency.consumer_access_id,
                             producer_scope_id,
-                            predecessor_sets,
+                            consumer_scope.scope_id,
                         )
-                        for predecessor_sets in proved_relations
-                    )
-                if not complete:
-                    break
-            if not complete:
-                break
-        if not complete or not matching_dependencies:
+                        proved_relations = relations_by_key.get(relation_key)
+                        if (
+                            producer_domain is None
+                            or (
+                                not producer_scope.is_root
+                                and not producer_scope.segmentable
+                            )
+                            or not proved_relations
+                        ):
+                            dependency_is_complete = False
+                            break
+                        dependency_relations.extend(
+                            (
+                                access_dependency.kind,
+                                access_dependency.dependency_id,
+                                access_dependency.producer_access_id,
+                                access_dependency.consumer_access_id,
+                                producer_scope_id,
+                                predecessor_sets,
+                            )
+                            for predecessor_sets in proved_relations
+                        )
+                    if dependency_is_complete:
+                        pair_dependencies.extend(dependency_relations)
+            if pair_dependencies:
+                matching_dependencies.extend(pair_dependencies)
+        if not matching_dependencies:
             continue
 
-        signatures: list[frozenset[tuple[int, int]]] = []
+        signatures: list[frozenset[tuple[int, int | None, int]]] = []
         for consumer_action in range(consumer_domain.action_count):
-            predecessors: set[tuple[int, int]] = set()
+            predecessors: set[tuple[int, int | None, int]] = set()
             for (
                 _kind,
+                _dependency_id,
                 _producer_access_id,
                 _consumer_access_id,
                 producer_scope_id,
@@ -1775,13 +1764,21 @@ def add_ordered_action_events(
             ) in matching_dependencies:
                 producer_domain = domain_by_scope[producer_scope_id]
                 predecessors.update(
-                    (producer_domain.root, producer_domain.strand_task(action))
+                    (
+                        producer_domain.root,
+                        (
+                            None
+                            if scope_by_id[producer_scope_id].is_root
+                            else producer_scope_id
+                        ),
+                        action,
+                    )
                     for action in predecessor_sets[consumer_action]
                 )
             signatures.append(frozenset(predecessors))
 
-        key_by_signature: dict[frozenset[tuple[int, int]], int] = {}
-        ordered_signatures: list[frozenset[tuple[int, int]]] = []
+        key_by_signature: dict[frozenset[tuple[int, int | None, int]], int] = {}
+        ordered_signatures: list[frozenset[tuple[int, int | None, int]]] = []
         key_by_action: list[int | None] = []
         for signature in signatures:
             if not signature:
@@ -1794,71 +1791,91 @@ def add_ordered_action_events(
         if not ordered_signatures:
             continue
 
-        contribution_keys: dict[int, list[set[int]]] = {}
+        contribution_keys: dict[tuple[int, int | None], list[set[int]]] = {}
         for key, signature in enumerate(ordered_signatures):
-            for producer_root, producer_task in signature:
-                keys_by_task = contribution_keys.setdefault(
-                    producer_root,
-                    [
-                        set()
-                        for _ in range(
-                            event_graph.task_families[producer_root].task_count
-                        )
-                    ],
+            for producer_root, producer_scope_id, producer_action in signature:
+                producer_action_count = (
+                    event_graph.task_families[producer_root].task_count
+                    if producer_scope_id is None
+                    else domain_by_scope[producer_scope_id].action_count
                 )
-                keys_by_task[producer_task].add(key)
-        source_access_ids = {
-            access_id
+                keys_by_task = contribution_keys.setdefault(
+                    (producer_root, producer_scope_id),
+                    [set() for _ in range(producer_action_count)],
+                )
+                keys_by_task[producer_action].add(key)
+        covered_dependency_ids = frozenset(
+            dependency_id
             for (
                 _kind,
+                dependency_id,
                 _producer_access_id,
-                access_id,
+                _consumer_access_id,
                 _producer_scope_id,
                 _predecessor_sets,
             ) in matching_dependencies
-        }
-        source_event_ids = tuple(
-            sorted(
-                {
-                    wait.event_id
-                    for wait in dependency_graph.waits
-                    if wait.consumer_root == consumer_scope.root
-                    and wait.consumer_access_id in source_access_ids
-                }
-            )
         )
-        events.append(
-            InstantiatedKeyedEvent(
-                event_id=len(events),
-                source_event_ids=source_event_ids,
-                key_count=len(ordered_signatures),
-                contributions=tuple(
-                    InstantiatedEventContribution(
-                        producer_root=producer_root,
-                        keys_by_task=tuple(
-                            frozenset(keys) for keys in contribution_keys[producer_root]
-                        ),
-                    )
-                    for producer_root in sorted(contribution_keys)
-                ),
-                uses=(
-                    InstantiatedEventUse(
-                        consumer_root=consumer_scope.root,
-                        consumer_access_id=(
-                            next(iter(source_access_ids))
-                            if len(source_access_ids) == 1
-                            else None
-                        ),
-                        placement="access",
-                        required_keys_by_task=tuple(
-                            frozenset(()) if key is None else frozenset((key,))
-                            for key in key_by_action
-                        ),
-                        consumer_scope_id=consumer_scope.scope_id,
+        action_event = InstantiatedKeyedEvent(
+            event_id=len(events),
+            key_count=len(ordered_signatures),
+            contributions=tuple(
+                InstantiatedEventContribution(
+                    producer_root=producer_root,
+                    keys_by_task=tuple(
+                        frozenset(keys)
+                        for keys in contribution_keys[
+                            (producer_root, producer_scope_id)
+                        ]
+                    ),
+                    producer_scope_id=producer_scope_id,
+                )
+                for producer_root, producer_scope_id in sorted(
+                    contribution_keys,
+                    key=lambda item: (
+                        item[0],
+                        -1 if item[1] is None else item[1],
+                    ),
+                )
+            ),
+            uses=(
+                InstantiatedEventUse(
+                    consumer_root=consumer_scope.root,
+                    required_keys_by_task=tuple(
+                        frozenset(()) if key is None else frozenset((key,))
+                        for key in key_by_action
+                    ),
+                    dependency_ids=covered_dependency_ids,
+                    consumer_scope_id=(
+                        None if consumer_scope.is_root else consumer_scope.scope_id
                     ),
                 ),
-            )
+            ),
         )
+        events.append(action_event)
+        if all(
+            len(keys) <= 1
+            for contribution in action_event.contributions
+            for keys in contribution.keys_by_task
+        ):
+            action_covered_dependency_ids.update(covered_dependency_ids)
+
+    if action_covered_dependency_ids:
+        for event_id in range(original_event_count):
+            event = events[event_id]
+            retained_uses = tuple(
+                use
+                for use in event.uses
+                if not (
+                    event.is_family_done
+                    and use.dependency_ids <= action_covered_dependency_ids
+                )
+            )
+            events[event_id] = dataclasses.replace(event, uses=retained_uses)
+        events = [event for event in events if event.uses]
+        events = [
+            dataclasses.replace(event, event_id=event_id)
+            for event_id, event in enumerate(events)
+        ]
     return dataclasses.replace(
         event_graph,
         events=tuple(events),
@@ -1882,7 +1899,10 @@ def canonicalize_ready_events(
     contributors_by_event_key: dict[
         int,
         tuple[frozenset[tuple[int, int]], ...],
-    ] = {event.event_id: event.contributor_tasks_by_key for event in original_events}
+    ] = {
+        event.event_id: event_graph.contributor_tasks_by_key(event)
+        for event in original_events
+    }
     uses_to_remove: set[tuple[int, int]] = set()
 
     for consumer_root, consumer in enumerate(event_graph.task_families):
@@ -1890,8 +1910,12 @@ def canonicalize_ready_events(
             (event.event_id, use_index, use)
             for event in original_events
             if not event.is_family_done
+            and all(
+                contribution.producer_scope_id is None
+                for contribution in event.contributions
+            )
             for use_index, use in enumerate(event.uses)
-            if use.consumer_root == consumer_root and use.placement == "root_entry"
+            if use.consumer_root == consumer_root and use.consumer_scope_id is None
         )
         if not source_uses:
             continue
@@ -1940,17 +1964,6 @@ def canonicalize_ready_events(
 
         canonical_event = InstantiatedKeyedEvent(
             event_id=len(events),
-            source_event_ids=tuple(
-                sorted(
-                    {
-                        source_event_id
-                        for event_id, _use_index, _use in source_uses
-                        for source_event_id in original_events[
-                            event_id
-                        ].source_event_ids
-                    }
-                )
-            ),
             key_count=len(ordered_signatures),
             contributions=tuple(
                 InstantiatedEventContribution(
@@ -1964,11 +1977,14 @@ def canonicalize_ready_events(
             uses=(
                 InstantiatedEventUse(
                     consumer_root=consumer_root,
-                    consumer_access_id=None,
-                    placement="root_entry",
                     required_keys_by_task=tuple(
                         frozenset(()) if key is None else frozenset((key,))
                         for key in key_by_consumer_task
+                    ),
+                    dependency_ids=frozenset(
+                        dependency_id
+                        for _event_id, _use_index, use in source_uses
+                        for dependency_id in use.dependency_ids
                     ),
                 ),
             ),
@@ -2014,9 +2030,6 @@ def canonicalize_ready_events(
             continue
         merged_events[signature] = dataclasses.replace(
             previous,
-            source_event_ids=tuple(
-                sorted({*previous.source_event_ids, *event.source_event_ids})
-            ),
             uses=tuple(dict.fromkeys((*previous.uses, *event.uses))),
         )
     retained_events = tuple(merged_events.values())
@@ -2025,125 +2038,6 @@ def canonicalize_ready_events(
         events=tuple(
             dataclasses.replace(event, event_id=event_id)
             for event_id, event in enumerate(retained_events)
-        ),
-    )
-
-
-def canonicalize_task_readiness(
-    event_graph: InstantiatedEventGraph,
-    dependency_graph: TileDependencyGraph,
-) -> InstantiatedEventGraph:
-    """Promote complete exact predecessor sets to root-entry readiness.
-
-    Access-local placement describes where a wait is minimally required. When
-    every incoming memory relation for a task family has an exact task overlap,
-    the full predecessor signature also proves a conservative root-entry wait
-    and makes the complete opaque task eligible for local or direct execution.
-    This is a graph normalization over all incoming edges, not a topology
-    matcher for any particular chain.
-    """
-    access_by_id = {access.access_id: access for access in dependency_graph.accesses}
-    edges_by_consumer: dict[int, list[TileDependency]] = {}
-    for edge in dependency_graph.edges:
-        edges_by_consumer.setdefault(edge.consumer_root, []).append(edge)
-
-    replacement_events: list[InstantiatedKeyedEvent] = []
-    replaced_consumers: set[int] = set()
-    for consumer_root, incoming_edges in sorted(edges_by_consumer.items()):
-        consumer = event_graph.task_families[consumer_root]
-        predecessors_by_task: list[set[tuple[int, int]]] = [
-            set() for _ in range(consumer.task_count)
-        ]
-        valid = True
-        for edge in incoming_edges:
-            predecessor_sets = dependency_predecessor_sets(
-                edge,
-                task_families=event_graph.task_families,
-                access_by_id=access_by_id,
-            )
-            if predecessor_sets is None:
-                valid = False
-                break
-            for consumer_task, producer_tasks in enumerate(predecessor_sets):
-                predecessors_by_task[consumer_task].update(
-                    (edge.producer_root, producer_task)
-                    for producer_task in producer_tasks
-                )
-        signatures = tuple(frozenset(tasks) for tasks in predecessors_by_task)
-        if not valid or any(not signature for signature in signatures):
-            continue
-
-        key_by_signature: dict[frozenset[tuple[int, int]], int] = {}
-        ordered_signatures: list[frozenset[tuple[int, int]]] = []
-        key_by_task: list[int] = []
-        for signature in signatures:
-            key = key_by_signature.setdefault(signature, len(key_by_signature))
-            key_by_task.append(key)
-            if key == len(ordered_signatures):
-                ordered_signatures.append(signature)
-        contribution_keys: dict[int, list[set[int]]] = {}
-        for key, signature in enumerate(ordered_signatures):
-            for producer_root, producer_task in signature:
-                keys_by_task = contribution_keys.setdefault(
-                    producer_root,
-                    [
-                        set()
-                        for _ in range(
-                            event_graph.task_families[producer_root].task_count
-                        )
-                    ],
-                )
-                keys_by_task[producer_task].add(key)
-
-        semantic_event_ids = tuple(
-            sorted(
-                {use.event_id for use in dependency_graph.waits_for_root(consumer_root)}
-            )
-        )
-        replacement_events.append(
-            InstantiatedKeyedEvent(
-                event_id=-1,
-                source_event_ids=semantic_event_ids,
-                key_count=len(ordered_signatures),
-                contributions=tuple(
-                    InstantiatedEventContribution(
-                        producer_root=producer_root,
-                        keys_by_task=tuple(
-                            frozenset(keys) for keys in contribution_keys[producer_root]
-                        ),
-                    )
-                    for producer_root in sorted(contribution_keys)
-                ),
-                uses=(
-                    InstantiatedEventUse(
-                        consumer_root=consumer_root,
-                        consumer_access_id=None,
-                        placement="root_entry",
-                        required_keys_by_task=tuple(
-                            frozenset((key,)) for key in key_by_task
-                        ),
-                    ),
-                ),
-            )
-        )
-        replaced_consumers.add(consumer_root)
-
-    retained_events = [
-        dataclasses.replace(
-            event,
-            uses=tuple(
-                use for use in event.uses if use.consumer_root not in replaced_consumers
-            ),
-        )
-        for event in event_graph.events
-    ]
-    events = [event for event in retained_events if event.uses]
-    events.extend(replacement_events)
-    return dataclasses.replace(
-        event_graph,
-        events=tuple(
-            dataclasses.replace(event, event_id=event_id)
-            for event_id, event in enumerate(events)
         ),
     )
 
@@ -2185,7 +2079,14 @@ def derive_local_triggers(
         ]
     ] = []
     for event in event_graph.events:
-        if event.is_family_done or len(event.uses) != 1:
+        if (
+            event.is_family_done
+            or len(event.uses) != 1
+            or any(
+                contribution.producer_scope_id is not None
+                for contribution in event.contributions
+            )
+        ):
             continue
         if any(
             len(keys) > 1
@@ -2195,7 +2096,7 @@ def derive_local_triggers(
             continue
         use_index = 0
         use = event.uses[use_index]
-        if use.consumer_scope_id is not None or use.placement != "root_entry":
+        if use.consumer_scope_id is not None:
             continue
         if not event.key_count or any(not count for count in event.expected_arrivals):
             continue
@@ -2230,7 +2131,7 @@ def derive_local_triggers(
     for _root, _event_id, _use_index, event, _use, _tasks in candidates:
         for contributor in {
             contributor
-            for contributors in event.contributor_tasks_by_key
+            for contributors in event_graph.contributor_tasks_by_key(event)
             for contributor in contributors
         }:
             candidate_count_by_contributor[contributor] = (
@@ -2243,13 +2144,13 @@ def derive_local_triggers(
     ):
         if any(
             candidate_count_by_contributor[contributor] != 1
-            for contributors in event.contributor_tasks_by_key
+            for contributors in event_graph.contributor_tasks_by_key(event)
             for contributor in contributors
         ):
             continue
         valid = True
         possible_workers_by_key: list[frozenset[int]] = []
-        for key, contributors in enumerate(event.contributor_tasks_by_key):
+        for key, contributors in enumerate(event_graph.contributor_tasks_by_key(event)):
             possible_workers = frozenset(
                 worker
                 for contributor in contributors
@@ -2297,6 +2198,8 @@ def order_local_contributors_by_key(
         if len(event.contributions) != 1:
             continue
         contribution = event.contributions[0]
+        if contribution.producer_scope_id is not None:
+            continue
         root = contribution.producer_root
         if root in local_roots or root in replacement_by_root:
             continue
@@ -2401,7 +2304,7 @@ def _local_trigger_predecessors(
     for trigger in local_triggers:
         event = event_graph.event(trigger.event_index)
         use = event.uses[trigger.use_index]
-        contributors_by_key = event.contributor_tasks_by_key
+        contributors_by_key = event_graph.contributor_tasks_by_key(event)
         for consumer_task, required_keys in enumerate(use.required_keys_by_task):
             if len(required_keys) != 1:
                 raise ValueError("a local trigger requires exactly one key per task")
@@ -2485,7 +2388,7 @@ def validate_worker_schedule(
             add_edge(producer, consumer)
 
     for event in event_graph.events:
-        contributors_by_key = event.contributor_tasks_by_key
+        contributors_by_key = event_graph.contributor_tasks_by_key(event)
         for use in event.uses:
             consumer_tasks = (
                 range(len(use.required_keys_by_task))
@@ -2556,33 +2459,6 @@ def build_cross_loop_schedule(
         default_worker_count=physical_worker_limit,
         requested_worker_count=requested_worker_count,
     )
-    candidate_task_pairs, waits_by_root = _select_available_waits(
-        dependency_plan=dependency_plan,
-        task_families=task_families,
-        excluded_roots=excluded_roots,
-    )
-    action_capable_pairs = {
-        (contribution.producer_root, use.consumer_root)
-        for event in event_graph.events
-        for contribution in event.contributions
-        for use in event.uses
-        if use.consumer_scope_id is not None
-    }
-    candidate_task_pairs = frozenset(candidate_task_pairs | action_capable_pairs)
-    waits_by_root = {
-        root: tuple(
-            wait
-            for wait in waits
-            if (
-                dependency_plan.event(wait.event_id).producer_root,
-                wait.consumer_root,
-            )
-            in candidate_task_pairs
-        )
-        for root, waits in waits_by_root.items()
-    }
-    waits_by_root = {root: waits for root, waits in waits_by_root.items() if waits}
-    retained_waits = waits_by_root
     try:
         worker_schedule, local_triggers, ordered_action_events = build_worker_schedule(
             event_graph,
@@ -2602,36 +2478,16 @@ def build_cross_loop_schedule(
         *choose_counted_events(
             event_graph,
             local_triggers,
-            dependency_plan,
             excluded_direct_roots=ordered_action_roots,
         ),
         *ordered_action_events,
     )
-    selected_task_pairs = {
-        (contributor.producer_root, use.consumer_root)
+    covered_dependency_ids = frozenset(
+        dependency_id
         for event in counted_events
-        for contributor in event.contributors
         for use in event.uses
-    }
-    retained_waits = {
-        root: tuple(
-            wait
-            for wait in waits
-            if (
-                dependency_plan.event(wait.event_id).producer_root,
-                root,
-            )
-            not in selected_task_pairs
-        )
-        for root, waits in retained_waits.items()
-    }
-    retained_waits = {root: waits for root, waits in retained_waits.items() if waits}
-    retained_wait_pairs = {
-        (dependency_plan.event(wait.event_id).producer_root, consumer_root)
-        for consumer_root, waits in retained_waits.items()
-        for wait in waits
-    }
-    lowered_task_pairs = frozenset(selected_task_pairs | retained_wait_pairs)
+        for dependency_id in use.dependency_ids
+    )
     # Recompute coverage from the mechanisms that will actually be emitted.
     # Dependency analysis may prove a finer relation than the selected emitter
     # can materialize. Such a relation must monotonically coarsen to root
@@ -2639,7 +2495,7 @@ def build_cross_loop_schedule(
     # would remove the dependency entirely.
     root_completion_edges = _select_root_completion_edges(
         dependencies=dependency_plan.edges,
-        fully_task_ready_edges=lowered_task_pairs,
+        covered_dependency_ids=covered_dependency_ids,
         preordered_edges=preordered_edges,
     )
     root_order_edges = set(root_completion_edges) | set(preordered_edges)
@@ -2672,48 +2528,28 @@ def build_cross_loop_schedule(
             )
         )
     counted_events = tuple(retained_counted_events)
-    selected_task_pairs = {
-        (contributor.producer_root, use.consumer_root)
+    covered_dependency_ids = frozenset(
+        dependency_id
         for event in counted_events
-        for contributor in event.contributors
         for use in event.uses
-    }
-    lowered_task_pairs = frozenset(selected_task_pairs | retained_wait_pairs)
-    task_ready_edges = lowered_task_pairs
-    redundant_wait_pairs = {
-        (dependency_plan.event(wait.event_id).producer_root, consumer_root)
-        for consumer_root, waits in retained_waits.items()
-        for wait in waits
-        if _is_ordered_by_root_completion(
-            dependency_plan.event(wait.event_id).producer_root,
-            consumer_root,
-            root_order_edges,
+        for dependency_id in use.dependency_ids
+    )
+    task_ready_edges = frozenset(
+        (dependency.producer_root, dependency.consumer_root)
+        for dependency in dependency_plan.edges
+        if all(
+            access_dependency.dependency_id in covered_dependency_ids
+            for access_dependency in dependency.access_dependencies
         )
-    }
-    if redundant_wait_pairs:
-        retained_waits = {
-            consumer_root: tuple(
-                wait
-                for wait in waits
-                if (
-                    dependency_plan.event(wait.event_id).producer_root,
-                    consumer_root,
-                )
-                not in redundant_wait_pairs
-            )
-            for consumer_root, waits in retained_waits.items()
-        }
-        retained_waits = {
-            root: waits for root, waits in retained_waits.items() if waits
-        }
-        task_ready_edges = frozenset(task_ready_edges - redundant_wait_pairs)
+    )
     _validate_schedule_coverage(
         dependencies=dependency_plan.edges,
-        task_ready_edges=task_ready_edges,
+        covered_dependency_ids=covered_dependency_ids,
         root_completion_edges=root_completion_edges,
     )
     event_graph, family_done_events = lower_family_done_events(
         event_graph,
+        dependency_plan,
         root_completion_edges,
     )
     counted_events = (*counted_events, *family_done_events)
@@ -2723,7 +2559,6 @@ def build_cross_loop_schedule(
         worker_schedule=worker_schedule,
         local_triggers=local_triggers,
         task_ready_edges=task_ready_edges,
-        task_waits_by_root=retained_waits,
         counted_events=counted_events,
         worker_limit=worker_limit,
     )
@@ -2732,27 +2567,33 @@ def build_cross_loop_schedule(
 def _validate_schedule_coverage(
     *,
     dependencies: tuple[TileDependency, ...],
-    task_ready_edges: frozenset[tuple[int, int]],
+    covered_dependency_ids: frozenset[int],
     root_completion_edges: frozenset[tuple[int, int]],
 ) -> None:
     """Verify that every dependence has an emitted synchronization path."""
-    covered = set(task_ready_edges) | set(root_completion_edges)
     root_order_edges = set(root_completion_edges)
     for dependency in dependencies:
         pair = (dependency.producer_root, dependency.consumer_root)
-        if pair in covered or _is_ordered_by_root_completion(*pair, root_order_edges):
+        if _is_ordered_by_root_completion(*pair, root_order_edges):
+            continue
+        uncovered = tuple(
+            access_dependency.dependency_id
+            for access_dependency in dependency.access_dependencies
+            if access_dependency.dependency_id not in covered_dependency_ids
+        )
+        if not uncovered:
             continue
         raise exc.CrossLoopSchedulingError(
             f"{dependency.producer_root}->{dependency.consumer_root} through "
             f"allocations {sorted(dependency.tensor_names)!r} has no cross-loop "
-            "synchronization path"
+            f"synchronization path for dependencies {uncovered!r}"
         )
 
 
 def _select_root_completion_edges(
     *,
     dependencies: tuple[TileDependency, ...],
-    fully_task_ready_edges: frozenset[tuple[int, int]],
+    covered_dependency_ids: frozenset[int],
     preordered_edges: frozenset[tuple[int, int]],
 ) -> frozenset[tuple[int, int]]:
     """Choose the minimal source-ordered root-completion fallback edges."""
@@ -2766,7 +2607,10 @@ def _select_root_completion_edges(
         ),
     ):
         pair = (dependency.producer_root, dependency.consumer_root)
-        if pair in fully_task_ready_edges or pair in preordered_edges:
+        if pair in preordered_edges or all(
+            access_dependency.dependency_id in covered_dependency_ids
+            for access_dependency in dependency.access_dependencies
+        ):
             continue
         if _is_ordered_by_root_completion(*pair, ordered_root_edges):
             continue
@@ -2791,106 +2635,3 @@ def _is_ordered_by_root_completion(
         visited.add(current)
         pending.extend(target for source, target in edges if source == current)
     return False
-
-
-def _select_available_waits(
-    *,
-    dependency_plan: TileDependencyGraph,
-    task_families: tuple[InstantiatedTaskFamily, ...],
-    excluded_roots: frozenset[int],
-) -> tuple[
-    frozenset[tuple[int, int]],
-    dict[int, tuple[EventUse, ...]],
-]:
-    kinds_by_pair: dict[tuple[int, int], set[TileDependencyKind]] = {}
-    for dependency in dependency_plan.edges:
-        pair = (dependency.producer_root, dependency.consumer_root)
-        kinds_by_pair.setdefault(pair, set()).update(dependency.kinds)
-
-    waits_by_pair: dict[tuple[int, int], list[EventUse]] = {}
-    for wait in dependency_plan.waits:
-        event = dependency_plan.event(wait.event_id)
-        waits_by_pair.setdefault((event.producer_root, wait.consumer_root), []).append(
-            wait
-        )
-
-    fully_task_ready_pairs: set[tuple[int, int]] = set()
-    waits_by_root: dict[int, list[EventUse]] = {}
-    for pair in kinds_by_pair:
-        producer_root, consumer_root = pair
-        producer = task_families[producer_root]
-        consumer = task_families[consumer_root]
-        pair_waits = waits_by_pair.get(pair, ())
-        all_task_waits = tuple(
-            wait
-            for wait in pair_waits
-            if dependency_plan.event(wait.event_id).granularity == "task"
-        )
-        task_waits = tuple(
-            wait for wait in all_task_waits if wait.placement == "root_entry"
-        )
-        declared_root_waits = tuple(
-            wait
-            for wait in pair_waits
-            if dependency_plan.event(wait.event_id).granularity == "root"
-        )
-        can_use_tasks = (
-            producer_root not in excluded_roots
-            and consumer_root not in excluded_roots
-            # A one-task event is exactly root completion. Keep one canonical
-            # representation so singleton producers do not allocate and poll
-            # a second, equivalent task-event array.
-            and producer.task_count > 1
-            and consumer.task_count > 0
-            and bool(task_waits)
-            and len(task_waits) == len(all_task_waits)
-        )
-        producer_axes = set(producer.logical_axis_order)
-        consumer_axes = set(consumer.logical_axis_order)
-        for wait in task_waits:
-            predecessor_map = wait.predecessor_map
-            if (
-                predecessor_map is None
-                or {axis.producer_block_id for axis in predecessor_map.axes}
-                != producer_axes
-            ):
-                can_use_tasks = False
-                break
-            required_consumer_axes = {
-                axis.consumer_block_id for axis in predecessor_map.axes
-            }
-            if not required_consumer_axes <= consumer_axes:
-                can_use_tasks = False
-                break
-
-        if not can_use_tasks:
-            continue
-
-        selected_waits = waits_by_root.setdefault(consumer_root, [])
-        existing = {
-            (
-                wait.event_id,
-                wait.predecessor_map.axes,
-                None,
-            )
-            for wait in selected_waits
-            if wait.predecessor_map is not None
-        }
-        for wait in task_waits:
-            assert wait.predecessor_map is not None
-            key = (
-                wait.event_id,
-                wait.predecessor_map.axes,
-                None,
-            )
-            if key not in existing:
-                selected_waits.append(wait)
-                existing.add(key)
-
-        if not declared_root_waits:
-            fully_task_ready_pairs.add(pair)
-
-    return (
-        frozenset(fully_task_ready_pairs),
-        {root: tuple(waits) for root, waits in waits_by_root.items()},
-    )
