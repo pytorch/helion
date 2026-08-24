@@ -2451,8 +2451,8 @@ class TestPallas(TestCase):
         col_indices = torch.randperm(16, device=DEVICE).to(torch.int32)
 
         with self.assertRaisesRegex(
-            NotImplementedError,
-            "multiple indirect dims are not supported",
+            helion.exc.BackendUnsupported,
+            "unsupported by both one-hot and DMA lowering",
         ):
             code_and_output(
                 scatter_store_multiple_tensor_indices,
