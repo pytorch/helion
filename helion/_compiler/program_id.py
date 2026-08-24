@@ -416,7 +416,7 @@ if TYPE_CHECKING:
 NUM_SM_VAR = "_NUM_SM"
 NUM_XCD_VAR = "_NUM_XCDS"
 
-# Independent broadcast counters occupy distinct cache lines so polling one
+# Independent keyed-event counters occupy distinct cache lines so polling one
 # dependency does not contend with publication to another. Cross-loop event
 # state is currently CUDA-only, where 128 bytes is a conservative L2 line
 # alignment. The layout is expressed in bytes rather than a model-shaped
@@ -911,14 +911,10 @@ class ForEachProgramID(ProgramIDs):
         )
         counted_event_offsets: dict[CountedEventPlan, int] = {}
         counted_event_counter_count = 0
+        counted_event_key_stride = _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
         for plan in all_counted_event_plans:
             counted_event_offsets[plan] = counted_event_counter_count
-            stride = (
-                _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
-                if plan in ordered_action_event_plans
-                else 1
-            )
-            counted_event_counter_count += plan.key_count * stride
+            counted_event_counter_count += plan.key_count * counted_event_key_stride
         root_completion_producer_roots = sorted(
             {producer for producer, _ in root_completion_edges}
         )
@@ -1373,14 +1369,9 @@ class ForEachProgramID(ProgramIDs):
 
         def counted_event_counter(plan: CountedEventPlan, key: str) -> str:
             assert counted_event_arg is not None
-            stride = (
-                _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
-                if plan in ordered_action_event_plans
-                else 1
-            )
             return (
                 f"{counted_event_arg} + {counted_event_offsets[plan]} + "
-                f"({key}) * {stride}"
+                f"({key}) * {counted_event_key_stride}"
             )
 
         def counted_event_expected_arrivals(

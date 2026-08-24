@@ -29,6 +29,7 @@ from helion._compiler.cross_loop_scheduler import lower_counted_events
 from helion._compiler.cross_loop_scheduler import order_local_contributors_by_key
 from helion._compiler.cross_loop_scheduler import place_ordered_action_consumers
 from helion._compiler.cross_loop_scheduler import validate_worker_schedule
+from helion._compiler.program_id import _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
 from helion._compiler.tile_dependency import AllocationRegion
 from helion._compiler.tile_dependency import ExecutionScope
 from helion._compiler.tile_dependency import InstantiatedActionDomain
@@ -3528,6 +3529,19 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             )
             torch.testing.assert_close(out, torch.sum(x + launch + 1).reshape(1))
         self.assertGreaterEqual(code.count("tile_dependency_continuation_previous"), 2)
+        continuation_lines = [
+            line
+            for line in code.splitlines()
+            if "tile_dependency_continuation_previous" in line
+            and "tl.atomic_add" in line
+        ]
+        self.assertEqual(len(continuation_lines), 2)
+        for line in continuation_lines:
+            self.assertIn(f"* {_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}", line)
+        self.assertIn(
+            f"+ {16 * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS} +",
+            continuation_lines[1],
+        )
         self.assertNotIn("tile_dependency_task_wait", code)
         self.assertIn("tile_dependency_root_completion_wait", code)
 
@@ -3627,6 +3641,22 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, expected)
         self.assertIn("tile_dependency_keyed_event_wait", code)
         self.assertIn("tl.cast(5, tl.uint32)", code)
+        wait_lines = [
+            line
+            for line in code.splitlines()
+            if "tile_dependency_keyed_event_wait =" in line
+        ]
+        publication_lines = [
+            line
+            for line in code.splitlines()
+            if "tl.atomic_add(tile_dependency_state" in line
+        ]
+        self.assertTrue(wait_lines)
+        self.assertTrue(publication_lines)
+        for line in wait_lines:
+            self.assertIn(f"* {_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}]", line)
+        for line in publication_lines:
+            self.assertIn(f"* {_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}, 1", line)
         self.assertNotIn("tile_dependency_task_wait", code)
         self.assertNotIn("tile_dependency_root_completion", code)
 

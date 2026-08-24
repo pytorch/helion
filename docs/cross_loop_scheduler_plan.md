@@ -77,6 +77,106 @@ versus 78.87 microseconds separately. The nested-action refactor should first
 preserve these lowerings and resource envelopes; recovering the older Qwen
 76.9-microsecond result is not a reason to retain a special scheduler path.
 
+### Gemma A4B MoE stress-test checkpoint
+
+The batch-1 A4B MoE probe validates the full-DAG design on a substantially
+different seven-root chain. With source-level assignment-local GEMVs and an
+exact hierarchical top-k, the current generic lowering reaches 34.22
+microseconds versus 39.05 microseconds for the separately tuned Helion kernels
+on an uncontended B200. The hand-written Triton megakernel remains faster at
+30.94 microseconds. The generated schedule uses ordinary family completion for
+the routing prefix, keyed gate-to-down readiness with fan-in 44, final-arrival
+down-to-reduction execution with fan-in 32, and family completion into the
+post-norm. No MoE topology or root IDs are recognized by the compiler.
+
+The same source is correct for batches 2 and 8, including nontrivial L2
+remapping. Logical event keys retain the batch and route-slot coordinates while
+physical task traversal changes independently. A 512-wide reduction tail is
+also proved exactly with piecewise fan-in `(64, 64, 64, 64, 64, 32)`. These are
+positive evidence that logical task identity, allocation-coordinate overlap,
+and the keyed-event algebra are the right semantic foundation.
+
+The stress test also exposes concrete implementation gaps. They should be
+fixed within the existing architecture rather than by adding schedule types:
+
+- Every keyed-event counter is now cache-line isolated, rather than applying
+  that layout only to ordered-action events. On batch-1 A4B, the eight
+  gate-to-down keys receive 44 concurrent publications apiece. The original
+  diagnostic improved Helion from roughly 33--35 microseconds to 31.07
+  microseconds, matching the 31.02-microsecond hand Triton control. NCU reports
+  the same 526 atomic requests but 30% fewer L2 atomic-input active cycles.
+  Matched compiler A/B checks show no Qwen regression (79.10 to 79.07
+  microseconds) and improve Gemma E4B from 74.13 to 73.56 microseconds, with
+  identical register, spill, and shared-memory envelopes. Cache-line isolation
+  is therefore a storage invariant, not a model matcher or schedule knob.
+- A singleton/coarse producer that contributes to several joined event keys
+  still makes counted-event lowering reject an otherwise exact relation. The
+  batch-1 probe currently forwards route metadata through the gate/down roots
+  to avoid that limitation. The canonical event graph must preserve and lower
+  multi-key contributions or factor an already-satisfied coarse prerequisite
+  from the fine-grained event.
+- Piecewise arrival counts lower correctly for static consumers, but the
+  final-arrival executor is not selected for the nonuniform-tail case. A local
+  trigger should compare against the proved expected count for its key; a
+  nonuniform count is not by itself a reason to change executors.
+- Multi-wave worker schedules are represented compactly in Python but can
+  expand into long nested `tl.where` expressions when translated back from a
+  virtual schedule position to a logical task. Batch 8 emitted a 12-KiB
+  expression, and an end-to-end batch-16 lowering probe took about 175 seconds
+  and 2.2 GiB RSS. Preserve factored Cartesian coordinates and periodic worker
+  mappings through lowering so code size and compile work scale with schedule
+  factors, not task count or wave count.
+- The grouped MoE kernels initially selected the cooperative dynamic-grid
+  fallback solely because the static `max_active_tiles` capacity was not
+  specialized in source. Explicitly specializing that bound restores the
+  ordinary static event scheduler. This is a source annotation issue today;
+  the compiler may later infer such allocation-shape bounds, but it does not
+  justify a dynamic-queue schedule.
+- The grouped gate and down roots index their intermediate through routing-
+  dependent `active_tiles` and `order` arrays. The conservative indirect-access
+  rule therefore uses family completion. Prefer a task-major intermediate
+  layout in Helion source so both roots expose the shared logical group key.
+  Do not add an MoE matcher or a general speculative indirect-index proof. A
+  future generic extension may prove structurally identical, immutable index
+  expressions, but only if that proof remains local and exact.
+- A computed contiguous router slice such as
+  `group * group_size + arange(group_size)` is currently recorded as an
+  unknown subscript, so router-to-candidate readiness becomes whole-family
+  completion. Normalized one-sided access maps should retain this ordinary
+  affine vector expression.
+
+The batch-8 assignment-local source is intentionally not a performance target:
+it reloads an expert's weights for every routed assignment and measures 142.33
+microseconds versus 94.21 microseconds for the grouped standalone kernels. A
+verbatim composition of the grouped Helion kernels is also correct but falls
+back to family completion across its indirectly indexed intermediate.
+
+A source-level task-major intermediate resolves that ambiguity without a new
+compiler policy. The gate root writes activation and routing metadata by
+logical expert-tile key; the down root consumes the same key and scatters only
+its final weighted result. The existing graph then derives 64 gate-to-down
+event keys with fan-in 11. Combined with the hierarchical router, a 256-wide
+down tile, per-range staging, and the compiler-derived 286-worker candidate,
+the probe reaches about 69.8 microseconds versus 92.9 microseconds for separate
+grouped Helion at batch 8 / skew 2. At skew 0 it is approximately tied with the
+separate baseline. These measurements were interleaved on a GPU whose foreign
+process retained memory but was quiescent; repeat them on a fully uncontended
+GPU before treating the exact values as release numbers.
+
+This result strengthens rather than changes the design conclusion: source code
+should expose the logical task key when an intermediate is otherwise indexed
+through data-dependent routing, and the compiler should schedule the resulting
+ordinary event graph. The autotuner owns block widths, range pipeline depths,
+register cap, and worker count. It does not need an MoE-specific schedule.
+
+The batch-1 source need not fuse gate/up with GeGLU. Preserving vLLM's explicit
+W13-output materialization adds a normal intermediate root; the graph derives
+piecewise gate/up-to-GeGLU milestones and a keyed GeGLU-to-down join. Once
+keyed counters are cache-line isolated, this source measures 32.88 microseconds
+versus 32.68 microseconds for the manually fused source. Keep the boundary in
+the source when fidelity is preferred; do not require epilogue fusion as a
+compiler scheduling pattern.
+
 ### Ordered action domains inside task strands
 
 This section supersedes the earlier temporary rule that only a complete opaque
