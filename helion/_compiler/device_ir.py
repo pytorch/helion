@@ -4061,20 +4061,22 @@ def validate_host_tensor_usage(graph: torch.fx.Graph) -> None:
 
 def add_tile_with_offset_metadata(graph_info: GraphInfo) -> None:
     """
-    Recognize tile.index + offset patterns and add metadata to enable tensor descriptor indexing.
+    Recognize tile.index +/- offset patterns and add metadata to enable tensor descriptor indexing.
 
-    This pass identifies FX nodes that represent `tile.index + offset` (where offset is an
-    integer or SymInt), and adds the `tile_with_offset` metadata to those nodes so that
-    indexing strategies can generate efficient code (e.g., tensor descriptors) for them.
+    This pass identifies FX nodes that represent ``tile.index + offset`` or
+    ``tile.index - offset`` (where offset is an integer or SymInt), and adds the
+    ``tile_with_offset`` metadata to those nodes so that indexing strategies can
+    generate efficient code (e.g., tensor descriptors) for them.
     """
     graph = graph_info.graph
     env = CompileEnvironment.current()
-    add_targets = (operator.add, torch.ops.aten.add.Tensor)
+    add_targets = (operator.add, torch.ops.aten.add.Scalar, torch.ops.aten.add.Tensor)
+    sub_targets = (operator.sub, torch.ops.aten.sub.Scalar, torch.ops.aten.sub.Tensor)
     offset_types = (int, torch.SymInt)
     for node in graph.nodes:
         if (
             node.op != "call_function"
-            or node.target not in add_targets
+            or node.target not in (*add_targets, *sub_targets)
             or node.kwargs
             or len(node.args) != 2
         ):
@@ -4083,8 +4085,10 @@ def add_tile_with_offset_metadata(graph_info: GraphInfo) -> None:
         block_id: int | None = None
         total_offset: int | torch.SymInt = 0
         valid = True
+        is_subtraction = node.target in sub_targets
 
-        for arg in node.args:
+        for arg_index, arg in enumerate(node.args):
+            sign = -1 if is_subtraction and arg_index == 1 else 1
             tile_offset_value: int | torch.SymInt | None = None
             arg_block_id: int | None = None
 
@@ -4112,29 +4116,29 @@ def add_tile_with_offset_metadata(graph_info: GraphInfo) -> None:
                 else:
                     val = arg.meta.get("val")
                     if isinstance(val, offset_types):
-                        total_offset = total_offset + val
+                        total_offset = total_offset + sign * val
                         continue
 
                 if arg_block_id is not None:
-                    if block_id is not None:
+                    if block_id is not None or sign < 0:
                         valid = False
                         break
                     if tile_offset_value is None:
                         tile_offset_value = 0
                     block_id = arg_block_id
-                    total_offset = total_offset + tile_offset_value
+                    total_offset = total_offset + sign * tile_offset_value
                     continue
 
                 val = arg.meta.get("val")
                 if isinstance(val, offset_types):
-                    total_offset = total_offset + val
+                    total_offset = total_offset + sign * val
                     continue
 
                 valid = False
                 break
 
             if isinstance(arg, offset_types):
-                total_offset = total_offset + arg
+                total_offset = total_offset + sign * arg
                 continue
             valid = False
             break

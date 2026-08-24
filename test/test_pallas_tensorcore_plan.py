@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import operator
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import cast
@@ -7,6 +8,7 @@ from unittest.mock import patch
 
 import torch
 
+from helion._compiler.device_ir import add_tile_with_offset_metadata
 from helion._compiler.pallas.memory_access import MEMORY_ACCESS_META
 from helion._compiler.pallas.memory_access import MemoryAccess
 from helion._compiler.pallas.memory_access import MemoryAccessKind
@@ -25,6 +27,21 @@ from helion.language import memory_ops
 
 if TYPE_CHECKING:
     from helion._compiler.device_ir import GraphInfo
+
+
+def test_tile_offset_metadata_handles_subtraction() -> None:
+    graph = torch.fx.Graph()
+    tile_index = graph.placeholder("tile_index")
+    tile_index.meta["tile_with_offset"] = {"block_id": 3, "offset": 5}
+    shifted = graph.call_function(torch.ops.aten.sub.Tensor, (tile_index, 7))
+    reverse = graph.call_function(operator.sub, (7, tile_index))
+
+    graph_info = cast("GraphInfo", SimpleNamespace(graph=graph))
+    with patch("helion._compiler.device_ir.CompileEnvironment.current"):
+        add_tile_with_offset_metadata(graph_info)
+
+    assert shifted.meta["tile_with_offset"] == {"block_id": 3, "offset": -2}
+    assert "tile_with_offset" not in reverse.meta
 
 
 def _spec(
