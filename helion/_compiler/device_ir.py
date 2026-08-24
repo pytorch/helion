@@ -3843,6 +3843,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             else:
                 from ..language.matmul_ops import enable_cute_tcgen05_search
                 from ..language.matmul_ops import plan_cute_tcgen05_search
+                from .cute.cute_mma import _rank3_grouped_root_axes
                 from .cute.cute_mma import analyze_cute_mma_node
 
                 # The same structural analyzer gates tcgen05 search and codegen
@@ -3855,13 +3856,33 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 for graph_info in device_ir.graphs:
                     for node in graph_info.graph.nodes:
                         candidate = analyze_cute_mma_node(node, device_ir=device_ir)
+                        if candidate is None or candidate.requires_accumulator_seed:
+                            continue
                         if (
-                            candidate is None
-                            or candidate.requires_accumulator_seed
-                            or candidate.operands.output_block_ids
+                            candidate.operands.output_block_ids
                             not in root_grid_block_ids
                         ):
-                            continue
+                            if not candidate.operands.rhs.rhs_rank3_grouped_nt:
+                                continue
+                            env = CompileEnvironment.current()
+                            grouped_axes = _rank3_grouped_root_axes(
+                                env,
+                                device_ir,
+                                m_block_id=candidate.operands.m_block_id,
+                                n_block_id=candidate.operands.n_block_id,
+                                k_block_id=candidate.operands.k_block_id,
+                            )
+                            leading_block_id = (
+                                candidate.operands.leading_passthrough_block_id
+                            )
+                            if (
+                                grouped_axes is None
+                                or grouped_axes.segment_block_id is None
+                                or leading_block_id is None
+                                or env.canonical_block_id(grouped_axes.segment_block_id)
+                                != env.canonical_block_id(leading_block_id)
+                            ):
+                                continue
                         lhs = candidate.lhs.meta.get("val")
                         rhs = candidate.rhs.meta.get("val")
                         if not (
@@ -3891,6 +3912,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         ),
                         supports_small_n_scalar_fallback=(
                             supports_small_n_scalar_fallback
+                        ),
+                        allow_dynamic_hints=(
+                            candidate.operands.rhs.rhs_segment_group is not None
                         ),
                     )
                     if search_plan is None:

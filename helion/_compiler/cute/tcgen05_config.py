@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Hashable
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import NamedTuple
+from typing import TypeVar
 from typing import cast
 
 import torch
@@ -25,6 +27,7 @@ from .strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
 from .strategies import TCGEN05_LEGAL_L2_SWIZZLE_SIZES
 from .strategies import TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES
 from .strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
+from .strategies import TCGEN05_PERSISTENCE_MODEL_PID_TYPES
 from .strategies import TCGEN05_STRATEGY_CONFIG_KEY
 from .strategies import TCGEN05_STRATEGY_CONFIG_KEYS
 from .strategies import TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY
@@ -108,7 +111,6 @@ from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_SEARCH_CHOICES
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
-from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
@@ -156,7 +158,9 @@ from .tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from .tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Mapping
+    from collections.abc import Sequence
 
     from ...autotuner.block_id_sequence import BlockIdSequence
     from ...autotuner.config_fragment import BlockSizeFragment
@@ -189,8 +193,121 @@ class Tcgen05AbStagesThreeSearchConstraints(NamedTuple):
     per_cta_smem_budget_bytes: int
 
 
+class Tcgen05GroupedWorklistSmemFacts(NamedTuple):
+    group_count: int
+    device_split_sizes: bool
+
+
 TCGEN05_GROUPED_DYNAMIC_AB4_STAGE = 4
 TCGEN05_GROUPED_DYNAMIC_STAGE_TUPLES = ((4, 2), (8, 4))
+
+
+_SeedValue = TypeVar("_SeedValue", bound=Hashable)
+
+
+def _compiler_seed_values(
+    seeds: Sequence[Config],
+    key: str,
+    value_type: type[_SeedValue],
+    is_valid: Callable[[_SeedValue], bool],
+    *,
+    exact_type: bool = True,
+    is_valid_for_seed: Callable[[Config, _SeedValue], bool] | None = None,
+) -> tuple[_SeedValue, ...]:
+    return tuple(
+        dict.fromkeys(
+            cast("_SeedValue", value)
+            for seed in seeds
+            for value in (seed.config.get(key),)
+            if (
+                type(value) is value_type
+                if exact_type
+                else isinstance(value, value_type)
+            )
+            and is_valid(cast("_SeedValue", value))
+            and (
+                is_valid_for_seed is None
+                or is_valid_for_seed(seed, cast("_SeedValue", value))
+            )
+        )
+    )
+
+
+def _integer_fragment_with_seed_values(
+    fragment: IntegerFragment,
+    seed_values: tuple[int, ...],
+) -> ConfigSpecFragment:
+    seed_only_values = tuple(
+        value
+        for value in dict.fromkeys(seed_values)
+        if value < fragment.low or value > fragment.high
+    )
+    return (
+        fragment
+        if not seed_only_values
+        else _CompilerSeedIntegerFragment(fragment, seed_only_values)
+    )
+
+
+class _CompilerSeedIntegerFragment(IntegerFragment):
+    """An integer search range that can also encode frozen compiler seeds."""
+
+    def __init__(
+        self,
+        fragment: IntegerFragment,
+        seed_only_values: tuple[int, ...],
+    ) -> None:
+        super().__init__(fragment.low, fragment.high, fragment.default_val)
+        self.seed_only_values = seed_only_values
+
+    def pattern_neighbors(self, current: object, radius: int = 1) -> list[object]:
+        if type(current) is not int:
+            raise TypeError(f"Expected int, got {type(current).__name__}")
+        if self.low <= current <= self.high:
+            return super().pattern_neighbors(current, radius)
+        if current not in self.seed_only_values:
+            raise ValueError(f"{current!r} is not a compiler-seed integer value")
+        boundary = self.clamp(current)
+        return [boundary, *super().pattern_neighbors(boundary, radius)]
+
+    def encode(self, value: object) -> list[float]:
+        if type(value) is not int:
+            raise TypeError(f"Expected int, got {type(value).__name__}")
+        if not (self.low <= value <= self.high or value in self.seed_only_values):
+            raise ValueError(f"{value!r} is not a compiler-seed integer value")
+        return [float(value)]
+
+    def fingerprint(self) -> tuple[str | int, ...]:
+        return (
+            "compiler_seed_integer",
+            self.low,
+            self.high,
+            self.default_val,
+            *self.seed_only_values,
+        )
+
+
+def _enum_fragment_with_seed_values(
+    base_choices: tuple[object, ...],
+    seed_values: tuple[Hashable, ...],
+    *,
+    search_choices: tuple[object, ...],
+    original: EnumFragment | None = None,
+    search_only_if_widened: bool = False,
+) -> EnumFragment:
+    choices = tuple(dict.fromkeys((*base_choices, *seed_values)))
+    if original is not None and choices == base_choices:
+        return original
+    return EnumFragment(
+        choices,
+        search_choices=(
+            None
+            if search_only_if_widened and choices == base_choices
+            else search_choices
+        ),
+    )
+
+
 # The generated grouped kernel's non-operand allocations are about 1.6 KiB
 # (pipeline barriers, TensorMap staging, and TMEM bookkeeping). Keep a small
 # margin while still admitting CUTLASS's max-fit AB8/C4 pipeline on B200.
@@ -296,6 +413,7 @@ class CuteTcgen05Config:
         self.ab_stages_three_search_constraints: (
             Tcgen05AbStagesThreeSearchConstraints | None
         ) = None
+        self.grouped_worklist_smem_facts: Tcgen05GroupedWorklistSmemFacts | None = None
         self.deep_direct_entry_validation_enabled: bool = False
         self.num_epi_warps_search_choices: tuple[int, ...] | None = None
         self.num_epi_warps_validation_choices: tuple[int, ...] | None = None
@@ -871,18 +989,40 @@ class CuteTcgen05Config:
     def _fix_cluster_m2_search_config(self, config: dict[str, object]) -> None:
         if not (self.search_enabled and config.get("tcgen05_cluster_m") == 2):
             return
+        config_view = self._matmul_config_view(config)
+        if config_view is None:
+            config["tcgen05_cluster_m"] = 1
+            return
+        block_sizes, m_index, n_index, k_index = config_view
+
+        def is_grouped_worklist_two_cta() -> bool:
+            return (
+                config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+                == TCGEN05_GROUPED_MODE_WORKLIST_NM
+                and config.get("tcgen05_cluster_n", 1) == 1
+                and block_sizes[m_index] == TCGEN05_TWO_CTA_BLOCK_M
+                and block_sizes[n_index] == 128
+                and block_sizes[k_index] in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+                and config.get(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY)
+                in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+            )
+
         constraints = self.cluster_m2_search_constraints
+        if is_grouped_worklist_two_cta():
+            # The selected worklist source-M family owns the validated physical
+            # 256x32/224/256 MMA profile and its K envelope independently of
+            # the generic cluster-M2 policy. Compiler seeds widen the
+            # otherwise-narrow pid fragment, so keep this exact family even
+            # when generic constraints reject it or are absent.
+            config["pid_type"] = TCGEN05_TWO_CTA_SEED_PID_TYPE
+            config.pop("epilogue_subtile", None)
+            return
         if constraints is None:
             config["tcgen05_cluster_m"] = 1
             return
         if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
             config["tcgen05_cluster_m"] = 1
             return
-        config_view = self._matmul_config_view(config)
-        if config_view is None:
-            config["tcgen05_cluster_m"] = 1
-            return
-        block_sizes, m_index, n_index, k_index = config_view
         edge_k_tail_family = constraints.allow_edge_k_tail_family
         is_narrow_clc_aux_tma = self._is_clc_aux_tma_narrow_n_request(config)
         if edge_k_tail_family:
@@ -909,23 +1049,6 @@ class CuteTcgen05Config:
         # their sub-paths; doing it once here covers the full-tile and
         # small-grid paths too.
         config.pop("epilogue_subtile", None)
-        if (
-            config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
-            == TCGEN05_GROUPED_MODE_WORKLIST_NM
-            and config.get("tcgen05_cluster_n", 1) == 1
-            and block_sizes[m_index] == TCGEN05_TWO_CTA_BLOCK_M
-            and block_sizes[n_index] == 128
-            and bk in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
-            and config.get(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY)
-            in (
-                TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
-                TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
-            )
-        ):
-            # Worklist configs keep their 256x128 logical DSL tile. Their
-            # source-M metadata selects the physical 256x224/256 MMA profile
-            # through ``resolve_tcgen05_grouped_worklist_mma_profile``.
-            return
         # fp8 small-grid family: a sampled bm<=128 routes to the fp8-validated
         # per-CTA 64xbn 2-CTA tile (bm=128/bn=128) instead of the bm=256 full
         # tile, which underfills the device on small/wave-limited fp8 GEMMs. The
@@ -970,6 +1093,90 @@ class CuteTcgen05Config:
                     TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING
                 ]
 
+    def _fix_grouped_worklist_search_config(self, config: dict[str, object]) -> None:
+        """Project worklist search neighbors onto the validated logical tile."""
+        if not self.search_enabled:
+            return
+        if (
+            config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+            != TCGEN05_GROUPED_MODE_WORKLIST_NM
+        ):
+            return
+        source_m_tile = config.get(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY)
+        if (
+            type(source_m_tile) is not int
+            or source_m_tile not in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+        ):
+            return
+        config_view = self._matmul_config_view(config)
+        if config_view is None:
+            return
+        block_sizes, m_index, n_index, k_index = config_view
+        block_sizes[m_index] = TCGEN05_TWO_CTA_BLOCK_M
+        block_sizes[n_index] = 128
+        sampled_bk = block_sizes[k_index]
+        block_k_choices = TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+        assert self.matmul_block_ids is not None
+        semantic_k_block_id = self.matmul_block_ids[2]
+        known_static_ks = {
+            fact.static_k
+            for fact in self.config_spec.matmul_facts
+            if fact.k_block_id == semantic_k_block_id and fact.static_k is not None
+        }
+        constraints = self.cluster_m2_search_constraints
+        if constraints is not None:
+            known_static_ks.add(constraints.static_k)
+        if known_static_ks:
+            # Worklists require exact K divisibility but own an independent
+            # stage/tile-count envelope from generic cluster-M2 search. Filter
+            # only by that shared structural requirement: importing generic
+            # max-tile or edge-tail policy would rewrite valid worklist BKs.
+            constrained_choices = tuple(
+                block_k
+                for block_k in block_k_choices
+                if all(static_k % block_k == 0 for static_k in known_static_ks)
+            )
+            if not constrained_choices:
+                static_k_values = tuple(sorted(known_static_ks))
+                raise InvalidConfig(
+                    f"{TCGEN05_GROUPED_MODE_CONFIG_KEY}="
+                    f"{TCGEN05_GROUPED_MODE_WORKLIST_NM!r} has no supported "
+                    f"block_k in {TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES} "
+                    f"that divides every known static K in {static_k_values}"
+                )
+            block_k_choices = constrained_choices
+        block_sizes[k_index] = (
+            min(
+                block_k_choices,
+                key=lambda block_k: (abs(block_k - sampled_bk), block_k),
+            )
+            if type(sampled_bk) is int
+            else block_k_choices[0]
+        )
+        if source_m_tile != TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE:
+            # Only the compact source-32 profile supports CtaGroup.ONE. The
+            # reviewed source-224/256 profiles are CtaGroup.TWO even when a
+            # pattern neighbor independently mutates the cluster fragment.
+            config["tcgen05_cluster_m"] = 2
+
+    @staticmethod
+    def _is_grouped_clc_config(config: dict[str, object]) -> bool:
+        return (
+            config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY) in TCGEN05_GROUPED_MODES
+            and config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+            == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+        )
+
+    @staticmethod
+    def _is_grouped_runtime_direct_clc_config(config: dict[str, object]) -> bool:
+        return (
+            CuteTcgen05Config._is_grouped_clc_config(config)
+            and config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+            == TCGEN05_GROUPED_MODE_WORKLIST_NM
+            and config.get(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY) is True
+            and TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY not in config
+        )
+
     def prepare_normalization(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -984,26 +1191,8 @@ class CuteTcgen05Config:
                 raise InvalidConfig(
                     "tcgen05 grouped kernels require num_sm_multiplier=1"
                 )
-        grouped_clc = (
-            grouped_mode in TCGEN05_GROUPED_MODES
-            and config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
-            == Tcgen05PersistenceModel.CLC_PERSISTENT.value
-        )
-        if grouped_clc and (
-            config.get(TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY, 0) != 0
-        ):
-            if fix_invalid:
-                config.pop(TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY, None)
-            else:
-                raise InvalidConfig(
-                    "tcgen05 grouped CLC launches its exact full tile-record grid; "
-                    "reserved_sms cannot limit that grid"
-                )
-        if grouped_clc and not (
-            grouped_mode == TCGEN05_GROUPED_MODE_WORKLIST_NM
-            and config.get(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY) is True
-            and TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY not in config
-        ):
+        grouped_clc = self._is_grouped_clc_config(config)
+        if grouped_clc and not self._is_grouped_runtime_direct_clc_config(config):
             if fix_invalid:
                 config.pop(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY, None)
                 config[TCGEN05_STRATEGY_CONFIG_KEY] = (
@@ -1018,6 +1207,17 @@ class CuteTcgen05Config:
                     f"{TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY}=True, and no "
                     f"{TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY}; the "
                     "launcher must build an exact one-record-per-cluster tile table"
+                )
+        grouped_clc = self._is_grouped_clc_config(config)
+        if grouped_clc and (
+            config.get(TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY, 0) != 0
+        ):
+            if fix_invalid:
+                config.pop(TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY, None)
+            else:
+                raise InvalidConfig(
+                    "tcgen05 grouped CLC launches its exact full tile-record grid; "
+                    "reserved_sms cannot limit that grid"
                 )
         source_m_tile_key = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
         source_m_tile = config.get(source_m_tile_key)
@@ -1152,6 +1352,21 @@ class CuteTcgen05Config:
             dtype_bytes=dtype_bytes,
             per_cta_smem_budget_bytes=budget_bytes,
         )
+
+    def register_grouped_worklist_smem_facts(
+        self, *, group_count: int, device_split_sizes: bool
+    ) -> None:
+        if group_count <= 0:
+            raise ValueError(
+                "grouped worklist SMEM facts require a positive group count"
+            )
+        facts = Tcgen05GroupedWorklistSmemFacts(group_count, device_split_sizes)
+        if self.grouped_worklist_smem_facts not in (None, facts):
+            raise RuntimeError(
+                "conflicting grouped worklist SMEM facts were registered for one "
+                "ConfigSpec"
+            )
+        self.grouped_worklist_smem_facts = facts
 
     def allow_deep_direct_entry_validation(self, *, device: torch.device) -> None:
         self.deep_direct_entry_validation_enabled = (
@@ -1325,25 +1540,36 @@ class CuteTcgen05Config:
     def _grouped_worklist_nm_ab_config_matches(
         self, config: dict[str, object], ab_stages: object
     ) -> bool:
-        block_sizes = config.get("block_sizes")
-        block_k = (
-            block_sizes[2]
-            if isinstance(block_sizes, list) and len(block_sizes) >= 3
-            else None
-        )
+        config_view = self._matmul_config_view(config)
+        if config_view is None:
+            block_sizes = config.get("block_sizes")
+            if (
+                self.matmul_block_ids is not None
+                or not isinstance(block_sizes, list)
+                or len(block_sizes) != 3
+            ):
+                return False
+            # Reviewed/AOT configs can be normalized by a standalone ConfigSpec
+            # before compiler MMA analysis registers semantic block IDs.  That
+            # schema is exactly the canonical [M, N, K] triple.  Real kernels
+            # always use the registered semantic indices above, including when
+            # their block-size order is permuted.
+            config_view = (block_sizes, 0, 1, 2)
+        block_sizes, m_index, n_index, k_index = config_view
+        block_k = block_sizes[k_index]
         profile = resolve_tcgen05_grouped_worklist_mma_profile(
             config,
             block_k=block_k,
         )
         if not (
             type(ab_stages) is int
-            and 2 <= ab_stages <= 7
+            and 4 <= ab_stages <= 7
             and profile is not None
             and config.get("tcgen05_cluster_n", 1) == 1
             and config.get("tcgen05_acc_stages", 2) == 2
             and config.get("tcgen05_c_stages", 2) == 2
-            and isinstance(block_sizes, list)
-            and block_sizes[:2] == [TCGEN05_TWO_CTA_BLOCK_M, 128]
+            and block_sizes[m_index] == TCGEN05_TWO_CTA_BLOCK_M
+            and block_sizes[n_index] == 128
         ):
             return False
         constraints = self.ab_stages_three_search_constraints
@@ -1351,6 +1577,29 @@ class CuteTcgen05Config:
             # Fixed configs can be normalized before their input device is known.
             # CuTe MMA selection applies the real target's SMEM limit at codegen.
             return True
+        target_capacity_bytes = (
+            constraints.per_cta_smem_budget_bytes
+            + TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES
+        )
+        smem_facts = self.grouped_worklist_smem_facts
+        if smem_facts is None:
+            # Compiler-owned seeds register scheduler-specific allocation facts
+            # and are rejected here when their exact footprint is too large.  An
+            # explicit config may be normalized without a discovered worklist
+            # contract, so those facts can legitimately be absent. Admit only when the
+            # physical AB ring itself fits the raw target capacity, then defer
+            # scheduler/mailbox allocations to the resolved worklist codegen
+            # check.  That check proves the single grouped matmul and computes
+            # its exact footprint before emitting any allocations.
+            required_ab_bytes = tcgen05_ab_smem_bytes_per_cta(
+                bm=profile.mma_m,
+                bn=profile.mma_n,
+                bk=cast("int", block_k),
+                dtype_bytes=constraints.dtype_bytes,
+                ab_stages=ab_stages,
+                cluster_m=profile.cluster_m,
+            )
+            return required_ab_bytes <= target_capacity_bytes
         sched_stage_count = config.get(TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY, 1)
         if type(sched_stage_count) is not int or sched_stage_count <= 0:
             return False
@@ -1361,8 +1610,8 @@ class CuteTcgen05Config:
         # the raw target cap and apply the same conservative worklist upper bound
         # across scheduler modes as codegen.
         required_bytes = tcgen05_grouped_worklist_smem_bytes(
-            group_count=1,
-            device_split_sizes=False,
+            group_count=smem_facts.group_count,
+            device_split_sizes=smem_facts.device_split_sizes,
             sched_stage_count=sched_stage_count,
             bm=physical_bm,
             bn=physical_bn,
@@ -1372,10 +1621,6 @@ class CuteTcgen05Config:
             acc_stages=2,
             c_stages=2,
             cluster_m=profile.cluster_m,
-        )
-        target_capacity_bytes = (
-            constraints.per_cta_smem_budget_bytes
-            + TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES
         )
         return required_bytes <= target_capacity_bytes
 
@@ -1975,6 +2220,8 @@ class CuteTcgen05Config:
             != Tcgen05PersistenceModel.CLC_PERSISTENT.value
         ):
             return
+        if self._is_grouped_runtime_direct_clc_config(config):
+            return
         if self._is_validated_clc_persistence_search_candidate(config):
             return
         config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY] = (
@@ -2268,13 +2515,14 @@ class CuteTcgen05Config:
         config_view = self._matmul_config_view(config)
         if config_view is None:
             return
-        block_sizes, m_index, _, _ = config_view
+        block_sizes, m_index, n_index, k_index = config_view
         if (
             config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
             == TCGEN05_GROUPED_MODE_WORKLIST_NM
             and config.get("tcgen05_cluster_n", 1) == 1
-            and block_sizes[:2] == [TCGEN05_TWO_CTA_BLOCK_M, 128]
-            and block_sizes[2] in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+            and block_sizes[m_index] == TCGEN05_TWO_CTA_BLOCK_M
+            and block_sizes[n_index] == 128
+            and block_sizes[k_index] in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
             and config.get(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY)
             == TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
         ):
@@ -2588,24 +2836,23 @@ class CuteTcgen05Config:
         even though ``_aux_tma_search_enabled`` was widened (see
         ``aux_stages_autotune_fragments``).
         """
-        seed_choices = tuple(
-            dict.fromkeys(
-                value
-                for config in self.config_spec.compiler_seed_configs
-                if (value := config.config.get(TCGEN05_CONSUMER_REGS_CONFIG_KEY))
-                in TCGEN05_CONSUMER_REGS_CHOICES
-            )
+        seed_choices = _compiler_seed_values(
+            self.config_spec.compiler_seed_configs,
+            TCGEN05_CONSUMER_REGS_CONFIG_KEY,
+            int,
+            lambda value: value in TCGEN05_CONSUMER_REGS_CHOICES,
         )
         if not self._aux_tma_edge_search_enabled():
-            if not seed_choices:
+            if not any(
+                choice != TCGEN05_CONSUMER_REGS_DEFAULT for choice in seed_choices
+            ):
                 return {}
-            choices = tuple(
-                dict.fromkeys((TCGEN05_CONSUMER_REGS_DEFAULT, *seed_choices))
-            )
             return {
-                TCGEN05_CONSUMER_REGS_CONFIG_KEY: EnumFragment(
-                    choices,
+                TCGEN05_CONSUMER_REGS_CONFIG_KEY: _enum_fragment_with_seed_values(
+                    (TCGEN05_CONSUMER_REGS_DEFAULT,),
+                    seed_choices,
                     search_choices=(TCGEN05_CONSUMER_REGS_DEFAULT,),
+                    search_only_if_widened=True,
                 )
             }
         return {
@@ -2615,36 +2862,61 @@ class CuteTcgen05Config:
         }
 
     def persistence_model_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
-        default_model = derive_persistence_model_from_pid_type(
-            self.allowed_pid_types[0]
-        ).value
-        seed_override_models = tuple(
+        pid_default_models = tuple(
             dict.fromkeys(
-                model
-                for config in self.config_spec.compiler_seed_configs
-                if isinstance(
-                    model := config.config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY),
-                    str,
-                )
-                and model in {item.value for item in Tcgen05PersistenceModel}
-                and model
-                != self.persistence_model_default_from_config(config.config).value
+                derive_persistence_model_from_pid_type(pid_type).value
+                for pid_type in self.allowed_pid_types
             )
         )
+        seed_pid_types = _compiler_seed_values(
+            self.config_spec.compiler_seed_configs,
+            "pid_type",
+            str,
+            lambda pid_type: pid_type in TCGEN05_PERSISTENCE_MODEL_PID_TYPES,
+            exact_type=False,
+        )
+        seed_pid_default_models = tuple(
+            dict.fromkeys(
+                derive_persistence_model_from_pid_type(pid_type).value
+                for pid_type in seed_pid_types
+            )
+        )
+
+        def seed_default_model(seed: Config) -> str:
+            pid_type = seed.config.get("pid_type")
+            if (
+                isinstance(pid_type, str)
+                and pid_type in TCGEN05_PERSISTENCE_MODEL_PID_TYPES
+            ):
+                return derive_persistence_model_from_pid_type(pid_type).value
+            return self.persistence_model_default_from_config(seed.config).value
+
+        seed_override_models = _compiler_seed_values(
+            self.config_spec.compiler_seed_configs,
+            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY,
+            str,
+            lambda model: model in {item.value for item in Tcgen05PersistenceModel},
+            exact_type=False,
+            is_valid_for_seed=lambda seed, model: model != seed_default_model(seed),
+        )
         if not self._clc_persistence_search_enabled():
-            if not seed_override_models:
+            seed_pid_defaults_widen_domain = any(
+                model not in pid_default_models for model in seed_pid_default_models
+            )
+            if not seed_override_models and not seed_pid_defaults_widen_domain:
                 return {}
-            choices = tuple(dict.fromkeys((default_model, *seed_override_models)))
             return {
-                TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: EnumFragment(
-                    choices,
-                    search_choices=(default_model,),
+                TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: _enum_fragment_with_seed_values(
+                    pid_default_models,
+                    (*seed_pid_default_models, *seed_override_models),
+                    search_choices=pid_default_models,
+                    search_only_if_widened=True,
                 )
             }
         choices = tuple(
             dict.fromkeys(
                 (
-                    default_model,
+                    *pid_default_models,
                     Tcgen05PersistenceModel.NON_PERSISTENT.value,
                     Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
                     Tcgen05PersistenceModel.CLC_PERSISTENT.value,
@@ -2669,35 +2941,18 @@ class CuteTcgen05Config:
             strategy_choices = (Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,)
             scheduler_warps_choices = (0,)
             c_input_warps_choices = (0,)
-        strategy_seed_choices = tuple(
-            dict.fromkeys(
-                strategy
-                for config in self.config_spec.compiler_seed_configs
-                if isinstance(
-                    strategy := config.config.get(TCGEN05_STRATEGY_CONFIG_KEY),
-                    str,
-                )
-                and strategy in {item.value for item in Tcgen05Strategy}
-            )
+        strategy_seed_choices = _compiler_seed_values(
+            self.config_spec.compiler_seed_configs,
+            TCGEN05_STRATEGY_CONFIG_KEY,
+            str,
+            lambda strategy: strategy in {item.value for item in Tcgen05Strategy},
+            exact_type=False,
         )
-        scheduler_seed_choices = tuple(
-            dict.fromkeys(
-                scheduler_warps
-                for config in self.config_spec.compiler_seed_configs
-                if type(
-                    scheduler_warps := config.config.get(
-                        TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY
-                    )
-                )
-                is int
-                and scheduler_warps in (0, 1)
-            )
-        )
-        all_strategy_choices = tuple(
-            dict.fromkeys((*strategy_choices, *strategy_seed_choices))
-        )
-        all_scheduler_warps_choices = tuple(
-            dict.fromkeys((*scheduler_warps_choices, *scheduler_seed_choices))
+        scheduler_seed_choices = _compiler_seed_values(
+            self.config_spec.compiler_seed_configs,
+            TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY,
+            int,
+            lambda scheduler_warps: scheduler_warps in (0, 1),
         )
         # The store-warp slot stays narrowed to ``0`` in the autotune surface —
         # only an explicit ``helion.Config(tcgen05_warp_spec_store_warps=1)``
@@ -2715,25 +2970,21 @@ class CuteTcgen05Config:
         else:
             layout_choices = (Tcgen05LayoutStrategy.DEFAULT.value,)
         return {
-            TCGEN05_STRATEGY_CONFIG_KEY: EnumFragment(
-                all_strategy_choices,
-                search_choices=(
-                    strategy_choices
-                    if all_strategy_choices != strategy_choices
-                    else None
-                ),
+            TCGEN05_STRATEGY_CONFIG_KEY: _enum_fragment_with_seed_values(
+                strategy_choices,
+                strategy_seed_choices,
+                search_choices=strategy_choices,
+                search_only_if_widened=True,
             ),
             TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: EnumFragment(layout_choices),
             TCGEN05_WARP_SPEC_MMA_WARPS_KEY: EnumFragment((1,)),
             TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY: EnumFragment((1,)),
             TCGEN05_WARP_SPEC_EPI_LOAD_WARPS_KEY: EnumFragment((0,)),
-            TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: EnumFragment(
-                all_scheduler_warps_choices,
-                search_choices=(
-                    scheduler_warps_choices
-                    if all_scheduler_warps_choices != scheduler_warps_choices
-                    else None
-                ),
+            TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: _enum_fragment_with_seed_values(
+                scheduler_warps_choices,
+                scheduler_seed_choices,
+                search_choices=scheduler_warps_choices,
+                search_only_if_widened=True,
             ),
             TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: EnumFragment(c_input_warps_choices),
             TCGEN05_WARP_SPEC_STORE_WARPS_KEY: EnumFragment(store_warps_choices),
@@ -2900,13 +3151,9 @@ class CuteTcgen05Config:
                 if key in config:
                     if key == "tcgen05_ab_stages" and (
                         self._grouped_dynamic_deep_config_matches(config)
-                        or (
-                            type(config[key]) is int
-                            and config[key] > 3
-                            and self._grouped_worklist_nm_ab_config_matches(
-                                config,
-                                config[key],
-                            )
+                        or self._grouped_worklist_nm_ab_config_matches(
+                            config,
+                            config[key],
                         )
                     ):
                         config[key] = int(cast("Any", config[key]))
@@ -3250,6 +3497,7 @@ class CuteTcgen05Config:
             )
 
     def fix_search_config(self, config: dict[str, object]) -> None:
+        self._fix_grouped_worklist_search_config(config)
         self._fix_aux_edge_search_config(config)
         self._fix_cluster_m2_search_config(config)
         self._fix_cluster_m1_persistent_search_config(config)
@@ -3364,97 +3612,77 @@ class CuteTcgen05Config:
         ):
             fields["loop_orders"] = self.config_spec.loop_orders
         fields.update(self.optional_fragments(for_search=True))
-        seed_l2_swizzles = tuple(
-            dict.fromkeys(
-                value
-                for config in self.config_spec.compiler_seed_configs
-                if type(value := config.config.get(TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY))
-                is int
-                and value in TCGEN05_LEGAL_L2_SWIZZLE_SIZES
+        seeds = self.config_spec.compiler_seed_configs
+        if isinstance(fragment := fields.get("tcgen05_ab_stages"), IntegerFragment):
+            fields["tcgen05_ab_stages"] = _integer_fragment_with_seed_values(
+                fragment,
+                _compiler_seed_values(
+                    seeds, "tcgen05_ab_stages", int, lambda value: value > 0
+                ),
             )
+        l2_key = TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
+        if isinstance(fragment := fields.get(l2_key), EnumFragment):
+            fields[l2_key] = _enum_fragment_with_seed_values(
+                fragment.choices,
+                _compiler_seed_values(
+                    seeds,
+                    l2_key,
+                    int,
+                    lambda value: value in TCGEN05_LEGAL_L2_SWIZZLE_SIZES,
+                ),
+                search_choices=fragment.search_choices or fragment.choices,
+                original=fragment,
+            )
+        modes = _compiler_seed_values(
+            seeds,
+            TCGEN05_GROUPED_MODE_CONFIG_KEY,
+            str,
+            lambda value: value in TCGEN05_GROUPED_MODES,
+            exact_type=False,
         )
-        l2_swizzle_fragment = fields.get(TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY)
-        if seed_l2_swizzles and isinstance(l2_swizzle_fragment, EnumFragment):
-            choices = tuple(
-                dict.fromkeys((*l2_swizzle_fragment.choices, *seed_l2_swizzles))
-            )
-            if choices != l2_swizzle_fragment.choices:
-                fields[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = EnumFragment(
+        if any(mode in TCGEN05_GROUPED_DYNAMIC_MODES for mode in modes):
+            choices = TCGEN05_GROUPED_STATIC_RESERVED_SMS_SEARCH_CHOICES
+            fields[TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY] = (
+                _enum_fragment_with_seed_values(
                     choices,
-                    search_choices=(
-                        l2_swizzle_fragment.search_choices
-                        or l2_swizzle_fragment.choices
+                    _compiler_seed_values(
+                        seeds,
+                        TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
+                        int,
+                        lambda value: (
+                            0 <= value <= TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX
+                        ),
                     ),
+                    search_choices=choices,
                 )
-        grouped_seed_modes = tuple(
-            dict.fromkeys(
-                mode
-                for config in self.config_spec.compiler_seed_configs
-                if (mode := config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY))
-                in TCGEN05_GROUPED_MODES
             )
+        if modes:
+            fields[TCGEN05_GROUPED_MODE_CONFIG_KEY] = _enum_fragment_with_seed_values(
+                (None,), modes, search_choices=(None,)
+            )
+        runtime_direct = _compiler_seed_values(
+            seeds,
+            TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY,
+            bool,
+            lambda value: value is True,
         )
-        has_grouped_dynamic_seed = any(
-            mode in TCGEN05_GROUPED_DYNAMIC_MODES for mode in grouped_seed_modes
+        if runtime_direct:
+            fields[TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY] = (
+                _enum_fragment_with_seed_values(
+                    (False,), runtime_direct, search_choices=(False,)
+                )
+            )
+        source_m_tiles = _compiler_seed_values(
+            seeds,
+            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
+            int,
+            lambda value: value in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES,
         )
-        if has_grouped_dynamic_seed:
-            seed_reserved_sms = tuple(
-                dict.fromkeys(
-                    reserved_sms
-                    for config in self.config_spec.compiler_seed_configs
-                    if type(
-                        reserved_sms := config.config.get(
-                            TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY
-                        )
-                    )
-                    is int
-                    and 0 <= reserved_sms <= TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX
+        if source_m_tiles:
+            fields[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY] = (
+                _enum_fragment_with_seed_values(
+                    (None,), source_m_tiles, search_choices=(None,)
                 )
-            )
-            reserved_sms_choices = tuple(
-                dict.fromkeys(
-                    (
-                        *TCGEN05_GROUPED_STATIC_RESERVED_SMS_SEARCH_CHOICES,
-                        *seed_reserved_sms,
-                    )
-                )
-            )
-            fields[TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY] = EnumFragment(
-                reserved_sms_choices,
-                search_choices=TCGEN05_GROUPED_STATIC_RESERVED_SMS_SEARCH_CHOICES,
-            )
-        if grouped_seed_modes:
-            # Seed-only encoding: random/default search stays off the grouped
-            # path, while exact-proof compiler seeds survive flatten/unflatten.
-            fields[TCGEN05_GROUPED_MODE_CONFIG_KEY] = EnumFragment(
-                (None, *grouped_seed_modes),
-                search_choices=(None,),
-            )
-        if any(
-            config.config.get(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY) is True
-            for config in self.config_spec.compiler_seed_configs
-        ):
-            fields[TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY] = EnumFragment(
-                (False, True),
-                search_choices=(False,),
-            )
-        grouped_source_m_tiles = tuple(
-            dict.fromkeys(
-                source_m_tile
-                for config in self.config_spec.compiler_seed_configs
-                if (
-                    source_m_tile := config.config.get(
-                        TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
-                    )
-                )
-                and type(source_m_tile) is int
-                and source_m_tile in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
-            )
-        )
-        if grouped_source_m_tiles:
-            fields[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY] = EnumFragment(
-                (None, *grouped_source_m_tiles),
-                search_choices=(None,),
             )
         fields.update(self.strategy_autotune_fragments())
         fields.update(self.aux_load_mode_autotune_fragments())
@@ -3462,21 +3690,17 @@ class CuteTcgen05Config:
         fields.update(self.consumer_regs_autotune_fragments())
         fields.update(self.persistence_model_autotune_fragments())
         if self.config_spec.supports_config_key("pid_type"):
-            seed_pid_types = tuple(
-                cast("PidTypeLiteral", pid_type)
-                for seed in self.config_spec.compiler_seed_configs
-                if isinstance(pid_type := seed.config.get("pid_type"), str)
-            )
-            pid_type_choices = tuple(
-                dict.fromkeys((*self.allowed_pid_types, *seed_pid_types))
-            )
-            pid_type_search_choices = (
-                self.allowed_pid_types
-                if pid_type_choices != self.allowed_pid_types
-                else None
-            )
-            fields["pid_type"] = EnumFragment(
-                pid_type_choices, search_choices=pid_type_search_choices
+            fields["pid_type"] = _enum_fragment_with_seed_values(
+                self.allowed_pid_types,
+                _compiler_seed_values(
+                    seeds,
+                    "pid_type",
+                    str,
+                    lambda _value: True,
+                    exact_type=False,
+                ),
+                search_choices=self.allowed_pid_types,
+                search_only_if_widened=True,
             )
         if (
             self.config_spec.supports_config_key("indexing")

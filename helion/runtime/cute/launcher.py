@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from contextlib import suppress
 import contextvars
 from dataclasses import dataclass
+from dataclasses import field
 import hashlib
 import importlib
 import inspect
@@ -31,9 +32,17 @@ from typing import cast
 import weakref
 
 import torch
+from torch._subclasses import FakeTensor
+from torch._subclasses.fake_tensor import unset_fake_temporarily
+from torch.utils.weak import WeakIdKeyDictionary
 
 from ... import exc
 from ..._compiler.cute.device_state import Tcgen05GroupedSchedulerMode
+from ..._compiler.cute.grouped_worklist import Tcgen05GroupedWorklistValidationError
+from ..._compiler.cute.grouped_worklist import (
+    tcgen05_grouped_worklist_compatible_source_m_tiles,
+)
+from ..._compiler.cute.grouped_worklist import validate_tcgen05_grouped_worklist_rows
 from ..._compiler.cute.strategies import tcgen05_default_epilogue_tile_expr
 from ..._compiler.cute.strategies import tcgen05_explicit_d_store_tile_expr
 from ..._compiler.cute.strategies import tcgen05_smem_layout_expr
@@ -53,7 +62,9 @@ from ..._compiler.cute.tcgen05_constants import Tcgen05GroupedRuntimeTileField
 from ..triton.launcher import get_num_sm
 
 if TYPE_CHECKING:
+    from collections.abc import Hashable
     from collections.abc import Iterator
+    from collections.abc import Sequence
 
     from torch.cuda import _POOL_HANDLE
 
@@ -2105,6 +2116,19 @@ def _tcgen05_grouped_device_split_sizes(plan: dict[str, object]) -> bool:
     return bool(plan.get("device_split_sizes"))
 
 
+def _tcgen05_grouped_device_layout_kind(
+    plan: dict[str, object],
+) -> str:
+    kind = plan.get("device_layout_kind", "split_sizes")
+    if kind not in ("split_sizes", "offsets"):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"unknown tcgen05 grouped device layout kind: {kind!r}",
+        )
+    assert isinstance(kind, str)
+    return kind
+
+
 def _tcgen05_grouped_host_metadata_plans(
     cute_kernel: object,
 ) -> list[dict[str, object]]:
@@ -2321,7 +2345,7 @@ def _tcgen05_grouped_static_layout_arg(
         if layout.ndim != 1:
             raise exc.BackendUnsupported(
                 "cute",
-                "tcgen05 grouped device split_sizes must have shape [G]",
+                "tcgen05 grouped compact device layout must be rank 1",
             )
     elif worklist_metadata:
         if layout.ndim != 2 or layout.size(1) != 4:
@@ -2345,10 +2369,13 @@ def _validate_tcgen05_grouped_device_split_sizes(
     split_sizes: torch.Tensor,
 ) -> None:
     group_count = _plan_int_value(plan, "group_count")
-    if int(split_sizes.numel()) != group_count:
+    layout_kind = _tcgen05_grouped_device_layout_kind(plan)
+    expected_values = group_count + (layout_kind == "offsets")
+    if int(split_sizes.numel()) != expected_values:
+        expected_shape = "[G + 1]" if layout_kind == "offsets" else "[G]"
         raise exc.BackendUnsupported(
             "cute",
-            "tcgen05 grouped device split_sizes length must match group count",
+            f"tcgen05 grouped device {layout_kind} must have shape {expected_shape}",
         )
     if _tcgen05_plan_orientation(plan) != "nm":
         raise exc.BackendUnsupported(
@@ -2719,6 +2746,77 @@ def _tcgen05_grouped_tensor_mutation_key(
     return ("values", tuple(tensor.detach().reshape(-1).cpu().tolist()))
 
 
+@dataclass(frozen=True)
+class _Tcgen05GroupedWorklistCompatibilityClassifier:
+    """Project packed worklist values onto compatible source-M tile families."""
+
+    static_group_count: int | None
+    static_packed_m: int | None
+    cache: WeakIdKeyDictionary = field(
+        default_factory=WeakIdKeyDictionary,
+        compare=False,
+        repr=False,
+    )
+
+    def __call__(self, values: Sequence[object]) -> Hashable:
+        tensor = values[0]
+        if not isinstance(tensor, torch.Tensor):
+            return (
+                "not_tensor",
+                type(tensor).__module__,
+                type(tensor).__name__,
+            )
+        if isinstance(tensor, FakeTensor):
+            if not isinstance(tensor.constant, torch.Tensor):
+                return ()
+            tensor = tensor.constant
+
+        value_index = 1
+        group_count = self.static_group_count
+        if group_count is None:
+            group_count = cast("int", values[value_index])
+            value_index += 1
+        packed_m = self.static_packed_m
+        if packed_m is None:
+            packed_m = cast("int", values[value_index])
+
+        inference_values: tuple[int, ...] | None = None
+        if torch.is_inference(tensor):
+            with unset_fake_temporarily():
+                mutation_key = _tcgen05_grouped_tensor_mutation_key(tensor)
+            inference_values = cast("tuple[int, ...]", mutation_key[1])
+        else:
+            mutation_key = ("version", int(tensor._version))
+        input_key = (mutation_key, group_count, packed_m)
+        try:
+            cached_input_key, cached_result = self.cache[tensor]
+        except KeyError:
+            pass
+        else:
+            if cached_input_key == input_key:
+                return cast("tuple[int, ...]", cached_result)
+        if tensor.ndim != 2 or tensor.shape[1] != 4:
+            rows = []
+        elif inference_values is not None:
+            rows = [
+                list(inference_values[index : index + 4])
+                for index in range(0, len(inference_values), 4)
+            ]
+        else:
+            with unset_fake_temporarily():
+                rows = cast(
+                    "list[list[int]]",
+                    tensor.detach().reshape(-1, 4).cpu().tolist(),
+                )
+        result = tcgen05_grouped_worklist_compatible_source_m_tiles(
+            rows,
+            group_count=group_count,
+            packed_m=packed_m,
+        )
+        self.cache[tensor] = (input_key, result)
+        return result
+
+
 def _validate_tcgen05_grouped_direct_d_tensormap(
     tensor: torch.Tensor,
 ) -> None:
@@ -2928,72 +3026,18 @@ def _validate_tcgen05_grouped_worklist_nm(
     lhs = _tcgen05_grouped_dynamic_ab_tensor_arg(plan, args, "lhs_idx", "A")
     rhs = _tcgen05_grouped_dynamic_ab_tensor_arg(plan, args, "rhs_idx", "B")
     source_m_tile = _plan_int_value(plan, "source_m_tile")
-    expected_store_end = 0
-    seen_groups: set[int] = set()
-    for row in rows:
-        real_group, start, actual_m, aligned_m = (int(value) for value in row)
-        if real_group < 0 or real_group >= int(rhs.size(0)):
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 N,M worklist real group id is outside B_grouped",
-            )
-        if real_group in seen_groups:
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 N,M worklist requires unique real group ids",
-            )
-        seen_groups.add(real_group)
-        if start < 0 or start % source_m_tile != 0:
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 N,M worklist requires group starts aligned "
-                f"to {source_m_tile} rows",
-            )
-        if actual_m < 0 or actual_m > aligned_m:
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 N,M worklist requires 0 <= actual_m <= aligned_m",
-            )
-        if aligned_m < 0 or aligned_m % source_m_tile != 0:
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 N,M worklist requires aligned_m to be a "
-                f"nonnegative multiple of {source_m_tile}",
-            )
-        if (actual_m == 0) != (aligned_m == 0):
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 N,M worklist requires actual_m and aligned_m to be "
-                "zero together",
-            )
-        if start + aligned_m > int(lhs.size(0)):
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 N,M worklist aligned extent exceeds A extent",
-            )
-        if aligned_m == 0:
-            continue
-        if start < expected_store_end:
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 N,M worklist has overlapping A rows",
-            )
-        if start > expected_store_end:
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 N,M worklist has row holes",
-            )
-        expected_store_end = start + aligned_m
-    if expected_store_end != int(lhs.size(0)):
+    try:
+        validate_tcgen05_grouped_worklist_rows(
+            rows,
+            group_count=int(rhs.size(0)),
+            packed_m=int(lhs.size(0)),
+            source_m_tile=source_m_tile,
+        )
+    except Tcgen05GroupedWorklistValidationError as error:
         raise exc.BackendUnsupported(
             "cute",
-            "tcgen05 N,M worklist aligned extents must cover A rows",
-        )
-    if seen_groups and seen_groups != set(range(len(seen_groups))):
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05 N,M worklist requires dense real group ids",
-        )
+            str(error),
+        ) from None
 
 
 def _validate_tcgen05_grouped_runtime_direct_clc_grid(total_clusters: int) -> None:

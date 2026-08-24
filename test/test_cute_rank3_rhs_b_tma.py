@@ -424,6 +424,17 @@ def _make_non_k_contiguous_args() -> tuple[torch.Tensor, torch.Tensor, torch.Ten
     return a, b_grouped, layout
 
 
+def _make_mn_major_args() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    a, b_grouped, layout = _make_full_args()
+    b_grouped = b_grouped.transpose(1, 2).contiguous().transpose(1, 2)
+    assert b_grouped.stride() == (
+        b_grouped.size(1) * b_grouped.size(2),
+        1,
+        b_grouped.size(1),
+    )
+    return a, b_grouped, layout
+
+
 def _assert_mixed_result(
     out: torch.Tensor,
     args: tuple[torch.Tensor, ...],
@@ -522,6 +533,7 @@ def _seed_configs(
     args: tuple[torch.Tensor, ...],
     mode: str,
 ) -> tuple[Any, list[dict[str, Any]], list[dict[str, Any]]]:
+    kernel.reset()
     with (
         patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
         patch_cute_mma_support(),
@@ -1005,13 +1017,14 @@ def test_grouped_proof_rejects_unproven_aten_targets(target: Any) -> None:
     ("kernel", "args_fn", "config_fn"),
     [
         (_rank3_rhs_grouped_nt, _make_non_k_contiguous_args, _rank3_rhs_tma_config),
+        (_rank3_rhs_grouped_nt, _make_mn_major_args, _grouped_config),
         (
             _bad_mn_tail_zero_store,
             _make_mn_tail_args,
             lambda: _grouped_config(block_n=64, block_k=128),
         ),
     ],
-    ids=("strided-rhs", "non-preserving-tail-store"),
+    ids=("strided-rhs", "mn-major-outside-worklist", "non-preserving-tail-store"),
 )
 def test_rank3_rhs_unsafe_patterns_use_generic_fallback(
     kernel: Any, args_fn: Any, config_fn: Any

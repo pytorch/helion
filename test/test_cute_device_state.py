@@ -80,6 +80,20 @@ def _grouped_plan(**overrides: object) -> CuteTcgen05GroupedPlan:
     return CuteTcgen05GroupedPlan(**kwargs)
 
 
+def _runtime_direct_grouped_plan() -> CuteTcgen05GroupedPlan:
+    return _grouped_plan(
+        orientation=Tcgen05Orientation.NM,
+        scheduler_mode=Tcgen05GroupedSchedulerMode.RUNTIME_DIRECT,
+        runtime_tile_records="runtime_tile_records",
+        runtime_total_clusters="runtime_total_clusters",
+        valid_m="valid_m",
+        store_m="store_m",
+        source_m_tile=32,
+        d_mode=Tcgen05GroupedDMode.ALL_TILES,
+        d_tensormap="d_tensormap",
+    )
+
+
 def _lifecycle(**overrides: object) -> Tcgen05LifecycleContext:
     kwargs: dict[str, Any] = {
         "exec_active": "tcgen05_exec",
@@ -179,36 +193,26 @@ class TestCuteDeviceFunctionState(unittest.TestCase):
         device_search = _grouped_plan()
         self.assertFalse(device_search.uses_runtime_tile_table)
 
-        runtime_direct = _grouped_plan(
-            orientation=Tcgen05Orientation.NM,
-            scheduler_mode=Tcgen05GroupedSchedulerMode.RUNTIME_DIRECT,
-            runtime_tile_records="runtime_tile_records",
-            runtime_total_clusters="runtime_total_clusters",
-            real_groups="real_groups",
-            valid_m="valid_m",
-            store_m="store_m",
-            source_m_tile=32,
-            d_mode=Tcgen05GroupedDMode.ALL_TILES,
-            d_tensormap="d_tensormap",
-        )
+        runtime_direct = _runtime_direct_grouped_plan()
         self.assertTrue(runtime_direct.uses_runtime_tile_table)
 
-        with self.assertRaises(AssertionError):
-            dataclasses.replace(
+        invalid_replacements = (
+            lambda: dataclasses.replace(
                 runtime_direct,
                 scheduler_mode=Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH,
-            )
-        with self.assertRaises(AssertionError):
-            _grouped_plan(
+            ),
+            lambda: _grouped_plan(
                 scheduler_mode=Tcgen05GroupedSchedulerMode.RUNTIME_DIRECT,
-            )
-        with self.assertRaises(AssertionError):
-            _grouped_plan(fixed_tensormaps=True)
-        with self.assertRaises(AssertionError):
-            dataclasses.replace(
+            ),
+            lambda: _grouped_plan(fixed_tensormaps=True),
+            lambda: dataclasses.replace(
                 runtime_direct,
                 scheduler_mode=Tcgen05GroupedSchedulerMode.RUNTIME_CLC,
-            )
+            ),
+        )
+        for make_invalid in invalid_replacements:
+            with self.assertRaises(AssertionError):
+                make_invalid()
 
         runtime_clc = dataclasses.replace(
             runtime_direct,
@@ -220,18 +224,7 @@ class TestCuteDeviceFunctionState(unittest.TestCase):
         self.assertTrue(runtime_clc.uses_runtime_tile_table)
 
     def test_grouped_runtime_mode_matches_parent_warp_topology(self) -> None:
-        runtime_direct = _grouped_plan(
-            orientation=Tcgen05Orientation.NM,
-            scheduler_mode=Tcgen05GroupedSchedulerMode.RUNTIME_DIRECT,
-            runtime_tile_records="runtime_tile_records",
-            runtime_total_clusters="runtime_total_clusters",
-            real_groups="real_groups",
-            valid_m="valid_m",
-            store_m="store_m",
-            source_m_tile=32,
-            d_mode=Tcgen05GroupedDMode.ALL_TILES,
-            d_tensormap="d_tensormap",
-        )
+        runtime_direct = _runtime_direct_grouped_plan()
         _plan(grouped=runtime_direct)
         with self.assertRaises(AssertionError):
             _plan(grouped=runtime_direct, scheduler_warp_count=1)
@@ -241,6 +234,7 @@ class TestCuteDeviceFunctionState(unittest.TestCase):
             scheduler_mode=Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH,
             runtime_tile_records=None,
             runtime_total_clusters=None,
+            real_groups="real_groups",
         )
         _plan(grouped=device_search_nm, scheduler_warp_count=1)
         with self.assertRaises(AssertionError):

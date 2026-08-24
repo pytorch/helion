@@ -193,6 +193,7 @@ def _detect_grouped_rank3_specialized_mma_loop(
 ) -> bool:
     from ..compile_environment import CompileEnvironment
     from ..host_function import HostFunction
+    from .cute_mma import _rank3_grouped_root_axes
 
     device_ir = HostFunction.current().device_ir
     if len(device_ir.grid_block_ids) != 1 or len(block_ids) != 1:
@@ -200,7 +201,25 @@ def _detect_grouped_rank3_specialized_mma_loop(
     root_grid_ids = device_ir.grid_block_ids[0]
     if any(block_id in root_grid_ids for block_id in block_ids):
         return False
-    if len(root_grid_ids) == 2:
+    env = CompileEnvironment.current()
+    semantic_block_ids = env.config_spec._tcgen05_matmul_block_ids()
+    axes = None
+    if semantic_block_ids is not None:
+        m_block_id, n_block_id, k_block_id = semantic_block_ids
+        if env.canonical_block_id(k_block_id) == env.canonical_block_id(block_ids[0]):
+            axes = _rank3_grouped_root_axes(
+                env,
+                device_ir,
+                m_block_id=m_block_id,
+                n_block_id=n_block_id,
+                k_block_id=block_ids[0],
+            )
+    if semantic_block_ids is not None and axes is None:
+        return False
+    if axes is not None:
+        segment_root_grid_id = axes.segment_block_id
+        mn_root_grid_ids = [axes.m_block_id, axes.n_block_id]
+    elif len(root_grid_ids) == 2:
         segment_root_grid_id = None
         mn_root_grid_ids = root_grid_ids
     elif len(root_grid_ids) == 3:
@@ -208,8 +227,6 @@ def _detect_grouped_rank3_specialized_mma_loop(
         mn_root_grid_ids = root_grid_ids[1:]
     else:
         return False
-
-    env = CompileEnvironment.current()
     if segment_root_grid_id is not None:
         segment_block = env.block_sizes[segment_root_grid_id].from_config(config)
         segment_threads = env.config_spec.num_threads.config_get(

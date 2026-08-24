@@ -29,6 +29,9 @@ from .cute.attention_plan import SOFTCAP_KIND
 from .cute.attention_plan import TENSOR_BIAS_KIND
 from .cute.attention_plan import AttentionScoreModifier
 from .cute.attention_plan import AttentionScorePlan
+from .cute.tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
+from .cute.tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
+from .cute.tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
 
 if TYPE_CHECKING:
     import ast
@@ -2972,13 +2975,7 @@ def _grouped_rank3_specialized_mma_plan(
     env: CompileEnvironment,
 ) -> _SpecializedMmaPlan | None:
     from .cute.cute_mma import _choose_mma_impl
-    from .cute.tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
-    from .cute.tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
-    from .cute.tcgen05_constants import (
-        TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
-    )
-    from .cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
-    from .cute.tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_shape
+    from .cute.cute_mma import _rank3_grouped_root_axes
     from .host_function import HostFunction
 
     if node.target is not torch.ops.aten.addmm.default:
@@ -2987,14 +2984,34 @@ def _grouped_rank3_specialized_mma_plan(
     if len(device_ir.grid_block_ids) != 1:
         return None
     root_grid_ids = device_ir.grid_block_ids[0]
-    if len(root_grid_ids) == 2:
-        segment_root_grid_id = None
-        mn_root_grid_ids = root_grid_ids
-    elif len(root_grid_ids) == 3:
-        segment_root_grid_id = root_grid_ids[0]
-        mn_root_grid_ids = root_grid_ids[1:]
-    else:
+    axes = None
+    semantic_block_ids = env.config_spec._tcgen05_matmul_block_ids()
+    if semantic_block_ids is not None:
+        m_block_id, n_block_id, semantic_k_block_id = semantic_block_ids
+        if env.canonical_block_id(semantic_k_block_id) == env.canonical_block_id(
+            k_block_id
+        ):
+            axes = _rank3_grouped_root_axes(
+                env,
+                device_ir,
+                m_block_id=m_block_id,
+                n_block_id=n_block_id,
+                k_block_id=k_block_id,
+            )
+    if semantic_block_ids is not None and axes is None:
         return None
+    if axes is None:
+        if len(root_grid_ids) == 2:
+            segment_root_grid_id = None
+            mn_root_grid_ids = root_grid_ids
+        elif len(root_grid_ids) == 3:
+            segment_root_grid_id = root_grid_ids[0]
+            mn_root_grid_ids = root_grid_ids[1:]
+        else:
+            return None
+    else:
+        segment_root_grid_id = axes.segment_block_id
+        mn_root_grid_ids = [axes.m_block_id, axes.n_block_id]
     if segment_root_grid_id is not None:
         segment_block = env.block_sizes[segment_root_grid_id].from_config(config)
         if segment_block != 1:
@@ -3024,19 +3041,17 @@ def _grouped_rank3_specialized_mma_plan(
         return None
     mma_bm = bm
     mma_bn = bn
-    if config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY) == TCGEN05_GROUPED_MODE_WORKLIST_NM:
-        source_m_tile = config.get(
-            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
-            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
-        )
-        physical_shape = resolve_tcgen05_grouped_worklist_mma_shape(
-            cluster_m=config.get("tcgen05_cluster_m", 1),
-            block_k=bk,
-            source_m_tile=source_m_tile,
-        )
-        if physical_shape is None:
-            return None
-        mma_bm, mma_bn = physical_shape
+    worklist_profile = resolve_tcgen05_grouped_worklist_mma_profile(
+        config,
+        block_k=bk,
+    )
+    if (
+        config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY) == TCGEN05_GROUPED_MODE_WORKLIST_NM
+        and worklist_profile is None
+    ):
+        return None
+    if worklist_profile is not None:
+        mma_bm, mma_bn = worklist_profile.mma_m, worklist_profile.mma_n
     mma_impl = _choose_mma_impl(
         lhs_val.dtype,
         bm=mma_bm,
@@ -3044,6 +3059,7 @@ def _grouped_rank3_specialized_mma_plan(
         bk=bk,
         config=config,
         input_device=lhs_val.device,
+        defer_grouped_worklist_smem_check=worklist_profile is not None,
     )
     if mma_impl != "tcgen05":
         return None

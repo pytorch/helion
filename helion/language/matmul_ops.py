@@ -312,14 +312,18 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
 
 @dataclasses.dataclass(frozen=True)
 class CuteTcgen05SearchPlan:
-    """Side-effect-free tcgen05 search limits for one MMA candidate."""
+    """Side-effect-free tcgen05 search limits for one MMA candidate.
+
+    ``static_*`` are proven compile-time extents. Dynamic size hints remain
+    local to admission and are not retained in the plan.
+    """
 
     m: int | torch.SymInt
     n: int | torch.SymInt
     k: int | torch.SymInt
-    static_m: int
-    static_n: int
-    static_k: int
+    static_m: int | None
+    static_n: int | None
+    static_k: int | None
     leading_work_multiplier: int
     is_fp8: bool
     is_small_n: bool
@@ -345,13 +349,22 @@ def plan_cute_tcgen05_search(
     has_leading_passthrough: bool,
     supports_small_n_role_local_tma: bool = False,
     supports_small_n_scalar_fallback: bool = False,
+    allow_dynamic_hints: bool = False,
 ) -> CuteTcgen05SearchPlan | None:
     """Return search limits without mutating the shared ``ConfigSpec``."""
     m, n, k = _dot_dimensions(lhs, rhs)
     env = CompileEnvironment.current()
+
     static_m = _static_problem_extent(env, m)
     static_n = _static_problem_extent(env, n)
     static_k = _static_problem_extent(env, k)
+    if not allow_dynamic_hints and (
+        static_m is None or static_n is None or static_k is None
+    ):
+        return None
+    m_hint = static_m if static_m is not None else env.size_hint(m)
+    n_hint = static_n if static_n is not None else env.size_hint(n)
+    k_hint = static_k if static_k is not None else env.size_hint(k)
     is_fp8 = lhs.dtype == torch.float8_e4m3fn
     mma_k = 32 if is_fp8 else 16
     min_tcgen05_n = 16 if is_fp8 else 8
@@ -360,20 +373,18 @@ def plan_cute_tcgen05_search(
         env.backend_name != "cute"
         or lhs.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         or rhs.dtype != lhs.dtype
-        or static_m is None
-        or static_n is None
-        or static_k is None
-        or static_m < 64
+        or m_hint < 64
         # Size-one tile axes are fixed to block size one before this analysis,
         # so they cannot carry the minimum tcgen05 instruction tile.
-        or static_n < 2
+        or (static_n is not None and static_n < 2)
+        or (static_n is None and n_hint < min_tcgen05_n)
         or (
             is_small_n
             and not (
                 supports_small_n_role_local_tma or supports_small_n_scalar_fallback
             )
         )
-        or static_k < mma_k
+        or k_hint < mma_k
     ):
         return None
     small_n_requires_role_local_tma = (
@@ -389,13 +400,30 @@ def plan_cute_tcgen05_search(
     def pow2_floor_at_least(value: int, minimum: int) -> int:
         return 1 << (max(minimum, value).bit_length() - 1)
 
-    max_tcgen05_n = min(256, pow2_floor_at_least(static_n, min_tcgen05_n))
-    max_tcgen05_m = 256 if max_tcgen05_n >= 128 and static_m >= 256 else 128
-    max_search_m = min(max_tcgen05_m, pow2_floor_at_least(static_m, 64))
+    max_tcgen05_n = (
+        256
+        if static_n is None
+        else min(256, pow2_floor_at_least(static_n, min_tcgen05_n))
+    )
+    max_tcgen05_m = (
+        256 if max_tcgen05_n >= 128 and (static_m is None or static_m >= 256) else 128
+    )
+    max_search_m = (
+        max_tcgen05_m
+        if static_m is None
+        else min(max_tcgen05_m, pow2_floor_at_least(static_m, 64))
+    )
     max_search_n = max_tcgen05_n
-    max_search_k = min(128, pow2_floor_at_least(static_k, mma_k))
+    max_search_k = (
+        128 if static_k is None else min(128, pow2_floor_at_least(static_k, mma_k))
+    )
     min_search_m = 128 if max_tcgen05_m >= 256 else 64
-    if is_small_n and supports_small_n_scalar_fallback and not is_fp8:
+    if (
+        static_n is not None
+        and is_small_n
+        and supports_small_n_scalar_fallback
+        and not is_fp8
+    ):
         min_search_n = 1 << (static_n - 1).bit_length()
     else:
         min_search_n = min_tcgen05_n
@@ -405,21 +433,30 @@ def plan_cute_tcgen05_search(
         static_leading = _static_problem_extent(env, leading_operand.shape[0])
         if static_leading is not None:
             leading_work_multiplier = max(static_leading, 1)
-        if static_m % min_search_m != 0:
-            min_search_m = 64
-        max_search_m = min(max_search_m, static_m & -static_m)
-        max_search_n = min(max_search_n, static_n & -static_n)
-        max_search_k = min(max_search_k, static_k & -static_k)
-        if (
-            max_search_m < min_search_m
-            or max_search_n < min_search_n
-            or max_search_k < mma_k
-        ):
-            return None
-    if static_m % max_search_m != 0 and static_n % max_search_n != 0:
+        if static_m is not None and static_n is not None and static_k is not None:
+            if static_m % min_search_m != 0:
+                min_search_m = 64
+            max_search_m = min(max_search_m, static_m & -static_m)
+            max_search_n = min(max_search_n, static_n & -static_n)
+            max_search_k = min(max_search_k, static_k & -static_k)
+            if (
+                max_search_m < min_search_m
+                or max_search_n < min_search_n
+                or max_search_k < mma_k
+            ):
+                return None
+    if (
+        static_m is not None
+        and static_n is not None
+        and static_m % max_search_m != 0
+        and static_n % max_search_n != 0
+    ):
         max_search_m = min(max_search_m, 128)
     if small_n_requires_role_local_tma and (
-        static_m % max_search_m != 0 or static_k % max_search_k != 0
+        static_m is None
+        or static_k is None
+        or static_m % max_search_m != 0
+        or static_k % max_search_k != 0
     ):
         return None
     return CuteTcgen05SearchPlan(
@@ -474,52 +511,60 @@ def enable_cute_tcgen05_search(
     max_search_n = plan.max_search_n
     max_search_k = plan.max_search_k
     spec.cute_tcgen05_search_enabled = True
-    allow_full_tile_persistent_pid_types = (
-        static_m % max_search_m == 0
-        and static_n % max_search_n == 0
-        and static_k % max_search_k == 0
-    )
-    allow_small_n_persistent_pid_types = (
-        plan.is_small_n
-        and plan.small_n_supports_role_local_tma
-        and 0 < static_n < max_search_n
-        and static_m % max_search_m == 0
-        and static_k % max_search_k == 0
-    )
     max_cluster_m2_search_k = TCGEN05_TWO_CTA_MAX_K_TILES * max_search_k
-    allow_full_tile_cluster_m2_search = (
-        allow_full_tile_persistent_pid_types
-        and max_search_m >= TCGEN05_TWO_CTA_BLOCK_M
-        and max_search_n >= TCGEN05_TWO_CTA_BLOCK_N
-        and static_k <= max_cluster_m2_search_k
-    )
-    allow_edge_cluster_m2_search = (
-        not has_leading_passthrough
-        and not allow_full_tile_persistent_pid_types
-        and plan.max_tcgen05_m >= TCGEN05_TWO_CTA_BLOCK_M
-        and plan.max_tcgen05_n >= TCGEN05_TWO_CTA_BLOCK_N
-        and static_m >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
-        and static_n >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
-        and static_k >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
-        and static_k <= max_cluster_m2_search_k
-        and static_m % TCGEN05_TWO_CTA_BLOCK_M != 0
-        and static_n % TCGEN05_TWO_CTA_BLOCK_N != 0
-        and static_k % max_search_k != 0
-    )
-    allow_fp8_small_grid_cluster_m2_search = (
-        not has_leading_passthrough
-        and plan.is_fp8
-        and allow_full_tile_persistent_pid_types
-        and max_search_m >= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
-        and max_search_n >= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
-        and static_k <= max_cluster_m2_search_k
-    )
+    if static_m is None or static_n is None or static_k is None:
+        allow_full_tile_persistent_pid_types = False
+        allow_small_n_persistent_pid_types = False
+        allow_full_tile_cluster_m2_search = False
+        allow_edge_cluster_m2_search = False
+        allow_fp8_small_grid_cluster_m2_search = False
+    else:
+        allow_full_tile_persistent_pid_types = (
+            static_m % max_search_m == 0
+            and static_n % max_search_n == 0
+            and static_k % max_search_k == 0
+        )
+        allow_small_n_persistent_pid_types = (
+            plan.is_small_n
+            and plan.small_n_supports_role_local_tma
+            and 0 < static_n < max_search_n
+            and static_m % max_search_m == 0
+            and static_k % max_search_k == 0
+        )
+        allow_full_tile_cluster_m2_search = (
+            allow_full_tile_persistent_pid_types
+            and max_search_m >= TCGEN05_TWO_CTA_BLOCK_M
+            and max_search_n >= TCGEN05_TWO_CTA_BLOCK_N
+            and static_k <= max_cluster_m2_search_k
+        )
+        allow_edge_cluster_m2_search = (
+            not has_leading_passthrough
+            and not allow_full_tile_persistent_pid_types
+            and plan.max_tcgen05_m >= TCGEN05_TWO_CTA_BLOCK_M
+            and plan.max_tcgen05_n >= TCGEN05_TWO_CTA_BLOCK_N
+            and static_m >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
+            and static_n >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
+            and static_k >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
+            and static_k <= max_cluster_m2_search_k
+            and static_m % TCGEN05_TWO_CTA_BLOCK_M != 0
+            and static_n % TCGEN05_TWO_CTA_BLOCK_N != 0
+            and static_k % max_search_k != 0
+        )
+        allow_fp8_small_grid_cluster_m2_search = (
+            not has_leading_passthrough
+            and plan.is_fp8
+            and allow_full_tile_persistent_pid_types
+            and max_search_m >= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
+            and max_search_n >= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
+            and static_k <= max_cluster_m2_search_k
+        )
     allow_cluster_m2_search = (
         allow_full_tile_cluster_m2_search
         or allow_edge_cluster_m2_search
         or allow_fp8_small_grid_cluster_m2_search
     )
     if allow_cluster_m2_search:
+        assert static_m is not None and static_n is not None and static_k is not None
         num_sms = _cuda_num_sms_or_zero(lhs.device)
         if num_sms > 0:
             if allow_fp8_small_grid_cluster_m2_search:
