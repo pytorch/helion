@@ -367,11 +367,17 @@ TCGEN05_AB_PRODUCER_ADVANCE_MODES = (
 )
 TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY = "tcgen05_ab_consumer_wait_mode"
 TCGEN05_AB_CONSUMER_WAIT_MODE_NORMAL = "normal"
+# Wait directly on the current AB stage instead of issuing a speculative
+# ``consumer_try_wait`` and carrying its token across the MMA loop. This is a
+# correctness-preserving codegen choice for the role-local static-full
+# CtaGroup.TWO path.
+TCGEN05_AB_CONSUMER_WAIT_MODE_DIRECT = "direct"
 # Invalid-output diagnostic for the guarded clustered CtaGroup.ONE bridge:
 # removes only AB consumer try-wait/wait edges.
 TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP = "skip"
 TCGEN05_AB_CONSUMER_WAIT_MODES = (
     TCGEN05_AB_CONSUMER_WAIT_MODE_NORMAL,
+    TCGEN05_AB_CONSUMER_WAIT_MODE_DIRECT,
     TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP,
 )
 TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY = "tcgen05_ab_consumer_phase_mode"

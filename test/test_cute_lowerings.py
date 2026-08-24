@@ -124,6 +124,7 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY,
 )
+from helion._compiler.cute.tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODE_DIRECT
 from helion._compiler.cute.tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
@@ -10071,6 +10072,14 @@ class TestCuteLowerings(unittest.TestCase):
                     ),
                 }
             )
+
+        config_spec.normalize(
+            {
+                TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY: (
+                    TCGEN05_AB_CONSUMER_WAIT_MODE_DIRECT
+                ),
+            }
+        )
 
     def test_tcgen05_ab_consumer_phase_mode_config_validation(self) -> None:
         """Invalid-output AB phase diagnostic is rejected unless opted in."""
@@ -21563,6 +21572,7 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         use_tma_a: bool = True,
         use_tma_b: bool = True,
         static_full_tiles: bool = False,
+        direct_consumer_wait: bool = False,
     ) -> _PerKiterTmaArgs:
         if use_tma_b_mcast_mask is None:
             use_tma_b_mcast_mask = cluster_m > 1 or is_two_cta
@@ -21597,6 +21607,7 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             exec_active="exec_active",
             scalar_load_a=self._scalar_load_a(),
             scalar_load_b=self._scalar_load_b(),
+            direct_consumer_wait=direct_consumer_wait,
             static_full_tiles=static_full_tiles,
         )
 
@@ -21833,6 +21844,18 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             "ab_pipeline.consumer_wait(ab_consumer_state, ab_consumer_try_token)",
             body_src,
         )
+
+    def test_pipeline_consumer_if_can_wait_without_try_token(self) -> None:
+        args = self._make_args(direct_consumer_wait=True)
+        node = _build_kloop_pipeline_consumer_if(
+            args,
+            gate_exec_warp=False,
+            include_scalar_fallback=False,
+        )
+
+        body_src = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
+        self.assertNotIn("consumer_try_wait", body_src)
+        self.assertIn("ab_pipeline.consumer_wait(ab_consumer_state)", body_src)
 
     def test_pipeline_consumer_prefetch_two_cta_gates_try_wait_to_leader(
         self,
