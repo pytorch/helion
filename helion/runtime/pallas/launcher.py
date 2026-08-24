@@ -51,6 +51,16 @@ class _TorchTensorOrJaxArray(Protocol):
 # check at codegen time.
 _PALLAS_UNSUPPORTED_DTYPES = frozenset({torch.int64, torch.uint64, torch.float64})
 
+_DsPadDim = tuple[int, int, int, int] | tuple[int, int, int, int, int]
+
+
+def _unpack_ds_pad_dim(pad_info: _DsPadDim) -> tuple[int, int, int, int, int]:
+    """Normalize legacy trailing-only and leading+trailing pad descriptors."""
+    if len(pad_info) == 4:
+        arg_idx, dim, block_size, extra_pad = pad_info
+        return arg_idx, dim, block_size, extra_pad, 0
+    return pad_info
+
 
 def _pallas_interpret_enabled() -> bool:
     """Whether Pallas interpret mode (CPU, no TPU) is on, per the
@@ -831,21 +841,19 @@ def _pallas_output_only_descriptors(
 
 
 def _pallas_padded_output_dims_by_arg(
-    _ds_pad_dims: list[tuple[int, int, int, int]],
+    _ds_pad_dims: list[_DsPadDim],
     output_arg_set: frozenset[int] | set[int],
-) -> dict[int, list[int]]:
+) -> dict[int, dict[int, int]]:
     """Group ``_ds_pad_dims`` entries (arg_idx → padded dims) for output args.
 
-    ``_ds_pad_dims`` carries ``(arg_idx, dim, block_size, extra_pad)``
-    tuples for every padded position; this filter keeps only the ones
-    whose ``arg_idx`` is in ``output_arg_set`` so callers can slice
-    those outputs back to their original shapes.  Both the torch path
-    (via ``_LauncherFastPath``) and the JAX-export launcher use this.
+    The mapped value for each dimension is its leading pad, which callers need
+    in order to slice padded outputs back to their original shapes.
     """
-    padded_dims_by_arg: dict[int, list[int]] = {}
-    for arg_idx, dim, _bs, _extra in _ds_pad_dims:
+    padded_dims_by_arg: dict[int, dict[int, int]] = {}
+    for pad_info in _ds_pad_dims:
+        arg_idx, dim, _bs, _extra, pad_before = _unpack_ds_pad_dim(pad_info)
         if arg_idx in output_arg_set:
-            padded_dims_by_arg.setdefault(arg_idx, []).append(dim)
+            padded_dims_by_arg.setdefault(arg_idx, {})[dim] = pad_before
     return padded_dims_by_arg
 
 
@@ -858,7 +866,7 @@ class _LauncherFastPath:
         "output_only_count",  # number of write-only output tensors
         "output_only_descriptors",  # (out_idx, orig_pos) per output-only result
         "padded_output_arg_indices",  # output args that get padded
-        "padded_output_dims_by_arg",  # {arg: [padded dims]} (to slice back)
+        "padded_output_dims_by_arg",  # {arg: {dim: pad_before}} (to slice back)
         "tensor_arg_indices_tuple",  # tensor arg positions (tuple = fast iter)
     )
 
@@ -867,7 +875,7 @@ class _LauncherFastPath:
         tensor_arg_indices: list[int],
         arg_to_tensor_pos: dict[int, int],
         _output_indices: list[int],
-        _ds_pad_dims: list[tuple[int, int, int, int]] | None,
+        _ds_pad_dims: list[_DsPadDim] | None,
     ) -> None:
         # Tuple iteration is faster than list in the hot-path comprehension.
         self.tensor_arg_indices_tuple: tuple[int, ...] = tuple(tensor_arg_indices)
@@ -881,7 +889,7 @@ class _LauncherFastPath:
         self.ds_pad_required: bool | None = None
 
         if _ds_pad_dims:
-            self.padded_output_dims_by_arg: dict[int, list[int]] = (
+            self.padded_output_dims_by_arg: dict[int, dict[int, int]] = (
                 _pallas_padded_output_dims_by_arg(_ds_pad_dims, set(_output_indices))
             )
             self.padded_output_arg_indices: frozenset[int] = frozenset(
@@ -899,12 +907,12 @@ class _LauncherFastPath:
 
 
 def _pallas_slice_to_orig(
-    t: torch.Tensor, dims: list[int], orig_shape: torch.Size
+    t: torch.Tensor, dims: dict[int, int], orig_shape: torch.Size
 ) -> torch.Tensor:
     """Slice a ds-padded tensor back to ``orig_shape`` along ``dims``."""
     slices: list[slice] = [slice(None)] * t.ndim
-    for dim in dims:
-        slices[dim] = slice(None, orig_shape[dim])
+    for dim, pad_before in dims.items():
+        slices[dim] = slice(pad_before, pad_before + orig_shape[dim])
     return t[tuple(slices)]
 
 
@@ -913,7 +921,7 @@ def _pallas_collect_outputs(
     args: tuple[object, ...],
     output_only_descriptors: Iterable[tuple[int, int]],
     orig_output_tensors: dict[int, torch.Tensor] | None,
-    padded_dims_by_arg: dict[int, list[int]],
+    padded_dims_by_arg: dict[int, dict[int, int]],
     inplace_output_arg_indices: Iterable[int],
 ) -> object:
     """Turn raw kernel ``results`` into the launcher's return value.
@@ -970,7 +978,7 @@ def _pallas_collect_outputs(
 
 def _pallas_apply_ds_padding_fast(
     args: tuple[object, ...],
-    _ds_pad_dims: list[tuple[int, int, int, int]],
+    _ds_pad_dims: list[_DsPadDim],
     fast_path: _LauncherFastPath,
     padded_output_arg_indices: frozenset[int],
 ) -> tuple[tuple[object, ...], dict[int, torch.Tensor] | None, bool]:
@@ -978,12 +986,13 @@ def _pallas_apply_ds_padding_fast(
     args_list: list[object] | None = None
     orig_output_tensors: dict[int, torch.Tensor] | None = None
     any_padding = False
-    for arg_idx, dim, block_size, extra_pad in _ds_pad_dims:
+    for pad_info in _ds_pad_dims:
+        arg_idx, dim, block_size, extra_pad, pad_before = _unpack_ds_pad_dim(pad_info)
         a = args[arg_idx] if args_list is None else args_list[arg_idx]
         if not isinstance(a, torch.Tensor):
             continue
-        pad_amount = (-a.shape[dim]) % block_size + extra_pad
-        if pad_amount == 0:
+        pad_after = (-(pad_before + a.shape[dim])) % block_size + extra_pad
+        if pad_before == 0 and pad_after == 0:
             continue
         any_padding = True
         if args_list is None:
@@ -994,7 +1003,9 @@ def _pallas_apply_ds_padding_fast(
             if arg_idx not in orig_output_tensors:
                 orig_output_tensors[arg_idx] = cast("torch.Tensor", a)
         pad_widths = [0] * (2 * a.ndim)
-        pad_widths[2 * (a.ndim - 1 - dim) + 1] = pad_amount
+        pad_index = 2 * (a.ndim - 1 - dim)
+        pad_widths[pad_index] = pad_before
+        pad_widths[pad_index + 1] = pad_after
         args_list[arg_idx] = torch.nn.functional.pad(a, pad_widths)
     if fast_path.ds_pad_required is None:
         # First-call precomputation: lock in whether any pad amount is
@@ -1350,13 +1361,14 @@ def _ensure_cpu_tpu_info() -> None:
 def _pallas_apply_ds_padding(
     args: tuple[object, ...],
     _output_indices: list[int],
-    _ds_pad_dims: list[tuple[int, int, int, int]],
+    _ds_pad_dims: list[_DsPadDim],
 ) -> tuple[tuple[object, ...], dict[int, torch.Tensor]]:
     """Pad tensor args so ``pl.ds(offset, block_size)`` never reads OOB.
 
     ``_ds_pad_dims`` contains ``(arg_index, dim, block_size, extra_pad)``
-    tuples.  The pad amount is ``(-tensor.shape[dim]) % block_size +
-    extra_pad``, where *extra_pad* accounts for non-zero loop begins.
+    tuples, optionally followed by ``pad_before``.  The trailing pad rounds
+    the combined leading pad and tensor extent up to a block multiple, then
+    adds *extra_pad* for non-zero loop begins.
 
     Returns the padded args tuple and a dict mapping output arg indices
     to their original (unpadded) tensors for post-call copy-back.
@@ -1364,17 +1376,20 @@ def _pallas_apply_ds_padding(
     args_list = list(args)
     orig_output_tensors: dict[int, torch.Tensor] = {}
     output_set = set(_output_indices)
-    for arg_idx, dim, block_size, extra_pad in _ds_pad_dims:
+    for pad_info in _ds_pad_dims:
+        arg_idx, dim, block_size, extra_pad, pad_before = _unpack_ds_pad_dim(pad_info)
         a = args_list[arg_idx]
         if not isinstance(a, torch.Tensor):
             continue
-        pad_amount = (-a.shape[dim]) % block_size + extra_pad
-        if pad_amount == 0:
+        pad_after = (-(pad_before + a.shape[dim])) % block_size + extra_pad
+        if pad_before == 0 and pad_after == 0:
             continue
         if arg_idx in output_set and arg_idx not in orig_output_tensors:
             orig_output_tensors[arg_idx] = a
         pad_widths = [0] * (2 * a.ndim)
-        pad_widths[2 * (a.ndim - 1 - dim) + 1] = pad_amount
+        pad_index = 2 * (a.ndim - 1 - dim)
+        pad_widths[pad_index] = pad_before
+        pad_widths[pad_index + 1] = pad_after
         args_list[arg_idx] = torch.nn.functional.pad(a, pad_widths)
     return tuple(args_list), orig_output_tensors
 
@@ -1951,7 +1966,7 @@ def _pallas_jax_call(
     interpret: bool,
     compact: dict[str, object] | None = None,
     orig_shapes: dict[int, tuple[int, ...]] | None = None,
-    ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
+    ds_pad_dims: list[_DsPadDim] | None = None,
     return_all_outputs: bool = False,
 ) -> list[object]:
     """Drive the shared compile core (``pl.kernel``) + jit_fn on raw ``jax.Array``s
@@ -2044,7 +2059,7 @@ def _pallas_install_launcher_cache(
     _smem_arg_indices: list[int] | None,
     _scratch_shapes: list[object] | None,
     _hbm_arg_indices: list[int] | None,
-    _ds_pad_dims: list[tuple[int, int, int, int]] | None,
+    _ds_pad_dims: list[_DsPadDim] | None,
     _pallas_interpret: bool | None,
     _collective_id: int | None,
     _matmul_dot_general: dict[str, object] | None = None,
@@ -2131,7 +2146,7 @@ def _pallas_invoke_cached_launcher(
     args: tuple[object, ...],
     *,
     cache_attr: str,
-    _ds_pad_dims: list[tuple[int, int, int, int]] | None,
+    _ds_pad_dims: list[_DsPadDim] | None,
 ) -> object:
     """Shared fast-invoke tail: lift direct-call snapshot, ds-pad, dispatch."""
     _grid = cache[0]
@@ -2177,7 +2192,7 @@ def default_pallas_launcher(
     _smem_arg_indices: list[int] | None = None,
     _scratch_shapes: list[tuple[tuple[int, ...], str | None, str]] | None = None,
     _hbm_arg_indices: list[int] | None = None,
-    _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
+    _ds_pad_dims: list[_DsPadDim] | None = None,
     _pallas_interpret: bool | None = None,
     _collective_id: int | None = None,
     _uses_remote_copy: bool = False,
@@ -2671,7 +2686,7 @@ def _pallas_install_compact_launcher_cache(
     _smem_arg_indices: list[int] | None,
     _scratch_shapes: list[object] | None,
     _hbm_arg_indices: list[int] | None,
-    _ds_pad_dims: list[tuple[int, int, int, int]] | None,
+    _ds_pad_dims: list[_DsPadDim] | None,
     _pallas_interpret: bool | None,
     _compact_build_worklist: Callable[..., object],
     _compact_offset_arg_indices: list[int] | None,

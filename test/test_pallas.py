@@ -4790,6 +4790,27 @@ class TestPallas(TestCase):
         )
         torch.testing.assert_close(result, args[0] + args[1])
 
+    def test_ds_padding_with_leading_pad(self) -> None:
+        from helion.runtime.pallas.launcher import _pallas_apply_ds_padding
+        from helion.runtime.pallas.launcher import _pallas_padded_output_dims_by_arg
+        from helion.runtime.pallas.launcher import _pallas_slice_to_orig
+
+        x = torch.arange(1, 6, device=DEVICE, dtype=torch.float32)
+        pad_info: list[tuple[int, int, int, int] | tuple[int, int, int, int, int]] = [
+            (0, 0, 8, 0, 2)
+        ]
+        (padded,), originals = _pallas_apply_ds_padding((x,), [0], pad_info)
+        padded = cast("torch.Tensor", padded)
+
+        torch.testing.assert_close(
+            padded,
+            torch.tensor([0, 0, 1, 2, 3, 4, 5, 0], device=DEVICE, dtype=torch.float32),
+        )
+        self.assertIs(originals[0], x)
+        padded_dims = _pallas_padded_output_dims_by_arg(pad_info, {0})
+        restored = _pallas_slice_to_orig(padded, padded_dims[0], x.shape)
+        torch.testing.assert_close(restored, x)
+
     def test_fori_loop_multidim_partial_tile(self) -> None:
         """A nested partial tile primes the inner axis inside the outer loop."""
         args = (
@@ -5242,10 +5263,10 @@ class TestPallas(TestCase):
         self.assertIsNotNone(match, "expected _ds_pad_dims in the launcher call")
         pad_dims = ast.literal_eval(
             match.group(1)
-        )  # [(arg, dim, block_size, extra_pad)]
+        )  # [(arg, dim, block_size, extra_pad[, pad_before])]
         self.assertTrue(pad_dims, "expected pl.ds pad dims to be present")
         self.assertTrue(
-            all(extra_pad == 0 for *_, extra_pad in pad_dims),
+            all(pad_info[3] == 0 for pad_info in pad_dims),
             f"block-aligned begin should skip the pad (extra_pad==0), got {pad_dims}",
         )
 

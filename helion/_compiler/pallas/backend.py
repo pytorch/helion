@@ -916,16 +916,17 @@ class PallasBackend(Backend):
         self,
         sorted_args: list[Argument] | None,
         config: Config,
-    ) -> list[tuple[int, int, int, int]] | None:
+    ) -> list[tuple[int, int, int, int] | tuple[int, int, int, int, int]] | None:
         """Identify pl.ds() dims that may need padding and their block sizes.
 
         Uses ``pallas_pad_info`` recorded during codegen to identify which
         tensor dimensions use ``pl.ds()`` slicing, plus the one dummy row an
         empty resident operand needs (see :meth:`_zero_row_resident_pad_info`).
 
-        Returns ``[(arg_index, tensor_dim, block_size, extra_pad), ...]``
-        or ``None``.  The launcher computes the actual pad amount at runtime
-        as ``(-tensor.shape[dim]) % block_size + extra_pad``.
+        Returns four-tuples ``(arg_index, tensor_dim, block_size, extra_pad)``
+        for ordinary trailing padding and five-tuples with a final
+        ``pad_before`` value for negatively-offset tile accesses.  The launcher
+        computes the trailing pad at runtime after accounting for ``pad_before``.
 
         ``extra_pad`` is 0 when the tile loop starts at offset 0,
         ``begin % block_size`` for a constant begin offset, or
@@ -941,18 +942,21 @@ class PallasBackend(Backend):
         env = CompileEnvironment.current()
         device_fn = DeviceFunction.current()
 
-        result: list[tuple[int, int, int, int]] = []
+        result: list[tuple[int, int, int, int] | tuple[int, int, int, int, int]] = []
         if device_fn.pallas_pad_info:
             for i, arg in enumerate(sorted_args):
                 if not isinstance(arg, TensorArg):
                     continue
                 dims_info = device_fn.pallas_pad_info.get(id(arg.fake_value))
                 if dims_info is not None:
-                    for dim, (block_id, extra_pad) in dims_info.items():
+                    for dim, (block_id, extra_pad, pad_before) in dims_info.items():
                         bsi = env.block_sizes[block_id]
                         bs = bsi.from_config(config)
                         if isinstance(bs, int) and bs > 1:
-                            result.append((i, dim, bs, extra_pad))
+                            if pad_before:
+                                result.append((i, dim, bs, extra_pad, pad_before))
+                            else:
+                                result.append((i, dim, bs, extra_pad))
 
         result.extend(self._zero_row_resident_pad_info(sorted_args))
         return result or None
@@ -1706,7 +1710,7 @@ class JaxLaunchMeta:
     scratch_shape_exprs: list[tuple[list[str], str | None, str]]
     hbm_arg_indices: list[int]
     smem_arg_indices: list[int]
-    ds_pad_dims: list[tuple[int, int, int, int]]
+    ds_pad_dims: list[tuple[int, int, int, int] | tuple[int, int, int, int, int]]
     out_shape_exprs: list[list[str]]
     out_dtypes: list[str]
     interpret: bool
@@ -2132,7 +2136,7 @@ def capture_jax_launch_metadata(
         ),
         ds_pad_dims=list(
             cast(
-                "list[tuple[int, int, int, int]] | None",
+                "list[tuple[int, int, int, int] | tuple[int, int, int, int, int]] | None",
                 kw.get("_ds_pad_dims"),
             )
             or []
@@ -2387,12 +2391,14 @@ def _jax_entrypoint_source(meta: JaxLaunchMeta, device_kernel: str) -> str:
         *const_lines,
         f"    _scratch_shapes = {scratch_shapes}",
         "    orig_shapes = {pos: tuple(slots[pos].shape) for pos in _OUTPUT_INDICES}",
-        "    for arg_idx, dim, block_size, extra_pad in _DS_PAD_DIMS:",
+        "    for pad_info in _DS_PAD_DIMS:",
+        "        arg_idx, dim, block_size, extra_pad = pad_info[:4]",
+        "        pad_before = pad_info[4] if len(pad_info) == 5 else 0",
         "        value = slots[arg_idx]",
-        "        pad_amount = (-value.shape[dim]) % block_size + extra_pad",
-        "        if pad_amount:",
+        "        pad_after = (-(pad_before + value.shape[dim])) % block_size + extra_pad",
+        "        if pad_before or pad_after:",
         "            pad_widths = [(0, 0)] * value.ndim",
-        "            pad_widths[dim] = (0, pad_amount)",
+        "            pad_widths[dim] = (pad_before, pad_after)",
         "            slots[arg_idx] = jnp.pad(value, pad_widths)",
         "    results = _pallas_jax_call(",
         f"        {device_kernel},",

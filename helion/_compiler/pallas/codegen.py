@@ -837,8 +837,37 @@ def _tile_index_with_offset_pattern_code(
     assert isinstance(pattern, TileIndexWithOffsetPattern)
 
     block_id = pattern.block_id
-    offset_str = state.device_function.literal_expr(pattern.offset)
-    return _ds_expr(state, block_id, offset_str, tensor=tensor, tensor_dim=tensor_dim)
+    offset = pattern.offset
+    pad_before = 0
+    if isinstance(offset, int):
+        concrete_offset = offset
+    elif isinstance(offset, torch.SymInt):
+        from helion._compiler.compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        # The launcher padding descriptor is static Python data.  Do not bake
+        # a size hint into a kernel that is intended to accept dynamic shapes.
+        concrete_offset = (
+            env.try_concretize_symint(offset) if env.settings.static_shapes else offset
+        )
+    else:
+        concrete_offset = offset
+    if isinstance(concrete_offset, int) and concrete_offset < 0:
+        pad_before = -concrete_offset
+        offset = 0
+    offset_str = (
+        ""
+        if isinstance(offset, int) and offset == 0
+        else state.device_function.literal_expr(offset)
+    )
+    return _ds_expr(
+        state,
+        block_id,
+        offset_str,
+        tensor=tensor,
+        tensor_dim=tensor_dim,
+        pad_before=pad_before,
+    )
 
 
 def _tile_begin_with_offset_pattern_code(
@@ -992,6 +1021,7 @@ def _ds_expr(
     *,
     tensor: torch.Tensor | None = None,
     tensor_dim: int | None = None,
+    pad_before: int = 0,
 ) -> str:
     """Return a ``pl.ds(offset, block_size)`` expression for *block_id*, offset by *tile_offset*.
 
@@ -1028,7 +1058,14 @@ def _ds_expr(
         from helion.language.memory_ops import _record_pad_info
 
         extra_pad = _loop_begin_extra_pad(block_id, state)
-        _record_pad_info(state, tensor, tensor_dim, block_id, extra_pad)
+        _record_pad_info(
+            state,
+            tensor,
+            tensor_dim,
+            block_id,
+            extra_pad,
+            pad_before,
+        )
 
         # Skip when tile_offset is set (e.g. offset + 64) — the shift
         # means the full expression may not be a multiple of block_size.

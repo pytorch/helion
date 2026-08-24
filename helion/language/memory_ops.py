@@ -234,12 +234,16 @@ def _record_pad_info(
     tensor_dim: int,
     block_id: int,
     extra_pad: int = 0,
+    pad_before: int = 0,
 ) -> None:
     """Record that a tensor dimension uses pl.ds() and may need host-side padding.
 
     *extra_pad* accounts for non-zero loop begins: 0 when the loop starts
     at offset 0, ``begin % block_size`` for a constant begin, or
     ``block_size - 1`` for a data-dependent begin.
+
+    *pad_before* shifts a negatively-offset tile access into the tensor's
+    nonnegative, block-aligned padded coordinate space.
 
     Note: stores one entry per (tensor, dim).  If two inner loops tile the
     same dim with different block_ids, the last one wins.  This is fine when
@@ -249,7 +253,7 @@ def _record_pad_info(
     tensor_id = id(tensor)
     if tensor_id not in pad_info:
         pad_info[tensor_id] = {}
-    pad_info[tensor_id][tensor_dim] = (block_id, extra_pad)
+    pad_info[tensor_id][tensor_dim] = (block_id, extra_pad, pad_before)
 
 
 def _maybe_get_symbol_origin(idx: object) -> SymbolOrigin | None:

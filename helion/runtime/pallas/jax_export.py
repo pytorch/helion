@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 
     from ..kernel import Kernel
     from .launcher import _BlockSpecInfo
+    from .launcher import _DsPadDim
 
 
 _TORCH_TO_JNP_DTYPE: dict[torch.dtype, object] | None = None
@@ -284,7 +285,7 @@ def default_pallas_jax_launcher(
     _block_spec_info: _BlockSpecInfo | None = None,
     _scratch_shapes: list[object] | None = None,
     _hbm_arg_indices: list[int] | None = None,
-    _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
+    _ds_pad_dims: list[_DsPadDim] | None = None,
     _smem_arg_indices: list[int] | None = None,
     _pallas_interpret: bool | None = None,
     _collective_id: int | None = None,
@@ -320,7 +321,8 @@ def default_pallas_jax_launcher(
     # mirrors on the JAX side, so no JAX-side duplicate is needed here.
     orig_shapes: dict[int, tuple[int, ...]] = {}
     if _ds_pad_dims:
-        for arg_idx, _, _, _ in _ds_pad_dims:
+        for pad_info in _ds_pad_dims:
+            arg_idx = pad_info[0]
             if arg_idx in orig_shapes:
                 continue
             a = args[arg_idx]

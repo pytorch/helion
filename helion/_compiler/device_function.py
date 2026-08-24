@@ -371,9 +371,9 @@ class DeviceFunction:
         # Root-grid memory operations routed through explicit DMA resources.
         # Inner-loop schedulers keep iteration-specific bindings on loop state.
         self.pallas_grid_dma_bindings: dict[torch.fx.Node, DmaResources] = {}
-        # Pallas: id(fake_tensor) → {dim: (block_id, extra_pad)} for dims
-        # using pl.ds() that may need host-side padding.
-        self.pallas_pad_info: dict[int, dict[int, tuple[int, int]]] = {}
+        # Pallas: id(fake_tensor) → {dim: (block_id, extra_pad, pad_before)}
+        # for dims using pl.ds() that may need host-side padding.
+        self.pallas_pad_info: dict[int, dict[int, tuple[int, int, int]]] = {}
         # Pallas ordered carry: jagged row block_id -> CarryBoundaryTile.  Filled by
         # the emit_pipeline codegen when the tile is a legal map axis; read by
         # the store codegen to stitch the boundary across neighbouring groups.

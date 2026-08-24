@@ -782,8 +782,14 @@ class TestPallasClampedRefs(TestCase):
 
         x = torch.randn((32, 20), device=DEVICE)
         y = torch.randn((32, 44), device=DEVICE)
-        code, out = code_and_output(kernel, (x, y), block_sizes=[16, 64])
+        code, out = code_and_output(kernel, (x, y), block_sizes=[16, 128])
         self.assertIn("jnp.pad", code)
+        self.assertIn(
+            "y[:, pl.ds(pl.multiple_of(offset_1, _BLOCK_SIZE_1), _BLOCK_SIZE_1)]",
+            code,
+        )
+        self.assertNotIn("offset_1 + -20", code)
+        self.assertIn("_ds_pad_dims=[(1, 1, 128, 0, 20)]", code)
         torch.testing.assert_close(out, torch.cat([x, y], dim=1))
 
 
