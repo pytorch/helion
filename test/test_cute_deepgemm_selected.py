@@ -240,6 +240,7 @@ def test_grouped_worklist_nm_codegen_and_wrapper_plan() -> None:
     assert "(256, 256)" in code
     assert "cute.local_tile(tma_tensor_a, (256, 128)" in code
     assert "cute.local_tile(tma_tensor_b, (256, 128)" in code
+    assert "cute.local_tile(tcgen05_tma_store_tensor, (256, 256)," in code
     assert "StMatrix8x8x16bOp(transpose=True, num_matrices=4)" in code
     assert "cute.arch.alloc_smem(cutlass.Int32, 9" in code
 
@@ -259,6 +260,10 @@ def test_grouped_worklist_nm_codegen_and_wrapper_plan() -> None:
         "dynamic_ab_tensormaps": True,
         "dynamic_d_tensormap": True,
     }
+    d_plan = next(
+        plan for plan in _wrapper_plans(code) if plan["kind"] == "tcgen05_d_tma"
+    )
+    assert (d_plan["bm"], d_plan["bn"], d_plan["orientation"]) == (256, 256, "nm")
 
 
 def test_grouped_worklist_nm_legacy_bk64_codegen() -> None:
@@ -279,6 +284,7 @@ def test_grouped_worklist_nm_legacy_bk64_codegen() -> None:
     assert "(256, 224, 64)" in code
     assert "cute.local_tile(tma_tensor_a, (256, 64)" in code
     assert "cute.local_tile(tma_tensor_b, (224, 64)" in code
+    assert "cute.local_tile(tcgen05_tma_store_tensor, (256, 224)," in code
     plan = next(
         plan
         for plan in _wrapper_plans(code)
@@ -286,6 +292,10 @@ def test_grouped_worklist_nm_legacy_bk64_codegen() -> None:
     )
     assert plan["bk"] == 64
     assert plan["source_m_tile"] == TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE
+    d_plan = next(
+        plan for plan in _wrapper_plans(code) if plan["kind"] == "tcgen05_d_tma"
+    )
+    assert (d_plan["bm"], d_plan["bn"], d_plan["orientation"]) == (256, 224, "nm")
 
 
 def test_grouped_worklist_nm_rejects_over_budget_host_metadata_profile() -> None:

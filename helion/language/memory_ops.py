@@ -1799,6 +1799,17 @@ def _codegen_cute_store_tcgen05_tile(
         if compact_fragment_epilogue is not None
         else tcgen05_source_bn
     )
+    # NM grouped stores expose transposed logical source dimensions, while the
+    # wrapper already applies the NM orientation when constructing the D
+    # TensorMap. Keep the descriptor and device local tile in the physical MMA
+    # orientation; MN compact-fragment stores still use their proven
+    # destination shape.
+    tcgen05_tma_store_bm = (
+        tcgen05_value.bm if tcgen05_nm_store else tcgen05_destination_bm
+    )
+    tcgen05_tma_store_bn = (
+        tcgen05_value.bn if tcgen05_nm_store else tcgen05_destination_bn
+    )
     tile_coord_n = f"({n_index}) // cutlass.Int32({tcgen05_destination_bn})"
     static_tile_coord_m = tile_coord_m
     static_tile_coord_n = tile_coord_n
@@ -3330,8 +3341,8 @@ def _codegen_cute_store_tcgen05_tile(
         d_tma_plan: dict[str, object] = {
             "kind": "tcgen05_d_tma",
             "d_name": tensor_name,
-            "bm": tcgen05_destination_bm,
-            "bn": tcgen05_destination_bn,
+            "bm": tcgen05_tma_store_bm,
+            "bn": tcgen05_tma_store_bn,
             "c_stage_count": tcgen05_value.c_stage_count,
             "output_dtype": target_dtype,
             "kernel_args": [
@@ -3538,8 +3549,8 @@ def _codegen_cute_store_tcgen05_tile(
     ) -> tuple[list[str], list[str]]:
         if rank3_mnl_tensor is None:
             rank3_mnl_tensor = d_tma_uses_rank3_mnl_tensor
-        store_bm = tcgen05_destination_bm if tma_store else tcgen05_bm
-        store_bn = tcgen05_destination_bn if tma_store else tcgen05_bn
+        store_bm = tcgen05_tma_store_bm if tma_store else tcgen05_bm
+        store_bn = tcgen05_tma_store_bn if tma_store else tcgen05_bn
         epi_tile_expr = tcgen05_store_epi_tile_expr
         static_setup = [
             (
