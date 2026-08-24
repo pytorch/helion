@@ -7,11 +7,13 @@ import importlib
 import threading
 from typing import TYPE_CHECKING
 from typing import cast
+import unittest
 from unittest.mock import patch
 
 import torch
 
 import helion
+from helion._compat import supports_torch_compile_fusion
 from helion._compiler._dynamo.variables import infer_output_spec
 from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.pallas.backend import PallasBackend
@@ -670,6 +672,10 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
 
         self.assertFalse(add_one._bound_kernels)
 
+    @unittest.skipUnless(
+        supports_torch_compile_fusion(),
+        "requires Helion's torch.compile fusion integration",
+    )
     def test_inductor_lowering_bind_does_not_wait_for_bind_lock(self) -> None:
         from helion._compiler._inductor.template_buffer import _bind_kernel_for_lowering
 
@@ -1019,6 +1025,10 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         is_compiling.assert_called_once_with()
         torch.testing.assert_close(out, x + 1)
 
+    @unittest.skipUnless(
+        supports_torch_compile_fusion(),
+        "requires Helion's torch.compile fusion integration",
+    )
     def test_fullgraph_capture_preserves_eager_caches(self) -> None:
         @helion.kernel(
             static_shapes=True,

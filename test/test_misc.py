@@ -35,6 +35,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 from helion.runtime.settings import _get_backend
@@ -1106,6 +1107,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         if _get_backend() == "triton":
             self.assertIn("tl.associative_scan", code)
 
+    @skipIfXPU("Triton topk produces incorrect values on XPU")
     def test_torch_topk_in_kernel(self):
         """Test that torch.topk works inside Helion kernels.
 
@@ -1136,6 +1138,7 @@ class TestMisc(RefEagerTestBase, TestCase):
             # Uses tl.topk for largest=True
             self.assertIn("tl.topk", code)
 
+    @skipIfXPU("Triton sort produces incorrect values on XPU")
     def test_torch_topk_smallest(self):
         """Test torch.topk with largest=False (k smallest elements)."""
 
