@@ -6,21 +6,41 @@ from typing import Literal
 import torch
 
 import helion
-from helion._compiler.cross_loop_dependencies import AllocationRegion
-from helion._compiler.cross_loop_dependencies import CrossLoopAccess
-from helion._compiler.cross_loop_dependencies import LogicalTaskAxis
-from helion._compiler.cross_loop_dependencies import TaskFamily
-from helion._compiler.cross_loop_dependencies import TileDependencyKind
-from helion._compiler.cross_loop_dependencies import allocation_regions_may_overlap
-from helion._compiler.cross_loop_dependencies import build_cross_loop_dependency_plan
-from helion._compiler.cross_loop_dependencies import predecessor_task_ids
-from helion._compiler.cross_loop_dependencies import prove_uniform_task_partition
-from helion._compiler.tile_dependency_planner import TILE_DEPENDENCY_FRONTIER_CONFIG
-from helion._compiler.tile_dependency_planner import AccessProgramPoint
-from helion._compiler.tile_dependency_planner import InstantiatedTaskFamily
-from helion._compiler.tile_dependency_planner import _compress_task_to_key
-from helion._compiler.tile_dependency_planner import build_generic_schedule_plan
-from helion._compiler.tile_dependency_planner import derive_singleton_worker_affinity
+from helion._compiler.cross_loop_scheduler import CROSS_LOOP_NUM_WORKERS_CONFIG
+from helion._compiler.cross_loop_scheduler import AccessProgramPoint
+from helion._compiler.cross_loop_scheduler import CountedEventContribution
+from helion._compiler.cross_loop_scheduler import CountedEventPlan
+from helion._compiler.cross_loop_scheduler import CountedEventUse
+from helion._compiler.cross_loop_scheduler import InstantiatedEventContribution
+from helion._compiler.cross_loop_scheduler import InstantiatedEventGraph
+from helion._compiler.cross_loop_scheduler import InstantiatedEventUse
+from helion._compiler.cross_loop_scheduler import InstantiatedKeyedEvent
+from helion._compiler.cross_loop_scheduler import InstantiatedTaskFamily
+from helion._compiler.cross_loop_scheduler import WorkerSchedule
+from helion._compiler.cross_loop_scheduler import WorkerScheduleSegment
+from helion._compiler.cross_loop_scheduler import _compress_task_to_key
+from helion._compiler.cross_loop_scheduler import build_baseline_worker_schedule
+from helion._compiler.cross_loop_scheduler import build_cross_loop_schedule
+from helion._compiler.cross_loop_scheduler import canonicalize_ready_events
+from helion._compiler.cross_loop_scheduler import canonicalize_task_readiness
+from helion._compiler.cross_loop_scheduler import choose_counted_events
+from helion._compiler.cross_loop_scheduler import derive_local_triggers
+from helion._compiler.cross_loop_scheduler import instantiate_event_graph
+from helion._compiler.cross_loop_scheduler import lower_counted_events
+from helion._compiler.cross_loop_scheduler import order_local_contributors_by_key
+from helion._compiler.cross_loop_scheduler import validate_worker_schedule
+from helion._compiler.tile_dependency import AllocationRegion
+from helion._compiler.tile_dependency import EventContribution
+from helion._compiler.tile_dependency import KeyedEvent
+from helion._compiler.tile_dependency import LogicalTaskAxis
+from helion._compiler.tile_dependency import TaskFamily
+from helion._compiler.tile_dependency import TileAccess
+from helion._compiler.tile_dependency import TileDependencyGraph
+from helion._compiler.tile_dependency import TileDependencyKind
+from helion._compiler.tile_dependency import allocation_regions_may_overlap
+from helion._compiler.tile_dependency import build_tile_dependency_graph
+from helion._compiler.tile_dependency import predecessor_task_ids
+from helion._compiler.tile_dependency import prove_uniform_task_partition
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -417,8 +437,8 @@ def _access(
     tensor_name: str = "tmp",
     storage_offset: int = 0,
     layout_is_static: bool = True,
-) -> CrossLoopAccess:
-    return CrossLoopAccess(
+) -> TileAccess:
+    return TileAccess(
         access_id=access_id,
         memory_op_index=access_id,
         graph_id=root,
@@ -441,6 +461,581 @@ def _access(
 
 
 class TestCrossLoopDependencies(TestCase):
+    def test_semantic_event_graph_composes_arbitrary_chain_depth(self) -> None:
+        graph = build_tile_dependency_graph(
+            (
+                _access(0, root=0, allocation_id=0, kind="store", block_ids=(10,)),
+                _access(1, root=1, allocation_id=0, kind="load", block_ids=(20,)),
+                _access(2, root=1, allocation_id=1, kind="store", block_ids=(20,)),
+                _access(3, root=2, allocation_id=1, kind="load", block_ids=(30,)),
+                _access(4, root=2, allocation_id=2, kind="store", block_ids=(30,)),
+                _access(5, root=3, allocation_id=2, kind="load", block_ids=(40,)),
+            ),
+            [[10], [20], [30], [40]],
+        )
+
+        self.assertEqual(len(graph.task_families), 4)
+        self.assertEqual(
+            tuple(event.producer_root for event in graph.events),
+            (0, 1, 2),
+        )
+        self.assertEqual(
+            tuple(use.consumer_root for use in graph.waits),
+            (1, 2, 3),
+        )
+        configured = instantiate_event_graph(
+            graph,
+            tuple(
+                InstantiatedTaskFamily(
+                    logical_axis_order=(block_id,),
+                    physical_axis_order=(block_id,),
+                    axis_counts_items=((block_id, 4),),
+                    block_sizes_items=((block_id, 1),),
+                )
+                for block_id in (10, 20, 30, 40)
+            ),
+        )
+        self.assertEqual(len(configured.events), 3)
+        self.assertEqual(
+            tuple(event.expected_arrivals for event in configured.events),
+            ((1, 1, 1, 1),) * 3,
+        )
+        canonical = canonicalize_ready_events(configured)
+        baseline = build_baseline_worker_schedule(
+            canonical.task_families, worker_count=4
+        )
+        local_triggers = derive_local_triggers(canonical, baseline)
+        self.assertEqual(
+            tuple(
+                canonical.event(trigger.event_index)
+                .uses[trigger.use_index]
+                .consumer_root
+                for trigger in local_triggers
+            ),
+            (1, 2, 3),
+        )
+        local_tasks = frozenset(
+            (root, task)
+            for root in (1, 2, 3)
+            for task in range(canonical.task_families[root].task_count)
+        )
+        validate_worker_schedule(
+            canonical,
+            baseline.without_tasks(local_tasks),
+            local_triggers,
+        )
+
+    def test_semantic_event_graph_represents_diamond_without_path_matching(
+        self,
+    ) -> None:
+        graph = build_tile_dependency_graph(
+            (
+                _access(0, root=0, allocation_id=0, kind="store", block_ids=(10,)),
+                _access(1, root=0, allocation_id=1, kind="store", block_ids=(10,)),
+                _access(2, root=1, allocation_id=0, kind="load", block_ids=(20,)),
+                _access(3, root=1, allocation_id=2, kind="store", block_ids=(20,)),
+                _access(4, root=2, allocation_id=1, kind="load", block_ids=(30,)),
+                _access(5, root=2, allocation_id=3, kind="store", block_ids=(30,)),
+                _access(6, root=3, allocation_id=2, kind="load", block_ids=(40,)),
+                _access(7, root=3, allocation_id=3, kind="load", block_ids=(40,)),
+            ),
+            [[10], [20], [30], [40]],
+        )
+
+        root_zero_events = graph.events_contributed_by(0)
+        self.assertEqual(len(root_zero_events), 1)
+        self.assertEqual(
+            {
+                use.consumer_root
+                for use in graph.uses_for_event(root_zero_events[0].event_id)
+            },
+            {1, 2},
+        )
+        self.assertEqual(
+            {
+                graph.event(use.event_id).producer_root
+                for use in graph.waits_for_root(3)
+            },
+            {1, 2},
+        )
+        configured = instantiate_event_graph(
+            graph,
+            tuple(
+                InstantiatedTaskFamily(
+                    logical_axis_order=(block_id,),
+                    physical_axis_order=(block_id,),
+                    axis_counts_items=((block_id, 4),),
+                    block_sizes_items=((block_id, 1),),
+                )
+                for block_id in (10, 20, 30, 40)
+            ),
+        )
+        root_zero_event = configured.events_contributed_by(0)[0]
+        self.assertEqual(
+            {use.consumer_root for use in root_zero_event.uses},
+            {1, 2},
+        )
+        canonical = canonicalize_ready_events(configured)
+        local_triggers = derive_local_triggers(
+            canonical,
+            build_baseline_worker_schedule(canonical.task_families, worker_count=4),
+        )
+        self.assertEqual(
+            {
+                canonical.event(trigger.event_index)
+                .uses[trigger.use_index]
+                .consumer_root
+                for trigger in local_triggers
+            },
+            {3},
+        )
+
+    def test_exact_and_family_done_dependencies_can_share_one_consumer(
+        self,
+    ) -> None:
+        graph = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    allocation_id=0,
+                    kind="store",
+                    block_ids=(10,),
+                    layout_is_static=False,
+                ),
+                _access(1, root=1, allocation_id=1, kind="store", block_ids=(20,)),
+                _access(
+                    2,
+                    root=2,
+                    allocation_id=0,
+                    kind="load",
+                    block_ids=(30,),
+                    layout_is_static=False,
+                ),
+                _access(3, root=2, allocation_id=1, kind="load", block_ids=(30,)),
+            ),
+            [[10], [20], [30]],
+        )
+
+        required_events = tuple(
+            graph.event(use.event_id) for use in graph.waits_for_root(2)
+        )
+        self.assertEqual(len(required_events), 2)
+        self.assertEqual(
+            {(event.producer_root, event.is_family_done) for event in required_events},
+            {(0, True), (1, False)},
+        )
+        configured = instantiate_event_graph(
+            graph,
+            tuple(
+                InstantiatedTaskFamily(
+                    logical_axis_order=(block_id,),
+                    physical_axis_order=(block_id,),
+                    axis_counts_items=((block_id, 4),),
+                    block_sizes_items=((block_id, 1),),
+                )
+                for block_id in (10, 20, 30)
+            ),
+        )
+        configured_uses = configured.uses_for_root(2)
+        self.assertEqual(len(configured_uses), 2)
+        family_event = next(
+            event for event in configured.events if event.is_family_done
+        )
+        self.assertEqual(family_event.family_done_root, 0)
+        self.assertEqual(family_event.expected_arrivals, (4,))
+
+    def test_baseline_worker_schedule_preserves_source_order(self) -> None:
+        task_families = (
+            InstantiatedTaskFamily((10,), (10,), ((10, 3),), ((10, 1),)),
+            InstantiatedTaskFamily((20,), (20,), ((20, 5),), ((20, 1),)),
+        )
+
+        schedule = build_baseline_worker_schedule(task_families, worker_count=4)
+
+        self.assertEqual(schedule.placement(0, 0), (0, 0))
+        self.assertEqual(schedule.placement(0, 2), (2, 0))
+        self.assertEqual(schedule.placement(1, 0), (0, 1))
+        self.assertEqual(schedule.placement(1, 4), (0, 2))
+        self.assertEqual(schedule.task_at(3, 0), None)
+        self.assertEqual(schedule.task_at(3, 1), (1, 3))
+
+    def test_baseline_worker_schedule_preserves_physical_traversal(self) -> None:
+        task_families = (
+            InstantiatedTaskFamily(
+                (10,),
+                (10,),
+                ((10, 4),),
+                ((10, 1),),
+                logical_task_by_physical_task=(0, 2, 1, 3),
+            ),
+        )
+
+        schedule = build_baseline_worker_schedule(task_families, worker_count=2)
+
+        self.assertEqual(schedule.placement(0, 0), (0, 0))
+        self.assertEqual(schedule.placement(0, 2), (1, 0))
+        self.assertEqual(schedule.placement(0, 1), (0, 1))
+        self.assertEqual(schedule.placement(0, 3), (1, 1))
+
+    def test_worker_schedule_segment_supports_multiple_rounds(self) -> None:
+        segment = WorkerScheduleSegment(
+            root=2,
+            task_begin=10,
+            task_count=3,
+            task_step=2,
+            worker_begin=2,
+            worker_count=2,
+            schedule_begin=0,
+        )
+
+        self.assertEqual(segment.placement(10), (2, 0))
+        self.assertEqual(segment.placement(12), (3, 0))
+        self.assertEqual(segment.placement(14), (2, 1))
+        self.assertEqual(segment.placement(11), None)
+        self.assertEqual(segment.task_at(2, 1), 14)
+
+        periodic = WorkerScheduleSegment(
+            root=3,
+            task_begin=0,
+            task_count=6,
+            task_step=1,
+            task_period=3,
+            task_period_step=10,
+            worker_begin=0,
+            worker_count=2,
+            schedule_begin=0,
+        )
+        self.assertEqual(
+            tuple(periodic.task_for_offset(offset) for offset in range(6)),
+            (0, 1, 2, 10, 11, 12),
+        )
+        self.assertEqual(periodic.placement(11), (0, 2))
+
+        rectangular = WorkerScheduleSegment(
+            root=4,
+            task_begin=0,
+            task_count=6,
+            task_step=1,
+            worker_begin=0,
+            worker_count=4,
+            schedule_begin=0,
+            schedule_period=2,
+            schedule_period_step=4,
+        )
+        self.assertEqual(
+            tuple(rectangular.schedule_for_offset(offset) for offset in range(6)),
+            (0, 1, 4, 5, 8, 9),
+        )
+        self.assertEqual(rectangular.task_at(1, 2), 5)
+
+    def test_worker_schedule_removes_local_tasks_without_closing_positions(
+        self,
+    ) -> None:
+        task_families = (
+            InstantiatedTaskFamily((10,), (10,), ((10, 3),), ((10, 1),)),
+            InstantiatedTaskFamily((20,), (20,), ((20, 3),), ((20, 1),)),
+        )
+        baseline = build_baseline_worker_schedule(task_families, worker_count=2)
+
+        schedule = baseline.without_tasks(frozenset(((0, 1), (1, 0), (1, 2))))
+
+        self.assertEqual(schedule.placement(0, 0), (0, 0))
+        self.assertEqual(schedule.placement(0, 1), None)
+        self.assertEqual(schedule.placement(0, 2), (0, 1))
+        self.assertEqual(schedule.placement(1, 0), None)
+        self.assertEqual(schedule.placement(1, 1), (1, 2))
+        self.assertEqual(schedule.placement(1, 2), None)
+
+    def test_local_contributors_are_ordered_by_ready_key(self) -> None:
+        task_families = (
+            InstantiatedTaskFamily((10,), (10,), ((10, 4),), ((10, 1),)),
+            InstantiatedTaskFamily((20,), (20,), ((20, 2),), ((20, 1),)),
+        )
+        event_graph = InstantiatedEventGraph(
+            task_families=task_families,
+            events=(
+                InstantiatedKeyedEvent(
+                    event_id=0,
+                    source_event_ids=(0,),
+                    key_count=2,
+                    contributions=(
+                        InstantiatedEventContribution(
+                            producer_root=0,
+                            keys_by_task=(
+                                frozenset((0,)),
+                                frozenset((1,)),
+                                frozenset((0,)),
+                                frozenset((1,)),
+                            ),
+                        ),
+                    ),
+                    uses=(
+                        InstantiatedEventUse(
+                            consumer_root=1,
+                            consumer_access_id=None,
+                            placement="root_entry",
+                            required_keys_by_task=(
+                                frozenset((0,)),
+                                frozenset((1,)),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        baseline = build_baseline_worker_schedule(task_families, worker_count=2)
+        triggers = derive_local_triggers(event_graph, baseline)
+
+        schedule = order_local_contributors_by_key(
+            event_graph,
+            baseline,
+            triggers,
+        )
+
+        self.assertEqual(schedule.placement(0, 0), (0, 0))
+        self.assertEqual(schedule.placement(0, 2), (1, 0))
+        self.assertEqual(schedule.placement(0, 1), (0, 1))
+        self.assertEqual(schedule.placement(0, 3), (1, 1))
+
+    def test_worker_schedule_detects_dependency_order_cycle(self) -> None:
+        graph = build_tile_dependency_graph(
+            (
+                _access(0, root=0, allocation_id=0, kind="store", block_ids=(10,)),
+                _access(1, root=1, allocation_id=0, kind="load", block_ids=(20,)),
+            ),
+            [[10], [20]],
+        )
+        task_families = (
+            InstantiatedTaskFamily((10,), (10,), ((10, 1),), ((10, 1),)),
+            InstantiatedTaskFamily((20,), (20,), ((20, 1),), ((20, 1),)),
+        )
+        event_graph = instantiate_event_graph(graph, task_families)
+
+        validate_worker_schedule(
+            event_graph,
+            build_baseline_worker_schedule(task_families, worker_count=1),
+        )
+        reversed_schedule = WorkerSchedule(
+            worker_count=1,
+            segments=(
+                WorkerScheduleSegment(1, 0, 1, 0, 1, 0),
+                WorkerScheduleSegment(0, 0, 1, 0, 1, 1),
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "dependency/order cycle"):
+            validate_worker_schedule(event_graph, reversed_schedule)
+
+    def test_counted_event_supports_independent_consumer_uses(self) -> None:
+        event = CountedEventPlan(
+            contributors=(
+                CountedEventContribution(
+                    source_event_ids=(3,),
+                    producer_root=0,
+                    task_to_key=(0, 0),
+                ),
+            ),
+            uses=(
+                CountedEventUse(consumer_root=1, key_by_task=(0,)),
+                CountedEventUse(consumer_root=2, key_by_task=(0, 0)),
+            ),
+        )
+
+        self.assertEqual(event.key_count, 1)
+        self.assertEqual(event.expected_arrivals, 2)
+        self.assertIsNone(event.local_use)
+        self.assertEqual(tuple(use.consumer_root for use in event.uses), (1, 2))
+
+    def test_counted_event_selection_keeps_independent_direct_uses(self) -> None:
+        task_families = tuple(
+            InstantiatedTaskFamily((axis,), (axis,), ((axis, 2),), ((axis, 1),))
+            for axis in (10, 20, 30)
+        )
+        event_graph = InstantiatedEventGraph(
+            task_families=task_families,
+            events=(
+                InstantiatedKeyedEvent(
+                    event_id=0,
+                    source_event_ids=(0,),
+                    key_count=2,
+                    contributions=(
+                        InstantiatedEventContribution(
+                            producer_root=0,
+                            keys_by_task=(frozenset((0,)), frozenset((1,))),
+                        ),
+                    ),
+                    uses=tuple(
+                        InstantiatedEventUse(
+                            consumer_root=root,
+                            consumer_access_id=None,
+                            placement="root_entry",
+                            required_keys_by_task=(
+                                frozenset((0,)),
+                                frozenset((1,)),
+                            ),
+                        )
+                        for root in (1, 2)
+                    ),
+                ),
+            ),
+        )
+        dependency_graph = TileDependencyGraph((), (), (), (), ())
+
+        (selected,) = choose_counted_events(
+            event_graph,
+            (),
+            dependency_graph,
+            excluded_direct_roots=frozenset((1,)),
+        )
+
+        self.assertEqual(selected.key_count, 2)
+        self.assertEqual(tuple(use.consumer_root for use in selected.uses), (2,))
+
+    def test_counted_event_lowering_is_derived_from_the_semantic_graph(self) -> None:
+        task_families = (
+            InstantiatedTaskFamily((10,), (10,), ((10, 4),), ((10, 1),)),
+            InstantiatedTaskFamily((20,), (20,), ((20, 2),), ((20, 2),)),
+        )
+        event_graph = InstantiatedEventGraph(
+            task_families=task_families,
+            events=(
+                InstantiatedKeyedEvent(
+                    event_id=0,
+                    source_event_ids=(3,),
+                    key_count=2,
+                    contributions=(
+                        InstantiatedEventContribution(
+                            producer_root=0,
+                            keys_by_task=(
+                                frozenset((0,)),
+                                frozenset((0,)),
+                                frozenset((1,)),
+                                frozenset((1,)),
+                            ),
+                        ),
+                    ),
+                    uses=(
+                        InstantiatedEventUse(
+                            consumer_root=1,
+                            consumer_access_id=None,
+                            placement="root_entry",
+                            required_keys_by_task=(
+                                frozenset((0,)),
+                                frozenset((1,)),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        baseline = build_baseline_worker_schedule(task_families, worker_count=4)
+        triggers = derive_local_triggers(event_graph, baseline)
+
+        (lowered,) = lower_counted_events(event_graph, triggers)
+
+        self.assertEqual(lowered.single_contributor.task_to_key, (0, 0, 1, 1))
+        self.assertEqual(lowered.uses[0].key_by_task, (0, 1))
+        self.assertEqual(lowered.expected_arrivals, 2)
+        self.assertEqual(lowered.local_trigger_use, 0)
+
+    def test_ready_event_canonicalization_derives_fanin(self) -> None:
+        graph = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    allocation_id=0,
+                    kind="store",
+                    shape=(4,),
+                    block_ids=(10,),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    allocation_id=0,
+                    kind="load",
+                    shape=(4,),
+                    block_ids=(20,),
+                ),
+            ),
+            [[10], [20]],
+        )
+        task_families = (
+            InstantiatedTaskFamily((10,), (10,), ((10, 4),), ((10, 1),)),
+            InstantiatedTaskFamily((20,), (20,), ((20, 2),), ((20, 2),)),
+        )
+
+        event_graph = canonicalize_ready_events(
+            instantiate_event_graph(graph, task_families)
+        )
+        event = event_graph.events[-1]
+
+        self.assertEqual(event.key_count, 2)
+        self.assertEqual(event.expected_arrivals, (2, 2))
+        self.assertEqual(
+            event.contributions[0].keys_by_task,
+            (
+                frozenset((0,)),
+                frozenset((0,)),
+                frozenset((1,)),
+                frozenset((1,)),
+            ),
+        )
+        self.assertEqual(
+            event.uses[0].required_keys_by_task,
+            (frozenset((0,)), frozenset((1,))),
+        )
+
+    def test_ready_event_canonicalization_supports_overlapping_keys(self) -> None:
+        task_families = (
+            InstantiatedTaskFamily((10,), (10,), ((10, 3),), ((10, 1),)),
+            InstantiatedTaskFamily((20,), (20,), ((20, 2),), ((20, 1),)),
+        )
+        event_graph = InstantiatedEventGraph(
+            task_families=task_families,
+            events=(
+                InstantiatedKeyedEvent(
+                    event_id=0,
+                    source_event_ids=(0,),
+                    key_count=3,
+                    contributions=(
+                        InstantiatedEventContribution(
+                            producer_root=0,
+                            keys_by_task=(
+                                frozenset((0,)),
+                                frozenset((1,)),
+                                frozenset((2,)),
+                            ),
+                        ),
+                    ),
+                    uses=(
+                        InstantiatedEventUse(
+                            consumer_root=1,
+                            consumer_access_id=None,
+                            placement="root_entry",
+                            required_keys_by_task=(
+                                frozenset((0, 1)),
+                                frozenset((1, 2)),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        event = canonicalize_ready_events(event_graph).events[-1]
+
+        self.assertEqual(event.key_count, 2)
+        self.assertEqual(event.expected_arrivals, (2, 2))
+        self.assertEqual(
+            event.contributions[0].keys_by_task,
+            (
+                frozenset((0,)),
+                frozenset((0, 1)),
+                frozenset((1,)),
+            ),
+        )
+
     def test_noninjective_regions_are_not_coordinate_disjoint(self) -> None:
         for layout, left_interval, right_interval, second_dimension in (
             (((2, 1), (0, 1), 0), (0, 1), (0, 1), (0, 1)),
@@ -465,7 +1060,7 @@ class TestCrossLoopDependencies(TestCase):
                 self.assertTrue(allocation_regions_may_overlap(left, right))
 
     def test_nonstatic_layout_falls_back_to_root_readiness(self) -> None:
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(
                     0,
@@ -480,9 +1075,21 @@ class TestCrossLoopDependencies(TestCase):
         )
 
         self.assertEqual(plan.events[0].granularity, "root")
+        self.assertTrue(plan.events[0].is_family_done)
+        self.assertEqual(plan.events[0].contributors, (EventContribution(0),))
+
+    def test_multi_contributor_event_has_no_unique_producer(self) -> None:
+        event = KeyedEvent(
+            event_id=0,
+            contributors=(EventContribution(0), EventContribution(1)),
+            granularity="task",
+        )
+
+        with self.assertRaisesRegex(ValueError, "no unique producer root"):
+            _ = event.producer_root
 
     def test_multidimensional_storage_offset_falls_back_to_root(self) -> None:
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(
                     0,
@@ -508,7 +1115,7 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(plan.events[0].granularity, "root")
 
     def test_one_dimensional_storage_offset_remains_task_ready(self) -> None:
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(
                     0,
@@ -551,52 +1158,8 @@ class TestCrossLoopDependencies(TestCase):
             },
         )
 
-    def test_singleton_worker_affinity_uses_idle_predecessor_workers(self) -> None:
-        dependency_plan = build_cross_loop_dependency_plan(
-            (
-                _access(0, root=0, allocation_id=0, kind="store", block_ids=(10,)),
-                _access(1, root=1, allocation_id=0, kind="load", block_ids=(11,)),
-                _access(2, root=2, allocation_id=1, kind="store", block_ids=(12,)),
-                _access(3, root=3, allocation_id=1, kind="load", block_ids=(13,)),
-            ),
-            [[10], [11], [12], [13]],
-        )
-        task_families = tuple(
-            InstantiatedTaskFamily(
-                logical_axis_order=(10 + root,),
-                physical_axis_order=(10 + root,),
-                axis_counts_items=((10 + root, count),),
-                block_sizes_items=((10 + root, 1),),
-            )
-            for root, count in enumerate((4, 1, 8, 1))
-        )
-
-        self.assertEqual(
-            derive_singleton_worker_affinity(
-                dependency_plan=dependency_plan,
-                task_families=task_families,
-                singleton_roots=frozenset((1, 3)),
-                worker_limit=16,
-            ),
-            {1: 4, 3: 9},
-        )
-        self.assertEqual(
-            derive_singleton_worker_affinity(
-                dependency_plan=dependency_plan,
-                task_families=(
-                    dataclasses.replace(
-                        task_families[0], axis_counts_items=((10, 16),)
-                    ),
-                    *task_families[1:],
-                ),
-                singleton_roots=frozenset((1,)),
-                worker_limit=16,
-            ),
-            {1: 15},
-        )
-
     def test_source_phase_boundary_satisfies_allocation_dependency(self) -> None:
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(0, root=0, kind="store", block_ids=(10,)),
                 _access(1, root=1, kind="load", block_ids=(20,)),
@@ -611,7 +1174,7 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(plan.edges, ())
 
     def test_edge_retains_every_alias_of_the_allocation(self) -> None:
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(
                     0,
@@ -652,7 +1215,7 @@ class TestCrossLoopDependencies(TestCase):
         )
 
     def test_identity_mapping_is_task_ready(self) -> None:
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(0, root=0, kind="store", block_ids=(10,)),
                 _access(1, root=1, kind="load", block_ids=(20,)),
@@ -683,7 +1246,7 @@ class TestCrossLoopDependencies(TestCase):
         )
 
     def test_aligned_in_place_update_is_task_ready(self) -> None:
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(0, root=0, kind="store", block_ids=(10,)),
                 _access(1, root=1, kind="load", block_ids=(20,)),
@@ -713,7 +1276,7 @@ class TestCrossLoopDependencies(TestCase):
         )
 
     def test_aligned_write_after_read_is_task_ready(self) -> None:
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(0, root=0, kind="load", block_ids=(10,)),
                 _access(1, root=1, kind="store", block_ids=(20,)),
@@ -730,7 +1293,7 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(plan.events[0].granularity, "task")
 
     def test_unproven_write_hazard_falls_back_to_root(self) -> None:
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(0, root=0, kind="store", block_ids=(10,)),
                 _access(
@@ -750,7 +1313,7 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(plan.events[0].granularity, "root")
 
     def test_reversed_mapping_falls_back_to_root(self) -> None:
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(0, root=0, kind="store", block_ids=(10,)),
                 _access(
@@ -773,7 +1336,7 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(plan.waits[0].placement, "access")
 
     def test_batch_axis_is_part_of_task_mapping(self) -> None:
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(
                     0,
@@ -822,7 +1385,7 @@ class TestCrossLoopDependencies(TestCase):
         )
 
     def test_size_one_view_dimensions_are_normalized(self) -> None:
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(
                     0,
@@ -863,7 +1426,7 @@ class TestCrossLoopDependencies(TestCase):
         )
 
     def test_nontrivial_reshape_still_falls_back_to_root(self) -> None:
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(
                     0,
@@ -893,7 +1456,7 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(plan.edges[0].readiness[0].granularity, "root")
 
     def test_unequal_tiles_map_to_every_overlapping_producer(self) -> None:
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(0, root=0, kind="store", block_ids=(10,)),
                 _access(1, root=1, kind="load", block_ids=(20,)),
@@ -915,7 +1478,7 @@ class TestCrossLoopDependencies(TestCase):
         )
 
     def test_uniform_partition_uses_coordinates_not_flattened_pid_runs(self) -> None:
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(
                     0,
@@ -985,7 +1548,7 @@ class TestCrossLoopDependencies(TestCase):
         )
 
     def test_uniform_partition_accepts_non_power_of_two_fanin(self) -> None:
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(0, root=0, kind="store", shape=(96,), block_ids=(10,)),
                 _access(1, root=1, kind="load", shape=(96,), block_ids=(20,)),
@@ -1014,7 +1577,7 @@ class TestCrossLoopDependencies(TestCase):
     def test_uniform_partition_accepts_compact_partial_domains(
         self,
     ) -> None:
-        overlapping = build_cross_loop_dependency_plan(
+        overlapping = build_tile_dependency_graph(
             (
                 _access(0, root=0, kind="store", block_ids=(10,)),
                 _access(1, root=1, kind="load", block_ids=(20,)),
@@ -1044,7 +1607,7 @@ class TestCrossLoopDependencies(TestCase):
             )
         )
 
-        identity = build_cross_loop_dependency_plan(
+        identity = build_tile_dependency_graph(
             (
                 _access(0, root=0, kind="store", block_ids=(10,)),
                 _access(1, root=1, kind="load", block_ids=(20,)),
@@ -1066,7 +1629,7 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(prefix.participating_producer_tasks, 6)
         self.assertFalse(prefix.covers_producer_domain)
 
-        suffix = build_cross_loop_dependency_plan(
+        suffix = build_tile_dependency_graph(
             (
                 _access(0, root=0, kind="store", block_ids=(10,)),
                 _access(
@@ -1096,7 +1659,7 @@ class TestCrossLoopDependencies(TestCase):
         )
 
     def test_tile_id_indices_use_scalar_extent(self) -> None:
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(
                     0,
@@ -1130,7 +1693,7 @@ class TestCrossLoopDependencies(TestCase):
         )
 
     def test_multiple_stores_fall_back_to_root(self) -> None:
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(0, root=0, kind="store", block_ids=(10,)),
                 _access(1, root=0, kind="store", block_ids=(10,)),
@@ -1143,7 +1706,7 @@ class TestCrossLoopDependencies(TestCase):
         self.assertFalse(edge.is_task_ready)
 
     def test_masked_store_falls_back_to_root(self) -> None:
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(0, root=0, kind="store", block_ids=(10,), masked=True),
                 _access(1, root=1, kind="load", block_ids=(20,)),
@@ -1154,7 +1717,7 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(plan.edges[0].readiness[0].granularity, "root")
 
     def test_nonzero_or_dynamic_grid_start_falls_back_to_root(self) -> None:
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(0, root=0, kind="store", block_ids=(10,)),
                 _access(1, root=1, kind="load", block_ids=(20,)),
@@ -1173,7 +1736,7 @@ class TestCrossLoopDependencies(TestCase):
             )
             for root in range(4)
         )
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(0, root=0, kind="store"),
                 _access(1, root=1, kind="load", block_ids=(1,)),
@@ -1197,7 +1760,7 @@ class TestCrossLoopDependencies(TestCase):
         )
 
     def test_partial_write_retains_uncovered_reaching_definition(self) -> None:
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(
                     0,
@@ -1276,7 +1839,7 @@ class TestCrossLoopDependencies(TestCase):
         )
 
     def test_fanout_keeps_one_edge_per_consumer(self) -> None:
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(0, root=0, kind="store"),
                 _access(1, root=1, kind="load", block_ids=(1,)),
@@ -1297,7 +1860,7 @@ class TestCrossLoopDependencies(TestCase):
         )
 
     def test_mixed_accesses_retain_their_strongest_readiness(self) -> None:
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(0, root=0, allocation_id=0, kind="store"),
                 _access(1, root=1, allocation_id=0, kind="load", block_ids=(1,)),
@@ -1327,8 +1890,8 @@ class TestCrossLoopDependencies(TestCase):
             [(1, 1, "root_entry"), (1, 3, "access")],
         )
 
-    def test_single_consumer_stream_dominates_later_root_ready_access(self) -> None:
-        dependency_plan = build_cross_loop_dependency_plan(
+    def test_mixed_exact_and_unknown_accesses_use_root_completion(self) -> None:
+        dependency_plan = build_tile_dependency_graph(
             (
                 _access(
                     0,
@@ -1364,7 +1927,7 @@ class TestCrossLoopDependencies(TestCase):
             ),
             [[10, 11], [20]],
         )
-        schedule = build_generic_schedule_plan(
+        schedule = build_cross_loop_schedule(
             dependency_plan=dependency_plan,
             task_families=(
                 InstantiatedTaskFamily(
@@ -1401,21 +1964,19 @@ class TestCrossLoopDependencies(TestCase):
             physical_worker_limit=2,
         )
 
-        self.assertEqual(schedule.task_ready_edges, frozenset(((0, 1),)))
-        self.assertEqual(schedule.root_completion_edges, frozenset())
-        self.assertEqual(len(schedule.access_cohorts), 1)
-        self.assertTrue(schedule.access_cohorts[0].is_per_coordinate)
-        self.assertEqual(schedule.access_cohorts[0].milestone_count, 4)
+        self.assertEqual(schedule.task_ready_edges, frozenset())
+        self.assertEqual(schedule.root_completion_edges, frozenset(((0, 1),)))
+        self.assertEqual(schedule.access_cohorts, ())
 
     def test_singleton_producer_uses_root_completion(self) -> None:
-        dependency_plan = build_cross_loop_dependency_plan(
+        dependency_plan = build_tile_dependency_graph(
             (
                 _access(0, root=0, kind="store", block_ids=(10,)),
                 _access(1, root=1, kind="load", block_ids=(20,)),
             ),
             [[10], [20]],
         )
-        schedule = build_generic_schedule_plan(
+        schedule = build_cross_loop_schedule(
             dependency_plan=dependency_plan,
             task_families=(
                 InstantiatedTaskFamily(
@@ -1444,7 +2005,7 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(schedule.root_completion_edges, frozenset(((0, 1),)))
 
     def test_root_completion_path_elides_redundant_exact_task_wait(self) -> None:
-        dependency_plan = build_cross_loop_dependency_plan(
+        dependency_plan = build_tile_dependency_graph(
             (
                 _access(0, root=0, allocation_id=0, kind="store", block_ids=(10,)),
                 _access(
@@ -1487,7 +2048,7 @@ class TestCrossLoopDependencies(TestCase):
             for root in range(4)
         )
 
-        schedule = build_generic_schedule_plan(
+        schedule = build_cross_loop_schedule(
             dependency_plan=dependency_plan,
             task_families=task_families,
             available_access_ids_by_root=(
@@ -1515,8 +2076,8 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(schedule.task_ready_edges, frozenset())
         self.assertEqual(schedule.task_waits_by_root, {})
 
-    def test_counted_event_derives_one_wave_readiness_frontier(self) -> None:
-        dependency_plan = build_cross_loop_dependency_plan(
+    def test_worker_schedule_derives_access_ready_overlap(self) -> None:
+        dependency_plan = build_tile_dependency_graph(
             (
                 _access(
                     0,
@@ -1614,39 +2175,82 @@ class TestCrossLoopDependencies(TestCase):
             "physical_worker_limit": 8,
         }
 
-        schedule = build_generic_schedule_plan(**kwargs, frontier_index=0)
+        task_ready_graph = canonicalize_task_readiness(
+            instantiate_event_graph(dependency_plan, task_families),
+            dependency_plan,
+        )
+        root_two_event = next(
+            event
+            for event in task_ready_graph.events
+            if any(use.consumer_root == 2 for use in event.uses)
+        )
+        self.assertEqual(root_two_event.expected_arrivals, (4,))
+        self.assertEqual(root_two_event.uses[0].placement, "root_entry")
+
+        schedule = build_cross_loop_schedule(**kwargs, requested_worker_count=6)
 
         self.assertEqual(len(schedule.counted_events), 1)
         event = schedule.counted_events[0]
         self.assertEqual(
             (
                 event.producer_root,
-                event.key_root,
-                event.on_ready_root,
+                event.uses[0].consumer_root,
+                event.local_use.consumer_root if event.local_use is not None else None,
                 event.expected_arrivals,
             ),
             (0, 1, 1, 2),
         )
-        self.assertEqual(len(schedule.readiness_frontiers), 1)
-        frontier = schedule.readiness_frontiers[0]
-        self.assertEqual(frontier.event, event)
-        self.assertEqual(frontier.worker_count, 6)
-        self.assertEqual(frontier.downstream_tasks, 1)
-        self.assertEqual(frontier.downstream_cohort.stage_sizes, (3, 1))
+        self.assertEqual(len(schedule.local_triggers), 1)
+        local_trigger = schedule.local_triggers[0]
+        local_event = schedule.event_graph.event(local_trigger.event_index)
+        self.assertEqual(local_trigger.use_index, 0)
+        self.assertEqual(
+            local_event.uses[local_trigger.use_index].consumer_root,
+            1,
+        )
+        self.assertEqual(
+            local_trigger.possible_workers,
+            frozenset(range(schedule.worker_limit)),
+        )
+        self.assertEqual(schedule.worker_limit, 6)
+        self.assertEqual(len(schedule.access_cohorts), 1)
+        self.assertEqual(schedule.access_cohorts[0].stage_sizes, (3, 1))
+        self.assertEqual(schedule.worker_schedule.placement(2, 0), (5, 1))
+        self.assertEqual(schedule.worker_schedule.placement(0, 6), (0, 1))
 
-        fallback = build_generic_schedule_plan(**kwargs, frontier_index=-1)
-        self.assertEqual(fallback.counted_events, ())
-        self.assertEqual(fallback.readiness_frontiers, ())
+        snapped = build_cross_loop_schedule(**kwargs, requested_worker_count=7)
+        self.assertEqual(snapped.worker_limit, 6)
+        self.assertEqual(snapped.worker_schedule, schedule.worker_schedule)
+
+        fallback = build_cross_loop_schedule(**kwargs, requested_worker_count=0)
+        self.assertEqual(
+            sum(
+                not fallback.event_graph.event(event.graph_event_index).is_family_done
+                for event in fallback.counted_events
+                if event.graph_event_index is not None
+            ),
+            1,
+        )
         self.assertEqual(fallback.access_cohorts, ())
+        self.assertEqual(fallback.task_ready_edges, frozenset(((0, 1),)))
         self.assertEqual(
             fallback.root_completion_edges,
-            frozenset(((0, 1), (1, 2))),
+            frozenset(((1, 2),)),
         )
+        (family_done,) = tuple(
+            event
+            for event in fallback.counted_events
+            if event.graph_event_index is not None
+            and fallback.event_graph.event(event.graph_event_index).is_family_done
+        )
+        self.assertEqual(family_done.key_count, 1)
+        self.assertEqual(family_done.producer_root, 1)
+        self.assertEqual(tuple(use.consumer_root for use in family_done.uses), (2,))
         with self.assertRaisesRegex(
             helion.exc.InvalidConfig,
-            "only 1 readiness frontiers",
+            "must be nonnegative",
         ):
-            build_generic_schedule_plan(**kwargs, frontier_index=1)
+            build_cross_loop_schedule(**kwargs, requested_worker_count=-1)
 
         short_families = (
             dataclasses.replace(
@@ -1661,7 +2265,7 @@ class TestCrossLoopDependencies(TestCase):
             ),
             task_families[2],
         )
-        short_schedule = build_generic_schedule_plan(
+        short_schedule = build_cross_loop_schedule(
             **{
                 **kwargs,
                 "task_families": short_families,
@@ -1675,16 +2279,25 @@ class TestCrossLoopDependencies(TestCase):
                 },
             }
         )
-        self.assertEqual(short_schedule.readiness_frontiers, ())
-        self.assertEqual(short_schedule.counted_events, ())
+        self.assertEqual(
+            sum(
+                not short_schedule.event_graph.event(
+                    event.graph_event_index
+                ).is_family_done
+                for event in short_schedule.counted_events
+                if event.graph_event_index is not None
+            ),
+            1,
+        )
         self.assertEqual(short_schedule.access_cohorts, ())
+        self.assertEqual(short_schedule.task_ready_edges, frozenset(((0, 1),)))
         self.assertEqual(
             short_schedule.root_completion_edges,
-            frozenset(((0, 1), (1, 2))),
+            frozenset(((1, 2),)),
         )
 
     def test_multi_producer_join_uses_one_keyed_event(self) -> None:
-        dependency_plan = build_cross_loop_dependency_plan(
+        dependency_plan = build_tile_dependency_graph(
             (
                 _access(0, root=0, allocation_id=0, kind="store", block_ids=(10,)),
                 _access(1, root=1, allocation_id=1, kind="store", block_ids=(20,)),
@@ -1703,7 +2316,7 @@ class TestCrossLoopDependencies(TestCase):
             for root, block_id in enumerate((10, 20, 30))
         )
 
-        schedule = build_generic_schedule_plan(
+        schedule = build_cross_loop_schedule(
             dependency_plan=dependency_plan,
             task_families=task_families,
             available_access_ids_by_root=(
@@ -1723,7 +2336,7 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(schedule.task_waits_by_root, {})
         self.assertEqual(len(schedule.counted_events), 1)
         event = schedule.counted_events[0]
-        self.assertEqual(event.key_root, 2)
+        self.assertEqual(event.uses[0].consumer_root, 2)
         self.assertEqual(event.expected_arrivals, 2)
         self.assertEqual(
             [
@@ -1734,7 +2347,7 @@ class TestCrossLoopDependencies(TestCase):
         )
 
     def test_repeated_join_predecessors_coalesce_consumer_tasks(self) -> None:
-        dependency_plan = build_cross_loop_dependency_plan(
+        dependency_plan = build_tile_dependency_graph(
             (
                 _access(
                     0,
@@ -1785,7 +2398,7 @@ class TestCrossLoopDependencies(TestCase):
             ),
         )
 
-        schedule = build_generic_schedule_plan(
+        schedule = build_cross_loop_schedule(
             dependency_plan=dependency_plan,
             task_families=task_families,
             available_access_ids_by_root=(
@@ -1808,11 +2421,12 @@ class TestCrossLoopDependencies(TestCase):
 
         self.assertEqual(schedule.root_completion_edges, frozenset())
         self.assertEqual(len(schedule.counted_events), 1)
+        self.assertEqual(schedule.local_triggers, ())
         event = schedule.counted_events[0]
-        self.assertIsNone(event.on_ready_root)
-        self.assertEqual(event.key_tasks, 8)
+        self.assertIsNone(event.local_use)
+        self.assertEqual(event.key_count, 8)
         self.assertEqual(event.expected_arrivals, 5)
-        self.assertEqual(event.consumer_key_by_task, tuple(i // 4 for i in range(32)))
+        self.assertEqual(event.uses[0].key_by_task, tuple(i // 4 for i in range(32)))
         self.assertEqual(
             [contributor.expected_arrivals for contributor in event.contributors],
             [4, 1],
@@ -1823,7 +2437,7 @@ class TestCrossLoopDependencies(TestCase):
         width = 4
         splits = 4
         elements = heads * width
-        dependency_plan = build_cross_loop_dependency_plan(
+        dependency_plan = build_tile_dependency_graph(
             (
                 _access(
                     0,
@@ -1862,7 +2476,7 @@ class TestCrossLoopDependencies(TestCase):
             ),
         )
 
-        schedule = build_generic_schedule_plan(
+        schedule = build_cross_loop_schedule(
             dependency_plan=dependency_plan,
             task_families=task_families,
             available_access_ids_by_root=(frozenset((0,)), frozenset((1,))),
@@ -1881,21 +2495,21 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(schedule.root_completion_edges, frozenset())
         self.assertEqual(len(schedule.counted_events), 1)
         event = schedule.counted_events[0]
-        self.assertEqual(event.key_tasks, heads)
+        self.assertEqual(event.key_count, heads)
         self.assertEqual(event.expected_arrivals, width)
         self.assertEqual(
-            event.consumer_key_by_task,
+            event.uses[0].key_by_task,
             tuple(task // splits for task in range(heads * splits)),
         )
         self.assertEqual(len(event.contributors[0].task_to_key_segments), 1)
-        self.assertEqual(len(event.consumer_task_to_key_segments), 1)
+        self.assertEqual(len(event.uses[0].task_to_key_segments), 1)
 
     def test_strided_ready_groups_use_exact_coordinates_with_overlapping_hulls(
         self,
     ) -> None:
         columns = 8
         splits = 4
-        dependency_plan = build_cross_loop_dependency_plan(
+        dependency_plan = build_tile_dependency_graph(
             (
                 _access(
                     0,
@@ -1934,7 +2548,7 @@ class TestCrossLoopDependencies(TestCase):
             ),
         )
 
-        schedule = build_generic_schedule_plan(
+        schedule = build_cross_loop_schedule(
             dependency_plan=dependency_plan,
             task_families=task_families,
             available_access_ids_by_root=(frozenset((0,)), frozenset((1,))),
@@ -1948,15 +2562,115 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(schedule.root_completion_edges, frozenset())
         self.assertEqual(len(schedule.counted_events), 1)
         event = schedule.counted_events[0]
-        self.assertEqual(event.key_tasks, columns)
+        self.assertEqual(event.key_count, columns)
         self.assertEqual(event.expected_arrivals, 1)
         self.assertEqual(
-            event.consumer_key_by_task,
+            event.uses[0].key_by_task,
             tuple(task // splits for task in range(columns * splits)),
         )
 
-    def test_root_completion_disables_every_unselected_frontier(self) -> None:
-        accesses: list[CrossLoopAccess] = []
+    def test_multiple_access_events_in_one_root_fall_back_together(self) -> None:
+        dependency_plan = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    allocation_id=0,
+                    kind="store",
+                    shape=(1, 128),
+                    strides=(128, 1),
+                    block_ids=(10, 11),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    allocation_id=1,
+                    kind="store",
+                    shape=(1, 128),
+                    strides=(128, 1),
+                    block_ids=(20, 21),
+                ),
+                _access(
+                    2,
+                    root=2,
+                    allocation_id=0,
+                    kind="load",
+                    shape=(1, 128),
+                    strides=(128, 1),
+                    block_ids=(30, 31),
+                ),
+                _access(
+                    3,
+                    root=2,
+                    allocation_id=1,
+                    kind="load",
+                    shape=(1, 128),
+                    strides=(128, 1),
+                    block_ids=(30, 32),
+                ),
+            ),
+            [[10, 11], [20, 21], [30]],
+        )
+        task_families = (
+            InstantiatedTaskFamily(
+                (10, 11),
+                (11, 10),
+                ((10, 1), (11, 8)),
+                ((10, 1), (11, 16)),
+            ),
+            InstantiatedTaskFamily(
+                (20, 21),
+                (21, 20),
+                ((20, 1), (21, 8)),
+                ((20, 1), (21, 16)),
+            ),
+            InstantiatedTaskFamily((30,), (30,), ((30, 1),), ((30, 1),)),
+        )
+
+        schedule = build_cross_loop_schedule(
+            dependency_plan=dependency_plan,
+            task_families=task_families,
+            available_access_ids_by_root=(
+                frozenset((0,)),
+                frozenset((1,)),
+                frozenset((2, 3)),
+            ),
+            access_program_points={
+                2: AccessProgramPoint(
+                    ((30, "outer"), (31, "first_inner")),
+                    loop_id=7,
+                    loop_depth=1,
+                    root_statement_index=0,
+                ),
+                3: AccessProgramPoint(
+                    ((30, "outer"), (32, "second_inner")),
+                    loop_id=8,
+                    loop_depth=1,
+                    root_statement_index=1,
+                ),
+            },
+            axis_geometry={
+                10: (1, 1),
+                11: (8, 16),
+                20: (1, 1),
+                21: (8, 16),
+                30: (1, 1),
+                31: (8, 16),
+                32: (8, 16),
+            },
+            excluded_roots=frozenset(),
+            preordered_edges=frozenset(),
+            physical_worker_limit=4,
+        )
+
+        self.assertEqual(schedule.access_cohorts, ())
+        self.assertEqual(
+            schedule.root_completion_edges,
+            frozenset(((0, 2), (1, 2))),
+        )
+
+    def test_worker_schedule_handles_independent_components(self) -> None:
+        accesses: list[TileAccess] = []
         task_families: list[InstantiatedTaskFamily] = []
         access_points: dict[int, AccessProgramPoint] = {}
         axis_geometry: dict[int, tuple[int, int]] = {}
@@ -2069,7 +2783,7 @@ class TestCrossLoopDependencies(TestCase):
                 }
             )
 
-        dependency_plan = build_cross_loop_dependency_plan(
+        dependency_plan = build_tile_dependency_graph(
             tuple(accesses),
             [list(family.logical_axis_order) for family in task_families],
         )
@@ -2084,22 +2798,39 @@ class TestCrossLoopDependencies(TestCase):
             "physical_worker_limit": 8,
         }
 
-        schedule = build_generic_schedule_plan(**kwargs, frontier_index=-1)
-        self.assertEqual(schedule.counted_events, ())
-        self.assertEqual(schedule.readiness_frontiers, ())
+        schedule = build_cross_loop_schedule(**kwargs, requested_worker_count=0)
+        self.assertEqual(
+            sum(
+                not schedule.event_graph.event(event.graph_event_index).is_family_done
+                for event in schedule.counted_events
+                if event.graph_event_index is not None
+            ),
+            2,
+        )
         self.assertEqual(schedule.access_cohorts, ())
         self.assertEqual(
-            schedule.root_completion_edges,
-            frozenset(((0, 1), (1, 2), (3, 4), (4, 5))),
+            schedule.task_ready_edges,
+            frozenset(((0, 1), (3, 4))),
         )
-        with self.assertRaisesRegex(
-            helion.exc.InvalidConfig,
-            "no unique readiness-frontier component",
-        ):
-            build_generic_schedule_plan(**kwargs, frontier_index=0)
+        self.assertEqual(
+            schedule.root_completion_edges,
+            frozenset(((1, 2), (4, 5))),
+        )
+        overlapped = build_cross_loop_schedule(**kwargs, requested_worker_count=6)
+        self.assertEqual(overlapped.worker_limit, 6)
+        self.assertEqual(
+            [
+                (plan.producer_root, plan.consumer_root, plan.stage_sizes)
+                for plan in overlapped.access_cohorts
+            ],
+            [(1, 2, (3, 1)), (4, 5, (3, 1))],
+        )
+        self.assertEqual(overlapped.root_completion_edges, frozenset())
+        self.assertEqual(overlapped.worker_schedule.placement(2, 0), (5, 1))
+        self.assertEqual(overlapped.worker_schedule.placement(5, 0), (5, 5))
 
     def test_alias_names_share_an_allocation_dependency(self) -> None:
-        plan = build_cross_loop_dependency_plan(
+        plan = build_tile_dependency_graph(
             (
                 _access(
                     0,
@@ -2201,7 +2932,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             torch.testing.assert_close(out, torch.sum(x + launch + 1).reshape(1))
         self.assertGreaterEqual(code.count("tile_dependency_continuation_previous"), 2)
         self.assertNotIn("tile_dependency_task_wait", code)
-        self.assertIn("tile_dependency_singleton_input_wait", code)
+        self.assertIn("tile_dependency_root_completion_wait", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -2257,7 +2988,8 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             expected = torch.cat((expected[:64] * 2, expected[64:]))
             torch.testing.assert_close(out, expected)
         self.assertIn("tile_dependency_continuation_previous", code)
-        self.assertIn("tile_dependency_task_wait", code)
+        self.assertIn("tile_dependency_keyed_event_wait", code)
+        self.assertNotIn("tile_dependency_task_wait", code)
         self.assertNotIn("tile_dependency_root_completion", code)
 
     @skipIfNotCUDA()
@@ -2399,7 +3131,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         x = torch.arange(4096, device=DEVICE, dtype=torch.float32)
         bound = offset_affine_chain.bind((x,))
         assert bound.host_function is not None
-        dependency_plan = bound.host_function.device_ir.cross_loop_dependency_plan
+        dependency_plan = bound.host_function.device_ir.tile_dependency_graph
         assert dependency_plan is not None
         self.assertEqual(dependency_plan.events[0].granularity, "root")
 
@@ -2429,7 +3161,8 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, (x + 1) * 2)
-        self.assertIn("tile_dependency_task_wait", code)
+        self.assertIn("tile_dependency_continuation_task", code)
+        self.assertNotIn("tile_dependency_task_wait", code)
         self.assertNotIn("tile_dependency_root_completion", code)
 
     @skipIfNotCUDA()
@@ -2450,7 +3183,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(out, (x + 1) * 2)
         self.assertIn("tile_dependency_continuation_previous", code)
-        self.assertIn("tile_dependency_continuation_physical_task", code)
+        self.assertIn("tile_dependency_scheduled_physical_task", code)
         self.assertNotIn("tile_dependency_root_completion", code)
 
     @skipIfNotCUDA()
@@ -2486,12 +3219,12 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, torch.sum(x * 2, dim=-1))
-        self.assertGreaterEqual(code.count("tile_dependency_singleton_input_wait"), 2)
-        self.assertIn("if tl.program_id(0) == 4:", code)
+        self.assertGreaterEqual(code.count("tile_dependency_root_completion_wait"), 2)
+        self.assertIn("if tl.program_id(0) == 0:", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_singleton_stream_uses_graph_derived_per_coordinate_readiness(self) -> None:
+    def test_singleton_stream_uses_root_completion(self) -> None:
         for batch in (1, 2):
             with self.subTest(batch=batch):
                 x = torch.arange(
@@ -2509,10 +3242,10 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                 torch.testing.assert_close(out, torch.sum(x + 1, dim=-1) + x[:, 0] + 1)
                 self.assertNotIn("tile_dependency_ordered_group", code)
                 if batch == 1:
-                    self.assertIn("tile_dependency_cohort_wait", code)
-                    self.assertNotIn("tile_dependency_root_completion", code)
-                else:
                     self.assertIn("tile_dependency_root_completion", code)
+                else:
+                    self.assertIn("tile_dependency_keyed_event_wait", code)
+                    self.assertNotIn("tile_dependency_root_completion", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -2591,7 +3324,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                     bound = grouped_affine_chain.bind(kernel_args)
                     assert bound.host_function is not None
                     dependency_plan = (
-                        bound.host_function.device_ir.cross_loop_dependency_plan
+                        bound.host_function.device_ir.tile_dependency_graph
                     )
                     assert dependency_plan is not None
                     self.assertTrue(
@@ -2616,11 +3349,17 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                         not in bound.host_function.device_ir.grid_block_ids[2]
                     }
                     self.assertEqual(len(nested_block_ids), 1)
-                frontier_config = (
-                    {TILE_DEPENDENCY_FRONTIER_CONFIG: 0}
-                    if not reverse_groups and group_size == 32
-                    else {}
-                )
+                worker_config = {}
+                if not reverse_groups and group_size == 32:
+                    producer_tasks = batch * (2 * intermediate // block_sizes[1])
+                    consumer_tasks = batch * (64 // block_sizes[3])
+                    arrivals_per_key = 2 * group_size // block_sizes[1]
+                    minimum_workers = (producer_tasks + consumer_tasks + 1) // 2
+                    worker_config[CROSS_LOOP_NUM_WORKERS_CONFIG] = (
+                        (minimum_workers + arrivals_per_key - 1)
+                        // arrivals_per_key
+                        * arrivals_per_key
+                    )
                 code, out = code_and_output(
                     grouped_affine_chain,
                     kernel_args,
@@ -2629,7 +3368,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                     num_sm_multiplier=1,
                     num_warps=4,
                     num_stages=2,
-                    **frontier_config,
+                    **worker_config,
                 )
 
                 gate_up = (x.float() @ w13.float()).half()
@@ -2657,34 +3396,40 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                 ).reshape(batch, intermediate) @ w2.float()
                 torch.testing.assert_close(out, expected, rtol=3e-2, atol=3e-2)
 
-                if reverse_groups or group_size != 32:
+                if reverse_groups:
                     self.assertNotIn("tile_dependency_group_arrivals", code)
                     self.assertIn("tile_dependency_root_completion", code)
+                elif group_size != 32:
+                    self.assertNotIn("tile_dependency_group_arrivals", code)
+                    self.assertNotIn("tile_dependency_cohort_wait", code)
+                    self.assertIn("tile_dependency_continuation_previous", code)
+                    self.assertIn("tile_dependency_keyed_event_wait", code)
                 else:
                     self.assertNotIn("tile_dependency_group_arrivals", code)
                     self.assertNotIn("tile_dependency_root_completion", code)
                     self.assertNotIn("tile_dependency_task_wait", code)
-                    self.assertIn("tile_dependency_continuation_previous", code)
+                    self.assertTrue(
+                        "tile_dependency_continuation_previous" in code
+                        or "tile_dependency_keyed_event_wait" in code
+                    )
                     self.assertIn("tile_dependency_cohort_wait", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_readiness_frontier_defaults_to_root_completion(self) -> None:
+    def test_default_schedule_coarsens_only_the_access_local_use(self) -> None:
         torch.manual_seed(0)
         x = torch.rand((1, 64), device=DEVICE, dtype=torch.float16)
         w13 = torch.rand((64, 256), device=DEVICE, dtype=torch.float16)
         w2 = torch.rand((128, 64), device=DEVICE, dtype=torch.float16)
         kernel_args = (x, w13, w2, 32, hl.constexpr(False))
         bound = grouped_affine_chain.bind(kernel_args)
-        frontier = bound.config_spec.user_defined_tunables[
-            TILE_DEPENDENCY_FRONTIER_CONFIG
-        ]
-        self.assertIsInstance(frontier, IntegerFragment)
-        assert isinstance(frontier, IntegerFragment)
-        self.assertEqual((frontier.low, frontier.high), (-1, 3))
+        workers = bound.config_spec.user_defined_tunables[CROSS_LOOP_NUM_WORKERS_CONFIG]
+        self.assertIsInstance(workers, IntegerFragment)
+        assert isinstance(workers, IntegerFragment)
+        self.assertEqual((workers.low, workers.high), (0, 256))
         self.assertEqual(
-            bound.config_spec.default_config()[TILE_DEPENDENCY_FRONTIER_CONFIG],
-            -1,
+            bound.config_spec.default_config()[CROSS_LOOP_NUM_WORKERS_CONFIG],
+            0,
         )
 
         code, out = code_and_output(
@@ -2706,7 +3451,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         ).reshape(1, 128) @ w2.float()
         torch.testing.assert_close(out, expected, rtol=3e-2, atol=3e-2)
         self.assertIn("tile_dependency_root_completion", code)
-        self.assertNotIn("tile_dependency_continuation_previous", code)
+        self.assertIn("tile_dependency_continuation_previous", code)
         self.assertNotIn("tile_dependency_cohort_wait", code)
 
 

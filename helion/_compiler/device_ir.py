@@ -91,10 +91,10 @@ if TYPE_CHECKING:
     from ..autotuner.config_spec import AccumulatorFact
     from ..autotuner.config_spec import ConfigSpec
     from ..autotuner.config_spec import MemoryOpFact
-    from .cross_loop_dependencies import CrossLoopAccess
-    from .cross_loop_dependencies import CrossLoopDependencyPlan
-    from .cross_loop_dependencies import TaskFamily
     from .cute.layout import CuTeGridExecutionPlan
+    from .tile_dependency import TaskFamily
+    from .tile_dependency import TileAccess
+    from .tile_dependency import TileDependencyGraph
 
     class _TLS(Protocol):
         device_irs: list[DeviceIR]
@@ -794,7 +794,7 @@ class DeviceIR:
         self.rolled_reductions: list[RolledReductionInfo] = []
         self.phases: list[KernelPhase] = []
         self.implicit_dependency_starts: frozenset[int] = frozenset()
-        self.cross_loop_dependency_plan: CrossLoopDependencyPlan | None = None
+        self.tile_dependency_graph: TileDependencyGraph | None = None
         self.task_families: list[TaskFamily] = []
         self.grid_block_ids: list[list[int]] = []
         self.noncanonical_task_origin_block_ids: set[int] = set()
@@ -3183,8 +3183,8 @@ class WalkHostAST(NodeVisitor):
             )
             if not canonical_origin:
                 self.device_ir.noncanonical_task_origin_block_ids.update(block_ids)
-            from .cross_loop_dependencies import LogicalTaskAxis
-            from .cross_loop_dependencies import TaskFamily
+            from .tile_dependency import LogicalTaskAxis
+            from .tile_dependency import TaskFamily
 
             env = CompileEnvironment.current()
             self.device_ir.task_families.append(
@@ -3492,7 +3492,7 @@ def _graph_peak_live_tiles(
 
 def _collect_memory_op_facts(
     device_ir: DeviceIR,
-) -> tuple[list[MemoryOpFact], dict[int, int], tuple[CrossLoopAccess, ...]]:
+) -> tuple[list[MemoryOpFact], dict[int, int], tuple[TileAccess, ...]]:
     """Walk every device graph once and record per-load/store metadata.
 
     Produces one ``MemoryOpFact`` per load/store in the order used to size
@@ -3505,7 +3505,7 @@ def _collect_memory_op_facts(
     reduction-fact builders need no bespoke walk. ``reductions_fed`` runs
     ``_classify_load_dataflow`` once over ALL reduction axes, grouped by axis.
 
-    Returns ``(memory_op_facts, liveness_by_axis, cross_loop_accesses)``. The
+    Returns ``(memory_op_facts, liveness_by_axis, tile_accesses)``. The
     second result is the per-axis peak simultaneously-live rdim-shaped tile count
     (max over graphs). The third is the allocation-coordinate access view used for
     cross-root legality and scheduling.
@@ -3513,10 +3513,10 @@ def _collect_memory_op_facts(
     from ..autotuner.config_spec import MemoryOpFact
     from ..language import memory_ops
     from ..language.atomic_ops import ATOMIC_OPS
-    from .cross_loop_dependencies import CROSS_LOOP_ACCESS_ID_META
-    from .cross_loop_dependencies import CrossLoopAccess
-    from .cross_loop_dependencies import owner_root_by_graph_id
     from .inductor_lowering import ReductionLowering
+    from .tile_dependency import TILE_ACCESS_ID_META
+    from .tile_dependency import TileAccess
+    from .tile_dependency import owner_root_by_graph_id
 
     load_op = memory_ops.load
     store_op = memory_ops.store
@@ -3528,15 +3528,13 @@ def _collect_memory_op_facts(
     # complete by the time we apply it to the (operand-less) facts below.
     operands: dict[torch.fx.Node, str] = {}
     records: list[tuple[torch.fx.Node, MemoryOpFact]] = []
-    cross_loop_accesses: list[CrossLoopAccess] = []
+    tile_accesses: list[TileAccess] = []
     memory_op_index = 0
     cross_loop_access_id = 0
     eviction_index = 0
     liveness_by_axis: dict[int, int] = {}
-    collect_cross_loop_accesses = len(device_ir.root_ids) > 1
-    graph_owners = (
-        owner_root_by_graph_id(device_ir) if collect_cross_loop_accesses else ()
-    )
+    collect_tile_accesses = len(device_ir.root_ids) > 1
+    graph_owners = owner_root_by_graph_id(device_ir) if collect_tile_accesses else ()
     allocation_ids: dict[int, int] = {}
 
     for graph_info in device_ir.graphs:
@@ -3619,7 +3617,7 @@ def _collect_memory_op_facts(
             storage_offset = 0
             layout_is_static = False
             if fake is not None:
-                if collect_cross_loop_accesses:
+                if collect_tile_accesses:
                     storage = fake.untyped_storage()
                     storage_key = int(getattr(storage, "_cdata", id(storage)))
                     allocation_id = allocation_ids.setdefault(
@@ -3708,7 +3706,7 @@ def _collect_memory_op_facts(
                     inner_extent = env.size_hint(fake.shape[-1])
 
             tensor_name = origin.root_rw_name() if origin else None
-            if collect_cross_loop_accesses:
+            if collect_tile_accesses:
                 owner_root = (
                     graph_owners[graph_info.graph_id]
                     if graph_info.graph_id < len(graph_owners)
@@ -3719,9 +3717,9 @@ def _collect_memory_op_facts(
                     and len(node.args) > (2 if is_load else 3)
                     and node.args[2 if is_load else 3] is not None
                 )
-                node.meta[CROSS_LOOP_ACCESS_ID_META] = cross_loop_access_id
-                cross_loop_accesses.append(
-                    CrossLoopAccess(
+                node.meta[TILE_ACCESS_ID_META] = cross_loop_access_id
+                tile_accesses.append(
+                    TileAccess(
                         access_id=cross_loop_access_id,
                         memory_op_index=memory_op_index if not is_atomic else -1,
                         graph_id=graph_info.graph_id,
@@ -3777,7 +3775,7 @@ def _collect_memory_op_facts(
             memory_op_index += 1
 
     facts = [fact._replace(matmul_operand=operands.get(node)) for node, fact in records]
-    return facts, liveness_by_axis, tuple(cross_loop_accesses)
+    return facts, liveness_by_axis, tuple(tile_accesses)
 
 
 def _indexing_uses_tensor_descriptor(
@@ -3974,7 +3972,7 @@ def _root_phases(phases: list[KernelPhase], root_count: int) -> tuple[int, ...]:
 def _install_dependency_phases(
     device_ir: DeviceIR,
     root_nodes: list[ast.For],
-    dependency_plan: CrossLoopDependencyPlan,
+    dependency_plan: TileDependencyGraph,
     source_phase_starts: frozenset[int],
 ) -> None:
     if dependency_plan.edges and source_phase_starts:
@@ -4263,14 +4261,14 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         (
             memory_op_facts,
             liveness_by_axis,
-            cross_loop_accesses,
+            tile_accesses,
         ) = _collect_memory_op_facts(device_ir)
         config_spec.memory_op_facts = memory_op_facts
-        from .cross_loop_dependencies import build_cross_loop_dependency_plan
+        from .tile_dependency import build_tile_dependency_graph
 
         if len(device_ir.task_families) > 1:
-            device_ir.cross_loop_dependency_plan = build_cross_loop_dependency_plan(
-                cross_loop_accesses,
+            device_ir.tile_dependency_graph = build_tile_dependency_graph(
+                tile_accesses,
                 task_families=tuple(device_ir.task_families),
                 root_phases=source_root_phases,
                 noncanonical_task_origin_block_ids=frozenset(
@@ -4280,41 +4278,36 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             _install_dependency_phases(
                 device_ir,
                 visitor.root_nodes,
-                device_ir.cross_loop_dependency_plan,
+                device_ir.tile_dependency_graph,
                 source_phase_starts,
             )
             if device_ir.implicit_dependency_starts:
                 from ..autotuner.config_fragment import IntegerFragment
-                from .tile_dependency_planner import TILE_DEPENDENCY_FRONTIER_CONFIG
-                from .tile_dependency_planner import TILE_DEPENDENCY_FRONTIER_DEFAULT
-                from .tile_dependency_planner import (
-                    potential_readiness_frontier_stream_axes,
-                )
+                from .cross_loop_scheduler import CROSS_LOOP_NUM_WORKERS_CONFIG
+                from .cross_loop_scheduler import CROSS_LOOP_NUM_WORKERS_DEFAULT
 
-                frontier_stream_axes = potential_readiness_frontier_stream_axes(
-                    device_ir.cross_loop_dependency_plan,
-                    tuple(device_ir.task_families),
-                )
-                if frontier_stream_axes:
-                    if (
-                        TILE_DEPENDENCY_FRONTIER_CONFIG
-                        in config_spec.user_defined_tunables
-                    ):
-                        raise exc.CrossLoopSchedulingError(
-                            f"{TILE_DEPENDENCY_FRONTIER_CONFIG!r} is reserved for "
-                            "compiler-derived tile-dependency scheduling"
+                max_worker_count = max(
+                    (
+                        math.prod(
+                            _maximum_axis_task_count(config_spec, block_id)
+                            for block_id in family.logical_axis_order
                         )
-                    max_frontier_index = max(
-                        _maximum_axis_task_count(config_spec, block_id) - 1
-                        for block_id in frontier_stream_axes
+                        for family in device_ir.task_families
+                    ),
+                    default=1,
+                )
+                if CROSS_LOOP_NUM_WORKERS_CONFIG in config_spec.user_defined_tunables:
+                    raise exc.CrossLoopSchedulingError(
+                        f"{CROSS_LOOP_NUM_WORKERS_CONFIG!r} is reserved for "
+                        "compiler-derived cross-loop scheduling"
                     )
-                    config_spec.user_defined_tunables[
-                        TILE_DEPENDENCY_FRONTIER_CONFIG
-                    ] = IntegerFragment(
-                        -1,
-                        max_frontier_index,
-                        default_val=TILE_DEPENDENCY_FRONTIER_DEFAULT,
+                config_spec.user_defined_tunables[CROSS_LOOP_NUM_WORKERS_CONFIG] = (
+                    IntegerFragment(
+                        0,
+                        max_worker_count,
+                        default_val=CROSS_LOOP_NUM_WORKERS_DEFAULT,
                     )
+                )
             if device_ir.implicit_dependency_starts:
                 if (
                     CompileEnvironment.current().backend_name != "triton"
@@ -4322,7 +4315,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 ):
                     edge = next(
                         edge
-                        for edge in device_ir.cross_loop_dependency_plan.edges
+                        for edge in device_ir.tile_dependency_graph.edges
                         if edge.consumer_root in device_ir.implicit_dependency_starts
                     )
                     names = sorted(edge.tensor_names)

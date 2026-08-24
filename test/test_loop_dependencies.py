@@ -14,7 +14,6 @@ import helion
 from helion import exc
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.device_function import DeviceFunction
-from helion._compiler.program_id import ForEachProgramID
 from helion._compiler.program_id import _ast_fingerprint
 from helion._compiler.program_id import _clone_opaque_loop_segment
 from helion._compiler.program_id import _clone_opaque_statements
@@ -248,9 +247,9 @@ class TestTileDependencyScheduling(unittest.TestCase):
 
     def test_tile_dependency_schedule_has_no_separate_public_object(self) -> None:
         self.assertFalse(hasattr(helion, "TileDependencySchedule"))
-        self.assertEqual(helion.Config().tile_dependency_frontier, -1)
+        self.assertEqual(helion.Config().cross_loop_num_workers, 0)
         self.assertEqual(
-            helion.Config(tile_dependency_frontier=3).tile_dependency_frontier,
+            helion.Config(cross_loop_num_workers=3).cross_loop_num_workers,
             3,
         )
 
@@ -263,7 +262,7 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         bound = tile_dependency_info_across_barrier.bind((x,))
         host_function = bound.host_function
         assert host_function is not None
-        dependency_plan = host_function.device_ir.cross_loop_dependency_plan
+        dependency_plan = host_function.device_ir.tile_dependency_graph
         assert dependency_plan is not None
         self.assertTrue(dependency_plan.accesses)
         self.assertEqual(dependency_plan.edges, ())
@@ -285,7 +284,7 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
             pid_type="persistent_blocked",
         )
         torch.testing.assert_close(output, (x + 1) * 2)
-        self.assertIn("tile_dependency_singleton_input_wait", code)
+        self.assertIn("tile_dependency_root_completion_wait", code)
 
     @skipIfRefEager("persistent grid-barrier codegen is unavailable in ref eager mode")
     def test_allocation_graph_tracks_atomics_as_writes(self) -> None:
@@ -325,7 +324,7 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out0, (x + 1) * 2)
         torch.testing.assert_close(out1, (x + 1) * 3)
         self.assertEqual(code.count("sem='release'"), 1)
-        self.assertIn("tile_dependency_task_wait", code)
+        self.assertGreaterEqual(code.count("tile_dependency_keyed_event_wait"), 2)
         self.assertIn("ld.acquire.gpu.global.u32", code)
         self.assertNotIn("triton_helpers.x_grid_barrier(", code)
 
@@ -340,8 +339,9 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
             num_warps=1,
         )
         torch.testing.assert_close(output, (x + 1) * 2 - 3)
-        self.assertEqual(code.count("sem='release'"), 2)
-        self.assertIn("tile_dependency_task_wait", code)
+        self.assertNotIn("tl.atomic_", code)
+        self.assertIn("tile_dependency_root_1(tmp0, tmp1", code)
+        self.assertIn("tile_dependency_root_2(tmp1, out", code)
         self.assertNotIn("tile_dependency_root_completion", code)
         self.assertNotIn("triton_helpers.x_grid_barrier(", code)
 
@@ -351,7 +351,7 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         bound = dynamic_implicit_tile_dependency_chain.bind((x,))
         host_function = bound.host_function
         assert host_function is not None
-        dependency_plan = host_function.device_ir.cross_loop_dependency_plan
+        dependency_plan = host_function.device_ir.tile_dependency_graph
         assert dependency_plan is not None
         self.assertTrue(dependency_plan.accesses)
         self.assertTrue(

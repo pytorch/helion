@@ -609,8 +609,8 @@ def run(args) -> None:
             [
                 dataclasses.asdict(dependency)
                 for dependency in (
-                    host_function.device_ir.cross_loop_dependency_plan.edges
-                    if host_function.device_ir.cross_loop_dependency_plan is not None
+                    host_function.device_ir.tile_dependency_graph.edges
+                    if host_function.device_ir.tile_dependency_graph is not None
                     else ()
                 )
             ],
@@ -630,8 +630,8 @@ def run(args) -> None:
         {
             "roots": len(host_function.device_ir.root_ids),
             "tile_dependencies": len(
-                host_function.device_ir.cross_loop_dependency_plan.edges
-                if host_function.device_ir.cross_loop_dependency_plan is not None
+                host_function.device_ir.tile_dependency_graph.edges
+                if host_function.device_ir.tile_dependency_graph is not None
                 else ()
             ),
             "implicit_phase_starts": sorted(

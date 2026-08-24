@@ -1375,7 +1375,7 @@ def _config_for_probe(bound, args, geometry):
         full_splits=args.full_splits,
         sliding_splits=args.sliding_splits,
         worker_multiplier=2,
-        frontier_index=None,
+        cross_loop_workers=None,
         num_warps=args.num_warps,
         kernel_stages=args.kernel_stages,
     )

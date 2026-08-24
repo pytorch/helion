@@ -32,43 +32,335 @@ counted readiness, and access-local waits. There is no model-name, root-number,
 or flattened-task-ID matcher in that path; the custom partitioned-attention
 scheduler has been deleted.
 
-The remaining structural planner is nevertheless too narrow. It attaches a
-`key_root` and optional `on_ready_root` to each `KeyedEventPlan`, reconstructs a
-specific counted-intermediate-plus-downstream shape as
-`ReadinessFrontierPlan`, and permits only one such frontier component. The
-latest Qwen/Gemma probes show that the final abstraction should instead plan
-the complete event DAG and expose only three execution modes: local, direct,
-or root completion. The canonical target design is the next section. Older
-references in this document to continuation as a separate mode, frontier
-candidates, or `tile_dependency_frontier` describe migration history and are
-superseded by that design.
+The scheduler now plans the complete event DAG. `ReadinessFrontierPlan`, its
+single-component topology matcher, and the `tile_dependency_frontier` config
+have been deleted. One `WorkerSchedule` records all static placement, including
+direct ready-family placement, while `LocalTrigger` records final-arrival
+execution.
+Access-ready consumer placement recursively contracts arbitrary chains of
+local tasks to their static ancestors; it no longer searches for a particular
+three-root FFN topology. Multiple independent components and distinct
+readiness timelines for batch or other outer coordinates use the same pass.
 
-Fresh cache-bypassed B200 measurements after the cleanup are 76.48 microseconds
-for Qwen versus 86.20 microseconds for its separate-kernel baseline, and 75.15
-microseconds for the tuned Gemma sliding non-shared layer versus 78.62
-microseconds separately.
-The Qwen kernel uses 251 registers, no spills, and 17,408 bytes of shared
-memory. The Gemma kernel uses 204 registers, no spills, and 34,816 bytes of
-shared memory. Qwen also matches the retained custom scheduler within noise:
-76.08 versus 76.16 microseconds in adjacent fresh runs.
+The only dependency-scheduling tuning input is now
+`cross_loop_num_workers`: a requested kernel-wide worker count. Positive values
+are snapped to complete event-key boundaries, after which local triggers,
+static placement, staged access waits, and root-completion fallback are derived
+deterministically. Zero retains the ordinary persistent grid and conservative
+access-local fallback. Counted-event lowering is use-oriented and supports one
+event feeding multiple consumer roots. Every uniformly keyed root-entry wait
+now uses that path, while irregular exact predecessor sets retain the generic
+per-task-event fallback. Whole-family completion is represented by the same
+one-key event IR; lowering aggregates its logical task completions into one
+publication per finishing worker when that is equivalent.
 
 The region-aware dependency proof is the retained foundation. Dynamic task
 counts use the existing cooperative phase fallback, while large static task
 domains are planned without a task-product cutoff: task-region proofs use a
 sorted allocation-interval sweep rather than a producer-by-consumer Cartesian
-scan. The next migration replaces frontier selection and its config field with
-full-DAG event propagation and worker-liveness allocation. Gemma's shared-KV
-variants remain a root-codegen/resource-envelope problem: their current fused
-kernels use roughly 70 KiB of shared memory and support only two resident CTAs
-per SM. Do not add dependency-scheduler cases to disguise that limitation.
+scan. The former frontier selector and config field have been removed.
+
+The remaining architectural gap is now explicit: the semantic DAG ends at
+whole outer-loop tasks, while the most important FFN handoff is recovered by a
+parallel `AccessCohortPlan` path that discovers and splits a consumer's nested
+loop after ordinary code generation. This is not the intended final design.
+Dependency-bearing nested loop iterations must become ordinary ordered work in
+the same DAG. Gemma's shared-KV variants remain a root-codegen/resource-envelope
+problem: their current fused kernels use roughly 70 KiB of shared memory and
+support only two resident CTAs per SM. Do not add dependency-scheduler cases to
+disguise that limitation.
+
+The latest uncontended measurements for the retained implementation are about
+77.79 microseconds for Qwen versus 84.90 microseconds for its same-source
+separate baseline, and about 74.31 microseconds for Gemma sliding non-shared
+versus 78.87 microseconds separately. The nested-action refactor should first
+preserve these lowerings and resource envelopes; recovering the older Qwen
+76.9-microsecond result is not a reason to retain a special scheduler path.
+
+### Ordered action domains inside task strands
+
+This section supersedes the earlier temporary rule that only a complete opaque
+root task may appear as work in the event DAG. Worker placement remains at
+outer-task granularity, but dependency-bearing nested loop work is first-class
+for readiness, publication, ordering, and liveness.
+
+The compiler distinguishes two concepts:
+
+```text
+task strand     one outer-loop task and its persistent worker assignment
+ordered action  one dependency-visible region executed within that strand
+```
+
+An ordered action is not an independently movable task. It inherits its
+strand's worker, executes in source program order, and carries live values to
+the next action. Arithmetic inside the action remains opaque. Only the control
+skeleton needed for cross-root memory ordering is visible to the scheduler.
+
+For example, a natural RMSNorm followed by a matmul should be represented as:
+
+```text
+RMS strand(row):
+    opaque reduction and inverse-RMS prefix
+    -> produce normalized group 0
+    -> produce normalized group 1
+    -> ...
+
+matmul strand(row, output tile):
+    initialize accumulator
+    -> consume K group 0
+    -> consume K group 1
+    -> ...
+    -> store output
+
+produce(row, group) -> keyed event(row, group) -> consume(row, output, group)
+```
+
+This exposes each inner RMS output tile without recognizing RMSNorm and lets a
+downstream reduction consume it without recognizing a matmul. It enables
+streaming but does not replicate the RMS reduction or move its group actions to
+other workers. Recomputation remains a separate source or computation-transform
+choice.
+
+The current FFN access-cohort lowering is the consumer-only prototype of this
+model. It is driven by a dependent load, not by `hl.dot`: it finds the load's
+enclosing loop, maps loop iterations to producer keys, derives their readiness
+positions through the existing event graph, combines adjacent iterations with
+the same effective readiness frontier, and splits the complete loop body. The
+dot and accumulator update are preserved only because they reside in that loop
+body. The current path cannot attach publication to a nested producer store,
+which is why it cannot express the natural RMSNorm example.
+
+#### One semantic work graph
+
+Build one compressed bipartite graph:
+
+```text
+ordered work-action family --contributes--> keyed event
+keyed event --required-at--> ordered work-action family
+
+same-strand program order:
+action[i] -> action[i + 1]
+```
+
+A root with no dependency-bearing nested loop still has exactly one action per
+outer task, preserving today's behavior. A nested action domain is identified
+by a stable DeviceIR loop callsite path, not merely a graph ID or block ID. A
+graph body may have several callsites, and rolling, cloning, branches, or while
+loops may change execution multiplicity without changing that body. Each scope
+therefore records its owner root, parent scope, lexical position, local axes,
+bounds and step, plus whether it is guaranteed to execute and can be segmented.
+Its action coordinates consist of the outer task axes plus the relevant
+enclosing loop axes. Loads require events at action entry; stores publish events
+at action completion. Multiple loads in one action form an ordinary joined
+predecessor signature.
+
+The complete Qwen FFN then follows from ordinary graph composition:
+
+```text
+W13 tile actions
+    -> gate/up keyed event
+    -> activation task action
+    -> activation keyed event
+    -> ordered W2 K actions
+```
+
+There is no query for a three-node path and no FFN object. Attention,
+reductions, scans, producer-side tiled epilogues, and longer chains use the same
+relations.
+
+#### Maximal ordered segments
+
+The semantic graph retains exact action-level dependencies. After choosing the
+static worker schedule, propagate readiness through the complete DAG and along
+same-strand program-order edges. For each ordered loop domain:
+
+1. Compute every action's exact predecessor-event signature.
+2. Include readiness already guaranteed by preceding actions in the strand.
+3. Derive the effective producer schedule frontier for each action.
+4. Quotient adjacent actions with the same frontier into a schedule-level
+   milestone key. Its contributors are the deduplicated union of the exact
+   predecessor actions for the complete interval.
+5. Combine the maximal contiguous action interval for that milestone into one
+   emitted loop segment.
+6. Insert one acquire before the segment and retain publications at the exact
+   producer action boundaries required by downstream uses.
+
+Qwen's 64/32 and Gemma's 36/4 regions are results of this pass, not fixed stage
+counts. They require schedule-derived event aggregation rather than merely
+exposing 96 or 40 exact K actions: the two milestone keys have expected arrival
+counts `(64, 32)` or `(36, 4)`. Counted-event lowering must therefore support
+piecewise/nonuniform expected counts. Without this quotient, the generic graph
+would emit dozens of individual polls or lose the existing overlap. More waves,
+batch coordinates, several inner axes, and longer dependency chains use the
+same prefix-readiness calculation. If a loop domain, program order, carried
+state, or event relation cannot be represented exactly, move the wait
+monotonically outward to an enclosing action or `FamilyDone`.
+
+#### Simplify `tile_dependency.py` around one relation
+
+Do not add an action-domain layer alongside the current affine and cohort
+types. Refactor the existing dependency representation so there is one source
+of truth:
+
+```text
+DeviceIR loop path and logical coordinates
+    -> normalized allocation-coordinate access domain
+    -> exact producer-action / consumer-action overlap relation
+    -> predecessor-signature quotient
+    -> KeyedEvent contributor and use relations
+```
+
+Each access should be normalized independently into an allocation-coordinate
+mapping over its complete action domain. Producer and consumer axes should not
+be paired by a second bespoke proof. The normalized form must retain exact
+contiguous intervals and injective coordinate or strided boxes; an address hull
+alone is insufficient for noncontiguous views. For a selected static
+configuration, evaluate exact access regions, discover overlaps with the
+existing sorted interval sweep, and compress the resulting regular relation
+for storage and lowering. Affine structure is a one-sided access/address map or
+an efficient encoding of the resulting relation, not an independent pairwise
+semantic proof.
+
+This should permit deletion or substantial collapse of:
+
+- `AffinePredecessorAxis` and `AffinePredecessorMap` as a separate pairwise
+  proof language;
+- `ReadinessRequirement`, whose task/root distinction becomes a property of
+  the proved action relation or its conservative fallback;
+- duplicate `predecessor_task_ids()` and `_edge_predecessor_sets()` relation
+  evaluation;
+- `UniformTaskPartition` as a second proof of dependency membership; any
+  uniform partition needed for compact lowering should be derived only from
+  the canonical action-to-key relation;
+- dimension-pairing special cases for size-one views and storage offsets after
+  those views have been normalized into allocation coordinates; and
+- the parallel raw-wait selection path currently needed to recover information
+  discarded by root-task canonicalization.
+
+This does not require a general symbolic-set solver. Exact affine rectangular
+or strided regions are supported; unknown, indirect, masked, dynamic, or
+non-injective cases conservatively use an enclosing action or whole-family
+completion. Batch and every other non-singleton outer axis remain part of the
+logical action coordinates and therefore of event identity. L2 remapping is
+applied only after those logical relations are built. Configuration-time
+enumeration may validate a concrete relation, but the retained IR must compress
+regular domains rather than store one object per runtime action; W2 alone can
+otherwise create tens of thousands of action instances.
+
+#### Scheduler changes should be focused
+
+The existing event algebra and most scheduling policy remain:
+
+- `KeyedEvent` still represents joins, fanout, exact readiness, and
+  `FamilyDone`.
+- `WorkerSchedule` still places outer task strands only.
+- A local final-arrival executor still applies only to a complete movable task
+  start, not to arbitrary inner actions.
+- Inner actions inherit their strand's worker and contribute same-worker order
+  edges to readiness and deadlock analysis.
+- Completing any action may publish outgoing events, so chains compose through
+  any number of root or nested-loop boundaries.
+- Direct placement and liveness operate on task strands while consulting all
+  action-level waits and publications.
+
+The event algebra and outer placement policy survive, but this is more than a
+mechanical type substitution. Event contribution/use relations, readiness
+grouping, liveness, cycle validation, and counted-event lowering must all
+understand action endpoints and same-strand order. The current event
+canonicalization should be generalized rather than duplicated.
+`canonicalize_task_readiness()` and `canonicalize_ready_events()` should
+converge on one predecessor-signature quotient over action program points. The
+current recursive local-ancestor and worker-cycle proofs should consume that
+graph with same-strand edges instead of learning about a new scheduling mode.
+
+A locally triggered root that later blocks at a nested action may occupy one of
+the workers required to produce that action's event. Initially forbid local
+execution for such a strand unless the action-level liveness proof establishes
+progress. This is a generic non-preemptive-worker rule, not a topology case.
+
+#### Producer publication and lowering safety
+
+A nested producer action may publish only at a boundary guaranteed to execute
+exactly once for each counted logical action. Conditional branches, while
+loops, zero-trip or dynamic loops, duplicated callsites, and ambiguous control
+flow must initially lift publication to a guaranteed enclosing scope or
+`FamilyDone`.
+
+Publication must follow CTA-wide completion of every store represented by the
+action and use release ordering. For pipelined, unrolled, or flattened
+`tl.range` loops, publication belongs between emitted loop segments after any
+required pipeline completion; inserting an atomic immediately after a
+syntactic store may publish while asynchronous work remains in flight. Segment
+boundaries must align with the selected physical inner-loop traversal while
+event identity remains in logical coordinates.
+
+Several stores from one action that satisfy the same key contribute once, not
+once per store. Later overlapping stores remain reaching definitions and must
+not be hidden by an earlier publication. The generic lowering may reuse the
+existing loop-cloning and body-fingerprint helpers, but loop selection is by
+stable scope identity and all waits/publications come from the final action
+graph.
+
+#### Required deletion outcome
+
+The refactor is not complete while any of these remain as a parallel policy:
+
+- `AccessCohortPlan`;
+- `_derive_access_cohorts`;
+- `place_access_ready_consumers`;
+- `EventUse.placement == "access"`;
+- cohort-specific counter allocation and publication;
+- cohort-specific exclusions from counted-event lowering;
+- late access-marker-based loop discovery; or
+- cohort-specific AST splitting.
+
+The final lowering may still segment a generated loop, but it must do so as a
+mechanical rendering of generic ordered action segments identified by stable
+DeviceIR loop IDs. It must not search the lowered AST for a characteristic
+load, dot, reduction, model, or root topology.
+
+#### Implementation sequence and gates
+
+1. Build the reachable DeviceIR execution-scope tree from root callsites.
+   Record stable callsite paths, parent scopes, logical action axes, bounds,
+   steps, source order, and execution/segmentability proofs for every
+   cross-root load and store. Add graph-only tests for sibling loops sharing
+   block IDs, repeated graph bodies, nested loops, branches, and rolled graphs.
+2. Replace the pairwise affine-predecessor proof with one normalized
+   action-domain overlap relation. Preserve conservative fallback before
+   deleting the old proof.
+3. First use the new relation to reconstruct the existing root-only event graph
+   and differentially compare every current affine test, Qwen, and Gemma. Only
+   then delete the old pairwise proof and duplicate scheduler-side relation
+   evaluation.
+4. Generalize event contributors and uses to action domains. Verify joins,
+   fanout, partial writes, outer batch axes, and arbitrary-length chains before
+   changing scheduling.
+5. Add same-strand order/affinity to readiness, liveness, and cycle checking.
+   Keep outer task placement and existing local triggers unchanged initially.
+6. Add generic schedule-derived event quotienting and maximal ordered loop
+   segments. Support piecewise arrival counts and verify that this reproduces
+   Qwen 64/32 and Gemma 36/4 without a cohort object.
+7. Lower generic action waits and publications using stable callsite identity,
+   preserving loop bodies, range attributes, accumulator state, and outlined
+   root ABIs.
+8. Delete the complete cohort path and the old affine/event duplication only
+   after structural lowered-code equivalence and correctness tests pass.
+9. Validate the natural non-recomputed RMSNorm-to-matmul source as a producer-
+   side streaming case, while treating any decision to replicate its reduction
+   as an independent computation optimization.
+10. Re-run Qwen and Gemma correctness, lowered Triton inspection, resource
+   usage, repeated CUDA Graph replay, and uncontended performance. Do not add a
+   model-specific escape hatch to recover a small latency difference.
 
 ### Canonical full-DAG event scheduler
 
-This section is authoritative for the next compiler refactor. The compiler is
-not an FFN scheduler, an attention scheduler, or a collection of multi-root
-patterns. It constructs one semantic event DAG and one static cross-loop
-schedule. The familiar three outcomes are represented by two orthogonal
-choices rather than three unrelated schedule types:
+This section, together with the ordered-action-domain section above, is
+authoritative for the next compiler refactor. The compiler is not an FFN
+scheduler, an attention scheduler, or a collection of multi-root patterns. It
+constructs one semantic event DAG and one static cross-loop schedule. The
+familiar three outcomes are represented by two orthogonal choices rather than
+three unrelated schedule types:
 
 ```text
 readiness: exact keyed event | whole-family completion event
@@ -90,11 +382,11 @@ worker count and deterministic task order.
 Keep correctness, scheduling, and lowering separate:
 
 ```text
-DeviceIR logical task families and opaque root bodies
+DeviceIR task strands, ordered action domains, and opaque action bodies
     ↓
 Allocation-coordinate accesses and reaching definitions
     ↓
-Pairwise producer -> consumer task relations
+Pairwise producer-action -> consumer-action relations
     ↓
 Full keyed-event DAG and event uses
     ↓
@@ -131,8 +423,10 @@ Retain only three semantic concepts:
 
    - Root ID and source order.
    - Logical coordinate domain, including batch and other outer axes.
+   - Stable ordered action domains for dependency-bearing nested loops.
+   - A projection from every action coordinate to its owning outer task strand.
    - Reads and writes in underlying allocation coordinates.
-   - Stable DeviceIR program points for root-entry and access-local uses.
+   - Stable DeviceIR program points for action entry and completion.
 
    Physical PID mappings, opaque root bodies, and their generated ABI remain
    attached to DeviceIR and are bound by the scheduler/lowering for a selected
@@ -154,10 +448,10 @@ Retain only three semantic concepts:
 
 3. `EventUse`
 
-   - The consuming family and logical task coordinates.
-   - The root-entry or access-loop program point at which readiness is needed.
-   - A relation mapping event keys to the consumer tasks or access regions that
-     require them.
+   - The consuming action domain and logical action coordinates.
+   - The stable DeviceIR action-entry program point at which readiness is
+     needed.
+   - A relation mapping event keys to the action instances that require them.
 
 The execution planner produces one `CrossLoopSchedule` containing:
 
@@ -192,11 +486,11 @@ scheduled and others are local. Physical lowering may coarsen this to one
 arrival per worker only after proving that the worker's assigned tasks are
 complete; active-worker counts are not the semantic definition.
 
-Initially, the only movable executable unit is one complete logical root task.
-An access-local `EventUse` inserts a wait inside its owning task; it does not
-create a movable action segment. Moving a loop fragment later would require an
-explicit same-worker, program-order, and live-in/live-out continuation-state
-contract.
+The only independently movable executable unit is one complete logical root
+task. Dependency-bearing nested actions are nevertheless first-class graph
+nodes: they inherit the owning task strand's worker and carry explicit
+same-worker, program-order, and live-state continuity. Making an action visible
+to the dependency graph does not permit moving it to another worker.
 
 This deliberately eliminates separate `ReadyAction`, `DirectAction`,
 `TaskAction`, root-completion-plan, task-placement, and dispatch-round records.
@@ -247,15 +541,15 @@ the invoked task are represented and the task may be reordered safely.
 Represent the schedulable graph as a symbolic bipartite DAG:
 
 ```text
-TaskFamily instance --contributes--> KeyedEvent
-KeyedEvent --required-at--> TaskFamily instance and stable program point
+ordered action-family instance --contributes--> KeyedEvent
+KeyedEvent --required-at--> ordered action-family instance
 ```
 
-A task instance is a coordinate in a `TaskFamily`, not a separate IR class.
-The only initially movable unit is one complete opaque logical root task.
-Access-local uses remain waits inside that task. The graph remains compressed
-by task families, affine or run-length relations, and key domains; it must not
-allocate one compiler node per runtime task.
+An action instance is a coordinate in a logical action domain, not a separately
+allocated compiler object. Root actions are independently movable; nested
+actions inherit their task strand's worker and source order. The graph remains
+compressed by action domains, affine or run-length relations, and key domains;
+it must not allocate one compiler node per runtime action.
 
 Build and plan this graph with the following semantic and scheduling passes.
 
@@ -289,9 +583,9 @@ writer.
 
 ##### Pass 2: event canonicalization
 
-For each consumer task or access program point, collect its complete direct
-predecessor signature across all incoming relations. Quotient structurally
-equivalent signatures into an event key domain and create:
+For each consumer action program point, collect its complete direct predecessor
+signature across all incoming relations. Quotient structurally equivalent
+signatures into an event key domain and create:
 
 ```text
 KeyedEvent
@@ -299,21 +593,22 @@ KeyedEvent
     expected arrivals per key
 
 EventUse
-    event-key -> consumer-task/access relation
+    event-key -> consumer-action relation
 ```
 
 This canonicalization may join contributors from several roots, share one
 event among several uses, or leave a producer task contributing to several
-keys. If all prerequisites of one movable consumer task are exact, combine
-them into one joined event so local execution has a single final arrival. If
+keys. If all prerequisites of one movable root-task action are exact, combine
+them into one joined event so local execution has a single final arrival.
+Nested actions use the same joined events but retain their parent worker. If
 any required relation is unknown, require the relevant canonical `FamilyDone`
-event instead of inventing a partial trigger. Exact and whole-family
-prerequisites may coexist at one use when different reaching definitions have
-different proof precision.
+event at the nearest safe enclosing action instead of inventing a partial
+trigger. Exact and whole-family prerequisites may coexist at one use when
+different reaching definitions have different proof precision.
 
-Completing a consumer task contributes to its outgoing events in exactly the
-same way as an original source root. This is the only mechanism needed to
-compose dependencies across several root boundaries.
+Completing a consumer action contributes to its outgoing events in exactly the
+same way as an original source root action. This is the only mechanism needed
+to compose dependencies across several root or nested-loop boundaries.
 
 ##### Pass 3: instantiate the baseline worker schedule for one `W`
 
@@ -438,21 +733,23 @@ for W in legal_worker_counts(event_graph, compiled_capacity):
 
 #### Full-DAG composition, not multi-root pattern matching
 
-An event use enables an ordinary opaque task. Completing that task publishes
-its outgoing event contributions. Transitive pipelines therefore emerge by
-ordinary graph propagation:
+An event use enables an opaque action. A root-entry action may begin a movable
+task; a nested action resumes its existing task strand on the same worker.
+Completing either publishes its outgoing event contributions. Transitive
+pipelines therefore emerge by ordinary graph propagation:
 
 ```text
-producer tasks
+producer actions
     -> event A
-    -> intermediate tasks
+    -> intermediate actions
     -> event B
-    -> downstream tasks
+    -> downstream actions
 ```
 
-The analyzer never asks whether this is an FFN or attention. It also never
-asks for exactly one intermediate root. Chains, diamonds, joins, and fanout all
-use the same representation.
+The analyzer never asks whether this is an FFN, attention, RMSNorm, or a
+matmul. It also never asks for exactly one intermediate root or one nesting
+depth. Chains, diamonds, joins, fanout, and producer-to-consumer inner-loop
+pipelines all use the same representation.
 
 For a selected resident worker count `W`, assign each independently reorderable
 producer task a deterministic schedule rank. The default is its existing
@@ -635,8 +932,9 @@ for Gemma.
 
 Given `W`, ready groups and worker placement are derived deterministically.
 `G` is a result of `W` and the contributor mapping, not another knob. Remove
-`tile_dependency_frontier`; do not replace it with local/direct toggles,
-producer-order knobs, raw cohort sizes, or model-specific schedule choices.
+`tile_dependency_frontier`; it has now been replaced by
+`cross_loop_num_workers`. Do not add local/direct toggles, producer-order knobs,
+raw cohort sizes, or model-specific schedule choices.
 For a DAG with several independent or partially connected subgraphs, form one
 kernel-wide finite set from the capacity endpoint and every task/event
 relation's legal aligned breakpoints. Each `W` still uses the same planner; a
@@ -685,7 +983,7 @@ Recommended symbol renames:
 | `CrossLoopDependencyEdge` | `TileDependency` |
 | `CrossLoopDependencyPlan` | `TileDependencyGraph` |
 | `build_cross_loop_dependency_plan` | `build_tile_dependency_graph` |
-| `cross_loop_access_marker` | `tile_access_marker` |
+| Lowered access markers | delete; use stable DeviceIR loop/action identity |
 | `tile_dependency_planner.py` | `cross_loop_scheduler.py` |
 | `GenericSchedulePlan` | `CrossLoopSchedule` |
 | `build_generic_schedule_plan` | `build_cross_loop_schedule` |
@@ -697,13 +995,13 @@ Recommended symbol renames:
 | `ReadinessFrontierPlan` and `ReadinessFrontierSelection` | delete |
 | `TILE_DEPENDENCY_FRONTIER_CONFIG` | delete |
 
-`TileDependencyKind`, `TaskFamily`, `LogicalTaskAxis`, `AllocationRegion`, and
-`UniformTaskPartition` already describe semantic facts well and may retain
-their names. An `EventUse` retains only the stable DeviceIR access/marker ID.
-The current `AccessProgramPoint` is the configuration-specific binding from
-that ID to lowered coordinates and remains a scheduler implementation detail,
-as do task/key segment compression and logical/physical PID conversion. Do not
-create two independently discovered notions of source program position.
+`TileDependencyKind`, logical task geometry, and allocation identity remain
+useful. Refactor `TaskFamily` to own or reference its ordered action domains
+rather than adding a parallel inner-loop hierarchy. `UniformTaskPartition` may
+survive only as a compact lowering view derived from the canonical action/key
+relation; it must not remain a second legality proof. `EventUse` names a stable
+DeviceIR action endpoint directly. Delete `AccessProgramPoint` and lowered AST
+access-marker discovery so there is only one notion of source program position.
 
 The generated runtime state should use event terminology rather than the
 deleted schedule topology: for example `cross_loop_event_state`,
@@ -724,8 +1022,9 @@ re-exports are acceptable during migration, but remove them with the old
 frontier planner so the final compiler has one vocabulary.
 
 - `tile_dependency.py` (currently `cross_loop_dependencies.py`)
-  - Retain `TaskFamily`, allocation regions, reaching definitions, and exact
-    pairwise predecessor proofs.
+  - Retain allocation regions and reaching definitions, but replace the
+    pairwise producer/consumer-axis proof with one normalized access-domain
+    representation over root and nested-loop coordinates.
   - Replace producer-owned `EventSpec` plus consumer `WaitSpec` as the final
     representation with event relations that support independent contributor
     and use maps.
@@ -737,12 +1036,12 @@ frontier planner so the final compiler has one vocabulary.
     graph.
   - Make `KeyedEvent` independent of `key_root` and remove `on_ready_root`.
   - Replace `AccessCohortPlan`, `ReadinessFrontierPlan`, and
-    `ReadinessFrontierSelection` with generic event uses, one ordered
+    `ReadinessFrontierSelection` with generic action event uses, one ordered
     `WorkerSchedule`, local triggers, and worker-liveness analysis.
   - Remove `_select_readiness_frontier` and the assumption that exactly one
     counted event feeds exactly one downstream cohort.
-  - Retain `UniformTaskPartition` and compressed task/key segments only as
-    relation encodings.
+  - Retain compressed task/action-to-key segments only as derived relation
+    encodings.
   - Treat `FamilyDone` as a canonical one-key `KeyedEvent`, not a second
     synchronization hierarchy.
   - Derive task placement and dispatch rounds from `WorkerSchedule`; do not
@@ -802,14 +1101,20 @@ frontier planner so the final compiler has one vocabulary.
 
 Current status:
 
-- Probe validation and the full-DAG design are complete.
-- The existing dependency/reaching-definition implementation is the retained
-  starting point.
-- Full-DAG event uses, readiness propagation, and worker-liveness allocation
-  are not implemented yet.
-- The old frontier planner and config remain until Qwen and Gemma reach
-  correctness, lowered-code, resource, and performance parity through the new
-  path.
+- Full-DAG event uses, recursive local-trigger ancestry, ordered worker
+  placement, and monotonic root-completion fallback are implemented.
+- The old frontier planner, its AST emitter, fixed-depth candidate search, old
+  config field, compatibility modules, and single-consumer counted-event
+  assumptions have been removed.
+- Outer-coordinate readiness patterns are refined into common access stages,
+  so batch size greater than one does not require identical absolute producer
+  timelines.
+- Remaining cleanup is to make the access-local event materialization less
+  separately named, move more lowering mechanics out of `program_id.py`, and
+  decide whether canonical `FamilyDone` events can directly replace the
+  root-edge projection without obscuring the simple lowering.
+- Final gates are broader shape tests, fresh Qwen/Gemma lowered-code and
+  resource comparison, uncontended latency runs, and NCU confirmation.
 
 #### Findings from reviewing the probes and current compiler
 
@@ -1880,8 +2185,8 @@ Selectively port concepts from
 
 - Ownership mapping from nested DeviceIR graphs to top-level roots.
 - Allocation-based grouping of memory facts.
-- Stable access IDs.
-- `EventSpec`, `WaitSpec`, and affine predecessor-map concepts.
+- Stable DeviceIR loop identity and source order.
+- Conservative allocation-coordinate normalization and overlap checking.
 - Conservative task-ready versus root-ready classification.
 - Tests for unequal tiles, Cartesian grids, joins, fanout, indirect-index
   fallback, and CUDA graph replay.
@@ -2143,31 +2448,31 @@ Status values: **pending**, **in progress**, **complete**, or **blocked**.
 | 6 | complete | Replace the one-producer event model and partitioned-attention matcher with region-aware, multi-contributor keyed events. | Qwen QKV/QK/cache/attention and both FFN variants use the same contributor/event lowering; the custom matcher and temporary partial-write pass-through are deleted. |
 | 7 | complete | Audit and separate unrelated codegen changes; handle dynamic and large task domains without assertions or arbitrary planning cutoffs. | Schedule-off codegen is unchanged, dynamic shapes use the cooperative phase fallback, and static region matching scales with task domains plus actual overlaps rather than their Cartesian product. |
 | 8 | in progress | Final correctness, performance, lint, and design review, including a second-model Gemma4 probe. | Test matrix passes; Qwen meets the agreed performance range; remaining limitations are explicit and structural. |
-| 9 | pending | Replace the frontier/cohort planner with the full-DAG `CrossLoopSchedule`, canonical `FamilyDone` events, `WorkerSchedule`, and `LocalTrigger`. | Qwen and Gemma reach lowered-code and performance parity through one graph/scheduling path, adversarial DAG tests pass, and the old topology records and tuning field are deleted. |
+| 9 | in progress | Finish the full-DAG `CrossLoopSchedule` migration with canonical `FamilyDone` events, `WorkerSchedule`, and `LocalTrigger`. | Qwen and Gemma reach lowered-code and performance parity through one graph/scheduling path, adversarial DAG tests pass, and the old topology records and tuning field are deleted. |
+| 10 | in progress | Promote dependency-bearing nested loops to ordered action domains in the same DAG and delete the access-cohort side path. | Natural producer-side and consumer-side streaming lower through generic events; Qwen 64/32 and Gemma 36/4 segments are graph-derived; no cohort-specific planner or emitter remains. |
 
 ### Current migration boundary
 
 The dependency graph now owns ordinary root-entry readiness, exact task
 readiness, generic multi-producer joins, repeated-predecessor ready groups,
-nested-loop access cohorts, and last-arrival continuations. The old
+and last-arrival continuations. Nested-loop consumer readiness is still routed
+through `AccessCohortPlan`; this is the remaining parallel representation and
+must be absorbed into the ordered action-domain DAG. The old
 flattened-ID grouped-continuation, ordered-input-singleton, and partitioned
 attention matchers and their emitters have been deleted. The Qwen QKV/QK/cache
 join, attention admission, two merge levels, quantization handoff, and FFN all
 use the same keyed-event and root-dispatch machinery.
 
-Only one structural emitter remains: one-wave reduction fanout. It consumes
-the unified allocation-based dependency graph for legality but deliberately
-replicates computation, so it is not a dependency protocol and should remain a
-separate optimization pass.
+The compiler-side one-wave reduction-fanout matcher and emitter have been
+deleted. Dependency scheduling never replicates an opaque root. The retained
+Gemma benchmark source explicitly output-tiles and recomputes its short RMS
+reductions; that is a kernel-author computation choice and is intentionally
+outside the scheduler.
 
-The review classifies that remaining path as follows:
-
-- One-wave reduction fanout deliberately replicates an opaque singleton
-  computation in every consumer CTA. That is an optional computation-
-  replication transform, not a dependency-scheduling primitive. Keep it
-  outside the generic scheduler until DeviceIR can prove the root is pure and
-  idempotent; do not teach the dependency graph about reductions by inspecting
-  lowered Triton.
+Root completion is no longer stored as a parallel schedule topology. It is a
+canonical one-key `FamilyDone` event in `CrossLoopSchedule`; the generated
+kernel retains the efficient physical implementation of one publication per
+finishing worker rather than one atomic per logical task.
 Region-aware reaching definitions now split exact partial writes, retain
 unknown earlier definitions conservatively, and derive complete predecessor
 sets for multi-root joins. Ordinary size-one views, storage offsets, and the
@@ -2209,44 +2514,41 @@ the performance gap: the one-head source with generic ready groups matches the
 deleted custom schedule. Let the existing block-size tuner choose task
 granularity; do not add a scheduler-specific fanout knob.
 
-### Next execution plan
+### Remaining execution plan
 
-The current implementation already proves region-aware dependencies, preserves
-logical task identity under physical remapping, lowers counted final-arrival
-execution, and has validated Qwen and Gemma performance. Its frontier,
-cohort, and two-wave records are the migration baseline, not the target IR.
+The module split, full event DAG, symbolic `WorkerSchedule`, `LocalTrigger`,
+canonical `FamilyDone`, and worker-count tuning migration are complete. The
+former frontier/two-wave records, topology matchers, compatibility modules,
+and compiler-side reduction replication have been deleted.
 
 Remaining, in order:
 
-1. Introduce `tile_dependency.py` with independent contributor/use relations.
-   Represent `FamilyDone` as the canonical one-key `KeyedEvent` and keep stable
-   DeviceIR program points for root-entry and access-local uses.
-2. Introduce `cross_loop_scheduler.py` and a single symbolic
-   `WorkerSchedule`. Reproduce the existing persistent traversal first, with
-   `TaskPlacement` and dispatch rounds available only as derived queries.
-3. Port whole-family completion through the new event representation and
-   reproduce current root-completion codegen exactly.
-4. Port `LocalTrigger`, tracking its possible executor-worker set, and compare
-   lowered Qwen code against the retained immediate Triton probe.
-5. Port exact statically scheduled consumers, permitting multiple tasks per
-   key and multiple ordered tasks per worker, and compare lowered Gemma code
-   against the retained direct-keyed probe.
-6. Add complete-DAG readiness and worker-liveness validation with monotonic
-   exact-to-`FamilyDone` fallback. Derive worker reuse only after the schedule
-   stabilizes; never assume a coarse edge is a graph cut.
-7. Keep access-local readiness as waits within the owning scheduled task and
-   validate carried reduction state across attention partial/merge, merge/O,
-   and O/post-normalization boundaries.
-8. Add the adversarial chain, diamond, fanout, multi-wave, partial in-place,
-   and mixed exact/whole-family tests from the validation matrix.
-9. Re-run full-layer correctness, repeated graph replay, NCU, and interleaved
-   tuned standalone Helion controls for Qwen and all Gemma variants. Delete the
-   frontier/cohort planner and configuration only after lowered-code, resource,
-   and performance parity.
-10. Keep one-wave reduction replication outside dependency scheduling. Replace
-    `_OneWaveReductionFanout` only with an independently justified purity and
-    recomputation transform; disabling it regressed the retained Qwen layer
-    from 76.41 to 79.76 microseconds.
+1. Refactor `tile_dependency.py` around DeviceIR callsite-scoped ordered action
+   domains and one normalized allocation-overlap relation, as specified above.
+   Do not add another compatibility plan beside `AccessCohortPlan`.
+2. Differentially prove that the new relation preserves batch/outer axes,
+   unequal tiles and tails, offsets and ordinary views, multi-producer joins,
+   and logical identity under L2 traversal before deleting the old affine
+   path.
+3. Generalize the existing keyed-event graph and worker-schedule validation to
+   action endpoints with inherited same-worker order. Preserve root-task local
+   and static placement semantics.
+4. Move schedule-derived event quotienting and maximal contiguous loop-segment
+   formation into ordinary DAG readiness propagation. Support piecewise event
+   arrival counts, then reproduce the current Qwen and Gemma FFN lowerings.
+5. Add producer-side nested publication and validate a natural,
+   non-recomputed RMSNorm-to-matmul source.
+6. Delete the complete access-cohort path, late access-marker discovery, and
+   duplicate affine/readiness representations.
+7. Finish adversarial coverage for mixed exact/whole-family paths, multiple
+   event uses, nested producers and consumers, batches and other outer axes,
+   partial in-place regions, and worker-schedule progress.
+8. Re-run full-layer correctness, repeated graph replay, lowered-code diffs,
+   NCU, and interleaved tuned standalone Helion controls for Qwen and all Gemma
+   variants on uncontended GPUs.
+9. Remove stale names and dead migration helpers only when generated code is
+   unchanged; keep outlined Triton helpers because they are proven register-
+   lifetime boundaries inside the one launched kernel.
 
 Do not add a strategy cost model or another scheduler-specific tuning index.
 The dependency graph derives events, fan-in, legal order, and progress facts;
@@ -2261,17 +2563,14 @@ unknown address relations select `FamilyDone`.
 
 ### Current performance evidence
 
-- The final generic graph-derived Qwen schedule is 75.82 microseconds versus
-  86.17 microseconds for separate kernels in the latest fresh paired run, with
-  251 registers, zero spills, and 17,408 bytes of shared memory. A fresh run of
-  the retained custom scheduler measured 76.16 microseconds, so the generic
-  replacement is at parity within noise. Earlier software/environment snapshots
-  measured the same designs near 74--75 microseconds.
-- The final tuned Gemma sliding non-shared schedule is 74.02 microseconds versus
-  78.98 microseconds separately, with 204 registers, zero spills, and 34,816
-  bytes of shared memory. Eliminating an exact task wait already dominated by a
-  whole-root dependency path recovered about 2 microseconds without changing
-  any scheduling policy.
+- The current generic graph-derived Qwen schedule is 77.79 microseconds versus
+  84.90 microseconds for separate kernels, with 253 registers, zero spills, and
+  17,408 bytes of shared memory. The approximately 0.9-microsecond gap from the
+  older 76.87-microsecond lowering is not a reason to retain a specialized
+  schedule.
+- The current tuned Gemma sliding non-shared schedule is 74.31 microseconds
+  versus 78.87 microseconds separately, with 203 registers, zero spills, and
+  34,816 bytes of shared memory.
 - NCU reports 141.44 microseconds for the final Qwen kernel, compared with
   150.02 microseconds before ready-group coalescing and 139.14 microseconds for
   the deleted custom path. The final run transfers 233.4 MB, reaches 21.5% of
@@ -2606,6 +2905,15 @@ Open, to be answered with implementation evidence:
 - Represented `FamilyDone` as the canonical one-key `KeyedEvent` whose
   contributors are the complete logical task family. This preserves one event
   abstraction and permits physical per-worker aggregation during lowering.
+- Removed the stored root-completion topology from `CrossLoopSchedule`.
+  Selected coarse relations now lower to canonical one-key event plans, while
+  the emitter derives the same efficient per-worker arrival protocol from the
+  final `WorkerSchedule`; the Gemma lowered kernel is unchanged.
+- Routed every uniformly keyed root-entry relation through the counted-event
+  lowering, including ordinary one-to-one direct waits. Excluding an access-
+  local consumer now removes only that event use rather than discarding other
+  consumers of the same event. Irregular predecessor sets deliberately retain
+  the exact per-task fallback.
 
 ### 2026-08-22
 

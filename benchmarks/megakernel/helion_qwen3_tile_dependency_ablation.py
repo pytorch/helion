@@ -10,7 +10,7 @@ import types
 
 import torch
 
-from helion._compiler import tile_dependency_planner
+from helion._compiler import cross_loop_scheduler
 
 # The original comparison probe was superseded by the production persistent
 # probe in the exploration worktree.  Keep this new ablation self-contained by
@@ -40,10 +40,8 @@ def main() -> None:
     args, remaining = parser.parse_known_args()
 
     if args.disable_continuation:
-        original_counted_events = tile_dependency_planner._derive_counted_events
-        original_coalesced_events = (
-            tile_dependency_planner._derive_coalesced_keyed_events
-        )
+        original_counted_events = cross_loop_scheduler._derive_counted_events
+        original_coalesced_events = cross_loop_scheduler._derive_coalesced_keyed_events
 
         def derive_counted_events_without_continuation(**kwargs: object):
             return _without_on_ready(original_counted_events(**kwargs))
@@ -51,10 +49,10 @@ def main() -> None:
         def derive_coalesced_events_without_continuation(**kwargs: object):
             return _without_on_ready(original_coalesced_events(**kwargs))
 
-        tile_dependency_planner._derive_counted_events = (
+        cross_loop_scheduler._derive_counted_events = (
             derive_counted_events_without_continuation
         )
-        tile_dependency_planner._derive_coalesced_keyed_events = (
+        cross_loop_scheduler._derive_coalesced_keyed_events = (
             derive_coalesced_events_without_continuation
         )
 

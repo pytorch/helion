@@ -678,8 +678,8 @@ def _megakernel_config(bound, args, geometry):
             else (3 if geometry.layer_type == "full" else 4),
         }
     )
-    if args.frontier_index is not None:
-        values["tile_dependency_frontier"] = args.frontier_index
+    if args.cross_loop_workers is not None:
+        values["cross_loop_num_workers"] = args.cross_loop_workers
     config = helion.Config.from_dict(values)
     bound.config_spec.normalize(config.config)
     return config
@@ -738,7 +738,7 @@ def run(args) -> None:
     if args.dump_config:
         print("MEGAKERNEL_CONFIG", dict(config), flush=True)
         print("ROOT_BLOCK_IDS", host_function.device_ir.grid_block_ids, flush=True)
-        dependency_plan = host_function.device_ir.cross_loop_dependency_plan
+        dependency_plan = host_function.device_ir.tile_dependency_graph
         assert dependency_plan is not None
         print("DEPENDENCY_EVENTS", dependency_plan.events, flush=True)
         print("DEPENDENCY_WAITS", dependency_plan.waits, flush=True)
@@ -791,8 +791,8 @@ def run(args) -> None:
             "variant": variant_name(geometry),
             "roots": len(host_function.device_ir.root_ids),
             "tile_dependencies": len(
-                host_function.device_ir.cross_loop_dependency_plan.edges
-                if host_function.device_ir.cross_loop_dependency_plan is not None
+                host_function.device_ir.tile_dependency_graph.edges
+                if host_function.device_ir.tile_dependency_graph is not None
                 else ()
             ),
             "implicit_phase_starts": sorted(
@@ -883,7 +883,7 @@ def main() -> None:
     parser.add_argument("--full-splits", type=int, default=64)
     parser.add_argument("--attention-block", type=int, default=32)
     parser.add_argument("--worker-multiplier", type=int, default=2)
-    parser.add_argument("--frontier-index", type=int)
+    parser.add_argument("--cross-loop-workers", type=int)
     parser.add_argument("--num-warps", type=int)
     parser.add_argument("--kernel-stages", type=int)
     parser.add_argument(

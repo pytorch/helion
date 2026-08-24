@@ -22,8 +22,8 @@ import types
 import torch
 
 import helion
+from helion._compiler.cross_loop_scheduler import CROSS_LOOP_NUM_WORKERS_CONFIG
 from helion._compiler.program_id import ForEachProgramID
-from helion._compiler.tile_dependency_planner import TILE_DEPENDENCY_FRONTIER_CONFIG
 import helion.language as hl
 
 FP8_MAX = 448.0
@@ -83,9 +83,7 @@ def tiled_rms_norm_per_block_quant(
         quant_n_blk = quant_n_idx[None, :, :]
         square_sum = hl.zeros([quant_m], dtype=torch.float32)
         for reduce_g in hl.tile(groups_per_row, block_size=1):
-            square_sum = square_sum + torch.sum(
-                rms_partials[quant_m, reduce_g], dim=-1
-            )
+            square_sum = square_sum + torch.sum(rms_partials[quant_m, reduce_g], dim=-1)
         inv_rms = torch.rsqrt(square_sum * (1.0 / hidden_size) + epsilon)
         quant_values = unrounded_values[quant_m_blk, quant_n_blk]
         normalized = (quant_values * inv_rms[:, None, None]).to(
@@ -920,7 +918,7 @@ def _build_original_helion_reference(*args: object, **kwargs: object):
 def _probe_config(bound, args):
     """Map the retained one-warp probe geometry onto the granular source."""
     values = dict(bound.config_spec.default_config())
-    values.pop(TILE_DEPENDENCY_FRONTIER_CONFIG, None)
+    values.pop(CROSS_LOOP_NUM_WORKERS_CONFIG, None)
     uses_flat_qk = _USE_TASK_ALIGNED_ATTENTION or _USE_CANONICAL_ATTENTION_VIEWS
     downstream_shift = (
         2
@@ -1039,8 +1037,8 @@ def _probe_config(bound, args):
             "num_sm_multiplier": args.worker_multiplier,
         }
     )
-    if TILE_DEPENDENCY_FRONTIER_CONFIG in bound.config_spec.user_defined_tunables:
-        values[TILE_DEPENDENCY_FRONTIER_CONFIG] = 0
+    if CROSS_LOOP_NUM_WORKERS_CONFIG in bound.config_spec.user_defined_tunables:
+        values[CROSS_LOOP_NUM_WORKERS_CONFIG] = 1024
     config = helion.Config.from_dict(values)
     bound.config_spec.normalize(config.config)
     return config
@@ -1141,7 +1139,7 @@ def main() -> None:
             )
             host_function = bound.host_function
             assert host_function is not None
-            dependency_plan = host_function.device_ir.cross_loop_dependency_plan
+            dependency_plan = host_function.device_ir.tile_dependency_graph
             assert dependency_plan is not None
             print(
                 "TASK_FAMILIES",

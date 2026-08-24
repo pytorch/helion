@@ -33,16 +33,16 @@ _EVICTION_POLICY_MAP = {
 
 def _mark_cross_loop_access_wait(state: CodegenState) -> None:
     """Record an exact access-local scheduling point before a consumer load."""
-    from ..cross_loop_dependencies import CROSS_LOOP_ACCESS_ID_META
-    from ..cross_loop_dependencies import cross_loop_access_marker
+    from ..tile_dependency import TILE_ACCESS_ID_META
+    from ..tile_dependency import tile_access_marker
 
     fx_node = state.fx_node
     if fx_node is None:
         return
-    access_id = fx_node.meta.get(CROSS_LOOP_ACCESS_ID_META)
+    access_id = fx_node.meta.get(TILE_ACCESS_ID_META)
     if not isinstance(access_id, int):
         return
-    plan = state.codegen.host_function.device_ir.cross_loop_dependency_plan
+    plan = state.codegen.host_function.device_ir.tile_dependency_graph
     if plan is None:
         return
     waits = tuple(
@@ -77,7 +77,7 @@ def _mark_cross_loop_access_wait(state: CodegenState) -> None:
             state.device_function.cross_loop_access_coordinates[access_id] = None
             return
     state.device_function.cross_loop_access_coordinates[access_id] = coordinates
-    state.add_statement(cross_loop_access_marker(access_id))
+    state.add_statement(tile_access_marker(access_id))
 
 
 @_decorators.codegen(store, "triton")

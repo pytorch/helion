@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from .device_ir import DeviceIR
 
 
-CROSS_LOOP_ACCESS_ID_META = "_cross_loop_access_id"
+TILE_ACCESS_ID_META = "_cross_loop_access_id"
 
 
 class TileDependencyKind(enum.Enum):
@@ -25,18 +25,18 @@ class TileDependencyKind(enum.Enum):
     WRITE_AFTER_WRITE = "write_after_write"
 
 
-def cross_loop_access_marker(access_id: int) -> ast.stmt:
+def tile_access_marker(access_id: int) -> ast.stmt:
     """Return a tagged inert program point immediately before a consumer load."""
     from .ast_extension import create
 
     marker = create(ast.Expr, value=create(ast.Constant, value=None))
-    setattr(marker, CROSS_LOOP_ACCESS_ID_META, access_id)
+    setattr(marker, TILE_ACCESS_ID_META, access_id)
     return marker
 
 
-def cross_loop_access_marker_id(statement: ast.AST) -> int | None:
+def tile_access_marker_id(statement: ast.AST) -> int | None:
     """Return the access attached to an explicit compiler program point."""
-    access_id = getattr(statement, CROSS_LOOP_ACCESS_ID_META, None)
+    access_id = getattr(statement, TILE_ACCESS_ID_META, None)
     return access_id if isinstance(access_id, int) else None
 
 
@@ -107,7 +107,7 @@ class TaskFamily:
 
 
 @dataclasses.dataclass(frozen=True)
-class CrossLoopAccess:
+class TileAccess:
     """The memory facts needed to prove a cross-root readiness relation."""
 
     access_id: int
@@ -253,16 +253,41 @@ class ReadinessRequirement:
 
 
 @dataclasses.dataclass(frozen=True)
-class EventSpec:
-    """Completion state published by one producer task family."""
+class EventContribution:
+    """One task family's contribution to a semantic readiness event."""
 
-    event_id: int
     producer_root: int
-    granularity: Literal["task", "root"]
 
 
 @dataclasses.dataclass(frozen=True)
-class WaitSpec:
+class KeyedEvent:
+    """A logical readiness-key domain with independent contributors.
+
+    The initial dependency builder emits singleton contributor tuples. Keeping
+    the contributor relation independent of event identity lets the graph pass
+    later canonicalize joins without changing the consumer-use representation.
+    A root-granularity singleton is the canonical ``FamilyDone`` event.
+    """
+
+    event_id: int
+    contributors: tuple[EventContribution, ...]
+    granularity: Literal["task", "root"]
+
+    @property
+    def producer_root(self) -> int:
+        """Return the producer of a single-contributor event."""
+        if len(self.contributors) != 1:
+            raise ValueError("a multi-contributor event has no unique producer root")
+        return self.contributors[0].producer_root
+
+    @property
+    def is_family_done(self) -> bool:
+        """Whether this is the canonical whole-family completion event."""
+        return self.granularity == "root" and len(self.contributors) == 1
+
+
+@dataclasses.dataclass(frozen=True)
+class EventUse:
     """One consumer's wait on a producer completion event."""
 
     consumer_root: int
@@ -273,7 +298,7 @@ class WaitSpec:
 
 
 @dataclasses.dataclass(frozen=True)
-class CrossLoopDependencyEdge:
+class TileDependency:
     """One allocation hazard between two source-ordered root families."""
 
     producer_root: int
@@ -281,8 +306,8 @@ class CrossLoopDependencyEdge:
     allocation_id: int
     tensor_names: frozenset[str]
     kinds: frozenset[TileDependencyKind]
-    producer_accesses: tuple[CrossLoopAccess, ...]
-    consumer_accesses: tuple[CrossLoopAccess, ...]
+    producer_accesses: tuple[TileAccess, ...]
+    consumer_accesses: tuple[TileAccess, ...]
     access_dependencies: tuple[AccessDependency, ...]
     readiness: tuple[ReadinessRequirement, ...]
 
@@ -302,19 +327,28 @@ class CrossLoopDependencyEdge:
 
 
 @dataclasses.dataclass(frozen=True)
-class CrossLoopDependencyPlan:
+class TileDependencyGraph:
     """Allocation-derived dependencies and their strongest proven readiness."""
 
-    accesses: tuple[CrossLoopAccess, ...]
-    edges: tuple[CrossLoopDependencyEdge, ...]
-    events: tuple[EventSpec, ...]
-    waits: tuple[WaitSpec, ...]
+    task_families: tuple[TaskFamily, ...]
+    accesses: tuple[TileAccess, ...]
+    edges: tuple[TileDependency, ...]
+    events: tuple[KeyedEvent, ...]
+    waits: tuple[EventUse, ...]
+
+    def __post_init__(self) -> None:
+        if tuple(event.event_id for event in self.events) != tuple(
+            range(len(self.events))
+        ):
+            raise ValueError("keyed event IDs must be contiguous and source ordered")
+        if any(not 0 <= use.event_id < len(self.events) for use in self.waits):
+            raise ValueError("event use references an unknown keyed event")
 
     def edges_between(
         self,
         producer_root: int,
         consumer_root: int,
-    ) -> tuple[CrossLoopDependencyEdge, ...]:
+    ) -> tuple[TileDependency, ...]:
         return tuple(
             edge
             for edge in self.edges
@@ -322,11 +356,34 @@ class CrossLoopDependencyPlan:
             and edge.consumer_root == consumer_root
         )
 
-    def event(self, event_id: int) -> EventSpec:
+    def event(self, event_id: int) -> KeyedEvent:
         return self.events[event_id]
 
-    def waits_for_root(self, root: int) -> tuple[WaitSpec, ...]:
+    def waits_for_root(self, root: int) -> tuple[EventUse, ...]:
         return tuple(wait for wait in self.waits if wait.consumer_root == root)
+
+    def uses_for_event(self, event_id: int) -> tuple[EventUse, ...]:
+        """Return every use of one event, preserving source order."""
+        return tuple(wait for wait in self.waits if wait.event_id == event_id)
+
+    def events_contributed_by(self, root: int) -> tuple[KeyedEvent, ...]:
+        """Return events receiving contributions from one task family."""
+        return tuple(
+            event
+            for event in self.events
+            if any(
+                contributor.producer_root == root for contributor in event.contributors
+            )
+        )
+
+    def family_done(self, root: int) -> KeyedEvent | None:
+        """Return the canonical whole-family event for ``root``, if required."""
+        events = tuple(
+            event for event in self.events_contributed_by(root) if event.is_family_done
+        )
+        if len(events) > 1:
+            raise AssertionError(f"task family {root} has multiple FamilyDone events")
+        return events[0] if events else None
 
 
 def predecessor_task_ids(
@@ -646,12 +703,12 @@ def prove_uniform_task_partition(
 @dataclasses.dataclass(frozen=True)
 class _ReachingAccess:
     root: int
-    access: CrossLoopAccess
+    access: TileAccess
     region: AllocationRegion
 
 
 def _access_region(
-    access: CrossLoopAccess,
+    access: TileAccess,
     task_family: TaskFamily,
 ) -> AllocationRegion:
     """Conservatively summarize one root's union of an access.
@@ -729,7 +786,7 @@ def _access_region(
 
 
 def access_task_region(
-    access: CrossLoopAccess,
+    access: TileAccess,
     *,
     task_coordinates: dict[int, int],
     block_sizes: dict[int, int],
@@ -802,7 +859,7 @@ def access_task_region(
 
 
 def _allocation_region_from_bounds(
-    access: CrossLoopAccess,
+    access: TileAccess,
     bounds: tuple[tuple[int, int], ...],
     exact_dimensions: tuple[bool, ...],
 ) -> AllocationRegion:
@@ -994,14 +1051,14 @@ def _subtract_reaching_accesses(
     ]
 
 
-def build_cross_loop_dependency_plan(
-    accesses: tuple[CrossLoopAccess, ...],
+def build_tile_dependency_graph(
+    accesses: tuple[TileAccess, ...],
     grid_block_ids: list[list[int]] | None = None,
     *,
     task_families: tuple[TaskFamily, ...] | None = None,
     root_phases: tuple[int, ...] | None = None,
     noncanonical_task_origin_block_ids: frozenset[int] = frozenset(),
-) -> CrossLoopDependencyPlan:
+) -> TileDependencyGraph:
     """Build the minimal source-ordered allocation hazard graph.
 
     This pass is deliberately independent of code generation. It identifies the
@@ -1038,7 +1095,7 @@ def build_cross_loop_dependency_plan(
     elif len(root_phases) != root_count:
         raise ValueError("root_phases must have one entry per task family")
     grid_block_ids = [list(family.logical_axis_order) for family in task_families]
-    accesses_by_root: list[list[CrossLoopAccess]] = [[] for _ in range(root_count)]
+    accesses_by_root: list[list[TileAccess]] = [[] for _ in range(root_count)]
     for access in accesses:
         if 0 <= access.root < root_count and access.allocation_id >= 0:
             accesses_by_root[access.root].append(access)
@@ -1172,7 +1229,7 @@ def build_cross_loop_dependency_plan(
                     )
                 )
 
-    edges: list[CrossLoopDependencyEdge] = []
+    edges: list[TileDependency] = []
     for (producer_root, consumer_root, allocation_id), dependency_set in sorted(
         dependencies_by_edge.items()
     ):
@@ -1229,7 +1286,7 @@ def build_cross_loop_dependency_plan(
                     ),
                 )
         edges.append(
-            CrossLoopDependencyEdge(
+            TileDependency(
                 producer_root=producer_root,
                 consumer_root=consumer_root,
                 allocation_id=allocation_id,
@@ -1245,7 +1302,8 @@ def build_cross_loop_dependency_plan(
         )
 
     events, waits = _build_event_plan(tuple(edges), grid_block_ids)
-    return CrossLoopDependencyPlan(
+    return TileDependencyGraph(
+        task_families=task_families,
         accesses=accesses,
         edges=tuple(edges),
         events=events,
@@ -1254,18 +1312,18 @@ def build_cross_loop_dependency_plan(
 
 
 def _build_event_plan(
-    edges: tuple[CrossLoopDependencyEdge, ...],
+    edges: tuple[TileDependency, ...],
     grid_block_ids: list[list[int]],
-) -> tuple[tuple[EventSpec, ...], tuple[WaitSpec, ...]]:
+) -> tuple[tuple[KeyedEvent, ...], tuple[EventUse, ...]]:
     """Lower allocation hazards to shared producer events and consumer waits.
 
     A root-completion requirement subsumes task waits between the same pair of
     roots. Task events are shared by every consumer of that producer root;
     publication occurs after the producer's unchanged task body.
     """
-    events: list[EventSpec] = []
+    events: list[KeyedEvent] = []
     event_by_key: dict[tuple[int, Literal["task", "root"]], int] = {}
-    waits: list[WaitSpec] = []
+    waits: list[EventUse] = []
 
     def event_id(producer_root: int, granularity: Literal["task", "root"]) -> int:
         key = (producer_root, granularity)
@@ -1274,15 +1332,15 @@ def _build_event_plan(
         result = len(events)
         event_by_key[key] = result
         events.append(
-            EventSpec(
+            KeyedEvent(
                 event_id=result,
-                producer_root=producer_root,
+                contributors=(EventContribution(producer_root),),
                 granularity=granularity,
             )
         )
         return result
 
-    edges_by_pair: dict[tuple[int, int], list[CrossLoopDependencyEdge]] = {}
+    edges_by_pair: dict[tuple[int, int], list[TileDependency]] = {}
     for edge in edges:
         edges_by_pair.setdefault((edge.producer_root, edge.consumer_root), []).append(
             edge
@@ -1291,7 +1349,7 @@ def _build_event_plan(
     for (producer_root, consumer_root), pair_edges in edges_by_pair.items():
         if any(not edge.has_complete_readiness for edge in pair_edges):
             waits.append(
-                WaitSpec(
+                EventUse(
                     consumer_root=consumer_root,
                     consumer_access_id=None,
                     event_id=event_id(producer_root, "root"),
@@ -1306,7 +1364,7 @@ def _build_event_plan(
             for requirement in edge.readiness:
                 granularity = requirement.granularity
                 predecessor_map = requirement.predecessor_map
-                wait = WaitSpec(
+                wait = EventUse(
                     consumer_root=consumer_root,
                     consumer_access_id=requirement.consumer_access_id,
                     event_id=event_id(producer_root, granularity),
@@ -1329,10 +1387,10 @@ def _build_event_plan(
 
 
 def _accesses_by_allocation(
-    accesses: list[CrossLoopAccess],
+    accesses: list[TileAccess],
     kind: Literal["load", "store"],
-) -> dict[int, tuple[CrossLoopAccess, ...]]:
-    result: dict[int, list[CrossLoopAccess]] = {}
+) -> dict[int, tuple[TileAccess, ...]]:
+    result: dict[int, list[TileAccess]] = {}
     for access in accesses:
         if access.kind == kind:
             result.setdefault(access.allocation_id, []).append(access)
@@ -1345,8 +1403,8 @@ def _accesses_by_allocation(
 def _build_access_readiness(
     *,
     kind: TileDependencyKind,
-    producer_accesses: tuple[CrossLoopAccess, ...],
-    consumer_accesses: tuple[CrossLoopAccess, ...],
+    producer_accesses: tuple[TileAccess, ...],
+    consumer_accesses: tuple[TileAccess, ...],
     producer_grid_block_ids: list[int],
     noncanonical_task_origin_block_ids: frozenset[int],
 ) -> tuple[ReadinessRequirement, ...]:
@@ -1371,8 +1429,8 @@ def _build_access_readiness(
 
 def _build_affine_predecessor_map(
     *,
-    producer_accesses: tuple[CrossLoopAccess, ...],
-    consumer_access: CrossLoopAccess,
+    producer_accesses: tuple[TileAccess, ...],
+    consumer_access: TileAccess,
     producer_grid_block_ids: list[int],
     noncanonical_task_origin_block_ids: frozenset[int],
 ) -> AffinePredecessorMap | None:
@@ -1553,7 +1611,7 @@ def _build_affine_predecessor_map(
 
 
 def _normalized_access_positions(
-    access: CrossLoopAccess,
+    access: TileAccess,
 ) -> tuple[int, ...] | None:
     """Return fully affine view dimensions in logical order.
 
