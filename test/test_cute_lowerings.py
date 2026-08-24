@@ -112,6 +112,7 @@ from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
 from helion._compiler.cute.strategies import TCGEN05_STRATEGY_CONFIG_KEY
+from helion._compiler.cute.strategies import TCGEN05_WARP_SPEC_DEFAULTS_BY_KEY
 from helion._compiler.cute.strategies import Tcgen05LayoutStrategy
 from helion._compiler.cute.strategies import Tcgen05Strategy
 from helion._compiler.cute.strategies import Tcgen05WarpSpec
@@ -15933,7 +15934,7 @@ class TestCuteLowerings(unittest.TestCase):
                 ),
             ),
         )
-        config = cast("Any", {})
+        config = _make_tcgen05_persistent_config(**TCGEN05_WARP_SPEC_DEFAULTS_BY_KEY)
 
         with (
             patch.object(
