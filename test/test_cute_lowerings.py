@@ -1260,9 +1260,27 @@ class TestCuteLowerings(unittest.TestCase):
         )
         self.assertIn("'lhs_tma_order': (1, 0)", code)
         self.assertIn("'rhs_tma_order': (0, 1)", code)
-        self.assertIn("while tcgen05_role_local", code)
         self.assertIn("cute.gemm(", direct_code)
-        self.assertIn("while tcgen05_role_local", direct_code)
+        for name, persistent_code in (
+            ("swapped", code),
+            ("direct", direct_code),
+        ):
+            with self.subTest(schedule=name):
+                self.assertIn(
+                    "tcgen05_role_local_0_tile_sched = "
+                    "cutlass.utils.StaticPersistentTileScheduler.create(",
+                    persistent_code,
+                )
+                self.assertIn(
+                    "tcgen05_role_local_0_work_tile = "
+                    "tcgen05_role_local_0_tile_sched.initial_work_tile_info()",
+                    persistent_code,
+                )
+                self.assertNotIn("while tcgen05_role_local", persistent_code)
+                self.assertNotIn(
+                    "tcgen05_role_local_0_tile_sched.advance_to_next_work()",
+                    persistent_code,
+                )
         self.assertIn("cute.gemm(", direct_row_code)
         self.assertNotIn("while tcgen05_role_local", direct_row_code)
         torch.testing.assert_close(direct_actual, expected.T, rtol=0, atol=0)
