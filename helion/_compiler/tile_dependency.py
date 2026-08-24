@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 TILE_ACTION_SCOPE_IDS_META = "_tile_dependency_action_scope_ids"
 TILE_ACTION_SCOPE_ID_ATTR = "_tile_dependency_action_scope_id"
+DependencyPoint = tuple[int, int | None]
 
 
 class TileDependencyKind(enum.Enum):
@@ -225,6 +226,30 @@ class InstantiatedActionDomain:
             raise IndexError(action)
         return action // self.actions_per_strand
 
+    def action_from_coordinates(self, coordinates: dict[int, int]) -> int:
+        """Encode complete logical coordinates as a strand-major action ID."""
+        counts = self.axis_counts
+        strand_task = 0
+        multiplier = 1
+        for axis in self.strand_axis_order:
+            coordinate = coordinates[axis]
+            count = counts[axis]
+            if not 0 <= coordinate < count:
+                raise IndexError(coordinate)
+            strand_task += coordinate * multiplier
+            multiplier *= count
+
+        local_action = 0
+        multiplier = 1
+        for axis in self.nested_axis_order:
+            coordinate = coordinates[axis]
+            count = counts[axis]
+            if not 0 <= coordinate < count:
+                raise IndexError(coordinate)
+            local_action += coordinate * multiplier
+            multiplier *= count
+        return strand_task * self.actions_per_strand + local_action
+
 
 def build_execution_scopes(device_ir: DeviceIR) -> tuple[ExecutionScope, ...]:
     """Build the reachable DeviceIR callsite tree used by dependency actions.
@@ -392,6 +417,7 @@ class TileAccess:
     layout_is_static: bool
     subscript_is_full_slice: tuple[bool, ...] = ()
     is_atomic: bool = False
+    graph_node_index: int = -1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -425,15 +451,14 @@ class AccessDependency:
 
 @dataclasses.dataclass(frozen=True)
 class ActionDependencyRelation:
-    """Exact overlap from one producer action domain to one consumer domain."""
+    """Exact overlap from producer actions to one consumer action domain."""
 
     kind: TileDependencyKind
     dependency_id: int
     producer_access_id: int
     consumer_access_id: int
-    producer_scope_id: int
     consumer_scope_id: int
-    predecessors_by_consumer_action: tuple[frozenset[int], ...]
+    predecessors_by_consumer_action: tuple[frozenset[tuple[int, int | None, int]], ...]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -494,6 +519,20 @@ class TileDependencyGraph:
         return tuple(
             self.execution_scopes[scope_id]
             for scope_id in self.scope_ids_by_access[access_id]
+        )
+
+    def dependency_points(
+        self,
+        dependency: AccessDependency,
+    ) -> frozenset[DependencyPoint]:
+        """Return every reachable consumer callsite for one memory hazard."""
+        if not 0 <= dependency.consumer_access_id < len(self.scope_ids_by_access):
+            return frozenset(((dependency.dependency_id, None),))
+        scope_ids = self.scope_ids_by_access[dependency.consumer_access_id]
+        return (
+            frozenset((dependency.dependency_id, scope_id) for scope_id in scope_ids)
+            if scope_ids
+            else frozenset(((dependency.dependency_id, None),))
         )
 
 
@@ -886,18 +925,127 @@ def instantiate_action_domains(
     return tuple(result)
 
 
+def preceding_actions_for_access(
+    dependency_graph: TileDependencyGraph,
+    *,
+    action_domains: tuple[InstantiatedActionDomain, ...],
+    source_scope_id: int,
+    consumer_scope_id: int,
+    consumer_access_id: int,
+) -> tuple[frozenset[int], ...] | None:
+    """Map each consumer action to earlier source-scope actions in its strand.
+
+    The source action's entry wait dominates an access in a descendant scope.
+    For a lexically earlier sibling or descendant callsite, every source action
+    under the shared enclosing action has completed before the access.  Other
+    scope pairs are unordered and return ``None``.
+    """
+    scope_by_id = {scope.scope_id: scope for scope in dependency_graph.execution_scopes}
+    domain_by_scope = {domain.scope_id: domain for domain in action_domains}
+    source_scope = scope_by_id[source_scope_id]
+    consumer_scope = scope_by_id[consumer_scope_id]
+    source_domain = domain_by_scope.get(source_scope_id)
+    consumer_domain = domain_by_scope.get(consumer_scope_id)
+    if (
+        source_scope.root != consumer_scope.root
+        or source_domain is None
+        or consumer_domain is None
+    ):
+        return None
+    try:
+        consumer_access = next(
+            access
+            for access in dependency_graph.accesses
+            if access.access_id == consumer_access_id
+        )
+    except StopIteration:
+        return None
+    if consumer_access.graph_node_index < 0:
+        return None
+
+    def lineage(scope_id: int) -> tuple[int, ...]:
+        result: list[int] = []
+        current: int | None = scope_id
+        while current is not None:
+            result.append(current)
+            current = scope_by_id[current].parent_scope_id
+        result.reverse()
+        return tuple(result)
+
+    source_lineage = lineage(source_scope_id)
+    consumer_lineage = lineage(consumer_scope_id)
+    common_length = 0
+    for source_ancestor, consumer_ancestor in zip(
+        source_lineage, consumer_lineage, strict=False
+    ):
+        if source_ancestor != consumer_ancestor:
+            break
+        common_length += 1
+    if not common_length:
+        return None
+
+    # An action-entry wait dominates every access in that action and all of its
+    # descendant callsites. Project each consumer action to that ancestor.
+    if common_length == len(source_lineage):
+        return tuple(
+            frozenset(
+                (
+                    source_domain.action_from_coordinates(
+                        consumer_domain.action_coordinates(consumer_action)
+                    ),
+                )
+            )
+            for consumer_action in range(consumer_domain.action_count)
+        )
+
+    common_scope_id = source_lineage[common_length - 1]
+    source_child = scope_by_id[source_lineage[common_length]]
+    source_node_index = source_child.callsite_path[-1][0]
+    if common_length == len(consumer_lineage):
+        consumer_node_index = consumer_access.graph_node_index
+    else:
+        consumer_child = scope_by_id[consumer_lineage[common_length]]
+        consumer_node_index = consumer_child.callsite_path[-1][0]
+    if source_node_index >= consumer_node_index:
+        return None
+
+    # The complete earlier subtree has run for the current common-ancestor
+    # action. Group source actions by that shared coordinate prefix once, then
+    # look up the group for every consumer action.
+    common_domain = domain_by_scope[common_scope_id]
+    source_actions_by_common_action: dict[int, set[int]] = {}
+    for source_action in range(source_domain.action_count):
+        common_action = common_domain.action_from_coordinates(
+            source_domain.action_coordinates(source_action)
+        )
+        source_actions_by_common_action.setdefault(common_action, set()).add(
+            source_action
+        )
+    return tuple(
+        frozenset(
+            source_actions_by_common_action.get(
+                common_domain.action_from_coordinates(
+                    consumer_domain.action_coordinates(consumer_action)
+                ),
+                (),
+            )
+        )
+        for consumer_action in range(consumer_domain.action_count)
+    )
+
+
 def instantiate_action_relations(
     dependency_graph: TileDependencyGraph,
     *,
     task_families: tuple[InstantiatedTaskFamily, ...],
     axis_geometry: dict[int, tuple[int, int]],
 ) -> tuple[ActionDependencyRelation, ...]:
-    """Prove direct access overlap between configured ordered-action domains.
+    """Prove canonical producer-action sets for every consumer access scope.
 
-    Each returned relation names stable DeviceIR scopes. Missing relations are
-    deliberately not guessed: control-dependent, dynamic, or otherwise
-    uninstantiable accesses remain candidates for an enclosing action or
-    whole-family completion when the event graph is built.
+    One returned relation unions every reachable producer callsite for a
+    source-level memory hazard. Missing or non-segmentable callsites make the
+    relation unavailable rather than leaving the scheduler to reconstruct
+    partial access semantics.
     """
     domains = instantiate_action_domains(
         dependency_graph,
@@ -912,38 +1060,83 @@ def instantiate_action_relations(
         for access_dependency in dependency.access_dependencies:
             producer_access = access_by_id[access_dependency.producer_access_id]
             consumer_access = access_by_id[access_dependency.consumer_access_id]
-            for producer_scope_id in dependency_graph.scope_ids_by_access[
+            producer_scope_ids = dependency_graph.scope_ids_by_access[
                 producer_access.access_id
+            ]
+            if not producer_scope_ids:
+                continue
+            for consumer_scope_id in dependency_graph.scope_ids_by_access[
+                consumer_access.access_id
             ]:
-                producer_scope = scope_by_id[producer_scope_id]
-                producer_domain = domain_by_scope.get(producer_scope_id)
-                if not producer_scope.guaranteed or producer_domain is None:
+                consumer_scope = scope_by_id[consumer_scope_id]
+                consumer_domain = domain_by_scope.get(consumer_scope_id)
+                if (
+                    not consumer_scope.guaranteed
+                    or consumer_domain is None
+                    or (
+                        not consumer_scope.is_root
+                        and (
+                            not consumer_scope.segmentable
+                            or len(consumer_domain.nested_axis_order) != 1
+                        )
+                    )
+                ):
                     continue
-                for consumer_scope_id in dependency_graph.scope_ids_by_access[
-                    consumer_access.access_id
-                ]:
-                    consumer_scope = scope_by_id[consumer_scope_id]
-                    consumer_domain = domain_by_scope.get(consumer_scope_id)
-                    if not consumer_scope.guaranteed or consumer_domain is None:
-                        continue
-                    predecessors = _access_predecessor_sets(
+                result_predecessors: list[set[tuple[int, int | None, int]]] = [
+                    set() for _ in range(consumer_domain.action_count)
+                ]
+                complete = True
+                for producer_scope_id in producer_scope_ids:
+                    producer_scope = scope_by_id[producer_scope_id]
+                    producer_domain = domain_by_scope.get(producer_scope_id)
+                    if (
+                        not producer_scope.guaranteed
+                        or producer_domain is None
+                        or (
+                            not producer_scope.is_root
+                            and (
+                                not producer_scope.segmentable
+                                or len(producer_domain.nested_axis_order) != 1
+                            )
+                        )
+                    ):
+                        complete = False
+                        break
+                    access_predecessors = _access_predecessor_sets(
                         producer_access=producer_access,
                         producer_domain=producer_domain,
                         consumer_access=consumer_access,
                         consumer_domain=consumer_domain,
                         dependency_region=access_dependency.region,
                     )
-                    if predecessors is None:
-                        continue
+                    if access_predecessors is None:
+                        complete = False
+                        break
+                    normalized_scope_id = (
+                        None if producer_scope.is_root else producer_scope_id
+                    )
+                    for consumer_action, producer_actions in enumerate(
+                        access_predecessors
+                    ):
+                        result_predecessors[consumer_action].update(
+                            (
+                                producer_domain.root,
+                                normalized_scope_id,
+                                producer_action,
+                            )
+                            for producer_action in producer_actions
+                        )
+                if complete:
                     result.append(
                         ActionDependencyRelation(
                             kind=access_dependency.kind,
                             dependency_id=access_dependency.dependency_id,
                             producer_access_id=producer_access.access_id,
                             consumer_access_id=consumer_access.access_id,
-                            producer_scope_id=producer_scope_id,
                             consumer_scope_id=consumer_scope_id,
-                            predecessors_by_consumer_action=predecessors,
+                            predecessors_by_consumer_action=tuple(
+                                frozenset(actions) for actions in result_predecessors
+                            ),
                         )
                     )
     return tuple(result)

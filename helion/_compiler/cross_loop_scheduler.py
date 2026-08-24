@@ -4,14 +4,15 @@ import dataclasses
 import itertools
 
 from .. import exc
+from .tile_dependency import ActionDependencyRelation
+from .tile_dependency import DependencyPoint
 from .tile_dependency import InstantiatedActionDomain
 from .tile_dependency import InstantiatedTaskFamily
-from .tile_dependency import TileDependency
 from .tile_dependency import TileDependencyGraph
-from .tile_dependency import TileDependencyKind
 from .tile_dependency import instantiate_action_domains
 from .tile_dependency import instantiate_action_relations
 from .tile_dependency import instantiate_root_predecessor_sets
+from .tile_dependency import preceding_actions_for_access
 
 CROSS_LOOP_NUM_WORKERS_CONFIG = "cross_loop_num_workers"
 CROSS_LOOP_NUM_WORKERS_DEFAULT = 0
@@ -639,13 +640,21 @@ def build_worker_schedule(
     WorkerSchedule,
     tuple[LocalTrigger, ...],
     tuple[CountedEventPlan, ...],
+    InstantiatedEventGraph,
 ]:
     """Derive local and static task placement for one worker count."""
     baseline = build_baseline_worker_schedule(task_families, worker_count)
+    nested_wait_roots = frozenset(
+        use.consumer_root
+        for event in event_graph.events
+        for use in event.uses
+        if use.consumer_scope_id is not None
+    )
     local_triggers = choose_local_triggers(
         event_graph,
         baseline,
         worker_limit=worker_count,
+        excluded_roots=nested_wait_roots,
     )
     ordered = order_local_contributors_by_key(
         event_graph,
@@ -656,6 +665,7 @@ def build_worker_schedule(
         event_graph,
         ordered,
         worker_limit=worker_count,
+        excluded_roots=nested_wait_roots,
     )
     local_tasks = frozenset(
         (use.consumer_root, task)
@@ -670,14 +680,23 @@ def build_worker_schedule(
         schedule,
         local_triggers,
     )
+    action_dependency_points = frozenset(
+        dependency_point
+        for event in ordered_action_events
+        for use in event.uses
+        for dependency_point in use.dependency_points
+    )
+    scheduled_event_graph = _without_root_uses_for_dependencies(
+        event_graph, action_dependency_points
+    )
     schedule, local_triggers = place_ready_families(
-        event_graph,
+        scheduled_event_graph,
         ordered,
         schedule,
         local_triggers,
     )
-    validate_worker_schedule(event_graph, schedule, local_triggers)
-    return schedule, local_triggers, ordered_action_events
+    validate_worker_schedule(scheduled_event_graph, schedule, local_triggers)
+    return schedule, local_triggers, ordered_action_events, scheduled_event_graph
 
 
 @dataclasses.dataclass(frozen=True)
@@ -710,7 +729,7 @@ class InstantiatedEventUse:
 
     consumer_root: int
     required_keys_by_task: tuple[frozenset[int], ...]
-    dependency_ids: frozenset[int] = frozenset()
+    dependency_points: frozenset[DependencyPoint] = frozenset()
     consumer_scope_id: int | None = None
 
 
@@ -809,6 +828,27 @@ class InstantiatedEventGraph:
         return tuple(frozenset(tasks) for tasks in result)
 
 
+def _without_root_uses_for_dependencies(
+    event_graph: InstantiatedEventGraph,
+    dependency_points: frozenset[DependencyPoint],
+) -> InstantiatedEventGraph:
+    """Remove root-entry alternatives covered by selected action checkpoints."""
+    if not dependency_points:
+        return event_graph
+    events: list[InstantiatedKeyedEvent] = []
+    for event in event_graph.events:
+        uses: list[InstantiatedEventUse] = []
+        for use in event.uses:
+            if use.consumer_scope_id is not None:
+                uses.append(use)
+                continue
+            remaining = use.dependency_points - dependency_points
+            if remaining:
+                uses.append(dataclasses.replace(use, dependency_points=remaining))
+        events.append(dataclasses.replace(event, uses=tuple(uses)))
+    return dataclasses.replace(event_graph, events=tuple(events))
+
+
 @dataclasses.dataclass(frozen=True)
 class TaskToKeySegment:
     """One compact run of a flattened task-to-event-key mapping."""
@@ -851,7 +891,7 @@ class CountedEventUse:
 
     consumer_root: int
     key_by_task: tuple[int, ...]
-    dependency_ids: frozenset[int] = frozenset()
+    dependency_points: frozenset[DependencyPoint] = frozenset()
     consumer_scope_id: int | None = None
 
     @property
@@ -956,6 +996,7 @@ def place_ordered_action_consumers(
     static_ancestors_cache: dict[tuple[int, int], frozenset[tuple[int, int]]] = {}
     result = worker_schedule
     plans: list[CountedEventPlan] = []
+    selected_dependency_points: set[DependencyPoint] = set()
     for consumer_root, event_uses in sorted(uses_by_consumer.items()):
         # Several nested scopes in one strand require a joint program-order
         # analysis. Keep their exact events, but do not move the strand until
@@ -1036,6 +1077,10 @@ def place_ordered_action_consumers(
         earliest_readiness = min(
             position for pattern in readiness_by_strand for position in pattern
         )
+        candidate_event_graph = _without_root_uses_for_dependencies(
+            event_graph,
+            frozenset(selected_dependency_points) | use.dependency_points,
+        )
         for position in range(earliest_readiness + 1, original_position):
             busy_workers = frozenset(
                 worker
@@ -1053,7 +1098,7 @@ def place_ordered_action_consumers(
                         unavailable_workers=busy_workers,
                     )
                     if _is_valid_worker_schedule(
-                        event_graph,
+                        candidate_event_graph,
                         candidate,
                         local_triggers,
                     )
@@ -1139,6 +1184,7 @@ def place_ordered_action_consumers(
             continue
 
         result = candidate
+        selected_dependency_points.update(use.dependency_points)
         plans.append(
             CountedEventPlan(
                 contributors=tuple(
@@ -1161,7 +1207,7 @@ def place_ordered_action_consumers(
                     CountedEventUse(
                         consumer_root=consumer_root,
                         key_by_task=tuple(key_by_action),
-                        dependency_ids=use.dependency_ids,
+                        dependency_points=use.dependency_points,
                         consumer_scope_id=use.consumer_scope_id,
                     ),
                 ),
@@ -1228,12 +1274,15 @@ def lower_family_done_events(
                     frozenset((0,))
                     for _ in range(event_graph.task_families[consumer_root].task_count)
                 ),
-                dependency_ids=frozenset(
-                    dependency.dependency_id
+                dependency_points=frozenset(
+                    dependency_point
                     for dependency in dependency_graph.edges_between(
                         producer_root, consumer_root
                     )
-                    for dependency in dependency.access_dependencies
+                    for access_dependency in dependency.access_dependencies
+                    for dependency_point in dependency_graph.dependency_points(
+                        access_dependency
+                    )
                 ),
             )
             for consumer_root in sorted(consumer_roots)
@@ -1277,7 +1326,7 @@ def lower_family_done_events(
                     CountedEventUse(
                         consumer_root=use.consumer_root,
                         key_by_task=tuple(0 for _ in use.required_keys_by_task),
-                        dependency_ids=use.dependency_ids,
+                        dependency_points=use.dependency_points,
                     )
                     for use in selected_uses
                 ),
@@ -1340,7 +1389,7 @@ def lower_counted_events(
                     key_by_task=tuple(
                         next(iter(keys)) for keys in use.required_keys_by_task
                     ),
-                    dependency_ids=use.dependency_ids,
+                    dependency_points=use.dependency_points,
                 )
             )
             use_indices.append(use_index)
@@ -1404,7 +1453,7 @@ def choose_counted_events(
     event_graph: InstantiatedEventGraph,
     local_triggers: tuple[LocalTrigger, ...],
     *,
-    excluded_direct_roots: frozenset[int] = frozenset(),
+    excluded_dependency_points: frozenset[DependencyPoint] = frozenset(),
 ) -> tuple[CountedEventPlan, ...]:
     """Select every uniformly keyed root-entry event for one lowering path.
 
@@ -1418,12 +1467,18 @@ def choose_counted_events(
     }
     selected: list[CountedEventPlan] = []
     for event in lower_counted_events(event_graph, local_triggers):
-        retained_use_indices = tuple(
-            use_index
-            for use_index, use in enumerate(event.uses)
-            if use_index == event.local_trigger_use
-            or use.consumer_root not in excluded_direct_roots
-        )
+        retained_uses: list[CountedEventUse] = []
+        retained_use_indices: list[int] = []
+        for use_index, use in enumerate(event.uses):
+            remaining = use.dependency_points - excluded_dependency_points
+            if use_index != event.local_trigger_use and not remaining:
+                continue
+            retained_use_indices.append(use_index)
+            retained_uses.append(
+                use
+                if use_index == event.local_trigger_use
+                else dataclasses.replace(use, dependency_points=remaining)
+            )
         if not retained_use_indices or (
             event.local_trigger_use is None and event.key_count <= 1
         ):
@@ -1431,7 +1486,7 @@ def choose_counted_events(
         selected.append(
             dataclasses.replace(
                 event,
-                uses=tuple(event.uses[index] for index in retained_use_indices),
+                uses=tuple(retained_uses),
                 local_trigger_use=(
                     retained_use_indices.index(event.local_trigger_use)
                     if event.local_trigger_use is not None
@@ -1532,11 +1587,12 @@ def instantiate_event_graph(
         dependency_graph,
         task_families=task_families,
     )
-    dependency_ids_by_pair = {
+    dependency_points_by_pair = {
         pair: frozenset(
-            dependency.dependency_id
+            dependency_point
             for edge in dependency_graph.edges_between(*pair)
             for dependency in edge.access_dependencies
+            for dependency_point in dependency_graph.dependency_points(dependency)
         )
         for pair in root_relations
     }
@@ -1558,7 +1614,9 @@ def instantiate_event_graph(
             InstantiatedEventUse(
                 consumer_root=consumer_root,
                 required_keys_by_task=predecessors,
-                dependency_ids=dependency_ids_by_pair[(producer_root, consumer_root)],
+                dependency_points=dependency_points_by_pair[
+                    (producer_root, consumer_root)
+                ],
             )
         )
 
@@ -1600,7 +1658,7 @@ def instantiate_event_graph(
                             frozenset((0,))
                             for _ in range(task_families[consumer_root].task_count)
                         ),
-                        dependency_ids=dependency_ids_by_pair[
+                        dependency_points=dependency_points_by_pair[
                             (producer_root, consumer_root)
                         ],
                     )
@@ -1611,6 +1669,36 @@ def instantiate_event_graph(
         )
 
     return InstantiatedEventGraph(task_families=task_families, events=tuple(result))
+
+
+def _merge_equivalent_events(
+    events: tuple[InstantiatedKeyedEvent, ...] | list[InstantiatedKeyedEvent],
+) -> tuple[InstantiatedKeyedEvent, ...]:
+    """Share one counter relation among all structurally identical events."""
+    merged: dict[
+        tuple[
+            int,
+            tuple[InstantiatedEventContribution, ...],
+            int | None,
+        ],
+        InstantiatedKeyedEvent,
+    ] = {}
+    for event in events:
+        if not event.uses:
+            continue
+        signature = (event.key_count, event.contributions, event.family_done_root)
+        previous = merged.get(signature)
+        if previous is None:
+            merged[signature] = event
+            continue
+        merged[signature] = dataclasses.replace(
+            previous,
+            uses=tuple(dict.fromkeys((*previous.uses, *event.uses))),
+        )
+    return tuple(
+        dataclasses.replace(event, event_id=event_id)
+        for event_id, event in enumerate(merged.values())
+    )
 
 
 def add_ordered_action_events(
@@ -1632,150 +1720,42 @@ def add_ordered_action_events(
         axis_geometry=axis_geometry,
     )
     domain_by_scope = {domain.scope_id: domain for domain in action_domains}
-    scope_by_id = {scope.scope_id: scope for scope in dependency_graph.execution_scopes}
     relations = instantiate_action_relations(
         dependency_graph,
         task_families=event_graph.task_families,
         axis_geometry=axis_geometry,
     )
-    relations_by_key: dict[
-        tuple[TileDependencyKind, int, int, int, int],
-        list[tuple[frozenset[int], ...]],
-    ] = {}
+    relations_by_consumer_scope: dict[int, list[ActionDependencyRelation]] = {}
     for relation in relations:
-        relations_by_key.setdefault(
-            (
-                relation.kind,
-                relation.producer_access_id,
-                relation.consumer_access_id,
-                relation.producer_scope_id,
-                relation.consumer_scope_id,
-            ),
-            [],
-        ).append(relation.predecessors_by_consumer_action)
+        relations_by_consumer_scope.setdefault(relation.consumer_scope_id, []).append(
+            relation
+        )
 
     events = list(event_graph.events)
-    original_event_count = len(events)
-    action_covered_dependency_ids: set[int] = set()
+    action_event_indices: list[int] = []
     for consumer_scope in dependency_graph.execution_scopes:
         if not consumer_scope.is_root and not consumer_scope.segmentable:
             continue
         consumer_domain = domain_by_scope.get(consumer_scope.scope_id)
         if consumer_domain is None:
             continue
-
-        matching_dependencies: list[
-            tuple[
-                TileDependencyKind,
-                int,
-                int,
-                int,
-                int,
-                tuple[frozenset[int], ...],
-            ]
-        ] = []
-        edges_by_producer: dict[int, list[TileDependency]] = {}
-        for edge in dependency_graph.edges:
-            if edge.consumer_root == consumer_scope.root:
-                edges_by_producer.setdefault(edge.producer_root, []).append(edge)
-        for _producer_root, pair_edges in sorted(edges_by_producer.items()):
-            pair_dependencies: list[
-                tuple[
-                    TileDependencyKind,
-                    int,
-                    int,
-                    int,
-                    int,
-                    tuple[frozenset[int], ...],
-                ]
-            ] = []
-            for edge in pair_edges:
-                for access_dependency in edge.access_dependencies:
-                    consumer_scopes = dependency_graph.scope_ids_by_access[
-                        access_dependency.consumer_access_id
-                    ]
-                    if consumer_scope.scope_id not in consumer_scopes:
-                        continue
-                    producer_scopes = dependency_graph.scope_ids_by_access[
-                        access_dependency.producer_access_id
-                    ]
-                    if not producer_scopes:
-                        continue
-                    dependency_relations: list[
-                        tuple[
-                            TileDependencyKind,
-                            int,
-                            int,
-                            int,
-                            int,
-                            tuple[frozenset[int], ...],
-                        ]
-                    ] = []
-                    dependency_is_complete = True
-                    for producer_scope_id in producer_scopes:
-                        producer_scope = scope_by_id[producer_scope_id]
-                        producer_domain = domain_by_scope.get(producer_scope_id)
-                        relation_key = (
-                            access_dependency.kind,
-                            access_dependency.producer_access_id,
-                            access_dependency.consumer_access_id,
-                            producer_scope_id,
-                            consumer_scope.scope_id,
-                        )
-                        proved_relations = relations_by_key.get(relation_key)
-                        if (
-                            producer_domain is None
-                            or (
-                                not producer_scope.is_root
-                                and not producer_scope.segmentable
-                            )
-                            or not proved_relations
-                        ):
-                            dependency_is_complete = False
-                            break
-                        dependency_relations.extend(
-                            (
-                                access_dependency.kind,
-                                access_dependency.dependency_id,
-                                access_dependency.producer_access_id,
-                                access_dependency.consumer_access_id,
-                                producer_scope_id,
-                                predecessor_sets,
-                            )
-                            for predecessor_sets in proved_relations
-                        )
-                    if dependency_is_complete:
-                        pair_dependencies.extend(dependency_relations)
-            if pair_dependencies:
-                matching_dependencies.extend(pair_dependencies)
-        if not matching_dependencies:
+        matching_relations = relations_by_consumer_scope.get(
+            consumer_scope.scope_id, ()
+        )
+        if not matching_relations:
             continue
 
         signatures: list[frozenset[tuple[int, int | None, int]]] = []
         for consumer_action in range(consumer_domain.action_count):
-            predecessors: set[tuple[int, int | None, int]] = set()
-            for (
-                _kind,
-                _dependency_id,
-                _producer_access_id,
-                _consumer_access_id,
-                producer_scope_id,
-                predecessor_sets,
-            ) in matching_dependencies:
-                producer_domain = domain_by_scope[producer_scope_id]
-                predecessors.update(
-                    (
-                        producer_domain.root,
-                        (
-                            None
-                            if scope_by_id[producer_scope_id].is_root
-                            else producer_scope_id
-                        ),
-                        action,
-                    )
-                    for action in predecessor_sets[consumer_action]
+            signatures.append(
+                frozenset(
+                    predecessor
+                    for relation in matching_relations
+                    for predecessor in relation.predecessors_by_consumer_action[
+                        consumer_action
+                    ]
                 )
-            signatures.append(frozenset(predecessors))
+            )
 
         key_by_signature: dict[frozenset[tuple[int, int | None, int]], int] = {}
         ordered_signatures: list[frozenset[tuple[int, int | None, int]]] = []
@@ -1804,16 +1784,9 @@ def add_ordered_action_events(
                     [set() for _ in range(producer_action_count)],
                 )
                 keys_by_task[producer_action].add(key)
-        covered_dependency_ids = frozenset(
-            dependency_id
-            for (
-                _kind,
-                dependency_id,
-                _producer_access_id,
-                _consumer_access_id,
-                _producer_scope_id,
-                _predecessor_sets,
-            ) in matching_dependencies
+        covered_dependency_points = frozenset(
+            (relation.dependency_id, relation.consumer_scope_id)
+            for relation in matching_relations
         )
         action_event = InstantiatedKeyedEvent(
             event_id=len(events),
@@ -1844,7 +1817,7 @@ def add_ordered_action_events(
                         frozenset(()) if key is None else frozenset((key,))
                         for key in key_by_action
                     ),
-                    dependency_ids=covered_dependency_ids,
+                    dependency_points=covered_dependency_points,
                     consumer_scope_id=(
                         None if consumer_scope.is_root else consumer_scope.scope_id
                     ),
@@ -1852,33 +1825,90 @@ def add_ordered_action_events(
             ),
         )
         events.append(action_event)
-        if all(
-            len(keys) <= 1
-            for contribution in action_event.contributions
-            for keys in contribution.keys_by_task
-        ):
-            action_covered_dependency_ids.update(covered_dependency_ids)
+        action_event_indices.append(len(events) - 1)
 
-    if action_covered_dependency_ids:
-        for event_id in range(original_event_count):
-            event = events[event_id]
-            retained_uses = tuple(
-                use
-                for use in event.uses
-                if not (
-                    event.is_family_done
-                    and use.dependency_ids <= action_covered_dependency_ids
+    # Readiness acquired at an earlier nested checkpoint remains available to
+    # later actions in the same non-preemptive strand.  Transfer a later
+    # hazard's coverage to one earlier event only when that event alone covers
+    # the complete exact predecessor set at every occurrence of the access.
+    # Root-entry events are deliberately not sources here: they are a coarse
+    # lowering fallback, not interior program points.
+    implied_points_by_event: dict[int, set[DependencyPoint]] = {}
+    for relation in sorted(
+        relations,
+        key=lambda relation: (relation.dependency_id, relation.consumer_scope_id),
+    ):
+        dependency_point = (relation.dependency_id, relation.consumer_scope_id)
+        for event_index in action_event_indices:
+            event = events[event_index]
+            if len(event.uses) != 1:
+                continue
+            use = event.uses[0]
+            source_scope_id = use.consumer_scope_id
+            if (
+                source_scope_id is None
+                or dependency_point in use.dependency_points
+                or relation.consumer_scope_id == source_scope_id
+            ):
+                continue
+            contributors_by_key = event.contributor_actions_by_key
+            predecessors_by_source_action = tuple(
+                frozenset(
+                    predecessor
+                    for key in required_keys
+                    for predecessor in contributors_by_key[key]
                 )
+                for required_keys in use.required_keys_by_task
             )
-            events[event_id] = dataclasses.replace(event, uses=retained_uses)
-        events = [event for event in events if event.uses]
-        events = [
-            dataclasses.replace(event, event_id=event_id)
-            for event_id, event in enumerate(events)
-        ]
+            preceding_actions = preceding_actions_for_access(
+                dependency_graph,
+                action_domains=action_domains,
+                source_scope_id=source_scope_id,
+                consumer_scope_id=relation.consumer_scope_id,
+                consumer_access_id=relation.consumer_access_id,
+            )
+            if preceding_actions is None:
+                continue
+            relation_is_covered = True
+            for consumer_action, source_actions in enumerate(preceding_actions):
+                acquired_predecessors = frozenset(
+                    predecessor
+                    for source_action in source_actions
+                    for predecessor in predecessors_by_source_action[source_action]
+                )
+                if (
+                    not relation.predecessors_by_consumer_action[consumer_action]
+                    <= acquired_predecessors
+                ):
+                    relation_is_covered = False
+                    break
+            if relation_is_covered:
+                implied_points_by_event.setdefault(event_index, set()).add(
+                    dependency_point
+                )
+                break
+
+    for event_index, dependency_points in implied_points_by_event.items():
+        event = events[event_index]
+        use = event.uses[0]
+        events[event_index] = dataclasses.replace(
+            event,
+            uses=(
+                dataclasses.replace(
+                    use,
+                    dependency_points=use.dependency_points
+                    | frozenset(dependency_points),
+                ),
+            ),
+        )
+
+    # Keep root-entry events as fallback candidates. The worker scheduler
+    # suppresses them only after it selects an action plan carrying the same
+    # hazard IDs; otherwise exact root readiness or FamilyDone remains
+    # available without rebuilding dependency semantics.
     return dataclasses.replace(
         event_graph,
-        events=tuple(events),
+        events=_merge_equivalent_events(events),
         action_domains=action_domains,
     )
 
@@ -1981,10 +2011,10 @@ def canonicalize_ready_events(
                         frozenset(()) if key is None else frozenset((key,))
                         for key in key_by_consumer_task
                     ),
-                    dependency_ids=frozenset(
-                        dependency_id
+                    dependency_points=frozenset(
+                        dependency_point
                         for _event_id, _use_index, use in source_uses
-                        for dependency_id in use.dependency_ids
+                        for dependency_point in use.dependency_points
                     ),
                 ),
             ),
@@ -2012,33 +2042,9 @@ def canonicalize_ready_events(
         if retained_uses != event.uses:
             events[event_id] = dataclasses.replace(event, uses=retained_uses)
 
-    merged_events: dict[
-        tuple[
-            int,
-            tuple[InstantiatedEventContribution, ...],
-            int | None,
-        ],
-        InstantiatedKeyedEvent,
-    ] = {}
-    for event in events:
-        if not event.uses:
-            continue
-        signature = (event.key_count, event.contributions, event.family_done_root)
-        previous = merged_events.get(signature)
-        if previous is None:
-            merged_events[signature] = event
-            continue
-        merged_events[signature] = dataclasses.replace(
-            previous,
-            uses=tuple(dict.fromkeys((*previous.uses, *event.uses))),
-        )
-    retained_events = tuple(merged_events.values())
     return dataclasses.replace(
         event_graph,
-        events=tuple(
-            dataclasses.replace(event, event_id=event_id)
-            for event_id, event in enumerate(retained_events)
-        ),
+        events=_merge_equivalent_events(events),
     )
 
 
@@ -2447,12 +2453,11 @@ def build_cross_loop_schedule(
 ) -> CrossLoopSchedule:
     """Derive all generic readiness strategies without inspecting root bodies."""
     event_graph = canonicalize_ready_events(
-        instantiate_event_graph(dependency_plan, task_families)
-    )
-    event_graph = add_ordered_action_events(
-        event_graph,
-        dependency_plan,
-        axis_geometry=axis_geometry,
+        add_ordered_action_events(
+            instantiate_event_graph(dependency_plan, task_families),
+            dependency_plan,
+            axis_geometry=axis_geometry,
+        )
     )
     worker_limit = resolve_worker_count(
         event_graph,
@@ -2460,7 +2465,12 @@ def build_cross_loop_schedule(
         requested_worker_count=requested_worker_count,
     )
     try:
-        worker_schedule, local_triggers, ordered_action_events = build_worker_schedule(
+        (
+            worker_schedule,
+            local_triggers,
+            ordered_action_events,
+            event_graph,
+        ) = build_worker_schedule(
             event_graph,
             task_families,
             worker_count=worker_limit,
@@ -2471,22 +2481,25 @@ def build_cross_loop_schedule(
             "admit a progress-safe worker schedule"
         ) from error
 
-    ordered_action_roots = frozenset(
-        use.consumer_root for plan in ordered_action_events for use in plan.uses
+    ordered_action_dependency_points = frozenset(
+        dependency_point
+        for plan in ordered_action_events
+        for use in plan.uses
+        for dependency_point in use.dependency_points
     )
     counted_events = (
         *choose_counted_events(
             event_graph,
             local_triggers,
-            excluded_direct_roots=ordered_action_roots,
+            excluded_dependency_points=ordered_action_dependency_points,
         ),
         *ordered_action_events,
     )
-    covered_dependency_ids = frozenset(
-        dependency_id
+    covered_dependency_points = frozenset(
+        dependency_point
         for event in counted_events
         for use in event.uses
-        for dependency_id in use.dependency_ids
+        for dependency_point in use.dependency_points
     )
     # Recompute coverage from the mechanisms that will actually be emitted.
     # Dependency analysis may prove a finer relation than the selected emitter
@@ -2494,8 +2507,8 @@ def build_cross_loop_schedule(
     # completion; retaining a task-ready classification without an emitter
     # would remove the dependency entirely.
     root_completion_edges = _select_root_completion_edges(
-        dependencies=dependency_plan.edges,
-        covered_dependency_ids=covered_dependency_ids,
+        dependency_graph=dependency_plan,
+        covered_dependency_points=covered_dependency_points,
         preordered_edges=preordered_edges,
     )
     root_order_edges = set(root_completion_edges) | set(preordered_edges)
@@ -2528,24 +2541,26 @@ def build_cross_loop_schedule(
             )
         )
     counted_events = tuple(retained_counted_events)
-    covered_dependency_ids = frozenset(
-        dependency_id
+    covered_dependency_points = frozenset(
+        dependency_point
         for event in counted_events
         for use in event.uses
-        for dependency_id in use.dependency_ids
+        for dependency_point in use.dependency_points
     )
     task_ready_edges = frozenset(
         (dependency.producer_root, dependency.consumer_root)
         for dependency in dependency_plan.edges
         if all(
-            access_dependency.dependency_id in covered_dependency_ids
+            dependency_plan.dependency_points(access_dependency)
+            <= covered_dependency_points
             for access_dependency in dependency.access_dependencies
         )
     )
     _validate_schedule_coverage(
-        dependencies=dependency_plan.edges,
-        covered_dependency_ids=covered_dependency_ids,
+        dependency_graph=dependency_plan,
+        covered_dependency_points=covered_dependency_points,
         root_completion_edges=root_completion_edges,
+        preordered_edges=preordered_edges,
     )
     event_graph, family_done_events = lower_family_done_events(
         event_graph,
@@ -2566,20 +2581,24 @@ def build_cross_loop_schedule(
 
 def _validate_schedule_coverage(
     *,
-    dependencies: tuple[TileDependency, ...],
-    covered_dependency_ids: frozenset[int],
+    dependency_graph: TileDependencyGraph,
+    covered_dependency_points: frozenset[DependencyPoint],
     root_completion_edges: frozenset[tuple[int, int]],
+    preordered_edges: frozenset[tuple[int, int]],
 ) -> None:
     """Verify that every dependence has an emitted synchronization path."""
-    root_order_edges = set(root_completion_edges)
-    for dependency in dependencies:
+    root_order_edges = set(root_completion_edges) | set(preordered_edges)
+    for dependency in dependency_graph.edges:
         pair = (dependency.producer_root, dependency.consumer_root)
         if _is_ordered_by_root_completion(*pair, root_order_edges):
             continue
         uncovered = tuple(
-            access_dependency.dependency_id
+            dependency_point
             for access_dependency in dependency.access_dependencies
-            if access_dependency.dependency_id not in covered_dependency_ids
+            for dependency_point in dependency_graph.dependency_points(
+                access_dependency
+            )
+            if dependency_point not in covered_dependency_points
         )
         if not uncovered:
             continue
@@ -2592,14 +2611,15 @@ def _validate_schedule_coverage(
 
 def _select_root_completion_edges(
     *,
-    dependencies: tuple[TileDependency, ...],
-    covered_dependency_ids: frozenset[int],
+    dependency_graph: TileDependencyGraph,
+    covered_dependency_points: frozenset[DependencyPoint],
     preordered_edges: frozenset[tuple[int, int]],
 ) -> frozenset[tuple[int, int]]:
     """Choose the minimal source-ordered root-completion fallback edges."""
-    ordered_root_edges: set[tuple[int, int]] = set()
+    selected_edges: set[tuple[int, int]] = set()
+    ordered_root_edges = set(preordered_edges)
     for dependency in sorted(
-        dependencies,
+        dependency_graph.edges,
         key=lambda edge: (
             edge.consumer_root - edge.producer_root,
             edge.producer_root,
@@ -2607,15 +2627,17 @@ def _select_root_completion_edges(
         ),
     ):
         pair = (dependency.producer_root, dependency.consumer_root)
-        if pair in preordered_edges or all(
-            access_dependency.dependency_id in covered_dependency_ids
+        if all(
+            dependency_graph.dependency_points(access_dependency)
+            <= covered_dependency_points
             for access_dependency in dependency.access_dependencies
         ):
             continue
         if _is_ordered_by_root_completion(*pair, ordered_root_edges):
             continue
+        selected_edges.add(pair)
         ordered_root_edges.add(pair)
-    return frozenset(ordered_root_edges)
+    return frozenset(selected_edges)
 
 
 def _is_ordered_by_root_completion(

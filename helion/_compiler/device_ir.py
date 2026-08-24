@@ -3560,7 +3560,7 @@ def _collect_memory_op_facts(
             and isinstance(getattr(node.meta["lowering"], "block_index", None), int)
         }
         redset = set(red_axis_by_id)
-        for node in graph.nodes:
+        for graph_node_index, node in enumerate(graph.nodes):
             if node.op != "call_function":
                 continue
 
@@ -3745,6 +3745,7 @@ def _collect_memory_op_facts(
                         subscript_is_full_slice=subscript_is_full_slice,
                         is_atomic=is_atomic,
                         layout_is_static=layout_is_static,
+                        graph_node_index=graph_node_index,
                     )
                 )
                 cross_loop_access_id += 1

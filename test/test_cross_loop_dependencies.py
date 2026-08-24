@@ -261,6 +261,29 @@ def streamed_singleton_reduction(x: torch.Tensor) -> torch.Tensor:
     static_shapes=True,
     autotune_effort="none",
 )
+def prewait_singleton_reduction(x: torch.Tensor) -> torch.Tensor:
+    """Keep the scalar read before the nested waits as an ordering adversary."""
+    batch, width = x.size()
+    tmp = torch.empty_like(x)
+    out = torch.empty((batch,), dtype=torch.float32, device=x.device)
+
+    for producer_batch, producer_width in hl.tile([batch, width]):
+        tmp[producer_batch, producer_width] = x[producer_batch, producer_width] + 1
+    for consumer_batch in hl.tile(batch, block_size=1):
+        first = tmp[consumer_batch, 0].to(torch.float32)
+        acc = hl.zeros([consumer_batch], dtype=torch.float32)
+        for reduction_width in hl.tile(width, block_size=16):
+            acc = acc + torch.sum(
+                tmp[consumer_batch, reduction_width].to(torch.float32), dim=-1
+            )
+        out[consumer_batch] = acc + first
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
 def nested_store_chain(x: torch.Tensor) -> torch.Tensor:
     batch, width = x.size()
     tmp = torch.empty_like(x)
@@ -581,9 +604,13 @@ class TestCrossLoopDependencies(TestCase):
         producer_relation = next(
             relation
             for relation in producer_relations
-            if relation.producer_scope_id == producer_scope.scope_id
+            if any(
+                action_scope_id == producer_scope.scope_id
+                for predecessors in relation.predecessors_by_consumer_action
+                for _root, action_scope_id, _action in predecessors
+            )
         )
-        producer_domain = producer_domains[producer_relation.producer_scope_id]
+        producer_domain = producer_domains[producer_scope.scope_id]
         consumer_domain = producer_domains[producer_relation.consumer_scope_id]
         self.assertEqual(producer_domain.action_count, 8)
         self.assertEqual(consumer_domain.action_count, 8)
@@ -591,7 +618,9 @@ class TestCrossLoopDependencies(TestCase):
             producer_relation.predecessors_by_consumer_action
         ):
             self.assertEqual(len(predecessors), 1)
-            producer_action = next(iter(predecessors))
+            producer_root, producer_scope_id, producer_action = next(iter(predecessors))
+            self.assertEqual(producer_root, 0)
+            self.assertEqual(producer_scope_id, producer_scope.scope_id)
             producer_coordinates = producer_domain.action_coordinates(producer_action)
             consumer_coordinates = consumer_domain.action_coordinates(consumer_action)
             self.assertEqual(
@@ -693,16 +722,18 @@ class TestCrossLoopDependencies(TestCase):
             )
             if relation.consumer_scope_id == consumer_scope.scope_id
         )
-        producer_domain = consumer_domains[consumer_relation.producer_scope_id]
         consumer_domain = consumer_domains[consumer_relation.consumer_scope_id]
-        self.assertEqual(producer_domain.action_count, 8)
+        producer_family = consumer_families[0]
+        self.assertEqual(producer_family.task_count, 8)
         self.assertEqual(consumer_domain.action_count, 8)
         for consumer_action, predecessors in enumerate(
             consumer_relation.predecessors_by_consumer_action
         ):
             self.assertEqual(len(predecessors), 1)
-            producer_action = next(iter(predecessors))
-            producer_coordinates = producer_domain.action_coordinates(producer_action)
+            producer_root, producer_scope_id, producer_action = next(iter(predecessors))
+            self.assertEqual(producer_root, 0)
+            self.assertIsNone(producer_scope_id)
+            producer_coordinates = producer_family.task_coordinates(producer_action)
             consumer_coordinates = consumer_domain.action_coordinates(consumer_action)
             self.assertEqual(
                 producer_coordinates[producer_batch_axis],
@@ -1109,6 +1140,7 @@ class TestCrossLoopDependencies(TestCase):
                                 frozenset((0,)),
                                 frozenset((1,)),
                             ),
+                            dependency_points=frozenset(((root - 1, None),)),
                         )
                         for root in (1, 2)
                     ),
@@ -1118,7 +1150,7 @@ class TestCrossLoopDependencies(TestCase):
         (selected,) = choose_counted_events(
             event_graph,
             (),
-            excluded_direct_roots=frozenset((1,)),
+            excluded_dependency_points=frozenset(((0, None),)),
         )
 
         self.assertEqual(selected.key_count, 2)
@@ -3604,11 +3636,24 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
 
                 torch.testing.assert_close(out, torch.sum(x + 1, dim=-1) + x[:, 0] + 1)
                 self.assertNotIn("tile_dependency_ordered_group", code)
-                if batch == 1:
-                    self.assertIn("tile_dependency_action_wait", code)
-                else:
-                    self.assertIn("tile_dependency_keyed_event_wait", code)
+                self.assertIn("tile_dependency_action_wait", code)
                 self.assertNotIn("tile_dependency_root_completion", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_nested_wait_does_not_cover_an_earlier_access(self) -> None:
+        x = torch.arange(4096, device=DEVICE, dtype=torch.float32).reshape(1, 4096)
+        code, out = code_and_output(
+            prewait_singleton_reduction,
+            (x,),
+            block_sizes=[1, 16],
+            pid_type="persistent_blocked",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+
+        torch.testing.assert_close(out, torch.sum(x + 1, dim=-1) + x[:, 0] + 1)
+        self.assertIn("tile_dependency_root_completion_wait", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")

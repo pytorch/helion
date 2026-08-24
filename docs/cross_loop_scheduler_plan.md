@@ -3565,10 +3565,11 @@ Completed in the current scheduler checkpoint:
   uniform-partition proof, task-readiness builder, exact task-event buffers,
   and raw per-task polling path. Configured allocation-overlap relations and
   their keyed-event quotient are now the single source of dependency truth.
-- Track schedule coverage by hazard identity rather than root pair. This lets
-  exact action events and family completion coexist for different regions or
-  program points between the same roots without treating an unrelated exact
-  path as proof that a coarse edge was covered.
+- Track schedule coverage by `(hazard, consumer callsite)` dependency points
+  rather than by root pair or source-level hazard alone. This lets exact action
+  events and family completion coexist for distinct regions and repeated
+  callsites between the same roots without treating an unrelated exact path as
+  proof that a coarse edge was covered.
 - Recompute dependency coverage from the counted events and waits that will
   actually be emitted. Redundant fine-grained uses are removed only after the
   selected root-completion order proves them unnecessary.
@@ -3585,38 +3586,52 @@ Completed in the current scheduler checkpoint:
   actions remain on their owning non-preemptive task strand; worker placement
   still applies only to outer root tasks. A focused nested-producer streaming
   test now lowers to keyed waits and publications without root completion.
+- Added generic same-strand program-order reasoning. For every later access,
+  the dependency pass computes which earlier scope actions have necessarily
+  executed in the same strand. A prior wait suppresses the later fallback only
+  when its acquired producer-action set covers that access's exact predecessor
+  set for every action. A scalar read after a streamed reduction is therefore
+  covered, while the same read before the reduction correctly retains family
+  completion.
+- Exclude any root containing a nested blocking wait from local final-arrival
+  execution. This is the conservative non-preemptive liveness rule until a
+  future action-level proof can establish that such a strand cannot occupy a
+  worker needed for its own progress.
+- Canonical action relations now directly name producer root, producer scope,
+  and producer action. The scheduler no longer reconstructs producer access
+  overlap from allocation regions. Structurally identical keyed events are
+  merged before scheduling, eliminating duplicate waits while retaining the
+  original dependency points.
 - Reproduced Qwen's 64/32 and Gemma's 36/4 loop segmentation through stable
-  action scopes. The saved lowerings are
-  `/tmp/qwen3_ordered_action_lowered.py` and
-  `/tmp/gemma4_ordered_action_lowered.py`.
-- Revalidated Qwen at 77.86 microseconds (253 registers, no spills, 17,408
-  bytes shared) and Gemma at 72.27 microseconds versus 80.17 microseconds for
-  separate Helion (203 registers, no spills, 34,816 bytes shared).
-- The last fully green pre-publication checkpoint passed 78 dependency tests
-  plus 15 subtests, and 14 loop-dependency tests with 4 expected skips. The
-  current nested-publication checkpoint has one intentionally exposed failing
-  streaming assertion: a consumer that finishes a nested reduction and then
-  performs a root-scope scalar read conservatively falls back to family
-  completion even when the preceding nested waits already cover that read.
+  action scopes. The current saved lowerings are
+  `/tmp/qwen3_action_dag_lowered.py` and
+  `/tmp/gemma4_action_dag_lowered.py`; their event topology and resource use
+  match the prior best lowerings.
+- Revalidated Qwen at 78.04 microseconds versus 85.39 microseconds separately
+  (253 registers, no spills, 17,408 bytes shared) and Gemma at 73.30
+  microseconds versus 80.13 microseconds separately (203 registers, no spills,
+  34,816 bytes shared). These are within the observed run-to-run envelope of
+  the prior 77.86 and 72.27 microsecond measurements.
+- The current checkpoint passes 79 dependency tests plus 15 subtests, and 14
+  loop-dependency tests with 4 expected skips. Both strict Qwen validation and
+  Gemma output/cache validation pass.
 
 Remaining work, in order:
 
-1. Make action program points and same-strand dominance explicit. For each
-   later hazard, prove whether the union of readiness acquired by preceding
-   actions in the same strand contains its exact predecessor set. Only this
-   proof may suppress the later wait or family-completion fallback. This is
-   the generic replacement for the remaining singleton-reduction failure and
-   is required for natural RMSNorm-to-matmul streaming.
-2. Extend progress/liveness validation over those program-order edges,
-   especially before permitting a locally triggered root whose strand later
-   blocks at a nested wait.
-3. Finish the nested publication/codegen safety gates above: guarantee one
+1. Generalize placement and lowering from one dependency-bearing nested scope
+   per consumer strand to any ordered set of scopes. Choose one outer-strand
+   placement from the union of their constraints, derive milestones for each
+   scope independently, apply the same stable-scope segmentation transform to
+   each, and outline the root once. This removes the remaining
+   `len(event_uses) == 1` policy and one-scope lowering assertion without adding
+   another schedule kind.
+2. Finish the nested publication/codegen safety gates above: guarantee one
    publication per logical action, preserve reaching-definition order, and
    publish only after configured pipeline work is complete.
-4. Generalize the current conservative one-nested-axis renderer only when an
+3. Generalize the current conservative one-nested-axis renderer only when an
    exact relation produces representable segments; unsupported cases continue
    to lift safely.
-5. Compress large action relations into runs/boxes so graphs such as W2 do not
+4. Compress large action relations into runs/boxes so graphs such as W2 do not
    require one Python object per logical nested action.
-6. Re-run strict Qwen and Gemma correctness, save every lowered Triton kernel,
+5. Re-run strict Qwen and Gemma correctness, save every lowered Triton kernel,
    and benchmark on an uncontended GPU after each semantic deletion.
