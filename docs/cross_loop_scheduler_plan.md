@@ -3602,36 +3602,58 @@ Completed in the current scheduler checkpoint:
   overlap from allocation regions. Structurally identical keyed events are
   merged before scheduling, eliminating duplicate waits while retaining the
   original dependency points.
+- Generalized one outer task strand to contain any number of supported sibling
+  action scopes. Placement is solved once from the union of their exact event
+  constraints; each scope then receives the same generic milestone quotient.
+  This removes the one-scope scheduler and lowering assertions. A focused
+  two-producer/two-scope kernel starts its first reduction while the second
+  producer is still running, waits at both stable scope boundaries, and uses no
+  family-completion barrier.
+- Preserve action-scope identity when cloning untouched AST loops. This makes
+  repeated mechanical segmentation compositional rather than silently losing
+  the metadata needed to find later sibling scopes.
+- Instrument nested producer publication before consumer segmentation. Split
+  loop clones therefore retain the original logical action-coordinate origin;
+  they cannot rebase a later segment to action zero and republish the wrong
+  event keys. A three-root nested load/store chain now waits, computes, and
+  publishes through the same scope while preserving exact downstream keys.
+- Verified nested publication with both `tl.range(num_stages=4)` and
+  `tl.range(loop_unroll_factor=2)`. The original range attributes remain in the
+  lowered kernel, and the CTA-wide completion plus release publication remains
+  ordered after the loop body's stores.
+- Made nested publication an explicit lowering capability. The dependency DAG
+  still records every nested store, but a configured tensor-descriptor store is
+  not offered as an early-publication endpoint until its asynchronous
+  completion protocol is proved. Its dependency monotonically falls back to an
+  enclosing root event or family completion.
+- Added an explicit two-axis nested-consumer test. The scope and accesses remain
+  visible in the action DAG, while the current one-axis renderer declines the
+  optimization and emits the proven family-completion fallback without a
+  topology-specific branch.
 - Reproduced Qwen's 64/32 and Gemma's 36/4 loop segmentation through stable
   action scopes. The current saved lowerings are
-  `/tmp/qwen3_action_dag_lowered.py` and
-  `/tmp/gemma4_action_dag_lowered.py`; their event topology and resource use
-  match the prior best lowerings.
-- Revalidated Qwen at 78.04 microseconds versus 85.39 microseconds separately
-  (253 registers, no spills, 17,408 bytes shared) and Gemma at 73.30
-  microseconds versus 80.13 microseconds separately (203 registers, no spills,
+  `/tmp/qwen3_multi_scope_final_lowered.py` and
+  `/tmp/gemma4_multi_scope_final_lowered.py`; their event topology and resource
+  use match the prior best lowerings.
+- Revalidated Qwen at 78.20 microseconds versus 85.52 microseconds separately
+  (253 registers, no spills, 17,408 bytes shared) and Gemma at 73.18
+  microseconds versus 80.09 microseconds separately (203 registers, no spills,
   34,816 bytes shared). These are within the observed run-to-run envelope of
   the prior 77.86 and 72.27 microsecond measurements.
-- The current checkpoint passes 79 dependency tests plus 15 subtests, and 14
+- The current checkpoint passes 83 dependency tests plus 18 subtests, and 14
   loop-dependency tests with 4 expected skips. Both strict Qwen validation and
   Gemma output/cache validation pass.
 
-Remaining work, in order:
+Deferred extensions, in priority order:
 
-1. Generalize placement and lowering from one dependency-bearing nested scope
-   per consumer strand to any ordered set of scopes. Choose one outer-strand
-   placement from the union of their constraints, derive milestones for each
-   scope independently, apply the same stable-scope segmentation transform to
-   each, and outline the root once. This removes the remaining
-   `len(event_uses) == 1` policy and one-scope lowering assertion without adding
-   another schedule kind.
-2. Finish the nested publication/codegen safety gates above: guarantee one
-   publication per logical action, preserve reaching-definition order, and
-   publish only after configured pipeline work is complete.
-3. Generalize the current conservative one-nested-axis renderer only when an
+1. Generalize the current conservative one-nested-axis renderer only when an
    exact relation produces representable segments; unsupported cases continue
    to lift safely.
-4. Compress large action relations into runs/boxes so graphs such as W2 do not
-   require one Python object per logical nested action.
-5. Re-run strict Qwen and Gemma correctness, save every lowered Triton kernel,
+2. Compress large action relations into runs/boxes only if configuration-time
+   memory or latency becomes material. Qwen and Gemma currently instantiate
+   their full action relations without a hard cutoff, so avoid adding a second
+   compact proof language prematurely.
+3. Expand adversarial coverage for repeated callsites, nested control flow,
+   tails, and multi-axis scopes while preserving monotone fallback.
+4. Continue saving and structurally comparing every Qwen and Gemma lowering,
    and benchmark on an uncontended GPU after each semantic deletion.

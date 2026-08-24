@@ -971,6 +971,201 @@ class CountedEventPlan:
         return self.single_contributor.producer_root
 
 
+@dataclasses.dataclass(frozen=True)
+class _OrderedActionReadiness:
+    """Configured readiness of one nested scope on its owning task strands."""
+
+    event: InstantiatedKeyedEvent
+    use: InstantiatedEventUse
+    domain: InstantiatedActionDomain
+    predecessors_by_action: tuple[frozenset[tuple[int, int | None, int]], ...]
+    readiness_by_strand: tuple[tuple[int, ...], ...]
+    ancestor_placements: frozenset[tuple[int, int]]
+
+
+def _ordered_action_readiness(
+    event_graph: InstantiatedEventGraph,
+    event: InstantiatedKeyedEvent,
+    use: InstantiatedEventUse,
+    *,
+    worker_schedule: WorkerSchedule,
+    local_predecessors: dict[tuple[int, int], frozenset[tuple[int, int]]],
+    static_ancestors_cache: dict[tuple[int, int], frozenset[tuple[int, int]]],
+) -> _OrderedActionReadiness | None:
+    """Project one exact action relation onto static worker completion positions."""
+    assert use.consumer_scope_id is not None
+    domain = event_graph.action_domain(use.consumer_scope_id)
+    consumer = event_graph.task_families[use.consumer_root]
+    if (
+        domain.root != use.consumer_root
+        or len(domain.nested_axis_order) != 1
+        or domain.strand_count != consumer.task_count
+        or len(use.required_keys_by_task) != domain.action_count
+    ):
+        return None
+
+    contributor_actions_by_key = event.contributor_actions_by_key
+    contributor_tasks_by_key = event_graph.contributor_tasks_by_key(event)
+    predecessors_by_action: list[frozenset[tuple[int, int | None, int]]] = []
+    readiness_by_strand: list[list[int]] = [[] for _ in range(domain.strand_count)]
+    ancestor_placements: set[tuple[int, int]] = set()
+    for action, required_keys in enumerate(use.required_keys_by_task):
+        predecessor_actions = frozenset(
+            predecessor
+            for key in required_keys
+            for predecessor in contributor_actions_by_key[key]
+        )
+        if not predecessor_actions:
+            return None
+        predecessors_by_action.append(predecessor_actions)
+        predecessor_tasks = frozenset(
+            predecessor
+            for key in required_keys
+            for predecessor in contributor_tasks_by_key[key]
+        )
+        ancestors = frozenset(
+            ancestor
+            for predecessor in predecessor_tasks
+            for ancestor in _static_ancestors(
+                predecessor,
+                worker_schedule=worker_schedule,
+                local_predecessors=local_predecessors,
+                cache=static_ancestors_cache,
+            )
+        )
+        placements = tuple(
+            placement
+            for ancestor in ancestors
+            if (placement := worker_schedule.placement(*ancestor)) is not None
+        )
+        if not placements:
+            return None
+        ancestor_placements.update(placements)
+        readiness_by_strand[domain.strand_task(action)].append(
+            max(position for _worker, position in placements)
+        )
+    if any(
+        len(readiness) != domain.actions_per_strand for readiness in readiness_by_strand
+    ):
+        return None
+    return _OrderedActionReadiness(
+        event=event,
+        use=use,
+        domain=domain,
+        predecessors_by_action=tuple(predecessors_by_action),
+        readiness_by_strand=tuple(tuple(pattern) for pattern in readiness_by_strand),
+        ancestor_placements=frozenset(ancestor_placements),
+    )
+
+
+def _ordered_action_milestones(
+    event_graph: InstantiatedEventGraph,
+    readiness: _OrderedActionReadiness,
+    *,
+    consumer_position: int,
+) -> tuple[CountedEventPlan, int] | None:
+    """Quotient one action relation into maximal equal-readiness loop segments."""
+    domain = readiness.domain
+    effective_patterns = tuple(
+        tuple(max(position, consumer_position - 1) for position in pattern)
+        for pattern in readiness.readiness_by_strand
+    )
+    boundaries = [0]
+    for action_offset in range(1, domain.actions_per_strand):
+        if any(
+            pattern[action_offset] != pattern[action_offset - 1]
+            for pattern in effective_patterns
+        ):
+            boundaries.append(action_offset)
+    boundaries.append(domain.actions_per_strand)
+    segments = tuple(itertools.pairwise(boundaries))
+
+    signatures_by_strand: list[list[frozenset[tuple[int, int | None, int]]]] = []
+    for strand_task in range(domain.strand_count):
+        strand_begin = strand_task * domain.actions_per_strand
+        strand_signatures: list[frozenset[tuple[int, int | None, int]]] = []
+        for segment_begin, segment_end in segments:
+            signature = frozenset(
+                predecessor
+                for action in range(
+                    strand_begin + segment_begin,
+                    strand_begin + segment_end,
+                )
+                for predecessor in readiness.predecessors_by_action[action]
+            )
+            if not signature:
+                return None
+            strand_signatures.append(signature)
+        signatures_by_strand.append(strand_signatures)
+
+    key_by_signature: dict[frozenset[tuple[int, int | None, int]], int] = {}
+    ordered_signatures: list[frozenset[tuple[int, int | None, int]]] = []
+    key_by_action = [-1] * domain.action_count
+    for strand_task, strand_signatures in enumerate(signatures_by_strand):
+        strand_begin = strand_task * domain.actions_per_strand
+        for (segment_begin, segment_end), signature in zip(
+            segments, strand_signatures, strict=True
+        ):
+            key = key_by_signature.setdefault(signature, len(key_by_signature))
+            if key == len(ordered_signatures):
+                ordered_signatures.append(signature)
+            for action in range(
+                strand_begin + segment_begin,
+                strand_begin + segment_end,
+            ):
+                key_by_action[action] = key
+    if any(key < 0 for key in key_by_action):
+        return None
+
+    contribution_keys: dict[tuple[int, int | None], list[int | None]] = {}
+    for key, signature in enumerate(ordered_signatures):
+        for producer_root, producer_scope_id, producer_action in signature:
+            contribution_id = (producer_root, producer_scope_id)
+            task_to_key = contribution_keys.get(contribution_id)
+            if task_to_key is None:
+                action_count = (
+                    event_graph.task_families[producer_root].task_count
+                    if producer_scope_id is None
+                    else event_graph.action_domain(producer_scope_id).action_count
+                )
+                new_task_to_key: list[int | None] = [None for _ in range(action_count)]
+                contribution_keys[contribution_id] = new_task_to_key
+                task_to_key = new_task_to_key
+            previous = task_to_key[producer_action]
+            if previous is not None and previous != key:
+                return None
+            task_to_key[producer_action] = key
+
+    plan = CountedEventPlan(
+        contributors=tuple(
+            CountedEventContribution(
+                producer_root=producer_root,
+                task_to_key=tuple(
+                    contribution_keys[(producer_root, producer_scope_id)]
+                ),
+                producer_scope_id=producer_scope_id,
+            )
+            for producer_root, producer_scope_id in sorted(
+                contribution_keys,
+                key=lambda item: (
+                    item[0],
+                    -1 if item[1] is None else item[1],
+                ),
+            )
+        ),
+        uses=(
+            CountedEventUse(
+                consumer_root=readiness.use.consumer_root,
+                key_by_task=tuple(key_by_action),
+                dependency_points=readiness.use.dependency_points,
+                consumer_scope_id=readiness.use.consumer_scope_id,
+            ),
+        ),
+        graph_event_index=readiness.event.event_id,
+    )
+    return plan, len(segments)
+
+
 def place_ordered_action_consumers(
     event_graph: InstantiatedEventGraph,
     worker_schedule: WorkerSchedule,
@@ -998,72 +1193,47 @@ def place_ordered_action_consumers(
     plans: list[CountedEventPlan] = []
     selected_dependency_points: set[DependencyPoint] = set()
     for consumer_root, event_uses in sorted(uses_by_consumer.items()):
-        # Several nested scopes in one strand require a joint program-order
-        # analysis. Keep their exact events, but do not move the strand until
-        # that general liveness composition is available.
-        if len(event_uses) != 1:
-            continue
-        event, use = event_uses[0]
-        assert use.consumer_scope_id is not None
-        domain = event_graph.action_domain(use.consumer_scope_id)
         consumer = event_graph.task_families[consumer_root]
-        if (
-            domain.root != consumer_root
-            or len(domain.nested_axis_order) != 1
-            or domain.strand_count != consumer.task_count
-            or len(use.required_keys_by_task) != domain.action_count
-            or consumer.task_count > result.worker_count
-        ):
+        if consumer.task_count > result.worker_count:
             continue
 
-        contributor_actions_by_key = event.contributor_actions_by_key
-        contributor_tasks_by_key = event_graph.contributor_tasks_by_key(event)
-        predecessors_by_action: list[frozenset[tuple[int, int | None, int]]] = []
-        readiness_by_strand: list[list[int]] = [[] for _ in range(domain.strand_count)]
-        ancestor_placements: set[tuple[int, int]] = set()
-        valid = True
-        for action, required_keys in enumerate(use.required_keys_by_task):
-            predecessor_actions = frozenset(
-                predecessor
-                for key in required_keys
-                for predecessor in contributor_actions_by_key[key]
-            )
-            predecessors_by_action.append(predecessor_actions)
-            if not predecessor_actions:
-                valid = False
-                break
-            predecessor_tasks = frozenset(
-                predecessor
-                for key in required_keys
-                for predecessor in contributor_tasks_by_key[key]
-            )
-            ancestors = frozenset(
-                ancestor
-                for predecessor in predecessor_tasks
-                for ancestor in _static_ancestors(
-                    predecessor,
-                    worker_schedule=result,
-                    local_predecessors=local_predecessors,
-                    cache=static_ancestors_cache,
-                )
-            )
-            placements = tuple(
-                placement
-                for ancestor in ancestors
-                if (placement := result.placement(*ancestor)) is not None
-            )
-            if not placements:
-                valid = False
-                break
-            ancestor_placements.update(placements)
-            readiness_by_strand[domain.strand_task(action)].append(
-                max(position for _worker, position in placements)
-            )
-        if not valid or any(
-            len(readiness) != domain.actions_per_strand
-            for readiness in readiness_by_strand
+        # A preceding scope may already carry every dependency point needed by
+        # a later scope.  The implication was proved from DeviceIR program
+        # order when the event graph was built, so the later wait is redundant.
+        uncovered_event_uses: list[
+            tuple[InstantiatedKeyedEvent, InstantiatedEventUse]
+        ] = []
+        preceding_dependency_points: set[DependencyPoint] = set()
+        for event, use in sorted(
+            event_uses,
+            key=lambda item: (
+                item[1].consumer_scope_id
+                if item[1].consumer_scope_id is not None
+                else -1,
+                item[0].event_id,
+            ),
         ):
+            if use.dependency_points and use.dependency_points <= (
+                preceding_dependency_points
+            ):
+                continue
+            uncovered_event_uses.append((event, use))
+            preceding_dependency_points.update(use.dependency_points)
+
+        readiness = tuple(
+            _ordered_action_readiness(
+                event_graph,
+                event,
+                use,
+                worker_schedule=result,
+                local_predecessors=local_predecessors,
+                static_ancestors_cache=static_ancestors_cache,
+            )
+            for event, use in uncovered_event_uses
+        )
+        if not readiness or any(item is None for item in readiness):
             continue
+        ordered_readiness = tuple(item for item in readiness if item is not None)
 
         current_consumer_positions = tuple(
             placement[1]
@@ -1073,15 +1243,47 @@ def place_ordered_action_consumers(
         if len(current_consumer_positions) != consumer.task_count:
             continue
         original_position = min(current_consumer_positions)
-        chosen: tuple[int, WorkerSchedule] | None = None
-        earliest_readiness = min(
-            position for pattern in readiness_by_strand for position in pattern
+        dependency_points = frozenset(
+            dependency_point
+            for item in ordered_readiness
+            for dependency_point in item.use.dependency_points
         )
         candidate_event_graph = _without_root_uses_for_dependencies(
             event_graph,
-            frozenset(selected_dependency_points) | use.dependency_points,
+            frozenset(selected_dependency_points) | dependency_points,
         )
+        earliest_readiness = min(
+            position
+            for item in ordered_readiness
+            for pattern in item.readiness_by_strand
+            for position in pattern
+        )
+        ancestor_placements = frozenset(
+            placement
+            for item in ordered_readiness
+            for placement in item.ancestor_placements
+        )
+        chosen: tuple[WorkerSchedule, tuple[CountedEventPlan, ...]] | None = None
         for position in range(earliest_readiness + 1, original_position):
+            milestone_results = tuple(
+                _ordered_action_milestones(
+                    event_graph,
+                    item,
+                    consumer_position=position,
+                )
+                for item in ordered_readiness
+            )
+            if any(item is None for item in milestone_results):
+                continue
+            concrete_milestones = tuple(
+                item for item in milestone_results if item is not None
+            )
+            # One readiness stage is equivalent to the existing root-entry
+            # event. Moving the strand is useful only when program order exposes
+            # more than one frontier, whether within one loop or across several
+            # sibling loops. Program-order-dominated scopes were removed above.
+            if sum(stage_count for _plan, stage_count in concrete_milestones) <= 1:
+                continue
             busy_workers = frozenset(
                 worker
                 for worker, ancestor_position in ancestor_placements
@@ -1106,114 +1308,16 @@ def place_ordered_action_consumers(
                 None,
             )
             if candidate is not None:
-                chosen = (position, candidate)
+                chosen = (
+                    candidate,
+                    tuple(plan for plan, _stage_count in concrete_milestones),
+                )
                 break
         if chosen is None:
             continue
-
-        consumer_position, candidate = chosen
-        effective_patterns = tuple(
-            tuple(max(position, consumer_position - 1) for position in pattern)
-            for pattern in readiness_by_strand
-        )
-        boundaries = [0]
-        for action_offset in range(1, domain.actions_per_strand):
-            if any(
-                pattern[action_offset] != pattern[action_offset - 1]
-                for pattern in effective_patterns
-            ):
-                boundaries.append(action_offset)
-        boundaries.append(domain.actions_per_strand)
-        if len(boundaries) <= 2:
-            continue
-
-        key_by_signature: dict[frozenset[tuple[int, int | None, int]], int] = {}
-        ordered_signatures: list[frozenset[tuple[int, int | None, int]]] = []
-        key_by_action = [-1] * domain.action_count
-        for strand_task in range(domain.strand_count):
-            strand_begin = strand_task * domain.actions_per_strand
-            for segment_begin, segment_end in itertools.pairwise(boundaries):
-                signature = frozenset(
-                    predecessor
-                    for action in range(
-                        strand_begin + segment_begin,
-                        strand_begin + segment_end,
-                    )
-                    for predecessor in predecessors_by_action[action]
-                )
-                if not signature:
-                    valid = False
-                    break
-                key = key_by_signature.setdefault(signature, len(key_by_signature))
-                if key == len(ordered_signatures):
-                    ordered_signatures.append(signature)
-                for action in range(
-                    strand_begin + segment_begin,
-                    strand_begin + segment_end,
-                ):
-                    key_by_action[action] = key
-            if not valid:
-                break
-        if not valid or any(key < 0 for key in key_by_action):
-            continue
-
-        contribution_keys: dict[tuple[int, int | None], list[int | None]] = {}
-        for key, signature in enumerate(ordered_signatures):
-            for producer_root, producer_scope_id, producer_action in signature:
-                contribution_id = (producer_root, producer_scope_id)
-                task_to_key = contribution_keys.get(contribution_id)
-                if task_to_key is None:
-                    action_count = (
-                        event_graph.task_families[producer_root].task_count
-                        if producer_scope_id is None
-                        else event_graph.action_domain(producer_scope_id).action_count
-                    )
-                    new_task_to_key: list[int | None] = [
-                        None for _ in range(action_count)
-                    ]
-                    contribution_keys[contribution_id] = new_task_to_key
-                    task_to_key = new_task_to_key
-                previous = task_to_key[producer_action]
-                if previous is not None and previous != key:
-                    valid = False
-                    break
-                task_to_key[producer_action] = key
-            if not valid:
-                break
-        if not valid:
-            continue
-
-        result = candidate
-        selected_dependency_points.update(use.dependency_points)
-        plans.append(
-            CountedEventPlan(
-                contributors=tuple(
-                    CountedEventContribution(
-                        producer_root=producer_root,
-                        task_to_key=tuple(
-                            contribution_keys[(producer_root, producer_scope_id)]
-                        ),
-                        producer_scope_id=producer_scope_id,
-                    )
-                    for producer_root, producer_scope_id in sorted(
-                        contribution_keys,
-                        key=lambda item: (
-                            item[0],
-                            -1 if item[1] is None else item[1],
-                        ),
-                    )
-                ),
-                uses=(
-                    CountedEventUse(
-                        consumer_root=consumer_root,
-                        key_by_task=tuple(key_by_action),
-                        dependency_points=use.dependency_points,
-                        consumer_scope_id=use.consumer_scope_id,
-                    ),
-                ),
-                graph_event_index=event.event_id,
-            )
-        )
+        result, action_plans = chosen
+        selected_dependency_points.update(dependency_points)
+        plans.extend(action_plans)
     return result, tuple(plans)
 
 
@@ -1706,6 +1810,7 @@ def add_ordered_action_events(
     dependency_graph: TileDependencyGraph,
     *,
     axis_geometry: dict[int, tuple[int, int]],
+    publishable_action_scope_ids: frozenset[int] | None = None,
 ) -> InstantiatedEventGraph:
     """Add exact nested action relations to the configured keyed-event DAG.
 
@@ -1742,6 +1847,17 @@ def add_ordered_action_events(
         matching_relations = relations_by_consumer_scope.get(
             consumer_scope.scope_id, ()
         )
+        if publishable_action_scope_ids is not None:
+            matching_relations = tuple(
+                relation
+                for relation in matching_relations
+                if all(
+                    producer_scope_id is None
+                    or producer_scope_id in publishable_action_scope_ids
+                    for predecessors in relation.predecessors_by_consumer_action
+                    for _producer_root, producer_scope_id, _action in predecessors
+                )
+            )
         if not matching_relations:
             continue
 
@@ -2450,6 +2566,7 @@ def build_cross_loop_schedule(
     preordered_edges: frozenset[tuple[int, int]],
     physical_worker_limit: int,
     requested_worker_count: int = CROSS_LOOP_NUM_WORKERS_DEFAULT,
+    publishable_action_scope_ids: frozenset[int] | None = None,
 ) -> CrossLoopSchedule:
     """Derive all generic readiness strategies without inspecting root bodies."""
     event_graph = canonicalize_ready_events(
@@ -2457,6 +2574,7 @@ def build_cross_loop_schedule(
             instantiate_event_graph(dependency_plan, task_families),
             dependency_plan,
             axis_geometry=axis_geometry,
+            publishable_action_scope_ids=publishable_action_scope_ids,
         )
     )
     worker_limit = resolve_worker_count(

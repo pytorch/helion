@@ -284,6 +284,36 @@ def prewait_singleton_reduction(x: torch.Tensor) -> torch.Tensor:
     static_shapes=True,
     autotune_effort="none",
 )
+def streamed_sibling_reductions(x: torch.Tensor) -> torch.Tensor:
+    """Exercise two independently ready nested scopes in one consumer strand."""
+    batch, width = x.size()
+    left = torch.empty_like(x)
+    right = torch.empty_like(x)
+    out = torch.empty((batch,), dtype=torch.float32, device=x.device)
+
+    for producer_batch, producer_width in hl.tile([batch, width]):
+        left[producer_batch, producer_width] = x[producer_batch, producer_width] + 1
+    for producer_batch, producer_width in hl.tile([batch, width]):
+        right[producer_batch, producer_width] = x[producer_batch, producer_width] * 2
+    for consumer_batch in hl.tile(batch, block_size=1):
+        left_acc = hl.zeros([consumer_batch], dtype=torch.float32)
+        for reduction_width in hl.tile(width, block_size=16):
+            left_acc = left_acc + torch.sum(
+                left[consumer_batch, reduction_width].to(torch.float32), dim=-1
+            )
+        right_acc = hl.zeros([consumer_batch], dtype=torch.float32)
+        for reduction_width in hl.tile(width, block_size=16):
+            right_acc = right_acc + torch.sum(
+                right[consumer_batch, reduction_width].to(torch.float32), dim=-1
+            )
+        out[consumer_batch] = left_acc + right_acc
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
 def nested_store_chain(x: torch.Tensor) -> torch.Tensor:
     batch, width = x.size()
     tmp = torch.empty_like(x)
@@ -294,6 +324,47 @@ def nested_store_chain(x: torch.Tensor) -> torch.Tensor:
             tmp[producer_batch, producer_width] = x[producer_batch, producer_width] + 1
     for consumer_batch, consumer_width in hl.tile([batch, width], block_size=[1, 16]):
         out[consumer_batch, consumer_width] = tmp[consumer_batch, consumer_width] * 2
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def nested_load_store_chain(x: torch.Tensor) -> torch.Tensor:
+    """Make one nested scope both a readiness consumer and a producer."""
+    batch, width = x.size()
+    first = torch.empty_like(x)
+    second = torch.empty_like(x)
+    out = torch.empty_like(x)
+
+    for producer_batch, producer_width in hl.tile([batch, width]):
+        first[producer_batch, producer_width] = x[producer_batch, producer_width] + 1
+    for middle_batch in hl.tile(batch, block_size=1):
+        for middle_width in hl.tile(width, block_size=16):
+            second[middle_batch, middle_width] = first[middle_batch, middle_width] * 2
+    for consumer_batch, consumer_width in hl.tile([batch, width], block_size=[1, 16]):
+        out[consumer_batch, consumer_width] = second[consumer_batch, consumer_width] + 3
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def nested_two_axis_consumer(x: torch.Tensor) -> torch.Tensor:
+    """Exercise conservative fallback for an unrendered two-axis action scope."""
+    rows, columns = x.size()
+    tmp = torch.empty_like(x)
+    out = torch.empty_like(x)
+
+    for producer_row, producer_column in hl.tile([rows, columns]):
+        tmp[producer_row, producer_column] = x[producer_row, producer_column] + 1
+    for _consumer in hl.tile(1, block_size=1):
+        for consumer_row, consumer_column in hl.tile(
+            [rows, columns], block_size=[8, 8]
+        ):
+            out[consumer_row, consumer_column] = tmp[consumer_row, consumer_column] * 2
     return out
 
 
@@ -651,6 +722,22 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(producer_event.key_count, 8)
         self.assertEqual(producer_event.expected_arrivals, (1,) * 8)
         self.assertEqual(producer_event.uses[0].consumer_scope_id, None)
+        synchronous_only_graph = add_ordered_action_events(
+            instantiate_event_graph(
+                producer_graph.tile_dependency_graph,
+                producer_families,
+            ),
+            producer_graph.tile_dependency_graph,
+            axis_geometry=producer_axis_geometry,
+            publishable_action_scope_ids=frozenset(),
+        )
+        self.assertFalse(
+            any(
+                contribution.producer_scope_id is not None
+                for event in synchronous_only_graph.events
+                for contribution in event.contributions
+            )
+        )
 
         consumer_graph = streamed_singleton_reduction.bind((x,)).host_function.device_ir
         assert consumer_graph.tile_dependency_graph is not None
@@ -2678,6 +2765,70 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(plan.uses[0].key_by_task, (0, 0, 0, 1))
         self.assertEqual(plan.uses[0].consumer_scope_id, 7)
 
+    def test_ordered_action_milestones_compose_sibling_scopes(self) -> None:
+        task_families = (
+            InstantiatedTaskFamily((10,), (10,), ((10, 4),), ((10, 1),)),
+            InstantiatedTaskFamily((20,), (20,), ((20, 4),), ((20, 1),)),
+            InstantiatedTaskFamily((30,), (30,), ((30, 1),), ((30, 1),)),
+        )
+        action_domains = tuple(
+            InstantiatedActionDomain(
+                scope_id=scope_id,
+                root=2,
+                strand_axis_order=(30,),
+                logical_axis_order=(30, nested_axis),
+                axis_counts_items=((30, 1), (nested_axis, 4)),
+                block_sizes_items=((30, 1), (nested_axis, 1)),
+            )
+            for scope_id, nested_axis in ((7, 31), (8, 32))
+        )
+        event_graph = InstantiatedEventGraph(
+            task_families=task_families,
+            events=tuple(
+                InstantiatedKeyedEvent(
+                    event_id=producer_root,
+                    key_count=4,
+                    contributions=(
+                        InstantiatedEventContribution(
+                            producer_root=producer_root,
+                            keys_by_task=tuple(frozenset((task,)) for task in range(4)),
+                        ),
+                    ),
+                    uses=(
+                        InstantiatedEventUse(
+                            consumer_root=2,
+                            required_keys_by_task=tuple(
+                                frozenset((action,)) for action in range(4)
+                            ),
+                            dependency_points=frozenset(((producer_root, scope_id),)),
+                            consumer_scope_id=scope_id,
+                        ),
+                    ),
+                )
+                for producer_root, scope_id in ((0, 7), (1, 8))
+            ),
+            action_domains=action_domains,
+        )
+        schedule = WorkerSchedule(
+            worker_count=4,
+            segments=(
+                WorkerScheduleSegment(0, 0, 4, 0, 4, 0),
+                WorkerScheduleSegment(1, 0, 3, 0, 4, 4),
+                WorkerScheduleSegment(1, 3, 1, 0, 4, 8),
+                WorkerScheduleSegment(2, 0, 1, 3, 1, 3),
+            ),
+        )
+
+        placed, plans = place_ordered_action_consumers(event_graph, schedule, ())
+
+        self.assertEqual(placed.placement(2, 0), (3, 1))
+        self.assertEqual(len(plans), 2)
+        plans_by_scope = {plan.uses[0].consumer_scope_id: plan for plan in plans}
+        self.assertEqual(plans_by_scope[7].expected_arrivals_by_key, (4,))
+        self.assertEqual(plans_by_scope[7].uses[0].key_by_task, (0, 0, 0, 0))
+        self.assertEqual(plans_by_scope[8].expected_arrivals_by_key, (3, 1))
+        self.assertEqual(plans_by_scope[8].uses[0].key_by_task, (0, 0, 0, 1))
+
     def test_multi_producer_join_uses_one_keyed_event(self) -> None:
         dependency_plan = build_tile_dependency_graph(
             (
@@ -3238,17 +3389,68 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_nested_producer_actions_publish_readiness(self) -> None:
         x = torch.arange(2 * 64, device=DEVICE, dtype=torch.float32).reshape(2, 64)
+        for name, extra_config, expected_range_option in (
+            ("default", {"num_warps": 1}, None),
+            (
+                "pipelined",
+                {"num_warps": 4, "range_num_stages": [0, 4, 0]},
+                "num_stages=4",
+            ),
+            (
+                "unrolled",
+                {"num_warps": 4, "range_unroll_factors": [0, 2, 0]},
+                "loop_unroll_factor=2",
+            ),
+        ):
+            with self.subTest(name=name):
+                code, out = code_and_output(
+                    nested_store_chain,
+                    (x,),
+                    pid_type="persistent_blocked",
+                    num_sm_multiplier=1,
+                    **extra_config,
+                )
+
+                torch.testing.assert_close(out, (x + 1) * 2)
+                self.assertIn("tile_dependency_keyed_event_wait", code)
+                self.assertNotIn("tile_dependency_root_completion", code)
+                if expected_range_option is not None:
+                    self.assertIn(expected_range_option, code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_nested_scope_can_consume_and_publish_readiness(self) -> None:
+        x = torch.arange(4096, device=DEVICE, dtype=torch.float32).reshape(1, 4096)
         code, out = code_and_output(
-            nested_store_chain,
+            nested_load_store_chain,
             (x,),
+            block_sizes=[1, 16],
+            pid_type="persistent_blocked",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+
+        torch.testing.assert_close(out, (x + 1) * 2 + 3)
+        self.assertIn("tile_dependency_action_wait", code)
+        self.assertIn("tile_dependency_keyed_event_wait", code)
+        self.assertNotIn("tile_dependency_root_completion", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_two_axis_nested_scope_falls_back_to_root_completion(self) -> None:
+        x = torch.arange(32 * 32, device=DEVICE, dtype=torch.float32).reshape(32, 32)
+        code, out = code_and_output(
+            nested_two_axis_consumer,
+            (x,),
+            block_sizes=[8, 8],
             pid_type="persistent_blocked",
             num_sm_multiplier=1,
             num_warps=1,
         )
 
         torch.testing.assert_close(out, (x + 1) * 2)
-        self.assertIn("tile_dependency_keyed_event_wait", code)
-        self.assertNotIn("tile_dependency_root_completion", code)
+        self.assertNotIn("tile_dependency_action_wait", code)
+        self.assertIn("tile_dependency_root_completion_wait", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -3654,6 +3856,26 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(out, torch.sum(x + 1, dim=-1) + x[:, 0] + 1)
         self.assertIn("tile_dependency_root_completion_wait", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_multiple_nested_scopes_share_one_scheduled_strand(self) -> None:
+        x = torch.arange(4096, device=DEVICE, dtype=torch.float32).reshape(1, 4096)
+        code, out = code_and_output(
+            streamed_sibling_reductions,
+            (x,),
+            block_sizes=[1, 16, 1, 16],
+            pid_type="persistent_blocked",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+
+        torch.testing.assert_close(
+            out,
+            torch.sum(x + 1, dim=-1) + torch.sum(x * 2, dim=-1),
+        )
+        self.assertGreaterEqual(code.count("tile_dependency_action_wait"), 2)
+        self.assertNotIn("tile_dependency_root_completion_wait", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")

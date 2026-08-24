@@ -112,6 +112,7 @@ def _clone_opaque_statements_with_loop_rewrite(
     rewrite: Callable[[ast.For], list[ast.stmt] | None],
 ) -> list[ast.stmt]:
     """Clone an opaque body while replacing selected loops."""
+    from .tile_dependency import TILE_ACTION_SCOPE_ID_ATTR
 
     def clone(value: object) -> object:
         if isinstance(value, list):
@@ -130,8 +131,14 @@ def _clone_opaque_statements_with_loop_rewrite(
         if isinstance(value, ast.AST):
             fields = {field: clone(getattr(value, field)) for field in value._fields}
             if isinstance(value, ExtendedAST):
-                return value.copy(**fields)
-            return ast.copy_location(type(value)(**fields), value)
+                cloned = value.copy(**fields)
+            else:
+                cloned = ast.copy_location(type(value)(**fields), value)
+            if (
+                scope_id := getattr(value, TILE_ACTION_SCOPE_ID_ATTR, None)
+            ) is not None:
+                setattr(cloned, TILE_ACTION_SCOPE_ID_ATTR, scope_id)
+            return cloned
         return value
 
     return cast("list[ast.stmt]", clone(body))
@@ -192,7 +199,16 @@ def _clone_opaque_statements_with_action_stages(
 
     cloned = _clone_opaque_statements_with_loop_rewrite(body, rewrite)
     if not scheduled:
-        raise AssertionError(f"missing ordered action scope {scope_id}")
+        present_scope_ids = sorted(
+            found_scope_id
+            for statement in body
+            for node in ast.walk(statement)
+            if isinstance(node, ast.For)
+            if (found_scope_id := tile_action_scope_id(node)) is not None
+        )
+        raise AssertionError(
+            f"missing ordered action scope {scope_id}; found {present_scope_ids}"
+        )
     return cloned
 
 
@@ -775,6 +791,33 @@ class ForEachProgramID(ProgramIDs):
             running_offset += task_count
         dependency_plan = HostFunction.current().device_ir.tile_dependency_graph
         assert dependency_plan is not None
+        indexing = device_function.config.get("indexing", ())
+
+        def uses_tensor_descriptor(memory_op_index: int) -> bool:
+            if isinstance(indexing, str):
+                return indexing == "tensor_descriptor"
+            return (
+                isinstance(indexing, (list, tuple))
+                and 0 <= memory_op_index < len(indexing)
+                and indexing[memory_op_index] == "tensor_descriptor"
+            )
+
+        unpublishable_action_scope_ids = frozenset(
+            scope_id
+            for access in dependency_plan.accesses
+            if access.kind == "store" and uses_tensor_descriptor(access.memory_op_index)
+            for scope_id in dependency_plan.scope_ids_by_access[access.access_id]
+        )
+        publishable_action_scope_ids = (
+            frozenset(
+                scope.scope_id
+                for scope in dependency_plan.execution_scopes
+                if not scope.is_root
+                and scope.scope_id not in unpublishable_action_scope_ids
+            )
+            if unpublishable_action_scope_ids
+            else None
+        )
         physical_worker_limit = CompileEnvironment.current().config_spec.num_sm * cast(
             "int", device_function.config.get("num_sm_multiplier", 1)
         )
@@ -803,6 +846,7 @@ class ForEachProgramID(ProgramIDs):
                     CROSS_LOOP_NUM_WORKERS_DEFAULT,
                 ),
             ),
+            publishable_action_scope_ids=publishable_action_scope_ids,
         )
         root_completion_edges = set(cross_loop_schedule.root_completion_edges)
         family_done_event_plans = tuple(
@@ -1227,13 +1271,12 @@ class ForEachProgramID(ProgramIDs):
                 multiplier *= count
             return " + ".join(terms) or "0"
 
-        def ordered_action_consumer_body(
+        def body_with_action_waits(
             plan: CountedEventPlan,
             use: CountedEventUse,
+            body: list[ast.stmt],
             consumer_coordinates: dict[int, str],
-            logical_pid: str,
-            extra_argument_names: tuple[str, ...],
-        ) -> ast.stmt:
+        ) -> list[ast.stmt]:
             assert use.consumer_scope_id is not None
             domain = cross_loop_schedule.event_graph.action_domain(
                 use.consumer_scope_id
@@ -1292,25 +1335,11 @@ class ForEachProgramID(ProgramIDs):
                         )
                     )
                 )
-            scheduled_root_body = _clone_opaque_statements_with_action_stages(
-                case_bodies[use.consumer_root],
+            return _clone_opaque_statements_with_action_stages(
+                body,
                 scope_id=use.consumer_scope_id,
                 split_iteration_offsets=boundaries,
                 stage_waits=tuple(stage_waits),
-            )
-            scheduled_root_body = body_with_action_publications(
-                use.consumer_root,
-                scheduled_root_body,
-                consumer_coordinates,
-            )
-            return self._outline_cross_loop_region(
-                device_function,
-                name_hint=f"tile_dependency_root_{use.consumer_root}",
-                body=[
-                    statement_from_string(f"{self.shared_pid_var} = {logical_pid}"),
-                    *scheduled_root_body,
-                ],
-                extra_argument_names=extra_argument_names,
             )
 
         def task_to_key_expression(
@@ -1508,7 +1537,7 @@ class ForEachProgramID(ProgramIDs):
 
             def rewrite(loop: ast.For) -> list[ast.stmt] | None:
                 scope_id = tile_action_scope_id(loop)
-                if scope_id not in scope_ids:
+                if scope_id is None or scope_id not in scope_ids:
                     return None
                 if scope_id in emitted_scope_ids:
                     raise AssertionError(
@@ -1749,17 +1778,38 @@ class ForEachProgramID(ProgramIDs):
                 )
             action_event_uses = ordered_action_events_by_consumer.get(root, ())
             if action_event_uses:
-                if len(action_event_uses) != 1:
-                    raise AssertionError(
-                        "ordered action scheduling requires one scope per consumer root"
-                    )
-                action_plan, action_use = action_event_uses[0]
-                opaque_call = ordered_action_consumer_body(
-                    action_plan,
-                    action_use,
+                # Instrument the original logical loop before segmentation.
+                # Split ranges then retain the original action-coordinate
+                # expression instead of rebasing publication IDs per segment.
+                scheduled_root_body = body_with_action_publications(
+                    root,
+                    case_bodies[root],
                     scheduled_coordinates,
-                    scheduled_logical_pid,
-                    extra_argument_names,
+                )
+                for action_plan, action_use in sorted(
+                    action_event_uses,
+                    key=lambda item: (
+                        item[1].consumer_scope_id
+                        if item[1].consumer_scope_id is not None
+                        else -1
+                    ),
+                ):
+                    scheduled_root_body = body_with_action_waits(
+                        action_plan,
+                        action_use,
+                        scheduled_root_body,
+                        scheduled_coordinates,
+                    )
+                opaque_call = self._outline_cross_loop_region(
+                    device_function,
+                    name_hint=f"tile_dependency_root_{root}",
+                    body=[
+                        statement_from_string(
+                            f"{self.shared_pid_var} = {scheduled_logical_pid}"
+                        ),
+                        *scheduled_root_body,
+                    ],
+                    extra_argument_names=extra_argument_names,
                 )
             else:
                 opaque_call = self._outline_opaque_tile_body(
