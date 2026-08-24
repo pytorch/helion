@@ -309,6 +309,52 @@ A100_HARDWARE = HardwareInfo(
 )
 
 
+def _grouped_worklist_with_viewed_inputs(
+    a_storage: torch.Tensor,
+    b_storage: torch.Tensor,
+    worklist: torch.Tensor,
+) -> torch.Tensor:
+    a_packed = a_storage.view(-1, a_storage.size(2))
+    b_grouped = b_storage.view(-1, b_storage.size(2), b_storage.size(3))
+    m_total, k = a_packed.shape
+    _groups, n, k2 = b_grouped.shape
+    assert k == k2
+    block_m = hl.register_block_size(256)
+    block_n = hl.register_block_size(128)
+    block_k = hl.register_block_size(64, 128)
+    out = torch.empty([m_total, n], dtype=a_packed.dtype, device=a_packed.device)
+    for work_tile, tile_m, tile_n in hl.tile(
+        [worklist.size(0), 256, n],
+        block_size=[1, block_m, block_n],
+    ):
+        work_id = work_tile.begin
+        group_id = worklist[work_id, 0]
+        start = worklist[work_id, 1]
+        valid_m = worklist[work_id, 2]
+        store_m = worklist[work_id, 3]
+        local_m = tile_m.index
+        row = start + local_m
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k, block_size=block_k):
+            a_block = hl.load(
+                a_packed,
+                [row, tile_k],
+                extra_mask=(local_m < valid_m)[:, None],  # pyrefly: ignore[bad-index]
+            )
+            acc = torch.addmm(
+                acc,
+                a_block,
+                b_grouped[group_id, tile_n, tile_k].T,
+            )
+        hl.store(
+            out,
+            [row, tile_n],
+            acc.to(out.dtype),
+            extra_mask=(local_m < store_m)[:, None],  # pyrefly: ignore[bad-index]
+        )
+    return out
+
+
 class TestAutotunerHeuristic(TestCase):
     @staticmethod
     def _heuristic(name: str, **attributes: object) -> type[AutotunerHeuristic]:
@@ -1992,6 +2038,8 @@ class TestAutotunerHeuristic(TestCase):
         analysis = Tcgen05GroupedWorklistAnalysis(
             seed_facts=seed_facts,
             metadata_tensor=MagicMock(),
+            packed_tensor=MagicMock(),
+            grouped_tensor=MagicMock(),
         )
         env = MagicMock(device=torch.device("cuda:0"), config_spec=spec)
         device_ir = MagicMock()
@@ -2422,7 +2470,6 @@ class TestAutotunerHeuristic(TestCase):
                     device=DEVICE,
                     dtype=torch.int32,
                 ),
-                None,
             )
 
         kernel = helion.kernel(
@@ -2517,6 +2564,7 @@ class TestAutotunerHeuristic(TestCase):
             n: int = 256,
             k: int = 256,
             b_major: str = "k",
+            source_m_tile: int = 32,
         ) -> tuple[object, ...]:
             if b_major == "k":
                 b_grouped = torch.empty(
@@ -2532,15 +2580,26 @@ class TestAutotunerHeuristic(TestCase):
                     dtype=torch.bfloat16,
                 ).transpose(1, 2)
             worklist = torch.tensor(
-                [[group, group * 32, 32, 32] for group in range(6)],
+                [
+                    [
+                        group,
+                        group * source_m_tile,
+                        source_m_tile,
+                        source_m_tile,
+                    ]
+                    for group in range(6)
+                ],
                 device=DEVICE,
                 dtype=torch.int32,
             )
             return (
-                torch.empty([6 * 32, k], device=DEVICE, dtype=torch.bfloat16),
+                torch.empty(
+                    [6 * source_m_tile, k],
+                    device=DEVICE,
+                    dtype=torch.bfloat16,
+                ),
                 b_grouped,
                 worklist,
-                None,
             )
 
         kernel = helion.kernel(
@@ -2562,6 +2621,14 @@ class TestAutotunerHeuristic(TestCase):
         different_k_args = make_args(k=192)
         different_n_args = make_args(n=240)
         different_layout_args = make_args(b_major="n")
+        source224_args = make_args(k=128, source_m_tile=224)
+        # Reuse one dynamic schema across packed shapes, then change only the
+        # worklist values while keeping the larger tensor metadata unchanged.
+        shape_kernel = helion.kernel(
+            _GROUPED_GEMM_DEEPGEMM_BODY,
+            backend="cute",
+            static_shapes=False,
+        )
 
         with (
             patch_cute_mma_support(),
@@ -2584,6 +2651,19 @@ class TestAutotunerHeuristic(TestCase):
             different_k = kernel.bind(different_k_args)
             different_n = kernel.bind(different_n_args)
             different_layout = kernel.bind(different_layout_args)
+            shape_source32 = shape_kernel.bind(first_args)
+            shape_source224 = shape_kernel.bind(source224_args)
+
+            compact_extents = (32, 32, 32, 32, 32, 1184)
+            compact_rows = []
+            start = 0
+            for group, extent in enumerate(compact_extents):
+                compact_rows.append([group, start, extent, extent])
+                start += extent
+            cast("torch.Tensor", source224_args[2]).copy_(
+                cast("torch.Tensor", source224_args[2]).new_tensor(compact_rows)
+            )
+            shape_compact = shape_kernel.bind(source224_args)
 
             first_output = cast("torch.Tensor", first_args[0])
             different_k_output = cast("torch.Tensor", different_k_args[0])
@@ -2608,6 +2688,24 @@ class TestAutotunerHeuristic(TestCase):
         self.assertIsNot(smaller_sm, first)
         self.assertIsNot(smaller_sm, different_k)
         self.assertEqual(len(kernel._bound_kernels), 6)
+        self.assertIsNot(shape_source224, shape_source32)
+        self.assertTrue(
+            any(
+                config.config.get(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY)
+                == 224
+                for config in shape_source224.config_spec.compiler_seed_configs
+            )
+        )
+        self.assertIsNot(shape_compact, shape_source224)
+        self.assertEqual(
+            {
+                config.config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY]
+                for config in shape_compact.config_spec.compiler_seed_configs
+                if config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+                == TCGEN05_GROUPED_MODE_WORKLIST_NM
+            },
+            {32},
+        )
 
         def specialization_results(bound: object) -> dict[str, object]:
             matches = [
@@ -2689,6 +2787,80 @@ class TestAutotunerHeuristic(TestCase):
         )
 
     @onlyBackends(["cute"])
+    def test_grouped_worklist_view_dimension_guard_fallback(self) -> None:
+        groups = 6
+        source_m_tile = 224
+        n = 256
+        k = 128
+        static_viewed_inputs = helion.kernel(
+            _grouped_worklist_with_viewed_inputs,
+            backend="cute",
+            static_shapes=True,
+        )
+        dynamic_viewed_inputs = helion.kernel(
+            _grouped_worklist_with_viewed_inputs,
+            backend="cute",
+            static_shapes=False,
+        )
+
+        args = (
+            torch.empty(
+                [groups, source_m_tile, k],
+                device=DEVICE,
+                dtype=torch.bfloat16,
+            ),
+            torch.empty([1, groups, n, k], device=DEVICE, dtype=torch.bfloat16),
+            torch.tensor(
+                [
+                    [
+                        group,
+                        group * source_m_tile,
+                        source_m_tile,
+                        source_m_tile,
+                    ]
+                    for group in range(groups)
+                ],
+                device=DEVICE,
+                dtype=torch.int32,
+            ),
+        )
+
+        with (
+            patch_cute_mma_support(),
+            patch(
+                "helion._compiler.autotuner_heuristics.cute."
+                "tcgen05_runtime_n_ptx_compatible",
+                return_value=True,
+            ),
+            patch(
+                "helion._compiler.cute.cutedsl_compat.check_cute_backend_requirements"
+            ),
+            patch(
+                "helion._hardware.get_hardware_info",
+                return_value=BLACKWELL_HARDWARE,
+            ),
+        ):
+            static_bound = static_viewed_inputs.bind(args)
+            dynamic_bound = dynamic_viewed_inputs.bind(args)
+
+        self.assertTrue(static_bound.env.grouped_worklist_compatibility_guards)
+        self.assertTrue(
+            any(
+                config.config.get(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY)
+                == source_m_tile
+                for config in static_bound.config_spec.compiler_seed_configs
+            )
+        )
+        self.assertFalse(dynamic_bound.env.grouped_worklist_compatibility_guards)
+        self.assertFalse(
+            any(
+                config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+                == TCGEN05_GROUPED_MODE_WORKLIST_NM
+                for config in dynamic_bound.config_spec.compiler_seed_configs
+            )
+        )
+
+    @onlyBackends(["cute"])
     def test_grouped_worklist_smem_facts_register_with_heuristics_disabled(
         self,
     ) -> None:
@@ -2733,7 +2905,6 @@ class TestAutotunerHeuristic(TestCase):
                     device=DEVICE,
                     dtype=torch.int32,
                 ),
-                None,
             )
 
         groups = 6
@@ -3229,7 +3400,7 @@ class TestAutotunerHeuristic(TestCase):
             )
 
             renamed_args = make_args(224, "n")
-            pretuned_bound = grouped_gemm_deepgemm.bind((*renamed_args[:3], None))
+            pretuned_bound = grouped_gemm_deepgemm.bind(renamed_args[:3])
             self.assertIsNotNone(pretuned_bound.config_spec.compiler_default_config)
             self.assertEqual(
                 grouped_seeds(pretuned_bound.config_spec, 224),

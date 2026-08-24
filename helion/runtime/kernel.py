@@ -2679,10 +2679,20 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
         def make_grouped_worklist_compatibility_extractor(
             source: Source,
-            group_count: int,
-            packed_m: int,
+            group_count: Source | int,
+            packed_m: Source | int,
         ) -> Callable[[Sequence[object]], Hashable]:
             extract_tensor = make_extractor(source)
+
+            def make_dimension_extractor(
+                dimension: Source | int,
+            ) -> Callable[[Sequence[object]], Hashable]:
+                if isinstance(dimension, int):
+                    return lambda _args, value=dimension: value
+                return make_extractor(dimension)
+
+            extract_group_count = make_dimension_extractor(group_count)
+            extract_packed_m = make_dimension_extractor(packed_m)
             cache: WeakIdKeyDictionary = WeakIdKeyDictionary()
 
             def grouped_worklist_compatibility_extractor(
@@ -2703,6 +2713,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     if not isinstance(tensor.constant, torch.Tensor):
                         return ()
                     tensor = tensor.constant
+                group_count = cast("int", extract_group_count(args))
+                packed_m = cast("int", extract_packed_m(args))
                 inference_values: tuple[int, ...] | None = None
                 if torch.is_inference(tensor):
                     from .cute.launcher import _tcgen05_grouped_tensor_mutation_key
@@ -2712,12 +2724,13 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     inference_values = cast("tuple[int, ...]", mutation_key[1])
                 else:
                     mutation_key = ("version", int(tensor._version))
+                input_key = (mutation_key, group_count, packed_m)
                 try:
-                    cached_mutation_key, cached_result = cache[tensor]
+                    cached_input_key, cached_result = cache[tensor]
                 except KeyError:
                     pass
                 else:
-                    if cached_mutation_key == mutation_key:
+                    if cached_input_key == input_key:
                         return cast("tuple[int, ...]", cached_result)
                 if tensor.ndim != 2 or tensor.shape[1] != 4:
                     rows = []
@@ -2737,7 +2750,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     group_count=group_count,
                     packed_m=packed_m,
                 )
-                cache[tensor] = (mutation_key, result)
+                cache[tensor] = (input_key, result)
                 return result
 
             return grouped_worklist_compatibility_extractor

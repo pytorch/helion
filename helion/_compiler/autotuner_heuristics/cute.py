@@ -1173,8 +1173,8 @@ def _tcgen05_grouped_worklist_source_m_tiles(
     facts = analysis.seed_facts
     if not env.register_grouped_worklist_compatibility_guard(
         analysis.metadata_tensor,
-        group_count=facts.groups_hint,
-        packed_m=facts.packed_m_hint,
+        grouped_tensor=analysis.grouped_tensor,
+        packed_tensor=analysis.packed_tensor,
     ):
         return ()
     worklist = env.runtime_value_for_tensor(analysis.metadata_tensor)
@@ -1185,6 +1185,9 @@ def _tcgen05_grouped_worklist_source_m_tiles(
 
     from ..cute.grouped_worklist import (
         tcgen05_grouped_worklist_compatible_source_m_tiles,
+    )
+    from ..cute.grouped_worklist import (
+        tcgen05_grouped_worklist_source_m_tiles_by_preference,
     )
 
     if isinstance(worklist, FakeTensor):
@@ -1202,15 +1205,7 @@ def _tcgen05_grouped_worklist_source_m_tiles(
         group_count=facts.groups_hint,
         packed_m=facts.packed_m_hint,
     )
-    # Prefer the established two-CTA profiles over the compact source-32
-    # fallback. Ordinary 224- and 256-packed inputs are distinguishable because
-    # their segment capacities are incompatible with the other large tile.
-    preference = {
-        TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT: 0,
-        TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE: 1,
-        TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE: 2,
-    }
-    return tuple(sorted(compatible, key=preference.__getitem__))
+    return tcgen05_grouped_worklist_source_m_tiles_by_preference(compatible)
 
 
 _TCGEN05_GROUPED_WORKLIST_AUTOMATIC_SEED_LIMIT = 8
@@ -1298,8 +1293,8 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
         if analysis.input_kind == "external_worklist":
             env.register_grouped_worklist_compatibility_guard(
                 analysis.metadata_tensor,
-                group_count=seed_facts.groups_hint,
-                packed_m=seed_facts.packed_m_hint,
+                grouped_tensor=analysis.grouped_tensor,
+                packed_tensor=analysis.packed_tensor,
             )
         if seed_facts.groups_hint > 0:
             spec.register_cute_tcgen05_grouped_worklist_smem_facts(

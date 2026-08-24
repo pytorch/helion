@@ -7,7 +7,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -15,6 +18,25 @@ if TYPE_CHECKING:
 
 class Tcgen05GroupedWorklistValidationError(ValueError):
     """A value-level violation of the grouped-worklist contract."""
+
+
+_TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_PREFERENCE = (
+    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+    TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+    TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
+)
+
+
+def tcgen05_grouped_worklist_source_m_tiles_by_preference(
+    source_m_tiles: Sequence[int],
+) -> tuple[int, ...]:
+    """Order compatible source-M tiles from established to fallback profiles."""
+    return tuple(
+        sorted(
+            source_m_tiles,
+            key=_TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_PREFERENCE.index,
+        )
+    )
 
 
 def _analyze_tcgen05_grouped_worklist_rows(

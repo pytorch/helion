@@ -549,11 +549,14 @@ class Tcgen05GroupedWorklistAnalysis:
 
     ``metadata_tensor`` is the traced fake tensor for either a compact device
     segment layout or the external ``[segments, 4]`` worklist described by
-    ``input_kind``.
+    ``input_kind``. ``packed_tensor`` and ``grouped_tensor`` provide replayable
+    runtime sources for the dimensions that define that layout.
     """
 
     seed_facts: Tcgen05GroupedWorklistSeedFacts
     metadata_tensor: torch.Tensor
+    packed_tensor: torch.Tensor
+    grouped_tensor: torch.Tensor
     device_layout_kind: Literal["split_sizes", "offsets"] | None = None
 
     @property
@@ -3803,6 +3806,8 @@ def analyze_tcgen05_grouped_worklist(
                 # Resolve and cache the input path while HostFunction is active.
                 # Seed ranking later replays this path against real bind values.
                 env.tensor_input_source(proof.layout_tensor)
+                env.tensor_input_source(proof.lhs.source_fake)
+                env.tensor_input_source(proof.rhs.source_fake)
                 return Tcgen05GroupedWorklistAnalysis(
                     seed_facts=Tcgen05GroupedWorklistSeedFacts(
                         groups,
@@ -3813,6 +3818,8 @@ def analyze_tcgen05_grouped_worklist(
                         device_split_sizes,
                     ),
                     metadata_tensor=proof.layout_tensor,
+                    packed_tensor=proof.lhs.source_fake,
+                    grouped_tensor=proof.rhs.source_fake,
                     device_layout_kind=(
                         proof.packed_split.layout_kind
                         if proof.packed_split is not None

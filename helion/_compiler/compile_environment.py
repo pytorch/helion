@@ -60,10 +60,10 @@ class TensorDescriptorLayoutGuard:
 
 @dataclasses.dataclass(frozen=True)
 class GroupedWorklistCompatibilityGuard:
-    """Runtime values needed to classify a packed grouped-worklist layout."""
+    """Dimensions needed to classify a packed grouped-worklist layout."""
 
-    group_count: int
-    packed_m: int
+    group_count: Source | int
+    packed_m: Source | int
 
 
 def _is_supported_tensor_input_source(source: Source) -> bool:
@@ -610,14 +610,30 @@ class CompileEnvironment:
         self,
         fake_tensor: torch.Tensor,
         *,
-        group_count: int,
-        packed_m: int,
+        grouped_tensor: torch.Tensor,
+        packed_tensor: torch.Tensor,
     ) -> bool:
         """Specialize a bound kernel on compatible packed source-M tile families."""
         source = self.tensor_input_source(fake_tensor)
         if source is None:
             return False
-        guard = GroupedWorklistCompatibilityGuard(group_count, packed_m)
+
+        def dimension_source(tensor: torch.Tensor) -> Source | int | None:
+            tensor_source = self.tensor_input_source(tensor)
+            if tensor_source is not None:
+                return TensorPropertySource(tensor_source, TensorProperty.SIZE, 0)
+            if self.settings.static_shapes:
+                return self.size_hint(tensor.shape[0])
+            return None
+
+        group_count = dimension_source(grouped_tensor)
+        packed_m = dimension_source(packed_tensor)
+        if group_count is None or packed_m is None:
+            return False
+        guard = GroupedWorklistCompatibilityGuard(
+            group_count,
+            packed_m,
+        )
         previous = self.grouped_worklist_compatibility_guards.setdefault(source, guard)
         if previous != guard:
             raise RuntimeError(
