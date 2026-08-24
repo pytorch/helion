@@ -763,33 +763,48 @@ class TypePropagation(ast.NodeVisitor):
                 + ", ".join(map(str, unhandled))
             )
         if isinstance(func, NestedFunctionType):
-            return self._call_nested_function(func, args)
+            return self._call_nested_function(func, args, kwargs)
 
         # pyrefly: ignore [bad-argument-type, bad-return]
         return func.propagate_call(tuple(args), kwargs, self.origin())
 
     def _call_nested_function(
-        self, func: NestedFunctionType, args: list[TypeInfo]
+        self,
+        func: NestedFunctionType,
+        args: list[TypeInfo],
+        kwargs: dict[str, TypeInfo],
     ) -> TypeInfo:
         func_node = func.func_node
         params = func_node.args
+        if kwargs:
+            raise exc.StatementNotSupported(
+                f"Keyword arguments are not supported when calling nested "
+                f"function '{func_node.name}'"
+            )
         if len(args) != len(params.args):
             raise exc.TypeInferenceError(
                 f"Function '{func_node.name}' expects "
                 f"{len(params.args)} arguments, got {len(args)}"
             )
+        effective_return = func.find_effective_return()
         self.push_scope()
         for param, arg_type in zip(params.args, args, strict=True):
             self.scope.set(param.arg, arg_type)
         try:
             result: TypeInfo = NoType(origin=self.origin())
             for stmt in func_node.body:
-                if isinstance(stmt, ast.Return) and stmt.value is not None:
-                    result = self.visit(stmt.value)
+                if isinstance(stmt, ast.Return):
+                    result = (
+                        self.visit(stmt.value)
+                        if stmt.value is not None
+                        else NoType(origin=self.origin())
+                    )
                     break
                 result = self.visit(stmt)
         finally:
             self.pop_scope()
+        if effective_return is None or effective_return.value is None:
+            return NoType(origin=self.origin())
         return result
 
     def visit_IfExp(self, node: ast.IfExp) -> TypeInfo:
@@ -1257,6 +1272,22 @@ class TypePropagation(ast.NodeVisitor):
             raise exc.StatementNotSupported(
                 f"Default arguments not supported in nested function '{node.name}'"
             )
+        for stmt in ast.walk(node):
+            if isinstance(stmt, (ast.Global, ast.Nonlocal)):
+                raise exc.StatementNotSupported(
+                    f"'global'/'nonlocal' not supported in nested function "
+                    f"'{node.name}'"
+                )
+        for descendant in ast.walk(node):
+            if (
+                isinstance(descendant, ast.Call)
+                and isinstance(descendant.func, ast.Name)
+                and descendant.func.id == node.name
+            ):
+                raise exc.StatementNotSupported(
+                    f"Recursive nested function '{node.name}' is not supported"
+                )
+        # nested defs are inlined using the caller's scope (dynamic scoping).
         func_type = NestedFunctionType(origin=self.origin(), func_node=node)
         self.scope.set(node.name, func_type)
         return func_type

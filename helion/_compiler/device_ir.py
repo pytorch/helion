@@ -2568,7 +2568,7 @@ class WalkDeviceAST(NodeVisitor):
         # pyrefly: ignore [missing-attribute]
         func_type_info = node.func._type_info
         if isinstance(func_type_info, NestedFunctionType):
-            return self._call_nested_function(func_type_info, args)
+            return self._call_nested_function(func_type_info, args, kwargs)
         if isinstance(func_type_info, CallableType) and (
             replacement := get_device_func_replacement(func_type_info.value)
         ):
@@ -2585,10 +2585,19 @@ class WalkDeviceAST(NodeVisitor):
         self.scope[node.name] = None
 
     def _call_nested_function(
-        self, func: NestedFunctionType, args: list[object]
+        self,
+        func: NestedFunctionType,
+        args: list[object],
+        kwargs: dict[str, object],
     ) -> object:
         func_node = func.func_node
         params = func_node.args
+        if kwargs:
+            raise exc.StatementNotSupported(
+                f"Keyword arguments are not supported when calling nested "
+                f"function '{func_node.name}'"
+            )
+        func.find_effective_return()
         old_scope = self.scope.copy()
         for param, arg_val in zip(params.args, args, strict=True):
             self.scope[param.arg] = arg_val

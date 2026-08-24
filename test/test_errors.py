@@ -668,6 +668,101 @@ class TestErrors(RefEagerTestDisabled, TestCase):
         with self.assertRaises(helion.exc.StatementNotSupported):
             code_and_output(fn, (torch.randn(8, device=DEVICE),))
 
+    def test_nested_function_return_in_control_flow(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            def f(a):
+                if a.sum() > 0:
+                    return a * 2.0
+                return a
+
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = f(x[tile])
+            return out
+
+        with self.assertRaises(helion.exc.StatementNotSupported):
+            code_and_output(fn, (torch.randn(8, device=DEVICE),))
+
+    def test_nested_function_recursion(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            def f(a):
+                return f(a)
+
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = f(x[tile])
+            return out
+
+        with self.assertRaises(helion.exc.StatementNotSupported):
+            code_and_output(fn, (torch.randn(8, device=DEVICE),))
+
+    def test_nested_function_call_kwarg_on_positional(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            def double(a):
+                return a * 2.0
+
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = double(a=x[tile])
+            return out
+
+        with self.assertRaises(helion.exc.StatementNotSupported):
+            code_and_output(fn, (torch.randn(8, device=DEVICE),))
+
+    def test_nested_function_global_nonlocal(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            scale = 2.0
+
+            def f(a):
+                nonlocal scale
+                return a * scale
+
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = f(x[tile])
+            return out
+
+        with self.assertRaises(helion.exc.StatementNotSupported):
+            code_and_output(fn, (torch.randn(8, device=DEVICE),))
+
+    def test_nested_function_multi_call_diff_dtype(self):
+        @helion.kernel()
+        def fn(x_int: torch.Tensor, x_float: torch.Tensor):
+            out_int = torch.empty_like(x_int)
+            out_float = torch.empty_like(x_float)
+
+            def double(a):
+                return a * 2
+
+            for tile in hl.tile(x_int.size(0)):
+                out_int[tile] = double(x_int[tile])
+            for tile in hl.tile(x_float.size(0)):
+                out_float[tile] = double(x_float[tile])
+            return out_int, out_float
+
+        x_int = torch.randint(0, 10, (128,), device=DEVICE)
+        x_float = torch.randn(128, device=DEVICE)
+        with self.assertRaises(helion.exc.ControlFlowTensorMismatch):
+            code_and_output(fn, (x_int, x_float))
+
+    def test_nested_function_no_return_in_value_context(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            def noop(a):
+                b = a * 2.0  # noqa: F841
+
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = noop(x[tile])
+            return out
+
+        with self.assertRaises(helion.exc.RequiresTensorInAssignment):
+            code_and_output(fn, (torch.randn(8, device=DEVICE),))
+
 
 def _make_fake_kernel():
     """Create a minimal fake kernel for autotuner unit tests."""

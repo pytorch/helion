@@ -164,6 +164,112 @@ class TestClosures(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, (x, y))
         torch.testing.assert_close(result, x * 0.7 + y * 0.3)
 
+    def test_nested_def_calls_nested_def(self):
+        @helion.kernel
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+
+            def a(v):
+                return v * 2.0
+
+            def b(v):
+                return a(v) + 1.0
+
+            for tile in hl.tile(x.size(0)):
+                out[tile] = b(x[tile])
+            return out
+
+        x = torch.randn(128, device=DEVICE)
+        _, result = code_and_output(fn, (x,))
+        torch.testing.assert_close(result, x * 2.0 + 1.0)
+
+    def test_nested_def_tuple_return_unpack(self):
+        @helion.kernel
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+
+            def pair(v):
+                return v * 2.0, v * 3.0
+
+            for tile in hl.tile(x.size(0)):
+                a, b = pair(x[tile])
+                out[tile] = a + b
+            return out
+
+        x = torch.randn(128, device=DEVICE)
+        _, result = code_and_output(fn, (x,))
+        torch.testing.assert_close(result, x * 5.0)
+
+    def test_nested_def_alias(self):
+        @helion.kernel
+        def fn(x: torch.tensor) -> torch.tensor:
+            out = torch.empty_like(x)
+
+            def double(v):
+                return v * 2.0
+
+            g = double
+            for tile in hl.tile(x.size(0)):
+                out[tile] = g(x[tile])
+            return out
+
+        x = torch.randn(128, device=DEVICE)
+        _, result = code_and_output(fn, (x,))
+        torch.testing.assert_close(result, x * 2.0)
+
+    def test_nested_def_in_control_flow(self):
+        # A nested function defined inside a branch is still callable afterwards.
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            if x.size(0) > 0:
+
+                def double(a):
+                    return a * 2.0
+
+            for tile in hl.tile(x.size(0)):
+                out[tile] = double(x[tile])
+            return out
+
+        x = torch.randn(128, device=DEVICE)
+        _, result = code_and_output(fn, (x,))
+        torch.testing.assert_close(result, x * 2.0)
+
+    def test_nested_def_dead_code_after_return(self):
+        @helion.kernel
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+
+            def f(a):  # noqa: RET503
+                b = a * 2.0
+                return b  # noqa: RET504
+                # dead code
+                c = a * 3.0  # noqa: F841
+
+            for tile in hl.tile(x.size(0)):
+                out[tile] = f(x[tile])
+            return out
+
+        x = torch.randn(128, device=DEVICE)
+        _, result = code_and_output(fn, (x,))
+        torch.testing.assert_close(result, x * 2.0)
+
+    def test_nested_def_called_on_host(self):
+        @helion.kernel
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            def allocate():
+                return torch.empty_like(x)
+
+            out = allocate()
+
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * 2.0
+            return out
+
+        x = torch.randn(128, device=DEVICE)
+        _, result = code_and_output(fn, (x,))
+        torch.testing.assert_close(result, x * 2.0)
+
 
 if __name__ == "__main__":
     unittest.main()
