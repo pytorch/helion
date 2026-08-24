@@ -260,6 +260,23 @@ def streamed_singleton_reduction(x: torch.Tensor) -> torch.Tensor:
     static_shapes=True,
     autotune_effort="none",
 )
+def nested_store_chain(x: torch.Tensor) -> torch.Tensor:
+    batch, width = x.size()
+    tmp = torch.empty_like(x)
+    out = torch.empty_like(x)
+
+    for producer_batch in hl.tile(batch, block_size=1):
+        for producer_width in hl.tile(width, block_size=16):
+            tmp[producer_batch, producer_width] = x[producer_batch, producer_width] + 1
+    for consumer_batch, consumer_width in hl.tile([batch, width], block_size=[1, 16]):
+        out[consumer_batch, consumer_width] = tmp[consumer_batch, consumer_width] * 2
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
 def offset_affine_chain(x: torch.Tensor) -> torch.Tensor:
     width = x.size(0)
     tmp = torch.empty_like(x)
@@ -461,6 +478,63 @@ def _access(
 
 
 class TestCrossLoopDependencies(TestCase):
+    @skipIfNotCUDA()
+    def test_device_ir_scopes_preserve_nested_producer_and_consumer_axes(
+        self,
+    ) -> None:
+        x = torch.empty((2, 64), device=DEVICE, dtype=torch.float32)
+
+        producer_graph = nested_store_chain.bind((x,)).host_function.device_ir
+        assert producer_graph.tile_dependency_graph is not None
+        producer_store = next(
+            access
+            for access in producer_graph.tile_dependency_graph.accesses
+            if access.root == 0 and access.kind == "store"
+        )
+        (producer_scope,) = producer_graph.tile_dependency_graph.scopes_for_access(
+            producer_store.access_id
+        )
+        self.assertEqual(producer_scope.kind, "loop")
+        self.assertEqual(len(producer_scope.callsite_path), 1)
+        self.assertEqual(
+            producer_scope.logical_axis_order,
+            (
+                *producer_graph.task_families[0].logical_axis_order,
+                *producer_scope.local_axis_order,
+            ),
+        )
+        self.assertTrue(producer_scope.guaranteed)
+        self.assertTrue(producer_scope.segmentable)
+
+        consumer_graph = streamed_singleton_reduction.bind((x,)).host_function.device_ir
+        assert consumer_graph.tile_dependency_graph is not None
+        consumer_load = next(
+            access
+            for access in consumer_graph.tile_dependency_graph.accesses
+            if access.root == 1
+            and access.kind == "load"
+            and any(
+                scope.kind == "loop"
+                for scope in consumer_graph.tile_dependency_graph.scopes_for_access(
+                    access.access_id
+                )
+            )
+        )
+        (consumer_scope,) = consumer_graph.tile_dependency_graph.scopes_for_access(
+            consumer_load.access_id
+        )
+        self.assertEqual(consumer_scope.kind, "loop")
+        self.assertEqual(len(consumer_scope.callsite_path), 1)
+        self.assertEqual(
+            consumer_scope.logical_axis_order,
+            (
+                *consumer_graph.task_families[1].logical_axis_order,
+                *consumer_scope.local_axis_order,
+            ),
+        )
+        self.assertTrue(consumer_scope.guaranteed)
+        self.assertTrue(consumer_scope.segmentable)
+
     def test_semantic_event_graph_composes_arbitrary_chain_depth(self) -> None:
         graph = build_tile_dependency_graph(
             (

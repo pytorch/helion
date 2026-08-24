@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
 
 TILE_ACCESS_ID_META = "_cross_loop_access_id"
+TILE_ACTION_SCOPE_IDS_META = "_tile_dependency_action_scope_ids"
 
 
 class TileDependencyKind(enum.Enum):
@@ -42,40 +43,12 @@ def tile_access_marker_id(statement: ast.AST) -> int | None:
 
 def owner_root_by_graph_id(device_ir: DeviceIR) -> tuple[int, ...]:
     """Resolve every nested DeviceIR graph to its top-level root."""
-    from .device_ir import NodeArgsGraphInfo
-    from .device_ir import WhileLoopGraphInfo
-
-    graph_id_by_graph = {
-        id(graph_info.graph): graph_info.graph_id for graph_info in device_ir.graphs
-    }
-    owners = [-1] * len(device_ir.graphs)
-    for root, graph_id in enumerate(device_ir.root_ids):
-        owners[graph_id] = root
-
-    changed = True
-    while changed:
-        changed = False
-        for graph_info in device_ir.graphs:
-            owner = owners[graph_info.graph_id]
-            if owner >= 0:
-                if isinstance(graph_info, WhileLoopGraphInfo):
-                    cond_graph_id = graph_info.cond_graph_id
-                    if owners[cond_graph_id] < 0:
-                        owners[cond_graph_id] = owner
-                        changed = True
-                continue
-            if not isinstance(graph_info, NodeArgsGraphInfo):
-                continue
-            parent_owners = {
-                owners[parent_id]
-                for node in graph_info.node_args
-                if (parent_id := graph_id_by_graph.get(id(node.graph))) is not None
-                and owners[parent_id] >= 0
-            }
-            if len(parent_owners) == 1:
-                owners[graph_info.graph_id] = parent_owners.pop()
-                changed = True
-    return tuple(owners)
+    roots_by_graph: list[set[int]] = [set() for _ in device_ir.graphs]
+    for scope in build_execution_scopes(device_ir):
+        roots_by_graph[scope.graph_id].add(scope.root)
+    return tuple(
+        next(iter(roots)) if len(roots) == 1 else -1 for roots in roots_by_graph
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -104,6 +77,176 @@ class TaskFamily:
 
     def axis(self, block_id: int) -> LogicalTaskAxis | None:
         return next((axis for axis in self.axes if axis.block_id == block_id), None)
+
+
+@dataclasses.dataclass(frozen=True)
+class ExecutionScope:
+    """One reachable DeviceIR callsite in an outer task's execution strand.
+
+    ``graph_id`` identifies the called body, while ``callsite_path`` identifies
+    this particular invocation of that body.  Nested loop actions inherit the
+    worker assigned to their owning root task; this record describes their
+    logical coordinate domain and program-order identity, not an independently
+    movable scheduling unit.
+    """
+
+    scope_id: int
+    root: int
+    graph_id: int
+    callsite_path: tuple[tuple[int, int], ...]
+    parent_scope_id: int | None
+    kind: Literal["root", "loop", "branch", "while_condition", "while_body"]
+    local_axis_order: tuple[int, ...]
+    logical_axis_order: tuple[int, ...]
+    guaranteed: bool
+    segmentable: bool
+
+    @property
+    def is_root(self) -> bool:
+        return self.kind == "root"
+
+
+def build_execution_scopes(device_ir: DeviceIR) -> tuple[ExecutionScope, ...]:
+    """Build the reachable DeviceIR callsite tree used by dependency actions.
+
+    A DeviceIR graph body is not itself a unique execution point: one body may
+    be referenced by several callsites, and control-flow graphs have different
+    execution guarantees from ordinary device loops.  Paths therefore use the
+    lexical call node and child argument slot within each owning root.
+    """
+    from ..language import _tracing_ops
+    from .device_ir import ForLoopGraphInfo
+
+    scopes: list[ExecutionScope] = []
+
+    def add_scope(
+        *,
+        root: int,
+        graph_id: int,
+        callsite_path: tuple[tuple[int, int], ...],
+        parent_scope_id: int | None,
+        kind: Literal["root", "loop", "branch", "while_condition", "while_body"],
+        local_axis_order: tuple[int, ...],
+        logical_axis_order: tuple[int, ...],
+        guaranteed: bool,
+        segmentable: bool,
+    ) -> int:
+        scope_id = len(scopes)
+        scopes.append(
+            ExecutionScope(
+                scope_id=scope_id,
+                root=root,
+                graph_id=graph_id,
+                callsite_path=callsite_path,
+                parent_scope_id=parent_scope_id,
+                kind=kind,
+                local_axis_order=local_axis_order,
+                logical_axis_order=logical_axis_order,
+                guaranteed=guaranteed,
+                segmentable=segmentable,
+            )
+        )
+        return scope_id
+
+    def walk(
+        *,
+        root: int,
+        scope_id: int,
+        ancestor_graph_ids: frozenset[int],
+    ) -> None:
+        scope = scopes[scope_id]
+        graph = device_ir.graphs[scope.graph_id].graph
+        for node_index, node in enumerate(graph.nodes):
+            if node.op != "call_function":
+                continue
+
+            child_specs: list[
+                tuple[
+                    int,
+                    int,
+                    Literal["loop", "branch", "while_condition", "while_body"],
+                    bool,
+                ]
+            ] = []
+            if (
+                _tracing_ops.is_for_loop_target(node.target)
+                and node.args
+                and isinstance(node.args[0], int)
+            ):
+                child_specs.append((0, node.args[0], "loop", scope.guaranteed))
+            elif node.target is _tracing_ops._if and len(node.args) >= 3:
+                if isinstance(node.args[1], int):
+                    child_specs.append((1, node.args[1], "branch", False))
+                if isinstance(node.args[2], int):
+                    child_specs.append((2, node.args[2], "branch", False))
+            elif node.target is _tracing_ops._while_loop and len(node.args) >= 2:
+                if isinstance(node.args[0], int):
+                    child_specs.append((0, node.args[0], "while_condition", False))
+                if isinstance(node.args[1], int):
+                    child_specs.append((1, node.args[1], "while_body", False))
+
+            callsite_scope_ids: list[tuple[int, int]] = []
+            for child_slot, child_graph_id, kind, guaranteed in child_specs:
+                if not 0 <= child_graph_id < len(device_ir.graphs):
+                    continue
+                child_info = device_ir.graphs[child_graph_id]
+                local_axes = (
+                    tuple(child_info.block_ids)
+                    if kind == "loop" and isinstance(child_info, ForLoopGraphInfo)
+                    else ()
+                )
+                axes_are_unique = not set(local_axes).intersection(
+                    scope.logical_axis_order
+                )
+                child_scope_id = add_scope(
+                    root=root,
+                    graph_id=child_graph_id,
+                    callsite_path=(*scope.callsite_path, (node_index, child_slot)),
+                    parent_scope_id=scope_id,
+                    kind=kind,
+                    local_axis_order=local_axes,
+                    logical_axis_order=(*scope.logical_axis_order, *local_axes),
+                    guaranteed=guaranteed,
+                    segmentable=(
+                        kind == "loop"
+                        and guaranteed
+                        and axes_are_unique
+                        and not any(
+                            axis in device_ir.noncanonical_task_origin_block_ids
+                            for axis in local_axes
+                        )
+                    ),
+                )
+                callsite_scope_ids.append((child_slot, child_scope_id))
+                if child_graph_id not in ancestor_graph_ids:
+                    walk(
+                        root=root,
+                        scope_id=child_scope_id,
+                        ancestor_graph_ids=ancestor_graph_ids
+                        | frozenset((child_graph_id,)),
+                    )
+            if callsite_scope_ids:
+                node.meta[TILE_ACTION_SCOPE_IDS_META] = tuple(callsite_scope_ids)
+
+    for root, graph_id in enumerate(device_ir.root_ids):
+        family = device_ir.task_families[root]
+        root_scope_id = add_scope(
+            root=root,
+            graph_id=graph_id,
+            callsite_path=(),
+            parent_scope_id=None,
+            kind="root",
+            local_axis_order=family.logical_axis_order,
+            logical_axis_order=family.logical_axis_order,
+            guaranteed=True,
+            segmentable=False,
+        )
+        walk(
+            root=root,
+            scope_id=root_scope_id,
+            ancestor_graph_ids=frozenset((graph_id,)),
+        )
+    return tuple(scopes)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -335,6 +478,8 @@ class TileDependencyGraph:
     edges: tuple[TileDependency, ...]
     events: tuple[KeyedEvent, ...]
     waits: tuple[EventUse, ...]
+    execution_scopes: tuple[ExecutionScope, ...] = ()
+    scope_ids_by_access: tuple[tuple[int, ...], ...] = ()
 
     def __post_init__(self) -> None:
         if tuple(event.event_id for event in self.events) != tuple(
@@ -343,6 +488,16 @@ class TileDependencyGraph:
             raise ValueError("keyed event IDs must be contiguous and source ordered")
         if any(not 0 <= use.event_id < len(self.events) for use in self.waits):
             raise ValueError("event use references an unknown keyed event")
+        if tuple(scope.scope_id for scope in self.execution_scopes) != tuple(
+            range(len(self.execution_scopes))
+        ):
+            raise ValueError("execution scope IDs must be contiguous")
+        if any(
+            not 0 <= scope_id < len(self.execution_scopes)
+            for scope_ids in self.scope_ids_by_access
+            for scope_id in scope_ids
+        ):
+            raise ValueError("access references an unknown execution scope")
 
     def edges_between(
         self,
@@ -384,6 +539,14 @@ class TileDependencyGraph:
         if len(events) > 1:
             raise AssertionError(f"task family {root} has multiple FamilyDone events")
         return events[0] if events else None
+
+    def scopes_for_access(self, access_id: int) -> tuple[ExecutionScope, ...]:
+        if not 0 <= access_id < len(self.scope_ids_by_access):
+            return ()
+        return tuple(
+            self.execution_scopes[scope_id]
+            for scope_id in self.scope_ids_by_access[access_id]
+        )
 
 
 def predecessor_task_ids(
@@ -1055,6 +1218,7 @@ def build_tile_dependency_graph(
     accesses: tuple[TileAccess, ...],
     grid_block_ids: list[list[int]] | None = None,
     *,
+    device_ir: DeviceIR | None = None,
     task_families: tuple[TaskFamily, ...] | None = None,
     root_phases: tuple[int, ...] | None = None,
     noncanonical_task_origin_block_ids: frozenset[int] = frozenset(),
@@ -1066,9 +1230,13 @@ def build_tile_dependency_graph(
     task readiness for the strict affine subset. Anything else remains a
     root-completion dependency.
     """
+    if task_families is None and device_ir is not None:
+        task_families = tuple(device_ir.task_families)
     if task_families is None:
         if grid_block_ids is None:
-            raise TypeError("grid_block_ids or task_families must be provided")
+            raise TypeError(
+                "device_ir, grid_block_ids, or task_families must be provided"
+            )
         task_families = tuple(
             TaskFamily(
                 axes=tuple(
@@ -1302,12 +1470,30 @@ def build_tile_dependency_graph(
         )
 
     events, waits = _build_event_plan(tuple(edges), grid_block_ids)
+    execution_scopes = (
+        build_execution_scopes(device_ir) if device_ir is not None else ()
+    )
+    scope_ids_by_graph: dict[int, list[int]] = {}
+    for scope in execution_scopes:
+        scope_ids_by_graph.setdefault(scope.graph_id, []).append(scope.scope_id)
+    scope_ids_by_access: list[tuple[int, ...]] = [
+        ()
+        for _ in range(max((access.access_id for access in accesses), default=-1) + 1)
+    ]
+    for access in accesses:
+        scope_ids_by_access[access.access_id] = tuple(
+            scope_id
+            for scope_id in scope_ids_by_graph.get(access.graph_id, ())
+            if execution_scopes[scope_id].root == access.root
+        )
     return TileDependencyGraph(
         task_families=task_families,
         accesses=accesses,
         edges=tuple(edges),
         events=events,
         waits=waits,
+        execution_scopes=execution_scopes,
+        scope_ids_by_access=tuple(scope_ids_by_access),
     )
 
 

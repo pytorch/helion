@@ -4269,6 +4269,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         if len(device_ir.task_families) > 1:
             device_ir.tile_dependency_graph = build_tile_dependency_graph(
                 tile_accesses,
+                device_ir=device_ir,
                 task_families=tuple(device_ir.task_families),
                 root_phases=source_root_phases,
                 noncanonical_task_origin_block_ids=frozenset(
