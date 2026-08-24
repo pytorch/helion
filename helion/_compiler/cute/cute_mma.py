@@ -82,6 +82,7 @@ from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODE_DIRECT
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP
 from .tcgen05_constants import TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY
@@ -4251,6 +4252,7 @@ class _PerKiterTmaArgs:
     exec_active: str
     scalar_load_a: ast.stmt
     scalar_load_b: ast.stmt
+    direct_consumer_wait: bool = False
     # ``cluster_n`` is only consulted when ``is_two_cta=True`` to pick the
     # V-leader vs cluster-leader form for the AB consumer-release predicate
     # (cute_plan.md §6.12.7). Default 1 preserves byte-identity for the
@@ -4429,6 +4431,8 @@ def _build_kloop_pipeline_consumer_if(
         )
     if args.skip_consumer_wait:
         consumer_src = "pass"
+    elif args.direct_consumer_wait:
+        consumer_src = f"{args.tma_pipeline}.consumer_wait({args.tma_consumer_state})"
     else:
         consumer_src = ""
         if not use_existing_try_token:
@@ -4478,6 +4482,7 @@ def _build_kloop_pipeline_consumer_prefetch_stmts(
 ) -> list[ast.stmt]:
     """Peek the next AB full barrier after advancing the consumer state."""
     assert args.is_two_cta, "AB consumer prefetch is validated for CtaGroup.TWO"
+    assert not args.direct_consumer_wait, "direct AB waits do not prefetch a token"
     predicate = args.tma_next_consumer_tile
     owner_predicate = _tcgen05_two_cta_owner_predicate(
         args.exec_active,
@@ -6650,6 +6655,9 @@ def _emit_mma_pipeline(
         TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY,
         TCGEN05_AB_CONSUMER_WAIT_MODE_NORMAL,
     )
+    tcgen05_use_direct_ab_consumer_wait = (
+        tcgen05_ab_consumer_wait_mode == TCGEN05_AB_CONSUMER_WAIT_MODE_DIRECT
+    )
     diagnose_skip_ab_consumer_wait = (
         tcgen05_ab_consumer_wait_mode == TCGEN05_AB_CONSUMER_WAIT_MODE_SKIP
     )
@@ -6677,13 +6685,25 @@ def _emit_mma_pipeline(
             f"{TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1!r} requires the guarded "
             "cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
         )
-    # Static-full CtaGroup.TWO keeps a prefetched AB consumer token live
-    # across the accumulator acquire and each K-loop issue. CtaGroup.ONE
-    # keeps the older adjacent try-wait/wait sequence.
-    tcgen05_use_role_local_ab_consumer_prefetch = (
+    # Static-full CtaGroup.TWO normally keeps a prefetched AB consumer token
+    # live across the accumulator acquire and each K-loop issue. The direct
+    # mode avoids that speculative poll and waits on the current stage only.
+    tcgen05_role_local_ab_consumer_wait = (
         tcgen05_use_role_local_mma_exec
         and tcgen05_is_two_cta
         and tcgen05_use_tma_pipeline
+    )
+    if tcgen05_use_direct_ab_consumer_wait and not (
+        tcgen05_role_local_ab_consumer_wait and tcgen05_static_full_tma_fast_path
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY}="
+            f"{TCGEN05_AB_CONSUMER_WAIT_MODE_DIRECT!r} requires the role-local "
+            "static-full CtaGroup.TWO TMA path",
+        )
+    tcgen05_use_role_local_ab_consumer_prefetch = (
+        tcgen05_role_local_ab_consumer_wait and not tcgen05_use_direct_ab_consumer_wait
     )
     # Keep a distinct name so future epi-role gating changes are localized.
     tcgen05_use_role_local_epi = (
@@ -10565,6 +10585,7 @@ def _emit_mma_pipeline(
                 skip_producer_acquire=diagnose_skip_ab_producer_acquire,
                 skip_producer_advance=diagnose_skip_ab_producer_advance,
                 skip_consumer_wait=diagnose_skip_ab_consumer_wait,
+                direct_consumer_wait=tcgen05_use_direct_ab_consumer_wait,
                 exec_active=tcgen05_plan.exec_active,
                 scalar_load_a=scalar_load_a,
                 scalar_load_b=scalar_load_b,
@@ -10698,7 +10719,7 @@ def _emit_mma_pipeline(
                                 )
                             )
                         )
-                    else:
+                    elif not tcgen05_use_direct_ab_consumer_wait:
                         exec_loop_body.append(
                             statement_from_string(
                                 f"{tma_consumer_try_token} = cutlass.Boolean(0)"

@@ -169,6 +169,7 @@ _M64_SWAP_CONFIGS = {
         "tcgen05_static_work_grid_clusters": 32,
         "tcgen05_static_work_iterations": 3,
         "tcgen05_launch_warps": 7,
+        "tcgen05_ab_consumer_wait_mode": "direct",
         "tcgen05_aux_load_placement": "subtile_pre_acc_wait",
     },
     (64, 5120, 51200): {

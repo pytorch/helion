@@ -47,6 +47,7 @@ from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODES
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODE_DIRECT
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_WAIT_MODES
 from .tcgen05_constants import TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY
@@ -2843,7 +2844,16 @@ class CuteTcgen05Config:
             ),
         ):
             self._validate_diagnostic_mode(
-                config, key, modes, normal_mode, fix_invalid=fix_invalid
+                config,
+                key,
+                modes,
+                normal_mode,
+                safe_non_normal_modes=(
+                    (TCGEN05_AB_CONSUMER_WAIT_MODE_DIRECT,)
+                    if key == TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY
+                    else ()
+                ),
+                fix_invalid=fix_invalid,
             )
 
         self._validate_bool_config(
@@ -2998,6 +3008,7 @@ class CuteTcgen05Config:
         modes: tuple[str, ...],
         normal_mode: str,
         *,
+        safe_non_normal_modes: tuple[str, ...] = (),
         fix_invalid: bool,
     ) -> None:
         if key not in config:
@@ -3015,7 +3026,7 @@ class CuteTcgen05Config:
                 return
             raise InvalidConfig(f"{key} must be one of {modes!r}, got {config[key]!r}")
         if (
-            config[key] != normal_mode
+            config[key] not in (normal_mode, *safe_non_normal_modes)
             and config.get(TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY) is not True
         ):
             if fix_invalid:

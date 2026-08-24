@@ -588,6 +588,7 @@ class TestPretunedCuteCodegen(TestCase):
                     "tcgen05_static_work_grid_clusters",
                     "tcgen05_static_work_iterations",
                     "tcgen05_launch_warps",
+                    "tcgen05_ab_consumer_wait_mode",
                 )
             },
             {
@@ -595,6 +596,7 @@ class TestPretunedCuteCodegen(TestCase):
                 "tcgen05_static_work_grid_clusters": 32,
                 "tcgen05_static_work_iterations": 3,
                 "tcgen05_launch_warps": 7,
+                "tcgen05_ab_consumer_wait_mode": "direct",
             },
         )
         fallback_index = heuristic._select(
@@ -640,6 +642,10 @@ class TestPretunedCuteCodegen(TestCase):
         self.assertIn("(4, 32, 1)", code)
         self.assertIn("block=(32, 7, 1)", code)
         self.assertNotIn("StaticPersistentTileScheduler", code)
+        self.assertNotIn("tcgen05_ab_pipeline.consumer_try_wait", code)
+        self.assertIn(
+            "tcgen05_ab_pipeline.consumer_wait(tcgen05_ab_consumer_state)", code
+        )
         aux_load = code.index("tcgen05_aux_loaded_0 = tcgen05_aux_rmem_0.load()")
         acc_wait = code.index(
             "tcgen05_acc_pipeline.consumer_wait(tcgen05_acc_consumer_state)"
@@ -675,6 +681,7 @@ class TestPretunedCuteCodegen(TestCase):
             tcgen05_static_work_grid_clusters=1,
             tcgen05_static_work_iterations=2,
             tcgen05_launch_warps=7,
+            tcgen05_ab_consumer_wait_mode="direct",
             tcgen05_aux_load_placement="subtile_pre_acc_wait",
         )
         bound = module.scale_mm_cute_swap_ab.bind(swap_args)
