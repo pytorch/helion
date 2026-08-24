@@ -31,6 +31,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import import_path
 from helion._testing import onlyBackends
+from helion._testing import skipIfPallasTpu
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.base_search import PopulationBasedSearch
@@ -688,6 +689,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         self.assertIsInstance(loaded[0], _ReturnValue)
         self.assertEqual(loaded[0].value, 3)
 
+    @skipIfPallasTpu("spawned workers cannot acquire an initialized TPU device")
     def test_spawn_precompile_loads_trusted_python_args(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -721,6 +723,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
                     process.kill()
                     process.join(timeout=5)
 
+    @skipIfPallasTpu("spawned workers cannot acquire an initialized TPU device")
     def test_spawn_loads_source_module_from_file(self) -> None:
         # Regression: a kernel loaded by path / notebook / exec lives under a
         # synthetic module name that only the parent's sys.modules knows about.

@@ -8,11 +8,13 @@ from pretuned_kernels.gdn_decode.gdn_decode import GDN_DECODE_CONFIG
 from pretuned_kernels.gdn_decode.gdn_decode import gdn_decode
 import torch
 
+from helion._testing import skipIfPallasInterpret
 from helion._testing import skipUnlessBackends
 
 pytestmark = skipUnlessBackends(["pallas"])
 
 
+@skipIfPallasInterpret("indirect DMA codegen requires physical TPU lowering")
 def test_causal_conv1d_decode_uses_indirect_dma() -> None:
     tokens, heads, head_dim = 512, 4, 128
     args = (
@@ -32,6 +34,7 @@ def test_causal_conv1d_decode_uses_indirect_dma() -> None:
     assert "one_hot" not in code
 
 
+@skipIfPallasInterpret("indirect DMA codegen requires physical TPU lowering")
 def test_gdn_decode_uses_indirect_dma() -> None:
     tokens, heads, dim = 512, 2, 128
     args = (

@@ -855,6 +855,7 @@ class TestPallas(TestCase):
         )
         torch.testing.assert_close(result, x[:, :128] + 1)
 
+    @xfailIfPallasTpu("Mosaic cannot prove alignment of single-row BF16 stores")
     def test_dynamic_window_declines_unaligned_1d_dma(self) -> None:
         table = torch.randn(512, device=DEVICE, dtype=torch.bfloat16)
         starts = torch.tensor([0, 1], device=DEVICE, dtype=torch.int32)
