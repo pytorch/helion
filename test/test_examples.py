@@ -1088,6 +1088,10 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="concat2d_dim1_simple",
         )
 
+    @xfailIfPallasInterpret(
+        "jax interpret-mode discharge cannot handle non-divisible blocked "
+        "slices (traced sizes)"
+    )
     def test_concat(self):
         args = (
             torch.randn(512, 500, device=DEVICE),
@@ -1100,6 +1104,10 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="concat2d_dim1",
         )
 
+    @xfailIfPallasInterpret(
+        "emit_pipeline ds-pad DMA uses a tracer-size dynamic_slice, unsupported"
+        " in JAX Pallas interpret mode"
+    )
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_concat_block_ptr(self):
