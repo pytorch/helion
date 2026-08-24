@@ -739,7 +739,8 @@ _TCGEN05_GROUPED_B200_PANEL_RESERVED_SMS = 20
 # These measurements rank the initial seed population only. Other SM counts are
 # scaled proportionally, and live autotuning remains authoritative.
 
-# Exhaustive schema for the side-effect-free grouped-worklist config builder.
+# Intentionally mirrored by ``pretuned_kernels.grouped_gemm_deepgemm``'s
+# stdlib-only reviewed-profile builder; its schema-parity test guards drift.
 _TCGEN05_GROUPED_WORKLIST_CONFIG_KEYS = frozenset(
     {
         "block_sizes",
@@ -780,8 +781,8 @@ def tcgen05_grouped_worklist_config_values(
 ) -> dict[str, object]:
     """Return the exact values used by the grouped-worklist seed builder.
 
-    This side-effect-free seam exposes compiler seed values without depending on
-    the compiler's private builder.
+    This side-effect-free seam lets checked-in, stdlib-only reviewed profiles
+    verify value parity without depending on the compiler's private builder.
     """
     if clc and not runtime_direct:
         raise ValueError("grouped worklist CLC requires runtime_direct=True")
