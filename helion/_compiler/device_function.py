@@ -785,7 +785,7 @@ class DeviceFunction:
             # A tunable-only expression is constant for each compiled config.
             arg_type = (
                 ConstExprArg
-                if sym.free_symbols and sym.free_symbols <= tunable_symbols
+                if sym.free_symbols and sym.free_symbols.issubset(tunable_symbols)
                 else SymbolArgument
             )
             arg = arg_type(
