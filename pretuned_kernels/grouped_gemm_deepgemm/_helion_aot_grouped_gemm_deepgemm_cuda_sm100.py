@@ -1,10 +1,9 @@
 """Reviewed B200 dispatch for ``grouped_gemm_deepgemm``.
 
-Ordinary JIT evaluation selects one of the reviewed exact logical profiles,
-while the user key separately specializes the physical B major and total
-packed-M work. The reviewed profile supplies the packed-A source tile; an
-internal expected-M value of zero represents a legacy call that omitted that
-shape hint.
+Ordinary JIT evaluation selects one of the reviewed profiles from logical
+G/N/K dimensions and the source tile inferred from the packed worklist. The
+user key also specializes the physical B major and total packed-M work. No
+logical expected-M hint is part of the kernel API or dispatch key.
 
 Dynamic standalone compilation is disabled for this kernel: CuTe specializes
 the physical grouped-B major, while four reviewed config values are shared by
@@ -92,18 +91,15 @@ SUPPORTED_HARDWARE_NAMES = ("NVIDIA B200",)
 
 def autotune_grouped_gemm_deepgemm(
     groups: int,
-    expected_m_per_group: int,
     n: int,
     k: int,
     b_major: str = "k",
-    source_m_tile: int | None = None,
+    source_m_tile: int = _REVIEWED.LEGACY_M_ALIGNMENT,
     packed_m: int | None = None,
 ) -> dict[str, object]:
-    """Return the reviewed config for one logical grouped shape."""
+    """Return the reviewed config for observable grouped-layout facts."""
     if any(type(value) is not int or value <= 0 for value in (groups, n, k)):
         raise ValueError("grouped-GEMM dispatch dimensions must be positive integers")
-    if type(expected_m_per_group) is not int or expected_m_per_group < 0:
-        raise ValueError("expected M/group must be a nonnegative integer key")
     # b_major and packed_m are validated AOT key features; reviewed profile
     # selection intentionally keys only on the logical shape and source tile.
     if b_major not in ("k", "n"):
@@ -112,7 +108,6 @@ def autotune_grouped_gemm_deepgemm(
         raise ValueError("packed M must be a positive integer key")
     config_name = _REVIEWED.reviewed_config_name(
         groups,
-        expected_m_per_group or None,
         n,
         k,
         source_m_tile,

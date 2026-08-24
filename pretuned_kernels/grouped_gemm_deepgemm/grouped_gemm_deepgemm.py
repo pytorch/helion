@@ -2,6 +2,7 @@
 
 This dashboard kernel uses the eight reviewed ``(groups, expected M/group, N,
 K)`` shapes and their deterministic seed-0 stream of actual per-group M sizes.
+Expected M/group is benchmark-generation data, not a kernel argument.
 Both implementations consume the
 same logical A and grouped B values, with A repacked to each implementation's
 required physical alignment and logically equivalent group metadata. They
@@ -22,31 +23,99 @@ a freshly built checkout when producing benchmark evidence.
 
 from __future__ import annotations
 
+from threading import Lock
 from typing import TYPE_CHECKING
 from typing import cast
 
-from benchmarks.cute import grouped_gemm_deepgemm_support as _SUPPORT
+from benchmarks.cute import grouped_gemm_benchmark as _COMMON
 from pretuned_kernels.grouped_gemm_deepgemm import reviewed_profiles as _REVIEWED
 import torch
+from torch._subclasses import FakeTensor
+from torch._subclasses.fake_tensor import unset_fake_temporarily
+from torch.utils.weak import WeakIdKeyDictionary
 
 import helion
+from helion._compiler.cute.grouped_worklist import (
+    tcgen05_grouped_worklist_compatible_source_m_tiles,
+)
+from helion._compiler.cute.grouped_worklist import (
+    tcgen05_grouped_worklist_source_m_tiles_by_preference,
+)
 import helion.language as hl
+from helion.runtime.cute.launcher import _tcgen05_grouped_tensor_mutation_key
 
 if TYPE_CHECKING:
     from helion.runtime.kernel import Kernel
+
+
+_SOURCE_M_TILE_CACHE: WeakIdKeyDictionary = WeakIdKeyDictionary()
+_SOURCE_M_TILE_CACHE_LOCK = Lock()
+
+
+def _worklist_rows(
+    worklist: torch.Tensor,
+    mutation_key: tuple[object, ...],
+) -> tuple[tuple[int, ...], ...]:
+    if mutation_key[0] == "values":
+        flat_values = cast("tuple[int, ...]", mutation_key[1])
+    else:
+        flat_values = tuple(
+            int(value) for value in worklist.detach().reshape(-1).cpu().tolist()
+        )
+    return tuple(
+        flat_values[offset : offset + 4] for offset in range(0, len(flat_values), 4)
+    )
+
+
+def _source_m_tile(
+    worklist: torch.Tensor,
+    *,
+    groups: int,
+    packed_m: int,
+) -> int:
+    """Cache the compiler-preferred source tile admitted by its validator."""
+    if isinstance(worklist, FakeTensor):
+        concrete_worklist = worklist.constant
+        if not isinstance(concrete_worklist, torch.Tensor):
+            raise ValueError(
+                "reviewed AOT dispatch requires concrete packed-worklist values"
+            )
+        worklist = concrete_worklist
+    with unset_fake_temporarily():
+        mutation_key = _tcgen05_grouped_tensor_mutation_key(worklist)
+        with _SOURCE_M_TILE_CACHE_LOCK:
+            cached = _SOURCE_M_TILE_CACHE.get(worklist)
+            if cached is not None and cached[:3] == (mutation_key, groups, packed_m):
+                return cached[3]
+            rows = _worklist_rows(worklist, mutation_key)
+            compatible = tcgen05_grouped_worklist_compatible_source_m_tiles(
+                rows,
+                group_count=groups,
+                packed_m=packed_m,
+            )
+            if not compatible:
+                raise ValueError(
+                    "worklist does not describe a valid supported packed source-M "
+                    "layout"
+                )
+            source_m_tile = tcgen05_grouped_worklist_source_m_tiles_by_preference(
+                compatible
+            )[0]
+            _SOURCE_M_TILE_CACHE[worklist] = (
+                mutation_key,
+                groups,
+                packed_m,
+                source_m_tile,
+            )
+    return source_m_tile
 
 
 def _selected_key(
     a_packed: torch.Tensor,
     b_grouped: torch.Tensor,
     worklist: torch.Tensor,
-    expected_m_per_group: int | None = None,
-) -> tuple[int, int, int, int, str, int, int]:
+) -> tuple[int, int, int, str, int, int]:
     """Select by logical shape, physical layout, and packed work volume."""
-    if expected_m_per_group is not None and (
-        type(expected_m_per_group) is not int or expected_m_per_group <= 0
-    ):
-        raise ValueError("expected_m_per_group must be None or a positive integer")
     if b_grouped.ndim != 3:
         raise ValueError("b_grouped must have shape [groups, n, k]")
     if worklist.ndim != 2 or int(worklist.size(1)) != 4:
@@ -62,23 +131,19 @@ def _selected_key(
         raise ValueError(
             "b_grouped must use contiguous K-major or N-major grouped storage"
         )
-    profile = _REVIEWED.reviewed_worklist_profile(
-        groups,
-        expected_m_per_group,
-        n,
-        k,
+    packed_m = int(a_packed.size(0))
+    source_m_tile = _source_m_tile(
+        worklist,
+        groups=groups,
+        packed_m=packed_m,
     )
-    # AOT key flattening omits None values. Use zero as an internal sentinel so
-    # legacy calls retain a stable expected-M key field. The physical source
-    # tile is derived from the reviewed profile rather than a user annotation.
     return (
         groups,
-        expected_m_per_group or 0,
         n,
         k,
         b_major,
-        profile.source_m_tile,
-        int(a_packed.size(0)),
+        source_m_tile,
+        packed_m,
     )
 
 
@@ -86,7 +151,6 @@ def _reference(
     a_packed: torch.Tensor,
     b_grouped: torch.Tensor,
     worklist: torch.Tensor,
-    expected_m_per_group: int | None = None,
 ) -> torch.Tensor:
     """FP32 oracle for valid rows and zero-filled aligned padding."""
     output = torch.zeros(
@@ -110,7 +174,7 @@ def _check_aot_output(actual: object, expected: object) -> None:
         raise AssertionError(
             "grouped GEMM AOT validation requires BF16 output and FP32 oracle"
         )
-    difference = _SUPPORT.normalized_difference(actual, expected)
+    difference = _COMMON.normalized_difference(actual, expected)
     if not difference <= 1e-5:
         raise AssertionError(
             f"grouped GEMM AOT FP32-oracle difference {difference} exceeds 1e-5"
@@ -121,7 +185,6 @@ def grouped_gemm_deepgemm(
     a_packed: torch.Tensor,
     b_grouped: torch.Tensor,
     worklist: torch.Tensor,
-    expected_m_per_group: int | None = None,
 ) -> torch.Tensor:
     """BF16 ``A[sum(align(Mg)),K] @ B[G,N,K].T`` using an N,M worklist."""
     m_total_aligned, k = a_packed.shape

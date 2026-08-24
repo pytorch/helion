@@ -314,7 +314,6 @@ def prepare_helion(
         packed.a,
         b,
         packed.worklist,
-        inputs.case.expected_m_per_group,
     )
     kernel = grouped_gemm_deepgemm.create_grouped_gemm_deepgemm_kernel()
     if selection_mode == "live_autotune":

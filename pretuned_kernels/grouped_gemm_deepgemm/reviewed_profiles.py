@@ -400,39 +400,25 @@ REVIEWED_PUBLIC_SHAPE_PROFILES: dict[
     ),
 }
 
-# DeepGEMM's masked small-M publication generator fixes E[M/group] at 20;
-# unlisted shapes from that family retain the reviewed compact-row fallback.
-_EXPECTED_M20_FALLBACK = ReviewedWorklistProfile(
-    "_SOURCE32_CONFIG",
-    "k",
-)
-_LEGACY_FALLBACK = ReviewedWorklistProfile(
-    AOT_CONFIG_NAMES[-1],
-    "k",
-)
+# Expected M/group belongs only to benchmark input generation. Runtime AOT
+# dispatch projects those records onto facts available from tensors and the
+# packed worklist; this guard ensures that projection remains one-to-one.
+REVIEWED_DISPATCH_PROFILES = {
+    (groups, n, k, profile.source_m_tile): profile
+    for (groups, _expected_m_per_group, n, k), profile in (
+        REVIEWED_PUBLIC_SHAPE_PROFILES.items()
+    )
+}
+if len(REVIEWED_DISPATCH_PROFILES) != len(REVIEWED_PUBLIC_SHAPE_PROFILES):
+    raise RuntimeError(
+        "reviewed grouped-GEMM profiles collide without expected-M metadata"
+    )
+
 _FALLBACK_CONFIG_BY_SOURCE_M_TILE = {
     SMALL_M_ALIGNMENT: "_SOURCE32_CONFIG",
     LEGACY_M_ALIGNMENT: AOT_CONFIG_NAMES[-1],
     PROFILED_M_ALIGNMENT: "_SOURCE256_BK64_AB6_R240_DIRECT_CONFIG",
 }
-
-
-def reviewed_worklist_profile(
-    groups: int,
-    expected_m_per_group: int | None,
-    n: int,
-    k: int,
-) -> ReviewedWorklistProfile:
-    """Select exact reviewed metadata or the unchanged legacy fallback."""
-    if expected_m_per_group is not None:
-        selected = REVIEWED_PUBLIC_SHAPE_PROFILES.get(
-            (groups, expected_m_per_group, n, k)
-        )
-        if selected is not None:
-            return selected
-    if expected_m_per_group == 20:
-        return _EXPECTED_M20_FALLBACK
-    return _LEGACY_FALLBACK
 
 
 def exact_reviewed_worklist_profile(
@@ -441,7 +427,7 @@ def exact_reviewed_worklist_profile(
     n: int,
     k: int,
 ) -> ReviewedWorklistProfile:
-    """Return an exact reviewed profile, never a generic fallback."""
+    """Return an exact benchmark profile, never a generic fallback."""
     key = (groups, expected_m_per_group, n, k)
     try:
         return REVIEWED_PUBLIC_SHAPE_PROFILES[key]
@@ -451,14 +437,14 @@ def exact_reviewed_worklist_profile(
 
 def reviewed_config_name(
     groups: int,
-    expected_m_per_group: int | None,
     n: int,
     k: int,
-    source_m_tile: int | None = None,
+    source_m_tile: int,
 ) -> str:
-    """Select a reviewed config compatible with the requested A packing."""
+    """Select by logical dimensions and compiler-observable A packing."""
 
-    profile = reviewed_worklist_profile(groups, expected_m_per_group, n, k)
-    if source_m_tile is None or profile.source_m_tile == source_m_tile:
+    source_m_tile = validate_source_m_tile(source_m_tile)
+    profile = REVIEWED_DISPATCH_PROFILES.get((groups, n, k, source_m_tile))
+    if profile is not None:
         return profile.config_name
-    return _FALLBACK_CONFIG_BY_SOURCE_M_TILE[validate_source_m_tile(source_m_tile)]
+    return _FALLBACK_CONFIG_BY_SOURCE_M_TILE[source_m_tile]

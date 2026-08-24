@@ -430,6 +430,7 @@ def test_all_helion_selections_use_canonical_k_layout_and_distinct_apis(
         "final_reviewed_aot": [],
     }
     bound_caches: dict[str, str] = {}
+    bound_arg_counts: list[int] = []
     current_mode = ""
 
     class ConfigSpec:
@@ -482,8 +483,9 @@ def test_all_helion_selections_use_canonical_k_layout_and_distinct_apis(
                 disable_autotuner_heuristics=False,
             )
 
-        def bind(self, _args: object) -> Bound:
+        def bind(self, args: tuple[object, ...]) -> Bound:
             bound_caches[current_mode] = self.settings.autotune_cache
+            bound_arg_counts.append(len(args))
             return Bound(self.settings)
 
     packed = SimpleNamespace(
@@ -548,6 +550,7 @@ def test_all_helion_selections_use_canonical_k_layout_and_distinct_apis(
         "live_autotune": runner.LIVE_AUTOTUNE_CACHE,
         "final_reviewed_aot": "AOTAutotuneCache",
     }
+    assert bound_arg_counts == [3, 3, 3]
     assert selections["compiler_heuristic"]["selection_api"].startswith(
         "BoundKernel.set_config"
     )

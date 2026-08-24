@@ -142,12 +142,16 @@ N-major workloads fitted in local sweeps; only its K-major entries can match
 this canonical-layout campaign. Treat exact benchmark-row results as in-sample,
 and use separate held-out distributions for generalization claims. The caller
 supplies the canonical B layout and reviewed A packing before binding; the
-compiler does not rewrite caller-owned inputs.
-Ordinary worklist tensors use their mutation version for dispatch
-specialization. An inference-mode worklist has no version counter, so binding
-re-reads its contents and keys the compatibility guard from those values,
-matching the launcher's value-based metadata key. Each inference-worklist
-specialization check therefore incurs a device-to-host metadata read.
+compiler does not rewrite caller-owned inputs. Expected M/group remains only
+benchmark input-generation data and is not passed to the kernel. Reviewed AOT
+dispatch uses G/N/K, B major, packed M, and a source tile admitted by the
+compiler's worklist validator. When multiple source tiles are compatible,
+dispatch shares the compiler's preference order: 224, then 256, then the
+compact-32 fallback. Ordinary worklist tensors cache that source tile by tensor
+mutation version, avoiding a value read on repeated calls. An
+inference-mode worklist has no version counter, so dispatch re-reads its contents
+and keys the compatibility guard from those values, matching the launcher's
+value-based metadata key.
 
 The output directory contains one `result.json`, `worker.log`, `telemetry.csv`,
 and `compute_applications.jsonl` per provider/replicate plus `summary.json`.

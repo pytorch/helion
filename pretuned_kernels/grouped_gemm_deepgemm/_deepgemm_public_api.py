@@ -156,7 +156,6 @@ def _captured_calls(
         a,
         helion_b,
         worklist,
-        shape.expected_m_per_group,
     )
     bound = kernel_factory().bind(kernel_args)
     bound.env.config_spec.cute_tcgen05_search_enabled = True
@@ -224,7 +223,6 @@ def _run_aot_training(
             a,
             helion_b,
             worklist,
-            shape.expected_m_per_group,
         )
         bound = kernel_factory().bind(kernel_args)
         bound.env.config_spec.cute_tcgen05_search_enabled = True

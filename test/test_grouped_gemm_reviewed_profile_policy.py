@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from hashlib import sha256
 import importlib.util
+import inspect
 import json
 from pathlib import Path
 import shutil
@@ -12,9 +13,14 @@ from types import ModuleType
 from pretuned_kernels.grouped_gemm_deepgemm import (
     _helion_aot_grouped_gemm_deepgemm_cuda_sm100 as reviewed_heuristic,
 )
+from pretuned_kernels.grouped_gemm_deepgemm import (
+    grouped_gemm_deepgemm as pretuned_deepgemm,
+)
 from pretuned_kernels.grouped_gemm_deepgemm import reviewed_profiles
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensor
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from helion._compiler.autotuner_heuristics import cute as cute_heuristics
 from helion._compiler.backend import CuteBackend
@@ -58,19 +64,15 @@ def test_reviewed_profile_selection_and_config_values() -> None:
         )
         == reviewed_profiles.SOURCE_M_TILES
     )
-    expected_m20 = reviewed_profiles.reviewed_worklist_profile(32, 20, 1, 1)
-    expected_none = reviewed_profiles.reviewed_worklist_profile(32, None, 1, 1)
-
-    assert expected_m20 == reviewed_profiles.ReviewedWorklistProfile(
-        "_SOURCE32_CONFIG",
-        "k",
+    assert reviewed_profiles.reviewed_config_name(32, 1, 1, 32) == ("_SOURCE32_CONFIG")
+    assert (
+        reviewed_profiles.reviewed_config_name(32, 1, 1, 224)
+        == (reviewed_profiles.AOT_CONFIG_NAMES[-1])
     )
-    assert expected_none == reviewed_profiles.ReviewedWorklistProfile(
-        reviewed_profiles.AOT_CONFIG_NAMES[-1],
-        "k",
+    assert reviewed_profiles.reviewed_config_name(32, 1, 1, 256) == (
+        "_SOURCE256_BK64_AB6_R240_DIRECT_CONFIG"
     )
-    assert reviewed_profiles.reviewed_worklist_profile(32, 192, 1, 1) == expected_none
-    profile = reviewed_profiles.reviewed_worklist_profile(6, 20, 4096, 4096)
+    profile = reviewed_profiles.exact_reviewed_worklist_profile(6, 20, 4096, 4096)
     first = reviewed_profiles.reviewed_config_values(profile.config_name)
     second = reviewed_profiles.reviewed_config_values(profile.config_name)
 
@@ -81,22 +83,205 @@ def test_reviewed_profile_selection_and_config_values() -> None:
     assert first["block_sizes"] == [256, 128, 128]
     assert first["tcgen05_grouped_worklist_source_m_tile"] == 32
     assert first["tcgen05_grouped_runtime_direct"] is True
-    assert reviewed_profiles.reviewed_config_name(6, 20, 4096, 4096) == (
+    assert reviewed_profiles.reviewed_config_name(6, 4096, 4096, 32) == (
         profile.config_name
     )
     assert (
-        reviewed_profiles.reviewed_config_name(
-            6, 20, 4096, 4096, reviewed_profiles.LEGACY_M_ALIGNMENT
-        )
+        reviewed_profiles.reviewed_config_name(6, 4096, 4096, 224)
         == reviewed_profiles.AOT_CONFIG_NAMES[-1]
     )
     with pytest.raises(ValueError, match=reviewed_profiles.SOURCE_M_TILE_ERROR):
-        reviewed_profiles.reviewed_config_name(6, 20, 4096, 4096, 64)
-    profile = reviewed_profiles.reviewed_worklist_profile(6, 20, 7168, 3072)
+        reviewed_profiles.reviewed_config_name(6, 4096, 4096, 64)
+    profile = reviewed_profiles.exact_reviewed_worklist_profile(6, 20, 7168, 3072)
     config = reviewed_profiles.reviewed_config_values(profile.config_name)
 
     assert profile.config_name == "_SOURCE32_BK128_AB5_R256_RSV32_DIRECT_CONFIG"
     assert config["tcgen05_grouped_static_reserved_sms"] == 32
+
+
+def test_pretuned_kernel_api_has_no_expected_m_hint() -> None:
+    assert tuple(
+        inspect.signature(pretuned_deepgemm._GROUPED_GEMM_DEEPGEMM_BODY).parameters
+    ) == ("a_packed", "b_grouped", "worklist")
+    assert tuple(
+        inspect.signature(reviewed_heuristic.autotune_grouped_gemm_deepgemm).parameters
+    ) == ("groups", "n", "k", "b_major", "source_m_tile", "packed_m")
+
+
+def test_aot_key_distinguishes_b_layout_and_packed_extent() -> None:
+    a = torch.empty(256, 64)
+    a_larger = torch.empty(384, 64)
+    b_k_major = torch.empty(2, 128, 64)
+    b_n_major = b_k_major.transpose(1, 2).contiguous().transpose(1, 2)
+    b_strided = torch.empty(2, 128, 128)[:, :, ::2]
+    worklist = torch.tensor(((0, 0, 100, 128), (1, 128, 100, 128)))
+    larger_worklist = torch.tensor(((0, 0, 161, 192), (1, 192, 161, 192)))
+
+    keys = {
+        pretuned_deepgemm._selected_key(a, b_k_major, worklist),
+        pretuned_deepgemm._selected_key(a, b_n_major, worklist),
+        pretuned_deepgemm._selected_key(a_larger, b_k_major, larger_worklist),
+    }
+
+    assert len(keys) == 3
+    assert all(key[-2] == reviewed_profiles.SMALL_M_ALIGNMENT for key in keys)
+    with pytest.raises(ValueError, match="contiguous K-major or N-major"):
+        pretuned_deepgemm._selected_key(a, b_strided, worklist)
+
+
+def test_aot_key_selects_all_reviewed_profiles_without_expected_m() -> None:
+    for shape, profile in reviewed_profiles.REVIEWED_PUBLIC_SHAPE_PROFILES.items():
+        groups, expected_m_per_group, n, k = shape
+        actual_ms = (expected_m_per_group,) * groups
+        source_m_tile = profile.source_m_tile
+        packed_m = sum(
+            (actual_m + source_m_tile - 1) // source_m_tile * source_m_tile
+            for actual_m in actual_ms
+        )
+        a = torch.empty((packed_m, k), device="meta")
+        if profile.b_major == "k":
+            b = torch.empty((groups, n, k), device="meta")
+        else:
+            b = torch.empty(
+                (groups, k, n),
+                device="meta",
+            ).transpose(1, 2)
+        worklist_rows = []
+        start = 0
+        for group, actual_m in enumerate(actual_ms):
+            stored_m = (actual_m + source_m_tile - 1) // source_m_tile * source_m_tile
+            worklist_rows.append((group, start, actual_m, stored_m))
+            start += stored_m
+        worklist = torch.tensor(worklist_rows, dtype=torch.int32)
+
+        key = pretuned_deepgemm._selected_key(a, b, worklist)
+
+        assert key == (
+            groups,
+            n,
+            k,
+            profile.b_major,
+            source_m_tile,
+            packed_m,
+        )
+        assert reviewed_heuristic.autotune_grouped_gemm_deepgemm(*key) == (
+            reviewed_profiles.reviewed_config_values(profile.config_name)
+        )
+
+
+def test_aot_key_caches_worklist_analysis_until_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    a = torch.empty(448, 64)
+    b = torch.empty(2, 128, 64)
+    worklist = torch.tensor(
+        ((0, 0, 1, 224), (1, 224, 1, 224)),
+        dtype=torch.int32,
+    )
+    reads = 0
+    read_worklist_rows = pretuned_deepgemm._worklist_rows
+
+    def count_reads(
+        tensor: torch.Tensor,
+        mutation_key: tuple[object, ...],
+    ) -> tuple[tuple[int, ...], ...]:
+        nonlocal reads
+        reads += 1
+        return read_worklist_rows(tensor, mutation_key)
+
+    pretuned_deepgemm._SOURCE_M_TILE_CACHE.clear()
+    monkeypatch.setattr(pretuned_deepgemm, "_worklist_rows", count_reads)
+    first = pretuned_deepgemm._selected_key(a, b, worklist)
+    repeated = pretuned_deepgemm._selected_key(a, b, worklist)
+
+    assert first == repeated
+    assert first[-2] == reviewed_profiles.LEGACY_M_ALIGNMENT
+    assert reads == 1
+    assert reviewed_heuristic.autotune_grouped_gemm_deepgemm(*first) == (
+        reviewed_profiles.reviewed_config_values(reviewed_profiles.AOT_CONFIG_NAMES[-1])
+    )
+
+    worklist.copy_(
+        torch.tensor(
+            ((0, 0, 1, 32), (1, 32, 1, 416)),
+            dtype=torch.int32,
+        )
+    )
+    changed = pretuned_deepgemm._selected_key(a, b, worklist)
+
+    assert changed[-2] == reviewed_profiles.SMALL_M_ALIGNMENT
+    assert changed != first
+    assert reads == 2
+    assert reviewed_heuristic.autotune_grouped_gemm_deepgemm(*changed) == (
+        reviewed_profiles.reviewed_config_values("_SOURCE32_CONFIG")
+    )
+
+
+def test_aot_key_tracks_inference_worklist_values() -> None:
+    a = torch.empty(448, 64)
+    b = torch.empty(2, 128, 64)
+    with torch.inference_mode():
+        worklist = torch.tensor(
+            ((0, 0, 1, 224), (1, 224, 1, 224)),
+            dtype=torch.int32,
+        )
+        first = pretuned_deepgemm._selected_key(a, b, worklist)
+        worklist.copy_(
+            torch.tensor(
+                ((0, 0, 1, 32), (1, 32, 1, 416)),
+                dtype=torch.int32,
+            )
+        )
+        changed = pretuned_deepgemm._selected_key(a, b, worklist)
+
+    assert first[-2] == reviewed_profiles.LEGACY_M_ALIGNMENT
+    assert changed[-2] == reviewed_profiles.SMALL_M_ALIGNMENT
+    assert changed != first
+
+
+def test_aot_key_accepts_constant_backed_fake_worklist_values() -> None:
+    concrete_worklist = torch.tensor(((0, 0, 1, 224),), dtype=torch.int32)
+    mode = FakeTensorMode()
+    a = mode.from_tensor(torch.empty(224, 64))
+    b = mode.from_tensor(torch.empty(1, 128, 64))
+    worklist = FakeTensor(
+        mode,
+        torch.empty_like(concrete_worklist, device="meta"),
+        concrete_worklist.device,
+        constant=concrete_worklist,
+    )
+
+    with mode:
+        key = pretuned_deepgemm._selected_key(a, b, worklist)
+
+    assert key == (
+        1,
+        128,
+        64,
+        "k",
+        reviewed_profiles.LEGACY_M_ALIGNMENT,
+        224,
+    )
+
+
+def test_aot_key_uses_compiler_preference_for_ambiguous_worklist() -> None:
+    a = torch.empty(1792, 64)
+    b = torch.empty(1, 128, 64)
+    worklist = torch.tensor(((0, 0, 1700, 1792),), dtype=torch.int32)
+
+    key = pretuned_deepgemm._selected_key(a, b, worklist)
+
+    assert key[-2] == reviewed_profiles.LEGACY_M_ALIGNMENT
+
+
+def test_aot_key_rejects_unknown_fake_worklist_values() -> None:
+    with FakeTensorMode():
+        a = torch.empty(224, 64)
+        b = torch.empty(1, 128, 64)
+        worklist = torch.empty(1, 4, dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="requires concrete packed-worklist values"):
+        pretuned_deepgemm._selected_key(a, b, worklist)
 
 
 def test_official_benchmark_manifest_is_exact_and_fixed() -> None:
@@ -259,16 +444,23 @@ def test_reviewed_heuristic_selects_every_profile_and_fallback() -> None:
         profile.b_major
         for profile in reviewed_profiles.REVIEWED_PUBLIC_SHAPE_PROFILES.values()
     } <= {"k", "n"}
+    assert len(reviewed_profiles.REVIEWED_DISPATCH_PROFILES) == 24
     for shape, profile in reviewed_profiles.REVIEWED_PUBLIC_SHAPE_PROFILES.items():
-        assert reviewed_heuristic.autotune_grouped_gemm_deepgemm(*shape) == (
-            reviewed_profiles.reviewed_config_values(profile.config_name)
-        )
+        groups, _expected_m_per_group, n, k = shape
+        for b_major in ("k", "n"):
+            assert reviewed_heuristic.autotune_grouped_gemm_deepgemm(
+                groups,
+                n,
+                k,
+                b_major=b_major,
+                source_m_tile=profile.source_m_tile,
+                packed_m=groups * profile.source_m_tile,
+            ) == (reviewed_profiles.reviewed_config_values(profile.config_name))
 
     assert not hasattr(reviewed_heuristic, "key_grouped_gemm_deepgemm")
     assert reviewed_heuristic.SUPPORTED_HARDWARE_NAMES == ("NVIDIA B200",)
     assert reviewed_heuristic.autotune_grouped_gemm_deepgemm(
         6,
-        20,
         4096,
         4096,
         b_major="k",
@@ -276,29 +468,29 @@ def test_reviewed_heuristic_selects_every_profile_and_fallback() -> None:
         packed_m=1536,
     ) == reviewed_heuristic.autotune_grouped_gemm_deepgemm(
         6,
-        20,
         4096,
         4096,
         b_major="n",
         source_m_tile=256,
         packed_m=3072,
     )
-    assert reviewed_heuristic.autotune_grouped_gemm_deepgemm(6, 20, 4096, 4096) != (
-        reviewed_heuristic.autotune_grouped_gemm_deepgemm(6, 1024, 4096, 4096)
+    assert reviewed_heuristic.autotune_grouped_gemm_deepgemm(
+        6, 4096, 4096, source_m_tile=32
+    ) != reviewed_heuristic.autotune_grouped_gemm_deepgemm(
+        6, 4096, 4096, source_m_tile=256
     )
-    assert reviewed_heuristic.autotune_grouped_gemm_deepgemm(1, 0, 1, 1) == (
+    assert reviewed_heuristic.autotune_grouped_gemm_deepgemm(1, 1, 1) == (
         reviewed_profiles.reviewed_config_values(reviewed_profiles.AOT_CONFIG_NAMES[-1])
     )
     with pytest.raises(ValueError, match="must be 'k' or 'n'"):
         reviewed_heuristic.autotune_grouped_gemm_deepgemm(
             6,
-            20,
             4096,
             4096,
             b_major="strided",
         )
     with pytest.raises(ValueError, match="packed M must be a positive integer"):
-        reviewed_heuristic.autotune_grouped_gemm_deepgemm(6, 20, 4096, 4096, packed_m=0)
+        reviewed_heuristic.autotune_grouped_gemm_deepgemm(6, 4096, 4096, packed_m=0)
 
 
 def test_b200_official_reviewed_profiles_remain_rank_zero() -> None:
@@ -362,7 +554,9 @@ with ThreadPoolExecutor(max_workers=2) as pool:
         "isolated_grouped_gemm_aot_second",
     ))
 print(json.dumps({
-    "config": first.autotune_grouped_gemm_deepgemm(6, 20, 4096, 4096),
+    "config": first.autotune_grouped_gemm_deepgemm(
+        6, 4096, 4096, source_m_tile=32
+    ),
     "shared_profile_module": first._REVIEWED is second._REVIEWED,
     "shared_state_module": (
         first._PROFILE_STATE_MODULE_NAME == second._PROFILE_STATE_MODULE_NAME
@@ -384,7 +578,7 @@ print(json.dumps({
     assert payload["shared_state_module"] is True
     assert payload["uses_sys_global_lock_registry"] is False
     assert payload["config"] == reviewed_heuristic.autotune_grouped_gemm_deepgemm(
-        6, 20, 4096, 4096
+        6, 4096, 4096, source_m_tile=32
     )
 
 
