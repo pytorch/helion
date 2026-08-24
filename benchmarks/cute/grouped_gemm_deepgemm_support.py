@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from hashlib import sha256
 import importlib
 import importlib.machinery
 import os
 from pathlib import Path
-import subprocess
 import sys
 from typing import TYPE_CHECKING
 from typing import Any
@@ -15,7 +13,7 @@ from typing import Protocol
 from typing import Sequence
 from typing import cast
 
-from pretuned_kernels.grouped_gemm_deepgemm import reviewed_runtime
+from benchmarks.cute import grouped_gemm_benchmark as common
 import torch
 
 if TYPE_CHECKING:
@@ -47,39 +45,6 @@ class _DeepGemmRuntime(Protocol):
     def set_block_size_multiple_of(self, value: int) -> None: ...
 
 
-def align(value: int, alignment: int) -> int:
-    """Round a value up to an alignment."""
-    return ((value + alignment - 1) // alignment) * alignment
-
-
-def file_sha256(path: Path) -> str:
-    """Return the SHA-256 digest of one regular file."""
-    digest = sha256()
-    with path.open("rb") as file:
-        while chunk := file.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _git(root: Path, *args: str) -> str:
-    return subprocess.check_output(
-        ("git", "-C", str(root), *args),
-        text=True,
-    ).rstrip("\n")
-
-
-def _clean_checkout(root: Path, expected_head: str, label: str) -> str:
-    if not root.is_dir():
-        raise RuntimeError(f"{label} root does not exist: {root}")
-    head = _git(root, "rev-parse", "HEAD")
-    if head != expected_head:
-        raise RuntimeError(f"{label} HEAD is {head}, expected {expected_head}")
-    status = _git(root, "status", "--porcelain=v1", "--untracked-files=all")
-    if status:
-        raise RuntimeError(f"{label} checkout is dirty: {status.splitlines()}")
-    return head
-
-
 def _native_extension(root: Path) -> tuple[Path, dict[str, object]]:
     extensions = sorted((root / "deep_gemm").glob("_C*.so"))
     if len(extensions) != 1:
@@ -107,7 +72,7 @@ def _native_extension(root: Path) -> tuple[Path, dict[str, object]]:
         "path": extension_link.relative_to(root).as_posix(),
         "resolved_path": extension.relative_to(root.resolve()).as_posix(),
         "is_symlink": extension_link.is_symlink(),
-        "sha256": file_sha256(extension),
+        "sha256": common.file_sha256(extension),
         "size_bytes": extension.stat().st_size,
         "python_extension_suffix": suffixes[0],
     }
@@ -115,21 +80,27 @@ def _native_extension(root: Path) -> tuple[Path, dict[str, object]]:
 
 def _reset_public_runtime(module: _DeepGemmRuntime) -> dict[str, object]:
     """Reset process-global DeepGEMM controls to the upstream public defaults."""
+
+    requested = {
+        "num_sms": 0,
+        "tc_util": 100,
+        "pdl": False,
+        "ignore_compile_dims": False,
+        "block_size_multiple_of": 1,
+    }
     module.set_num_sms(0)
     module.set_tc_util(100)
     module.set_pdl(False)
     module.set_ignore_compile_dims(False)
     module.set_block_size_multiple_of(1)
-    runtime: dict[str, object] = {
+    observed: dict[str, object] = {
         "num_sms": int(module.get_num_sms()),
         "tc_util": int(module.get_tc_util()),
         "pdl": bool(module.get_pdl()),
-        "ignore_compile_dims": False,
-        "block_size_multiple_of": 1,
     }
-    if runtime["tc_util"] != 100 or runtime["pdl"] is not False:
-        raise RuntimeError(f"DeepGEMM runtime controls did not reset: {runtime}")
-    return runtime
+    if observed["tc_util"] != 100 or observed["pdl"] is not False:
+        raise RuntimeError(f"DeepGEMM runtime controls did not reset: {observed}")
+    return {"requested": requested, "observed": observed}
 
 
 def make_case(
@@ -141,7 +112,7 @@ def make_case(
     m_alignment: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Create one logical case packed for a chosen source-M alignment."""
-    aligned_ms = [align(value, m_alignment) for value in actual_ms]
+    aligned_ms = [common.align(value, m_alignment) for value in actual_ms]
     m_total = sum(aligned_ms)
     a = torch.randn((m_total, k), device=device, dtype=torch.bfloat16)
     b = torch.randn((groups, n, k), device=device, dtype=torch.bfloat16)
@@ -174,7 +145,7 @@ def repack_case_alignment(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Repack the same logical A values without redrawing inputs or changing B."""
     source_rows = worklist.detach().cpu().tolist()
-    aligned_ms = [align(value, target_alignment) for value in actual_ms]
+    aligned_ms = [common.align(value, target_alignment) for value in actual_ms]
     m_total = sum(aligned_ms)
     repacked_a = torch.zeros((m_total, a.size(1)), device=a.device, dtype=a.dtype)
     repacked_reference = torch.zeros(
@@ -221,7 +192,7 @@ def correctness(
     group_ids = sorted(int(value) for value in torch.unique(layout[valid]).tolist())
     if group_ids != list(range(len(group_ids))):
         raise ValueError("grouped GEMM layout group IDs must be contiguous from zero")
-    logical = reviewed_runtime.check_logical_outputs(
+    logical = common.check_logical_outputs(
         tuple(output[layout == group] for group in group_ids),
         tuple(reference[layout == group] for group in group_ids),
         max_diff=max_diff,
@@ -242,27 +213,6 @@ def correctness(
     }
 
 
-def launch_deepgemm(
-    deep_gemm: ModuleType,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    output: torch.Tensor,
-    layout: torch.Tensor,
-) -> torch.Tensor:
-    """Launch the pinned public DeepGEMM contiguous grouped contract."""
-
-    deep_gemm.m_grouped_bf16_gemm_nt_contiguous(
-        a,
-        b,
-        output,
-        layout,
-        compiled_dims="nk",
-        use_psum_layout=False,
-        ensure_zero_padding=False,
-    )
-    return output
-
-
 def import_deepgemm(root: Path, m_alignment: int) -> tuple[Any, dict[str, object]]:
     """Import the pinned public DeepGEMM API and record its native artifact."""
     unexpected_environment = sorted(
@@ -276,17 +226,17 @@ def import_deepgemm(root: Path, m_alignment: int) -> tuple[Any, dict[str, object
         )
     root = root.expanduser().resolve(strict=True)
     source = {
-        "git_head": _clean_checkout(root, DEEPGEMM_COMMIT, "DeepGEMM"),
-        "cutlass_head": _clean_checkout(
+        "git_head": common.clean_checkout(root, DEEPGEMM_COMMIT, "DeepGEMM")["commit"],
+        "cutlass_head": common.clean_checkout(
             root / "third-party" / "cutlass",
             DEEPGEMM_CUTLASS_COMMIT,
             "DeepGEMM CUTLASS",
-        ),
-        "fmt_head": _clean_checkout(
+        )["commit"],
+        "fmt_head": common.clean_checkout(
             root / "third-party" / "fmt",
             DEEPGEMM_FMT_COMMIT,
             "DeepGEMM fmt",
-        ),
+        )["commit"],
     }
     extension, extension_identity = _native_extension(root)
     original_path = list(sys.path)
@@ -337,3 +287,80 @@ def import_deepgemm(root: Path, m_alignment: int) -> tuple[Any, dict[str, object
             sorted(_ALLOWED_DEEPGEMM_ENVIRONMENT & os.environ.keys()), True
         ),
     }
+
+
+def prepare_deepgemm_default(
+    inputs: common.GroupedGemmInputs,
+    *,
+    deepgemm_root: Path,
+) -> common.PreparedImplementation:
+    """Prepare DeepGEMM's pinned public contiguous grouped API."""
+
+    deep_gemm, provenance = import_deepgemm(deepgemm_root, M_ALIGNMENT)
+    packed = common.pack_compact_rows(inputs, M_ALIGNMENT)
+    layout = torch.full(
+        (packed.a.size(0),),
+        -1,
+        device=packed.a.device,
+        dtype=torch.int32,
+    )
+    for group, (start, actual_m) in enumerate(
+        zip(packed.starts, packed.actual_ms, strict=True)
+    ):
+        layout[start : start + actual_m] = group
+    output = torch.empty(
+        (packed.a.size(0), inputs.case.n),
+        device=packed.a.device,
+        dtype=packed.a.dtype,
+    )
+
+    def call() -> torch.Tensor:
+        return launch_deepgemm(deep_gemm, packed.a, inputs.b, output, layout)
+
+    return common.PreparedImplementation(
+        name="deepgemm-public-default",
+        call=call,
+        output_tensors=lambda result: (cast("torch.Tensor", result),),
+        logical_outputs=lambda result: packed.output_slices(
+            cast("torch.Tensor", result)
+        ),
+        config={
+            "provider": "deepgemm",
+            "selection_mode": "public_api_fixed_no_tune",
+            "b_layout": "k_major",
+            "api": {
+                "function": "m_grouped_bf16_gemm_nt_contiguous",
+                "compiled_dims": "nk",
+                "use_psum_layout": False,
+                "ensure_zero_padding": False,
+            },
+            "a_layout": {
+                "kind": "aligned_contiguous_layout",
+                "alignment": M_ALIGNMENT,
+                "logical_values_bitwise_equal": True,
+            },
+            "preprocessing_timed": False,
+            "provenance": provenance,
+        },
+        owners=(deep_gemm, inputs, packed, layout, output),
+    )
+
+
+def launch_deepgemm(
+    deep_gemm: ModuleType,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    output: torch.Tensor,
+    layout: torch.Tensor,
+) -> torch.Tensor:
+    """Launch the pinned public DeepGEMM contiguous grouped contract."""
+    deep_gemm.m_grouped_bf16_gemm_nt_contiguous(
+        a,
+        b,
+        output,
+        layout,
+        compiled_dims="nk",
+        use_psum_layout=False,
+        ensure_zero_padding=False,
+    )
+    return output

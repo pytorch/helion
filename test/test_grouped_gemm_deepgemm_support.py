@@ -159,9 +159,11 @@ def test_import_deepgemm_records_public_module_and_alignment(
 
     heads: list[tuple[Path, str, str]] = []
     monkeypatch.setattr(
-        support,
-        "_clean_checkout",
-        lambda path, expected, label: heads.append((path, expected, label)) or expected,
+        support.common,
+        "clean_checkout",
+        lambda path, expected, label: (
+            heads.append((path, expected, label)) or {"commit": expected}
+        ),
     )
     monkeypatch.setattr(
         support,
@@ -201,13 +203,17 @@ def test_import_deepgemm_records_public_module_and_alignment(
     assert alignments == [support.M_ALIGNMENT]
     assert provenance["git_head"] == support.DEEPGEMM_COMMIT
     assert provenance["m_alignment"] == support.M_ALIGNMENT
-    assert provenance["native_extension"]["sha256"] == "abc"
+    native_extension = cast("dict[str, object]", provenance["native_extension"])
+    assert native_extension["sha256"] == "abc"
     assert provenance["runtime_controls"] == {
-        "num_sms": 148,
-        "tc_util": 100,
-        "pdl": False,
-        "ignore_compile_dims": False,
-        "block_size_multiple_of": 1,
+        "requested": {
+            "num_sms": 0,
+            "tc_util": 100,
+            "pdl": False,
+            "ignore_compile_dims": False,
+            "block_size_multiple_of": 1,
+        },
+        "observed": {"num_sms": 148, "tc_util": 100, "pdl": False},
     }
     assert [item[2] for item in heads] == [
         "DeepGEMM",
@@ -224,7 +230,11 @@ def test_import_deepgemm_rejects_module_outside_checkout(
     root.mkdir()
     extension = root / "_C.so"
     extension.write_bytes(b"extension")
-    monkeypatch.setattr(support, "_clean_checkout", lambda *_args: "head")
+    monkeypatch.setattr(
+        support.common,
+        "clean_checkout",
+        lambda *_args: {"commit": "head"},
+    )
     monkeypatch.setattr(
         support,
         "_native_extension",
@@ -251,7 +261,7 @@ def test_import_deepgemm_rejects_control_environment(
         support.import_deepgemm(tmp_path, support.M_ALIGNMENT)
 
 
-def test_effective_reviewed_config_checks_requested_and_normalized(
+def test_effective_reviewed_config_checks_requested_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     requested = {"block_sizes": [256, 128, 64], "num_warps": 8}
