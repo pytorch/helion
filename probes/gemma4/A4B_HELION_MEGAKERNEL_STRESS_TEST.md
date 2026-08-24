@@ -41,10 +41,9 @@ cross_loop_num_workers=0
 Run it with:
 
 ```bash
-PYTHONPATH=$PWD:/home/eche/local/helion-gemma4/benchmarks/gemma4 \
+PYTHONPATH=$PWD \
 CUDA_VISIBLE_DEVICES=0 \
-/home/eche/.conda/envs/helion-cu13/bin/python \
-  benchmarks/gemma4/helion_gemma4_a4b_moe_megakernel.py \
+python -m probes.gemma4.helion_gemma4_a4b_moe_megakernel \
   --batch 1 --route-skew 2 \
   --source-mode assignment_hierarchical_topk --config-mode matched \
   --workers 0 --worker-multiplier 4 --num-warps 4 --maxnreg 128 \
@@ -95,10 +94,9 @@ cross_loop_num_workers=288 # normalized to the legal 286-worker candidate
 Run it with:
 
 ```bash
-PYTHONPATH=$PWD:/home/eche/local/helion-gemma4/benchmarks/gemma4 \
+PYTHONPATH=$PWD \
 CUDA_VISIBLE_DEVICES=0 \
-/home/eche/.conda/envs/helion-cu13/bin/python \
-  benchmarks/gemma4/helion_gemma4_a4b_moe_megakernel.py \
+python -m probes.gemma4.helion_gemma4_a4b_moe_megakernel \
   --batch 8 --route-skew 2 \
   --source-mode grouped_task_major --config-mode matched \
   --workers 288 --worker-multiplier 4 --num-warps 4 --maxnreg 256 \

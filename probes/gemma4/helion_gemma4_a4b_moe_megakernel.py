@@ -3,8 +3,8 @@
 """Single-kernel Helion stress tests for the Gemma 4 26B-A4B MoE sub-layer.
 
 The probe includes a verbatim production decomposition, assignment-local
-source experiments, and a composition of the production grouped kernels. Add
-the external Gemma benchmark directory to ``PYTHONPATH`` when running it.
+source experiments, and a composition of the production grouped kernels. Its
+Helion baselines and optional hand-written Triton comparison live beside it.
 """
 
 from __future__ import annotations
@@ -15,21 +15,22 @@ import json
 import linecache
 from pathlib import Path
 
-from benchmarks.gemma4.common import benchmark_interleaved
-from benchmarks.gemma4.common import capture
-from benchmarks.gemma4.common import visible_gpu_pids
-from benchmarks.gemma4.helion_gemma4_e4b_megakernel import _Bridge
-from benchmarks.gemma4.helion_gemma4_e4b_megakernel import _helion_resources
-from benchmarks.gemma4.helion_gemma4_e4b_megakernel import _inline_invocation
-from benchmarks.gemma4.helion_gemma4_e4b_megakernel import _Invocation
-from gemma4_a4b_moe_common import Gemma4A4BMoEShape
-from gemma4_a4b_moe_common import allocate_moe
-from gemma4_a4b_moe_common import max_aligned_tiles
-from gemma4_a4b_moe_common import moe_reference
-from gemma4_a4b_moe_common import tiles_per_expert as tiles_per_expert_of
-import helion_gemma4_a4b_moe as separate
 import torch
-import triton_gemma4_a4b_moe_megakernel as hand_triton
+
+from probes.gemma4.common import benchmark_interleaved
+from probes.gemma4.common import capture
+from probes.gemma4.common import visible_gpu_pids
+from probes.gemma4.gemma4_a4b_moe_common import Gemma4A4BMoEShape
+from probes.gemma4.gemma4_a4b_moe_common import allocate_moe
+from probes.gemma4.gemma4_a4b_moe_common import max_aligned_tiles
+from probes.gemma4.gemma4_a4b_moe_common import moe_reference
+from probes.gemma4.gemma4_a4b_moe_common import tiles_per_expert as tiles_per_expert_of
+import probes.gemma4.helion_gemma4_a4b_moe as separate
+from probes.gemma4.helion_gemma4_e4b_megakernel import _Bridge
+from probes.gemma4.helion_gemma4_e4b_megakernel import _helion_resources
+from probes.gemma4.helion_gemma4_e4b_megakernel import _inline_invocation
+from probes.gemma4.helion_gemma4_e4b_megakernel import _Invocation
+import probes.gemma4.triton_gemma4_a4b_moe_megakernel as hand_triton
 
 import helion
 import helion.language as hl
@@ -1728,10 +1729,7 @@ def main() -> None:
     parser.add_argument("--batch-replays", type=int, default=50)
     parser.add_argument(
         "--config-path",
-        default=(
-            "/home/eche/local/helion-gemma4/benchmarks/gemma4/"
-            "gemma4_a4b_moe_b200_configs.json"
-        ),
+        default=str(Path(__file__).with_name("gemma4_a4b_moe_b200_configs.json")),
     )
     parser.add_argument("--allow-busy", action="store_true")
     parser.add_argument("--smoke", action="store_true")

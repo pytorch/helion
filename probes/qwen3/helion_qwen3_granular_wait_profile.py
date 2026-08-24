@@ -9,12 +9,11 @@ generated acquire waits.  The opaque Helion tile bodies are unchanged.
 from __future__ import annotations
 
 import argparse
-import sys
-import types
 from typing import TYPE_CHECKING
 
-import helion_qwen3_granular_tile_dependency as granular
 import torch
+
+from probes.qwen3 import helion_qwen3_granular_tile_dependency as granular
 
 from helion._compiler.ast_extension import statement_from_string
 from helion._compiler.program_id import ForEachProgramID
@@ -96,11 +95,9 @@ def main() -> None:
     parser.add_argument("--task-aligned-attention", action="store_true")
     args = parser.parse_args()
 
-    compatibility = types.ModuleType("triton_qwen3_sm_overlap_probe")
-    compatibility.build_helion_reference = granular._build_helion_reference
-    sys.modules.setdefault("triton_qwen3_sm_overlap_probe", compatibility)
+    from probes.qwen3 import helion_qwen3_tile_dependency as probe
 
-    import helion_qwen3_tile_dependency as probe
+    probe.build_helion_reference = granular._build_helion_reference
 
     probe.require_idle_visible_gpu()
     sites_by_device_function = _trace_waits()

@@ -16,17 +16,18 @@ import linecache
 from pathlib import Path
 from types import SimpleNamespace
 
-from benchmarks.gemma4.common import Gemma4E4BShape
-from benchmarks.gemma4.common import allocate_layer
-from benchmarks.gemma4.common import benchmark_interleaved
-from benchmarks.gemma4.common import capture
-from benchmarks.gemma4.common import layer_reference
-from benchmarks.gemma4.common import require_idle_visible_gpu
-from benchmarks.gemma4.common import visible_gpu_pids
-import benchmarks.gemma4.helion_gemma4_e4b_layer as layer
-import benchmarks.gemma4.helion_gemma4_e4b_megakernel as mega
-import benchmarks.gemma4.triton_gemma4_codegen_schedule_probe as codegen_probe
 import torch
+
+from probes.gemma4.common import Gemma4E4BShape
+from probes.gemma4.common import allocate_layer
+from probes.gemma4.common import benchmark_interleaved
+from probes.gemma4.common import capture
+from probes.gemma4.common import layer_reference
+from probes.gemma4.common import require_idle_visible_gpu
+from probes.gemma4.common import visible_gpu_pids
+import probes.gemma4.helion_gemma4_e4b_layer as layer
+import probes.gemma4.helion_gemma4_e4b_megakernel as mega
+import probes.gemma4.triton_gemma4_codegen_schedule_probe as codegen_probe
 
 import helion
 
@@ -863,7 +864,7 @@ def main() -> None:
     parser.add_argument("--correctness-replays", type=int, default=20)
     parser.add_argument(
         "--config-path",
-        default="benchmarks/gemma4/gemma4_e4b_b200_configs.json",
+        default=str(Path(__file__).with_name("gemma4_e4b_b200_configs.json")),
     )
     parser.add_argument(
         "--lowered-output",

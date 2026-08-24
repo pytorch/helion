@@ -8,22 +8,21 @@ import ast
 import linecache
 from pathlib import Path
 
-from helion_qwen3_layer_baseline import FFN_CONFIGS
-from helion_qwen3_layer_baseline import FP8_MAX  # noqa: F401 - generated source global
-from helion_qwen3_layer_baseline import FP8_MIN  # noqa: F401 - generated source global
-from helion_qwen3_layer_baseline import (  # noqa: F401 - generated source global
-    FP8_MIN_SCALE,
-)
-from helion_qwen3_layer_baseline import block_fp8_mm
-from helion_qwen3_layer_baseline import compile_config
-from helion_qwen3_layer_baseline import silu_and_mul_per_block_quant
-from helion_qwen3_tile_dependency import _inline_invocation
-from helion_qwen3_tile_dependency import _Invocation
 import torch
-from triton_qwen3_interleaved_admission import benchmark_interleaved
-from triton_qwen3_interleaved_admission import capture
-from triton_qwen3_interleaved_admission import require_idle_visible_gpu
-from triton_qwen3_interleaved_admission import visible_gpu_pids
+
+from probes.common import benchmark_interleaved
+from probes.common import capture
+from probes.common import require_idle_visible_gpu
+from probes.common import visible_gpu_pids
+from probes.qwen3.helion_qwen3_layer_baseline import FFN_CONFIGS
+from probes.qwen3.helion_qwen3_layer_baseline import FP8_MAX  # noqa: F401
+from probes.qwen3.helion_qwen3_layer_baseline import FP8_MIN  # noqa: F401
+from probes.qwen3.helion_qwen3_layer_baseline import FP8_MIN_SCALE  # noqa: F401
+from probes.qwen3.helion_qwen3_layer_baseline import block_fp8_mm
+from probes.qwen3.helion_qwen3_layer_baseline import compile_config
+from probes.qwen3.helion_qwen3_layer_baseline import silu_and_mul_per_block_quant
+from probes.qwen3.helion_qwen3_tile_dependency import _inline_invocation
+from probes.qwen3.helion_qwen3_tile_dependency import _Invocation
 
 import helion
 import helion.language as hl  # noqa: F401 - generated source global

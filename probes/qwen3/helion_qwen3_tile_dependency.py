@@ -16,26 +16,39 @@ import linecache
 import math  # noqa: F401 - used by the generated kernel's module globals
 from pathlib import Path
 import textwrap
+from typing import Callable
 from typing import Protocol
 
-from helion_qwen3_layer_baseline import allocate as allocate_layer
-from helion_qwen3_layer_baseline import block_fp8_mm
-from helion_qwen3_layer_baseline import fused_qk_norm_rope
-from helion_qwen3_layer_baseline import merge_attention_splits
-from helion_qwen3_layer_baseline import paged_gqa_decode_attention_split
-from helion_qwen3_layer_baseline import per_token_group_fp8_quant
-from helion_qwen3_layer_baseline import reshape_and_cache_flash
-from helion_qwen3_layer_baseline import rms_norm_per_block_quant
-from helion_qwen3_layer_baseline import silu_and_mul_per_block_quant
 import torch
-from triton_qwen3_interleaved_admission import benchmark_interleaved
-from triton_qwen3_interleaved_admission import capture
-from triton_qwen3_interleaved_admission import require_idle_visible_gpu
-from triton_qwen3_interleaved_admission import visible_gpu_pids
-from triton_qwen3_sm_overlap_probe import build_helion_reference
+
+from probes.common import benchmark_interleaved
+from probes.common import capture
+from probes.common import require_idle_visible_gpu
+from probes.common import visible_gpu_pids
+from probes.qwen3.helion_qwen3_layer_baseline import allocate as allocate_layer
+from probes.qwen3.helion_qwen3_layer_baseline import block_fp8_mm
+from probes.qwen3.helion_qwen3_layer_baseline import fused_qk_norm_rope
+from probes.qwen3.helion_qwen3_layer_baseline import merge_attention_splits
+from probes.qwen3.helion_qwen3_layer_baseline import paged_gqa_decode_attention_split
+from probes.qwen3.helion_qwen3_layer_baseline import per_token_group_fp8_quant
+from probes.qwen3.helion_qwen3_layer_baseline import reshape_and_cache_flash
+from probes.qwen3.helion_qwen3_layer_baseline import rms_norm_per_block_quant
+from probes.qwen3.helion_qwen3_layer_baseline import silu_and_mul_per_block_quant
 
 import helion
 import helion.language as hl  # noqa: F401 - used by the generated kernel
+
+
+def build_helion_reference(
+    args, tensors
+) -> tuple[Callable[[], object], dict[str, torch.Tensor]]:
+    """Build the local same-source separate-kernel baseline."""
+    from probes.qwen3.helion_qwen3_granular_tile_dependency import (
+        _build_helion_reference,
+    )
+
+    return _build_helion_reference(args, tensors)
+
 
 FP8_MAX = 448.0
 FP8_MIN = -448.0
@@ -763,13 +776,7 @@ def main() -> None:
     parser.add_argument("--timing-only", action="store_true")
     parser.add_argument(
         "--config-path",
-        default=str(
-            Path(__file__).resolve().parents[3]
-            / "helion-megakernel-probe"
-            / "benchmarks"
-            / "megakernel"
-            / "qwen3_layer_helion_b200_configs.json"
-        ),
+        default=str(Path(__file__).with_name("qwen3_layer_helion_b200_configs.json")),
     )
     run(parser.parse_args())
 

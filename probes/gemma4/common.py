@@ -406,7 +406,7 @@ def visible_gpu_pids() -> set[int]:
 
 def require_idle_visible_gpu() -> None:
     visible = visible_gpu()
-    memory_limit = int(os.environ.get("GEMMA4_IDLE_MEMORY_LIMIT_MB", "256"))
+    memory_limit = int(os.environ.get("MEGAKERNEL_IDLE_MEMORY_LIMIT_MB", "256"))
     pids = visible_gpu_pids()
     if pids:
         raise RuntimeError(f"GPU {visible} has compute processes {sorted(pids)}")

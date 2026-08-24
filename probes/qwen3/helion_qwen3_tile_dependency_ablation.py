@@ -6,27 +6,10 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import sys
-import types
 
 import torch
 
 from helion._compiler import cross_loop_scheduler
-
-# The original comparison probe was superseded by the production persistent
-# probe in the exploration worktree.  Keep this new ablation self-contained by
-# supplying the one compatibility symbol the Helion harness imports, without
-# editing either existing probe.
-_compat_probe = types.ModuleType("triton_qwen3_sm_overlap_probe")
-
-
-def _build_helion_reference(*args: object, **kwargs: object):
-    from triton_qwen3_whole_layer_persistent import build_helion_reference
-
-    return build_helion_reference(*args, **kwargs)
-
-
-_compat_probe.build_helion_reference = _build_helion_reference
-sys.modules.setdefault("triton_qwen3_sm_overlap_probe", _compat_probe)
 
 
 def _without_on_ready(events):
@@ -56,7 +39,7 @@ def main() -> None:
             derive_coalesced_events_without_continuation
         )
 
-    import helion_qwen3_tile_dependency as probe
+    from probes.qwen3 import helion_qwen3_tile_dependency as probe
 
     sys.argv = [sys.argv[0], *remaining]
     if not args.strict_validation:

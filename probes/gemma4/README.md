@@ -17,7 +17,7 @@ Run the measured configuration from the repository root:
 
 ```bash
 export PYTHONPATH="$PWD"
-python benchmarks/gemma4/triton_gemma4_codegen_schedule_probe.py \
+python -m probes.gemma4.triton_gemma4_codegen_schedule_probe \
     --layer 0 \
     --workers 576 \
     --ffn-stream \

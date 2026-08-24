@@ -17,7 +17,6 @@ import json
 import math
 from pathlib import Path
 import sys
-import types
 
 import torch
 
@@ -645,13 +644,15 @@ def _compile_granular_separate_kernel(kernel, kernel_args, args):
 
 def _build_helion_reference(args, tensors):
     """Build a separate-launch graph from the exact sources used above."""
-    from helion_qwen3_layer_baseline import FFN_CONFIGS
-    from helion_qwen3_layer_baseline import block_fp8_mm
-    from helion_qwen3_layer_baseline import compile_config
-    from helion_qwen3_layer_baseline import fused_qk_norm_rope
-    from helion_qwen3_layer_baseline import paged_gqa_decode_attention_split
-    from helion_qwen3_layer_baseline import per_token_group_fp8_quant
-    from helion_qwen3_layer_baseline import silu_and_mul_per_block_quant
+    from probes.qwen3.helion_qwen3_layer_baseline import FFN_CONFIGS
+    from probes.qwen3.helion_qwen3_layer_baseline import block_fp8_mm
+    from probes.qwen3.helion_qwen3_layer_baseline import compile_config
+    from probes.qwen3.helion_qwen3_layer_baseline import fused_qk_norm_rope
+    from probes.qwen3.helion_qwen3_layer_baseline import (
+        paged_gqa_decode_attention_split,
+    )
+    from probes.qwen3.helion_qwen3_layer_baseline import per_token_group_fp8_quant
+    from probes.qwen3.helion_qwen3_layer_baseline import silu_and_mul_per_block_quant
 
     configs = json.loads(Path(args.config_path).read_text())
     initial_residual = tensors["residual"].clone()
@@ -909,12 +910,6 @@ def _build_helion_reference(args, tensors):
     }
 
 
-def _build_original_helion_reference(*args: object, **kwargs: object):
-    from triton_qwen3_whole_layer_persistent import build_helion_reference
-
-    return build_helion_reference(*args, **kwargs)
-
-
 def _probe_config(bound, args):
     """Map the retained one-warp probe geometry onto the granular source."""
     values = dict(bound.config_spec.default_config())
@@ -1054,11 +1049,6 @@ def main() -> None:
     parser.add_argument("--dump-accesses", action="store_true")
     parser.add_argument("--canonical-attention-views", action="store_true")
     parser.add_argument("--task-aligned-attention", action="store_true")
-    parser.add_argument(
-        "--reference",
-        choices=("same_source", "tuned"),
-        default="same_source",
-    )
     args, remaining = parser.parse_known_args()
     if args.canonical_attention_views and args.task_aligned_attention:
         parser.error(
@@ -1083,15 +1073,9 @@ def main() -> None:
             return original_wait_for_counter(**kwargs)
 
         ForEachProgramID._wait_for_counter = staticmethod(filtered_wait_for_counter)
-    compatibility = types.ModuleType("triton_qwen3_sm_overlap_probe")
-    compatibility.build_helion_reference = (
-        _build_helion_reference
-        if args.reference == "same_source"
-        else _build_original_helion_reference
-    )
-    sys.modules.setdefault("triton_qwen3_sm_overlap_probe", compatibility)
+    from probes.qwen3 import helion_qwen3_tile_dependency as probe
 
-    import helion_qwen3_tile_dependency as probe
+    probe.build_helion_reference = _build_helion_reference
 
     probe.rms_norm_per_block_quant = tiled_rms_norm_per_block_quant
     probe.reshape_and_cache_flash = tiled_reshape_and_cache_flash

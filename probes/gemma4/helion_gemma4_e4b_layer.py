@@ -17,18 +17,19 @@ import math
 from pathlib import Path
 import time
 
-from benchmarks.gemma4.common import E4B_LAYER_COUNTS
-from benchmarks.gemma4.common import E4B_REPRESENTATIVE_LAYERS
-from benchmarks.gemma4.common import Gemma4E4BShape
-from benchmarks.gemma4.common import allocate_layer
-from benchmarks.gemma4.common import benchmark_interleaved
-from benchmarks.gemma4.common import capture
-from benchmarks.gemma4.common import layer_reference
-from benchmarks.gemma4.common import paged_attention_reference
-from benchmarks.gemma4.common import require_idle_visible_gpu
-from benchmarks.gemma4.common import variant_name
-from benchmarks.gemma4.common import visible_gpu_pids
 import torch
+
+from probes.gemma4.common import E4B_LAYER_COUNTS
+from probes.gemma4.common import E4B_REPRESENTATIVE_LAYERS
+from probes.gemma4.common import Gemma4E4BShape
+from probes.gemma4.common import allocate_layer
+from probes.gemma4.common import benchmark_interleaved
+from probes.gemma4.common import capture
+from probes.gemma4.common import layer_reference
+from probes.gemma4.common import paged_attention_reference
+from probes.gemma4.common import require_idle_visible_gpu
+from probes.gemma4.common import variant_name
+from probes.gemma4.common import visible_gpu_pids
 
 import helion
 import helion.language as hl
@@ -1597,7 +1598,7 @@ def main():
     parser.add_argument("--batch-replays", type=int, default=20)
     parser.add_argument(
         "--config-path",
-        default="benchmarks/gemma4/gemma4_e4b_b200_configs.json",
+        default=str(Path(__file__).with_name("gemma4_e4b_b200_configs.json")),
     )
     parser.add_argument("--tune", nargs="*", default=[])
     parser.add_argument("--smoke", action="store_true")

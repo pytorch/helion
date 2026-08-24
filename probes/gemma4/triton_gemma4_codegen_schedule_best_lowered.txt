@@ -8,7 +8,7 @@ import triton
 import triton.language as tl
 from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
-import benchmarks.gemma4.helion_gemma4_e4b_megakernel as _source_module
+import probes.gemma4.helion_gemma4_e4b_megakernel as _source_module
 
 _BLOCK_SIZE_3 = tl.constexpr(8)
 _BLOCK_SIZE_7 = tl.constexpr(256)
