@@ -66,6 +66,25 @@ class TestAOTRuntimeEmbedding(TestCase):
                     Path(tmp),
                 )
 
+    def test_symlink_loop_source_uses_output_directory_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            first_link = output_dir / "first.py"
+            second_link = output_dir / "second.py"
+            first_link.symlink_to(second_link)
+            second_link.symlink_to(first_link)
+
+            path = generate_standalone_file(
+                "add",
+                [_synthetic_code()],
+                "",
+                output_dir,
+                kernel_source_file=str(first_link),
+            )
+
+            self.assertEqual(path, output_dir / "add_standalone.py")
+            self.assertTrue(path.is_file())
+
 
 @helion.kernel(
     static_shapes=True,

@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import datetime
+import hashlib
 import json
 import logging
 import operator
@@ -30,13 +31,22 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+from typing import TYPE_CHECKING
 from typing import Any
 import uuid
 
-from .._hardware import get_hardware_info
+from ..exc import AOTHardwareManifestError
+from .aot_cache import AOT_HARDWARE_MANIFEST
+from .aot_cache import AOT_RUNNER_HARDWARE_VALIDATION_ENV
+from .aot_cache import load_hardware_manifest
+from .aot_compile import canonical_kernel_source_path
+from .aot_compile import standalone_output_path
 from .heuristic_generator import PerformanceTarget
 from .heuristic_generator import evaluate_heuristic
 from .heuristic_generator import generate_heuristic
+
+if TYPE_CHECKING:
+    from .._hardware import HardwareInfo
 
 # Global state for signal handling
 _current_process: subprocess.Popen[str] | None = None
@@ -81,7 +91,7 @@ class RunConfig:
 
     benchmark_cmd: list[str]
     output_dir: Path
-    hardware_id: str
+    hardware: HardwareInfo | None
     run_id: str
 
     # Performance target
@@ -116,6 +126,285 @@ class RunConfig:
     def run_log_dir(self) -> Path:
         """Get the log directory for this run."""
         return self.run_dir / "logs"
+
+    @property
+    def hardware_id(self) -> str:
+        """Get the hardware identifier used in AOT artifact names."""
+        return self.require_hardware().hardware_id
+
+    def require_hardware(self) -> HardwareInfo:
+        """Return the subprocess-recorded identity after collect."""
+        if self.hardware is None:
+            raise AOTHardwareManifestError(
+                f"AOT hardware identity is not recorded in {self.run_dir}"
+            )
+        return self.hardware
+
+
+def load_run_hardware(config: RunConfig) -> None:
+    """Use the benchmark subprocess manifest as the run's hardware identity."""
+    config.hardware = load_hardware_manifest(config.run_dir)
+
+
+_FileState = tuple[int, int, int, int, int, bytes]
+
+
+class _StandaloneOutputMetadataError(RuntimeError):
+    """Raised when compile freshness cannot derive exact expected outputs."""
+
+
+def _file_state(path: Path) -> _FileState | None:
+    """Return enough identity to prove that a phase refreshed an artifact."""
+    try:
+        stat = path.stat()
+        with path.open("rb") as file:
+            digest = hashlib.sha256(file.read()).digest()
+    except FileNotFoundError:
+        return None
+    return (
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+        digest,
+    )
+
+
+def _file_was_refreshed(path: Path, before: _FileState | None) -> bool:
+    after = _file_state(path)
+    return after is not None and after != before
+
+
+def _validate_run_manifest(config: RunConfig, phase: str) -> bool:
+    """Fail closed if the configured run identity no longer matches its manifest."""
+    try:
+        configured = config.require_hardware()
+        recorded = load_hardware_manifest(config.run_dir)
+    except RuntimeError as error:
+        log.error("Cannot run AOT %s phase: %s", phase, error)
+        return False
+    if configured != recorded:
+        log.error(
+            "Cannot run AOT %s phase: configured hardware %s no longer matches "
+            "the run manifest %s",
+            phase,
+            configured.hardware_id,
+            recorded.hardware_id,
+        )
+        return False
+    return True
+
+
+def _benchmark_env(config: RunConfig, mode: str) -> dict[str, str]:
+    """Build child settings, delegating device validation to actual kernel args."""
+    env = {
+        "HELION_AOT_MODE": mode,
+        "HELION_AOT_DATA_DIR": str(config.run_dir),
+        "HELION_AUTOTUNE_CACHE": "AOTAutotuneCache",
+    }
+    if config.hardware is not None:
+        env[AOT_RUNNER_HARDWARE_VALIDATION_ENV] = "1"
+    return env
+
+
+def _standalone_outputs(
+    config: RunConfig,
+) -> tuple[tuple[str, Path], ...]:
+    """Return the exact output path for each selected eligible kernel.
+
+    Invalid metadata raises ``_StandaloneOutputMetadataError``. An empty tuple
+    is valid and means every selected kernel explicitly has ``standalone=False``.
+    """
+    configs_file = config.run_dir / f"tuned_configs_{config.hardware_id}.json"
+    try:
+        serialized_bytes = configs_file.read_bytes()
+    except OSError as error:
+        raise _StandaloneOutputMetadataError(
+            f"cannot read tuned-config metadata {configs_file}: {error}"
+        ) from error
+    try:
+        serialized = serialized_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise _StandaloneOutputMetadataError(
+            f"tuned-config metadata {configs_file} is not valid UTF-8: {error}"
+        ) from error
+    try:
+        data = json.loads(serialized)
+    except json.JSONDecodeError as error:
+        raise _StandaloneOutputMetadataError(
+            f"invalid tuned-config JSON in {configs_file}: {error}"
+        ) from error
+    if not isinstance(data, dict):
+        raise _StandaloneOutputMetadataError(
+            f"tuned-config metadata {configs_file} must contain a JSON object"
+        )
+
+    kernel_names = (
+        tuple(dict.fromkeys(config.kernels)) if config.kernels else tuple(data)
+    )
+    if not kernel_names:
+        raise _StandaloneOutputMetadataError(
+            f"tuned-config metadata {configs_file} contains no selected kernels"
+        )
+
+    kernel_metadata: list[tuple[str, bool, str | None]] = []
+    for kernel_name in kernel_names:
+        if not isinstance(kernel_name, str) or not kernel_name:
+            raise _StandaloneOutputMetadataError(
+                f"invalid selected kernel name {kernel_name!r}"
+            )
+        if kernel_name not in data:
+            raise _StandaloneOutputMetadataError(
+                f"selected kernel {kernel_name!r} is absent from {configs_file}"
+            )
+        configs = data[kernel_name]
+        if not isinstance(configs, list) or not configs:
+            raise _StandaloneOutputMetadataError(
+                f"kernel {kernel_name!r} must have a nonempty tuned-config list"
+            )
+        flags: set[bool] = set()
+        for index, recorded_config in enumerate(configs):
+            if not isinstance(recorded_config, dict):
+                raise _StandaloneOutputMetadataError(
+                    f"kernel {kernel_name!r} tuned config {index} must be a JSON object"
+                )
+            flag = recorded_config.get("standalone", True)
+            if type(flag) is not bool:
+                raise _StandaloneOutputMetadataError(
+                    f"kernel {kernel_name!r} tuned config {index} has non-boolean "
+                    f"standalone value {flag!r}"
+                )
+            flags.add(flag)
+        if len(flags) != 1:
+            raise _StandaloneOutputMetadataError(
+                f"kernel {kernel_name!r} has conflicting standalone values"
+            )
+        standalone = flags.pop()
+
+        source_file: str | None = None
+        if standalone:
+            # load_kernel_source_files intentionally keeps the first recorded
+            # source for legacy offline-build placement. Freshness proof is
+            # stricter: every eligible row must identify the same canonical
+            # source or fallback.
+            source_paths: set[Path | None] = set()
+            for index, recorded_config in enumerate(configs):
+                value = recorded_config.get("kernel_source_file")
+                if value is not None and not isinstance(value, str):
+                    raise _StandaloneOutputMetadataError(
+                        f"kernel {kernel_name!r} tuned config {index} has invalid "
+                        f"kernel_source_file {value!r}"
+                    )
+                source_paths.add(canonical_kernel_source_path(value))
+            if len(source_paths) > 1:
+                raise _StandaloneOutputMetadataError(
+                    f"kernel {kernel_name!r} has conflicting canonical source identities"
+                )
+            source_path = source_paths.pop()
+            source_file = None if source_path is None else str(source_path)
+        kernel_metadata.append((kernel_name, standalone, source_file))
+
+    outputs = []
+    for kernel_name, standalone, source_file in kernel_metadata:
+        if not standalone:
+            continue
+        output_path = standalone_output_path(
+            kernel_name=kernel_name,
+            output_dir=config.run_dir,
+            kernel_source_file=source_file,
+        )
+        outputs.append((kernel_name, output_path))
+    return tuple(outputs)
+
+
+def _can_start_collect(run_dir: Path) -> bool:
+    """Allow a new run or a retry that has only runner metadata and logs."""
+    manifest_temporary_prefix = f".{AOT_HARDWARE_MANIFEST}."
+    manifest_temporary_suffix = ".tmp"
+    allowed_names = {
+        "run_metadata.json",
+        "logs",
+        f".{AOT_HARDWARE_MANIFEST}.lock",
+    }
+    return not run_dir.exists() or all(
+        entry.name in allowed_names
+        or (
+            entry.name.startswith(manifest_temporary_prefix)
+            and entry.name.endswith(manifest_temporary_suffix)
+            and len(entry.name)
+            > len(manifest_temporary_prefix) + len(manifest_temporary_suffix)
+        )
+        for entry in run_dir.iterdir()
+    )
+
+
+def resolve_run_hardware(
+    output_dir: Path,
+    run_id: str | None,
+    phase: str,
+) -> HardwareInfo | None:
+    """Load a resumed run's identity; collect discovers new identity in the child."""
+    if run_id is None:
+        if phase in ("all", "collect"):
+            return None
+        raise AOTHardwareManifestError(
+            f"AOT phase {phase!r} requires --run-id with a hardware manifest"
+        )
+    run_dir = output_dir / run_id
+    if (run_dir / AOT_HARDWARE_MANIFEST).is_file():
+        return load_hardware_manifest(run_dir)
+    if phase in ("all", "collect") and _can_start_collect(run_dir):
+        return None
+    raise AOTHardwareManifestError(
+        f"Cannot resume AOT run without {run_dir / AOT_HARDWARE_MANIFEST}"
+    )
+
+
+_MAX_PENDING_LOG_FINALIZE_ATTEMPTS = 100
+
+
+def _finalize_pending_log(pending: Path, authoritative: Path) -> None:
+    """Atomically publish a pending log without overwriting an earlier attempt."""
+    if not pending.is_file():
+        return
+    for attempt in range(_MAX_PENDING_LOG_FINALIZE_ATTEMPTS):
+        destination = (
+            authoritative
+            if attempt == 0
+            else authoritative.with_name(f"{authoritative.name}.{attempt}")
+        )
+        try:
+            with destination.open("x"):
+                pass
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise RuntimeError(
+                f"Unable to reserve an AOT log destination for {pending}; "
+                f"ensure {destination.parent} is writable"
+            ) from exc
+        try:
+            # Renaming preserves the inode used by an open FileHandler, so
+            # subsequent runner logs continue in the selected destination.
+            os.replace(pending, destination)
+        except OSError as exc:
+            destination.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"Unable to atomically publish AOT log {pending} as "
+                f"{destination}; ensure the log directory is writable"
+            ) from exc
+        return
+    raise RuntimeError(
+        f"Unable to publish {pending} after "
+        f"{_MAX_PENDING_LOG_FINALIZE_ATTEMPTS} log-name collisions"
+    )
+
+
+def _runner_log_file(config: RunConfig) -> Path:
+    if config.hardware is not None:
+        return config.run_log_dir / f"runner_{config.hardware_id}.log"
+    return config.run_log_dir / "runner_pending.log"
 
 
 def run_benchmark(
@@ -209,13 +498,20 @@ def run_collect_phase(config: RunConfig) -> bool:
     log.info("=" * 60)
 
     cmd = config.collect_benchmark or config.benchmark_cmd
-    log_file = config.run_log_dir / f"collect_{config.hardware_id}.log"
+    identity_known = config.hardware is not None
+    if identity_known and not _validate_run_manifest(config, "collect"):
+        return False
+    configs_file = (
+        config.run_dir / f"tuned_configs_{config.hardware_id}.json"
+        if identity_known
+        else None
+    )
+    configs_before = None if configs_file is None else _file_state(configs_file)
+    log_file = config.run_log_dir / (
+        f"collect_{config.hardware_id}.log" if identity_known else "collect_pending.log"
+    )
 
-    env = {
-        "HELION_AOT_MODE": "collect",
-        "HELION_AOT_DATA_DIR": str(config.run_dir),
-        "HELION_AUTOTUNE_CACHE": "AOTAutotuneCache",
-    }
+    env = _benchmark_env(config, "collect")
 
     return_code, _, _ = run_benchmark(cmd, env, log_file, "collect", config.kernels)
 
@@ -223,14 +519,32 @@ def run_collect_phase(config: RunConfig) -> bool:
         log.error(f"Collect phase failed with return code {return_code}")
         return False
 
+    try:
+        load_run_hardware(config)
+        if not identity_known:
+            _finalize_pending_log(
+                log_file,
+                config.run_log_dir / f"collect_{config.hardware_id}.log",
+            )
+            _finalize_pending_log(
+                config.run_log_dir / "runner_pending.log",
+                config.run_log_dir / f"runner_{config.hardware_id}.log",
+            )
+    except (OSError, RuntimeError) as exc:
+        log.error(str(exc))
+        return False
+
     # Check that we collected some configs
     configs_file = config.run_dir / f"tuned_configs_{config.hardware_id}.json"
-    if not configs_file.exists():
-        log.error("No configs were collected")
+    if not _file_was_refreshed(configs_file, configs_before):
+        log.error("Collect phase did not write fresh tuned configs")
         return False
 
     data = json.loads(configs_file.read_text())
     total_configs = sum(len(v) for v in data.values())
+    if total_configs == 0:
+        log.error("No configs were collected")
+        return False
     log.info(f"Collected {total_configs} configs for {len(data)} kernels")
 
     return True
@@ -246,14 +560,14 @@ def run_measure_phase(config: RunConfig) -> bool:
     log.info("PHASE 2: Measuring configs across shapes")
     log.info("=" * 60)
 
+    if not _validate_run_manifest(config, "measure"):
+        return False
     cmd = config.measure_benchmark or config.benchmark_cmd
     log_file = config.run_log_dir / f"measure_{config.hardware_id}.log"
+    measurements_file = config.run_dir / f"measurements_{config.hardware_id}.csv"
+    measurements_before = _file_state(measurements_file)
 
-    env = {
-        "HELION_AOT_MODE": "measure",
-        "HELION_AOT_DATA_DIR": str(config.run_dir),
-        "HELION_AUTOTUNE_CACHE": "AOTAutotuneCache",
-    }
+    env = _benchmark_env(config, "measure")
 
     return_code, _, _ = run_benchmark(cmd, env, log_file, "measure", config.kernels)
 
@@ -262,14 +576,16 @@ def run_measure_phase(config: RunConfig) -> bool:
         return False
 
     # Check that we have measurements
-    measurements_file = config.run_dir / f"measurements_{config.hardware_id}.csv"
-    if not measurements_file.exists():
-        log.error("No measurements were recorded")
+    if not _file_was_refreshed(measurements_file, measurements_before):
+        log.error("Measure phase did not write fresh measurements")
         return False
 
     # Count measurements
     with open(measurements_file) as f:
         num_measurements = sum(1 for _ in f) - 1  # Subtract header
+    if num_measurements <= 0:
+        log.error("No measurements were recorded")
+        return False
     log.info(f"Recorded {num_measurements} measurements")
 
     return True
@@ -311,6 +627,7 @@ def run_build_heuristic_phase(config: RunConfig) -> bool:
             output_dir=config.run_dir,
             target=target,
             kernel_source_files=kernel_source_files,
+            hardware=config.require_hardware(),
         )
 
         # Dump generated code to stdout if requested
@@ -357,6 +674,10 @@ def run_evaluate_phase(config: RunConfig) -> bool:
     log.info("PHASE 4: Evaluating heuristics")
     log.info("=" * 60)
 
+    run_benchmark_requested = bool(config.evaluate_benchmark or config.benchmark_cmd)
+    if run_benchmark_requested and not _validate_run_manifest(config, "evaluate"):
+        return False
+
     # First evaluate against measurement data
     measurements_file = config.run_dir / f"measurements_{config.hardware_id}.csv"
     eval_results = evaluate_heuristic(
@@ -383,22 +704,19 @@ def run_evaluate_phase(config: RunConfig) -> bool:
             all_passed = False
 
     # Optionally run the benchmark in evaluate mode
-    if config.evaluate_benchmark or config.benchmark_cmd:
+    if run_benchmark_requested:
         cmd = config.evaluate_benchmark or config.benchmark_cmd
         log_file = config.run_log_dir / f"evaluate_{config.hardware_id}.log"
 
-        env = {
-            "HELION_AOT_MODE": "evaluate",
-            "HELION_AOT_DATA_DIR": str(config.run_dir),
-            "HELION_AUTOTUNE_CACHE": "AOTAutotuneCache",
-        }
+        env = _benchmark_env(config, "evaluate")
 
         return_code, _, _ = run_benchmark(
             cmd, env, log_file, "evaluate", config.kernels
         )
 
         if return_code != 0:
-            log.warning(f"Evaluate benchmark failed with return code {return_code}")
+            log.error(f"Evaluate benchmark failed with return code {return_code}")
+            all_passed = False
 
     # Save evaluation results
     eval_file = config.run_dir / f"evaluation_{config.hardware_id}.json"
@@ -425,18 +743,33 @@ def run_compile_phase(config: RunConfig) -> bool:
     log.info("Generating standalone Triton files")
     log.info("=" * 60)
 
+    if not _validate_run_manifest(config, "compile"):
+        return False
+    try:
+        outputs = _standalone_outputs(config)
+    except _StandaloneOutputMetadataError as error:
+        log.error("Cannot validate standalone compile outputs: %s", error)
+        return False
+    output_states = {path: _file_state(path) for _kernel_name, path in outputs}
     log_file = config.run_log_dir / f"compile_{config.hardware_id}.log"
-    env = {
-        "HELION_AOT_MODE": "compile",
-        "HELION_AOT_DATA_DIR": str(config.run_dir),
-        "HELION_AUTOTUNE_CACHE": "AOTAutotuneCache",
-    }
+    env = _benchmark_env(config, "compile")
 
     return_code, _, _ = run_benchmark(
         config.benchmark_cmd, env, log_file, "compile", config.kernels
     )
     if return_code != 0:
         log.error("Standalone compilation failed (return code %d)", return_code)
+        return False
+    stale_kernels = [
+        kernel_name
+        for kernel_name, path in outputs
+        if not _file_was_refreshed(path, output_states[path])
+    ]
+    if stale_kernels:
+        log.error(
+            "Standalone compilation did not write fresh artifacts for: %s",
+            ", ".join(stale_kernels),
+        )
         return False
     return True
 
@@ -471,7 +804,12 @@ def list_previous_runs(output_dir: Path) -> None:
     print("-" * 90)
 
     for run_id, meta in runs:
-        hardware = meta.get("hardware_id", "unknown")[:28]
+        hardware_id = meta.get("hardware_id")
+        hardware = (
+            hardware_id[:28]
+            if isinstance(hardware_id, str) and hardware_id
+            else "unknown"
+        )
         status = "OK" if meta.get("success") else ("FAIL" if "success" in meta else "?")
         started = meta.get("started_at", "")[:19]
         print(f"{run_id:<30} {hardware:<30} {status:<10} {started:<20}")
@@ -488,13 +826,13 @@ def run_full_workflow(config: RunConfig) -> bool:
     log.info("Starting AOT autotuning workflow")
     log.info(f"Run ID: {config.run_id}")
     log.info(f"Run directory: {config.run_dir}")
-    log.info(f"Hardware ID: {config.hardware_id}")
     log.info(f"Performance goal: {config.goal_type} <= {config.threshold}")
 
     # Phase 1: Collect
     if not run_collect_phase(config):
         log.error("Collect phase failed, aborting workflow")
         return False
+    log.info(f"Hardware ID: {config.hardware_id}")
 
     # Phase 2: Measure
     if not run_measure_phase(config):
@@ -763,10 +1101,15 @@ Examples:
     if file_header and not file_header.endswith("\n"):
         file_header += "\n"
 
+    try:
+        run_hardware = resolve_run_hardware(output_dir, args.run_id, args.phase)
+    except RuntimeError as exc:
+        parser.error(str(exc))
+
     config = RunConfig(
         benchmark_cmd=benchmark_cmd,
         output_dir=output_dir,
-        hardware_id=get_hardware_info().hardware_id,
+        hardware=run_hardware,
         run_id=run_id,
         goal_type=args.goal,
         threshold=args.threshold,
@@ -794,7 +1137,7 @@ Examples:
     config.run_log_dir.mkdir(parents=True, exist_ok=True)
 
     # Add file handler to capture all logging to run directory
-    runner_log_file = config.run_log_dir / f"runner_{config.hardware_id}.log"
+    runner_log_file = _runner_log_file(config)
     file_handler = logging.FileHandler(runner_log_file)
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(
@@ -816,7 +1159,7 @@ Examples:
     # Save run metadata
     run_meta = {
         "run_id": run_id,
-        "hardware_id": config.hardware_id,
+        "hardware_id": (None if config.hardware is None else config.hardware_id),
         "benchmark_cmd": benchmark_cmd,
         "goal_type": config.goal_type,
         "threshold": config.threshold,
@@ -846,6 +1189,7 @@ Examples:
 
     # Update metadata with completion status
     run_meta["completed_at"] = datetime.now().isoformat()
+    run_meta["hardware_id"] = None if config.hardware is None else config.hardware_id
     run_meta["success"] = success
     meta_file.write_text(json.dumps(run_meta, indent=2))
 

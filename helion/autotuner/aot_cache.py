@@ -17,8 +17,12 @@ The workflow is:
 
 from __future__ import annotations
 
+import ast
+from collections.abc import Mapping
+import contextlib
 import csv
 from dataclasses import dataclass
+import functools
 import hashlib
 import importlib
 import importlib.util
@@ -30,6 +34,7 @@ import operator
 import os
 from pathlib import Path
 import sys
+import tempfile
 import threading
 import traceback
 import types
@@ -38,10 +43,17 @@ from typing import Any
 from typing import ClassVar
 from typing import Literal
 
+from filelock import FileLock
 import torch
 
+from .._hardware import HardwareInfo
 from .._hardware import get_hardware_info
+from ..exc import AOTHardwareManifestError
 from ..runtime.config import Config
+from .aot_compile import _standalone_call_key
+from .aot_compile import generate_standalone_file
+from .aot_compile import kernel_source_identity
+from .aot_compile import standalone_output_path
 from .aot_kernel import _flatten_key_value
 from .aot_kernel import extract_key_features
 from .aot_kernel import extract_shape_features
@@ -52,6 +64,7 @@ from .benchmark_provider import _MultiShapeAutotuneArgs
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from types import ModuleType
     from typing import Callable
 
     from .base_search import BaseSearch
@@ -61,12 +74,38 @@ log: logging.Logger = logging.getLogger(__name__)
 # Environment variable to control AOT mode
 AOT_MODE_ENV = "HELION_AOT_MODE"
 AOT_DATA_DIR_ENV = "HELION_AOT_DATA_DIR"
+AOT_HARDWARE_MANIFEST = "hardware.json"
+# Internal runner-to-child contract: validate the run manifest against the
+# hardware resolved from the benchmark's actual kernel arguments.
+AOT_RUNNER_HARDWARE_VALIDATION_ENV = "HELION_AOT_RUNNER_VALIDATE_HARDWARE"
+_HARDWARE_MANIFEST_FIELDS = (
+    "hardware_id",
+    "device_kind",
+    "hardware_name",
+    "runtime_version",
+    "compute_capability",
+)
 # Environment variable to override heuristic search path (for comparing heuristics)
 HEURISTIC_DIR_ENV = "HELION_HEURISTIC_DIR"
+# Optional module-level artifact contract. When present, discovery and loading
+# require an exact hardware-name match instead of relying only on compatible
+# compute-capability filenames.
+SUPPORTED_HARDWARE_NAMES = "SUPPORTED_HARDWARE_NAMES"
 # Environment variable to enable verbose output in quiet AOT modes.
 AOT_VERBOSE_ENV = "HELION_AOT_VERBOSE"
 
 AOTMode = Literal["collect", "measure", "evaluate", "compile", "disabled"]
+
+
+class HeuristicArtifactMetadataError(RuntimeError):
+    """Raised when a heuristic artifact declares invalid support metadata."""
+
+
+class _AOTHeuristicAbstention:
+    """Internal marker for an intentional per-key heuristic fallback."""
+
+
+_AOT_HEURISTIC_ABSTENTION = _AOTHeuristicAbstention()
 
 
 def get_aot_mode() -> AOTMode:
@@ -96,14 +135,341 @@ def get_aot_data_dir() -> Path:
     return Path.cwd() / ".helion_aot"
 
 
-# Cache for heuristic file lookups
-_heuristic_file_cache: dict[str, Path | None] = {}
+def _missing_manifest_message(data_dir: Path) -> str:
+    return (
+        f"AOT directory {data_dir} is missing required {AOT_HARDWARE_MANIFEST}. "
+        "Helion cannot safely identify artifacts from a pre-manifest AOT run. "
+        "Recollect into a fresh AOT data directory: set HELION_AOT_DATA_DIR to "
+        "an empty path or use a new aot_runner --run-id. A directory containing "
+        "legacy AOT artifacts such as heuristic_*.py, tuned_configs_*.json, or "
+        "measurements_*.csv is intentionally not adopted in place."
+    )
+
+
+def _hardware_manifest_data(hardware: HardwareInfo) -> dict[str, str]:
+    return {field: getattr(hardware, field) for field in _HARDWARE_MANIFEST_FIELDS}
+
+
+def load_hardware_manifest(data_dir: Path) -> HardwareInfo:
+    """Load and validate the hardware identity recorded by an AOT benchmark."""
+    manifest_file = data_dir / AOT_HARDWARE_MANIFEST
+    if not manifest_file.is_file():
+        raise AOTHardwareManifestError(_missing_manifest_message(data_dir))
+
+    try:
+        data = json.loads(manifest_file.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AOTHardwareManifestError(
+            f"Invalid AOT hardware manifest: {manifest_file}"
+        ) from exc
+
+    required_fields = set(_HARDWARE_MANIFEST_FIELDS)
+    if (
+        not isinstance(data, dict)
+        or not required_fields.issubset(data)
+        or any(
+            not isinstance(data[field], str) or not data[field]
+            for field in _HARDWARE_MANIFEST_FIELDS
+        )
+    ):
+        raise AOTHardwareManifestError(
+            f"Invalid AOT hardware manifest: {manifest_file}"
+        )
+
+    hardware = HardwareInfo(
+        device_kind=data["device_kind"],
+        hardware_name=data["hardware_name"],
+        runtime_version=data["runtime_version"],
+        compute_capability=data["compute_capability"],
+    )
+    # Keep the derived ID in the manifest as a corruption/inconsistency check.
+    if data["hardware_id"] != hardware.hardware_id:
+        raise AOTHardwareManifestError(
+            f"Inconsistent AOT hardware identity in {manifest_file}: "
+            f"{data['hardware_id']!r} != {hardware.hardware_id!r}"
+        )
+    return hardware
+
+
+def validate_hardware_manifest(data_dir: Path, hardware: HardwareInfo) -> None:
+    """Reject an AOT data directory recorded for different hardware."""
+    recorded = load_hardware_manifest(data_dir)
+    if recorded != hardware:
+        raise AOTHardwareManifestError(
+            f"AOT hardware identity mismatch in {data_dir / AOT_HARDWARE_MANIFEST}: "
+            f"recorded {recorded!r}, observed {hardware!r}; use a run directory "
+            "collected on the current hardware"
+        )
+
+
+def validate_runner_hardware(data_dir: Path, hardware: HardwareInfo) -> None:
+    """Validate the runner's manifest using hardware resolved inside its child."""
+    if os.environ.get(AOT_RUNNER_HARDWARE_VALIDATION_ENV) == "1":
+        validate_hardware_manifest(data_dir, hardware)
+
+
+_LEGACY_AOT_ARTIFACT_PREFIXES = (
+    "_helion_aot_",
+    "evaluation_",
+    "heuristic_",
+    "measurements_",
+    "tuned_configs_",
+)
+
+
+def _is_legacy_aot_artifact_name(name: str) -> bool:
+    return name.startswith(_LEGACY_AOT_ARTIFACT_PREFIXES) or "_standalone." in name
+
+
+def _legacy_aot_artifacts(data_dir: Path) -> list[Path]:
+    """Find artifacts that must not be assigned a new hardware identity."""
+    artifacts = [
+        entry
+        for entry in data_dir.iterdir()
+        if _is_legacy_aot_artifact_name(entry.name)
+    ]
+    pycache = data_dir / "__pycache__"
+    if pycache.is_dir():
+        artifacts.extend(
+            entry
+            for entry in pycache.iterdir()
+            if _is_legacy_aot_artifact_name(entry.name)
+        )
+    return sorted(artifacts)
+
+
+def write_hardware_manifest(data_dir: Path, hardware: HardwareInfo) -> None:
+    """Record one unambiguous hardware identity for an AOT benchmark run."""
+    manifest_file = data_dir / AOT_HARDWARE_MANIFEST
+    lock_file = data_dir / f".{AOT_HARDWARE_MANIFEST}.lock"
+    temporary_file: Path | None = None
+    try:
+        # FileLock uses an OS-held lock on supported platforms, which is
+        # released if the writer exits or crashes. A persistent lock path is
+        # therefore harmless, unlike a create-once sentinel that a dead writer
+        # could strand indefinitely.
+        with FileLock(str(lock_file)):
+            if manifest_file.is_file():
+                existing = load_hardware_manifest(data_dir)
+                if existing != hardware:
+                    raise AOTHardwareManifestError(
+                        f"Ambiguous AOT hardware identity in {manifest_file}: "
+                        f"already recorded {existing.hardware_id!r}, "
+                        f"but benchmark observed {hardware.hardware_id!r}"
+                    )
+                return
+
+            if artifacts := _legacy_aot_artifacts(data_dir):
+                artifact_names = ", ".join(
+                    str(path.relative_to(data_dir)) for path in artifacts[:5]
+                )
+                raise AOTHardwareManifestError(
+                    f"{_missing_manifest_message(data_dir)} Conflicting legacy "
+                    f"artifacts: {artifact_names}"
+                )
+
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=data_dir,
+                prefix=f".{AOT_HARDWARE_MANIFEST}.",
+                suffix=".tmp",
+                delete=False,
+            ) as output:
+                temporary_file = Path(output.name)
+                output.write(
+                    json.dumps(_hardware_manifest_data(hardware), indent=2) + "\n"
+                )
+                output.flush()
+                os.fsync(output.fileno())
+
+            # The fully written, fsynced file appears at the public path in one
+            # atomic rename. Readers can observe either no manifest or the
+            # complete JSON document, never the writer's partial output.
+            os.replace(temporary_file, manifest_file)
+            temporary_file = None
+    except AOTHardwareManifestError:
+        raise
+    except OSError as exc:
+        raise AOTHardwareManifestError(
+            "Failed to atomically create AOT hardware manifest "
+            f"{manifest_file}. Set {AOT_DATA_DIR_ENV} to a fresh, writable "
+            "directory, then recollect the AOT data."
+        ) from exc
+    finally:
+        if temporary_file is not None:
+            with contextlib.suppress(OSError):
+                temporary_file.unlink(missing_ok=True)
+
+
+def _resolved_path(path: str | Path) -> Path:
+    """Return the canonical identity used by all AOT file caches."""
+    return Path(path).expanduser().resolve()
+
+
+def _normalize_supported_hardware_names(
+    value: object,
+    artifact: Path,
+) -> tuple[str, ...]:
+    if not isinstance(value, (tuple, list, set, frozenset)) or not value:
+        raise HeuristicArtifactMetadataError(
+            f"{artifact}: {SUPPORTED_HARDWARE_NAMES} must be a nonempty "
+            "sequence or set of hardware names"
+        )
+    if any(type(name) is not str or not name for name in value):
+        raise HeuristicArtifactMetadataError(
+            f"{artifact}: {SUPPORTED_HARDWARE_NAMES} entries must be nonempty strings"
+        )
+    return tuple(sorted(set(value)))
+
+
+@functools.cache
+def _declared_supported_hardware_names(artifact: Path) -> tuple[str, ...] | None:
+    """Read the optional exact-hardware contract without executing the artifact."""
+    try:
+        tree = ast.parse(artifact.read_text(), filename=str(artifact))
+    except (OSError, SyntaxError) as exc:
+        raise HeuristicArtifactMetadataError(
+            f"Unable to inspect heuristic artifact metadata in {artifact}"
+        ) from exc
+
+    declaration: ast.Assign | ast.AnnAssign | None = None
+    for node in tree.body:
+        candidate_declaration: ast.Assign | ast.AnnAssign | None = None
+        if isinstance(node, ast.Assign):
+            matching_targets = [
+                item
+                for item in node.targets
+                if isinstance(item, ast.Name) and item.id == SUPPORTED_HARDWARE_NAMES
+            ]
+            if matching_targets:
+                candidate_declaration = node
+        elif isinstance(node, ast.AnnAssign):
+            if (
+                isinstance(node.target, ast.Name)
+                and node.target.id == SUPPORTED_HARDWARE_NAMES
+            ):
+                candidate_declaration = node
+        elif isinstance(node, ast.AugAssign):
+            if (
+                isinstance(node.target, ast.Name)
+                and node.target.id == SUPPORTED_HARDWARE_NAMES
+            ):
+                raise HeuristicArtifactMetadataError(
+                    f"{artifact}: {SUPPORTED_HARDWARE_NAMES} must be one "
+                    "module-level literal assignment"
+                )
+        if candidate_declaration is None:
+            continue
+        if declaration is not None:
+            raise HeuristicArtifactMetadataError(
+                f"{artifact}: {SUPPORTED_HARDWARE_NAMES} must be one "
+                "module-level literal assignment"
+            )
+        declaration = candidate_declaration
+
+    if declaration is None:
+        return None
+    value_node = declaration.value
+    if value_node is None:
+        raise HeuristicArtifactMetadataError(
+            f"{artifact}: {SUPPORTED_HARDWARE_NAMES} must have a literal value"
+        )
+    try:
+        value = ast.literal_eval(value_node)
+    except (ValueError, TypeError) as exc:
+        raise HeuristicArtifactMetadataError(
+            f"{artifact}: {SUPPORTED_HARDWARE_NAMES} must have a literal value"
+        ) from exc
+    return _normalize_supported_hardware_names(value, artifact)
+
+
+def get_heuristic_hardware(device: torch.device | None) -> HardwareInfo:
+    """Return the hardware identity used for heuristic discovery and caching."""
+    if device is not None:
+        from .._argument_device import _canonicalize_argument_device
+
+        # Keep this boundary canonical even though get_hardware_info also
+        # canonicalizes: callers and tests may replace that downstream seam.
+        device = _canonicalize_argument_device(device)
+    return get_hardware_info(_explicit_hardware_device(device))
+
+
+def heuristic_artifact_identity(
+    artifact: Path,
+    hardware: HardwareInfo,
+) -> str | None:
+    """Return the artifact identity, or ``None`` for unsupported hardware."""
+    names = _declared_supported_hardware_names(artifact)
+    if names is None:
+        return str(artifact)
+    if hardware.hardware_name not in names:
+        return None
+    return (
+        f"{artifact}::{SUPPORTED_HARDWARE_NAMES}={','.join(names)}"
+        f"::hardware_name={hardware.hardware_name}"
+    )
+
+
+def heuristic_module_supports_hardware(
+    module: ModuleType,
+    artifact: Path,
+    hardware: HardwareInfo,
+) -> bool:
+    """Validate a loaded module against its declared hardware support."""
+    declared_names = _declared_supported_hardware_names(artifact)
+    runtime_value = getattr(module, SUPPORTED_HARDWARE_NAMES, None)
+    if declared_names is None:
+        if runtime_value is not None:
+            raise HeuristicArtifactMetadataError(
+                f"{artifact}: {SUPPORTED_HARDWARE_NAMES} must be a "
+                "module-level literal assignment"
+            )
+        return True
+    runtime_names = _normalize_supported_hardware_names(runtime_value, artifact)
+    if runtime_names != declared_names:
+        raise HeuristicArtifactMetadataError(
+            f"{artifact}: loaded {SUPPORTED_HARDWARE_NAMES} does not match "
+            "its static declaration"
+        )
+    return hardware.hardware_name in declared_names
+
+
+# Cache for heuristic file lookups. Every value that affects the candidate list
+# belongs in the key so one process can safely switch devices or override dirs.
+_heuristic_file_cache: dict[
+    tuple[str | None, str | None, str | None, str | None, HardwareInfo], Path | None
+] = {}
+
+
+class _UseEnvironmentHeuristicDir:
+    """Sentinel selecting the process override at discovery time."""
+
+
+_USE_ENVIRONMENT_HEURISTIC_DIR = _UseEnvironmentHeuristicDir()
+
+
+def _explicit_hardware_device(device: torch.device | None) -> torch.device | None:
+    """Return devices that hardware discovery can resolve explicitly.
+
+    Pallas uses CPU tensors as a bridge for TPU execution.  Keeping that CPU
+    device explicit lets ``get_hardware_info`` prefer TPU on mixed-device hosts
+    while retaining its ordinary accelerator fallback. Unknown device kinds leave
+    accelerator discovery automatic.
+    """
+    if device is not None and device.type in ("cpu", "cuda", "xpu"):
+        return device
+    return None
 
 
 def find_heuristic_file(
-    kernel_source_file: str | Path,
+    kernel_source_file: str | Path | None,
     kernel_name: str | None = None,
     data_dir: Path | None = None,
+    device: torch.device | None = None,
+    resolved_heuristic_dir: Path | _UseEnvironmentHeuristicDir | None = (
+        _USE_ENVIRONMENT_HEURISTIC_DIR
+    ),
 ) -> Path | None:
     """
     Find the heuristic file for a kernel.
@@ -118,48 +484,95 @@ def find_heuristic_file(
     4. AOT data directory: heuristic_<kernel_name>.py (fallback)
 
     Args:
-        kernel_source_file: Path to the kernel's source file
+        kernel_source_file: Canonical kernel source path, or ``None`` when the
+            source is not safely file-backed. Source-adjacent lookup is skipped
+            for ``None`` while explicit and AOT data directories remain usable.
         kernel_name: Optional kernel name for fallback lookup
         data_dir: Optional AOT data directory for fallback lookup
+        device: Optional device whose hardware-specific heuristic should be used
+        resolved_heuristic_dir: Pre-resolved override directory or explicit
+            ``None``. When omitted, ``HELION_HEURISTIC_DIR`` is resolved from
+            the environment.
 
     Returns:
         Path to heuristic file if found, None otherwise
     """
-    cache_key = str(kernel_source_file)
+    source_path = (
+        None if kernel_source_file is None else _resolved_path(kernel_source_file)
+    )
+    hw = get_heuristic_hardware(device)
+    compatible_computes = tuple(hw.get_compatible_compute_ids())
+    if isinstance(resolved_heuristic_dir, _UseEnvironmentHeuristicDir):
+        heuristic_dir_value = os.environ.get(HEURISTIC_DIR_ENV)
+        heuristic_dir = (
+            None if heuristic_dir_value is None else _resolved_path(heuristic_dir_value)
+        )
+    else:
+        heuristic_dir = resolved_heuristic_dir
+    resolved_data_dir = None if data_dir is None else _resolved_path(data_dir)
+    cache_key = (
+        None if source_path is None else str(source_path),
+        kernel_name,
+        None if resolved_data_dir is None else str(resolved_data_dir),
+        None if heuristic_dir is None else str(heuristic_dir),
+        hw,
+    )
     if cache_key in _heuristic_file_cache:
         return _heuristic_file_cache[cache_key]
 
-    source_path = Path(kernel_source_file)
-    base_name = source_path.stem
-    hw = get_hardware_info()
-    compatible_computes = hw.get_compatible_compute_ids()
-
-    candidates: list[Path] = []
+    candidates: list[tuple[Path, bool]] = []
 
     # 1. Check HELION_HEURISTIC_DIR override
-    if (heuristic_dir := os.environ.get(HEURISTIC_DIR_ENV)) is not None:
-        heuristic_dir_path = Path(heuristic_dir)
-        for compat_compute in compatible_computes:
-            candidates.append(
-                heuristic_dir_path
-                / f"_helion_aot_{base_name}_{hw.device_kind}_{compat_compute}.py"
-            )
+    if heuristic_dir is not None:
+        if source_path is not None:
+            for compat_compute in compatible_computes:
+                candidates.append(
+                    (
+                        heuristic_dir
+                        / f"_helion_aot_{source_path.stem}_{hw.device_kind}_{compat_compute}.py",
+                        False,
+                    )
+                )
         if kernel_name:
-            candidates.append(heuristic_dir_path / f"heuristic_{kernel_name}.py")
+            candidates.append((heuristic_dir / f"heuristic_{kernel_name}.py", False))
 
     # 2. Check next to kernel source file with compute capability fallback
-    for compat_compute in compatible_computes:
-        heuristic_name = f"_helion_aot_{base_name}_{hw.device_kind}_{compat_compute}.py"
-        candidates.append(source_path.parent / heuristic_name)
+    if source_path is not None:
+        for compat_compute in compatible_computes:
+            heuristic_name = (
+                f"_helion_aot_{source_path.stem}_{hw.device_kind}_{compat_compute}.py"
+            )
+            candidates.append((source_path.parent / heuristic_name, False))
 
     # 3. Check AOT data directory (fallback)
-    if data_dir is not None and kernel_name is not None:
-        candidates.append(data_dir / f"heuristic_{kernel_name}.py")
+    if resolved_data_dir is not None and kernel_name is not None:
+        candidates.append((resolved_data_dir / f"heuristic_{kernel_name}.py", True))
 
     # Find first existing file
     result: Path | None = None
-    for candidate in candidates:
-        if candidate.exists():
+    for candidate, requires_manifest in candidates:
+        if candidate.is_file():
+            candidate = candidate.resolve()
+            try:
+                supported_names = _declared_supported_hardware_names(candidate)
+            except HeuristicArtifactMetadataError:
+                log.warning(
+                    "Skipping heuristic with invalid artifact metadata: %s",
+                    candidate,
+                    exc_info=True,
+                )
+                continue
+            if supported_names is not None and hw.hardware_name not in supported_names:
+                log.debug(
+                    "Skipping heuristic %s: %s is not in %s",
+                    candidate,
+                    hw.hardware_name,
+                    supported_names,
+                )
+                continue
+            if requires_manifest:
+                assert resolved_data_dir is not None
+                validate_hardware_manifest(resolved_data_dir, hw)
             log.debug(f"Found heuristic file: {candidate}")
             result = candidate
             break
@@ -171,13 +584,17 @@ def find_heuristic_file(
 def clear_heuristic_cache() -> None:
     """Clear the heuristic file cache (useful for testing)."""
     _heuristic_file_cache.clear()
+    _declared_supported_hardware_names.cache_clear()
 
 
 def load_kernel_source_files(data_dir: Path, hardware_id: str) -> dict[str, str]:
     """
     Load kernel source file mappings from tuned configs JSON.
 
-    This is a standalone function for use by aot_runner.py during heuristic generation.
+    This is a best-effort legacy helper for offline heuristic generation and
+    intentionally keeps the first nonempty source recorded for each kernel.
+    Standalone compile freshness uses a stricter parser because conflicting
+    eligible source paths make the expected output location ambiguous.
 
     Args:
         data_dir: Directory containing the tuned configs file
@@ -263,6 +680,7 @@ class TunedConfig:
     timing_ms: float | None = None
     kernel_source_file: str | None = None
     shape_features: dict[str, Any] | None = None
+    standalone: bool = True
     # SHA256 hashes (first 8 chars) for correctness verification:
     # [0] = input tensor hashes before kernel runs
     # [1] = input tensor hashes after kernel runs (to detect in-place modifications)
@@ -278,7 +696,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
     - collect: Tune each shape individually, record results
     - measure: Measure each shape with all observed configs
     - evaluate: Use heuristics to select configs, validate performance
-    - disabled: Fall through to underlying autotuner (default)
+    - disabled: Ignore AOT artifacts and return the compiler default config
 
     When collect_fn/measure_fn are set on the kernel:
     - collect_fn: In collect mode, only these inputs are autotuned
@@ -292,14 +710,29 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
     # Class-level caches for heuristic lookup (shared across instances)
     # Maps heuristic file path -> loaded module
-    _heuristic_modules: ClassVar[dict[Path, Any]] = {}
-    # Maps (kernel_source_file, kernel_name, shape_features_hash) -> Config
-    # Using source file ensures kernels with same name in different modules don't collide
-    _heuristic_results: ClassVar[dict[tuple[str, str, str], Config]] = {}
-    # Tracks which kernels have shown the "no heuristic" warning (to avoid spam)
-    _no_heuristic_warned: ClassVar[set[str]] = set()
-    # Tracks which kernels have already been compiled in compile mode
-    _compiled_kernels: ClassVar[set[str]] = set()
+    _heuristic_modules: ClassVar[dict[Path, ModuleType]] = {}
+    _supported_heuristics: ClassVar[
+        dict[
+            tuple[Path, HardwareInfo],
+            tuple[ModuleType, str] | None,
+        ]
+    ] = {}
+    # Maps (kernel source, kernel name, hardware, heuristic file, shape hash) to
+    # the selected Config or an explicit per-key abstention. Missing or invalid
+    # artifacts are not cached here.
+    # Source and hardware prevent same-name kernels and cross-device results from aliasing;
+    # the heuristic path keeps directory overrides isolated.
+    _heuristic_results: ClassVar[
+        dict[
+            tuple[str, str, HardwareInfo, str, str],
+            Config | _AOTHeuristicAbstention,
+        ]
+    ] = {}
+    # Tracks which exact kernels have shown the "no heuristic" warning.
+    _no_heuristic_warned: ClassVar[set[tuple[str, str, HardwareInfo]]] = set()
+    # Dynamic compile suppression is scoped to the exact source, hardware, and
+    # heuristic. Same-name kernels and runtime override changes must not alias.
+    _compiled_kernels: ClassVar[set[tuple[str, str, HardwareInfo, str]]] = set()
     # Static-shape compile mode accumulates one source variant per normalized
     # call signature and rewrites the dispatcher whenever a shape is observed.
     _compiled_kernel_variants: ClassVar[
@@ -314,6 +747,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
     def clear_caches(cls) -> None:
         """Clear all class-level caches (heuristic modules and results)."""
         cls._heuristic_modules.clear()
+        cls._supported_heuristics.clear()
         cls._heuristic_results.clear()
         cls._no_heuristic_warned.clear()
         cls._compiled_kernels.clear()
@@ -333,17 +767,38 @@ class AOTAutotuneCache(AutotuneCacheBase):
         if not isinstance(self.args, _MultiShapeAutotuneArgs):
             self.args = self.kernel.kernel.normalize_args(*self.args)
         self.mode = get_aot_mode()
-        self.hardware_id = get_hardware_info().hardware_id
+        hardware_device = _explicit_hardware_device(self.kernel.env.device)
+        self._hardware_device = hardware_device
+        self.hardware = get_hardware_info(hardware_device)
+        self.hardware_id = self.hardware.hardware_id
+        code_object = self.kernel.kernel.__code__
+        self._kernel_source_file, self._kernel_source = kernel_source_identity(
+            code_object.co_filename,
+            code_object,
+        )
         self.data_dir = get_aot_data_dir()
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self._tuned_configs: dict[str, list[TunedConfig]] = self._load_tuned_configs()
+        if self.mode == "disabled":
+            self._tuned_configs: dict[str, list[TunedConfig]] = {}
+        else:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            if self.mode == "collect":
+                write_hardware_manifest(self.data_dir, self.hardware)
+            elif self.mode == "measure":
+                # Measure consumes tuned configs produced by collect, so its
+                # data directory is always a recorded run rather than an
+                # optional deployment lookup location.
+                validate_hardware_manifest(self.data_dir, self.hardware)
+            else:
+                # The runner extends the same exact check to evaluate and
+                # compile inside the child, where the benchmark's actual
+                # argument device is known.
+                validate_runner_hardware(self.data_dir, self.hardware)
+            self._tuned_configs = self._load_tuned_configs()
         self.shape_key = self._create_shape_key()
         self._verbose = is_aot_verbose()
 
-        # Look up optional collect_fn/measure_fn from the Kernel object
-        # These are set by @aot_kernel() decorator
-        self._collect_fn = getattr(self.kernel.kernel, "_aot_collect_fn", None)
-        self._measure_fn = getattr(self.kernel.kernel, "_aot_measure_fn", None)
+        self._collect_fn = self.kernel.kernel._aot_collect_fn
+        self._measure_fn = self.kernel.kernel._aot_measure_fn
 
         # Announce mode once per mode type (quiet in evaluate/compile unless verbose)
         should_announce = (
@@ -390,6 +845,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                         timing_ms=cfg.get("timing_ms"),
                         kernel_source_file=cfg.get("kernel_source_file"),
                         shape_features=cfg.get("shape_features"),
+                        standalone=cfg.get("standalone", True),
                         tensor_hashes=cfg.get("tensor_hashes"),
                     )
                     for cfg in configs
@@ -410,6 +866,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                     "timing_ms": cfg.timing_ms,
                     "kernel_source_file": cfg.kernel_source_file,
                     "shape_features": cfg.shape_features,
+                    "standalone": cfg.standalone,
                     "tensor_hashes": cfg.tensor_hashes,
                 }
                 for cfg in config_list
@@ -424,6 +881,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
         timing_ms: float | None = None,
         kernel_source_file: str | None = None,
         shape_features: dict[str, Any] | None = None,
+        standalone: bool = True,
         tensor_hashes: list[list[str]] | None = None,
     ) -> None:
         """Add a tuned config for a kernel/shape combination."""
@@ -447,6 +905,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                     existing.kernel_source_file = kernel_source_file
                 if shape_features is not None:
                     existing.shape_features = shape_features
+                existing.standalone = standalone
                 if tensor_hashes is not None:
                     existing.tensor_hashes = tensor_hashes
                 return
@@ -458,6 +917,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 timing_ms=timing_ms,
                 kernel_source_file=kernel_source_file,
                 shape_features=shape_features,
+                standalone=standalone,
                 tensor_hashes=tensor_hashes,
             )
         )
@@ -524,7 +984,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
             args = self.args
 
         # Check if user provided a key function
-        user_key = getattr(self.kernel.kernel, "_aot_user_key", None)
+        user_key = self.kernel.kernel._aot_user_key
         if user_key is not None:
             # Extract features from flattened key output
             key_value = user_key(*args)
@@ -535,6 +995,11 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
     def get(self) -> Config | None:
         """Get a cached config based on current mode."""
+        if self.mode == "disabled":
+            # This is an explicit AOT bypass: do not load a checked-in heuristic
+            # and do not delegate to a live autotuning search.
+            return self.autotuner.config_spec.default_config()
+
         if self.mode == "collect":
             # In collect mode, check if we already have a config for this exact shape
             kernel_name = self.kernel.kernel.name
@@ -553,9 +1018,11 @@ class AOTAutotuneCache(AutotuneCacheBase):
             # In compile mode: use heuristic + generate standalone Triton code
             self._maybe_run_compile()
 
-        # For disabled/evaluate/compile modes: try heuristic, fall back to default config
+        # For evaluate/compile modes: try heuristic, fall back to default config
         # (never trigger autotuning for aot_kernel)
         config = self._get_heuristic_config(self.args)
+        if isinstance(config, _AOTHeuristicAbstention):
+            return self.autotuner.config_spec.default_config()
         if config is not None:
             return config
 
@@ -563,8 +1030,9 @@ class AOTAutotuneCache(AutotuneCacheBase):
         kernel_name = self.kernel.kernel.name
         from .. import exc
 
-        if kernel_name not in AOTAutotuneCache._no_heuristic_warned:
-            AOTAutotuneCache._no_heuristic_warned.add(kernel_name)
+        warning_key = (self._kernel_source, kernel_name, self.hardware)
+        if warning_key not in AOTAutotuneCache._no_heuristic_warned:
+            AOTAutotuneCache._no_heuristic_warned.add(warning_key)
             if exc.NoAOTHeuristicWarning not in self.autotuner.settings.ignore_warnings:
                 print(
                     f"[AOT] Warning: No heuristic found for '{kernel_name}'. "
@@ -592,7 +1060,11 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
         if self.mode == "collect":
             kernel_name = self.kernel.kernel.name
-            kernel_source_file = self.kernel.kernel.__code__.co_filename
+            kernel_source_file = (
+                None
+                if self._kernel_source_file is None
+                else str(self._kernel_source_file)
+            )
             shape_features = self._extract_shape_features()
 
             # Hash inputs, run kernel, hash inputs again and outputs
@@ -615,6 +1087,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 timing_ms=timing_ms,
                 kernel_source_file=kernel_source_file,
                 shape_features=shape_features,
+                standalone=self.kernel.kernel._aot_standalone,
                 tensor_hashes=tensor_hashes,
             )
             self._save_tuned_configs()
@@ -713,17 +1186,83 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
     def _find_heuristic_file(self) -> Path | None:
         """Find the heuristic file for this kernel using shared lookup."""
-        kernel_name = self.kernel.kernel.name
-        kernel_source_file = self.kernel.kernel.__code__.co_filename
         return find_heuristic_file(
-            kernel_source_file,
-            kernel_name=kernel_name,
+            self._kernel_source_file,
+            kernel_name=self.kernel.kernel.name,
             data_dir=self.data_dir,
+            device=self._hardware_device,
+        )
+
+    def _load_supported_heuristic(
+        self, heuristic_file: Path
+    ) -> tuple[ModuleType, tuple[str, str, HardwareInfo, str]] | None:
+        """Load and validate one heuristic for this cache's exact hardware."""
+        validation_key = (heuristic_file, self.hardware)
+        if validation_key in AOTAutotuneCache._supported_heuristics:
+            cached = AOTAutotuneCache._supported_heuristics[validation_key]
+            if cached is None:
+                return None
+            module, artifact_identity = cached
+            return (
+                module,
+                (
+                    self._kernel_source,
+                    self.kernel.kernel.name,
+                    self.hardware,
+                    artifact_identity,
+                ),
+            )
+
+        if heuristic_file in AOTAutotuneCache._heuristic_modules:
+            module = AOTAutotuneCache._heuristic_modules[heuristic_file]
+        else:
+            spec = importlib.util.spec_from_file_location("heuristic", heuristic_file)
+            if spec is None or spec.loader is None:
+                AOTAutotuneCache._supported_heuristics[validation_key] = None
+                return None
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            AOTAutotuneCache._heuristic_modules[heuristic_file] = module
+            log.debug(f"Loaded heuristic module: {heuristic_file}")
+
+        try:
+            supports_hardware = heuristic_module_supports_hardware(
+                module,
+                heuristic_file,
+                self.hardware,
+            )
+        except HeuristicArtifactMetadataError:
+            log.warning(
+                "Skipping heuristic with invalid artifact metadata: %s",
+                heuristic_file,
+                exc_info=True,
+            )
+            AOTAutotuneCache._supported_heuristics[validation_key] = None
+            return None
+        if not supports_hardware:
+            AOTAutotuneCache._supported_heuristics[validation_key] = None
+            return None
+        artifact_identity = heuristic_artifact_identity(heuristic_file, self.hardware)
+        if artifact_identity is None:
+            AOTAutotuneCache._supported_heuristics[validation_key] = None
+            return None
+        AOTAutotuneCache._supported_heuristics[validation_key] = (
+            module,
+            artifact_identity,
+        )
+        return (
+            module,
+            (
+                self._kernel_source,
+                self.kernel.kernel.name,
+                self.hardware,
+                artifact_identity,
+            ),
         )
 
     def _get_heuristic_config(
         self, args: Sequence[object] | None = None
-    ) -> Config | None:
+    ) -> Config | _AOTHeuristicAbstention | None:
         """
         Use the heuristic to select a config.
 
@@ -743,63 +1282,61 @@ class AOTAutotuneCache(AutotuneCacheBase):
             args = self.args
 
         kernel_name = self.kernel.kernel.name
-        kernel_source_file = self.kernel.kernel.__code__.co_filename
-
         # Compute cache key based on shape features
         shape_features = self._extract_shape_features(args)
         shape_hash = hashlib.sha256(
             json.dumps(shape_features, sort_keys=True).encode()
         ).hexdigest()[:16]
 
-        # Check if we already have a cached result for this kernel+shape
-        cache_key = (kernel_source_file, kernel_name, shape_hash)
-        if cache_key in AOTAutotuneCache._heuristic_results:
-            log.debug(
-                f"Using cached heuristic result for {kernel_name} shape={shape_hash}"
-            )
-            return AOTAutotuneCache._heuristic_results[cache_key]
-
         try:
-            # Load heuristic module from cache or import fresh
-            if heuristic_file in AOTAutotuneCache._heuristic_modules:
-                module = AOTAutotuneCache._heuristic_modules[heuristic_file]
-            else:
-                spec = importlib.util.spec_from_file_location(
-                    "heuristic", heuristic_file
+            loaded = self._load_supported_heuristic(heuristic_file)
+            if loaded is None:
+                return None
+            module, result_key_prefix = loaded
+            cache_key = (*result_key_prefix, shape_hash)
+            if cache_key in AOTAutotuneCache._heuristic_results:
+                log.debug(
+                    f"Using cached heuristic result for {kernel_name} shape={shape_hash}"
                 )
-                if spec is None or spec.loader is None:
-                    return None
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                AOTAutotuneCache._heuristic_modules[heuristic_file] = module
-                log.debug(f"Loaded heuristic module: {heuristic_file}")
+                return AOTAutotuneCache._heuristic_results[cache_key]
 
-            # Call autotune_<kernel>(*args) to get the config
+            # Call autotune_<kernel>(*args) to get the config.
             # If there's a user key, we need to pass flattened key values, not raw args
-            config: Config | None = None
             autotune_fn = getattr(module, f"autotune_{kernel_name}", None)
-            if autotune_fn is not None:
-                user_key = getattr(self.kernel.kernel, "_aot_user_key", None)
-                if user_key is not None:
-                    # User key: pass flattened key values to heuristic
-                    key_value = user_key(*args)
-                    flat_key = _flatten_key_value(key_value)
-                    config_dict = autotune_fn(*flat_key)
-                else:
-                    # No user key: pass raw args to heuristic
-                    config_dict = autotune_fn(*args)
+            if autotune_fn is None:
+                return None
+            user_key = self.kernel.kernel._aot_user_key
+            if user_key is not None:
+                # User key: pass flattened key values to heuristic
+                key_value = user_key(*args)
+                flat_key = _flatten_key_value(key_value)
+                config_dict = autotune_fn(*flat_key)
+            else:
+                # No user key: pass raw args to heuristic
+                config_dict = autotune_fn(*args)
+            if config_dict is None:
+                config: Config | _AOTHeuristicAbstention = _AOT_HEURISTIC_ABSTENTION
+            else:
+                if not isinstance(config_dict, Mapping):
+                    raise TypeError(
+                        f"autotune_{kernel_name} must return a mapping or None, got "
+                        f"{type(config_dict).__name__}"
+                    )
                 config = Config(**config_dict)
 
-            # Cache the result
-            if config is not None:
-                AOTAutotuneCache._heuristic_results[cache_key] = config
-                log.debug(
-                    f"Cached heuristic result for {kernel_name} shape={shape_hash}"
-                )
+            # Cache explicit per-key abstention as well as selected configs.
+            # Heuristic artifacts are immutable for their artifact identity, so
+            # repeating an intentional fallback cannot produce a new result.
+            AOTAutotuneCache._heuristic_results[cache_key] = config
+            log.debug(f"Cached heuristic result for {kernel_name} shape={shape_hash}")
 
             return config
-        except Exception as e:
-            log.warning(f"Failed to load heuristic from {heuristic_file}: {e}")
+        except Exception:
+            log.warning(
+                "Failed to load heuristic from %s",
+                heuristic_file,
+                exc_info=True,
+            )
 
         return None
 
@@ -815,6 +1352,12 @@ class AOTAutotuneCache(AutotuneCacheBase):
         dispatch by a normalized call signature.
         """
         kernel_name = self.kernel.kernel.name
+        if not self.kernel.kernel._aot_standalone:
+            log.info(
+                "Skipping standalone compile for AOT kernel '%s' (standalone=False)",
+                kernel_name,
+            )
+            return
         heuristic_file = self._find_heuristic_file()
         if heuristic_file is None:
             log.warning(
@@ -822,20 +1365,21 @@ class AOTAutotuneCache(AutotuneCacheBase):
             )
             return
 
-        # -- load heuristic module ------------------------------------------
-        if heuristic_file in AOTAutotuneCache._heuristic_modules:
-            module = AOTAutotuneCache._heuristic_modules[heuristic_file]
-        else:
-            spec = importlib.util.spec_from_file_location("heuristic", heuristic_file)
-            if spec is None or spec.loader is None:
-                return
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            AOTAutotuneCache._heuristic_modules[heuristic_file] = module
+        loaded = self._load_supported_heuristic(heuristic_file)
+        if loaded is None:
+            return
+        module, compiled_kernel_key = loaded
 
         if self.kernel.settings.static_shapes:
             self._compile_current_static_shape(heuristic_file, kernel_name)
             return
+
+        selected = self._get_heuristic_config(self.args)
+        if isinstance(selected, _AOTHeuristicAbstention):
+            raise RuntimeError(
+                "dynamic standalone compilation cannot encode a per-workload "
+                "heuristic abstention; declare the AOT kernel with standalone=False"
+            )
 
         # -- extract selected configs ---------------------------------------
         # nearest_neighbor backend: module-level CONFIGS
@@ -847,9 +1391,9 @@ class AOTAutotuneCache(AutotuneCacheBase):
             log.warning("Cannot extract configs from heuristic for '%s'", kernel_name)
             return
 
-        if kernel_name in AOTAutotuneCache._compiled_kernels:
+        if compiled_kernel_key in AOTAutotuneCache._compiled_kernels:
             return
-        AOTAutotuneCache._compiled_kernels.add(kernel_name)
+        AOTAutotuneCache._compiled_kernels.add(compiled_kernel_key)
 
         # -- generate Triton code for each config --------------------------
         triton_codes: list[str] = []
@@ -870,14 +1414,12 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 )
 
         # -- emit standalone file -------------------------------------------
-        from .aot_compile import generate_standalone_file
-
         out_path = generate_standalone_file(
             kernel_name=kernel_name,
             triton_codes=triton_codes,
             heuristic_code=heuristic_file.read_text(),
             output_dir=self.data_dir,
-            kernel_source_file=self.kernel.kernel.__code__.co_filename,
+            kernel_source_file=self._kernel_source_file,
         )
         print(f"[AOT] Standalone: {out_path}", file=sys.stderr)
 
@@ -889,6 +1431,13 @@ class AOTAutotuneCache(AutotuneCacheBase):
         """Compile one observed static call and update its exact dispatcher."""
         normalized_args = self.kernel.kernel.normalize_args(*self.args)
         config = self._get_heuristic_config(normalized_args)
+        if isinstance(config, _AOTHeuristicAbstention):
+            log.debug(
+                "Heuristic abstained for static kernel '%s', skipping standalone "
+                "compile",
+                kernel_name,
+            )
+            return
         if config is None:
             log.warning(
                 "No heuristic config for static kernel '%s', skipping standalone compile",
@@ -896,24 +1445,19 @@ class AOTAutotuneCache(AutotuneCacheBase):
             )
             return
 
-        from .aot_compile import _standalone_call_key
-        from .aot_compile import generate_standalone_file
-
         call_key = _standalone_call_key(normalized_args)
         code_object = self.kernel.kernel.__code__
-        source_path = Path(code_object.co_filename).resolve()
-        if source_path.is_file():
+        source_path = self._kernel_source_file
+        output_path = standalone_output_path(
+            kernel_name=kernel_name,
+            output_dir=self.data_dir,
+            kernel_source_file=source_path,
+        )
+        if source_path is not None:
             source_digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
-            kernel_source_file: str | None = str(source_path)
-            output_identity = str(
-                source_path.parent / f"{source_path.stem}_{kernel_name}_standalone.py"
-            )
         else:
             source_digest = hashlib.sha256(marshal.dumps(code_object)).hexdigest()
-            kernel_source_file = None
-            output_identity = str(
-                (self.data_dir / f"{kernel_name}_standalone.py").resolve()
-            )
+        output_identity = str(output_path.resolve())
         variants_key = (
             output_identity,
             kernel_name,
@@ -959,7 +1503,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 triton_codes=[variant[1][1] for variant in ordered],
                 heuristic_code=heuristic_file.read_text(),
                 output_dir=self.data_dir,
-                kernel_source_file=kernel_source_file,
+                kernel_source_file=source_path,
                 dispatch_keys=[variant[0] for variant in ordered],
             )
             variants[call_key] = (config_fingerprint, code)
@@ -1102,10 +1646,10 @@ class AOTAutotuneCache(AutotuneCacheBase):
     def _maybe_run_input_fn_workflows(self) -> None:
         """Run collect_fn/measure_fn workflows if applicable."""
         # Check if input_fn workflow should run (only once per kernel)
-        if getattr(self.kernel.kernel, "_aot_workflow_done", False):
+        if self.kernel.kernel._aot_workflow_done:
             return
         # Mark done FIRST to prevent recursive calls when we invoke the kernel
-        self.kernel.kernel._aot_workflow_done = True  # type: ignore[attr-defined]
+        self.kernel.kernel._aot_workflow_done = True
 
         if self.mode == "collect" and self._collect_fn is not None:
             self._run_collect_fn_workflow()
