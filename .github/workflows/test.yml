@@ -265,7 +265,7 @@ jobs:
 
       - name: Run Tests
         run: |
-          set -o pipefail
+          set -e -o pipefail
           source .venv/bin/activate
           uv pip install pytest-xdist
           uv pip install pytest-rerunfailures
