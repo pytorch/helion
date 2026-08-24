@@ -3398,3 +3398,183 @@ Open, to be answered with implementation evidence:
   Qwen strict end-to-end validation and Gemma output/cache validation also
   pass. Ruff and formatting pass; targeted Pyrefly reports only the two
   pre-existing duplicate-SymPy-module errors in `device_ir.py`.
+
+## 2026-08-23 scope-aware action DAG refactor
+
+### Architectural decision
+
+The target architecture is **one scope-aware memory/event graph plus
+non-preemptive outer task strands**. This completes the full-DAG design rather
+than adding another scheduler beside it.
+
+Nested loop iterations are dependency-visible action checkpoints, but they are
+not independently movable tasks. A worker still enters one outer root task and
+runs its program-order strand. The graph may place waits and publications at
+proved nested boundaries while accumulators, descriptors, and other live state
+remain local to that strand. This avoids continuation-state transport and keeps
+the original root body unchanged apart from synchronization and mechanical loop
+segmentation.
+
+The architecture is:
+
+```text
+reachable DeviceIR callsite/scope tree
+                ↓
+logical action domains on non-preemptive root strands
+                ↓
+one-sided allocation-coordinate access maps
+                ↓
+exact producer-action → consumer-action overlap relations
+                ↓
+canonical keyed-event DAG
+                ↓
+schedule-derived milestone quotient + outer worker placement
+                ↓
+generic waits/publications at stable scope boundaries
+```
+
+### Dependency representation
+
+1. Build execution scopes by traversing reachable DeviceIR callsites. Scope
+   identity is `(root, callsite path)`, not merely `graph_id`: sibling loops may
+   reuse a graph body, transformed graphs may be copied, and one graph body may
+   have multiple callsites.
+2. Keep the root `TaskFamily` as the only worker-placement domain. Each nested
+   segment has an `ActionDomain` containing its complete logical coordinates:
+   outer/root axes first, then enclosing nested-loop axes.
+3. Associate every load and store with its stable execution scope and lexical
+   operation order. Normalize each access independently into an exact map from
+   logical action coordinates to an allocation footprint.
+4. Build producer-action to consumer-action relations solely from allocation
+   footprint overlap and reaching definitions. Do not maintain a second
+   producer/consumer dimension-pairing proof language in the scheduler.
+5. Preserve exact boxes, intervals, and the small strided forms required for
+   ordinary views. Do not reduce accesses to address hulls. Batch and all other
+   outer axes stay in the logical coordinates; L2 remapping remains a later
+   physical traversal decision.
+6. Unknown, indirect, conditional, non-injective, or dynamically shaped cases
+   lift monotonically to an enclosing proved scope, ultimately `FamilyDone`.
+
+`tile_dependency.py` owns memory facts, action domains, configuration-time
+relation instantiation, and the canonical event graph. The scheduler consumes
+only action/event relations. It should not import `TileAccess`,
+`AllocationRegion`, or a separate pairwise affine predecessor proof.
+
+### Event and scheduling model
+
+- Root entry/exit and nested loop entry/exit are instances of the same action
+  endpoint abstraction. Root completion is the one-key family-completion event
+  over logical action completions, including work executed through local or
+  direct readiness.
+- Exact predecessor signatures are the source of truth. Repeated signatures
+  become keyed events; multi-producer joins union and deduplicate the producing
+  actions.
+- The scheduler assigns only outer task strands to ordered worker-program
+  positions. Nested waits/publications remain inside their owning strands.
+- Local final-arrival execution is valid only for a complete movable root-task
+  start. A locally triggered strand with a later blocking nested wait is
+  conservatively disallowed until action-level liveness proves progress.
+- Progress validation combines event dependencies with scope/program-order
+  edges. A root-completion edge is a component cut only when no exact event path
+  still connects the same components.
+- Multiple action instances with one logical key map to ordered worker-program
+  positions, not to one ambiguous `key → worker` assignment.
+
+### Generic milestone quotient
+
+The Qwen 64/32 and Gemma 36/4 FFN handoffs are not separate scheduling kinds.
+They are the same graph rewrite:
+
+1. Start with exact predecessor sets for every nested consumer action.
+2. Account for the actual worker-program position at which each predecessor
+   becomes complete.
+3. Coalesce adjacent consumer actions with the same effective readiness into
+   maximal representable loop segments.
+4. Replace each segment's individual keys with one milestone key whose
+   predecessor set is the deduplicated union of those exact keys.
+5. Derive each milestone's arrival count from that union. Arrival counts may be
+   nonuniform across segments.
+
+This is a schedule-derived quotient of the exact action DAG, not an FFN
+matcher, an access cohort, or a new schedule policy. The same operation applies
+to any contiguous nested consumer range whose exact dependencies admit the
+quotient. The lowering emits one wait before each original loop segment and
+preserves the loop body and range attributes.
+
+### Publication and lowering constraints
+
+- A nested publication is legal only at a boundary proved to execute exactly
+  once per counted action. Conditional branches, while loops, zero-trip or
+  dynamic loops, and duplicated callsites lift to an enclosing guaranteed
+  boundary unless separately proved.
+- Multiple stores within one strand are ordered reaching definitions. Later
+  overlapping stores remain prerequisites; repeated stores by one action are
+  deduplicated before counting.
+- Publication requires CTA-wide completion and release semantics. For
+  pipelined or unrolled `tl.range`, publication occurs only between emitted
+  segments where all relevant asynchronous work is complete, not naively after
+  a source-level iteration.
+- Segment boundaries must be representable in the configured physical inner
+  traversal. Logical coordinates prove dependencies; lowering order determines
+  which exact relations can be rendered as contiguous segments.
+- Stable DeviceIR scope metadata locates the lowered loop. Mechanical AST
+  cloning/splitting may remain initially, but marker-based discovery and
+  cohort-specific emitters must not return.
+
+### Generality check
+
+- **Qwen FFN:** exact W13 producer actions quotient into the existing 64/32 K
+  milestones for activation/W2 while retaining batch in every key.
+- **Gemma FFN:** the same quotient produces 36/4 milestones; no model, tensor
+  name, or task-count matcher is involved.
+- **Attention:** ordinary exact keyed readiness remains an edge-local result.
+  Multi-stage attention chains compose through the same event DAG without a
+  special attention lowering.
+- **RMSNorm → matmul:** future nested producer publication can expose tiles as
+  the reduction/matmul strand reaches proved checkpoints. It does not require
+  making inner iterations independently schedulable.
+- **Unknown future chains:** arbitrary DAG paths compose by event reachability
+  and program order. The scheduler does not search for a named three-node FFN
+  shape or a named two-node attention shape.
+
+### Implementation checkpoint
+
+Completed in the current scheduler checkpoint:
+
+- Added stable DeviceIR callsite scopes and propagated their identity to
+  lowered loops.
+- Added configured action domains with full outer and nested logical axes.
+- Moved configured allocation-overlap relation construction into
+  `tile_dependency.py`; root and nested relations now use the same proof.
+- Added generic nested-consumer keyed events and schedule-derived milestone
+  quotienting with nonuniform arrival counts.
+- Deleted `AccessCohortPlan`, `_derive_access_cohorts`,
+  `place_access_ready_consumers`, access-marker discovery, cohort counter
+  allocation, cohort lowering, and the access-specific event placement mode.
+- Reproduced Qwen's 64/32 and Gemma's 36/4 loop segmentation through stable
+  action scopes. The saved lowerings are
+  `/tmp/qwen3_ordered_action_lowered.py` and
+  `/tmp/gemma4_ordered_action_lowered.py`.
+- Revalidated Qwen at 77.86 microseconds (253 registers, no spills, 17,408
+  bytes shared) and Gemma at 72.27 microseconds versus 80.17 microseconds for
+  separate Helion (203 registers, no spills, 34,816 bytes shared).
+- Focused validation passes 78 dependency tests plus 15 subtests, and 14 loop-
+  dependency tests with 4 expected skips.
+
+Remaining work, in order:
+
+1. Consolidate the residual root-only affine/event pipeline into the canonical
+   action-overlap relation and remove duplicate readiness builders and
+   canonicalizers.
+2. Generalize event endpoints, liveness, and validation so nested producer
+   publications are first-class while outer strand placement remains
+   unchanged.
+3. Add the publication/codegen safety gates above, then validate natural
+   RMSNorm-to-matmul streaming.
+4. Generalize the current conservative one-nested-axis renderer only when an
+   exact relation produces representable segments; unsupported cases continue
+   to lift safely.
+5. Compress large action relations into runs/boxes so graphs such as W2 do not
+   require one Python object per logical nested action.
+6. Re-run strict Qwen and Gemma correctness, save every lowered Triton kernel,
+   and benchmark on an uncontended GPU after each semantic deletion.

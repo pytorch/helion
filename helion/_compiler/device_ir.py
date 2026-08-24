@@ -346,15 +346,23 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         args = state.ast_args[3]
         assert isinstance(args, list)
         assert all(isinstance(x, ast.AST) for x in args)
+        device_loop = state.device_function.tile_strategy.codegen_device_loop(
+            state, self.block_ids
+        )
+        if state.fx_node is not None:
+            from .tile_dependency import TILE_ACTION_SCOPE_ID_ATTR
+            from .tile_dependency import TILE_ACTION_SCOPE_IDS_META
+
+            scope_ids = dict(state.fx_node.meta.get(TILE_ACTION_SCOPE_IDS_META, ()))
+            if (scope_id := scope_ids.get(0)) is not None:
+                setattr(device_loop.for_node, TILE_ACTION_SCOPE_ID_ATTR, scope_id)
         # Make the active graph reachable by the strategy so it can pick
         # different lane-loop shapes for the reduce vs consume sweeps.
         # pyrefly: ignore [missing-attribute]
         state.codegen._cute_active_graph_info = self
         try:
             with state.codegen.add_device_loop(
-                state.device_function.tile_strategy.codegen_device_loop(
-                    state, self.block_ids
-                ),
+                device_loop,
                 needs_barrier_before=self.needs_barrier_before,
             ):
                 return codegen_call_with_graph(
@@ -3514,7 +3522,6 @@ def _collect_memory_op_facts(
     from ..language import memory_ops
     from ..language.atomic_ops import ATOMIC_OPS
     from .inductor_lowering import ReductionLowering
-    from .tile_dependency import TILE_ACCESS_ID_META
     from .tile_dependency import TileAccess
     from .tile_dependency import owner_root_by_graph_id
 
@@ -3717,7 +3724,6 @@ def _collect_memory_op_facts(
                     and len(node.args) > (2 if is_load else 3)
                     and node.args[2 if is_load else 3] is not None
                 )
-                node.meta[TILE_ACCESS_ID_META] = cross_loop_access_id
                 tile_accesses.append(
                     TileAccess(
                         access_id=cross_loop_access_id,

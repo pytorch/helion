@@ -2,83 +2,24 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
-import math
-from operator import itemgetter
 from typing import Literal
 
 from .. import exc
-from .tile_dependency import AffinePredecessorAxis
-from .tile_dependency import AllocationRegion
 from .tile_dependency import EventUse
-from .tile_dependency import TileAccess
+from .tile_dependency import InstantiatedActionDomain
+from .tile_dependency import InstantiatedTaskFamily
 from .tile_dependency import TileDependency
 from .tile_dependency import TileDependencyGraph
 from .tile_dependency import TileDependencyKind
 from .tile_dependency import UniformTaskPartition
-from .tile_dependency import access_task_region
-from .tile_dependency import allocation_regions_may_overlap
+from .tile_dependency import dependency_predecessor_sets
+from .tile_dependency import instantiate_action_domains
+from .tile_dependency import instantiate_action_relations
 from .tile_dependency import predecessor_task_ids
 from .tile_dependency import prove_uniform_task_partition
 
 CROSS_LOOP_NUM_WORKERS_CONFIG = "cross_loop_num_workers"
 CROSS_LOOP_NUM_WORKERS_DEFAULT = 0
-
-
-@dataclasses.dataclass(frozen=True)
-class AccessProgramPoint:
-    """A lowered access location with its logical loop coordinates.
-
-    The dependency proof names axes by source-level block ID.  The expressions
-    here are used only to materialize an already-proven event key at the
-    explicit access marker; they are never used to infer dependency geometry.
-    """
-
-    coordinate_items: tuple[tuple[int, str], ...] | None
-    loop_id: int | None
-    loop_depth: int
-    root_statement_index: int
-
-    @property
-    def coordinates(self) -> dict[int, str] | None:
-        if self.coordinate_items is None:
-            return None
-        return dict(self.coordinate_items)
-
-
-@dataclasses.dataclass(frozen=True)
-class InstantiatedTaskFamily:
-    """A logical task family instantiated for one kernel configuration."""
-
-    logical_axis_order: tuple[int, ...]
-    physical_axis_order: tuple[int, ...]
-    axis_counts_items: tuple[tuple[int, int], ...]
-    block_sizes_items: tuple[tuple[int, int], ...]
-    logical_task_by_physical_task: tuple[int, ...] | None = None
-
-    def __post_init__(self) -> None:
-        task_order = self.logical_task_by_physical_task
-        if task_order is not None and (
-            len(task_order) != self.task_count
-            or set(task_order) != set(range(self.task_count))
-        ):
-            raise ValueError("physical traversal must permute the logical task domain")
-
-    @property
-    def axis_counts(self) -> dict[int, int]:
-        return dict(self.axis_counts_items)
-
-    @property
-    def block_sizes(self) -> dict[int, int]:
-        return dict(self.block_sizes_items)
-
-    @property
-    def task_count(self) -> int:
-        return math.prod(count for _, count in self.axis_counts_items)
-
-    @property
-    def physical_traversal(self) -> tuple[int, ...]:
-        task_order = self.logical_task_by_physical_task
-        return task_order if task_order is not None else tuple(range(self.task_count))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -471,10 +412,7 @@ def _family_placements_at_position(
     run_end = len(free_workers)
     while run_end:
         run_begin = run_end - 1
-        while (
-            run_begin
-            and free_workers[run_begin - 1] == free_workers[run_begin] - 1
-        ):
+        while run_begin and free_workers[run_begin - 1] == free_workers[run_begin] - 1:
             run_begin -= 1
         if run_end - run_begin >= family.task_count:
             worker_begin = free_workers[run_end - family.task_count]
@@ -516,9 +454,7 @@ def _static_ancestors(
     task: tuple[int, int],
     *,
     worker_schedule: WorkerSchedule,
-    local_predecessors: dict[
-        tuple[int, int], frozenset[tuple[int, int]]
-    ],
+    local_predecessors: dict[tuple[int, int], frozenset[tuple[int, int]]],
     cache: dict[tuple[int, int], frozenset[tuple[int, int]]],
     visiting: frozenset[tuple[int, int]] = frozenset(),
 ) -> frozenset[tuple[int, int]]:
@@ -547,156 +483,6 @@ def _static_ancestors(
     return result
 
 
-def place_access_ready_consumers(
-    event_graph: InstantiatedEventGraph,
-    worker_schedule: WorkerSchedule,
-    local_triggers: tuple[LocalTrigger, ...],
-    access_cohorts: tuple[AccessCohortPlan, ...],
-) -> tuple[WorkerSchedule, tuple[AccessCohortPlan, ...]]:
-    """Move access-waiting roots into progress-safe idle worker positions.
-
-    A local task may itself be enabled by another local task.  Recursively
-    contracting those triggers gives the static ancestors that make each
-    access stream coordinate ready.  A consumer can start at the first
-    schedule position with enough workers that have no unfinished ancestors;
-    its access waits retain the exact runtime ordering.
-    """
-    local_predecessors = _local_trigger_predecessors(event_graph, local_triggers)
-    static_ancestors_cache: dict[tuple[int, int], frozenset[tuple[int, int]]] = {}
-
-    result = worker_schedule
-    updated_cohorts: list[AccessCohortPlan] = []
-    for cohort in access_cohorts:
-        producer = event_graph.task_families[cohort.producer_root]
-        consumer = event_graph.task_families[cohort.consumer_root]
-        if consumer.task_count > result.worker_count:
-            updated_cohorts.append(cohort)
-            continue
-
-        readiness_by_outer: dict[tuple[int, ...], list[int | None]] = {}
-        ancestor_placements: set[tuple[int, int]] = set()
-        valid = True
-        for task in range(producer.task_count):
-            coordinates = _task_coordinates(task, producer)
-            outer = tuple(coordinates[axis] for axis in cohort.outer_producer_axes)
-            stream = coordinates[cohort.producer_stream_axis]
-            readiness = readiness_by_outer.get(outer)
-            if readiness is None:
-                new_readiness: list[int | None] = [
-                    None for _ in range(cohort.stream_count)
-                ]
-                readiness_by_outer[outer] = new_readiness
-                readiness = new_readiness
-            if not 0 <= stream < cohort.stream_count or readiness[stream] is not None:
-                valid = False
-                break
-            ancestors = _static_ancestors(
-                (cohort.producer_root, task),
-                worker_schedule=worker_schedule,
-                local_predecessors=local_predecessors,
-                cache=static_ancestors_cache,
-            )
-            placements = tuple(
-                placement
-                for ancestor in ancestors
-                if (placement := result.placement(*ancestor)) is not None
-            )
-            if not placements:
-                valid = False
-                break
-            ancestor_placements.update(placements)
-            readiness[stream] = max(position for _worker, position in placements)
-        if not valid or any(
-            any(position is None for position in readiness)
-            for readiness in readiness_by_outer.values()
-        ):
-            updated_cohorts.append(cohort)
-            continue
-
-        granularity = cohort.stream_task_granularity
-        if cohort.stream_count % granularity:
-            updated_cohorts.append(cohort)
-            continue
-        chunk_readiness_patterns = tuple(
-            tuple(
-                max(
-                    position
-                    for position in readiness[begin : begin + granularity]
-                    if position is not None
-                )
-                for begin in range(0, cohort.stream_count, granularity)
-            )
-            for readiness in readiness_by_outer.values()
-        )
-
-        current_consumer_positions = tuple(
-            placement[1]
-            for task in range(consumer.task_count)
-            if (placement := result.placement(cohort.consumer_root, task)) is not None
-        )
-        if len(current_consumer_positions) != consumer.task_count:
-            updated_cohorts.append(cohort)
-            continue
-        original_position = min(current_consumer_positions)
-        chosen: tuple[int, WorkerSchedule] | None = None
-        earliest_readiness = min(
-            position for pattern in chunk_readiness_patterns for position in pattern
-        )
-        for position in range(earliest_readiness + 1, original_position):
-            busy_workers = {
-                worker
-                for worker, ancestor_position in ancestor_placements
-                if ancestor_position >= position
-            }
-            candidate = next(
-                (
-                    candidate
-                    for candidate in _family_placements_at_position(
-                        result,
-                        root=cohort.consumer_root,
-                        family=consumer,
-                        position=position,
-                        unavailable_workers=frozenset(busy_workers),
-                    )
-                    if _is_valid_worker_schedule(
-                        event_graph, candidate, local_triggers
-                    )
-                ),
-                None,
-            )
-            if candidate is not None:
-                chosen = (position, candidate)
-            if chosen is not None:
-                break
-        if chosen is None:
-            updated_cohorts.append(cohort)
-            continue
-
-        consumer_position, candidate = chosen
-        effective_patterns = tuple(
-            tuple(max(position, consumer_position - 1) for position in pattern)
-            for pattern in chunk_readiness_patterns
-        )
-        chunk_count = len(effective_patterns[0])
-        stage_chunks: list[int] = []
-        stage_begin = 0
-        for chunk in range(1, chunk_count):
-            if any(
-                pattern[chunk] != pattern[chunk - 1] for pattern in effective_patterns
-            ):
-                stage_chunks.append(chunk - stage_begin)
-                stage_begin = chunk
-        stage_chunks.append(chunk_count - stage_begin)
-        stage_sizes = tuple(chunks * granularity for chunks in stage_chunks)
-        if len(stage_sizes) <= 1:
-            updated_cohorts.append(cohort)
-            continue
-
-        result = candidate
-        updated_cohorts.append(dataclasses.replace(cohort, stage_sizes=stage_sizes))
-    return result, tuple(updated_cohorts)
-
-
 def place_ready_families(
     event_graph: InstantiatedEventGraph,
     original_schedule: WorkerSchedule,
@@ -713,17 +499,11 @@ def place_ready_families(
     """
     result = worker_schedule
     remaining_triggers = local_triggers
-    local_predecessors = _local_trigger_predecessors(
-        event_graph, remaining_triggers
-    )
-    static_ancestors_cache: dict[
-        tuple[int, int], frozenset[tuple[int, int]]
-    ] = {}
+    local_predecessors = _local_trigger_predecessors(event_graph, remaining_triggers)
+    static_ancestors_cache: dict[tuple[int, int], frozenset[tuple[int, int]]] = {}
     candidate_roots = sorted(
         {
-            event_graph.event(trigger.event_index).uses[
-                trigger.use_index
-            ].consumer_root
+            event_graph.event(trigger.event_index).uses[trigger.use_index].consumer_root
             for trigger in remaining_triggers
         }
     )
@@ -734,9 +514,9 @@ def place_ready_families(
         root_triggers = tuple(
             trigger
             for trigger in remaining_triggers
-            if event_graph.event(trigger.event_index).uses[
-                trigger.use_index
-            ].consumer_root
+            if event_graph.event(trigger.event_index)
+            .uses[trigger.use_index]
+            .consumer_root
             == root
         )
         readiness_positions: list[int] = []
@@ -758,7 +538,9 @@ def place_ready_families(
                 valid = False
                 break
             ancestor_placements.update(placements)
-            readiness_positions.append(max(position for _worker, position in placements))
+            readiness_positions.append(
+                max(position for _worker, position in placements)
+            )
         if not valid:
             continue
 
@@ -771,9 +553,7 @@ def place_ready_families(
             continue
         original_position = min(original_positions)
         remaining_without_root = tuple(
-            trigger
-            for trigger in remaining_triggers
-            if trigger not in root_triggers
+            trigger for trigger in remaining_triggers if trigger not in root_triggers
         )
         for position in range(min(readiness_positions) + 1, original_position):
             unfinished_workers = frozenset(
@@ -858,13 +638,12 @@ def resolve_worker_count(
 def build_worker_schedule(
     event_graph: InstantiatedEventGraph,
     task_families: tuple[InstantiatedTaskFamily, ...],
-    access_cohorts: tuple[AccessCohortPlan, ...],
     *,
     worker_count: int,
 ) -> tuple[
     WorkerSchedule,
     tuple[LocalTrigger, ...],
-    tuple[AccessCohortPlan, ...],
+    tuple[CountedEventPlan, ...],
 ]:
     """Derive local and static task placement for one worker count."""
     baseline = build_baseline_worker_schedule(task_families, worker_count)
@@ -891,11 +670,10 @@ def build_worker_schedule(
         if required_keys
     )
     schedule = ordered.without_tasks(local_tasks)
-    schedule, selected_cohorts = place_access_ready_consumers(
+    schedule, ordered_action_events = place_ordered_action_consumers(
         event_graph,
         schedule,
         local_triggers,
-        access_cohorts,
     )
     schedule, local_triggers = place_ready_families(
         event_graph,
@@ -903,11 +681,8 @@ def build_worker_schedule(
         schedule,
         local_triggers,
     )
-    selected_cohorts = tuple(
-        cohort for cohort in selected_cohorts if len(cohort.stage_sizes) > 1
-    )
     validate_worker_schedule(event_graph, schedule, local_triggers)
-    return schedule, local_triggers, selected_cohorts
+    return schedule, local_triggers, ordered_action_events
 
 
 @dataclasses.dataclass(frozen=True)
@@ -931,6 +706,7 @@ class InstantiatedEventContribution:
 
     producer_root: int
     keys_by_task: tuple[frozenset[int], ...]
+    producer_scope_id: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -941,6 +717,7 @@ class InstantiatedEventUse:
     consumer_access_id: int | None
     placement: Literal["root_entry", "access"]
     required_keys_by_task: tuple[frozenset[int], ...]
+    consumer_scope_id: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -988,6 +765,7 @@ class InstantiatedEventGraph:
 
     task_families: tuple[InstantiatedTaskFamily, ...]
     events: tuple[InstantiatedKeyedEvent, ...]
+    action_domains: tuple[InstantiatedActionDomain, ...] = ()
 
     def event(self, event_id: int) -> InstantiatedKeyedEvent:
         return self.events[event_id]
@@ -1010,28 +788,10 @@ class InstantiatedEventGraph:
             if use.consumer_root == root
         )
 
-
-@dataclasses.dataclass(frozen=True)
-class AccessCohortPlan:
-    """A contiguous coarsening of one access-local readiness relation."""
-
-    event_id: int
-    producer_root: int
-    consumer_root: int
-    axes: tuple[AffinePredecessorAxis, ...]
-    access_ids: tuple[int, ...]
-    producer_stream_axis: int
-    stream_count: int
-    stream_task_granularity: int
-    stage_sizes: tuple[int, ...]
-    outer_producer_axes: tuple[int, ...]
-
-    @property
-    def stage_offsets(self) -> tuple[int, ...]:
-        result = [0]
-        for size in self.stage_sizes:
-            result.append(result[-1] + size)
-        return tuple(result)
+    def action_domain(self, scope_id: int) -> InstantiatedActionDomain:
+        return next(
+            domain for domain in self.action_domains if domain.scope_id == scope_id
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1078,6 +838,7 @@ class CountedEventUse:
     consumer_root: int
     key_by_task: tuple[int, ...]
     consumer_access_id: int | None = None
+    consumer_scope_id: int | None = None
 
     @property
     def task_to_key_segments(self) -> tuple[TaskToKeySegment, ...]:
@@ -1135,15 +896,19 @@ class CountedEventPlan:
 
     @property
     def expected_arrivals(self) -> int:
+        counts = set(self.expected_arrivals_by_key)
+        if len(counts) != 1:
+            raise ValueError("keyed event has nonuniform total fan-in")
+        return counts.pop()
+
+    @property
+    def expected_arrivals_by_key(self) -> tuple[int, ...]:
         arrivals = [0] * self.key_count
         for contributor in self.contributors:
             for key in contributor.task_to_key:
                 if key is not None:
                     arrivals[key] += 1
-        counts = set(arrivals)
-        if len(counts) != 1:
-            raise ValueError("keyed event has nonuniform total fan-in")
-        return counts.pop()
+        return tuple(arrivals)
 
     @property
     def is_single_contributor(self) -> bool:
@@ -1174,6 +939,229 @@ class CountedEventPlan:
         return partition
 
 
+def place_ordered_action_consumers(
+    event_graph: InstantiatedEventGraph,
+    worker_schedule: WorkerSchedule,
+    local_triggers: tuple[LocalTrigger, ...],
+) -> tuple[WorkerSchedule, tuple[CountedEventPlan, ...]]:
+    """Place strands with nested waits and derive their milestone events.
+
+    Exact action dependencies remain the semantic source of truth. This pass
+    uses only worker positions and same-strand action order to quotient adjacent
+    actions into maximal segments with the same effective readiness frontier.
+    It does not inspect operation kinds or recognize a graph topology.
+    """
+    uses_by_consumer: dict[
+        int,
+        list[tuple[InstantiatedKeyedEvent, InstantiatedEventUse]],
+    ] = {}
+    for event in event_graph.events:
+        for use in event.uses:
+            if use.consumer_scope_id is not None:
+                uses_by_consumer.setdefault(use.consumer_root, []).append((event, use))
+
+    local_predecessors = _local_trigger_predecessors(event_graph, local_triggers)
+    static_ancestors_cache: dict[tuple[int, int], frozenset[tuple[int, int]]] = {}
+    result = worker_schedule
+    plans: list[CountedEventPlan] = []
+    for consumer_root, event_uses in sorted(uses_by_consumer.items()):
+        # Several nested scopes in one strand require a joint program-order
+        # analysis. Keep their exact events, but do not move the strand until
+        # that general liveness composition is available.
+        if len(event_uses) != 1:
+            continue
+        event, use = event_uses[0]
+        assert use.consumer_scope_id is not None
+        domain = event_graph.action_domain(use.consumer_scope_id)
+        consumer = event_graph.task_families[consumer_root]
+        if (
+            domain.root != consumer_root
+            or len(domain.nested_axis_order) != 1
+            or domain.strand_count != consumer.task_count
+            or len(use.required_keys_by_task) != domain.action_count
+            or consumer.task_count > result.worker_count
+        ):
+            continue
+
+        contributors_by_key = event.contributor_tasks_by_key
+        predecessors_by_action: list[frozenset[tuple[int, int]]] = []
+        readiness_by_strand: list[list[int]] = [[] for _ in range(domain.strand_count)]
+        ancestor_placements: set[tuple[int, int]] = set()
+        valid = True
+        for action, required_keys in enumerate(use.required_keys_by_task):
+            predecessors = frozenset(
+                predecessor
+                for key in required_keys
+                for predecessor in contributors_by_key[key]
+            )
+            predecessors_by_action.append(predecessors)
+            if not predecessors:
+                valid = False
+                break
+            ancestors = frozenset(
+                ancestor
+                for predecessor in predecessors
+                for ancestor in _static_ancestors(
+                    predecessor,
+                    worker_schedule=result,
+                    local_predecessors=local_predecessors,
+                    cache=static_ancestors_cache,
+                )
+            )
+            placements = tuple(
+                placement
+                for ancestor in ancestors
+                if (placement := result.placement(*ancestor)) is not None
+            )
+            if not placements:
+                valid = False
+                break
+            ancestor_placements.update(placements)
+            readiness_by_strand[domain.strand_task(action)].append(
+                max(position for _worker, position in placements)
+            )
+        if not valid or any(
+            len(readiness) != domain.actions_per_strand
+            for readiness in readiness_by_strand
+        ):
+            continue
+
+        current_consumer_positions = tuple(
+            placement[1]
+            for task in range(consumer.task_count)
+            if (placement := result.placement(consumer_root, task)) is not None
+        )
+        if len(current_consumer_positions) != consumer.task_count:
+            continue
+        original_position = min(current_consumer_positions)
+        chosen: tuple[int, WorkerSchedule] | None = None
+        earliest_readiness = min(
+            position for pattern in readiness_by_strand for position in pattern
+        )
+        for position in range(earliest_readiness + 1, original_position):
+            busy_workers = frozenset(
+                worker
+                for worker, ancestor_position in ancestor_placements
+                if ancestor_position >= position
+            )
+            candidate = next(
+                (
+                    candidate
+                    for candidate in _family_placements_at_position(
+                        result,
+                        root=consumer_root,
+                        family=consumer,
+                        position=position,
+                        unavailable_workers=busy_workers,
+                    )
+                    if _is_valid_worker_schedule(
+                        event_graph,
+                        candidate,
+                        local_triggers,
+                    )
+                ),
+                None,
+            )
+            if candidate is not None:
+                chosen = (position, candidate)
+                break
+        if chosen is None:
+            continue
+
+        consumer_position, candidate = chosen
+        effective_patterns = tuple(
+            tuple(max(position, consumer_position - 1) for position in pattern)
+            for pattern in readiness_by_strand
+        )
+        boundaries = [0]
+        for action_offset in range(1, domain.actions_per_strand):
+            if any(
+                pattern[action_offset] != pattern[action_offset - 1]
+                for pattern in effective_patterns
+            ):
+                boundaries.append(action_offset)
+        boundaries.append(domain.actions_per_strand)
+        if len(boundaries) <= 2:
+            continue
+
+        key_by_signature: dict[frozenset[tuple[int, int]], int] = {}
+        ordered_signatures: list[frozenset[tuple[int, int]]] = []
+        key_by_action = [-1] * domain.action_count
+        for strand_task in range(domain.strand_count):
+            strand_begin = strand_task * domain.actions_per_strand
+            for segment_begin, segment_end in itertools.pairwise(boundaries):
+                signature = frozenset(
+                    predecessor
+                    for action in range(
+                        strand_begin + segment_begin,
+                        strand_begin + segment_end,
+                    )
+                    for predecessor in predecessors_by_action[action]
+                )
+                if not signature:
+                    valid = False
+                    break
+                key = key_by_signature.setdefault(signature, len(key_by_signature))
+                if key == len(ordered_signatures):
+                    ordered_signatures.append(signature)
+                for action in range(
+                    strand_begin + segment_begin,
+                    strand_begin + segment_end,
+                ):
+                    key_by_action[action] = key
+            if not valid:
+                break
+        if not valid or any(key < 0 for key in key_by_action):
+            continue
+
+        contribution_keys: dict[int, list[int | None]] = {}
+        for key, signature in enumerate(ordered_signatures):
+            for producer_root, producer_task in signature:
+                task_to_key = contribution_keys.get(producer_root)
+                if task_to_key is None:
+                    new_task_to_key: list[int | None] = [
+                        None
+                        for _ in range(
+                            event_graph.task_families[producer_root].task_count
+                        )
+                    ]
+                    contribution_keys[producer_root] = new_task_to_key
+                    task_to_key = new_task_to_key
+                previous = task_to_key[producer_task]
+                if previous is not None and previous != key:
+                    valid = False
+                    break
+                task_to_key[producer_task] = key
+            if not valid:
+                break
+        if not valid:
+            continue
+
+        result = candidate
+        plans.append(
+            CountedEventPlan(
+                contributors=tuple(
+                    CountedEventContribution(
+                        source_event_ids=event.source_event_ids,
+                        producer_root=producer_root,
+                        task_to_key=tuple(contribution_keys[producer_root]),
+                    )
+                    for producer_root in sorted(contribution_keys)
+                ),
+                uses=(
+                    CountedEventUse(
+                        consumer_root=consumer_root,
+                        key_by_task=tuple(key_by_action),
+                        consumer_access_id=use.consumer_access_id,
+                        consumer_scope_id=use.consumer_scope_id,
+                    ),
+                ),
+                graph_event_index=event.event_id,
+            )
+        )
+    return result, tuple(plans)
+
+
 @dataclasses.dataclass(frozen=True)
 class CrossLoopSchedule:
     """Pure graph-derived choices consumed by persistent-kernel lowering."""
@@ -1183,7 +1171,6 @@ class CrossLoopSchedule:
     local_triggers: tuple[LocalTrigger, ...]
     task_ready_edges: frozenset[tuple[int, int]]
     task_waits_by_root: dict[int, tuple[EventUse, ...]]
-    access_cohorts: tuple[AccessCohortPlan, ...]
     counted_events: tuple[CountedEventPlan, ...]
     worker_limit: int
 
@@ -1365,8 +1352,10 @@ def lower_counted_events(
         uses: list[CountedEventUse] = []
         use_indices: list[int] = []
         for use_index, use in enumerate(event.uses):
-            if use.placement != "root_entry" or any(
-                len(keys) != 1 for keys in use.required_keys_by_task
+            if (
+                use.consumer_scope_id is not None
+                or use.placement != "root_entry"
+                or any(len(keys) != 1 for keys in use.required_keys_by_task)
             ):
                 continue
             uses.append(
@@ -1556,21 +1545,6 @@ def _compress_task_to_key(
     return tuple(repeated)
 
 
-def _task_coordinates(
-    task: int,
-    family: InstantiatedTaskFamily,
-) -> dict[int, int]:
-    coordinates: dict[int, int] = {}
-    remainder = task
-    for block_id in family.logical_axis_order:
-        count = family.axis_counts[block_id]
-        coordinates[block_id] = remainder % count
-        remainder //= count
-    if remainder:
-        raise AssertionError("task exceeds its logical coordinate domain")
-    return coordinates
-
-
 def instantiate_event_graph(
     dependency_graph: TileDependencyGraph,
     task_families: tuple[InstantiatedTaskFamily, ...],
@@ -1638,7 +1612,7 @@ def instantiate_event_graph(
             for consumer_task in range(consumer.task_count):
                 predecessors = predecessor_task_ids(
                     predecessor_map,
-                    consumer_coordinates=_task_coordinates(consumer_task, consumer),
+                    consumer_coordinates=consumer.task_coordinates(consumer_task),
                     block_sizes={**producer.block_sizes, **consumer.block_sizes},
                     producer_axis_order=producer.logical_axis_order,
                     producer_axis_counts=producer.axis_counts,
@@ -1750,6 +1724,217 @@ def instantiate_event_graph(
         )
 
     return InstantiatedEventGraph(task_families=task_families, events=tuple(result))
+
+
+def add_ordered_action_events(
+    event_graph: InstantiatedEventGraph,
+    dependency_graph: TileDependencyGraph,
+    *,
+    axis_geometry: dict[int, tuple[int, int]],
+) -> InstantiatedEventGraph:
+    """Add exact nested consumer actions to the configured keyed-event DAG.
+
+    This pass is a predecessor-signature quotient over allocation-derived
+    action relations. It has no knowledge of FFN, attention, reductions, or
+    operation kinds. Nested producer publication is enabled separately once
+    its completion point can be emitted safely; until then, only root-scope
+    producers contribute to these additional events.
+    """
+    action_domains = instantiate_action_domains(
+        dependency_graph,
+        task_families=event_graph.task_families,
+        axis_geometry=axis_geometry,
+    )
+    domain_by_scope = {domain.scope_id: domain for domain in action_domains}
+    scope_by_id = {scope.scope_id: scope for scope in dependency_graph.execution_scopes}
+    relations = instantiate_action_relations(
+        dependency_graph,
+        task_families=event_graph.task_families,
+        axis_geometry=axis_geometry,
+    )
+    relations_by_key: dict[
+        tuple[TileDependencyKind, int, int, int, int],
+        list[tuple[frozenset[int], ...]],
+    ] = {}
+    for relation in relations:
+        relations_by_key.setdefault(
+            (
+                relation.kind,
+                relation.producer_access_id,
+                relation.consumer_access_id,
+                relation.producer_scope_id,
+                relation.consumer_scope_id,
+            ),
+            [],
+        ).append(relation.predecessors_by_consumer_action)
+
+    events = list(event_graph.events)
+    for consumer_scope in dependency_graph.execution_scopes:
+        if consumer_scope.is_root or not consumer_scope.segmentable:
+            continue
+        consumer_domain = domain_by_scope.get(consumer_scope.scope_id)
+        if consumer_domain is None:
+            continue
+
+        matching_dependencies: list[
+            tuple[
+                TileDependencyKind,
+                int,
+                int,
+                int,
+                tuple[frozenset[int], ...],
+            ]
+        ] = []
+        complete = True
+        for edge in dependency_graph.edges:
+            for access_dependency in edge.access_dependencies:
+                consumer_scopes = dependency_graph.scope_ids_by_access[
+                    access_dependency.consumer_access_id
+                ]
+                if consumer_scope.scope_id not in consumer_scopes:
+                    continue
+                producer_scopes = dependency_graph.scope_ids_by_access[
+                    access_dependency.producer_access_id
+                ]
+                if not producer_scopes:
+                    complete = False
+                    break
+                for producer_scope_id in producer_scopes:
+                    producer_scope = scope_by_id[producer_scope_id]
+                    producer_domain = domain_by_scope.get(producer_scope_id)
+                    relation_key = (
+                        access_dependency.kind,
+                        access_dependency.producer_access_id,
+                        access_dependency.consumer_access_id,
+                        producer_scope_id,
+                        consumer_scope.scope_id,
+                    )
+                    proved_relations = relations_by_key.get(relation_key)
+                    if (
+                        not producer_scope.is_root
+                        or producer_domain is None
+                        or not proved_relations
+                    ):
+                        complete = False
+                        break
+                    matching_dependencies.extend(
+                        (
+                            access_dependency.kind,
+                            access_dependency.producer_access_id,
+                            access_dependency.consumer_access_id,
+                            producer_scope_id,
+                            predecessor_sets,
+                        )
+                        for predecessor_sets in proved_relations
+                    )
+                if not complete:
+                    break
+            if not complete:
+                break
+        if not complete or not matching_dependencies:
+            continue
+
+        signatures: list[frozenset[tuple[int, int]]] = []
+        for consumer_action in range(consumer_domain.action_count):
+            predecessors: set[tuple[int, int]] = set()
+            for (
+                _kind,
+                _producer_access_id,
+                _consumer_access_id,
+                producer_scope_id,
+                predecessor_sets,
+            ) in matching_dependencies:
+                producer_domain = domain_by_scope[producer_scope_id]
+                predecessors.update(
+                    (producer_domain.root, producer_domain.strand_task(action))
+                    for action in predecessor_sets[consumer_action]
+                )
+            signatures.append(frozenset(predecessors))
+
+        key_by_signature: dict[frozenset[tuple[int, int]], int] = {}
+        ordered_signatures: list[frozenset[tuple[int, int]]] = []
+        key_by_action: list[int | None] = []
+        for signature in signatures:
+            if not signature:
+                key_by_action.append(None)
+                continue
+            key = key_by_signature.setdefault(signature, len(key_by_signature))
+            key_by_action.append(key)
+            if key == len(ordered_signatures):
+                ordered_signatures.append(signature)
+        if not ordered_signatures:
+            continue
+
+        contribution_keys: dict[int, list[set[int]]] = {}
+        for key, signature in enumerate(ordered_signatures):
+            for producer_root, producer_task in signature:
+                keys_by_task = contribution_keys.setdefault(
+                    producer_root,
+                    [
+                        set()
+                        for _ in range(
+                            event_graph.task_families[producer_root].task_count
+                        )
+                    ],
+                )
+                keys_by_task[producer_task].add(key)
+        source_access_ids = {
+            access_id
+            for (
+                _kind,
+                _producer_access_id,
+                access_id,
+                _producer_scope_id,
+                _predecessor_sets,
+            ) in matching_dependencies
+        }
+        source_event_ids = tuple(
+            sorted(
+                {
+                    wait.event_id
+                    for wait in dependency_graph.waits
+                    if wait.consumer_root == consumer_scope.root
+                    and wait.consumer_access_id in source_access_ids
+                }
+            )
+        )
+        events.append(
+            InstantiatedKeyedEvent(
+                event_id=len(events),
+                source_event_ids=source_event_ids,
+                key_count=len(ordered_signatures),
+                contributions=tuple(
+                    InstantiatedEventContribution(
+                        producer_root=producer_root,
+                        keys_by_task=tuple(
+                            frozenset(keys) for keys in contribution_keys[producer_root]
+                        ),
+                    )
+                    for producer_root in sorted(contribution_keys)
+                ),
+                uses=(
+                    InstantiatedEventUse(
+                        consumer_root=consumer_scope.root,
+                        consumer_access_id=(
+                            next(iter(source_access_ids))
+                            if len(source_access_ids) == 1
+                            else None
+                        ),
+                        placement="access",
+                        required_keys_by_task=tuple(
+                            frozenset(()) if key is None else frozenset((key,))
+                            for key in key_by_action
+                        ),
+                        consumer_scope_id=consumer_scope.scope_id,
+                    ),
+                ),
+            )
+        )
+    return dataclasses.replace(
+        event_graph,
+        events=tuple(events),
+        action_domains=action_domains,
+    )
 
 
 def canonicalize_ready_events(
@@ -1934,7 +2119,7 @@ def canonicalize_task_readiness(
         ]
         valid = True
         for edge in incoming_edges:
-            predecessor_sets = _edge_predecessor_sets(
+            predecessor_sets = dependency_predecessor_sets(
                 edge,
                 task_families=event_graph.task_families,
                 access_by_id=access_by_id,
@@ -2037,6 +2222,8 @@ def derive_local_triggers(
     ] = {}
     for event in event_graph.events:
         for use_index, use in enumerate(event.uses):
+            if use.consumer_scope_id is not None:
+                continue
             for consumer_task, keys in enumerate(use.required_keys_by_task):
                 if keys:
                     prerequisite_uses_by_task.setdefault(
@@ -2071,7 +2258,7 @@ def derive_local_triggers(
             continue
         use_index = 0
         use = event.uses[use_index]
-        if use.placement != "root_entry":
+        if use.consumer_scope_id is not None or use.placement != "root_entry":
             continue
         if not event.key_count or any(not count for count in event.expected_arrivals):
             continue
@@ -2363,7 +2550,19 @@ def validate_worker_schedule(
     for event in event_graph.events:
         contributors_by_key = event.contributor_tasks_by_key
         for use in event.uses:
-            for consumer_task, required_keys in enumerate(use.required_keys_by_task):
+            consumer_tasks = (
+                range(len(use.required_keys_by_task))
+                if use.consumer_scope_id is None
+                else (
+                    event_graph.action_domain(use.consumer_scope_id).strand_task(action)
+                    for action in range(len(use.required_keys_by_task))
+                )
+            )
+            for consumer_task, required_keys in zip(
+                consumer_tasks,
+                use.required_keys_by_task,
+                strict=True,
+            ):
                 consumer = (use.consumer_root, consumer_task)
                 if consumer in local_predecessors:
                     continue
@@ -2396,125 +2595,10 @@ def validate_worker_schedule(
         )
 
 
-def _edge_predecessor_sets(
-    edge: TileDependency,
-    *,
-    task_families: tuple[InstantiatedTaskFamily, ...],
-    access_by_id: dict[int, TileAccess],
-) -> tuple[frozenset[int], ...] | None:
-    """Evaluate conservative task overlap with an interval sweep.
-
-    The prior implementation compared every producer task with every consumer
-    task and needed an arbitrary work cutoff.  Allocation-address intervals
-    provide a complete candidate index: sorting them makes planning cost
-    proportional to the task domains plus the overlaps the relation actually
-    contains.  Unknown intervals are not guessed; they retain root completion.
-    """
-    producer = task_families[edge.producer_root]
-    consumer = task_families[edge.consumer_root]
-    region_cache: dict[tuple[int, int], AllocationRegion] = {}
-
-    def task_region(
-        access_id: int,
-        task: int,
-        family: InstantiatedTaskFamily,
-    ) -> AllocationRegion:
-        key = (access_id, task)
-        if key not in region_cache:
-            access = access_by_id[access_id]
-            region_cache[key] = access_task_region(
-                access,
-                task_coordinates=_task_coordinates(task, family),
-                block_sizes=family.block_sizes,
-            )
-        return region_cache[key]
-
-    def indexed_regions(
-        access_id: int,
-        family: InstantiatedTaskFamily,
-        task_count: int,
-        dependency_region: AllocationRegion,
-    ) -> list[tuple[int, int, int, AllocationRegion]] | None:
-        result: list[tuple[int, int, int, AllocationRegion]] = []
-        for task in range(task_count):
-            region = task_region(access_id, task, family)
-            interval = region.address_interval
-            if interval is None:
-                return None
-            if interval[0] < interval[1] and allocation_regions_may_overlap(
-                region, dependency_region
-            ):
-                result.append((interval[0], interval[1], task, region))
-        result.sort(key=itemgetter(0, 1, 2))
-        return result
-
-    predecessors = [set() for _ in range(consumer.task_count)]
-    for dependency in edge.access_dependencies:
-        producer_regions = indexed_regions(
-            dependency.producer_access_id,
-            producer,
-            producer.task_count,
-            dependency.region,
-        )
-        consumer_regions = indexed_regions(
-            dependency.consumer_access_id,
-            consumer,
-            consumer.task_count,
-            dependency.region,
-        )
-        if producer_regions is None or consumer_regions is None:
-            return None
-
-        # Regions are half-open, so ends precede starts at the same address.
-        # Producer starts precede consumer starts so equal-start pairs are
-        # emitted exactly once.
-        producer_end = 0
-        consumer_end = 1
-        producer_start = 2
-        consumer_start = 3
-        sweep_events: list[tuple[int, int, int, AllocationRegion]] = []
-        for begin, end, task, region in producer_regions:
-            sweep_events.extend(
-                (
-                    (begin, producer_start, task, region),
-                    (end, producer_end, task, region),
-                )
-            )
-        for begin, end, task, region in consumer_regions:
-            sweep_events.extend(
-                (
-                    (begin, consumer_start, task, region),
-                    (end, consumer_end, task, region),
-                )
-            )
-        sweep_events.sort(key=itemgetter(0, 1, 2))
-
-        active_producers: dict[int, AllocationRegion] = {}
-        active_consumers: dict[int, AllocationRegion] = {}
-        for _, event_kind, task, region in sweep_events:
-            if event_kind == producer_end:
-                active_producers.pop(task)
-            elif event_kind == consumer_end:
-                active_consumers.pop(task)
-            elif event_kind == producer_start:
-                for consumer_task, consumer_region in active_consumers.items():
-                    if allocation_regions_may_overlap(region, consumer_region):
-                        predecessors[consumer_task].add(task)
-                active_producers[task] = region
-            else:
-                for producer_task, producer_region in active_producers.items():
-                    if allocation_regions_may_overlap(producer_region, region):
-                        predecessors[task].add(producer_task)
-                active_consumers[task] = region
-    return tuple(frozenset(tasks) for tasks in predecessors)
-
-
 def build_cross_loop_schedule(
     *,
     dependency_plan: TileDependencyGraph,
     task_families: tuple[InstantiatedTaskFamily, ...],
-    available_access_ids_by_root: tuple[frozenset[int], ...],
-    access_program_points: dict[int, AccessProgramPoint],
     axis_geometry: dict[int, tuple[int, int]],
     excluded_roots: frozenset[int],
     preordered_edges: frozenset[tuple[int, int]],
@@ -2528,6 +2612,11 @@ def build_cross_loop_schedule(
             dependency_plan,
         )
     )
+    event_graph = add_ordered_action_events(
+        event_graph,
+        dependency_plan,
+        axis_geometry=axis_geometry,
+    )
     worker_limit = resolve_worker_count(
         event_graph,
         default_worker_count=physical_worker_limit,
@@ -2536,46 +2625,16 @@ def build_cross_loop_schedule(
     candidate_task_pairs, waits_by_root = _select_available_waits(
         dependency_plan=dependency_plan,
         task_families=task_families,
-        available_access_ids_by_root=available_access_ids_by_root,
-        access_program_points=access_program_points,
-        axis_geometry=axis_geometry,
         excluded_roots=excluded_roots,
     )
-    access_cohorts = _derive_access_cohorts(
-        dependency_plan=dependency_plan,
-        waits_by_root=waits_by_root,
-        task_families=task_families,
-        axis_geometry=axis_geometry,
-        access_program_points=access_program_points,
-    )
-    cohort_pairs = {(plan.producer_root, plan.consumer_root) for plan in access_cohorts}
-    waits_by_pair: dict[tuple[int, int], list[EventUse]] = {}
-    for consumer_root, waits in waits_by_root.items():
-        for wait in waits:
-            producer_root = dependency_plan.event(wait.event_id).producer_root
-            waits_by_pair.setdefault((producer_root, consumer_root), []).append(wait)
-    access_fallback_pairs = {
-        pair
-        for pair, waits in waits_by_pair.items()
-        if pair not in cohort_pairs
-        and waits
-        and all(wait.placement == "access" for wait in waits)
+    action_capable_pairs = {
+        (contribution.producer_root, use.consumer_root)
+        for event in event_graph.events
+        for contribution in event.contributions
+        for use in event.uses
+        if use.consumer_scope_id is not None
     }
-    if access_fallback_pairs:
-        candidate_task_pairs = frozenset(candidate_task_pairs - access_fallback_pairs)
-        waits_by_root = {
-            root: tuple(
-                wait
-                for wait in waits
-                if (
-                    dependency_plan.event(wait.event_id).producer_root,
-                    root,
-                )
-                not in access_fallback_pairs
-            )
-            for root, waits in waits_by_root.items()
-        }
-        waits_by_root = {root: waits for root, waits in waits_by_root.items() if waits}
+    candidate_task_pairs = frozenset(candidate_task_pairs | action_capable_pairs)
     waits_by_root = {
         root: tuple(
             wait
@@ -2589,35 +2648,11 @@ def build_cross_loop_schedule(
         for root, waits in waits_by_root.items()
     }
     waits_by_root = {root: waits for root, waits in waits_by_root.items() if waits}
-    access_cohorts = tuple(
-        plan
-        for plan in access_cohorts
-        if (plan.producer_root, plan.consumer_root) in candidate_task_pairs
-    )
-    coarsened_access_waits = {
-        (plan.consumer_root, plan.event_id, access_id)
-        for plan in access_cohorts
-        for access_id in plan.access_ids
-    }
-    retained_waits = {
-        root: tuple(
-            wait
-            for wait in waits
-            if (
-                root,
-                wait.event_id,
-                wait.consumer_access_id,
-            )
-            not in coarsened_access_waits
-        )
-        for root, waits in waits_by_root.items()
-    }
-    retained_waits = {root: waits for root, waits in retained_waits.items() if waits}
+    retained_waits = waits_by_root
     try:
-        worker_schedule, local_triggers, access_cohorts = build_worker_schedule(
+        worker_schedule, local_triggers, ordered_action_events = build_worker_schedule(
             event_graph,
             task_families,
-            access_cohorts,
             worker_count=worker_limit,
         )
     except ValueError as error:
@@ -2626,13 +2661,17 @@ def build_cross_loop_schedule(
             "admit a progress-safe worker schedule"
         ) from error
 
-    counted_events = choose_counted_events(
-        event_graph,
-        local_triggers,
-        dependency_plan,
-        excluded_direct_roots=frozenset(
-            cohort.consumer_root for cohort in access_cohorts
+    ordered_action_roots = frozenset(
+        use.consumer_root for plan in ordered_action_events for use in plan.uses
+    )
+    counted_events = (
+        *choose_counted_events(
+            event_graph,
+            local_triggers,
+            dependency_plan,
+            excluded_direct_roots=ordered_action_roots,
         ),
+        *ordered_action_events,
     )
     selected_task_pairs = {
         (contributor.producer_root, use.consumer_root)
@@ -2653,21 +2692,12 @@ def build_cross_loop_schedule(
         for root, waits in retained_waits.items()
     }
     retained_waits = {root: waits for root, waits in retained_waits.items() if waits}
-    access_cohorts = tuple(
-        cohort
-        for cohort in access_cohorts
-        if (cohort.producer_root, cohort.consumer_root) not in selected_task_pairs
-    )
     retained_wait_pairs = {
         (dependency_plan.event(wait.event_id).producer_root, consumer_root)
         for consumer_root, waits in retained_waits.items()
         for wait in waits
     }
-    lowered_task_pairs = frozenset(
-        selected_task_pairs
-        | retained_wait_pairs
-        | {(cohort.producer_root, cohort.consumer_root) for cohort in access_cohorts}
-    )
+    lowered_task_pairs = frozenset(selected_task_pairs | retained_wait_pairs)
     # Recompute coverage from the mechanisms that will actually be emitted.
     # Dependency analysis may prove a finer relation than the selected emitter
     # can materialize. Such a relation must monotonically coarsen to root
@@ -2724,7 +2754,6 @@ def build_cross_loop_schedule(
         local_triggers=local_triggers,
         task_ready_edges=task_ready_edges,
         task_waits_by_root=retained_waits,
-        access_cohorts=access_cohorts,
         counted_events=counted_events,
         worker_limit=worker_limit,
     )
@@ -2798,9 +2827,6 @@ def _select_available_waits(
     *,
     dependency_plan: TileDependencyGraph,
     task_families: tuple[InstantiatedTaskFamily, ...],
-    available_access_ids_by_root: tuple[frozenset[int], ...],
-    access_program_points: dict[int, AccessProgramPoint],
-    axis_geometry: dict[int, tuple[int, int]],
     excluded_roots: frozenset[int],
 ) -> tuple[
     frozenset[tuple[int, int]],
@@ -2825,10 +2851,13 @@ def _select_available_waits(
         producer = task_families[producer_root]
         consumer = task_families[consumer_root]
         pair_waits = waits_by_pair.get(pair, ())
-        task_waits = tuple(
+        all_task_waits = tuple(
             wait
             for wait in pair_waits
             if dependency_plan.event(wait.event_id).granularity == "task"
+        )
+        task_waits = tuple(
+            wait for wait in all_task_waits if wait.placement == "root_entry"
         )
         declared_root_waits = tuple(
             wait
@@ -2844,6 +2873,7 @@ def _select_available_waits(
             and producer.task_count > 1
             and consumer.task_count > 0
             and bool(task_waits)
+            and len(task_waits) == len(all_task_waits)
         )
         producer_axes = set(producer.logical_axis_order)
         consumer_axes = set(consumer.logical_axis_order)
@@ -2859,23 +2889,7 @@ def _select_available_waits(
             required_consumer_axes = {
                 axis.consumer_block_id for axis in predecessor_map.axes
             }
-            if wait.placement == "root_entry":
-                if not required_consumer_axes <= consumer_axes:
-                    can_use_tasks = False
-                    break
-                continue
-            access_id = wait.consumer_access_id
-            program_point = (
-                access_program_points.get(access_id) if access_id is not None else None
-            )
-            coordinates = program_point.coordinates if program_point else None
-            if (
-                access_id is None
-                or access_id not in available_access_ids_by_root[consumer_root]
-                or coordinates is None
-                or not required_consumer_axes <= coordinates.keys()
-                or any(axis not in axis_geometry for axis in required_consumer_axes)
-            ):
+            if not required_consumer_axes <= consumer_axes:
                 can_use_tasks = False
                 break
 
@@ -2887,7 +2901,7 @@ def _select_available_waits(
             (
                 wait.event_id,
                 wait.predecessor_map.axes,
-                wait.consumer_access_id if wait.placement == "access" else None,
+                None,
             )
             for wait in selected_waits
             if wait.predecessor_map is not None
@@ -2897,7 +2911,7 @@ def _select_available_waits(
             key = (
                 wait.event_id,
                 wait.predecessor_map.axes,
-                wait.consumer_access_id if wait.placement == "access" else None,
+                None,
             )
             if key not in existing:
                 selected_waits.append(wait)
@@ -2909,172 +2923,4 @@ def _select_available_waits(
     return (
         frozenset(fully_task_ready_pairs),
         {root: tuple(waits) for root, waits in waits_by_root.items()},
-    )
-
-
-def _derive_access_cohorts(
-    *,
-    dependency_plan: TileDependencyGraph,
-    waits_by_root: dict[int, tuple[EventUse, ...]],
-    task_families: tuple[InstantiatedTaskFamily, ...],
-    axis_geometry: dict[int, tuple[int, int]],
-    access_program_points: dict[int, AccessProgramPoint],
-) -> tuple[AccessCohortPlan, ...]:
-    result: list[AccessCohortPlan] = []
-    for consumer_root, waits in waits_by_root.items():
-        waits_by_event: dict[int, list[EventUse]] = {}
-        for wait in waits:
-            if wait.placement == "access":
-                waits_by_event.setdefault(wait.event_id, []).append(wait)
-        for event_id, event_waits in waits_by_event.items():
-            predecessor_maps = [
-                wait.predecessor_map
-                for wait in event_waits
-                if wait.predecessor_map is not None
-            ]
-            if len(predecessor_maps) != len(event_waits):
-                continue
-            axes = predecessor_maps[0].axes
-            axis_pairs = tuple(
-                (axis.producer_block_id, axis.consumer_block_id) for axis in axes
-            )
-            if any(
-                tuple(
-                    (axis.producer_block_id, axis.consumer_block_id)
-                    for axis in mapping.axes
-                )
-                != axis_pairs
-                for mapping in predecessor_maps[1:]
-            ):
-                continue
-
-            producer_root = dependency_plan.event(event_id).producer_root
-            producer = task_families[producer_root]
-            consumer = task_families[consumer_root]
-            producer_counts = producer.axis_counts
-            producer_blocks = producer.block_sizes
-            consumer_counts = consumer.axis_counts
-            axes_by_producer = {axis.producer_block_id: axis for axis in axes}
-            if len(axes_by_producer) != len(axes) or set(axes_by_producer) != set(
-                producer.logical_axis_order
-            ):
-                continue
-
-            nested_axes = [
-                axis for axis in axes if axis.consumer_block_id not in consumer_counts
-            ]
-            if len(nested_axes) != 1:
-                continue
-            stream_axis = nested_axes[0]
-            valid = True
-            stream_task_granularity: int | None = None
-            for predecessor_map in predecessor_maps:
-                seen_consumer_axes: set[int] = set()
-                for axis in predecessor_map.axes:
-                    consumer_geometry = axis_geometry.get(axis.consumer_block_id)
-                    if consumer_geometry is None:
-                        valid = False
-                        break
-                    consumer_count, consumer_block = consumer_geometry
-                    producer_block = producer_blocks[axis.producer_block_id]
-                    producer_width = 1 if axis.producer_is_scalar else producer_block
-                    consumer_width = 1 if axis.consumer_is_scalar else consumer_block
-                    if axis.consumer_block_id in seen_consumer_axes or (
-                        axis.producer_offset != axis.consumer_offset
-                    ):
-                        valid = False
-                        break
-                    is_stream_axis = (
-                        axis.producer_block_id == stream_axis.producer_block_id
-                        and axis.consumer_block_id == stream_axis.consumer_block_id
-                    )
-                    if not is_stream_axis:
-                        if (
-                            producer_counts[axis.producer_block_id] != consumer_count
-                            or producer_width != consumer_width
-                        ):
-                            valid = False
-                            break
-                        seen_consumer_axes.add(axis.consumer_block_id)
-                        continue
-                    if axis.producer_is_scalar or axis.consumer_is_scalar:
-                        if (
-                            axis.producer_is_scalar != axis.consumer_is_scalar
-                            or producer_counts[axis.producer_block_id] != consumer_count
-                            or producer_width != consumer_width
-                        ):
-                            valid = False
-                            break
-                        ratio = 1
-                    else:
-                        if consumer_width % producer_width:
-                            valid = False
-                            break
-                        ratio = consumer_width // producer_width
-                        if producer_counts[axis.producer_block_id] != (
-                            consumer_count * ratio
-                        ):
-                            valid = False
-                            break
-                    if (
-                        stream_task_granularity is not None
-                        and stream_task_granularity != ratio
-                    ):
-                        valid = False
-                        break
-                    stream_task_granularity = ratio
-                    seen_consumer_axes.add(axis.consumer_block_id)
-                if not valid:
-                    break
-            if not valid or stream_task_granularity is None:
-                continue
-
-            stream_count = producer_counts[stream_axis.producer_block_id]
-            if stream_count <= 1:
-                continue
-            access_ids = tuple(
-                wait.consumer_access_id
-                for wait in event_waits
-                if wait.consumer_access_id is not None
-            )
-            if len(access_ids) != len(event_waits):
-                continue
-            program_points = tuple(
-                access_program_points[access_id]
-                for access_id in access_ids
-                if access_id in access_program_points
-            )
-            loop_ids = {point.loop_id for point in program_points}
-            if (
-                len(program_points) != len(access_ids)
-                or None in loop_ids
-                or len(loop_ids) != 1
-                or any(point.coordinates is None for point in program_points)
-            ):
-                continue
-            result.append(
-                AccessCohortPlan(
-                    event_id=event_id,
-                    producer_root=producer_root,
-                    consumer_root=consumer_root,
-                    axes=axes,
-                    access_ids=access_ids,
-                    producer_stream_axis=stream_axis.producer_block_id,
-                    stream_count=stream_count,
-                    stream_task_granularity=stream_task_granularity,
-                    stage_sizes=(stream_count,),
-                    outer_producer_axes=tuple(
-                        block_id
-                        for block_id in producer.logical_axis_order
-                        if block_id != stream_axis.producer_block_id
-                    ),
-                )
-            )
-    plan_count_by_consumer: dict[int, int] = {}
-    for plan in result:
-        plan_count_by_consumer[plan.consumer_root] = (
-            plan_count_by_consumer.get(plan.consumer_root, 0) + 1
-        )
-    return tuple(
-        plan for plan in result if plan_count_by_consumer[plan.consumer_root] == 1
     )

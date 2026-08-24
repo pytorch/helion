@@ -1,21 +1,23 @@
 from __future__ import annotations
 
-import ast
 import dataclasses
 import enum
 import itertools
 import math
+from operator import itemgetter
 from typing import TYPE_CHECKING
 from typing import Literal
 
 import sympy
 
 if TYPE_CHECKING:
+    import ast
+
     from .device_ir import DeviceIR
 
 
-TILE_ACCESS_ID_META = "_cross_loop_access_id"
 TILE_ACTION_SCOPE_IDS_META = "_tile_dependency_action_scope_ids"
+TILE_ACTION_SCOPE_ID_ATTR = "_tile_dependency_action_scope_id"
 
 
 class TileDependencyKind(enum.Enum):
@@ -26,19 +28,10 @@ class TileDependencyKind(enum.Enum):
     WRITE_AFTER_WRITE = "write_after_write"
 
 
-def tile_access_marker(access_id: int) -> ast.stmt:
-    """Return a tagged inert program point immediately before a consumer load."""
-    from .ast_extension import create
-
-    marker = create(ast.Expr, value=create(ast.Constant, value=None))
-    setattr(marker, TILE_ACCESS_ID_META, access_id)
-    return marker
-
-
-def tile_access_marker_id(statement: ast.AST) -> int | None:
-    """Return the access attached to an explicit compiler program point."""
-    access_id = getattr(statement, TILE_ACCESS_ID_META, None)
-    return access_id if isinstance(access_id, int) else None
+def tile_action_scope_id(node: ast.AST) -> int | None:
+    """Return the stable DeviceIR execution scope attached to a lowered loop."""
+    scope_id = getattr(node, TILE_ACTION_SCOPE_ID_ATTR, None)
+    return scope_id if isinstance(scope_id, int) else None
 
 
 def owner_root_by_graph_id(device_ir: DeviceIR) -> tuple[int, ...]:
@@ -80,6 +73,54 @@ class TaskFamily:
 
 
 @dataclasses.dataclass(frozen=True)
+class InstantiatedTaskFamily:
+    """A logical task family instantiated for one kernel configuration."""
+
+    logical_axis_order: tuple[int, ...]
+    physical_axis_order: tuple[int, ...]
+    axis_counts_items: tuple[tuple[int, int], ...]
+    block_sizes_items: tuple[tuple[int, int], ...]
+    logical_task_by_physical_task: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        task_order = self.logical_task_by_physical_task
+        if task_order is not None and (
+            len(task_order) != self.task_count
+            or set(task_order) != set(range(self.task_count))
+        ):
+            raise ValueError("physical traversal must permute the logical task domain")
+
+    @property
+    def axis_counts(self) -> dict[int, int]:
+        return dict(self.axis_counts_items)
+
+    @property
+    def block_sizes(self) -> dict[int, int]:
+        return dict(self.block_sizes_items)
+
+    @property
+    def task_count(self) -> int:
+        return math.prod(count for _, count in self.axis_counts_items)
+
+    @property
+    def physical_traversal(self) -> tuple[int, ...]:
+        task_order = self.logical_task_by_physical_task
+        return task_order if task_order is not None else tuple(range(self.task_count))
+
+    def task_coordinates(self, task: int) -> dict[int, int]:
+        """Decode one logical task ID using the authoritative axis order."""
+        coordinates: dict[int, int] = {}
+        remainder = task
+        for block_id in self.logical_axis_order:
+            count = self.axis_counts[block_id]
+            coordinates[block_id] = remainder % count
+            remainder //= count
+        if remainder:
+            raise AssertionError("task exceeds its logical coordinate domain")
+        return coordinates
+
+
+@dataclasses.dataclass(frozen=True)
 class ExecutionScope:
     """One reachable DeviceIR callsite in an outer task's execution strand.
 
@@ -104,6 +145,86 @@ class ExecutionScope:
     @property
     def is_root(self) -> bool:
         return self.kind == "root"
+
+
+@dataclasses.dataclass(frozen=True)
+class InstantiatedActionDomain:
+    """One configured ordered-action domain inside an outer task strand."""
+
+    scope_id: int
+    root: int
+    strand_axis_order: tuple[int, ...]
+    logical_axis_order: tuple[int, ...]
+    axis_counts_items: tuple[tuple[int, int], ...]
+    block_sizes_items: tuple[tuple[int, int], ...]
+
+    def __post_init__(self) -> None:
+        if self.logical_axis_order[: len(self.strand_axis_order)] != (
+            self.strand_axis_order
+        ):
+            raise ValueError("action axes must begin with their task-strand axes")
+        if len(set(self.logical_axis_order)) != len(self.logical_axis_order):
+            raise ValueError("action axes must be unique")
+        if tuple(axis for axis, _ in self.axis_counts_items) != (
+            self.logical_axis_order
+        ) or tuple(axis for axis, _ in self.block_sizes_items) != (
+            self.logical_axis_order
+        ):
+            raise ValueError("action geometry must follow logical axis order")
+        if any(count <= 0 for _, count in self.axis_counts_items):
+            raise ValueError("action axis counts must be positive")
+        if any(size <= 0 for _, size in self.block_sizes_items):
+            raise ValueError("action block sizes must be positive")
+
+    @property
+    def axis_counts(self) -> dict[int, int]:
+        return dict(self.axis_counts_items)
+
+    @property
+    def block_sizes(self) -> dict[int, int]:
+        return dict(self.block_sizes_items)
+
+    @property
+    def nested_axis_order(self) -> tuple[int, ...]:
+        return self.logical_axis_order[len(self.strand_axis_order) :]
+
+    @property
+    def strand_count(self) -> int:
+        counts = self.axis_counts
+        return math.prod(counts[axis] for axis in self.strand_axis_order)
+
+    @property
+    def actions_per_strand(self) -> int:
+        counts = self.axis_counts
+        return math.prod(counts[axis] for axis in self.nested_axis_order)
+
+    @property
+    def action_count(self) -> int:
+        return self.strand_count * self.actions_per_strand
+
+    def action_coordinates(self, action: int) -> dict[int, int]:
+        """Decode a strand-major action ID into complete logical coordinates."""
+        if not 0 <= action < self.action_count:
+            raise IndexError(action)
+        coordinates: dict[int, int] = {}
+        counts = self.axis_counts
+        strand_task, local_action = divmod(action, self.actions_per_strand)
+        for axis in self.strand_axis_order:
+            count = counts[axis]
+            coordinates[axis] = strand_task % count
+            strand_task //= count
+        for axis in self.nested_axis_order:
+            count = counts[axis]
+            coordinates[axis] = local_action % count
+            local_action //= count
+        if strand_task or local_action:
+            raise AssertionError("action exceeds its logical coordinate domain")
+        return coordinates
+
+    def strand_task(self, action: int) -> int:
+        if not 0 <= action < self.action_count:
+            raise IndexError(action)
+        return action // self.actions_per_strand
 
 
 def build_execution_scopes(device_ir: DeviceIR) -> tuple[ExecutionScope, ...]:
@@ -300,6 +421,18 @@ class AccessDependency:
     producer_access_id: int
     consumer_access_id: int
     region: AllocationRegion
+
+
+@dataclasses.dataclass(frozen=True)
+class ActionDependencyRelation:
+    """Exact overlap from one producer action domain to one consumer domain."""
+
+    kind: TileDependencyKind
+    producer_access_id: int
+    consumer_access_id: int
+    producer_scope_id: int
+    consumer_scope_id: int
+    predecessors_by_consumer_action: tuple[frozenset[int], ...]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1019,6 +1152,245 @@ def access_task_region(
         tuple(bounds),
         tuple(exact_dimensions),
     )
+
+
+_ConfiguredDomain = InstantiatedTaskFamily | InstantiatedActionDomain
+
+
+def _domain_task_count(domain: _ConfiguredDomain) -> int:
+    return (
+        domain.task_count
+        if isinstance(domain, InstantiatedTaskFamily)
+        else domain.action_count
+    )
+
+
+def _domain_coordinates(
+    domain: _ConfiguredDomain,
+    task: int,
+) -> dict[int, int]:
+    return (
+        domain.task_coordinates(task)
+        if isinstance(domain, InstantiatedTaskFamily)
+        else domain.action_coordinates(task)
+    )
+
+
+def _access_predecessor_sets(
+    *,
+    producer_access: TileAccess,
+    producer_domain: _ConfiguredDomain,
+    consumer_access: TileAccess,
+    consumer_domain: _ConfiguredDomain,
+    dependency_region: AllocationRegion,
+) -> tuple[frozenset[int], ...] | None:
+    """Evaluate exact overlap for one configured access pair."""
+
+    def indexed_regions(
+        access: TileAccess,
+        domain: _ConfiguredDomain,
+    ) -> list[tuple[int, int, int, AllocationRegion]] | None:
+        result: list[tuple[int, int, int, AllocationRegion]] = []
+        for task in range(_domain_task_count(domain)):
+            region = access_task_region(
+                access,
+                task_coordinates=_domain_coordinates(domain, task),
+                block_sizes=domain.block_sizes,
+            )
+            interval = region.address_interval
+            if interval is None:
+                return None
+            if interval[0] < interval[1] and allocation_regions_may_overlap(
+                region, dependency_region
+            ):
+                result.append((interval[0], interval[1], task, region))
+        result.sort(key=itemgetter(0, 1, 2))
+        return result
+
+    producer_regions = indexed_regions(producer_access, producer_domain)
+    consumer_regions = indexed_regions(consumer_access, consumer_domain)
+    if producer_regions is None or consumer_regions is None:
+        return None
+
+    predecessors = [set() for _ in range(_domain_task_count(consumer_domain))]
+    # Regions are half-open, so ends precede starts at the same address.
+    # Producer starts precede consumer starts so equal-start pairs are emitted
+    # exactly once.
+    producer_end = 0
+    consumer_end = 1
+    producer_start = 2
+    consumer_start = 3
+    sweep_events: list[tuple[int, int, int, AllocationRegion]] = []
+    for begin, end, task, region in producer_regions:
+        sweep_events.extend(
+            (
+                (begin, producer_start, task, region),
+                (end, producer_end, task, region),
+            )
+        )
+    for begin, end, task, region in consumer_regions:
+        sweep_events.extend(
+            (
+                (begin, consumer_start, task, region),
+                (end, consumer_end, task, region),
+            )
+        )
+    sweep_events.sort(key=itemgetter(0, 1, 2))
+
+    active_producers: dict[int, AllocationRegion] = {}
+    active_consumers: dict[int, AllocationRegion] = {}
+    for _, event_kind, task, region in sweep_events:
+        if event_kind == producer_end:
+            active_producers.pop(task)
+        elif event_kind == consumer_end:
+            active_consumers.pop(task)
+        elif event_kind == producer_start:
+            for consumer_task, consumer_region in active_consumers.items():
+                if allocation_regions_may_overlap(region, consumer_region):
+                    predecessors[consumer_task].add(task)
+            active_producers[task] = region
+        else:
+            for producer_task, producer_region in active_producers.items():
+                if allocation_regions_may_overlap(producer_region, region):
+                    predecessors[task].add(producer_task)
+            active_consumers[task] = region
+    return tuple(frozenset(tasks) for tasks in predecessors)
+
+
+def dependency_predecessor_sets(
+    dependency: TileDependency,
+    *,
+    task_families: tuple[InstantiatedTaskFamily, ...],
+    access_by_id: dict[int, TileAccess],
+) -> tuple[frozenset[int], ...] | None:
+    """Evaluate one configured root-task relation by allocation overlap."""
+    producer = task_families[dependency.producer_root]
+    consumer = task_families[dependency.consumer_root]
+    predecessors = [set() for _ in range(consumer.task_count)]
+    for access_dependency in dependency.access_dependencies:
+        relation = _access_predecessor_sets(
+            producer_access=access_by_id[access_dependency.producer_access_id],
+            producer_domain=producer,
+            consumer_access=access_by_id[access_dependency.consumer_access_id],
+            consumer_domain=consumer,
+            dependency_region=access_dependency.region,
+        )
+        if relation is None:
+            return None
+        for consumer_task, producer_tasks in enumerate(relation):
+            predecessors[consumer_task].update(producer_tasks)
+    return tuple(frozenset(tasks) for tasks in predecessors)
+
+
+def instantiate_action_domains(
+    dependency_graph: TileDependencyGraph,
+    *,
+    task_families: tuple[InstantiatedTaskFamily, ...],
+    axis_geometry: dict[int, tuple[int, int]],
+) -> tuple[InstantiatedActionDomain, ...]:
+    """Bind reachable DeviceIR scopes to one static logical configuration."""
+    if len(task_families) != len(dependency_graph.task_families):
+        raise ValueError("task family count disagrees with the dependency graph")
+
+    result: list[InstantiatedActionDomain] = []
+    for scope in dependency_graph.execution_scopes:
+        family = task_families[scope.root]
+        strand_axes = family.logical_axis_order
+        if scope.logical_axis_order[: len(strand_axes)] != strand_axes:
+            continue
+        family_counts = family.axis_counts
+        family_blocks = family.block_sizes
+        counts: list[tuple[int, int]] = []
+        blocks: list[tuple[int, int]] = []
+        valid = True
+        for axis in scope.logical_axis_order:
+            if axis in family_counts:
+                count = family_counts[axis]
+                block = family_blocks[axis]
+            elif (geometry := axis_geometry.get(axis)) is not None:
+                count, block = geometry
+            else:
+                valid = False
+                break
+            if count <= 0 or block <= 0:
+                valid = False
+                break
+            counts.append((axis, count))
+            blocks.append((axis, block))
+        if valid:
+            result.append(
+                InstantiatedActionDomain(
+                    scope_id=scope.scope_id,
+                    root=scope.root,
+                    strand_axis_order=strand_axes,
+                    logical_axis_order=scope.logical_axis_order,
+                    axis_counts_items=tuple(counts),
+                    block_sizes_items=tuple(blocks),
+                )
+            )
+    return tuple(result)
+
+
+def instantiate_action_relations(
+    dependency_graph: TileDependencyGraph,
+    *,
+    task_families: tuple[InstantiatedTaskFamily, ...],
+    axis_geometry: dict[int, tuple[int, int]],
+) -> tuple[ActionDependencyRelation, ...]:
+    """Prove direct access overlap between configured ordered-action domains.
+
+    Each returned relation names stable DeviceIR scopes. Missing relations are
+    deliberately not guessed: control-dependent, dynamic, or otherwise
+    uninstantiable accesses remain candidates for an enclosing action or
+    whole-family completion when the event graph is built.
+    """
+    domains = instantiate_action_domains(
+        dependency_graph,
+        task_families=task_families,
+        axis_geometry=axis_geometry,
+    )
+    domain_by_scope = {domain.scope_id: domain for domain in domains}
+    scope_by_id = {scope.scope_id: scope for scope in dependency_graph.execution_scopes}
+    access_by_id = {access.access_id: access for access in dependency_graph.accesses}
+    result: list[ActionDependencyRelation] = []
+    for dependency in dependency_graph.edges:
+        for access_dependency in dependency.access_dependencies:
+            producer_access = access_by_id[access_dependency.producer_access_id]
+            consumer_access = access_by_id[access_dependency.consumer_access_id]
+            for producer_scope_id in dependency_graph.scope_ids_by_access[
+                producer_access.access_id
+            ]:
+                producer_scope = scope_by_id[producer_scope_id]
+                producer_domain = domain_by_scope.get(producer_scope_id)
+                if not producer_scope.guaranteed or producer_domain is None:
+                    continue
+                for consumer_scope_id in dependency_graph.scope_ids_by_access[
+                    consumer_access.access_id
+                ]:
+                    consumer_scope = scope_by_id[consumer_scope_id]
+                    consumer_domain = domain_by_scope.get(consumer_scope_id)
+                    if not consumer_scope.guaranteed or consumer_domain is None:
+                        continue
+                    predecessors = _access_predecessor_sets(
+                        producer_access=producer_access,
+                        producer_domain=producer_domain,
+                        consumer_access=consumer_access,
+                        consumer_domain=consumer_domain,
+                        dependency_region=access_dependency.region,
+                    )
+                    if predecessors is None:
+                        continue
+                    result.append(
+                        ActionDependencyRelation(
+                            kind=access_dependency.kind,
+                            producer_access_id=producer_access.access_id,
+                            consumer_access_id=consumer_access.access_id,
+                            producer_scope_id=producer_scope_id,
+                            consumer_scope_id=consumer_scope_id,
+                            predecessors_by_consumer_action=predecessors,
+                        )
+                    )
+    return tuple(result)
 
 
 def _allocation_region_from_bounds(

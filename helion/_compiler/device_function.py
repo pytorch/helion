@@ -385,11 +385,6 @@ class DeviceFunction:
             tuple[str, tuple[str, ...], tuple[ast.stmt, ...], bool]
         ] = []
         self.triton_outlined_helper_constexprs: dict[str, int] = {}
-        # Task-coordinate expressions available at access-local cross-loop wait
-        # sites. ``None`` means the same access was emitted in incompatible
-        # coordinate scopes and must use root-completion scheduling.
-        self.cross_loop_access_coordinates: dict[int, dict[int, str] | None] = {}
-
         # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`
         self.pallas_tensor_dim_tilings: dict[int, list[DimensionTiling]] = {}
         # Track Pallas remote-copy operands by tensor and storage identity. The
