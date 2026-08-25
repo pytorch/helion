@@ -507,10 +507,44 @@ class TestPretunedCuteCodegen(TestCase):
         bf16_q = torch.empty((2, 32, 32768, 64), device="meta", dtype=torch.bfloat16)
         self.assertEqual(heuristic.key_attention(bf16_q, bf16_q, bf16_q), 2)
 
-    def test_attention_gb300_benchmark_uses_long_dense_configs(self) -> None:
+    def test_attention_long_causal_uses_one_cta_configs(self) -> None:
+        path = (
+            PRETUNED_KERNELS_DIR / "attention" / "_helion_aot_attention_cuda_sm103.py"
+        )
+        spec = importlib.util.spec_from_file_location("_causal_attention_aot", path)
+        assert spec is not None and spec.loader is not None
+        heuristic = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(heuristic)
+
+        for expected_index, seq_len in enumerate((65536, 131072, 262144, 524288)):
+            with self.subTest(seq_len=seq_len):
+                q = torch.empty(
+                    (2, 32, seq_len, 64), device="meta", dtype=torch.float16
+                )
+                self.assertEqual(
+                    heuristic.key_causal_attention(q, q, q), expected_index
+                )
+                config = heuristic.autotune_causal_attention(q, q, q)
+                self.assertEqual(config["cute_flash_pipeline_family"], "fa4")
+                self.assertFalse(config["cute_flash_persistent"])
+                self.assertTrue(config["cute_flash_causal_loop_split"])
+
+    def test_attention_gb300_benchmark_uses_dense_and_causal_configs(self) -> None:
         module = _import_pretuned_kernel_module("attention")
         shapes, rep = module._benchmark_spec((10, 3))
-        self.assertEqual([shape[2] for shape in shapes], [32768, 65536, 131072, 262144])
+        self.assertEqual(
+            [(shape[2], shape[5]) for shape in shapes],
+            [
+                (32768, False),
+                (65536, False),
+                (131072, False),
+                (262144, False),
+                (65536, True),
+                (131072, True),
+                (262144, True),
+                (524288, True),
+            ],
+        )
         self.assertEqual(rep, 10)
 
     def test_tcgen05_fragment_epilogues_are_registered_for_b200(self) -> None:
