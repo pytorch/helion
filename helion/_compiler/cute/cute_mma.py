@@ -57,6 +57,7 @@ from .device_state import Tcgen05GroupedDMode
 from .device_state import Tcgen05Orientation
 from .fragment_epilogue import Tcgen05FragmentEpiloguePlan
 from .fragment_epilogue import _tcgen05_fragment_dtype_supported
+from .fragment_epilogue import _tcgen05_fragment_source_layout_reachable
 from .fragment_epilogue import _tcgen05_fragment_source_layout_supported
 from .fragment_epilogue import analyze_tcgen05_fragment_epilogue_candidate
 from .fragment_epilogue import analyze_tcgen05_fragment_epilogue_plan
@@ -147,6 +148,7 @@ from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
 if TYPE_CHECKING:
     from ...autotuner.config_spec import MatmulFact
+    from ...language.matmul_ops import CuteTcgen05SearchPlan
     from ...runtime.config import Config
     from ..aten_lowering import LoweringContext
     from ..compile_environment import CompileEnvironment
@@ -2970,6 +2972,20 @@ class _CuteMmaNode(_CuteMmaTarget):
             not self.operands.has_leading_passthrough
             and self.output_store_analysis is not None
             and self.operands.scalar_loads_use_identity_axis_mapping
+        )
+
+    def supports_tcgen05_search_plan(self, plan: CuteTcgen05SearchPlan) -> bool:
+        """Whether the search contains a usable tile for this MMA candidate."""
+        if not self.requires_fragment_epilogue:
+            return True
+        return _tcgen05_fragment_epilogue_operands_supported(
+            self.operands
+        ) and _tcgen05_fragment_source_layout_reachable(
+            min_bm=plan.min_search_m,
+            max_bm=plan.max_search_m,
+            min_bn=plan.min_search_n,
+            max_bn=plan.max_search_n,
+            input_dtype=self.operands.lhs.source_fake.dtype,
         )
 
 

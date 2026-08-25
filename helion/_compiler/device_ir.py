@@ -3893,7 +3893,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             supports_small_n_scalar_fallback
                         ),
                     )
-                    if search_plan is None:
+                    if (
+                        search_plan is None
+                        or not candidate.supports_tcgen05_search_plan(search_plan)
+                    ):
                         continue
                     search_candidates.append((candidate, lhs, search_plan))
                 analysis_keys = {

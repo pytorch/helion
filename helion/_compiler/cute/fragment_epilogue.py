@@ -79,6 +79,22 @@ def _tcgen05_fragment_source_layout_supported(
     )
 
 
+def _tcgen05_fragment_source_layout_reachable(
+    *,
+    min_bm: int,
+    max_bm: int,
+    min_bn: int,
+    max_bn: int,
+    input_dtype: torch.dtype,
+) -> bool:
+    """Whether a search range contains a supported source ownership layout."""
+    return (
+        _tcgen05_fragment_dtype_supported(input_dtype)
+        and min_bm <= _TCGEN05_FRAGMENT_SOURCE_BM <= max_bm
+        and any(min_bn <= bn <= max_bn for bn in _TCGEN05_FRAGMENT_SOURCE_BNS)
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class _FragmentSlot:
     thread: int

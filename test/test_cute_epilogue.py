@@ -450,19 +450,18 @@ class TestCuteEpilogue(unittest.TestCase):
             "cutlass.Int32(32), None].iterator",
             code,
         )
-        scalar_assignment = next(
-            line.strip()
-            for line in code.splitlines()
-            if "tcgen05_colvec_scalar_full" in line and " = " in line
+        scalar_read = (
+            "tcgen05_aux_loaded_0 = tcgen05_tTR_gAux_grouped_0"
+            "[0, 0, 0, cutlass.Int32(_tcgen05_subtile)]"
         )
-        self.assertIn("tcgen05_tTR_gAux_grouped_0[0, 0, 0, 0]", scalar_assignment)
-        scalar_name = scalar_assignment.split(" = ", 1)[0]
-        scalar_pos = code.index(scalar_assignment)
-        loop_pos = code.index("for _tcgen05_subtile in cutlass.range", scalar_pos)
-        scalar_use_pos = code.index(f"tcgen05_aux_loaded_0 = {scalar_name}", loop_pos)
+        self.assertIn(scalar_read, code)
+        self.assertNotIn(
+            "tcgen05_aux_loaded_0 = tcgen05_tTR_gAux_grouped_0.load()", code
+        )
+        loop_pos = code.index("for _tcgen05_subtile in cutlass.range")
+        scalar_use_pos = code.index(scalar_read, loop_pos)
         product_pos = code.index("tcgen05_aux_product", scalar_use_pos)
         wait_pos = code.index("tcgen05_acc_pipeline.consumer_wait", loop_pos)
-        self.assertLess(scalar_pos, loop_pos)
         self.assertLess(scalar_use_pos, product_pos)
         self.assertLess(product_pos, wait_pos)
         self.assertNotIn("tcgen05_aux_rowvec_pred_1", code)
