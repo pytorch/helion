@@ -44,6 +44,7 @@ KERNELS = [
     "rms_norm",
     "layer_norm",
     "softmax",
+    "attention",
     "scaled_mm",
     "scale_mm_cute",
     "nvfp4_gemv",

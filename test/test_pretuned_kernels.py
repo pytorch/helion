@@ -468,6 +468,21 @@ class TestPretunedCuteCodegen(TestCase):
     def test_interleaved_swiglu(self) -> None:
         self._run_tcgen05_fragment_epilogue_correctness("interleaved_swiglu")
 
+    def test_attention(self) -> None:
+        if not is_cuda() or torch.cuda.get_device_capability() < (10, 0):
+            self.skipTest("attention requires the B200 CuTe flash backend.")
+        module = _import_pretuned_kernel_module("attention")
+        module.correctness_check()
+
+    def test_attention_is_registered_for_b200(self) -> None:
+        path = PRETUNED_KERNELS_DIR / "run.py"
+        spec = importlib.util.spec_from_file_location("_pretuned_runner", path)
+        assert spec is not None and spec.loader is not None
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        self.assertIn("attention", runner.KERNELS)
+        self.assertEqual(runner._supported_hardware("attention"), {"b200"})
+
     def test_tcgen05_fragment_epilogues_are_registered_for_b200(self) -> None:
         path = PRETUNED_KERNELS_DIR / "run.py"
         spec = importlib.util.spec_from_file_location("_pretuned_runner", path)
