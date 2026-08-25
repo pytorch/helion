@@ -68,7 +68,7 @@ KERNELS = [
 
 # Map a compute capability (heuristic file suffix) to a hardware alias. The
 # nightly runs one GPU per alias.
-_HARDWARE_BY_COMPUTE = {"sm90": "h100", "sm100": "b200"}
+_HARDWARE_BY_COMPUTE = {"sm90": "h100", "sm100": "b200", "sm103": "gb300"}
 
 
 def parse_kernel_names(value: str) -> list[str]:

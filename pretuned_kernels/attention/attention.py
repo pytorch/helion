@@ -1,9 +1,10 @@
-"""Scaled dot-product attention for the B200 CuTe flash backend.
+"""Scaled dot-product attention for the B200/GB300 CuTe flash backend.
 
 This is the output-only dense attention kernel from ``examples/attention.py``.
 It is pretuned for the non-causal shapes used by
 ``benchmarks/cute/compare_attention_backends.py`` and compares against a single
-cuDNN SDPA baseline.
+cuDNN SDPA baseline.  On GB300 the default sweep uses the long dense sequence
+lengths whose nonpersistent two-CTA schedules outperform SDPA.
 """
 
 from __future__ import annotations
@@ -71,15 +72,38 @@ def attention(
     return out.view(q_in.size())
 
 
-# Non-causal dense shapes from benchmarks/cute/compare_attention_backends.py.
-SHAPES = [
+AttentionShape = tuple[int, int, int, int, torch.dtype]
+
+
+# Original B200 representative sweep.
+B200_SHAPES: tuple[AttentionShape, ...] = (
     (1, 4, 512, 64, torch.float16),
     (2, 8, 512, 64, torch.float16),
     (2, 32, 1024, 64, torch.float16),
     (2, 32, 2048, 64, torch.float16),
     (4, 32, 4096, 128, torch.bfloat16),
     (8, 32, 8192, 128, torch.bfloat16),
-]
+)
+
+# Non-causal half of the comparison harness's dense_causal8 suite. Each shape
+# selects a distinct sm103 nonpersistent two-CTA config.
+GB300_SHAPES: tuple[AttentionShape, ...] = (
+    (2, 32, 32768, 64, torch.float16),
+    (2, 32, 65536, 64, torch.float16),
+    (2, 32, 131072, 64, torch.float16),
+    (2, 32, 262144, 64, torch.float16),
+)
+
+
+def _benchmark_spec(
+    compute_capability: tuple[int, int],
+) -> tuple[tuple[AttentionShape, ...], int]:
+    """Return the target-specific shapes and CUDA-graph repetitions."""
+    if compute_capability == (10, 3):
+        # These kernels take up to roughly one second, so ten samples are
+        # sufficient and keep the standalone sweep practical.
+        return GB300_SHAPES, 10
+    return B200_SHAPES, 200
 
 
 def _make_inputs(
@@ -104,11 +128,18 @@ def use_cudagraph() -> bool:
 def correctness_check() -> None:
     """Check every checked-in config branch against cuDNN SDPA."""
     torch.manual_seed(0)
-    shapes = (
+    shapes: tuple[AttentionShape, ...] = (
         (1, 2, 256, 64, torch.float16),
         (1, 2, 256, 128, torch.bfloat16),
         (1, 1, 8192, 64, torch.float16),
     )
+    if torch.cuda.get_device_capability() == (10, 3):
+        # Exercise all four sm103 long-sequence selectors with a small
+        # batch/head count so correctness does not require the benchmark's
+        # full-size allocation.
+        shapes += tuple(
+            (1, 1, seq, 64, torch.float16) for seq in (32768, 65536, 131072, 262144)
+        )
     for shape in shapes:
         args = _make_inputs(*shape)
         actual = attention(*args)
@@ -123,7 +154,9 @@ def main(verbose: bool = True) -> dict:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from _bench import run_sweep  # pyrefly: ignore[missing-import]
 
-    def make_calls(shape: tuple[int, int, int, int, torch.dtype]) -> tuple:
+    shapes, rep = _benchmark_spec(torch.cuda.get_device_capability())
+
+    def make_calls(shape: AttentionShape) -> tuple:
         z, h, seq_len, head_dim, dtype = shape
         q, k, v = _make_inputs(z, h, seq_len, head_dim, dtype)
 
@@ -140,11 +173,11 @@ def main(verbose: bool = True) -> dict:
         )
 
     return run_sweep(
-        SHAPES,
+        shapes,
         make_calls,
         use_cudagraph=use_cudagraph(),
         warmup=50,
-        rep=200,
+        rep=rep,
         verbose=verbose,
         shape_header=f"{'z':>2s}  {'h':>3s}  {'seq':>6s}  {'d':>4s}",
     )

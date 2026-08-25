@@ -470,18 +470,48 @@ class TestPretunedCuteCodegen(TestCase):
 
     def test_attention(self) -> None:
         if not is_cuda() or torch.cuda.get_device_capability() < (10, 0):
-            self.skipTest("attention requires the B200 CuTe flash backend.")
+            self.skipTest("attention requires the SM100+ CuTe flash backend.")
         module = _import_pretuned_kernel_module("attention")
         module.correctness_check()
 
-    def test_attention_is_registered_for_b200(self) -> None:
+    def test_attention_is_registered_for_b200_and_gb300(self) -> None:
         path = PRETUNED_KERNELS_DIR / "run.py"
         spec = importlib.util.spec_from_file_location("_pretuned_runner", path)
         assert spec is not None and spec.loader is not None
         runner = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(runner)
         self.assertIn("attention", runner.KERNELS)
-        self.assertEqual(runner._supported_hardware("attention"), {"b200"})
+        self.assertEqual(runner._supported_hardware("attention"), {"b200", "gb300"})
+
+    def test_attention_long_dense_uses_two_cta_configs(self) -> None:
+        path = (
+            PRETUNED_KERNELS_DIR / "attention" / "_helion_aot_attention_cuda_sm103.py"
+        )
+        spec = importlib.util.spec_from_file_location("_attention_aot", path)
+        assert spec is not None and spec.loader is not None
+        heuristic = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(heuristic)
+
+        for expected_index, seq_len in enumerate(
+            (32768, 65536, 131072, 262144), start=3
+        ):
+            with self.subTest(seq_len=seq_len):
+                q = torch.empty(
+                    (2, 32, seq_len, 64), device="meta", dtype=torch.float16
+                )
+                self.assertEqual(heuristic.key_attention(q, q, q), expected_index)
+                config = heuristic.autotune_attention(q, q, q)
+                self.assertEqual(config["cute_flash_pipeline_family"], "fa4_2cta")
+                self.assertFalse(config["cute_flash_persistent"])
+
+        bf16_q = torch.empty((2, 32, 32768, 64), device="meta", dtype=torch.bfloat16)
+        self.assertEqual(heuristic.key_attention(bf16_q, bf16_q, bf16_q), 2)
+
+    def test_attention_gb300_benchmark_uses_long_dense_configs(self) -> None:
+        module = _import_pretuned_kernel_module("attention")
+        shapes, rep = module._benchmark_spec((10, 3))
+        self.assertEqual([shape[2] for shape in shapes], [32768, 65536, 131072, 262144])
+        self.assertEqual(rep, 10)
 
     def test_tcgen05_fragment_epilogues_are_registered_for_b200(self) -> None:
         path = PRETUNED_KERNELS_DIR / "run.py"
