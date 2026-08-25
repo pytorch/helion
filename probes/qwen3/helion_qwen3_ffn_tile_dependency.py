@@ -146,6 +146,8 @@ def _persistent_config(bound, args):
     values["block_sizes"] = [
         block_sizes[spec.block_id] for spec in bound.config_spec.block_sizes
     ]
+    if args.batch > 1:
+        values["loop_orders"] = [[1, 0] for _ in values["loop_orders"]]
 
     def by_root(specs, selected, default):
         return [
@@ -186,7 +188,7 @@ def _persistent_config(bound, args):
             "num_warps": 1,
             "num_stages": args.kernel_stages,
             "pid_type": "persistent_blocked",
-            "num_sm_multiplier": 8,
+            "num_sm_multiplier": args.worker_multiplier,
         }
     )
     config = helion.Config.from_dict(values)
@@ -213,13 +215,16 @@ def _helion_resources(compiled_wrapper):
 
 
 def run(args) -> None:
-    require_idle_visible_gpu()
+    if not args.allow_busy:
+        require_idle_visible_gpu()
     device = "cuda"
-    ffn_q = torch.randn((1, args.hidden), device=device, dtype=torch.bfloat16).to(
-        torch.float8_e4m3fn
-    )
+    ffn_q = torch.randn(
+        (args.batch, args.hidden), device=device, dtype=torch.bfloat16
+    ).to(torch.float8_e4m3fn)
     ffn_scale = torch.rand(
-        (1, args.hidden // args.group), device=device, dtype=torch.float32
+        (args.batch, args.hidden // args.group),
+        device=device,
+        dtype=torch.float32,
     )
     w13_q = torch.randn(
         (2 * args.intermediate, args.hidden), device=device, dtype=torch.bfloat16
@@ -323,6 +328,7 @@ def run(args) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--hidden", type=int, default=4096)
     parser.add_argument("--intermediate", type=int, default=12288)
     parser.add_argument("--group", type=int, default=128)
@@ -333,12 +339,14 @@ def main() -> None:
     parser.add_argument("--w2-stages", type=int, default=4)
     parser.add_argument("--w2-unroll", type=int, default=4)
     parser.add_argument("--kernel-stages", type=int, default=2)
+    parser.add_argument("--worker-multiplier", type=int, default=8)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-warmups", type=int, default=5)
     parser.add_argument("--profile-replays", type=int, default=1)
     parser.add_argument("--dump-config", action="store_true")
     parser.add_argument("--dump-triton", action="store_true")
     parser.add_argument("--skip-validation", action="store_true")
+    parser.add_argument("--allow-busy", action="store_true")
     run(parser.parse_args())
 
 

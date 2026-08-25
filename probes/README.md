@@ -20,9 +20,12 @@ Qwen3-8B layer:
 
 ```bash
 python -m probes.qwen3.helion_qwen3_granular_tile_dependency \
-  --task-aligned-attention --strict-validation --probe-config \
+  --strict-validation --probe-config \
   --repeats 30 --batch-replays 20
 ```
+
+The optional `--task-aligned-attention` mode is a dependency-analysis stress
+probe; it is not the fastest batch-one lowering.
 
 Gemma 4 E4B layer:
 

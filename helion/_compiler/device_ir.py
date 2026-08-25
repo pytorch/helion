@@ -350,12 +350,12 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
             state, self.block_ids
         )
         if state.fx_node is not None:
-            from .tile_dependency import TILE_ACTION_SCOPE_ID_ATTR
-            from .tile_dependency import TILE_ACTION_SCOPE_IDS_META
+            from .tile_dependency import TILE_DEPENDENCY_SCOPE_ID_ATTR
+            from .tile_dependency import TILE_DEPENDENCY_SCOPE_IDS_META
 
-            scope_ids = dict(state.fx_node.meta.get(TILE_ACTION_SCOPE_IDS_META, ()))
+            scope_ids = dict(state.fx_node.meta.get(TILE_DEPENDENCY_SCOPE_IDS_META, ()))
             if (scope_id := scope_ids.get(0)) is not None:
-                setattr(device_loop.for_node, TILE_ACTION_SCOPE_ID_ATTR, scope_id)
+                setattr(device_loop.for_node, TILE_DEPENDENCY_SCOPE_ID_ATTR, scope_id)
         # Make the active graph reachable by the strategy so it can pick
         # different lane-loop shapes for the reduce vs consume sweeps.
         # pyrefly: ignore [missing-attribute]
@@ -3303,6 +3303,8 @@ def _subscript_block_id(env: CompileEnvironment, sub: object) -> int | None:
 
 def _subscript_is_scalar_tile_index(subscript: object) -> bool:
     """Return whether an affine subscript is derived from ``tile.id``."""
+    if isinstance(subscript, int):
+        return True
     if not isinstance(subscript, torch.fx.Node) or isinstance(
         subscript.meta.get("val"), torch.Tensor
     ):
@@ -3325,6 +3327,8 @@ def _subscript_static_offset(
     subscript: object,
 ) -> int | None:
     """Recover a constant offset through affine and shape-only FX nodes."""
+    if isinstance(subscript, int):
+        return subscript
     if not isinstance(subscript, torch.fx.Node):
         return None
     node = subscript
@@ -3339,6 +3343,12 @@ def _subscript_static_offset(
                 return offset + scale * info.offset
             if env.known_equal(info.offset, 0):
                 return offset
+            return None
+        if node.target is torch.ops.prims.iota.default:
+            start = node.kwargs.get("start", 0)
+            step = node.kwargs.get("step", 1)
+            if isinstance(start, int) and step == 1:
+                return offset + scale * start
             return None
         args = node.args
         if node.target is torch.ops.aten.add.Tensor and len(args) == 2:
@@ -3363,6 +3373,41 @@ def _subscript_static_offset(
         if len(node_args) != 1:
             return None
         node = node_args[0]
+    return None
+
+
+def _subscript_static_extent(subscript: object) -> int | None:
+    """Return the width of a proved contiguous static index vector."""
+    if isinstance(subscript, int):
+        return 1
+    if not isinstance(subscript, torch.fx.Node):
+        return None
+    node = subscript
+    seen: set[torch.fx.Node] = set()
+    while node not in seen:
+        seen.add(node)
+        if node.target is torch.ops.prims.iota.default:
+            length = node.args[0] if node.args else None
+            start = node.kwargs.get("start", 0)
+            step = node.kwargs.get("step", 1)
+            if (
+                isinstance(length, int)
+                and length >= 0
+                and isinstance(start, int)
+                and step == 1
+            ):
+                return length
+            return None
+        args = node.args
+        if node.target is torch.ops.aten.add.Tensor and len(args) == 2:
+            constant, operand = args[1], args[0]
+            if not isinstance(constant, int):
+                constant, operand = operand, constant
+            if isinstance(constant, int) and isinstance(operand, torch.fx.Node):
+                node = operand
+                continue
+            return None
+        return None
     return None
 
 
@@ -3612,10 +3657,13 @@ def _collect_memory_op_facts(
             subscript_index_scales: tuple[int, ...] = ()
             subscript_affine_block_ids: tuple[int | None, ...] = ()
             subscript_extents: tuple[int, ...] = ()
-            subscript_dims: tuple[int, ...] = ()
-            subscript_offsets: tuple[int | None, ...] = ()
-            subscript_is_scalar: tuple[bool, ...] = ()
-            subscript_is_full_slice: tuple[bool, ...] = ()
+            tile_subscript_dims: tuple[int, ...] = ()
+            tile_subscript_affine_block_ids: tuple[int | None, ...] = ()
+            tile_subscript_index_scales: tuple[int, ...] = ()
+            tile_subscript_offsets: tuple[int | None, ...] = ()
+            tile_subscript_is_scalar: tuple[bool, ...] = ()
+            tile_subscript_is_full_slice: tuple[bool, ...] = ()
+            tile_subscript_static_extents: tuple[int | None, ...] = ()
             inner_extent: int | None = None
             accessed_numel = 0
             allocation_id = -1
@@ -3666,7 +3714,6 @@ def _collect_memory_op_facts(
                         for pos, sub in enumerate(index_list)
                         if not isinstance(sub, int) and pos < fake.ndim
                     ]
-                    subscript_dims = tuple(positions)
                     indexed_block_ids = tuple(
                         env.resolve_block_id(fake.shape[pos]) for pos in positions
                     )
@@ -3690,21 +3737,40 @@ def _collect_memory_op_facts(
                     ]
                     subscript_affine_block_ids = tuple(bid for bid, _ in affine)
                     subscript_index_scales = tuple(scale for _, scale in affine)
-                    subscript_offsets = tuple(
-                        _subscript_static_offset(env, index_list[pos])
-                        for pos in positions
-                    )
-                    subscript_is_scalar = tuple(
-                        _subscript_is_scalar_tile_index(index_list[pos])
-                        for pos in positions
-                    )
-                    subscript_is_full_slice = tuple(
-                        _subscript_is_full_slice(index_list[pos]) for pos in positions
-                    )
                     # Extent per subscript position; size_hint, not int(), so a SymInt dim
                     # is not specialized.
                     subscript_extents = tuple(
                         env.size_hint(fake.shape[pos]) for pos in positions
+                    )
+                    tile_positions = tuple(
+                        pos for pos in range(min(len(index_list), fake.ndim))
+                    )
+                    tile_affine = tuple(
+                        subscript_index_scale(env, index_list[pos])
+                        for pos in tile_positions
+                    )
+                    tile_subscript_dims = tile_positions
+                    tile_subscript_affine_block_ids = tuple(
+                        block_id for block_id, _scale in tile_affine
+                    )
+                    tile_subscript_index_scales = tuple(
+                        scale for _block_id, scale in tile_affine
+                    )
+                    tile_subscript_offsets = tuple(
+                        _subscript_static_offset(env, index_list[pos])
+                        for pos in tile_positions
+                    )
+                    tile_subscript_is_scalar = tuple(
+                        _subscript_is_scalar_tile_index(index_list[pos])
+                        for pos in tile_positions
+                    )
+                    tile_subscript_is_full_slice = tuple(
+                        _subscript_is_full_slice(index_list[pos])
+                        for pos in tile_positions
+                    )
+                    tile_subscript_static_extents = tuple(
+                        _subscript_static_extent(index_list[pos])
+                        for pos in tile_positions
                     )
                 if fake.ndim >= 2:
                     # size_hint (not int()): int() would guard a SymInt inner dim to a
@@ -3736,13 +3802,14 @@ def _collect_memory_op_facts(
                         tensor_shape=tensor_shape,
                         tensor_strides=tensor_strides,
                         storage_offset=storage_offset,
-                        subscript_dims=subscript_dims,
-                        subscript_affine_block_ids=subscript_affine_block_ids,
-                        subscript_index_scales=subscript_index_scales,
-                        subscript_offsets=subscript_offsets,
-                        subscript_is_scalar=subscript_is_scalar,
+                        subscript_dims=tile_subscript_dims,
+                        subscript_affine_block_ids=tile_subscript_affine_block_ids,
+                        subscript_index_scales=tile_subscript_index_scales,
+                        subscript_offsets=tile_subscript_offsets,
+                        subscript_is_scalar=tile_subscript_is_scalar,
                         has_explicit_mask=has_explicit_mask,
-                        subscript_is_full_slice=subscript_is_full_slice,
+                        subscript_is_full_slice=tile_subscript_is_full_slice,
+                        subscript_static_extents=tile_subscript_static_extents,
                         is_atomic=is_atomic,
                         layout_is_static=layout_is_static,
                         graph_node_index=graph_node_index,

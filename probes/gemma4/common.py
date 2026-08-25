@@ -11,6 +11,8 @@ from typing import Callable
 
 import torch
 
+from probes.common import make_l2_cache_clearer
+
 
 @dataclass(frozen=True)
 class Gemma4E4BShape:
@@ -362,15 +364,29 @@ def benchmark_interleaved(
     names = list(entries)
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
+    clear_l2 = make_l2_cache_clearer()
     for sample in range(repeats):
         order = names[sample % len(names) :] + names[: sample % len(names)]
         for name in order:
-            start.record()
-            for _ in range(batch_replays):
-                entries[name]()
-            end.record()
-            end.synchronize()
-            samples[name].append(start.elapsed_time(end) * 1000.0 / batch_replays)
+            if clear_l2 is None:
+                start.record()
+                for _ in range(batch_replays):
+                    entries[name]()
+                end.record()
+                end.synchronize()
+                elapsed_us = start.elapsed_time(end) * 1000.0 / batch_replays
+            else:
+                elapsed_us = 0.0
+                for _ in range(batch_replays):
+                    clear_l2()
+                    torch.cuda.synchronize()
+                    start.record()
+                    entries[name]()
+                    end.record()
+                    end.synchronize()
+                    elapsed_us += start.elapsed_time(end) * 1000.0
+                elapsed_us /= batch_replays
+            samples[name].append(elapsed_us)
     return {
         name: {
             "median_us": statistics.median(values),

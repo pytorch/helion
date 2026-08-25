@@ -1509,6 +1509,11 @@ def _prepare_hand_triton(
 def run(args) -> None:
     if not args.allow_busy:
         separate.require_idle_visible_gpu()
+    if args.source_mode == "matched" and args.batch != 1:
+        raise ValueError(
+            "the matched source preserves batch-one standalone kernels; use "
+            "assignment_hierarchical_topk_unfused_geglu for batched validation"
+        )
     shape = Gemma4A4BMoEShape(batch=args.batch)
     tensors = allocate_moe(shape, args.seed, route_skew=args.route_skew)
     reference = moe_reference(tensors, shape)

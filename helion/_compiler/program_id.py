@@ -9,6 +9,7 @@ from typing import ClassVar
 from typing import NamedTuple
 from typing import cast
 
+import sympy
 import torch
 
 from .. import exc
@@ -19,11 +20,9 @@ from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .cross_loop_scheduler import CROSS_LOOP_NUM_WORKERS_CONFIG
 from .cross_loop_scheduler import CROSS_LOOP_NUM_WORKERS_DEFAULT
-from .cross_loop_scheduler import CountedEventContribution
 from .cross_loop_scheduler import CountedEventPlan
-from .cross_loop_scheduler import CountedEventUse
-from .cross_loop_scheduler import TaskToKeySegment
-from .cross_loop_scheduler import _compress_task_to_key
+from .cross_loop_scheduler import EventContribution
+from .cross_loop_scheduler import EventUse
 from .cross_loop_scheduler import build_cross_loop_schedule
 from .cute.cutedsl_compat import emit_pipeline_advance
 from .cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_DEFAULT
@@ -39,7 +38,11 @@ from .device_function import DeviceFunction
 from .device_function import TensorArg
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
-from .tile_dependency import InstantiatedTaskFamily
+from .tile_dependency import LogicalDomain
+from .tile_dependency import LogicalRelation
+from .tile_dependency import instantiate_root_domains
+from .tile_dependency import logical_axis_symbol
+from .tile_dependency import physical_traversal_relation
 
 
 def typed_program_id(dim: int = 0) -> str:
@@ -72,7 +75,7 @@ def _clone_ast_value(value: object) -> object:
     if isinstance(value, tuple):
         return tuple(_clone_ast_value(item) for item in value)
     if isinstance(value, ast.AST):
-        from .tile_dependency import TILE_ACTION_SCOPE_ID_ATTR
+        from .tile_dependency import TILE_DEPENDENCY_SCOPE_ID_ATTR
 
         fields = {
             field: _clone_ast_value(getattr(value, field)) for field in value._fields
@@ -81,8 +84,10 @@ def _clone_ast_value(value: object) -> object:
             cloned = value.copy(**fields)
         else:
             cloned = ast.copy_location(type(value)(**fields), value)
-        if (scope_id := getattr(value, TILE_ACTION_SCOPE_ID_ATTR, None)) is not None:
-            setattr(cloned, TILE_ACTION_SCOPE_ID_ATTR, scope_id)
+        if (
+            scope_id := getattr(value, TILE_DEPENDENCY_SCOPE_ID_ATTR, None)
+        ) is not None:
+            setattr(cloned, TILE_DEPENDENCY_SCOPE_ID_ATTR, scope_id)
         return cloned
     return value
 
@@ -112,7 +117,7 @@ def _clone_opaque_statements_with_loop_rewrite(
     rewrite: Callable[[ast.For], list[ast.stmt] | None],
 ) -> list[ast.stmt]:
     """Clone an opaque body while replacing selected loops."""
-    from .tile_dependency import TILE_ACTION_SCOPE_ID_ATTR
+    from .tile_dependency import TILE_DEPENDENCY_SCOPE_ID_ATTR
 
     def clone(value: object) -> object:
         if isinstance(value, list):
@@ -135,37 +140,37 @@ def _clone_opaque_statements_with_loop_rewrite(
             else:
                 cloned = ast.copy_location(type(value)(**fields), value)
             if (
-                scope_id := getattr(value, TILE_ACTION_SCOPE_ID_ATTR, None)
+                scope_id := getattr(value, TILE_DEPENDENCY_SCOPE_ID_ATTR, None)
             ) is not None:
-                setattr(cloned, TILE_ACTION_SCOPE_ID_ATTR, scope_id)
+                setattr(cloned, TILE_DEPENDENCY_SCOPE_ID_ATTR, scope_id)
             return cloned
         return value
 
     return cast("list[ast.stmt]", clone(body))
 
 
-def _clone_opaque_statements_with_action_stages(
+def _clone_opaque_statements_with_scope_stages(
     body: list[ast.stmt],
     *,
     scope_id: int,
     split_iteration_offsets: tuple[int, ...],
     stage_waits: tuple[tuple[ast.stmt, ...], ...],
 ) -> list[ast.stmt]:
-    """Split one stable DeviceIR action loop and wait before each segment."""
-    from .tile_dependency import tile_action_scope_id
+    """Split one stable DeviceIR scope loop and wait before each segment."""
+    from .tile_dependency import tile_dependency_scope_id
 
     if len(stage_waits) != len(split_iteration_offsets) + 1:
-        raise AssertionError("each action-loop segment requires one wait")
+        raise AssertionError("each scope-loop segment requires one wait")
     scheduled = False
 
     def rewrite(loop: ast.For) -> list[ast.stmt] | None:
         nonlocal scheduled
-        if tile_action_scope_id(loop) != scope_id:
+        if tile_dependency_scope_id(loop) != scope_id:
             return None
         if scheduled:
-            raise AssertionError("one action scope must identify one lowered loop")
+            raise AssertionError("one dependency scope must identify one lowered loop")
         if not isinstance(loop.iter, ast.Call) or len(loop.iter.args) < 2:
-            raise AssertionError("ordered action scheduling requires a range-like loop")
+            raise AssertionError("nested scope scheduling requires a range-like loop")
         begin = ast.unparse(loop.iter.args[0])
         step = ast.unparse(loop.iter.args[2]) if len(loop.iter.args) >= 3 else "1"
         split_offsets = tuple(
@@ -204,10 +209,10 @@ def _clone_opaque_statements_with_action_stages(
             for statement in body
             for node in ast.walk(statement)
             if isinstance(node, ast.For)
-            if (found_scope_id := tile_action_scope_id(node)) is not None
+            if (found_scope_id := tile_dependency_scope_id(node)) is not None
         )
         raise AssertionError(
-            f"missing ordered action scope {scope_id}; found {present_scope_ids}"
+            f"missing dependency scope {scope_id}; found {present_scope_ids}"
         )
     return cloned
 
@@ -237,43 +242,6 @@ def _clone_opaque_loop_segment(
         cloned.iter.args[1] = end
     if _ast_fingerprint(cloned.body) != _ast_fingerprint(loop.body):
         raise AssertionError("tile-dependency staging changed an opaque loop body")
-    return cloned
-
-
-def _prepend_schedule_to_opaque_loop(
-    loop: ast.For,
-    schedule: list[ast.stmt],
-    *,
-    force_serial_pipeline: bool,
-) -> ast.For:
-    """Add synchronization before iterations without changing their computation."""
-    cloned = cast("ast.For", _clone_ast_value(loop))
-    computation = _ast_fingerprint(cloned.body)
-    cloned.body = [*_clone_opaque_statements(schedule), *cloned.body]
-    if _ast_fingerprint(cloned.body[len(schedule) :]) != computation:
-        raise AssertionError("tile-dependency wait changed an opaque loop body")
-    if force_serial_pipeline:
-        if not isinstance(cloned.iter, ast.Call):
-            raise AssertionError("ordered tile dependency requires a range loop")
-        cloned.iter.keywords = [
-            keyword
-            for keyword in cloned.iter.keywords
-            if keyword.arg not in {"num_stages", "disallow_acc_multi_buffer"}
-        ]
-        cloned.iter.keywords.extend(
-            [
-                create(
-                    ast.keyword,
-                    arg="num_stages",
-                    value=create(ast.Constant, value=1),
-                ),
-                create(
-                    ast.keyword,
-                    arg="disallow_acc_multi_buffer",
-                    value=create(ast.Constant, value=True),
-                ),
-            ]
-        )
     return cloned
 
 
@@ -406,8 +374,6 @@ _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_K = 7
 _TCGEN05_GROUPED_SELECTED_MAILBOX_GLOBAL_M_START = 8
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-    import sympy
 
     from .cute.cute_mma import _Tcgen05SchedPipelinePlan
     from .cute.device_state import CuteTcgen05MatmulPlan
@@ -802,29 +768,23 @@ class ForEachProgramID(ProgramIDs):
                 and indexing[memory_op_index] == "tensor_descriptor"
             )
 
-        unpublishable_action_scope_ids = frozenset(
+        unpublishable_scope_ids = frozenset(
             scope_id
             for access in dependency_plan.accesses
             if access.kind == "store" and uses_tensor_descriptor(access.memory_op_index)
             for scope_id in dependency_plan.scope_ids_by_access[access.access_id]
         )
-        publishable_action_scope_ids = (
+        publishable_scope_ids = (
             frozenset(
                 scope.scope_id
                 for scope in dependency_plan.execution_scopes
-                if not scope.is_root
-                and scope.scope_id not in unpublishable_action_scope_ids
+                if not scope.is_root and scope.scope_id not in unpublishable_scope_ids
             )
-            if unpublishable_action_scope_ids
+            if unpublishable_scope_ids
             else None
         )
         physical_worker_limit = CompileEnvironment.current().config_spec.num_sm * cast(
             "int", device_function.config.get("num_sm_multiplier", 1)
-        )
-        instantiated_task_families = self._instantiated_task_families(device_function)
-        assert instantiated_task_families is not None
-        assert [family.task_count for family in instantiated_task_families] == (
-            static_task_counts
         )
         axis_geometry = {
             block_id: geometry
@@ -832,11 +792,28 @@ class ForEachProgramID(ProgramIDs):
             if (geometry := self._static_block_axis_geometry(block_id, device_function))
             is not None
         }
+        configured_root_domains = instantiate_root_domains(
+            dependency_plan,
+            axis_geometry=axis_geometry,
+        )
+        if any(domain is None for domain in configured_root_domains):
+            raise exc.CrossLoopSchedulingError(
+                "cross-loop scheduling requires static root domains"
+            )
+        root_domains = tuple(
+            domain for domain in configured_root_domains if domain is not None
+        )
+        root_traversals = self._root_physical_traversals(
+            device_function,
+            root_domains,
+        )
+        assert root_traversals is not None
+        assert [domain.size for domain in root_domains] == static_task_counts
         cross_loop_schedule = build_cross_loop_schedule(
             dependency_plan=dependency_plan,
-            task_families=instantiated_task_families,
+            root_domains=root_domains,
+            root_traversals=root_traversals,
             axis_geometry=axis_geometry,
-            excluded_roots=frozenset(),
             preordered_edges=frozenset(),
             physical_worker_limit=physical_worker_limit,
             requested_worker_count=cast(
@@ -846,7 +823,7 @@ class ForEachProgramID(ProgramIDs):
                     CROSS_LOOP_NUM_WORKERS_DEFAULT,
                 ),
             ),
-            publishable_action_scope_ids=publishable_action_scope_ids,
+            publishable_scope_ids=publishable_scope_ids,
         )
         root_completion_edges = set(cross_loop_schedule.root_completion_edges)
         family_done_event_plans = tuple(
@@ -857,7 +834,7 @@ class ForEachProgramID(ProgramIDs):
                 plan.graph_event_index
             ).is_family_done
         )
-        ordered_action_event_plans = tuple(
+        nested_scope_event_plans = tuple(
             plan
             for plan in cross_loop_schedule.counted_events
             if any(use.consumer_scope_id is not None for use in plan.uses)
@@ -866,35 +843,27 @@ class ForEachProgramID(ProgramIDs):
             plan
             for plan in cross_loop_schedule.counted_events
             if plan not in family_done_event_plans
-            and plan not in ordered_action_event_plans
+            and plan not in nested_scope_event_plans
         )
         all_counted_event_plans = (
             *counted_event_plans,
-            *ordered_action_event_plans,
+            *nested_scope_event_plans,
         )
         launch_worker_limit = cross_loop_schedule.worker_limit
         if launch_worker_limit != physical_worker_limit:
             strategy.grid_size_expr = str(launch_worker_limit)
 
         static_workers_by_root = {
-            root: cross_loop_schedule.worker_schedule.workers_for_tasks(
-                root,
-                tuple(
-                    task
-                    for task in range(family.task_count)
-                    if cross_loop_schedule.worker_schedule.placement(root, task)
-                    is not None
-                ),
-            )
-            for root, family in enumerate(instantiated_task_families)
+            root: cross_loop_schedule.worker_schedule.workers_for_root(root)
+            for root in range(len(root_domains))
         }
         local_task_count_by_root: dict[int, int] = {}
         for trigger in cross_loop_schedule.local_triggers:
             event = cross_loop_schedule.event_graph.event(trigger.event_index)
             use = event.uses[trigger.use_index]
-            local_task_count_by_root[use.consumer_root] = sum(
-                bool(keys) for keys in use.required_keys_by_task
-            )
+            if not use.keys.is_total_function():
+                raise AssertionError("a local event must cover its complete root")
+            local_task_count_by_root[use.consumer_root] = use.keys.source_domain.size
 
         def active_worker_count(root: int) -> int:
             return len(static_workers_by_root[root])
@@ -1027,26 +996,29 @@ class ForEachProgramID(ProgramIDs):
         root_physical_axis_order: list[tuple[int, ...]] = []
         root_logical_axis_order: list[tuple[int, ...]] = []
         root_axis_counts: list[dict[int, int]] = []
-        for family in instantiated_task_families:
-            root_physical_axis_order.append(family.physical_axis_order)
-            root_logical_axis_order.append(family.logical_axis_order)
-            root_counts = family.axis_counts
-            root_axis_counts.append(root_counts)
+        for root, domain in enumerate(root_domains):
+            geometry = self._static_case_geometry(root, device_function)
+            if geometry is None:
+                raise AssertionError("configured root geometry became dynamic")
+            physical_axis_order, _axis_counts, _block_sizes = geometry
+            root_physical_axis_order.append(physical_axis_order)
+            root_logical_axis_order.append(domain.axis_order)
+            root_axis_counts.append(domain.axis_counts)
         root_events_by_producer: dict[
             int,
             list[
                 tuple[
                     CountedEventPlan,
-                    CountedEventContribution,
+                    EventContribution,
                 ]
             ],
         ] = {}
-        action_events_by_scope: dict[
+        producer_events_by_scope: dict[
             int,
             list[
                 tuple[
                     CountedEventPlan,
-                    CountedEventContribution,
+                    EventContribution,
                 ]
             ],
         ] = {}
@@ -1057,49 +1029,27 @@ class ForEachProgramID(ProgramIDs):
                         contributor.producer_root, []
                     ).append((plan, contributor))
                 else:
-                    action_events_by_scope.setdefault(
+                    producer_events_by_scope.setdefault(
                         contributor.producer_scope_id, []
                     ).append((plan, contributor))
-        action_event_roots = {
-            cross_loop_schedule.event_graph.action_domain(scope_id).root
-            for scope_id in action_events_by_scope
+        nested_producer_roots = {
+            contributor.producer_root
+            for contributions in producer_events_by_scope.values()
+            for _plan, contributor in contributions
         }
-        ordered_local_events: set[CountedEventPlan] = set()
-        for plan in counted_event_plans:
-            if plan.local_use is None or plan.graph_event_index is None:
-                continue
-            event = cross_loop_schedule.event_graph.event(plan.graph_event_index)
-            if len(event.contributions) != 1:
-                continue
-            contribution = event.contributions[0]
-            if contribution.producer_scope_id is not None or any(
-                len(keys) != 1 for keys in contribution.keys_by_task
-            ):
-                continue
-            tasks_by_key: list[list[int]] = [[] for _ in range(event.key_count)]
-            for task, keys in enumerate(contribution.keys_by_task):
-                tasks_by_key[next(iter(keys))].append(task)
-            key_major_order = tuple(
-                task for tasks in tasks_by_key for task in sorted(tasks)
-            )
-            if (
-                cross_loop_schedule.worker_schedule.task_order(
-                    contribution.producer_root
-                )
-                != key_major_order
-            ):
-                continue
-            ordered_local_events.add(plan)
         scheduled_task_roots = {
             root
-            for root, family in enumerate(instantiated_task_families)
-            if cross_loop_schedule.worker_schedule.task_order(root)
-            and cross_loop_schedule.worker_schedule.task_order(root)
-            != family.physical_traversal
+            for root, traversal in enumerate(root_traversals)
+            if any(
+                segment.task_relation != traversal
+                for segment in cross_loop_schedule.worker_schedule.segments_for_root(
+                    root
+                )
+            )
         }
         counted_event_uses_by_waiting_root: dict[
             int,
-            list[tuple[CountedEventPlan, CountedEventUse]],
+            list[tuple[CountedEventPlan, EventUse]],
         ] = {}
         for plan in counted_event_plans:
             for use_index, use in enumerate(plan.uses):
@@ -1110,15 +1060,15 @@ class ForEachProgramID(ProgramIDs):
                 counted_event_uses_by_waiting_root.setdefault(
                     use.consumer_root, []
                 ).append((plan, use))
-        ordered_action_events_by_consumer: dict[
+        nested_scope_events_by_consumer: dict[
             int,
-            list[tuple[CountedEventPlan, CountedEventUse]],
+            list[tuple[CountedEventPlan, EventUse]],
         ] = {}
-        for plan in ordered_action_event_plans:
+        for plan in nested_scope_event_plans:
             for use in plan.uses:
                 if use.consumer_scope_id is None:
                     continue
-                ordered_action_events_by_consumer.setdefault(
+                nested_scope_events_by_consumer.setdefault(
                     use.consumer_root, []
                 ).append((plan, use))
 
@@ -1139,6 +1089,178 @@ class ForEachProgramID(ProgramIDs):
                     coordinates[block_id] = f"((({task}) // {multiplier}) % {count})"
                 multiplier *= counts[block_id]
             return coordinates
+
+        def relation_expression(
+            expression: sympy.Expr,
+            coordinates: dict[int, str],
+        ) -> str:
+            """Render the restricted logical-relation expression grammar."""
+            if isinstance(expression, sympy.Integer):
+                return str(int(expression))
+            if isinstance(expression, sympy.Symbol):
+                axis = next(
+                    (
+                        axis
+                        for axis in coordinates
+                        if logical_axis_symbol(axis) == expression
+                    ),
+                    None,
+                )
+                if axis is None:
+                    raise AssertionError(
+                        f"unknown logical relation symbol {expression}"
+                    )
+                return f"({coordinates[axis]})"
+            if isinstance(expression, sympy.Add):
+                return " + ".join(
+                    f"({relation_expression(cast('sympy.Expr', term), coordinates)})"
+                    for term in expression.as_ordered_terms()
+                )
+            if isinstance(expression, sympy.Mul):
+                return " * ".join(
+                    f"({relation_expression(factor, coordinates)})"
+                    for factor in expression.as_ordered_factors()
+                )
+            if expression.func in (sympy.floor, sympy.ceiling):
+                numerator, denominator = sympy.fraction(
+                    sympy.together(expression.args[0])
+                )
+                if not isinstance(denominator, sympy.Integer) or denominator <= 0:
+                    raise AssertionError(
+                        "logical floor/ceiling requires a positive static divisor"
+                    )
+                numerator_expr = relation_expression(numerator, coordinates)
+                if expression.func == sympy.floor:
+                    return f"(({numerator_expr}) // {int(denominator)})"
+                return f"(-((-({numerator_expr})) // {int(denominator)}))"
+            if expression.func in (sympy.Min, sympy.Max):
+                function = (
+                    "tl.minimum" if expression.func == sympy.Min else "tl.maximum"
+                )
+                rendered = relation_expression(
+                    cast("sympy.Expr", expression.args[0]), coordinates
+                )
+                for argument in expression.args[1:]:
+                    rendered = (
+                        f"{function}(({rendered}), "
+                        f"({relation_expression(cast('sympy.Expr', argument), coordinates)}))"
+                    )
+                return rendered
+            if isinstance(expression, sympy.Mod):
+                numerator, denominator = expression.args
+                if not isinstance(denominator, sympy.Integer) or denominator <= 0:
+                    raise AssertionError(
+                        "logical modulo requires a positive static divisor"
+                    )
+                return (
+                    f"(({relation_expression(cast('sympy.Expr', numerator), coordinates)}) % "
+                    f"{int(denominator)})"
+                )
+            if isinstance(expression, sympy.Rational):
+                if expression.q == 1:
+                    return str(expression.p)
+                return f"({expression.p} / {expression.q})"
+            raise AssertionError(
+                f"unsupported logical relation expression {expression!r}"
+            )
+
+        def relation_source_membership(
+            bounds: tuple[tuple[int, int, int, int], ...],
+            coordinates: dict[int, str],
+        ) -> str:
+            conditions: list[str] = []
+            for axis, begin, end, step in bounds:
+                coordinate = coordinates[axis]
+                conditions.extend(
+                    (
+                        f"({coordinate}) >= {begin}",
+                        f"({coordinate}) < {end}",
+                    )
+                )
+                if step != 1:
+                    conditions.append(f"(({coordinate}) - {begin}) % {step} == 0")
+            return " and ".join(conditions) or "True"
+
+        def relation_point_coordinates(
+            relation: LogicalRelation,
+            source_coordinates: dict[int, str],
+        ) -> tuple[dict[int, str], str]:
+            """Render an at-most-one-valued relation without task tables."""
+            canonical = relation.canonical_single_valued()
+            if canonical is None or not canonical.pieces:
+                raise AssertionError("event relation is not single-valued")
+            memberships: list[str] = []
+            values_by_axis: dict[int, list[tuple[str, str]]] = {
+                axis: [] for axis in canonical.target_domain.axis_order
+            }
+            for piece in canonical.pieces:
+                source_membership = relation_source_membership(
+                    piece.source_bounds_items,
+                    source_coordinates,
+                )
+                target_memberships: list[str] = []
+                piece_values: dict[int, str] = {}
+                for axis, begin, end, step in piece.target_ranges:
+                    if (
+                        step != 1
+                        or sympy.simplify(end - begin)  # pyrefly: ignore[unsupported-operation]
+                        != 1
+                    ):
+                        raise AssertionError("event relation target is not one point")
+                    value = relation_expression(begin, source_coordinates)
+                    piece_values[axis] = value
+                    target_memberships.extend(
+                        (
+                            f"({value}) >= 0",
+                            f"({value}) < {canonical.target_domain.axis_counts[axis]}",
+                        )
+                    )
+                membership = " and ".join((source_membership, *target_memberships))
+                memberships.append(membership)
+                for axis, value in piece_values.items():
+                    values_by_axis[axis].append((membership, value))
+
+            def select(values: list[tuple[str, str]]) -> str:
+                expressions = tuple(
+                    dict.fromkeys(value for _membership, value in values)
+                )
+                if len(expressions) == 1:
+                    return expressions[0]
+                result = values[-1][1]
+                for membership, value in reversed(values[:-1]):
+                    result = f"tl.where({membership}, {value}, {result})"
+                return result
+
+            return (
+                {axis: select(values) for axis, values in values_by_axis.items()},
+                (
+                    "True"
+                    if canonical.is_total_function()
+                    else " or ".join(f"({membership})" for membership in memberships)
+                ),
+            )
+
+        def relation_flat_target(
+            relation: LogicalRelation,
+            source_coordinates: dict[int, str],
+        ) -> tuple[str, str]:
+            target_coordinates, membership = relation_point_coordinates(
+                relation,
+                source_coordinates,
+            )
+            terms: list[str] = []
+            multiplier = 1
+            for axis in relation.target_domain.axis_order:
+                count = relation.target_domain.axis_counts[axis]
+                if count != 1:
+                    coordinate = target_coordinates[axis]
+                    terms.append(
+                        f"({coordinate})"
+                        if multiplier == 1
+                        else f"({coordinate}) * {multiplier}"
+                    )
+                multiplier *= count
+            return " + ".join(terms) or "0", membership
 
         from .tile_strategy import L2GroupingProgramIDs
 
@@ -1267,57 +1389,48 @@ class ForEachProgramID(ProgramIDs):
                 multiplier *= count
             return " + ".join(terms) or "0"
 
-        def body_with_action_waits(
+        def body_with_scope_waits(
             plan: CountedEventPlan,
-            use: CountedEventUse,
+            use: EventUse,
             body: list[ast.stmt],
             consumer_coordinates: dict[int, str],
         ) -> list[ast.stmt]:
             assert use.consumer_scope_id is not None
-            domain = cross_loop_schedule.event_graph.action_domain(
-                use.consumer_scope_id
-            )
-            if len(domain.nested_axis_order) != 1:
-                raise AssertionError(
-                    "ordered action lowering currently requires one nested loop axis"
-                )
-            if len(use.key_by_task) != domain.action_count:
-                raise AssertionError("ordered action use has the wrong domain size")
-
-            boundaries: tuple[int, ...] | None = None
-            for strand_task in range(domain.strand_count):
-                begin = strand_task * domain.actions_per_strand
-                keys = use.key_by_task[begin : begin + domain.actions_per_strand]
-                strand_boundaries = tuple(
-                    action
-                    for action in range(1, domain.actions_per_strand)
-                    if keys[action] != keys[action - 1]
-                )
-                if boundaries is None:
-                    boundaries = strand_boundaries
-                elif boundaries != strand_boundaries:
-                    raise AssertionError(
-                        "ordered action segments must align across task strands"
-                    )
-            assert boundaries is not None
-
-            strand_task = logical_task_from_coordinates(
+            domain = cross_loop_schedule.event_graph.scope_domain(use.consumer_scope_id)
+            nested_axes = cross_loop_schedule.event_graph.nested_axes(
                 use.consumer_root,
-                consumer_coordinates,
+                use.consumer_scope_id,
+            )
+            if len(nested_axes) != 1:
+                raise AssertionError(
+                    "nested scope lowering currently requires one loop axis"
+                )
+            (nested_axis,) = nested_axes
+            boundaries = tuple(
+                sorted(
+                    {
+                        boundary
+                        for piece in use.keys.pieces
+                        for axis, begin, end, _step in piece.source_bounds_items
+                        if axis == nested_axis
+                        for boundary in (begin, end)
+                        if 0 < boundary < domain.axis_counts[nested_axis]
+                    }
+                )
             )
             stage_offsets = (0, *boundaries)
             stage_waits: list[tuple[ast.stmt, ...]] = []
             for action_offset in stage_offsets:
-                stage_keys = tuple(
-                    use.key_by_task[strand * domain.actions_per_strand + action_offset]
-                    for strand in range(domain.strand_count)
+                scope_coordinates = {
+                    **consumer_coordinates,
+                    nested_axis: str(action_offset),
+                }
+                event_key, membership = relation_flat_target(
+                    use.keys,
+                    scope_coordinates,
                 )
-                event_key, membership = task_to_key_expression(
-                    strand_task,
-                    _compress_task_to_key(stage_keys),
-                )
-                if not membership:
-                    raise AssertionError("ordered action has no event-key membership")
+                if membership == "False":
+                    raise AssertionError("nested scope stage has no event key")
                 stage_waits.append(
                     tuple(
                         self._wait_for_counter(
@@ -1327,45 +1440,16 @@ class ForEachProgramID(ProgramIDs):
                                 f"tl.cast({epoch_var}, tl.uint32) * "
                                 f"tl.cast({counted_event_expected_arrivals(plan, event_key)}, tl.uint32)"
                             ),
-                            prefix="tile_dependency_action_wait",
+                            prefix="tile_dependency_scope_wait",
                         )
                     )
                 )
-            return _clone_opaque_statements_with_action_stages(
+            return _clone_opaque_statements_with_scope_stages(
                 body,
                 scope_id=use.consumer_scope_id,
                 split_iteration_offsets=boundaries,
                 stage_waits=tuple(stage_waits),
             )
-
-        def task_to_key_expression(
-            task: str,
-            segments: tuple[TaskToKeySegment, ...],
-        ) -> tuple[str, str]:
-            key_expression = ""
-            membership_parts: list[str] = []
-            for segment in reversed(segments):
-                begin = segment.task_begin
-                end = begin + segment.task_count
-                condition = f"(({task}) >= {begin} and ({task}) < {end})"
-                membership_parts.append(condition)
-                task_offset = f"(({task}) - {begin})"
-                if segment.key_period is not None:
-                    task_offset = f"({task_offset} % {segment.key_period})"
-                segment_key = (
-                    f"{segment.first_key} + "
-                    f"({task_offset} // {segment.tasks_per_key}) * "
-                    f"{segment.key_stride}"
-                )
-                if not key_expression:
-                    key_expression = segment_key
-                else:
-                    key_expression = (
-                        f"tl.where({condition}, {segment_key}, {key_expression})"
-                    )
-            if not key_expression:
-                raise AssertionError("keyed event has no task-to-key mapping")
-            return key_expression, " or ".join(reversed(membership_parts))
 
         def counted_event_counter(plan: CountedEventPlan, key: str) -> str:
             assert counted_event_arg is not None
@@ -1374,17 +1458,43 @@ class ForEachProgramID(ProgramIDs):
                 f"({key}) * {counted_event_key_stride}"
             )
 
+        def counted_event_uniform_arrivals(
+            plan: CountedEventPlan,
+        ) -> int | None:
+            total = 0
+            for contributor in plan.contributors:
+                inverse = contributor.keys.inverse()
+                cardinality = None if inverse is None else inverse.fiber_cardinality()
+                count = None if cardinality is None else cardinality.constant_value()
+                if count is None:
+                    return None
+                total += count
+            return total
+
         def counted_event_expected_arrivals(
             plan: CountedEventPlan,
             key: str,
         ) -> str:
-            arrivals = plan.expected_arrivals_by_key
-            if len(set(arrivals)) == 1:
-                return str(arrivals[0])
-            expression = str(arrivals[-1])
-            for event_key, count in reversed(tuple(enumerate(arrivals[:-1]))):
-                expression = f"tl.where(({key}) == {event_key}, {count}, {expression})"
-            return expression
+            uniform = counted_event_uniform_arrivals(plan)
+            if uniform is not None:
+                return str(uniform)
+            key_coordinates = flat_task_coordinates(
+                key,
+                plan.key_domain.axis_order,
+                plan.key_domain.axis_counts,
+            )
+            expressions: list[str] = []
+            for contributor in plan.contributors:
+                inverse = contributor.keys.inverse()
+                cardinality = None if inverse is None else inverse.fiber_cardinality()
+                if cardinality is None:
+                    raise AssertionError("event fan-in is not symbolically known")
+                values, _membership = relation_point_coordinates(
+                    cardinality,
+                    key_coordinates,
+                )
+                expressions.append(values[cardinality.target_domain.axis_order[0]])
+            return " + ".join(f"({expression})" for expression in expressions)
 
         def emit_counted_event_for_key(
             plan: CountedEventPlan,
@@ -1393,7 +1503,7 @@ class ForEachProgramID(ProgramIDs):
             local_use = plan.local_use
             if local_use is None:
                 counter = counted_event_counter(plan, key)
-                if set(plan.expected_arrivals_by_key) == {1}:
+                if counted_event_uniform_arrivals(plan) == 1:
                     return [
                         statement_from_string(
                             f"tl.atomic_xchg({counter}, {epoch_var}, "
@@ -1406,25 +1516,27 @@ class ForEachProgramID(ProgramIDs):
                     )
                 ]
 
-            consumer_task_by_key: list[int | None] = [None] * plan.key_count
-            for consumer_task, consumer_key in enumerate(local_use.key_by_task):
-                if consumer_task_by_key[consumer_key] is not None:
-                    raise AssertionError("local event key has multiple consumer tasks")
-                consumer_task_by_key[consumer_key] = consumer_task
-            if any(task is None for task in consumer_task_by_key):
-                raise AssertionError("local event key has no consumer task")
-            concrete_tasks = tuple(
-                task for task in consumer_task_by_key if task is not None
-            )
-            if concrete_tasks == tuple(range(plan.key_count)):
+            inverse_use = local_use.keys.inverse()
+            if inverse_use is None or not inverse_use.is_total_function():
+                raise AssertionError(
+                    "local event use must bijectively cover its consumer"
+                )
+            if inverse_use.is_positional_bijection():
                 consumer_task_expression = key
             else:
-                consumer_task_expression = str(concrete_tasks[-1])
-                for event_key, task in reversed(tuple(enumerate(concrete_tasks[:-1]))):
-                    consumer_task_expression = (
-                        f"tl.where(({key}) == {event_key}, {task}, "
-                        f"{consumer_task_expression})"
-                    )
+                key_coordinates = flat_task_coordinates(
+                    key,
+                    plan.key_domain.axis_order,
+                    plan.key_domain.axis_counts,
+                )
+                consumer_coordinates, _membership = relation_point_coordinates(
+                    inverse_use,
+                    key_coordinates,
+                )
+                consumer_task_expression = logical_task_from_coordinates(
+                    local_use.consumer_root,
+                    consumer_coordinates,
+                )
             consumer_task = device_function.new_var(
                 "tile_dependency_continuation_task", dce=True
             )
@@ -1449,7 +1561,7 @@ class ForEachProgramID(ProgramIDs):
                 device_function,
                 root=on_ready_root,
                 logical_pid=consumer_logical_pid,
-                body=body_with_action_publications(
+                body=body_with_scope_publications(
                     on_ready_root,
                     case_bodies[on_ready_root],
                     consumer_coordinates,
@@ -1475,7 +1587,10 @@ class ForEachProgramID(ProgramIDs):
                 )
                 last_arrival_body.extend(consumer_publications)
             last_arrival_body.extend(root_completion_publication(on_ready_root))
-            if plan.expected_arrivals == 1:
+            expected_arrivals = counted_event_uniform_arrivals(plan)
+            if expected_arrivals is None:
+                raise AssertionError("local execution requires uniform event fan-in")
+            if expected_arrivals == 1:
                 return [*assignments, *last_arrival_body]
             arrival_counter = counted_event_counter(plan, key)
             return [
@@ -1483,7 +1598,7 @@ class ForEachProgramID(ProgramIDs):
                 *self._emit_counted_event_on_ready(
                     counter=arrival_counter,
                     epoch=epoch_var,
-                    expected_arrivals=plan.expected_arrivals,
+                    expected_arrivals=expected_arrivals,
                     previous=previous,
                     on_ready=last_arrival_body,
                 ),
@@ -1491,100 +1606,93 @@ class ForEachProgramID(ProgramIDs):
 
         def emit_counted_event_from_producer_coordinates(
             plan: CountedEventPlan,
-            contributor: CountedEventContribution,
+            contributor: EventContribution,
             producer_coordinates: dict[int, str],
         ) -> list[ast.stmt]:
-            producer_task = logical_task_from_coordinates(
-                contributor.producer_root, producer_coordinates
+            key, membership = relation_flat_target(
+                contributor.keys,
+                producer_coordinates,
             )
-            key, membership = task_to_key_expression(
-                producer_task, contributor.task_to_key_segments
-            )
+            publications = emit_counted_event_for_key(plan, key)
+            if membership == "True":
+                return publications
             return [
                 create(
                     ast.If,
                     test=expr_from_string(membership),
-                    body=emit_counted_event_for_key(plan, key),
+                    body=publications,
                     orelse=[],
                 )
             ]
 
-        def body_with_action_publications(
+        def body_with_scope_publications(
             root: int,
             body: list[ast.stmt],
             producer_coordinates: dict[int, str],
         ) -> list[ast.stmt]:
-            """Publish nested action events without moving the owning strand."""
-            from .tile_dependency import tile_action_scope_id
+            """Publish nested scope events without moving the owning strand."""
+            from .tile_dependency import tile_dependency_scope_id
 
             scope_ids = {
                 scope_id
-                for scope_id in action_events_by_scope
-                if cross_loop_schedule.event_graph.action_domain(scope_id).root == root
+                for scope_id, contributions in producer_events_by_scope.items()
+                if any(
+                    contributor.producer_root == root
+                    for _plan, contributor in contributions
+                )
             }
             if not scope_ids:
                 return body
             emitted_scope_ids: set[int] = set()
 
             def rewrite(loop: ast.For) -> list[ast.stmt] | None:
-                scope_id = tile_action_scope_id(loop)
+                scope_id = tile_dependency_scope_id(loop)
                 if scope_id is None or scope_id not in scope_ids:
                     return None
                 if scope_id in emitted_scope_ids:
                     raise AssertionError(
-                        "one action scope must identify one lowered loop"
+                        "one dependency scope must identify one lowered loop"
                     )
-                domain = cross_loop_schedule.event_graph.action_domain(scope_id)
+                nested_axes = cross_loop_schedule.event_graph.nested_axes(
+                    root, scope_id
+                )
                 if (
-                    len(domain.nested_axis_order) != 1
+                    len(nested_axes) != 1
                     or not isinstance(loop.target, ast.Name)
                     or not isinstance(loop.iter, ast.Call)
                     or len(loop.iter.args) < 2
                 ):
                     raise AssertionError(
-                        "nested action publication requires one range-like loop axis"
+                        "nested scope publication requires one range-like loop axis"
                     )
-                nested_axis = domain.nested_axis_order[0]
+                nested_axis = nested_axes[0]
                 begin = ast.unparse(loop.iter.args[0])
                 step = (
                     ast.unparse(loop.iter.args[2]) if len(loop.iter.args) >= 3 else "1"
                 )
-                action_coordinates = {
+                scope_coordinates = {
                     **producer_coordinates,
                     nested_axis: f"(({loop.target.id}) - ({begin})) // ({step})",
                 }
-                strand_task = logical_task_from_coordinates(root, action_coordinates)
-                local_action_terms: list[str] = []
-                multiplier = 1
-                for axis in domain.nested_axis_order:
-                    count = domain.axis_counts[axis]
-                    if count != 1:
-                        coordinate = action_coordinates[axis]
-                        local_action_terms.append(
-                            f"({coordinate})"
-                            if multiplier == 1
-                            else f"({coordinate}) * {multiplier}"
-                        )
-                    multiplier *= count
-                local_action = " + ".join(local_action_terms) or "0"
-                action = (
-                    f"({strand_task}) * {domain.actions_per_strand} + ({local_action})"
-                )
 
                 publications: list[ast.stmt] = []
-                for plan, contributor in action_events_by_scope[scope_id]:
-                    key, membership = task_to_key_expression(
-                        action,
-                        contributor.task_to_key_segments,
+                for plan, contributor in producer_events_by_scope[scope_id]:
+                    key, membership = relation_flat_target(
+                        contributor.keys,
+                        scope_coordinates,
                     )
-                    publications.append(
-                        create(
-                            ast.If,
-                            test=expr_from_string(membership),
-                            body=emit_counted_event_for_key(plan, key),
-                            orelse=[],
+                    event_publications = emit_counted_event_for_key(plan, key)
+                    if membership == "True":
+                        publications.extend(event_publications)
+                    else:
+                        publications.append(
+                            create(
+                                ast.If,
+                                test=expr_from_string(membership),
+                                body=event_publications,
+                                orelse=[],
+                            )
                         )
-                    )
 
                 cloned = cast("ast.For", _clone_ast_value(loop))
                 computation = _ast_fingerprint(cloned.body)
@@ -1599,7 +1707,7 @@ class ForEachProgramID(ProgramIDs):
                     != computation
                 ):
                     raise AssertionError(
-                        "nested action publication changed the loop computation"
+                        "nested scope publication changed the loop computation"
                     )
                 emitted_scope_ids.add(scope_id)
                 return [cloned]
@@ -1607,7 +1715,7 @@ class ForEachProgramID(ProgramIDs):
             result = _clone_opaque_statements_with_loop_rewrite(body, rewrite)
             if emitted_scope_ids != scope_ids:
                 missing = sorted(scope_ids - emitted_scope_ids)
-                raise AssertionError(f"missing nested producer action scopes {missing}")
+                raise AssertionError(f"missing nested producer scopes {missing}")
             return result
 
         def scheduled_logical_task_expression(
@@ -1618,26 +1726,17 @@ class ForEachProgramID(ProgramIDs):
             if root not in scheduled_task_roots:
                 return None
             worker_schedule = cross_loop_schedule.worker_schedule
-            family = instantiated_task_families[root]
-            task_order = worker_schedule.task_order(root)
-            if len(task_order) != family.task_count:
-                return None
-            if task_order == family.physical_traversal:
-                return None
-
+            root_domain = root_domains[root]
             segments = worker_schedule.segments_for_root(root)
-            occupied_offsets = sorted(
-                segment.schedule_for_offset(offset)
-                for segment in segments
-                for offset in range(segment.task_count)
-            )
-            schedule_begin = occupied_offsets[0]
-            if occupied_offsets != list(
-                range(schedule_begin, schedule_begin + family.task_count)
+            schedule_interval = worker_schedule.contiguous_global_interval(root)
+            if (
+                schedule_interval is None
+                or schedule_interval[1] - schedule_interval[0] != root_domain.size
             ):
                 raise AssertionError(
                     f"root {root} does not occupy one contiguous schedule interval"
                 )
+            schedule_begin = schedule_interval[0]
 
             expression = ""
             for segment in reversed(segments):
@@ -1666,7 +1765,23 @@ class ForEachProgramID(ProgramIDs):
                         f"({inner}) < {segment.schedule_period} and "
                         f"({task_offset}) < {segment.task_count}"
                     )
-                if segment.task_period is None:
+                if segment.task_relation is not None:
+                    ordinal_coordinates = flat_task_coordinates(
+                        task_offset,
+                        segment.task_relation.source_domain.axis_order,
+                        segment.task_relation.source_domain.axis_counts,
+                    )
+                    task_coordinates, relation_membership = relation_point_coordinates(
+                        segment.task_relation,
+                        ordinal_coordinates,
+                    )
+                    if relation_membership != "True":
+                        membership = f"({membership}) and ({relation_membership})"
+                    segment_task = logical_task_from_coordinates(
+                        root,
+                        task_coordinates,
+                    )
+                elif segment.task_period is None:
                     segment_task = (
                         f"{segment.task_begin} + ({task_offset}) * {segment.task_step}"
                     )
@@ -1696,13 +1811,12 @@ class ForEachProgramID(ProgramIDs):
             force_noinline: bool = False,
         ) -> list[ast.stmt]:
             body: list[ast.stmt] = []
-            has_task_scheduling = root in ordered_action_events_by_consumer
+            has_task_scheduling = root in nested_scope_events_by_consumer
             producer_events = tuple(root_events_by_producer.get(root, ()))
             scheduled_local_task = local_task
             scheduled_logical_pid = logical_pid
-            scheduled_event_task = local_task
             scheduled_coordinates: dict[int, str] | None = None
-            if producer_events or root in action_event_roots:
+            if producer_events or root in nested_producer_roots:
                 has_task_scheduling = True
             if (
                 logical_task_expr := scheduled_logical_task_expression(
@@ -1710,14 +1824,14 @@ class ForEachProgramID(ProgramIDs):
                     local_task,
                 )
             ) is not None:
-                scheduled_event_task = device_function.new_var(
+                scheduled_task = device_function.new_var(
                     "tile_dependency_scheduled_logical_task", dce=True
                 )
                 physical_task = device_function.new_var(
                     "tile_dependency_scheduled_physical_task", dce=True
                 )
                 scheduled_coordinates = flat_task_coordinates(
-                    scheduled_event_task,
+                    scheduled_task,
                     root_logical_axis_order[root],
                     root_axis_counts[root],
                 )
@@ -1727,7 +1841,7 @@ class ForEachProgramID(ProgramIDs):
                 body.extend(
                     [
                         statement_from_string(
-                            f"{scheduled_event_task} = {logical_task_expr}"
+                            f"{scheduled_task} = {logical_task_expr}"
                         ),
                         statement_from_string(
                             f"{physical_task} = {physical_task_expr}"
@@ -1740,54 +1854,60 @@ class ForEachProgramID(ProgramIDs):
                 scheduled_coordinates = logical_coordinates_for_physical_task(
                     root, scheduled_local_task
                 )
-                scheduled_event_task = logical_task_from_coordinates(
-                    root, scheduled_coordinates
-                )
             for (
                 incoming_counted_event,
                 incoming_use,
             ) in counted_event_uses_by_waiting_root.get(root, ()):
                 has_task_scheduling = True
                 assert counted_event_arg is not None
-                event_key, _ = task_to_key_expression(
-                    scheduled_event_task,
-                    incoming_use.task_to_key_segments,
+                event_key, membership = relation_flat_target(
+                    incoming_use.keys,
+                    scheduled_coordinates,
                 )
-                body.extend(
-                    self._wait_for_counter(
-                        device_function=device_function,
-                        counter=counted_event_counter(
-                            incoming_counted_event,
-                            event_key,
-                        ),
-                        target=(
-                            f"tl.cast({epoch_var}, tl.uint32) * "
-                            f"tl.cast({counted_event_expected_arrivals(incoming_counted_event, event_key)}, tl.uint32)"
-                        ),
-                        prefix="tile_dependency_keyed_event_wait",
+                wait = self._wait_for_counter(
+                    device_function=device_function,
+                    counter=counted_event_counter(
+                        incoming_counted_event,
+                        event_key,
+                    ),
+                    target=(
+                        f"tl.cast({epoch_var}, tl.uint32) * "
+                        f"tl.cast({counted_event_expected_arrivals(incoming_counted_event, event_key)}, tl.uint32)"
+                    ),
+                    prefix="tile_dependency_keyed_event_wait",
+                )
+                if not incoming_use.keys.is_total_function():
+                    body.append(
+                        create(
+                            ast.If,
+                            test=expr_from_string(membership),
+                            body=wait,
+                            orelse=[],
+                        )
                     )
-                )
-            action_event_uses = ordered_action_events_by_consumer.get(root, ())
-            if action_event_uses:
+                else:
+                    body.extend(wait)
+            nested_event_uses = nested_scope_events_by_consumer.get(root, ())
+            if nested_event_uses:
                 # Instrument the original logical loop before segmentation.
-                # Split ranges then retain the original action-coordinate
+                # Split ranges then retain the original scope-coordinate
                 # expression instead of rebasing publication IDs per segment.
-                scheduled_root_body = body_with_action_publications(
+                scheduled_root_body = body_with_scope_publications(
                     root,
                     case_bodies[root],
                     scheduled_coordinates,
                 )
-                for action_plan, action_use in sorted(
-                    action_event_uses,
+                for scope_plan, scope_use in sorted(
+                    nested_event_uses,
                     key=lambda item: (
                         item[1].consumer_scope_id
                         if item[1].consumer_scope_id is not None
                         else -1
                     ),
                 ):
-                    scheduled_root_body = body_with_action_waits(
-                        action_plan,
-                        action_use,
+                    scheduled_root_body = body_with_scope_waits(
+                        scope_plan,
+                        scope_use,
                         scheduled_root_body,
                         scheduled_coordinates,
                     )
@@ -1807,7 +1927,7 @@ class ForEachProgramID(ProgramIDs):
                     device_function,
                     root=root,
                     logical_pid=scheduled_logical_pid,
-                    body=body_with_action_publications(
+                    body=body_with_scope_publications(
                         root,
                         case_bodies[root],
                         scheduled_coordinates,
@@ -1822,17 +1942,6 @@ class ForEachProgramID(ProgramIDs):
                 body.append(self._cross_loop_publication_barrier(device_function))
                 body.extend(publications)
             for counted_event, contributor in producer_events:
-                if (
-                    counted_event in ordered_local_events
-                    and counted_event.is_single_contributor
-                ):
-                    body.extend(
-                        emit_counted_event_for_key(
-                            counted_event,
-                            f"({local_task}) // {counted_event.expected_arrivals}",
-                        )
-                    )
-                    continue
                 body.extend(
                     emit_counted_event_from_producer_coordinates(
                         counted_event,
@@ -1853,38 +1962,35 @@ class ForEachProgramID(ProgramIDs):
             ]
 
         dense_assignment_by_root: dict[int, tuple[int, int, int]] = {}
-        for root, family in enumerate(instantiated_task_families):
-            task_order = cross_loop_schedule.worker_schedule.task_order(root)
-            if not task_order:
+        for root, root_domain in enumerate(root_domains):
+            segments = sorted(
+                cross_loop_schedule.worker_schedule.segments_for_root(root),
+                key=lambda segment: segment.schedule_begin,
+            )
+            if not segments:
                 continue
-            if len(task_order) != family.task_count:
+            if sum(segment.task_count for segment in segments) != root_domain.size:
                 raise exc.CrossLoopSchedulingError(
                     "partially static task families are not supported yet"
                 )
-            placements = tuple(
-                cross_loop_schedule.worker_schedule.placement(root, task)
-                for task in task_order
-            )
-            if any(placement is None for placement in placements):
-                raise AssertionError("static task order contains an unplaced task")
-            concrete = tuple(
-                placement for placement in placements if placement is not None
-            )
-            workers = sorted({worker_id for worker_id, _position in concrete})
-            worker_begin = workers[0]
-            worker_count = len(workers)
-            if workers != list(range(worker_begin, worker_begin + worker_count)):
+            worker_begin = segments[0].worker_begin
+            worker_count = segments[0].worker_count
+            if any(
+                segment.worker_begin != worker_begin
+                or segment.worker_count != worker_count
+                or segment.schedule_step != 1
+                or segment.schedule_period is not None
+                for segment in segments
+            ):
                 raise exc.CrossLoopSchedulingError(
                     f"root {root} has a noncontiguous static worker assignment"
                 )
-            first_position = concrete[0][1]
-            if any(
-                placement
-                != (
-                    worker_begin + ordinal % worker_count,
-                    first_position + ordinal // worker_count,
-                )
-                for ordinal, placement in enumerate(concrete)
+            schedule_begin = segments[0].schedule_begin
+            if schedule_begin % worker_count or any(
+                segment.schedule_begin
+                != schedule_begin
+                + sum(previous.task_count for previous in segments[:index])
+                for index, segment in enumerate(segments)
             ):
                 raise exc.CrossLoopSchedulingError(
                     f"root {root} has a non-dense static worker schedule"
@@ -1892,7 +1998,7 @@ class ForEachProgramID(ProgramIDs):
             dense_assignment_by_root[root] = (
                 worker_begin,
                 worker_count,
-                len(task_order),
+                root_domain.size,
             )
 
         def static_root_body(root: int) -> list[ast.stmt]:
@@ -2023,81 +2129,43 @@ class ForEachProgramID(ProgramIDs):
             return case.parent_strategy.pid_info
         return case.pid_info
 
-    def _instantiated_task_families(
+    def _root_physical_traversals(
         self,
         device_function: DeviceFunction,
-    ) -> tuple[InstantiatedTaskFamily, ...] | None:
-        """Bind DeviceIR logical task families to one physical configuration."""
-        logical_families = HostFunction.current().device_ir.task_families
-        if len(logical_families) != len(self.cases):
+        root_domains: tuple[LogicalDomain, ...],
+    ) -> tuple[LogicalRelation, ...] | None:
+        """Bind each logical root domain to its configured PID traversal."""
+        if len(root_domains) != len(self.cases):
             return None
-        result: list[InstantiatedTaskFamily] = []
-        for root, logical_family in enumerate(logical_families):
+        result: list[LogicalRelation] = []
+        for root, domain in enumerate(root_domains):
             geometry = self._static_case_geometry(root, device_function)
             if geometry is None:
                 return None
             physical_axis_order, axis_counts, block_sizes = geometry
-            if set(logical_family.logical_axis_order) != set(physical_axis_order):
+            if (
+                set(domain.axis_order) != set(physical_axis_order)
+                or domain.axis_counts
+                != {axis: axis_counts[axis] for axis in domain.axis_order}
+                or domain.block_sizes
+                != {axis: block_sizes[axis] for axis in domain.axis_order}
+            ):
                 return None
-            task_count = math.prod(axis_counts.values())
-            logical_task_by_physical_task: list[int] = []
             case = self.cases[root]
-            for physical_task in range(task_count):
-                coordinates: dict[int, int] = {}
-                if isinstance(case, L2GroupingProgramIDs) and not (
-                    len(physical_axis_order) >= 2
-                    and (
-                        axis_counts[physical_axis_order[1]] == 1
-                        or case.group_size >= axis_counts[physical_axis_order[0]]
-                    )
-                ):
-                    first_axis, second_axis = physical_axis_order[:2]
-                    first_count = axis_counts[first_axis]
-                    second_count = axis_counts[second_axis]
-                    inner_size = first_count * second_count
-                    inner_task = physical_task % inner_size
-                    group_span = case.group_size * second_count
-                    group = inner_task // group_span
-                    first_in_group = group * case.group_size
-                    actual_group_size = min(
-                        first_count - first_in_group,
-                        case.group_size,
-                    )
-                    within_group = inner_task % group_span
-                    coordinates[first_axis] = (
-                        first_in_group + within_group % actual_group_size
-                    )
-                    coordinates[second_axis] = within_group // actual_group_size
-                    remainder = physical_task // inner_size
-                    for block_id in physical_axis_order[2:]:
-                        count = axis_counts[block_id]
-                        coordinates[block_id] = remainder % count
-                        remainder //= count
-                else:
-                    remainder = physical_task
-                    for block_id in physical_axis_order:
-                        count = axis_counts[block_id]
-                        coordinates[block_id] = remainder % count
-                        remainder //= count
-                logical_task = 0
-                multiplier = 1
-                for block_id in logical_family.logical_axis_order:
-                    logical_task += coordinates[block_id] * multiplier
-                    multiplier *= axis_counts[block_id]
-                logical_task_by_physical_task.append(logical_task)
+            l2_group_size = None
+            if isinstance(case, L2GroupingProgramIDs) and not (
+                len(physical_axis_order) >= 2
+                and (
+                    axis_counts[physical_axis_order[1]] == 1
+                    or case.group_size >= axis_counts[physical_axis_order[0]]
+                )
+            ):
+                l2_group_size = case.group_size
             result.append(
-                InstantiatedTaskFamily(
-                    logical_axis_order=logical_family.logical_axis_order,
-                    physical_axis_order=physical_axis_order,
-                    axis_counts_items=tuple(
-                        (block_id, axis_counts[block_id])
-                        for block_id in logical_family.logical_axis_order
-                    ),
-                    block_sizes_items=tuple(
-                        (block_id, block_sizes[block_id])
-                        for block_id in logical_family.logical_axis_order
-                    ),
-                    logical_task_by_physical_task=tuple(logical_task_by_physical_task),
+                physical_traversal_relation(
+                    domain,
+                    physical_axis_order,
+                    l2_group_size=l2_group_size,
                 )
             )
         return tuple(result)

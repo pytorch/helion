@@ -706,12 +706,12 @@ def _build_helion_reference(args, tensors):
         qk(*qk_args)
     key_begin = args.q_heads * args.head_dim
     qkv_width = (args.q_heads + 2 * args.kv_heads) * args.head_dim
-    query = qkv[:, :key_begin].view(1, args.q_heads, args.head_dim)
+    query = qkv[:, :key_begin].view(args.batch, args.q_heads, args.head_dim)
     key = qkv[:, key_begin : key_begin + args.kv_heads * args.head_dim].view(
-        1, args.kv_heads, args.head_dim
+        args.batch, args.kv_heads, args.head_dim
     )
     value = qkv[:, key_begin + args.kv_heads * args.head_dim : qkv_width].view(
-        1, args.kv_heads, args.head_dim
+        args.batch, args.kv_heads, args.head_dim
     )
     cache_args = (
         key,
@@ -754,7 +754,7 @@ def _build_helion_reference(args, tensors):
     _, merge = _compile_granular_separate_kernel(merge_kernel, merge_args, args)
     attention = merge(*merge_args)
     quant_args = (
-        attention.view(1, args.hidden),
+        attention.view(args.batch, args.hidden),
         tensors["attention_q"],
         tensors["attention_scale"],
         args.group,
@@ -828,13 +828,15 @@ def _build_helion_reference(args, tensors):
         rms(*rms_args)
         local_qkv = qkv_mm(*qkv_args)
         qk(local_qkv, *qk_args[1:])
-        local_query = local_qkv[:, :key_begin].view(1, args.q_heads, args.head_dim)
+        local_query = local_qkv[:, :key_begin].view(
+            args.batch, args.q_heads, args.head_dim
+        )
         local_key = local_qkv[
             :, key_begin : key_begin + args.kv_heads * args.head_dim
-        ].view(1, args.kv_heads, args.head_dim)
+        ].view(args.batch, args.kv_heads, args.head_dim)
         local_value = local_qkv[
             :, key_begin + args.kv_heads * args.head_dim : qkv_width
-        ].view(1, args.kv_heads, args.head_dim)
+        ].view(args.batch, args.kv_heads, args.head_dim)
         cache(
             local_key,
             local_value,
@@ -853,7 +855,7 @@ def _build_helion_reference(args, tensors):
         )
         local_attention = merge(local_partials, local_lse)
         attention_quant(
-            local_attention.view(1, args.hidden),
+            local_attention.view(args.batch, args.hidden),
             tensors["attention_q"],
             tensors["attention_scale"],
             args.group,
@@ -1102,7 +1104,7 @@ def main() -> None:
 
         def compose_task_aligned_source() -> str:
             return original_compose().replace(
-                "attention_flat = attention.view(1, hidden)",
+                "attention_flat = attention.view(batch, hidden)",
                 "attention_flat = attention",
             )
 

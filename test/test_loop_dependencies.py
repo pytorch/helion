@@ -17,7 +17,8 @@ from helion._compiler.device_function import DeviceFunction
 from helion._compiler.program_id import _ast_fingerprint
 from helion._compiler.program_id import _clone_opaque_loop_segment
 from helion._compiler.program_id import _clone_opaque_statements
-from helion._compiler.program_id import _prepend_schedule_to_opaque_loop
+from helion._compiler.program_id import _clone_opaque_statements_with_scope_stages
+from helion._compiler.tile_dependency import TILE_DEPENDENCY_SCOPE_ID_ATTR
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -163,15 +164,25 @@ class TestTileDependencyScheduling(unittest.TestCase):
         second = _clone_opaque_loop_segment(
             loop, begin=ast.parse("64", mode="eval").body
         )
-        waited = _prepend_schedule_to_opaque_loop(
-            loop,
-            ast.parse("ready = tl.load(counter)\n").body,
-            force_serial_pipeline=True,
+        setattr(loop, TILE_DEPENDENCY_SCOPE_ID_ATTR, 7)
+        staged = _clone_opaque_statements_with_scope_stages(
+            [loop],
+            scope_id=7,
+            split_iteration_offsets=(4,),
+            stage_waits=(
+                tuple(ast.parse("first_ready = tl.load(counter)\n").body),
+                tuple(ast.parse("second_ready = tl.load(counter + 1)\n").body),
+            ),
         )
 
         self.assertEqual(_ast_fingerprint(first.body), computation)
         self.assertEqual(_ast_fingerprint(second.body), computation)
-        self.assertEqual(_ast_fingerprint(waited.body[1:]), computation)
+        self.assertIsInstance(staged[1], ast.For)
+        self.assertIsInstance(staged[3], ast.For)
+        self.assertEqual(_ast_fingerprint(staged[1].body), computation)
+        self.assertEqual(_ast_fingerprint(staged[3].body), computation)
+        self.assertEqual(ast.unparse(staged[0]), "first_ready = tl.load(counter)")
+        self.assertEqual(ast.unparse(staged[2]), "second_ready = tl.load(counter + 1)")
 
     def test_opaque_tile_body_can_be_outlined_without_rewriting(self) -> None:
         device_function = object.__new__(DeviceFunction)

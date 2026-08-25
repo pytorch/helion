@@ -21,6 +21,573 @@ The scheduler should:
 - Become simpler by deriving scheduling from producer and consumer accesses,
   rather than accumulating topology matchers and exceptional cases.
 
+## Authoritative target architecture (2026-08-25)
+
+This section is the current design contract. All other descriptions of
+separate root-task, ordered-action, access-cohort, readiness-frontier, or
+counted-event IRs in this document are implementation history and do not
+define the target.
+
+The compiler should have one coordinate model and one relation algebra:
+
+```text
+DeviceIR execution scopes + LogicalDomain
+                    ↓
+allocation-coordinate access relations
+                    ↓
+source-ordered reaching definitions
+                    ↓
+symbolic LogicalRelation dependency edges
+                    ↓
+relation quotient into KeyedEvent objects
+                    ↓
+WorkerSchedule over non-preemptive outer strands
+                    ↓
+direct relation and worker-stream lowering
+```
+
+The design intentionally does not introduce a separate abstraction for nested
+"actions." Root tasks and nested loop instances are both instances of an
+execution scope over a `LogicalDomain`. The distinction that remains is an
+execution constraint: only an outer root strand is independently placeable.
+A nested scope projects onto its owning strand and executes there in lexical
+program order with its live values intact.
+
+### Minimal retained IR
+
+1. **`LogicalDomain`** describes a bounded Cartesian integer domain: stable
+   axis identity, extent expressions that become positive integers for a
+   selected configuration, and optional tile geometry. It does not own a
+   traversal. Root scopes, nested scopes, event-key spaces, allocation
+   coordinates, and worker-stream spaces all use this same value type. Each
+   domain carries a semantic kind so equal-rank allocation, event, task, and
+   worker domains cannot be composed accidentally.
+2. **`ExecutionScope`** identifies a DeviceIR callsite and carries only facts
+   not expressible as an access relation: parent and lexical order, owning root
+   strand, its logical domain, the projection to that strand, guaranteed-
+   execution multiplicity relative to its parent, stable entry and completion
+   insertion points, access order, dominance/post-dominance facts, the lowered
+   loop and induction-variable mapping, and backend/configuration-dependent
+   wait/publication/segmentation capabilities. Stable scope identity remains
+   necessary for code insertion and repeated callsites. It is not a second
+   dependency graph.
+3. **`LogicalRelation`** is the single binary, set-valued relation used for
+   accesses, dependency edges, event contribution/use maps, scope-to-strand
+   projection, and compact schedule maps. Its direction is always
+   `source instance -> set[target instances]`, and its domain and codomain
+   kinds must match every composition.
+4. **`KeyedEvent`** contains a logical key domain, producer-to-key relations,
+   consumer-to-key relations, and covered hazard/program-point provenance.
+   Final-arrival execution is a scheduler-owned `LocalTrigger`, not part of
+   dependency identity. `FamilyDone` is the same event with a unit key domain.
+5. **`WorkerSchedule`** remains the only placement abstraction. Its segments
+   map a logical outer-task subdomain to worker-stream positions. Nested scopes
+   inherit placement through their scope-to-strand relation.
+
+There should be no separate semantic and lowered event IRs, no action-only
+dependency graph, and no schedule type for continuation, direct readiness,
+milestones, attention, FFN, or MoE.
+
+### Restricted relation algebra
+
+`LogicalRelation` is deliberately smaller than a general polyhedral system. It
+is a normalized finite disjoint union of pieces supporting:
+
+- bounded Cartesian integer domains;
+- affine expressions with static integer coefficients;
+- floor division and modulo by positive static constants;
+- rectangular and residue-class guards;
+- target points or Cartesian target ranges `(begin, end, step)` whose
+  endpoints and static strides use those expressions;
+- exact union and deduplication for equal, disjoint, contained, or
+  rectilinearly subtractable pieces;
+- restriction to a source or target subdomain;
+- composition when the result remains in this grammar;
+- inversion for projections, permutations, constant scaling, div/mod tiling,
+  and bounded range mappings; and
+- symbolic cardinality for disjoint target ranges.
+
+The implementation may use small internal expression/piece records, but they
+must remain implementation details of `LogicalRelation`, not parallel compiler
+IRs. There is no general satisfiability or equivalence solver: expressions are
+normalized affine-div forms with static coefficients and positive static
+divisors; guards come only from understood indexing operations; inversion and
+composition use explicit closed rewrite rules; and relation-piece growth must
+remain proportional to source access pieces rather than runtime points. A
+relation that cannot be proved closed in this grammar lifts monotonically to
+an enclosing scope or `FamilyDone`. Flatten/unflatten uses affine linearization
+and static div/mod; a tile crossing a reshape boundary may become a small finite
+union, but a decomposition whose piece count scales with tensor extent is
+rejected.
+
+Enumeration is permitted as a differential test oracle during migration. It
+must not be the normal compiler representation, an intermediate passed to the
+scheduler, or a fallback whose cost scales with a large runtime task domain.
+
+### Direct symbolic dependency construction
+
+Every load and store is interpreted as a `LogicalRelation` from its execution
+scope to allocation-coordinate ranges. Producer and consumer access relations
+are composed through allocation coordinates to obtain the exact dependency
+relation directly. The compiler must not enumerate access footprints and then
+attempt to rediscover their structure.
+
+For the one-dimensional producer-16/consumer-32 example:
+
+```text
+consumer c -> producer range [2*c, 2*c + 2)
+```
+
+For Qwen gate/up to activation:
+
+```text
+(batch, group) ->
+    (batch, [8*group, 8*group + 8))
+  union
+    (batch, [768 + 8*group, 768 + 8*group + 8))
+```
+
+For the W2 reduction:
+
+```text
+(batch, output_tile, k_group) -> activation(batch, k_group)
+```
+
+The absent `output_tile` coordinate is therefore dropped by event quotienting
+without recognizing an FFN. Unequal tiles and boundary fragments produce
+piecewise ranges and symbolic cardinalities. Uniform fan-in is not a legality
+requirement.
+
+Views and reshapes are handled before dependency construction:
+
+```text
+scope coordinate
+    -> logical tensor interval
+    -> allocation-coordinate interval
+    -> overlapping producer-coordinate range
+```
+
+Source-ordered reaching definitions remain authoritative for partial and
+in-place writes. They restrict the allocation support on which each composed
+relation is valid. Multiple accesses are unioned and deduplicated as relations;
+fan-in counts distinct `(producer instance, event key)` pairs rather than
+access edges.
+
+### One event construction path
+
+Event formation operates directly on symbolic dependency relations:
+
+1. Form a consumer signature from the normalized producer-range expressions
+   required at that program point.
+2. Build the semantic quotient from the normalized consumer expressions that
+   determine those predecessor ranges. Axes absent from every predecessor
+   expression are dropped. The quotient need not be mathematically minimal;
+   when equality cannot be proved, retain a finer exact consumer key.
+3. Use the inverse relation to derive producer contributions and symbolic
+   fanout.
+4. Union source-tagged relations for joins and derive per-key fan-in from
+   symbolic cardinality after deduplication.
+5. Represent root completion by coarsening to a unit key domain.
+
+The event object produced here is also the object consumed by scheduling and
+lowering. Eliminate the current `InstantiatedEvent*` versus `CountedEvent*`
+duplication and the later task-to-key adaptation pass. Backend artifacts such
+as counter offsets, counter storage layout, and selected prefix/count encoding
+may exist transiently, but they reference this event and do not copy its
+relations.
+
+A monotonic completed-producer-prefix counter is an optional lowering of a
+range relation, not part of dependency semantics. It is legal only when the
+selected producer traversal proves that the required range is a completed
+prefix. Otherwise the same relation lowers to counted keys, bounded fanout, or
+`FamilyDone`.
+
+### Nested scopes without an action-specific scheduler
+
+The same relation graph handles root and nested boundaries. A nested scope's
+domain includes its enclosing root coordinates and local loop coordinates. Its
+scope-to-strand projection drops the local coordinates.
+
+Program-order edges between scopes are also relations. They allow the graph
+to prove that a wait at an earlier checkpoint covers a later access and allow
+milestones to compose through arbitrary chains. The scheduler does not build
+an `ActionDependencyRelation`, `_OrderedActionReadiness`, or a separate action
+event graph.
+
+This unification does not make nested iterations movable tasks. A reduction or
+matmul loop may carry accumulators, descriptors, and pipeline state across
+iterations. Scheduling may insert waits or publications at proved checkpoints
+and may mechanically split a representable loop, but it may move only the
+complete owning outer strand unless a future transformation explicitly
+materializes continuation state.
+
+Relations also cannot replace execution guarantees. `ExecutionScope` must
+retain whether a checkpoint executes exactly once and whether synchronization
+may legally be emitted there. Conditional branches, dynamic or zero-trip
+loops, asynchronous stores without a proved completion point, and unsupported
+control flow lift to an enclosing legal scope.
+
+### Symbolic milestones and worker scheduling
+
+Milestones are a schedule-dependent quotient of the same dependency relation:
+
+```text
+consumer scope -> required producer region
+               -> producer completion round under WorkerSchedule
+               -> one admission frontier in the consumer loop
+```
+
+The selected worker position partitions a one-dimensional nested loop into at
+most two contiguous regions: the prefix whose producers are already complete
+at admission and the remaining suffix. This derives Qwen's 64/32 and Gemma's
+36/4 handoffs without a cohort or FFN abstraction, while avoiding one cloned
+loop per later producer-completion level. If the whole loop has one readiness
+condition, lowering inserts one wait around the original loop and does not
+split it. When lowering cannot represent the frontier exactly, it coarsens the
+dependency.
+
+The semantic quotient above and this admission-frontier quotient are distinct
+operations implemented by the same relation algebra. The first groups equal
+exact predecessor fibers; the second groups the exact fibers on either side of
+the selected schedule frontier.
+
+The implementation must not materialize those fibers. Scheduling needs three
+exact reductions over a relation, all kept as private operations of the
+restricted relation algebra rather than as another compiler IR:
+
+- project or invert a contribution to obtain `event key -> producer strand`;
+- count the distinct producer instances in that preimage for event fan-in; and
+- map those strands through `WorkerSchedule` and take the maximum stream
+  position needed for readiness.
+
+The result of the last operation is a single-valued symbolic relation from an
+event key to a completion position. It is a scheduling query, not a new
+semantic graph node or a public "piecewise scalar" abstraction. If an exact
+result would require enumerating a runtime-sized domain or modulo period, the
+query declines and the event is conservatively coarsened.
+
+`WorkerScheduleSegment` remains the sole placement record, but it becomes a
+compact relation from a logical outer-task subdomain to worker-stream
+positions. It must not encode a recovered sequence of flattened task IDs.
+One root may have several disjoint segments, enabling batch fibers or other
+readiness-equivalent regions to begin at different times. The relation is
+bijective over non-local tasks and efficiently usable in both directions:
+scheduling queries task-to-position, while code generation queries
+position-to-task.
+
+Code generation emits segments in the exact global worker-stream order checked
+by liveness, rather than regrouping all segments by source root. The following
+are mandatory invariants:
+
+- every non-local outer task executes exactly once;
+- scheduled task subdomains are disjoint and cover the required domain;
+- a waiting worker never owns an unmet producer later in its stream;
+- liveness validates the same order code generation emits;
+- `FamilyDone` is published once per participating worker after that worker's
+  final segment for the root;
+- each scope receives the milestone plan associated with its scheduled root
+  subdomain;
+- fanout lowers as a compact bounded range where possible, not an unrolled
+  select forest; and
+- nonuniform tail fan-in lowers as a symbolic cardinality formula or a small
+  number of pieces, never a key-indexed table.
+
+A completion position alone is not a liveness proof because it discards worker
+identity. The production liveness proof is therefore mutation-local and
+worker-aware:
+
+1. Start from the source-ordered schedule, which is valid by construction.
+2. Before moving or inserting a consumer region, compute its transitive
+   prerequisite strand relation symbolically.
+3. For every occupied destination worker, reject the mutation if any required
+   strand would remain later than the new blocking point on that worker.
+4. Recompute the compact prerequisite relation after each accepted mutation.
+
+This also detects mutual cross-worker waits that have the same scalar
+completion round. The existing expanded task/event-node validator remains only
+as a small-domain differential oracle. It must not run in production on a
+domain whose size scales with runtime task or event-key count. Final-arrival
+local execution remains a contraction of this graph only when there is one
+complete movable consumer task per key, a sole complete prerequisite, and no
+nested wait in the consumer strand.
+
+Do not pay for a generic root-tag dispatcher when the final schedule is
+root-monotone and contiguous. Code generation should mechanically canonicalize
+such a `WorkerSchedule` back to the current simple root loops. Use a compact
+component/position dispatcher only for genuinely interleaved schedules. This
+is an emitter simplification of one schedule IR, not another schedule type.
+
+L2 traversal is composed only after selecting a logical task. Its transform
+must be bijective, including partial final groups. Event-key traversal is also
+explicit and independent of key identity; first-seen integer numbering must
+not influence contributor order, worker-count breakpoints, or placement.
+
+### Required deletions
+
+The completed migration should remove or subsume:
+
+- `InstantiatedTaskFamily`'s duplicate logical-domain implementation;
+- `InstantiatedActionDomain` as a distinct domain abstraction;
+- `ActionDependencyRelation.predecessors_by_consumer_action`;
+- `_access_predecessor_sets`, `dependency_predecessor_sets`,
+  `instantiate_root_predecessor_sets`, and `instantiate_action_relations` as
+  enumeration-based APIs;
+- `InstantiatedEventContribution`, `InstantiatedEventUse`, and
+  `InstantiatedKeyedEvent` duplication with `CountedEventContribution`,
+  `CountedEventUse`, and `CountedEventPlan`;
+- `instantiate_event_graph`, `canonicalize_ready_events`, and
+  `lower_counted_events` as separate expand/recompress stages;
+- action/cohort-specific readiness and placement abstractions;
+- `TaskToKeySegment`, `_compress_task_to_key`, `_fit_task_sequence`, and the
+  balanced `tl.where` diagnostic stopgap;
+- materialized predecessor, task-to-key, expected-arrival, and physical-
+  traversal tables; and
+- action-specific or cohort-specific lowering branches.
+
+`ExecutionScope`, the allocation reaching-definition analysis, stable loop
+metadata, mechanical loop segmentation, and synchronization capability checks
+remain necessary correctness machinery.
+
+### Migration and validation order
+
+1. Finalize `LogicalDomain` and the restricted `LogicalRelation` grammar with
+   exhaustive small-domain differential tests.
+2. Construct symbolic access and dependency relations beside the old
+   enumerated proof. Verify identity, unequal tile sizes, tails, batch axes,
+   offsets/views, joins, fanout, and L2-independent logical identity.
+3. Build symbolic `KeyedEvent` objects beside the old event graph. Compare
+   dependency relations, semantic quotienting, fan-in, joins, fanout, and
+   fallback decisions exhaustively on small domains.
+4. Switch event scheduling and direct event lowering to the symbolic graph,
+   including per-use final-arrival annotations and symbolic cardinality.
+5. Delete predecessor, event, fan-in, and task/key tables together with their
+   compressors only after the symbolic event path no longer consumes them.
+6. Replace materialized physical traversal with a compact logical-to-physical
+   transform.
+7. Generalize `WorkerScheduleSegment` while reproducing current batch-one
+   schedule structure and resource envelope.
+8. Emit and validate global worker-stream order, including split-root
+   `FamilyDone` aggregation and per-region milestones.
+9. Enable partial root-domain placement and symbolic milestone formation.
+10. Delete the remaining legacy event IR and enumeration paths after
+    differential, correctness, and performance parity.
+
+### Active implementation task list (2026-08-25)
+
+- [x] Give every event a canonical event-local coordinate chart before event
+  identity is assigned. Group equivalent fanout by the complete producer
+  contribution signature; never alpha-rename an already-created event.
+- [x] Add exact relation operations for source projection, inversion/preimage,
+  distinct fiber cardinality, compact worker placement, and fiber maximum,
+  with small-domain differential tests.
+- [x] Make readiness-frontier construction, direct placement, final-arrival
+  selection, key-major ordering, and worker-count snapping consume symbolic
+  relations without task/key arrays. Nested scopes now use one symbolic
+  admission frontier rather than enumerating every later readiness level.
+- [x] Complete the incremental worker-aware mutation proof. Static contributor
+  closure follows local triggers and earlier blocking dependencies, same-round
+  producers remain eligible on other workers, and adversarial transitive-worker
+  tests retain the expanded graph validator only as a small-domain oracle.
+- [x] Lower key expressions, event membership, fan-in, and compact fanout
+  directly from `KeyedEvent` relations.
+- [x] Delete `relation_fibers`, `_materialize_keyed_events`,
+  `InstantiatedActionDomain`, `InstantiatedTaskFamily`, `InstantiatedEvent*`,
+  the enumerated predecessor/action APIs, `_compress_task_to_key`, and the
+  duplicate legacy event/canonicalization passes. `CountedEventPlan` remains
+  only as a lowering-selection record referencing canonical event relations;
+  it is not a second semantic event IR.
+- [x] Replace flattened `WorkerSchedule._placements` and materialized physical
+  traversal tables with compact logical-domain schedule relations. Per-task
+  lookup remains only for unit tests and the small-domain validator.
+- [x] Remove or rename remaining migration-shaped wrappers and stale comments
+  where doing so reduces concepts. Dependency-bearing nested loops are scopes,
+  not a parallel action/cohort scheduling hierarchy.
+- [x] Verify correctness and bounded lowering resources for Qwen batch
+  1/2/8/16, Gemma E4B, and Gemma A4B/MoE batch 1/8/16. Batched A4B uses the
+  unfused-GeGLU source that preserves the vLLM kernel boundaries; the batch-one
+  matched source now rejects unsupported batched use explicitly.
+- [x] Verify affine-chain compile-time scaling through 19,968 producer tasks
+  and 624 consumer tasks without compile time or generated-code size scaling
+  with task count.
+- [x] Add uneven/uniform Muse relation coverage, rerun cold-L2 Qwen/Gemma
+  benchmarks, and retain representative lowered Triton and NCU evidence.
+
+Latest validation checkpoint (2026-08-25): the Qwen batch-scaling stress source
+passes correctness at batch 1/2/8/16 and lowers to 1,286--1,394 lines with only
+18--32 `tl.where` sites, independent of the runtime task count. That source
+keeps each complete RMS reduction and all 32 quant groups inside one opaque
+root; it compiles at 255 registers with 336--456 spill bytes and is not the
+Qwen performance source. The intended granular Qwen source exposes the RMS
+partial and finalize loops as ordinary roots and compiles at 252 registers
+with no spills. Gemma E4B passes at 162 registers with no spilling. The
+vLLM-boundary-preserving Gemma A4B/MoE source passes at batch 1/8/16 with
+96/80/84 registers and 0/2/0 spill bytes.
+
+Qwen lowering wall time is also flat across batch: batch 1/2/8/16 take
+14.35/14.58/14.43/14.50 seconds in fresh Python processes, including roughly
+11 seconds of import, tracing, and source setup. The symbolic scheduling and
+code-generation increment therefore remains a few seconds rather than scaling
+with the 8,192-task batched producer domain. This was achieved by composing
+relation pieces directly instead of globally canonicalizing both operands,
+grouping equal source guards during fiber reductions, and proving constant or
+dominant expressions from finite bounds before asking SymPy to simplify them.
+
+Cold-L2 B200 measurement of the intended granular Qwen source is 89.59
+microseconds versus 98.39 microseconds for separate Helion. The saved
+pre-refactor lowering `/tmp/qwen3_multi_scope_final_lowered.py` measures 88.86
+microseconds under the same cold harness, so the symbolic refactor is at
+performance parity within run-to-run noise. Warm medians are 78.04 versus
+85.29 microseconds, matching the earlier 78.20-versus-85.52 checkpoint.
+
+The previously recorded 156.50-microsecond Qwen result came from the different
+opaque fused-RMS source, not from a scheduler regression. Its lowered Triton
+has two 101/102-line noinline roots in which one CTA serially performs the
+4,096-element reduction and all 32 quant groups. Every QKV/W13 worker waits on
+those singleton roots, and the full kernel spills 336--456 bytes. The granular
+source instead emits 32 partial tasks and 32 finalize/quant tasks per RMS
+boundary, retains 252 registers with no spills, and recovers the old schedule.
+This is a source visibility issue: nested work hidden inside an opaque task
+cannot be scheduled independently by the current cross-loop scheduler.
+
+For completeness, the granular Qwen source at batch 2 and 8 currently measures
+130.03/384.38 microseconds versus separate Helion at 121.24/300.76; those larger
+batches remain performance work rather than a compile-scaling or correctness
+failure. Gemma E4B is 107.21 versus 91.21. Gemma A4B batch 1 is 54.83 versus
+53.53 for the matched separate baseline; the earlier batch 1/8/16 sweep was
+55.21/139.16/236.83 versus 53.16/108.94/223.99. These cold-cache numbers
+supersede warm-cache figures when assessing the performance objective.
+
+The affine compile-scaling probe remains flat: 65,536 through 1,048,576
+elements lower in 0.186--0.198 seconds to approximately 4.8 KB/82 lines, and
+the 19,968-producer/624-consumer Muse-sized case lowers in 0.210 seconds to
+4.7 KB/82 lines. No case emits a task-count-dependent `tl.where` forest.
+Representative final artifacts are
+`/tmp/qwen3_granular_symbolic_final_lowered.py` (the current granular Qwen
+lowering), `/tmp/qwen3_multi_scope_final_lowered.py` (its known-good
+pre-refactor counterpart), `/tmp/qwen_b1_symbolic_final_lowered.py` (the
+opaque fused-RMS diagnostic),
+`/tmp/gemma_e4b_symbolic_final_lowered.py`,
+`/tmp/gemma_a4b_symbolic_final_lowered.py`, and the matching NCU CSV files
+`/tmp/ncu_qwen_symbolic_final.csv`,
+`/tmp/ncu_gemma_e4b_symbolic_final.csv`, and
+`/tmp/ncu_gemma_a4b_symbolic_final.csv`.
+
+The liveness proof deliberately keeps worker identity. The symbolic scalar
+query `event key -> maximum producer stream position` is sufficient to derive
+frontiers, but it is not sufficient to prove progress: equal maximum positions
+can hide a producer later on the waiting worker or a mutual cross-worker wait.
+Before every placement mutation the scheduler must therefore preserve the
+correlated `(worker, stream position)` prerequisite relation. This is a
+relation reduction over the existing graph, not a new schedule IR.
+
+Relation "fibers" are not retained compiler objects. A fiber is simply the set
+of relation targets for one fixed source coordinate. The only required fiber
+operations are exact cardinality (event fan-in) and reduction after composing
+with worker placement (frontier position). Both return ordinary
+`LogicalRelation` values over canonical value domains; no public piecewise-
+scalar abstraction is introduced.
+
+Required stress tests are:
+
+- the 65,536-element producer-16/consumer-32 affine chain;
+- Muse's approximately 25,500-task small-tile configuration, including the
+  uneven 16-by-1,248 and uniform 13-by-1,536 cases;
+- Qwen FFN and full layer at batch 1, 2, 8, and 16 with cold-L2 flushing,
+  saved lowered Triton, and NCU timelines;
+- Gemma E4B schedule/performance parity; and
+- affine task-major Gemma A4B at batch 1, 8, and 16 with generated-code size
+  and compiler peak memory bounded by relation complexity rather than task
+  count.
+
+The existing dense-factorization prototype is diagnostic only: it demonstrates
+that direct coordinate rendering removes the `tl.where` explosion, but it
+still expands the relation first. Replace it during steps 1--3 rather than
+building more compiler behavior on top of it.
+
+### Symbolic migration status (2026-08-25)
+
+- `LogicalDomain` is implemented without an embedded traversal. Scope identity
+  and semantic domain kind are part of its type, while physical/L2 order is a
+  separate caller choice.
+- The dependency and scheduling APIs accept `TileDependencyGraph`, configured
+  logical domains, and compact traversal relations. Production no longer has
+  `InstantiatedTaskFamily` or `InstantiatedActionDomain`.
+- Supported accesses are first lowered independently to
+  `scope -> allocation-coordinate` relations. Dependency construction uses a
+  generic overlap operation on those relations, rather than a second
+  producer/consumer axis-matching proof.
+- Ancestor and earlier-sibling program-order coverage is expressed as the same
+  `LogicalRelation` projection; the flattened compatibility implementation has
+  been deleted.
+- The final-form `KeyedEvent` path now performs a consumer-signature
+  quotient directly from symbolic relations. It supports unequal tile sizes,
+  tail tiles, batch axes, dropped irrelevant consumer axes, disjoint producer
+  ranges, multi-producer joins, nested scope endpoints, and unit-key
+  `FamilyDone` fallback without per-task predecessor or key tables. Production
+  scheduling and lowering consume these relations directly; the materialized
+  event adapter and duplicate event canonicalization pipeline are deleted.
+- `DependencyPoint` identifies the memory hazard plus both producer and
+  consumer callsites. Equivalent exact and family-completion certificates can
+  therefore be normalized without conflating independently executed producer
+  scopes. Final-arrival eligibility is based on complete obligation coverage,
+  not an incidental count of event objects.
+- Family-completion fallback is derived as the complete graph obligation set
+  minus obligations represented by usable exact events. This covers omitted
+  conditional/unknown-domain callsites and failed root projections; fallback
+  is no longer tied to whichever affine attempts happened to return `None`.
+- Root counted-event selection and emitter-capability filtering are one pass;
+  the former `lower_counted_events` adapter has been deleted.
+- Final-arrival selection and counted-event emission share the same canonical
+  relation-lowerability predicate, so scheduling cannot remove a consumer that
+  the emitter later rejects.
+- Traversal bijectivity is a tested constructor invariant of
+  `physical_traversal_relation` and `inverse().fiber_enumeration()`, rather than
+  an expensive generic theorem re-proved for every configuration. Production
+  keeps only constant-time typed-domain, size, and nonempty-relation checks;
+  small round-trip tests cover axis permutations, L2 full and tail groups with
+  outer axes, and multi-piece fiber enumeration. Dead schedule-reporting state
+  (`task_ready_edges`, stored local-trigger worker sets, unused endpoint
+  wrappers, and the unused `excluded_roots` API argument) has been removed.
+- Relation containment now checks arithmetic-progression phase as well as
+  bounds and stride. Shifted strided source or target sets cannot be absorbed
+  by `union()` or used as false program-order coverage certificates.
+- Literal integer subscripts and omitted trailing full slices are preserved in
+  the DeviceIR access map. Injective layouts are normalized after removing
+  size-one view dimensions, so ordinary `unsqueeze`/size-one aliases retain
+  exact allocation-coordinate dependencies.
+- Program-order implication is now relation composition: a later access is
+  covered by an earlier nested checkpoint only when the preceding-scope
+  relation composed with the checkpoint's acquired predecessors contains the
+  later dependency relation. Fallback is tracked per dependency point rather
+  than coarsening every access between a root pair.
+- Counted-event uses preserve partial source domains. Consumer tasks outside
+  the use relation perform no wait instead of forcing the entire edge to root
+  completion.
+- Point-relation composition distributes directly over existing pieces and
+  does not first construct a global source-cell canonicalization. Fiber maxima
+  group identical source guards and use finite expression bounds to select a
+  dominant value before constructing a symbolic `Max`. This removed the final
+  model-scale expand/recompress compile-time path while retaining the same
+  relation semantics.
+- The affine-chain compile probe remains flat at approximately 0.19--0.21
+  seconds for 65,536 through 1,048,576 elements, including the 19,968-producer/
+  624-consumer configuration. Generated source remains approximately 4.7 KB
+  with no task-count-dependent `tl.where` forest.
+- The expanded predecessor/event graph remains available only in
+  `validate_worker_schedule` as a small-domain oracle. Production scheduling
+  has no task-count-dependent relation materialization.
+- Qwen batch 1/2/8/16, Gemma E4B, and Gemma A4B batch 1/8/16 lower and pass
+  correctness checks. Batched A4B preserves the vLLM-style gate/up, GeGLU, and
+  down-projection boundaries.
+- Adversarial worker-correlated liveness, Muse compile scaling, bounded batched
+  lowering size, uncontended cold-L2 timing, and representative NCU validation
+  are complete. Further work is performance optimization, not completion of
+  the symbolic dependency/event refactor.
+
+All following architecture sections are dated rationale, experiments, and
+migration history. If their prescriptive wording conflicts with this section,
+this section takes precedence.
+
 ### Current checkpoint
 
 The graph-derived scheduler now lowers the Qwen attention and FFN components
@@ -2550,6 +3117,7 @@ Status values: **pending**, **in progress**, **complete**, or **blocked**.
 | 8 | in progress | Final correctness, performance, lint, and design review, including a second-model Gemma4 probe. | Test matrix passes; Qwen meets the agreed performance range; remaining limitations are explicit and structural. |
 | 9 | in progress | Finish the full-DAG `CrossLoopSchedule` migration with canonical `FamilyDone` events, `WorkerSchedule`, and `LocalTrigger`. | Qwen and Gemma reach lowered-code and performance parity through one graph/scheduling path, adversarial DAG tests pass, and the old topology records and tuning field are deleted. |
 | 10 | in progress | Promote dependency-bearing nested loops to ordered action domains in the same DAG and delete the access-cohort side path. | Natural producer-side and consumer-side streaming lower through generic events; Qwen 64/32 and Gemma 36/4 segments are graph-derived; no cohort-specific planner or emitter remains. |
+| 11 | in progress | Preserve logical-coordinate relations through dependency analysis, scheduling, and lowering, and permit one root family to occupy several graph-derived worker-stream segments. | Batch-scaled Qwen and affine Gemma lower through compact logical relations and segmented worker streams; emitted worker order matches the validated schedule; fanout, joins, nonuniform tails, and L2 remapping remain exact; no dependency, event, fan-in, or dispatch mapping is reconstructed from a flattened task table. |
 
 ### Current migration boundary
 
@@ -3744,15 +4312,59 @@ Completed in the current scheduler checkpoint:
   loop-dependency tests with 4 expected skips. Both strict Qwen validation and
   Gemma output/cache validation pass.
 
+### Batch scaling: preserve logical coordinates through lowering
+
+The cold-L2 batch-size stress test exposed one deeper architectural gap. The
+dependency proof retains batch and other outer axes, but configuration-time
+event construction flattens those coordinates into enumerated action IDs too
+early. Event lowering, physical task traversal, and worker placement then each
+try to recover structure from unrelated one-dimensional tables.
+
+For batch-two Qwen FFN, the exact W13-to-activation contribution is simply:
+
+```text
+(batch, output_tile) -> (batch, (output_tile % 768) // 8)
+```
+
+Materializing that function as 3,072 key entries and passing it through the
+current one-dimensional run compressor produces 382 segments and 381
+`tl.where` selections. Balancing the selection tree avoids Python parser-depth
+failure, but it does not reduce generated instructions or solve the underlying
+problem. The same premature flattening affects physical worker dispatch.
+
+The placement failure is distinct. The action dependency and milestone proofs
+succeed, but `place_ordered_action_consumers` can currently move only a whole
+root family. At batch two the complete 1,024-task W2 family does not fit into
+the useful holes in the final W13 wave. At batches eight and sixteen, the W2
+family is larger than the resident worker grid and is rejected before a
+partial pipeline can be considered. Compact event keys fix code size; they do
+not by themselves restore overlap.
+
+The authoritative architecture and migration sequence are specified at the
+top of this document. This stress test adds two concrete acceptance criteria:
+
+- The generated event and dispatch expressions must scale with normalized
+  relation pieces rather than the 3,072 batch-two W13 tasks or the much larger
+  batch-eight/sixteen domains.
+- Partial placement must retain the W2 nested-loop milestones for the exact
+  root subdomains moved into producer-tail capacity; compact key expressions
+  alone are insufficient.
+
+Dense, regular Qwen batching remains a static scheduling problem. Truly
+data-dependent ragged MoE routing may still select `FamilyDone` or a future
+runtime dispatcher, but that is independent of this coordinate-preservation
+failure.
+
 Deferred extensions, in priority order:
 
 1. Generalize the current conservative one-nested-axis renderer only when an
    exact relation produces representable segments; unsupported cases continue
    to lift safely.
-2. Compress large action relations into runs/boxes only if configuration-time
-   memory or latency becomes material. Qwen and Gemma currently instantiate
-   their full action relations without a hard cutoff, so avoid adding a second
-   compact proof language prematurely.
+2. Extend compact logical relations beyond the initial rectilinear/div-mod
+   form only when a real access requires it. Batch sixteen already makes
+   enumerated nested-action relations materially expensive, so the initial
+   compact representation is required; a broader symbolic relation language
+   is not.
 3. Expand adversarial coverage for repeated callsites, nested control flow,
    tails, and multi-axis scopes while preserving monotone fallback.
 4. Continue saving and structurally comparing every Qwen and Gemma lowering,

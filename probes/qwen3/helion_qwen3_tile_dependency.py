@@ -176,13 +176,14 @@ def _compose_qwen3_layer_source() -> str:
         ),
         _Bridge(
             f"""
-            query = qkv[:, : q_heads * head_dim].view(1, q_heads, head_dim)
+            batch = hidden_states.shape[0]
+            query = qkv[:, : q_heads * head_dim].view(batch, q_heads, head_dim)
             key_begin = q_heads * head_dim
             key = qkv[:, key_begin : key_begin + kv_heads * head_dim].view(
-                1, kv_heads, head_dim
+                batch, kv_heads, head_dim
             )
             value = qkv[:, key_begin + kv_heads * head_dim : {qkv_width}].view(
-                1, kv_heads, head_dim
+                batch, kv_heads, head_dim
             )
             """
         ),
@@ -235,7 +236,7 @@ def _compose_qwen3_layer_source() -> str:
             {"partial_out": "partial_out", "partial_lse": "partial_lse"},
             {"output": "attention"},
         ),
-        _Bridge("attention_flat = attention.view(1, hidden)"),
+        _Bridge("attention_flat = attention.view(batch, hidden)"),
         _Invocation(
             "attention_quant",
             per_token_group_fp8_quant,
@@ -513,6 +514,8 @@ def _probe_matched_config(bound, args):
             "num_sm_multiplier": args.worker_multiplier,
         }
     )
+    if args.cross_loop_workers is not None:
+        values["cross_loop_num_workers"] = args.cross_loop_workers
     config = helion.Config.from_dict(values)
     bound.config_spec.normalize(config.config)
     return config
@@ -576,7 +579,8 @@ def _helion_resources(compiled_wrapper):
 
 
 def run(args) -> None:
-    require_idle_visible_gpu()
+    if not args.allow_busy:
+        require_idle_visible_gpu()
     if args.print_source:
         print(GENERATED_SOURCE)
         return
@@ -745,6 +749,7 @@ def run(args) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--hidden", type=int, default=4096)
     parser.add_argument("--intermediate", type=int, default=12288)
     parser.add_argument("--q-heads", type=int, default=32)
@@ -768,12 +773,14 @@ def main() -> None:
     parser.add_argument("--projection-stages", type=int, default=4)
     parser.add_argument("--kernel-stages", type=int, default=2)
     parser.add_argument("--worker-multiplier", type=int, default=8)
+    parser.add_argument("--cross-loop-workers", type=int)
     parser.add_argument("--merge-split-block", type=int, default=32)
     parser.add_argument("--merge-q-block", type=int, default=4)
     parser.add_argument("--attention-context-block", type=int, default=32)
     parser.add_argument("--qk-head-block", type=int, choices=(1, 2, 4), default=1)
     parser.add_argument("--print-source", action="store_true")
     parser.add_argument("--timing-only", action="store_true")
+    parser.add_argument("--allow-busy", action="store_true")
     parser.add_argument(
         "--config-path",
         default=str(Path(__file__).with_name("qwen3_layer_helion_b200_configs.json")),

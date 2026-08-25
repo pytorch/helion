@@ -13,6 +13,21 @@ import torch
 T = TypeVar("T")
 
 
+def make_l2_cache_clearer() -> Callable[[], None] | None:
+    """Return Triton's L2 flush primitive when cold-cache timing is requested."""
+    if os.environ.get("MEGAKERNEL_CLEAR_L2") != "1":
+        return None
+    from triton import runtime
+
+    active = runtime.driver.active  # type: ignore[attr-defined]
+    cache = active.get_empty_cache_for_benchmark()  # type: ignore[attr-defined]
+
+    def clear() -> None:
+        active.clear_cache(cache)  # type: ignore[attr-defined]
+
+    return clear
+
+
 def capture(fn: Callable[[], T]) -> tuple[torch.cuda.CUDAGraph, T]:
     capture_stream = torch.cuda.Stream()
     capture_stream.wait_stream(torch.cuda.current_stream())
@@ -37,15 +52,29 @@ def benchmark_interleaved(
     names = list(entries)
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
+    clear_l2 = make_l2_cache_clearer()
     for sample in range(repeats):
         order = names[sample % len(names) :] + names[: sample % len(names)]
         for name in order:
-            start.record()
-            for _ in range(batch_replays):
-                entries[name]()
-            end.record()
-            end.synchronize()
-            samples[name].append(start.elapsed_time(end) * 1000.0 / batch_replays)
+            if clear_l2 is None:
+                start.record()
+                for _ in range(batch_replays):
+                    entries[name]()
+                end.record()
+                end.synchronize()
+                elapsed_us = start.elapsed_time(end) * 1000.0 / batch_replays
+            else:
+                elapsed_us = 0.0
+                for _ in range(batch_replays):
+                    clear_l2()
+                    torch.cuda.synchronize()
+                    start.record()
+                    entries[name]()
+                    end.record()
+                    end.synchronize()
+                    elapsed_us += start.elapsed_time(end) * 1000.0
+                elapsed_us /= batch_replays
+            samples[name].append(elapsed_us)
     return {
         name: {
             "median_us": statistics.median(values),

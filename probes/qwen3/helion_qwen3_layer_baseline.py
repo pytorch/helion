@@ -445,19 +445,20 @@ def paged_gqa_attention_baseline(
     block_size,
     q_per_kv,
 ):
-    blocks = block_table[0, : math.ceil(context / block_size)].long()
-    logical = kv_cache[blocks].reshape(-1, kv_cache.shape[2], kv_cache.shape[3])[
-        :context
-    ]
     head_dim = query.shape[-1]
-    k = logical[..., :head_dim].permute(1, 0, 2).repeat_interleave(q_per_kv, dim=0)
-    v = logical[..., head_dim:].permute(1, 0, 2).repeat_interleave(q_per_kv, dim=0)
-    q = query[0].unsqueeze(1)
-    return (
-        torch.nn.functional.scaled_dot_product_attention(q, k, v)
-        .squeeze(1)
-        .unsqueeze(0)
-    )
+    outputs = []
+    for token in range(query.shape[0]):
+        blocks = block_table[token, : math.ceil(context / block_size)].long()
+        logical = kv_cache[blocks].reshape(-1, kv_cache.shape[2], kv_cache.shape[3])[
+            :context
+        ]
+        k = logical[..., :head_dim].permute(1, 0, 2).repeat_interleave(q_per_kv, dim=0)
+        v = logical[..., head_dim:].permute(1, 0, 2).repeat_interleave(q_per_kv, dim=0)
+        q = query[token].unsqueeze(1)
+        outputs.append(
+            torch.nn.functional.scaled_dot_product_attention(q, k, v).squeeze(1)
+        )
+    return torch.cat(outputs, dim=0).unsqueeze(0)
 
 
 def paged_gqa_attention_split_baseline(
@@ -469,35 +470,41 @@ def paged_gqa_attention_split_baseline(
     q_per_kv: int,
     splits: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    blocks = block_table[0, : math.ceil(context / block_size)].long()
-    logical = kv_cache[blocks].reshape(-1, kv_cache.shape[2], kv_cache.shape[3])[
-        :context
-    ]
     head_dim = query.shape[-1]
     num_kv_heads = kv_cache.shape[2]
+    num_tokens = query.shape[0]
     split_context = context // splits
-    q = query.view(num_kv_heads, q_per_kv, head_dim).float()
+    q = query.reshape(num_tokens * num_kv_heads, q_per_kv, head_dim).float()
     partial_out = torch.empty(
-        (splits, num_kv_heads, q_per_kv, head_dim),
+        (splits, num_tokens * num_kv_heads, q_per_kv, head_dim),
         device=query.device,
         dtype=torch.float32,
     )
     partial_lse = torch.empty(
-        (splits, num_kv_heads, q_per_kv),
+        (splits, num_tokens * num_kv_heads, q_per_kv),
         device=query.device,
         dtype=torch.float32,
     )
     scale = 1.0 / math.sqrt(head_dim)
-    for split in range(splits):
-        begin = split * split_context
-        end = begin + split_context
-        k = logical[begin:end, :, :head_dim].permute(1, 0, 2).float()
-        v = logical[begin:end, :, head_dim:].permute(1, 0, 2).float()
-        scores = torch.einsum("gqd,gnd->gqn", q, k) * scale
-        partial_lse[split] = torch.logsumexp(scores, dim=-1) * math.log2(math.e)
-        partial_out[split] = torch.einsum(
-            "gqn,gnd->gqd", torch.softmax(scores, dim=-1), v
-        )
+    for token in range(num_tokens):
+        blocks = block_table[token, : math.ceil(context / block_size)].long()
+        logical = kv_cache[blocks].reshape(-1, kv_cache.shape[2], kv_cache.shape[3])[
+            :context
+        ]
+        group_begin = token * num_kv_heads
+        group_end = group_begin + num_kv_heads
+        for split in range(splits):
+            begin = split * split_context
+            end = begin + split_context
+            k = logical[begin:end, :, :head_dim].permute(1, 0, 2).float()
+            v = logical[begin:end, :, head_dim:].permute(1, 0, 2).float()
+            scores = torch.einsum("gqd,gnd->gqn", q[group_begin:group_end], k) * scale
+            partial_lse[split, group_begin:group_end] = torch.logsumexp(
+                scores, dim=-1
+            ) * math.log2(math.e)
+            partial_out[split, group_begin:group_end] = torch.einsum(
+                "gqn,gnd->gqd", torch.softmax(scores, dim=-1), v
+            )
     return partial_out, partial_lse
 
 
@@ -518,7 +525,7 @@ def paged_gqa_decode_attention_split(
     splits: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Split-KV partials for paged M=1 GQA decode attention."""
-    _, num_q_heads, head_dim = query.shape
+    num_tokens, num_q_heads, head_dim = query.shape
     num_kv_heads = kv_cache.shape[2]
     assert num_q_heads == num_kv_heads * q_per_kv
     assert context % splits == 0
@@ -529,37 +536,41 @@ def paged_gqa_decode_attention_split(
     hl.specialize(block_size)
     hl.specialize(splits)
     split_context = context // splits
-    q = query.view(num_kv_heads, q_per_kv, head_dim)
+    token_kv_heads = num_tokens * num_kv_heads
     partial_out = torch.empty(
-        (splits, num_kv_heads, q_per_kv, head_dim),
+        (splits, token_kv_heads, q_per_kv, head_dim),
         device=query.device,
         dtype=torch.float32,
     )
     partial_lse = torch.empty(
-        (splits, num_kv_heads, q_per_kv),
+        (splits, token_kv_heads, q_per_kv),
         device=query.device,
         dtype=torch.float32,
     )
     qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
-    for tile_split, tile_g, tile_q in hl.tile(
-        [splits, num_kv_heads, q_per_kv], block_size=[1, 1, None]
+    for tile_split, tile_bg, tile_q in hl.tile(
+        [splits, token_kv_heads, q_per_kv], block_size=[1, 1, None]
     ):
-        m_i = hl.full([tile_g, tile_q], float("-inf"), dtype=torch.float32)
-        l_i = hl.full([tile_g, tile_q], 1.0, dtype=torch.float32)
-        acc = hl.zeros([tile_g, tile_q, head_dim], dtype=torch.float32)
+        m_i = hl.full([tile_bg, tile_q], float("-inf"), dtype=torch.float32)
+        l_i = hl.full([tile_bg, tile_q], 1.0, dtype=torch.float32)
+        acc = hl.zeros([tile_bg, tile_q, head_dim], dtype=torch.float32)
         split_idx = tile_split.begin
-        q_blk = (q[tile_g, tile_q, :] * qk_scale).to(q.dtype)
+        token = tile_bg.index // num_kv_heads
+        kv_head = tile_bg.index % num_kv_heads
+        query_head = kv_head[:, None] * q_per_kv + tile_q.index[None, :]
+        q_blk = query[token[:, None], query_head, :]
+        q_blk = (q_blk * qk_scale).to(query.dtype)
         for tile_local_n in hl.tile(split_context):
             n = split_idx * split_context + tile_local_n.index
-            physical_block = block_table[0, n // block_size]
+            physical_block = block_table[token[:, None], (n // block_size)[None, :]]
             block_offset = n % block_size
             d = hl.arange(head_dim)
             k = hl.load(
                 kv_cache,
                 [
-                    physical_block[None, :, None],
+                    physical_block[:, :, None],
                     block_offset[None, :, None],
-                    tile_g.index[:, None, None],
+                    kv_head[:, None, None],
                     d[None, None, :],
                 ],
             )
@@ -572,18 +583,18 @@ def paged_gqa_decode_attention_split(
             v = hl.load(
                 kv_cache,
                 [
-                    physical_block[None, :, None],
+                    physical_block[:, :, None],
                     block_offset[None, :, None],
-                    tile_g.index[:, None, None],
+                    kv_head[:, None, None],
                     (d + head_dim)[None, None, :],
                 ],
             )
             acc = torch.baddbmm(acc, p.to(v.dtype), v)
             m_i = m_ij
-        partial_out[tile_split, tile_g, tile_q, :] = (acc / l_i[:, :, None])[
+        partial_out[tile_split, tile_bg, tile_q, :] = (acc / l_i[:, :, None])[
             None, :, :, :
         ]
-        partial_lse[tile_split, tile_g, tile_q] = (m_i + torch.log2(l_i))[None, :, :]
+        partial_lse[tile_split, tile_bg, tile_q] = (m_i + torch.log2(l_i))[None, :, :]
     return partial_out, partial_lse
 
 
@@ -715,22 +726,25 @@ def allocate(args):
     intermediate_groups = args.intermediate // args.group
     qkv_width = (args.q_heads + 2 * args.kv_heads) * args.head_dim
     logical_blocks = math.ceil(args.context / args.block_size)
-    physical_blocks = math.ceil(logical_blocks * 1.25)
+    batch = args.batch
+    physical_blocks = math.ceil(batch * logical_blocks * 1.25)
     block_table = (
         torch.randperm(physical_blocks, device=device, dtype=torch.int64)[
-            :logical_blocks
+            : batch * logical_blocks
         ]
         .to(torch.int32)
-        .view(1, -1)
+        .view(batch, logical_blocks)
     )
     final_logical_block = (args.context - 1) // args.block_size
     final_block_offset = (args.context - 1) % args.block_size
-    final_physical_block = int(block_table[0, final_logical_block].item())
+    final_physical_blocks = block_table[:, final_logical_block].to(torch.int64)
     tensors = {
         "hidden_states": torch.randn(
-            (1, args.hidden), device=device, dtype=torch.bfloat16
+            (batch, args.hidden), device=device, dtype=torch.bfloat16
         ),
-        "residual": torch.randn((1, args.hidden), device=device, dtype=torch.bfloat16),
+        "residual": torch.randn(
+            (batch, args.hidden), device=device, dtype=torch.bfloat16
+        ),
         "pre_weight": torch.randn((args.hidden,), device=device, dtype=torch.bfloat16)
         * 0.1
         + 1.0,
@@ -743,15 +757,17 @@ def allocate(args):
         "k_weight": torch.randn((args.head_dim,), device=device, dtype=torch.bfloat16)
         * 0.1
         + 1.0,
-        "position": torch.tensor([args.context - 1], device=device, dtype=torch.int64),
+        "position": torch.full(
+            (batch,), args.context - 1, device=device, dtype=torch.int64
+        ),
         "cos_sin": make_cos_sin(
             max(args.context, 4096), args.head_dim, args.rope_theta, device
         ),
         "pre_q": torch.empty(
-            (1, args.hidden), device=device, dtype=torch.float8_e4m3fn
+            (batch, args.hidden), device=device, dtype=torch.float8_e4m3fn
         ),
         "pre_scale": torch.empty(
-            (1, hidden_groups), device=device, dtype=torch.float32
+            (batch, hidden_groups), device=device, dtype=torch.float32
         ),
         "qkv_weight_q": make_fp8_random((qkv_width, args.hidden)),
         "qkv_weight_scale": torch.rand(
@@ -765,26 +781,22 @@ def allocate(args):
             dtype=torch.bfloat16,
         ),
         "block_table": block_table,
-        "slot_mapping": torch.tensor(
-            [final_physical_block * args.block_size + final_block_offset],
-            device=device,
-            dtype=torch.int64,
-        ),
+        "slot_mapping": final_physical_blocks * args.block_size + final_block_offset,
         "attention_q": torch.empty(
-            (1, args.hidden), device=device, dtype=torch.float8_e4m3fn
+            (batch, args.hidden), device=device, dtype=torch.float8_e4m3fn
         ),
         "attention_scale": torch.empty(
-            (1, hidden_groups), device=device, dtype=torch.float32
+            (batch, hidden_groups), device=device, dtype=torch.float32
         ),
         "o_weight_q": make_fp8_random((args.hidden, args.hidden)),
         "o_weight_scale": torch.rand((hidden_groups, hidden_groups), device=device)
         * 0.01
         + 0.01,
         "ffn_q": torch.empty(
-            (1, args.hidden), device=device, dtype=torch.float8_e4m3fn
+            (batch, args.hidden), device=device, dtype=torch.float8_e4m3fn
         ),
         "ffn_scale": torch.empty(
-            (1, hidden_groups), device=device, dtype=torch.float32
+            (batch, hidden_groups), device=device, dtype=torch.float32
         ),
         "w13_q": make_fp8_random((2 * args.intermediate, args.hidden)),
         "w13_scale": torch.rand((2 * intermediate_groups, hidden_groups), device=device)
@@ -859,13 +871,15 @@ def run(args):
     )
     qk_config, qk_compiled = build("qk_norm_rope", fused_qk_norm_rope, qk_args)
     qk_compiled(*qk_args)
-    query = qkv[:, : args.q_heads * args.head_dim].view(1, args.q_heads, args.head_dim)
+    query = qkv[:, : args.q_heads * args.head_dim].view(
+        args.batch, args.q_heads, args.head_dim
+    )
     key_begin = args.q_heads * args.head_dim
     key = qkv[:, key_begin : key_begin + args.kv_heads * args.head_dim].view(
-        1, args.kv_heads, args.head_dim
+        args.batch, args.kv_heads, args.head_dim
     )
     value = qkv[:, key_begin + args.kv_heads * args.head_dim : qkv_width].view(
-        1, args.kv_heads, args.head_dim
+        args.batch, args.kv_heads, args.head_dim
     )
 
     cache_args = (
@@ -902,7 +916,7 @@ def run(args):
         attention_merge_args,
     )
     attention = attention_merge_compiled(*attention_merge_args)
-    attention_flat = attention.view(1, args.hidden)
+    attention_flat = attention.view(args.batch, args.hidden)
 
     attention_quant_args = (
         attention_flat,
@@ -990,14 +1004,14 @@ def run(args):
         local_qk_args = (local_qkv, *qk_args[1:])
         qk_compiled(*local_qk_args)
         local_query = local_qkv[:, : args.q_heads * args.head_dim].view(
-            1, args.q_heads, args.head_dim
+            args.batch, args.q_heads, args.head_dim
         )
         local_key = local_qkv[
             :, key_begin : key_begin + args.kv_heads * args.head_dim
-        ].view(1, args.kv_heads, args.head_dim)
+        ].view(args.batch, args.kv_heads, args.head_dim)
         local_value = local_qkv[
             :, key_begin + args.kv_heads * args.head_dim : qkv_width
-        ].view(1, args.kv_heads, args.head_dim)
+        ].view(args.batch, args.kv_heads, args.head_dim)
         cache_compiled(
             local_key,
             local_value,
@@ -1016,7 +1030,7 @@ def run(args):
         )
         local_attention = attention_merge_compiled(local_partials, local_lse)
         attention_quant_compiled(
-            local_attention.view(1, args.hidden),
+            local_attention.view(args.batch, args.hidden),
             tensors["attention_q"],
             tensors["attention_scale"],
             args.group,
@@ -1126,6 +1140,7 @@ def run(args):
             {
                 "device": torch.cuda.get_device_name(),
                 "shape": {
+                    "batch": args.batch,
                     "hidden": args.hidden,
                     "intermediate": args.intermediate,
                     "q_heads": args.q_heads,
@@ -1153,6 +1168,7 @@ def run(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--hidden", type=int, default=4096)
     parser.add_argument("--intermediate", type=int, default=12288)
     parser.add_argument("--q-heads", type=int, default=32)
