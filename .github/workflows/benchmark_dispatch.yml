@@ -191,7 +191,11 @@ jobs:
       alias: mi350x
       kernels: ${{ matrix.kernels }}
       env-vars: ${{ github.event.inputs.env_vars }}
-      custom-args: ${{ github.event.inputs.custom_args }}
+      # Limit the target measurement window so TritonBench captures a bounded
+      # number of repetitions in each HIP graph on MI350X.
+      custom-args: >-
+        --rep 1
+        ${{ github.event.inputs.custom_args }}
 
   run-tpu:
     if: ${{ github.event.inputs.run_tpu == 'true' }}
