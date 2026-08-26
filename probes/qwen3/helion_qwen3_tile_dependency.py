@@ -19,9 +19,11 @@ import textwrap
 from typing import Callable
 from typing import Protocol
 
+from cuda.bindings import driver as cuda_driver
 import torch
 
 from probes.common import benchmark_interleaved
+from probes.common import benchmark_graphs_cold_l2
 from probes.common import capture
 from probes.common import require_idle_visible_gpu
 from probes.common import visible_gpu_pids
@@ -514,6 +516,8 @@ def _probe_matched_config(bound, args):
             "num_sm_multiplier": args.worker_multiplier,
         }
     )
+    if args.maxnreg is not None:
+        values["maxnreg"] = args.maxnreg
     if args.cross_loop_workers is not None:
         values["cross_loop_num_workers"] = args.cross_loop_workers
     config = helion.Config.from_dict(values)
@@ -571,10 +575,21 @@ def _helion_resources(compiled_wrapper):
     if len(kernels) != 1:
         raise RuntimeError(f"expected one compiled Helion kernel, found {len(kernels)}")
     kernel = kernels[0]
+    _ = kernel.run
+    error, blocks_per_sm = cuda_driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+        cuda_driver.CUfunction(int(kernel.function)),
+        32,
+        int(kernel.metadata.shared),
+    )
+    if error != cuda_driver.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"CUDA occupancy query failed: {error}")
     return {
         "registers": kernel.n_regs,
         "spills": kernel.n_spills,
         "shared": kernel.metadata.shared,
+        "blocks_per_sm": int(blocks_per_sm),
+        "device_blocks": int(blocks_per_sm)
+        * torch.cuda.get_device_properties(0).multi_processor_count,
     }
 
 
@@ -661,14 +676,35 @@ def run(args) -> None:
     if args.smoke:
         print("SMOKE_OK", tuple(tuple(output.shape) for output in outputs), flush=True)
         return
+    if args.profile:
+        graph, _ = capture(lambda: compiled(*composite_args))
+        for _ in range(args.profile_warmups):
+            graph.replay()
+        torch.cuda.synchronize()
+        if args.cold_l2:
+            from probes.common import flush_l2_exact
+
+            flush_l2_exact()
+        torch.cuda.cudart().cudaProfilerStart()
+        for _ in range(args.profile_replays):
+            graph.replay()
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStop()
+        return
     if args.timing_only:
         graph, _ = capture(lambda: compiled(*composite_args))
         benchmark_pids = visible_gpu_pids()
-        timings = benchmark_interleaved(
-            {"helion_tile_dependency": graph.replay},
-            args.repeats,
-            args.batch_replays,
-        )
+        if args.cold_l2:
+            timings = benchmark_graphs_cold_l2(
+                {"helion_tile_dependency": (graph.replay, lambda: None)},
+                args.repeats,
+            )
+        else:
+            timings = benchmark_interleaved(
+                {"helion_tile_dependency": graph.replay},
+                args.repeats,
+                args.batch_replays,
+            )
         if visible_gpu_pids() != benchmark_pids:
             raise RuntimeError("GPU process set changed during benchmark")
         print("TIMINGS", timings, flush=True)
@@ -733,14 +769,21 @@ def run(args) -> None:
     graph.replay()
     torch.cuda.synchronize()
     benchmark_pids = visible_gpu_pids()
-    timings = benchmark_interleaved(
-        {
-            "helion_tile_dependency": graph.replay,
-            "helion_separate": reference_graph.replay,
-        },
-        args.repeats,
-        args.batch_replays,
-    )
+    replay_entries = {
+        "helion_tile_dependency": graph.replay,
+        "helion_separate": reference_graph.replay,
+    }
+    if args.cold_l2:
+        timings = benchmark_graphs_cold_l2(
+            {name: (replay, lambda: None) for name, replay in replay_entries.items()},
+            args.repeats,
+        )
+    else:
+        timings = benchmark_interleaved(
+            replay_entries,
+            args.repeats,
+            args.batch_replays,
+        )
     if visible_gpu_pids() != benchmark_pids:
         raise RuntimeError("GPU process set changed during benchmark")
     print("TIMINGS", timings, flush=True)
@@ -772,6 +815,7 @@ def main() -> None:
     parser.add_argument("--probe-config", action="store_true")
     parser.add_argument("--projection-stages", type=int, default=4)
     parser.add_argument("--kernel-stages", type=int, default=2)
+    parser.add_argument("--maxnreg", type=int, choices=(32, 64, 128, 256))
     parser.add_argument("--worker-multiplier", type=int, default=8)
     parser.add_argument("--cross-loop-workers", type=int)
     parser.add_argument("--merge-split-block", type=int, default=32)
@@ -780,6 +824,10 @@ def main() -> None:
     parser.add_argument("--qk-head-block", type=int, choices=(1, 2, 4), default=1)
     parser.add_argument("--print-source", action="store_true")
     parser.add_argument("--timing-only", action="store_true")
+    parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--profile-warmups", type=int, default=3)
+    parser.add_argument("--profile-replays", type=int, default=1)
+    parser.add_argument("--cold-l2", action="store_true")
     parser.add_argument("--allow-busy", action="store_true")
     parser.add_argument(
         "--config-path",

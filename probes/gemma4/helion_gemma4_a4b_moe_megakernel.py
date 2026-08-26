@@ -20,6 +20,7 @@ import torch
 from probes.gemma4.common import benchmark_interleaved
 from probes.gemma4.common import capture
 from probes.gemma4.common import visible_gpu_pids
+from probes.common import benchmark_graphs_cold_l2
 from probes.gemma4.gemma4_a4b_moe_common import Gemma4A4BMoEShape
 from probes.gemma4.gemma4_a4b_moe_common import allocate_moe
 from probes.gemma4.gemma4_a4b_moe_common import max_aligned_tiles
@@ -1658,14 +1659,21 @@ def run(args) -> None:
             reference["moe_branch"],
         )
     pids = visible_gpu_pids()
-    timings = benchmark_interleaved(
-        {
-            "helion_a4b_moe_megakernel": megakernel_graph.replay,
-            **{name: graph.replay for name, graph in baseline_graphs.items()},
-        },
-        args.repeats,
-        args.batch_replays,
-    )
+    replay_entries = {
+        "helion_a4b_moe_megakernel": megakernel_graph.replay,
+        **{name: graph.replay for name, graph in baseline_graphs.items()},
+    }
+    if args.cold_l2:
+        timings = benchmark_graphs_cold_l2(
+            {name: (replay, lambda: None) for name, replay in replay_entries.items()},
+            args.repeats,
+        )
+    else:
+        timings = benchmark_interleaved(
+            replay_entries,
+            args.repeats,
+            args.batch_replays,
+        )
     if visible_gpu_pids() != pids:
         raise RuntimeError("GPU process set changed during benchmark")
     print(
@@ -1688,7 +1696,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--route-skew", type=float, default=2.0)
-    parser.add_argument("--workers", type=int, default=444)
+    parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--worker-multiplier", type=int, default=4)
     parser.add_argument("--num-warps", type=int, default=4)
     parser.add_argument("--kernel-stages", type=int, default=1)
@@ -1739,6 +1747,7 @@ def main() -> None:
     parser.add_argument("--allow-busy", action="store_true")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--cold-l2", action="store_true")
     parser.add_argument("--benchmark-fused-control", action="store_true")
     parser.add_argument("--benchmark-hand", action="store_true")
     parser.add_argument(

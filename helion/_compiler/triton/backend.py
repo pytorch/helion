@@ -569,13 +569,209 @@ class TritonBackend(Backend):
                 for tensor, numel, dtype in device_fn.triton_persistent_state_specs
             )
             out.append(f"_persistent_state_specs=({specs},)")
+        if device_fn.triton_constant_buffer_specs:
+            specs = ", ".join(
+                f"({tensor}, {values!r}, {dtype})"
+                for tensor, values, dtype in device_fn.triton_constant_buffer_specs
+            )
+            out.append(f"_constant_buffer_specs=({specs},)")
         if device_fn.triton_minimum_resident_programs is not None:
             out.append(
                 "_minimum_resident_programs="
                 f"{device_fn.triton_minimum_resident_programs}"
             )
-        out.extend(self.launcher_keyword_args(config, has_barrier=has_barrier))
+        if device_fn.triton_target_resident_programs_per_sm is not None:
+            out.append(
+                "_target_resident_programs_per_sm="
+                f"{device_fn.triton_target_resident_programs_per_sm}"
+            )
+        launcher_args = self.launcher_keyword_args(config, has_barrier=has_barrier)
+        if device_fn.triton_uses_clc:
+            configured_num_ctas = config.get("num_ctas", 1)
+            if configured_num_ctas != 1:
+                raise exc.InvalidConfig(
+                    "CLC dispatch requires num_ctas=1; multi-CTA clusters are "
+                    "not supported"
+                )
+            out.extend(("_requires_clc=True", "launch_pdl=True"))
+            if not any(arg.startswith("num_ctas=") for arg in launcher_args):
+                out.append("num_ctas=1")
+        out.extend(launcher_args)
         return out
+
+    @staticmethod
+    def _clc_sync_instruction(*, single_warp: bool) -> str:
+        return "" if single_warp else "bar.sync 0;"
+
+    @staticmethod
+    def _clc_wait_instruction(*, single_warp: bool) -> str:
+        # Multi-warp kernels obtain acquire ordering from their CTA barrier,
+        # but the single-warp lowering deliberately omits that barrier.  Use
+        # an acquire wait in both cases so the response load cannot move ahead
+        # of CLC completion.
+        return "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
+
+    @staticmethod
+    def pdl_wait_expr() -> str:
+        """Wait for the preceding programmatic launch and acquire its writes."""
+        return (
+            "tl.inline_asm_elementwise("
+            "asm='griddepcontrol.wait; mov.u32 $0, 0;', constraints='=r', "
+            "args=[], dtype=tl.uint32, is_pure=False, pack=1)"
+        )
+
+    @staticmethod
+    def clc_initialize_expr(
+        *,
+        single_warp: bool,
+    ) -> str:
+        """Initialize the compiler-owned per-CTA CLC scratch ABI."""
+        sync = TritonBackend._clc_sync_instruction(single_warp=single_warp)
+        asm = f"""
+        {{
+            .reg .pred leader;
+            .reg .b32 response_addr, mbar_addr, thread_id;
+            .shared .align 128 .b8 helion_clc_scratch[128];
+
+            mov.u32 response_addr, helion_clc_scratch;
+            add.u32 mbar_addr, response_addr, 16;
+            mov.u32 thread_id, %tid.x;
+            setp.eq.u32 leader, thread_id, 0;
+            @leader mbarrier.init.shared::cta.b64 [mbar_addr], 1;
+            @leader fence.mbarrier_init.release.cluster;
+            {sync}
+            mov.u32 $0, response_addr;
+        }}
+        """
+        return (
+            "tl.inline_asm_elementwise("
+            f"asm={asm!r}, constraints='=r', args=[], "
+            "dtype=tl.uint32, is_pure=False, pack=1)"
+        )
+
+    @staticmethod
+    def clc_wait_expr(
+        response_addr: str,
+        phase: str,
+        *,
+        single_warp: bool,
+    ) -> str:
+        """Wait for one CLC cancellation response and return its success bit."""
+        sync = TritonBackend._clc_sync_instruction(single_warp=single_warp)
+        wait = TritonBackend._clc_wait_instruction(single_warp=single_warp)
+        asm = r"""
+        {
+            .reg .pred complete, canceled;
+            .reg .b32 response_addr, mbar_addr, success, phase;
+            .reg .b128 response;
+
+            mov.u32 response_addr, $1;
+            mov.u32 phase, $2;
+            add.u32 mbar_addr, response_addr, 16;
+            mov.u32 success, 0;
+        HELION_CLC_WAIT:
+            {wait} complete, [mbar_addr], phase;
+            @!complete bra HELION_CLC_WAIT;
+            {sync}
+            ld.shared.b128 response, [response_addr];
+            clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 canceled, response;
+            selp.u32 success, 1, 0, canceled;
+            mov.u32 $0, success;
+        }
+        """.replace("{sync}", sync).replace("{wait}", wait)
+        return (
+            "tl.inline_asm_elementwise("
+            f"asm={asm!r}, constraints='=r,r,r', "
+            f"args=[{response_addr}, {phase}], dtype=tl.uint32, "
+            "is_pure=False, pack=1)"
+        )
+
+    @staticmethod
+    def clc_issue_expr(
+        response_addr: str,
+        *,
+        single_warp: bool,
+    ) -> str:
+        """Issue another cancellation request on an initialized CLC barrier."""
+        sync = TritonBackend._clc_sync_instruction(single_warp=single_warp)
+        proxy_fence = "@leader fence.proxy.async.shared::cta;"
+        asm = r"""
+        {
+            .reg .pred leader;
+            .reg .b32 response_addr, mbar_addr, thread_id;
+
+            mov.u32 response_addr, $1;
+            add.u32 mbar_addr, response_addr, 16;
+            mov.u32 thread_id, %tid.x;
+            setp.eq.u32 leader, thread_id, 0;
+            {sync}
+            {proxy_fence}
+            @leader clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.b128 [response_addr], [mbar_addr];
+            @leader mbarrier.arrive.expect_tx.relaxed.cta.shared::cta.b64 _, [mbar_addr], 16;
+            {sync}
+            mov.u32 $0, response_addr;
+        }
+        """.replace("{sync}", sync).replace("{proxy_fence}", proxy_fence)
+        return (
+            "tl.inline_asm_elementwise("
+            f"asm={asm!r}, constraints='=r,r', args=[{response_addr}], "
+            "dtype=tl.uint32, is_pure=False, pack=1)"
+        )
+
+    @staticmethod
+    def clc_ticket_expr(
+        cursor: str,
+        increment: str,
+        response_addr: str,
+        *,
+        single_warp: bool,
+    ) -> str:
+        """Claim one monotonic ticket for a CLC command and broadcast it."""
+        if not single_warp:
+            asm = r"""
+            {
+                .reg .pred leader;
+                .reg .b32 response_addr, thread_id;
+                .reg .b64 old;
+                mov.u32 response_addr, $3;
+                add.u32 response_addr, response_addr, 32;
+                mov.u32 thread_id, %tid.x;
+                setp.eq.u32 leader, thread_id, 0;
+                @leader atom.global.gpu.relaxed.add.u64 old, [$1], $2;
+                @leader st.shared.u64 [response_addr], old;
+                bar.sync 0;
+                ld.shared.u64 old, [response_addr];
+                bar.sync 0;
+                mov.u64 $0, old;
+            }
+            """
+            return (
+                "tl.inline_asm_elementwise("
+                f"asm={asm!r}, constraints='=l,l,l,r', "
+                f"args=[{cursor}, tl.cast({increment}, tl.uint64), "
+                f"{response_addr}], dtype=tl.uint64, is_pure=False, pack=1)"
+            )
+        asm = r"""
+        {
+            .reg .pred leader;
+            .reg .b32 lane, old_lo, old_hi;
+            .reg .b64 old;
+            mov.u32 lane, %laneid;
+            setp.eq.u32 leader, lane, 0;
+            mov.u64 old, 0;
+            @leader atom.global.gpu.relaxed.add.u64 old, [$1], $2;
+            mov.b64 {old_lo, old_hi}, old;
+            shfl.sync.idx.b32 old_lo, old_lo, 0, 0x1f, 0xffffffff;
+            shfl.sync.idx.b32 old_hi, old_hi, 0, 0x1f, 0xffffffff;
+            mov.b64 $0, {old_lo, old_hi};
+        }
+        """
+        return (
+            "tl.inline_asm_elementwise("
+            f"asm={asm!r}, constraints='=l,l,l', "
+            f"args=[{cursor}, tl.cast({increment}, tl.uint64)], "
+            "dtype=tl.uint64, is_pure=False, pack=1)"
+        )
 
     @staticmethod
     def reserved_launch_param_names() -> frozenset[str]:

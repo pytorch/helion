@@ -24,6 +24,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
@@ -295,7 +296,10 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
             pid_type="persistent_blocked",
         )
         torch.testing.assert_close(output, (x + 1) * 2)
-        self.assertIn("tile_dependency_root_completion_wait", code)
+        if "_requires_clc=True" in code:
+            self.assertIn("tile_dependency_keyed_event_wait", code)
+        else:
+            self.assertIn("tile_dependency_root_completion_wait", code)
 
     @skipIfRefEager("persistent grid-barrier codegen is unavailable in ref eager mode")
     def test_allocation_graph_tracks_atomics_as_writes(self) -> None:
@@ -379,6 +383,42 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         self.assertIn("triton_helpers.x_grid_barrier(", code)
         self.assertIn("launch_cooperative_grid=True", code)
 
+    @skipIfRefEager("persistent grid-barrier codegen is unavailable in ref eager")
+    def test_dynamic_schedule_does_not_leak_clc_launch_flags(self) -> None:
+        x = torch.arange(65, device=DEVICE, dtype=torch.float32)
+        code, output = code_and_output(
+            dynamic_implicit_tile_dependency_chain,
+            (x,),
+            block_sizes=[16, 32],
+            pid_type="persistent_blocked",
+            num_warps=1,
+        )
+        torch.testing.assert_close(output, (x + 1) * 2)
+        self.assertIn("launch_cooperative_grid=True", code)
+        self.assertNotIn("_requires_clc=True", code)
+        self.assertNotIn("launch_pdl=True", code)
+
+    @skipIfRefEager("CLC codegen is unavailable in ref eager mode")
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="Cluster Launch Control requires CUDA capability >= 10.0"
+    )
+    def test_clc_ticket_dispatch_executes_for_multiple_warp_counts(self) -> None:
+        x = torch.arange(64, device=DEVICE, dtype=torch.float32)
+        for num_warps in (1, 4, 8):
+            with self.subTest(num_warps=num_warps):
+                code, output = code_and_output(
+                    implicit_tile_dependency_chain,
+                    (x,),
+                    block_sizes=[8, 8],
+                    pid_type="persistent_blocked",
+                    num_warps=num_warps,
+                    cross_loop_num_workers=8,
+                )
+                torch.testing.assert_close(output, (x + 1) * 2)
+                self.assertIn("clusterlaunchcontrol.try_cancel", code)
+                self.assertIn("_requires_clc=True", code)
+                self.assertIn("launch_pdl=True", code)
+
     @skipIfRefEager("persistent tile-dependency codegen is unavailable in ref eager")
     def test_matmul_chain_allows_reused_accumulator_name(self) -> None:
         a = torch.arange(256, device=DEVICE, dtype=torch.float32).reshape(16, 16)
@@ -396,8 +436,11 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         self.assertNotIn("triton_helpers.x_grid_barrier(", code)
 
     @skipIfRefEager("persistent tile-dependency codegen is unavailable in ref eager")
-    def test_outlined_matmul_root_threads_tensor_descriptor(self) -> None:
-        a = torch.arange(256, device=DEVICE, dtype=torch.float32).reshape(16, 16)
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="Cluster Launch Control requires CUDA capability >= 10.0"
+    )
+    def test_clc_falls_back_from_tensor_descriptor_to_pointer(self) -> None:
+        a = torch.arange(512, device=DEVICE, dtype=torch.float32).reshape(32, 16)
         b = torch.eye(16, device=DEVICE)
         c = torch.eye(16, device=DEVICE)
         code, output = code_and_output(
@@ -417,8 +460,9 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(output, a, atol=0, rtol=0)
-        self.assertIn("b_desc = tl.make_tensor_descriptor", code)
-        self.assertIn("def tile_dependency_root_0(a, tmp, b_desc):", code)
+        self.assertNotIn("make_tensor_descriptor", code)
+        self.assertIn("clusterlaunchcontrol.try_cancel", code)
+        self.assertIn("_requires_clc=True", code)
 
 
 @onlyBackends(["cute"])

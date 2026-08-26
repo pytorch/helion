@@ -11,6 +11,8 @@ import torch
 
 import helion
 from helion._compiler.cross_loop_scheduler import CROSS_LOOP_NUM_WORKERS_CONFIG
+from helion._compiler.cross_loop_scheduler import ClcCommandPlan
+from helion._compiler.cross_loop_scheduler import ClcCommandPlanUnavailable
 from helion._compiler.cross_loop_scheduler import CountedEventPlan
 from helion._compiler.cross_loop_scheduler import EventContribution
 from helion._compiler.cross_loop_scheduler import EventGraph
@@ -18,9 +20,14 @@ from helion._compiler.cross_loop_scheduler import EventUse
 from helion._compiler.cross_loop_scheduler import KeyedEvent
 from helion._compiler.cross_loop_scheduler import WorkerSchedule
 from helion._compiler.cross_loop_scheduler import WorkerScheduleSegment
+from helion._compiler.cross_loop_scheduler import _clc_explicit_task_predecessors
+from helion._compiler.cross_loop_scheduler import _segmented_scope_event
 from helion._compiler.cross_loop_scheduler import _select_root_completion_edges
 from helion._compiler.cross_loop_scheduler import (
     build_baseline_worker_schedule as _build_baseline_worker_schedule,
+)
+from helion._compiler.cross_loop_scheduler import (
+    build_clc_command_plan as _build_clc_command_plan,
 )
 from helion._compiler.cross_loop_scheduler import (
     build_cross_loop_schedule as _build_cross_loop_schedule,
@@ -43,6 +50,7 @@ from helion._compiler.tile_dependency import LogicalTaskAxis
 from helion._compiler.tile_dependency import TaskFamily
 from helion._compiler.tile_dependency import TileAccess
 from helion._compiler.tile_dependency import TileDependencyKind
+from helion._compiler.tile_dependency import TileDependencyGraph
 from helion._compiler.tile_dependency import _LogicalRelationPiece
 from helion._compiler.tile_dependency import allocation_regions_may_overlap
 from helion._compiler.tile_dependency import build_tile_dependency_graph
@@ -817,6 +825,63 @@ def build_cross_loop_schedule(*, task_families, **kwargs):
         ),
         **kwargs,
     )
+
+
+def build_clc_command_plan(*, task_families, **kwargs):
+    root_domains = tuple(
+        family.logical_domain(identity=root)
+        for root, family in enumerate(task_families)
+    )
+    kwargs.setdefault(
+        "physical_worker_limit",
+        sum(domain.size for domain in root_domains),
+    )
+    schedule = _build_cross_loop_schedule(
+        root_domains=root_domains,
+        root_traversals=tuple(
+            family.physical_traversal_relation(domain)
+            for family, domain in zip(task_families, root_domains, strict=True)
+        ),
+        **kwargs,
+    )
+    return _build_clc_command_plan(schedule)
+
+
+def assert_valid_clc_command_quotient(
+    testcase: TestCase,
+    plan: ClcCommandPlan,
+) -> None:
+    """Check that commands partition and topologically quotient the schedule."""
+    explicit_tasks = {
+        (command_range.root, task)
+        for command_range in plan.command_ranges
+        for task in range(command_range.task_count)
+    }
+    commanded_tasks = [command.task for command in plan.commands]
+    testcase.assertEqual(len(commanded_tasks), len(set(commanded_tasks)))
+    testcase.assertEqual(set(commanded_tasks), explicit_tasks)
+
+    task_location = {
+        command.task: command_rank
+        for command_rank, command in enumerate(plan.commands)
+    }
+    for command in plan.commands:
+        placement = plan.base_schedule.worker_schedule.placement(*command.task)
+        testcase.assertIsNotNone(placement)
+        assert placement is not None
+        testcase.assertEqual(placement[0], command.worker)
+        testcase.assertEqual(command.position_begin, placement[1])
+        testcase.assertEqual(command.position_end, placement[1] + 1)
+
+    predecessors = _clc_explicit_task_predecessors(
+        plan.readiness,
+        plan.command_ranges,
+    )
+    for consumer, producer_tasks in predecessors.items():
+        consumer_command = task_location[consumer]
+        for producer in producer_tasks:
+            producer_command = task_location[producer]
+            testcase.assertLess(producer_command, consumer_command)
 
 
 def _one_dimensional_task_range(
@@ -2276,14 +2341,30 @@ class TestCrossLoopDependencies(TestCase):
     ) -> None:
         graph = build_tile_dependency_graph(
             (
-                _access(0, root=0, allocation_id=0, kind="store", block_ids=(10,)),
-                _access(1, root=0, allocation_id=1, kind="store", block_ids=(10,)),
-                _access(2, root=1, allocation_id=0, kind="load", block_ids=(20,)),
-                _access(3, root=1, allocation_id=2, kind="store", block_ids=(20,)),
-                _access(4, root=2, allocation_id=1, kind="load", block_ids=(30,)),
-                _access(5, root=2, allocation_id=3, kind="store", block_ids=(30,)),
-                _access(6, root=3, allocation_id=2, kind="load", block_ids=(40,)),
-                _access(7, root=3, allocation_id=3, kind="load", block_ids=(40,)),
+                _access(
+                    0, root=0, allocation_id=0, kind="store", block_ids=(10,)
+                ),
+                _access(
+                    1, root=0, allocation_id=1, kind="store", block_ids=(10,)
+                ),
+                _access(
+                    2, root=1, allocation_id=0, kind="load", block_ids=(20,)
+                ),
+                _access(
+                    3, root=1, allocation_id=2, kind="store", block_ids=(20,)
+                ),
+                _access(
+                    4, root=2, allocation_id=1, kind="load", block_ids=(30,)
+                ),
+                _access(
+                    5, root=2, allocation_id=3, kind="store", block_ids=(30,)
+                ),
+                _access(
+                    6, root=3, allocation_id=2, kind="load", block_ids=(40,)
+                ),
+                _access(
+                    7, root=3, allocation_id=3, kind="load", block_ids=(40,)
+                ),
             ),
             [[10], [20], [30], [40]],
         )
@@ -3950,6 +4031,224 @@ class TestCrossLoopDependencies(TestCase):
             frozenset(((0, 1), (1, 2), (2, 3))),
         )
 
+    def test_clc_plan_removes_exact_final_arrival_continuations(self) -> None:
+        dependency_plan = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    shape=(128,),
+                    block_ids=(10,),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    shape=(128,),
+                    block_ids=(20,),
+                ),
+            ),
+            [[10], [20]],
+        )
+        task_families = (
+            InstantiatedTaskFamily(
+                logical_axis_order=(10,),
+                physical_axis_order=(10,),
+                axis_counts_items=((10, 8),),
+                block_sizes_items=((10, 16),),
+            ),
+            InstantiatedTaskFamily(
+                logical_axis_order=(20,),
+                physical_axis_order=(20,),
+                axis_counts_items=((20, 4),),
+                block_sizes_items=((20, 32),),
+            ),
+        )
+
+        plan = build_clc_command_plan(
+            dependency_plan=dependency_plan,
+            task_families=task_families,
+            axis_geometry={10: (8, 16), 20: (4, 32)},
+            preordered_edges=frozenset(),
+        )
+
+        assert_valid_clc_command_quotient(self, plan)
+
+        self.assertEqual(
+            [(item.root, item.begin, item.end) for item in plan.command_ranges],
+            [(0, 0, 8)],
+        )
+        self.assertEqual(plan.launch_token_count, 8)
+        self.assertEqual(plan.task_order, tuple(range(8)))
+        self.assertEqual(
+            tuple(command_range.root for command_range in plan.command_ranges),
+            (0,),
+        )
+        self.assertTrue(plan.counted_events)
+        self.assertEqual(
+            tuple(
+                event.local_use.consumer_root
+                for event in plan.counted_events
+                if event.local_use is not None
+            ),
+            (1,),
+        )
+        self.assertFalse(
+            any(
+                contribution.producer_scope_id is not None
+                for event in plan.counted_events
+                for contribution in event.contributors
+            )
+        )
+        self.assertFalse(
+            any(
+                use.consumer_scope_id is not None
+                for event in plan.counted_events
+                for use in event.uses
+            )
+        )
+
+    def test_clc_plan_preserves_source_order_for_independent_roots(self) -> None:
+        dependency_plan = TileDependencyGraph(
+            task_families=(
+                TaskFamily((LogicalTaskAxis(10, None),)),
+                TaskFamily((LogicalTaskAxis(20, None),)),
+            ),
+            accesses=(),
+            edges=(),
+        )
+        task_families = (
+            InstantiatedTaskFamily(
+                logical_axis_order=(10,),
+                physical_axis_order=(10,),
+                axis_counts_items=((10, 3),),
+                block_sizes_items=((10, 1),),
+            ),
+            InstantiatedTaskFamily(
+                logical_axis_order=(20,),
+                physical_axis_order=(20,),
+                axis_counts_items=((20, 2),),
+                block_sizes_items=((20, 1),),
+            ),
+        )
+
+        plan = build_clc_command_plan(
+            dependency_plan=dependency_plan,
+            task_families=task_families,
+            axis_geometry={10: (3, 1), 20: (2, 1)},
+            preordered_edges=frozenset(),
+        )
+
+        assert_valid_clc_command_quotient(self, plan)
+
+        self.assertEqual(plan.task_order, (0, 1, 2, 3, 4))
+
+    def test_clc_plan_keeps_dense_family_dependency_compact(self) -> None:
+        task_count = 1025
+        dependency_plan = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    allocation_id=0,
+                    kind="store",
+                    shape=(task_count,),
+                    block_ids=(10,),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    allocation_id=0,
+                    kind="load",
+                    shape=(task_count,),
+                    block_ids=(20,),
+                    masked=True,
+                ),
+            ),
+            [[10], [20]],
+        )
+        task_families = _one_dimensional_families(
+            producer_count=task_count,
+            consumer_count=task_count,
+            producer_block=1,
+            consumer_block=1,
+        )
+
+        plan = build_clc_command_plan(
+            dependency_plan=dependency_plan,
+            task_families=task_families,
+            axis_geometry={10: (task_count, 1), 20: (task_count, 1)},
+            preordered_edges=frozenset(),
+            physical_worker_limit=task_count,
+        )
+
+        self.assertEqual(plan.command_count, 2 * task_count)
+        self.assertTrue(
+            all(command.task[0] == 0 for command in plan.commands[:task_count])
+        )
+        self.assertTrue(
+            all(command.task[0] == 1 for command in plan.commands[task_count:])
+        )
+
+        with (
+            mock.patch(
+                "helion._compiler.cross_loop_scheduler."
+                "_EXPLICIT_SCHEDULE_EDGE_LIMIT",
+                6000,
+            ),
+            self.assertRaisesRegex(
+                ClcCommandPlanUnavailable,
+                "6000-item materialization budget",
+            ),
+        ):
+            build_clc_command_plan(
+                dependency_plan=dependency_plan,
+                task_families=task_families,
+                axis_geometry={10: (task_count, 1), 20: (task_count, 1)},
+                preordered_edges=frozenset(),
+                physical_worker_limit=task_count,
+            )
+
+    def test_clc_command_quotient_handles_a_diamond_join(self) -> None:
+        dependency_plan = build_tile_dependency_graph(
+            (
+                _access(0, root=0, allocation_id=0, kind="store", block_ids=(10,)),
+                _access(1, root=0, allocation_id=1, kind="store", block_ids=(10,)),
+                _access(2, root=1, allocation_id=0, kind="load", block_ids=(20,)),
+                _access(3, root=1, allocation_id=2, kind="store", block_ids=(20,)),
+                _access(4, root=2, allocation_id=1, kind="load", block_ids=(30,)),
+                _access(5, root=2, allocation_id=3, kind="store", block_ids=(30,)),
+                _access(6, root=3, allocation_id=2, kind="load", block_ids=(40,)),
+                _access(7, root=3, allocation_id=3, kind="load", block_ids=(40,)),
+            ),
+            [[10], [20], [30], [40]],
+        )
+        task_families = tuple(
+            InstantiatedTaskFamily(
+                logical_axis_order=(block_id,),
+                physical_axis_order=(block_id,),
+                axis_counts_items=((block_id, 8),),
+                block_sizes_items=((block_id, 1),),
+            )
+            for block_id in (10, 20, 30, 40)
+        )
+
+        plan = build_clc_command_plan(
+            dependency_plan=dependency_plan,
+            task_families=task_families,
+            axis_geometry={
+                10: (8, 1),
+                20: (8, 1),
+                30: (8, 1),
+                40: (8, 1),
+            },
+            preordered_edges=frozenset(),
+            physical_worker_limit=4,
+        )
+
+        assert_valid_clc_command_quotient(self, plan)
+
     def test_worker_schedule_derives_access_ready_overlap(self) -> None:
         dependency_plan = build_tile_dependency_graph(
             (
@@ -4105,9 +4404,9 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(schedule.worker_schedule.placement(2, 0), (5, 1))
         self.assertEqual(schedule.worker_schedule.placement(0, 6), (0, 1))
 
-        snapped = build_cross_loop_schedule(**kwargs, requested_worker_count=7)
-        self.assertEqual(snapped.worker_limit, 6)
-        self.assertEqual(snapped.worker_schedule, schedule.worker_schedule)
+        exact = build_cross_loop_schedule(**kwargs, requested_worker_count=7)
+        self.assertEqual(exact.worker_limit, 7)
+        self.assertNotEqual(exact.worker_schedule, schedule.worker_schedule)
 
         default_schedule = build_cross_loop_schedule(**kwargs, requested_worker_count=0)
         self.assertEqual(
@@ -4287,6 +4586,59 @@ class TestCrossLoopDependencies(TestCase):
             ),
         )
         self.assertEqual(plan.uses[0].consumer_scope_id, 7)
+
+    def test_segmented_broadcast_falls_back_when_one_task_feeds_two_segments(
+        self,
+    ) -> None:
+        producer_domain = LogicalDomain((10,), ((10, 1),), identity=0)
+        consumer_domain = LogicalDomain((20,), ((20, 1),), identity=1)
+        action_domain = LogicalDomain(
+            (20, 21),
+            ((20, 1), (21, 4)),
+            ((20, 1), (21, 1)),
+            identity=2,
+        )
+        key_domain = LogicalDomain(
+            (0,),
+            ((0, 1),),
+            kind="event",
+            identity=0,
+        )
+        event = KeyedEvent(
+            event_id=0,
+            key_domain=key_domain,
+            contributions=(
+                EventContribution(
+                    producer_root=0,
+                    keys=LogicalRelation.total(producer_domain, key_domain),
+                ),
+            ),
+            uses=(
+                EventUse(
+                    consumer_root=1,
+                    consumer_scope_id=2,
+                    keys=LogicalRelation.total(action_domain, key_domain),
+                ),
+            ),
+        )
+        event_graph = EventGraph(
+            root_domains=(producer_domain, consumer_domain),
+            root_traversals=(
+                physical_traversal_relation(producer_domain, (10,)),
+                physical_traversal_relation(consumer_domain, (20,)),
+            ),
+            scope_domains=(None, None, action_domain),
+            events=(event,),
+        )
+
+        self.assertIsNone(
+            _segmented_scope_event(
+                event_graph,
+                event,
+                event.uses[0],
+                (0, 2, 4),
+            )
+        )
 
     def test_nested_scope_identity_readiness_uses_one_admission_frontier(self) -> None:
         """Per-iteration readiness is coarsened to one compact frontier."""
@@ -5270,7 +5622,10 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(out, (x + 1) * 2)
         self.assertNotIn("tile_dependency_scope_wait", code)
-        self.assertIn("tile_dependency_root_completion_wait", code)
+        if "_requires_clc=True" in code:
+            self.assertIn("tile_dependency_keyed_event_wait", code)
+        else:
+            self.assertIn("tile_dependency_root_completion_wait", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -5362,7 +5717,10 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             continuation_lines[1],
         )
         self.assertNotIn("tile_dependency_task_wait", code)
-        self.assertIn("tile_dependency_root_completion_wait", code)
+        if "_requires_clc=True" in code:
+            self.assertIn("tile_dependency_keyed_event_wait", code)
+        else:
+            self.assertIn("tile_dependency_root_completion_wait", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -5378,7 +5736,9 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, (x + 1) * 2)
-        self.assertIn("tile_dependency_keyed_event_wait", code)
+        self.assertIn("tile_dependency_continuation_previous", code)
+        self.assertIn("tl.maximum", code)
+        self.assertNotIn("tile_dependency_keyed_event_wait", code)
         self.assertNotIn("tile_dependency_task_wait", code)
         self.assertNotIn("tile_dependency_root_completion", code)
 
@@ -5592,7 +5952,10 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(out, (x[32:] + 1) * 2)
         self.assertNotIn("tile_dependency_task_wait", code)
-        self.assertIn("tile_dependency_root_completion", code)
+        if "_requires_clc=True" in code:
+            self.assertIn("tile_dependency_keyed_event_wait", code)
+        else:
+            self.assertIn("tile_dependency_root_completion", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -5629,7 +5992,10 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(out, (x + 1) * 2)
         self.assertIn("tile_dependency_continuation_previous", code)
-        self.assertIn("tile_dependency_scheduled_physical_task", code)
+        if "_requires_clc=True" in code:
+            self.assertIn("tile_dependency_clc_command_tasks", code)
+        else:
+            self.assertIn("tile_dependency_scheduled_physical_task", code)
         self.assertNotIn("tile_dependency_root_completion", code)
 
     @skipIfNotCUDA()
@@ -5665,8 +6031,13 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, torch.sum(x * 2, dim=-1))
-        self.assertGreaterEqual(code.count("tile_dependency_root_completion_wait"), 2)
-        self.assertIn("if tl.program_id(0) == 0:", code)
+        if "_requires_clc=True" in code:
+            self.assertGreaterEqual(code.count("tile_dependency_keyed_event_wait"), 2)
+        else:
+            self.assertGreaterEqual(
+                code.count("tile_dependency_root_completion_wait"), 2
+            )
+            self.assertIn("if tl.program_id(0) == 0:", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -5704,7 +6075,10 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, torch.sum(x + 1, dim=-1) + x[:, 0] + 1)
-        self.assertIn("tile_dependency_root_completion_wait", code)
+        if "_requires_clc=True" in code:
+            self.assertIn("tile_dependency_keyed_event_wait", code)
+        else:
+            self.assertIn("tile_dependency_root_completion_wait", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -5742,8 +6116,14 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         compiled(x)
         torch.cuda.synchronize()
 
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream):
+            compiled(x)
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with torch.cuda.graph(graph, stream=capture_stream):
             captured = compiled(x)
         for value in (3.0, 7.0, -2.0):
             x.fill_(value)
@@ -5873,7 +6253,10 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
 
                 if reverse_groups:
                     self.assertNotIn("tile_dependency_group_arrivals", code)
-                    self.assertIn("tile_dependency_root_completion", code)
+                    if "_requires_clc=True" in code:
+                        self.assertIn("tile_dependency_keyed_event_wait", code)
+                    else:
+                        self.assertIn("tile_dependency_root_completion", code)
                 elif group_size != 32:
                     self.assertNotIn("tile_dependency_group_arrivals", code)
                     self.assertNotIn("tile_dependency_cohort_wait", code)

@@ -32,6 +32,7 @@ from probes.gemma4.common import layer_reference
 from probes.gemma4.common import require_idle_visible_gpu
 from probes.gemma4.common import variant_name
 from probes.gemma4.common import visible_gpu_pids
+from probes.common import benchmark_graphs_cold_l2
 import probes.gemma4.helion_gemma4_e4b_layer as separate
 
 import helion
@@ -739,10 +740,10 @@ def run(args) -> None:
     if args.dump_config:
         print("MEGAKERNEL_CONFIG", dict(config), flush=True)
         print("ROOT_BLOCK_IDS", host_function.device_ir.grid_block_ids, flush=True)
-        dependency_plan = host_function.device_ir.tile_dependency_graph
-        assert dependency_plan is not None
-        print("DEPENDENCY_EVENTS", dependency_plan.events, flush=True)
-        print("DEPENDENCY_WAITS", dependency_plan.waits, flush=True)
+        dependency_graph = host_function.device_ir.tile_dependency_graph
+        assert dependency_graph is not None
+        print("DEPENDENCY_EDGES", dependency_graph.edges, flush=True)
+        print("EXECUTION_SCOPES", dependency_graph.execution_scopes, flush=True)
         print(
             "BLOCK_SPECS",
             [
@@ -813,11 +814,17 @@ def run(args) -> None:
     if args.timing_only:
         graph, _ = capture(lambda: compiled(*kernel_args))
         pids = visible_gpu_pids()
-        timings = benchmark_interleaved(
-            {"helion_megakernel": graph.replay},
-            args.repeats,
-            args.batch_replays,
-        )
+        if args.cold_l2:
+            timings = benchmark_graphs_cold_l2(
+                {"helion_megakernel": (graph.replay, lambda: None)},
+                args.repeats,
+            )
+        else:
+            timings = benchmark_interleaved(
+                {"helion_megakernel": graph.replay},
+                args.repeats,
+                args.batch_replays,
+            )
         if visible_gpu_pids() != pids:
             raise RuntimeError("GPU process set changed during benchmark")
         print("TIMINGS", timings, flush=True)
@@ -847,14 +854,21 @@ def run(args) -> None:
     torch.cuda.synchronize()
     _assert_close("separate_graph_output", separate_output, reference["output"])
     pids = visible_gpu_pids()
-    timings = benchmark_interleaved(
-        {
-            "helion_megakernel": megakernel_graph.replay,
-            "helion_separate_optimized": separate_graph.replay,
-        },
-        args.repeats,
-        args.batch_replays,
-    )
+    replay_entries = {
+        "helion_megakernel": megakernel_graph.replay,
+        "helion_separate_optimized": separate_graph.replay,
+    }
+    if args.cold_l2:
+        timings = benchmark_graphs_cold_l2(
+            {name: (replay, lambda: None) for name, replay in replay_entries.items()},
+            args.repeats,
+        )
+    else:
+        timings = benchmark_interleaved(
+            replay_entries,
+            args.repeats,
+            args.batch_replays,
+        )
     if visible_gpu_pids() != pids:
         raise RuntimeError("GPU process set changed during benchmark")
     print(
@@ -900,6 +914,7 @@ def main() -> None:
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--timing-only", action="store_true")
+    parser.add_argument("--cold-l2", action="store_true")
     parser.add_argument("--print-source", action="store_true")
     parser.add_argument("--print-lowered", action="store_true")
     parser.add_argument("--dump-config", action="store_true")

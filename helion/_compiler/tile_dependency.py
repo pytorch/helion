@@ -629,7 +629,17 @@ class LogicalRelation:
     @cached_property
     def _cached_inverse(self) -> LogicalRelation | None:
         pieces: list[_LogicalRelationPiece] = []
+        used_mixed_radix_inverse = False
         for piece in self.pieces:
+            mixed_radix_pieces = _mixed_radix_interval_inverse(
+                piece,
+                source_domain=self.source_domain,
+                target_domain=self.target_domain,
+            )
+            if mixed_radix_pieces is not None:
+                pieces.extend(mixed_radix_pieces)
+                used_mixed_radix_inverse = True
+                continue
             lower_bounds: dict[int, list[sympy.Expr]] = {}
             upper_bounds: dict[int, list[sympy.Expr]] = {}
             target_steps: dict[int, int] = {}
@@ -799,11 +809,14 @@ class LogicalRelation:
                     ),
                 )
             )
-        return LogicalRelation(
+        inverse = LogicalRelation(
             source_domain=self.target_domain,
             target_domain=self.source_domain,
             pieces=tuple(dict.fromkeys(pieces)),
         )
+        if used_mixed_radix_inverse:
+            return _compact_mixed_radix_point_map(inverse) or inverse
+        return inverse
 
     @staticmethod
     def _evaluate(expression: sympy.Expr, coordinates: dict[int, int]) -> int:
@@ -2371,6 +2384,208 @@ def _single_axis_interval(
     if stride <= 0 or width <= 0:
         return None
     return axis, stride, offset, width
+
+
+def _mixed_radix_interval_inverse(
+    piece: _LogicalRelationPiece,
+    *,
+    source_domain: LogicalDomain,
+    target_domain: LogicalDomain,
+) -> tuple[_LogicalRelationPiece, ...] | None:
+    """Invert a dense inner mixed-radix interval into a point relation.
+
+    This handles relations such as ``[256 * slot + 16 * tile, ... + 16)``.
+    Axes whose strides form a dense chain beginning at the interval width are
+    decoded symbolically; any remaining outer axes are represented by one
+    compact piece per coordinate. The transformation is exact and does not
+    enumerate either relation domain.
+    """
+    if (
+        source_domain.kind != "scope"
+        or target_domain.kind != "scope"
+        or len(source_domain.axis_order) <= 1
+        or len(target_domain.axis_order) != 1
+        or len(piece.target_ranges) != 1
+        or len(piece.target_ranges[0][1].free_symbols) <= 1
+    ):
+        return None
+    target_axis, begin, end, step = piece.target_ranges[0]
+    if step != 1:
+        return None
+    width_expression = sympy.simplify(end - begin)  # pyrefly: ignore[unsupported-operation]
+    if width_expression.free_symbols or width_expression.is_integer is not True:
+        return None
+    width = int(width_expression)
+    if width <= 0:
+        return None
+
+    source_symbols = {
+        logical_axis_symbol(axis): axis for axis in source_domain.axis_order
+    }
+    expanded_begin = sympy.expand(begin)
+    coefficients: dict[int, int] = {}
+    remainder = expanded_begin
+    for symbol, axis in source_symbols.items():
+        coefficient = sympy.simplify(expanded_begin.coeff(symbol))
+        if coefficient.free_symbols or coefficient.is_integer is not True:
+            return None
+        value = int(coefficient)
+        if value:
+            if value < 0:
+                return None
+            coefficients[axis] = value
+            remainder = sympy.simplify(remainder - coefficient * symbol)
+    if remainder.free_symbols or remainder.is_integer is not True:
+        return None
+    constant = int(remainder)
+
+    bounds = {
+        axis: (source_begin, source_end, source_step)
+        for axis, source_begin, source_end, source_step in piece.source_bounds_items
+    }
+    if set(bounds) != set(source_domain.axis_order) or any(
+        source_step != 1 for _begin, _end, source_step in bounds.values()
+    ):
+        return None
+    if any(
+        axis not in coefficients and source_end - source_begin != 1
+        for axis, (source_begin, source_end, _step) in bounds.items()
+    ):
+        return None
+
+    ordered_axes = sorted(coefficients, key=coefficients.__getitem__)
+    dense_axes: list[int] = []
+    expected_stride = width
+    for axis in ordered_axes:
+        if coefficients[axis] != expected_stride:
+            break
+        dense_axes.append(axis)
+        source_begin, source_end, _step = bounds[axis]
+        expected_stride *= source_end - source_begin
+    if not dense_axes:
+        return None
+    outer_axes = tuple(axis for axis in source_domain.axis_order if axis not in dense_axes)
+    if any(
+        0 < coefficients.get(axis, 0) < expected_stride for axis in outer_axes
+    ):
+        return None
+
+    target_symbol = logical_axis_symbol(target_axis)
+    result: list[_LogicalRelationPiece] = []
+    outer_ranges = tuple(
+        range(bounds[axis][0], bounds[axis][1]) for axis in outer_axes
+    )
+    for outer_coordinates in itertools.product(*outer_ranges):
+        coordinate_by_axis = dict(zip(outer_axes, outer_coordinates, strict=True))
+        interval_begin = constant + sum(
+            coefficients.get(axis, 0) * coordinate_by_axis[axis]
+            for axis in outer_axes
+        )
+        interval_begin += sum(
+            coefficients[axis] * bounds[axis][0] for axis in dense_axes
+        )
+        interval_end = interval_begin + expected_stride
+        if interval_begin < 0 or interval_end > target_domain.axis_counts[target_axis]:
+            return None
+
+        target_ranges: list[tuple[int, sympy.Expr, sympy.Expr, int]] = []
+        for axis in source_domain.axis_order:
+            if axis in coordinate_by_axis:
+                value: sympy.Expr = sympy.Integer(coordinate_by_axis[axis])
+            else:
+                source_begin, source_end, _step = bounds[axis]
+                count = source_end - source_begin
+                quotient = sympy.floor(
+                    (target_symbol - interval_begin) / coefficients[axis]  # pyrefly: ignore[bad-argument-type, unsupported-operation]
+                )
+                value = sympy.Integer(source_begin) + sympy.Mod(quotient, count)
+            target_ranges.append((axis, value, value + 1, 1))  # pyrefly: ignore[unsupported-operation]
+        result.append(
+            _LogicalRelationPiece(
+                source_bounds_items=((target_axis, interval_begin, interval_end, 1),),
+                target_ranges=tuple(target_ranges),
+            )
+        )
+    return tuple(result)
+
+
+def _compact_mixed_radix_point_map(
+    relation: LogicalRelation,
+) -> LogicalRelation | None:
+    """Collapse a piecewise one-dimensional point map to quotient/remainder.
+
+    Mixed-radix interval inversion can naturally produce one piece per outer
+    coordinate. When their union is a total function, recognize the equivalent
+    ``floor(index / stride) % radix`` coordinates so code generation remains
+    constant-sized.
+    """
+    if (
+        len(relation.pieces) <= 1
+        or len(relation.source_domain.axis_order) != 1
+        or len(relation.target_domain.axis_order) <= 1
+    ):
+        return None
+    canonical = relation.canonical_single_valued()
+    if canonical is None or not canonical.is_total_function():
+        return None
+    source_axis = relation.source_domain.axis_order[0]
+    source_symbol = logical_axis_symbol(source_axis)
+    source_size = relation.source_domain.size
+    values_by_axis: dict[int, list[int]] = {
+        axis: [] for axis in relation.target_domain.axis_order
+    }
+    for source in range(source_size):
+        targets = relation.target_coordinates({source_axis: source})
+        if len(targets) != 1:
+            return None
+        coordinates = next(iter(targets))
+        for axis, value in zip(
+            relation.target_domain.axis_order,
+            coordinates,
+            strict=True,
+        ):
+            values_by_axis[axis].append(value)
+
+    expressions: list[sympy.Expr] = []
+    for axis in relation.target_domain.axis_order:
+        values = values_by_axis[axis]
+        if all(value == values[0] for value in values):
+            expressions.append(sympy.Integer(values[0]))
+            continue
+        first_change = next(
+            (index for index, value in enumerate(values[1:], start=1) if value != values[0]),
+            None,
+        )
+        if first_change is None:
+            return None
+        radix = relation.target_domain.axis_counts[axis]
+        expression = sympy.Mod(
+            sympy.floor(source_symbol / first_change) + values[0],  # pyrefly: ignore[bad-argument-type, unsupported-operation]
+            radix,
+        )
+        if any(
+            relation._evaluate(expression, {source_axis: source}) != value
+            for source, value in enumerate(values)
+        ):
+            return None
+        expressions.append(expression)
+    return LogicalRelation.point_map(
+        relation.source_domain,
+        relation.target_domain,
+        (
+            (
+                (
+                    (
+                        source_axis,
+                        0,
+                        relation.source_domain.axis_counts[source_axis],
+                        1,
+                    ),
+                ),
+                tuple(expressions),
+            ),
+        ),
+    )
 
 
 def _single_axis_floor_point(

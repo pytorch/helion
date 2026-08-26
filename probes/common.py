@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import random
 import statistics
 import subprocess
 from typing import Callable
@@ -28,12 +29,51 @@ def make_l2_cache_clearer() -> Callable[[], None] | None:
     return clear
 
 
+def flush_l2_exact(*, flush_mib: int = 256) -> None:
+    """Flush exactly ``flush_mib`` MiB through Triton's benchmark buffer."""
+    import triton
+
+    driver = triton.runtime.driver.active
+    flush_buffer = driver.get_empty_cache_for_benchmark()
+    expected_bytes = flush_mib * 1024 * 1024
+    actual_bytes = flush_buffer.numel() * flush_buffer.element_size()
+    if actual_bytes != expected_bytes:
+        raise ValueError(
+            f"Triton L2 flush buffer is {actual_bytes} bytes, expected {expected_bytes}"
+        )
+    driver.clear_cache(flush_buffer)
+    driver.get_device_interface().synchronize()
+
+
 def capture(fn: Callable[[], T]) -> tuple[torch.cuda.CUDAGraph, T]:
     capture_stream = torch.cuda.Stream()
     capture_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(capture_stream):
         for _ in range(3):
             output = fn()
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        output = fn()
+    torch.cuda.synchronize()
+    return graph, output
+
+
+def capture_with_reset(
+    fn: Callable[[], T],
+    reset: Callable[[], None],
+    *,
+    warmups: int = 3,
+) -> tuple[torch.cuda.CUDAGraph, T]:
+    """Capture only ``fn`` while restoring mutable inputs between warmups."""
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        for _ in range(warmups):
+            reset()
+            output = fn()
+        reset()
     torch.cuda.current_stream().wait_stream(capture_stream)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
@@ -82,6 +122,158 @@ def benchmark_interleaved(
             "p90_us": sorted(values)[min(len(values) - 1, int(0.9 * len(values)))],
         }
         for name, values in samples.items()
+    }
+
+
+def benchmark_graphs_cold_l2(
+    entries: dict[str, tuple[Callable[[], object], Callable[[], None]]],
+    repeats: int,
+    *,
+    flush_mib: int = 256,
+    order_seed: int = 0,
+) -> dict[str, dict[str, object]]:
+    """Time each graph replay after an identical, verified L2 flush."""
+    if not entries:
+        return {}
+    if repeats <= 0 or repeats % 2:
+        raise ValueError("repeats must be positive and even")
+    names = list(entries)
+    rng = random.Random(order_seed)
+    samples: dict[str, list[float]] = {name: [] for name in names}
+    import triton
+
+    driver = triton.runtime.driver.active
+    flush_buffer = driver.get_empty_cache_for_benchmark()
+    expected_bytes = flush_mib * 1024 * 1024
+    actual_bytes = flush_buffer.numel() * flush_buffer.element_size()
+    if actual_bytes != expected_bytes:
+        raise ValueError(
+            f"Triton L2 flush buffer is {actual_bytes} bytes, expected {expected_bytes}"
+        )
+    device_interface = driver.get_device_interface()
+    flush_l2_exact(flush_mib=flush_mib)
+
+    while len(samples[names[0]]) < repeats:
+        order = list(names)
+        rng.shuffle(order)
+        pending: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+        for name in (*order, *reversed(order)):
+            replay, reset = entries[name]
+            reset()
+            driver.clear_cache(flush_buffer)
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            replay()
+            end.record()
+            pending.append((name, start, end))
+        device_interface.synchronize()
+        for name, start, end in pending:
+            samples[name].append(start.elapsed_time(end) * 1000.0)
+
+    result: dict[str, dict[str, object]] = {}
+    for name, values in samples.items():
+        values = values[:repeats]
+        ordered = sorted(values)
+        result[name] = {
+            "median_us": statistics.median(values),
+            "mean_us": statistics.fmean(values),
+            "stdev_us": statistics.stdev(values) if len(values) > 1 else 0.0,
+            "min_us": ordered[0],
+            "p10_us": ordered[int(0.1 * (len(ordered) - 1))],
+            "p90_us": ordered[int(0.9 * (len(ordered) - 1))],
+            "max_us": ordered[-1],
+            "samples_us": values,
+        }
+    return result
+
+
+def profile_cuda_timeline(
+    fn: Callable[[], object],
+) -> list[dict[str, float | int | str]]:
+    """Return one replay's CUDA activities with normalized start times."""
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as profiler:
+        fn()
+        torch.cuda.synchronize()
+    events = [
+        event
+        for event in profiler.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    if not events:
+        return []
+    origin = min(event.time_range.start for event in events)
+    return [
+        {
+            "name": event.name,
+            "start_us": event.time_range.start - origin,
+            "end_us": event.time_range.end - origin,
+            "duration_us": event.self_device_time_total,
+            "stream": event.device_resource_id,
+        }
+        for event in sorted(events, key=lambda event: event.time_range.start)
+    ]
+
+
+def error_stats(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
+    actual_f = actual.float()
+    expected_f = expected.float()
+    difference = (actual_f - expected_f).abs()
+    denominator = actual_f.norm() * expected_f.norm()
+    cosine = (
+        float((actual_f.flatten() @ expected_f.flatten() / denominator).item())
+        if float(denominator.item()) != 0.0
+        else 1.0
+    )
+    return {
+        "max_abs": float(difference.max().item()),
+        "mean_abs": float(difference.mean().item()),
+        "cosine": cosine,
+    }
+
+
+def clone_tensors(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {name: value.clone() for name, value in tensors.items()}
+
+
+def gpu_snapshot() -> dict[str, str | int]:
+    output = subprocess.run(
+        [
+            "nvidia-smi",
+            "-i",
+            visible_gpu(),
+            "--query-gpu=name,uuid,temperature.gpu,pstate,clocks.sm,clocks.mem,"
+            "power.draw,memory.used,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    fields = [field.strip() for field in output.split(",")]
+    keys = (
+        "name",
+        "uuid",
+        "temperature_c",
+        "pstate",
+        "sm_clock_mhz",
+        "memory_clock_mhz",
+        "power_w",
+        "memory_used_mb",
+        "utilization_pct",
+    )
+    integer_keys = {
+        "temperature_c",
+        "sm_clock_mhz",
+        "memory_clock_mhz",
+        "memory_used_mb",
+        "utilization_pct",
+    }
+    return {
+        key: int(value) if key in integer_keys else value
+        for key, value in zip(keys, fields, strict=True)
     }
 
 

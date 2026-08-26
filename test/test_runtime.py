@@ -8,6 +8,7 @@ from unittest.mock import patch
 import torch
 
 import helion.runtime
+from helion.runtime.triton.launcher import _get_constant_buffer
 from helion.runtime.triton.launcher import _get_persistent_state
 from helion.runtime.triton.launcher import default_launcher as triton_default_launcher
 
@@ -118,3 +119,91 @@ class TestPersistentTritonState(unittest.TestCase):
         self.assertEqual(retained[0].item(), 7)
         self.assertNotEqual(independent.data_ptr(), state.data_ptr())
         self.assertEqual(torch.count_nonzero(independent).item(), 0)
+
+    def test_constant_buffer_is_initialized_and_shared(self) -> None:
+        kernel = SimpleNamespace()
+        like = torch.empty(1, device="cuda")
+        values = (3, 1, 4, 1, 5)
+
+        first = _get_constant_buffer(
+            kernel,
+            like,
+            0,
+            values,
+            torch.uint32,
+        )
+        with torch.cuda.stream(torch.cuda.Stream()):
+            second = _get_constant_buffer(
+                kernel,
+                like,
+                0,
+                values,
+                torch.uint32,
+            )
+
+        self.assertEqual(first.data_ptr(), second.data_ptr())
+        self.assertEqual(first.cpu().tolist(), list(values))
+
+    def test_persistent_state_rejects_first_allocation_during_capture(self) -> None:
+        kernel = SimpleNamespace()
+        like = torch.empty(1, device="cuda")
+        with (
+            patch("torch.cuda.is_current_stream_capturing", return_value=True),
+            self.assertRaisesRegex(RuntimeError, "warm up.*capture stream"),
+        ):
+            _get_persistent_state(
+                kernel,
+                like,
+                ("capture",),
+                0,
+                1,
+                torch.uint64,
+            )
+
+    def test_constant_buffer_rejects_first_allocation_during_capture(self) -> None:
+        kernel = SimpleNamespace()
+        like = torch.empty(1, device="cuda")
+        with (
+            patch("torch.cuda.is_current_stream_capturing", return_value=True),
+            self.assertRaisesRegex(RuntimeError, "warm up.*capture stream"),
+        ):
+            _get_constant_buffer(kernel, like, 0, (1, 2, 3), torch.uint32)
+
+    def test_preallocated_compiler_buffers_are_capture_safe(self) -> None:
+        kernel = SimpleNamespace()
+        like = torch.empty(1, device="cuda")
+        state = _get_persistent_state(
+            kernel,
+            like,
+            ("capture",),
+            0,
+            1,
+            torch.uint64,
+        )
+        constants = _get_constant_buffer(
+            kernel,
+            like,
+            0,
+            (1, 2, 3),
+            torch.uint32,
+        )
+
+        with patch("torch.cuda.is_current_stream_capturing", return_value=True):
+            retained_state = _get_persistent_state(
+                kernel,
+                like,
+                ("capture",),
+                0,
+                1,
+                torch.uint64,
+            )
+            retained_constants = _get_constant_buffer(
+                kernel,
+                like,
+                0,
+                (1, 2, 3),
+                torch.uint32,
+            )
+
+        self.assertEqual(state.data_ptr(), retained_state.data_ptr())
+        self.assertEqual(constants.data_ptr(), retained_constants.data_ptr())

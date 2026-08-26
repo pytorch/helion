@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import ast
 import dataclasses
+import itertools
 import math
 from typing import TYPE_CHECKING
 from typing import ClassVar
@@ -20,10 +21,16 @@ from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .cross_loop_scheduler import CROSS_LOOP_NUM_WORKERS_CONFIG
 from .cross_loop_scheduler import CROSS_LOOP_NUM_WORKERS_DEFAULT
+from .cross_loop_scheduler import ClcCommandPlan
+from .cross_loop_scheduler import ClcCommandPlanUnavailable
 from .cross_loop_scheduler import CountedEventPlan
+from .cross_loop_scheduler import CrossLoopSchedule
 from .cross_loop_scheduler import EventContribution
 from .cross_loop_scheduler import EventUse
+from .cross_loop_scheduler import WorkerSchedule
+from .cross_loop_scheduler import build_clc_command_plan
 from .cross_loop_scheduler import build_cross_loop_schedule
+from .cross_loop_scheduler import uniform_preimage_cardinality
 from .cute.cutedsl_compat import emit_pipeline_advance
 from .cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_DEFAULT
 from .cute.strategies import l2_swizzle_size_from_config
@@ -809,7 +816,7 @@ class ForEachProgramID(ProgramIDs):
         )
         assert root_traversals is not None
         assert [domain.size for domain in root_domains] == static_task_counts
-        cross_loop_schedule = build_cross_loop_schedule(
+        base_schedule = build_cross_loop_schedule(
             dependency_plan=dependency_plan,
             root_domains=root_domains,
             root_traversals=root_traversals,
@@ -825,14 +832,44 @@ class ForEachProgramID(ProgramIDs):
             ),
             publishable_scope_ids=publishable_scope_ids,
         )
-        root_completion_edges = set(cross_loop_schedule.root_completion_edges)
-        family_done_event_plans = tuple(
-            plan
-            for plan in cross_loop_schedule.counted_events
-            if plan.graph_event_index is not None
-            and cross_loop_schedule.event_graph.event(
-                plan.graph_event_index
-            ).is_family_done
+        cross_loop_schedule: CrossLoopSchedule | ClcCommandPlan = base_schedule
+        clc_backend_supported = (
+            CompileEnvironment.current().config_spec.automatic_clc_dispatch
+        )
+        indexing = device_function.config.get("indexing", ())
+        uses_tensor_descriptors = (
+            indexing == "tensor_descriptor"
+            or isinstance(indexing, (list, tuple))
+            and "tensor_descriptor" in indexing
+        )
+        if clc_backend_supported and uses_tensor_descriptors:
+            raise AssertionError(
+                "automatic CLC dispatch must normalize tensor descriptors to pointers"
+            )
+        if clc_backend_supported:
+            try:
+                clc_plan = build_clc_command_plan(base_schedule)
+            except ClcCommandPlanUnavailable:
+                pass
+            else:
+                if clc_plan.uses_cancellation:
+                    cross_loop_schedule = clc_plan
+                    device_function.triton_uses_clc = True
+        is_clc = isinstance(cross_loop_schedule, ClcCommandPlan)
+        root_completion_edges = (
+            set() if is_clc else set(cross_loop_schedule.root_completion_edges)
+        )
+        family_done_event_plans = (
+            ()
+            if is_clc
+            else tuple(
+                plan
+                for plan in cross_loop_schedule.counted_events
+                if plan.graph_event_index is not None
+                and cross_loop_schedule.event_graph.event(
+                    plan.graph_event_index
+                ).is_family_done
+            )
         )
         nested_scope_event_plans = tuple(
             plan
@@ -849,18 +886,29 @@ class ForEachProgramID(ProgramIDs):
             *counted_event_plans,
             *nested_scope_event_plans,
         )
-        launch_worker_limit = cross_loop_schedule.worker_limit
-        if launch_worker_limit != physical_worker_limit:
+        launch_worker_limit = (
+            cross_loop_schedule.launch_token_count
+            if is_clc
+            else cross_loop_schedule.worker_limit
+        )
+        if is_clc:
+            strategy.grid_size_expr = str(cross_loop_schedule.launch_token_count)
+        elif launch_worker_limit != physical_worker_limit:
             strategy.grid_size_expr = str(launch_worker_limit)
 
-        static_workers_by_root = {
-            root: cross_loop_schedule.worker_schedule.workers_for_root(root)
-            for root in range(len(root_domains))
-        }
+        static_workers_by_root = (
+            {}
+            if is_clc
+            else {
+                root: cross_loop_schedule.worker_schedule.workers_for_root(root)
+                for root in range(len(root_domains))
+            }
+        )
         local_task_count_by_root: dict[int, int] = {}
-        for trigger in cross_loop_schedule.local_triggers:
-            event = cross_loop_schedule.event_graph.event(trigger.event_index)
-            use = event.uses[trigger.use_index]
+        for plan in counted_event_plans:
+            use = plan.local_use
+            if use is None:
+                continue
             if not use.keys.is_total_function():
                 raise AssertionError("a local event must cover its complete root")
             local_task_count_by_root[use.consumer_root] = use.keys.source_domain.size
@@ -871,15 +919,22 @@ class ForEachProgramID(ProgramIDs):
         def root_completion_arrival_count(root: int) -> int:
             return active_worker_count(root) + local_task_count_by_root.get(root, 0)
 
-        # Until a smaller progress-critical cohort is proven for a schedule,
-        # require every launched worker to fit concurrently.  This is checked
-        # by the launcher using CUDA's exact occupancy calculation after ptxas.
-        device_function.triton_minimum_resident_programs = strategy.grid_size_expr
-        device_function.preamble.extend(
-            strategy._persistent_setup_statements(total_expr)
-        )
+        if not is_clc:
+            device_function.triton_minimum_resident_programs = str(launch_worker_limit)
+        else:
+            num_sm = CompileEnvironment.current().config_spec.num_sm
+            device_function.triton_target_resident_programs_per_sm = str(
+                max(1, (base_schedule.worker_limit + num_sm - 1) // num_sm)
+            )
+        if not is_clc:
+            device_function.preamble.extend(
+                strategy._persistent_setup_statements(total_expr)
+            )
         counted_event_offsets: dict[CountedEventPlan, int] = {}
         counted_event_counter_count = 0
+        single_warp_cross_loop = device_function.config.num_warps == 1 and not any(
+            device_function.config.range_warp_specializes
+        )
         counted_event_key_stride = _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
         for plan in all_counted_event_plans:
             counted_event_offsets[plan] = counted_event_counter_count
@@ -910,15 +965,34 @@ class ForEachProgramID(ProgramIDs):
             len(root_completion_producer_roots) * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
         )
         static_state_base = (
-            f"(({strategy.grid_size_expr} + {_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS - 1}) "
-            f"// {_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}) * "
-            f"{_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}"
+            "0"
+            if is_clc
+            else (
+                f"(({strategy.grid_size_expr} + "
+                f"{_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS - 1}) // "
+                f"{_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}) * "
+                f"{_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}"
+            )
         )
         state_arg = self._register_cross_loop_state(
             device_function,
             name_hint="tile_dependency_state",
-            numel=f"{static_state_base} + {state_count}",
+            numel=(
+                str(max(1, int(static_state_base) + state_count))
+                if is_clc
+                else f"{static_state_base} + {state_count}"
+            ),
             dtype=_CROSS_LOOP_COUNTER_DTYPE,
+        )
+        clc_cursor_arg = (
+            self._register_cross_loop_state(
+                device_function,
+                name_hint="tile_dependency_clc_cursor",
+                numel="1",
+                dtype=torch.uint64,
+            )
+            if is_clc
+            else None
         )
 
         def state_section(offset: int | None) -> str | None:
@@ -931,9 +1005,14 @@ class ForEachProgramID(ProgramIDs):
         root_completion_counter_arg = state_section(root_completion_state_offset)
 
         stage_root_ranges = self._cross_loop_stage_root_ranges()
-        result: list[ast.stmt] = [
-            statement_from_string(f"{epoch_var} = tl.load({epoch_arg} + {worker}) + 1")
-        ]
+        if is_clc:
+            result = []
+        else:
+            result = [
+                statement_from_string(
+                    f"{epoch_var} = tl.load({epoch_arg} + {worker}) + 1"
+                )
+            ]
         consumed_on_ready_roots = {
             local_use.consumer_root
             for plan in counted_event_plans
@@ -1037,16 +1116,24 @@ class ForEachProgramID(ProgramIDs):
             for contributions in producer_events_by_scope.values()
             for _plan, contributor in contributions
         }
-        scheduled_task_roots = {
-            root
-            for root, traversal in enumerate(root_traversals)
-            if any(
-                segment.task_relation != traversal
-                for segment in cross_loop_schedule.worker_schedule.segments_for_root(
-                    root
+        scheduled_task_roots = (
+            {
+                root
+                for root, traversal in enumerate(root_traversals)
+                if cross_loop_schedule.traversal_for_root(root) != traversal
+            }
+            if is_clc
+            else {
+                root
+                for root, traversal in enumerate(root_traversals)
+                if any(
+                    segment.task_relation != traversal
+                    for segment in cross_loop_schedule.worker_schedule.segments_for_root(
+                        root
+                    )
                 )
-            )
-        }
+            }
+        )
         counted_event_uses_by_waiting_root: dict[
             int,
             list[tuple[CountedEventPlan, EventUse]],
@@ -1463,9 +1550,7 @@ class ForEachProgramID(ProgramIDs):
         ) -> int | None:
             total = 0
             for contributor in plan.contributors:
-                inverse = contributor.keys.inverse()
-                cardinality = None if inverse is None else inverse.fiber_cardinality()
-                count = None if cardinality is None else cardinality.constant_value()
+                count = uniform_preimage_cardinality(contributor.keys)
                 if count is None:
                     return None
                 total += count
@@ -1580,18 +1665,17 @@ class ForEachProgramID(ProgramIDs):
                     )
                 )
 
-            last_arrival_body = [consumer_call]
+            last_arrival_body: list[ast.stmt] = [consumer_call]
             if consumer_publications:
                 last_arrival_body.append(
                     self._cross_loop_publication_barrier(device_function)
                 )
                 last_arrival_body.extend(consumer_publications)
             last_arrival_body.extend(root_completion_publication(on_ready_root))
-            expected_arrivals = counted_event_uniform_arrivals(plan)
-            if expected_arrivals is None:
-                raise AssertionError("local execution requires uniform event fan-in")
-            if expected_arrivals == 1:
+            uniform_arrivals = counted_event_uniform_arrivals(plan)
+            if uniform_arrivals == 1:
                 return [*assignments, *last_arrival_body]
+            expected_arrivals = counted_event_expected_arrivals(plan, key)
             arrival_counter = counted_event_counter(plan, key)
             return [
                 *assignments,
@@ -1721,11 +1805,27 @@ class ForEachProgramID(ProgramIDs):
         def scheduled_logical_task_expression(
             root: int,
             schedule_ordinal: str,
+            worker_schedule: WorkerSchedule | None = None,
         ) -> str | None:
             """Map one root-local schedule position to its logical task ID."""
             if root not in scheduled_task_roots:
                 return None
-            worker_schedule = cross_loop_schedule.worker_schedule
+            if worker_schedule is None:
+                traversal = cross_loop_schedule.traversal_for_root(root)
+                ordinal_coordinates = flat_task_coordinates(
+                    schedule_ordinal,
+                    traversal.source_domain.axis_order,
+                    traversal.source_domain.axis_counts,
+                )
+                task_coordinates, membership = relation_point_coordinates(
+                    traversal,
+                    ordinal_coordinates,
+                )
+                if membership != "True":
+                    raise AssertionError(
+                        f"CLC root {root} traversal does not cover every task ordinal"
+                    )
+                return logical_task_from_coordinates(root, task_coordinates)
             root_domain = root_domains[root]
             segments = worker_schedule.segments_for_root(root)
             schedule_interval = worker_schedule.contiguous_global_interval(root)
@@ -1771,20 +1871,21 @@ class ForEachProgramID(ProgramIDs):
                         segment.task_relation.source_domain.axis_order,
                         segment.task_relation.source_domain.axis_counts,
                     )
-                    task_coordinates, relation_membership = relation_point_coordinates(
-                        segment.task_relation,
-                        ordinal_coordinates,
+                    task_coordinates, relation_membership = (
+                        relation_point_coordinates(
+                            segment.task_relation,
+                            ordinal_coordinates,
+                        )
                     )
-                    if relation_membership != "True":
-                        membership = f"({membership}) and ({relation_membership})"
                     segment_task = logical_task_from_coordinates(
-                        root,
-                        task_coordinates,
+                        root, task_coordinates
                     )
                 elif segment.task_period is None:
                     segment_task = (
-                        f"{segment.task_begin} + ({task_offset}) * {segment.task_step}"
+                        f"{segment.task_begin} + ({task_offset}) * "
+                        f"{segment.task_step}"
                     )
+                    relation_membership = "True"
                 else:
                     assert segment.task_period_step is not None
                     segment_task = (
@@ -1794,6 +1895,9 @@ class ForEachProgramID(ProgramIDs):
                         f"(({task_offset}) // {segment.task_period}) * "
                         f"{segment.task_period_step}"
                     )
+                    relation_membership = "True"
+                if relation_membership != "True":
+                    membership = f"({membership}) and ({relation_membership})"
                 if not expression:
                     expression = segment_task
                     continue
@@ -1809,6 +1913,8 @@ class ForEachProgramID(ProgramIDs):
             extra_argument_names: tuple[str, ...],
             *,
             force_noinline: bool = False,
+            outline_scheduled: bool = True,
+            worker_schedule: WorkerSchedule | None = None,
         ) -> list[ast.stmt]:
             body: list[ast.stmt] = []
             has_task_scheduling = root in nested_scope_events_by_consumer
@@ -1818,12 +1924,12 @@ class ForEachProgramID(ProgramIDs):
             scheduled_coordinates: dict[int, str] | None = None
             if producer_events or root in nested_producer_roots:
                 has_task_scheduling = True
-            if (
-                logical_task_expr := scheduled_logical_task_expression(
-                    root,
-                    local_task,
-                )
-            ) is not None:
+            logical_task_expr = scheduled_logical_task_expression(
+                root,
+                local_task,
+                worker_schedule,
+            )
+            if logical_task_expr is not None:
                 scheduled_task = device_function.new_var(
                     "tile_dependency_scheduled_logical_task", dce=True
                 )
@@ -1911,31 +2017,55 @@ class ForEachProgramID(ProgramIDs):
                         scheduled_root_body,
                         scheduled_coordinates,
                     )
-                opaque_call = self._outline_cross_loop_region(
-                    device_function,
-                    name_hint=f"tile_dependency_root_{root}",
-                    body=[
-                        statement_from_string(
-                            f"{self.shared_pid_var} = {scheduled_logical_pid}"
-                        ),
-                        *scheduled_root_body,
-                    ],
-                    extra_argument_names=extra_argument_names,
-                )
+                if force_noinline:
+                    body.extend(
+                        [
+                            statement_from_string(
+                                f"{self.shared_pid_var} = {scheduled_logical_pid}"
+                            ),
+                            *_clone_opaque_statements(scheduled_root_body),
+                        ]
+                    )
+                else:
+                    body.append(
+                        self._outline_cross_loop_region(
+                            device_function,
+                            name_hint=f"tile_dependency_root_{root}",
+                            body=[
+                                statement_from_string(
+                                    f"{self.shared_pid_var} = {scheduled_logical_pid}"
+                                ),
+                                *scheduled_root_body,
+                            ],
+                            extra_argument_names=extra_argument_names,
+                        )
+                    )
             else:
-                opaque_call = self._outline_opaque_tile_body(
-                    device_function,
-                    root=root,
-                    logical_pid=scheduled_logical_pid,
-                    body=body_with_scope_publications(
-                        root,
-                        case_bodies[root],
-                        scheduled_coordinates,
-                    ),
-                    extra_argument_names=extra_argument_names,
-                    noinline=force_noinline,
+                tile_body = body_with_scope_publications(
+                    root,
+                    case_bodies[root],
+                    scheduled_coordinates,
                 )
-            body.append(opaque_call)
+                if force_noinline and has_task_scheduling:
+                    body.extend(
+                        [
+                            statement_from_string(
+                                f"{self.shared_pid_var} = {scheduled_logical_pid}"
+                            ),
+                            *_clone_opaque_statements(tile_body),
+                        ]
+                    )
+                else:
+                    body.append(
+                        self._outline_opaque_tile_body(
+                            device_function,
+                            root=root,
+                            logical_pid=scheduled_logical_pid,
+                            body=tile_body,
+                            extra_argument_names=extra_argument_names,
+                            noinline=force_noinline,
+                        )
+                    )
             publications: list[ast.stmt] = []
             if publications or producer_events:
                 has_task_scheduling = True
@@ -1951,6 +2081,8 @@ class ForEachProgramID(ProgramIDs):
                 )
             if not has_task_scheduling:
                 return body
+            if not outline_scheduled:
+                return body
             return [
                 self._outline_cross_loop_region(
                     device_function,
@@ -1961,45 +2093,219 @@ class ForEachProgramID(ProgramIDs):
                 )
             ]
 
-        dense_assignment_by_root: dict[int, tuple[int, int, int]] = {}
-        for root, root_domain in enumerate(root_domains):
-            segments = sorted(
-                cross_loop_schedule.worker_schedule.segments_for_root(root),
-                key=lambda segment: segment.schedule_begin,
+        if is_clc:
+            from .triton.backend import TritonBackend
+
+            triton_backend = CompileEnvironment.current().backend
+            if not isinstance(triton_backend, TritonBackend):
+                raise exc.BackendUnsupported(
+                    CompileEnvironment.current().backend_name,
+                    "Cluster Launch Control dispatch",
+                )
+            clc_plan = cross_loop_schedule
+            single_warp_clc = single_warp_cross_loop
+            response_addr = device_function.new_var(
+                "tile_dependency_clc_response", dce=False
             )
-            if not segments:
-                continue
-            if sum(segment.task_count for segment in segments) != root_domain.size:
-                raise exc.CrossLoopSchedulingError(
-                    "partially static task families are not supported yet"
-                )
-            worker_begin = segments[0].worker_begin
-            worker_count = segments[0].worker_count
-            if any(
-                segment.worker_begin != worker_begin
-                or segment.worker_count != worker_count
-                or segment.schedule_step != 1
-                or segment.schedule_period is not None
-                for segment in segments
-            ):
-                raise exc.CrossLoopSchedulingError(
-                    f"root {root} has a noncontiguous static worker assignment"
-                )
-            schedule_begin = segments[0].schedule_begin
-            if schedule_begin % worker_count or any(
-                segment.schedule_begin
-                != schedule_begin
-                + sum(previous.task_count for previous in segments[:index])
-                for index, segment in enumerate(segments)
-            ):
-                raise exc.CrossLoopSchedulingError(
-                    f"root {root} has a non-dense static worker schedule"
-                )
-            dense_assignment_by_root[root] = (
-                worker_begin,
-                worker_count,
-                root_domain.size,
+            command_index = device_function.new_var(
+                "tile_dependency_clc_command_index", dce=True
             )
+            command_count = clc_plan.command_count
+
+            flat_physical_task = device_function.new_var(
+                "tile_dependency_clc_flat_physical_task", dce=True
+            )
+            command_tasks_arg = self._register_cross_loop_constant(
+                device_function,
+                name_hint="tile_dependency_clc_command_tasks",
+                values=clc_plan.task_order,
+                dtype=torch.uint32,
+            )
+            dispatch_flat_physical_task: list[ast.stmt] = []
+            for command_range in reversed(clc_plan.command_ranges):
+                root = command_range.root
+                root_ordinal = device_function.new_var(
+                    f"tile_dependency_clc_root_{root}_task", dce=True
+                )
+                root_body = task_scheduled_body(
+                    root,
+                    root_ordinal,
+                    f"{case_offsets[root]} + ({root_ordinal})",
+                    (root_ordinal, epoch_var),
+                    force_noinline=True,
+                )
+                dispatch_flat_physical_task = [
+                    create(
+                        ast.If,
+                        test=expr_from_string(
+                            f"{flat_physical_task} >= {command_range.begin} and "
+                            f"{flat_physical_task} < {command_range.end}"
+                        ),
+                        body=cast(
+                            "list[ast.stmt]",
+                            [
+                                statement_from_string(
+                                    f"{root_ordinal} = ({flat_physical_task}) - "
+                                    f"{command_range.begin}"
+                                ),
+                                *_clone_ast_value(root_body),
+                            ],
+                        ),
+                        orelse=dispatch_flat_physical_task,
+                    )
+                ]
+            task_dispatch_call = self._outline_cross_loop_region(
+                device_function,
+                name_hint="tile_dependency_clc_task",
+                body=dispatch_flat_physical_task,
+                extra_argument_names=(flat_physical_task, epoch_var),
+                noinline=False,
+            )
+
+            def dispatch_command(token: str) -> list[ast.stmt]:
+                return [
+                    statement_from_string(
+                        f"{flat_physical_task} = tl.cast("
+                        f"tl.load({command_tasks_arg} + ({token})), tl.int32)"
+                    ),
+                    _clone_stmt(task_dispatch_call),
+                ]
+
+            epoch_u64 = device_function.new_var(
+                "tile_dependency_clc_epoch_u64", dce=False
+            )
+            phase = device_function.new_var(
+                "tile_dependency_clc_phase", dce=False
+            )
+            success = device_function.new_var(
+                "tile_dependency_clc_success", dce=False
+            )
+            running = device_function.new_var(
+                "tile_dependency_clc_running", dce=False
+            )
+            ticket = device_function.new_var(
+                "tile_dependency_clc_ticket", dce=False
+            )
+            pdl_wait = device_function.new_var(
+                "tile_dependency_clc_pdl_wait", dce=False
+            )
+            assert clc_plan.uses_cancellation
+            assert clc_cursor_arg is not None
+            initialize_clc = statement_from_string(
+                f"{response_addr} = "
+                + triton_backend.clc_initialize_expr(
+                    single_warp=single_warp_clc,
+                )
+            )
+            issue_cancel = statement_from_string(
+                f"{response_addr} = "
+                + triton_backend.clc_issue_expr(
+                    response_addr,
+                    single_warp=single_warp_clc,
+                )
+            )
+
+            def claim_and_dispatch() -> list[ast.stmt]:
+                return [
+                    statement_from_string(
+                        f"{ticket} = "
+                        + triton_backend.clc_ticket_expr(
+                            clc_cursor_arg,
+                            "1",
+                            response_addr,
+                            single_warp=single_warp_clc,
+                        )
+                    ),
+                    statement_from_string(
+                        f"{epoch_u64} = {ticket} // {command_count} + 1"
+                    ),
+                    statement_from_string(
+                        f"{epoch_var} = tl.cast({epoch_u64}, tl.uint32)"
+                    ),
+                    statement_from_string(
+                        f"{command_index} = tl.cast("
+                        f"{ticket} % {command_count}, tl.int32)"
+                    ),
+                    *dispatch_command(command_index),
+                ]
+
+            result.extend(
+                [
+                    statement_from_string(
+                        f"{pdl_wait} = {triton_backend.pdl_wait_expr()}"
+                    ),
+                    initialize_clc,
+                    statement_from_string(f"{phase} = 0"),
+                    statement_from_string(f"{running} = 1"),
+                    create(
+                        ast.While,
+                        test=expr_from_string(f"{running} != 0"),
+                        body=[
+                            issue_cancel,
+                            *claim_and_dispatch(),
+                            statement_from_string(
+                                f"{success} = "
+                                + triton_backend.clc_wait_expr(
+                                    response_addr,
+                                    phase,
+                                    single_warp=single_warp_clc,
+                                )
+                            ),
+                            create(
+                                ast.If,
+                                test=expr_from_string(f"{success} != 0"),
+                                body=[
+                                    statement_from_string(
+                                        f"{phase} = {phase} ^ 1"
+                                    )
+                                ],
+                                orelse=[statement_from_string(f"{running} = 0")],
+                            ),
+                        ],
+                        orelse=[],
+                    ),
+                ]
+            )
+        else:
+            dense_assignment_by_root: dict[int, tuple[int, int, int]] = {}
+            for root, root_domain in enumerate(root_domains):
+                segments = sorted(
+                    cross_loop_schedule.worker_schedule.segments_for_root(root),
+                    key=lambda segment: segment.schedule_begin,
+                )
+                if not segments:
+                    continue
+                if sum(segment.task_count for segment in segments) != root_domain.size:
+                    raise exc.CrossLoopSchedulingError(
+                        "partially static task families are not supported yet"
+                    )
+                worker_begin = segments[0].worker_begin
+                worker_count = segments[0].worker_count
+                if any(
+                    segment.worker_begin != worker_begin
+                    or segment.worker_count != worker_count
+                    or segment.schedule_step != 1
+                    or segment.schedule_period is not None
+                    for segment in segments
+                ):
+                    raise exc.CrossLoopSchedulingError(
+                        f"root {root} has a noncontiguous static worker assignment"
+                    )
+                schedule_begin = segments[0].schedule_begin
+                if schedule_begin % worker_count or any(
+                    segment.schedule_begin
+                    != schedule_begin
+                    + sum(previous.task_count for previous in segments[:index])
+                    for index, segment in enumerate(segments)
+                ):
+                    raise exc.CrossLoopSchedulingError(
+                        f"root {root} has a non-dense static worker schedule"
+                    )
+                dense_assignment_by_root[root] = (
+                    worker_begin,
+                    worker_count,
+                    root_domain.size,
+                )
 
         def static_root_body(root: int) -> list[ast.stmt]:
             if root in consumed_on_ready_roots:
@@ -2016,6 +2322,7 @@ class ForEachProgramID(ProgramIDs):
                     str(case_offsets[root]),
                     (epoch_var,),
                     force_noinline=True,
+                    worker_schedule=cross_loop_schedule.worker_schedule,
                 )
             else:
                 local_task = f"({strategy.virtual_pid_var}) - {case_offsets[root]}"
@@ -2037,6 +2344,7 @@ class ForEachProgramID(ProgramIDs):
                             local_task,
                             strategy.virtual_pid_var,
                             (strategy.virtual_pid_var,),
+                            worker_schedule=cross_loop_schedule.worker_schedule,
                         ),
                         orelse=[],
                         type_comment=None,
@@ -2077,12 +2385,13 @@ class ForEachProgramID(ProgramIDs):
                 )
             ]
 
-        for root_begin, root_end in stage_root_ranges:
-            for root in range(root_begin, root_end):
-                result.extend(static_root_body(root))
-        result.append(
-            statement_from_string(f"tl.store({epoch_arg} + {worker}, {epoch_var})")
-        )
+        if not is_clc:
+            for root_begin, root_end in stage_root_ranges:
+                for root in range(root_begin, root_end):
+                    result.extend(static_root_body(root))
+            result.append(
+                statement_from_string(f"tl.store({epoch_arg} + {worker}, {epoch_var})")
+            )
         if (
             tuple(_ast_fingerprint(body) for body in case_bodies)
             != opaque_case_fingerprints
@@ -2269,12 +2578,22 @@ class ForEachProgramID(ProgramIDs):
             "constraints='=r,l', "
             f"args=[{counter}], dtype=tl.uint32, is_pure=False, pack=1)"
         )
+        backoff = device_function.new_var(f"{prefix}_backoff", dce=False)
+        poll_body = [
+            statement_from_string(
+                f"{backoff} = tl.inline_asm_elementwise("
+                "asm='nanosleep.u32 16; mov.u32 $0, $1;', "
+                "constraints='=r,r', args=[tl.arange(0, 32)], "
+                "dtype=tl.uint32, is_pure=False, pack=1)"
+            ),
+            statement_from_string(f"{value} = {load}"),
+        ]
         return [
             statement_from_string(f"{value} = {load}"),
             create(
                 ast.While,
                 test=expr_from_string(f"{value} != ({target})"),
-                body=[statement_from_string(f"{value} = {load}")],
+                body=poll_body,
                 orelse=[],
             ),
             statement_from_string(
@@ -2309,7 +2628,7 @@ class ForEachProgramID(ProgramIDs):
         *,
         counter: str,
         epoch: str,
-        expected_arrivals: int,
+        expected_arrivals: str,
         previous: str,
         on_ready: list[ast.stmt],
     ) -> list[ast.stmt]:
@@ -2333,7 +2652,9 @@ class ForEachProgramID(ProgramIDs):
     def _cross_loop_publication_barrier(
         device_function: DeviceFunction,
     ) -> ast.stmt:
-        if cast("int", device_function.config.get("num_warps", 1)) != 1:
+        if cast("int", device_function.config.get("num_warps", 1)) != 1 or any(
+            device_function.config.range_warp_specializes
+        ):
             return statement_from_string("tl.debug_barrier()")
         sync = device_function.new_var("tile_dependency_publication_sync", dce=False)
         return statement_from_string(
@@ -2362,6 +2683,28 @@ class ForEachProgramID(ProgramIDs):
         device_function.triton_persistent_state_args.append(name)
         device_function.triton_persistent_state_specs.append(
             (like.host_str(), numel, str(dtype))
+        )
+        return name
+
+    @staticmethod
+    def _register_cross_loop_constant(
+        device_function: DeviceFunction,
+        *,
+        name_hint: str,
+        values: tuple[int, ...],
+        dtype: torch.dtype,
+    ) -> str:
+        """Register immutable compiler data as one hidden launch argument."""
+        like = next(
+            argument
+            for argument in device_function.arguments
+            if isinstance(argument, TensorArg) and argument._host_str is not None
+        )
+        name = device_function.new_var(name_hint, dce=False)
+        device_function.wrapper_only_params.append(name)
+        device_function.triton_constant_buffer_args.append(name)
+        device_function.triton_constant_buffer_specs.append(
+            (like.host_str(), values, str(dtype))
         )
         return name
 

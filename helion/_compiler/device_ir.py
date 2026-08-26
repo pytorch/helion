@@ -4383,6 +4383,13 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         default_val=CROSS_LOOP_NUM_WORKERS_DEFAULT,
                     )
                 )
+                capability = config_spec.target_device_capability
+                config_spec.automatic_clc_dispatch = (
+                    CompileEnvironment.current().backend_name == "triton"
+                    and torch.version.hip is None
+                    and capability is not None
+                    and capability[0] >= 10
+                )
             if device_ir.implicit_dependency_starts:
                 if (
                     CompileEnvironment.current().backend_name != "triton"

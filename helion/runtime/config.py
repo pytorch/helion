@@ -378,7 +378,6 @@ class Config(Mapping[str, object]):
             self.config.get("cross_loop_num_workers", DEFAULT_CROSS_LOOP_NUM_WORKERS),
         )
 
-
 def _to_hashable(x: object) -> object:
     if isinstance(x, list):
         return tuple([_to_hashable(i) for i in x])

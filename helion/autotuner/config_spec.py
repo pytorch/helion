@@ -709,6 +709,11 @@ class ConfigSpec:
         self.range_flattens: BlockIdSequence[RangeFlattenSpec] = BlockIdSequence()
         self.static_ranges: BlockIdSequence[StaticRangeSpec] = BlockIdSequence()
 
+        # SM100+ cross-loop kernels use the compiler-derived CLC dispatcher.
+        # Until descriptor pipelines can be safely re-entered from its command
+        # loop, normalization maps descriptor requests to pointer indexing.
+        self.automatic_clc_dispatch = False
+
         self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
         # Why each disabled pid_type was removed, for search-space logging.
         self.disallowed_pid_type_reasons: dict[str, str] = {}
@@ -854,6 +859,8 @@ class ConfigSpec:
             self.epilogue_subtile_autotune_choices = EPILOGUE_SUBTILE_DEFAULT_CHOICES
 
     def valid_indexing_types(self) -> tuple[IndexingLiteral, ...]:
+        if self.automatic_clc_dispatch:
+            return ("pointer",)
         if supports_tensor_descriptor():
             return ("pointer", "tensor_descriptor")
         if not self.backend.supports_block_ptr_indexing():
@@ -862,6 +869,8 @@ class ConfigSpec:
 
     def valid_atomic_indexing_types(self) -> tuple[IndexingLiteral, ...]:
         """Atomic ops only support pointer and tensor_descriptor (no block_ptr)."""
+        if self.automatic_clc_dispatch:
+            return ("pointer",)
         if supports_tensor_descriptor():
             return ("pointer", "tensor_descriptor")
         return ("pointer",)
@@ -2040,6 +2049,18 @@ class ConfigSpec:
             config.setdefault("indexing", self.indexing.default())
         if self.supports_config_key("atomic_indexing"):
             config.setdefault("atomic_indexing", self.atomic_indexing.default())
+        if self.automatic_clc_dispatch:
+            for name in ("indexing", "atomic_indexing"):
+                indexing = config.get(name)
+                if indexing == "tensor_descriptor":
+                    config[name] = "pointer"
+                elif isinstance(indexing, list):
+                    config[name] = [
+                        "pointer" if value == "tensor_descriptor" else value
+                        for value in indexing
+                    ]
+            # Epilogue subtiling currently requires descriptor stores.
+            config.pop("epilogue_subtile", None)
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
         if self.backend_name == "cute":

@@ -76,7 +76,12 @@ def default_launcher(
     _remote_barrier_process_group_name: str | None = None,
     _remote_copy_scratch_specs: tuple[tuple[torch.Tensor, int], ...] = (),
     _persistent_state_specs: tuple[tuple[torch.Tensor, int, torch.dtype], ...] = (),
+    _constant_buffer_specs: tuple[
+        tuple[torch.Tensor, tuple[int, ...], torch.dtype], ...
+    ] = (),
     _minimum_resident_programs: int = 0,
+    _target_resident_programs_per_sm: int = 0,
+    _requires_clc: bool = False,
     ptx_options: str | None = None,
     launch_cooperative_grid: bool = False,
     **kwargs: dict,
@@ -100,7 +105,10 @@ def default_launcher(
             _remote_barrier_process_group_name=_remote_barrier_process_group_name,
             _remote_copy_scratch_specs=_remote_copy_scratch_specs,
             _persistent_state_specs=_persistent_state_specs,
+            _constant_buffer_specs=_constant_buffer_specs,
             _minimum_resident_programs=_minimum_resident_programs,
+            _target_resident_programs_per_sm=_target_resident_programs_per_sm,
+            _requires_clc=_requires_clc,
             ptx_options=ptx_options,
             launch_cooperative_grid=launch_cooperative_grid,
             **kwargs,
