@@ -529,6 +529,128 @@ class TestPretunedCuteCodegen(TestCase):
                 self.assertFalse(config["cute_flash_persistent"])
                 self.assertTrue(config["cute_flash_causal_loop_split"])
 
+    def test_attention_b200_long_configs(self) -> None:
+        path = (
+            PRETUNED_KERNELS_DIR / "attention" / "_helion_aot_attention_cuda_sm100.py"
+        )
+        spec = importlib.util.spec_from_file_location("_attention_b200_aot", path)
+        assert spec is not None and spec.loader is not None
+        heuristic = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(heuristic)
+
+        dense_expected = {
+            32768: {
+                "cute_flash_corr_regs": 72,
+                "cute_flash_corr_tile_size": 8,
+                "cute_flash_e2e_offset": 0,
+                "cute_flash_e2e_offset0": 1,
+                "cute_flash_first_load_order": 4,
+                "cute_flash_rescale_threshold": 12.0,
+                "cute_flash_role_map": "fa4",
+            },
+            65536: {
+                "cute_flash_corr_regs": 72,
+                "cute_flash_corr_tile_size": 16,
+                "cute_flash_e2e_offset": 14,
+                "cute_flash_e2e_offset0": 0,
+                "cute_flash_first_load_order": 4,
+                "cute_flash_role_map": "fa4",
+            },
+            131072: {
+                "cute_flash_corr_regs": 72,
+                "cute_flash_corr_tile_size": 8,
+                "cute_flash_e2e_offset": 0,
+                "cute_flash_e2e_offset0": 0,
+                "cute_flash_first_load_order": 0,
+                "cute_flash_role_map": "helion",
+            },
+            262144: {
+                "cute_flash_corr_regs": 72,
+                "cute_flash_corr_tile_size": 8,
+                "cute_flash_e2e_offset": 12,
+                "cute_flash_e2e_offset0": 2,
+                "cute_flash_first_load_order": 4,
+                "cute_flash_role_map": "fa4",
+            },
+        }
+        for expected_index, (seq_len, expected) in enumerate(
+            dense_expected.items(), start=3
+        ):
+            with self.subTest(kind="dense", seq_len=seq_len):
+                q = torch.empty(
+                    (2, 32, seq_len, 64), device="meta", dtype=torch.float16
+                )
+                self.assertEqual(heuristic.key_attention(q, q, q), expected_index)
+                config = heuristic.autotune_attention(q, q, q)
+                self.assertEqual(config["cute_flash_pipeline_family"], "fa4_2cta")
+                self.assertEqual(config["cute_flash_kv_stage"], 2)
+                self.assertEqual(config["cute_flash_e2e_schedule"], "16/6")
+                for key, value in expected.items():
+                    self.assertEqual(config[key], value)
+
+        causal_expected = {
+            65536: {
+                "cute_flash_causal_lpt_swizzle": 2,
+                "cute_flash_disc_pipe": 2,
+                "cute_flash_e2e_offset": 0,
+                "cute_flash_e2e_offset0": 0,
+                "cute_flash_epi_tma": True,
+                "cute_flash_kv_stage": 2,
+                "cute_flash_role_map": "fa4",
+                "cute_flash_softmax_regs": 184,
+                "cute_flash_wait_hint": 0,
+            },
+            131072: {
+                "cute_flash_causal_lpt_swizzle": 0,
+                "cute_flash_disc_pipe": 3,
+                "cute_flash_e2e_offset": 1,
+                "cute_flash_e2e_offset0": 14,
+                "cute_flash_epi_tma": True,
+                "cute_flash_kv_stage": 2,
+                "cute_flash_role_map": "fa4",
+                "cute_flash_softmax_regs": 192,
+                "cute_flash_wait_hint": 0,
+            },
+            262144: {
+                "cute_flash_causal_lpt_swizzle": 0,
+                "cute_flash_disc_pipe": 3,
+                "cute_flash_e2e_offset": 0,
+                "cute_flash_e2e_offset0": 15,
+                "cute_flash_epi_tma": False,
+                "cute_flash_kv_stage": 4,
+                "cute_flash_role_map": "helion",
+                "cute_flash_softmax_regs": 192,
+                "cute_flash_wait_hint": 10000000,
+            },
+            524288: {
+                "cute_flash_causal_lpt_swizzle": 0,
+                "cute_flash_disc_pipe": 3,
+                "cute_flash_e2e_offset": 14,
+                "cute_flash_e2e_offset0": 12,
+                "cute_flash_epi_tma": False,
+                "cute_flash_kv_stage": 2,
+                "cute_flash_role_map": "helion",
+                "cute_flash_softmax_regs": 184,
+                "cute_flash_wait_hint": 10000000,
+            },
+        }
+        for expected_index, (seq_len, expected) in enumerate(causal_expected.items()):
+            with self.subTest(kind="causal", seq_len=seq_len):
+                q = torch.empty(
+                    (2, 32, seq_len, 64), device="meta", dtype=torch.float16
+                )
+                self.assertEqual(
+                    heuristic.key_causal_attention(q, q, q), expected_index
+                )
+                config = heuristic.autotune_causal_attention(q, q, q)
+                self.assertEqual(config["cute_flash_pipeline_family"], "fa4")
+                self.assertTrue(config["cute_flash_causal_loop_split"])
+                for key, value in expected.items():
+                    self.assertEqual(config[key], value)
+
+        bf16_q = torch.empty((2, 32, 32768, 64), device="meta", dtype=torch.bfloat16)
+        self.assertEqual(heuristic.key_attention(bf16_q, bf16_q, bf16_q), 2)
+
     def test_attention_gb300_benchmark_uses_dense_and_causal_configs(self) -> None:
         module = _import_pretuned_kernel_module("attention")
         shapes, rep = module._benchmark_spec((10, 3))

@@ -192,8 +192,8 @@ def correctness_check() -> None:
         ((1, 2, 256, 128, torch.bfloat16, False), attention),
         ((1, 1, 8192, 64, torch.float16, False), attention),
     )
-    if torch.cuda.get_device_capability() == (10, 3):
-        # Exercise all eight sm103 long-sequence selectors with a small
+    if torch.cuda.get_device_capability() in ((10, 0), (10, 3)):
+        # Exercise all eight SM100/SM103 long-sequence selectors with a small
         # batch/head count so correctness does not require the benchmark's
         # full-size allocation.
         checks += tuple(
@@ -235,8 +235,10 @@ def main(verbose: bool = True) -> dict:
         return (
             helion_call,
             [("sdpa", sdpa_call)],
-            f"{'causal' if is_causal else 'dense':>6s}  "
-            f"{z:>2d}  {h:>3d}  {seq_len:>6d}  {head_dim:>4d}",
+            (
+                f"{'causal' if is_causal else 'dense':>6s}  "
+                f"{z:>2d}  {h:>3d}  {seq_len:>6d}  {head_dim:>4d}"
+            ),
         )
 
     return run_sweep(
