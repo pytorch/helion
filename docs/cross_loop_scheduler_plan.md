@@ -4369,3 +4369,286 @@ Deferred extensions, in priority order:
    tails, and multi-axis scopes while preserving monotone fallback.
 4. Continue saving and structurally comparing every Qwen and Gemma lowering,
    and benchmark on an uncontended GPU after each semantic deletion.
+
+### Mixed-radix predecessor quotients
+
+The DeepSeekV3 routed W13-to-SwiGLU boundary exposes an implementation gap in
+the relation algebra, not a new scheduling policy. The dependency pass already
+proves the exact relation from a consumer action to its producer tasks. For
+consumer coordinates `(slot, activation_block)`, the two predecessor pieces
+are:
+
+```text
+[256 * slot + 16 * activation_block,
+ 256 * slot + 16 * activation_block + 16)
+
+[256 * slot + 16 * activation_block + 128,
+ 256 * slot + 16 * activation_block + 144)
+```
+
+This is a regular partition of the 2,048 producer tasks into 64 logical event
+keys. Each key owns 16 gate tiles and 16 up tiles, so its fan-in is 32. The
+current implementation loses this structure because `LogicalRelation.inverse`
+examines each range piece independently and recognizes only intervals whose
+address expression uses one source axis. It therefore cannot derive the
+producer-to-key map from the combined two-piece, two-axis relation. Event
+construction retains one key per producer task, the scalar consumer emitter
+cannot wait on 32 independent keys, and coverage safely falls back to
+`FamilyDone`.
+
+The fix is a generic predecessor-quotient factorization. Event construction should
+make the following three related maps explicit:
+
+```text
+C -> K   consumer action to semantic event key
+K -> P   exact producer predecessors owned by each key
+P -> K   unique event key published by each participating producer
+```
+
+Here `C` is the consumer action domain, `K` is the consumer-signature quotient,
+and `P` is the producer action domain. The original dependency relation factors
+through `K`; equivalently, consumer actions with the same key have the same
+producer predecessor set. Disjointness and producer coverage are properties of
+that factorization, not prerequisites for constructing it. Overlapping fibers
+are semantically valid producer fanout to several event keys. Partial producer
+coverage is also valid when the converse has a compact exact membership guard.
+Specific lowering and scheduling strategies may impose stronger requirements.
+
+For the DeepSeekV3 example, keep the semantic key multidimensional:
+
+```text
+K = (slot, activation_block)
+
+C -> K:
+    (slot, activation_block) -> (slot, activation_block)
+
+K -> P:
+    the two 16-wide ranges above
+
+P -> K:
+    producer -> (
+        producer // 256,
+        (producer // 16) % 8,
+    )
+```
+
+The omitted producer digits are the 16 positions within a producer group and
+the gate/up half. They affect fan-in, but not event identity. The key is
+flattened to `slot * 8 + activation_block` only by lowering; flattened storage
+must not replace the semantic `(slot, activation_block)` coordinates in the
+proof.
+
+#### Relation operation and ownership
+
+Separate compiler discovery from relation-algebra verification:
+
+```text
+q = discover_predecessor_quotient({R_i})
+F_i = R_i.factor_through(q)
+```
+
+Quotient discovery is a deterministic compiler operation over every merged
+incoming relation at one consumer program point. It constructs the natural
+`C -> K` map from the coordinates that can change any predecessor fiber. In
+the initial axis-projection form, the key axes are the union of all source axes
+used by any `R_i`. It must not discover a separate, potentially incompatible
+key domain for each producer. Formally, it approximates the equivalence:
+
+```text
+c1 ~ c2  iff  for every producer endpoint i, R_i(c1) == R_i(c2)
+```
+
+The discovered `q` must be total and single-valued, and `K` must be its
+represented image rather than a larger Cartesian domain containing unused
+keys.
+
+`factor_through(q)` is the generic relation-algebra operation. It proves
+`R_i == q ; F_i` exactly and returns `F_i: K -> P_i`; it does not choose a
+schedule. Before discovery, accesses belonging to the same
+`(producer_root, producer_scope, producer_domain)` endpoint are unioned and
+deduplicated. Relations with different producer domains remain separate and
+factor independently through the common `q`.
+
+Add one closed mixed-radix converse operation to `LogicalRelation`, rather
+than a DeepSeek-, MoE-, dimension-, or constant-specific matcher. Given an
+exact `K -> P` predecessor relation, it must:
+
+1. Factor the predecessor relation into `K -> P`, proving that dropping the
+   non-key consumer axes does not change a predecessor fiber.
+2. Analyze all pieces together. Complementary gate/up ranges are one producer
+   partition; they must not be inverted independently.
+3. Recognize dense static mixed-radix affine layouts with any number of logical
+   source axes, positive static strides, axis permutations, and a bounded union
+   of contiguous ranges.
+4. Construct the exact relational converse `P -> K`. It may be multivalued
+   when one producer contributes to several keys and partial when some producer
+   tasks do not participate.
+5. Derive whether different keys have disjoint producer fibers and whether the
+   producer domain is fully covered. A total disjoint quotient permits an
+   unguarded single-key publication function; partial coverage requires a
+   compact exact membership guard.
+6. Derive producer key coordinates with ordinary floor/mod expressions. Piece
+   growth must be proportional to relation/access structure, never producer or
+   consumer task count.
+7. Derive fan-in directly as `K -> P` fiber cardinality. This may be a symbolic
+   per-key relation when boundary keys are smaller; do not reconstruct it by
+   inverting `P -> K` after the fact.
+8. Use `K -> P` directly for key-major producer enumeration and validation;
+   use `P -> K` only where producer publication needs key expressions.
+
+Do not introduce a persistent `RegularPartition` beside `KeyedEvent`. It would
+duplicate the event key domain, uses, contributors, cardinality, and legality
+facts. `KeyedEvent` is the persistent single source of truth:
+
+```text
+KeyedEvent.key_domain                 K
+EventUse.keys                         C -> K
+EventContribution.predecessors        K -> P
+```
+
+The publication relation `P -> K` is obtained through a dedicated cached
+`publication_converse()` query on `EventContribution.predecessors`, not stored
+as independent semantics and not repeatedly reconstructed by unrelated
+callers. Arrival counts are derived from
+`predecessors.fiber_cardinality()`. Fiber disjointness is derived from whether
+the converse is single-valued. Producer coverage is queried directly from the
+`K -> P` relation when possible, or conservatively through a representable
+converse; an unavailable proof means "unknown," not "false." An ephemeral
+relation-level factorization result may construct and validate the views
+atomically, but it must not become a parallel scheduler IR.
+
+This reverses the current persistent orientation of `EventContribution.keys`:
+the authoritative relation becomes `K -> P`, which is the dependency fact the
+compiler originally proved. Existing simple inversions remain valid. The new
+joint-piece mixed-radix converse is a closed relation-algebra operation, not a
+general symbolic equation solver.
+
+The recognizer is deliberately not an arbitrary multivariate integer solver.
+It accepts regular mixed-radix layouts whose coefficients and static domain
+extents establish a unique digit decomposition. It declines when it sees:
+
+- overlapping producer fibers or one producer contributing to several keys;
+- uncovered periodic producer regions whose membership cannot be represented
+  compactly;
+- non-affine or data-dependent indexing and masks;
+- incompatible or dynamic radices;
+- tail fragments whose exact support or fan-in cannot be expressed with a
+  bounded number of pieces; or
+- a quotient that drops a consumer axis which actually changes predecessor
+  membership.
+
+Declining preserves the current monotonic behavior: retain a finer exact event
+when its lowering is representable, otherwise use the canonical
+family-completion event. An exact quotient with overlapping fibers may remain
+in dependency analysis even when today's scalar publication emitter cannot
+lower its producer fanout. No guessed key, fan-in, or partial continuation is
+permitted.
+
+Lowering requirements remain separate from semantic legality:
+
+- ordinary waits permit several consumer actions to share one key;
+- the current one-publication-per-producer emitter requires a single-valued
+  `P -> K` relation, although bounded producer fanout remains semantically
+  legal for a future emitter;
+- final-arrival execution additionally requires one consumer action per key,
+  equivalently a total single-valued converse of `C -> K`;
+- whole-family key-major reordering requires complete producer coverage, while
+  ordinary guarded publication and continuation do not inherently require it;
+- local continuation may initially retain uniform fan-in, while ordinary waits
+  use the existing symbolic per-key arrival counts.
+
+#### Migration and acceptance criteria
+
+1. Add relation-level tests for the supplied `(8, 4096)` example. Verify the
+   exact `K -> P` fibers, `P -> K` key map, total/disjoint quotient proof, and
+   constant fan-in 32.
+2. Split event construction into joint `C -> K` discovery and per-endpoint
+   `R_i.factor_through(q)` verification. Then derive publication through the
+   cached mixed-radix converse. Remove the current
+   `relation.inverse().project_target(key_domain)` dependency from this path.
+3. Change `EventContribution` to retain only the authoritative `K -> P`
+   predecessor relation. Route fan-in, key-major ordering, and small-domain
+   validation through it; derive and cache `P -> K` for publication. Do not
+   duplicate relation semantics in scheduler-specific tables.
+4. Keep the current generic inverse for other relation operations. Extend it
+   only with closed mixed-radix rewrites that are independently useful; do not
+   make arbitrary symbolic inversion a prerequisite for event formation.
+5. Verify that slot counts 1, 2, 8, and 64 produce constant relation-piece and
+   generated-code complexity. Vary producer and activation block sizes where
+   the same regular partition exists.
+6. Add tests showing that overlap and partial support remain semantically
+   legal when representable, but strategies requiring single publication or
+   full-family reordering decline them. A single gate/up half with periodic
+   holes, incompatible tails, and non-affine indexing must reject or coarsen
+   safely when no compact converse is available.
+7. Add nested-scope and multi-producer-join variants, and verify that batch,
+   expert, head, and other outer coordinates remain semantic key axes while L2
+   traversal remains purely physical.
+8. Run the end-to-end reproducer and require 64 event keys, fan-in 32,
+   final-arrival execution, no W13-to-SwiGLU root-completion edge, and no
+   task-count-sized `tl.where` cascade. Check repeated-launch correctness.
+9. Revalidate Qwen3, Gemma4 E4B, Gemma4 A4B MoE, and full DeepSeekV3 MoE
+   lowering, resource use, cold-L2 latency, and SM overlap. The new relation
+   operation must not select a different schedule when the existing proof was
+   already sufficient.
+
+#### Implementation checkpoint (2026-08-25)
+
+The predecessor-quotient migration is complete for the supplied mixed-radix
+failure:
+
+- `EventContribution.predecessors: K -> P` is now the sole stored producer
+  dependency relation. Fan-in and key-major enumeration use it directly;
+  `P -> K` is a cached derived publication converse.
+- Event construction discovers one consumer quotient from all incoming
+  producer endpoints, factors every endpoint independently through it, and
+  unions/deduplicates accesses from the same producer root and execution
+  scope before deriving cardinality.
+- The mixed-radix converse analyzes all range pieces jointly and recovers the
+  exact `(slot, activation_block)` key for the routed W13-to-SwiGLU example.
+  Its current closed-form recognizer covers multidimensional key domains over
+  a one-dimensional producer task domain; higher-rank producer domains remain
+  on the existing exact fallback until an independently useful relational
+  rewrite is justified.
+  The end-to-end reproducer lowers to 64 keys with fan-in 32, executes the
+  consumer on the final arrival, emits one structural `tl.where`, and has no
+  root-completion wait on that boundary.
+- Unsupported overlap, periodic partial support, and nonrepresentable tails
+  remain exact in the tile-dependency relation. They do not enter the emitted
+  event candidate set unless a supported publication strategy exists; the
+  scheduler instead retains the finer producer-key fallback or root
+  completion.
+- Nested milestone coarsening remains a derived scheduling operation. It starts
+  from the cached exact converse of the authoritative predecessor relation,
+  composes the stage map, and inverts the exact result back to `K_stage -> P`.
+  This preserves Gemma's existing 36/4 down-projection milestone split without
+  introducing general range-image machinery into `LogicalRelation.then()`.
+- Worker-count snapping now ignores semantic frontiers that cannot be emitted
+  by the counted-event lowering.
+
+The implementation was reviewed twice. The final review approved the
+factorization and single-source-of-truth design and rejected a broader general
+range-composition extension as unnecessary. It also identified an existing
+large-batch compile-time hotspot: total-function checking repeatedly
+canonicalized thousands of already-disjoint L2 traversal pieces. A generic
+fast proof now recognizes a partition of the source domain with one valid
+target point per piece, reducing the check from a quadratic cell-by-piece scan
+to a sweep over the existing partition. Canonical single-valued forms are also
+cached per immutable relation.
+
+Validation results:
+
+- The complete cross-loop dependency suites pass: 127 tests, 4 skips, and 29
+  subtests after the new mixed-radix, worker-snapping, and partitioned-totality
+  coverage.
+- Qwen lowering completes in 13.6 seconds at batch 1 and 14.3 seconds at batch
+  8 in fresh processes. Stress cases batch 64 and 128 complete in 18.1 and
+  19.3 seconds with the granular source; no multi-minute compile remains.
+- The normalized Qwen, Gemma E4B, and Gemma A4B lowered Triton sources are
+  byte-identical to commit `572f3c62`, where their earlier dependency proofs
+  already succeeded.
+- Cold-L2 B200 measurements remain approximately 89.8 microseconds versus
+  97.9 for the granular Qwen layer, 105.1 versus 91.4 for Gemma E4B, and 48.0
+  versus 53.7 for the vLLM-boundary-preserving Gemma A4B MoE source. The
+  155.7-microsecond Qwen result is the intentionally opaque fused-RMS stress
+  source, which spills 456 bytes; it is not the performance source.

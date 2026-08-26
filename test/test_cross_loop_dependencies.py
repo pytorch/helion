@@ -33,6 +33,7 @@ from helion._compiler.cross_loop_scheduler import choose_counted_events
 from helion._compiler.cross_loop_scheduler import derive_local_triggers
 from helion._compiler.cross_loop_scheduler import order_local_contributors_by_key
 from helion._compiler.cross_loop_scheduler import place_nested_scope_consumers
+from helion._compiler.cross_loop_scheduler import resolve_worker_count
 from helion._compiler.cross_loop_scheduler import validate_worker_schedule
 from helion._compiler.program_id import _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
 from helion._compiler.tile_dependency import AllocationRegion
@@ -595,6 +596,41 @@ def direct_nested_continuation(x: torch.Tensor) -> torch.Tensor:
     static_shapes=True,
     autotune_effort="none",
 )
+def mixed_radix_continuation(x: torch.Tensor) -> torch.Tensor:
+    slots, gate_up_size = x.size()
+    intermediate = gate_up_size // 2
+    hl.specialize(slots)
+    hl.specialize(gate_up_size)
+    hl.specialize(intermediate)
+
+    gate_up = torch.empty_like(x)
+    activation = torch.empty(
+        (slots, intermediate),
+        dtype=x.dtype,
+        device=x.device,
+    )
+    flat_x = x.view(slots * gate_up_size)
+    flat_gate_up = gate_up.view(slots * gate_up_size)
+
+    for producer_tile in hl.tile(slots * gate_up_size, block_size=16):
+        flat_gate_up[producer_tile] = flat_x[producer_tile] + 1.0
+
+    for slot, activation_block in hl.tile(
+        [slots, intermediate],
+        block_size=[1, 256],
+    ):
+        gate = gate_up[slot, activation_block].to(torch.float32)
+        up = gate_up[slot, activation_block + intermediate].to(torch.float32)
+        activation[slot, activation_block] = (gate * torch.sigmoid(gate) * up).to(
+            x.dtype
+        )
+    return activation
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
 def specialized_quotient_chain(
     x: torch.Tensor,
     numerator: int,
@@ -844,14 +880,32 @@ def _expected_arrivals(
 ) -> tuple[int, ...]:
     result = [0] * key_domain.size
     for contribution in contributions:
-        inverse = contribution.keys.inverse()
-        assert inverse is not None
-        cardinality = inverse.fiber_cardinality()
+        cardinality = contribution.predecessors.fiber_cardinality()
         assert cardinality is not None
         for key, values in enumerate(cardinality.materialize()):
             assert len(values) == 1
             result[key] += next(iter(values))
     return tuple(result)
+
+
+def _event_contribution_from_publication(
+    producer_root: int,
+    publication: LogicalRelation,
+    producer_scope_id: int | None = None,
+) -> EventContribution:
+    predecessors = publication.inverse()
+    assert predecessors is not None
+    return EventContribution(
+        producer_root=producer_root,
+        producer_scope_id=producer_scope_id,
+        predecessors=predecessors,
+    )
+
+
+def _publication(contribution: EventContribution) -> LogicalRelation:
+    publication = contribution.producer_to_keys
+    assert publication is not None
+    return publication
 
 
 class TestCrossLoopDependencies(TestCase):
@@ -919,6 +973,143 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(
             tuple(physical_to_logical[physical] for physical in logical_to_physical),
             tuple(range(family.task_count)),
+        )
+
+    def test_mixed_radix_predecessor_quotient_derives_publication(self) -> None:
+        for slots in (1, 2, 8, 64):
+            with self.subTest(slots=slots):
+                consumer_domain = LogicalDomain(
+                    (20, 21),
+                    ((20, slots), (21, 8)),
+                    ((20, 1), (21, 256)),
+                    identity=1,
+                )
+                producer_domain = LogicalDomain(
+                    (10,),
+                    ((10, slots * 256),),
+                    ((10, 16),),
+                    identity=0,
+                )
+                key_domain = dataclasses.replace(
+                    consumer_domain,
+                    kind="event",
+                    identity=None,
+                )
+                slot = logical_axis_symbol(20)
+                activation_block = logical_axis_symbol(21)
+                begin = 256 * slot + 16 * activation_block
+                bounds = ((20, 0, slots, 1), (21, 0, 8, 1))
+                dependency = LogicalRelation(
+                    consumer_domain,
+                    producer_domain,
+                    (
+                        _LogicalRelationPiece(
+                            bounds,
+                            ((10, begin, begin + 16, 1),),
+                        ),
+                        _LogicalRelationPiece(
+                            bounds,
+                            ((10, begin + 128, begin + 144, 1),),
+                        ),
+                    ),
+                )
+                consumer_to_key = LogicalRelation.projection(
+                    consumer_domain,
+                    key_domain,
+                )
+                assert consumer_to_key is not None
+
+                predecessors = dependency.factor_through(consumer_to_key)
+
+                self.assertIsNotNone(predecessors)
+                assert predecessors is not None
+                self.assertEqual(len(predecessors.pieces), 2)
+                arrivals = predecessors.fiber_cardinality()
+                self.assertIsNotNone(arrivals)
+                assert arrivals is not None
+                self.assertEqual(arrivals.constant_value(), 32)
+                publication = predecessors.publication_converse()
+                self.assertIsNotNone(publication)
+                assert publication is not None
+                self.assertEqual(len(publication.pieces), 1)
+                self.assertTrue(publication.is_total_function())
+                for producer in (0, 15, 16, 127, 128, 255, slots * 256 - 1):
+                    self.assertEqual(
+                        publication.target_coordinates({10: producer}),
+                        frozenset(
+                            (
+                                (
+                                    producer // 256,
+                                    producer // 16 % 8,
+                                ),
+                            )
+                        ),
+                    )
+
+    def test_mixed_radix_partial_periodic_support_keeps_semantics(self) -> None:
+        slots = 8
+        key_domain = LogicalDomain(
+            (20, 21),
+            ((20, slots), (21, 8)),
+            kind="event",
+        )
+        producer_domain = LogicalDomain((10,), ((10, slots * 256),), identity=0)
+        slot = logical_axis_symbol(20)
+        activation_block = logical_axis_symbol(21)
+        begin = 256 * slot + 16 * activation_block
+        predecessors = LogicalRelation(
+            key_domain,
+            producer_domain,
+            (
+                _LogicalRelationPiece(
+                    ((20, 0, slots, 1), (21, 0, 8, 1)),
+                    ((10, begin, begin + 16, 1),),
+                ),
+            ),
+        )
+
+        arrivals = predecessors.fiber_cardinality()
+
+        self.assertIsNotNone(arrivals)
+        assert arrivals is not None
+        self.assertEqual(arrivals.constant_value(), 16)
+        self.assertIsNone(predecessors.publication_converse())
+
+    def test_mixed_radix_converse_matches_reversed_axis_relation(self) -> None:
+        key_domain = LogicalDomain(
+            (21, 20),
+            ((21, 3), (20, 2)),
+            kind="event",
+        )
+        producer_domain = LogicalDomain((10,), ((10, 24),), identity=0)
+        inner = logical_axis_symbol(21)
+        outer = logical_axis_symbol(20)
+        begin = 2 * inner + 12 * outer
+        bounds = ((21, 0, 3, 1), (20, 0, 2, 1))
+        predecessors = LogicalRelation(
+            key_domain,
+            producer_domain,
+            (
+                _LogicalRelationPiece(bounds, ((10, begin, begin + 2, 1),)),
+                _LogicalRelationPiece(bounds, ((10, begin + 6, begin + 8, 1),)),
+            ),
+        )
+
+        publication = predecessors.publication_converse()
+
+        self.assertIsNotNone(publication)
+        assert publication is not None
+        expected = {
+            producer: frozenset(
+                key
+                for key, producers in enumerate(predecessors.materialize())
+                if producer in producers
+            )
+            for producer in range(producer_domain.size)
+        }
+        self.assertEqual(
+            publication.materialize(),
+            tuple(expected[producer] for producer in range(producer_domain.size)),
         )
 
     def test_fiber_enumeration_preserves_multi_piece_bijection(self) -> None:
@@ -1269,6 +1460,28 @@ class TestCrossLoopDependencies(TestCase):
         self.assertFalse(relation.is_total_function())
         self.assertEqual(relation.materialize()[-2:], (frozenset(), frozenset()))
 
+    def test_partitioned_total_function_avoids_global_canonicalization(self) -> None:
+        source = LogicalDomain((10,), ((10, 128),), identity=0)
+        target = LogicalDomain((20,), ((20, 128),), identity=1)
+        relation = LogicalRelation.point_map(
+            source,
+            target,
+            tuple(
+                (
+                    ((10, index, index + 1, 1),),
+                    (sympy.Integer(index),),
+                )
+                for index in range(source.size)
+            ),
+        )
+
+        with mock.patch.object(
+            LogicalRelation,
+            "canonical_single_valued",
+            side_effect=AssertionError("slow fallback should not run"),
+        ):
+            self.assertTrue(relation.is_total_function())
+
     def test_large_affine_schedule_never_materializes_task_relations(self) -> None:
         size = 319_488
         plan = build_tile_dependency_graph(
@@ -1312,7 +1525,7 @@ class TestCrossLoopDependencies(TestCase):
 
         self.assertLessEqual(
             sum(
-                len(contributor.keys.pieces)
+                len(contributor.predecessors.pieces)
                 for event in schedule.counted_events
                 for contributor in event.contributors
             ),
@@ -1461,14 +1674,14 @@ class TestCrossLoopDependencies(TestCase):
         assert events is not None
         (event,) = events
         self.assertEqual(event.key_count, 3)
-        self.assertEqual(len(event.contributions[0].keys.pieces), 1)
+        self.assertEqual(len(event.contributions[0].predecessors.pieces), 1)
         self.assertEqual(len(event.uses[0].keys.pieces), 1)
         self.assertEqual(
             event.uses[0].keys.materialize(),
             (frozenset((0,)), frozenset((1,)), frozenset((2,))),
         )
         self.assertEqual(
-            event.contributions[0].keys.materialize(),
+            _publication(event.contributions[0]).materialize(),
             (
                 frozenset((0,)),
                 frozenset((0,)),
@@ -1529,7 +1742,8 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(len(event.contributions), 2)
         self.assertEqual(
             tuple(
-                contribution.keys.materialize() for contribution in event.contributions
+                _publication(contribution).materialize()
+                for contribution in event.contributions
             ),
             (
                 (
@@ -1713,8 +1927,8 @@ class TestCrossLoopDependencies(TestCase):
             [{1}, {2}],
         )
         self.assertNotEqual(
-            events[0].contributions[0].keys,
-            events[1].contributions[0].keys,
+            events[0].contributions[0].predecessors,
+            events[1].contributions[0].predecessors,
         )
 
     def test_symbolic_keyed_event_uses_one_chart_for_multi_producer_join(
@@ -1848,9 +2062,9 @@ class TestCrossLoopDependencies(TestCase):
         (event,) = events
         self.assertEqual(event.key_count, 2)
         self.assertEqual(len(event.contributions), 1)
-        self.assertEqual(len(event.contributions[0].keys.pieces), 2)
+        self.assertEqual(len(event.contributions[0].predecessors.pieces), 2)
         expected = tuple(frozenset((producer // 8 % 2,)) for producer in range(32))
-        self.assertEqual(event.contributions[0].keys.materialize(), expected)
+        self.assertEqual(_publication(event.contributions[0]).materialize(), expected)
 
     def test_unsupported_symbolic_event_coarsens_to_family_done(self) -> None:
         plan = build_tile_dependency_graph(
@@ -1887,7 +2101,7 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(event.key_count, 1)
         self.assertEqual(event.contributions[0].producer_root, 0)
         self.assertEqual(
-            event.contributions[0].keys.materialize(),
+            _publication(event.contributions[0]).materialize(),
             (frozenset((0,)),) * 4,
         )
         self.assertEqual(
@@ -2155,7 +2369,10 @@ class TestCrossLoopDependencies(TestCase):
                     event_id=0,
                     key_domain=key_domains[0],
                     contributions=(
-                        EventContribution(0, keys(domains[0], key_domains[0], 0, 2)),
+                        _event_contribution_from_publication(
+                            0,
+                            keys(domains[0], key_domains[0], 0, 2),
+                        ),
                     ),
                     uses=(EventUse(1, keys(domains[1], key_domains[0], 0, 2)),),
                 ),
@@ -2163,8 +2380,14 @@ class TestCrossLoopDependencies(TestCase):
                     event_id=1,
                     key_domain=key_domains[1],
                     contributions=(
-                        EventContribution(0, keys(domains[0], key_domains[1], 2, 4)),
-                        EventContribution(1, keys(domains[1], key_domains[1], 0, 2)),
+                        _event_contribution_from_publication(
+                            0,
+                            keys(domains[0], key_domains[1], 2, 4),
+                        ),
+                        _event_contribution_from_publication(
+                            1,
+                            keys(domains[1], key_domains[1], 0, 2),
+                        ),
                     ),
                     uses=(EventUse(2, keys(domains[2], key_domains[1], 0, 2)),),
                 ),
@@ -2195,7 +2418,7 @@ class TestCrossLoopDependencies(TestCase):
                 dataclasses.replace(
                     event_graph.events[1],
                     contributions=(
-                        EventContribution(
+                        _event_contribution_from_publication(
                             0,
                             keys(domains[0], key_domains[1], 1, 3),
                         ),
@@ -2211,18 +2434,18 @@ class TestCrossLoopDependencies(TestCase):
         consumer_domain = LogicalDomain((20,), ((20, 2),), identity=1)
         key_domain = LogicalDomain((0,), ((0, 2),), kind="event", identity=0)
         contribution = EventContribution(
-            0,
-            LogicalRelation(
-                producer_domain,
+            producer_root=0,
+            predecessors=LogicalRelation(
                 key_domain,
+                producer_domain,
                 (
                     _LogicalRelationPiece(
-                        ((10, 0, 4, 2),),
+                        ((0, 0, 2, 1),),
                         (
                             (
-                                0,
-                                sympy.floor(logical_axis_symbol(10) / 2),
-                                sympy.floor(logical_axis_symbol(10) / 2) + 1,
+                                10,
+                                2 * logical_axis_symbol(0),
+                                2 * logical_axis_symbol(0) + 1,
                                 1,
                             ),
                         ),
@@ -2266,10 +2489,79 @@ class TestCrossLoopDependencies(TestCase):
             worker_count=4,
         )
 
-        self.assertTrue(contribution.keys.is_single_valued())
-        self.assertIsNone(contribution.keys.canonical_single_valued())
+        publication = contribution.producer_to_keys
+        self.assertIsNotNone(publication)
+        assert publication is not None
+        self.assertIsNone(publication.canonical_single_valued())
         self.assertEqual(derive_local_triggers(event_graph, baseline), ())
         self.assertEqual(choose_counted_events(event_graph, ()), ())
+
+    def test_worker_count_ignores_unlowerable_event_frontier(self) -> None:
+        producer_domain = LogicalDomain((10,), ((10, 12),), identity=0)
+        consumer_domain = LogicalDomain((20,), ((20, 3),), identity=1)
+        key_domain = LogicalDomain((0,), ((0, 3),), kind="event", identity=0)
+        predecessors = LogicalRelation(
+            key_domain,
+            producer_domain,
+            tuple(
+                _LogicalRelationPiece(
+                    ((0, key, key + 1, 1),),
+                    (
+                        (
+                            10,
+                            sympy.Integer(key),
+                            sympy.Integer(key + 2),
+                            1,
+                        ),
+                    ),
+                )
+                for key in range(3)
+            ),
+        )
+        contribution = EventContribution(0, predecessors)
+        event_graph = EventGraph(
+            root_domains=(producer_domain, consumer_domain),
+            root_traversals=(
+                physical_traversal_relation(producer_domain, (10,)),
+                physical_traversal_relation(consumer_domain, (20,)),
+            ),
+            scope_domains=(),
+            events=(
+                KeyedEvent(
+                    0,
+                    key_domain,
+                    (contribution,),
+                    (
+                        EventUse(
+                            1,
+                            LogicalRelation.point_map(
+                                consumer_domain,
+                                key_domain,
+                                (
+                                    (
+                                        ((20, 0, 3, 1),),
+                                        (logical_axis_symbol(20),),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        publication = contribution.producer_to_keys
+        self.assertIsNotNone(publication)
+        assert publication is not None
+        self.assertFalse(publication.is_single_valued())
+        self.assertEqual(
+            resolve_worker_count(
+                event_graph,
+                default_worker_count=12,
+                requested_worker_count=5,
+            ),
+            3,
+        )
 
     def test_semantic_event_graph_represents_diamond_without_path_matching(
         self,
@@ -2628,10 +2920,10 @@ class TestCrossLoopDependencies(TestCase):
                     event_id=0,
                     key_domain=key_domain,
                     contributions=(
-                        EventContribution(
+                        _event_contribution_from_publication(
                             producer_root=0,
                             producer_scope_id=None,
-                            keys=LogicalRelation.point_map(
+                            publication=LogicalRelation.point_map(
                                 producer_domain,
                                 key_domain,
                                 (
@@ -2716,9 +3008,9 @@ class TestCrossLoopDependencies(TestCase):
         key_domain = LogicalDomain((), (), kind="event", identity=0)
         event = CountedEventPlan(
             contributors=(
-                EventContribution(
+                _event_contribution_from_publication(
                     producer_root=0,
-                    keys=LogicalRelation.total(producer_domain, key_domain),
+                    publication=LogicalRelation.total(producer_domain, key_domain),
                 ),
             ),
             uses=(
@@ -2761,10 +3053,10 @@ class TestCrossLoopDependencies(TestCase):
                     event_id=0,
                     key_domain=key_domain,
                     contributions=(
-                        EventContribution(
+                        _event_contribution_from_publication(
                             producer_root=0,
                             producer_scope_id=None,
-                            keys=LogicalRelation.point_map(
+                            publication=LogicalRelation.point_map(
                                 root_domains[0],
                                 key_domain,
                                 (
@@ -2828,10 +3120,10 @@ class TestCrossLoopDependencies(TestCase):
                     event_id=0,
                     key_domain=key_domain,
                     contributions=(
-                        EventContribution(
+                        _event_contribution_from_publication(
                             producer_root=0,
                             producer_scope_id=None,
-                            keys=LogicalRelation.point_map(
+                            publication=LogicalRelation.point_map(
                                 root_domains[0],
                                 key_domain,
                                 (
@@ -2872,7 +3164,7 @@ class TestCrossLoopDependencies(TestCase):
         (lowered,) = choose_counted_events(event_graph, triggers)
 
         self.assertEqual(
-            lowered.single_contributor.keys.materialize(),
+            _publication(lowered.single_contributor).materialize(),
             (
                 frozenset((0,)),
                 frozenset((0,)),
@@ -4200,10 +4492,10 @@ class TestCrossLoopDependencies(TestCase):
                     event_id=0,
                     key_domain=key_domain,
                     contributions=(
-                        EventContribution(
+                        _event_contribution_from_publication(
                             producer_root=0,
                             producer_scope_id=None,
-                            keys=LogicalRelation.point_map(
+                            publication=LogicalRelation.point_map(
                                 root_domains[0],
                                 key_domain,
                                 (
@@ -4269,7 +4561,7 @@ class TestCrossLoopDependencies(TestCase):
             (3, 1),
         )
         self.assertEqual(
-            plan.contributors[0].keys.materialize(),
+            _publication(plan.contributors[0]).materialize(),
             (
                 frozenset((0,)),
                 frozenset((0,)),
@@ -4317,9 +4609,9 @@ class TestCrossLoopDependencies(TestCase):
                     event_id=0,
                     key_domain=key_domain,
                     contributions=(
-                        EventContribution(
+                        _event_contribution_from_publication(
                             producer_root=0,
-                            keys=LogicalRelation.point_map(
+                            publication=LogicalRelation.point_map(
                                 root_domains[0],
                                 key_domain,
                                 (
@@ -4443,13 +4735,17 @@ class TestCrossLoopDependencies(TestCase):
                 KeyedEvent(
                     event_id=0,
                     key_domain=first_keys,
-                    contributions=(EventContribution(0, a_to_first),),
+                    contributions=(
+                        _event_contribution_from_publication(0, a_to_first),
+                    ),
                     uses=(EventUse(1, first_use),),
                 ),
                 KeyedEvent(
                     event_id=1,
                     key_domain=second_keys,
-                    contributions=(EventContribution(1, b_to_second),),
+                    contributions=(
+                        _event_contribution_from_publication(1, b_to_second),
+                    ),
                     uses=(EventUse(2, nested_use, consumer_scope_id=7),),
                 ),
             ),
@@ -4530,10 +4826,10 @@ class TestCrossLoopDependencies(TestCase):
                     event_id=producer_root,
                     key_domain=key_domain,
                     contributions=(
-                        EventContribution(
+                        _event_contribution_from_publication(
                             producer_root=producer_root,
                             producer_scope_id=None,
-                            keys=LogicalRelation.point_map(
+                            publication=LogicalRelation.point_map(
                                 root_domains[producer_root],
                                 key_domain,
                                 (
@@ -4846,7 +5142,7 @@ class TestCrossLoopDependencies(TestCase):
             event.uses[0].keys.materialize(),
             tuple(frozenset((task // splits,)) for task in range(heads * splits)),
         )
-        self.assertEqual(len(event.contributors[0].keys.pieces), 1)
+        self.assertEqual(len(event.contributors[0].predecessors.pieces), 1)
         self.assertEqual(len(event.uses[0].keys.pieces), 1)
 
     def test_strided_ready_groups_use_exact_coordinates_with_overlapping_hulls(
@@ -5401,6 +5697,26 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         self.assertIn("< 4", code)
         self.assertNotIn("tile_dependency_task_wait", code)
         self.assertNotIn("tile_dependency_root_completion", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_mixed_radix_dependency_uses_counted_continuation(self) -> None:
+        x = torch.randn((8, 4096), device=DEVICE, dtype=torch.float32)
+        for launch in range(2):
+            code, out = code_and_output(
+                mixed_radix_continuation,
+                (x + launch,),
+                pid_type="persistent_blocked",
+                num_sm_multiplier=1,
+                num_warps=1,
+            )
+            gate_up = x + launch + 1
+            gate, up = gate_up.chunk(2, dim=1)
+            torch.testing.assert_close(out, gate * torch.sigmoid(gate) * up)
+        self.assertIn("tile_dependency_continuation_previous", code)
+        self.assertIn("tl.cast(32, tl.uint32) - 1", code)
+        self.assertNotIn("tile_dependency_root_completion", code)
+        self.assertLessEqual(code.count("tl.where"), 2)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")

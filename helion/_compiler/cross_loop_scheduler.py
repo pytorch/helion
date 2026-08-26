@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import dataclasses
-from functools import cache
 from functools import cached_property
 import itertools
 import operator
@@ -740,10 +739,15 @@ def resolve_worker_count(
         return default_worker_count
     candidates = {domain.size for domain in event_graph.root_domains}
     for event in event_graph.events:
+        if any(
+            not _counted_contribution_is_lowerable(contribution)
+            for contribution in event.contributions
+        ):
+            continue
         relations_by_root: dict[int, LogicalRelation] = {}
         for contribution in event.contributions:
             root = contribution.producer_root
-            relation = contribution.keys
+            relation = contribution.predecessors
             previous = relations_by_root.get(root)
             if previous is not None:
                 relation = previous.union(relation)
@@ -753,8 +757,7 @@ def resolve_worker_count(
         else:
             fan_in_by_root: list[int] = []
             for relation in relations_by_root.values():
-                inverse = relation.inverse()
-                cardinality = None if inverse is None else inverse.fiber_cardinality()
+                cardinality = relation.fiber_cardinality()
                 fan_in = None if cardinality is None else cardinality.constant_value()
                 if fan_in is None:
                     break
@@ -859,14 +862,26 @@ class EventContribution:
     """A producer execution scope's symbolic contribution to one event."""
 
     producer_root: int
-    keys: LogicalRelation
+    predecessors: LogicalRelation
     producer_scope_id: int | None = None
+
+    @cached_property
+    def producer_to_keys(self) -> LogicalRelation | None:
+        """Return the derived publication relation, when representable."""
+        return self.predecessors.publication_converse()
+
+    @cached_property
+    def arrivals_per_key(self) -> LogicalRelation | None:
+        """Return the exact symbolic number of arrivals for each event key."""
+        return self.predecessors.fiber_cardinality()
 
     @property
     def expected_arrivals(self) -> int:
-        inverse = self.keys.inverse()
-        cardinality = None if inverse is None else inverse.fiber_cardinality()
-        count = None if cardinality is None else cardinality.constant_value()
+        count = (
+            None
+            if self.arrivals_per_key is None
+            else self.arrivals_per_key.constant_value()
+        )
         if count is None:
             raise ValueError("symbolic contributor has nonuniform fan-in")
         return count
@@ -901,10 +916,10 @@ class KeyedEvent:
         if self.key_domain.block_sizes_items:
             raise ValueError("event key domains must not inherit scope block sizes")
         if any(
-            contribution.keys.target_domain != self.key_domain
+            contribution.predecessors.source_domain != self.key_domain
             for contribution in self.contributions
         ) or any(use.keys.target_domain != self.key_domain for use in self.uses):
-            raise ValueError("event relations must target the event key domain")
+            raise ValueError("event relations must use the event key domain")
 
     @property
     def key_count(self) -> int:
@@ -916,7 +931,7 @@ class KeyedEvent:
             self.key_count == 1
             and len(self.contributions) == 1
             and self.contributions[0].producer_scope_id is None
-            and self.contributions[0].keys.is_total()
+            and self.contributions[0].predecessors.is_total()
         ):
             return self.contributions[0].producer_root
         return None
@@ -1015,7 +1030,7 @@ class EventGraph:
         """Return constant fan-in without enumerating event keys."""
         total = 0
         for contribution in event.contributions:
-            cardinality = _contribution_fiber_cardinality(contribution.keys)
+            cardinality = contribution.arrivals_per_key
             count = None if cardinality is None else cardinality.constant_value()
             if count is None:
                 return None
@@ -1029,35 +1044,26 @@ class EventGraph:
         """Enumerate producer strands only for the small-domain validator."""
         result: list[set[tuple[int, int]]] = [set() for _ in range(event.key_count)]
         for contribution in event.contributions:
-            strand_keys = contribution.keys.project_source(
+            key_to_strands = contribution.predecessors.project_target(
                 self.root_domains[contribution.producer_root]
             )
-            if strand_keys is None:
+            if key_to_strands is None:
                 raise ValueError(
                     "event contribution cannot be projected onto producer strands"
                 )
-            inverse = strand_keys.inverse()
-            if inverse is None:
-                raise ValueError("producer strand relation is not invertible")
-            tasks_by_key = inverse.materialize()
+            tasks_by_key = key_to_strands.materialize()
             for key, tasks in enumerate(tasks_by_key):
                 result[key].update((contribution.producer_root, task) for task in tasks)
         return tuple(frozenset(tasks) for tasks in result)
 
 
-@cache
-def _contribution_fiber_cardinality(
-    keys: LogicalRelation,
-) -> LogicalRelation | None:
-    inverse = keys.inverse()
-    return None if inverse is None else inverse.fiber_cardinality()
-
-
 def _counted_contribution_is_lowerable(contribution: EventContribution) -> bool:
     """Keep scheduler eligibility identical to counted-event code generation."""
+    publication = contribution.producer_to_keys
     return (
-        _contribution_fiber_cardinality(contribution.keys) is not None
-        and contribution.keys.canonical_single_valued() is not None
+        contribution.arrivals_per_key is not None
+        and publication is not None
+        and publication.canonical_single_valued() is not None
     )
 
 
@@ -1073,11 +1079,11 @@ def _canonical_event_domain(domain: LogicalDomain) -> LogicalDomain:
     )
 
 
-def _canonical_event_relation(
+def _canonical_event_use_relation(
     relation: LogicalRelation,
     key_domain: LogicalDomain,
 ) -> LogicalRelation:
-    """Express one candidate relation in its event-local coordinate chart."""
+    """Express one event use in its event-local coordinate chart."""
     old_domain = relation.target_domain
     if (
         old_domain.kind != "event"
@@ -1103,6 +1109,49 @@ def _canonical_event_relation(
     )
 
 
+def _canonical_event_predecessors(
+    relation: LogicalRelation,
+    key_domain: LogicalDomain,
+) -> LogicalRelation:
+    """Express key-to-producer fibers in event-local coordinates."""
+    old_domain = relation.source_domain
+    if (
+        old_domain.kind != "event"
+        or old_domain.identity is not None
+        or tuple(old_domain.axis_counts.values())
+        != tuple(key_domain.axis_counts.values())
+    ):
+        raise AssertionError("event relation does not match its quotient geometry")
+    renamed_axes = dict(zip(old_domain.axis_order, key_domain.axis_order, strict=True))
+    substitutions = {
+        logical_axis_symbol(axis): logical_axis_symbol(renamed_axes[axis])
+        for axis in old_domain.axis_order
+    }
+    return LogicalRelation(
+        source_domain=key_domain,
+        target_domain=relation.target_domain,
+        pieces=tuple(
+            dataclasses.replace(
+                piece,
+                source_bounds_items=tuple(
+                    (renamed_axes[axis], begin, end, step)
+                    for axis, begin, end, step in piece.source_bounds_items
+                ),
+                target_ranges=tuple(
+                    (
+                        axis,
+                        begin.xreplace(substitutions),
+                        end.xreplace(substitutions),
+                        step,
+                    )
+                    for axis, begin, end, step in piece.target_ranges
+                ),
+            )
+            for piece in relation.pieces
+        ),
+    )
+
+
 def _add_event_candidate(
     pending: dict[
         tuple[LogicalDomain, tuple[EventContribution, ...]],
@@ -1118,14 +1167,17 @@ def _add_event_candidate(
     canonical_contributions = tuple(
         dataclasses.replace(
             contribution,
-            keys=_canonical_event_relation(contribution.keys, canonical_domain),
+            predecessors=_canonical_event_predecessors(
+                contribution.predecessors,
+                canonical_domain,
+            ),
         )
         for contribution in contributions
     )
     canonical_uses = tuple(
         dataclasses.replace(
             use,
-            keys=_canonical_event_relation(use.keys, canonical_domain),
+            keys=_canonical_event_use_relation(use.keys, canonical_domain),
         )
         for use in uses
     )
@@ -1162,8 +1214,20 @@ def _finalize_keyed_events(
 ) -> tuple[KeyedEvent, ...]:
     """Assign deterministic IDs after the readiness quotient is complete."""
 
-    def retarget(relation: LogicalRelation, domain: LogicalDomain) -> LogicalRelation:
+    def retarget_use(
+        relation: LogicalRelation,
+        domain: LogicalDomain,
+    ) -> LogicalRelation:
         result = relation.retarget(domain)
+        if result is None:
+            raise AssertionError("event identity assignment changed key geometry")
+        return result
+
+    def retype_predecessors(
+        relation: LogicalRelation,
+        domain: LogicalDomain,
+    ) -> LogicalRelation:
+        result = relation.retype_source(domain)
         if result is None:
             raise AssertionError("event identity assignment changed key geometry")
         return result
@@ -1178,14 +1242,17 @@ def _finalize_keyed_events(
                 contributions=tuple(
                     dataclasses.replace(
                         contribution,
-                        keys=retarget(contribution.keys, identified_domain),
+                        predecessors=retype_predecessors(
+                            contribution.predecessors,
+                            identified_domain,
+                        ),
                     )
                     for contribution in contributions
                 ),
                 uses=tuple(
                     dataclasses.replace(
                         use,
-                        keys=retarget(use.keys, identified_domain),
+                        keys=retarget_use(use.keys, identified_domain),
                     )
                     for use in uses
                 ),
@@ -1219,8 +1286,8 @@ def _without_root_uses_for_dependencies(
 class CountedEventPlan:
     """A logical key space receiving contributions from one or more roots.
 
-    Each contributor has an independently proved task-to-key relation. The
-    expected count is derived by summing those relations; the event therefore
+    Each contributor has an independently proved key-to-predecessor relation.
+    The expected count is derived by summing its fibers; the event therefore
     represents both ordinary continuations and generic multi-predecessor joins.
     Consumer uses are independent of event identity. ``local_trigger_use``
     identifies the optional use executed by the final arriving contributor.
@@ -1316,7 +1383,8 @@ def _static_contribution_relations(
         return None
     expanded: list[tuple[int, LogicalRelation]] = []
     for contribution in trigger_event.contributions:
-        upstream_keys = contribution.keys.then(key_to_target)
+        publication = contribution.producer_to_keys
+        upstream_keys = None if publication is None else publication.then(key_to_target)
         if upstream_keys is None:
             return None
         upstream = _static_contribution_relations(
@@ -1346,11 +1414,14 @@ def _event_static_contributions(
     }
     expanded: list[tuple[int, LogicalRelation]] = []
     for contribution in event.contributions:
+        publication = contribution.producer_to_keys
+        if publication is None:
+            return None
         static_relations = _static_contribution_relations(
             event_graph,
             root=contribution.producer_root,
             scope_id=contribution.producer_scope_id,
-            keys=contribution.keys,
+            keys=publication,
             local_trigger_by_root=local_trigger_by_root,
         )
         if static_relations is None:
@@ -1601,11 +1672,25 @@ def _scope_milestones(
     coarsening = None if reduced_inverse is None else reduced_inverse.then(stage_keys)
     if coarsening is None:
         return None
-    contribution_relations = tuple(
-        contribution.keys.then(coarsening)
+    # This is a scheduling-derived coarsening of an already lowerable event,
+    # not a second dependency fact. Derive producer publication from the
+    # authoritative predecessor fibers, compose it with the stage map, then
+    # invert the exact result back into the representation owned by the plan.
+    publication_relations = tuple(
+        (
+            None
+            if contribution.producer_to_keys is None
+            else contribution.producer_to_keys.then(coarsening)
+        )
         for contribution in readiness.event.contributions
     )
-    if any(relation is None for relation in contribution_relations):
+    if any(relation is None for relation in publication_relations):
+        return None
+    predecessor_relations = tuple(
+        None if relation is None else relation.inverse()
+        for relation in publication_relations
+    )
+    if any(relation is None for relation in predecessor_relations):
         return None
     action_keys = stage_keys.lift_source(domain)
     if action_keys is None:
@@ -1616,11 +1701,11 @@ def _scope_milestones(
             EventContribution(
                 producer_root=contribution.producer_root,
                 producer_scope_id=contribution.producer_scope_id,
-                keys=relation,
+                predecessors=relation,
             )
             for contribution, relation in zip(
                 readiness.event.contributions,
-                contribution_relations,
+                predecessor_relations,
                 strict=True,
             )
             if relation is not None
@@ -1854,9 +1939,9 @@ def lower_family_done_events(
                     EventContribution(
                         producer_root=producer_root,
                         producer_scope_id=None,
-                        keys=LogicalRelation.total(
-                            event_graph.root_domains[producer_root],
+                        predecessors=LogicalRelation.total(
                             key_domain,
+                            event_graph.root_domains[producer_root],
                         ),
                     ),
                 ),
@@ -1872,7 +1957,7 @@ def lower_family_done_events(
                 contributors=(
                     EventContribution(
                         producer_root=producer_root,
-                        keys=family_event.contributions[0].keys,
+                        predecessors=family_event.contributions[0].predecessors,
                     ),
                 ),
                 uses=tuple(
@@ -2224,9 +2309,9 @@ def build_keyed_events(
                     EventContribution(
                         producer_root=producer_root,
                         producer_scope_id=producer_scope_id,
-                        keys=LogicalRelation.identity(
-                            producer_domain,
+                        predecessors=LogicalRelation.identity(
                             key_domain,
+                            producer_domain,
                         ),
                     ),
                 ),
@@ -2277,10 +2362,18 @@ def build_keyed_events(
             key_axes.update(used_axes)
             merged_relations.append((producer, relation, frozenset(dependency_points)))
 
-        inverses = tuple(
-            relation.inverse() for _producer, relation, _ in merged_relations
-        )
-        if any(inverse is None for inverse in inverses):
+        if any(
+            left_points & right_points
+            for left_index, (_left, _left_relation, left_points) in enumerate(
+                merged_relations
+            )
+            for _right, _right_relation, right_points in merged_relations[
+                left_index + 1 :
+            ]
+        ):
+            # The same memory obligation was represented at more than one
+            # producer scope. These are alternative synchronization points,
+            # not independent arrivals to one joined event.
             add_producer_keyed_events(
                 consumer_root=consumer_root,
                 consumer_scope_id=consumer_scope_id,
@@ -2310,47 +2403,52 @@ def build_keyed_events(
             return None
         contributions: list[EventContribution] = []
         dependency_points: set[DependencyPoint] = set()
-        for (producer, _relation, relation_points), inverse in zip(
-            merged_relations,
-            inverses,
-            strict=True,
-        ):
-            producer_root, producer_scope_id, producer_domain = producer
-            contribution_relation = (
-                None if inverse is None else inverse.project_target(key_domain)
-            )
-            if contribution_relation is None:
-                return None
+        for producer, relation, relation_points in merged_relations:
+            producer_root, producer_scope_id, _producer_domain = producer
+            predecessors = relation.factor_through(use_relation)
+            if predecessors is None:
+                break
             contributions.append(
                 EventContribution(
                     producer_root=producer_root,
                     producer_scope_id=producer_scope_id,
-                    keys=contribution_relation,
+                    predecessors=predecessors,
                 )
             )
             dependency_points.update(relation_points)
-        if any(
-            not contribution.keys.is_single_valued() for contribution in contributions
-        ):
+        else:
+            if all(
+                _counted_contribution_is_lowerable(contribution)
+                for contribution in contributions
+            ):
+                _add_event_candidate(
+                    pending_events,
+                    key_domain=key_domain,
+                    contributions=tuple(contributions),
+                    uses=(
+                        EventUse(
+                            consumer_root=consumer_root,
+                            consumer_scope_id=consumer_scope_id,
+                            keys=use_relation,
+                            dependency_points=frozenset(dependency_points),
+                        ),
+                    ),
+                )
+            else:
+                add_producer_keyed_events(
+                    consumer_root=consumer_root,
+                    consumer_scope_id=consumer_scope_id,
+                    relations=merged_relations,
+                )
+            continue
+
+        if len(contributions) != len(merged_relations):
             add_producer_keyed_events(
                 consumer_root=consumer_root,
                 consumer_scope_id=consumer_scope_id,
                 relations=merged_relations,
             )
             continue
-        _add_event_candidate(
-            pending_events,
-            key_domain=key_domain,
-            contributions=tuple(contributions),
-            uses=(
-                EventUse(
-                    consumer_root=consumer_root,
-                    consumer_scope_id=consumer_scope_id,
-                    keys=use_relation,
-                    dependency_points=frozenset(dependency_points),
-                ),
-            ),
-        )
 
     failed_consumers_by_producer: dict[int, dict[int, set[DependencyPoint]]] = {}
     for (
@@ -2395,9 +2493,9 @@ def build_keyed_events(
                 EventContribution(
                     producer_root=producer_root,
                     producer_scope_id=None,
-                    keys=LogicalRelation.total(
-                        producer_domain,
+                    predecessors=LogicalRelation.total(
                         key_domain,
+                        producer_domain,
                     ),
                 ),
             ),
@@ -2442,9 +2540,9 @@ def _root_completion_events(
                 EventContribution(
                     producer_root=producer_root,
                     producer_scope_id=None,
-                    keys=LogicalRelation.total(
-                        root_domains[producer_root],
+                    predecessors=LogicalRelation.total(
                         key_domain,
+                        root_domains[producer_root],
                     ),
                 ),
             ),
@@ -2558,11 +2656,14 @@ def derive_local_triggers(
             continue
         producer_relations = _merge_relations_by_root(
             tuple(
-                (contribution.producer_root, contribution.keys)
+                (contribution.producer_root, publication)
                 for contribution in event.contributions
+                if (publication := contribution.producer_to_keys) is not None
             )
         )
-        if producer_relations is None:
+        if producer_relations is None or len(producer_relations) != len(
+            {item.producer_root for item in event.contributions}
+        ):
             continue
 
         candidates.append(
@@ -2670,8 +2771,7 @@ def order_local_contributors_by_key(
         if root in local_roots or root in replacement_by_root:
             continue
         task_domain = event_graph.root_domains[root]
-        inverse = contribution.keys.inverse()
-        task_relation = None if inverse is None else inverse.fiber_enumeration()
+        task_relation = contribution.predecessors.fiber_enumeration()
         if (
             task_relation is None
             or task_relation.target_domain != event_graph.root_domains[root]

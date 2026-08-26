@@ -1463,8 +1463,7 @@ class ForEachProgramID(ProgramIDs):
         ) -> int | None:
             total = 0
             for contributor in plan.contributors:
-                inverse = contributor.keys.inverse()
-                cardinality = None if inverse is None else inverse.fiber_cardinality()
+                cardinality = contributor.arrivals_per_key
                 count = None if cardinality is None else cardinality.constant_value()
                 if count is None:
                     return None
@@ -1485,8 +1484,7 @@ class ForEachProgramID(ProgramIDs):
             )
             expressions: list[str] = []
             for contributor in plan.contributors:
-                inverse = contributor.keys.inverse()
-                cardinality = None if inverse is None else inverse.fiber_cardinality()
+                cardinality = contributor.arrivals_per_key
                 if cardinality is None:
                     raise AssertionError("event fan-in is not symbolically known")
                 values, _membership = relation_point_coordinates(
@@ -1609,8 +1607,11 @@ class ForEachProgramID(ProgramIDs):
             contributor: EventContribution,
             producer_coordinates: dict[int, str],
         ) -> list[ast.stmt]:
+            publication = contributor.producer_to_keys
+            if publication is None:
+                raise AssertionError("event publication relation is unavailable")
             key, membership = relation_flat_target(
-                contributor.keys,
+                publication,
                 producer_coordinates,
             )
             publications = emit_counted_event_for_key(plan, key)
@@ -1677,8 +1678,13 @@ class ForEachProgramID(ProgramIDs):
 
                 publications: list[ast.stmt] = []
                 for plan, contributor in producer_events_by_scope[scope_id]:
+                    publication = contributor.producer_to_keys
+                    if publication is None:
+                        raise AssertionError(
+                            "nested event publication relation is unavailable"
+                        )
                     key, membership = relation_flat_target(
-                        contributor.keys,
+                        publication,
                         scope_coordinates,
                     )
                     event_publications = emit_counted_event_for_key(plan, key)

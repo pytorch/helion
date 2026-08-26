@@ -372,6 +372,19 @@ class LogicalRelation:
             pieces=self.pieces,
         )
 
+    def retype_source(self, source_domain: LogicalDomain) -> LogicalRelation | None:
+        """Retype the source without changing its coordinate geometry."""
+        if (
+            self.source_domain.axis_order != source_domain.axis_order
+            or self.source_domain.axis_counts_items != source_domain.axis_counts_items
+        ):
+            return None
+        return LogicalRelation(
+            source_domain=source_domain,
+            target_domain=self.target_domain,
+            pieces=self.pieces,
+        )
+
     def project_target(
         self,
         target_domain: LogicalDomain,
@@ -581,6 +594,105 @@ class LogicalRelation:
         projected = following.project_source(retained_domain)
         return None if projected is None else projected.lift_source(self.source_domain)
 
+    def factor_through(
+        self,
+        quotient: LogicalRelation,
+    ) -> LogicalRelation | None:
+        """Factor this relation through an exact source-coordinate quotient.
+
+        Given ``self: C -> P`` and ``quotient: C -> K``, return ``F: K -> P``
+        only when ``self == quotient ; F`` is proved structurally.  The
+        currently supported quotient is a total coordinate projection or
+        renaming.  Dropped coordinates must neither restrict source support nor
+        occur in a target expression.
+        """
+        if quotient.source_domain != self.source_domain or len(quotient.pieces) != 1:
+            return None
+        (quotient_piece,) = quotient.pieces
+        if quotient_piece.source_bounds_items != tuple(
+            (axis, 0, self.source_domain.axis_counts[axis], 1)
+            for axis in self.source_domain.axis_order
+        ):
+            return None
+
+        source_axis_by_key_axis: dict[int, int] = {}
+        for key_axis, begin, end, step in quotient_piece.target_ranges:
+            interval = _single_axis_interval(
+                begin,
+                end,
+                domain=self.source_domain,
+            )
+            if interval is None:
+                return None
+            source_axis, stride, offset, width = interval
+            if stride != 1 or offset != 0 or width != 1 or step != 1:
+                return None
+            if source_axis in source_axis_by_key_axis.values():
+                return None
+            if (
+                self.source_domain.axis_counts[source_axis]
+                != quotient.target_domain.axis_counts[key_axis]
+            ):
+                return None
+            source_axis_by_key_axis[key_axis] = source_axis
+        if tuple(source_axis_by_key_axis) != quotient.target_domain.axis_order:
+            return None
+
+        key_axis_by_source_axis = {
+            source_axis: key_axis
+            for key_axis, source_axis in source_axis_by_key_axis.items()
+        }
+        dropped_axes = (
+            frozenset(self.source_domain.axis_order) - key_axis_by_source_axis.keys()
+        )
+        substitutions = {
+            logical_axis_symbol(source_axis): logical_axis_symbol(key_axis)
+            for source_axis, key_axis in key_axis_by_source_axis.items()
+        }
+        pieces: list[_LogicalRelationPiece] = []
+        for piece in self.pieces:
+            source_bounds = {
+                axis: (begin, end, step)
+                for axis, begin, end, step in piece.source_bounds_items
+            }
+            if any(
+                source_bounds[axis] != (0, self.source_domain.axis_counts[axis], 1)
+                for axis in dropped_axes
+            ):
+                return None
+            if any(
+                symbol == logical_axis_symbol(axis)
+                for _target_axis, begin, end, _step in piece.target_ranges
+                for symbol in begin.free_symbols | end.free_symbols
+                for axis in dropped_axes
+            ):
+                return None
+            pieces.append(
+                _LogicalRelationPiece(
+                    source_bounds_items=tuple(
+                        (
+                            key_axis,
+                            *source_bounds[source_axis_by_key_axis[key_axis]],
+                        )
+                        for key_axis in quotient.target_domain.axis_order
+                    ),
+                    target_ranges=tuple(
+                        (
+                            target_axis,
+                            begin.xreplace(substitutions),
+                            end.xreplace(substitutions),
+                            step,
+                        )
+                        for target_axis, begin, end, step in piece.target_ranges
+                    ),
+                )
+            )
+        return LogicalRelation(
+            source_domain=quotient.target_domain,
+            target_domain=self.target_domain,
+            pieces=tuple(dict.fromkeys(pieces)),
+        )
+
     def covers(self, required: LogicalRelation) -> bool:
         """Conservatively prove that this relation contains ``required``."""
         if (
@@ -625,6 +737,22 @@ class LogicalRelation:
     def inverse(self) -> LogicalRelation | None:
         """Invert supported affine point/range maps without enumeration."""
         return self._cached_inverse
+
+    def publication_converse(self) -> LogicalRelation | None:
+        """Return the exact converse needed to publish keyed readiness.
+
+        Ordinary inverses are attempted first.  Dense mixed-radix predecessor
+        fibers additionally need all pieces to be analyzed together: split
+        ranges may encode digits that affect fan-in but not event identity.
+        """
+        return self._cached_publication_converse
+
+    @cached_property
+    def _cached_publication_converse(self) -> LogicalRelation | None:
+        inverse = self.inverse()
+        if inverse is not None:
+            return inverse
+        return _dense_mixed_radix_publication_converse(self)
 
     @cached_property
     def _cached_inverse(self) -> LogicalRelation | None:
@@ -989,6 +1117,10 @@ class LogicalRelation:
         strided source guard or two different values on an overlapping source
         region is rejected instead of being expanded.
         """
+        return self._cached_canonical_single_valued
+
+    @cached_property
+    def _cached_canonical_single_valued(self) -> LogicalRelation | None:
         cells = _relation_source_cells(self)
         if cells is None:
             return None
@@ -1041,6 +1173,17 @@ class LogicalRelation:
 
     def is_total_function(self) -> bool:
         """Return whether every source instance maps to exactly one target."""
+        source_boxes = tuple(piece.source_bounds_items for piece in self.pieces)
+        if _source_boxes_partition_domain(source_boxes, self.source_domain) and all(
+            _target_point_is_in_domain(
+                piece.target_ranges,
+                source_domain=self.source_domain,
+                source_bounds=piece.source_bounds_items,
+                target_domain=self.target_domain,
+            )
+            for piece in self.pieces
+        ):
+            return True
         canonical = self.canonical_single_valued()
         if canonical is None:
             return False
@@ -2371,6 +2514,183 @@ def _single_axis_interval(
     if stride <= 0 or width <= 0:
         return None
     return axis, stride, offset, width
+
+
+def _static_affine_coefficients(
+    expression: sympy.Expr,
+    *,
+    domain: LogicalDomain,
+) -> tuple[dict[int, int], int] | None:
+    """Return nonnegative static coefficients for one affine expression."""
+    expanded = sympy.expand(expression)
+    remainder = expanded
+    coefficients: dict[int, int] = {}
+    for axis in domain.axis_order:
+        symbol = logical_axis_symbol(axis)
+        coefficient = sympy.simplify(expanded.coeff(symbol))
+        if coefficient.free_symbols or coefficient.is_integer is not True:
+            return None
+        value = int(coefficient)
+        if value < 0:
+            return None
+        coefficients[axis] = value
+        remainder -= coefficient * symbol  # pyrefly: ignore[unsupported-operation]
+    remainder = sympy.simplify(remainder)
+    if remainder.free_symbols or remainder.is_integer is not True:
+        return None
+    return coefficients, int(remainder)
+
+
+def _dense_mixed_radix_publication_converse(
+    relation: LogicalRelation,
+) -> LogicalRelation | None:
+    """Invert a dense mixed-radix key-to-producer partition exactly.
+
+    ``relation`` maps event keys to a bounded union of contiguous producer
+    ranges.  Every range must share one affine key layout.  The ranges are
+    considered jointly, allowing omitted producer digits (for example a
+    gate/up half) to contribute to fan-in without becoming event-key axes.
+
+    This intentionally recognizes only a total, disjoint producer partition.
+    Partial or overlapping relations remain valid dependency relations, but
+    their publication converse is left unavailable unless ordinary
+    :meth:`LogicalRelation.inverse` already represents it.
+    """
+    if len(relation.target_domain.axis_order) != 1 or not relation.pieces:
+        return None
+    producer_axis = relation.target_domain.axis_order[0]
+    full_key_bounds = tuple(
+        (axis, 0, relation.source_domain.axis_counts[axis], 1)
+        for axis in relation.source_domain.axis_order
+    )
+    layouts: list[tuple[dict[int, int], int, int]] = []
+    support_begins: list[int] = []
+    support_ends: list[int] = []
+    for piece in relation.pieces:
+        if piece.source_bounds_items != full_key_bounds:
+            return None
+        if len(piece.target_ranges) != 1:
+            return None
+        target_axis, begin, end, step = piece.target_ranges[0]
+        if target_axis != producer_axis or step != 1:
+            return None
+        begin = _simplify_logical_expression(
+            begin,
+            domain=relation.source_domain,
+            source_bounds=piece.source_bounds_items,
+        )
+        end = _simplify_logical_expression(
+            end,
+            domain=relation.source_domain,
+            source_bounds=piece.source_bounds_items,
+        )
+        layout = _static_affine_coefficients(
+            begin,
+            domain=relation.source_domain,
+        )
+        width = sympy.simplify(end - begin)  # pyrefly: ignore[unsupported-operation]
+        if (
+            layout is None
+            or width.free_symbols
+            or width.is_integer is not True
+            or int(width) <= 0
+        ):
+            return None
+        expression_bounds = _logical_expression_bounds(
+            begin,
+            domain=relation.source_domain,
+            source_bounds=piece.source_bounds_items,
+        )
+        end_bounds = _logical_expression_bounds(
+            end,
+            domain=relation.source_domain,
+            source_bounds=piece.source_bounds_items,
+        )
+        if (
+            expression_bounds is None
+            or end_bounds is None
+            or expression_bounds[0].free_symbols
+            or end_bounds[1].free_symbols
+            or expression_bounds[0].is_integer is not True
+            or end_bounds[1].is_integer is not True
+            or expression_bounds[0] < 0  # pyrefly: ignore[unsupported-operation]
+            or end_bounds[1] > relation.target_domain.axis_counts[producer_axis]  # pyrefly: ignore[unsupported-operation]
+        ):
+            return None
+        support_begins.append(int(expression_bounds[0]))
+        support_ends.append(int(end_bounds[1]))
+        coefficients, offset = layout
+        layouts.append((coefficients, offset, int(width)))
+
+    coefficients = layouts[0][0]
+    if any(piece_coefficients != coefficients for piece_coefficients, _, _ in layouts):
+        return None
+    cardinality = relation.fiber_cardinality()
+    fan_in = None if cardinality is None else cardinality.constant_value()
+    if fan_in is None or fan_in <= 0:
+        return None
+    support_begin = min(support_begins)
+    support_end = max(support_ends)
+    if fan_in * relation.source_domain.size != support_end - support_begin:
+        return None
+
+    producer = logical_axis_symbol(producer_axis)
+    key_expressions: list[sympy.Expr] = []
+    for key_axis in relation.source_domain.axis_order:
+        count = relation.source_domain.axis_counts[key_axis]
+        if count == 1:
+            key_expressions.append(sympy.Integer(0))
+            continue
+        stride = coefficients[key_axis]
+        if stride <= 0:
+            return None
+        period = stride * count
+        for piece_coefficients, offset, width in layouts:
+            residual_min = (offset - support_begin) % period
+            residual_max = residual_min + width - 1
+            for other_axis in relation.source_domain.axis_order:
+                if other_axis == key_axis:
+                    continue
+                other_stride = piece_coefficients[other_axis]
+                if other_stride % period == 0:
+                    continue
+                other_count = relation.source_domain.axis_counts[other_axis]
+                residual_max += other_stride * (other_count - 1)
+            minimum_digit = residual_min // stride
+            maximum_digit = residual_max // stride
+            if minimum_digit != maximum_digit or minimum_digit % count != 0:
+                return None
+        key_expressions.append(
+            sympy.Mod(  # pyrefly: ignore[bad-argument-type]
+                sympy.floor(producer / stride),  # pyrefly: ignore[bad-argument-type, unsupported-operation]
+                count,
+            )
+        )
+
+    if support_begin:
+        key_expressions = [
+            expression.xreplace(
+                {
+                    producer: producer - support_begin  # pyrefly: ignore[unsupported-operation]
+                }
+            )
+            for expression in key_expressions
+        ]
+
+    producer_bounds = (
+        (
+            producer_axis,
+            support_begin,
+            support_end,
+            1,
+        ),
+    )
+    result = LogicalRelation.point_map(
+        relation.target_domain,
+        relation.source_domain,
+        ((producer_bounds, tuple(key_expressions)),),
+    )
+    return result if result.canonical_single_valued() is not None else None
 
 
 def _single_axis_floor_point(
