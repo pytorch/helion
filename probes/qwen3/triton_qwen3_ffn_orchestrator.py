@@ -1,6 +1,11 @@
 # ruff: noqa: ANN001, ANN202
 # pyrefly: ignore-errors
-"""One-orchestrator-CTA tile-scheduling probe for the Qwen3 FP8 FFN.
+"""Historical one-orchestrator-CTA scheduling ablation for the Qwen3 FP8 FFN.
+
+This is not a supported compiler policy.  It remains because the current
+root-ordering negative probe reuses its input, validation, and resource
+helpers.  Use ``helion_qwen3_ffn_tile_dependency`` for the compiler benchmark
+and ``triton_qwen3_ffn_clc_manual`` for the manual CLC reference.
 
 The Helion-generated W13, SiLU/quant, and W2 tile bodies are kept unchanged.
 Only the persistent dispatch is replaced.  CTA 0 issues the initial W13 range,

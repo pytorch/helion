@@ -61,6 +61,7 @@ import time
 
 import torch
 
+from probes.common import benchmark_cache_mode
 from probes.common import benchmark_interleaved
 from probes.common import capture
 from probes.common import require_idle_visible_gpu
@@ -1383,6 +1384,7 @@ def run(args) -> None:
     )
     if visible_gpu_pids() != pids:
         raise RuntimeError("GPU process set changed during benchmark")
+    print("BENCHMARK_MODE", benchmark_cache_mode(), flush=True)
     print("TIMINGS", json.dumps(timings, sort_keys=True), flush=True)
 
 

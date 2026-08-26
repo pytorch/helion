@@ -17,6 +17,7 @@ from pathlib import Path
 
 import torch
 
+from probes.common import benchmark_cache_mode
 from probes.gemma4.common import benchmark_interleaved
 from probes.gemma4.common import capture
 from probes.gemma4.common import visible_gpu_pids
@@ -1674,6 +1675,7 @@ def run(args) -> None:
             {
                 "device": torch.cuda.get_device_name(),
                 "helion_module": helion.__file__,
+                "benchmark_mode": benchmark_cache_mode(),
                 "resources": _helion_resources(compiled),
                 "timings": timings,
             },

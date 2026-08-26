@@ -554,6 +554,27 @@ poll delay, task bundles, named task orders, or model-specific stage layouts.
   49.42 us separately, so adding a reset node is not justified by the current
   data. Retain the single 64-bit monotonic cursor until a simpler protocol has
   both a proof and a measured win.
+- Final review found that the autotuner's resident-wave upper bound must cover
+  the complete command stream, not merely the largest root. It is now the sum
+  of every root family's maximum task count; runtime residency validation
+  remains the authority that rejects physically unrealizable choices.
+- DeviceIR graph bodies may be shared by callsites owned by different roots,
+  but memory provenance is not yet callsite-specific. Memory collection now
+  fails closed when such a shared body contains a memory operation instead of
+  assigning it to `-1` and silently dropping its hazards. Correct support
+  should eventually attach allocation provenance per callsite; duplicating the
+  current graph-level fact would be unsound when callsites pass different
+  tensors.
+- The maintained probe suite uses cold-L2 timing by default, records the cache
+  mode, and writes generated result/PTX artifacts under `/tmp` or ignores them.
+  Superseded direct-canceled-ID and full-layer CTA-0 executors have been
+  removed; retained historical probes are explicitly labeled as diagnostics.
+- Cross-loop scheduling owns only dispatch, synchronization, and required
+  outlining. Ordinary root pipeline/unroll changes must be reviewed and landed
+  independently, even when they improve a megakernel. The existing one-warp
+  range-pipeline and per-loop alias relaxation should therefore be split from
+  this scheduler branch before merge rather than becoming implicit schedule
+  policy.
 
 Remaining work:
 

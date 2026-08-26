@@ -3568,7 +3568,7 @@ def _collect_memory_op_facts(
     from ..language.atomic_ops import ATOMIC_OPS
     from .inductor_lowering import ReductionLowering
     from .tile_dependency import TileAccess
-    from .tile_dependency import owner_root_by_graph_id
+    from .tile_dependency import owner_roots_by_graph_id
 
     load_op = memory_ops.load
     store_op = memory_ops.store
@@ -3586,7 +3586,7 @@ def _collect_memory_op_facts(
     eviction_index = 0
     liveness_by_axis: dict[int, int] = {}
     collect_tile_accesses = len(device_ir.root_ids) > 1
-    graph_owners = owner_root_by_graph_id(device_ir) if collect_tile_accesses else ()
+    graph_owners = owner_roots_by_graph_id(device_ir) if collect_tile_accesses else ()
     allocation_ids: dict[int, int] = {}
 
     for graph_info in device_ir.graphs:
@@ -3780,42 +3780,51 @@ def _collect_memory_op_facts(
 
             tensor_name = origin.root_rw_name() if origin else None
             if collect_tile_accesses:
-                owner_root = (
+                owner_roots = (
                     graph_owners[graph_info.graph_id]
                     if graph_info.graph_id < len(graph_owners)
-                    else -1
+                    else ()
                 )
+                if len(owner_roots) > 1:
+                    raise exc.CrossLoopSchedulingError(
+                        "cross-loop dependency analysis cannot attribute a "
+                        f"memory access in DeviceIR graph {graph_info.graph_id} "
+                        f"shared by roots {owner_roots}"
+                    )
                 has_explicit_mask = (
                     not is_atomic
                     and len(node.args) > (2 if is_load else 3)
                     and node.args[2 if is_load else 3] is not None
                 )
-                tile_accesses.append(
-                    TileAccess(
-                        access_id=cross_loop_access_id,
-                        memory_op_index=memory_op_index if not is_atomic else -1,
-                        graph_id=graph_info.graph_id,
-                        root=owner_root,
-                        allocation_id=allocation_id,
-                        kind="load" if is_load else "store",
-                        tensor_name=tensor_name,
-                        tensor_shape=tensor_shape,
-                        tensor_strides=tensor_strides,
-                        storage_offset=storage_offset,
-                        subscript_dims=tile_subscript_dims,
-                        subscript_affine_block_ids=tile_subscript_affine_block_ids,
-                        subscript_index_scales=tile_subscript_index_scales,
-                        subscript_offsets=tile_subscript_offsets,
-                        subscript_is_scalar=tile_subscript_is_scalar,
-                        has_explicit_mask=has_explicit_mask,
-                        subscript_is_full_slice=tile_subscript_is_full_slice,
-                        subscript_static_extents=tile_subscript_static_extents,
-                        is_atomic=is_atomic,
-                        layout_is_static=layout_is_static,
-                        graph_node_index=graph_node_index,
+                for owner_root in owner_roots:
+                    tile_accesses.append(
+                        TileAccess(
+                            access_id=cross_loop_access_id,
+                            memory_op_index=(memory_op_index if not is_atomic else -1),
+                            graph_id=graph_info.graph_id,
+                            root=owner_root,
+                            allocation_id=allocation_id,
+                            kind="load" if is_load else "store",
+                            tensor_name=tensor_name,
+                            tensor_shape=tensor_shape,
+                            tensor_strides=tensor_strides,
+                            storage_offset=storage_offset,
+                            subscript_dims=tile_subscript_dims,
+                            subscript_affine_block_ids=(
+                                tile_subscript_affine_block_ids
+                            ),
+                            subscript_index_scales=tile_subscript_index_scales,
+                            subscript_offsets=tile_subscript_offsets,
+                            subscript_is_scalar=tile_subscript_is_scalar,
+                            has_explicit_mask=has_explicit_mask,
+                            subscript_is_full_slice=tile_subscript_is_full_slice,
+                            subscript_static_extents=(tile_subscript_static_extents),
+                            is_atomic=is_atomic,
+                            layout_is_static=layout_is_static,
+                            graph_node_index=graph_node_index,
+                        )
                     )
-                )
-                cross_loop_access_id += 1
+                    cross_loop_access_id += 1
 
             if is_atomic:
                 continue
@@ -4362,14 +4371,14 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 from .cross_loop_scheduler import CROSS_LOOP_NUM_WORKERS_DEFAULT
 
                 max_worker_count = max(
-                    (
+                    1,
+                    sum(
                         math.prod(
                             _maximum_axis_task_count(config_spec, block_id)
                             for block_id in family.logical_axis_order
                         )
                         for family in device_ir.task_families
                     ),
-                    default=1,
                 )
                 if CROSS_LOOP_NUM_WORKERS_CONFIG in config_spec.user_defined_tunables:
                     raise exc.CrossLoopSchedulingError(

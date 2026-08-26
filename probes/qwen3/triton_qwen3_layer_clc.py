@@ -4788,7 +4788,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path(__file__).with_name("triton_qwen3_layer_clc_result.json"),
+        default=Path("/tmp/triton_qwen3_layer_clc_result.json"),
     )
     run(parser.parse_args())
 

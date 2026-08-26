@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import sys
 
 import torch
@@ -12,8 +11,12 @@ import torch
 from helion._compiler import cross_loop_scheduler
 
 
-def _without_on_ready(events):
-    return tuple(dataclasses.replace(event, on_ready_root=None) for event in events)
+def _disable_local_triggers(
+    event_graph: cross_loop_scheduler.EventGraph,
+    *,
+    excluded_roots: frozenset[int] = frozenset(),
+) -> tuple[cross_loop_scheduler.LocalTrigger, ...]:
+    return ()
 
 
 def main() -> None:
@@ -23,21 +26,7 @@ def main() -> None:
     args, remaining = parser.parse_known_args()
 
     if args.disable_continuation:
-        original_counted_events = cross_loop_scheduler._derive_counted_events
-        original_coalesced_events = cross_loop_scheduler._derive_coalesced_keyed_events
-
-        def derive_counted_events_without_continuation(**kwargs: object):
-            return _without_on_ready(original_counted_events(**kwargs))
-
-        def derive_coalesced_events_without_continuation(**kwargs: object):
-            return _without_on_ready(original_coalesced_events(**kwargs))
-
-        cross_loop_scheduler._derive_counted_events = (
-            derive_counted_events_without_continuation
-        )
-        cross_loop_scheduler._derive_coalesced_keyed_events = (
-            derive_coalesced_events_without_continuation
-        )
+        cross_loop_scheduler.choose_local_triggers = _disable_local_triggers
 
     from probes.qwen3 import helion_qwen3_tile_dependency as probe
 
@@ -65,8 +54,8 @@ def main() -> None:
     validation_failures: list[str] = []
     checked_bridge_state = False
 
-    def tracked_allocate_layer(namespace):
-        tensors = original_allocate_layer(namespace)
+    def tracked_allocate_layer(args):
+        tensors = original_allocate_layer(args)
         allocations.append(tensors)
         return tensors
 

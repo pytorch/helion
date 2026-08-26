@@ -1,12 +1,11 @@
 # ruff: noqa: ANN001, ANN201, ANN202
 """Qwen3-8B FP8 decode FFN megakernel using Cluster Launch Control.
 
-The logical grid contains all gate/up and down-projection tiles.  The first
-1,184 resident CTAs are gate/up producers.  Each issues one asynchronous CLC
-cancellation, overlaps it with its first tile, and then executes the canceled
-logical tile returned by Blackwell.  The final producer for each gate/up group
-runs the existing SiLU/quant continuation locally; an explicit-activation
-variant is retained as an ablation.
+The authoritative variant uses a monotonic command ticket after every
+successful cancellation; canceled CTA IDs are measured only by historical
+ablations and are not treated as dependency-safe task identity.  The final
+producer for each gate/up group runs the existing SiLU/quant continuation
+locally; an explicit-activation variant is retained as an ablation.
 
 The benchmark compares with the three tuned standalone Helion kernels in one
 CUDA graph.  Every measured replay is preceded by Triton's 256 MiB L2 flush.
@@ -1661,7 +1660,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path(__file__).with_name("triton_qwen3_ffn_clc_manual_result.json"),
+        default=Path("/tmp/triton_qwen3_ffn_clc_manual_result.json"),
     )
     run(parser.parse_args())
 

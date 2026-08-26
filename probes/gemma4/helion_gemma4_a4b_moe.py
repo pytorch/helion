@@ -25,6 +25,7 @@ import time
 
 import torch
 
+from probes.common import benchmark_cache_mode
 from probes.gemma4.gemma4_26b_a4b_common import benchmark_interleaved
 from probes.gemma4.gemma4_26b_a4b_common import capture
 from probes.gemma4.gemma4_26b_a4b_common import require_idle_visible_gpu
@@ -768,6 +769,7 @@ def run_batch(args, batch, configs, config_path):
     result = {
         "batch": batch,
         "route_skew": args.route_skew,
+        "benchmark_mode": benchmark_cache_mode(),
         "tiling": built["tiling"],
         "routing": routing_histogram(reference["topk_ids"], shape.num_experts),
         "weight_traffic": expert_weight_traffic_bytes(reference["topk_ids"], shape),

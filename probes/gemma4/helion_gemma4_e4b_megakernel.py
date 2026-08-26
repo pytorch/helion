@@ -24,6 +24,7 @@ from typing import Protocol
 
 import torch
 
+from probes.common import benchmark_cache_mode
 from probes.gemma4.common import Gemma4E4BShape
 from probes.gemma4.common import allocate_layer
 from probes.gemma4.common import benchmark_interleaved
@@ -748,8 +749,8 @@ def run(args) -> None:
         print("ROOT_BLOCK_IDS", host_function.device_ir.grid_block_ids, flush=True)
         dependency_plan = host_function.device_ir.tile_dependency_graph
         assert dependency_plan is not None
-        print("DEPENDENCY_EVENTS", dependency_plan.events, flush=True)
-        print("DEPENDENCY_WAITS", dependency_plan.waits, flush=True)
+        print("DEPENDENCY_EDGES", dependency_plan.edges, flush=True)
+        print("EXECUTION_SCOPES", dependency_plan.execution_scopes, flush=True)
         print(
             "BLOCK_SPECS",
             [
@@ -827,6 +828,7 @@ def run(args) -> None:
         )
         if visible_gpu_pids() != pids:
             raise RuntimeError("GPU process set changed during benchmark")
+        print("BENCHMARK_MODE", benchmark_cache_mode(), flush=True)
         print("TIMINGS", timings, flush=True)
         return
 
@@ -885,6 +887,7 @@ def run(args) -> None:
                 "helion_module": helion.__file__,
                 "layer": args.layer,
                 "variant": variant_name(geometry),
+                "benchmark_mode": benchmark_cache_mode(),
                 "resources": _helion_resources(compiled),
                 "timings": timings,
             },

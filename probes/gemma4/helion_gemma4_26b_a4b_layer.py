@@ -15,6 +15,7 @@ import time
 
 import torch
 
+from probes.common import benchmark_cache_mode
 from probes.gemma4.gemma4_26b_a4b_common import A4B_LAYER_COUNTS
 from probes.gemma4.gemma4_26b_a4b_common import A4B_REPRESENTATIVE_LAYERS
 from probes.gemma4.gemma4_26b_a4b_common import Gemma4A4BShape
@@ -1146,6 +1147,7 @@ def run_layer(args, layer_idx, configs, config_path):
         "configured_block_size": args.block_size,
         "effective_kernel_block_size": shape.block_size,
         "attention_context": geometry.attention_context,
+        "benchmark_mode": benchmark_cache_mode(),
         "splits": args.full_splits
         if geometry.layer_type == "full"
         else args.sliding_splits,

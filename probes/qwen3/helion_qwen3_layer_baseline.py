@@ -30,6 +30,7 @@ import time
 
 import torch
 
+from probes.common import benchmark_cache_mode
 from probes.common import benchmark_interleaved
 from probes.common import capture
 from probes.common import make_fp8_random
@@ -1151,6 +1152,7 @@ def run(args):
                     "attention_splits": args.attention_splits,
                 },
                 "kernel_count": 12,
+                "benchmark_mode": benchmark_cache_mode(),
                 "timings": timings,
                 "configs": {
                     **{name: configs.get(name) for name in sorted(configs)},

@@ -1,4 +1,15 @@
-# Gemma 4 E4B megakernel probe
+# Gemma 4 megakernel probes
+
+The maintained compiler-generated comparisons are documented in
+`probes/README.md`:
+
+- `helion_gemma4_e4b_megakernel.py` for the E4B layer;
+- `helion_gemma4_a4b_moe_megakernel.py` for the A4B MoE sub-layer; and
+- their corresponding standalone Helion baselines.
+
+All maintained performance comparisons use cold L2 by default and report the
+cache mode. The probe below is retained as a historical manual-scheduling
+experiment, not as the current compiler benchmark.
 
 `triton_gemma4_codegen_schedule_probe.py` preserves the Triton bodies generated
 from the existing Helion layer roots and replaces only their cross-root
@@ -8,16 +19,18 @@ On GPU 0 of the current NVIDIA B200 host at context length 8192, three fresh
 processes measured 74.72--74.78 microseconds for direct keyed activation
 scheduling versus 80.11--80.16 microseconds for the tuned separate Helion CUDA
 graph. Each process used 50 interleaved samples of 20 graph replays, and
-repeated-launch correctness passed. Absolute performance varies materially
+repeated-launch correctness passed under the historical warm-cache protocol.
+Absolute performance varies materially
 between otherwise-idle GPUs on this host, so comparisons must be same-process
-and same-GPU. The checked-in `triton_gemma4_codegen_schedule_best_lowered.txt`
-and each run's `--lowered-output` provide lowered Triton for inspection.
+and same-GPU. Each run's `--lowered-output` provides lowered Triton for
+inspection; generated lowerings are not checked in.
 
 Run the measured configuration from the repository root:
 
 ```bash
 export PYTHONPATH="$PWD"
-python -m probes.gemma4.triton_gemma4_codegen_schedule_probe \
+MEGAKERNEL_CLEAR_L2=1 python -m \
+  probes.gemma4.triton_gemma4_codegen_schedule_probe \
     --layer 0 \
     --workers 576 \
     --ffn-stream \

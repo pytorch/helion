@@ -17,8 +17,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from probes.common import benchmark_cache_mode
 from probes.common import benchmark_interleaved
 from probes.common import capture
+from probes.common import cold_l2_enabled
 from probes.common import require_idle_visible_gpu
 from probes.common import visible_gpu_pids
 from probes.qwen3.helion_qwen3_ffn_tile_dependency import _helion_resources
@@ -534,8 +536,8 @@ def _compile_separate(
 
 
 def run(args: argparse.Namespace) -> None:
-    if os.environ.get("MEGAKERNEL_CLEAR_L2") != "1":
-        raise RuntimeError("set MEGAKERNEL_CLEAR_L2=1 for this comparison")
+    if not cold_l2_enabled():
+        raise RuntimeError("cold-L2 timing is required for this comparison")
     if not args.allow_busy:
         require_idle_visible_gpu()
 
@@ -612,6 +614,7 @@ def run(args: argparse.Namespace) -> None:
         raise RuntimeError("GPU process set changed during benchmark")
     print("ROOT_MAJOR_RESOURCES", _helion_resources(root_major), flush=True)
     print("REORDERED_RESOURCES", _helion_resources(reordered), flush=True)
+    print("BENCHMARK_MODE", benchmark_cache_mode(), flush=True)
     print("TIMINGS", timings, flush=True)
     print("REORDERED_LOWERED", args.lowered_output.resolve(), flush=True)
 

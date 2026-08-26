@@ -12,6 +12,7 @@ from typing import Callable
 
 import torch
 
+from probes.common import benchmark_cache_mode
 from probes.common import benchmark_interleaved
 from probes.common import capture
 from probes.common import require_idle_visible_gpu
@@ -107,6 +108,7 @@ def run(args: argparse.Namespace) -> None:
             {
                 "tokens": args.tokens,
                 "dense_routed_activation": args.dense_routed_activation,
+                "benchmark_mode": benchmark_cache_mode(),
                 "resources": resources,
                 "timings": timings,
             },

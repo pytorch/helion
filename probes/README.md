@@ -12,14 +12,17 @@ export CUDA_VISIBLE_DEVICES=0
 Set `MEGAKERNEL_IDLE_MEMORY_LIMIT_MB` if the driver's idle allocation exceeds
 the default 256 MiB. Every comparison below validates outputs, captures CUDA
 graphs, and interleaves the megakernel and separate Helion launches in the same
-process.
+process. Benchmarks flush L2 before every measured replay by default. Set
+`MEGAKERNEL_CLEAR_L2=0` only for an explicitly warm-cache diagnostic; every
+benchmark reports its cache mode.
 
 ## Recommended comparisons
 
 Qwen3-8B layer:
 
 ```bash
-python -m probes.qwen3.helion_qwen3_granular_tile_dependency \
+MEGAKERNEL_CLEAR_L2=1 python -m \
+  probes.qwen3.helion_qwen3_granular_tile_dependency \
   --probe-config \
   --repeats 30 --batch-replays 20
 ```
@@ -27,10 +30,19 @@ python -m probes.qwen3.helion_qwen3_granular_tile_dependency \
 The optional `--task-aligned-attention` mode is a dependency-analysis stress
 probe; it is not the fastest batch-one lowering.
 
+Qwen3-8B FFN in isolation:
+
+```bash
+MEGAKERNEL_CLEAR_L2=1 python -m \
+  probes.qwen3.helion_qwen3_ffn_tile_dependency \
+  --repeats 30 --batch-replays 20
+```
+
 Gemma 4 E4B layer:
 
 ```bash
-python -m probes.gemma4.helion_gemma4_e4b_megakernel \
+MEGAKERNEL_CLEAR_L2=1 python -m \
+  probes.gemma4.helion_gemma4_e4b_megakernel \
   --layer 0 --config-mode fused --cross-loop-workers 576 \
   --benchmark --repeats 30 --batch-replays 20
 ```
@@ -38,7 +50,8 @@ python -m probes.gemma4.helion_gemma4_e4b_megakernel \
 Gemma 4 26B-A4B MoE sub-layer, preserving the separate GeGLU boundary:
 
 ```bash
-python -m probes.gemma4.helion_gemma4_a4b_moe_megakernel \
+MEGAKERNEL_CLEAR_L2=1 python -m \
+  probes.gemma4.helion_gemma4_a4b_moe_megakernel \
   --batch 1 --route-skew 2 \
   --source-mode assignment_hierarchical_topk_unfused_geglu \
   --config-mode matched --workers 444 --worker-multiplier 4 \
@@ -55,9 +68,11 @@ The comparison commands above already run these baselines. They can also be
 run alone:
 
 ```bash
-python -m probes.qwen3.helion_qwen3_layer_baseline --benchmark
-python -m probes.gemma4.helion_gemma4_e4b_layer --layer 0 --benchmark
-python -m probes.gemma4.helion_gemma4_a4b_moe \
+MEGAKERNEL_CLEAR_L2=1 python -m \
+  probes.qwen3.helion_qwen3_layer_baseline --benchmark
+MEGAKERNEL_CLEAR_L2=1 python -m \
+  probes.gemma4.helion_gemma4_e4b_layer --layer 0 --benchmark
+MEGAKERNEL_CLEAR_L2=1 python -m probes.gemma4.helion_gemma4_a4b_moe \
   --batch 1 --route-skew 2 --benchmark
 ```
 
@@ -82,7 +97,7 @@ Nemotron-3 Nano FP8 MoE (B200 production boundaries, including the overlapped
 shared-expert stream):
 
 ```bash
-CUDA_VISIBLE_DEVICES=<idle-gpu> \
+CUDA_VISIBLE_DEVICES=<idle-gpu> MEGAKERNEL_CLEAR_L2=1 \
 python -m probes.nemotron3.helion_nemotron3_nano_moe --benchmark
 ```
 
@@ -120,7 +135,7 @@ The checked-in B200 configuration contains tuned `M=1` schedules for the two
 routed GEMMs and two shared-expert GEMMs. Retune those kernels with:
 
 ```bash
-CUDA_VISIBLE_DEVICES=<idle-gpu> \
+CUDA_VISIBLE_DEVICES=<idle-gpu> MEGAKERNEL_CLEAR_L2=1 \
 python -m probes.nemotron3.helion_nemotron3_nano_moe \
   --tune routed_gemm1 \
   --tune routed_gemm2_fused_finalize \
@@ -130,3 +145,30 @@ python -m probes.nemotron3.helion_nemotron3_nano_moe \
 ```
 
 Use `--describe` to print the modeled kernel graph without initializing CUDA.
+
+Symbolic dependency compile-time scaling:
+
+```bash
+python -m probes.affine_chain_compile_scaling --size 1048576
+```
+
+## Scheduler reference and diagnostic probes
+
+- `qwen3/triton_qwen3_layer_clc.py` is the current standalone full-layer CLC
+  oracle. It uses the safe monotonic command ticket and writes results and
+  lowered artifacts under `/tmp` by default.
+- `qwen3/triton_qwen3_ffn_clc_manual.py` compares the safe ticket executor
+  with historical direct-ID variants. Only the ticket result represents the
+  current design.
+- `qwen3/triton_qwen3_ffn_task_stream_order.py` records the rejected
+  dependency-closed loop-interchange and partial-prefix orderings.
+- `gemma4/triton_gemma4_a4b_moe_megakernel.py` is the retained manual Triton
+  oracle for the A4B MoE boundary structure. The older E4B scheduler probes are
+  historical comparisons; the Helion megakernel above is authoritative.
+- `nemotron3/triton_clc_task_stream_overhead.py` and
+  `nemotron3/triton_nemotron3_schedule_overhead.py` isolate scheduler overhead;
+  they are diagnostics rather than end-to-end performance claims.
+
+The old CTA-0 orchestrator implementation is retained only as a helper module
+for the Qwen ordering ablation. It is not a supported scheduler or benchmark
+target. Generated PTX and result JSON files are intentionally ignored.

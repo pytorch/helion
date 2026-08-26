@@ -10,6 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
+from probes.common import benchmark_cache_mode
 from probes.common import benchmark_interleaved
 from probes.common import capture
 from probes.common import require_idle_visible_gpu
@@ -145,6 +146,7 @@ def run(args: argparse.Namespace) -> None:
                 "total_tasks": args.total_tasks,
                 "resident_tasks": args.resident_tasks,
                 "num_warps": args.num_warps,
+                "benchmark_mode": benchmark_cache_mode(),
                 "timings": timings,
             },
             sort_keys=True,

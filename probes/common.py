@@ -13,9 +13,19 @@ import torch
 T = TypeVar("T")
 
 
+def cold_l2_enabled() -> bool:
+    """Return whether benchmark replays flush L2 before each measurement."""
+    return os.environ.get("MEGAKERNEL_CLEAR_L2", "1") != "0"
+
+
+def benchmark_cache_mode() -> str:
+    """Return the cache protocol name recorded by benchmark probes."""
+    return "cold_l2" if cold_l2_enabled() else "warm_l2"
+
+
 def make_l2_cache_clearer() -> Callable[[], None] | None:
-    """Return Triton's L2 flush primitive when cold-cache timing is requested."""
-    if os.environ.get("MEGAKERNEL_CLEAR_L2") != "1":
+    """Return Triton's L2 flush primitive unless warm-cache timing is requested."""
+    if not cold_l2_enabled():
         return None
     from triton import runtime
 

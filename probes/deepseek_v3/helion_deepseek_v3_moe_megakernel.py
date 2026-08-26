@@ -14,11 +14,11 @@ import argparse
 import ast
 import json
 import linecache
-import os
 from pathlib import Path
 
 import torch
 
+from probes.common import benchmark_cache_mode
 from probes.common import benchmark_interleaved
 from probes.common import capture
 from probes.common import require_idle_visible_gpu
@@ -678,7 +678,7 @@ def run(args) -> None:
         "RESULT_JSON",
         json.dumps(
             {
-                "cold_l2": os.environ.get("MEGAKERNEL_CLEAR_L2") == "1",
+                "benchmark_mode": benchmark_cache_mode(),
                 "device": torch.cuda.get_device_name(),
                 "resources": _helion_resources(megakernel),
                 "timings": timings,

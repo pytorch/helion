@@ -35,6 +35,8 @@ from helion._compiler.cross_loop_scheduler import choose_counted_events
 from helion._compiler.cross_loop_scheduler import derive_counted_event_plans
 from helion._compiler.cross_loop_scheduler import derive_local_triggers
 from helion._compiler.cross_loop_scheduler import validate_task_stream
+from helion._compiler.device_ir import DeviceIR
+from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.program_id import _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
 from helion._compiler.tile_dependency import AllocationRegion
 from helion._compiler.tile_dependency import ExecutionScope
@@ -50,6 +52,7 @@ from helion._compiler.tile_dependency import build_tile_dependency_graph
 from helion._compiler.tile_dependency import instantiate_root_domains
 from helion._compiler.tile_dependency import instantiate_symbolic_dependencies
 from helion._compiler.tile_dependency import logical_axis_symbol
+from helion._compiler.tile_dependency import owner_roots_by_graph_id
 from helion._compiler.tile_dependency import physical_traversal_relation
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
@@ -60,6 +63,7 @@ from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion.autotuner.config_fragment import IntegerFragment
 import helion.language as hl
+from helion.language import _tracing_ops
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2616,6 +2620,34 @@ class TestCrossLoopDependencies(TestCase):
             event.uses[0].keys.materialize(),
             (frozenset((0,)), frozenset((1,))),
         )
+
+    def test_shared_device_graph_retains_every_root_owner(self) -> None:
+        device_ir = DeviceIR()
+        body = torch.fx.Graph()
+        body.output([])
+        shared_graph_id = device_ir.add_graph(
+            body,
+            graph_info_cls=ForLoopGraphInfo,
+            node_args=[],
+            block_ids=[30],
+        )
+        for root_axis in (10, 20):
+            root_graph = torch.fx.Graph()
+            loop = root_graph.call_function(
+                _tracing_ops._for_loop,
+                (shared_graph_id, [0], [1], []),
+            )
+            root_graph.output(loop)
+            device_ir.add_root_graph(root_graph)
+            device_ir.task_families.append(
+                TaskFamily((LogicalTaskAxis(root_axis, sympy.Integer(1)),))
+            )
+
+        owners = owner_roots_by_graph_id(device_ir)
+
+        self.assertEqual(owners[shared_graph_id], (0, 1))
+        self.assertEqual(owners[device_ir.root_ids[0]], (0,))
+        self.assertEqual(owners[device_ir.root_ids[1]], (1,))
 
     @skipIfNotCUDA()
     def test_device_ir_scopes_preserve_nested_producer_and_consumer_axes(
@@ -6773,7 +6805,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         workers = bound.config_spec.user_defined_tunables[CROSS_LOOP_NUM_WORKERS_CONFIG]
         self.assertIsInstance(workers, IntegerFragment)
         assert isinstance(workers, IntegerFragment)
-        self.assertEqual((workers.low, workers.high), (0, 256))
+        self.assertEqual((workers.low, workers.high), (0, 324))
         self.assertEqual(
             bound.config_spec.default_config()[CROSS_LOOP_NUM_WORKERS_CONFIG],
             0,
