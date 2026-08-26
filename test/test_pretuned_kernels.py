@@ -669,6 +669,24 @@ class TestPretunedCuteCodegen(TestCase):
         )
         self.assertEqual(rep, 10)
 
+    def test_attention_b200_benchmark_uses_dense_and_causal_configs(self) -> None:
+        module = _import_pretuned_kernel_module("attention")
+        shapes, rep = module._benchmark_spec((10, 0))
+        self.assertEqual(
+            [(shape[2], shape[5]) for shape in shapes],
+            [
+                (32768, False),
+                (65536, False),
+                (131072, False),
+                (262144, False),
+                (65536, True),
+                (131072, True),
+                (262144, True),
+                (524288, True),
+            ],
+        )
+        self.assertEqual(rep, 10)
+
     def test_tcgen05_fragment_epilogues_are_registered_for_b200(self) -> None:
         path = PRETUNED_KERNELS_DIR / "run.py"
         spec = importlib.util.spec_from_file_location("_pretuned_runner", path)

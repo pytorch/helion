@@ -3,8 +3,8 @@
 These are the output-only dense and causal attention kernels from
 ``examples/attention.py``. They are pretuned for shapes used by
 ``benchmarks/cute/compare_attention_backends.py`` and compare against a single
-cuDNN SDPA baseline. On GB300 the default sweep uses the long dense and causal
-sequence lengths from that benchmark's eight-shape comparison.
+cuDNN SDPA baseline. On B200 and GB300 the default sweep uses the long dense
+and causal sequence lengths from that benchmark's eight-shape comparison.
 """
 
 from __future__ import annotations
@@ -140,9 +140,9 @@ B200_SHAPES: tuple[AttentionShape, ...] = (
     (8, 32, 8192, 128, torch.bfloat16, False),
 )
 
-# The comparison harness's dense_causal8 suite. Dense shapes select sm103
+# The comparison harness's dense_causal8 suite. Dense shapes select
 # nonpersistent two-CTA configs; causal shapes select one-CTA configs.
-GB300_SHAPES: tuple[AttentionShape, ...] = (
+LONG_SHAPES: tuple[AttentionShape, ...] = (
     (2, 32, 32768, 64, torch.float16, False),
     (2, 32, 65536, 64, torch.float16, False),
     (2, 32, 131072, 64, torch.float16, False),
@@ -158,10 +158,10 @@ def _benchmark_spec(
     compute_capability: tuple[int, int],
 ) -> tuple[tuple[AttentionShape, ...], int]:
     """Return the target-specific shapes and CUDA-graph repetitions."""
-    if compute_capability == (10, 3):
+    if compute_capability in ((10, 0), (10, 3)):
         # These kernels take up to roughly one second, so ten samples are
         # sufficient and keep the standalone sweep practical.
-        return GB300_SHAPES, 10
+        return LONG_SHAPES, 10
     return B200_SHAPES, 200
 
 
