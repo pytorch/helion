@@ -32,6 +32,7 @@ from helion.autotuner.benchmark_provider import _aggregate_multi_shape_timings
 from helion.autotuner.benchmark_provider import _format_selected_multi_shape_measurement
 from helion.autotuner.benchmark_provider import _materialize_multi_shape_config
 from helion.autotuner.benchmark_provider import _MultiShapeAutotuneArgs
+from helion.autotuner.benchmark_provider import _select_multi_shape_configs
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import LoopOrderSpec
@@ -97,6 +98,80 @@ class TestMultiShapeTimingAggregation(unittest.TestCase):
                     ),
                     math.inf,
                 )
+
+
+class TestMultiShapeConfigSelection(unittest.TestCase):
+    @staticmethod
+    def _add_measurement(
+        carrier: _MultiShapeAutotuneArgs,
+        config: Config,
+        timings: tuple[float, ...],
+    ) -> None:
+        key = repr(config)
+        carrier.measured_configs[key] = config
+        carrier.measurements[key] = (
+            timings,
+            _aggregate_multi_shape_timings(
+                timings,
+                aggregation=carrier.aggregation,
+                references=carrier.reference_latencies,
+            ),
+            ("ok",) * len(timings),
+        )
+
+    def test_selects_optimal_bounded_portfolio(self) -> None:
+        carrier = _make_carrier(
+            tuple((object(), ()) for _ in range(3)),
+        )
+        carrier.num_config_limit = 3
+        configs = [Config(num_warps=value) for value in (1, 2, 4, 8)]
+        for config, timings in zip(
+            configs,
+            (
+                (1.0, 10.0, 10.0),
+                (10.0, 1.0, 10.0),
+                (10.0, 10.0, 1.0),
+                (4.0, 4.0, 4.0),
+            ),
+            strict=True,
+        ):
+            self._add_measurement(carrier, config, timings)
+
+        selection = _select_multi_shape_configs(carrier)
+
+        self.assertEqual(selection.configs, tuple(configs[:3]))
+        self.assertEqual(selection.case_config_indices, (0, 1, 2))
+        self.assertAlmostEqual(selection.objective, 1.0)
+
+    def test_returns_fewer_configs_when_extras_do_not_improve(self) -> None:
+        carrier = _make_carrier(((object(), ()), (object(), ())))
+        carrier.num_config_limit = 3
+        configs = [Config(num_warps=value) for value in (1, 2, 4)]
+        for config, timings in zip(
+            configs,
+            ((1.0, 1.0), (2.0, 2.0), (3.0, 3.0)),
+            strict=True,
+        ):
+            self._add_measurement(carrier, config, timings)
+
+        selection = _select_multi_shape_configs(carrier)
+
+        self.assertEqual(selection.configs, (configs[0],))
+        self.assertEqual(selection.case_config_indices, (0, 0))
+
+    def test_shared_specialization_uses_one_config(self) -> None:
+        shared_bound = object()
+        carrier = _make_carrier(((shared_bound, ()), (shared_bound, ())))
+        carrier.num_config_limit = 2
+        first = Config(num_warps=2)
+        second = Config(num_warps=4)
+        self._add_measurement(carrier, first, (1.0, 10.0))
+        self._add_measurement(carrier, second, (10.0, 1.0))
+
+        selection = _select_multi_shape_configs(carrier)
+
+        self.assertEqual(len(selection.configs), 1)
+        self.assertEqual(selection.case_config_indices, (0, 0))
 
 
 def _make_config_spec() -> ConfigSpec:
@@ -305,7 +380,7 @@ class TestMultiShapeRuntime(unittest.TestCase):
             side_effect=AssertionError("structural-only cache key used")
         )
         workload_key = (
-            "multi_shape:v1",
+            "multi_shape:v2",
             "max",
             "default",
             "workload-v2",
@@ -339,6 +414,9 @@ class TestMultiShapeRuntime(unittest.TestCase):
             ({"relative_to": "fastest"}, "relative_to"),
             ({"cache_tag": ""}, "non-empty string"),
             ({"cache_tag": 1}, "non-empty string"),
+            ({"num_config_limit": 0}, "positive integer"),
+            ({"num_config_limit": True}, "positive integer"),
+            ({"num_config_limit": 1.5}, "positive integer"),
         )
         for kwargs, message in invalid_options:
             kernel = object.__new__(Kernel)
@@ -437,9 +515,11 @@ class TestMultiShapeRuntime(unittest.TestCase):
         )
         kernel._get_bound_kernel_cache_key = Mock(side_effect=case_keys)
 
-        winner = kernel.autotune_multi(
+        portfolio = kernel.autotune_multi(
             [("case-a", 8), ("case-b", 16)], cache_tag="numeric-shapes-v1"
         )
+        self.assertEqual(len(portfolio), 1)
+        winner = portfolio[0]
 
         self.assertEqual(winner.config, {"block_sizes": [64], "num_warps": 4})
         self.assertEqual(len(backend.autotune_calls), 1)
@@ -448,7 +528,7 @@ class TestMultiShapeRuntime(unittest.TestCase):
         self.assertEqual(
             carrier.workload_key,
             (
-                "multi_shape:v1",
+                "multi_shape:v2",
                 "geomean",
                 None,
                 "numeric-shapes-v1",
@@ -459,6 +539,78 @@ class TestMultiShapeRuntime(unittest.TestCase):
         for bound in bounds:
             bound.compile_config.assert_called_once_with(winner)
             bound.set_config.assert_called_once_with(winner)
+
+    @patch("helion.runtime.kernel.target_device_capability", return_value=(9, 0))
+    @patch("helion.runtime.kernel._current_device_index", return_value=0)
+    @patch("helion.runtime.kernel.dist.is_initialized", return_value=False)
+    def test_returns_portfolio_and_installs_per_shape_configs(
+        self,
+        distributed: object,
+        current: object,
+        capability: object,
+    ) -> None:
+        backend = _RuntimeBackend()
+        settings = _runtime_settings()
+        bounds = [
+            _RuntimeBoundKernel(backend, settings),
+            _RuntimeBoundKernel(backend, settings),
+        ]
+        case_keys = [
+            SimpleNamespace(specialization_key=("shape", 8), extra_results=()),
+            SimpleNamespace(specialization_key=("shape", 16), extra_results=()),
+        ]
+        kernel = object.__new__(Kernel)
+        kernel.settings = settings  # pyrefly: ignore[bad-assignment]
+        kernel._annotations = [object, object]
+        kernel.normalize_args = Mock(side_effect=lambda *args: tuple(args))
+        kernel.bind = Mock(side_effect=bounds)
+        kernel._base_specialization_key = Mock(
+            side_effect=[("shape", 8), ("shape", 16)]
+        )
+        kernel._get_bound_kernel_cache_key = Mock(side_effect=case_keys)
+        selected = (Config(block_sizes=[64]), Config(block_sizes=[128]))
+
+        def autotune(
+            bound_kernel: object,
+            args: _MultiShapeAutotuneArgs,
+            *,
+            force: bool,
+            **options: object,
+        ) -> Config:
+            args.selected_configs = selected
+            args.selected_config_indices = (0, 1)
+            return selected[0]
+
+        backend.autotune = Mock(side_effect=autotune)  # type: ignore[method-assign]
+
+        result = kernel.autotune_multi(
+            [("case-a", 8), ("case-b", 16)],
+            cache_tag="numeric-shapes-v1",
+            num_config_limit=2,
+        )
+
+        self.assertIsInstance(result, list)
+        assert isinstance(result, list)
+        self.assertEqual([config.block_sizes for config in result], [[64], [128]])
+        carrier = backend.autotune.call_args.args[1]
+        self.assertEqual(
+            carrier.workload_key,
+            (
+                "multi_shape:v2",
+                "geomean",
+                None,
+                "numeric-shapes-v1",
+                2,
+                ((("shape", 8), ()), (("shape", 16), ())),
+            ),
+        )
+        self.assertEqual(
+            backend.finalized, [bounds[0], bounds[0], bounds[1], bounds[1]]
+        )
+        bounds[0].compile_config.assert_called_once_with(result[0])
+        bounds[0].set_config.assert_called_once_with(result[0])
+        bounds[1].compile_config.assert_called_once_with(result[1])
+        bounds[1].set_config.assert_called_once_with(result[1])
 
 
 class _Log:
@@ -1193,6 +1345,53 @@ class TestMultiShapeCacheBoundary(unittest.TestCase):
         self.assertNotIn("block_size", result.config)
         cache.put.assert_called_once_with(result)
 
+    @patch("helion.autotuner.base_cache.should_skip_cache", return_value=False)
+    def test_selects_portfolio_before_cache_put(self, skip_cache: object) -> None:
+        carrier = _make_carrier(((object(), ()), (object(), ())))
+        carrier.num_config_limit = 2
+        carrier.search_started = True
+        carrier.found_valid_config = True
+        cache = self._make_cache(carrier)
+        first = _materialize_multi_shape_config(
+            cache.autotuner.config_spec, Config(block_size=64)
+        )
+        second = _materialize_multi_shape_config(
+            cache.autotuner.config_spec, Config(block_size=128)
+        )
+        for config, timings in ((first, (1.0, 10.0)), (second, (10.0, 1.0))):
+            carrier.measured_configs[repr(config)] = config
+            carrier.measurements[repr(config)] = (
+                timings,
+                math.sqrt(10.0),
+                ("ok", "ok"),
+            )
+
+        result = cache.autotune(skip_cache=True)
+
+        self.assertEqual(result, first)
+        self.assertEqual(carrier.selected_configs, (first, second))
+        self.assertEqual(carrier.selected_config_indices, (0, 1))
+        cache.put.assert_called_once_with(first)
+
+    def test_cache_payload_restores_portfolio_and_assignments(self) -> None:
+        carrier = _make_carrier(((object(), ()), (object(), ())))
+        carrier.num_config_limit = 2
+        cache = object.__new__(LocalAutotuneCache)
+        cache.args = carrier  # pyrefly: ignore[bad-assignment]
+        configs = (Config(num_warps=2), Config(num_warps=4))
+
+        result = cache._load_cached_data(
+            {
+                "config": configs[0].to_json(),
+                "multi_shape_configs": [config.to_json() for config in configs],
+                "multi_shape_config_indices": [1, 0],
+            }
+        )
+
+        self.assertEqual(result, configs[0])
+        self.assertEqual(carrier.selected_configs, configs)
+        self.assertEqual(carrier.selected_config_indices, (1, 0))
+
 
 class _TrialLog:
     def __call__(self, message: str, *args: object, **kwargs: object) -> None:
@@ -1379,14 +1578,32 @@ class TestMultiShapeAutotuneIntegration(unittest.TestCase):
     def test_finite_search_installs_one_config_for_two_shapes(self) -> None:
         add, arg_sets = self._make_add_case()
 
-        winner = add.autotune_multi(
+        portfolio = add.autotune_multi(
             arg_sets,
             aggregation="max",
             relative_to="default",
             force=False,
         )
 
+        self.assertEqual(len(portfolio), 1)
+        winner = portfolio[0]
         self.assertIn(winner.block_sizes[0], (64, 128))
+        for args in arg_sets:
+            torch.testing.assert_close(add(*args), args[0] + args[1])
+
+    def test_finite_search_installs_bounded_portfolio(self) -> None:
+        add, arg_sets = self._make_add_case()
+
+        portfolio = add.autotune_multi(
+            arg_sets,
+            aggregation="geomean",
+            relative_to="default",
+            num_config_limit=2,
+            force=False,
+        )
+
+        self.assertGreaterEqual(len(portfolio), 1)
+        self.assertLessEqual(len(portfolio), 2)
         for args in arg_sets:
             torch.testing.assert_close(add(*args), args[0] + args[1])
 

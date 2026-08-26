@@ -1117,15 +1117,18 @@ class Kernel(Generic[_R]):
         aggregation: Literal["geomean", "max"] = "geomean",
         relative_to: Literal["default", "baseline"] | None = None,
         cache_tag: str | None = None,
+        num_config_limit: int = 1,
         force: bool = True,
         **options: object,
-    ) -> Config:
-        """Find one config using an objective measured across several inputs.
+    ) -> list[Config]:
+        """Find a bounded config portfolio across several representative inputs.
 
         The first argument set anchors config generation. Each candidate is measured
-        on every set, then reduced with a geometric mean or maximum. ``relative_to``
-        optionally optimizes per-shape latency relative to each shape's default config
-        or custom baseline. Only the supplied bound specializations are configured.
+        on every set. With ``num_config_limit``, the measured candidates are selected
+        to minimize the geometric mean or maximum of the best available
+        per-specialization latency. ``relative_to`` optionally optimizes latency
+        relative to each shape's default config or custom baseline. Only the supplied
+        bound specializations are configured.
 
         Every argument set must bind normally to the same exact, current accelerator
         device. Distributed processes are not supported. A non-empty ``cache_tag`` is
@@ -1138,11 +1141,13 @@ class Kernel(Generic[_R]):
             relative_to: Optional ``"default"`` or ``"baseline"`` normalization.
             cache_tag: User-managed cache discriminator for dynamic shapes, runtime
                 numeric arguments, or callbacks.
+            num_config_limit: Maximum portfolio size. Defaults to one.
             force: If true, ignore pinned configs and cache reads during the search.
             options: Additional options forwarded to the registered autotuner.
 
         Returns:
-            The config selected for all supplied specializations.
+            The selected config portfolio, containing up to ``num_config_limit``
+            configs.
         """
         from ..autotuner.benchmark_provider import LocalBenchmarkProvider
         from ..autotuner.benchmark_provider import _has_valid_multi_shape_measurement
@@ -1161,6 +1166,14 @@ class Kernel(Generic[_R]):
         if cache_tag is not None and (not isinstance(cache_tag, str) or not cache_tag):
             raise exc.InvalidAPIUsage(
                 "autotune_multi cache_tag must be a non-empty string"
+            )
+        if (
+            not isinstance(num_config_limit, int)
+            or isinstance(num_config_limit, bool)
+            or num_config_limit <= 0
+        ):
+            raise exc.InvalidAPIUsage(
+                "autotune_multi num_config_limit must be a positive integer"
             )
         if (
             not isinstance(arg_sets, Sequence)
@@ -1324,15 +1337,17 @@ class Kernel(Generic[_R]):
             relative_to=relative_to,
             cache_tag=cache_tag,
             workload_key=(
-                "multi_shape:v1",
+                "multi_shape:v2",
                 aggregation,
                 relative_to,
                 cache_tag,
+                *((num_config_limit,) if num_config_limit > 1 else ()),
                 tuple(
                     (case_key.specialization_key, case_key.extra_results)
                     for case_key in case_keys
                 ),
             ),
+            num_config_limit=num_config_limit,
             reference_latencies=None,
         )
 
@@ -1354,15 +1369,48 @@ class Kernel(Generic[_R]):
         ):
             raise exc.NoConfigFound
         winner = _materialize_multi_shape_config(anchor.config_spec, config)
+        selected_configs = multi_args.selected_configs or (winner,)
+        portfolio: list[Config] = []
+        for selected in selected_configs:
+            materialized = _materialize_multi_shape_config(anchor.config_spec, selected)
+            if materialized not in portfolio:
+                portfolio.append(materialized)
+        if not portfolio or len(portfolio) > num_config_limit:
+            raise exc.NoConfigFound
+        if multi_args.search_started and any(
+            not _has_valid_multi_shape_measurement(
+                multi_args,
+                anchor.config_spec,
+                selected,
+            )
+            for selected in portfolio
+        ):
+            raise exc.NoConfigFound
+
+        case_config_indices = multi_args.selected_config_indices
+        if len(case_config_indices) != len(cases):
+            case_config_indices = (0,) * len(cases)
+        assigned_by_kernel_id: dict[int, Config] = {}
+        for case_index, (bound_kernel, _) in enumerate(cases):
+            config_index = case_config_indices[case_index]
+            if config_index < 0 or config_index >= len(portfolio):
+                raise exc.NoConfigFound
+            assigned = portfolio[config_index]
+            previous = assigned_by_kernel_id.setdefault(id(bound_kernel), assigned)
+            if previous != assigned:
+                raise exc.NoConfigFound
         if ephemeral is not None:
             for bound_kernel in unique_bound_kernels:
-                bound_kernel.env.backend.finalize_ephemeral_cache(bound_kernel, winner)
+                for selected in portfolio:
+                    bound_kernel.env.backend.finalize_ephemeral_cache(
+                        bound_kernel, selected
+                    )
 
         for bound_kernel in unique_bound_kernels:
-            bound_kernel.compile_config(winner)
+            bound_kernel.compile_config(assigned_by_kernel_id[id(bound_kernel)])
         for bound_kernel in unique_bound_kernels:
-            bound_kernel.set_config(winner)
-        return winner
+            bound_kernel.set_config(assigned_by_kernel_id[id(bound_kernel)])
+        return portfolio
 
     def __call__(self, *args: object, **kwargs: object) -> _R:
         """

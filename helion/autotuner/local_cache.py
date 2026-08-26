@@ -217,9 +217,44 @@ class LocalAutotuneCache(AutotuneCacheBase):
         path = self._get_local_cache_path()
         try:
             data = json.loads(path.read_text())
-            return Config.from_json(data["config"])
+            return self._load_cached_data(data)
         except Exception:
             return None
+
+    def _load_cached_data(self, data: dict[str, object]) -> Config | None:
+        """Load the primary config and any multi-shape portfolio metadata."""
+        config = Config.from_json(data["config"])  # type: ignore[arg-type]
+        from .benchmark_provider import _MultiShapeAutotuneArgs
+
+        if (
+            isinstance(self.args, _MultiShapeAutotuneArgs)
+            and self.args.num_config_limit > 1
+        ):
+            raw_configs = data.get("multi_shape_configs")
+            raw_indices = data.get("multi_shape_config_indices")
+            if (
+                not isinstance(raw_configs, list)
+                or not all(isinstance(value, str) for value in raw_configs)
+                or not isinstance(raw_indices, list)
+                or not all(
+                    isinstance(value, int) and not isinstance(value, bool)
+                    for value in raw_indices
+                )
+            ):
+                return None
+            configs = tuple(Config.from_json(value) for value in raw_configs)
+            indices = tuple(raw_indices)
+            if (
+                not configs
+                or len(configs) > self.args.num_config_limit
+                or len(indices) != len(self.args.cases)
+                or any(index < 0 or index >= len(configs) for index in indices)
+            ):
+                return None
+            self.args.selected_configs = configs
+            self.args.selected_config_indices = indices
+            config = configs[0]
+        return config
 
     def put(self, config: Config) -> None:
         path = self._get_local_cache_path()
@@ -236,6 +271,16 @@ class LocalAutotuneCache(AutotuneCacheBase):
             "config": config.to_json(),
             "key": key_dict,
         }
+        from .benchmark_provider import _MultiShapeAutotuneArgs
+
+        if (
+            isinstance(self.args, _MultiShapeAutotuneArgs)
+            and self.args.num_config_limit > 1
+        ):
+            data["multi_shape_configs"] = [
+                selected.to_json() for selected in self.args.selected_configs
+            ]
+            data["multi_shape_config_indices"] = list(self.args.selected_config_indices)
 
         config_gen = self.kernel.config_spec.create_config_generation(
             advanced_controls_files=self.autotuner.settings.autotune_search_acf or None

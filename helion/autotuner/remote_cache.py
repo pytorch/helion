@@ -7,7 +7,6 @@ import logging
 import os
 from typing import TYPE_CHECKING
 
-from ..runtime.config import Config
 from .local_cache import LocalAutotuneCache
 from .local_cache import StrictLocalAutotuneCache
 
@@ -15,6 +14,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
     from typing import Callable
 
+    from ..runtime.config import Config
     from .base_search import BaseSearch
 
 log: logging.Logger = logging.getLogger(__name__)
@@ -106,10 +106,14 @@ class RemoteAutotuneCache(LocalAutotuneCache):
         cache_hash = self.key.stable_hash()
         data = _remote_get(self._backend, cache_hash)
         if data is not None:
-            config = Config.from_json(json.loads(data)["config"])
-            super().put(config)
-            log.debug("remote cache hit: %s", cache_hash)
-            return config
+            try:
+                config = self._load_cached_data(json.loads(data))
+            except Exception:
+                config = None
+            if config is not None:
+                super().put(config)
+                log.debug("remote cache hit: %s", cache_hash)
+                return config
         return super().get()
 
     def put(self, config: Config) -> None:
@@ -143,10 +147,14 @@ class StrictRemoteAutotuneCache(StrictLocalAutotuneCache):
         cache_hash = self.key.stable_hash()
         data = _remote_get(self._backend, cache_hash)
         if data is not None:
-            config = Config.from_json(json.loads(data)["config"])
-            super().put(config)
-            log.debug("remote cache hit: %s", cache_hash)
-            return config
+            try:
+                config = self._load_cached_data(json.loads(data))
+            except Exception:
+                config = None
+            if config is not None:
+                super().put(config)
+                log.debug("remote cache hit: %s", cache_hash)
+                return config
         return super().get()
 
     def put(self, config: Config) -> None:
