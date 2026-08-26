@@ -8,9 +8,10 @@ completed.
 
 The scheduler should:
 
-- Make the Qwen3 layer megakernel faster than the equivalent separate kernels.
-  The current target is approximately 74 microseconds versus approximately 80
-  microseconds for the separate-kernel baseline.
+- Make the Qwen3 layer megakernel faster than the equivalent separate kernels
+  under the cold-L2 benchmark protocol. Hot-cache numbers around 74 versus 80
+  microseconds motivated the original work, but they are no longer the
+  acceptance measurement.
 - Be correct for broader shapes, batch sizes, loop grids, indexing layouts, and
   producer/consumer topologies without recognizing Qwen-specific source shapes.
 - Preserve each root's existing code generation. Cross-loop scheduling may add
@@ -21,12 +22,588 @@ The scheduler should:
 - Become simpler by deriving scheduling from producer and consumer accesses,
   rather than accumulating topology matchers and exceptional cases.
 
-## Authoritative target architecture (2026-08-25)
+## Authoritative CLC task-stream architecture (updated 2026-08-26)
 
-This section is the current design contract. All other descriptions of
-separate root-task, ordered-action, access-cohort, readiness-frontier, or
-counted-event IRs in this document are implementation history and do not
-define the target.
+This design was developed from the Qwen full-layer and FFN CLC probes and a
+user-supplied DeepSeek-V3 MoE CLC probe, then reviewed independently. It
+supersedes the physical `WorkerSchedule` half of the prior architecture. It
+does **not** replace the symbolic dependency graph.
+
+The intended split is:
+
+```text
+TileDependencyGraph + LogicalRelation
+                 ↓
+             KeyedEvent DAG
+                 ↓
+   dependency-safe symbolic TaskStream
+                 ↓
+          SM100+ CLC executor
+```
+
+There is no static cross-loop scheduling backend. The former `WorkerSchedule`,
+placement, frontier, worker-reservation, and worker-cycle machinery has been
+deleted; `TaskStream` plus CLC is the only executor. On targets without CLC, a
+kernel that requires implicit cross-loop
+synchronization should be rejected with a clear diagnostic and should be split
+into separate kernels by its caller or source author. This restriction applies
+only to dependency-bearing multi-root fusion; unrelated multi-root programs do
+not become SM100-only.
+
+### What the probes establish
+
+- CLC can turn a full logical launch grid into a persistent, dynamically
+  balanced CTA pool while preserving Helion-generated tile bodies.
+- The current compiler-generated Qwen FFN measures about 50.3 microseconds
+  versus 49.3 microseconds for three standalone Helion kernels under cold L2.
+  The latest full Qwen layer run measures 95.43 microseconds versus 99.25
+  microseconds separately. Event-local `on_ready` actions remain useful for the
+  full DAG
+  even though the isolated FFN does not win on its own.
+- Both current Qwen probes prefer a requested minimum cohort of 1,024 CTAs,
+  which realizes seven resident CTAs per SM on B200. Eight CTAs per SM regresses
+  the isolated FFN to 55.74 microseconds. CLC removes producer/consumer worker
+  assignment, but not resident-cohort size as a performance choice.
+- The original DeepSeek probe showed that CLC can beat standalone kernels for
+  a heterogeneous MoE and is especially useful for balancing the tail, but it
+  used a manually constructed 592-CTA prefix. A subsequent compiler-generated
+  TaskStream probe now preserves the same important router, top-k, routed and
+  shared W13/SwiGLU/W2, reduction, and join boundaries. It recovers the event
+  graph and beats its matched overlapped separate-Helion baseline without
+  named stages or worker assignment. It remains a representative scheduling
+  probe rather than an exact reproduction of vLLM's fused grouped-routing
+  implementation.
+- The compiler-generated Gemma A4B MoE, preserving the standalone GeGLU
+  boundary, measures 49.27 microseconds versus 53.93 microseconds for the
+  boundary-matched separate baseline. Gemma E4B remains a negative case at
+  101.61 versus 91.06 microseconds; legality is correct, but fusion is not
+  profitable for that source/configuration.
+- Qwen command bundling by two or four tiles regressed substantially. Begin
+  with one independently scheduled outer tile per command.
+
+The current probes contain mechanisms that must not become compiler
+invariants: fixed task counts and offsets, named Qwen/DeepSeek stages, AST
+matching of generated helpers, a fixed physical-start prefix, direct use of
+canceled CTA IDs as dependency-ordered work, fixed steal counts, and raw
+shared-memory byte counts as user-facing policy.
+
+### TaskStream: the replacement placement abstraction
+
+Introduce one compact physical scheduling object:
+
+```text
+TaskStreamSegment:
+    command_domain
+    root
+    command_to_logical_task: LogicalRelation
+
+TaskStream:
+    ordered TaskStreamSegment sequence
+    total command count
+```
+
+`TaskStream` is a symbolic linear extension of movable outer-root tasks. It
+does not assign tasks to workers. The current compiler deliberately gives each
+segment one complete root family. Relation-derived sub-root segments remain a
+possible future extension, but they are not part of the architecture without
+performance evidence: a legal dependency quotient is not by itself a good
+execution order.
+
+The initial construction policy should be deliberately small:
+
+1. Form a stable topological order from the complete event DAG, including
+   `FamilyDone` edges and program-point waits.
+2. Keep one command per movable outer tile.
+3. Preserve the root's configured traversal by default.
+4. When an outgoing event proves one total, disjoint producer partition,
+   traverse that family key-major using the existing symbolic fiber
+   enumeration. This is what exposes Qwen W13 activation groups and DeepSeek
+   routed expert groups early. If several outgoing partitions conflict and no
+   common exact refinement is compact, retain the configured traversal rather
+   than guess.
+5. Allow independent root-family segments to be placed before dependent
+   segments. For DeepSeek, ordinary commands should first test a stream such
+   as router, shared W13, routed W13, shared W2, routed W2, with top-k and the
+   small elementwise/reduction steps represented by generic event actions.
+   The exact order must be derived from graph readiness, not root names.
+
+The root-entry progress invariant is stronger and simpler than the former
+worker-cycle proof:
+
+> Every root-entry wait in command `j` may depend only on publications from
+> commands with rank `< j`.
+
+Commands are claimed monotonically. Therefore, when command `j` is claimed,
+all of its possible predecessor commands have already been claimed. The
+minimum-rank unfinished command cannot be waiting on unclaimed later work, so
+some resident CTA can always make progress. Nested checkpoints are the one
+deliberate exception: a long-running consumer may wait for later producer
+commands partway through its reduction. Their stage partition separately
+proves that the requested resident wave contains enough producer progress.
+This removes the need to predict which worker owns each task without erasing
+the liveness requirement of staged reductions.
+
+### Robust CLC execution protocol
+
+For an SM100+ Triton kernel with `N` commands and cluster size one:
+
+1. Launch `N` CLC tokens.
+2. Every physical CTA claims a 64-bit ticket from one stream-local monotonic
+   cursor. Do not derive logical work from `program_id` or the canceled CTA ID.
+3. Derive `epoch = ticket // N` and `command = ticket % N`. Reuse the epoch
+   within that launch. Exactly `N` claims occur because each physical start
+   accounts for one launch token and each successful cancellation accounts for
+   one canceled token.
+4. For the first `N - W` tickets, where `W` is the requested resident wave,
+   issue an asynchronous cancellation, execute the command through the compact
+   TaskStream dispatcher, then wait for the response. A successful cancellation
+   grants another iteration; failure terminates that CTA. The final `W`
+   commands do not attempt cancellation.
+5. Use the epoch to retain the current no-reset counted-event protocol across
+   stream-serialized CUDA Graph replays.
+
+This removes the Qwen probe's unproven assumptions that physical starts form a
+known grid prefix and that canceled IDs arrive in dependency-safe order. The
+initial implementation must be restricted to `num_ctas == 1`. The CLC helper
+must have exactly one CTA leader issue and consume each request, with CTA-wide
+synchronization that is correct for one or multiple warps. The existing
+single-warp `elect.sync` probe is not sufficient for a general lowering.
+
+CLC does not require programmatic dependent launch. The compiler must not set
+`launch_pdl=True` unless it also emits the corresponding grid-dependency wait;
+ordinary stream ordering is retained for the current executor.
+
+CLC protocol storage is only the 16-byte response plus the 8-byte mbarrier,
+rounded to a 32-byte mailbox. Residency is realized after compiling the exact
+specialization: the runtime queries CUDA occupancy and, only for a cancelable
+tail, raises otherwise-unused dynamic shared memory to the smallest allocation
+that reaches the requested whole-CTA-per-SM wave. The configured value is a
+minimum resident cohort, not an exact worker count: hardware rounds it upward
+to a whole number of CTAs per SM. If an occupancy cliff skips the exact target,
+the nearest higher safe occupancy is retained. The runtime validates that the
+resulting capacity still covers the compiler's liveness requirement. Raw
+padding bytes are neither hard-coded nor exposed as a tuning choice. The SM100
+feature gate is compiler-derived, not an autotuner choice.
+
+### Events, nested scopes, and local execution
+
+`KeyedEvent` remains the sole dependency source of truth. Dynamic ownership
+changes only publication mechanics:
+
+- ordinary keyed events still use exact release publications and acquire
+  waits;
+- `FamilyDone` receives one arrival per completed producer task, with fan-in
+  equal to the logical family size, through exactly the same counted-event
+  allocation, publication, and wait lowering as every other event;
+- a later generic optimization may aggregate consecutive same-family or
+  same-key completions within one CTA before publishing, but fixed worker
+  ownership must not be retained solely for aggregation; and
+- root and nested scope bodies remain opaque except for synchronization and
+  mechanically proved segmentation.
+
+Event-local final-arrival execution becomes an optional queue-bypass
+optimization, not a separate schedule. It may execute at most one canonical
+ready consumer per key initially, and only when all of that consumer's other
+prerequisites are already satisfied and the complete task is movable. Any
+remaining fanout stays in the TaskStream. This expresses the useful one-head
+Qwen attention chain without an attention matcher; recursive chains follow
+ordinary event edges. Whether `on_ready` is enabled for an eligible use remains
+a small per-event tuning choice until Qwen, Gemma, and MoE data supports a
+single deterministic rule.
+
+CLC does not eliminate dependency-bearing nested-loop synchronization. It
+eliminates nested-loop *worker scheduling*. A long-running outer tile may read
+producer data incrementally while carrying an accumulator or pipeline state;
+without an inner checkpoint it must either read data before it is ready or wait
+for the whole producer family and lose the overlap. Splitting that reduction
+into independently movable commands would require transporting live state and
+would change the root's code generation, so it is not the initial design.
+
+Nested scopes therefore remain dependency-visible checkpoints inside their
+owning non-preemptive outer command. One bottom-up scope-tree rewrite now
+lowers waits and publications together: child scopes are transformed first,
+the current scope publishes after its transformed iteration body, and waits
+are placed immediately before each segment. Ancestor loop coordinates remain
+available to descendant event relations, so two or more nested one-dimensional
+scopes no longer require sequential AST passes or duplicate-scope discovery.
+The stage partition comes from the exact nested relation and requested resident
+wave. It uses a proven first-wave cut when that cut is an exact TaskStream
+prefix; otherwise it emits one whole-range milestone.
+
+Because a CLC command is non-preemptive, a command that reaches a later nested
+wait continues to occupy its CTA; CLC cannot return that worker to the stream.
+TaskStream ordering must therefore avoid admitting a large consumer subdomain
+merely because its first checkpoint is ready when its later checkpoint still
+depends on an unclaimed producer tail. This is a liveness/resource property of
+the complete command, not another dependency edge or a reason to make nested
+iterations independently movable.
+
+### Expected simplifications
+
+The CLC migration has removed:
+
+- per-worker task ownership and `WorkerSchedule` placement queries;
+- `place_ready_families` and singleton-hole placement;
+- worker-count snapping to event boundaries;
+- producer/consumer worker reservation;
+- worker-aware dependency-cycle validation; and
+- schedule-dependent reconstruction of event readiness from worker stream
+  positions.
+
+The symbolic access/dependency relations, event quotienting, fan-in,
+publication legality, root-completion fallback, nested scope metadata, and
+memory-ordering code remain necessary. CLC is an executor replacement, not a
+replacement for dependency analysis.
+
+Do not build a second TaskStream executor for pre-SM100 hardware. Supporting
+both CLC and a static persistent cursor would retain two progress and launch
+contracts and weaken the simplification.
+
+### Validation and migration sequence
+
+1. **Harden the probe protocol.** Replace prefix/canceled-ID task identity with
+   all-CTA 64-bit cursor claims and no-reset epochs. Validate exact coverage,
+   randomized per-task delays, repeated CUDA Graph replay, residency 6/7/8,
+   and `num_warps` 1/2/4/8.
+2. **Isolate the remaining policies.** On Qwen FFN compare queued activation
+   with `on_ready`; compare exact nested waits, whole readiness, and the current
+   64/32 cut. On the full layer compare a plain generic TaskStream with one
+   generic on-ready consumer per eligible event—no named attention modes.
+3. **De-specialize DeepSeek.** First retain its exact command order and
+   continuations while switching to cursor claims. Then replace the strided
+   per-worker routed-W13 bundle with ordinary one-tile commands. Finally derive
+   the multi-root bootstrap from graph order. Only add a generic segment
+   bundling property if profiling proves the one-tile stream loses for a reason
+   that bundling fixes.
+4. **Build TaskStream directly from `KeyedEvent`.** Emit its dispatcher from
+   compiler IR rather than reparsing lowered Triton, and differentially verify
+   task coverage and dependency order on small domains. **Complete.**
+5. **Add the CLC executor.** Reuse the existing persistent-state allocator and
+   event lowering; add the SM100/cluster-size gate, robust CTA-wide CLC
+   primitive, cursor/epoch protocol, and runtime-derived residency-cap
+   lowering. **Complete.**
+6. **Validate generality before deletion.** Test Qwen and Gemma E4B layers,
+   Gemma A4B and DeepSeek MoE, and Nemotron at batch 1/2/8/16 where applicable.
+   Require correctness under perturbed task duration and launch order, bounded
+   generated code and compile time, and no model/root/task-count matchers.
+7. **Benchmark rigorously.** Use interleaved cold-L2 measurements and NCU/SM
+   timelines. Record latency, overlap, cursor/event atomic traffic, register
+   pressure, spills, dynamic/static shared memory, actual CTAs per SM, and
+   launch/cancellation accounting.
+8. **Delete static placement after parity.** **Complete.** Keep the existing
+   `cross_loop_num_workers` spelling temporarily as the resident-wave tuning
+   knob; it no longer assigns workers to roots or snaps to event boundaries.
+   CLC capability is an explicit requirement for dependency-bearing cross-loop
+   fusion.
+
+The deliberately small initial tuning surface is:
+
+- resident CTAs per SM; and
+- only if the probes require them, one event-local `on_ready` bit and one
+  nested wait-partition choice per eligible event/scope.
+
+Do not initially tune raw worker assignments, CLC scratch bytes, steal depth,
+poll delay, task bundles, named task orders, or model-specific stage layouts.
+
+### CLC implementation checkpoint (2026-08-26)
+
+- The static executor and all worker-placement/frontier machinery are gone.
+  One symbolic `TaskStream` is executed by the bounded ticket-based CLC loop.
+  The prior direct-token mode was deleted because its liveness argument was
+  incomplete and its isolated Qwen FFN gain was only about 1.4 microseconds.
+- Nested counted events remain. CLC assigns outer commands; release/acquire
+  events establish completion and visibility, including checkpoints within a
+  non-preemptive reduction command. Multiple events at one nested scope are
+  grouped and the loop is split only once. Nested scope trees are transformed
+  in one recursive pass rather than separate publication and repeated
+  wait-splitting passes.
+- `FamilyDone` remains the conservative policy choice but no longer has a
+  separate emitter or counter layout. It is a one-key `CountedEventPlan` and
+  uses the generic event machinery end to end.
+- A complete one-key `FamilyDone` relation may use the same final-arrival
+  local continuation as any other event when its sole consumer is bijective
+  with the key and the event covers every prerequisite of that consumer. This
+  is relation-derived rather than a singleton/root-name policy. It removes the
+  O-projection-to-post-attention wait in Gemma E4B and the final wait in generic
+  reduction chains. Remaining whole-family fallbacks are selected as
+  lowering-only counted-event plans; they no longer blank or replace uses in
+  the semantic `EventGraph`.
+- The semantic `EventGraph` is immutable after event and local-trigger
+  selection. Nested coverage is filtered while selecting emitted plans rather
+  than deleting uses and invalidating `(event_id, use_index)` identities.
+- Event uses now retain dependency-point provenance per producer contribution.
+  A joint semantic event is never discarded merely because its full quotient
+  cannot be emitted as one counter. Lowering composes each retained obligation
+  back to its exact `consumer -> producer` relation and factors that relation
+  through a directly publishable quotient. Fully lowerable joins stay joined;
+  mixed joins split only in the lowering plan. Root waits and nested milestones
+  consume this same plan extraction, while local final-arrival execution still
+  requires one plan to cover every consumer obligation.
+- Lowerable plans are derived once, coalesced by `(key domain, contributors)`,
+  and reused for TaskStream ordering, root waits, and nested milestones. Local
+  triggers are annotated afterward, so they do not create a second plan-
+  discovery path. Per-contribution provenance is mandatory on every event use,
+  which removes the legacy untracked-provenance mode and makes pruning exact.
+- A symbolic flat-order comparison suppresses key-major remapping when it is
+  equivalent to the configured PID traversal. Size-one axes are omitted from
+  flattened ordinal expressions, keeping this proof compact without task
+  enumeration.
+- The Nemotron routed-output zeroing dependency exposed why plan extraction
+  must be allowed to change key coordinates. Its joint event with expert-map
+  readiness has 84 keys and makes the 11 zeroing tasks appear to fan out. The
+  exact zeroing relation instead factors through the producer-key quotient:
+  11 keys, one publication per zeroing task, and one keyed wait per routed-W2
+  output group. This is derived from the semantic relation and introduces no
+  Nemotron-specific pattern.
+- TaskStream validation now follows structural execution ownership through
+  `LocalTrigger` chains. It does not require exact coordinate composition for
+  what is only a root-order proof, and ignores semantic events with no retained
+  uses. Exact coordinate contraction remains optional input to prefix
+  optimization; failure coarsens the optimization instead of rejecting the
+  schedule.
+- `LogicalRelation` can project and compose a rectangular set through a dense
+  affine flattening. This retains exact maps such as
+  `(batch, head) -> 32 * batch + head` without enumerating tasks. The structural
+  liveness proof and this optimization-capability proof intentionally remain
+  separate. Compact composition now also proves that intermediate/target
+  clipping is inactive, discards only provably empty pieces, and declines
+  partially clipped strided cases rather than changing their residue class.
+- The CLC response now returns only cancellation success; canceled CTA IDs are
+  not task identity. Programmatic dependent launch was removed because CLC
+  does not require it and the kernel emitted no grid-dependency wait.
+- The residency check is capped by the actual command count, so a small launch
+  is not rejected merely because its configured wave is larger than the grid.
+- The focused dependency and runtime suites pass 144 tests plus 29 subtests
+  (four backend skips). A 4,500-case differential fuzz sweep also matches
+  symbolic point/range composition and source projection against explicit
+  small-domain materialization, including clipped boundaries. The affine
+  compile-scaling probe emits 100 source lines and takes about 0.08 seconds at
+  65,536 producer tasks. Qwen and Gemma A4B compile and execute at batch
+  1/2/8/16; the Qwen layer also validates at a shorter 2,048-token context.
+- The former fixed 12 KiB CLC scratch pad has been removed. The launcher now
+  derives an unused dynamic-shared allocation from the exact compiled function
+  and target GPU, configures it once per specialization under a lock, handles
+  CUDA's greater-than-48-KiB opt-in path, and records both Triton's required
+  bytes and the actual launch bytes for diagnostics. Qwen FFN at seven CTAs/SM
+  uses 28,129 launch bytes instead of a fixed static pad, drops from 88 to 74
+  registers/thread, and measures 50.39 us versus 49.62 us separate. Gemma A4B
+  at three CTAs/SM uses 57,313 bytes and improves to 49.39 us versus 54.47 us.
+- A `%gridid`-tagged per-launch 32-bit command cursor was prototyped to replace
+  the contended 64-bit monotonic ticket and its divide/modulo. It worked for
+  ordinary repeated launches but failed CUDA Graph replay because the captured
+  grid identity was reused, so it cannot provide replay generations. The
+  prototype was reverted; the monotonic 64-bit ticket remains authoritative.
+- Publication lowering now reuses canonical TaskStream key coordinates when a
+  segment is traversing the same predecessor partition. This removes the
+  post-hoc inverse and duplicate piecewise key expression from Qwen W13
+  publication. Cold-L2 latency was neutral, but the lowering is smaller and
+  keeps ordering and publication tied to the same proven relation.
+- A task stream that already fits entirely in the selected resident wave now
+  lowers as one ticket claim plus one dispatch. It uses the same command and
+  epoch spaces, but emits no CLC mailbox, cancellation request, or dead
+  persistent loop because there is no launch tail to steal.
+- Removed `CountedEventPlan.graph_event_index`. Lowering had stopped consuming
+  it after the semantic graph became immutable; retaining it only let tests
+  reach backward into the graph. Event plans now expose their own structural
+  properties, including `family_done_root`, with no provenance-dependent
+  classification.
+- Event fanout is canonicalized before IDs exist. Finalization now changes only
+  the identity field on the already-canonical event domain and installs that
+  domain on its relations; it no longer invokes the general relation
+  retargeting/inversion machinery after grouping equivalent events.
+- Normalized `overlapping_sources` by discarding only relation pieces whose
+  clipped target cardinality is provably zero. Nested-prefix analysis now
+  unions outer-key fibers before flattening the producer partition. This
+  restores exact batched Qwen milestones without enumerating tasks: batch two
+  lowers as 32/64 activation groups per batch and batch eight as 8/88.
+- Probed the obvious dependency-closed loop interchange before generalizing
+  `TaskStream`: order each independent batch fiber as W13 then W2 instead of
+  ordering complete roots. It is correct but substantially slower under cold
+  L2: batch two measured 88.81 us versus 69.74 us root-major, and batch eight
+  measured 276.85 us versus 219.19 us. The likely loss is cross-batch weight
+  reuse. Therefore the compiler retains one complete segment per root for now;
+  legal quotient interleaving is not automatically a profitable policy.
+- Probed the less disruptive alternative suggested by review: retain W13's
+  group-major traversal, run the exact first-wave producer prefix across all
+  batches, admit one complete W2 batch fiber, then finish W13 and the remaining
+  W2 work. The saved lowerings are
+  `/tmp/qwen3_ffn_prefix_one_batch_b{1,2,8}_lowered.py`. It is neutral at batch
+  one (51.11 us versus 50.79 us root-major) and decisively slower at batch two
+  (102.61 us versus 67.18 us) and batch eight (296.34 us versus 215.46 us).
+  The lowering explains the loss: those W2 commands pass their first nested
+  wait, compute the ready prefix, then pin resident CTAs at the second wait
+  while the W13 tail still needs those CTAs. CLC redistributes commands only
+  between complete outer tasks; it does not preempt a task at a nested
+  checkpoint. This rules out sub-root stream segmentation as a default and
+  leaves one complete root family per segment as the simple current policy.
+- The latest cold-L2 revalidation gives Qwen full layer 95.97 us versus
+  99.12 us separate, Qwen FFN 51.28 us versus 49.72 us separate, Gemma A4B
+  MoE 50.79 us versus 55.70 us for the boundary-matched separate baseline,
+  and Gemma E4B 100.46 us versus 91.63 us separate. The affine scaling probe
+  emits 96 lines with no `tl.where` and completes source generation in about
+  0.18 seconds.
+- A compiler-generated Nemotron-3 Nano FP8 MoE probe now preserves the
+  production kernel boundaries, including the independent shared-expert
+  stream and explicit routed-output zeroing. Its batch-one configuration uses
+  592 resident CTAs, two warps, a 512-element shared-up reduction tile, and an
+  independently tuned 128-element final-merge tile. It uses 254 registers, no
+  spills, 16 KiB shared memory, and four CTAs/SM. Four fresh-process cold-L2
+  runs measured 125.03--125.62 us for the megakernel versus 121.91--122.30 us
+  for the tuned overlapped separate baseline, a reproducible roughly 2.5--3%
+  miss. Serial separate execution is 147.19 us, so the generic task stream
+  still recovers about 22 of the 26 us exposed by overlapping the independent
+  shared branch. Treat this as validation of general lowering, not a stable
+  performance win.
+- Nemotron's routed activation has a data-dependent valid-row mask. Masked
+  affine accesses now retain their statically indexed allocation footprint as
+  a conservative synchronization relation, while reaching-definition
+  analysis continues to treat masked writes as non-exact. This restores the
+  exact row/block W1-to-activation event without making the runtime mask part
+  of the dependency algebra. A diagnostic source without the redundant mask
+  does not close the remaining performance gap. Likewise, halving the
+  activation tile enables a final-arrival W1-to-activation continuation but
+  regresses by about 3 us. Do not add transitive-join or continuation policy
+  for this case.
+- NCU confirms that the remaining Nemotron gap is not evidence for another
+  dependency strategy. The fused kernel is register-limited at 254 registers
+  per thread and four two-warp CTAs per SM: theoretical occupancy is 12.5%,
+  achieved occupancy is 11.98%, and schedulers report no eligible warp in
+  91.33% of cycles. A four-warp 128-register cap trades that limit for spills
+  and is not reproducibly faster. Further work belongs to heterogeneous root
+  codegen/resource isolation, not task-stream policy.
+- Nemotron also validates at batch 2 and batch 8 with the same 1,165-line
+  lowering and 24 scalar `tl.where` expressions, demonstrating that generated
+  code size is independent of the expanded task count. Cold-L2 batch-2 latency
+  is 159.73 microseconds versus 167.94 separately. Batch 8 is a resource-
+  coupling negative case at 370.02 versus 321.41 microseconds: the combined
+  kernel reaches 255 registers and spills 482 bytes, while batch 2 remains
+  spill-free at 254 registers. This is not a dependency-proof or task-stream
+  expansion failure.
+- The compiler-generated DeepSeek-V3 BF16 scheduling probe lowers 4,476 outer
+  commands into 615 lines. It derives 32-arrival continuations for both W13 to
+  SwiGLU boundaries, eight per-slot activation arrivals before routed W2, 64
+  routed-W2 arrivals per output reduction, and a nine-arrival shared/routed
+  join. The lowering contains one CLC cancellation site and no enumerated
+  predecessor cascade. At 592 requested resident CTAs it measures 405.21
+  microseconds versus 424.79 for its matched overlapped separate-Helion
+  baseline under cold L2; forcing three CTAs per SM measures 405.32
+  microseconds. The megakernel has 712 spill bytes, mostly inherited from the
+  generic 256-way top-k root (564 spill bytes standalone), so future DeepSeek
+  performance work should improve that compute body rather than specialize
+  dependency scheduling.
+- Revalidation after masked-affine synchronization support passes 150 focused
+  tests with four expected backend skips and 29 subtests. Cold-L2 measurements
+  on one B200 are 94.97 us versus 98.78 us separately for Qwen, 49.88 us
+  versus 54.80 us for Gemma A4B, and 101.04 us versus 91.97 us for the known
+  resource-limited Gemma E4B case. The affine compile-scaling probe remains
+  flat: 65,536 elements lower in 0.17 seconds and 1,048,576 elements in 0.15
+  seconds, both as 97 lines with no `tl.where`.
+- Batch-scaled Qwen and Gemma A4B execute correctly at batch 2 and 8, and the
+  A4B probe also validates at batch 16. Qwen FFN batch eight remains a negative
+  performance case: raising the minimum resident cohort from seven to fifteen
+  CTAs per SM improves roughly 215.5 us to 197.0 us, but the separate kernels
+  remain about 168.0 us. NCU shows that the seven-CTA fused configuration has
+  10.9% theoretical warp occupancy, while the standalone W13 and W2 kernels
+  reach 25.0% and 23.4%. This is evidence for autotuning the existing resident
+  cohort and investigating whole-kernel resource coupling, not for adding a
+  model-specific command order.
+- NCU reports that the current Gemma E4B megakernel is jointly limited to four
+  CTAs/SM by 194 registers/thread and roughly 47 KiB of total shared memory.
+  Its low 12.5% theoretical warp occupancy supports treating the remaining
+  E4B gap as heterogeneous whole-kernel resource coupling, not as evidence for
+  another dependency-policy special case. Snapping the requested wave from
+  576 to the physical four-CTA wave of 592 changes cold-L2 latency only from
+  96.93 us to 96.58 us.
+- The retained Gemma source adaptation uses a 512-element output tile for the
+  post-FF residual/RMSNorm and a 1024-element tile for the final PLE
+  residual/RMSNorm. The other tested 512/1024 combinations were slower. A
+  128-register cap spills 62 registers and regresses E4B to 103.85 us; changing
+  the whole kernel from two warps to one or four regresses to 126.64 us and
+  115.02 us respectively. These results reinforce that a single global Triton
+  resource configuration, not dependency proof failure, is the current E4B
+  limitation.
+- Counted-event final arrivals now use a release RMW followed, on the winning
+  path, by an acquire load of the same counter before executing the local
+  continuation. This preserves producer-to-continuation visibility without
+  imposing acquire semantics on every arrival. Generated Qwen PTX contains
+  `atom.global.gpu.release.add.u32` followed by
+  `ld.acquire.gpu.global.u32`; the focused dependency/runtime suite remains at
+  144 passed, four skipped, and 29 passing subtests.
+- The latest batch-one cold-L2 regression sweep gives 95.43 us versus 99.25 us
+  for the full Qwen layer, 49.27 us versus 53.93 us for Gemma A4B's matched
+  separate baseline, and 101.61 us versus 91.06 us for Gemma E4B. The full
+  Qwen layer and A4B retain useful gains; Gemma E4B remains the known
+  whole-kernel resource-envelope negative case.
+- CLC remains an outer-command executor, not a replacement for nested
+  dependency checkpoints. Qwen W13-to-activation is a generic final-arrival
+  continuation, while W2 retains two relation-derived acquire checkpoints
+  inside its non-preemptive reduction command. A CLC cancellation is requested
+  only between complete commands; it cannot reclaim a CTA blocked at one of
+  those checkpoints.
+- Probes rejected three tempting executor shortcuts. Pre-issuing cancellation
+  before the ticket claim recovered only about 0.2 us and raised register use;
+  replacing Triton's scalar ticket/continuation atomics with custom one-warp
+  inline PTX was neutral or slower; and raising the resident wave through
+  8--14 CTAs/SM or launching the entire 2,048-command FFN stream at once
+  regressed sharply. Coarser W13/W2 tiles also regressed. None should become a
+  compiler policy.
+- A bounded ownership-chain or canceled-ID ordering scheme is not a safe
+  replacement for the monotonic ticket: CLC does not guarantee a
+  dependency-safe physical-start prefix or ordered canceled IDs. A 32-bit
+  ticket probe with reset cost excluded still measured about 50.45 us versus
+  49.42 us separately, so adding a reset node is not justified by the current
+  data. Retain the single 64-bit monotonic cursor until a simpler protocol has
+  both a proof and a measured win.
+
+Remaining work:
+
+1. Keep Gemma E4B and large-batch Nemotron as explicit negative cases. NCU and
+   resource inspection attribute their current limits to the combined kernel
+   resource envelope; follow-up work should focus on codegen/resource
+   isolation rather than adding readiness cases.
+2. Compare the representative DeepSeek probe with the exact production
+   vLLM/Helion implementation when its tuned local source and generated root
+   artifacts are available. The current matched baseline validates scheduling,
+   but is not a claim against the best production grouped-MoE kernels.
+3. Rename `cross_loop_num_workers` only when a clean configuration migration is
+   available; its current semantics are resident wave size, not worker roles.
+4. Audit the remaining event-plan and nested-scope lowering for post-hoc
+   semantic rewrites or duplicate ownership. Preserve nested checkpoints, but
+   keep their correctness relation in `KeyedEvent`; any stage coarsening must
+   remain a lowering view rather than a second dependency graph.
+
+The final cleanup review identified one concrete consolidation sequence:
+
+1. Build the semantic `EventGraph` solely from DeviceIR and proved symbolic
+   synchronization relations. Whether the current Triton AST can render a
+   nested scope must not suppress or reshape a semantic dependency.
+2. Select one executable mechanism for each dependency point in a single pass,
+   in priority order: local final-arrival, nested exact/coarsened wait, root
+   keyed wait, then `FamilyDone`. This should remove the current exclusion,
+   prune, recount, and append sequence.
+3. Construct `FamilyDone` once, only for dependency points left uncovered by
+   finer mechanisms. A local symbolic-proof failure should not discard exact
+   events elsewhere in the graph.
+4. Index publications and waits uniformly by `(root, scope_id)`, with
+   `scope_id=None` denoting the root. Keep the existing bottom-up recursive
+   nested-loop rewrite; do not introduce movable nested tasks.
+5. Keep the current compact handwritten L2 PID formulas until
+   `physical_traversal_relation` can represent full groups with one floor/mod
+   piece, at most one tail piece, and an equally compact exact inverse. Directly
+   rendering today's piece-per-group relation would recreate large nested
+   `tl.where` expressions. Once the relation is compact, make it authoritative
+   in lowering and add differential tail/permutation/batch tests.
+6. Delete the now-unused dependency-wait helper, single-section state-layout
+   scaffolding, one-use wrappers, stale preordered-edge API, and unused relation
+   retyping helper once their callers and tests are migrated.
+
+## Prior static-scheduler architecture (semantic portions retained)
+
+This section records the architecture that preceded the CLC-only decision.
+Its `LogicalDomain`, `LogicalRelation`, execution-scope, dependency, and event
+model remain authoritative. Its `WorkerSchedule` physical placement and
+worker-liveness design are now migration history and must not constrain the
+CLC implementation.
 
 The compiler should have one coordinate model and one relation algebra:
 
@@ -3100,7 +3677,11 @@ schedule consumed by code generation. Diagnostics and probes inspect
 enter the allocation graph conservatively as writes, so removing the source
 scanner does not create a synchronization hole.
 
-## Implementation plan
+## Historical static-scheduler implementation plan
+
+The checklist below records the path that led to the current design. It is
+superseded by the authoritative CLC architecture and current checkpoint above;
+its in-progress labels describe the state at that historical checkpoint.
 
 Status values: **pending**, **in progress**, **complete**, or **blocked**.
 
@@ -3138,9 +3719,9 @@ reductions; that is a kernel-author computation choice and is intentionally
 outside the scheduler.
 
 Root completion is no longer stored as a parallel schedule topology. It is a
-canonical one-key `FamilyDone` event in `CrossLoopSchedule`; the generated
-kernel retains the efficient physical implementation of one publication per
-finishing worker rather than one atomic per logical task.
+canonical one-key `FamilyDone` event in `CrossLoopSchedule` and uses the same
+counter allocation, per-logical-task publication, epoch arithmetic, and wait
+lowering as every other counted event.
 Region-aware reaching definitions now split exact partial writes, retain
 unknown earlier definitions conservatively, and derive complete predecessor
 sets for multi-root joins. Ordinary size-one views, storage offsets, and the
@@ -4594,6 +5175,9 @@ Lowering requirements remain separate from semantic legality:
 
 #### Implementation checkpoint (2026-08-25)
 
+This checkpoint records the predecessor-quotient refactor before the later CLC
+executor cleanup above. Its measurements and scheduler details are historical.
+
 The predecessor-quotient migration is complete for the supplied mixed-radix
 failure:
 
@@ -4626,10 +5210,12 @@ failure:
 - Worker-count snapping now ignores semantic frontiers that cannot be emitted
   by the counted-event lowering.
 
-The implementation was reviewed twice. The final review approved the
-factorization and single-source-of-truth design and rejected a broader general
-range-composition extension as unnecessary. It also identified an existing
-large-batch compile-time hotspot: total-function checking repeatedly
+The implementation was reviewed twice. The review approved the factorization
+and single-source-of-truth design. A later Qwen batch-2 test demonstrated that
+dense affine range composition is independently useful, so that operation was
+subsequently added without making exact composition part of liveness
+validation. The review also identified an existing large-batch compile-time
+hotspot: total-function checking repeatedly
 canonicalized thousands of already-disjoint L2 traversal pieces. A generic
 fast proof now recognizes a partition of the source domain with one valid
 target point per piece, reducing the check from a quadratic cell-by-piece scan

@@ -107,10 +107,10 @@ class Config(Mapping[str, object]):
                 improve L2 locality on multi-XCD GPUs (MI300/MI350). Supported for pid_type
                 "flat", "persistent_blocked", and "persistent_interleaved"; composes with
                 ``l2_groupings``.
-            cross_loop_num_workers: Target number of persistent workers used by
-                the cross-loop scheduler. The compiler snaps positive values to
-                complete event-key boundaries; ``0`` selects the ordinary
-                persistent grid.
+            cross_loop_num_workers: Minimum number of concurrently resident CTAs
+                in the cross-loop scheduler's initial wave. The runtime rounds
+                this upward to a whole number of CTAs per SM. ``0`` uses
+                ``num_sm_multiplier * num_sm``.
             **kwargs: Additional user-defined configuration parameters.
         """
         self.config = {}

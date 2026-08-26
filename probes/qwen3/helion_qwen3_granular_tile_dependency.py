@@ -1035,7 +1035,9 @@ def _probe_config(bound, args):
         }
     )
     if CROSS_LOOP_NUM_WORKERS_CONFIG in bound.config_spec.user_defined_tunables:
-        values[CROSS_LOOP_NUM_WORKERS_CONFIG] = 1024
+        values[CROSS_LOOP_NUM_WORKERS_CONFIG] = (
+            args.cross_loop_workers if args.cross_loop_workers is not None else 1024
+        )
     config = helion.Config.from_dict(values)
     bound.config_spec.normalize(config.config)
     return config

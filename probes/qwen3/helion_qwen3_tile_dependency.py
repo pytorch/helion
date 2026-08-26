@@ -571,10 +571,17 @@ def _helion_resources(compiled_wrapper):
     if len(kernels) != 1:
         raise RuntimeError(f"expected one compiled Helion kernel, found {len(kernels)}")
     kernel = kernels[0]
+    launch_shared = getattr(
+        kernel, "_helion_launch_dynamic_shared_bytes", kernel.metadata.shared
+    )
     return {
         "registers": kernel.n_regs,
         "spills": kernel.n_spills,
-        "shared": kernel.metadata.shared,
+        "shared": launch_shared,
+        "triton_required_shared": kernel.metadata.shared,
+        "resident_blocks_per_sm": getattr(
+            kernel, "_helion_resident_blocks_per_sm", None
+        ),
     }
 
 
@@ -594,6 +601,11 @@ def run(args) -> None:
         if args.probe_config
         else bound.config_spec.default_config()
     )
+    lowered = bound.to_triton_code(config)
+    lowered_path = args.lowered_output.resolve()
+    lowered_path.parent.mkdir(parents=True, exist_ok=True)
+    lowered_path.write_text(lowered)
+    print("LOWERED_TRITON", lowered_path, flush=True)
     if args.dump_config:
         print("CONFIG", dict(config), flush=True)
         print(
@@ -634,7 +646,7 @@ def run(args) -> None:
             flush=True,
         )
     if args.dump_triton:
-        print(bound.to_triton_code(config), flush=True)
+        print(lowered, flush=True)
         return
     if args.inspect_only:
         return
@@ -768,6 +780,11 @@ def main() -> None:
     parser.add_argument("--dump-config", action="store_true")
     parser.add_argument("--dump-ir", action="store_true")
     parser.add_argument("--dump-triton", action="store_true")
+    parser.add_argument(
+        "--lowered-output",
+        type=Path,
+        default=Path("/tmp/qwen3_layer_clc_lowered.py"),
+    )
     parser.add_argument("--inspect-only", action="store_true")
     parser.add_argument("--probe-config", action="store_true")
     parser.add_argument("--projection-stages", type=int, default=4)

@@ -22,9 +22,21 @@ from __future__ import annotations
 
 import contextvars
 import math
+import threading
+from typing import TYPE_CHECKING
+from typing import Protocol
+from typing import cast
 import weakref
 
 import torch
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+
+class _CompiledKernelWithPackedMetadata(Protocol):
+    packed_metadata: tuple[object, ...]
+
 
 try:
     import triton
@@ -249,11 +261,12 @@ def default_launcher(
             *args,
             **{**run_kwargs, "warmup": True},
         )
-        _validate_resident_program_capacity(
+        _configure_resident_program_capacity(
             compiled_kernel,
             args,
             num_warps=num_warps,
             required_programs=_minimum_resident_programs,
+            grid_programs=math.prod(grid),
         )
     return triton_kernel.run(  # type: ignore[union-attr]
         *args,
@@ -378,14 +391,79 @@ def _get_persistent_state(
     return state
 
 
-def _validate_resident_program_capacity(
+def _select_residency_shared_memory(
+    minimum: int,
+    maximum: int,
+    target_blocks: int,
+    occupancy: Callable[[int], int],
+) -> tuple[int, int]:
+    """Choose the least shared memory that reaches the nearest safe occupancy."""
+    if not 0 <= minimum <= maximum:
+        raise ValueError("invalid dynamic shared-memory search range")
+    if target_blocks <= 0:
+        raise ValueError("target blocks per SM must be positive")
+
+    cache: dict[int, int] = {}
+
+    def cached_occupancy(shared: int) -> int:
+        result = cache.get(shared)
+        if result is None:
+            result = occupancy(shared)
+            cache[shared] = result
+        return result
+
+    base_blocks = cached_occupancy(minimum)
+    if base_blocks <= target_blocks:
+        return minimum, base_blocks
+
+    def first_at_most(limit: int) -> int | None:
+        if cached_occupancy(maximum) > limit:
+            return None
+        low = minimum
+        high = maximum
+        while low < high:
+            candidate = (low + high) // 2
+            if cached_occupancy(candidate) <= limit:
+                high = candidate
+            else:
+                low = candidate + 1
+        return low
+
+    selected = first_at_most(target_blocks)
+    if selected is None:
+        nearest_higher = cached_occupancy(maximum)
+        selected = first_at_most(nearest_higher)
+        assert selected is not None
+        return selected, nearest_higher
+
+    selected_blocks = cached_occupancy(selected)
+    if selected_blocks == target_blocks:
+        return selected, selected_blocks
+
+    # An occupancy cliff may skip the requested value. Keep the nearest higher
+    # resident count because excess residency is safe while too little can
+    # deadlock a polling schedule.
+    nearest_higher = cached_occupancy(selected - 1)
+    selected = first_at_most(nearest_higher)
+    assert selected is not None
+    return selected, nearest_higher
+
+
+def _configure_resident_program_capacity(
     compiled_kernel: object,
     args: tuple[object, ...],
     *,
     num_warps: int,
     required_programs: int,
+    grid_programs: int,
 ) -> None:
-    """Reject a polling schedule whose required CTA cohort cannot be resident."""
+    """Realize and validate the requested resident CTA cohort.
+
+    A CLC launch with a cancelable tail uses unused dynamic shared memory to
+    cap physical residency at the smallest whole-device wave that contains the
+    requested cohort. This keeps the policy in logical CTA units while deriving
+    the hardware allocation from the compiled specialization and target GPU.
+    """
     import importlib
 
     tensor = next((arg for arg in args if isinstance(arg, torch.Tensor)), None)
@@ -395,44 +473,154 @@ def _validate_resident_program_capacity(
     if compiled_kernel is None:
         raise RuntimeError("unable to compile cross-loop scheduled kernel")
 
-    # Accessing ``run`` initializes Triton's module/function handles without
-    # launching the kernel.  Cache the exact driver result on the compiled
-    # specialization because this wrapper is also called during graph capture.
-    _run = compiled_kernel.run  # type: ignore[attr-defined]
-    function = getattr(compiled_kernel, "function", None)
-    metadata = getattr(compiled_kernel, "metadata", None)
-    shared = getattr(metadata, "shared", None)
-    if function is None or not isinstance(shared, int):
-        raise RuntimeError("unable to query cross-loop kernel occupancy")
-
     device = tensor.device
-    cache = vars(compiled_kernel).setdefault(
-        "_helion_resident_program_capacity_cache", {}
-    )
-    key = (device, num_warps, shared)
-    capacity = cache.get(key)
-    if capacity is None:
-        cuda_driver = importlib.import_module("cuda.bindings.driver")
-        with torch.cuda.device(device):
-            error, blocks_per_sm = (
-                cuda_driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
-                    cuda_driver.CUfunction(int(function)),
-                    num_warps * 32,
-                    shared,
-                )
-            )
-        if error != cuda_driver.CUresult.CUDA_SUCCESS:
+    configuration_key = (device, num_warps, required_programs, grid_programs)
+    kernel_state = vars(compiled_kernel)
+    configured = kernel_state.get("_helion_resident_program_configuration")
+    if configured is not None:
+        configured_key, _launch_shared, _capacity = configured
+        if configured_key != configuration_key:
             raise RuntimeError(
-                f"CUDA occupancy query failed for cross-loop kernel: {error}"
+                "one compiled Triton specialization received conflicting "
+                "cross-loop residency requests"
             )
+        return
+
+    lock = kernel_state.setdefault(
+        "_helion_resident_program_configuration_lock",
+        threading.Lock(),
+    )
+    with lock:
+        configured = kernel_state.get("_helion_resident_program_configuration")
+        if configured is not None:
+            configured_key, _launch_shared, _capacity = configured
+            if configured_key != configuration_key:
+                raise RuntimeError(
+                    "one compiled Triton specialization received conflicting "
+                    "cross-loop residency requests"
+                )
+            return
+
+        # Accessing ``run`` initializes Triton's exact module/function handles
+        # without launching it. Configure this cached specialization once,
+        # before it can be captured into a CUDA graph.
+        _run = compiled_kernel.run  # type: ignore[attr-defined]
+        function = getattr(compiled_kernel, "function", None)
+        metadata = getattr(compiled_kernel, "metadata", None)
+        shared = getattr(metadata, "shared", None)
+        packed_metadata = getattr(compiled_kernel, "packed_metadata", None)
+        if (
+            function is None
+            or not isinstance(shared, int)
+            or not isinstance(packed_metadata, tuple)
+            or len(packed_metadata) < 3
+        ):
+            raise RuntimeError("unable to query cross-loop kernel occupancy")
+
         properties = torch.cuda.get_device_properties(device)
-        capacity = int(blocks_per_sm) * int(properties.multi_processor_count)
-        cache[key] = capacity
-    if required_programs > capacity:
-        raise RuntimeError(
-            "Cross-loop scheduling requires "
-            f"{required_programs} concurrently resident programs, but this "
-            f"kernel/device can residently execute only {capacity}. Choose a "
-            "lower-resource configuration, an earlier dependency frontier, "
-            "or root completion."
-        )
+        sm_count = int(properties.multi_processor_count)
+        if sm_count <= 0:
+            raise RuntimeError("cross-loop residency checks require at least one SM")
+        cuda_driver = importlib.import_module("cuda.bindings.driver")
+        function_handle = cuda_driver.CUfunction(int(function))
+
+        def blocks_per_sm(dynamic_shared: int) -> int:
+            error, blocks = cuda_driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                function_handle,
+                num_warps * 32,
+                dynamic_shared,
+            )
+            if error != cuda_driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(
+                    f"CUDA occupancy query failed for cross-loop kernel: {error}"
+                )
+            return int(blocks)
+
+        with torch.cuda.device(device):
+            launch_shared = shared
+            resident_blocks = blocks_per_sm(launch_shared)
+            if grid_programs > required_programs:
+                target_blocks = math.ceil(required_programs / sm_count)
+                if resident_blocks > target_blocks:
+                    error, current_maximum = cuda_driver.cuFuncGetAttribute(
+                        cuda_driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        function_handle,
+                    )
+                    if error != cuda_driver.CUresult.CUDA_SUCCESS:
+                        raise RuntimeError(
+                            "CUDA dynamic shared-memory query failed for "
+                            f"cross-loop kernel: {error}"
+                        )
+                    current_maximum = max(shared, int(current_maximum))
+                    launch_shared, resident_blocks = _select_residency_shared_memory(
+                        shared,
+                        current_maximum,
+                        target_blocks,
+                        blocks_per_sm,
+                    )
+                    if resident_blocks > target_blocks:
+                        error, static_shared = cuda_driver.cuFuncGetAttribute(
+                            cuda_driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
+                            function_handle,
+                        )
+                        if error != cuda_driver.CUresult.CUDA_SUCCESS:
+                            raise RuntimeError(
+                                "CUDA static shared-memory query failed for "
+                                f"cross-loop kernel: {error}"
+                            )
+                        maximum_dynamic = int(
+                            properties.shared_memory_per_block_optin
+                        ) - int(static_shared)
+                        if maximum_dynamic > current_maximum:
+                            (error,) = cuda_driver.cuFuncSetCacheConfig(
+                                function_handle,
+                                cuda_driver.CUfunc_cache.CU_FUNC_CACHE_PREFER_SHARED,
+                            )
+                            if error != cuda_driver.CUresult.CUDA_SUCCESS:
+                                raise RuntimeError(
+                                    "CUDA shared-memory cache setup failed for "
+                                    f"cross-loop kernel: {error}"
+                                )
+                            (error,) = cuda_driver.cuFuncSetAttribute(
+                                function_handle,
+                                cuda_driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                maximum_dynamic,
+                            )
+                            if error != cuda_driver.CUresult.CUDA_SUCCESS:
+                                raise RuntimeError(
+                                    "CUDA dynamic shared-memory limit setup failed "
+                                    f"for cross-loop kernel: {error}"
+                                )
+                            launch_shared, resident_blocks = (
+                                _select_residency_shared_memory(
+                                    shared,
+                                    maximum_dynamic,
+                                    target_blocks,
+                                    blocks_per_sm,
+                                )
+                            )
+
+            capacity = resident_blocks * sm_count
+            if required_programs > capacity:
+                raise RuntimeError(
+                    "Cross-loop scheduling requires "
+                    f"{required_programs} concurrently resident programs, but "
+                    f"this kernel/device can residently execute only {capacity}. "
+                    "Choose a smaller resident cohort or a lower-resource "
+                    "kernel configuration."
+                )
+            if launch_shared != shared:
+                packed = list(packed_metadata)
+                packed[2] = launch_shared
+                cast(
+                    "_CompiledKernelWithPackedMetadata",
+                    compiled_kernel,
+                ).packed_metadata = tuple(packed)
+            kernel_state["_helion_required_dynamic_shared_bytes"] = shared
+            kernel_state["_helion_launch_dynamic_shared_bytes"] = launch_shared
+            kernel_state["_helion_resident_blocks_per_sm"] = resident_blocks
+            kernel_state["_helion_resident_program_configuration"] = (
+                configuration_key,
+                launch_shared,
+                capacity,
+            )

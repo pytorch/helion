@@ -372,19 +372,6 @@ class LogicalRelation:
             pieces=self.pieces,
         )
 
-    def retype_source(self, source_domain: LogicalDomain) -> LogicalRelation | None:
-        """Retype the source without changing its coordinate geometry."""
-        if (
-            self.source_domain.axis_order != source_domain.axis_order
-            or self.source_domain.axis_counts_items != source_domain.axis_counts_items
-        ):
-            return None
-        return LogicalRelation(
-            source_domain=source_domain,
-            target_domain=self.target_domain,
-            pieces=self.pieces,
-        )
-
     def project_target(
         self,
         target_domain: LogicalDomain,
@@ -450,6 +437,33 @@ class LogicalRelation:
                 if not eliminated_axes:
                     target_ranges.append((target_axis, begin, end, target_step))
                     continue
+                dense_projection = _dense_affine_range_image(
+                    begin,
+                    end,
+                    target_step=target_step,
+                    domain=self.source_domain,
+                    coordinate_ranges={
+                        axis: (
+                            sympy.Integer(source_begin),
+                            sympy.Integer(source_end),
+                            source_step,
+                        )
+                        for axis, source_begin, source_end, source_step in piece.source_bounds_items
+                    },
+                    projected_axes=eliminated_axes,
+                )
+                if dense_projection is not None:
+                    projected_begin, projected_end, projected_axes = dense_projection
+                    if eliminated_uses & projected_axes:
+                        # Reusing a varying projected coordinate in multiple
+                        # target dimensions would create a diagonal rather
+                        # than a Cartesian product.
+                        return None
+                    eliminated_uses.update(projected_axes)
+                    target_ranges.append(
+                        (target_axis, projected_begin, projected_end, 1)
+                    )
+                    continue
                 if len(eliminated_axes) != 1 or expression_axes & retained_axes:
                     return None
                 (eliminated_axis,) = eliminated_axes
@@ -481,14 +495,20 @@ class LogicalRelation:
                     projected_step = stride * source_step
                 else:
                     return None
-                target_ranges.append(
-                    (
-                        target_axis,
-                        projected_begin,
-                        projected_end,
-                        projected_step,
-                    )
+                projected_range = (
+                    (target_axis, projected_begin, projected_end, projected_step),
                 )
+                projected_source_bounds = tuple(
+                    (axis, *source_bounds[axis]) for axis in source_domain.axis_order
+                )
+                if not _target_box_is_unclipped(
+                    projected_range,
+                    target_domain=self.target_domain,
+                    source_domain=source_domain,
+                    source_bounds=projected_source_bounds,
+                ):
+                    return None
+                target_ranges.append(projected_range[0])
             pieces.append(
                 _LogicalRelationPiece(
                     source_bounds_items=tuple(
@@ -550,6 +570,9 @@ class LogicalRelation:
         point_composition = _compose_point_relations(self, following)
         if point_composition is not None:
             return point_composition
+        range_composition = _compose_range_relations(self, following)
+        if range_composition is not None:
+            return range_composition
         if len(self.pieces) != 1:
             return None
         piece = self.pieces[0]
@@ -1763,26 +1786,37 @@ class LogicalRelation:
                             ),
                         )
                     )
+                target_ranges = tuple(
+                    (
+                        axis,
+                        (
+                            sympy.Max(*lower_bounds[axis])
+                            if lower_bounds[axis]
+                            else sympy.Integer(0)
+                        ),
+                        (
+                            sympy.Min(*upper_bounds[axis])
+                            if upper_bounds[axis]
+                            else sympy.Integer(target_counts[axis])
+                        ),
+                        1,
+                    )
+                    for axis in self.source_domain.axis_order
+                )
+                if (
+                    _target_box_cardinality(
+                        target_ranges,
+                        target_domain=self.source_domain,
+                        source_domain=other.source_domain,
+                        source_bounds=consumer_piece.source_bounds_items,
+                    )
+                    == 0
+                ):
+                    continue
                 pieces.append(
                     _LogicalRelationPiece(
                         source_bounds_items=consumer_piece.source_bounds_items,
-                        target_ranges=tuple(
-                            (
-                                axis,
-                                (
-                                    sympy.Max(*lower_bounds[axis])
-                                    if lower_bounds[axis]
-                                    else sympy.Integer(0)
-                                ),
-                                (
-                                    sympy.Min(*upper_bounds[axis])
-                                    if upper_bounds[axis]
-                                    else sympy.Integer(target_counts[axis])
-                                ),
-                                1,
-                            )
-                            for axis in self.source_domain.axis_order
-                        ),
+                        target_ranges=target_ranges,
                     )
                 )
         return LogicalRelation(
@@ -2356,6 +2390,35 @@ def _target_box_cardinality(
     return sympy.simplify(cardinality)
 
 
+def _target_box_is_unclipped(
+    target_ranges: tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...],
+    *,
+    target_domain: LogicalDomain,
+    source_domain: LogicalDomain,
+    source_bounds: tuple[tuple[int, int, int, int], ...],
+) -> bool:
+    """Prove that target-domain clipping is inactive for one relation piece."""
+    for axis, begin, end, _step in target_ranges:
+        begin_bounds = _logical_expression_bounds(
+            begin,
+            domain=source_domain,
+            source_bounds=source_bounds,
+        )
+        end_bounds = _logical_expression_bounds(
+            end,
+            domain=source_domain,
+            source_bounds=source_bounds,
+        )
+        if (
+            begin_bounds is None
+            or end_bounds is None
+            or begin_bounds[0] < 0  # pyrefly: ignore[unsupported-operation]
+            or end_bounds[1] > target_domain.axis_counts[axis]  # pyrefly: ignore[unsupported-operation]
+        ):
+            return False
+    return True
+
+
 def _target_box_is_nonempty_for_all_sources(
     target_ranges: tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...],
     *,
@@ -2539,6 +2602,67 @@ def _static_affine_coefficients(
     if remainder.free_symbols or remainder.is_integer is not True:
         return None
     return coefficients, int(remainder)
+
+
+def _dense_affine_range_image(
+    begin: sympy.Expr,
+    end: sympy.Expr,
+    *,
+    target_step: int,
+    domain: LogicalDomain,
+    coordinate_ranges: dict[int, tuple[sympy.Expr, sympy.Expr, int]],
+    projected_axes: frozenset[int] | set[int],
+) -> tuple[sympy.Expr, sympy.Expr, frozenset[int]] | None:
+    """Map rectangular coordinates whose affine image is one dense interval.
+
+    This is the compact relational form of flattening a rectangular coordinate
+    space. For example, projecting ``tile`` from ``32 * batch + tile`` over
+    ``tile in [0, 32)`` yields ``[32 * batch, 32 * batch + 32)``. Multiple
+    projected axes are accepted only when their strides overlap or abut the
+    interval already covered by less-significant axes.
+    """
+    if target_step != 1:
+        return None
+    layout = _static_affine_coefficients(begin, domain=domain)
+    width = sympy.simplify(end - begin)  # pyrefly: ignore[unsupported-operation]
+    if (
+        layout is None
+        or width.free_symbols
+        or width.is_integer is not True
+        or int(width) <= 0
+    ):
+        return None
+    coefficients, _offset = layout
+    substitutions: dict[sympy.Basic, sympy.Expr] = {}
+    varying_axes: set[int] = set()
+    strides_and_counts: list[tuple[int, int]] = []
+    for axis in projected_axes:
+        source_begin, source_end, source_step = coordinate_ranges[axis]
+        range_width = sympy.simplify(source_end - source_begin)  # pyrefly: ignore[unsupported-operation]
+        if range_width.free_symbols or range_width.is_integer is not True:
+            return None
+        static_width = int(range_width)
+        if static_width <= 0:
+            return None
+        substitutions[logical_axis_symbol(axis)] = source_begin
+        count = (static_width - 1) // source_step + 1
+        coefficient = coefficients[axis]
+        if count <= 1 or coefficient == 0:
+            continue
+        varying_axes.add(axis)
+        strides_and_counts.append((coefficient * source_step, count))
+
+    covered_width = int(width)
+    for stride, count in sorted(strides_and_counts):
+        if stride > covered_width:
+            return None
+        covered_width += stride * (count - 1)
+    projected_begin = sympy.simplify(begin.xreplace(substitutions))
+    return (
+        projected_begin,
+        projected_begin + covered_width,  # pyrefly: ignore[unsupported-operation]
+        frozenset(varying_axes),
+    )
 
 
 def _dense_mixed_radix_publication_converse(
@@ -2870,8 +2994,6 @@ def _compose_point_relations(
             for axis, begin, end, step in following_piece.source_bounds_items:
                 if step != 1:
                     return None
-                if begin == 0 and end == following.source_domain.axis_counts[axis]:
-                    continue
                 expression_bounds = _logical_expression_bounds(
                     first_targets[axis],
                     domain=first.source_domain,
@@ -2944,6 +3066,128 @@ def _compose_point_relations(
                         )
                         for axis, begin, end, step in following_piece.target_ranges
                     ),
+                )
+            )
+    return LogicalRelation(
+        source_domain=first.source_domain,
+        target_domain=following.target_domain,
+        pieces=tuple(dict.fromkeys(pieces)),
+    )
+
+
+def _compose_range_relations(
+    first: LogicalRelation,
+    following: LogicalRelation,
+) -> LogicalRelation | None:
+    """Compose rectangular ranges through separable affine interval maps.
+
+    This covers the common case where one relation selects a contiguous range
+    of intermediate keys and the following relation maps each key to a
+    contiguous affine range.  The image is retained only when it is itself one
+    rectangular strided range; otherwise composition declines.
+    """
+    full_following_bounds = tuple(
+        (axis, 0, following.source_domain.axis_counts[axis], 1)
+        for axis in following.source_domain.axis_order
+    )
+    if any(
+        piece.source_bounds_items != full_following_bounds for piece in following.pieces
+    ):
+        return None
+
+    pieces: list[_LogicalRelationPiece] = []
+    for first_piece in first.pieces:
+        # Relation ranges are clipped to their target domain.  Composing their
+        # affine expressions directly is exact only when that clipping is
+        # provably inactive over this source piece.  Otherwise the preimage of
+        # the boundary must be partitioned first, which this compact composer
+        # intentionally leaves to a more general representation.
+        if (
+            _target_box_cardinality(
+                first_piece.target_ranges,
+                target_domain=first.target_domain,
+                source_domain=first.source_domain,
+                source_bounds=first_piece.source_bounds_items,
+            )
+            == 0
+        ):
+            continue
+        if not _target_box_is_unclipped(
+            first_piece.target_ranges,
+            target_domain=first.target_domain,
+            source_domain=first.source_domain,
+            source_bounds=first_piece.source_bounds_items,
+        ):
+            return None
+        intermediate_ranges = {
+            axis: (begin, end, step)
+            for axis, begin, end, step in first_piece.target_ranges
+        }
+        for following_piece in following.pieces:
+            used_intermediate_axes: set[int] = set()
+            target_ranges: list[tuple[int, sympy.Expr, sympy.Expr, int]] = []
+            for target_axis, begin, end, target_step in following_piece.target_ranges:
+                if not begin.free_symbols and not end.free_symbols:
+                    target_ranges.append((target_axis, begin, end, target_step))
+                    continue
+                dense_image = _dense_affine_range_image(
+                    begin,
+                    end,
+                    target_step=target_step,
+                    domain=following.source_domain,
+                    coordinate_ranges=intermediate_ranges,
+                    projected_axes=frozenset(following.source_domain.axis_order),
+                )
+                if dense_image is not None:
+                    result_begin, result_end, varying_axes = dense_image
+                    if used_intermediate_axes & varying_axes:
+                        return None
+                    used_intermediate_axes.update(varying_axes)
+                    target_ranges.append((target_axis, result_begin, result_end, 1))
+                    continue
+                interval = _single_axis_interval(
+                    begin,
+                    end,
+                    domain=following.source_domain,
+                )
+                if interval is None or target_step != 1:
+                    return None
+                source_axis, stride, offset, width = interval
+                source_range = intermediate_ranges.get(source_axis)
+                if source_range is None:
+                    return None
+                source_begin, source_end, source_step = source_range
+                if source_step != 1 or source_axis in used_intermediate_axes:
+                    return None
+                used_intermediate_axes.add(source_axis)
+                result_begin = (  # pyrefly: ignore[unsupported-operation]
+                    stride * source_begin + offset
+                )
+                if width >= stride:
+                    result_end = (  # pyrefly: ignore[unsupported-operation]
+                        stride * (source_end - 1) + offset + width
+                    )
+                    result_step = 1
+                elif width == 1:
+                    result_end = (  # pyrefly: ignore[unsupported-operation]
+                        stride * (source_end - 1) + offset + 1
+                    )
+                    result_step = stride
+                else:
+                    return None
+                result_range = ((target_axis, result_begin, result_end, result_step),)
+                if not _target_box_is_unclipped(
+                    result_range,
+                    target_domain=following.target_domain,
+                    source_domain=first.source_domain,
+                    source_bounds=first_piece.source_bounds_items,
+                ):
+                    return None
+                target_ranges.append(result_range[0])
+            pieces.append(
+                _LogicalRelationPiece(
+                    source_bounds_items=first_piece.source_bounds_items,
+                    target_ranges=tuple(target_ranges),
                 )
             )
     return LogicalRelation(
@@ -3261,8 +3505,10 @@ class TileDependencyRelation:
     """One symbolic dependency between execution-scope instance domains.
 
     ``relation`` maps each consumer instance to the producer instances it must
-    observe.  A missing relation means that dependency scheduling must lift to
-    an enclosing scope or family completion.
+    observe.  It may conservatively include producer instances selected only
+    by the access's static address footprint when a runtime mask can remove
+    accesses.  A missing relation means that dependency scheduling must lift
+    to an enclosing scope or family completion.
     """
 
     kind: TileDependencyKind
@@ -3538,10 +3784,16 @@ def _symbolic_coordinate_access_relation(
     allocation_domain: LogicalDomain,
     tensor_dimensions: tuple[int, ...],
 ) -> LogicalRelation | None:
-    """Map one access scope to its exact allocation-coordinate footprint."""
+    """Map one access scope to a safe allocation-coordinate footprint.
+
+    An explicit runtime mask can only remove addresses from the statically
+    indexed footprint.  Retaining that footprint is therefore a conservative
+    synchronization obligation even when it is not the exact runtime access
+    set.  Reaching-definition analysis separately keeps masked writes
+    non-exact, so this does not let them hide an earlier definition.
+    """
     if (
         not access.layout_is_static
-        or access.has_explicit_mask
         or allocation_domain.kind != "allocation"
         or allocation_domain.identity != access.allocation_id
         or allocation_domain.axis_counts_items
@@ -3636,10 +3888,9 @@ def _symbolic_linear_access_relation(
     source_domain: LogicalDomain,
     allocation_domain: LogicalDomain,
 ) -> LogicalRelation | None:
-    """Map a provably contiguous view tile to linear allocation addresses."""
+    """Map a view tile to a conservative linear-address footprint."""
     if (
         not access.layout_is_static
-        or access.has_explicit_mask
         or allocation_domain.kind != "allocation"
         or allocation_domain.identity != access.allocation_id
         or allocation_domain.axis_order != (_ALLOCATION_ADDRESS_AXIS,)
@@ -3737,7 +3988,11 @@ def _symbolic_access_predecessors(
     consumer_access: TileAccess,
     consumer_domain: LogicalDomain,
 ) -> LogicalRelation | None:
-    """Compose two scope-to-allocation maps into exact predecessors."""
+    """Compose two scope-to-allocation maps into proved predecessors.
+
+    The result exactly represents the compiler's synchronization obligation,
+    which may itself conservatively overapproximate a runtime-masked access.
+    """
     if not producer_access.layout_is_static or not consumer_access.layout_is_static:
         return None
     producer_layout = _normalized_coordinate_layout(producer_access)

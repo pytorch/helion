@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import ast
 import linecache
+import os
 from pathlib import Path
+from unittest import mock
 
 import torch
 
@@ -142,7 +144,10 @@ def _persistent_config(bound, args):
     root_ids = bound.host_function.device_ir.grid_block_ids
     w13_n = root_ids[0][-1]
     w2_n = root_ids[2][-1]
-    block_sizes = {w13_n: 16, w2_n: 8}
+    block_sizes = {
+        w13_n: getattr(args, "w13_block_n", 16),
+        w2_n: getattr(args, "w2_block_n", 8),
+    }
     values["block_sizes"] = [
         block_sizes[spec.block_id] for spec in bound.config_spec.block_sizes
     ]
@@ -183,20 +188,31 @@ def _persistent_config(bound, args):
         {w13_reduction: False, w2_reduction: True},
         None,
     )
+    eviction = [""] * len(values["load_eviction_policies"])
+    for index in getattr(args, "evict_first", ()):
+        eviction[index] = "first"
+    for index in getattr(args, "evict_last", ()):
+        eviction[index] = "last"
+    values["load_eviction_policies"] = eviction
     values.update(
         {
-            "num_warps": 1,
+            "num_warps": args.num_warps,
             "num_stages": args.kernel_stages,
             "pid_type": "persistent_blocked",
             "num_sm_multiplier": args.worker_multiplier,
         }
     )
+    if args.maxnreg is not None:
+        values["maxnreg"] = args.maxnreg
+    cross_loop_workers = getattr(args, "cross_loop_workers", None)
+    if cross_loop_workers is not None:
+        values["cross_loop_num_workers"] = cross_loop_workers
     config = helion.Config.from_dict(values)
     bound.config_spec.normalize(config.config)
     return config
 
 
-def _helion_resources(compiled_wrapper):
+def _helion_kernel(compiled_wrapper):
     """Recover the single Triton kernel owned by a compiled Helion wrapper."""
     kernels = []
     for value in compiled_wrapper.__globals__.values():
@@ -206,11 +222,22 @@ def _helion_resources(compiled_wrapper):
         kernels.extend(device_caches[torch.cuda.current_device()][0].values())
     if len(kernels) != 1:
         raise RuntimeError(f"expected one compiled Helion kernel, found {len(kernels)}")
-    kernel = kernels[0]
+    return kernels[0]
+
+
+def _helion_resources(compiled_wrapper):
+    kernel = _helion_kernel(compiled_wrapper)
+    launch_shared = getattr(
+        kernel, "_helion_launch_dynamic_shared_bytes", kernel.metadata.shared
+    )
     return {
         "registers": kernel.n_regs,
         "spills": kernel.n_spills,
-        "shared": kernel.metadata.shared,
+        "shared": launch_shared,
+        "triton_required_shared": kernel.metadata.shared,
+        "resident_blocks_per_sm": getattr(
+            kernel, "_helion_resident_blocks_per_sm", None
+        ),
     }
 
 
@@ -261,6 +288,19 @@ def run(args) -> None:
         return
     compiled = bound.compile_config(config)
     output, gate_up, activation_q, activation_scale = compiled(*kernel_args)
+    if args.artifact_prefix is not None:
+        prefix = args.artifact_prefix.resolve()
+        prefix.parent.mkdir(parents=True, exist_ok=True)
+        prefix.with_suffix(".py").write_text(bound.to_triton_code(config))
+        kernel = _helion_kernel(compiled)
+        for suffix, key in (
+            (".ptx", "ptx"),
+            (".ttir", "ttir"),
+            (".ttgir", "ttgir"),
+            (".ll", "llir"),
+        ):
+            if key in kernel.asm:
+                prefix.with_suffix(suffix).write_text(kernel.asm[key])
 
     _, w13 = compile_config(
         block_fp8_mm,
@@ -301,17 +341,24 @@ def run(args) -> None:
 
     separate_graph, _ = capture(launch_separate)
     if args.profile:
+        profile_graph = (
+            persistent_graph if args.profile_target == "megakernel" else separate_graph
+        )
         for _ in range(args.profile_warmups):
-            persistent_graph.replay()
+            profile_graph.replay()
         torch.cuda.synchronize()
         print("RESOURCES", _helion_resources(compiled), flush=True)
         torch.cuda.cudart().cudaProfilerStart()
         for _ in range(args.profile_replays):
-            persistent_graph.replay()
+            profile_graph.replay()
         torch.cuda.synchronize()
         torch.cuda.cudart().cudaProfilerStop()
         return
     pids = visible_gpu_pids()
+    if not args.allow_busy and (foreign_pids := pids - {os.getpid()}):
+        raise RuntimeError(
+            f"GPU gained foreign compute processes {sorted(foreign_pids)}"
+        )
     timings = benchmark_interleaved(
         {
             "helion_tile_dependency_ffn": persistent_graph.replay,
@@ -336,18 +383,40 @@ def main() -> None:
     parser.add_argument("--batch-replays", type=int, default=10)
     parser.add_argument("--w13-stages", type=int, default=4)
     parser.add_argument("--w13-unroll", type=int, default=2)
+    parser.add_argument("--w13-block-n", type=int, default=16)
     parser.add_argument("--w2-stages", type=int, default=4)
     parser.add_argument("--w2-unroll", type=int, default=4)
+    parser.add_argument("--w2-block-n", type=int, default=8)
     parser.add_argument("--kernel-stages", type=int, default=2)
+    parser.add_argument("--num-warps", type=int, choices=(1, 2, 4, 8), default=1)
+    parser.add_argument("--maxnreg", type=int, choices=(32, 64, 128, 256))
     parser.add_argument("--worker-multiplier", type=int, default=8)
+    parser.add_argument("--cross-loop-workers", type=int)
+    parser.add_argument("--evict-first", type=int, action="append", default=[])
+    parser.add_argument("--evict-last", type=int, action="append", default=[])
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument(
+        "--profile-target",
+        choices=("megakernel", "separate"),
+        default="megakernel",
+    )
     parser.add_argument("--profile-warmups", type=int, default=5)
     parser.add_argument("--profile-replays", type=int, default=1)
     parser.add_argument("--dump-config", action="store_true")
     parser.add_argument("--dump-triton", action="store_true")
+    parser.add_argument("--artifact-prefix", type=Path)
+    parser.add_argument("--disable-local-triggers", action="store_true")
     parser.add_argument("--skip-validation", action="store_true")
     parser.add_argument("--allow-busy", action="store_true")
-    run(parser.parse_args())
+    args = parser.parse_args()
+    if args.disable_local_triggers:
+        with mock.patch(
+            "helion._compiler.cross_loop_scheduler.choose_local_triggers",
+            return_value=(),
+        ):
+            run(args)
+    else:
+        run(args)
 
 
 if __name__ == "__main__":

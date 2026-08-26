@@ -23,6 +23,7 @@ from .cross_loop_scheduler import CROSS_LOOP_NUM_WORKERS_DEFAULT
 from .cross_loop_scheduler import CountedEventPlan
 from .cross_loop_scheduler import EventContribution
 from .cross_loop_scheduler import EventUse
+from .cross_loop_scheduler import TaskStreamSegment
 from .cross_loop_scheduler import build_cross_loop_schedule
 from .cute.cutedsl_compat import emit_pipeline_advance
 from .cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_DEFAULT
@@ -109,111 +110,6 @@ def _clone_opaque_statements(body: list[ast.stmt]) -> list[ast.stmt]:
     cloned = [_clone_stmt(statement) for statement in body]
     if _ast_fingerprint(cloned) != _ast_fingerprint(body):
         raise AssertionError("opaque tile-body cloning changed its computation")
-    return cloned
-
-
-def _clone_opaque_statements_with_loop_rewrite(
-    body: list[ast.stmt],
-    rewrite: Callable[[ast.For], list[ast.stmt] | None],
-) -> list[ast.stmt]:
-    """Clone an opaque body while replacing selected loops."""
-    from .tile_dependency import TILE_DEPENDENCY_SCOPE_ID_ATTR
-
-    def clone(value: object) -> object:
-        if isinstance(value, list):
-            result: list[object] = []
-            for item in value:
-                if (
-                    isinstance(item, ast.For)
-                    and (replacement := rewrite(item)) is not None
-                ):
-                    result.extend(replacement)
-                else:
-                    result.append(clone(item))
-            return result
-        if isinstance(value, tuple):
-            return tuple(clone(item) for item in value)
-        if isinstance(value, ast.AST):
-            fields = {field: clone(getattr(value, field)) for field in value._fields}
-            if isinstance(value, ExtendedAST):
-                cloned = value.copy(**fields)
-            else:
-                cloned = ast.copy_location(type(value)(**fields), value)
-            if (
-                scope_id := getattr(value, TILE_DEPENDENCY_SCOPE_ID_ATTR, None)
-            ) is not None:
-                setattr(cloned, TILE_DEPENDENCY_SCOPE_ID_ATTR, scope_id)
-            return cloned
-        return value
-
-    return cast("list[ast.stmt]", clone(body))
-
-
-def _clone_opaque_statements_with_scope_stages(
-    body: list[ast.stmt],
-    *,
-    scope_id: int,
-    split_iteration_offsets: tuple[int, ...],
-    stage_waits: tuple[tuple[ast.stmt, ...], ...],
-) -> list[ast.stmt]:
-    """Split one stable DeviceIR scope loop and wait before each segment."""
-    from .tile_dependency import tile_dependency_scope_id
-
-    if len(stage_waits) != len(split_iteration_offsets) + 1:
-        raise AssertionError("each scope-loop segment requires one wait")
-    scheduled = False
-
-    def rewrite(loop: ast.For) -> list[ast.stmt] | None:
-        nonlocal scheduled
-        if tile_dependency_scope_id(loop) != scope_id:
-            return None
-        if scheduled:
-            raise AssertionError("one dependency scope must identify one lowered loop")
-        if not isinstance(loop.iter, ast.Call) or len(loop.iter.args) < 2:
-            raise AssertionError("nested scope scheduling requires a range-like loop")
-        begin = ast.unparse(loop.iter.args[0])
-        step = ast.unparse(loop.iter.args[2]) if len(loop.iter.args) >= 3 else "1"
-        split_offsets = tuple(
-            f"({begin}) + ({offset}) * ({step})" for offset in split_iteration_offsets
-        )
-        boundaries = (None, *split_offsets, None)
-        result: list[ast.stmt] = []
-        for index, waits in enumerate(stage_waits):
-            result.extend(_clone_opaque_statements(list(waits)))
-            begin_text = boundaries[index]
-            end_text = boundaries[index + 1]
-            segment_begin = (
-                cast("ast.expr", expr_from_string(begin_text))
-                if begin_text is not None
-                else None
-            )
-            segment_end = (
-                cast("ast.expr", expr_from_string(end_text))
-                if end_text is not None
-                else None
-            )
-            result.append(
-                _clone_opaque_loop_segment(
-                    loop,
-                    begin=segment_begin,
-                    end=segment_end,
-                )
-            )
-        scheduled = True
-        return result
-
-    cloned = _clone_opaque_statements_with_loop_rewrite(body, rewrite)
-    if not scheduled:
-        present_scope_ids = sorted(
-            found_scope_id
-            for statement in body
-            for node in ast.walk(statement)
-            if isinstance(node, ast.For)
-            if (found_scope_id := tile_dependency_scope_id(node)) is not None
-        )
-        raise AssertionError(
-            f"missing dependency scope {scope_id}; found {present_scope_ids}"
-        )
     return cloned
 
 
@@ -373,8 +269,6 @@ _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_N = 6
 _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_K = 7
 _TCGEN05_GROUPED_SELECTED_MAILBOX_GLOBAL_M_START = 8
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from .cute.cute_mma import _Tcgen05SchedPipelinePlan
     from .cute.device_state import CuteTcgen05MatmulPlan
     from .inductor_lowering import CodegenState
@@ -392,6 +286,8 @@ _CROSS_LOOP_COUNTER_DTYPE = torch.uint32
 _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS = (
     _CROSS_LOOP_COUNTER_ALIGNMENT_BYTES // _CROSS_LOOP_COUNTER_DTYPE.itemsize
 )
+_CROSS_LOOP_CLC_MAILBOX_BYTES = 32
+_CROSS_LOOP_CLC_SHARED_BYTES = _CROSS_LOOP_CLC_MAILBOX_BYTES
 
 
 class PIDInfo(NamedTuple):
@@ -587,9 +483,7 @@ class ForEachProgramID(ProgramIDs):
         )
 
         if HostFunction.current().device_ir.implicit_dependency_starts:
-            return self._emit_cross_loop_schedule(
-                base_strategy, device_function, total_expr
-            )
+            return self._emit_cross_loop_schedule(base_strategy, device_function)
 
         # Delegate to helper for phase-split persistent loops
         return self._emit_phase_loops(base_strategy, device_function, total_expr)
@@ -727,21 +621,32 @@ class ForEachProgramID(ProgramIDs):
         self,
         strategy: PersistentProgramIDs,
         device_function: DeviceFunction,
-        total_expr: str,
     ) -> list[ast.stmt]:
-        """Emit monotonic arrival-counter phases without a cooperative launch.
+        """Execute the symbolic cross-loop task stream with SM100 CLC.
 
-        Every physical worker publishes one release arrival.  All workers
-        acquire-poll the same monotonic counter before entering the next phase.
-        The counter target is epoch-scaled, so fixed CUDA Graph arguments need
-        neither a reset kernel nor a host-side epoch update.
+        Keyed release/acquire counters enforce the event DAG. A monotonic
+        ticket cursor supplies dependency-ordered commands and replay epochs
+        without a reset launch.
         """
         static_task_counts = self._static_case_task_counts(device_function)
         if static_task_counts is None:
-            CompileEnvironment.current().has_barrier = True
-            return self._emit_phase_loops(strategy, device_function, total_expr)
+            raise exc.CrossLoopSchedulingError(
+                "cross-loop scheduling requires static logical task domains"
+            )
+        if CompileEnvironment.current().backend.name != "triton":
+            raise exc.BackendUnsupported(
+                CompileEnvironment.current().backend.name,
+                "cross-loop CLC execution requires the Triton backend",
+            )
+        capability = CompileEnvironment.current().config_spec.target_device_capability
+        if capability is None or capability < (10, 0):
+            raise exc.BackendUnsupported(
+                CompileEnvironment.current().backend.name,
+                "cross-loop CLC execution requires an SM100-or-newer GPU",
+            )
+        if cast("int", device_function.config.get("num_ctas", 1)) != 1:
+            raise exc.InvalidConfig("cross-loop CLC execution requires num_ctas=1")
 
-        worker = typed_program_id(0)
         epoch_var = device_function.new_var("tile_dependency_epoch", dce=False)
         base_body = self._prepare_persistent_body(
             cast("list[ast.stmt]", device_function.body),
@@ -768,23 +673,56 @@ class ForEachProgramID(ProgramIDs):
                 and indexing[memory_op_index] == "tensor_descriptor"
             )
 
-        unpublishable_scope_ids = frozenset(
+        unlowerable_scope_ids = frozenset(
             scope_id
             for access in dependency_plan.accesses
             if access.kind == "store" and uses_tensor_descriptor(access.memory_op_index)
             for scope_id in dependency_plan.scope_ids_by_access[access.access_id]
         )
-        publishable_scope_ids = (
-            frozenset(
-                scope.scope_id
-                for scope in dependency_plan.execution_scopes
-                if not scope.is_root and scope.scope_id not in unpublishable_scope_ids
-            )
-            if unpublishable_scope_ids
-            else None
+        from .tile_dependency import TILE_DEPENDENCY_SCOPE_ID_ATTR
+        from .tile_dependency import tile_dependency_scope_id
+
+        loops_by_scope: dict[int, list[ast.For]] = {}
+        for body in case_bodies:
+            for statement in body:
+                for node in ast.walk(statement):
+                    if not isinstance(node, ast.For):
+                        continue
+                    scope_id = tile_dependency_scope_id(node)
+                    if scope_id is not None:
+                        loops_by_scope.setdefault(scope_id, []).append(node)
+        renderable_scope_ids = frozenset(
+            scope.scope_id
+            for scope in dependency_plan.execution_scopes
+            if not scope.is_root
+            and scope.segmentable
+            and len(scope.local_axis_order) == 1
+            and len(loops_by_scope.get(scope.scope_id, ())) == 1
+            for loop in loops_by_scope[scope.scope_id]
+            if isinstance(loop.target, ast.Name)
+            and isinstance(loop.iter, ast.Call)
+            and len(loop.iter.args) >= 2
         )
-        physical_worker_limit = CompileEnvironment.current().config_spec.num_sm * cast(
-            "int", device_function.config.get("num_sm_multiplier", 1)
+
+        def has_renderable_scope_path(scope_id: int) -> bool:
+            parent = dependency_plan.execution_scopes[scope_id].parent_scope_id
+            while parent is not None:
+                parent_scope = dependency_plan.execution_scopes[parent]
+                if parent_scope.is_root:
+                    return True
+                if parent not in renderable_scope_ids:
+                    return False
+                parent = parent_scope.parent_scope_id
+            return False
+
+        lowerable_scope_ids = frozenset(
+            scope_id
+            for scope_id in renderable_scope_ids - unlowerable_scope_ids
+            if has_renderable_scope_path(scope_id)
+        )
+        default_resident_wave_size = (
+            CompileEnvironment.current().config_spec.num_sm
+            * cast("int", device_function.config.get("num_sm_multiplier", 1))
         )
         axis_geometry = {
             block_id: geometry
@@ -814,184 +752,53 @@ class ForEachProgramID(ProgramIDs):
             root_domains=root_domains,
             root_traversals=root_traversals,
             axis_geometry=axis_geometry,
-            preordered_edges=frozenset(),
-            physical_worker_limit=physical_worker_limit,
-            requested_worker_count=cast(
+            default_resident_wave_size=default_resident_wave_size,
+            requested_resident_wave_size=cast(
                 "int",
                 device_function.config.get(
                     CROSS_LOOP_NUM_WORKERS_CONFIG,
                     CROSS_LOOP_NUM_WORKERS_DEFAULT,
                 ),
             ),
-            publishable_scope_ids=publishable_scope_ids,
+            lowerable_scope_ids=lowerable_scope_ids,
         )
-        root_completion_edges = set(cross_loop_schedule.root_completion_edges)
-        family_done_event_plans = tuple(
-            plan
-            for plan in cross_loop_schedule.counted_events
-            if plan.graph_event_index is not None
-            and cross_loop_schedule.event_graph.event(
-                plan.graph_event_index
-            ).is_family_done
-        )
-        nested_scope_event_plans = tuple(
-            plan
-            for plan in cross_loop_schedule.counted_events
-            if any(use.consumer_scope_id is not None for use in plan.uses)
-        )
-        counted_event_plans = tuple(
-            plan
-            for plan in cross_loop_schedule.counted_events
-            if plan not in family_done_event_plans
-            and plan not in nested_scope_event_plans
-        )
-        all_counted_event_plans = (
-            *counted_event_plans,
-            *nested_scope_event_plans,
-        )
-        launch_worker_limit = cross_loop_schedule.worker_limit
-        if launch_worker_limit != physical_worker_limit:
-            strategy.grid_size_expr = str(launch_worker_limit)
+        resident_wave_size = cross_loop_schedule.resident_wave_size
+        strategy.grid_size_expr = str(cross_loop_schedule.task_stream.command_count)
 
-        static_workers_by_root = {
-            root: cross_loop_schedule.worker_schedule.workers_for_root(root)
-            for root in range(len(root_domains))
-        }
-        local_task_count_by_root: dict[int, int] = {}
         for trigger in cross_loop_schedule.local_triggers:
             event = cross_loop_schedule.event_graph.event(trigger.event_index)
             use = event.uses[trigger.use_index]
             if not use.keys.is_total_function():
                 raise AssertionError("a local event must cover its complete root")
-            local_task_count_by_root[use.consumer_root] = use.keys.source_domain.size
 
-        def active_worker_count(root: int) -> int:
-            return len(static_workers_by_root[root])
-
-        def root_completion_arrival_count(root: int) -> int:
-            return active_worker_count(root) + local_task_count_by_root.get(root, 0)
-
-        # Until a smaller progress-critical cohort is proven for a schedule,
-        # require every launched worker to fit concurrently.  This is checked
-        # by the launcher using CUDA's exact occupancy calculation after ptxas.
-        device_function.triton_minimum_resident_programs = strategy.grid_size_expr
-        device_function.preamble.extend(
-            strategy._persistent_setup_statements(total_expr)
+        # Require only the portion of the requested wave that the launch can
+        # actually contain.  Small task streams do not need an otherwise idle
+        # full-device wave to be resident.
+        device_function.triton_minimum_resident_programs = str(
+            min(resident_wave_size, cross_loop_schedule.task_stream.command_count)
         )
         counted_event_offsets: dict[CountedEventPlan, int] = {}
         counted_event_counter_count = 0
         counted_event_key_stride = _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
-        for plan in all_counted_event_plans:
+        for plan in cross_loop_schedule.counted_events:
             counted_event_offsets[plan] = counted_event_counter_count
             counted_event_counter_count += plan.key_count * counted_event_key_stride
-        root_completion_producer_roots = sorted(
-            {producer for producer, _ in root_completion_edges}
-        )
-        root_completion_indices = {
-            root: index for index, root in enumerate(root_completion_producer_roots)
-        }
-        state_count = 0
-
-        def reserve_state(count: int) -> int | None:
-            nonlocal state_count
-            if not count:
-                return None
-            state_count = (
-                (state_count + _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS - 1)
-                // _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
-                * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
-            )
-            offset = state_count
-            state_count += count
-            return offset
-
-        counted_event_state_offset = reserve_state(counted_event_counter_count)
-        root_completion_state_offset = reserve_state(
-            len(root_completion_producer_roots) * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
-        )
-        static_state_base = (
-            f"(({strategy.grid_size_expr} + {_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS - 1}) "
-            f"// {_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}) * "
-            f"{_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}"
-        )
         state_arg = self._register_cross_loop_state(
             device_function,
             name_hint="tile_dependency_state",
-            numel=f"{static_state_base} + {state_count}",
+            numel=str(counted_event_counter_count),
             dtype=_CROSS_LOOP_COUNTER_DTYPE,
         )
+        ticket_arg = self._register_cross_loop_state(
+            device_function,
+            name_hint="tile_dependency_ticket_state",
+            numel="1",
+            dtype=torch.uint64,
+        )
 
-        def state_section(offset: int | None) -> str | None:
-            if offset is None:
-                return None
-            return f"{state_arg} + ({static_state_base}) + {offset}"
+        counted_event_arg = state_arg if counted_event_counter_count else None
 
-        epoch_arg = state_arg
-        counted_event_arg = state_section(counted_event_state_offset)
-        root_completion_counter_arg = state_section(root_completion_state_offset)
-
-        stage_root_ranges = self._cross_loop_stage_root_ranges()
-        result: list[ast.stmt] = [
-            statement_from_string(f"{epoch_var} = tl.load({epoch_arg} + {worker}) + 1")
-        ]
-        consumed_on_ready_roots = {
-            local_use.consumer_root
-            for plan in counted_event_plans
-            if (local_use := plan.local_use) is not None
-        }
-
-        root_completion_incoming: dict[int, tuple[int, ...]] = {
-            consumer: tuple(
-                sorted(
-                    producer
-                    for producer, target in root_completion_edges
-                    if target == consumer
-                )
-            )
-            for consumer in {consumer for _, consumer in root_completion_edges}
-        }
-
-        def root_completion_counter(root: int) -> str:
-            assert root_completion_counter_arg is not None
-            return (
-                f"{root_completion_counter_arg} + "
-                f"{root_completion_indices[root] * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}"
-            )
-
-        def root_completion_dependency(root: int) -> tuple[str, str]:
-            arrivals = root_completion_arrival_count(root)
-            return (
-                root_completion_counter(root),
-                f"tl.cast({epoch_var}, tl.uint32) * tl.cast({arrivals}, tl.uint32)",
-            )
-
-        def root_completion_input_dependencies(
-            root: int,
-        ) -> tuple[tuple[str, str], ...]:
-            producers = root_completion_incoming.get(root, ())
-            return tuple(root_completion_dependency(producer) for producer in producers)
-
-        def root_completion_publication(root: int) -> list[ast.stmt]:
-            if root not in root_completion_indices:
-                return []
-            completion_counter = root_completion_counter(root)
-            arrivals = root_completion_arrival_count(root)
-            result = [self._cross_loop_publication_barrier(device_function)]
-            if arrivals == 1:
-                result.append(
-                    statement_from_string(
-                        f"tl.atomic_xchg({completion_counter}, {epoch_var}, "
-                        "sem='release', scope='gpu')"
-                    )
-                )
-            else:
-                result.append(
-                    statement_from_string(
-                        f"tl.atomic_add({completion_counter}, 1, "
-                        "sem='release', scope='gpu')"
-                    )
-                )
-            return result
+        result: list[ast.stmt] = []
 
         root_physical_axis_order: list[tuple[int, ...]] = []
         root_logical_axis_order: list[tuple[int, ...]] = []
@@ -1004,73 +811,44 @@ class ForEachProgramID(ProgramIDs):
             root_physical_axis_order.append(physical_axis_order)
             root_logical_axis_order.append(domain.axis_order)
             root_axis_counts.append(domain.axis_counts)
-        root_events_by_producer: dict[
-            int,
-            list[
-                tuple[
-                    CountedEventPlan,
-                    EventContribution,
-                ]
-            ],
+        event_publications_by_endpoint: dict[
+            tuple[int, int | None],
+            list[tuple[CountedEventPlan, EventContribution]],
         ] = {}
-        producer_events_by_scope: dict[
-            int,
-            list[
-                tuple[
-                    CountedEventPlan,
-                    EventContribution,
-                ]
-            ],
+        event_waits_by_endpoint: dict[
+            tuple[int, int | None],
+            list[tuple[CountedEventPlan, EventUse]],
         ] = {}
-        for plan in all_counted_event_plans:
+        for plan in cross_loop_schedule.counted_events:
             for contributor in plan.contributors:
-                if contributor.producer_scope_id is None:
-                    root_events_by_producer.setdefault(
-                        contributor.producer_root, []
-                    ).append((plan, contributor))
-                else:
-                    producer_events_by_scope.setdefault(
-                        contributor.producer_scope_id, []
-                    ).append((plan, contributor))
-        nested_producer_roots = {
-            contributor.producer_root
-            for contributions in producer_events_by_scope.values()
-            for _plan, contributor in contributions
+                event_publications_by_endpoint.setdefault(
+                    (contributor.producer_root, contributor.producer_scope_id),
+                    [],
+                ).append((plan, contributor))
+            for use_index, use in enumerate(plan.uses):
+                if use_index == plan.local_trigger_use:
+                    continue
+                event_waits_by_endpoint.setdefault(
+                    (use.consumer_root, use.consumer_scope_id),
+                    [],
+                ).append((plan, use))
+        roots_with_nested_events = frozenset(
+            root
+            for root, scope_id in (
+                event_publications_by_endpoint.keys() | event_waits_by_endpoint.keys()
+            )
+            if scope_id is not None
+        )
+        task_stream_segment_by_root: dict[int, TaskStreamSegment] = {
+            segment.root: segment
+            for segment in cross_loop_schedule.task_stream.segments
         }
         scheduled_task_roots = {
             root
             for root, traversal in enumerate(root_traversals)
-            if any(
-                segment.task_relation != traversal
-                for segment in cross_loop_schedule.worker_schedule.segments_for_root(
-                    root
-                )
-            )
+            if (segment := task_stream_segment_by_root.get(root)) is not None
+            and segment.task_traversal != traversal
         }
-        counted_event_uses_by_waiting_root: dict[
-            int,
-            list[tuple[CountedEventPlan, EventUse]],
-        ] = {}
-        for plan in counted_event_plans:
-            for use_index, use in enumerate(plan.uses):
-                if use_index == plan.local_trigger_use:
-                    continue
-                if use.consumer_scope_id is not None:
-                    continue
-                counted_event_uses_by_waiting_root.setdefault(
-                    use.consumer_root, []
-                ).append((plan, use))
-        nested_scope_events_by_consumer: dict[
-            int,
-            list[tuple[CountedEventPlan, EventUse]],
-        ] = {}
-        for plan in nested_scope_event_plans:
-            for use in plan.uses:
-                if use.consumer_scope_id is None:
-                    continue
-                nested_scope_events_by_consumer.setdefault(
-                    use.consumer_root, []
-                ).append((plan, use))
 
         def flat_task_coordinates(
             task: str,
@@ -1078,10 +856,13 @@ class ForEachProgramID(ProgramIDs):
             counts: dict[int, int],
         ) -> dict[int, str]:
             coordinates: dict[int, str] = {}
+            static_task = int(task) if task.removeprefix("-").isdigit() else None
             multiplier = 1
             for block_id in axis_order:
                 count = counts[block_id]
-                if count == 1:
+                if static_task is not None:
+                    coordinates[block_id] = str((static_task // multiplier) % count)
+                elif count == 1:
                     coordinates[block_id] = "0"
                 elif multiplier == 1:
                     coordinates[block_id] = f"(({task}) % {count})"
@@ -1095,6 +876,13 @@ class ForEachProgramID(ProgramIDs):
             coordinates: dict[int, str],
         ) -> str:
             """Render the restricted logical-relation expression grammar."""
+            substitutions = {
+                logical_axis_symbol(axis): sympy.Integer(coordinate)
+                for axis, coordinate in coordinates.items()
+                if coordinate.removeprefix("-").isdigit()
+            }
+            if substitutions:
+                expression = sympy.simplify(expression.xreplace(substitutions))
             if isinstance(expression, sympy.Integer):
                 return str(int(expression))
             if isinstance(expression, sympy.Symbol):
@@ -1167,10 +955,18 @@ class ForEachProgramID(ProgramIDs):
         def relation_source_membership(
             bounds: tuple[tuple[int, int, int, int], ...],
             coordinates: dict[int, str],
+            domain: LogicalDomain,
         ) -> str:
             conditions: list[str] = []
             for axis, begin, end, step in bounds:
                 coordinate = coordinates[axis]
+                if (begin, end, step) == (0, domain.axis_counts[axis], 1):
+                    continue
+                if coordinate.removeprefix("-").isdigit():
+                    value = int(coordinate)
+                    if not begin <= value < end or (value - begin) % step:
+                        return "False"
+                    continue
                 conditions.extend(
                     (
                         f"({coordinate}) >= {begin}",
@@ -1197,9 +993,13 @@ class ForEachProgramID(ProgramIDs):
                 source_membership = relation_source_membership(
                     piece.source_bounds_items,
                     source_coordinates,
+                    canonical.source_domain,
                 )
+                if source_membership == "False":
+                    continue
                 target_memberships: list[str] = []
                 piece_values: dict[int, str] = {}
+                target_is_in_domain = True
                 for axis, begin, end, step in piece.target_ranges:
                     if (
                         step != 1
@@ -1209,18 +1009,32 @@ class ForEachProgramID(ProgramIDs):
                         raise AssertionError("event relation target is not one point")
                     value = relation_expression(begin, source_coordinates)
                     piece_values[axis] = value
+                    if value.removeprefix("-").isdigit():
+                        target_is_in_domain &= (
+                            0 <= int(value) < canonical.target_domain.axis_counts[axis]
+                        )
+                        continue
                     target_memberships.extend(
                         (
                             f"({value}) >= 0",
                             f"({value}) < {canonical.target_domain.axis_counts[axis]}",
                         )
                     )
-                membership = " and ".join((source_membership, *target_memberships))
+                if not target_is_in_domain:
+                    continue
+                membership_parts = tuple(
+                    part
+                    for part in (source_membership, *target_memberships)
+                    if part != "True"
+                )
+                membership = " and ".join(membership_parts) or "True"
                 memberships.append(membership)
                 for axis, value in piece_values.items():
                     values_by_axis[axis].append((membership, value))
 
             def select(values: list[tuple[str, str]]) -> str:
+                if not values:
+                    return "0"
                 expressions = tuple(
                     dict.fromkeys(value for _membership, value in values)
                 )
@@ -1235,8 +1049,9 @@ class ForEachProgramID(ProgramIDs):
                 {axis: select(values) for axis, values in values_by_axis.items()},
                 (
                     "True"
-                    if canonical.is_total_function()
+                    if canonical.is_total_function() and memberships
                     else " or ".join(f"({membership})" for membership in memberships)
+                    or "False"
                 ),
             )
 
@@ -1255,7 +1070,7 @@ class ForEachProgramID(ProgramIDs):
                 if count != 1:
                     coordinate = target_coordinates[axis]
                     terms.append(
-                        f"({coordinate})"
+                        coordinate
                         if multiplier == 1
                         else f"({coordinate}) * {multiplier}"
                     )
@@ -1389,51 +1204,172 @@ class ForEachProgramID(ProgramIDs):
                 multiplier *= count
             return " + ".join(terms) or "0"
 
-        def body_with_scope_waits(
-            plan: CountedEventPlan,
-            use: EventUse,
+        def body_with_nested_events(
+            root: int,
             body: list[ast.stmt],
-            consumer_coordinates: dict[int, str],
+            root_coordinates: dict[int, str],
         ) -> list[ast.stmt]:
-            assert use.consumer_scope_id is not None
-            domain = cross_loop_schedule.event_graph.scope_domain(use.consumer_scope_id)
-            nested_axes = cross_loop_schedule.event_graph.nested_axes(
-                use.consumer_root,
-                use.consumer_scope_id,
-            )
-            if len(nested_axes) != 1:
-                raise AssertionError(
-                    "nested scope lowering currently requires one loop axis"
+            """Lower all dependency-bearing loops in one bottom-up traversal."""
+            publications_by_scope = {
+                scope_id: tuple(publications)
+                for (producer_root, scope_id), publications in (
+                    event_publications_by_endpoint.items()
                 )
-            (nested_axis,) = nested_axes
-            boundaries = tuple(
-                sorted(
-                    {
-                        boundary
-                        for piece in use.keys.pieces
-                        for axis, begin, end, _step in piece.source_bounds_items
-                        if axis == nested_axis
-                        for boundary in (begin, end)
-                        if 0 < boundary < domain.axis_counts[nested_axis]
+                if producer_root == root and scope_id is not None
+            }
+            waits_by_scope = {
+                scope_id: tuple(waits)
+                for (consumer_root, scope_id), waits in event_waits_by_endpoint.items()
+                if consumer_root == root and scope_id is not None
+            }
+            selected_scope_ids = frozenset(waits_by_scope) | frozenset(
+                publications_by_scope
+            )
+            if not selected_scope_ids:
+                return body
+            lowered_scope_ids: set[int] = set()
+
+            def clone_value(
+                value: object,
+                coordinates: dict[int, str],
+            ) -> object:
+                if isinstance(value, list):
+                    result: list[object] = []
+                    for item in value:
+                        if isinstance(item, ast.For):
+                            result.extend(rewrite_loop(item, coordinates))
+                        else:
+                            result.append(clone_value(item, coordinates))
+                    return result
+                if isinstance(value, tuple):
+                    return tuple(clone_value(item, coordinates) for item in value)
+                if isinstance(value, ast.AST):
+                    fields = {
+                        field: clone_value(getattr(value, field), coordinates)
+                        for field in value._fields
                     }
+                    if isinstance(value, ExtendedAST):
+                        cloned = value.copy(**fields)
+                    else:
+                        cloned = ast.copy_location(type(value)(**fields), value)
+                    scope_id = getattr(
+                        value,
+                        TILE_DEPENDENCY_SCOPE_ID_ATTR,
+                        None,
+                    )
+                    if scope_id is not None:
+                        setattr(cloned, TILE_DEPENDENCY_SCOPE_ID_ATTR, scope_id)
+                    return cloned
+                return value
+
+            def rewrite_loop(
+                loop: ast.For,
+                parent_coordinates: dict[int, str],
+            ) -> list[ast.stmt]:
+                scope_id = tile_dependency_scope_id(loop)
+                loop_coordinates = parent_coordinates
+                if scope_id in renderable_scope_ids:
+                    scope = dependency_plan.execution_scopes[scope_id]
+                    (local_axis,) = scope.local_axis_order
+                    assert isinstance(loop.target, ast.Name)
+                    assert isinstance(loop.iter, ast.Call)
+                    begin = ast.unparse(loop.iter.args[0])
+                    step = (
+                        ast.unparse(loop.iter.args[2])
+                        if len(loop.iter.args) >= 3
+                        else "1"
+                    )
+                    loop_coordinates = {
+                        **parent_coordinates,
+                        local_axis: f"(({loop.target.id}) - ({begin})) // ({step})",
+                    }
+
+                cloned = cast("ast.For", _clone_ast_value(loop))
+                cloned.body = cast(
+                    "list[ast.stmt]",
+                    clone_value(loop.body, loop_coordinates),
                 )
-            )
-            stage_offsets = (0, *boundaries)
-            stage_waits: list[tuple[ast.stmt, ...]] = []
-            for action_offset in stage_offsets:
-                scope_coordinates = {
-                    **consumer_coordinates,
-                    nested_axis: str(action_offset),
-                }
-                event_key, membership = relation_flat_target(
-                    use.keys,
-                    scope_coordinates,
+                cloned.orelse = cast(
+                    "list[ast.stmt]",
+                    clone_value(loop.orelse, parent_coordinates),
                 )
-                if membership == "False":
-                    raise AssertionError("nested scope stage has no event key")
-                stage_waits.append(
-                    tuple(
-                        self._wait_for_counter(
+                if scope_id not in selected_scope_ids:
+                    return [cloned]
+                if scope_id in lowered_scope_ids:
+                    raise AssertionError(
+                        "one dependency scope must identify one lowered loop"
+                    )
+                lowered_scope_ids.add(scope_id)
+                if scope_id not in renderable_scope_ids or cloned.orelse:
+                    raise AssertionError(
+                        "nested scope scheduling requires one plain range-like loop"
+                    )
+
+                publications: list[ast.stmt] = []
+                for plan, contributor in publications_by_scope.get(scope_id, ()):
+                    publication = contributor.producer_to_keys
+                    if publication is None:
+                        raise AssertionError(
+                            "nested event publication relation is unavailable"
+                        )
+                    key, membership = relation_flat_target(
+                        publication,
+                        loop_coordinates,
+                    )
+                    event_publications = emit_counted_event_for_key(plan, key)
+                    if membership == "True":
+                        publications.extend(event_publications)
+                    else:
+                        publications.append(
+                            create(
+                                ast.If,
+                                test=expr_from_string(membership),
+                                body=event_publications,
+                                orelse=[],
+                            )
+                        )
+                if publications:
+                    cloned.body.extend(
+                        [
+                            self._cross_loop_publication_barrier(device_function),
+                            *publications,
+                        ]
+                    )
+
+                scope_uses = waits_by_scope.get(scope_id, ())
+                if not scope_uses:
+                    return [cloned]
+                scope = dependency_plan.execution_scopes[scope_id]
+                (local_axis,) = scope.local_axis_order
+                domain = cross_loop_schedule.event_graph.scope_domain(scope_id)
+                boundaries = tuple(
+                    sorted(
+                        {
+                            boundary
+                            for _plan, use in scope_uses
+                            for piece in use.keys.pieces
+                            for axis, begin, end, _step in piece.source_bounds_items
+                            if axis == local_axis
+                            for boundary in (begin, end)
+                            if 0 < boundary < domain.axis_counts[local_axis]
+                        }
+                    )
+                )
+                stage_waits: list[tuple[ast.stmt, ...]] = []
+                for action_offset in (0, *boundaries):
+                    stage_coordinates = {
+                        **parent_coordinates,
+                        local_axis: str(action_offset),
+                    }
+                    waits: list[ast.stmt] = []
+                    for plan, use in scope_uses:
+                        event_key, membership = relation_flat_target(
+                            use.keys,
+                            stage_coordinates,
+                        )
+                        if membership == "False":
+                            continue
+                        event_waits = self._wait_for_counter(
                             device_function=device_function,
                             counter=counted_event_counter(plan, event_key),
                             target=(
@@ -1442,14 +1378,65 @@ class ForEachProgramID(ProgramIDs):
                             ),
                             prefix="tile_dependency_scope_wait",
                         )
-                    )
+                        if membership == "True":
+                            waits.extend(event_waits)
+                        else:
+                            waits.append(
+                                create(
+                                    ast.If,
+                                    test=expr_from_string(membership),
+                                    body=event_waits,
+                                    orelse=[],
+                                )
+                            )
+                    stage_waits.append(tuple(waits))
+
+                begin = ast.unparse(cloned.iter.args[0])
+                step = (
+                    ast.unparse(cloned.iter.args[2])
+                    if len(cloned.iter.args) >= 3
+                    else "1"
                 )
-            return _clone_opaque_statements_with_scope_stages(
-                body,
-                scope_id=use.consumer_scope_id,
-                split_iteration_offsets=boundaries,
-                stage_waits=tuple(stage_waits),
+                split_offsets = tuple(
+                    f"({begin}) + ({offset}) * ({step})" for offset in boundaries
+                )
+                split_points = (None, *split_offsets, None)
+                segments: list[ast.stmt] = []
+                for index, waits in enumerate(stage_waits):
+                    segments.extend(_clone_opaque_statements(list(waits)))
+                    segment_begin = (
+                        None
+                        if split_points[index] is None
+                        else cast(
+                            "ast.expr",
+                            expr_from_string(split_points[index]),
+                        )
+                    )
+                    segment_end = (
+                        None
+                        if split_points[index + 1] is None
+                        else cast(
+                            "ast.expr",
+                            expr_from_string(split_points[index + 1]),
+                        )
+                    )
+                    segments.append(
+                        _clone_opaque_loop_segment(
+                            cloned,
+                            begin=segment_begin,
+                            end=segment_end,
+                        )
+                    )
+                return segments
+
+            result = cast(
+                "list[ast.stmt]",
+                clone_value(body, root_coordinates),
             )
+            if lowered_scope_ids != selected_scope_ids:
+                missing = sorted(selected_scope_ids - lowered_scope_ids)
+                raise AssertionError(f"missing nested dependency scopes {missing}")
+            return result
 
         def counted_event_counter(plan: CountedEventPlan, key: str) -> str:
             assert counted_event_arg is not None
@@ -1559,7 +1546,7 @@ class ForEachProgramID(ProgramIDs):
                 device_function,
                 root=on_ready_root,
                 logical_pid=consumer_logical_pid,
-                body=body_with_scope_publications(
+                body=body_with_nested_events(
                     on_ready_root,
                     case_bodies[on_ready_root],
                     consumer_coordinates,
@@ -1567,8 +1554,8 @@ class ForEachProgramID(ProgramIDs):
                 extra_argument_names=consumer_extra_arguments,
             )
             consumer_publications: list[ast.stmt] = []
-            for nested_event, nested_contributor in root_events_by_producer.get(
-                on_ready_root, ()
+            for nested_event, nested_contributor in event_publications_by_endpoint.get(
+                (on_ready_root, None), ()
             ):
                 consumer_publications.extend(
                     emit_counted_event_from_producer_coordinates(
@@ -1584,7 +1571,6 @@ class ForEachProgramID(ProgramIDs):
                     self._cross_loop_publication_barrier(device_function)
                 )
                 last_arrival_body.extend(consumer_publications)
-            last_arrival_body.extend(root_completion_publication(on_ready_root))
             expected_arrivals = counted_event_uniform_arrivals(plan)
             if expected_arrivals is None:
                 raise AssertionError("local execution requires uniform event fan-in")
@@ -1594,6 +1580,7 @@ class ForEachProgramID(ProgramIDs):
             return [
                 *assignments,
                 *self._emit_counted_event_on_ready(
+                    device_function=device_function,
                     counter=arrival_counter,
                     epoch=epoch_var,
                     expected_arrivals=expected_arrivals,
@@ -1606,15 +1593,41 @@ class ForEachProgramID(ProgramIDs):
             plan: CountedEventPlan,
             contributor: EventContribution,
             producer_coordinates: dict[int, str],
+            task_stream_coordinates: dict[int, str] | None = None,
         ) -> list[ast.stmt]:
-            publication = contributor.producer_to_keys
-            if publication is None:
-                raise AssertionError("event publication relation is unavailable")
-            key, membership = relation_flat_target(
-                publication,
-                producer_coordinates,
-            )
-            publications = emit_counted_event_for_key(plan, key)
+            segment = task_stream_segment_by_root.get(contributor.producer_root)
+            if (
+                task_stream_coordinates is not None
+                and segment is not None
+                and segment.ordering_partition == contributor.predecessors
+            ):
+                terms: list[str] = []
+                multiplier = 1
+                for axis in plan.key_domain.axis_order:
+                    count = plan.key_domain.axis_counts[axis]
+                    if count != 1:
+                        coordinate = task_stream_coordinates[axis]
+                        terms.append(
+                            coordinate
+                            if multiplier == 1
+                            else f"({coordinate}) * {multiplier}"
+                        )
+                    multiplier *= count
+                key = " + ".join(terms) or "0"
+                membership = "True"
+            else:
+                publication = contributor.producer_to_keys
+                if publication is None:
+                    raise AssertionError("event publication relation is unavailable")
+                key, membership = relation_flat_target(
+                    publication,
+                    producer_coordinates,
+                )
+            event_key = device_function.new_var("tile_dependency_event_key", dce=True)
+            publications = [
+                statement_from_string(f"{event_key} = {key}"),
+                *emit_counted_event_for_key(plan, event_key),
+            ]
             if membership == "True":
                 return publications
             return [
@@ -1626,187 +1639,28 @@ class ForEachProgramID(ProgramIDs):
                 )
             ]
 
-        def body_with_scope_publications(
-            root: int,
-            body: list[ast.stmt],
-            producer_coordinates: dict[int, str],
-        ) -> list[ast.stmt]:
-            """Publish nested scope events without moving the owning strand."""
-            from .tile_dependency import tile_dependency_scope_id
-
-            scope_ids = {
-                scope_id
-                for scope_id, contributions in producer_events_by_scope.items()
-                if any(
-                    contributor.producer_root == root
-                    for _plan, contributor in contributions
-                )
-            }
-            if not scope_ids:
-                return body
-            emitted_scope_ids: set[int] = set()
-
-            def rewrite(loop: ast.For) -> list[ast.stmt] | None:
-                scope_id = tile_dependency_scope_id(loop)
-                if scope_id is None or scope_id not in scope_ids:
-                    return None
-                if scope_id in emitted_scope_ids:
-                    raise AssertionError(
-                        "one dependency scope must identify one lowered loop"
-                    )
-                nested_axes = cross_loop_schedule.event_graph.nested_axes(
-                    root, scope_id
-                )
-                if (
-                    len(nested_axes) != 1
-                    or not isinstance(loop.target, ast.Name)
-                    or not isinstance(loop.iter, ast.Call)
-                    or len(loop.iter.args) < 2
-                ):
-                    raise AssertionError(
-                        "nested scope publication requires one range-like loop axis"
-                    )
-                nested_axis = nested_axes[0]
-                begin = ast.unparse(loop.iter.args[0])
-                step = (
-                    ast.unparse(loop.iter.args[2]) if len(loop.iter.args) >= 3 else "1"
-                )
-                scope_coordinates = {
-                    **producer_coordinates,
-                    nested_axis: f"(({loop.target.id}) - ({begin})) // ({step})",
-                }
-
-                publications: list[ast.stmt] = []
-                for plan, contributor in producer_events_by_scope[scope_id]:
-                    publication = contributor.producer_to_keys
-                    if publication is None:
-                        raise AssertionError(
-                            "nested event publication relation is unavailable"
-                        )
-                    key, membership = relation_flat_target(
-                        publication,
-                        scope_coordinates,
-                    )
-                    event_publications = emit_counted_event_for_key(plan, key)
-                    if membership == "True":
-                        publications.extend(event_publications)
-                    else:
-                        publications.append(
-                            create(
-                                ast.If,
-                                test=expr_from_string(membership),
-                                body=event_publications,
-                                orelse=[],
-                            )
-                        )
-
-                cloned = cast("ast.For", _clone_ast_value(loop))
-                computation = _ast_fingerprint(cloned.body)
-                cloned.body.extend(
-                    [
-                        self._cross_loop_publication_barrier(device_function),
-                        *publications,
-                    ]
-                )
-                if (
-                    _ast_fingerprint(cloned.body[: -len(publications) - 1])
-                    != computation
-                ):
-                    raise AssertionError(
-                        "nested scope publication changed the loop computation"
-                    )
-                emitted_scope_ids.add(scope_id)
-                return [cloned]
-
-            result = _clone_opaque_statements_with_loop_rewrite(body, rewrite)
-            if emitted_scope_ids != scope_ids:
-                missing = sorted(scope_ids - emitted_scope_ids)
-                raise AssertionError(f"missing nested producer scopes {missing}")
-            return result
-
         def scheduled_logical_task_expression(
             root: int,
             schedule_ordinal: str,
-        ) -> str | None:
+        ) -> tuple[str, dict[int, str]] | None:
             """Map one root-local schedule position to its logical task ID."""
             if root not in scheduled_task_roots:
                 return None
-            worker_schedule = cross_loop_schedule.worker_schedule
-            root_domain = root_domains[root]
-            segments = worker_schedule.segments_for_root(root)
-            schedule_interval = worker_schedule.contiguous_global_interval(root)
-            if (
-                schedule_interval is None
-                or schedule_interval[1] - schedule_interval[0] != root_domain.size
-            ):
-                raise AssertionError(
-                    f"root {root} does not occupy one contiguous schedule interval"
-                )
-            schedule_begin = schedule_interval[0]
-
-            expression = ""
-            for segment in reversed(segments):
-                ordinal_begin = segment.schedule_begin - schedule_begin
-                ordinal_delta = f"(({schedule_ordinal}) - {ordinal_begin})"
-                if segment.schedule_period is None:
-                    task_offset = f"({ordinal_delta} // {segment.schedule_step})"
-                    membership = (
-                        f"({ordinal_delta}) >= 0 and "
-                        f"({ordinal_delta} % {segment.schedule_step}) == 0 and "
-                        f"({task_offset}) < {segment.task_count}"
-                    )
-                else:
-                    assert segment.schedule_period_step is not None
-                    within_period = (
-                        f"({ordinal_delta} % {segment.schedule_period_step})"
-                    )
-                    inner = f"({within_period} // {segment.schedule_step})"
-                    task_offset = (
-                        f"({ordinal_delta} // {segment.schedule_period_step}) * "
-                        f"{segment.schedule_period} + {inner}"
-                    )
-                    membership = (
-                        f"({ordinal_delta}) >= 0 and "
-                        f"({within_period} % {segment.schedule_step}) == 0 and "
-                        f"({inner}) < {segment.schedule_period} and "
-                        f"({task_offset}) < {segment.task_count}"
-                    )
-                if segment.task_relation is not None:
-                    ordinal_coordinates = flat_task_coordinates(
-                        task_offset,
-                        segment.task_relation.source_domain.axis_order,
-                        segment.task_relation.source_domain.axis_counts,
-                    )
-                    task_coordinates, relation_membership = relation_point_coordinates(
-                        segment.task_relation,
-                        ordinal_coordinates,
-                    )
-                    if relation_membership != "True":
-                        membership = f"({membership}) and ({relation_membership})"
-                    segment_task = logical_task_from_coordinates(
-                        root,
-                        task_coordinates,
-                    )
-                elif segment.task_period is None:
-                    segment_task = (
-                        f"{segment.task_begin} + ({task_offset}) * {segment.task_step}"
-                    )
-                else:
-                    assert segment.task_period_step is not None
-                    segment_task = (
-                        f"{segment.task_begin} + "
-                        f"(({task_offset}) % {segment.task_period}) * "
-                        f"{segment.task_step} + "
-                        f"(({task_offset}) // {segment.task_period}) * "
-                        f"{segment.task_period_step}"
-                    )
-                if not expression:
-                    expression = segment_task
-                    continue
-                expression = f"tl.where({membership}, {segment_task}, {expression})"
-            if not expression:
-                raise AssertionError(f"root {root} has no static schedule")
-            return expression
+            segment = task_stream_segment_by_root[root]
+            traversal = segment.task_traversal
+            ordinal_coordinates = flat_task_coordinates(
+                schedule_ordinal,
+                traversal.source_domain.axis_order,
+                traversal.source_domain.axis_counts,
+            )
+            task_coordinates, _membership = relation_point_coordinates(
+                traversal,
+                ordinal_coordinates,
+            )
+            return (
+                logical_task_from_coordinates(root, task_coordinates),
+                ordinal_coordinates,
+            )
 
         def task_scheduled_body(
             root: int,
@@ -1817,19 +1671,16 @@ class ForEachProgramID(ProgramIDs):
             force_noinline: bool = False,
         ) -> list[ast.stmt]:
             body: list[ast.stmt] = []
-            has_task_scheduling = root in nested_scope_events_by_consumer
-            producer_events = tuple(root_events_by_producer.get(root, ()))
+            producer_events = tuple(
+                event_publications_by_endpoint.get((root, None), ())
+            )
             scheduled_local_task = local_task
             scheduled_logical_pid = logical_pid
             scheduled_coordinates: dict[int, str] | None = None
-            if producer_events or root in nested_producer_roots:
-                has_task_scheduling = True
-            if (
-                logical_task_expr := scheduled_logical_task_expression(
-                    root,
-                    local_task,
-                )
-            ) is not None:
+            task_stream_coordinates: dict[int, str] | None = None
+            scheduled = scheduled_logical_task_expression(root, local_task)
+            if scheduled is not None:
+                logical_task_expr, task_stream_coordinates = scheduled
                 scheduled_task = device_function.new_var(
                     "tile_dependency_scheduled_logical_task", dce=True
                 )
@@ -1863,8 +1714,7 @@ class ForEachProgramID(ProgramIDs):
             for (
                 incoming_counted_event,
                 incoming_use,
-            ) in counted_event_uses_by_waiting_root.get(root, ()):
-                has_task_scheduling = True
+            ) in event_waits_by_endpoint.get((root, None), ()):
                 assert counted_event_arg is not None
                 event_key, membership = relation_flat_target(
                     incoming_use.keys,
@@ -1893,30 +1743,12 @@ class ForEachProgramID(ProgramIDs):
                     )
                 else:
                     body.extend(wait)
-            nested_event_uses = nested_scope_events_by_consumer.get(root, ())
-            if nested_event_uses:
-                # Instrument the original logical loop before segmentation.
-                # Split ranges then retain the original scope-coordinate
-                # expression instead of rebasing publication IDs per segment.
-                scheduled_root_body = body_with_scope_publications(
-                    root,
-                    case_bodies[root],
-                    scheduled_coordinates,
-                )
-                for scope_plan, scope_use in sorted(
-                    nested_event_uses,
-                    key=lambda item: (
-                        item[1].consumer_scope_id
-                        if item[1].consumer_scope_id is not None
-                        else -1
-                    ),
-                ):
-                    scheduled_root_body = body_with_scope_waits(
-                        scope_plan,
-                        scope_use,
-                        scheduled_root_body,
-                        scheduled_coordinates,
-                    )
+            scheduled_root_body = body_with_nested_events(
+                root,
+                case_bodies[root],
+                scheduled_coordinates,
+            )
+            if root in roots_with_nested_events:
                 opaque_call = self._outline_cross_loop_region(
                     device_function,
                     name_hint=f"tile_dependency_root_{root}",
@@ -1933,30 +1765,22 @@ class ForEachProgramID(ProgramIDs):
                     device_function,
                     root=root,
                     logical_pid=scheduled_logical_pid,
-                    body=body_with_scope_publications(
-                        root,
-                        case_bodies[root],
-                        scheduled_coordinates,
-                    ),
+                    body=scheduled_root_body,
                     extra_argument_names=extra_argument_names,
                     noinline=force_noinline,
                 )
             body.append(opaque_call)
-            publications: list[ast.stmt] = []
-            if publications or producer_events:
-                has_task_scheduling = True
+            if producer_events:
                 body.append(self._cross_loop_publication_barrier(device_function))
-                body.extend(publications)
             for counted_event, contributor in producer_events:
                 body.extend(
                     emit_counted_event_from_producer_coordinates(
                         counted_event,
                         contributor,
                         scheduled_coordinates,
+                        task_stream_coordinates,
                     )
                 )
-            if not has_task_scheduling:
-                return body
             return [
                 self._outline_cross_loop_region(
                     device_function,
@@ -1967,127 +1791,195 @@ class ForEachProgramID(ProgramIDs):
                 )
             ]
 
-        dense_assignment_by_root: dict[int, tuple[int, int, int]] = {}
-        for root, root_domain in enumerate(root_domains):
-            segments = sorted(
-                cross_loop_schedule.worker_schedule.segments_for_root(root),
-                key=lambda segment: segment.schedule_begin,
-            )
-            if not segments:
-                continue
-            if sum(segment.task_count for segment in segments) != root_domain.size:
-                raise exc.CrossLoopSchedulingError(
-                    "partially static task families are not supported yet"
+        if not cross_loop_schedule.task_stream.segments:
+            return result
+        command_count = cross_loop_schedule.task_stream.command_count
+        command = device_function.new_var("tile_dependency_command", dce=False)
+
+        segment_bodies: list[tuple[TaskStreamSegment, list[ast.stmt]]] = []
+        for segment in cross_loop_schedule.task_stream.segments:
+            root = segment.root
+            local_task = f"({command}) - {segment.command_begin}"
+            logical_pid = f"{case_offsets[root]} + ({local_task})"
+            segment_bodies.append(
+                (
+                    segment,
+                    task_scheduled_body(
+                        root,
+                        local_task,
+                        logical_pid,
+                        (command, epoch_var),
+                    ),
                 )
-            worker_begin = segments[0].worker_begin
-            worker_count = segments[0].worker_count
-            if any(
-                segment.worker_begin != worker_begin
-                or segment.worker_count != worker_count
-                or segment.schedule_step != 1
-                or segment.schedule_period is not None
-                for segment in segments
-            ):
-                raise exc.CrossLoopSchedulingError(
-                    f"root {root} has a noncontiguous static worker assignment"
-                )
-            schedule_begin = segments[0].schedule_begin
-            if schedule_begin % worker_count or any(
-                segment.schedule_begin
-                != schedule_begin
-                + sum(previous.task_count for previous in segments[:index])
-                for index, segment in enumerate(segments)
-            ):
-                raise exc.CrossLoopSchedulingError(
-                    f"root {root} has a non-dense static worker schedule"
-                )
-            dense_assignment_by_root[root] = (
-                worker_begin,
-                worker_count,
-                root_domain.size,
             )
 
-        def static_root_body(root: int) -> list[ast.stmt]:
-            if root in consumed_on_ready_roots:
-                return []
-            assignment = dense_assignment_by_root.get(root)
-            if assignment is None:
-                return []
-            worker_begin, worker_count, task_count = assignment
-            task_dispatch: list[ast.stmt]
-            if task_count == 1:
-                task_dispatch = task_scheduled_body(
-                    root,
-                    "0",
-                    str(case_offsets[root]),
-                    (epoch_var,),
-                    force_noinline=True,
-                )
-            else:
-                local_task = f"({strategy.virtual_pid_var}) - {case_offsets[root]}"
-                task_dispatch = [
-                    create(
-                        ast.For,
-                        target=create(
-                            ast.Name,
-                            id=strategy.virtual_pid_var,
-                            ctx=ast.Store(),
-                        ),
-                        iter=expr_from_string(
-                            f"tl.range((({worker}) - {worker_begin}) + "
-                            f"({case_offsets[root]}), "
-                            f"({case_offsets[root] + task_count}), {worker_count})"
-                        ),
-                        body=task_scheduled_body(
-                            root,
-                            local_task,
-                            strategy.virtual_pid_var,
-                            (strategy.virtual_pid_var,),
-                        ),
-                        orelse=[],
-                        type_comment=None,
-                    )
-                ]
-            incoming_roots = root_completion_incoming.get(root, ())
-            publishes_completion = root in root_completion_indices
-            if (
-                worker_begin == 0
-                and worker_count == launch_worker_limit
-                and not incoming_roots
-                and not publishes_completion
-            ):
-                return task_dispatch
-
-            active_body = self._wait_for_dependencies(
-                device_function=device_function,
-                dependencies=root_completion_input_dependencies(root),
-                prefix="tile_dependency_root_completion_wait",
-            )
-            active_body.extend(task_dispatch)
-            if publishes_completion:
-                active_body.extend(root_completion_publication(root))
-            condition = (
-                f"({worker}) == {worker_begin}"
-                if worker_count == 1
-                else (
-                    f"({worker}) >= {worker_begin} and "
-                    f"({worker}) < {worker_begin + worker_count}"
-                )
-            )
+        def balanced_dispatch(
+            choices: list[tuple[TaskStreamSegment, list[ast.stmt]]],
+        ) -> list[ast.stmt]:
+            """Dispatch one valid command with logarithmic branch depth."""
+            if len(choices) == 1:
+                return choices[0][1]
+            midpoint = len(choices) // 2
+            boundary = choices[midpoint][0].command_begin
             return [
                 create(
                     ast.If,
-                    test=expr_from_string(condition),
-                    body=active_body,
-                    orelse=[],
+                    test=expr_from_string(f"({command}) < {boundary}"),
+                    body=balanced_dispatch(choices[:midpoint]),
+                    orelse=balanced_dispatch(choices[midpoint:]),
                 )
             ]
 
-        for root_begin, root_end in stage_root_ranges:
-            for root in range(root_begin, root_end):
-                result.extend(static_root_body(root))
+        dispatch = balanced_dispatch(segment_bodies)
+        ticket = device_function.new_var("tile_dependency_ticket", dce=False)
+        command_claim = [
+            statement_from_string(
+                f"{ticket} = tl.atomic_add({ticket_arg}, 1, sem='relaxed', scope='gpu')"
+            ),
+            statement_from_string(
+                f"{command} = ({ticket} % {command_count}).to(tl.int32)"
+            ),
+            statement_from_string(
+                f"{epoch_var} = ({ticket} // {command_count} + 1).to(tl.uint32)"
+            ),
+        ]
+
+        # A fully resident stream has no cancelable launch tail. It still uses
+        # the same ticket-defined command and epoch spaces, but needs neither a
+        # CLC mailbox nor a persistent steal loop.
+        if command_count <= resident_wave_size:
+            result.extend((*command_claim, *dispatch))
+            if (
+                tuple(_ast_fingerprint(body) for body in case_bodies)
+                != opaque_case_fingerprints
+            ):
+                raise AssertionError(
+                    "tile-dependency lowering mutated an opaque source tile body"
+                )
+            return result
+
+        response = device_function.new_var("tile_dependency_clc_response", dce=False)
+        phase = device_function.new_var("tile_dependency_clc_phase", dce=False)
+        active = device_function.new_var("tile_dependency_clc_active", dce=False)
+        success = device_function.new_var("tile_dependency_clc_success", dce=False)
+        clc_sync = (
+            "bar.warp.sync 0xffffffff;"
+            if cast("int", device_function.config.get("num_warps", 1)) == 1
+            else "bar.sync 0;"
+        )
+        init_asm = f"""{{
+            .reg .pred leader;
+            .reg .b32 response_addr, mbar_addr, thread_id;
+            .shared .align 16 .b8 helion_cross_loop_clc_scratch[{_CROSS_LOOP_CLC_SHARED_BYTES}];
+
+            mov.u32 response_addr, helion_cross_loop_clc_scratch;
+            add.u32 mbar_addr, response_addr, 16;
+            mov.u32 thread_id, %tid.x;
+            setp.eq.u32 leader, thread_id, 0;
+            @leader mbarrier.init.shared::cta.b64 [mbar_addr], 1;
+            {clc_sync}
+            mov.u32 $0, response_addr;
+        }}"""
+        issue_asm = f"""{{
+            .reg .pred leader;
+            .reg .b32 response_addr, mbar_addr, thread_id;
+
+            mov.u32 response_addr, $1;
+            add.u32 mbar_addr, response_addr, 16;
+            mov.u32 thread_id, %tid.x;
+            setp.eq.u32 leader, thread_id, 0;
+            @leader fence.proxy.async.shared::cta;
+            @leader clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.b128 [response_addr], [mbar_addr];
+            @leader mbarrier.arrive.expect_tx.relaxed.cta.shared::cta.b64 _, [mbar_addr], 16;
+            {clc_sync}
+            mov.u32 $0, response_addr;
+        }}"""
+        wait_asm = f"""{{
+            .reg .pred complete, canceled, leader;
+            .reg .b32 response_addr, mbar_addr, success, phase, thread_id;
+            .reg .b128 response_value;
+
+            mov.u32 response_addr, $1;
+            add.u32 mbar_addr, response_addr, 16;
+            mov.u32 phase, $2;
+            mov.u32 thread_id, %tid.x;
+            setp.eq.u32 leader, thread_id, 0;
+            mov.u32 success, 0;
+            @!leader bra HELION_CLC_WAIT_DONE;
+        HELION_CLC_WAIT:
+            mbarrier.try_wait.parity.relaxed.cta.shared.b64 complete, [mbar_addr], phase;
+            @!complete bra HELION_CLC_WAIT;
+        HELION_CLC_WAIT_DONE:
+            {clc_sync}
+            ld.shared.b128 response_value, [response_addr];
+            clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 canceled, response_value;
+            selp.u32 success, 1, 0, canceled;
+            {clc_sync}
+            mov.u32 $0, success;
+        }}"""
+
+        def issue_cancel() -> ast.stmt:
+            return statement_from_string(
+                f"{response} = tl.inline_asm_elementwise("
+                f"asm={issue_asm!r}, constraints='=r,r', "
+                f"args=[{response}], dtype=tl.uint32, "
+                "is_pure=False, pack=1)"
+            )
+
+        result.extend(
+            [
+                statement_from_string(
+                    f"{response} = tl.inline_asm_elementwise("
+                    f"asm={init_asm!r}, constraints='=r', args=[], "
+                    "dtype=tl.uint32, is_pure=False, pack=1)"
+                ),
+                statement_from_string(f"{phase} = tl.full([], 0, tl.uint32)"),
+                statement_from_string(f"{active} = tl.full([], True, tl.int1)"),
+            ]
+        )
+        canceling = f"({command}) < {command_count - resident_wave_size}"
+        before_dispatch = [
+            create(
+                ast.If,
+                test=expr_from_string(canceling),
+                body=[issue_cancel()],
+                orelse=[],
+            )
+        ]
+        wait_and_continue: list[ast.stmt] = [
+            statement_from_string(
+                f"{success} = tl.inline_asm_elementwise("
+                f"asm={wait_asm!r}, constraints='=r,r,r', "
+                f"args=[{response}, {phase}], "
+                "dtype=tl.uint32, "
+                "is_pure=False, pack=1)"
+            ),
+            statement_from_string(f"{phase} = 1 - {phase}"),
+            create(
+                ast.If,
+                test=expr_from_string(f"{success} != 0"),
+                body=[ast.Pass()],
+                orelse=[statement_from_string(f"{active} = False")],
+            ),
+        ]
+        loop_body: list[ast.stmt] = [
+            *command_claim,
+            *before_dispatch,
+            *dispatch,
+            create(
+                ast.If,
+                test=expr_from_string(canceling),
+                body=wait_and_continue,
+                orelse=[statement_from_string(f"{active} = False")],
+            ),
+        ]
         result.append(
-            statement_from_string(f"tl.store({epoch_arg} + {worker}, {epoch_var})")
+            create(
+                ast.While,
+                test=expr_from_string(active),
+                body=loop_body,
+                orelse=[],
+            )
         )
         if (
             tuple(_ast_fingerprint(body) for body in case_bodies)
@@ -2096,18 +1988,6 @@ class ForEachProgramID(ProgramIDs):
             raise AssertionError(
                 "tile-dependency lowering mutated an opaque source tile body"
             )
-        return result
-
-    def _cross_loop_stage_root_ranges(self) -> list[tuple[int, int]]:
-        result: list[tuple[int, int]] = []
-        begin = 0
-        for index in range(1, len(self.case_phases) + 1):
-            if (
-                index == len(self.case_phases)
-                or self.case_phases[index] != self.case_phases[index - 1]
-            ):
-                result.append((begin, index))
-                begin = index
         return result
 
     def _extract_case_bodies(self, base_body: list[ast.stmt]) -> list[list[ast.stmt]]:
@@ -2269,18 +2149,12 @@ class ForEachProgramID(ProgramIDs):
     ) -> list[ast.stmt]:
         value = device_function.new_var(prefix, dce=False)
         sync = device_function.new_var(f"{prefix}_sync", dce=False)
-        load = (
-            "tl.inline_asm_elementwise("
-            "asm='ld.acquire.gpu.global.u32 $0, [$1];', "
-            "constraints='=r,l', "
-            f"args=[{counter}], dtype=tl.uint32, is_pure=False, pack=1)"
-        )
         return [
-            statement_from_string(f"{value} = {load}"),
+            ForEachProgramID._acquire_counter(counter=counter, value=value),
             create(
                 ast.While,
                 test=expr_from_string(f"{value} != ({target})"),
-                body=[statement_from_string(f"{value} = {load}")],
+                body=[ForEachProgramID._acquire_counter(counter=counter, value=value)],
                 orelse=[],
             ),
             statement_from_string(
@@ -2292,27 +2166,9 @@ class ForEachProgramID(ProgramIDs):
         ]
 
     @staticmethod
-    def _wait_for_dependencies(
-        *,
-        device_function: DeviceFunction,
-        dependencies: tuple[tuple[str, str], ...],
-        prefix: str,
-    ) -> list[ast.stmt]:
-        """Emit every acquire wait in one graph-derived dependency set."""
-        return [
-            statement
-            for counter, target in dependencies
-            for statement in ForEachProgramID._wait_for_counter(
-                device_function=device_function,
-                counter=counter,
-                target=target,
-                prefix=prefix,
-            )
-        ]
-
-    @staticmethod
     def _emit_counted_event_on_ready(
         *,
+        device_function: DeviceFunction,
         counter: str,
         epoch: str,
         expected_arrivals: int,
@@ -2320,9 +2176,12 @@ class ForEachProgramID(ProgramIDs):
         on_ready: list[ast.stmt],
     ) -> list[ast.stmt]:
         """Contribute once and run ``on_ready`` for the final arrival."""
+        acquired = device_function.new_var(
+            "tile_dependency_continuation_acquire", dce=False
+        )
         return [
             statement_from_string(
-                f"{previous} = tl.atomic_add({counter}, 1, sem='acq_rel', scope='gpu')"
+                f"{previous} = tl.atomic_add({counter}, 1, sem='release', scope='gpu')"
             ),
             create(
                 ast.If,
@@ -2330,10 +2189,26 @@ class ForEachProgramID(ProgramIDs):
                     f"{previous} == tl.cast({epoch}, tl.uint32) * "
                     f"tl.cast({expected_arrivals}, tl.uint32) - 1"
                 ),
-                body=on_ready,
+                body=[
+                    ForEachProgramID._acquire_counter(
+                        counter=counter,
+                        value=acquired,
+                    ),
+                    *on_ready,
+                ],
                 orelse=[],
             ),
         ]
+
+    @staticmethod
+    def _acquire_counter(*, counter: str, value: str) -> ast.stmt:
+        """Load an event counter with GPU-scope acquire semantics."""
+        return statement_from_string(
+            f"{value} = tl.inline_asm_elementwise("
+            "asm='ld.acquire.gpu.global.u32 $0, [$1];', "
+            "constraints='=r,l', "
+            f"args=[{counter}], dtype=tl.uint32, is_pure=False, pack=1)"
+        )
 
     @staticmethod
     def _cross_loop_publication_barrier(

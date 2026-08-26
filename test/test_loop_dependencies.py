@@ -17,8 +17,6 @@ from helion._compiler.device_function import DeviceFunction
 from helion._compiler.program_id import _ast_fingerprint
 from helion._compiler.program_id import _clone_opaque_loop_segment
 from helion._compiler.program_id import _clone_opaque_statements
-from helion._compiler.program_id import _clone_opaque_statements_with_scope_stages
-from helion._compiler.tile_dependency import TILE_DEPENDENCY_SCOPE_ID_ATTR
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -151,7 +149,7 @@ class TestTileDependencyScheduling(unittest.TestCase):
         self.assertEqual(_ast_fingerprint(cloned), _ast_fingerprint(body))
         self.assertIsNot(cloned[0], body[0])
 
-    def test_tile_dependency_loop_staging_preserves_computation(self) -> None:
+    def test_tile_dependency_loop_segments_preserve_computation(self) -> None:
         loop = ast.parse(
             "for k in tl.range(0, 128, 16):\n"
             "    partial = tl.load(pointer + k)\n"
@@ -164,25 +162,8 @@ class TestTileDependencyScheduling(unittest.TestCase):
         second = _clone_opaque_loop_segment(
             loop, begin=ast.parse("64", mode="eval").body
         )
-        setattr(loop, TILE_DEPENDENCY_SCOPE_ID_ATTR, 7)
-        staged = _clone_opaque_statements_with_scope_stages(
-            [loop],
-            scope_id=7,
-            split_iteration_offsets=(4,),
-            stage_waits=(
-                tuple(ast.parse("first_ready = tl.load(counter)\n").body),
-                tuple(ast.parse("second_ready = tl.load(counter + 1)\n").body),
-            ),
-        )
-
         self.assertEqual(_ast_fingerprint(first.body), computation)
         self.assertEqual(_ast_fingerprint(second.body), computation)
-        self.assertIsInstance(staged[1], ast.For)
-        self.assertIsInstance(staged[3], ast.For)
-        self.assertEqual(_ast_fingerprint(staged[1].body), computation)
-        self.assertEqual(_ast_fingerprint(staged[3].body), computation)
-        self.assertEqual(ast.unparse(staged[0]), "first_ready = tl.load(counter)")
-        self.assertEqual(ast.unparse(staged[2]), "second_ready = tl.load(counter + 1)")
 
     def test_opaque_tile_body_can_be_outlined_without_rewriting(self) -> None:
         device_function = object.__new__(DeviceFunction)
@@ -295,7 +276,9 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
             pid_type="persistent_blocked",
         )
         torch.testing.assert_close(output, (x + 1) * 2)
-        self.assertIn("tile_dependency_root_completion_wait", code)
+        self.assertIn("tile_dependency_root_0_scheduled_task", code)
+        self.assertNotIn("tile_dependency_keyed_event_wait", code)
+        self.assertNotIn("clusterlaunchcontrol.try_cancel", code)
 
     @skipIfRefEager("persistent grid-barrier codegen is unavailable in ref eager mode")
     def test_allocation_graph_tracks_atomics_as_writes(self) -> None:
@@ -350,14 +333,15 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
             num_warps=1,
         )
         torch.testing.assert_close(output, (x + 1) * 2 - 3)
-        self.assertNotIn("tl.atomic_", code)
+        self.assertIn("tile_dependency_ticket = tl.atomic_add", code)
+        self.assertNotIn("tile_dependency_keyed_event_wait", code)
         self.assertIn("tile_dependency_root_1(tmp0, tmp1", code)
         self.assertIn("tile_dependency_root_2(tmp1, out", code)
         self.assertNotIn("tile_dependency_root_completion", code)
         self.assertNotIn("triton_helpers.x_grid_barrier(", code)
 
     @skipIfRefEager("persistent grid-barrier codegen is unavailable in ref eager")
-    def test_dynamic_shape_schedule_uses_safe_phase_fallback(self) -> None:
+    def test_dynamic_shape_cross_loop_schedule_is_rejected(self) -> None:
         x = torch.arange(65, device=DEVICE, dtype=torch.float32)
         bound = dynamic_implicit_tile_dependency_chain.bind((x,))
         host_function = bound.host_function
@@ -368,16 +352,17 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         self.assertTrue(
             all(not access.layout_is_static for access in dependency_plan.accesses)
         )
-        code, output = code_and_output(
-            dynamic_implicit_tile_dependency_chain,
-            (x,),
-            block_sizes=[16, 32],
-            pid_type="persistent_blocked",
-            num_warps=1,
-        )
-        torch.testing.assert_close(output, (x + 1) * 2)
-        self.assertIn("triton_helpers.x_grid_barrier(", code)
-        self.assertIn("launch_cooperative_grid=True", code)
+        with pytest.raises(
+            exc.CrossLoopSchedulingError,
+            match="requires static logical task domains",
+        ):
+            code_and_output(
+                dynamic_implicit_tile_dependency_chain,
+                (x,),
+                block_sizes=[16, 32],
+                pid_type="persistent_blocked",
+                num_warps=1,
+            )
 
     @skipIfRefEager("persistent tile-dependency codegen is unavailable in ref eager")
     def test_matmul_chain_allows_reused_accumulator_name(self) -> None:
@@ -418,7 +403,7 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(output, a, atol=0, rtol=0)
         self.assertIn("b_desc = tl.make_tensor_descriptor", code)
-        self.assertIn("def tile_dependency_root_0(a, tmp, b_desc):", code)
+        self.assertIn("def tile_dependency_root_0(a, tmp, b_desc", code)
 
 
 @onlyBackends(["cute"])

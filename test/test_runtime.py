@@ -9,6 +9,7 @@ import torch
 
 import helion.runtime
 from helion.runtime.triton.launcher import _get_persistent_state
+from helion.runtime.triton.launcher import _select_residency_shared_memory
 from helion.runtime.triton.launcher import default_launcher as triton_default_launcher
 
 
@@ -46,6 +47,34 @@ class TestRuntimeGetNumSm(unittest.TestCase):
 
 
 class TestTritonLauncher(unittest.TestCase):
+    def test_residency_shared_memory_selects_exact_target(self) -> None:
+        def occupancy(shared: int) -> int:
+            if shared < 64:
+                return 8
+            if shared < 128:
+                return 6
+            return 4
+
+        self.assertEqual(
+            _select_residency_shared_memory(32, 160, 6, occupancy),
+            (64, 6),
+        )
+
+    def test_residency_shared_memory_keeps_nearest_higher_occupancy(self) -> None:
+        def occupancy(shared: int) -> int:
+            return 8 if shared < 64 else 4
+
+        self.assertEqual(
+            _select_residency_shared_memory(32, 160, 6, occupancy),
+            (32, 8),
+        )
+
+    def test_residency_shared_memory_does_not_reduce_base_occupancy(self) -> None:
+        self.assertEqual(
+            _select_residency_shared_memory(32, 160, 6, lambda _shared: 4),
+            (32, 4),
+        )
+
     def test_residency_check_uses_exact_compiled_specialization(self) -> None:
         compiled_kernel = object()
         calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
@@ -59,7 +88,7 @@ class TestTritonLauncher(unittest.TestCase):
 
         argument = object()
         with patch(
-            "helion.runtime.triton.launcher._validate_resident_program_capacity"
+            "helion.runtime.triton.launcher._configure_resident_program_capacity"
         ) as validate:
             result = triton_default_launcher(
                 FakeJITFunction(),
@@ -92,6 +121,7 @@ class TestTritonLauncher(unittest.TestCase):
             (argument,),
             num_warps=2,
             required_programs=7,
+            grid_programs=8,
         )
 
 

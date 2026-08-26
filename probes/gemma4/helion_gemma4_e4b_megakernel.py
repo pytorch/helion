@@ -51,7 +51,7 @@ def post_ff_residual_tiled(
     m, hidden = down.size()
     hl.specialize(hidden)
     output = torch.empty_like(down)
-    for tile_m, tile_n in hl.tile([m, hidden], block_size=[1, 1024]):
+    for tile_m, tile_n in hl.tile([m, hidden], block_size=[1, 256]):
         values = down[tile_m, :].to(torch.float32)
         inv_rms = torch.rsqrt(torch.mean(values * values, dim=-1) + eps)
         output_values = down[tile_m, tile_n].to(torch.float32)
@@ -510,7 +510,7 @@ def _megakernel_config(bound, args, geometry):
             3: q_projection["block_sizes"][0],
             4: q_projection["block_sizes"][1],
             6: 1,
-            10: 4,
+            10: args.attention_heads,
             12: min(
                 args.attention_block,
                 geometry.attention_context
@@ -526,13 +526,13 @@ def _megakernel_config(bound, args, geometry):
                 if geometry.layer_type == "full"
                 else args.sliding_splits
             ),
-            17: o_projection["block_sizes"][0],
-            18: o_projection["block_sizes"][1],
+            17: args.o_block_n or o_projection["block_sizes"][0],
+            18: args.o_block_k or o_projection["block_sizes"][1],
             21: gate_projection["block_sizes"][0],
             22: gate_projection["block_sizes"][1],
             24: 256,
-            26: down_projection["block_sizes"][0],
-            27: down_projection["block_sizes"][1],
+            26: args.down_block_n or down_projection["block_sizes"][0],
+            27: args.down_block_k or down_projection["block_sizes"][1],
             31: ple_gate["block_sizes"][0],
             32: ple_gate["block_sizes"][1],
             34: 32,
@@ -609,13 +609,13 @@ def _megakernel_config(bound, args, geometry):
             fused_block_sizes = {
                 3: 8,
                 4: 256,
-                17: 16,
-                18: 512,
+                17: args.o_block_n or 16,
+                18: args.o_block_k or 512,
                 21: 32,
                 22: 256,
                 24: 256,
-                26: 16,
-                27: 512,
+                26: args.down_block_n or 16,
+                27: args.down_block_k or 512,
                 31: 2,
                 32: 256,
                 34: 32,
@@ -696,10 +696,17 @@ def _helion_resources(compiled_wrapper):
     if len(kernels) != 1:
         raise RuntimeError(f"expected one compiled Helion kernel, found {len(kernels)}")
     kernel = kernels[0]
+    launch_shared = getattr(
+        kernel, "_helion_launch_dynamic_shared_bytes", kernel.metadata.shared
+    )
     return {
         "registers": kernel.n_regs,
         "spills": kernel.n_spills,
-        "shared": kernel.metadata.shared,
+        "shared": launch_shared,
+        "triton_required_shared": kernel.metadata.shared,
+        "resident_blocks_per_sm": getattr(
+            kernel, "_helion_resident_blocks_per_sm", None
+        ),
     }
 
 
@@ -846,6 +853,19 @@ def run(args) -> None:
     separate_graph.replay()
     torch.cuda.synchronize()
     _assert_close("separate_graph_output", separate_output, reference["output"])
+    if args.profile:
+        graph = (
+            megakernel_graph if args.profile_target == "megakernel" else separate_graph
+        )
+        for _ in range(args.profile_warmups):
+            graph.replay()
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStart()
+        for _ in range(args.profile_replays):
+            graph.replay()
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStop()
+        return
     pids = visible_gpu_pids()
     timings = benchmark_interleaved(
         {
@@ -883,6 +903,11 @@ def main() -> None:
     parser.add_argument("--sliding-splits", type=int, default=16)
     parser.add_argument("--full-splits", type=int, default=64)
     parser.add_argument("--attention-block", type=int, default=32)
+    parser.add_argument("--attention-heads", type=int, default=4)
+    parser.add_argument("--o-block-n", type=int)
+    parser.add_argument("--o-block-k", type=int)
+    parser.add_argument("--down-block-n", type=int)
+    parser.add_argument("--down-block-k", type=int)
     parser.add_argument("--worker-multiplier", type=int, default=2)
     parser.add_argument("--cross-loop-workers", type=int)
     parser.add_argument("--num-warps", type=int)
@@ -900,6 +925,14 @@ def main() -> None:
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--timing-only", action="store_true")
+    parser.add_argument("--profile", action="store_true")
+    parser.add_argument(
+        "--profile-target",
+        choices=("megakernel", "separate"),
+        default="megakernel",
+    )
+    parser.add_argument("--profile-warmups", type=int, default=5)
+    parser.add_argument("--profile-replays", type=int, default=1)
     parser.add_argument("--print-source", action="store_true")
     parser.add_argument("--print-lowered", action="store_true")
     parser.add_argument("--dump-config", action="store_true")
