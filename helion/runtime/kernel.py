@@ -271,6 +271,14 @@ class _PreparedCall:
             or kernel._key_fn is not None
         ):
             return None
+        # A prepared call only matches while every tensor argument keeps an identical
+        # dtype, shape, stride and device, so an extractor that reads only those
+        # properties cannot change under it and does not need rechecking per launch.
+        extra_guards = tuple(
+            (extractor, expected)
+            for extractor, expected in extra_guards
+            if not getattr(extractor, "_helion_prepared_implied", False)
+        )
         # The caller already obtained a non-None ``_fast_dispatch_key``, which
         # proves every argument has an exact supported type.
         try:
@@ -2267,6 +2275,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                             )
                         return cast("torch.Tensor", result).size(_index)
 
+                    size_extractor._helion_prepared_implied = True  # pyrefly: ignore
                     return size_extractor
                 if v.prop == TensorProperty.STRIDE:
 
@@ -2283,6 +2292,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                             )
                         return cast("torch.Tensor", result).stride(_index)
 
+                    stride_extractor._helion_prepared_implied = True  # pyrefly: ignore
                     return stride_extractor
                 raise exc.SpecializeArgType(v)
             if isinstance(v, GetItemSource):
@@ -2353,6 +2363,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     _element_size,
                 )
 
+            td_layout_extractor._helion_prepared_implied = True  # pyrefly: ignore
             extractors.append(td_layout_extractor)
         return extractors
 
