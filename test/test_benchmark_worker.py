@@ -16,6 +16,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from types import ModuleType
 from types import SimpleNamespace
@@ -44,10 +45,12 @@ from helion.autotuner.benchmark_job import BenchmarkJob
 from helion.autotuner.benchmark_provider import BenchmarkResult
 from helion.autotuner.benchmark_provider import IsolatedBenchmarkFailure
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
+from helion.autotuner.benchmark_provider import MultiShapeBenchmarkProvider
 from helion.autotuner.benchmark_worker import BenchmarkSubprocessError
 from helion.autotuner.benchmark_worker import BenchmarkTimeout
 from helion.autotuner.benchmark_worker import BenchmarkWorker
 from helion.autotuner.benchmark_worker import BenchmarkWorkerDied
+from helion.autotuner.benchmark_worker import BenchmarkWorkerUnkillable
 from helion.autotuner.benchmarking import _estimate_runtime_and_warmup
 from helion.autotuner.benchmarking import do_bench
 from helion.autotuner.benchmarking import do_bench_generic
@@ -737,6 +740,67 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         self.assertEqual(provider._autotune_metrics.num_compile_failures, 0)
         run_job.assert_called_once()
 
+    def test_unkillable_worker_aborts_subprocess_benchmark(self) -> None:
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.config_spec = SimpleNamespace(
+            compiler_seed_timeout_retry_repetitions=None
+        )
+        provider.log = Mock()
+        provider._autotune_metrics = AutotuneMetrics()
+        provider._worker_failure_config_ids = []
+
+        with (
+            patch.object(
+                provider,
+                "_run_subprocess_benchmark_job",
+                side_effect=BenchmarkWorkerUnkillable("worker remained alive"),
+            ),
+            self.assertRaisesRegex(BenchmarkWorkerUnkillable, "remained alive"),
+        ):
+            provider._benchmark_function_subprocess(
+                Config(), cast("CompiledConfig", object())
+            )
+
+        self.assertEqual(provider._autotune_metrics.num_worker_failures, 0)
+
+    def test_unkillable_worker_aborts_subprocess_accuracy_check(self) -> None:
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.settings = Settings(autotune_accuracy_check=True)
+        provider.config_spec = SimpleNamespace(
+            compiler_seed_timeout_retry_repetitions=None
+        )
+        provider.log = Mock()
+        provider._autotune_metrics = AutotuneMetrics()
+        provider._worker_failure_config_ids = []
+
+        with (
+            patch.object(provider, "_run_subprocess_benchmark_job", return_value=1.0),
+            patch.object(
+                provider,
+                "_run_subprocess_accuracy_check_job",
+                side_effect=BenchmarkWorkerUnkillable("worker remained alive"),
+            ),
+            self.assertRaisesRegex(BenchmarkWorkerUnkillable, "remained alive"),
+        ):
+            provider._benchmark_function_subprocess(
+                Config(), cast("CompiledConfig", object())
+            )
+
+        self.assertEqual(provider._autotune_metrics.num_worker_failures, 0)
+
+    def test_unkillable_worker_is_not_skippable_for_multi_shape(self) -> None:
+        child = SimpleNamespace(
+            config_spec=SimpleNamespace(backend=None),
+            settings=SimpleNamespace(autotune_ignore_errors=True),
+        )
+
+        self.assertFalse(
+            MultiShapeBenchmarkProvider._is_skippable_child_failure(
+                cast("LocalBenchmarkProvider", child),
+                BenchmarkWorkerUnkillable("worker remained alive"),
+            )
+        )
+
     def test_compiler_seed_timeout_retries_with_three_repetitions(self) -> None:
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         provider.settings = Settings(autotune_accuracy_check=False)
@@ -1102,6 +1166,174 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         finally:
             worker.shutdown()
 
+    def test_timeout_with_unkillable_worker_prevents_respawn(self) -> None:
+        worker = BenchmarkWorker()
+        process = Mock(pid=123)
+        process.is_alive.return_value = True
+        connection = Mock()
+        kill_started = threading.Event()
+
+        def poll_until_watchdog_runs(timeout: float) -> bool:
+            self.assertTrue(kill_started.wait(timeout=1.0))
+            return False
+
+        connection.poll.side_effect = poll_until_watchdog_runs
+        worker._process = process
+        worker._parent_connection = connection
+
+        with (
+            patch(
+                "helion.autotuner.benchmark_worker.signal_process_tree",
+                side_effect=lambda *_args: kill_started.set(),
+            ) as signal_tree,
+            self.assertRaisesRegex(
+                BenchmarkWorkerUnkillable,
+                "refusing to launch another worker",
+            ),
+        ):
+            worker.run(_ReturnValue(7), timeout=0.01)
+
+        signal_tree.assert_called_once_with(process, signal.SIGKILL)
+        process.join.assert_called_once_with(timeout=5)
+        connection.close.assert_called_once_with()
+        self.assertIs(worker._process, process)
+        self.assertIs(worker._parent_connection, connection)
+
+        with (
+            patch.object(worker, "_start") as start,
+            self.assertRaises(BenchmarkWorkerUnkillable),
+        ):
+            worker.run(_ReturnValue(8), timeout=30.0)
+        start.assert_not_called()
+
+    def test_watchdog_claim_cannot_race_successful_completion(self) -> None:
+        worker = BenchmarkWorker()
+        process = Mock(pid=123)
+        process.is_alive.side_effect = (True, False)
+        connection = Mock()
+        event_type = threading.Event
+        watchdog_checked_done = event_type()
+        release_watchdog = event_type()
+
+        class PausingDoneEvent:
+            def __init__(self) -> None:
+                self._event = event_type()
+
+            def is_set(self) -> bool:
+                result = self._event.is_set()
+                if not result:
+                    watchdog_checked_done.set()
+                    self.assert_released()
+                return result
+
+            def assert_released(self) -> None:
+                if not release_watchdog.wait(timeout=2.0):
+                    raise AssertionError("watchdog release timed out")
+
+            def set(self) -> None:
+                self._event.set()
+
+        timeout_event = event_type()
+        done_event = PausingDoneEvent()
+        event_calls = 0
+
+        def event_factory():
+            nonlocal event_calls
+            event_calls += 1
+            if event_calls == 1:
+                return timeout_event
+            if event_calls == 2:
+                return done_event
+            return event_type()
+
+        def receive_after_watchdog_check() -> int:
+            if not watchdog_checked_done.wait(timeout=2.0):
+                raise AssertionError("watchdog did not inspect completion state")
+            return 7
+
+        connection.poll.return_value = True
+        connection.recv.side_effect = receive_after_watchdog_check
+        worker._process = process
+        worker._parent_connection = connection
+        outcome: dict[str, object] = {}
+
+        def run_worker() -> None:
+            try:
+                outcome["result"] = worker.run(_ReturnValue(7), timeout=0.01)
+            except BaseException as error:
+                outcome["error"] = error
+
+        runner = threading.Thread(target=run_worker)
+        with (
+            patch(
+                "helion.autotuner.benchmark_worker.threading.Event",
+                side_effect=event_factory,
+            ),
+            patch("helion.autotuner.benchmark_worker.signal_process_tree"),
+        ):
+            runner.start()
+            self.assertTrue(watchdog_checked_done.wait(timeout=2.0))
+            runner.join(timeout=0.1)
+            self.assertTrue(runner.is_alive())
+            release_watchdog.set()
+            runner.join(timeout=2.0)
+
+        self.assertFalse(runner.is_alive())
+        self.assertNotIn("result", outcome)
+        self.assertIsInstance(outcome.get("error"), BenchmarkTimeout)
+
+    def test_shutdown_surfaces_unkillable_worker(self) -> None:
+        worker = BenchmarkWorker()
+        process = Mock(pid=123)
+        process.is_alive.side_effect = (True, True)
+        connection = Mock()
+        worker._process = process
+        worker._parent_connection = connection
+
+        with (
+            patch("helion.autotuner.benchmark_worker.signal_process_tree"),
+            self.assertRaisesRegex(
+                BenchmarkWorkerUnkillable,
+                "refusing to launch another worker",
+            ),
+        ):
+            worker.shutdown()
+
+        self.assertIs(worker._process, process)
+        self.assertIs(worker._parent_connection, connection)
+
+    def test_provider_cleanup_retains_unkillable_worker(self) -> None:
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        worker = Mock()
+        worker.shutdown.side_effect = BenchmarkWorkerUnkillable("worker remained alive")
+        provider._benchmark_worker = worker
+
+        with self.assertRaisesRegex(BenchmarkWorkerUnkillable, "remained alive"):
+            provider.cleanup()
+
+        self.assertIs(provider._benchmark_worker, worker)
+
+    def test_multi_shape_cleanup_attempts_every_child(self) -> None:
+        provider = MultiShapeBenchmarkProvider.__new__(MultiShapeBenchmarkProvider)
+        first = Mock()
+        second = Mock()
+        first.cleanup.side_effect = BenchmarkWorkerUnkillable("worker remained alive")
+        second.cleanup.side_effect = OSError("ordinary cleanup failure")
+        provider.children = [first, second]
+        provider._original_configs_by_materialized_key = {"a": []}
+        provider._anchor_fns_by_materialized_key = {"a": Mock()}
+        provider._effective_source_repairs = {Config(): Mock()}
+        provider.budget_exceeded_fn = Mock()
+
+        with self.assertRaisesRegex(BenchmarkWorkerUnkillable, "remained alive"):
+            provider.cleanup()
+
+        second.cleanup.assert_called_once_with()
+        first.cleanup.assert_called_once_with()
+        self.assertEqual(provider._original_configs_by_materialized_key, {})
+        self.assertEqual(provider._anchor_fns_by_materialized_key, {})
+        self.assertEqual(provider._effective_source_repairs, {})
+
     def test_timeout_kills_worker_process_group(self) -> None:
         worker = BenchmarkWorker()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1182,6 +1414,31 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
 
 
 class TestSuspiciousRebenchmark(unittest.TestCase):
+    def test_isolated_unkillable_worker_is_fatal(self) -> None:
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.settings = Settings(autotune_benchmark_subprocess=True)
+        provider.log = Mock()
+        provider._autotune_metrics = AutotuneMetrics()
+
+        with (
+            patch.object(provider, "_subprocess_benchmark_enabled", return_value=True),
+            patch.object(
+                provider,
+                "_run_subprocess_benchmark_job",
+                side_effect=BenchmarkWorkerUnkillable("worker remained alive"),
+            ),
+            self.assertRaisesRegex(BenchmarkWorkerUnkillable, "remained alive"),
+        ):
+            provider.benchmark_isolated(
+                [cast("CompiledConfig", object())],
+                warmup=1,
+                rep=100,
+            )
+
+        self.assertEqual(
+            provider._autotune_metrics.num_isolated_rebenchmark_timeouts, 0
+        )
+
     def test_isolated_timeout_is_distinct_from_unavailable_timing(self) -> None:
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         provider.settings = Settings(autotune_benchmark_subprocess=True)

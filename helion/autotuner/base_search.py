@@ -45,9 +45,11 @@ from .benchmark_provider import MultiShapeBenchmarkProvider
 from .benchmark_provider import _clone_args
 from .benchmark_provider import _MultiShapeAutotuneArgs
 from .benchmark_provider import _unset_fn
+from .benchmarking import MirroredBenchmarkTrace
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
 from .benchmarking import interleaved_bench
+from .benchmarking import mirrored_bench_generic
 from .logger import AutotuningLogger
 from .metrics import AutotuneMetrics
 from .metrics import KernelMetadata
@@ -1258,6 +1260,7 @@ class PopulationBasedSearch(BaseSearch):
         self._compiler_seed_members: list[PopulationMember] = []
         self._best_available_seed_configs: list[Config] = []
         self._selected_member: PopulationMember | None = None
+        self._terminal_refinement_members: dict[Config, PopulationMember] | None = None
         self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
             overrides=self.settings.autotune_config_overrides or None,
             advanced_controls_files=self.settings.autotune_search_acf or None,
@@ -1602,6 +1605,7 @@ class PopulationBasedSearch(BaseSearch):
             *self._compiler_seed_members,
             *self._benchmarked_members.values(),
             *self._pinned_finalist_members.values(),
+            *(getattr(self, "_terminal_refinement_members", None) or {}).values(),
         ]
         seen: set[int] = set()
         for member in candidates:
@@ -1625,6 +1629,9 @@ class PopulationBasedSearch(BaseSearch):
 
     def _record_benchmarked_member(self, member: PopulationMember) -> None:
         """Keep successful benchmarked members available for final verification."""
+        terminal_members = getattr(self, "_terminal_refinement_members", None)
+        if terminal_members is not None:
+            self._record_terminal_refinement_member(terminal_members, member)
         if not member.perfs or not math.isfinite(member.perf):
             return
         if member.config in self._pinned_finalist_configs:
@@ -1638,6 +1645,31 @@ class PopulationBasedSearch(BaseSearch):
             self._benchmarked_members, member.config, member
         )
         self._prune_benchmarked_members(top_k)
+
+    def _record_terminal_refinement_member(
+        self,
+        target: dict[Config, PopulationMember],
+        member: PopulationMember,
+    ) -> None:
+        """Refresh terminal history without replacing a reusable result by failure."""
+        existing = target.get(member.config)
+
+        def reusable(candidate: PopulationMember | None) -> bool:
+            return bool(
+                candidate is not None
+                and candidate.status in {"ok", "deduplicated"}
+                and candidate.perfs
+                and math.isfinite(candidate.perf)
+            )
+
+        if reusable(existing) and not reusable(member):
+            return
+        self._record_best_member_for_config(
+            target,
+            member.config,
+            member,
+            replace=True,
+        )
 
     def _record_best_member_for_config(
         self,
@@ -1703,6 +1735,11 @@ class PopulationBasedSearch(BaseSearch):
         A failed duplicate retains the last successful snapshot for final checking,
         unless source quarantine has invalidated that snapshot too.
         """
+        terminal_members = getattr(self, "_terminal_refinement_members", None)
+        if terminal_members is not None:
+            for member in members:
+                self._record_terminal_refinement_member(terminal_members, member)
+
         benchmarked_members = getattr(self, "_benchmarked_members", None)
         pinned_configs = getattr(self, "_pinned_finalist_configs", None)
         pinned_members = getattr(self, "_pinned_finalist_members", None)
@@ -1730,6 +1767,12 @@ class PopulationBasedSearch(BaseSearch):
 
         for config in refreshed_configs:
             member = finite_members.get(config)
+            if member is None and use_verified_history and terminal_members is not None:
+                # The higher-effort rebenchmark invalidated every fresh sample
+                # for this config; drop any older ok snapshot so terminal
+                # refinement re-measures the config instead of resurrecting a
+                # quarantined result.
+                terminal_members.pop(config, None)
             if config in pinned_configs and member is not None:
                 self._record_best_member_for_config(
                     pinned_members,
@@ -2180,6 +2223,67 @@ class PopulationBasedSearch(BaseSearch):
             failure_statuses=failure_statuses,
         )
 
+    def mirrored_rebenchmark(
+        self,
+        members: list[PopulationMember],
+        *,
+        desc: str,
+        target_ms: float = _REBENCHMARK_TARGET_MS_DEFAULT,
+    ) -> MirroredBenchmarkTrace:
+        """Rebenchmark candidates with deterministic mirrored wall-time sweeps."""
+        if len(members) < 2:
+            return MirroredBenchmarkTrace([], [], [member.perf for member in members])
+        if isinstance(self.benchmark_provider, MultiShapeBenchmarkProvider):
+            raise exc.AutotuneError(
+                "mirrored terminal refinement does not support multi-shape benchmarking"
+            )
+        if self.settings.autotune_benchmark_fn is not None:
+            raise exc.AutotuneError(
+                "mirrored terminal refinement requires the default benchmark function"
+            )
+
+        repeat_reference_perf_ms = self._repeat_reference_perf(members)
+        repeat = self._repeat_for_target_ms(target_ms, repeat_reference_perf_ms)
+        if (capstr := os.getenv("HELION_CAP_REBENCHMARK_REPEAT")) is not None:
+            repeat = min(repeat, int(capstr))
+            repeat = max(2, repeat - repeat % 2)
+        else:
+            repeat = max(2, repeat + repeat % 2)
+
+        if self.benchmark_provider.mutated_arg_indices:
+            benchmark_args = _clone_args(
+                self.args,
+                self.kernel.env.process_group_name,
+                idx_to_clone=self.benchmark_provider.mutated_arg_indices,
+            )
+        else:
+            benchmark_args = self.args
+
+        def after_call(index: int) -> None:
+            clear_jit_fast_path_caches(members[index].fn, self.log)
+
+        try:
+            trace = mirrored_bench_generic(
+                [functools.partial(member.fn, *benchmark_args) for member in members],
+                repeat=repeat,
+                desc=desc if self.settings.autotune_progress_bar else None,
+                after_call=after_call,
+            )
+            trace = dataclasses.replace(
+                trace,
+                target_ms=target_ms,
+                repeat_reference_perf_ms=repeat_reference_perf_ms,
+            )
+            trace = sync_object(
+                trace,
+                process_group_name=self.kernel.env.process_group_name,
+            )
+            self._apply_rebenchmark_timings(members, trace.medians_ms)
+            return trace
+        finally:
+            for member in members:
+                clear_jit_fast_path_caches(member.fn, self.log)
+
     def _resolve_isolated_rebenchmark_results(
         self,
         members: Sequence[PopulationMember],
@@ -2277,6 +2381,7 @@ class PopulationBasedSearch(BaseSearch):
             *getattr(self, "_compiler_seed_members", ()),
             *getattr(self, "_benchmarked_members", {}).values(),
             *getattr(self, "_pinned_finalist_members", {}).values(),
+            *(getattr(self, "_terminal_refinement_members", None) or {}).values(),
         ]
         invalidated: list[PopulationMember] = []
         invalidated_configs = set(failed_config_statuses)
@@ -2321,6 +2426,7 @@ class PopulationBasedSearch(BaseSearch):
             *getattr(self, "_compiler_seed_members", ()),
             *getattr(self, "_benchmarked_members", {}).values(),
             *getattr(self, "_pinned_finalist_members", {}).values(),
+            *(getattr(self, "_terminal_refinement_members", None) or {}).values(),
         ]
         self.best_perf_so_far = min(
             (
@@ -2596,10 +2702,15 @@ class PopulationBasedSearch(BaseSearch):
         """
         best = self.final_rebenchmark_best(self.best)
         best = self.run_finishing_phase(best, self.finishing_rounds)
+        best = self.run_terminal_refinement(best)
         if self._final_pick_supported():
             best = self.run_final_pick_verification(best)
         self.best = best
         return best.config
+
+    def run_terminal_refinement(self, best: PopulationMember) -> PopulationMember:
+        """Run an optional backend/search-specific post-search refinement."""
+        return best
 
     def _resolve_device_micros_paired_bench(
         self,

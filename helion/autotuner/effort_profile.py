@@ -39,6 +39,8 @@ class FlashStructuralSearchConfig:
     retained_family_slowdown_limit: float
     exhaust_unrestricted_path: bool
     starting_paths: int = 14
+    terminal_coordinate_rounds: int = 2
+    terminal_coordinate_beam_width: int = 4
 
 
 @dataclass(frozen=True)
