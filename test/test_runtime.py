@@ -73,13 +73,13 @@ class TestTritonLauncher(unittest.TestCase):
             num_warps=1,
             num_stages=1,
             _cross_loop_dispatch_kind="static",
-            _cross_loop_fallback_reason="tensor_descriptor_indexing",
+            _cross_loop_fallback_reason="command_plan_unavailable: test",
         )
 
         self.assertEqual(result, "launched")
         self.assertEqual(
             kernel._helion_cross_loop_dispatch,
-            ("static", "tensor_descriptor_indexing"),
+            ("static", "command_plan_unavailable: test"),
         )
 
     def test_residency_check_uses_exact_compiled_specialization(self) -> None:
@@ -394,6 +394,7 @@ class TestPersistentTritonState(unittest.TestCase):
             packed_metadata=("original", 1024),
         )
         like = torch.empty(1, device="cuda")
+
         def fail_pack(_metadata):
             raise RuntimeError("packing failed")
 

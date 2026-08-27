@@ -14,6 +14,7 @@ import sympy
 import torch
 
 from .. import exc
+from .._compat import device_num_sm
 from .ast_extension import ExtendedAST
 from .ast_extension import create
 from .ast_extension import expr_from_string
@@ -832,7 +833,6 @@ class ForEachProgramID(ProgramIDs):
             root_domains=root_domains,
             root_traversals=root_traversals,
             axis_geometry=axis_geometry,
-            preordered_edges=frozenset(),
             physical_worker_limit=physical_worker_limit,
             requested_worker_count=cast(
                 "int",
@@ -844,21 +844,9 @@ class ForEachProgramID(ProgramIDs):
             publishable_scope_ids=publishable_scope_ids,
         )
         cross_loop_schedule: CrossLoopSchedule | ClcCommandPlan = base_schedule
-        uses_tensor_descriptors = any(
-            indexing == "tensor_descriptor"
-            or isinstance(indexing, (list, tuple))
-            and "tensor_descriptor" in indexing
-            for indexing in (
-                device_function.config.get("indexing", ()),
-                device_function.config.get("atomic_indexing", ()),
-            )
-        )
-        clc_backend_supported = (
-            CompileEnvironment.current().config_spec.automatic_clc_dispatch
-            and not uses_tensor_descriptors
-        )
+        config_spec = CompileEnvironment.current().config_spec
         clc_fallback_reason: str | None = None
-        if clc_backend_supported:
+        if config_spec.automatic_clc_dispatch:
             try:
                 clc_plan = build_clc_command_plan(base_schedule)
             except ClcCommandPlanUnavailable as error:
@@ -869,8 +857,6 @@ class ForEachProgramID(ProgramIDs):
                     device_function.triton_uses_clc = True
                 else:
                     clc_fallback_reason = "no_cancellable_launch_tokens"
-        elif uses_tensor_descriptors:
-            clc_fallback_reason = "tensor_descriptor_indexing"
         else:
             clc_fallback_reason = "clc_backend_unavailable"
         is_clc = isinstance(cross_loop_schedule, ClcCommandPlan)
@@ -944,7 +930,7 @@ class ForEachProgramID(ProgramIDs):
         if not is_clc:
             device_function.triton_minimum_resident_programs = str(launch_worker_limit)
         else:
-            num_sm = CompileEnvironment.current().config_spec.num_sm
+            num_sm = device_num_sm(CompileEnvironment.current().device)
             device_function.triton_target_resident_programs_per_sm = str(
                 max(1, (base_schedule.worker_limit + num_sm - 1) // num_sm)
             )
@@ -1188,10 +1174,24 @@ class ForEachProgramID(ProgramIDs):
         ) -> dict[int, str]:
             coordinates: dict[int, str] = {}
             multiplier = 1
+            last_nontrivial_axis = next(
+                (
+                    block_id
+                    for block_id in reversed(axis_order)
+                    if counts[block_id] != 1
+                ),
+                None,
+            )
             for block_id in axis_order:
                 count = counts[block_id]
                 if count == 1:
                     coordinates[block_id] = "0"
+                elif block_id == last_nontrivial_axis:
+                    coordinates[block_id] = (
+                        f"({task})"
+                        if multiplier == 1
+                        else f"(({task}) // {multiplier})"
+                    )
                 elif multiplier == 1:
                     coordinates[block_id] = f"(({task}) % {count})"
                 else:
@@ -1274,18 +1274,17 @@ class ForEachProgramID(ProgramIDs):
             )
 
         def relation_source_membership(
+            domain: LogicalDomain,
             bounds: tuple[tuple[int, int, int, int], ...],
             coordinates: dict[int, str],
         ) -> str:
             conditions: list[str] = []
             for axis, begin, end, step in bounds:
                 coordinate = coordinates[axis]
-                conditions.extend(
-                    (
-                        f"({coordinate}) >= {begin}",
-                        f"({coordinate}) < {end}",
-                    )
-                )
+                if begin != 0:
+                    conditions.append(f"({coordinate}) >= {begin}")
+                if end != domain.axis_counts[axis]:
+                    conditions.append(f"({coordinate}) < {end}")
                 if step != 1:
                     conditions.append(f"(({coordinate}) - {begin}) % {step} == 0")
             return " and ".join(conditions) or "True"
@@ -1298,12 +1297,14 @@ class ForEachProgramID(ProgramIDs):
             canonical = relation.canonical_single_valued()
             if canonical is None or not canonical.pieces:
                 raise AssertionError("event relation is not single-valued")
+            is_total = canonical.is_total_function()
             memberships: list[str] = []
             values_by_axis: dict[int, list[tuple[str, str]]] = {
                 axis: [] for axis in canonical.target_domain.axis_order
             }
             for piece in canonical.pieces:
                 source_membership = relation_source_membership(
+                    canonical.source_domain,
                     piece.source_bounds_items,
                     source_coordinates,
                 )
@@ -1318,13 +1319,20 @@ class ForEachProgramID(ProgramIDs):
                         raise AssertionError("event relation target is not one point")
                     value = relation_expression(begin, source_coordinates)
                     piece_values[axis] = value
-                    target_memberships.extend(
-                        (
-                            f"({value}) >= 0",
-                            f"({value}) < {canonical.target_domain.axis_counts[axis]}",
+                    if not is_total:
+                        target_memberships.extend(
+                            (
+                                f"({value}) >= 0",
+                                f"({value}) < "
+                                f"{canonical.target_domain.axis_counts[axis]}",
+                            )
                         )
+                membership = " and ".join(
+                    (
+                        *(() if source_membership == "True" else (source_membership,)),
+                        *target_memberships,
                     )
-                membership = " and ".join((source_membership, *target_memberships))
+                ) or "True"
                 memberships.append(membership)
                 for axis, value in piece_values.items():
                     values_by_axis[axis].append((membership, value))
@@ -1344,7 +1352,7 @@ class ForEachProgramID(ProgramIDs):
                 {axis: select(values) for axis, values in values_by_axis.items()},
                 (
                     "True"
-                    if canonical.is_total_function()
+                    if is_total
                     else " or ".join(f"({membership})" for membership in memberships)
                 ),
             )
@@ -2164,7 +2172,6 @@ class ForEachProgramID(ProgramIDs):
                     create(
                         ast.If,
                         test=expr_from_string(
-                            f"{command_index} >= {command_range.begin} and "
                             f"{command_index} < {command_range.end}"
                         ),
                         body=cast(

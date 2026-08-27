@@ -38,10 +38,10 @@ on the final-arriving producer CTA.
 
 Current constraints and fallbacks:
 
-- CLC is selected only on SM100+ Triton configurations with pointer indexing
-  and one-CTA clusters. Descriptor configurations retain the ordinary static
-  persistent lowering; the compiler does not silently rewrite the user's
-  indexing choice.
+- CLC is selected only on SM100+ Triton configurations with one-CTA clusters.
+  Tensor-descriptor indexing is normalized to pointer indexing before
+  lowering because descriptor pipelines cannot safely re-enter the CLC
+  command loop yet.
 - A schedule whose canonical task permutation cannot be represented by compact
   relations retains the same single persistent megakernel and dependency
   schedule but uses its static dispatcher. The generated launcher records the
@@ -82,9 +82,10 @@ Seven CTAs per SM is the clear scheduling optimum in that sweep, while its
 remaining roughly 1 us gap to the separate graph is fixed CLC/dispatch overhead
 rather than a missed worker-count choice. `num_sm_multiplier` retains its
 existing power-of-two behavior. `cross_loop_num_workers` remains a manual
-exact-count diagnostic override and does not create a second autotuning
-dimension; the Qwen probes use it to request their measured seven-CTA-per-SM
-cohort without changing the general multiplier contract.
+diagnostic target and does not create a second autotuning dimension. CLC rounds
+it up to a uniform whole-CTA-per-SM residency cap; the Qwen FFN probe requests
+the measured seven-CTA-per-SM cohort directly, while the 1,024-worker Qwen
+decode target runs with the realizable 1,036-worker cohort on a 148-SM B200.
 
 The command-table experiment has now been superseded. The compiler emits the
 same command order through compact symbolic ranges and no longer allocates an
@@ -99,6 +100,17 @@ whole Qwen3 layer (4,992), Gemma4 A4B MoE (774), and DeepSeek V3 MoE (4,477).
 Their scheduled task-body ASTs and synchronization-site counts are unchanged;
 the generated source is one line shorter because the constant-buffer launch
 argument disappeared.
+
+The follow-up generic relation cleanup was also checked against fresh
+lowerings for Qwen3 FFN, Qwen3 decode, DeepSeek V3 MoE, and Nemotron3 Nano MoE.
+All four preserve the exact command sequence, launch metadata, constexprs, and
+synchronization-site counts; their end-to-end artifact correctness checks pass.
+Paired cold-L2 measurements against `a9b3fe88` on the same idle B200 changed by
+0.000, -0.256, +0.064, and +0.144 microseconds respectively. These differences
+are within run-to-run quantization/noise, so the existing tuned configurations
+remain appropriate. Nemotron retains its pre-existing fused resource-lifetime
+gap to standalone Helion; this cleanup neither creates nor materially changes
+it.
 
 Hardening status:
 
@@ -118,8 +130,9 @@ Hardening status:
   arbitrary planner budgets.
 - [x] Re-run the priority cold-L2 matrix and focused compiler/runtime tests.
 - [x] Complete the final generality review and focused repository checks.
-- [x] Preserve the existing `num_sm_multiplier` contract and keep exact
-  non-power-of-two worker cohorts confined to the manual scheduler override.
+- [x] Preserve the existing `num_sm_multiplier` contract and keep arbitrary
+  worker targets confined to the manual scheduler override, with CLC rounding
+  them up to a uniform per-SM residency cap.
 - [ ] Run repository lint/type checks when the development environment includes
   its declared `ruff` and `pyrefly` tools.
 
@@ -3746,7 +3759,7 @@ Open, to be answered with implementation evidence:
 - Found and removed a redundant exact task edge in Gemma. The direct
   `post_ff -> final` wait was already ordered by the whole-root path through
   PLE gate and projection. The new generic transitive-elision pass trusts only
-  root-completion/preordered edges, never a partial fine-grained edge. This
+  root-completion edges, never a partial fine-grained edge. This
   improved Gemma from 76.09 to 74.09 microseconds.
 - Revalidated Qwen at 76.09 microseconds versus 86.27 separately and Gemma
   sliding non-shared at 74.09 versus 78.87. Saved final lowered Triton at

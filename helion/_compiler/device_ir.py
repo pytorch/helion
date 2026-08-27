@@ -4389,7 +4389,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         f"{CROSS_LOOP_NUM_WORKERS_CONFIG!r} is reserved for "
                         "compiler-derived cross-loop scheduling"
                     )
-                # Keep exact worker counts available as a manual diagnostic
+                # Keep arbitrary worker targets available as a manual diagnostic
                 # override without creating a second automatic search axis.
                 config_spec.user_defined_tunables[CROSS_LOOP_NUM_WORKERS_CONFIG] = (
                     IntegerFragment(

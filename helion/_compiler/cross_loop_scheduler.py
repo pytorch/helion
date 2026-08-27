@@ -22,6 +22,7 @@ from .tile_dependency import preceding_scope_relation
 CROSS_LOOP_NUM_WORKERS_CONFIG = "cross_loop_num_workers"
 CROSS_LOOP_NUM_WORKERS_DEFAULT = 0
 
+
 class ClcCommandPlanUnavailable(exc.CrossLoopSchedulingError):
     """The canonical schedule cannot be represented by CLC command ranges."""
 
@@ -160,6 +161,19 @@ class WorkerScheduleSegment:
             + task_offset // self.schedule_period * self.schedule_period_step
         )
 
+    def placement_for_offset(self, task_offset: int) -> tuple[int, int]:
+        """Return ``(worker, position)`` for one offset in this segment."""
+        schedule_offset = self.schedule_for_offset(task_offset)
+        return (
+            self.worker_begin + schedule_offset % self.worker_count,
+            schedule_offset // self.worker_count,
+        )
+
+    def order_for_offset(self, task_offset: int) -> tuple[int, int]:
+        """Return sortable ``(position, worker)`` order for one task offset."""
+        worker, position = self.placement_for_offset(task_offset)
+        return position, worker
+
     @cached_property
     def _task_offset_by_task(self) -> dict[int, int]:
         result: dict[int, int] = {}
@@ -206,11 +220,7 @@ class WorkerScheduleSegment:
             )
             if task_offset is None:
                 return None
-        schedule_offset = self.schedule_for_offset(task_offset)
-        return (
-            self.worker_begin + schedule_offset % self.worker_count,
-            schedule_offset // self.worker_count,
-        )
+        return self.placement_for_offset(task_offset)
 
     def task_at(self, worker: int, position: int) -> int | None:
         """Return the task at one worker position, if this segment owns it."""
@@ -1993,6 +2003,16 @@ class ClcCommandPlan:
     base_schedule: CrossLoopSchedule
     command_ranges: tuple[ClcCommandRange, ...]
 
+    def __post_init__(self) -> None:
+        expected_begin = 0
+        for command_range in self.command_ranges:
+            if command_range.begin != expected_begin:
+                raise ValueError(
+                    "CLC command ranges must be contiguous from zero, got "
+                    f"{command_range.begin} after {expected_begin}"
+                )
+            expected_begin = command_range.end
+
     @property
     def event_graph(self) -> EventGraph:
         return self.base_schedule.event_graph
@@ -2015,7 +2035,7 @@ class ClcCommandPlan:
 
     @property
     def command_count(self) -> int:
-        return sum(command_range.task_count for command_range in self.command_ranges)
+        return self.command_ranges[-1].end if self.command_ranges else 0
 
     @property
     def uses_cancellation(self) -> bool:
@@ -3181,7 +3201,6 @@ def finalize_readiness_plan(
     event_graph: EventGraph,
     counted_events: tuple[CountedEventPlan, ...],
     dependency_plan: TileDependencyGraph,
-    preordered_edges: frozenset[tuple[int, int]],
 ) -> ReadinessPlan:
     """Finalize dependency coverage once, independently of task dispatch."""
     covered_dependency_points = frozenset(
@@ -3193,9 +3212,8 @@ def finalize_readiness_plan(
     root_completion_edges = _select_root_completion_edges(
         dependency_graph=dependency_plan,
         covered_dependency_points=covered_dependency_points,
-        preordered_edges=preordered_edges,
     )
-    root_order_edges = set(root_completion_edges) | set(preordered_edges)
+    root_order_edges = set(root_completion_edges)
     retained_counted_events: list[CountedEventPlan] = []
     for event in counted_events:
         retained_use_indices = tuple(
@@ -3235,7 +3253,6 @@ def finalize_readiness_plan(
         dependency_graph=dependency_plan,
         covered_dependency_points=covered_dependency_points,
         root_completion_edges=root_completion_edges,
-        preordered_edges=preordered_edges,
     )
     event_graph, family_done_events = lower_family_done_events(
         event_graph,
@@ -3254,7 +3271,6 @@ def build_cross_loop_schedule(
     root_domains: tuple[LogicalDomain, ...],
     root_traversals: tuple[LogicalRelation, ...],
     axis_geometry: dict[int, tuple[int, int]],
-    preordered_edges: frozenset[tuple[int, int]],
     physical_worker_limit: int,
     requested_worker_count: int = CROSS_LOOP_NUM_WORKERS_DEFAULT,
     publishable_scope_ids: frozenset[int] | None = None,
@@ -3306,7 +3322,6 @@ def build_cross_loop_schedule(
         event_graph=event_graph,
         counted_events=counted_events,
         dependency_plan=dependency_plan,
-        preordered_edges=preordered_edges,
     )
     return CrossLoopSchedule(
         readiness=readiness,
@@ -3355,11 +3370,7 @@ def build_clc_command_plan(base_schedule: CrossLoopSchedule) -> ClcCommandPlan:
             continue
         segments = sorted(
             base_schedule.worker_schedule.segments_for_root(root),
-            key=lambda segment: (
-                segment.schedule_for_offset(0) // segment.worker_count,
-                segment.worker_begin
-                + segment.schedule_for_offset(0) % segment.worker_count,
-            ),
+            key=lambda segment: segment.order_for_offset(0),
         )
         if sum(segment.task_count for segment in segments) != domain.size:
             raise ClcCommandPlanUnavailable(
@@ -3368,18 +3379,13 @@ def build_clc_command_plan(base_schedule: CrossLoopSchedule) -> ClcCommandPlan:
         if not segments:
             raise ClcCommandPlanUnavailable(f"CLC root {root} has no static placement")
         for left, right in itertools.pairwise(segments):
-            left_end = left.placement(left.task_for_offset(left.task_count - 1))
-            right_begin = right.placement(right.task_for_offset(0))
-            if left_end is None or right_begin is None:
-                raise AssertionError("worker schedule segment lost its own task")
-            if (left_end[1], left_end[0]) >= (right_begin[1], right_begin[0]):
+            left_end = left.order_for_offset(left.task_count - 1)
+            right_begin = right.order_for_offset(0)
+            if left_end >= right_begin:
                 raise ClcCommandPlanUnavailable(
                     f"CLC root {root} has interleaved worker schedule segments"
                 )
-        first = segments[0].placement(segments[0].task_for_offset(0))
-        if first is None:
-            raise AssertionError("worker schedule segment lost its first task")
-        root_priority[root] = (first[1], first[0], root)
+        root_priority[root] = (*segments[0].order_for_offset(0), root)
         segments_by_root[root] = tuple(segments)
 
     ordered_roots = tuple(sorted(segments_by_root, key=root_priority.__getitem__))
@@ -3474,10 +3480,9 @@ def _validate_schedule_coverage(
     dependency_graph: TileDependencyGraph,
     covered_dependency_points: frozenset[DependencyPoint],
     root_completion_edges: frozenset[tuple[int, int]],
-    preordered_edges: frozenset[tuple[int, int]],
 ) -> None:
     """Verify that every dependence has an emitted synchronization path."""
-    root_order_edges = set(root_completion_edges) | set(preordered_edges)
+    root_order_edges = set(root_completion_edges)
     for dependency in dependency_graph.edges:
         pair = (dependency.producer_root, dependency.consumer_root)
         if _is_ordered_by_root_completion(*pair, root_order_edges):
@@ -3503,11 +3508,10 @@ def _select_root_completion_edges(
     *,
     dependency_graph: TileDependencyGraph,
     covered_dependency_points: frozenset[DependencyPoint],
-    preordered_edges: frozenset[tuple[int, int]],
 ) -> frozenset[tuple[int, int]]:
     """Choose the minimal source-ordered root-completion fallback edges."""
     selected_edges: set[tuple[int, int]] = set()
-    ordered_root_edges = set(preordered_edges)
+    ordered_root_edges: set[tuple[int, int]] = set()
     for dependency in sorted(
         dependency_graph.edges,
         key=lambda edge: (

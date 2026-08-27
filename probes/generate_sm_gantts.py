@@ -1701,14 +1701,22 @@ def main() -> None:
     args = parser.parse_args()
     if not args.allow_busy:
         require_idle_visible_gpu()
-    models = (
-        ("muse-glimmer-sliding", "muse-glimmer-full")
-        if args.model == "muse-glimmer"
-        else (args.model,)
-    )
-    for model in models:
-        comparison = BUILDERS[model]()
-        _write_artifacts(comparison, args.output_dir.resolve())
+    if args.model == "muse-glimmer":
+        for model in ("muse-glimmer-sliding", "muse-glimmer-full"):
+            command = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--model",
+                model,
+                "--output-dir",
+                str(args.output_dir.resolve()),
+            ]
+            if args.allow_busy:
+                command.append("--allow-busy")
+            subprocess.run(command, check=True)
+        return
+    comparison = BUILDERS[args.model]()
+    _write_artifacts(comparison, args.output_dir.resolve())
 
 
 if __name__ == "__main__":

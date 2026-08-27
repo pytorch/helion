@@ -1548,7 +1548,6 @@ class TestCrossLoopDependencies(TestCase):
                 dependency_plan=plan,
                 task_families=task_families,
                 axis_geometry={10: (size // 16, 16), 20: (size // 512, 512)},
-                preordered_edges=frozenset(),
                 physical_worker_limit=148,
             )
 
@@ -2734,7 +2733,6 @@ class TestCrossLoopDependencies(TestCase):
             _select_root_completion_edges(
                 dependency_graph=graph,
                 covered_dependency_points=covered_points,
-                preordered_edges=frozenset(),
             ),
             frozenset(((0, 1),)),
         )
@@ -4109,7 +4107,6 @@ class TestCrossLoopDependencies(TestCase):
                 ),
             ),
             axis_geometry={10: (1, 1), 11: (4, 16), 20: (1, 1), 21: (4, 16)},
-            preordered_edges=frozenset(),
             physical_worker_limit=2,
         )
 
@@ -4140,7 +4137,6 @@ class TestCrossLoopDependencies(TestCase):
                 ),
             ),
             axis_geometry={10: (1, 128), 20: (4, 32)},
-            preordered_edges=frozenset(),
             physical_worker_limit=4,
         )
 
@@ -4199,7 +4195,6 @@ class TestCrossLoopDependencies(TestCase):
                 30: (8, 16),
                 40: (8, 16),
             },
-            preordered_edges=frozenset(),
             physical_worker_limit=8,
         )
 
@@ -4247,7 +4242,6 @@ class TestCrossLoopDependencies(TestCase):
             dependency_plan=dependency_plan,
             task_families=task_families,
             axis_geometry={10: (8, 16), 20: (4, 32)},
-            preordered_edges=frozenset(),
         )
 
         assert_valid_clc_command_ranges(self, plan)
@@ -4313,7 +4307,6 @@ class TestCrossLoopDependencies(TestCase):
             dependency_plan=dependency_plan,
             task_families=task_families,
             axis_geometry={10: (3, 1), 20: (2, 1)},
-            preordered_edges=frozenset(),
         )
 
         assert_valid_clc_command_ranges(self, plan)
@@ -4367,7 +4360,6 @@ class TestCrossLoopDependencies(TestCase):
             dependency_plan=dependency_plan,
             task_families=task_families,
             axis_geometry={10: (2, 1), 20: (1, 2), 30: (2, 1)},
-            preordered_edges=frozenset(),
             physical_worker_limit=4,
         )
 
@@ -4440,7 +4432,6 @@ class TestCrossLoopDependencies(TestCase):
                     axis_geometry={
                         block_id: (task_count, 1) for block_id in block_ids
                     },
-                    preordered_edges=frozenset(),
                     physical_worker_limit=max(1, root_count * task_count // 2),
                 )
                 assert_valid_clc_command_ranges(self, plan)
@@ -4480,7 +4471,6 @@ class TestCrossLoopDependencies(TestCase):
             dependency_plan=dependency_plan,
             task_families=task_families,
             axis_geometry={10: (task_count, 1), 20: (task_count, 1)},
-            preordered_edges=frozenset(),
             physical_worker_limit=task_count,
         )
 
@@ -4526,7 +4516,6 @@ class TestCrossLoopDependencies(TestCase):
                 30: (8, 1),
                 40: (8, 1),
             },
-            preordered_edges=frozenset(),
             physical_worker_limit=4,
         )
 
@@ -4638,7 +4627,6 @@ class TestCrossLoopDependencies(TestCase):
                 30: (1, 1),
                 31: (4, 32),
             },
-            "preordered_edges": frozenset(),
             "physical_worker_limit": 8,
         }
 
@@ -5316,7 +5304,6 @@ class TestCrossLoopDependencies(TestCase):
             dependency_plan=dependency_plan,
             task_families=task_families,
             axis_geometry={10: (8, 16), 20: (8, 16), 30: (8, 16)},
-            preordered_edges=frozenset(),
             physical_worker_limit=8,
         )
 
@@ -5395,7 +5382,6 @@ class TestCrossLoopDependencies(TestCase):
                 22: (4, 1),
                 30: (8, 1),
             },
-            preordered_edges=frozenset(),
             physical_worker_limit=32,
         )
 
@@ -5468,7 +5454,6 @@ class TestCrossLoopDependencies(TestCase):
                 21: (1, width),
                 22: (splits, 1),
             },
-            preordered_edges=frozenset(),
             physical_worker_limit=128,
         )
 
@@ -5532,7 +5517,6 @@ class TestCrossLoopDependencies(TestCase):
             dependency_plan=dependency_plan,
             task_families=task_families,
             axis_geometry={10: (columns, 1), 20: (columns, 1), 22: (splits, 1)},
-            preordered_edges=frozenset(),
             physical_worker_limit=32,
         )
 
@@ -5616,7 +5600,6 @@ class TestCrossLoopDependencies(TestCase):
                 31: (8, 16),
                 32: (8, 16),
             },
-            preordered_edges=frozenset(),
             physical_worker_limit=4,
         )
 
@@ -5775,7 +5758,6 @@ class TestCrossLoopDependencies(TestCase):
             "dependency_plan": dependency_plan,
             "task_families": tuple(task_families),
             "axis_geometry": axis_geometry,
-            "preordered_edges": frozenset(),
             "physical_worker_limit": 8,
         }
 
@@ -6196,6 +6178,18 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                 self.assertNotIn("tile_dependency_task_wait", code)
                 self.assertIn("tile_dependency_continuation_previous", code)
                 self.assertNotIn("tile_dependency_root_completion", code)
+                if batch == 3 and "_requires_clc=True" in code:
+                    start = code.index("def tile_dependency_clc_task")
+                    dispatch = code[
+                        start : code.index("\n@triton.jit", start + 1)
+                    ]
+                    # The partial final L2 group makes this a multi-piece total
+                    # relation. Keep its source-piece tests, but omit the full
+                    # command-domain modulo and redundant target bounds.
+                    self.assertIn("tl.where(", dispatch)
+                    self.assertNotIn("% 12", dispatch)
+                    self.assertNotIn(">= 0", dispatch)
+                    self.assertEqual(dispatch.count("< 12"), 1)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -6278,6 +6272,19 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         if "_requires_clc=True" in code:
             self.assertNotIn("tile_dependency_clc_command_tasks", code)
             self.assertIn("tile_dependency_clc_command_index", code)
+            dispatch = code[
+                code.index("def tile_dependency_clc_task") : code.index(
+                    "\n@triton.jit", code.index("def tile_dependency_clc_task") + 1
+                )
+            ]
+            # This root uses a two-dimensional permuted traversal. Preserve its
+            # quotient and inner-axis modulo, but omit the redundant modulo by
+            # the final source-axis extent and the dispatch lower bound.
+            self.assertNotIn("tl.where(", dispatch)
+            self.assertNotIn("tile_dependency_clc_command_index >= 0", dispatch)
+            self.assertIn("// 128", dispatch)
+            self.assertIn("% 64", dispatch)
+            self.assertNotIn("% 32", dispatch)
         else:
             self.assertIn("tile_dependency_scheduled_physical_task", code)
         self.assertNotIn("tile_dependency_root_completion", code)
