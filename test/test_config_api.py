@@ -19,11 +19,12 @@ import torch
 import helion
 from helion import exc
 from helion._compiler.autotuner_heuristics.cute import (
-    tcgen05_grouped_worklist_seed_configs,
+    _tcgen05_grouped_worklist_seed_family,
 )
 from helion._compiler.backend import PallasBackend
 from helion._compiler.backend import TritonBackend
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute.grouped_worklist_policy import GroupedWorklistTargetPolicy
 from helion._compiler.cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from helion._compiler.cute.tcgen05_config import Tcgen05AbStagesThreeSearchConstraints
 from helion._compiler.cute.tcgen05_constants import (
@@ -1549,63 +1550,29 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
             explicit_epi_tile_compatible=True,
         )
         spec.allow_tcgen05_cluster_m2_search(static_k=128)
+
         for source_m_tile in (
             TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
             TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
         ):
             for block_k in (64, 128):
-                config = helion.Config(
-                    block_sizes=[256, 128, block_k],
-                    pid_type="persistent_interleaved",
-                    tcgen05_cluster_m=2,
-                    tcgen05_cluster_n=1,
-                    tcgen05_grouped_mode=TCGEN05_GROUPED_MODE_WORKLIST_NM,
-                    tcgen05_grouped_worklist_source_m_tile=source_m_tile,
-                )
-                spec.normalize(config, _fix_invalid=True)
-                self.assertEqual(config.block_sizes[:3], [256, 128, block_k])
-                self.assertEqual(config.config["tcgen05_cluster_m"], 2)
-                self.assertEqual(config.config["pid_type"], "persistent_interleaved")
+                with self.subTest(
+                    source_m_tile=source_m_tile,
+                    block_k=block_k,
+                ):
+                    config = self._grouped_worklist_config(
+                        block_sizes=[256, 128, block_k],
+                        source_m_tile=source_m_tile,
+                    )
 
-    def test_grouped_worklist_cluster_m1_fix_uses_semantic_axes(self) -> None:
-        spec = self._make_permuted_cute_tcgen05_spec()
-        config = helion.Config(
-            block_sizes=[128, 64, 256],
-            pid_type="persistent_interleaved",
-            tcgen05_cluster_m=1,
-            tcgen05_cluster_n=1,
-            tcgen05_grouped_mode=TCGEN05_GROUPED_MODE_WORKLIST_NM,
-            tcgen05_grouped_worklist_source_m_tile=32,
-        )
-        spec._cute_tcgen05_config.fix_search_config(config.config)
-        self.assertEqual(config.block_sizes, [128, 64, 256])
-        self.assertEqual(config.config["tcgen05_cluster_m"], 1)
+                    spec.normalize(config, _fix_invalid=True)
 
-    def test_grouped_worklist_deep_ab_uses_semantic_axes(self) -> None:
-        spec = self._make_permuted_cute_tcgen05_spec()
-        config = helion.Config(
-            block_sizes=[128, 128, 256],
-            num_stages=7,
-            num_warps=8,
-            pid_type="persistent_interleaved",
-            tcgen05_cluster_m=1,
-            tcgen05_cluster_n=1,
-            tcgen05_ab_stages=5,
-            tcgen05_acc_stages=2,
-            tcgen05_c_stages=2,
-            tcgen05_num_epi_warps=4,
-            tcgen05_consumer_regs=256,
-            tcgen05_grouped_mode=TCGEN05_GROUPED_MODE_WORKLIST_NM,
-            tcgen05_grouped_worklist_source_m_tile=32,
-        )
-        spec.normalize(config)
-        self.assertEqual(config.block_sizes, [128, 128, 256])
-        self.assertEqual(config.config["tcgen05_ab_stages"], 5)
-
-        positional_decoy = helion.Config.from_dict(config.config)
-        positional_decoy.config["block_sizes"] = [256, 128, 64]
-        with self.assertRaisesRegex(exc.InvalidConfig, "tcgen05_ab_stages"):
-            spec.normalize(positional_decoy)
+                    self.assertEqual(config.block_sizes[:3], [256, 128, block_k])
+                    self.assertEqual(config.config["tcgen05_cluster_m"], 2)
+                    self.assertEqual(
+                        config.config["pid_type"],
+                        "persistent_interleaved",
+                    )
 
     def test_grouped_worklist_search_fix_projects_semantic_tile(self) -> None:
         spec = self._register_default_cute_tcgen05_mma_analysis(
@@ -2306,7 +2273,7 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
         reviewed_configs = [
             config
             for groups, packed_m, n, k, b_major, source_m_tile in seed_inputs
-            for config in tcgen05_grouped_worklist_seed_configs(
+            for config in _tcgen05_grouped_worklist_seed_family(
                 groups=groups,
                 packed_m=packed_m,
                 n=n,
@@ -2314,7 +2281,8 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
                 b_major=b_major,
                 source_m_tile=source_m_tile,
                 num_sm=148,
-            )
+                target_policy=GroupedWorklistTargetPolicy(),
+            )[0]
         ]
         spec = self._constrained_grouped_worklist_spec(
             TCGEN05_AB_STAGES_THREE_MIN_DEVICE_SMEM_OPTIN

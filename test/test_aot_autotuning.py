@@ -50,6 +50,31 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
+def test_future_cuda_arch_does_not_load_sm103_aot_fallback(tmp_path: Path) -> None:
+    source_path = tmp_path / "demo.py"
+    source_path.touch()
+    (tmp_path / "_helion_aot_demo_cuda_sm103.py").touch()
+    sm100_heuristic = tmp_path / "_helion_aot_demo_cuda_sm100.py"
+    sm100_heuristic.touch()
+    future_hardware = HardwareInfo(
+        device_kind="cuda",
+        hardware_name="NVIDIA future GPU",
+        runtime_version="14.0",
+        compute_capability="sm120",
+    )
+
+    aot_cache_module.clear_heuristic_cache()
+    try:
+        with patch.object(
+            aot_cache_module,
+            "get_hardware_info",
+            return_value=future_hardware,
+        ):
+            assert aot_cache_module.find_heuristic_file(source_path) == sm100_heuristic
+    finally:
+        aot_cache_module.clear_heuristic_cache()
+
+
 @onlyBackends(["triton", "cute"])
 class TestShapeKey:
     """Tests for ShapeKey class."""

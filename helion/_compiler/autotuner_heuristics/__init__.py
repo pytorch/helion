@@ -96,18 +96,20 @@ def compiler_promotion_specialization_key(
     backend: str,
     device: torch.device,
 ) -> tuple[tuple[str, str | None], ...]:
-    """Return named-target facts that can change a promoted compiler default.
+    """Return named-target facts that can change seeds or their promotion.
 
     Compute capability is already part of the bound-kernel specialization key.
-    Only heuristics with an additional named-target promotion fence need more
-    device identity.  Non-matching products share the ``None`` bucket because
-    they all decline that promotion; capability-only heuristics add no key at
-    all. ``get_hardware_info`` is cached per canonical device.
+    Heuristics may request exact product identity either for a promotion fence
+    or because product policy changes their emitted seeds. Non-matching products
+    share the ``None`` bucket; capability-only heuristics add no key at all.
+    ``get_hardware_info`` is cached per canonical device.
     """
     registry_signature = []
     for heuristic in get_heuristics(backend):
-        named_targets = heuristic.PROMOTE_NAMED_TARGETS
-        if heuristic.promote_seed_to_default and named_targets:
+        named_targets = heuristic.CACHE_NAMED_TARGETS
+        if named_targets is None and heuristic.promote_seed_to_default:
+            named_targets = heuristic.PROMOTE_NAMED_TARGETS
+        if named_targets:
             registry_signature.append((heuristic.name, named_targets))
     if not registry_signature:
         return ()

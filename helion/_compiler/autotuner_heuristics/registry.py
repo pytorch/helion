@@ -36,6 +36,10 @@ class AutotunerHeuristic:
     # Optional exact product targets for seeds validated on one named device.
     # This never limits where a seed fires, only where it becomes the default.
     PROMOTE_NAMED_TARGETS: ClassVar[frozenset[NamedHardwareTarget] | None] = None
+    # Optional exact product identities that can change emitted seeds even when
+    # promotion itself is architecture-wide. These identities become part of
+    # the bound-kernel cache key without narrowing ``should_promote``.
+    CACHE_NAMED_TARGETS: ClassVar[frozenset[NamedHardwareTarget] | None] = None
     # Runtime facts that can change this heuristic's emitted seed configs.  The
     # bound-kernel cache adds these facts only after the heuristic actually
     # fires, so a shape- or SM-sensitive heuristic does not force unrelated

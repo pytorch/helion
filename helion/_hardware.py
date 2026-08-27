@@ -5,7 +5,10 @@ import functools
 
 import torch
 
-# Compute capability lists for fallback (newest to oldest)
+# Linear compute-capability fallback lists (newest to oldest). ``sm103`` is not
+# a safe generic fallback for arbitrary future CUDA architectures, so it stays
+# outside this chain: an exact sm103 target still falls back to sm100 through
+# the unknown-current path, without offering sm103 artifacts to future targets.
 _CUDA_COMPUTE_CAPS: list[str] = [
     "sm100",
     "sm90",
