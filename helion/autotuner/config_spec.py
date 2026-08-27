@@ -28,6 +28,7 @@ from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
 from .._compat import target_device_capability as get_target_device_capability
 from .._compat import warps_to_threads
+from .._compiler.cute.cute_flash import FLASH_CAUSAL_LPT_SWIZZLE_KEY
 from .._compiler.cute.cute_flash import FLASH_CONFIG_KEYS
 from .._compiler.cute.cute_flash import FLASH_CORR_REGS_KEY
 from .._compiler.cute.cute_flash import FLASH_E2E_FREQ_KEY
@@ -35,7 +36,12 @@ from .._compiler.cute.cute_flash import FLASH_E2E_OFFSET0_KEY
 from .._compiler.cute.cute_flash import FLASH_E2E_OFFSET_KEY
 from .._compiler.cute.cute_flash import FLASH_E2E_RES_KEY
 from .._compiler.cute.cute_flash import FLASH_E2E_SCHEDULE_KEY
+from .._compiler.cute.cute_flash import FLASH_EPI_STG_GMEM_KEY
+from .._compiler.cute.cute_flash import FLASH_EPI_STG_KEY
+from .._compiler.cute.cute_flash import FLASH_EPI_STG_STORE_KEY
+from .._compiler.cute.cute_flash import FLASH_EPI_TMA_KEY
 from .._compiler.cute.cute_flash import FLASH_EXP2_IMPL_KEY
+from .._compiler.cute.cute_flash import FLASH_EXP2_PACKET_KEY
 from .._compiler.cute.cute_flash import FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS
 from .._compiler.cute.cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
 from .._compiler.cute.cute_flash import FLASH_MMA_INTERLEAVE_KEY
@@ -45,9 +51,7 @@ from .._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILY_KEY
 from .._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
 from .._compiler.cute.cute_flash import FLASH_TOPOLOGY_KEY
 from .._compiler.cute.cute_flash import FlashAttentionConfig
-from .._compiler.cute.cute_flash import _flash_causal_hd64_seed_num_kv_supported
-from .._compiler.cute.cute_flash import _flash_causal_hd64_seed_offset0
-from .._compiler.cute.cute_flash import _flash_causal_hd64_seed_params
+from .._compiler.cute.cute_flash import _flash_compound_exp2_packet_overrides
 from .._compiler.cute.cute_flash import _flash_e2e_offset_period
 from .._compiler.cute.cute_flash import _flash_e2e_schedule_default
 from .._compiler.cute.cute_flash import _flash_masked_e2e_schedule_params
@@ -56,6 +60,7 @@ from .._compiler.cute.cute_flash import _flash_normalize_e2e_params
 from .._compiler.cute.cute_flash import _flash_parse_e2e_schedule
 from .._compiler.cute.cute_flash import _flash_pipeline_family_flags
 from .._compiler.cute.cute_flash import flash_effective_config_values
+from .._compiler.cute.cute_flash import flash_exp2_packet_is_compound
 from .._compiler.cute.cute_flash import resolve_flash_config
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_STRATEGY_CONFIG_KEYS
@@ -762,6 +767,8 @@ class ConfigSpec:
         self.cute_flash_search_enabled: bool = False
         self._cute_flash_head_dim: int | None = None
         self._cute_flash_num_kv: int | None = None
+        self._cute_flash_num_bh: int | None = None
+        self._cute_flash_tensor_4d_heads: int | None = None
         self._cute_flash_dtype: torch.dtype = torch.float16
         self._cute_flash_is_causal: bool = False
         self._cute_flash_has_kv_tile_pruning: bool = False
@@ -769,7 +776,15 @@ class ConfigSpec:
         self._cute_flash_small_biased_candidate: bool = False
         self._cute_flash_standard_dense_output: bool = False
         self._cute_flash_standard_causal_output: bool = False
+        self._cute_flash_output_requires_tma: bool = False
+        self._cute_flash_supports_tensor_4d_tma: bool = True
         self._cute_flash_block_size_targets: dict[int, int] = {}
+        # Some large attention outputs require the FA4-only TMA epilogue, but
+        # odd KV-tile counts and some score plans require the incompatible WS
+        # flash topology. Keep that narrow fallback explicit so codegen does
+        # not rediscover the unavailable flash path for a 128x128 candidate.
+        self.cute_attention_generic_fallback_enabled: bool = False
+        self._cute_attention_generic_fallback_block_size_targets: dict[int, int] = {}
         self.compiler_default_config: helion.Config | None = None
         self.compiler_seed_configs: list[helion.Config] = []
         # Compiler paths can opt their seeds into a single bounded timeout
@@ -950,13 +965,54 @@ class ConfigSpec:
             self._cute_flash_num_kv,
             flash_config,
             dtype=self._cute_flash_dtype,
+            num_bh=self._cute_flash_num_bh,
             is_causal=self._cute_flash_is_causal,
+            has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
+            requires_ws_overlap=self._cute_flash_requires_ws_overlap,
+            small_biased_candidate=self._cute_flash_small_biased_candidate,
             standard_dense_output=self._cute_flash_standard_dense_output,
+            standard_causal_output=self._cute_flash_standard_causal_output,
+            supports_tensor_4d_tma=self._cute_flash_supports_tensor_4d_tma,
             prefer_packed_reduce=(
                 self._cute_flash_has_kv_tile_pruning
                 or self._cute_flash_requires_ws_overlap
             ),
         )
+
+    def _legalize_cute_flash_compiler_seed(
+        self, seed: helion.Config | None
+    ) -> helion.Config | None:
+        """Project compiler-owned causal seeds onto a required TMA output path."""
+        if seed is None or not self._cute_flash_output_requires_tma:
+            return seed
+        if self._resolve_cute_flash_config(seed.config).epi_tma:
+            return seed
+        if not self._cute_flash_is_causal:
+            return None
+        projected = helion.Config.from_dict(
+            {
+                **seed.config,
+                FLASH_EPI_TMA_KEY: True,
+                FLASH_EPI_STG_KEY: False,
+                FLASH_EPI_STG_STORE_KEY: "slice",
+                FLASH_EPI_STG_GMEM_KEY: "stage",
+            }
+        )
+        effective = self._resolve_cute_flash_config(projected.config)
+        return projected if effective.epi_tma and not effective.epi_stg else None
+
+    def _legalize_cute_flash_compiler_seeds(
+        self, seeds: Sequence[helion.Config]
+    ) -> list[helion.Config]:
+        """Legalize and deduplicate compiler seeds while preserving rank order."""
+        result: list[helion.Config] = []
+        seen: set[helion.Config] = set()
+        for seed in seeds:
+            projected = self._legalize_cute_flash_compiler_seed(seed)
+            if projected is not None and projected not in seen:
+                result.append(projected)
+                seen.add(projected)
+        return result
 
     def _normalize_cute_flash(
         self, config: dict[str, object], *, fix_invalid: bool
@@ -978,6 +1034,9 @@ class ConfigSpec:
         # active Boolean fragment validates it.
         if FLASH_MMA_INTERLEAVE_KEY in config:
             config[FLASH_MMA_INTERLEAVE_KEY] = bool(config[FLASH_MMA_INTERLEAVE_KEY])
+        causal_lpt = config.get(FLASH_CAUSAL_LPT_SWIZZLE_KEY)
+        if self._cute_flash_is_causal and type(causal_lpt) is int:
+            config[FLASH_CAUSAL_LPT_SWIZZLE_KEY] = 1
         from .._compiler.cute.cute_flash import flash_autotune_fragments
 
         block_size_targets = self._cute_flash_block_size_target_list()
@@ -991,6 +1050,21 @@ class ConfigSpec:
             config.pop("epilogue_subtile", None)
         elif not self._is_cute_flash_config_envelope(config, block_size_targets):
             return
+
+        config.update(
+            _flash_compound_exp2_packet_overrides(
+                self._cute_flash_head_dim,
+                self._cute_flash_num_kv,
+                config,
+                dtype=self._cute_flash_dtype,
+                is_causal=self._cute_flash_is_causal,
+                has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
+                requires_ws_overlap=self._cute_flash_requires_ws_overlap,
+                small_biased_candidate=self._cute_flash_small_biased_candidate,
+                standard_dense_output=self._cute_flash_standard_dense_output,
+                standard_causal_output=self._cute_flash_standard_causal_output,
+            )
+        )
 
         has_legacy_structural_config = any(
             config.get(key) is not None for key in FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS
@@ -1015,16 +1089,28 @@ class ConfigSpec:
             requested_family = _flash_pipeline_family_flags(
                 config.get(FLASH_PIPELINE_FAMILY_KEY)
             )
-            pipeline_family_override = (
-                str(config[FLASH_PIPELINE_FAMILY_KEY])
-                if requested_family is not None
-                else legacy_effective.pipeline_family
-                if legacy_effective is not None
-                else None
-            )
             if requested_family is not None:
-                topology_override = requested_family.topology
+                requested_family_name = str(config[FLASH_PIPELINE_FAMILY_KEY])
+                if (
+                    requested_family.tensor_4d_tma
+                    and not self._cute_flash_supports_tensor_4d_tma
+                ):
+                    effective_family = self._resolve_cute_flash_config(
+                        {FLASH_PIPELINE_FAMILY_KEY: requested_family_name}
+                    ).pipeline_family
+                    pipeline_family_override = effective_family
+                    effective_flags = _flash_pipeline_family_flags(effective_family)
+                    assert effective_flags is not None
+                    topology_override = effective_flags.topology
+                else:
+                    pipeline_family_override = requested_family_name
+                    topology_override = requested_family.topology
             else:
+                pipeline_family_override = (
+                    legacy_effective.pipeline_family
+                    if legacy_effective is not None
+                    else None
+                )
                 valid_manual_topologies = {"fa4", "ws_overlap"}
                 topology_value = config.get(FLASH_TOPOLOGY_KEY)
                 topology_override = (
@@ -1032,19 +1118,49 @@ class ConfigSpec:
                     if topology_value in valid_manual_topologies
                     else None
                 )
-        fragments = flash_autotune_fragments(
-            self._cute_flash_head_dim,
-            self._cute_flash_num_kv,
-            dtype=self._cute_flash_dtype,
-            is_causal=self._cute_flash_is_causal,
-            has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
-            requires_ws_overlap=self._cute_flash_requires_ws_overlap,
-            small_biased_candidate=self._cute_flash_small_biased_candidate,
-            standard_dense_output=self._cute_flash_standard_dense_output,
-            standard_causal_output=self._cute_flash_standard_causal_output,
-            target_device_capability=self.target_device_capability,
-            topology_override=cast("str | None", topology_override),
-            pipeline_family_override=pipeline_family_override,
+
+        def make_fragments(
+            topology: str | None,
+            family: str | None,
+        ) -> dict[str, ConfigSpecFragment]:
+            return flash_autotune_fragments(
+                self._cute_flash_head_dim,
+                self._cute_flash_num_kv,
+                num_bh=self._cute_flash_num_bh,
+                tensor_4d_heads=self._cute_flash_tensor_4d_heads,
+                dtype=self._cute_flash_dtype,
+                is_causal=self._cute_flash_is_causal,
+                has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
+                requires_ws_overlap=self._cute_flash_requires_ws_overlap,
+                small_biased_candidate=self._cute_flash_small_biased_candidate,
+                standard_dense_output=self._cute_flash_standard_dense_output,
+                standard_causal_output=self._cute_flash_standard_causal_output,
+                output_requires_tma=self._cute_flash_output_requires_tma,
+                supports_tensor_4d_tma=self._cute_flash_supports_tensor_4d_tma,
+                target_device_capability=self.target_device_capability,
+                topology_override=topology,
+                pipeline_family_override=family,
+            )
+
+        if (
+            fix_invalid
+            and self._cute_flash_output_requires_tma
+            and pipeline_family_override is not None
+        ):
+            requested_effective = self._resolve_cute_flash_config(
+                {
+                    FLASH_PIPELINE_FAMILY_KEY: pipeline_family_override,
+                    FLASH_EPI_TMA_KEY: True,
+                    FLASH_EPI_STG_KEY: False,
+                }
+            )
+            if not requested_effective.epi_tma:
+                config.pop(FLASH_PIPELINE_FAMILY_KEY, None)
+                topology_override = None
+                pipeline_family_override = None
+
+        fragments = make_fragments(
+            cast("str | None", topology_override), pipeline_family_override
         )
         e2e_offset_was_present = FLASH_E2E_OFFSET_KEY in config
         e2e_offset0_was_present = FLASH_E2E_OFFSET0_KEY in config
@@ -1080,21 +1196,44 @@ class ConfigSpec:
             )
 
         effective = self._resolve_cute_flash_config(config)
+        if self._cute_flash_output_requires_tma and not effective.epi_tma:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{FLASH_EPI_TMA_KEY}=False is not legal for this output shape"
+                )
+            config[FLASH_EPI_TMA_KEY] = True
+            config[FLASH_EPI_STG_KEY] = False
+            effective = self._resolve_cute_flash_config(config)
+            if not effective.epi_tma:
+                repair_fragments = make_fragments(None, None)
+                family_fragment = cast(
+                    "EnumFragment", repair_fragments[FLASH_PIPELINE_FAMILY_KEY]
+                )
+                for family in family_fragment.choices:
+                    repaired = self._resolve_cute_flash_config(
+                        {
+                            **config,
+                            FLASH_PIPELINE_FAMILY_KEY: family,
+                            FLASH_EPI_TMA_KEY: True,
+                            FLASH_EPI_STG_KEY: False,
+                        }
+                    )
+                    if repaired.epi_tma:
+                        config[FLASH_PIPELINE_FAMILY_KEY] = family
+                        effective = repaired
+                        fragments = repair_fragments
+                        break
+            if not effective.epi_tma:
+                raise InvalidConfig(
+                    "CuTe flash output requires TMA, but no legal TMA output "
+                    "schedule is available"
+                )
         effective_topology = effective.topology
         config.update(flash_effective_config_values(effective))
         if effective_topology == "fa4":
             config.update(explicit_e2e_offsets)
-        e2e_schedule_default = (
-            "8/2"
-            if (
-                effective_topology == "fa4"
-                and self._cute_flash_is_causal
-                and self._cute_flash_head_dim == 64
-                and _flash_causal_hd64_seed_num_kv_supported(self._cute_flash_num_kv)
-            )
-            else _flash_e2e_schedule_default(
-                effective_topology, self._cute_flash_head_dim
-            )
+        e2e_schedule_default = _flash_e2e_schedule_default(
+            effective_topology, self._cute_flash_head_dim
         )
         exp2_impl, e2e_freq, e2e_res = _flash_parse_e2e_schedule(
             str(config[FLASH_E2E_SCHEDULE_KEY]), e2e_schedule_default
@@ -1134,16 +1273,8 @@ class ConfigSpec:
             and effective_topology == "fa4"
             and self._cute_flash_head_dim == 64
         ):
-            if self._cute_flash_is_causal and _flash_causal_hd64_seed_num_kv_supported(
-                self._cute_flash_num_kv
-            ):
-                schedule_default_offset = (
-                    _flash_causal_hd64_seed_params(self._cute_flash_num_kv)[0]
-                    % e2e_offset_period
-                )
-            else:
-                split_default_freq = e2e_freq if e2e_res > 0 else masked_e2e_freq
-                schedule_default_offset = split_default_freq // 8
+            split_default_freq = e2e_freq if e2e_res > 0 else masked_e2e_freq
+            schedule_default_offset = split_default_freq // 8
         else:
             schedule_default_offset = 0
         default_offset = schedule_default_offset
@@ -1158,17 +1289,7 @@ class ConfigSpec:
                 default_offset %= e2e_offset_period
         if not e2e_offset_was_present:
             config[FLASH_E2E_OFFSET_KEY] = default_offset
-        default_offset0 = (
-            _flash_causal_hd64_seed_offset0(self._cute_flash_num_kv)
-            if (
-                e2e_offset_period > 0
-                and effective_topology == "fa4"
-                and self._cute_flash_is_causal
-                and self._cute_flash_head_dim == 64
-                and _flash_causal_hd64_seed_num_kv_supported(self._cute_flash_num_kv)
-            )
-            else 0
-        )
+        default_offset0 = 0
         env_offset0 = os.environ.get("HELION_CUTE_FLASH_E2E_OFFSET0")
         if env_offset0 is not None:
             env_offset0_value = int(env_offset0)
@@ -1288,6 +1409,8 @@ class ConfigSpec:
         *,
         head_dim: int,
         num_kv: int,
+        num_bh: int | None = None,
+        tensor_4d_heads: int | None = None,
         dtype: torch.dtype = torch.float16,
         block_size_targets: Mapping[int, int],
         is_causal: bool = False,
@@ -1296,10 +1419,16 @@ class ConfigSpec:
         small_biased_candidate: bool = False,
         standard_dense_output: bool = False,
         standard_causal_output: bool = False,
+        output_requires_tma: bool = False,
+        supports_tensor_4d_tma: bool = True,
     ) -> None:
+        self.cute_attention_generic_fallback_enabled = False
+        self._cute_attention_generic_fallback_block_size_targets = {}
         self.cute_flash_search_enabled = True
         self._cute_flash_head_dim = head_dim
         self._cute_flash_num_kv = num_kv
+        self._cute_flash_num_bh = num_bh
+        self._cute_flash_tensor_4d_heads = tensor_4d_heads
         self._cute_flash_dtype = dtype
         self._cute_flash_is_causal = is_causal
         self._cute_flash_has_kv_tile_pruning = has_kv_tile_pruning
@@ -1307,11 +1436,31 @@ class ConfigSpec:
         self._cute_flash_small_biased_candidate = small_biased_candidate
         self._cute_flash_standard_dense_output = standard_dense_output
         self._cute_flash_standard_causal_output = standard_causal_output
+        self._cute_flash_output_requires_tma = output_requires_tma
+        self._cute_flash_supports_tensor_4d_tma = supports_tensor_4d_tma
         self._cute_flash_block_size_targets = dict(block_size_targets)
         for block_id, target in block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
             spec.autotuner_min = target
             spec.max_size = target
+
+    def enable_cute_attention_generic_fallback(
+        self, *, block_size_targets: Mapping[int, int] | None = None
+    ) -> None:
+        """Use generic CuTe for an attention shape with no legal flash output."""
+        self.cute_attention_generic_fallback_enabled = True
+        self._cute_attention_generic_fallback_block_size_targets = dict(
+            block_size_targets or {}
+        )
+        # These are legality bounds for the generic attention lowering, not a
+        # selected winner. They make the ordinary default a known-good initial
+        # candidate while leaving all larger block sizes available to tuning.
+        for (
+            block_id,
+            target,
+        ) in self._cute_attention_generic_fallback_block_size_targets.items():
+            spec = self.block_sizes.block_id_lookup(block_id)
+            spec.autotuner_min = max(spec.autotuner_min, target)
 
     def _pre_normalize_cute_flash_block_sizes(self, config: dict[str, object]) -> None:
         if not self.cute_flash_search_enabled or "block_sizes" not in config:
@@ -1512,10 +1661,12 @@ class ConfigSpec:
             from .._compiler.cute.cute_flash import flash_attention_seed_configs
 
             assert self._cute_flash_head_dim is not None
-            seeds.extend(
+            flash_seeds = list(
                 flash_attention_seed_configs(
                     self._cute_flash_head_dim,
                     self._cute_flash_num_kv,
+                    num_bh=self._cute_flash_num_bh,
+                    tensor_4d_heads=self._cute_flash_tensor_4d_heads,
                     dtype=self._cute_flash_dtype,
                     is_causal=self._cute_flash_is_causal,
                     has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
@@ -1524,9 +1675,12 @@ class ConfigSpec:
                     standard_dense_output=self._cute_flash_standard_dense_output,
                     standard_causal_output=self._cute_flash_standard_causal_output,
                     target_device_capability=self.target_device_capability,
+                    supports_tensor_4d_tma=(self._cute_flash_supports_tensor_4d_tma),
                     block_size_targets=self._cute_flash_block_size_target_list(),
                 )
             )
+            flash_seeds = self._legalize_cute_flash_compiler_seeds(flash_seeds)
+            seeds.extend(flash_seeds)
         return seeds
 
     def _fix_tcgen05_cluster_m2_search_config(self, config: dict[str, object]) -> None:
@@ -2414,28 +2568,79 @@ class ConfigSpec:
     ) -> ConfigGeneration:
         from .config_generation import ConfigGeneration
 
-        effective_overrides = overrides
+        effective_overrides = dict(overrides) if overrides else None
         family_override: str | None = None
-        if self.cute_flash_search_enabled and overrides:
-            exact_family = overrides.get(FLASH_PIPELINE_FAMILY_KEY)
-            if _flash_pipeline_family_flags(exact_family) is not None:
-                family_override = cast("str", exact_family)
-            elif FLASH_PIPELINE_FAMILY_KEY not in overrides:
+        if self.cute_flash_search_enabled and effective_overrides:
+            if FLASH_PIPELINE_FAMILY_KEY not in effective_overrides:
                 legacy = {
-                    key: overrides[key]
+                    key: effective_overrides[key]
                     for key in FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS
-                    if overrides.get(key) is not None
+                    if effective_overrides.get(key) is not None
                 }
                 if legacy:
-                    if FLASH_PERSISTENT_KEY in overrides:
-                        legacy[FLASH_PERSISTENT_KEY] = overrides[FLASH_PERSISTENT_KEY]
-                    family_override = self._resolve_cute_flash_config(
-                        legacy
-                    ).pipeline_family
-                    effective_overrides = {
-                        **overrides,
-                        FLASH_PIPELINE_FAMILY_KEY: family_override,
-                    }
+                    if FLASH_PERSISTENT_KEY in effective_overrides:
+                        legacy[FLASH_PERSISTENT_KEY] = effective_overrides[
+                            FLASH_PERSISTENT_KEY
+                        ]
+                    effective_overrides[FLASH_PIPELINE_FAMILY_KEY] = (
+                        self._resolve_cute_flash_config(legacy).pipeline_family
+                    )
+
+            requested_packet = effective_overrides.get(FLASH_EXP2_PACKET_KEY)
+            if flash_exp2_packet_is_compound(requested_packet):
+                assert self._cute_flash_head_dim is not None
+                assert self._cute_flash_num_kv is not None
+                packet_requirements = _flash_compound_exp2_packet_overrides(
+                    self._cute_flash_head_dim,
+                    self._cute_flash_num_kv,
+                    {
+                        key: value
+                        for key, value in effective_overrides.items()
+                        if key != FLASH_PIPELINE_FAMILY_KEY
+                    },
+                    dtype=self._cute_flash_dtype,
+                    is_causal=self._cute_flash_is_causal,
+                    has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
+                    requires_ws_overlap=self._cute_flash_requires_ws_overlap,
+                    small_biased_candidate=self._cute_flash_small_biased_candidate,
+                    standard_dense_output=self._cute_flash_standard_dense_output,
+                    standard_causal_output=self._cute_flash_standard_causal_output,
+                )
+                if not packet_requirements:
+                    raise InvalidConfig(
+                        f"{FLASH_EXP2_PACKET_KEY}={requested_packet!r} is not "
+                        "effective for this kernel"
+                    )
+                for key, required_value in packet_requirements.items():
+                    if (
+                        key in effective_overrides
+                        and effective_overrides[key] != required_value
+                    ):
+                        raise InvalidConfig(
+                            f"{FLASH_EXP2_PACKET_KEY}={requested_packet!r} "
+                            f"requires {key}={required_value!r}, got "
+                            f"{effective_overrides[key]!r}"
+                        )
+                    effective_overrides[key] = required_value
+
+            exact_family = effective_overrides.get(FLASH_PIPELINE_FAMILY_KEY)
+            family_flags = _flash_pipeline_family_flags(exact_family)
+            if family_flags is not None:
+                family_override = cast("str", exact_family)
+                if family_flags.use_clc_scheduler or family_flags.local_tma_partition:
+                    if effective_overrides.get(FLASH_PERSISTENT_KEY) is False:
+                        raise InvalidConfig(
+                            f"{FLASH_PIPELINE_FAMILY_KEY}={family_override!r} "
+                            f"requires {FLASH_PERSISTENT_KEY}=True"
+                        )
+                    effective_overrides[FLASH_PERSISTENT_KEY] = True
+
+            if self._cute_flash_output_requires_tma:
+                if effective_overrides.get(FLASH_EPI_TMA_KEY) is False:
+                    raise InvalidConfig(
+                        f"{FLASH_EPI_TMA_KEY}=False is not legal for this output shape"
+                    )
+                effective_overrides[FLASH_EPI_TMA_KEY] = True
         return ConfigGeneration(
             self,
             overrides=effective_overrides,
@@ -2461,6 +2666,67 @@ class ConfigSpec:
         overrides: Mapping[str, object],
     ) -> None:
         if self.backend_name == "cute":
+            family = overrides.get(FLASH_PIPELINE_FAMILY_KEY)
+            family_flags = _flash_pipeline_family_flags(family)
+            if self.cute_flash_search_enabled and family_flags is not None:
+                effective_family = self._resolve_cute_flash_config(
+                    {FLASH_PIPELINE_FAMILY_KEY: family}
+                ).pipeline_family
+                if effective_family != family:
+                    raise InvalidConfig(
+                        f"cute_flash_pipeline_family={family!r} is not effective "
+                        f"for this kernel; it normalizes to {effective_family!r}"
+                    )
+            if self.cute_flash_search_enabled and FLASH_EXP2_PACKET_KEY in overrides:
+                assert self._cute_flash_head_dim is not None
+                assert self._cute_flash_num_kv is not None
+                packet_requirements = _flash_compound_exp2_packet_overrides(
+                    self._cute_flash_head_dim,
+                    self._cute_flash_num_kv,
+                    {
+                        key: value
+                        for key, value in overrides.items()
+                        if key != FLASH_PIPELINE_FAMILY_KEY
+                    },
+                    dtype=self._cute_flash_dtype,
+                    is_causal=self._cute_flash_is_causal,
+                    has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
+                    requires_ws_overlap=self._cute_flash_requires_ws_overlap,
+                    small_biased_candidate=self._cute_flash_small_biased_candidate,
+                    standard_dense_output=self._cute_flash_standard_dense_output,
+                    standard_causal_output=self._cute_flash_standard_causal_output,
+                )
+                requested_packet = overrides[FLASH_EXP2_PACKET_KEY]
+                for key, required_value in packet_requirements.items():
+                    if key in overrides and overrides[key] != required_value:
+                        raise InvalidConfig(
+                            f"cute_flash_exp2_packet={requested_packet!r} "
+                            f"requires {key}={required_value!r}, got "
+                            f"{overrides[key]!r}"
+                        )
+                if family_flags is not None:
+                    effective_packet = self._resolve_cute_flash_config(
+                        {
+                            FLASH_PIPELINE_FAMILY_KEY: family,
+                            FLASH_EXP2_PACKET_KEY: requested_packet,
+                        }
+                    ).exp2_packet
+                    if effective_packet != requested_packet:
+                        raise InvalidConfig(
+                            f"cute_flash_exp2_packet={requested_packet!r} is not "
+                            f"effective with cute_flash_pipeline_family={family!r}"
+                        )
+            if (
+                self.cute_flash_search_enabled
+                and family_flags is not None
+                and (family_flags.use_clc_scheduler or family_flags.local_tma_partition)
+            ):
+                if overrides.get(FLASH_PERSISTENT_KEY) is False:
+                    raise InvalidConfig(
+                        f"cute_flash_pipeline_family={family!r} requires "
+                        "cute_flash_persistent=True"
+                    )
+                config[FLASH_PERSISTENT_KEY] = True
             self._cute_tcgen05_config.prepare_override_normalization(
                 config,
                 overrides,
@@ -2565,6 +2831,8 @@ class ConfigSpec:
                     flash_autotune_fragments(
                         self._cute_flash_head_dim,
                         self._cute_flash_num_kv,
+                        num_bh=self._cute_flash_num_bh,
+                        tensor_4d_heads=self._cute_flash_tensor_4d_heads,
                         dtype=self._cute_flash_dtype,
                         is_causal=self._cute_flash_is_causal,
                         has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
@@ -2577,6 +2845,10 @@ class ConfigSpec:
                             self._cute_flash_standard_causal_output
                         ),
                         target_device_capability=self.target_device_capability,
+                        output_requires_tma=self._cute_flash_output_requires_tma,
+                        supports_tensor_4d_tma=(
+                            self._cute_flash_supports_tensor_4d_tma
+                        ),
                         pipeline_family_override=_flash_pipeline_family_override,
                     )
                 )

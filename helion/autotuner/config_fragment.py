@@ -294,19 +294,33 @@ class IntegerFragment(BaseIntegerFragment):
 class EnumFragment(ConfigSpecFragment):
     choices: tuple[object, ...]
     search_choices: tuple[object, ...] | None = None
+    coverage_choices: tuple[object, ...] | None = None
 
     def __post_init__(self) -> None:
-        if self.search_choices is None:
-            return
-        if not self.search_choices:
-            raise ValueError("search_choices must not be empty")
-        invalid = [
-            choice for choice in self.search_choices if choice not in self.choices
-        ]
-        if invalid:
-            raise ValueError(
-                f"search_choices must be a subset of choices, got {invalid!r}"
-            )
+        if self.search_choices is not None:
+            if not self.search_choices:
+                raise ValueError("search_choices must not be empty")
+            invalid = [
+                choice for choice in self.search_choices if choice not in self.choices
+            ]
+            if invalid:
+                raise ValueError(
+                    f"search_choices must be a subset of choices, got {invalid!r}"
+                )
+        if self.coverage_choices is not None:
+            if not self.coverage_choices:
+                raise ValueError("coverage_choices must not be empty")
+            active_choices = self._active_choices()
+            invalid = [
+                choice
+                for choice in self.coverage_choices
+                if choice not in active_choices
+            ]
+            if invalid:
+                raise ValueError(
+                    "coverage_choices must be a subset of active search choices, "
+                    f"got {invalid!r}"
+                )
 
     def _active_choices(self) -> tuple[object, ...]:
         return self.choices if self.search_choices is None else self.search_choices
@@ -350,14 +364,14 @@ class EnumFragment(ConfigSpecFragment):
         return list(active)
 
     def fingerprint(self) -> FragmentFingerprint:
-        if self.search_choices is None:
-            return ("enum", *(repr(choice) for choice in self.choices))
-        return (
-            "enum",
-            *(repr(choice) for choice in self.choices),
-            "search",
-            *(repr(choice) for choice in self.search_choices),
-        )
+        result = ["enum", *(repr(choice) for choice in self.choices)]
+        if self.search_choices is not None:
+            result.extend(("search", *(repr(choice) for choice in self.search_choices)))
+        if self.coverage_choices is not None:
+            result.extend(
+                ("coverage", *(repr(choice) for choice in self.coverage_choices))
+            )
+        return tuple(result)
 
     def encode(self, value: object) -> list[float]:
         """Encode enum values as their index."""

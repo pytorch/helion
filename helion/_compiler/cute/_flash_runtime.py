@@ -1213,6 +1213,143 @@ def fa4_disc_exp_convert_store_causal(
     return p_sum
 
 
+def _disc_resident_exp_store_rowsum(
+    frg: cute.Tensor,
+    tiled_st: object,
+    tSTtS: cute.Tensor,
+    tSTcS: cute.Tensor,
+    ci: int,
+    scale: Float32,
+    minus_max_scale: Float32,
+    e2e_freq: int,
+    e2e_res: int,
+    e2e_offset: int,
+    last_frag: bool,
+    io_dtype: object,
+    pair_batch: int,
+    emu_batch: int,
+    degree2: bool,
+) -> Float32:
+    """Consume one resident score chunk without changing chunk order."""
+    _disc_chunk_exp(
+        frg,
+        scale,
+        minus_max_scale,
+        e2e_freq,
+        e2e_res,
+        e2e_offset,
+        last_frag,
+        pair_batch,
+        emu_batch,
+        degree2,
+    )
+    _disc_chunk_convert_store(frg, tiled_st, tSTtS, tSTcS, ci, io_dtype)
+    return _disc_chunk_rowsum(frg)
+
+
+def fa4_disc_exp_convert_store_resident3_013_prefetch2(
+    frg0: cute.Tensor,
+    frg1: cute.Tensor,
+    frg3: cute.Tensor,
+    tiled_ld: object,
+    tLDtS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    tiled_st: object,
+    tSTtS: cute.Tensor,
+    tSTcS: cute.Tensor,
+    scale: Float32,
+    minus_max_scale: Float32,
+    e2e_freq: int,
+    e2e_res: int,
+    e2e_offset: int,
+    pfor_ptr_stage: object,
+    pfor2_ptr_stage: object,
+    io_dtype: object = cutlass.BFloat16,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
+    degree2: bool = False,
+) -> Float32:
+    """Prefetch reloaded chunk 2 while consuming resident chunk 1."""
+    p_sum = _disc_resident_exp_store_rowsum(
+        frg0,
+        tiled_st,
+        tSTtS,
+        tSTcS,
+        0,
+        scale,
+        minus_max_scale,
+        e2e_freq,
+        e2e_res,
+        e2e_offset,
+        False,
+        io_dtype,
+        pair_batch,
+        emu_batch,
+        degree2,
+    )
+    ld_shape = tLDcS[None, 0, None, None].shape  # pyrefly: ignore[missing-attribute]
+    frg2 = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
+    cute.copy(tiled_ld, tLDtS[None, 2, None, None], frg2)
+    _disc_pin_frag(frg2)
+    p_sum = p_sum + _disc_resident_exp_store_rowsum(
+        frg1,
+        tiled_st,
+        tSTtS,
+        tSTcS,
+        1,
+        scale,
+        minus_max_scale,
+        e2e_freq,
+        e2e_res,
+        e2e_offset,
+        False,
+        io_dtype,
+        pair_batch,
+        emu_batch,
+        degree2,
+    )
+    cute.arch.fence_view_async_tmem_load()
+    p_sum = p_sum + _disc_resident_exp_store_rowsum(
+        frg2,
+        tiled_st,
+        tSTtS,
+        tSTcS,
+        2,
+        scale,
+        minus_max_scale,
+        e2e_freq,
+        e2e_res,
+        e2e_offset,
+        False,
+        io_dtype,
+        pair_batch,
+        emu_batch,
+        degree2,
+    )
+    cute.arch.fence_view_async_tmem_store()
+    mbarrier_arrive(pfor_ptr_stage)
+    p_sum = p_sum + _disc_resident_exp_store_rowsum(
+        frg3,
+        tiled_st,
+        tSTtS,
+        tSTcS,
+        3,
+        scale,
+        minus_max_scale,
+        e2e_freq,
+        e2e_res,
+        e2e_offset,
+        True,
+        io_dtype,
+        pair_batch,
+        emu_batch,
+        degree2,
+    )
+    cute.arch.fence_view_async_tmem_store()
+    mbarrier_arrive(pfor2_ptr_stage)
+    return p_sum
+
+
 def _disc_chunk_exp(
     frg: cute.Tensor,
     scale: Float32,
@@ -2200,6 +2337,20 @@ def fa4_store_o_smem_to_gmem_whole(
         )
 
 
+def relu_fragment_inplace(frg: cute.Tensor) -> None:
+    """Apply torch.relu semantics to an FP32 register fragment."""
+    value = frg.load()
+    # Preserve NaNs; every non-positive value maps to the +0 produced by CUDA
+    # torch.relu, including negative zero.
+    frg.store(
+        cute.where(
+            value != value,
+            value,
+            cute.where(value > 0.0, value, 0.0),
+        )
+    )
+
+
 def fa4_correction_epilogue_to_smem(
     tiled_t2r: object,
     tiled_r2s: object,
@@ -2208,6 +2359,7 @@ def fa4_correction_epilogue_to_smem(
     tOcO_corr_t2r: cute.Tensor,
     inv_sum: object,
     chunks: int,
+    relu_output: bool = False,
 ) -> None:
     """FA4 correction epilogue: rescale O in TMEM and stage fp16 output in SMEM."""
     for i in range(chunks):
@@ -2215,6 +2367,8 @@ def fa4_correction_epilogue_to_smem(
         reg = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
         cute.copy(tiled_t2r, tOtO_corr_t2r[None, 0, 0, i], reg)
         reg.store(reg.load() * inv_sum)
+        if cutlass.const_expr(relu_output):
+            relu_fragment_inplace(reg)
         cvt_copy(tiled_r2s, reg, tOsO_corr_r2s[None, 0, 0, i])
 
 
@@ -2232,6 +2386,7 @@ def fa4_correction_epilogue_handoff_to_smem(
     inv_sum: object,
     chunks: int,
     wait_hint: int = 10_000_000,
+    relu_output: bool = False,
 ) -> None:
     """Wait for O/epilogue handoff, stage final O in SMEM, then publish it."""
     mbar_spin_wait(o_full_ptr_stage, o_full_phase, wait_hint)
@@ -2244,6 +2399,7 @@ def fa4_correction_epilogue_handoff_to_smem(
         tOcO_corr_t2r,
         inv_sum,
         chunks,
+        relu_output=relu_output,
     )
     cute.arch.fence_view_async_shared()
     cute.arch.mbarrier_arrive(corr_epi_full_ptr_stage)
@@ -2259,6 +2415,7 @@ def fa4_correction_epilogue_to_smem_scoped(
     head_dim: int,
     corr_tile_size: int,
     o_dtype: object,
+    relu_output: bool = False,
     *,
     loc: object = None,
     ip: object = None,
@@ -2298,6 +2455,8 @@ def fa4_correction_epilogue_to_smem_scoped(
         reg = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
         cute.copy(tiled_t2r, tOtO_t2r[None, 0, 0, i], reg)
         reg.store(reg.load() * inv_sum)
+        if cutlass.const_expr(relu_output):
+            relu_fragment_inplace(reg)
         cvt_copy(tiled_r2s, reg, tOsO_r2s[None, 0, 0, i])
 
 
@@ -2311,6 +2470,7 @@ def fa4_correction_epilogue_to_smem_scoped_2cta(
     head_dim: int,
     corr_tile_size: int,
     o_dtype: object,
+    relu_output: bool = False,
     *,
     loc: object = None,
     ip: object = None,
@@ -2349,6 +2509,8 @@ def fa4_correction_epilogue_to_smem_scoped_2cta(
         reg = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
         cute.copy(tiled_t2r, tOtO_t2r[None, 0, 0, i], reg)
         reg.store(reg.load() * inv_sum)
+        if cutlass.const_expr(relu_output):
+            relu_fragment_inplace(reg)
         cvt_copy(tiled_r2s, reg, tOsO_r2s[None, 0, 0, i])
 
 
@@ -2367,6 +2529,7 @@ def fa4_correction_epilogue_handoff_to_smem_scoped(
     corr_tile_size: int,
     o_dtype: object,
     wait_hint: int = 10_000_000,
+    relu_output: bool = False,
 ) -> None:
     """Wait for O/epilogue handoff, scope copy views, then publish staged O."""
     mbar_spin_wait(o_full_ptr_stage, o_full_phase, wait_hint)
@@ -2380,6 +2543,7 @@ def fa4_correction_epilogue_handoff_to_smem_scoped(
         head_dim,
         corr_tile_size,
         o_dtype,
+        relu_output=relu_output,
     )
     cute.arch.fence_view_async_shared()
     cute.arch.mbarrier_arrive(corr_epi_full_ptr_stage)
@@ -2400,6 +2564,7 @@ def fa4_correction_epilogue_handoff_to_smem_scoped_2cta(
     corr_tile_size: int,
     o_dtype: object,
     wait_hint: int = 10_000_000,
+    relu_output: bool = False,
 ) -> None:
     """Wait for handoff and stage a two-CTA output in CTA-local shared memory."""
     mbar_spin_wait(o_full_ptr_stage, o_full_phase, wait_hint)
@@ -2413,6 +2578,7 @@ def fa4_correction_epilogue_handoff_to_smem_scoped_2cta(
         head_dim,
         corr_tile_size,
         o_dtype,
+        relu_output=relu_output,
     )
     cute.arch.fence_view_async_shared()
     cute.arch.mbarrier_arrive(corr_epi_full_ptr_stage)

@@ -9,6 +9,7 @@ import importlib
 import math
 import os
 import threading
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
@@ -20,16 +21,21 @@ import pytest
 import torch
 
 import helion
+from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.attention_plan import causal_score_plan
 from helion._compiler.cute.flash_policy import get_flash_target_policy
 from helion._compiler.cute.flash_tuning import FlashPackedExp2Mode
 from helion._compiler.cute.flash_tuning import FlashSoftmaxLowering
+from helion._compiler.device_ir import DeviceIR
+from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
+from helion.autotuner.config_spec import BlockSizeSpec
+from helion.autotuner.config_spec import ConfigSpec
 from helion.exc import BackendUnsupported
 from helion.exc import CuteBackendUnavailable
 from helion.exc import InvalidConfig
@@ -46,8 +52,6 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from typing_extensions import Self
 
-    from helion.autotuner.config_spec import ConfigSpec
-
 cutlass = pytest.importorskip("cutlass")
 cute = pytest.importorskip("cutlass.cute")
 
@@ -58,6 +62,7 @@ _cute_grouped_reduce_shared_tree = importlib.import_module(
     "helion._compiler.cute.reduce_helpers"
 )._cute_grouped_reduce_shared_tree
 _cute_flash = importlib.import_module("helion._compiler.cute.cute_flash")
+_compiler_backend = importlib.import_module("helion._compiler.backend")
 flash_fa4_shared_storage = importlib.import_module(
     "helion._compiler.cute._flash_runtime"
 ).flash_fa4_shared_storage
@@ -921,6 +926,55 @@ def cute_batched_dot_unsupported_epilogue_tcgen05(
     for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
         acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
         for tile_k in hl.tile(k):
+            acc = hl.dot(
+                x[tile_b, tile_m, tile_k],
+                y[tile_b, tile_k, tile_n],
+                acc=acc,
+            )
+        out[tile_b, tile_m, tile_n] = (
+            acc + torch.sin(residual[tile_b, tile_m, tile_n])
+        ).to(torch.bfloat16)
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_batched_dot_fixed_m_fragment_epilogue_tcgen05(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    residual: torch.Tensor,
+) -> torch.Tensor:
+    b, m, k = x.size()
+    _, _, n = y.size()
+    block_m = hl.register_block_size(256, 256)
+    block_n = hl.register_block_size(64)
+    block_k = hl.register_block_size(64)
+    out = torch.empty([b, m, n], dtype=torch.bfloat16, device=x.device)
+    for tile_b, tile_m, tile_n in hl.tile([b, m, n], block_size=[1, block_m, block_n]):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k, block_size=block_k):
+            acc = hl.dot(
+                x[tile_b, tile_m, tile_k],
+                y[tile_b, tile_k, tile_n],
+                acc=acc,
+            )
+        out[tile_b, tile_m, tile_n] = (
+            acc + torch.sin(residual[tile_b, tile_m, tile_n])
+        ).to(torch.bfloat16)
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_batched_dot_literal_fragment_epilogue_tcgen05(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    residual: torch.Tensor,
+) -> torch.Tensor:
+    b, m, k = x.size()
+    _, _, n = y.size()
+    out = torch.empty([b, m, n], dtype=torch.bfloat16, device=x.device)
+    for tile_b, tile_m, tile_n in hl.tile([b, m, n], block_size=[1, 128, 64]):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k, block_size=64):
             acc = hl.dot(
                 x[tile_b, tile_m, tile_k],
                 y[tile_b, tile_k, tile_n],
@@ -2412,7 +2466,7 @@ class TestCuteBackend(TestCase):
         self.assertNotIn("flash_tile_id % 512", code)
         self.assertNotIn("flash_tile_id // 512", code)
 
-    def test_flash_attention_fa4_no_prelude_uses_counted_loop_for_mid_dense(
+    def test_flash_attention_fa4_no_prelude_explicit_counted_loop_preserves_tile_id(
         self,
     ) -> None:
         code = _cute_flash._flash_fa4_wrap(
@@ -2420,6 +2474,7 @@ class TestCuteBackend(TestCase):
             "    cute.arch.setmaxregister_increase(200)",
             "        flash_sink = flash_sink + flash_tile_id",
             persistent=True,
+            persistent_loop="counted",
             prelude="none",
             total_tiles=8192,
             num_m_pairs=128,
@@ -2441,6 +2496,7 @@ class TestCuteBackend(TestCase):
             "    cute.arch.setmaxregister_increase(200)",
             "        flash_sink = flash_sink + cutlass.Int32(1)",
             persistent=True,
+            persistent_loop="counted",
             prelude="none",
             total_tiles=8192,
             num_m_pairs=128,
@@ -2448,14 +2504,13 @@ class TestCuteBackend(TestCase):
         self.assertIn("for flash_tile_iter in cutlass.range", code)
         self.assertNotIn("flash_tile_id = flash_tile_id + flash_grid_dim", code)
 
-    def test_flash_attention_fa4_no_prelude_keeps_while_loop_for_long_sequence(
-        self,
-    ) -> None:
+    def test_flash_attention_fa4_no_prelude_explicit_while_loop(self) -> None:
         code = _cute_flash._flash_fa4_wrap(
             "if warp_idx == 0:",
             "    cute.arch.setmaxregister_increase(200)",
             "        flash_sink = flash_sink + cutlass.Int32(1)",
             persistent=True,
+            persistent_loop="while",
             prelude="none",
             total_tiles=8192,
             num_m_pairs=1024,
@@ -2599,6 +2654,62 @@ class TestCuteBackend(TestCase):
                     self.assertNotIn("sO = storage.sO.get_tensor", code)
                     tol = 3e-2 if dtype is torch.bfloat16 else 1e-2
                     torch.testing.assert_close(out, expected, atol=tol, rtol=tol)
+
+    def test_flash_attention_generalized_pipeline_families_match_sdpa(self) -> None:
+        cases = (
+            (
+                torch.float16,
+                64,
+                "fa4_cga2_local_tma_4d",
+                {},
+            ),
+            (
+                torch.float16,
+                64,
+                "fa4_clc_local_tma_4d",
+                {
+                    "cute_flash_clc_heads_per_batch": 2,
+                    "cute_flash_clc_pdl": True,
+                    "cute_flash_clc_stages": 3,
+                },
+            ),
+            (
+                torch.bfloat16,
+                128,
+                "fa4_local_tma",
+                {},
+            ),
+        )
+        for dtype, head_dim, family, family_config in cases:
+            with self.subTest(dtype=str(dtype), head_dim=head_dim, family=family):
+                q, k, v = (
+                    torch.randn(1, 2, 512, head_dim, dtype=dtype, device=DEVICE)
+                    for _ in range(3)
+                )
+                config = {
+                    "block_sizes": [1, 128, 128],
+                    "cute_flash_pipeline_family": family,
+                    **family_config,
+                }
+                resolved = resolve_flash_config(
+                    head_dim,
+                    4,
+                    config,
+                    dtype=dtype,
+                    num_bh=2,
+                    standard_dense_output=True,
+                )
+                self.assertEqual(resolved.pipeline_family, family)
+
+                code, out = code_and_output(cute_dense_attention, (q, k, v), **config)
+                _repeated_code, repeated = code_and_output(
+                    cute_dense_attention, (q, k, v), **config
+                )
+                self.assertTrue(_flash_fired(code))
+                self.assertTrue(torch.equal(out, repeated))
+                expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+                tol = 3e-2 if dtype is torch.bfloat16 else 1e-2
+                torch.testing.assert_close(out, expected, atol=tol, rtol=tol)
 
     def test_flash_attention_fa4_sync_schedule_controls_match_sdpa(self) -> None:
         for dtype in (torch.float16, torch.bfloat16):
@@ -2883,17 +2994,15 @@ class TestCuteBackend(TestCase):
             torch.empty(1, 1, 32768, 64, dtype=torch.float16, device=DEVICE)
             for _ in range(3)
         )
-        resident_config = helion.Config(
-            block_sizes=[1, 128, 128],
-            cute_flash_pipeline_family="fa4_2cta",
-            cute_flash_persistent=False,
-            cute_flash_exp2_packet="deg1_8x2_corr10",
-            cute_flash_e2e_schedule="8/2",
-            cute_flash_e2e_offset=5,
-            cute_flash_e2e_offset0=1,
-            cute_flash_kv_stage=6,
-            cute_flash_stat_transport="single",
+        resident_seed = _cute_flash.flash_attention_seed_config(
+            64,
+            256,
+            dtype=torch.float16,
+            standard_dense_output=True,
+            target_device_capability=(10, 3),
         )
+        assert resident_seed is not None
+        resident_config = helion.Config(**resident_seed.config)
         resident_bound = cute_dense_attention.bind((resident_q, resident_k, resident_v))
         with patch.object(
             resident_bound.env.config_spec, "target_device_capability", (10, 3)
@@ -2923,17 +3032,15 @@ class TestCuteBackend(TestCase):
             torch.empty(1, 1, 262144, 64, dtype=torch.float16, device=DEVICE)
             for _ in range(3)
         )
-        config = helion.Config(
-            block_sizes=[1, 128, 128],
-            cute_flash_pipeline_family="fa4_2cta",
-            cute_flash_persistent=False,
-            cute_flash_exp2_packet="deg1_16x8",
-            cute_flash_e2e_schedule="16/8",
-            cute_flash_e2e_offset=0,
-            cute_flash_e2e_offset0=10,
-            cute_flash_kv_stage=6,
-            cute_flash_stat_transport="single_final",
+        packed_seed = _cute_flash.flash_attention_seed_config(
+            64,
+            2048,
+            dtype=torch.float16,
+            standard_dense_output=True,
+            target_device_capability=(10, 3),
         )
+        assert packed_seed is not None
+        config = helion.Config(**packed_seed.config)
         dense_bound = cute_dense_attention.bind((q, k, v))
         with patch.object(
             dense_bound.env.config_spec, "target_device_capability", (10, 3)
@@ -2948,33 +3055,8 @@ class TestCuteBackend(TestCase):
         self.assertNotIn("f16x2_xu=True", b200_code)
 
         packed_lse_bound = cute_dense_attention_with_lse.bind((q, k, v))
-        target_policy = get_flash_target_policy((10, 3))
-        lse_tuning = dataclasses.replace(
-            target_policy.tuning,
-            dense_policies=tuple(
-                dataclasses.replace(policy, stat_transport="single")
-                if policy.num_kv == 2048
-                else policy
-                for policy in target_policy.tuning.dense_policies
-            ),
-        )
-        lse_config = helion.Config(
-            **{**config.config, "cute_flash_stat_transport": "single"}
-        )
-        with (
-            patch.object(
-                dense_bound.env.config_spec,
-                "target_device_capability",
-                (10, 3),
-            ),
-            patch.object(
-                _cute_flash,
-                "get_flash_target_policy",
-                return_value=dataclasses.replace(target_policy, tuning=lse_tuning),
-            ),
-        ):
-            packed_control_code = dense_bound.to_triton_code(lse_config)
-        self.assertIn("f16x2_xu=True", packed_control_code)
+        # Admit the measured target config through normalization so this test
+        # isolates the graph-level LSE gate in flash codegen.
         with (
             patch.object(
                 packed_lse_bound.env.config_spec,
@@ -2982,32 +3064,47 @@ class TestCuteBackend(TestCase):
                 (10, 3),
             ),
             patch.object(
-                _cute_flash,
-                "get_flash_target_policy",
-                return_value=dataclasses.replace(target_policy, tuning=lse_tuning),
+                packed_lse_bound.env.config_spec,
+                "_cute_flash_standard_dense_output",
+                True,
             ),
         ):
-            packed_lse_code = packed_lse_bound.to_triton_code(lse_config)
+            packed_lse_code = packed_lse_bound.to_triton_code(config)
         self.assertNotIn("f16x2_xu=True", packed_lse_code)
 
         lse_bound = cute_dense_attention_with_lse.bind(
             (resident_q, resident_k, resident_v)
         )
-        resident_lse_config = helion.Config(
-            **{**resident_config.config, "cute_flash_stat_transport": "single"}
-        )
-        with patch.object(
-            lse_bound.env.config_spec, "target_device_capability", (10, 3)
+        with (
+            patch.object(
+                lse_bound.env.config_spec, "target_device_capability", (10, 3)
+            ),
+            patch.object(
+                lse_bound.env.config_spec,
+                "_cute_flash_standard_dense_output",
+                True,
+            ),
         ):
-            lse_code = lse_bound.to_triton_code(resident_lse_config)
+            lse_code = lse_bound.to_triton_code(resident_config)
         self.assertNotIn("f16x2_xu=True", lse_code)
         self.assertNotIn("resident_softmax_value_graph", lse_code)
 
         modified_bound = cute_softcap_attention.bind(
             (resident_q, resident_k, resident_v)
         )
-        with patch.object(
-            modified_bound.env.config_spec, "target_device_capability", (10, 3)
+        # As above, broaden only config validation; the modifier remains in
+        # the graph and must independently disable the target-only lowering.
+        with (
+            patch.object(
+                modified_bound.env.config_spec,
+                "target_device_capability",
+                (10, 3),
+            ),
+            patch.object(
+                modified_bound.env.config_spec,
+                "_cute_flash_standard_dense_output",
+                True,
+            ),
         ):
             modified_code = modified_bound.to_triton_code(resident_config)
         self.assertNotIn("resident_softmax_value_graph", modified_code)
@@ -3264,6 +3361,7 @@ class TestCuteBackend(TestCase):
             (q, k, v),
             block_sizes=[1, 128, 128],
             cute_flash_pipeline_family="fa4_2cta_causal",
+            cute_flash_epi_tma=True,
         )
         self.assertIn("_flash_tma_o", code)
         self.assertIn("flash_mma_tile_coord_v", code)
@@ -3335,6 +3433,9 @@ class TestCuteBackend(TestCase):
             cute_dense_attention,
             (q, k, v),
             block_sizes=[1, 128, 128],
+            cute_flash_pipeline_family="fa4_clc",
+            cute_flash_clc_heads_per_batch=32,
+            cute_flash_clc_stages=2,
         )
 
         self.assertIn(
@@ -3363,6 +3464,10 @@ class TestCuteBackend(TestCase):
             cute_dense_attention,
             (q, k, v),
             block_sizes=[1, 128, 128],
+            cute_flash_epi_stg=True,
+            cute_flash_role_map="fa4",
+            cute_flash_role_chain=True,
+            cute_flash_split_p_arrive=True,
         )
 
         self.assertIn("elif warp_idx == 13:", code)
@@ -3441,7 +3546,11 @@ class TestCuteBackend(TestCase):
                     cute_flash_persistent=True,
                     cute_flash_use_2cta=True,
                     cute_flash_epi_tma=True,
+                    cute_flash_exp2_packet="8x2",
+                    cute_flash_precompute_qk_desc=True,
+                    cute_flash_split_p_arrive=True,
                     cute_flash_stat_transport="single",
+                    cute_flash_softmax_disc=False,
                 )
 
                 self.assertIn("cta_group=2", code)
@@ -3463,6 +3572,340 @@ class TestCuteBackend(TestCase):
 
                 expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
                 torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_bf16_dense_two_cta_lse_matches_reference(self) -> None:
+        seq_len = 32_768
+        q = torch.zeros(1, 1, seq_len, 64, dtype=torch.bfloat16, device=DEVICE)
+        k = torch.zeros_like(q)
+        v = torch.empty_like(q)
+        q[..., 0] = torch.linspace(-4.0, 4.0, seq_len, device=DEVICE).to(torch.bfloat16)
+        k[..., 0::2, 0] = -1.0
+        k[..., 1::2, 0] = 1.0
+        v_neg = torch.linspace(-1.0, 0.5, 64, device=DEVICE).to(torch.bfloat16)
+        v_pos = torch.linspace(0.75, -0.25, 64, device=DEVICE).to(torch.bfloat16)
+        v[..., 0::2, :] = v_neg
+        v[..., 1::2, :] = v_pos
+
+        config: dict[str, object] = {
+            "block_sizes": [1, 128, 128],
+            "cute_flash_pipeline_family": "fa4_2cta",
+            "cute_flash_persistent": False,
+            "cute_flash_stat_transport": "single",
+            "cute_flash_exp2_packet": "8x2",
+        }
+        resolved = resolve_flash_config(
+            64,
+            seq_len // 128,
+            config,
+            dtype=torch.bfloat16,
+            standard_dense_output=False,
+        )
+        self.assertTrue(resolved.use_2cta_instrs)
+        self.assertEqual(resolved.pipeline_family, "fa4_2cta")
+        self.assertEqual(resolved.stat_transport, "single")
+
+        code, (out, lse) = code_and_output(
+            cute_dense_attention_with_lse, (q, k, v), **config
+        )
+        self.assertIn("is_two_cta=True", code)
+        self.assertIn("_flash_mLSE[", code)
+
+        # Half of the keys have each score sign, giving an O(N) reference.
+        a = q[..., 0].float() / math.sqrt(64)
+        pos_weight = torch.sigmoid(2.0 * a)[..., None]
+        expected_out = (
+            (1.0 - pos_weight) * v_neg.float() + pos_weight * v_pos.float()
+        ).to(torch.bfloat16)
+        expected_lse = (math.log(seq_len // 2) + torch.logaddexp(-a, a)) * math.log2(
+            math.e
+        )
+        torch.testing.assert_close(out, expected_out, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
+
+    def test_flash_attention_bf16_large_2cta_seed_matches_sdpa(self) -> None:
+        seq_len = 524_288
+        seeds = _cute_flash.flash_attention_seed_configs(
+            64,
+            seq_len // 128,
+            dtype=torch.bfloat16,
+            standard_dense_output=True,
+        )
+        seed = next(
+            seed
+            for seed in seeds
+            if resolve_flash_config(
+                64,
+                seq_len // 128,
+                seed.config,
+                dtype=torch.bfloat16,
+                standard_dense_output=True,
+            ).pipeline_family
+            == "fa4_2cta"
+        )
+        self.assertEqual(seed.config["block_sizes"], [1, 128, 128])
+        resolved = resolve_flash_config(
+            64,
+            seq_len // 128,
+            seed.config,
+            dtype=torch.bfloat16,
+            standard_dense_output=True,
+        )
+        self.assertTrue(resolved.use_2cta_instrs)
+        self.assertEqual(resolved.exp2_packet, "8x2")
+
+        torch.manual_seed(20260814)
+        q, k, v = (
+            torch.randn(1, 1, seq_len, 64, dtype=torch.bfloat16, device=DEVICE)
+            for _ in range(3)
+        )
+        code, out = code_and_output(cute_dense_attention, (q, k, v), **seed.config)
+        self.assertIn("is_two_cta=True", code)
+        self.assertIn("pair_batch=8, emu_batch=2", code)
+        expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_flash_attention_bf16_dense_2048kv_seed_matches_sdpa(self) -> None:
+        seq_len = 262_144
+        seeds = _cute_flash.flash_attention_seed_configs(
+            64,
+            seq_len // 128,
+            dtype=torch.bfloat16,
+            standard_dense_output=True,
+        )
+        seed = next(
+            seed
+            for seed in seeds
+            if resolve_flash_config(
+                64,
+                seq_len // 128,
+                seed.config,
+                dtype=torch.bfloat16,
+                standard_dense_output=True,
+            ).epi_tma
+        )
+        resolved = resolve_flash_config(
+            64,
+            seq_len // 128,
+            seed.config,
+            dtype=torch.bfloat16,
+            standard_dense_output=True,
+        )
+        self.assertTrue(resolved.epi_tma)
+
+        torch.manual_seed(20260815)
+        q, k, v = (
+            torch.randn(1, 1, seq_len, 64, dtype=torch.bfloat16, device=DEVICE)
+            for _ in range(3)
+        )
+        code, out = code_and_output(cute_dense_attention, (q, k, v), **seed.config)
+        repeated = code_and_output(cute_dense_attention, (q, k, v), **seed.config)[1]
+        expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+        self.assertIn("_flash_tma_o", code)
+        self.assertTrue(torch.equal(out, repeated))
+        torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+
+    def test_flash_attention_large_direct_output_requires_tma(self) -> None:
+        self.assertFalse(_cute_flash._flash_output_requires_tma(1, (1 << 31) - 1, 1))
+        self.assertFalse(_cute_flash._flash_output_requires_tma(1, 1 << 31, 1))
+        self.assertTrue(_cute_flash._flash_output_requires_tma(1, (1 << 31) + 1, 1))
+        self.assertFalse(_cute_flash._flash_output_requires_tma(32, 1_048_576, 64))
+        self.assertTrue(_cute_flash._flash_output_requires_tma(256, 262_144, 64))
+
+    def test_flash_attention_odd_large_output_uses_tuned_generic_fallback(
+        self,
+    ) -> None:
+        num_kv = 2049
+        with self.assertRaisesRegex(InvalidConfig, "pipeline family.*not legal"):
+            _cute_flash.flash_autotune_fragments(
+                64,
+                num_kv,
+                num_bh=256,
+                dtype=torch.float16,
+                standard_dense_output=True,
+                output_requires_tma=True,
+            )
+
+        q, k, v = (
+            torch.empty(
+                8,
+                32,
+                num_kv * 128,
+                64,
+                dtype=torch.float16,
+                device="meta",  # @ignore-device-lint
+            )
+            for _ in range(3)
+        )
+        fallback_kernel = helion.kernel(
+            backend="cute",
+            static_shapes=True,
+            disable_autotuner_heuristics=True,
+        )(cute_dense_attention.fn)
+        bound = fallback_kernel.bind((q, k, v))
+        spec = bound.config_spec
+        self.assertFalse(spec.cute_flash_search_enabled)
+        self.assertTrue(spec.cute_attention_generic_fallback_enabled)
+        self.assertEqual(spec.compiler_seed_configs, [])
+
+        initial = spec.default_config()
+        self.assertEqual(initial.config["block_sizes"], [1, 64, 64])
+        config_gen = spec.create_config_generation()
+        population = config_gen.random_population(30)
+        self.assertTrue(
+            any(
+                config.config.get("block_sizes") == [1, 64, 64] for config in population
+            )
+        )
+        self.assertTrue(
+            all(
+                config.config["block_sizes"][1] >= 64
+                and config.config["block_sizes"][2] >= 64
+                for config in population
+            )
+        )
+        self.assertGreater(
+            len(
+                {
+                    tuple(config.config["block_sizes"])
+                    for config in population
+                    if "block_sizes" in config.config
+                }
+            ),
+            1,
+        )
+        for config in (initial, helion.Config(block_sizes=[1, 128, 128])):
+            code = bound.to_triton_code(config)
+            self.assertFalse(_flash_fired(code))
+            self.assertIn("cutlass.Int64", code)
+
+    def test_flash_attention_generic_fallback_vetoes_multiple_loops(self) -> None:
+        def run_detection(requires_ws_order: tuple[bool, bool]) -> ConfigSpec:
+            spec = ConfigSpec(backend=_compiler_backend.CuteBackend())
+            for block_id, size_hint in enumerate((256, 262_144, 262_144)):
+                spec.block_sizes.append(
+                    BlockSizeSpec(block_id=block_id, size_hint=size_hint)
+                )
+            env = SimpleNamespace(
+                config_spec=spec,
+                block_sizes={
+                    0: SimpleNamespace(size=256),
+                    1: SimpleNamespace(size=262_144),
+                    2: SimpleNamespace(size=262_144),
+                },
+            )
+            device_ir = DeviceIR()
+            device_ir.grid_block_ids = [[0, 1]]
+            for graph_id in range(2):
+                graph = torch.fx.Graph()
+                graph.output(())
+                device_ir.graphs.append(
+                    ForLoopGraphInfo(
+                        graph_id=graph_id,
+                        graph=graph,
+                        node_args=[],
+                        block_ids=[2],
+                    )
+                )
+            patterns = [
+                SimpleNamespace(
+                    head_dim=64,
+                    io_dtype=torch.float16,
+                    is_causal=False,
+                    score_plan=SimpleNamespace(
+                        has_kv_tile_pruning=False,
+                        requires_ws_overlap=requires_ws,
+                    ),
+                )
+                for requires_ws in requires_ws_order
+            ]
+            with (
+                patch.object(CompileEnvironment, "current", return_value=env),
+                patch.object(
+                    _compiler_backend,
+                    "_attention_flash_gate_enabled",
+                    return_value=True,
+                ),
+                patch.object(
+                    _compiler_backend,
+                    "_attention_flash_supported",
+                    return_value=True,
+                ),
+                patch.object(
+                    _compiler_backend,
+                    "_attention_softmax_pattern_head_dim",
+                    side_effect=patterns,
+                ),
+                patch.object(
+                    _cute_flash,
+                    "_flash_output_requires_tma",
+                    return_value=True,
+                ),
+                patch.object(
+                    _cute_flash,
+                    "flash_attention_graph_lse_plan_valid_from_graphs",
+                    return_value=True,
+                ),
+                patch.object(
+                    _cute_flash,
+                    "flash_attention_graph_small_biased_candidate_from_graphs",
+                    return_value=False,
+                ),
+                patch.object(
+                    _cute_flash,
+                    "flash_attention_graph_standard_causal_output_from_graphs",
+                    return_value=False,
+                ),
+                patch.object(
+                    _cute_flash,
+                    "flash_attention_graph_standard_dense_output_from_graphs",
+                    return_value=True,
+                ),
+                patch.object(
+                    _cute_flash,
+                    "flash_attention_graph_supports_tensor_4d_tma_from_graphs",
+                    return_value=True,
+                ),
+                patch.object(
+                    _cute_flash,
+                    "flash_attention_graph_tensor_4d_batch_heads_from_graphs",
+                    return_value=None,
+                ),
+            ):
+                surface = _compiler_backend.detect_flash_search_surface(device_ir)
+            self.assertIsNone(surface)
+            return spec
+
+        for requires_ws_order in ((False, True), (True, False)):
+            with self.subTest(requires_ws_order=requires_ws_order):
+                spec = run_detection(requires_ws_order)
+                self.assertFalse(spec.cute_flash_search_enabled)
+                self.assertTrue(spec.cute_attention_generic_fallback_enabled)
+                self.assertGreaterEqual(
+                    spec.block_sizes.block_id_lookup(1).autotuner_min,
+                    64,
+                )
+                self.assertGreaterEqual(
+                    spec.block_sizes.block_id_lookup(2).autotuner_min,
+                    64,
+                )
+
+    def test_flash_attention_large_direct_lse_declines_search(self) -> None:
+        # O can use TMA once it crosses the Int32 element-coordinate limit, but
+        # LSE is still stored through a direct (seq, batch) layout.
+        q, k, v = (
+            torch.empty(
+                1,
+                2049,
+                1_048_576,
+                64,
+                dtype=torch.bfloat16,
+                device="meta",  # @ignore-device-lint
+            )
+            for _ in range(3)
+        )
+        bound = cute_dense_attention_with_lse.bind((q, k, v))
+        self.assertFalse(bound.config_spec.cute_flash_search_enabled)
 
     def test_flash_attention_clc_preserves_explicit_flattened_geometry(self) -> None:
         q, k, v = (
@@ -3614,7 +4057,8 @@ class TestCuteBackend(TestCase):
                 cute_causal_attention, (q, k, v), block_sizes=[1, 128, 128]
             )
         self.assertTrue(_flash_fired(code))
-        self.assertIn("flash_lpt_group < 1", code)
+        self.assertIn("flash_lpt_group", code)
+        self.assertIn("flash_lpt_mod", code)
         self.assertIn("flash_num_active_kv", code)
         expected = torch.nn.functional.scaled_dot_product_attention(
             q,
@@ -3812,7 +4256,9 @@ class TestCuteBackend(TestCase):
                 expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
                 torch.testing.assert_close(out, expected, atol=0.05, rtol=0.02)
 
-    def test_flash_attention_dense_degree2_seed_requires_standard_output(self) -> None:
+    def test_flash_attention_dense_specialized_seeds_require_standard_output(
+        self,
+    ) -> None:
         target = torch.empty(1, 1, 262_144, 64, dtype=torch.float16, device=DEVICE)
         cases = (
             (cute_dense_attention, True),
@@ -3826,45 +4272,47 @@ class TestCuteBackend(TestCase):
                     bound.config_spec._cute_flash_standard_dense_output,
                     expected_standard,
                 )
-                has_degree1_seed = any(
+                packet_seeds = {
                     seed.config.get(_cute_flash.FLASH_EXP2_PACKET_KEY)
-                    in {"deg1_8x2_corr10", "deg1_16x8"}
                     for seed in bound.config_spec.compiler_seed_configs
-                )
-                target_policy = get_flash_target_policy(
-                    bound.config_spec.target_device_capability
-                )
+                }
                 self.assertEqual(
-                    has_degree1_seed,
-                    expected_standard
-                    and target_policy.tuning.dense_policy(2048) is not None,
+                    bool(packet_seeds & {"deg1_8x2_corr10", "deg1_16x8"}),
+                    expected_standard,
                 )
-                has_degree2_seed = any(
-                    seed.config.get(_cute_flash.FLASH_EXP2_PACKET_KEY) == "deg2_16x6"
-                    for seed in bound.config_spec.compiler_seed_configs
-                )
+                has_degree2_seed = "deg2_16x6" in packet_seeds
                 self.assertEqual(has_degree2_seed, expected_standard)
 
     def test_flash_attention_auxiliary_outputs_have_no_causal_degree1_seed(
         self,
     ) -> None:
-        target = torch.empty(1, 1, 65_536, 64, dtype=torch.float16, device=DEVICE)
-        slopes = torch.empty(1, dtype=torch.float32, device=DEVICE)
-        cases = (
-            (cute_causal_attention, (target, target, target)),
-            (cute_alibi_attention, (target, target, target, slopes)),
-        )
-        for kernel, args in cases:
-            with self.subTest(kernel=kernel.__name__):
-                bound = kernel.bind(args)
-                self.assertFalse(bound.config_spec._cute_flash_standard_causal_output)
-                self.assertFalse(
-                    any(
-                        seed.config.get(_cute_flash.FLASH_EXP2_PACKET_KEY)
-                        == "hybrid_deg1_16x8"
-                        for seed in bound.config_spec.compiler_seed_configs
+        for dtype, seq_len in (
+            (torch.float16, 65_536),
+            (torch.bfloat16, 1_048_576),
+        ):
+            target = torch.empty(1, 1, seq_len, 64, dtype=dtype, device=DEVICE)
+            slopes = torch.empty(1, dtype=torch.float32, device=DEVICE)
+            cases = (
+                (cute_causal_attention, (target, target, target)),
+                (cute_alibi_attention, (target, target, target, slopes)),
+            )
+            for kernel, args in cases:
+                with self.subTest(
+                    dtype=str(dtype),
+                    seq_len=seq_len,
+                    kernel=kernel.__name__,
+                ):
+                    bound = kernel.bind(args)
+                    self.assertFalse(
+                        bound.config_spec._cute_flash_standard_causal_output
                     )
-                )
+                    self.assertFalse(
+                        any(
+                            seed.config.get(_cute_flash.FLASH_EXP2_PACKET_KEY)
+                            == "hybrid_deg1_16x8"
+                            for seed in bound.config_spec.compiler_seed_configs
+                        )
+                    )
 
     def test_flash_attention_bias_fires_and_matches_sdpa(self) -> None:
         q, k, v = (
@@ -3979,17 +4427,13 @@ class TestCuteBackend(TestCase):
             for _ in range(3)
         )
         bias = torch.randn(1, 2, 256, 256, dtype=torch.float16, device=DEVICE) * 0.25
-        with patch.dict(
-            os.environ,
-            {"HELION_CUTE_FLASH_STAGE_LOCAL_SOFTMAX_SETUP": "1"},
-            clear=False,
-        ):
-            code, out = code_and_output(
-                cute_biased_attention,
-                (q, k, v, bias),
-                block_sizes=[1, 128, 128],
-                cute_flash_small_biased=False,
-            )
+        code, out = code_and_output(
+            cute_biased_attention,
+            (q, k, v, bias),
+            block_sizes=[1, 128, 128],
+            cute_flash_small_biased=False,
+            cute_flash_softmax_setup="stage_local",
+        )
         self.assertTrue(_flash_fired(code))
         self.assertIn("flash_tiled_ld_coord", code)
         self.assertIn("add_score_bias_t2r", code)
@@ -4593,7 +5037,7 @@ class TestCuteBackend(TestCase):
             },
             clear=False,
         ):
-            self.assertEqual(resolve_flash_config(64, 2).disc_pipe_depth, 4)
+            self.assertEqual(resolve_flash_config(64, 2).disc_pipe_depth, 2)
             self.assertEqual(
                 resolve_flash_config(64, 2, is_causal=True).disc_pipe_depth, 2
             )
@@ -4714,8 +5158,11 @@ class TestCuteBackend(TestCase):
                 "cute_flash_topology": "fa4",
                 "cute_flash_e2e_schedule": "16/4",
                 "cute_flash_masked_e2e_schedule": "xu",
+                "cute_flash_causal_kv_order": "descending",
+                "cute_flash_causal_loop_split": True,
             },
             is_causal=True,
+            standard_causal_output=True,
         )
         self.assertEqual(cfg.e2e_schedule, "16/4")
         self.assertEqual((cfg.e2e_freq, cfg.e2e_res), (16, 4))
@@ -4731,8 +5178,11 @@ class TestCuteBackend(TestCase):
                 "cute_flash_masked_e2e_schedule": "16/4",
                 "cute_flash_e2e_offset": 15,
                 "cute_flash_e2e_offset0": 14,
+                "cute_flash_causal_kv_order": "descending",
+                "cute_flash_causal_loop_split": True,
             },
             is_causal=True,
+            standard_causal_output=True,
         )
         self.assertEqual(cfg.e2e_schedule, "xu")
         self.assertEqual(cfg.masked_e2e_schedule, "16/4")
@@ -4747,8 +5197,11 @@ class TestCuteBackend(TestCase):
                 "cute_flash_e2e_schedule": "8/2",
                 "cute_flash_masked_e2e_schedule": "16/4",
                 "cute_flash_e2e_offset": 15,
+                "cute_flash_causal_kv_order": "descending",
+                "cute_flash_causal_loop_split": True,
             },
             is_causal=True,
+            standard_causal_output=True,
         )
         self.assertEqual(cfg.e2e_schedule, "8/2")
         self.assertEqual(cfg.masked_e2e_schedule, "16/4")
@@ -4837,7 +5290,7 @@ class TestCuteBackend(TestCase):
             },
             is_causal=True,
         )
-        self.assertEqual(cfg.e2e_offset, 0)
+        self.assertEqual(cfg.e2e_offset, 1)
 
         cfg = resolve_flash_config(
             64,
@@ -5002,6 +5455,19 @@ class TestCuteBackend(TestCase):
         )
         self.assertEqual(cfg.rescale_chunk_cols, 16)
 
+        # A 64-column TMEM fragment for D128 reaches CuTe lowering but fails in
+        # NVVM for both supported dtypes. Keep legacy configs parseable while
+        # canonicalizing them to the safe D128 default.
+        cfg = resolve_flash_config(
+            128,
+            2,
+            {
+                "cute_flash_topology": "fa4",
+                "cute_flash_rescale_chunk_cols": 64,
+            },
+        )
+        self.assertEqual(cfg.rescale_chunk_cols, 16)
+
         with patch.dict(
             os.environ,
             {
@@ -5040,6 +5506,49 @@ class TestCuteBackend(TestCase):
         self.assertEqual(cfg.topology, "ws_overlap")
         self.assertEqual(cfg.rescale_chunk_cols, 32)
 
+        cfg = resolve_flash_config(
+            64,
+            384,
+            {
+                "cute_flash_pipeline_family": "fa4_clc",
+                "cute_flash_persistent": True,
+                "cute_flash_softmax_disc": True,
+                "cute_flash_rescale_chunk_cols": 64,
+                "cute_flash_clc_heads_per_batch": 32,
+            },
+            num_bh=64,
+            standard_dense_output=True,
+        )
+        self.assertTrue(cfg.use_clc_scheduler)
+        self.assertEqual(cfg.rescale_chunk_cols, 32)
+
+        clc_fragments = _cute_flash.flash_autotune_fragments(
+            64,
+            384,
+            num_bh=64,
+            standard_dense_output=True,
+            pipeline_family_override="fa4_clc",
+        )
+        clc_chunk = clc_fragments[_cute_flash.FLASH_RESCALE_CHUNK_COLS_KEY]
+        self.assertIn(64, clc_chunk.choices)
+        self.assertNotIn(64, clc_chunk.search_choices or ())
+
+        cfg = resolve_flash_config(
+            64,
+            384,
+            {
+                "cute_flash_pipeline_family": "fa4_clc_local_tma_4d",
+                "cute_flash_persistent": True,
+                "cute_flash_softmax_disc": False,
+                "cute_flash_rescale_chunk_cols": 64,
+                "cute_flash_clc_heads_per_batch": 16,
+            },
+            num_bh=64,
+            standard_dense_output=True,
+        )
+        self.assertTrue(cfg.use_clc_scheduler)
+        self.assertEqual(cfg.rescale_chunk_cols, 32)
+
         with patch.dict(
             os.environ,
             {
@@ -5049,6 +5558,39 @@ class TestCuteBackend(TestCase):
             clear=True,
         ):
             self.assertEqual(resolve_flash_config(64, 2).rescale_chunk_cols, 32)
+
+    def test_flash_attention_cga2_local_disables_paired_epilogue(self) -> None:
+        cfg = resolve_flash_config(
+            64,
+            384,
+            {
+                "cute_flash_pipeline_family": "fa4_cga2_local_tma_4d",
+                "cute_flash_persistent": True,
+                "cute_flash_epi_stg": True,
+                "cute_flash_epi_stg_gmem": "pair",
+            },
+            num_bh=64,
+            standard_dense_output=True,
+        )
+        self.assertTrue(cfg.use_cga2_local_cta)
+        self.assertTrue(cfg.epi_stg)
+        self.assertEqual(cfg.epi_stg_gmem, "stage")
+
+        cfg = resolve_flash_config(
+            64,
+            384,
+            {
+                "cute_flash_pipeline_family": "fa4_cga2_local_tma_4d",
+                "cute_flash_persistent": False,
+                "cute_flash_epi_stg": True,
+                "cute_flash_epi_stg_gmem": "pair",
+            },
+            num_bh=64,
+            standard_dense_output=True,
+        )
+        self.assertTrue(cfg.use_cga2_local_cta)
+        self.assertFalse(cfg.persistent)
+        self.assertEqual(cfg.epi_stg_gmem, "pair")
 
     def test_flash_attention_fa4_register_budget_overrides(self) -> None:
         with patch.dict(
@@ -5169,83 +5711,28 @@ class TestCuteBackend(TestCase):
         )
         self.assertLessEqual(total, 512)
 
-    def test_flash_attention_dense_hd64_corr_reg_seed_buckets(self) -> None:
+    def test_flash_attention_dense_hd64_defaults_are_length_invariant(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
-            cfg_32k = resolve_flash_config(64, 256)
-            cfg_64k = resolve_flash_config(64, 512)
+            configs = [
+                resolve_flash_config(64, num_kv) for num_kv in (256, 512, 1024, 2048)
+            ]
             cfg_64k_bf16 = resolve_flash_config(64, 512, dtype=torch.bfloat16)
-            cfg_128k = resolve_flash_config(64, 1024)
-            cfg_256k = resolve_flash_config(64, 2048)
 
-        self.assertEqual(cfg_32k.corr_regs, 64)
-        self.assertEqual(cfg_64k.corr_regs, 80)
-        self.assertEqual(cfg_128k.corr_regs, 72)
-        self.assertEqual(cfg_256k.corr_regs, 80)
-        self.assertEqual(cfg_32k.e2e_schedule, "8/2")
-        self.assertEqual(cfg_64k.e2e_schedule, "8/2")
-        self.assertEqual(cfg_128k.e2e_schedule, "16/4")
-        self.assertEqual(cfg_256k.e2e_schedule, "16/4")
-        self.assertEqual(cfg_32k.first_load_order, 0)
-        self.assertEqual(cfg_64k.first_load_order, 4)
-        self.assertEqual(cfg_128k.first_load_order, 0)
-        self.assertEqual(cfg_256k.first_load_order, 4)
-        self.assertFalse(cfg_32k.precompute_qk_desc)
-        self.assertTrue(cfg_64k.precompute_qk_desc)
-        self.assertFalse(cfg_128k.precompute_qk_desc)
-        self.assertFalse(cfg_256k.precompute_qk_desc)
-        self.assertEqual(cfg_64k.rescale_threshold, 8.0)
+        expected = _cute_flash.flash_effective_config_values(configs[0])
+        for num_kv, config in zip((256, 512, 1024, 2048), configs, strict=True):
+            with self.subTest(num_kv=num_kv):
+                self.assertEqual(
+                    _cute_flash.flash_effective_config_values(config), expected
+                )
+
+        self.assertEqual(configs[0].corr_regs, 64)
+        self.assertEqual(configs[0].e2e_schedule, "16/4")
+        self.assertEqual(configs[0].first_load_order, 0)
+        self.assertFalse(configs[0].precompute_qk_desc)
+        self.assertFalse(configs[0].epi_tma)
+        self.assertFalse(configs[0].epi_stg)
+        self.assertEqual(configs[0].rescale_threshold, 8.0)
         self.assertEqual(cfg_64k_bf16.rescale_threshold, 8.0)
-        self.assertTrue(cfg_64k.split_p_arrive)
-        self.assertTrue(cfg_128k.use_clc_scheduler)
-        self.assertEqual(cfg_128k.clc_stages, 2)
-        with patch.dict(
-            os.environ,
-            {"HELION_CUTE_FLASH_CLC_STAGES": "1"},
-            clear=True,
-        ):
-            self.assertEqual(resolve_flash_config(64, 1024).clc_stages, 2)
-        self.assertEqual(cfg_64k.corr_tile_size, 16)
-        self.assertEqual(cfg_64k.role_map, "fa4")
-        self.assertTrue(
-            _cute_flash._flash_role_chain_default(
-                hd=64,
-                num_kv=512,
-                is_causal=False,
-                role_map=cfg_64k.role_map,
-            )
-        )
-        self.assertFalse(
-            _cute_flash._flash_role_chain_default(
-                hd=64,
-                num_kv=1024,
-                is_causal=False,
-                role_map=cfg_128k.role_map,
-            )
-        )
-        self.assertFalse(
-            _cute_flash._flash_role_chain_default(
-                hd=64,
-                num_kv=512,
-                is_causal=True,
-                role_map=cfg_64k.role_map,
-            )
-        )
-
-    def test_flash_attention_dense_hd64_epi_tma_seed_buckets(self) -> None:
-        with patch.dict(os.environ, {}, clear=True):
-            cfg_32k = resolve_flash_config(64, 256)
-            cfg_64k = resolve_flash_config(64, 512)
-            cfg_128k = resolve_flash_config(64, 1024)
-            cfg_256k = resolve_flash_config(64, 2048)
-
-        self.assertTrue(cfg_32k.epi_tma)
-        self.assertFalse(cfg_32k.epi_stg)
-        self.assertFalse(cfg_64k.epi_tma)
-        self.assertTrue(cfg_64k.epi_stg)
-        self.assertTrue(cfg_128k.epi_tma)
-        self.assertFalse(cfg_128k.epi_stg)
-        self.assertFalse(cfg_256k.epi_tma)
-        self.assertTrue(cfg_256k.epi_stg)
 
     def test_flash_attention_dense_hd64_two_cta_eligibility(self) -> None:
         force_two_cta = {
@@ -5290,13 +5777,13 @@ class TestCuteBackend(TestCase):
         self.assertTrue(dense_64k.use_2cta_instrs)
         self.assertEqual(dense_64k.pipeline_family, "fa4_2cta")
         self.assertTrue(dense_64k.precompute_qk_desc)
-        self.assertTrue(dense_64k.epi_tma)
-        self.assertFalse(dense_64k.epi_stg)
+        self.assertFalse(dense_64k.epi_tma)
+        self.assertTrue(dense_64k.epi_stg)
         self.assertEqual(dense_64k.epi_stg_gmem, "stage")
-        self.assertEqual(dense_64k.p_store_repetition, 16)
+        self.assertEqual(dense_64k.p_store_repetition, 32)
         self.assertEqual(dense_64k.s_load_repetition, 32)
-        self.assertFalse(dense_64k.softmax_disc)
-        self.assertTrue(dense_64k.split_p_arrive)
+        self.assertTrue(dense_64k.softmax_disc)
+        self.assertFalse(dense_64k.split_p_arrive)
         self.assertTrue(dense_32k.use_2cta_instrs)
         self.assertTrue(dense_128k.use_2cta_instrs)
         self.assertFalse(dense_unaligned.use_2cta_instrs)
@@ -5319,8 +5806,14 @@ class TestCuteBackend(TestCase):
         )
         self.assertFalse(dense_long_unaligned.use_2cta_instrs)
         self.assertEqual(dense_long_unaligned.pipeline_family, "fa4")
-        self.assertFalse(dense_bf16.use_2cta_instrs)
-        self.assertEqual(dense_bf16.pipeline_family, "fa4")
+        self.assertTrue(dense_bf16.use_2cta_instrs)
+        self.assertEqual(dense_bf16.pipeline_family, "fa4_2cta")
+        self.assertTrue(dense_bf16.precompute_qk_desc)
+        self.assertFalse(dense_bf16.epi_tma)
+        self.assertTrue(dense_bf16.epi_stg)
+        self.assertTrue(dense_bf16.softmax_disc)
+        self.assertFalse(dense_bf16.split_p_arrive)
+        self.assertEqual(dense_bf16.exp2_packet, "8x2")
         self.assertFalse(causal.use_2cta_instrs)
         self.assertEqual(causal.pipeline_family, "fa4")
         self.assertTrue(dense_hd128.use_2cta_instrs)
@@ -5331,9 +5824,9 @@ class TestCuteBackend(TestCase):
         epi_tma = fragments[_cute_flash.FLASH_EPI_TMA_KEY]
         self.assertEqual(
             set(family.search_choices or ()),
-            {"fa4", "ws_overlap", "fa4_2cta"},
+            set(_cute_flash.FLASH_AUTOTUNE_PIPELINE_FAMILIES) - {"fa4_2cta_causal"},
         )
-        self.assertEqual(epi_tma.search_choices, (False,))
+        self.assertEqual(epi_tma.search_choices, (False, True))
 
         eligible_32k = _cute_flash.flash_autotune_fragments(64, 256)
         self.assertIn(
@@ -5375,6 +5868,39 @@ class TestCuteBackend(TestCase):
             ].search_choices
             or (),
         )
+        bf16_fragments = _cute_flash.flash_autotune_fragments(
+            64,
+            4096,
+            dtype=torch.bfloat16,
+            standard_dense_output=True,
+        )
+        self.assertIn(
+            "fa4_2cta",
+            bf16_fragments[_cute_flash.FLASH_PIPELINE_FAMILY_KEY].search_choices or (),
+        )
+        self.assertIn(
+            "8x2",
+            bf16_fragments[_cute_flash.FLASH_EXP2_PACKET_KEY].search_choices or (),
+        )
+        for kwargs in (
+            {"has_kv_tile_pruning": True},
+            {"requires_ws_overlap": True},
+            {"small_biased_candidate": True},
+            {"is_causal": True},
+        ):
+            with self.subTest(bf16_ineligible=kwargs):
+                fragments = _cute_flash.flash_autotune_fragments(
+                    64,
+                    4096,
+                    dtype=torch.bfloat16,
+                    standard_dense_output=True,
+                    **kwargs,
+                )
+                self.assertNotIn(
+                    "fa4_2cta",
+                    fragments[_cute_flash.FLASH_PIPELINE_FAMILY_KEY].search_choices
+                    or (),
+                )
 
     def test_flash_attention_pipeline_family_resolution(self) -> None:
         expected_flags = {
@@ -5512,7 +6038,9 @@ class TestCuteBackend(TestCase):
                 {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_2cta_tma_4d"},
                 dtype=torch.bfloat16,
             )
-            self.assertEqual(bf16_2cta.pipeline_family, "fa4")
+            self.assertEqual(bf16_2cta.pipeline_family, "fa4_2cta")
+            self.assertTrue(bf16_2cta.use_2cta_instrs)
+            self.assertFalse(bf16_2cta.tensor_4d_tma)
             causal_clc = resolve_flash_config(
                 64,
                 512,
@@ -5536,7 +6064,7 @@ class TestCuteBackend(TestCase):
                 {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_clc"},
             )
             self.assertEqual(legacy_clc, family_clc)
-            self.assertEqual(family_clc.clc_heads_per_batch, 32)
+            self.assertEqual(family_clc.clc_heads_per_batch, 0)
             self.assertEqual(family_clc.clc_stages, 2)
             clc_fragments = _cute_flash.flash_autotune_fragments(
                 64,
@@ -5545,7 +6073,7 @@ class TestCuteBackend(TestCase):
             )
             self.assertEqual(
                 clc_fragments[_cute_flash.FLASH_CLC_HEADS_PER_BATCH_KEY].default(),
-                32,
+                1,
             )
 
             base = resolve_flash_config(
@@ -5568,6 +6096,50 @@ class TestCuteBackend(TestCase):
             self.assertIn("mma_interleave", field_names)
             self.assertEqual(base.q_tile_count, 2)
             self.assertTrue(base.mma_interleave)
+
+    def test_flash_attention_role_chain_resolution(self) -> None:
+        family_key = _cute_flash.FLASH_PIPELINE_FAMILY_KEY
+        role_chain_key = _cute_flash.FLASH_ROLE_CHAIN_KEY
+
+        with patch.dict(os.environ, {"HELION_CUTE_FLASH_ROLE_CHAIN": "0"}, clear=True):
+            config_enables = resolve_flash_config(
+                64,
+                512,
+                {family_key: "fa4", role_chain_key: True},
+            )
+            config_disables = resolve_flash_config(
+                64,
+                512,
+                {family_key: "fa4", role_chain_key: False},
+            )
+        self.assertTrue(config_enables.role_chain)
+        self.assertFalse(config_disables.role_chain)
+
+        with patch.dict(os.environ, {"HELION_CUTE_FLASH_ROLE_CHAIN": "1"}, clear=True):
+            config_disables = resolve_flash_config(
+                64,
+                512,
+                {family_key: "fa4", role_chain_key: False},
+            )
+            unsupported_ws = resolve_flash_config(
+                64,
+                512,
+                {family_key: "ws_overlap", role_chain_key: True},
+            )
+            unsupported_clc = resolve_flash_config(
+                64,
+                512,
+                {family_key: "fa4_clc", role_chain_key: True},
+            )
+            unsupported_hd128_2cta = resolve_flash_config(
+                128,
+                512,
+                {family_key: "fa4_2cta", role_chain_key: True},
+            )
+        self.assertFalse(config_disables.role_chain)
+        self.assertFalse(unsupported_ws.role_chain)
+        self.assertFalse(unsupported_clc.role_chain)
+        self.assertFalse(unsupported_hd128_2cta.role_chain)
 
     def test_flash_attention_sync_and_softmax_controls_normalize(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
@@ -5606,6 +6178,20 @@ class TestCuteBackend(TestCase):
                 {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_2cta"},
             )
             self.assertEqual(two_cta.exp2_packet, "8x2")
+            bf16_fa4 = resolve_flash_config(
+                64,
+                512,
+                {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4"},
+                dtype=torch.bfloat16,
+            )
+            self.assertEqual(bf16_fa4.exp2_packet, "1x1")
+            bf16_two_cta = resolve_flash_config(
+                64,
+                512,
+                {_cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_2cta"},
+                dtype=torch.bfloat16,
+            )
+            self.assertEqual(bf16_two_cta.exp2_packet, "8x2")
             hd128_two_cta = resolve_flash_config(
                 128,
                 512,
@@ -5655,10 +6241,15 @@ class TestCuteBackend(TestCase):
                     _cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
                     _cute_flash.FLASH_Q_TILE_COUNT_KEY: "also-ignored",
                     _cute_flash.FLASH_MMA_INTERLEAVE_KEY: False,
+                    _cute_flash.FLASH_SOFTMAX_DISC_KEY: False,
+                    _cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: False,
+                    _cute_flash.FLASH_STAT_TRANSPORT_KEY: "ring2",
                 },
             )
         self.assertEqual(inactive.q_tile_count, 2)
         self.assertTrue(inactive.mma_interleave)
+        self.assertEqual(inactive.stat_transport, "ring2")
+        self.assertTrue(inactive.split_p_arrive)
 
     def test_flash_attention_fa4_persistent_config_overrides_env(self) -> None:
         with patch.dict(os.environ, {"HELION_CUTE_FLASH_PERSISTENT": "1"}, clear=True):
@@ -5683,7 +6274,7 @@ class TestCuteBackend(TestCase):
                 is_causal=True,
             )
             self.assertFalse(causal_cfg.persistent)
-            self.assertEqual(causal_cfg.causal_lpt_swizzle, 8)
+            self.assertEqual(causal_cfg.causal_lpt_swizzle, 1)
 
             dense_cfg = _cute_flash.flash_config_from_config(
                 config,
@@ -5739,6 +6330,7 @@ class TestCuteBackend(TestCase):
             64,
             1,
             {_cute_flash.FLASH_SMALL_BIASED_KEY: False},
+            small_biased_candidate=True,
         )
         self.assertFalse(cfg.small_biased)
 
@@ -5753,15 +6345,13 @@ class TestCuteBackend(TestCase):
         short_causal = resolve_flash_config(64, 2, is_causal=True)
         self.assertEqual(short_causal.e2e_offset, 2)
         self.assertTrue(short_causal.packed_reduce)
-        self.assertEqual(short_causal.causal_lpt_swizzle, 0)
-        self.assertEqual(
-            resolve_flash_config(64, 64, is_causal=True).causal_lpt_swizzle,
-            8,
-        )
-        self.assertEqual(
-            resolve_flash_config(64, 512, is_causal=True).causal_lpt_swizzle,
-            1,
-        )
+        self.assertEqual(short_causal.causal_lpt_swizzle, 1)
+        for num_kv in (64, 512):
+            with self.subTest(num_kv=num_kv):
+                self.assertEqual(
+                    resolve_flash_config(64, num_kv, is_causal=True).causal_lpt_swizzle,
+                    1,
+                )
 
         with patch.dict(
             os.environ,
@@ -5773,7 +6363,7 @@ class TestCuteBackend(TestCase):
         ):
             self.assertEqual(
                 resolve_flash_config(64, 64, is_causal=True).causal_lpt_swizzle,
-                8,
+                1,
             )
             self.assertEqual(resolve_flash_config(64, 64).causal_lpt_swizzle, 0)
 
@@ -5786,7 +6376,7 @@ class TestCuteBackend(TestCase):
             },
             is_causal=True,
         )
-        self.assertEqual(cfg.causal_lpt_swizzle, 16)
+        self.assertEqual(cfg.causal_lpt_swizzle, 1)
 
     def test_flash_attention_binds_qkv_by_graph_operands(self) -> None:
         q, k, v = (
@@ -7033,7 +7623,7 @@ class TestCuteBackend(TestCase):
         self.assertNotIn("cute.gemm(", code)
         torch.testing.assert_close(out.float(), expected, atol=1e-1, rtol=1e-2)
 
-    def test_unsupported_batched_epilogue_falls_back_correctly(self) -> None:
+    def test_narrow_batched_fragment_epilogue_falls_back_correctly(self) -> None:
         args = (
             torch.randn(2, 128, 64, device=DEVICE, dtype=HALF_DTYPE),
             torch.randn(2, 64, 8, device=DEVICE, dtype=HALF_DTYPE),
@@ -7047,6 +7637,58 @@ class TestCuteBackend(TestCase):
             out = bound.compile_config(config)(*args)
         expected = torch.bmm(args[0].float(), args[1].float()) + torch.sin(args[2])
         self.assertNotIn("cute.gemm(", code)
+        torch.testing.assert_close(out.float(), expected, atol=1e-1, rtol=1e-2)
+
+    def test_supported_batched_fragment_epilogue_uses_tcgen05(self) -> None:
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+        args = (
+            torch.randn(2, 128, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(2, 64, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(2, 128, 64, device=DEVICE),
+        )
+        config = helion.Config(block_sizes=[1, 128, 64, 64], pid_type="flat")
+        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
+            bound = cute_batched_dot_unsupported_epilogue_tcgen05.bind(args)
+            self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+            code = bound.to_triton_code(config)
+            out = bound.compile_config(config)(*args)
+        expected = torch.bmm(args[0].float(), args[1].float()) + torch.sin(args[2])
+        self.assertIn("cute.gemm(", code)
+        torch.testing.assert_close(out.float(), expected, atol=1e-1, rtol=1e-2)
+
+    def test_fixed_m_batched_fragment_epilogue_falls_back_correctly(self) -> None:
+        args = (
+            torch.randn(2, 256, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(2, 64, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(2, 256, 64, device=DEVICE),
+        )
+        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
+            bound = cute_batched_dot_fixed_m_fragment_epilogue_tcgen05.bind(args)
+            self.assertFalse(bound.config_spec.cute_tcgen05_search_enabled)
+            config = bound.config_spec.default_config()
+            code = bound.to_triton_code(config)
+            out = bound.compile_config(config)(*args)
+        expected = torch.bmm(args[0].float(), args[1].float()) + torch.sin(args[2])
+        self.assertNotIn("cute.gemm(", code)
+        torch.testing.assert_close(out.float(), expected, atol=1e-1, rtol=1e-2)
+
+    def test_literal_batched_fragment_epilogue_uses_tcgen05(self) -> None:
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+        args = (
+            torch.randn(2, 128, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(2, 64, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(2, 128, 64, device=DEVICE),
+        )
+        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
+            bound = cute_batched_dot_literal_fragment_epilogue_tcgen05.bind(args)
+            self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+            config = bound.config_spec.default_config()
+            code = bound.to_triton_code(config)
+            out = bound.compile_config(config)(*args)
+        expected = torch.bmm(args[0].float(), args[1].float()) + torch.sin(args[2])
+        self.assertIn("cute.gemm(", code)
         torch.testing.assert_close(out.float(), expected, atol=1e-1, rtol=1e-2)
 
     def test_batched_dot_codegen_rejected_does_not_shape_search(self) -> None:
@@ -7797,6 +8439,40 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(out.float(), ref, atol=2.0, rtol=5e-2)
         self.assertFalse(out.float().isnan().any().item())
         self.assertIn("tcgen05_aux_rowvec_smem_layout_", code)
+
+    def test_matmul_mma_tcgen05_fp8_four_cta_broadcast_scale_reuse(self) -> None:
+        """The bm256 cluster-N=2 scale reuse path is numerically correct."""
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        m, k, n = 512, 512, 256
+        x = (torch.randn(m, k, device=DEVICE) * 0.2).to(torch.float8_e4m3fn)
+        y = (torch.randn(k, n, device=DEVICE) * 0.2).to(torch.float8_e4m3fn)
+        scale_m = (
+            (torch.arange(m, device=DEVICE, dtype=torch.float32) + 1.0)
+            .reshape(m, 1)
+            .expand(m, n)
+        )
+        scale_n = torch.linspace(0.5, 1.5, n, device=DEVICE)
+        code, out = code_and_output(
+            cute_matmul_mma_fp8_rowwise_colwise_scale,
+            (x, y, scale_m, scale_n),
+            block_sizes=[256, 128, 128],
+            pid_type="persistent_blocked",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=1,
+            tcgen05_c_stages=2,
+            tcgen05_aux_load_placement="pre_acc_wait",
+        )
+        ref = (x.float() @ y.float()) * scale_m * scale_n.reshape(1, -1)
+        torch.testing.assert_close(out.float(), ref, atol=2.0, rtol=5e-2)
+        self.assertFalse(out.float().isnan().any().item())
+        self.assertIn("tcgen05_aux_rowvec_smem_layout_", code)
+        self.assertIn("tcgen05_colvec_scalar_full_", code)
 
     def test_matmul_mma_tcgen05_f16_m128_cluster_m2_keeps_cta_group_one(
         self,
@@ -10790,31 +11466,8 @@ def cute_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 class TestCuteConfigValuePriors(TestCase):
     """The cute backend supplies per-key value priors (the learned distribution
-    that replaces the old hardcoded per-shape seeds); they bias the random half
-    of the initial population toward the known-good 2-CTA matmul family."""
-
-    def _assert_prior_choices(
-        self,
-        prior: Callable[[Any, int], object],
-        fragment: Any,
-        expected_values: Any,
-    ) -> None:
-        captured_values: tuple[object, ...] | None = None
-
-        def fake_choices(values, *, weights, k):
-            nonlocal captured_values
-            self.assertEqual(k, 1)
-            captured_values = tuple(values)
-            return [values[0]]
-
-        with patch("random.choices", side_effect=fake_choices):
-            value = prior(fragment, 0)
-        self.assertIsNotNone(captured_values)
-        self.assertEqual(set(captured_values), expected_values)
-        choices = fragment.search_choices or fragment.choices
-        self.assertIn(value, choices)
-        for candidate in captured_values:
-            self.assertIn(candidate, choices)
+    used by generic kernels. Flash attention instead builds structural coverage
+    from its live legality model before uniformly filling the population."""
 
     def test_priors_cover_the_template_keys(self) -> None:
         from helion._compiler.backend import CuteBackend
@@ -10866,291 +11519,51 @@ class TestCuteConfigValuePriors(TestCase):
         # the biased indexing slots should pick TMA.
         self.assertGreater(tma, total // 2)
 
-    def test_flash_priors_bias_dense_hd64_fa4_values(self) -> None:
+    def test_flash_search_does_not_install_shape_specific_value_priors(self) -> None:
         from helion._compiler.backend import CuteBackend
-        from helion._compiler.cute.cute_flash import FLASH_CLC_HEADS_PER_BATCH_KEY
-        from helion._compiler.cute.cute_flash import FLASH_CLC_PDL_KEY
-        from helion._compiler.cute.cute_flash import FLASH_CLC_STAGES_KEY
-        from helion._compiler.cute.cute_flash import FLASH_CORR_REGS_KEY
-        from helion._compiler.cute.cute_flash import FLASH_CORR_TILE_SIZE_KEY
-        from helion._compiler.cute.cute_flash import FLASH_DISC_PIPE_KEY
-        from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET0_KEY
-        from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET_KEY
-        from helion._compiler.cute.cute_flash import FLASH_E2E_SCHEDULE_KEY
-        from helion._compiler.cute.cute_flash import FLASH_EPI_STG_GMEM_KEY
-        from helion._compiler.cute.cute_flash import FLASH_EPI_STG_KEY
-        from helion._compiler.cute.cute_flash import FLASH_EPI_STG_STORE_KEY
-        from helion._compiler.cute.cute_flash import FLASH_EPI_TMA_KEY
-        from helion._compiler.cute.cute_flash import FLASH_FIRST_LOAD_ORDER_KEY
-        from helion._compiler.cute.cute_flash import FLASH_KV_ORDER_KEY
-        from helion._compiler.cute.cute_flash import FLASH_KV_STAGE_KEY
-        from helion._compiler.cute.cute_flash import FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS
-        from helion._compiler.cute.cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
-        from helion._compiler.cute.cute_flash import FLASH_OTHER_REGS_KEY
-        from helion._compiler.cute.cute_flash import FLASH_P_STORE_REP_KEY
-        from helion._compiler.cute.cute_flash import FLASH_PACKED_REDUCE_KEY
-        from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_CTAS_PER_SM_KEY
-        from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_KEY
-        from helion._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILY_KEY
-        from helion._compiler.cute.cute_flash import FLASH_PRECOMPUTE_QK_DESC_KEY
-        from helion._compiler.cute.cute_flash import FLASH_RESCALE_CHUNK_COLS_KEY
-        from helion._compiler.cute.cute_flash import FLASH_RESCALE_THRESHOLD_KEY
-        from helion._compiler.cute.cute_flash import FLASH_S_LOAD_REP_KEY
-        from helion._compiler.cute.cute_flash import FLASH_S_STAGE_KEY
-        from helion._compiler.cute.cute_flash import FLASH_SKIP_RESCALE_STATS_KEY
-        from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_DISC_KEY
-        from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
         from helion.autotuner.config_generation import ConfigGeneration
 
-        q, k, v = (
-            torch.empty(1, 1, 8192, 64, dtype=torch.float16, device=DEVICE)
-            for _ in range(3)
+        q, k, v = (torch.empty(1, 1, 8192, 64, dtype=torch.float16) for _ in range(3))
+        backend_prior_keys = set(CuteBackend().config_value_priors(cast("Any", None)))
+        self.assertFalse(
+            any(key.startswith("cute_flash_") for key in backend_prior_keys)
         )
-        bound = cute_dense_attention.bind((q, k, v))
-        self.assertTrue(bound.config_spec.cute_flash_search_enabled)
-        bound.config_spec.compiler_seed_configs = []
-        bound.config_spec.compiler_default_config = None
-        priors = CuteBackend().config_value_priors(bound.config_spec)
-        fragments = bound.config_spec._flat_fields()
 
-        expected = {
-            FLASH_S_STAGE_KEY: {2},
-            FLASH_PIPELINE_FAMILY_KEY: {"fa4", "ws_overlap"},
-            FLASH_PERSISTENT_KEY: {True},
-            FLASH_PERSISTENT_CTAS_PER_SM_KEY: {1, 2, 3, 4},
-            FLASH_E2E_SCHEDULE_KEY: {"8/2", "16/4"},
-            FLASH_SOFTMAX_DISC_KEY: {False, True},
-            FLASH_DISC_PIPE_KEY: {2, 3, 4},
-            FLASH_P_STORE_REP_KEY: {16, 32},
-            FLASH_S_LOAD_REP_KEY: {16, 32},
-            FLASH_PRECOMPUTE_QK_DESC_KEY: {False, True},
-            FLASH_FIRST_LOAD_ORDER_KEY: {0, 1, 2, 3, 4},
-            FLASH_KV_ORDER_KEY: {"ascending", "descending"},
-            FLASH_RESCALE_THRESHOLD_KEY: {8.0},
-            FLASH_SKIP_RESCALE_STATS_KEY: {False, True},
-            FLASH_RESCALE_CHUNK_COLS_KEY: {16, 32},
-            FLASH_CORR_REGS_KEY: {64},
-            FLASH_OTHER_REGS_KEY: {32, 40, 48, 56, 64, 80},
-            FLASH_CORR_TILE_SIZE_KEY: {8, 16, 32},
-            FLASH_EPI_TMA_KEY: {False, True},
-            FLASH_EPI_STG_KEY: {False, True},
-            FLASH_EPI_STG_STORE_KEY: {"slice", "whole"},
-            FLASH_EPI_STG_GMEM_KEY: {"stage", "pair"},
-            FLASH_SOFTMAX_REGS_KEY: {184, 200},
-            FLASH_KV_STAGE_KEY: {2, 3},
-            FLASH_PACKED_REDUCE_KEY: {True},
-            FLASH_CLC_HEADS_PER_BATCH_KEY: {0, 32},
-            FLASH_CLC_PDL_KEY: {False, True},
-            FLASH_CLC_STAGES_KEY: {2, 3},
-            FLASH_E2E_OFFSET_KEY: {0, 1, 2, 3},
-            FLASH_E2E_OFFSET0_KEY: {0, 1, 2, 3},
-        }
-        for key, values in expected.items():
-            self.assertIn(key, priors)
-            self._assert_prior_choices(priors[key], fragments[key], values)
+        for kernel in (cute_dense_attention, cute_causal_attention):
+            with self.subTest(kernel=kernel.__name__):
+                spec = kernel.bind((q, k, v)).config_spec
+                self.assertTrue(spec.cute_flash_search_enabled)
+                generation = ConfigGeneration(spec)
+                engaged = set(generation._config_value_priors) & set(
+                    generation._key_to_flat_indices
+                )
+                self.assertLessEqual(engaged, backend_prior_keys)
+                self.assertFalse(any(key.startswith("cute_flash_") for key in engaged))
 
-        bound.config_spec._cute_flash_num_kv = 256
-        very_long_priors = CuteBackend().config_value_priors(bound.config_spec)
-        very_long_fragments = bound.config_spec._flat_fields()
-        self._assert_prior_choices(
-            very_long_priors[FLASH_RESCALE_THRESHOLD_KEY],
-            very_long_fragments[FLASH_RESCALE_THRESHOLD_KEY],
-            {8.0, 12.0},
-        )
-        bound.config_spec._cute_flash_num_kv = 384
-        bound.config_spec._cute_flash_dtype = torch.bfloat16
-        bf16_priors = CuteBackend().config_value_priors(bound.config_spec)
-        bf16_fragments = bound.config_spec._flat_fields()
-        self._assert_prior_choices(
-            bf16_priors[FLASH_RESCALE_THRESHOLD_KEY],
-            bf16_fragments[FLASH_RESCALE_THRESHOLD_KEY],
-            {8.0, 16.0, 32.0},
-        )
-        for key, values in {
-            FLASH_PIPELINE_FAMILY_KEY: {"fa4", "ws_overlap", "fa4_2cta"},
-            FLASH_E2E_SCHEDULE_KEY: {"8/2", "16/4"},
-            FLASH_E2E_OFFSET_KEY: {0},
-            FLASH_E2E_OFFSET0_KEY: {1},
-            FLASH_KV_STAGE_KEY: {2, 3},
-            FLASH_PERSISTENT_CTAS_PER_SM_KEY: {1},
-            FLASH_SOFTMAX_DISC_KEY: {False},
-            FLASH_DISC_PIPE_KEY: {1},
-            FLASH_P_STORE_REP_KEY: {16},
-            FLASH_S_LOAD_REP_KEY: {32},
-            FLASH_PRECOMPUTE_QK_DESC_KEY: {False},
-            FLASH_FIRST_LOAD_ORDER_KEY: {0},
-            FLASH_KV_ORDER_KEY: {"descending"},
-            FLASH_SKIP_RESCALE_STATS_KEY: {False},
-            FLASH_RESCALE_CHUNK_COLS_KEY: {8},
-            FLASH_SOFTMAX_REGS_KEY: {192, 200},
-            FLASH_CORR_REGS_KEY: {64},
-            FLASH_OTHER_REGS_KEY: {40},
-            FLASH_CORR_TILE_SIZE_KEY: {8, 16},
-            FLASH_EPI_TMA_KEY: {True},
-            FLASH_EPI_STG_KEY: {False},
-            FLASH_EPI_STG_STORE_KEY: {"slice"},
-            FLASH_EPI_STG_GMEM_KEY: {"stage"},
-            FLASH_PACKED_REDUCE_KEY: {True},
-            FLASH_CLC_HEADS_PER_BATCH_KEY: {0},
-            FLASH_CLC_PDL_KEY: {False},
-            FLASH_CLC_STAGES_KEY: {1},
-        }.items():
-            self._assert_prior_choices(
-                very_long_priors[key],
-                very_long_fragments[key],
-                values,
-            )
-        bound.config_spec._cute_flash_num_kv = 512
-        staged_priors = CuteBackend().config_value_priors(bound.config_spec)
-        staged_fragments = bound.config_spec._flat_fields()
-        for key, values in {
-            FLASH_EPI_TMA_KEY: {False},
-            FLASH_EPI_STG_KEY: {True},
-            FLASH_EPI_STG_STORE_KEY: {"slice"},
-            FLASH_EPI_STG_GMEM_KEY: {"stage"},
-        }.items():
-            self._assert_prior_choices(
-                staged_priors[key], staged_fragments[key], values
-            )
-        bound.config_spec._cute_flash_num_kv = 1024
-        tma_priors = CuteBackend().config_value_priors(bound.config_spec)
-        tma_fragments = bound.config_spec._flat_fields()
-        for key, values in {
-            FLASH_EPI_TMA_KEY: {True},
-            FLASH_EPI_STG_KEY: {False},
-            FLASH_EPI_STG_STORE_KEY: {"slice"},
-            FLASH_EPI_STG_GMEM_KEY: {"stage"},
-        }.items():
-            self._assert_prior_choices(tma_priors[key], tma_fragments[key], values)
-        bound.config_spec._cute_flash_num_kv = 2048
-        bound.config_spec._cute_flash_dtype = torch.float16
-        two_cta_priors = CuteBackend().config_value_priors(bound.config_spec)
-        two_cta_fragments = bound.config_spec._flat_fields()
-        self._assert_prior_choices(
-            two_cta_priors[FLASH_PIPELINE_FAMILY_KEY],
-            two_cta_fragments[FLASH_PIPELINE_FAMILY_KEY],
-            {"fa4", "ws_overlap", "fa4_2cta"},
-        )
-        bound.config_spec._cute_flash_num_kv = 64
-
-        gen = ConfigGeneration(bound.config_spec)
-        with patch(
-            "random.choices", side_effect=lambda values, weights, k: [values[0]]
-        ):
-            biased_config = gen.unflatten(gen.biased_random_flat()).config
-        self.assertEqual(biased_config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
-        self.assertEqual(biased_config[FLASH_E2E_SCHEDULE_KEY], "8/2")
-        self.assertEqual(biased_config[FLASH_MASKED_E2E_SCHEDULE_KEY], "inherit")
-        self.assertEqual(biased_config[FLASH_KV_STAGE_KEY], 2)
-        self.assertEqual(biased_config[FLASH_PERSISTENT_CTAS_PER_SM_KEY], 1)
-        self.assertEqual(biased_config[FLASH_E2E_OFFSET_KEY], 2)
-        self.assertEqual(biased_config[FLASH_E2E_OFFSET0_KEY], 2)
-        self.assertTrue(biased_config[FLASH_SOFTMAX_DISC_KEY])
-        self.assertEqual(biased_config[FLASH_P_STORE_REP_KEY], 16)
-        self.assertEqual(biased_config[FLASH_S_LOAD_REP_KEY], 32)
-        self.assertFalse(biased_config[FLASH_PRECOMPUTE_QK_DESC_KEY])
-        self.assertEqual(biased_config[FLASH_FIRST_LOAD_ORDER_KEY], 0)
-        self.assertEqual(biased_config[FLASH_KV_ORDER_KEY], "ascending")
-        self.assertEqual(biased_config[FLASH_OTHER_REGS_KEY], 48)
-        self.assertTrue(biased_config[FLASH_EPI_TMA_KEY])
-        self.assertFalse(biased_config[FLASH_EPI_STG_KEY])
-        self.assertEqual(biased_config[FLASH_CORR_TILE_SIZE_KEY], 16)
-        self.assertFalse(biased_config[FLASH_SKIP_RESCALE_STATS_KEY])
-        self.assertEqual(biased_config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
-        for legacy_key in FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS:
-            self.assertNotIn(legacy_key, biased_config)
-
-    def test_flash_priors_bias_causal_hd64_shape_family_values(self) -> None:
-        from helion._compiler.backend import CuteBackend
-        from helion._compiler.cute.cute_flash import FLASH_CAUSAL_KV_ORDER_KEY
-        from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LOOP_SPLIT_KEY
-        from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LPT_SWIZZLE_KEY
-        from helion._compiler.cute.cute_flash import FLASH_DISC_PIPE_KEY
-        from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET0_KEY
-        from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET_KEY
-        from helion._compiler.cute.cute_flash import FLASH_E2E_SCHEDULE_KEY
-        from helion._compiler.cute.cute_flash import FLASH_EPI_TMA_KEY
-        from helion._compiler.cute.cute_flash import FLASH_KV_STAGE_KEY
-        from helion._compiler.cute.cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
-        from helion._compiler.cute.cute_flash import FLASH_PACKED_REDUCE_KEY
-        from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_KEY
-        from helion._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILY_KEY
-        from helion._compiler.cute.cute_flash import FLASH_ROLE_MAP_KEY
-        from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
+    def test_flash_search_uses_effective_structural_coverage(self) -> None:
         from helion.autotuner.config_generation import ConfigGeneration
 
-        q, k, v = (
-            torch.empty(1, 1, 8192, 64, dtype=torch.float16, device=DEVICE)
-            for _ in range(3)
-        )
-        bound = cute_causal_attention.bind((q, k, v))
-        self.assertTrue(bound.config_spec.cute_flash_search_enabled)
-        bound.config_spec.compiler_seed_configs = []
-        bound.config_spec.compiler_default_config = None
-        # Exercise the causal shape family through the recorded flash fact without
-        # allocating a separate long-sequence Q/K/V triple for every case.
-        for num_kv in (32, 64, 128, 256, 512):
-            with self.subTest(num_kv=num_kv):
-                bound.config_spec._cute_flash_num_kv = num_kv
-                priors = CuteBackend().config_value_priors(bound.config_spec)
-                fragments = bound.config_spec._flat_fields()
-                expected = {
-                    FLASH_PIPELINE_FAMILY_KEY: {"fa4", "ws_overlap"},
-                    FLASH_PERSISTENT_KEY: {False},
-                    FLASH_KV_STAGE_KEY: {2, 3, 4, 6, 8, 10},
-                    FLASH_E2E_SCHEDULE_KEY: {"16/4", "8/2", "xu"},
-                    FLASH_MASKED_E2E_SCHEDULE_KEY: {
-                        "inherit",
-                        "xu",
-                        "16/4",
-                        "8/2",
-                    },
-                    FLASH_PACKED_REDUCE_KEY: {True},
-                    FLASH_EPI_TMA_KEY: {False, True},
-                    FLASH_ROLE_MAP_KEY: {"fa4", "helion"},
-                    FLASH_CAUSAL_LOOP_SPLIT_KEY: {False, True},
-                    FLASH_CAUSAL_LPT_SWIZZLE_KEY: {0, 1, 2, 4, 8, 16},
-                    FLASH_CAUSAL_KV_ORDER_KEY: {"ascending", "descending"},
-                    FLASH_DISC_PIPE_KEY: {2, 3, 4},
-                    FLASH_SOFTMAX_REGS_KEY: {184, 192, 200},
-                    FLASH_E2E_OFFSET_KEY: set(range(16)),
-                    FLASH_E2E_OFFSET0_KEY: {0, 1, 2, 3, 4, 8, 11},
-                }
-                for key, values in expected.items():
-                    self.assertIn(key, priors)
-                    self._assert_prior_choices(priors[key], fragments[key], values)
+        q, k, v = (torch.empty(1, 1, 8192, 64, dtype=torch.float16) for _ in range(3))
+        for kernel in (cute_dense_attention, cute_causal_attention):
+            with self.subTest(kernel=kernel.__name__):
+                spec = kernel.bind((q, k, v)).config_spec
+                generation = ConfigGeneration(spec)
+                configs = generation.flash_deterministic_population_configs()
+                self.assertTrue(configs)
 
-        bound.config_spec._cute_flash_num_kv = 96
-        unsupported_priors = CuteBackend().config_value_priors(bound.config_spec)
-        self.assertNotIn(FLASH_CAUSAL_LPT_SWIZZLE_KEY, unsupported_priors)
-        self.assertNotIn(FLASH_E2E_OFFSET_KEY, unsupported_priors)
-
-        bound.config_spec._cute_flash_num_kv = 512
-        gen = ConfigGeneration(bound.config_spec)
-        with patch(
-            "random.choices", side_effect=lambda values, weights, k: [values[0]]
-        ):
-            population = [
-                gen.unflatten(flat).config for flat in gen.random_population_flat(4)
-            ]
-        self.assertEqual(len(population), 4)
-        biased_config = next(
-            config
-            for config in population
-            if config[FLASH_CAUSAL_LPT_SWIZZLE_KEY] == 1
-            and config[FLASH_CAUSAL_KV_ORDER_KEY] == "descending"
-            and config[FLASH_MASKED_E2E_SCHEDULE_KEY] == "16/4"
-            and config[FLASH_ROLE_MAP_KEY] == "helion"
-        )
-        self.assertEqual(biased_config[FLASH_CAUSAL_LPT_SWIZZLE_KEY], 1)
-        self.assertEqual(biased_config[FLASH_CAUSAL_KV_ORDER_KEY], "descending")
-        self.assertEqual(biased_config[FLASH_MASKED_E2E_SCHEDULE_KEY], "16/4")
-        self.assertEqual(biased_config[FLASH_ROLE_MAP_KEY], "helion")
-        self.assertFalse(biased_config[FLASH_EPI_TMA_KEY])
-        self.assertEqual(biased_config[FLASH_E2E_OFFSET_KEY], 9)
-        self.assertEqual(biased_config[FLASH_E2E_OFFSET0_KEY], 3)
-        self.assertEqual(biased_config[FLASH_DISC_PIPE_KEY], 4)
-        self.assertEqual(biased_config[FLASH_SOFTMAX_REGS_KEY], 184)
+                fragments = spec._flat_fields()
+                for key in (
+                    _cute_flash.FLASH_PIPELINE_FAMILY_KEY,
+                    _cute_flash.FLASH_EXP2_PACKET_KEY,
+                ):
+                    fragment = fragments[key]
+                    expected = set(
+                        fragment.choices
+                        if fragment.search_choices is None
+                        else fragment.search_choices
+                    )
+                    effective = {config.config[key] for config in configs}
+                    self.assertEqual(effective, expected, key)
 
 
 class TestCuteBackendRequirements(TestCase):

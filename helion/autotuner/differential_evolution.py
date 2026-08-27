@@ -91,6 +91,22 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         self.best_perf_history: list[float] = []
         self.generations_without_improvement = 0
 
+    def _algorithm_cache_policy(self) -> dict[str, object]:
+        return {
+            "de_version": 1,
+            "population_size": self.population_size,
+            "max_generations": self.max_generations,
+            "crossover_rate": self.crossover_rate,
+            "immediate_update": self.immediate_update,
+            "min_improvement_delta": self.min_improvement_delta,
+            "patience": self.patience,
+            "initial_population_strategy": self.initial_population_strategy,
+            "best_available_pad_random": self.best_available_pad_random,
+            "finishing_rounds": self.finishing_rounds,
+            "compile_timeout_lower_bound": self.compile_timeout_lower_bound,
+            "compile_timeout_quantile": self.compile_timeout_quantile,
+        }
+
     @classmethod
     def get_kwargs_from_profile(
         cls, profile: AutotuneEffortProfile, settings: Settings

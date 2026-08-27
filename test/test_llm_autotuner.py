@@ -165,6 +165,73 @@ class TestLLMGuidedSearch(TestCase):
                 self.assertEqual(context[1]["content"], "initial")
                 self.assertEqual(len(context), expected_len)
 
+    def test_benchmark_batch_repairs_prior_source_aliases_before_ingest(self):
+        from helion.autotuner.base_search import PopulationMember
+        from helion.autotuner.benchmark_provider import BenchmarkResult
+
+        search = self._make_mock_search()
+        failed_config = helion.Config(block_sizes=[64])
+        alias_config = helion.Config(block_sizes=[128])
+        failed_result = BenchmarkResult(
+            config=failed_config,
+            fn=lambda: None,
+            perf=float("inf"),
+            status="error",
+            compile_time=0.1,
+        )
+        repair_result = BenchmarkResult(
+            config=failed_config,
+            fn=lambda: None,
+            perf=1.25,
+            status="deduplicated",
+            compile_time=None,
+        )
+        alias_result = BenchmarkResult(
+            config=alias_config,
+            fn=lambda: None,
+            perf=1.25,
+            status="ok",
+            compile_time=0.2,
+        )
+        failed_member = PopulationMember(
+            fn=failed_result.fn,
+            perfs=[failed_result.perf],
+            flat_values=(),
+            config=failed_config,
+            status=failed_result.status,
+            compile_time=failed_result.compile_time,
+        )
+        search.population = [failed_member]
+        search._compiler_seed_members = []
+        search._benchmarked_members = {}
+        search._pinned_finalist_members = {}
+        search._latest_results_by_config_key = {
+            search._config_key(failed_config): failed_result
+        }
+        search._all_benchmark_results = [failed_result]
+        search.config_gen = SimpleNamespace(flatten=lambda _config: ())
+        search.set_generation = lambda _generation: None
+        search.benchmark_batch = lambda _configs, *, desc: [alias_result]
+        search.benchmark_provider = SimpleNamespace(
+            take_effective_source_repairs=lambda: {
+                failed_config: repair_result,
+            }
+        )
+        search._record_benchmarked_member = lambda _member: None
+
+        search._benchmark_and_ingest([alias_config], generation=2, desc="source alias")
+
+        self.assertEqual(failed_member.perf, 1.25)
+        self.assertEqual(failed_member.status, "deduplicated")
+        self.assertIs(
+            search._latest_results_by_config_key[search._config_key(failed_config)],
+            repair_result,
+        )
+        self.assertIs(
+            search._latest_results_by_config_key[search._config_key(alias_config)],
+            alias_result,
+        )
+
     @onlyBackends(["triton", "cute"])
     def test_autotune_runs_full_llm_guided_loop_with_mocked_provider(self):
         """LLM-guided search runs the public round loop with mocked LLM and benchmark backends."""
@@ -198,6 +265,9 @@ class TestLLMGuidedSearch(TestCase):
 
             def set_budget_exceeded_fn(self, fn) -> None:
                 pass
+
+            def take_effective_source_repairs(self):
+                return {}
 
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float16),
@@ -1369,7 +1439,9 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                     num_configs_tested=7,
                     num_compile_failures=1,
                     num_worker_failures=2,
+                    num_isolated_rebenchmark_timeouts=3,
                     num_accuracy_failures=2,
+                    num_successful_candidate_measurements=5,
                     num_unique_sources=3,
                     num_source_deduplications=4,
                     num_generations=3,
@@ -1402,7 +1474,9 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                     num_configs_tested=11,
                     num_compile_failures=3,
                     num_worker_failures=4,
+                    num_isolated_rebenchmark_timeouts=5,
                     num_accuracy_failures=5,
+                    num_successful_candidate_measurements=8,
                     num_unique_sources=5,
                     num_source_deduplications=6,
                     num_generations=6,
@@ -1413,7 +1487,8 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
             def set_best_available_seed_configs(self, configs):
                 self.seed_configs = list(configs)
 
-            def autotune(self):
+            def autotune(self, *, skip_cache=False):
+                self.skip_cache = skip_cache
                 return Config(num_warps=8)
 
         kernel = SimpleNamespace(
@@ -1453,10 +1528,15 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
         )
         self.assertTrue(lfbo_instances[0].kwargs["best_available_pad_random"])
         self.assertEqual(lfbo_instances[0].seed_configs, [Config(num_warps=4)])
+        self.assertFalse(lfbo_instances[0].skip_cache)
         self.assertEqual(search._autotune_metrics.num_configs_tested, 18)
         self.assertEqual(search._autotune_metrics.num_compile_failures, 4)
         self.assertEqual(search._autotune_metrics.num_worker_failures, 6)
+        self.assertEqual(search._autotune_metrics.num_isolated_rebenchmark_timeouts, 8)
         self.assertEqual(search._autotune_metrics.num_accuracy_failures, 7)
+        self.assertEqual(
+            search._autotune_metrics.num_successful_candidate_measurements, 13
+        )
         self.assertEqual(search._autotune_metrics.num_unique_sources, 8)
         self.assertEqual(search._autotune_metrics.num_source_deduplications, 10)
         self.assertEqual(search._autotune_metrics.num_generations, 9)
@@ -1511,6 +1591,7 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                     num_configs_tested=4,
                     num_compile_failures=1,
                     num_worker_failures=1,
+                    num_isolated_rebenchmark_timeouts=1,
                     num_accuracy_failures=0,
                     num_generations=2,
                 )
@@ -1543,6 +1624,7 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                     num_configs_tested=6,
                     num_compile_failures=2,
                     num_worker_failures=2,
+                    num_isolated_rebenchmark_timeouts=2,
                     num_accuracy_failures=1,
                     num_generations=5,
                 )
@@ -1552,7 +1634,8 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
             def set_best_available_seed_configs(self, configs):
                 self.seed_configs = list(configs)
 
-            def autotune(self):
+            def autotune(self, *, skip_cache=False):
+                self.skip_cache = skip_cache
                 stage_order.append("lfbo")
                 return Config(num_warps=8)
 
@@ -1587,6 +1670,7 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
             InitialPopulationStrategy.FROM_BEST_AVAILABLE,
         )
         self.assertEqual(lfbo_instances[0].seed_configs, [Config(num_warps=4)])
+        self.assertTrue(lfbo_instances[0].skip_cache)
         self.assertTrue(search.hybrid_stage_breakdown["used_llm_seed"])
         self.assertEqual(search.hybrid_stage_breakdown["llm_seed_configs_tested"], 4)
         self.assertEqual(
@@ -1595,6 +1679,7 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
         self.assertEqual(search._autotune_metrics.num_configs_tested, 10)
         self.assertEqual(search._autotune_metrics.num_compile_failures, 3)
         self.assertEqual(search._autotune_metrics.num_worker_failures, 3)
+        self.assertEqual(search._autotune_metrics.num_isolated_rebenchmark_timeouts, 3)
         self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
         self.assertEqual(search._autotune_metrics.num_generations, 7)
 
@@ -1627,7 +1712,8 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 self._autotune_metrics = AutotuneMetrics(num_configs_tested=3)
                 lfbo_instances.append(self)
 
-            def autotune(self):
+            def autotune(self, *, skip_cache=False):
+                self.skip_cache = skip_cache
                 return Config(num_warps=16)
 
         kernel = SimpleNamespace(
@@ -1663,4 +1749,5 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
             lfbo_instances[0].kwargs["initial_population_strategy"],
             InitialPopulationStrategy.FROM_RANDOM,
         )
+        self.assertFalse(lfbo_instances[0].skip_cache)
         self.assertFalse(search.hybrid_stage_breakdown["used_llm_seed"])

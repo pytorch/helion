@@ -13739,6 +13739,7 @@ class TestCuteLowerings(unittest.TestCase):
                 _FakeBlockSize(16, block_id=2, reduction=True),
             ],
             config_spec=SimpleNamespace(
+                cute_attention_generic_fallback_enabled=False,
                 num_threads=SimpleNamespace(config_get=lambda *args: 0),
                 loop_orders=SimpleNamespace(config_get=lambda *args: None),
                 l2_groupings=SimpleNamespace(config_get=lambda *args: 1),
