@@ -339,8 +339,8 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         load_args.assert_called_once_with("/tmp/args.pt")
         event_bench.assert_not_called()
         wall_clock_bench.assert_called_once()
-        self.assertNotIn("fixed_repetitions", wall_clock_bench.call_args.kwargs)
-        self.assertNotIn("probe_long_kernel", wall_clock_bench.call_args.kwargs)
+        self.assertIsNone(wall_clock_bench.call_args.kwargs["fixed_repetitions"])
+        self.assertIs(wall_clock_bench.call_args.kwargs["probe_long_kernel"], False)
 
     def test_wall_clock_fixed_repetitions_run_setup_and_measurements(self) -> None:
         invocation_count = 0
@@ -392,6 +392,58 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             )()
 
         self.assertIs(wall_clock_bench.call_args.kwargs["probe_long_kernel"], True)
+
+    def test_benchmark_job_forwards_long_kernel_probe_on_event_path(self) -> None:
+        fn = _ReturnValue(torch.empty(()))
+
+        with (
+            patch(
+                "helion.autotuner.benchmark_job._load_compiled_fn",
+                return_value=fn,
+            ),
+            patch(
+                "helion.autotuner.benchmark_job.load_trusted_kernel_args",
+                return_value=(),
+            ),
+            patch(
+                "helion.autotuner.benchmark_job.do_bench",
+                return_value=1.25,
+            ) as event_bench,
+            patch("helion.autotuner.benchmark_job.do_bench_generic") as wall_bench,
+        ):
+            BenchmarkJob(
+                fn_spec=cast("SerializedCompiledFunction", object()),
+                args_path="/tmp/args.pt",
+                use_wall_clock=False,
+                probe_long_kernel=True,
+            )()
+
+        wall_bench.assert_not_called()
+        self.assertIs(event_bench.call_args.kwargs["probe_long_kernel"], True)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_event_timed_long_kernel_skips_redundant_estimates(self) -> None:
+        # A kernel longer than both timing windows must be measured with
+        # setup + single-call estimate + one timed repeat (3 launches), not
+        # the 5-call estimate loop.
+        invocation_count = 0
+        sleep_cycles = int(50e6)  # tens of ms at ~GHz clocks
+
+        def fn() -> None:
+            nonlocal invocation_count
+            invocation_count += 1
+            torch.cuda._sleep(sleep_cycles)
+
+        result = do_bench(
+            fn,
+            warmup=1,
+            rep=1,
+            return_mode="median",
+            probe_long_kernel=True,
+        )
+
+        self.assertEqual(invocation_count, 3)
+        self.assertGreater(cast("float", result), 1.0)
 
     def test_wall_clock_long_kernel_skips_redundant_estimates(self) -> None:
         invocation_count = 0
@@ -1040,8 +1092,10 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         self.assertEqual(provider._benchmark_worker.run.call_args.kwargs["timeout"], 17)
 
     def test_long_kernel_probe_is_cute_flash_gated(self) -> None:
+        # The probe applies to flash searches on both timer paths: the
+        # event-timed do_bench now short-circuits its estimate loop the same
+        # way do_bench_generic does for multi-second candidates.
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
-        provider._subprocess_benchmark_uses_wall_clock = lambda: True
         provider.config_spec = SimpleNamespace(cute_flash_search_enabled=False)
         self.assertFalse(provider._probe_long_cute_flash_kernel())
 

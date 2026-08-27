@@ -14,7 +14,6 @@ import re
 import tempfile
 from typing import TYPE_CHECKING
 from typing import Any
-from typing import Callable
 from typing import Sequence
 
 import sympy
@@ -1054,23 +1053,15 @@ class CuteBackend(Backend):
             return "warn"
         return None
 
-    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
-        # The default Triton do_bench uses CUDA events that mis-time the CuTe
-        # path on Blackwell - launches show up as ~5ms when the kernel is
-        # actually 250ms+. Use synchronized wall-clock timing instead so
-        # autotune scores reflect real performance.
-        from ...autotuner.benchmarking import do_bench_generic
-
-        return do_bench_generic
-
-    def get_interleaved_bench(self) -> Callable[..., list[float]]:
-        # Same rationale as get_do_bench: the default interleaved bench uses
-        # CUDA events that mis-time the CuTe path. Use the synchronized
-        # wall-clock fallback so the autotuner's interleaved compare path
-        # produces real timings.
-        from ...autotuner.benchmarking import interleaved_bench_generic
-
-        return interleaved_bench_generic
+    # Note: this backend intentionally does NOT override get_do_bench /
+    # get_interleaved_bench. CUDA-event timing once mis-read CuTe launches
+    # (~5ms reported for 250ms kernels) because the pre-compiled-launcher
+    # per-call ``@cute.jit`` dispatch path spent ~200ms on the host per
+    # launch; with ``_CompiledCuteLauncher`` kernels launch on the Torch
+    # current stream and event timing matches synchronized wall-clock timing
+    # to <0.1ms on B200 across flash families (including CLC+PDL and
+    # multi-second launches). Event timing avoids charging per-launch host
+    # overhead to the kernel, which the wall path does.
 
     def autotune(
         self,

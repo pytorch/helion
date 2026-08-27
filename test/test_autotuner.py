@@ -15183,15 +15183,23 @@ class TestAutotuneBudget(TestCase):
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         self.assertFalse(provider.budget_exceeded_fn())
 
-    def test_cute_wall_clock_benchmark_uses_subprocess_worker(self) -> None:
+    def test_cute_benchmark_uses_event_timed_subprocess_worker(self) -> None:
+        # CuTe inherits the default (None) do_bench hooks: compiled launchers
+        # run on the Torch current stream, so CUDA-event timing is accurate
+        # and subprocess benchmark jobs must NOT switch to the wall-clock
+        # path that charges per-launch host overhead to the kernel.
         from helion._compiler.backend import CuteBackend
+
+        backend = CuteBackend()
+        self.assertIsNone(backend.get_do_bench())
+        self.assertIsNone(backend.get_interleaved_bench())
 
         provider = self._make_stub_provider()
         provider.kernel.supports_subprocess_benchmark = lambda: True
-        provider.config_spec = SimpleNamespace(backend=CuteBackend())
+        provider.config_spec = SimpleNamespace(backend=backend)
 
         self.assertTrue(provider._subprocess_benchmark_enabled())
-        self.assertTrue(provider._subprocess_benchmark_uses_wall_clock())
+        self.assertFalse(provider._subprocess_benchmark_uses_wall_clock())
 
     def test_non_cute_custom_benchmark_stays_in_process(self) -> None:
         from helion.autotuner.benchmarking import do_bench_generic

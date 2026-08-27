@@ -42,30 +42,14 @@ class BenchmarkJob:
                 bench = do_bench_generic if self.use_wall_clock else do_bench
                 # return_mode="median" guarantees a float return.
                 benchmark_fn = functools.partial(fn, *args)
-                if self.use_wall_clock and self.probe_long_kernel:
-                    result = do_bench_generic(
-                        benchmark_fn,
-                        return_mode="median",
-                        warmup=self.warmup,
-                        rep=self.rep,
-                        fixed_repetitions=self.fixed_repetitions,
-                        probe_long_kernel=True,
-                    )
-                elif self.fixed_repetitions is None:
-                    result = bench(
-                        benchmark_fn,
-                        return_mode="median",
-                        warmup=self.warmup,
-                        rep=self.rep,
-                    )
-                else:
-                    result = bench(
-                        benchmark_fn,
-                        return_mode="median",
-                        warmup=self.warmup,
-                        rep=self.rep,
-                        fixed_repetitions=self.fixed_repetitions,
-                    )
+                result = bench(
+                    benchmark_fn,
+                    return_mode="median",
+                    warmup=self.warmup,
+                    rep=self.rep,
+                    fixed_repetitions=self.fixed_repetitions,
+                    probe_long_kernel=self.probe_long_kernel,
+                )
                 return cast(
                     "float",
                     result,
