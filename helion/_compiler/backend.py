@@ -3037,6 +3037,13 @@ def _grouped_rank3_specialized_mma_plan(
     env: CompileEnvironment,
 ) -> _SpecializedMmaPlan | None:
     from .cute.cute_mma import _choose_mma_impl
+    from .cute.tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
+    from .cute.tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
+    from .cute.tcgen05_constants import (
+        TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
+    )
+    from .cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
+    from .cute.tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_shape
     from .host_function import HostFunction
 
     if node.target is not torch.ops.aten.addmm.default:
@@ -3080,13 +3087,32 @@ def _grouped_rank3_specialized_mma_plan(
     lhs_val = lhs_node.meta.get("val")
     if not isinstance(lhs_val, torch.Tensor):
         return None
+    mma_bm = bm
+    mma_bn = bn
+    if config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY) == TCGEN05_GROUPED_MODE_WORKLIST_NM:
+        source_m_tile = config.get(
+            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
+            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+        )
+        physical_shape = resolve_tcgen05_grouped_worklist_mma_shape(
+            cluster_m=config.get("tcgen05_cluster_m", 1),
+            block_k=bk,
+            source_m_tile=source_m_tile,
+        )
+        if physical_shape is None:
+            return None
+        mma_bm, mma_bn = physical_shape
     mma_impl = _choose_mma_impl(
         lhs_val.dtype,
-        bm=bm,
-        bn=bn,
+        bm=mma_bm,
+        bn=mma_bn,
         bk=bk,
         config=config,
         input_device=lhs_val.device,
+        defer_grouped_worklist_smem_check=(
+            config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+            == TCGEN05_GROUPED_MODE_WORKLIST_NM
+        ),
     )
     if mma_impl != "tcgen05":
         return None

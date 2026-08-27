@@ -2978,6 +2978,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
     def _grouped_worklist_nm_valid_store_m_stmts(
         self,
         device_function: DeviceFunction,
+        *,
+        include_store_m: bool = True,
     ) -> list[ast.stmt]:
         plan = self._tcgen05_plan()
         assert plan is not None and plan.accumulator_view == "nm"
@@ -3005,7 +3007,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             remaining_m = (
                 f"max({grouped.problem_m} - {tile_start_var}, cutlass.Int32(0))"
             )
-            return [
+            stmts = [
                 statement_from_string(
                     f"{tile_start_var} = {grouped_cta_tile_idx_m} * "
                     f"cutlass.Int32({source_tile_m})"
@@ -3014,12 +3016,16 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     f"{grouped_valid_m} = min(cutlass.Int32({source_tile_m}), "
                     f"{remaining_m})"
                 ),
-                statement_from_string(
-                    f"{grouped_store_m} = min(cutlass.Int32({source_tile_m}), "
-                    f"{remaining_m})"
-                ),
             ]
-        return [
+            if include_store_m:
+                stmts.append(
+                    statement_from_string(
+                        f"{grouped_store_m} = min(cutlass.Int32({source_tile_m}), "
+                        f"{remaining_m})"
+                    )
+                )
+            return stmts
+        stmts = [
             statement_from_string(
                 f"{tile_start_var} = {grouped_cta_tile_idx_m} * "
                 f"cutlass.Int32({source_tile_m})"
@@ -3028,11 +3034,15 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 f"{grouped_valid_m} = min(cutlass.Int32({source_tile_m}), "
                 f"max({metadata_load_expr(2)} - {tile_start_var}, cutlass.Int32(0)))"
             ),
-            statement_from_string(
-                f"{grouped_store_m} = min(cutlass.Int32({source_tile_m}), "
-                f"{metadata_load_expr(3)} - {tile_start_var})"
-            ),
         ]
+        if include_store_m:
+            stmts.append(
+                statement_from_string(
+                    f"{grouped_store_m} = min(cutlass.Int32({source_tile_m}), "
+                    f"{metadata_load_expr(3)} - {tile_start_var})"
+                )
+            )
+        return stmts
 
     def _build_specialized_grouped_static_role_local_while(
         self,
@@ -3457,9 +3467,19 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 sched_consumer_state=sched_consumer_state,
             )
 
+        epi_role = role_block.role_predicate == self._tcgen05_epi_role_predicate()
+        mma_exec_role = (
+            role_block.role_predicate == self._tcgen05_mma_exec_role_predicate()
+        )
+        tma_load_role = (
+            role_block.role_predicate == self._tcgen05_tma_load_role_predicate()
+        )
         grouped_valid_store_m_stmts = (
-            self._grouped_worklist_nm_valid_store_m_stmts(device_function)
-            if role_block.role_predicate == self._tcgen05_epi_role_predicate()
+            self._grouped_worklist_nm_valid_store_m_stmts(
+                device_function,
+                include_store_m=epi_role,
+            )
+            if epi_role or mma_exec_role or tma_load_role
             else []
         )
         mailbox_fields = (
