@@ -165,3 +165,92 @@ def default_metal_launcher(
     total_threads = (gx * bx, gy * by, gz * bz)
     group_size = (bx, by, bz)
     dispatch_fn(*tensor_args, threads=total_threads, group_size=group_size)
+
+
+_flydsl_jit_cache: dict = {}
+_flydsl_compiled_cache: dict = {}  # cache_key -> flyc.CompiledFunction
+_flydsl_stream: object = None  # one persistent HIP stream, reused across launches
+
+
+def default_flydsl_launcher(
+    flydsl_kernel: object,
+    grid: tuple[int, ...],
+    *args: object,
+    _num_threads: int = 64,
+    **kwargs: object,
+) -> None:
+    """Default launcher for FlyDSL kernels on ROCm devices.
+
+    @flyc.kernel can only run inside @flyc.jit, so generate a temp Python file
+    wrapping it in @flyc.jit with explicit fx.Tensor params.
+    """
+    import importlib.util
+    import tempfile
+
+    kwargs.pop("num_warps", None)
+    kwargs.pop("num_stages", None)
+    if kwargs:
+        from .. import exc
+
+        raise exc.BackendUnsupported(
+            "flydsl", f"unexpected launcher kwargs: {sorted(kwargs)}"
+        )
+
+    n = len(args)
+    gx = grid[0] if len(grid) > 0 else 1
+    gy = grid[1] if len(grid) > 1 else 1
+    gz = grid[2] if len(grid) > 2 else 1
+
+    # _num_threads = 64*bm from launcher_keyword_args; default 64 = bm=1.
+    cache_key = (id(flydsl_kernel), n, gx, gy, gz, _num_threads)
+    if cache_key not in _flydsl_jit_cache:
+        params = ", ".join(f"_a{i}: fx.Tensor" for i in range(n))
+        call = ", ".join(f"_a{i}" for i in range(n))
+        src = f"""
+import flydsl.expr as fx
+import flydsl.compiler as flyc
+
+def _make(kernel):
+    @flyc.jit
+    def _launch({params}, _s: fx.Stream):
+        kernel({call}).launch(
+            grid=({gx}, {gy}, {gz}),
+            block=({_num_threads}, 1, 1),
+            stream=_s,
+        )
+    return _launch
+"""
+        with tempfile.NamedTemporaryFile(
+            suffix=".py", mode="w", delete=False, prefix="_flydsl_jit_"
+        ) as tf:
+            tf.write(src)
+            fname = tf.name
+
+        try:
+            spec = importlib.util.spec_from_file_location(
+                f"_flydsl_jit_{abs(hash(cache_key))}", fname
+            )
+            mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+            spec.loader.exec_module(mod)  # type: ignore[union-attr]
+            _flydsl_jit_cache[cache_key] = mod._make(flydsl_kernel)
+        finally:
+            import os as _os
+
+            _os.unlink(fname)
+
+    # Persistent null stream (fx.Stream(None) -> stream 0), reused across launches.
+    global _flydsl_stream
+    if _flydsl_stream is None:
+        import flydsl.expr as _fx  # pyrefly: ignore[missing-import]
+
+        _flydsl_stream = _fx.Stream(None)
+
+    # Cache a directly-callable flyc.CompiledFunction instead of re-entering the
+    # @flyc.jit wrapper on every launch.
+    compiled = _flydsl_compiled_cache.get(cache_key)
+    if compiled is None:
+        import flydsl.compiler as _flyc  # pyrefly: ignore[missing-import]
+
+        compiled = _flyc.compile(_flydsl_jit_cache[cache_key], *args, _flydsl_stream)
+        _flydsl_compiled_cache[cache_key] = compiled
+    compiled(*args, _flydsl_stream)
