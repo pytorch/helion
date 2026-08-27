@@ -590,14 +590,14 @@ class TestPretunedCuteCodegen(TestCase):
 
         causal_expected = {
             65536: {
-                "cute_flash_causal_lpt_swizzle": 2,
-                "cute_flash_disc_pipe": 2,
+                "cute_flash_causal_lpt_swizzle": 0,
+                "cute_flash_disc_pipe": 3,
                 "cute_flash_e2e_offset": 0,
-                "cute_flash_e2e_offset0": 0,
+                "cute_flash_e2e_offset0": 14,
                 "cute_flash_epi_tma": True,
-                "cute_flash_kv_stage": 2,
+                "cute_flash_kv_stage": 3,
                 "cute_flash_role_map": "fa4",
-                "cute_flash_softmax_regs": 184,
+                "cute_flash_softmax_regs": 200,
                 "cute_flash_wait_hint": 0,
             },
             131072: {

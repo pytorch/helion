@@ -237,15 +237,15 @@ _CAUSAL_HD64_BASE = {
 _CAUSAL_CONFIGS = [
     {
         **_CAUSAL_HD64_BASE,
-        "cute_flash_causal_lpt_swizzle": 2,
-        "cute_flash_disc_pipe": 2,
+        "cute_flash_causal_lpt_swizzle": 0,
+        "cute_flash_disc_pipe": 3,
         "cute_flash_e2e_offset": 0,
-        "cute_flash_e2e_offset0": 0,
+        "cute_flash_e2e_offset0": 14,
         "cute_flash_epi_tma": True,
         "cute_flash_first_load_order": 0,
-        "cute_flash_kv_stage": 2,
+        "cute_flash_kv_stage": 3,
         "cute_flash_role_map": "fa4",
-        "cute_flash_softmax_regs": 184,
+        "cute_flash_softmax_regs": 200,
     },
     {
         **_CAUSAL_HD64_BASE,
