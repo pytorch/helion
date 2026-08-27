@@ -523,6 +523,7 @@ def _seed_configs(
     args: tuple[torch.Tensor, ...],
     mode: str,
 ) -> tuple[Any, list[dict[str, Any]], list[dict[str, Any]]]:
+    kernel.reset()
     with (
         patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
         patch_cute_mma_support(),

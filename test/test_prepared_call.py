@@ -168,12 +168,17 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         )
 
         for value in variants:
+            static_indices_value = getattr(value, "_dynamo_static_indices", None)
             with (
                 self.subTest(
-                    shape=value.shape,
-                    stride=value.stride(),
-                    dtype=value.dtype,
-                    static_indices=getattr(value, "_dynamo_static_indices", None),
+                    shape=tuple(value.shape),
+                    stride=tuple(value.stride()),
+                    dtype=str(value.dtype),
+                    static_indices=(
+                        tuple(sorted(static_indices_value))
+                        if static_indices_value is not None
+                        else None
+                    ),
                 ),
                 patch.object(
                     add_one,
@@ -236,6 +241,41 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         constexpr_nan = float("nan")
         self.assertTrue(torch.isnan(scale_constexpr(x, constexpr_nan)).all())
         self.assertIsNone(scale_constexpr._prepared_call)  # type: ignore[attr-defined]
+
+    def test_nested_constexpr_values_do_not_reuse_preparation(self) -> None:
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[64]),
+        )
+        def add_constexpr(x: torch.Tensor, values: hl.constexpr) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + values[0]
+            return out
+
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(add_constexpr(x, (1.0, 2.0)), x + 1.0)
+        torch.testing.assert_close(add_constexpr(x, (3.0, 4.0)), x + 3.0)
+        self.assertEqual(len(add_constexpr._bound_kernels), 2)  # type: ignore[attr-defined]
+
+    def test_constexpr_wrapped_scalars_use_prepared_call(self) -> None:
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[64]),
+        )
+        def scale(x: torch.Tensor, value: int) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * value
+            return out
+
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(scale(x, hl.constexpr(2)), x * 2)
+        prepared = scale._prepared_call  # type: ignore[attr-defined]
+        self.assertIsNotNone(prepared)
+        torch.testing.assert_close(scale(x, hl.constexpr(2)), x * 2)
+        self.assertIs(scale._prepared_call, prepared)  # type: ignore[attr-defined]
+        torch.testing.assert_close(scale(x, hl.constexpr(3)), x * 3)
 
     def test_custom_key_is_evaluated_once_and_disables_preparation(self) -> None:
         state = {"key": 0}
@@ -1030,6 +1070,9 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
         "requires Helion's torch.compile fusion integration",
     )
     def test_fullgraph_capture_preserves_eager_caches(self) -> None:
+        if not supports_torch_compile_fusion():
+            self.skipTest("torch.compile fusion is unavailable")
+
         @helion.kernel(
             static_shapes=True,
             config=helion.Config(block_sizes=[64]),

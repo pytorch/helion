@@ -12813,6 +12813,7 @@ class TestCuteLowerings(unittest.TestCase):
             env={},
         )
         env = SimpleNamespace(resolve_block_id=lambda size: None)
+        codegen = hl.dot._codegen["cute"]
 
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
@@ -12829,7 +12830,7 @@ class TestCuteLowerings(unittest.TestCase):
                 return_value=ast.Name(id="dot_result", ctx=ast.Load()),
             ) as emit,
         ):
-            result = hl.dot._codegen["cute"](state)
+            result = codegen(state)
 
         self.assertEqual(ast.unparse(result), "dot_result")
         self.assertEqual(emit.call_args.kwargs["out_dtype"], torch.float32)
@@ -12874,6 +12875,7 @@ class TestCuteLowerings(unittest.TestCase):
             env={},
         )
         env = SimpleNamespace(resolve_block_id=lambda size: None)
+        codegen = hl.dot._codegen["cute"]
 
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
@@ -12891,7 +12893,7 @@ class TestCuteLowerings(unittest.TestCase):
             ) as emit,
             self.assertRaisesRegex(exc.BackendUnsupported, "hl.dot"),
         ):
-            hl.dot._codegen["cute"](state)
+            codegen(state)
 
         emit.assert_not_called()
 
@@ -12931,6 +12933,7 @@ class TestCuteLowerings(unittest.TestCase):
             env={},
         )
         env = SimpleNamespace(resolve_block_id=lambda size: None)
+        codegen = hl.dot._codegen["cute"]
 
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
@@ -12951,7 +12954,7 @@ class TestCuteLowerings(unittest.TestCase):
                 TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
             ),
         ):
-            hl.dot._codegen["cute"](state)
+            codegen(state)
 
         emit.assert_not_called()
 
@@ -12993,6 +12996,7 @@ class TestCuteLowerings(unittest.TestCase):
             env={},
         )
         env = SimpleNamespace(resolve_block_id=lambda size: None)
+        codegen = hl.dot._codegen["cute"]
 
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
@@ -13009,7 +13013,7 @@ class TestCuteLowerings(unittest.TestCase):
                 return_value=ast.Name(id="dot_result", ctx=ast.Load()),
             ) as emit,
         ):
-            hl.dot._codegen["cute"](state)
+            codegen(state)
 
         self.assertEqual(emit.call_args.kwargs["out_dtype"], torch.float32)
 
@@ -13061,6 +13065,7 @@ class TestCuteLowerings(unittest.TestCase):
         env = SimpleNamespace(
             resolve_block_id=lambda size: 11 if int(size) == 8 else None
         )
+        codegen = hl.dot._codegen["cute"]
 
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
@@ -13077,7 +13082,7 @@ class TestCuteLowerings(unittest.TestCase):
                 return_value=ast.Name(id="dot_result", ctx=ast.Load()),
             ) as emit,
         ):
-            result = hl.dot._codegen["cute"](state)
+            result = codegen(state)
 
         self.assertEqual(ast.unparse(result), "dot_result")
         self.assertIsNone(emit.call_args.kwargs["k_block_id"])
@@ -13135,6 +13140,7 @@ class TestCuteLowerings(unittest.TestCase):
         env = SimpleNamespace(
             resolve_block_id=lambda size: 11 if int(size) == 8 else None
         )
+        codegen = hl.dot._codegen["cute"]
 
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
@@ -13147,7 +13153,7 @@ class TestCuteLowerings(unittest.TestCase):
                 return_value=ast.Name(id="dot_result", ctx=ast.Load()),
             ) as emit,
         ):
-            result = hl.dot._codegen["cute"](state)
+            result = codegen(state)
 
         self.assertEqual(ast.unparse(result), "dot_result")
         self.assertEqual(emit.call_args.kwargs["k_block_id"], 11)
@@ -15965,6 +15971,11 @@ class TestCuteLowerings(unittest.TestCase):
             ),
             patch.object(
                 cute_mma_module, "_mma_tiles_are_static_full", return_value=True
+            ),
+            patch.object(
+                cute_mma_module,
+                "warp_spec_from_config",
+                return_value=SimpleNamespace(store_warps=0),
             ),
             patch.object(
                 cute_mma_module,
