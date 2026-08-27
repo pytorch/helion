@@ -57,6 +57,7 @@ from .device_state import CuteTcgen05GroupedPlan
 from .device_state import CuteTcgen05MatmulPlan
 from .device_state import CuteTcgen05StoreValue
 from .device_state import Tcgen05GroupedDMode
+from .device_state import Tcgen05GroupedSchedulerMode
 from .device_state import Tcgen05Orientation
 from .fragment_epilogue import Tcgen05FragmentEpiloguePlan
 from .fragment_epilogue import _tcgen05_fragment_dtype_supported
@@ -70,6 +71,7 @@ from .matmul_utils import analyze_direct_grouped_n_loads
 from .mma_support import get_cute_mma_support
 from .strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
 from .strategies import TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES
+from .strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
 from .strategies import Tcgen05LayoutStrategy
 from .strategies import Tcgen05PersistenceModel
 from .strategies import is_pure_matmul_role_lifecycle_config
@@ -123,6 +125,7 @@ from .tcgen05_constants import TCGEN05_GROUPED_MODE_DYNAMIC
 from .tcgen05_constants import TCGEN05_GROUPED_MODE_STATIC
 from .tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
 from .tcgen05_constants import TCGEN05_GROUPED_MODES
+from .tcgen05_constants import TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_BLOCK_K_CHOICES
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_COMMON_K_BLOCK_PAIRS
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY
@@ -7019,7 +7022,6 @@ def _emit_mma_pipeline(
     tcgen05_grouped_fixed_tensormaps = False
     tcgen05_grouped_d_mode = Tcgen05GroupedDMode.NONE
     tcgen05_grouped_worklist_persistent = False
-    tcgen05_grouped_use_runtime_n_ptx = False
     grouped_worklist_supported = False
     tcgen05_grouped_device_split_sizes = False
     tcgen05_grouped_layout_arg_name: str | None = None
@@ -7037,6 +7039,16 @@ def _emit_mma_pipeline(
     tcgen05_grouped_sched_params: str | None = None
     tcgen05_grouped_problem_sizes: str | None = None
     tcgen05_grouped_starts: str | None = None
+    tcgen05_grouped_runtime_tile_records: str | None = None
+    tcgen05_grouped_runtime_nm_direct = False
+    tcgen05_grouped_use_runtime_n_ptx = False
+    tcgen05_grouped_scheduler_mode = Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH
+    tcgen05_grouped_runtime_nm_clc_requested = (
+        df.config.get(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY, False) is True
+        and df.config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+        == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+    )
+    tcgen05_l2_swizzle_size_value = 1
     tcgen05_grouped_static_quota_args: tuple[str, ...] = ()
     tcgen05_grouped_real_groups: str | None = None
     tcgen05_grouped_metadata_idx: str | None = None
@@ -7253,8 +7265,15 @@ def _emit_mma_pipeline(
                     and bk in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
                 )
             ),
-            "no_scheduler_warp": (
-                grouped_warp_spec is not None and grouped_warp_spec.scheduler_warps == 0
+            "supported_scheduler_warp": (
+                grouped_warp_spec is not None
+                and (
+                    grouped_warp_spec.scheduler_warps == 0
+                    or (
+                        tcgen05_grouped_runtime_nm_clc_requested
+                        and grouped_warp_spec.scheduler_warps == 1
+                    )
+                )
             ),
             "no_c_input_warp": (
                 grouped_warp_spec is not None and grouped_warp_spec.c_input_warps == 0
@@ -7274,10 +7293,14 @@ def _emit_mma_pipeline(
                 "persistent_interleaved static-full 128x(64|128)x(16|32|64|128) "
                 "TMA-load + TMA-store kernels, or the generated segment "
                 "worklist BK64/BK128 or direct BK64 dynamic-TensorMap variant "
-                "(including the CtaGroup.TWO 256x(64|128)x(64|128) worklist "
-                "shape), with no "
-                "scheduler/C-input/store warp variants; failed checks: "
-                + ", ".join(failed_grouped_checks),
+                f"(including CtaGroup.TWO physical 256x"
+                f"{TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES}x"
+                f"{TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES} and CtaGroup.ONE "
+                f"physical {TCGEN05_ONE_CTA_MAX_BLOCK_M}x"
+                f"{TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE}x"
+                f"{TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES} worklist shapes), "
+                "with optional one-warp CLC scheduling and no C-input/store "
+                "warp variants; failed checks: " + ", ".join(failed_grouped_checks),
             )
         grouped_count_value = (
             int(rhs_info.source_fake.shape[0])
@@ -7437,11 +7460,6 @@ def _emit_mma_pipeline(
                     "failed checks: " + ", ".join(failed_worklist_nm_checks),
                 )
             assert requested_schedule is not None
-            tcgen05_grouped_use_runtime_n_ptx = tcgen05_runtime_n_ptx_compatible()
-            if not tcgen05_grouped_use_runtime_n_ptx:
-                # Static-width typed MMA remains correct because padded source
-                # rows are independent and the epilogue masks rows past valid_m.
-                warn_tcgen05_runtime_n_ptx_fallback()
         if (
             tcgen05_grouped_dynamic_ab_tensormap_rank is not None
             and not tcgen05_grouped_direct_pointer_metadata_requested
@@ -7474,6 +7492,70 @@ def _emit_mma_pipeline(
             # starts and valid extents remain scheduler metadata, but no longer
             # require rebasing A/B/D descriptors in the kernel.
             tcgen05_grouped_d_mode = Tcgen05GroupedDMode.NONE
+        # Generic runtime-variable-M N,M worklists can bypass both the grouped
+        # scheduler search and its scheduler-warp/SMEM-mailbox broadcast.  The
+        # launcher expands the current worklist into one record per logical
+        # output tile; every role replays that runtime table directly without
+        # specializing on the current per-group M sizes.
+        tcgen05_grouped_runtime_nm_direct_requested = (
+            df.config.get(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY, False) is True
+        )
+        tcgen05_grouped_runtime_nm_direct = (
+            requested_schedule is Tcgen05Orientation.NM
+            and tcgen05_grouped_worklist_persistent
+            and not tcgen05_grouped_device_split_sizes
+            and tcgen05_grouped_runtime_nm_direct_requested
+            # Direct replay remains an explicit profile opt-in for both CTA
+            # group sizes.  The host table must use the physical MMA width,
+            # which is 128 for CTA-group::1 and 256 for CTA-group::2.
+            and (tcgen05_is_two_cta or grouped_worklist_one_cta)
+            and tcgen05_grouped_dynamic_ab_tensormap_rank is not None
+        )
+        if (
+            tcgen05_grouped_runtime_nm_direct_requested
+            and not tcgen05_grouped_runtime_nm_direct
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped runtime-direct was explicitly requested but "
+                "the kernel is not an eligible generic worklist_nm launch; it "
+                "requires persistent worklist metadata, no device split sizes "
+                "or static problem signature, a supported CTA-group tile, and "
+                "dynamic grouped A/B TensorMaps",
+            )
+        if (
+            tcgen05_grouped_runtime_nm_clc_requested
+            and not tcgen05_grouped_runtime_nm_direct
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped CLC persistence is supported only by the "
+                "worklist_nm runtime-direct path with an exact host-expanded "
+                "tile table and no static problem signature",
+            )
+        if (
+            tcgen05_grouped_runtime_nm_clc_requested
+            and not tcgen05_grouped_fixed_tensormaps
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped runtime-direct CLC currently requires fixed "
+                "full-allocation TensorMaps; dynamic TensorMap workspaces are "
+                "sized for the resident persistent grid, not the exact full "
+                "CLC request grid",
+            )
+        if tcgen05_grouped_runtime_nm_direct:
+            tcgen05_grouped_scheduler_mode = (
+                Tcgen05GroupedSchedulerMode.RUNTIME_CLC
+                if tcgen05_grouped_runtime_nm_clc_requested
+                else Tcgen05GroupedSchedulerMode.RUNTIME_DIRECT
+            )
+            tcgen05_grouped_use_runtime_n_ptx = tcgen05_runtime_n_ptx_compatible()
+            if not tcgen05_grouped_use_runtime_n_ptx:
+                # Static-width typed MMA is the pre-existing correctness path:
+                # padded A rows are independent, and the epilogue zeros rows
+                # outside valid_m. Raw runtime-N only narrows that tail work.
+                warn_tcgen05_runtime_n_ptx_fallback()
         nm_deep_ab = (
             requested_schedule is not None
             and grouped_worklist_supported
@@ -7531,6 +7613,10 @@ def _emit_mma_pipeline(
         tcgen05_grouped_sched_params = df.new_var("tcgen05_grouped_tile_sched_params")
         tcgen05_grouped_problem_sizes = df.new_var("tcgen05_grouped_problem_sizes")
         tcgen05_grouped_starts = df.new_var("tcgen05_grouped_starts")
+        if tcgen05_grouped_runtime_nm_direct:
+            tcgen05_grouped_runtime_tile_records = df.new_var(
+                "tcgen05_grouped_runtime_tile_records"
+            )
         if (
             tcgen05_grouped_static_problem_shapes is not None
             and len(tcgen05_grouped_static_problem_shapes)
@@ -7599,6 +7685,13 @@ def _emit_mma_pipeline(
             problem_n=cast("str", tcgen05_grouped_problem_n),
             problem_k=cast("str", tcgen05_grouped_problem_k),
             global_m_start=cast("str", tcgen05_grouped_global_m_start),
+            scheduler_mode=tcgen05_grouped_scheduler_mode,
+            runtime_tile_records=tcgen05_grouped_runtime_tile_records,
+            runtime_total_clusters=(
+                tcgen05_grouped_total_clusters
+                if tcgen05_grouped_runtime_nm_direct
+                else None
+            ),
             static_problem_shapes=tcgen05_grouped_static_problem_shapes,
             static_group_quota_args=tcgen05_grouped_static_quota_args,
             real_groups=tcgen05_grouped_real_groups,
@@ -7874,6 +7967,7 @@ def _emit_mma_pipeline(
         and tcgen05_nm_orientation
         and tcgen05_grouped_plan is not None
         and tcgen05_grouped_worklist_persistent
+        and tcgen05_grouped_runtime_nm_direct
         and tcgen05_grouped_use_runtime_n_ptx
     )
     if tcgen05_runtime_n_specialization:
@@ -8232,6 +8326,7 @@ def _emit_mma_pipeline(
             and tcgen05_warp_spec.scheduler_warps == 0
             and tcgen05_warp_spec.c_input_warps == 0
             and tcgen05_warp_spec.store_warps == 0
+            and not tcgen05_grouped_runtime_nm_direct
         )
         tcgen05_effective_scheduler_warps = (
             1 if nm_scheduler_decode else tcgen05_warp_spec.scheduler_warps
@@ -8849,20 +8944,16 @@ def _emit_mma_pipeline(
             # tolerated by hardware because the CTA shape has only
             # warps 4 and 5 (no warps 6/7 to disagree with).
             #
-            # Under ``ROLE_LOCAL_WITH_SCHEDULER`` the launched CTA
-            # has 7 warps (4 epi + 1 exec + 1 tma_load + 1 sched).
-            # If we kept the MONOLITHIC consumer predicate the
-            # warpgroup-1 warps would split as
-            # exec=increase / tma=decrease / sched=decrease, which
-            # is a real warpgroup-uniformity violation that triggers
-            # ``CUDA_ERROR_LAUNCH_FAILED`` at launch on sm_100a.
-            # Match Quack's pattern: only the 4 epi warps are
-            # consumers; exec joins the producer warpgroup (lower
-            # register budget) so warpgroup 1 is uniformly
-            # decrease.
+            # Under ``ROLE_LOCAL_WITH_SCHEDULER`` the launched CTA has 7 warps
+            # (4 epi + 1 exec + 1 tma_load + 1 sched). Scheduler-free
+            # runtime-direct has the same role split minus the scheduler warp.
+            # In both cases only the four epi warps are consumers; exec joins
+            # the producer warpgroup (lower register budget), keeping
+            # warpgroup 1 uniformly decreased.
             if (
                 tcgen05_matmul_plan.has_scheduler_warp
                 or tcgen05_use_flat_role_coordinates
+                or tcgen05_grouped_runtime_nm_direct
             ):
                 consumer_predicate = epi_active
             else:
@@ -9788,15 +9879,24 @@ def _emit_mma_pipeline(
                         )
                     )
                 grouped_wrapper_params: list[str] = []
-                if not grouped_plan.device_split_sizes:
+                if (
+                    not grouped_plan.device_split_sizes
+                    and not grouped_plan.uses_runtime_tile_table
+                ):
                     grouped_wrapper_params.extend(
                         [
                             grouped_plan.problem_sizes,
                             grouped_plan.starts,
                         ]
                     )
-                if grouped_plan.real_groups is not None:
+                if (
+                    grouped_plan.real_groups is not None
+                    and not grouped_plan.uses_runtime_tile_table
+                ):
                     grouped_wrapper_params.append(grouped_plan.real_groups)
+                if grouped_plan.uses_runtime_tile_table:
+                    assert grouped_plan.runtime_tile_records is not None
+                    grouped_wrapper_params.append(grouped_plan.runtime_tile_records)
                 if tcgen05_grouped_ab_tensormaps is not None:
                     grouped_wrapper_params.append(tcgen05_grouped_ab_tensormaps)
                 elif grouped_plan.d_tensormap is not None:
@@ -9811,12 +9911,17 @@ def _emit_mma_pipeline(
                             grouped_plan.direct_strides,
                         ]
                     )
-                grouped_wrapper_params.append(grouped_plan.sched_params)
+                if not grouped_plan.uses_runtime_tile_table:
+                    grouped_wrapper_params.append(grouped_plan.sched_params)
+                else:
+                    assert grouped_plan.runtime_total_clusters is not None
+                    grouped_wrapper_params.append(grouped_plan.runtime_total_clusters)
                 grouped_wrapper_params.extend(grouped_plan.static_group_quota_args)
                 df.wrapper_only_params.extend(grouped_wrapper_params)
                 cg.cute_wrapper_plans.append(
                     {
                         "kind": "tcgen05_grouped_static_persistent",
+                        "scheduler_mode": grouped_plan.scheduler_mode.value,
                         "layout_name": grouped_plan.layout,
                         **(
                             {"n_sizes_name": tcgen05_grouped_n_sizes_arg_name}
@@ -9868,6 +9973,7 @@ def _emit_mma_pipeline(
                         ),
                         "cluster_m": tcgen05_cluster_m,
                         "cluster_n": tcgen05_cluster_n,
+                        "l2_swizzle_size": tcgen05_l2_swizzle_size_value,
                         **(
                             {
                                 TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY: (
@@ -9887,15 +9993,31 @@ def _emit_mma_pipeline(
                             else {}
                         ),
                         "k_total_size": k_total_size,
-                        "problem_sizes_arg": grouped_plan.problem_sizes,
-                        "starts_arg": grouped_plan.starts,
+                        **(
+                            {
+                                "problem_sizes_arg": grouped_plan.problem_sizes,
+                                "starts_arg": grouped_plan.starts,
+                            }
+                            if not grouped_plan.uses_runtime_tile_table
+                            else {}
+                        ),
                         **(
                             {"real_groups_arg": grouped_plan.real_groups}
                             if grouped_plan.real_groups is not None
+                            and not grouped_plan.uses_runtime_tile_table
                             else {}
                         ),
                         "sched_params_arg": grouped_plan.sched_params,
                         "total_clusters_arg": tcgen05_grouped_total_clusters,
+                        **(
+                            {
+                                "runtime_tile_records_arg": (
+                                    grouped_plan.runtime_tile_records
+                                )
+                            }
+                            if grouped_plan.uses_runtime_tile_table
+                            else {}
+                        ),
                         **(
                             {
                                 "static_group_quota_args": (

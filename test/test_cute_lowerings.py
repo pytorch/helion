@@ -20345,6 +20345,63 @@ class TestPersistentLoopSplitter(unittest.TestCase):
         self.assertEqual(reads, {"value", "increment"})
         self.assertEqual(writes, {"value"})
 
+    def test_prune_dead_generated_assignments_tracks_transitive_reads(self) -> None:
+        from helion._compiler.program_id import (
+            _prune_dead_side_effect_free_generated_assignments,
+        )
+
+        statements = [
+            self._stmt("tile_start = cta_m * 128"),
+            self._stmt("valid_m = min(128, problem_m - tile_start)"),
+            self._stmt("store_m = min(128, problem_m - tile_start)"),
+            self._stmt("pid_0 = cta_m"),
+            self._stmt("pid_1 = cta_n"),
+        ]
+
+        kept, live_in = _prune_dead_side_effect_free_generated_assignments(
+            statements, {"valid_m", "pid_1"}
+        )
+
+        self.assertEqual(
+            [ast.unparse(stmt) for stmt in kept],
+            [
+                "tile_start = cta_m * 128",
+                "valid_m = min(128, problem_m - tile_start)",
+                "pid_1 = cta_n",
+            ],
+        )
+        self.assertEqual(live_in, {"cta_m", "cta_n", "min", "problem_m"})
+
+    def test_literal_mailbox_access_fields_handles_staged_accesses(self) -> None:
+        from helion._compiler.program_id import _literal_mailbox_access_fields
+
+        tree = ast.parse(
+            """
+first = mailbox[cutlass.Int32(3)]
+second = mailbox[cutlass.Int32(7), consumer_state.index]
+mailbox[cutlass.Int32(3), producer_state.index] = first
+"""
+        )
+
+        reads, writes = _literal_mailbox_access_fields(tree, "mailbox")
+
+        self.assertEqual(reads, {3, 7})
+        self.assertEqual(writes, {3})
+        with self.assertRaisesRegex(AssertionError, "literal Int32 field"):
+            _literal_mailbox_access_fields(
+                ast.parse("value = mailbox[field]"), "mailbox"
+            )
+        for source in (
+            "consume(mailbox)",
+            "alias = mailbox",
+            "value = mailbox.iterator",
+        ):
+            with (
+                self.subTest(source=source),
+                self.assertRaisesRegex(AssertionError, "direct literal field access"),
+            ):
+                _literal_mailbox_access_fields(ast.parse(source), "mailbox")
+
     def test_omit_shared_loop_rejects_post_loop_dependency(self) -> None:
         from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 
@@ -20505,6 +20562,25 @@ class TestPersistentLoopSplitter(unittest.TestCase):
             work_tile_consume_stmts=[],
             work_tile_release_stmts=[],
         )
+
+    def test_clustered_pid_mailbox_rendezvous_precedes_first_acquire(self) -> None:
+        """Peer mailbox mbarriers must be initialized cluster-wide first."""
+        _stub_df, splitter = self._make_role_local_stubs(num_pid_dims=2)
+        splitter._tcgen05_l2_swizzle_size = lambda: 1  # type: ignore[attr-defined]
+        layout = self._make_minimal_layout(cluster_m=2)
+        layout.work_tile_publish_stmts = [self._stmt("sp.producer_acquire(ps)")]
+
+        emitted = splitter._build_tcgen05_persistent_prelude(layout)
+        source = "\n".join(ast.unparse(stmt) for stmt in emitted)
+        create = source.index("sp = cutlass.pipeline.PipelineAsync.create(")
+        arrive = source.index("cutlass.pipeline.pipeline_init_arrive(")
+        wait = source.index("cutlass.pipeline.pipeline_init_wait(")
+        acquire = source.index("sp.producer_acquire(ps)")
+
+        self.assertLess(create, arrive)
+        self.assertLess(arrive, wait)
+        self.assertLess(wait, acquire)
+        self.assertIn("cute.make_layout((2, 1, 1))", source)
 
     def test_tcgen05_persistent_foreach_multi_root_keeps_host_guard(self) -> None:
         """Multi-root tcgen05 role-local codegen is guarded as unvalidated.
