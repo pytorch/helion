@@ -8,6 +8,7 @@ from typing import TypeVar
 
 from torch.fx.node import map_aggregate
 
+from .._compiler.ascend.config import is_npu
 from ..exc import InvalidConfig
 from .config_fragment import ConfigSpecFragment
 from .config_fragment import assert_integer_power_of_two
@@ -225,6 +226,14 @@ class BlockIdSequence(MutableSequence[_BlockIdItemT]):
             )
         values = [*(values or ())]
         size = len(self)
+        if size == 0 and is_npu():
+            # On NPU, a tunable can have zero slots on the current device
+            # (e.g. ``range_warp_specialize`` is CUDA sm_100+ only, so it is
+            # empty on NPU). Drop any user-provided values so configs stay
+            # portable across devices instead of raising
+            # "Too many values, expected 0, got N". Other backends keep the
+            # upstream error so fat-fingered values are still reported.
+            return []
         if len(values) > size:
             raise InvalidConfig(
                 f"Too many values for config[{name!r}], expected {size}, got {len(values)}"

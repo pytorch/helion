@@ -13,6 +13,7 @@ from packaging import version
 import torch
 from torch._inductor.runtime.hints import DeviceProperties
 
+from ._compiler.ascend.config import is_npu
 from ._utils import triton_is_available
 
 if TYPE_CHECKING:
@@ -290,6 +291,26 @@ if triton_is_available():
                 get_min_size = min_dot_size_cuda(target)
             return get_min_size(torch_dtype_to_tl(lhs), torch_dtype_to_tl(rhs))
 
+        if device.type == "npu":
+            # triton-ascend's ``tl.dot`` supports arbitrary sizes (its
+            # ``min_dot_size`` returns ``(1, 1, 1)``).  Falling through to the
+            # conservative ``(16, 16, 16)`` default needlessly pads GEMV
+            # (n=1, e.g. ``hl.dot(mat, vec)``) by doubling the vector with
+            # zeros into a fractal memref that BiShengIR cannot align and that
+            # overflows the Unified Buffer.  Use triton-ascend's actual minimum.
+            try:
+                from triton.backends.ascend.compiler import (  # pyrefly: ignore[missing-import]
+                    min_dot_size as _ascend_min_dot_size,
+                )
+
+                return tuple(  # pyrefly: ignore[bad-return]
+                    _ascend_min_dot_size(None)(  # pyrefly: ignore[bad-argument-type]
+                        torch_dtype_to_tl(lhs), torch_dtype_to_tl(rhs)
+                    )
+                )
+            except Exception:
+                return (1, 1, 1)
+
         return (16, 16, 16)
 
     @functools.cache
@@ -310,6 +331,7 @@ if triton_is_available():
             return isinstance(target, GPUTarget) and target.backend == "tileir"
         except Exception:
             return False
+
 
 else:
     # Triton is not available — provide stubs / safe defaults
@@ -345,6 +367,25 @@ else:
 def supports_tensor_descriptor() -> bool:
     # call private func we can patch in testing
     return _supports_tensor_descriptor()
+
+
+def safe_clear_cache() -> None:
+    """Safely clear the Triton compile cache if the active driver supports it.
+
+    Works around NPU drivers that do not expose ``clear_cache``.
+    """
+    try:
+        from triton import runtime
+
+        driver = runtime.driver.active
+        if hasattr(driver, "clear_cache") and hasattr(
+            driver, "get_empty_cache_for_benchmark"
+        ):
+            cache = driver.get_empty_cache_for_benchmark()
+            driver.clear_cache(cache)
+    except Exception:
+        # Ignore errors when clearing the cache (especially for NPU).
+        pass
 
 
 def target_device_capability(
@@ -580,9 +621,11 @@ def supports_maxnreg() -> bool:
 
 @functools.cache
 def _supports_maxnreg() -> bool:
+    # Not supported on HIP (AMD), XPU (Intel), or NPU (Ascend) devices
     return (
         torch.version.hip is None
         and torch.version.xpu is None
+        and not is_npu()
         and torch.cuda.is_available()
     )
 

@@ -114,6 +114,60 @@ def iter_cache_entries(
             log.warning("Skipping corrupt cache file %s: %s", p.name, e)
 
 
+def _device_hardware_and_runtime(dev: torch.device, backend: str) -> tuple[str, str]:
+    """Best-effort ``(hardware, runtime_name)`` describing ``dev`` for the autotune cache key.
+
+    ``backend`` is the kernel's backend name (used to identify pallas-on-CPU
+    interpretation). Unavailable runtimes fall back to ``"unknown"`` so the
+    key stays stable across hosts.
+    """
+    hardware = get_device_name(dev)
+    runtime_name = None
+
+    if (
+        dev.type == "xpu"
+        and getattr(torch, "xpu", None) is not None
+        and torch.xpu.is_available()
+    ):
+        runtime_name = torch.xpu.get_device_properties(dev).driver_version
+    elif dev.type == "cuda" and torch.cuda.is_available():
+        if torch.version.cuda is not None:
+            runtime_name = str(torch.version.cuda)
+        elif torch.version.hip is not None:
+            runtime_name = torch.version.hip
+    elif dev.type == "mps":
+        # Include OS version as Metal runtime is part of OS
+        runtime_name = platform.mac_ver()[0] or "mps"
+    elif dev.type == "tpu":
+        hardware = "tpu"
+        try:
+            import torch_tpu  # type: ignore[import-not-found]
+
+            runtime_name = getattr(torch_tpu, "__version__", "unknown")
+        except ImportError:
+            runtime_name = "unknown"
+    elif dev.type == "npu":
+        hardware = "npu"
+        try:
+            import torch_npu  # type: ignore[import-not-found]
+
+            runtime_name = torch_npu.npu.get_device_name()
+        except ImportError:
+            runtime_name = "unknown"
+    elif dev.type == "cpu" and backend == "pallas":
+        hardware = "pallas_interpret"
+        runtime_name = "interpret"
+    elif dev.type == "mtia":
+        hardware = hardware or "mtia"
+        try:
+            runtime_name = str(torch.mtia.get_device_properties(dev))
+        except Exception:
+            runtime_name = "unknown"
+
+    assert hardware is not None and runtime_name is not None
+    return hardware, runtime_name
+
+
 class LocalAutotuneCache(AutotuneCacheBase):
     """
     This class implements the local autotune cache, storing the
@@ -159,40 +213,9 @@ class LocalAutotuneCache(AutotuneCacheBase):
 
         assert dev is not None
 
-        hardware = get_device_name(dev)
-        runtime_name = None
-
-        if (
-            dev.type == "xpu"
-            and getattr(torch, "xpu", None) is not None
-            and torch.xpu.is_available()
-        ):
-            runtime_name = torch.xpu.get_device_properties(dev).driver_version
-        elif dev.type == "cuda" and torch.cuda.is_available():
-            if torch.version.cuda is not None:
-                runtime_name = str(torch.version.cuda)
-            elif torch.version.hip is not None:
-                runtime_name = torch.version.hip
-        elif dev.type == "mps":
-            # Include OS version as Metal runtime is part of OS
-            runtime_name = platform.mac_ver()[0] or "mps"
-        elif dev.type == "tpu":
-            hardware = "tpu"
-            try:
-                import torch_tpu  # type: ignore[import-not-found]
-
-                runtime_name = getattr(torch_tpu, "__version__", "unknown")
-            except ImportError:
-                runtime_name = "unknown"
-        elif dev.type == "cpu" and self.kernel.kernel.settings.backend == "pallas":
-            hardware = "pallas_interpret"
-            runtime_name = "interpret"
-        elif dev.type == "mtia":
-            hardware = hardware or "mtia"
-            try:
-                runtime_name = str(torch.mtia.get_device_properties(dev))
-            except Exception:
-                runtime_name = "unknown"
+        hardware, runtime_name = _device_hardware_and_runtime(
+            dev, self.kernel.kernel.settings.backend
+        )
 
         assert hardware is not None and runtime_name is not None
         config_spec_hash = self.kernel.config_spec.cache_fingerprint_hash(
