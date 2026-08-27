@@ -4,6 +4,7 @@ import ast
 import dataclasses
 import enum
 from typing import TYPE_CHECKING
+from typing import Literal
 from typing import Protocol
 from typing import cast
 
@@ -85,12 +86,14 @@ class CuteTcgen05GroupedPlan:
     fixed_tensormaps: bool = False
     # N,M worklists carry their source-row tile explicitly so runtime metadata
     # validation and launch bounds consume the exact schedule selected by the
-    # compiler.  For the device-split variant, ``layout`` names the device
-    # ``split_sizes[G]`` tensor while ``problem_sizes`` and ``starts`` are
-    # kernel-local SMEM tensors.  ``m_size`` lets the launcher derive a safe
-    # static cluster bound without reading split values on the host.
+    # compiler.  For compact device layouts, ``layout`` names either the
+    # ``split_sizes[G]`` or ``offsets[G + 1]`` tensor while ``problem_sizes``
+    # and ``starts`` are kernel-local SMEM tensors.  ``m_size`` lets the
+    # launcher derive a safe static cluster bound without reading layout
+    # values on the host.
     source_m_tile: int | None = None
     m_size: int | None = None
+    device_layout_kind: Literal["split_sizes", "offsets"] | None = None
 
     def __post_init__(self) -> None:
         assert (self.valid_m is None) == (self.store_m is None)
@@ -101,6 +104,8 @@ class CuteTcgen05GroupedPlan:
         assert (self.direct_pointers is None) == (self.direct_strides is None)
         assert (self.d_mode is Tcgen05GroupedDMode.NONE) == (self.d_tensormap is None)
         assert not self.device_split_sizes or self.orientation is Tcgen05Orientation.NM
+        assert self.device_layout_kind in (None, "split_sizes", "offsets")
+        assert (self.device_layout_kind is not None) == self.device_split_sizes
         assert (self.runtime_tile_records is None) == (
             self.runtime_total_clusters is None
         )

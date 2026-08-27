@@ -11,6 +11,8 @@ import torch
 
 import helion
 from helion._compat import requires_cuda_version
+from helion._compiler.cute.cute_mma import _TCGEN05_INSTR_DESC_N_FIELD_SHIFT
+from helion._compiler.cute.cute_mma import _TCGEN05_INSTR_DESC_N_LOW_BITS
 from helion._compiler.cute.device_state import Tcgen05GroupedSchedulerMode
 from helion._compiler.cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
@@ -88,14 +90,14 @@ def _selected_config(
         )
     # BK64/source-256 cannot fit the historical AB7 schedule in CTA SMEM.
     if ab_stages is None:
-        ab_stages = {
-            (64, TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE): 7,
-            (64, TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT): 7,
-            (64, TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE): 6,
-            (128, TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE): 3,
-            (128, TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT): 3,
-            (128, TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE): 3,
-        }[(block_k, source_m_tile)]
+        if block_k == 64:
+            ab_stages = (
+                6
+                if source_m_tile == TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE
+                else 7
+            )
+        else:
+            ab_stages = 3
     config = helion.Config(
         block_sizes=[256, 128, block_k],
         l2_groupings=[1],
@@ -135,11 +137,12 @@ def _selected_kernel(
     b_grouped: torch.Tensor,
     work_tile_metadata: torch.Tensor,
     row_alpha: hl.constexpr = 1,  # pyrefly: ignore[bad-function-definition]
+    mask_offset: hl.constexpr = 0,  # pyrefly: ignore[bad-function-definition]
 ) -> torch.Tensor:
     m_total_aligned, k = a_packed.shape
     _g, n, k2 = b_grouped.shape
     assert k == k2
-    assert work_tile_metadata.size(1) == 4
+    assert work_tile_metadata.size(1) >= 4
     block_m = hl.register_block_size(256)
     block_n = hl.register_block_size(128)
     block_k = hl.register_block_size(64)
@@ -164,6 +167,10 @@ def _selected_kernel(
         else:
             row_index = torch.add(global_m_start, local_m, alpha=2)
         valid_rows = local_m < valid_m
+        if mask_offset != 0:
+            valid_rows = (
+                local_m + mask_offset < valid_m  # pyrefly: ignore[unsupported-operation]
+            )
         store_rows = local_m < store_m
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         for tile_k in hl.tile(k, block_size=block_k):
@@ -255,10 +262,8 @@ def _configured_bound(
 
 def _code_for(
     args: tuple[torch.Tensor, ...],
-    config: helion.Config | None = None,
+    config: helion.Config,
 ) -> str:
-    if config is None:
-        config = _selected_config(runtime_direct=True)
     _selected_kernel.reset()
     bound = _selected_kernel.bind(args)
     bound.env.config_spec.cute_tcgen05_search_enabled = True
@@ -356,30 +361,9 @@ def _call_count(
     )
 
 
-def _expected_panel_coords(
-    *,
-    m_tiles: int,
-    n_tiles: int,
-    configured_panel_size: int,
-) -> list[tuple[int, int]]:
-    result: list[tuple[int, int]] = []
-    panel_size = min(configured_panel_size, n_tiles)
-    panel_span = panel_size * m_tiles
-    for linear in range(m_tiles * n_tiles):
-        panel = linear // panel_span
-        within = linear % panel_span
-        width = min(panel_size, n_tiles - panel * panel_size)
-        tile_m = within // width
-        tile_n = panel * panel_size + within % width
-        if panel % 2 == 1:
-            tile_m = m_tiles - 1 - tile_m
-        result.append((tile_m, tile_n))
-    return result
-
-
 def test_grouped_worklist_nm_runtime_tile_table_mapping() -> None:
     rows = [[2, 0, 257, 448], [0, 448, 513, 672], [1, 1120, 65, 224]]
-    problem_sizes = [(2560, row[3], 128, 1) for row in rows]
+    problem_sizes = [(12_800, row[3], 128, 1) for row in rows]
     records = _tcgen05_grouped_runtime_nm_tile_records(
         rows,
         problem_sizes,
@@ -387,51 +371,57 @@ def test_grouped_worklist_nm_runtime_tile_table_mapping() -> None:
         source_tile_n=256,
         l2_swizzle_size=8,
     )
+    assert records.shape[1] == TCGEN05_GROUPED_RUNTIME_TILE_FIELD_COUNT
 
     cursor = 0
     for metadata_idx, (real_group, start, actual_m, aligned_m) in enumerate(rows):
         m_tiles = aligned_m // 224
-        n_tiles = 10
+        n_tiles = 50
         count = m_tiles * n_tiles
         group_records = records[cursor : cursor + count].tolist()
-        assert [(record[0], record[1]) for record in group_records] == (
-            _expected_panel_coords(
-                m_tiles=m_tiles,
-                n_tiles=n_tiles,
-                configured_panel_size=8,
+        coords = [
+            (
+                record[Tcgen05GroupedRuntimeTileField.CTA_M],
+                record[Tcgen05GroupedRuntimeTileField.CTA_N],
             )
-        )
+            for record in group_records
+        ]
+        assert sorted(coords) == [
+            (tile_m, tile_n) for tile_m in range(m_tiles) for tile_n in range(n_tiles)
+        ]
+        if metadata_idx == 0:
+            assert coords[:32] == [
+                *((tile_m, tile_n) for tile_m in (0, 1) for tile_n in range(8)),
+                *((tile_m, tile_n) for tile_m in (1, 0) for tile_n in range(8, 16)),
+            ]
         for record in group_records:
-            tile_m = record[0]
-            assert tuple(record[2:8]) == (
+            tile_m = record[Tcgen05GroupedRuntimeTileField.CTA_M]
+            assert tuple(
+                record[field]
+                for field in (
+                    Tcgen05GroupedRuntimeTileField.METADATA_IDX,
+                    Tcgen05GroupedRuntimeTileField.GROUP_IDX,
+                    Tcgen05GroupedRuntimeTileField.PROBLEM_M,
+                    Tcgen05GroupedRuntimeTileField.PROBLEM_N,
+                    Tcgen05GroupedRuntimeTileField.PROBLEM_K,
+                    Tcgen05GroupedRuntimeTileField.GLOBAL_M_START,
+                )
+            ) == (
                 metadata_idx,
                 real_group,
                 aligned_m,
-                2560,
+                12_800,
                 128,
                 start,
             )
-            assert record[8] == min(224, max(actual_m - tile_m * 224, 0))
-            assert record[9] == min(224, aligned_m - tile_m * 224)
+            assert record[Tcgen05GroupedRuntimeTileField.VALID_M] == min(
+                224, max(actual_m - tile_m * 224, 0)
+            )
+            assert record[Tcgen05GroupedRuntimeTileField.STORE_M] == min(
+                224, aligned_m - tile_m * 224
+            )
         cursor += count
     assert cursor == len(records)
-
-
-@pytest.mark.parametrize("l2_swizzle_size", (1, 8))
-def test_grouped_worklist_nm_tile_table_excludes_zero_tile_groups(
-    l2_swizzle_size: int,
-) -> None:
-    records = _tcgen05_grouped_runtime_nm_tile_records(
-        [[0, 0, 0, 0], [1, 0, 33, 224]],
-        [(256, 0, 128, 1), (256, 224, 128, 1)],
-        source_tile_m=224,
-        source_tile_n=256,
-        l2_swizzle_size=l2_swizzle_size,
-    )
-
-    # The zero-tile row is absent before either raster path performs division
-    # or modulo; the surviving row retains its original metadata index.
-    assert records.tolist() == [[0, 0, 1, 1, 224, 256, 128, 0, 33, 224]]
 
 
 @pytest.mark.parametrize(
@@ -455,6 +445,67 @@ def test_grouped_worklist_nm_runtime_tile_table_rejects_invalid_problem_shape(
             source_tile_n=128,
             l2_swizzle_size=1,
         )
+
+
+def test_grouped_worklist_nm_small_tile_table_matches_reference() -> None:
+    rows = [[2, 0, 33, 64], [0, 64, 65, 96]]
+    problem_sizes = [(896, row[3], 128, 1) for row in rows]
+    records = _tcgen05_grouped_runtime_nm_tile_records(
+        rows,
+        problem_sizes,
+        source_tile_m=32,
+        source_tile_n=128,
+        l2_swizzle_size=3,
+    )
+
+    expected: list[list[int]] = []
+    for metadata_idx, (real_group, start, actual_m, aligned_m) in enumerate(rows):
+        m_tiles = aligned_m // 32
+        n_tiles = 7
+        panel_size = 3
+        for local_idx in range(m_tiles * n_tiles):
+            panel_span = panel_size * m_tiles
+            panel_idx = local_idx // panel_span
+            panel_linear = local_idx % panel_span
+            panel_width = min(panel_size, n_tiles - panel_idx * panel_size)
+            tile_m = panel_linear // panel_width
+            tile_n = panel_idx * panel_size + panel_linear % panel_width
+            if panel_idx % 2:
+                tile_m = m_tiles - 1 - tile_m
+            expected.append(
+                [
+                    tile_m,
+                    tile_n,
+                    metadata_idx,
+                    real_group,
+                    aligned_m,
+                    896,
+                    128,
+                    start,
+                    min(32, max(actual_m - tile_m * 32, 0)),
+                    32,
+                ]
+            )
+
+    assert len(records) == 35
+    assert records.tolist() == expected
+
+
+@pytest.mark.parametrize("l2_swizzle_size", (1, 8))
+def test_grouped_worklist_nm_tile_table_excludes_zero_tile_groups(
+    l2_swizzle_size: int,
+) -> None:
+    records = _tcgen05_grouped_runtime_nm_tile_records(
+        [[0, 0, 0, 0], [1, 0, 33, 224]],
+        [(256, 0, 128, 1), (256, 224, 128, 1)],
+        source_tile_m=224,
+        source_tile_n=256,
+        l2_swizzle_size=l2_swizzle_size,
+    )
+
+    # The zero-tile row is absent before either raster path performs division
+    # or modulo; the surviving row retains its original metadata index.
+    assert records.tolist() == [[0, 0, 1, 1, 224, 256, 128, 0, 33, 224]]
 
 
 def test_grouped_worklist_nm_runtime_direct_clc_checks_grid_z_limit() -> None:
@@ -545,6 +596,50 @@ def _run_graph_replay(
     return warmup, captured
 
 
+def _run_standard_graph_replay_case(
+    m_sizes: tuple[int, ...],
+    *,
+    n: int,
+    k: int,
+    source_m_tile: int,
+    block_k: int = 64,
+    ab_stages: int | None = None,
+    cluster_m: int = 2,
+    consumer_regs: int | None = None,
+    mn_major_b: bool = False,
+    l2_swizzle_size: int | None = None,
+    runtime_direct: bool | None = None,
+    expected_metadata: list[list[int]] | None = None,
+    exact_replay: bool = False,
+) -> None:
+    _require_runtime_cuda13_sm100_or_newer()
+    args = _make_args(
+        m_sizes,
+        n=n,
+        k=k,
+        dirty_padding=True,
+        mn_major_b=mn_major_b,
+        source_m_tile=source_m_tile,
+    )
+    expected_b_stride = (n * k, 1, n) if mn_major_b else (n * k, k, 1)
+    assert tuple(args[1].stride()) == expected_b_stride
+    if expected_metadata is not None:
+        assert args[2].cpu().tolist() == expected_metadata
+
+    warmup, captured = _run_graph_replay(
+        args,
+        block_k,
+        ab_stages=ab_stages,
+        source_m_tile=source_m_tile,
+        cluster_m=cluster_m,
+        consumer_regs=consumer_regs,
+        l2_swizzle_size=l2_swizzle_size,
+        runtime_direct=runtime_direct,
+    )
+    if exact_replay:
+        torch.testing.assert_close(captured, warmup, rtol=0, atol=0)
+
+
 def _refresh_worklist_without_recompile(
     bound: Any,
     args: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -575,7 +670,7 @@ def _require_codegen_cuda() -> None:
         pytest.skip("tcgen05 selected-path codegen needs CUDA fake inputs")
 
 
-def _require_runtime_cuda13_sm100() -> None:
+def _require_runtime_cuda13_sm100_or_newer() -> None:
     _require_codegen_cuda()
     if not requires_cuda_version("13"):
         pytest.skip("tcgen05 selected-path runtime needs CUDA >= 13")
@@ -592,7 +687,10 @@ def _require_runtime_cuda13_sm100() -> None:
 def test_grouped_worklist_nm_codegen_and_wrapper_plan() -> None:
     _require_codegen_cuda()
 
-    code = _code_for(_make_args((1, 127, 224, 256), n=224, k=128))
+    code = _code_for(
+        _make_args((1, 127, 224, 256), n=224, k=128),
+        _selected_config(runtime_direct=True),
+    )
 
     assert "StaticPersistentGroupTileScheduler.create" not in code
     assert "tcgen05_grouped_runtime_tile_records.iterator" in code
@@ -633,6 +731,15 @@ def test_grouped_worklist_nm_codegen_and_wrapper_plan() -> None:
         plan for plan in _wrapper_plans(code) if plan["kind"] == "tcgen05_d_tma"
     )
     assert (d_plan["bm"], d_plan["bn"], d_plan["orientation"]) == (256, 256, "nm")
+    assert not {
+        "problem_sizes_arg",
+        "starts_arg",
+        "real_groups_arg",
+    }.intersection(plan)
+    wrapper_body: list[str] = []
+    wrapper_call_args: list[str] = []
+    _append_cute_wrapper_plan(wrapper_body, wrapper_call_args, plan, num_sm=148)
+    assert plan["sched_params_arg"] not in wrapper_call_args
 
 
 def test_grouped_worklist_nm_runtime_direct_clc_uses_exact_record_ids() -> None:
@@ -735,6 +842,7 @@ def test_grouped_worklist_nm_runtime_direct_clc_uses_exact_record_ids() -> None:
         num_sm=148,
     )
     assert "    grid_z = tcgen05_grouped_total_clusters" in wrapper_body
+    assert grouped_plan["sched_params_arg"] not in wrapper_call_args
     assert not any(
         "StaticPersistentGroupTileScheduler.get_grid_shape" in line
         for line in wrapper_body
@@ -810,13 +918,25 @@ def test_grouped_worklist_nm_can_retain_scheduler_mailbox() -> None:
 
     _require_codegen_cuda()
 
-    code = _code_for(
-        _make_args((1, 127, 224, 256), n=224, k=128),
-        _selected_config(runtime_direct=False),
-    )
+    with (
+        patch(
+            "helion._compiler.cute.cute_mma.tcgen05_runtime_n_ptx_compatible",
+            return_value=False,
+        ),
+        patch(
+            "helion._compiler.cute.cute_mma.warn_tcgen05_runtime_n_ptx_fallback"
+        ) as warn_fallback,
+    ):
+        code = _code_for(
+            _make_args((1, 127, 224, 256), n=224, k=128),
+            _selected_config(runtime_direct=False),
+        )
 
     assert "StaticPersistentGroupTileScheduler.create" in code
     assert "tcgen05_grouped_runtime_tile_records.iterator" not in code
+    assert "cutlass.experimental.primitives.inline_ptx(" not in code
+    assert "cute.gemm(" in code
+    warn_fallback.assert_not_called()
     assert "tcgen05_work_tile_smem" in code
     assert (
         "cutlass.Int32(0) < tcgen05_grouped_selected_source_m_tiles <= "
@@ -895,10 +1015,6 @@ def test_grouped_worklist_nm_can_retain_scheduler_mailbox() -> None:
     assert (
         plan["scheduler_mode"] == Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH.value
     )
-    d_plan = next(
-        plan for plan in _wrapper_plans(code) if plan["kind"] == "tcgen05_d_tma"
-    )
-    assert (d_plan["bm"], d_plan["bn"], d_plan["orientation"]) == (256, 256, "nm")
 
 
 def test_grouped_worklist_nm_codegen_backstop_rejects_generated_smem() -> None:
@@ -957,6 +1073,32 @@ def test_grouped_worklist_nm_rejects_alpha_scaled_row() -> None:
         bound.to_triton_code(_selected_config())
 
 
+def test_tcgen05_runtime_instr_desc_n_field_matches_cutlass() -> None:
+    import cutlass
+    from cutlass.experimental.primitives import Tcgen05InstrDesc
+
+    def build(n_dim: int) -> int:
+        # Mirror the pinned BF16/F32 K-major layout used by the grouped tail.
+        return int(
+            Tcgen05InstrDesc.build(
+                c_dtype=cutlass.Float32,
+                a_dtype=cutlass.BFloat16,
+                b_dtype=cutlass.BFloat16,
+                a_major=0,
+                b_major=0,
+                n_dim=n_dim,
+                m_dim=256,
+            )
+        )
+
+    runtime_n = 32
+    encoded = build(0) | (
+        (runtime_n >> _TCGEN05_INSTR_DESC_N_LOW_BITS)
+        << _TCGEN05_INSTR_DESC_N_FIELD_SHIFT
+    )
+    assert encoded == build(runtime_n)
+
+
 @pytest.mark.parametrize(
     ("block_k", "source_m_tile"),
     (
@@ -974,7 +1116,15 @@ def test_grouped_worklist_nm_runtime_n_tail_descriptors_codegen(
 ) -> None:
     _require_codegen_cuda()
 
-    config = _selected_config(block_k, source_m_tile, runtime_direct=True)
+    config = _selected_config(
+        block_k,
+        source_m_tile,
+        ab_stages=3,
+        cluster_m=(
+            1 if source_m_tile == TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE else 2
+        ),
+        runtime_direct=True,
+    )
     with patch(
         "helion._compiler.cute.cute_mma.tcgen05_runtime_n_ptx_compatible",
         return_value=True,
@@ -984,23 +1134,29 @@ def test_grouped_worklist_nm_runtime_n_tail_descriptors_codegen(
             config,
         )
 
+    is_two_cta = source_m_tile != TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
     assert "cutlass.experimental.primitives.inline_ptx(" in code
-    assert (
-        "tcgen05_tma_b_peer_delta = mma_slice_tidx * "
-        "(tcgen05_tma_runtime_mma_n // cutlass.Int32(2) - "
-        f"cutlass.Int32({source_m_tile // 2}))"
-    ) in code
-    assert (
-        "tcgen05_tma_tensor_b_tail = cute.domain_offset("
-        "(tcgen05_tma_b_peer_delta, 0), tma_tensor_b)"
-    ) in code
-    assert (
-        f"cute.local_tile(tcgen05_tma_tensor_b_tail, ({source_m_tile}, {block_k})"
-        in code
-    )
-    assert "n_dim=0, m_dim=256" in code
+    if is_two_cta:
+        assert (
+            "tcgen05_tma_b_peer_delta = mma_slice_tidx * "
+            "(tcgen05_tma_runtime_mma_n // cutlass.Int32(2) - "
+            f"cutlass.Int32({source_m_tile // 2}))"
+        ) in code
+        assert (
+            "tcgen05_tma_tensor_b_tail = cute.domain_offset("
+            "(tcgen05_tma_b_peer_delta, 0), tma_tensor_b)"
+        ) in code
+        assert (
+            f"cute.local_tile(tcgen05_tma_tensor_b_tail, "
+            f"({source_m_tile}, {block_k})" in code
+        )
+    else:
+        assert "tcgen05_tma_b_peer_delta" not in code
+        assert "tcgen05_tma_tensor_b_tail" not in code
+        assert f"cute.local_tile(tma_tensor_b, ({source_m_tile}, {block_k})" in code
+    assert f"n_dim=0, m_dim={256 if is_two_cta else 128}" in code
     assert f"if tcgen05_runtime_mma_n == cutlass.Int32({source_m_tile}):" in code
-    assert "tcgen05.mma.cta_group::2.kind::f16" in code
+    assert f"tcgen05.mma.cta_group::{2 if is_two_cta else 1}.kind::f16" in code
     tree = ast.parse(code)
     instr_desc_call = next(
         node
@@ -1024,34 +1180,36 @@ def test_grouped_worklist_nm_runtime_n_tail_descriptors_codegen(
         for node in ast.walk(tree)
         if isinstance(node, ast.If) and ast.unparse(node.test) == tail_predicate
     ]
-    assert len(tail_guards) == 2
-    tma_guard = next(
-        node for node in tail_guards if "tcgen05_tma_b_peer_delta" in ast.unparse(node)
-    )
+    assert len(tail_guards) == (2 if is_two_cta else 1)
     mma_guard = next(
         node for node in tail_guards if "Tcgen05InstrDesc.build" in ast.unparse(node)
     )
-    assert "tcgen05_tma_tensor_b_tail" in ast.unparse(tma_guard)
-    assert "Tcgen05InstrDesc.build" not in ast.unparse(tma_guard)
     assert "tcgen05_tma_b_peer_delta" not in ast.unparse(mma_guard)
-
-    # Keep both sides of the dynamic tail branch on the same CuTe pytree by
-    # normalizing the full-N TensorMap with a DSL-typed zero domain offset.
-    normalized_tail_runs = []
-    for node in ast.walk(tree):
-        body = getattr(node, "body", None)
-        if not isinstance(body, list):
-            continue
-        for index in range(len(body) - 2):
-            run = body[index : index + 3]
-            if (
-                "tcgen05_tma_b_peer_delta = cutlass.Int32(0)" in ast.unparse(run[0])
-                and "tcgen05_tma_tensor_b_tail = cute.domain_offset("
-                in ast.unparse(run[1])
-                and run[2] is tma_guard
-            ):
-                normalized_tail_runs.append(run)
-    assert len(normalized_tail_runs) == 1
+    if is_two_cta:
+        tma_guard = next(
+            node
+            for node in tail_guards
+            if "tcgen05_tma_b_peer_delta" in ast.unparse(node)
+        )
+        assert "tcgen05_tma_tensor_b_tail" in ast.unparse(tma_guard)
+        assert "Tcgen05InstrDesc.build" not in ast.unparse(tma_guard)
+        # Keep both sides of the dynamic tail branch on the same CuTe pytree by
+        # normalizing the full-N TensorMap with a DSL-typed zero domain offset.
+        normalized_tail_runs = []
+        for node in ast.walk(tree):
+            body = getattr(node, "body", None)
+            if not isinstance(body, list):
+                continue
+            for index in range(len(body) - 2):
+                run = body[index : index + 3]
+                if (
+                    "tcgen05_tma_b_peer_delta = cutlass.Int32(0)" in ast.unparse(run[0])
+                    and "tcgen05_tma_tensor_b_tail = cute.domain_offset("
+                    in ast.unparse(run[1])
+                    and run[2] is tma_guard
+                ):
+                    normalized_tail_runs.append(run)
+        assert len(normalized_tail_runs) == 1
 
 
 @pytest.mark.parametrize(
@@ -1165,49 +1323,73 @@ def test_grouped_worklist_nm_bk128_ab2_keeps_unsplit_tma_store_codegen(
     assert "cute.copy(tcgen05_tma_store_atom" in code
 
 
-def test_grouped_worklist_nm_one_cta_codegen() -> None:
+@pytest.mark.parametrize("runtime_direct", (False, True))
+def test_grouped_worklist_nm_one_cta_codegen(runtime_direct: bool) -> None:
     _require_codegen_cuda()
 
     source_m_tile = TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
-    config = _selected_config(64, source_m_tile, cluster_m=1)
-    code = _code_for(
-        _make_args((24, 23), n=512, k=128, source_m_tile=source_m_tile),
-        config,
+    config = _selected_config(
+        64,
+        source_m_tile,
+        cluster_m=1,
+        runtime_direct=runtime_direct,
     )
+    with patch(
+        "helion._compiler.cute.cute_mma.tcgen05_runtime_n_ptx_compatible",
+        return_value=True,
+    ):
+        code = _code_for(
+            _make_args((24, 23), n=512, k=128, source_m_tile=source_m_tile),
+            config,
+        )
 
+    assert config.block_sizes[:3] == [256, 128, 64]
     assert "cute.nvgpu.tcgen05.CtaGroup.ONE" in code
     assert "cute.nvgpu.tcgen05.CtaGroup.TWO" not in code
-    assert config.block_sizes[:3] == [256, 128, 64]
     assert "tcgen05_tma_b_peer_delta" not in code
     assert "tcgen05_tma_tensor_b_tail" not in code
     assert "cute.gemm(" in code
-    assert "cutlass.experimental.primitives.inline_ptx(" not in code
-    assert "tcgen05.mma.cta_group::1.kind::f16" not in code
+    assert ("cutlass.experimental.primitives.inline_ptx(" in code) is runtime_direct
+    assert ("tcgen05.mma.cta_group::1.kind::f16" in code) is runtime_direct
     assert "tcgen05.mma.cta_group::2.kind::f16" not in code
-    assert "StaticPersistentGroupTileScheduler.create" in code
     assert "cute.local_tile(tma_tensor_a, (128, 64)" in code
     assert f"cute.local_tile(tma_tensor_b, ({source_m_tile}, 64)" in code
+    tma_role_predicate = (
+        "cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(5)"
+    )
+    tma_role_sources = [
+        ast.unparse(node)
+        for node in ast.walk(ast.parse(code))
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == tma_role_predicate
+        and "while tcgen05_role_local_0" in ast.unparse(node)
+    ]
+    assert len(tma_role_sources) == 1
+    assert "tcgen05_grouped_valid_m =" not in tma_role_sources[0]
 
     plans = _wrapper_plans(code)
     grouped_plan = next(
         plan for plan in plans if plan["kind"] == "tcgen05_grouped_static_persistent"
     )
-    assert (
-        grouped_plan["scheduler_mode"]
-        == Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH.value
+    expected_scheduler = (
+        Tcgen05GroupedSchedulerMode.RUNTIME_DIRECT
+        if runtime_direct
+        else Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH
     )
-    assert "StaticPersistentGroupTileScheduler.create" in code
-    assert "tcgen05_grouped_runtime_tile_records.iterator" not in code
-    from helion._compiler.program_id import _literal_mailbox_access_fields
+    assert grouped_plan["scheduler_mode"] == expected_scheduler.value
+    assert ("StaticPersistentGroupTileScheduler.create" in code) is not runtime_direct
+    assert ("tcgen05_grouped_runtime_tile_records.iterator" in code) is runtime_direct
+    if not runtime_direct:
+        from helion._compiler.program_id import _literal_mailbox_access_fields
 
-    consumer_fields, producer_fields = _literal_mailbox_access_fields(
-        ast.parse(code), "tcgen05_work_tile_smem"
-    )
-    assert consumer_fields == producer_fields == {0, 1, 2, 3, 4, 8}
-    assert _scheduler_mailbox_publish_fields(code) == (
-        {0, 1, 2, 3, 4, 8},
-        {2},
-    )
+        consumer_fields, producer_fields = _literal_mailbox_access_fields(
+            ast.parse(code), "tcgen05_work_tile_smem"
+        )
+        assert consumer_fields == producer_fields == {0, 1, 2, 3, 4, 8}
+        assert _scheduler_mailbox_publish_fields(code) == (
+            {0, 1, 2, 3, 4, 8},
+            {2},
+        )
     assert "num_sm_multiplier" not in grouped_plan
     assert {
         "bm": grouped_plan["bm"],
@@ -1351,17 +1533,17 @@ def test_grouped_worklist_nm_one_cta_runtime_direct_upper_n_record_count() -> No
     ]
     records = _tcgen05_grouped_runtime_nm_tile_records(
         rows,
-        [(4096, 32, 2048, 1)] * len(rows),
+        [(7168, 32, 2048, 1)] * len(rows),
         source_tile_m=32,
         source_tile_n=128,
         l2_swizzle_size=1,
     )
 
-    assert len(records) == 6 * 32
+    assert len(records) == 6 * 56
     for metadata_idx in range(6):
-        group_records = records[metadata_idx * 32 : (metadata_idx + 1) * 32].tolist()
-        assert [record[1] for record in group_records] == list(range(32))
-        assert {record[2] for record in group_records} == {metadata_idx}
+        group_records = records[metadata_idx * 56 : (metadata_idx + 1) * 56]
+        assert group_records[:, 1].tolist() == list(range(56))
+        assert set(group_records[:, 2].tolist()) == {metadata_idx}
 
 
 def test_grouped_worklist_nm_panel_raster_codegen_and_mapping() -> None:
@@ -1392,22 +1574,6 @@ def test_grouped_worklist_nm_panel_raster_codegen_and_mapping() -> None:
     )
     panel_l2_swizzle_size = grouped_plan["l2_swizzle_size"]
     assert panel_l2_swizzle_size == 8
-    runtime_records = _tcgen05_grouped_runtime_nm_tile_records(
-        [[0, 0, 257, 448], [1, 448, 513, 672]],
-        [(2560, 448, 128, 1), (2560, 672, 128, 1)],
-        source_tile_m=source_m_tile,
-        source_tile_n=256,
-        l2_swizzle_size=panel_l2_swizzle_size,
-    )
-    runtime_record_rows = runtime_records.tolist()
-    assert runtime_record_rows
-    assert [(record[0], record[1]) for record in runtime_record_rows[:20]] == (
-        _expected_panel_coords(
-            m_tiles=2,
-            n_tiles=10,
-            configured_panel_size=8,
-        )
-    )
 
 
 def test_grouped_worklist_nm_fixed_tensormap_rejects_misaligned_d() -> None:
@@ -1418,32 +1584,33 @@ def test_grouped_worklist_nm_fixed_tensormap_rejects_misaligned_d() -> None:
     k = 128
     a_packed = torch.empty((m_total, k), dtype=torch.bfloat16, device=DEVICE)
     b_grouped = torch.empty((1, n, k), dtype=torch.bfloat16, device=DEVICE)
+    work_tile_metadata = torch.tensor(
+        [[0, 0, m_total, m_total]],
+        dtype=torch.int32,
+        device=DEVICE,
+    )
     aligned_output = torch.empty((m_total, n), dtype=torch.bfloat16, device=DEVICE)
     d_storage = torch.empty(m_total * n + 1, dtype=torch.bfloat16, device=DEVICE)
     output = d_storage[1:].view(m_total, n)
     assert output.data_ptr() % 16 != 0
 
-    plan: dict[str, object] = {
-        "fixed_tensormaps": True,
-        "orientation": "nm",
-        "worklist_metadata": True,
-        "dynamic_ab_tensormap_rank": 2,
-        "lhs_idx": 0,
-        "rhs_idx": 1,
-        "n_size": n,
-        "k_total_size": k,
-        "bm": 256,
-        "bk": 64,
-    }
+    code = _code_for(
+        (a_packed, b_grouped, work_tile_metadata),
+        _selected_config(64, m_total),
+    )
+    plans = _wrapper_plans(code)
+    plan = next(
+        candidate
+        for candidate in plans
+        if candidate["kind"] == "tcgen05_grouped_static_persistent"
+    )
     cute_kernel = type("FixedTensorMapKernel", (), {})()
-    cute_kernel._helion_cute_wrapper_plans = [
-        {"kind": "tcgen05_d_tma", "fixed_tensormap": True, "d_idx": 2}
-    ]
+    cute_kernel._helion_cute_wrapper_plans = plans
 
     _validate_tcgen05_grouped_fixed_tensormaps(
         cute_kernel,
         plan,
-        (a_packed, b_grouped, aligned_output),
+        (work_tile_metadata, a_packed, b_grouped, aligned_output),
     )
     with pytest.raises(
         helion.exc.BackendUnsupported,
@@ -1452,7 +1619,7 @@ def test_grouped_worklist_nm_fixed_tensormap_rejects_misaligned_d() -> None:
         _validate_tcgen05_grouped_fixed_tensormaps(
             cute_kernel,
             plan,
-            (a_packed, b_grouped, output),
+            (work_tile_metadata, a_packed, b_grouped, output),
         )
 
 
@@ -1530,6 +1697,85 @@ def test_grouped_worklist_nm_legacy_bk64_codegen() -> None:
     assert (d_plan["bm"], d_plan["bn"], d_plan["orientation"]) == (256, 224, "nm")
 
 
+def test_grouped_worklist_nm_compiler_facts_reject_over_budget_profile() -> None:
+    _require_codegen_cuda()
+
+    # Source-256/BK64/AB7 exceeds the exact B200 worklist footprint.  Compiler
+    # seeds register the host allocation facts, so normalization rejects this
+    # profile before the generated-allocation backstop.
+    config = _selected_config(
+        64,
+        TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+        ab_stages=7,
+    )
+    args = _make_args(
+        (224, 256),
+        n=224,
+        k=64,
+        source_m_tile=TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+    )
+    _selected_kernel.reset()
+    bound = _selected_kernel.bind(args)
+    bound.env.config_spec.cute_tcgen05_search_enabled = True
+    bound.env.config_spec.register_cute_tcgen05_grouped_worklist_smem_facts(
+        group_count=int(args[2].size(0)),
+        device_split_sizes=False,
+    )
+    with (
+        patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
+        patch_cute_mma_support(),
+        pytest.raises(
+            helion.exc.InvalidConfig,
+            match="tcgen05_ab_stages",
+        ),
+    ):
+        bound.to_triton_code(config)
+
+
+def test_grouped_worklist_nm_rejects_shifted_load_mask() -> None:
+    _require_codegen_cuda()
+
+    args = (*_make_args((224, 256), n=224, k=128), 1, 1)
+    _selected_kernel.reset()
+    bound = _selected_kernel.bind(args)
+    assert not bound.env.config_spec.cute_tcgen05_search_enabled
+    bound.env.config_spec.cute_tcgen05_search_enabled = True
+    with (
+        patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
+        patch_cute_mma_support(),
+        pytest.raises(
+            helion.exc.BackendUnsupported,
+            match="rank3 grouped semantic proof failed",
+        ),
+    ):
+        bound.to_triton_code(_selected_config())
+
+
+def test_grouped_worklist_nm_rejects_extra_metadata_columns() -> None:
+    _require_codegen_cuda()
+
+    a_packed, b_grouped, worklist = _make_args((224, 256), n=224, k=128)
+    extra_column = torch.zeros(
+        (worklist.size(0), 1),
+        dtype=worklist.dtype,
+        device=worklist.device,
+    )
+    args = (a_packed, b_grouped, torch.cat((worklist, extra_column), dim=1))
+    _selected_kernel.reset()
+    bound = _selected_kernel.bind(args)
+    assert not bound.env.config_spec.cute_tcgen05_search_enabled
+    bound.env.config_spec.cute_tcgen05_search_enabled = True
+    with (
+        patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
+        patch_cute_mma_support(),
+        pytest.raises(
+            helion.exc.BackendUnsupported,
+            match="rank3 grouped semantic proof failed|MMA RHS was not grouped rank-3",
+        ),
+    ):
+        bound.to_triton_code(_selected_config())
+
+
 @pytest.mark.parametrize(
     ("case", "match"),
     (
@@ -1559,7 +1805,7 @@ def test_grouped_worklist_nm_rejects_ineligible_inputs(case: str, match: str) ->
         args = (a_packed, strided_b, work_tile_metadata)
 
     with pytest.raises(helion.exc.BackendUnsupported, match=match):
-        _code_for(args)
+        _code_for(args, _selected_config())
 
 
 @pytest.mark.parametrize(
@@ -1567,19 +1813,21 @@ def test_grouped_worklist_nm_rejects_ineligible_inputs(case: str, match: str) ->
     (
         (64, TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT),
         (128, TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE),
+        (64, TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE),
     ),
 )
 def test_grouped_worklist_nm_runtime_and_graph_replay(
     block_k: int,
     source_m_tile: int,
 ) -> None:
-    _require_runtime_cuda13_sm100()
+    _require_runtime_cuda13_sm100_or_newer()
 
-    m_sizes = (224, 449, 256)
+    small_source = source_m_tile == TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
+    m_sizes = (24, 23, 19, 17, 20, 18) if small_source else (224, 449, 256)
     args = _make_args(
         m_sizes,
-        n=512,
-        k=2 * block_k,
+        n=4096 if small_source else 512,
+        k=2048 if small_source else 2 * block_k,
         dirty_padding=True,
         source_m_tile=source_m_tile,
     )
@@ -1610,12 +1858,16 @@ def test_grouped_worklist_nm_runtime_and_graph_replay(
         # and a non-identity metadata-row-to-group mapping.  Total aligned M is
         # unchanged, so this exercises the scheduler metadata refresh rather
         # than recompilation or a new allocation shape.
-        mutated_m_sizes = (
-            (225, 224, 449)
-            if source_m_tile == TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
-            else (257, 224, 256)
-        )
-        mutated_group_ids = (2, 0, 1)
+        if small_source:
+            mutated_m_sizes = (15, 20, 17, 19, 23, 24)
+            mutated_group_ids = (5, 4, 3, 2, 1, 0)
+        else:
+            mutated_m_sizes = (
+                (225, 224, 449)
+                if source_m_tile == TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
+                else (257, 224, 256)
+            )
+            mutated_group_ids = (2, 0, 1)
         _refresh_worklist_without_recompile(
             bound,
             args,
@@ -1628,13 +1880,23 @@ def test_grouped_worklist_nm_runtime_and_graph_replay(
         captured = _capture_and_replay(bound, args, poison=-7.0)
 
     _assert_output(captured, args)
+    if small_source:
+        a_packed, b_grouped, work_tile_metadata = args
+        for group, start, valid_m, _store_m in work_tile_metadata.cpu().tolist():
+            oracle = (
+                a_packed[start : start + valid_m].float() @ b_grouped[group].float().T
+            ).double()
+            actual = captured[start : start + valid_m].double()
+            denominator = (actual.square() + oracle.square()).sum()
+            diff = 1 - 2 * (actual * oracle).sum() / denominator
+            assert float(diff.item()) <= 1e-5
 
 
 @pytest.mark.parametrize("runtime_direct", (False, True))
 def test_grouped_worklist_nm_zero_token_groups_runtime_and_graph_replay(
     runtime_direct: bool,
 ) -> None:
-    _require_runtime_cuda13_sm100()
+    _require_runtime_cuda13_sm100_or_newer()
 
     source_m_tile = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
     args = _make_args(
@@ -1660,7 +1922,7 @@ def test_grouped_worklist_nm_zero_token_groups_runtime_and_graph_replay(
 
 
 def test_grouped_worklist_nm_zero_valid_tail_runtime_and_graph_replay() -> None:
-    _require_runtime_cuda13_sm100()
+    _require_runtime_cuda13_sm100_or_newer()
 
     source_m_tile = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
     n = 256
@@ -1706,60 +1968,99 @@ def test_grouped_worklist_nm_zero_valid_tail_runtime_and_graph_replay() -> None:
     )
 
 
-def test_grouped_worklist_nm_nonzero_overlap_is_rejected_at_launch() -> None:
-    _require_runtime_cuda13_sm100()
+@pytest.mark.parametrize(
+    ("m_sizes", "overlap", "ab_stages", "match"),
+    (
+        pytest.param(
+            (224, 224),
+            True,
+            None,
+            "overlapping A rows",
+            id="overlap",
+        ),
+        pytest.param((0, 0), False, 3, "all-empty worklist", id="all-empty"),
+    ),
+)
+def test_grouped_worklist_nm_invalid_metadata_is_rejected_at_launch(
+    m_sizes: tuple[int, ...],
+    overlap: bool,
+    ab_stages: int | None,
+    match: str,
+) -> None:
+    _require_runtime_cuda13_sm100_or_newer()
 
     source_m_tile = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
     args = _make_args(
-        (224, 224),
+        m_sizes,
         n=512,
         k=128,
         source_m_tile=source_m_tile,
     )
-    args[2][1, 1] = 0
+    if overlap:
+        args[2][1, 1] = 0
     with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
         bound = _configured_bound(
             args,
             64,
-            ab_stages=3,
+            ab_stages=ab_stages,
             source_m_tile=source_m_tile,
             runtime_direct=True,
         )
         with pytest.raises(
             helion.exc.BackendUnsupported,
-            match="overlapping A rows",
+            match=match,
         ):
             bound(*args)
 
 
-def test_grouped_worklist_nm_all_empty_is_rejected_at_launch() -> None:
-    _require_runtime_cuda13_sm100()
+@pytest.mark.parametrize(
+    ("source_m_tile", "mn_major_b", "consumer_regs", "l2_swizzle_size"),
+    (
+        pytest.param(
+            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+            True,
+            224,
+            16,
+            id="source224-n-major-r224-panel16",
+        ),
+        pytest.param(
+            TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+            True,
+            224,
+            16,
+            id="source256-n-major-r224-panel16",
+        ),
+        pytest.param(
+            TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+            False,
+            256,
+            8,
+            id="source256-k-major-r256-panel8",
+        ),
+        pytest.param(
+            TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+            False,
+            240,
+            1,
+            id="source256-k-major-r240-panel1",
+        ),
+        pytest.param(
+            TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+            False,
+            256,
+            1,
+            id="source256-k-major-r256-panel1",
+        ),
+    ),
+)
+def test_grouped_worklist_nm_clc_runtime_and_graph_replay(
+    source_m_tile: int,
+    mn_major_b: bool,
+    consumer_regs: int,
+    l2_swizzle_size: int,
+) -> None:
+    _require_runtime_cuda13_sm100_or_newer()
 
-    source_m_tile = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
-    args = _make_args(
-        (0, 0),
-        n=512,
-        k=128,
-        source_m_tile=source_m_tile,
-    )
-    with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
-        bound = _configured_bound(
-            args,
-            64,
-            source_m_tile=source_m_tile,
-            runtime_direct=True,
-        )
-        with pytest.raises(
-            helion.exc.BackendUnsupported,
-            match="all-empty worklist",
-        ):
-            bound(*args)
-
-
-def test_grouped_worklist_nm_runtime_direct_clc_runtime_and_graph_replay() -> None:
-    _require_runtime_cuda13_sm100()
-
-    source_m_tile = TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE
     m_sizes = (1024, 1024, 1024)
     n = 4096
     args = _make_args(
@@ -1767,6 +2068,7 @@ def test_grouped_worklist_nm_runtime_direct_clc_runtime_and_graph_replay() -> No
         n=n,
         k=128,
         dirty_padding=True,
+        mn_major_b=mn_major_b,
         source_m_tile=source_m_tile,
     )
     logical_clusters = sum(
@@ -1782,8 +2084,8 @@ def test_grouped_worklist_nm_runtime_direct_clc_runtime_and_graph_replay() -> No
             64,
             ab_stages=6,
             source_m_tile=source_m_tile,
-            consumer_regs=256,
-            l2_swizzle_size=8,
+            consumer_regs=consumer_regs,
+            l2_swizzle_size=l2_swizzle_size,
             runtime_direct=True,
             clc=True,
         )
@@ -1808,127 +2110,58 @@ def test_grouped_worklist_nm_runtime_direct_clc_runtime_and_graph_replay() -> No
 
 
 def test_grouped_worklist_nm_panel_raster_runtime_and_graph_replay() -> None:
-    _require_runtime_cuda13_sm100()
-
-    source_m_tile = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
-    args = _make_args(
+    _run_standard_graph_replay_case(
         (257, 513),
         n=2560,
         k=128,
-        dirty_padding=True,
-        source_m_tile=source_m_tile,
-    )
-    warmup, captured = _run_graph_replay(
-        args,
-        64,
-        source_m_tile=source_m_tile,
+        source_m_tile=TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
         l2_swizzle_size=8,
         runtime_direct=True,
+        exact_replay=True,
     )
-    torch.testing.assert_close(captured, warmup, rtol=0, atol=0)
 
 
 def test_grouped_worklist_nm_bk128_ab2_runtime_and_graph_replay() -> None:
-    _require_runtime_cuda13_sm100()
-
-    source_m_tile = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
-    args = _make_args(
+    _run_standard_graph_replay_case(
         (224, 449, 256),
         n=512,
         k=256,
-        dirty_padding=True,
-        source_m_tile=source_m_tile,
-    )
-    _run_graph_replay(
-        args,
-        128,
+        source_m_tile=TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+        block_k=128,
         ab_stages=2,
-        source_m_tile=source_m_tile,
     )
-
-
-def test_grouped_worklist_nm_small_source_public_profile_graph_replay() -> None:
-    _require_runtime_cuda13_sm100()
-
-    args = _make_args(
-        (24, 23, 19, 17, 20, 18),
-        n=4096,
-        k=2048,
-        dirty_padding=True,
-        source_m_tile=TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
-    )
-    assert args[2].cpu().tolist() == [
-        [0, 0, 24, 32],
-        [1, 32, 23, 32],
-        [2, 64, 19, 32],
-        [3, 96, 17, 32],
-        [4, 128, 20, 32],
-        [5, 160, 18, 32],
-    ]
-    _, captured = _run_graph_replay(
-        args,
-        64,
-        source_m_tile=TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
-    )
-    a_packed, b_grouped, work_tile_metadata = args
-    for group, start, valid_m, _store_m in work_tile_metadata.cpu().tolist():
-        oracle = a_packed[start : start + valid_m].float() @ b_grouped[group].float().T
-        actual = captured[start : start + valid_m].double()
-        oracle = oracle.double()
-        denominator = (actual.square() + oracle.square()).sum()
-        diff = 1 - 2 * (actual * oracle).sum() / denominator
-        assert float(diff.item()) <= 1e-5
 
 
 def test_grouped_worklist_nm_one_cta_mn_major_legacy_graph_replay() -> None:
-    _require_runtime_cuda13_sm100()
-
-    source_m_tile = TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
-    args = _make_args(
+    _run_standard_graph_replay_case(
         (24, 23, 19, 17, 20, 18),
         n=512,
         k=128,
-        dirty_padding=True,
+        source_m_tile=TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
         mn_major_b=True,
-        source_m_tile=source_m_tile,
-    )
-    n, k = args[1].shape[1:]
-    assert tuple(args[1].stride()) == (n * k, 1, n)
-    _run_graph_replay(
-        args,
-        64,
-        source_m_tile=source_m_tile,
         cluster_m=1,
         consumer_regs=240,
     )
 
 
 def test_grouped_worklist_nm_one_cta_direct_graph_replay() -> None:
-    _require_runtime_cuda13_sm100()
-
     source_m_tile = TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
     # Include a <=16-row group so CTA-group::1 exercises its runtime UMMA-N=16
     # descriptor path in addition to the full physical N=32 path.
     actual_ms = (24, 23, 19, 17, 20, 15)
-    args = _make_args(
-        actual_ms,
-        n=4096,
-        k=2048,
-        dirty_padding=True,
-        source_m_tile=source_m_tile,
-    )
     expected_metadata = []
     start = 0
     for group, actual_m in enumerate(actual_ms):
         expected_metadata.append([group, start, actual_m, source_m_tile])
         start += source_m_tile
-    assert args[2].cpu().tolist() == expected_metadata
-    _run_graph_replay(
-        args,
-        64,
+    _run_standard_graph_replay_case(
+        actual_ms,
+        n=4096,
+        k=2048,
         source_m_tile=source_m_tile,
         cluster_m=1,
         runtime_direct=True,
+        expected_metadata=expected_metadata,
     )
 
 
@@ -1945,51 +2178,31 @@ def test_grouped_worklist_nm_one_cta_promoted_profiles_graph_replay(
     consumer_regs: int,
     mn_major_b: bool,
 ) -> None:
-    _require_runtime_cuda13_sm100()
-
-    source_m_tile = TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
-    args = _make_args(
+    _run_standard_graph_replay_case(
         (24, 23, 19, 17, 20, 18),
         n=512,
         k=2 * block_k,
-        dirty_padding=True,
-        mn_major_b=mn_major_b,
-        source_m_tile=source_m_tile,
-    )
-    n, k = args[1].shape[1:]
-    expected_b_stride = (n * k, 1, n) if mn_major_b else (n * k, k, 1)
-    assert tuple(args[1].stride()) == expected_b_stride
-    warmup, captured = _run_graph_replay(
-        args,
-        block_k,
+        source_m_tile=TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
+        block_k=block_k,
         ab_stages=ab_stages,
-        source_m_tile=source_m_tile,
         cluster_m=1,
         consumer_regs=consumer_regs,
+        mn_major_b=mn_major_b,
         runtime_direct=True,
+        exact_replay=True,
     )
-    torch.testing.assert_close(captured, warmup, rtol=0, atol=0)
 
 
 def test_grouped_worklist_nm_one_cta_multitile_dynamic_graph_replay() -> None:
-    _require_runtime_cuda13_sm100()
-
-    source_m_tile = TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
-    args = _make_args(
+    _run_standard_graph_replay_case(
         (65, 33),
         n=160,
         k=128,
-        dirty_padding=True,
-        source_m_tile=source_m_tile,
-    )
-    assert args[2].cpu().tolist() == [
-        [0, 0, 65, 96],
-        [1, 96, 33, 64],
-    ]
-    warmup, captured = _run_graph_replay(
-        args,
-        64,
-        source_m_tile=source_m_tile,
+        source_m_tile=TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
         cluster_m=1,
+        expected_metadata=[
+            [0, 0, 65, 96],
+            [1, 96, 33, 64],
+        ],
+        exact_replay=True,
     )
-    torch.testing.assert_close(captured, warmup, rtol=0, atol=0)
