@@ -1169,7 +1169,7 @@ def _build_canonical_deepseek_v3() -> Comparison:
     shape = DeepseekV3MoEShape(batch=1)
     tensors = allocate_moe(shape, args.seed)
     reference = moe_reference(tensors, shape)
-    config_path = CROSS_KERNEL_ROOT / "probes/deepseek_v3/deepseek_v3_moe_b200_configs.json"
+    config_path = Path(probe.__file__).with_name("deepseek_v3_moe_b200_configs.json")
     configs = json.loads(config_path.read_text())
     root_stages = dict(enumerate(CANONICAL_DEEPSEEK_V3_STAGES))
     root_by_stage = {stage: root for root, stage in root_stages.items()}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import random
 import statistics
@@ -27,6 +28,41 @@ def make_l2_cache_clearer() -> Callable[[], None] | None:
         active.clear_cache(cache)  # type: ignore[attr-defined]
 
     return clear
+
+
+def lowered_triton_summary(source: str) -> dict[str, object]:
+    """Return a compact, reproducible fingerprint of lowered Triton code."""
+    lines = source.splitlines()
+    constexpr_indices = [
+        index
+        for index, line in enumerate(lines)
+        if line.startswith("_BLOCK_SIZE_") and " = tl.constexpr(" in line
+    ]
+    normalized_lines = list(lines)
+    for index, declaration in zip(
+        constexpr_indices,
+        sorted(lines[index] for index in constexpr_indices),
+        strict=True,
+    ):
+        normalized_lines[index] = declaration
+    normalized = "\n".join(normalized_lines)
+    if source.endswith("\n"):
+        normalized += "\n"
+    return {
+        "sha256": hashlib.sha256(source.encode()).hexdigest(),
+        "normalized_sha256": hashlib.sha256(normalized.encode()).hexdigest(),
+        "line_count": len(lines),
+        "jit_function_count": sum(line.strip() == "@triton.jit" for line in lines),
+        "dependency_wait_loop_count": sum(
+            line.lstrip().startswith("while tile_dependency_") for line in lines
+        ),
+        "atomic_add_count": source.count("tl.atomic_add("),
+        "atomic_exchange_count": source.count("tl.atomic_xchg("),
+        "debug_barrier_count": source.count("tl.debug_barrier("),
+        "dot_count": source.count("tl.dot("),
+        "load_count": source.count("tl.load("),
+        "store_count": source.count("tl.store("),
+    }
 
 
 def flush_l2_exact(*, flush_mib: int = 256) -> None:
@@ -244,8 +280,10 @@ def gpu_snapshot() -> dict[str, str | int]:
             "nvidia-smi",
             "-i",
             visible_gpu(),
-            "--query-gpu=name,uuid,temperature.gpu,pstate,clocks.sm,clocks.mem,"
-            "power.draw,memory.used,utilization.gpu",
+            (
+                "--query-gpu=name,uuid,temperature.gpu,pstate,clocks.sm,"
+                "clocks.mem,power.draw,memory.used,utilization.gpu"
+            ),
             "--format=csv,noheader,nounits",
         ],
         check=True,
