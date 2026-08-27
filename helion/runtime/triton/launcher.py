@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextvars
 import math
+import threading
 import weakref
 
 import torch
@@ -123,6 +124,15 @@ _CUS_PER_XCD: dict[str, int] = {
 }
 
 
+def _runtime_lock(owner: object) -> threading.RLock:
+    """Return the per-kernel lock guarding compiler-owned runtime state."""
+    values = vars(owner)
+    lock = values.get("_helion_runtime_lock")
+    if lock is None:
+        lock = values.setdefault("_helion_runtime_lock", threading.RLock())
+    return lock
+
+
 def get_num_xcd(device: torch.device | int | None = None) -> int:
     """Number of XCDs visible for ``device`` on AMD CDNA, else ``1``.
 
@@ -168,12 +178,11 @@ def default_launcher(
     _remote_barrier_process_group_name: str | None = None,
     _remote_copy_scratch_specs: tuple[tuple[torch.Tensor, int], ...] = (),
     _persistent_state_specs: tuple[tuple[torch.Tensor, int, torch.dtype], ...] = (),
-    _constant_buffer_specs: tuple[
-        tuple[torch.Tensor, tuple[int, ...], torch.dtype], ...
-    ] = (),
     _minimum_resident_programs: int = 0,
     _target_resident_programs_per_sm: int = 0,
     _requires_clc: bool = False,
+    _cross_loop_dispatch_kind: str | None = None,
+    _cross_loop_fallback_reason: str | None = None,
     ptx_options: str | None = None,
     launch_cooperative_grid: bool = False,
     **kwargs: dict,
@@ -185,6 +194,11 @@ def default_launcher(
     pointers, so every launch or replay sharing that state, including distinct
     graph instances captured on the same stream, must be serialized.
     """
+    if _cross_loop_dispatch_kind is not None:
+        vars(triton_kernel)["_helion_cross_loop_dispatch"] = (
+            _cross_loop_dispatch_kind,
+            _cross_loop_fallback_reason,
+        )
     if _requires_clc:
         tensor = next((arg for arg in args if isinstance(arg, torch.Tensor)), None)
         if tensor is None or tensor.device.type != "cuda":
@@ -245,7 +259,6 @@ def default_launcher(
             _target_resident_programs_per_sm,
             tuple(sorted((name, repr(value)) for name, value in kwargs.items())),
             tuple((numel, dtype) for _, numel, dtype in _persistent_state_specs),
-            tuple((values, dtype) for _, values, dtype in _constant_buffer_specs),
         )
         for slot, (state_like, numel, dtype) in enumerate(_persistent_state_specs):
             state = _get_persistent_state(
@@ -257,16 +270,6 @@ def default_launcher(
                 dtype,
             )
             args = (*args, state)
-    if _constant_buffer_specs:
-        for slot, (buffer_like, values, dtype) in enumerate(_constant_buffer_specs):
-            constant_buffer = _get_constant_buffer(
-                triton_kernel,
-                buffer_like,
-                slot,
-                values,
-                dtype,
-            )
-            args = (*args, constant_buffer)
     # For both CUDA and MTIA, use the same kernel execution.
     run_kwargs: dict = {
         "grid": grid,
@@ -297,12 +300,20 @@ def default_launcher(
             *args,
             **{**run_kwargs, "warmup": True},
         )
-        _limit_resident_programs_per_sm(
-            compiled_kernel,
-            args,
-            num_warps=num_warps,
-            target_programs=_target_resident_programs_per_sm,
-        )
+        # The launch metadata is mutable on Triton's compiled specialization.
+        # Keep target selection and the corresponding launch atomic with
+        # respect to another host thread using the same specialization.
+        with _runtime_lock(compiled_kernel):
+            _limit_resident_programs_per_sm(
+                compiled_kernel,
+                args,
+                num_warps=num_warps,
+                target_programs=_target_resident_programs_per_sm,
+            )
+            return triton_kernel.run(  # type: ignore[union-attr]
+                *args,
+                **run_kwargs,
+            )
     return triton_kernel.run(  # type: ignore[union-attr]
         *args,
         **run_kwargs,
@@ -417,40 +428,18 @@ def _get_persistent_state(
     if like.device.type != "cuda":
         raise RuntimeError("persistent Triton state requires a CUDA tensor")
     stream = torch.cuda.current_stream(like.device)
-    cache = vars(triton_kernel).setdefault("_helion_persistent_state_cache", {})
-    key = (like.device, dtype, stream.cuda_stream, namespace, slot)
-    state = cache.get(key)
-    if state is None or state.numel() < required_numel:
-        _reject_allocation_during_cuda_graph_capture(
-            like.device,
-            "persistent Triton state",
-        )
-        state = torch.zeros(required_numel, dtype=dtype, device=like.device)
-        cache[key] = state
-    return state
-
-
-def _get_constant_buffer(
-    triton_kernel: object,
-    like: torch.Tensor,
-    slot: int,
-    values: tuple[int, ...],
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Return immutable compiler data shared by launches and CUDA streams."""
-    if like.device.type != "cuda":
-        raise RuntimeError("persistent Triton constants require a CUDA tensor")
-    cache = vars(triton_kernel).setdefault("_helion_constant_buffer_cache", {})
-    key = (like.device, dtype, slot, values)
-    buffer = cache.get(key)
-    if buffer is None:
-        _reject_allocation_during_cuda_graph_capture(
-            like.device,
-            "persistent Triton constants",
-        )
-        buffer = torch.tensor(values, dtype=dtype, device=like.device)
-        cache[key] = buffer
-    return buffer
+    with _runtime_lock(triton_kernel):
+        cache = vars(triton_kernel).setdefault("_helion_persistent_state_cache", {})
+        key = (like.device, dtype, stream.cuda_stream, namespace, slot)
+        state = cache.get(key)
+        if state is None or state.numel() < required_numel:
+            _reject_allocation_during_cuda_graph_capture(
+                like.device,
+                "persistent Triton state",
+            )
+            state = torch.zeros(required_numel, dtype=dtype, device=like.device)
+            cache[key] = state
+        return state
 
 
 def _reject_allocation_during_cuda_graph_capture(
@@ -539,8 +528,6 @@ def _limit_resident_programs_per_sm(
     target_programs: int,
 ) -> None:
     """Cap CLC residency without exposing backend scratch bytes to scheduling."""
-    import importlib
-
     if target_programs <= 0:
         raise ValueError("the resident-program target must be positive")
     tensor = next((arg for arg in args if isinstance(arg, torch.Tensor)), None)
@@ -549,85 +536,121 @@ def _limit_resident_programs_per_sm(
     if compiled_kernel is None:
         raise RuntimeError("unable to compile CLC kernel")
 
-    # Initialize the CUDA function using Triton's original dynamic-shared size.
-    # The generated launcher reads the actual launch size from packed_metadata,
-    # which we replace below after choosing the smallest sufficient padding.
-    _run = compiled_kernel.run  # type: ignore[attr-defined]
-    function = getattr(compiled_kernel, "function", None)
-    metadata = getattr(compiled_kernel, "metadata", None)
-    shared = getattr(metadata, "shared", None)
-    if function is None or not isinstance(shared, int):
-        raise RuntimeError("unable to query CLC kernel occupancy")
+    with _runtime_lock(compiled_kernel):
+        # Initialize the CUDA function using Triton's original dynamic-shared
+        # size. The generated launcher reads the actual launch size from
+        # packed_metadata, which is restored for each cached target below.
+        _run = compiled_kernel.run  # type: ignore[attr-defined]
+        function = getattr(compiled_kernel, "function", None)
+        metadata = getattr(compiled_kernel, "metadata", None)
+        shared = getattr(metadata, "shared", None)
+        if function is None or not isinstance(shared, int):
+            raise RuntimeError("unable to query CLC kernel occupancy")
 
-    cache = vars(compiled_kernel).setdefault("_helion_clc_residency_limits", {})
-    cache_key = (tensor.device, num_warps, target_programs)
-    if cache_key in cache:
-        return
+        values = vars(compiled_kernel)
+        base_shared = values.setdefault("_helion_clc_base_shared", shared)
+        if not isinstance(base_shared, int):
+            raise RuntimeError("invalid cached CLC shared-memory baseline")
+        cache = values.setdefault("_helion_clc_residency_limits", {})
+        cache_key = (tensor.device, num_warps, target_programs)
+        padded_shared = cache.get(cache_key)
+        cache_miss = padded_shared is None
+        if padded_shared is None:
+            _reject_allocation_during_cuda_graph_capture(
+                tensor.device,
+                "CLC residency metadata",
+            )
+            padded_shared = _compute_clc_resident_shared_bytes(
+                function,
+                tensor.device,
+                num_warps=num_warps,
+                base_shared=base_shared,
+                target_programs=target_programs,
+            )
+        current_metadata = compiled_kernel.metadata  # type: ignore[attr-defined]
+        if current_metadata.shared == padded_shared:
+            if cache_miss:
+                cache[cache_key] = padded_shared
+            return
+        updated_metadata = current_metadata._replace(shared=padded_shared)
+        from triton.compiler.compiler import make_backend
 
-    cuda_driver = importlib.import_module("cuda.bindings.driver")
-    cuda_function = cuda_driver.CUfunction(int(function))
+        packed_metadata = make_backend(updated_metadata.target).pack_metadata(
+            updated_metadata
+        )
+        compiled_kernel.metadata = updated_metadata  # type: ignore[attr-defined]
+        compiled_kernel.packed_metadata = packed_metadata  # type: ignore[attr-defined]
+        if cache_miss:
+            cache[cache_key] = padded_shared
 
-    def blocks_per_sm(dynamic_shared: int) -> int:
-        error, blocks = cuda_driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+
+def _compute_clc_resident_shared_bytes(
+    function: object,
+    device: torch.device,
+    *,
+    num_warps: int,
+    base_shared: int,
+    target_programs: int,
+) -> int:
+    """Return dynamic shared bytes that cap occupancy at ``target_programs``."""
+    import importlib
+
+    with torch.cuda.device(device):
+        cuda_driver = importlib.import_module("cuda.bindings.driver")
+        cuda_function = cuda_driver.CUfunction(int(function))
+
+        def blocks_per_sm(dynamic_shared: int) -> int:
+            error, blocks = cuda_driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                cuda_function,
+                num_warps * 32,
+                dynamic_shared,
+            )
+            if error != cuda_driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(
+                    f"CUDA occupancy query failed for CLC kernel: {error}"
+                )
+            return int(blocks)
+
+        if blocks_per_sm(base_shared) <= target_programs:
+            return base_shared
+
+        error, static_shared = cuda_driver.cuFuncGetAttribute(
+            cuda_driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
             cuda_function,
-            num_warps * 32,
-            dynamic_shared,
         )
         if error != cuda_driver.CUresult.CUDA_SUCCESS:
-            raise RuntimeError(f"CUDA occupancy query failed for CLC kernel: {error}")
-        return int(blocks)
-
-    if blocks_per_sm(shared) <= target_programs:
-        cache[cache_key] = shared
-        return
-
-    error, static_shared = cuda_driver.cuFuncGetAttribute(
-        cuda_driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
-        cuda_function,
-    )
-    if error != cuda_driver.CUresult.CUDA_SUCCESS:
-        raise RuntimeError(f"CUDA shared-memory query failed for CLC kernel: {error}")
-    properties = torch.cuda.get_device_properties(tensor.device)
-    max_dynamic_shared = int(properties.shared_memory_per_block_optin) - int(
-        static_shared
-    )
-    error = cuda_driver.cuFuncSetAttribute(
-        cuda_function,
-        cuda_driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-        max_dynamic_shared,
-    )[0]
-    if error != cuda_driver.CUresult.CUDA_SUCCESS:
-        raise RuntimeError(f"CUDA shared-memory opt-in failed for CLC kernel: {error}")
-    alignment = 256
-    low = max(shared, alignment)
-    high = max_dynamic_shared
-    low_units = (low + alignment - 1) // alignment
-    high_units = high // alignment
-    if high_units < low_units or blocks_per_sm(high_units * alignment) > target_programs:
-        raise RuntimeError(
-            f"unable to limit CLC occupancy to {target_programs} programs per SM"
+            raise RuntimeError(
+                f"CUDA shared-memory query failed for CLC kernel: {error}"
+            )
+        properties = torch.cuda.get_device_properties(device)
+        max_dynamic_shared = int(properties.shared_memory_per_block_optin) - int(
+            static_shared
         )
-    while low_units < high_units:
-        midpoint = (low_units + high_units) // 2
-        if blocks_per_sm(midpoint * alignment) <= target_programs:
-            high_units = midpoint
-        else:
-            low_units = midpoint + 1
-    padded_shared = low_units * alignment
-
-    error = cuda_driver.cuFuncSetAttribute(
-        cuda_function,
-        cuda_driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-        padded_shared,
-    )[0]
-    if error != cuda_driver.CUresult.CUDA_SUCCESS:
-        raise RuntimeError(f"CUDA shared-memory configuration failed: {error}")
-
-    updated_metadata = metadata._replace(shared=padded_shared)
-    compiled_kernel.metadata = updated_metadata  # type: ignore[attr-defined]
-    from triton.compiler.compiler import make_backend
-
-    compiled_kernel.packed_metadata = make_backend(  # type: ignore[attr-defined]
-        updated_metadata.target
-    ).pack_metadata(updated_metadata)
-    cache[cache_key] = padded_shared
+        error = cuda_driver.cuFuncSetAttribute(
+            cuda_function,
+            cuda_driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            max_dynamic_shared,
+        )[0]
+        if error != cuda_driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(
+                f"CUDA shared-memory opt-in failed for CLC kernel: {error}"
+            )
+        alignment = 256
+        low = max(base_shared, alignment)
+        high = max_dynamic_shared
+        low_units = (low + alignment - 1) // alignment
+        high_units = high // alignment
+        if (
+            high_units < low_units
+            or blocks_per_sm(high_units * alignment) > target_programs
+        ):
+            raise RuntimeError(
+                f"unable to limit CLC occupancy to {target_programs} programs per SM"
+            )
+        while low_units < high_units:
+            midpoint = (low_units + high_units) // 2
+            if blocks_per_sm(midpoint * alignment) <= target_programs:
+                high_units = midpoint
+            else:
+                low_units = midpoint + 1
+        return low_units * alignment

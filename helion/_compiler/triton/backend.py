@@ -569,12 +569,6 @@ class TritonBackend(Backend):
                 for tensor, numel, dtype in device_fn.triton_persistent_state_specs
             )
             out.append(f"_persistent_state_specs=({specs},)")
-        if device_fn.triton_constant_buffer_specs:
-            specs = ", ".join(
-                f"({tensor}, {values!r}, {dtype})"
-                for tensor, values, dtype in device_fn.triton_constant_buffer_specs
-            )
-            out.append(f"_constant_buffer_specs=({specs},)")
         if device_fn.triton_minimum_resident_programs is not None:
             out.append(
                 "_minimum_resident_programs="
@@ -584,6 +578,16 @@ class TritonBackend(Backend):
             out.append(
                 "_target_resident_programs_per_sm="
                 f"{device_fn.triton_target_resident_programs_per_sm}"
+            )
+        if device_fn.triton_cross_loop_dispatch_kind is not None:
+            out.append(
+                "_cross_loop_dispatch_kind="
+                f"{device_fn.triton_cross_loop_dispatch_kind!r}"
+            )
+        if device_fn.triton_cross_loop_fallback_reason is not None:
+            out.append(
+                "_cross_loop_fallback_reason="
+                f"{device_fn.triton_cross_loop_fallback_reason!r}"
             )
         launcher_args = self.launcher_keyword_args(config, has_barrier=has_barrier)
         if device_fn.triton_uses_clc:

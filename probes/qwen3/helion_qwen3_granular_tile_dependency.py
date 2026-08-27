@@ -915,6 +915,10 @@ def _build_helion_reference(args, tensors):
 def _probe_config(bound, args):
     """Map the retained one-warp probe geometry onto the granular source."""
     values = dict(bound.config_spec.default_config())
+    # CLC currently re-enters ordinary pointer-based task bodies. Keep that
+    # backend choice explicit instead of rewriting descriptor configs later.
+    values["indexing"] = ["pointer"] * len(values["indexing"])
+    values["atomic_indexing"] = ["pointer"] * len(values["atomic_indexing"])
     values.pop(CROSS_LOOP_NUM_WORKERS_CONFIG, None)
     uses_flat_qk = _USE_TASK_ALIGNED_ATTENTION or _USE_CANONICAL_ATTENTION_VIEWS
     downstream_shift = (

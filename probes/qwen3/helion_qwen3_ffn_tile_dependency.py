@@ -323,13 +323,10 @@ def _clc_cursor_snapshot(compiled_wrapper):
 
 def _clc_command_layout(cursor_key):
     namespace = cursor_key[3]
-    constant_specs = namespace[-1]
-    if len(constant_specs) != 1:
-        raise AssertionError("CLC launch has an unexpected command-table layout")
-    (tasks, task_dtype), = constant_specs
-    if task_dtype != torch.uint32:
-        raise AssertionError("CLC command table must use uint32 entries")
-    return len(tasks)
+    (grid,) = namespace[0]
+    if grid <= 0:
+        raise AssertionError("CLC launch has an empty command range")
+    return grid
 
 
 def _validate_clc_replay_state(
@@ -382,11 +379,6 @@ def _validate_clc_replay_state(
             )
 
     cursor_key, _, _, launch_count, _ = active[0]
-    if len(cursor_key[3][-1]) == 1:
-        # Singleton-command plans retain only the task-order table. Their
-        # event-state layout is compiler-internal; exact output and cursor
-        # accounting above are the stable replay checks for this probe.
-        return
     matching_event_states = [
         state
         for key, state in entries
@@ -409,10 +401,18 @@ def _validate_clc_replay_state(
     frontier_offset = 96 * counter_stride
     expected_front = (expected_epoch * frontier_groups) & 0xFFFFFFFF
     expected_tail = (expected_epoch * (96 - frontier_groups)) & 0xFFFFFFFF
-    if int(event_state[frontier_offset].item()) != expected_front:
-        raise AssertionError("front activation counter does not match replay epoch")
-    if int(event_state[frontier_offset + counter_stride].item()) != expected_tail:
-        raise AssertionError("tail activation counter does not match replay epoch")
+    actual_front = int(event_state[frontier_offset].item())
+    if actual_front != expected_front:
+        raise AssertionError(
+            "front activation counter does not match replay epoch: "
+            f"actual={actual_front} expected={expected_front}"
+        )
+    actual_tail = int(event_state[frontier_offset + counter_stride].item())
+    if actual_tail != expected_tail:
+        raise AssertionError(
+            "tail activation counter does not match replay epoch: "
+            f"actual={actual_tail} expected={expected_tail}"
+        )
 
 
 def run(args) -> None:
@@ -548,8 +548,7 @@ def run(args) -> None:
             args.batch_replays,
         )
     worker_width = args.cross_loop_workers or (
-        args.worker_multiplier
-        * torch.cuda.get_device_properties(0).multi_processor_count
+        7 * torch.cuda.get_device_properties(0).multi_processor_count
     )
     _validate_clc_replay_state(
         compiled,

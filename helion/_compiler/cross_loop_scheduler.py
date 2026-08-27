@@ -3,7 +3,6 @@ from __future__ import annotations
 import dataclasses
 from functools import cache
 from functools import cached_property
-import heapq
 import itertools
 import operator
 
@@ -23,33 +22,8 @@ from .tile_dependency import preceding_scope_relation
 CROSS_LOOP_NUM_WORKERS_CONFIG = "cross_loop_num_workers"
 CROSS_LOOP_NUM_WORKERS_DEFAULT = 0
 
-# Some validation and compaction paths deliberately expand the configured task
-# DAG.  Keep that work bounded; larger affine schedules retain their symbolic
-# representation and the baseline compressed schedule.
-_EXPLICIT_SCHEDULE_TASK_LIMIT = 4096
-_CLC_COMMAND_TASK_LIMIT = 8192
-_EXPLICIT_SCHEDULE_EVENT_KEY_LIMIT = 65_536
-_EXPLICIT_SCHEDULE_EDGE_LIMIT = 1_048_576
-
-
 class ClcCommandPlanUnavailable(exc.CrossLoopSchedulingError):
-    """The graph is valid, but exceeds the bounded CLC command planner."""
-
-
-@dataclasses.dataclass
-class _ClcMaterializationBudget:
-    """Bound all explicitly materialized CLC graph incidences."""
-
-    limit: int | None
-    used: int = 0
-
-    def consume(self, count: int, description: str) -> None:
-        self.used += count
-        if self.limit is not None and self.used > self.limit:
-            raise ClcCommandPlanUnavailable(
-                f"CLC command planning exceeded its {self.limit}-item "
-                f"materialization budget while {description}"
-            )
+    """The canonical schedule cannot be represented by CLC command ranges."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1076,8 +1050,6 @@ class EventGraph:
     def materialized_required_keys_by_strand(
         self,
         use: EventUse,
-        *,
-        budget: _ClcMaterializationBudget | None = None,
     ) -> tuple[frozenset[int], ...]:
         """Return every event key required anywhere in each root strand.
 
@@ -1093,8 +1065,6 @@ class EventGraph:
             result: list[frozenset[int]] = []
             for task in range(strand_keys.source_domain.size):
                 keys = strand_keys.targets(task)
-                if budget is not None:
-                    budget.consume(len(keys), "materializing consumer incidences")
                 result.append(keys)
             return tuple(result)
 
@@ -1112,11 +1082,6 @@ class EventGraph:
                 source_task,
                 source_traversal=source_traversal,
             )
-            if budget is not None:
-                budget.consume(
-                    len(required_keys),
-                    "materializing nested consumer incidences",
-                )
             coordinates = scope_domain.coordinates(
                 source_task,
                 traversal=source_traversal,
@@ -1999,11 +1964,22 @@ class CrossLoopSchedule:
 
 @dataclasses.dataclass(frozen=True)
 class ClcCommandRange:
-    """One root's physical task ordinals in the flattened command table."""
+    """One symbolic run in the source-ordered CLC command stream."""
 
     root: int
     begin: int
     end: int
+    physical_tasks: LogicalRelation
+
+    def __post_init__(self) -> None:
+        if self.root < 0:
+            raise ValueError(f"root must be nonnegative, got {self.root}")
+        if self.begin < 0 or self.end <= self.begin:
+            raise ValueError(
+                f"CLC command range must be nonempty, got [{self.begin}, {self.end})"
+            )
+        if self.physical_tasks.source_domain.size != self.task_count:
+            raise ValueError("CLC command relation has the wrong source domain size")
 
     @property
     def task_count(self) -> int:
@@ -2011,29 +1987,11 @@ class ClcCommandRange:
 
 
 @dataclasses.dataclass(frozen=True)
-class ClcCommand:
-    """One logical task in the dependency-topological CLC stream."""
-
-    worker: int
-    position_begin: int
-    position_end: int
-    task: tuple[int, int]
-
-    def __post_init__(self) -> None:
-        if self.worker < 0:
-            raise ValueError(f"worker must be nonnegative, got {self.worker}")
-        if self.position_begin < 0 or self.position_end <= self.position_begin:
-            raise ValueError("invalid CLC command position interval")
-
-
-@dataclasses.dataclass(frozen=True)
 class ClcCommandPlan:
-    """A dependency-topological stream of logical worker commands."""
+    """A source-ordered symbolic command stream for CLC dispatch."""
 
     base_schedule: CrossLoopSchedule
     command_ranges: tuple[ClcCommandRange, ...]
-    commands: tuple[ClcCommand, ...]
-    task_order: tuple[int, ...]
 
     @property
     def event_graph(self) -> EventGraph:
@@ -2057,7 +2015,7 @@ class ClcCommandPlan:
 
     @property
     def command_count(self) -> int:
-        return len(self.commands)
+        return sum(command_range.task_count for command_range in self.command_ranges)
 
     @property
     def uses_cancellation(self) -> bool:
@@ -3350,11 +3308,6 @@ def build_cross_loop_schedule(
         dependency_plan=dependency_plan,
         preordered_edges=preordered_edges,
     )
-    worker_schedule = compact_ready_explicit_families(
-        readiness,
-        worker_schedule,
-        local_triggers,
-    )
     return CrossLoopSchedule(
         readiness=readiness,
         worker_schedule=worker_schedule,
@@ -3364,558 +3317,156 @@ def build_cross_loop_schedule(
 
 
 def build_clc_command_plan(base_schedule: CrossLoopSchedule) -> ClcCommandPlan:
-    """Quotient the canonical worker schedule into topological CLC commands."""
-    event_graph = base_schedule.event_graph
-    task_count = sum(domain.size for domain in event_graph.root_domains)
-    if task_count > _CLC_COMMAND_TASK_LIMIT:
-        raise ClcCommandPlanUnavailable(
-            "CLC command planning would materialize "
-            f"{task_count} tasks; the current limit is "
-            f"{_CLC_COMMAND_TASK_LIMIT}"
-        )
-    event_key_count = sum(plan.key_count for plan in base_schedule.counted_events)
-    if event_key_count > _EXPLICIT_SCHEDULE_EVENT_KEY_LIMIT:
-        raise ClcCommandPlanUnavailable(
-            "CLC command planning would materialize "
-            f"{event_key_count} event keys; the current limit is "
-            f"{_EXPLICIT_SCHEDULE_EVENT_KEY_LIMIT}"
-        )
+    """Project the canonical schedule into symbolic CLC command ranges.
 
-    local_roots = frozenset(
+    TileDependency and ReadinessPlan remain the only dependency authorities.
+    CLC changes task ownership, so complete root families are ordered by their
+    first canonical WorkerSchedule placement and checked against the existing
+    symbolic readiness plan. Each root keeps the canonical task permutation as
+    a compact symbolic relation; no second task dependency graph or per-task
+    command table is constructed.
+    """
+    event_graph = base_schedule.event_graph
+    local_root_list = tuple(
         event_graph.event(trigger.event_index).uses[trigger.use_index].consumer_root
         for trigger in base_schedule.local_triggers
     )
-    command_ranges: list[ClcCommandRange] = []
-    task_begin = 0
+    local_roots = frozenset(local_root_list)
+    if len(local_roots) != len(local_root_list):
+        raise ClcCommandPlanUnavailable(
+            "a locally executed root has multiple continuation triggers"
+        )
+    retained_local_roots = tuple(
+        local_use.consumer_root
+        for plan in base_schedule.counted_events
+        if (local_use := plan.local_use) is not None
+    )
+    if len(set(retained_local_roots)) != len(retained_local_roots) or frozenset(
+        retained_local_roots
+    ) != local_roots:
+        raise ClcCommandPlanUnavailable(
+            "locally executed roots do not have one retained continuation plan"
+        )
+
+    segments_by_root: dict[int, tuple[WorkerScheduleSegment, ...]] = {}
+    root_priority: dict[int, tuple[int, int, int]] = {}
     for root, domain in enumerate(event_graph.root_domains):
-        if root not in local_roots:
+        if root in local_roots:
+            continue
+        segments = sorted(
+            base_schedule.worker_schedule.segments_for_root(root),
+            key=lambda segment: (
+                segment.schedule_for_offset(0) // segment.worker_count,
+                segment.worker_begin
+                + segment.schedule_for_offset(0) % segment.worker_count,
+            ),
+        )
+        if sum(segment.task_count for segment in segments) != domain.size:
+            raise ClcCommandPlanUnavailable(
+                f"CLC root {root} does not have one complete static placement"
+            )
+        if not segments:
+            raise ClcCommandPlanUnavailable(f"CLC root {root} has no static placement")
+        for left, right in itertools.pairwise(segments):
+            left_end = left.placement(left.task_for_offset(left.task_count - 1))
+            right_begin = right.placement(right.task_for_offset(0))
+            if left_end is None or right_begin is None:
+                raise AssertionError("worker schedule segment lost its own task")
+            if (left_end[1], left_end[0]) >= (right_begin[1], right_begin[0]):
+                raise ClcCommandPlanUnavailable(
+                    f"CLC root {root} has interleaved worker schedule segments"
+                )
+        first = segments[0].placement(segments[0].task_for_offset(0))
+        if first is None:
+            raise AssertionError("worker schedule segment lost its first task")
+        root_priority[root] = (first[1], first[0], root)
+        segments_by_root[root] = tuple(segments)
+
+    ordered_roots = tuple(sorted(segments_by_root, key=root_priority.__getitem__))
+    root_rank = {root: rank for rank, root in enumerate(ordered_roots)}
+    local_trigger_by_root = {
+        event_graph.event(trigger.event_index)
+        .uses[trigger.use_index]
+        .consumer_root: trigger
+        for trigger in base_schedule.local_triggers
+    }
+    for plan in base_schedule.counted_events:
+        static_producer_roots: set[int] = set()
+        for contribution in plan.contributors:
+            static_relations = _static_contribution_relations(
+                event_graph,
+                root=contribution.producer_root,
+                scope_id=contribution.producer_scope_id,
+                keys=contribution.keys,
+                local_trigger_by_root=local_trigger_by_root,
+            )
+            if static_relations is None:
+                raise ClcCommandPlanUnavailable(
+                    "CLC readiness cannot be projected onto static roots"
+                )
+            static_producer_roots.update(
+                producer_root for producer_root, _relation in static_relations
+            )
+        for use in plan.uses:
+            consumer_rank = root_rank.get(use.consumer_root)
+            if consumer_rank is None:
+                continue
+            for producer_root in static_producer_roots:
+                producer_rank = root_rank.get(producer_root)
+                if producer_rank is not None and producer_rank >= consumer_rank:
+                    raise ClcCommandPlanUnavailable(
+                        "canonical worker order is not dependency-safe at root "
+                        f"granularity: {producer_root} -> {use.consumer_root}"
+                    )
+
+    command_ranges: list[ClcCommandRange] = []
+    command_begin = 0
+    for root in ordered_roots:
+        traversal_inverse = event_graph.root_traversals[root].inverse()
+        if traversal_inverse is None or not traversal_inverse.is_total_function():
+            raise ClcCommandPlanUnavailable(
+                f"CLC root {root} physical traversal is not bijective"
+            )
+        for segment in segments_by_root[root]:
+            logical_tasks = segment.task_relation
+            if logical_tasks is None:
+                raise ClcCommandPlanUnavailable(
+                    f"CLC root {root} has no symbolic task traversal"
+                )
+            physical_tasks = logical_tasks.then(traversal_inverse)
+            if physical_tasks is None:
+                raise ClcCommandPlanUnavailable(
+                    f"CLC root {root} task order cannot be mapped to physical tasks"
+                )
+            physical_tasks = physical_tasks.canonical_single_valued()
+            if (
+                physical_tasks is None
+                or not physical_tasks.is_total_function()
+                or physical_tasks.source_domain.size != segment.task_count
+                or physical_tasks.target_domain
+                != event_graph.root_traversals[root].source_domain
+            ):
+                raise ClcCommandPlanUnavailable(
+                    f"CLC root {root} task order is not a total physical mapping"
+                )
+            command_end = command_begin + segment.task_count
+            if command_end > 2_147_483_647:
+                raise ClcCommandPlanUnavailable(
+                    "CLC command count exceeds the signed 32-bit dispatcher domain"
+                )
             command_ranges.append(
                 ClcCommandRange(
                     root=root,
-                    begin=task_begin,
-                    end=task_begin + domain.size,
+                    begin=command_begin,
+                    end=command_end,
+                    physical_tasks=physical_tasks,
                 )
             )
-        task_begin += domain.size
-    command_ranges_tuple = tuple(command_ranges)
-    explicit_tasks = tuple(
-        (command_range.root, task)
-        for command_range in command_ranges_tuple
-        for task in range(command_range.task_count)
-    )
-    commands = _clc_task_commands(
-        base_schedule.worker_schedule,
-        explicit_tasks,
-    )
-    commands = _topologically_order_clc_commands(
-        commands,
-        base_schedule.readiness,
-        max_edges=_EXPLICIT_SCHEDULE_EDGE_LIMIT,
-    )
-    flat_task_by_logical = _clc_flat_task_by_logical(
-        event_graph,
-        command_ranges_tuple,
-    )
-    task_order = tuple(flat_task_by_logical[command.task] for command in commands)
-    if len(task_order) != len(set(task_order)) or frozenset(task_order) != frozenset(
-        flat_task_by_logical.values()
-    ):
-        raise AssertionError(
-            "CLC commands do not cover every explicit task exactly once"
-        )
+            command_begin = command_end
     return ClcCommandPlan(
         base_schedule=base_schedule,
-        command_ranges=command_ranges_tuple,
-        commands=commands,
-        task_order=task_order,
+        command_ranges=tuple(command_ranges),
     )
-
-
-def _clc_contributor_tasks_by_key(
-    event_graph: EventGraph,
-    contributors: tuple[EventContribution, ...],
-    key_count: int,
-    *,
-    budget: _ClcMaterializationBudget | None = None,
-) -> tuple[frozenset[tuple[int, int]], ...]:
-    result: list[set[tuple[int, int]]] = [set() for _ in range(key_count)]
-    for contributor in contributors:
-        producer_root = contributor.producer_root
-        strand_keys = contributor.keys.project_source(
-            event_graph.root_domains[producer_root]
-        )
-        if strand_keys is None:
-            raise ClcCommandPlanUnavailable(
-                "CLC event contribution cannot be projected onto producer tasks"
-        )
-        for task in range(strand_keys.source_domain.size):
-            keys = strand_keys.targets(task)
-            if budget is not None:
-                budget.consume(len(keys), "materializing producer incidences")
-            for key in keys:
-                result[key].add((producer_root, task))
-    return tuple(frozenset(tasks) for tasks in result)
-
-
-def _clc_local_predecessors(
-    readiness: ReadinessPlan,
-    *,
-    budget: _ClcMaterializationBudget | None = None,
-) -> dict[tuple[int, int], frozenset[tuple[int, int]]]:
-    event_graph = readiness.event_graph
-    result: dict[tuple[int, int], frozenset[tuple[int, int]]] = {}
-    for plan in readiness.counted_events:
-        local_use = plan.local_use
-        if local_use is None:
-            continue
-        required_keys = event_graph.required_keys_by_strand(local_use)
-        if required_keys is None:
-            raise ClcCommandPlanUnavailable(
-                "CLC continuation readiness cannot be projected onto its tasks"
-            )
-        producers_by_key = _clc_contributor_tasks_by_key(
-            event_graph,
-            plan.contributors,
-            plan.key_count,
-            budget=budget,
-        )
-        for consumer_task in range(required_keys.source_domain.size):
-            keys = required_keys.targets(consumer_task)
-            if budget is not None:
-                budget.consume(
-                    len(keys),
-                    "materializing continuation consumer incidences",
-                )
-            if len(keys) != 1:
-                raise ClcCommandPlanUnavailable(
-                    "CLC continuation requires exactly one event key per task"
-                )
-            (key,) = tuple(keys)
-            task = (local_use.consumer_root, consumer_task)
-            if task in result:
-                raise ClcCommandPlanUnavailable(
-                    f"CLC task {task} has multiple continuation triggers"
-                )
-            result[task] = producers_by_key[key]
-    return result
-
-
-def _clc_explicit_ancestors(
-    task: tuple[int, int],
-    *,
-    explicit_tasks: frozenset[tuple[int, int]],
-    local_predecessors: dict[tuple[int, int], frozenset[tuple[int, int]]],
-    cache: dict[tuple[int, int], frozenset[tuple[int, int]]],
-    budget: _ClcMaterializationBudget | None = None,
-    visiting: frozenset[tuple[int, int]] = frozenset(),
-) -> frozenset[tuple[int, int]]:
-    cached = cache.get(task)
-    if cached is not None:
-        return cached
-    if task in explicit_tasks:
-        result = frozenset((task,))
-    elif task in visiting:
-        raise exc.CrossLoopSchedulingError("CLC continuation graph contains a cycle")
-    else:
-        predecessors = local_predecessors.get(task)
-        if predecessors is None:
-            raise exc.CrossLoopSchedulingError(
-                f"CLC continuation task {task} has no trigger"
-            )
-        result = frozenset(
-            ancestor
-            for predecessor in predecessors
-            for ancestor in _clc_explicit_ancestors(
-                predecessor,
-                explicit_tasks=explicit_tasks,
-                local_predecessors=local_predecessors,
-                cache=cache,
-                budget=budget,
-                visiting=visiting | frozenset((task,)),
-            )
-        )
-        if not result:
-            raise exc.CrossLoopSchedulingError(
-                f"CLC continuation task {task} has no explicit ancestor"
-            )
-    if budget is not None:
-        budget.consume(len(result), "contracting continuation ancestors")
-    cache[task] = result
-    return result
-
-
-def _clc_explicit_task_predecessors(
-    readiness: ReadinessPlan,
-    command_ranges: tuple[ClcCommandRange, ...],
-    *,
-    max_edges: int | None = None,
-) -> dict[tuple[int, int], frozenset[tuple[int, int]]]:
-    """Contract local continuations into one explicit task dependency DAG."""
-    budget = _ClcMaterializationBudget(max_edges)
-    event_graph = readiness.event_graph
-    explicit_tasks = frozenset(
-        (command_range.root, task)
-        for command_range in command_ranges
-        for task in range(command_range.task_count)
-    )
-    predecessors: dict[tuple[int, int], set[tuple[int, int]]] = {
-        task: set() for task in explicit_tasks
-    }
-    local_predecessors = _clc_local_predecessors(
-        readiness,
-        budget=budget,
-    )
-    ancestor_cache: dict[tuple[int, int], frozenset[tuple[int, int]]] = {}
-    explicit_roots = {command_range.root for command_range in command_ranges}
-
-    for plan in readiness.counted_events:
-        producers_by_key = _clc_contributor_tasks_by_key(
-            event_graph,
-            plan.contributors,
-            plan.key_count,
-            budget=budget,
-        )
-        explicit_producers_by_key = tuple(
-            frozenset(
-                ancestor
-                for producer in producers
-                for ancestor in _clc_explicit_ancestors(
-                    producer,
-                    explicit_tasks=explicit_tasks,
-                    local_predecessors=local_predecessors,
-                    cache=ancestor_cache,
-                    budget=budget,
-                )
-            )
-            for producers in producers_by_key
-        )
-        for use in plan.uses:
-            if use.consumer_root not in explicit_roots:
-                continue
-            try:
-                required_keys = event_graph.materialized_required_keys_by_strand(
-                    use,
-                    budget=budget,
-                )
-            except ValueError as error:
-                raise ClcCommandPlanUnavailable(str(error)) from error
-            for consumer_task, keys in enumerate(required_keys):
-                consumer = (use.consumer_root, consumer_task)
-                task_predecessors = predecessors[consumer]
-                previous_count = len(task_predecessors)
-                task_predecessors.update(
-                    producer
-                    for key in keys
-                    for producer in explicit_producers_by_key[key]
-                    if producer != consumer
-                )
-                budget.consume(
-                    len(task_predecessors) - previous_count,
-                    "expanding dense dependency edges",
-                )
-    return {
-        task: frozenset(task_predecessors)
-        for task, task_predecessors in predecessors.items()
-    }
-
-
-def _clc_flat_task_by_logical(
-    event_graph: EventGraph,
-    command_ranges: tuple[ClcCommandRange, ...],
-) -> dict[tuple[int, int], int]:
-    """Map logical tasks to their stable flattened physical task IDs."""
-    result: dict[tuple[int, int], int] = {}
-    for command_range in command_ranges:
-        traversal = event_graph.root_traversals[command_range.root]
-        for physical_task in range(command_range.task_count):
-            logical_tasks = traversal.targets(physical_task)
-            if len(logical_tasks) != 1:
-                raise ClcCommandPlanUnavailable(
-                    f"CLC root {command_range.root} traversal is not single-valued"
-                )
-            (logical_task,) = logical_tasks
-            key = (command_range.root, logical_task)
-            if key in result:
-                raise ClcCommandPlanUnavailable(
-                    f"CLC root {command_range.root} traversal repeats task "
-                    f"{logical_task}"
-                )
-            result[key] = command_range.begin + physical_task
-    return result
-
-
-def _clc_task_commands(
-    worker_schedule: WorkerSchedule,
-    tasks: tuple[tuple[int, int], ...],
-) -> tuple[ClcCommand, ...]:
-    """Make each explicit logical task independently schedulable."""
-    commands: list[ClcCommand] = []
-    for task in tasks:
-        placement = worker_schedule.placement(*task)
-        if placement is None:
-            raise ClcCommandPlanUnavailable(f"CLC task {task} has no worker placement")
-        worker, position = placement
-        commands.append(
-            ClcCommand(
-                worker=worker,
-                position_begin=position,
-                position_end=position + 1,
-                task=task,
-            )
-        )
-    return tuple(commands)
-
-
-def _topologically_order_clc_commands(
-    commands: tuple[ClcCommand, ...],
-    readiness: ReadinessPlan,
-    *,
-    max_edges: int | None = None,
-) -> tuple[ClcCommand, ...]:
-    """Rank commands through compact event-key nodes.
-
-    A counted event is a hyperedge from all contributors of one key to every
-    consumer of that key.  Keeping one zero-cost node per key avoids expanding
-    dense all-to-all dependencies while preserving exactly the same partial-
-    residency argument: a command is issued only after every predecessor
-    command has appeared earlier in the ticket stream.
-    """
-    budget = _ClcMaterializationBudget(max_edges)
-    task_location: dict[tuple[int, int], int] = {}
-    commands_by_worker: dict[int, list[int]] = {}
-    for command_index, command in enumerate(commands):
-        commands_by_worker.setdefault(command.worker, []).append(command_index)
-        if command.task in task_location:
-            raise AssertionError(
-                f"CLC task {command.task} appears in multiple commands"
-            )
-        task_location[command.task] = command_index
-
-    successors: list[set[int]] = [set() for _ in commands]
-    indegree = [0] * len(commands)
-    priorities: list[tuple[int, int, int, int]] = [
-        (1, command.position_begin, command.worker, command_index)
-        for command_index, command in enumerate(commands)
-    ]
-    def add_event_node(plan_index: int, key: int) -> int:
-        node = len(successors)
-        successors.append(set())
-        indegree.append(0)
-        # Event nodes have no work.  Process them before ready task nodes so
-        # their consumers enter the same ready frontier as with direct edges.
-        priorities.append((0, plan_index, key, node))
-        return node
-
-    def add_edge(producer: int, consumer: int) -> None:
-        if producer == consumer or consumer in successors[producer]:
-            return
-        successors[producer].add(consumer)
-        indegree[consumer] += 1
-        budget.consume(1, "building compact dependency edges")
-
-    for worker_commands in commands_by_worker.values():
-        worker_commands.sort(key=lambda index: commands[index].position_begin)
-        for producer, consumer in itertools.pairwise(worker_commands):
-            add_edge(producer, consumer)
-
-    event_graph = readiness.event_graph
-    local_predecessors = _clc_local_predecessors(
-        readiness,
-        budget=budget,
-    )
-    ancestor_cache: dict[tuple[int, int], frozenset[tuple[int, int]]] = {}
-    explicit_tasks = frozenset(task_location)
-    for plan_index, plan in enumerate(readiness.counted_events):
-        producers_by_key = _clc_contributor_tasks_by_key(
-            event_graph,
-            plan.contributors,
-            plan.key_count,
-            budget=budget,
-        )
-        consumers_by_key: list[set[tuple[int, int]]] = [
-            set() for _ in range(plan.key_count)
-        ]
-        for use in plan.uses:
-            try:
-                required_keys_by_task = (
-                    event_graph.materialized_required_keys_by_strand(
-                        use,
-                        budget=budget,
-                    )
-                )
-            except ValueError as error:
-                raise ClcCommandPlanUnavailable(str(error)) from error
-            for consumer_task, required_keys in enumerate(required_keys_by_task):
-                consumer = (use.consumer_root, consumer_task)
-                if consumer not in explicit_tasks:
-                    continue
-                for key in required_keys:
-                    consumers_by_key[key].add(consumer)
-
-        for key, consumers in enumerate(consumers_by_key):
-            if not consumers:
-                continue
-            event_node = add_event_node(plan_index, key)
-            for producer in producers_by_key[key]:
-                ancestors = _clc_explicit_ancestors(
-                    producer,
-                    explicit_tasks=explicit_tasks,
-                    local_predecessors=local_predecessors,
-                    cache=ancestor_cache,
-                    budget=budget,
-                )
-                if not ancestors:
-                    raise ClcCommandPlanUnavailable(
-                        f"CLC task {producer} has no explicit executor"
-                    )
-                for ancestor in ancestors:
-                    add_edge(task_location[ancestor], event_node)
-            for consumer in consumers:
-                add_edge(event_node, task_location[consumer])
-
-    ready = [
-        priorities[index] for index, degree in enumerate(indegree) if degree == 0
-    ]
-    heapq.heapify(ready)
-    ordered: list[ClcCommand] = []
-    while ready:
-        *_priority, node = heapq.heappop(ready)
-        if node < len(commands):
-            ordered.append(commands[node])
-        for successor in successors[node]:
-            indegree[successor] -= 1
-            if indegree[successor] == 0:
-                heapq.heappush(ready, priorities[successor])
-    if any(indegree):
-        raise ClcCommandPlanUnavailable("CLC command quotient contains a cycle")
-    if len(ordered) != len(commands):
-        raise AssertionError("CLC command order omitted an explicit task")
-    return tuple(ordered)
-
-
-def compact_ready_explicit_families(
-    readiness: ReadinessPlan,
-    worker_schedule: WorkerSchedule,
-    local_triggers: tuple[LocalTrigger, ...],
-) -> WorkerSchedule:
-    """Pack complete ready families into otherwise idle resident-worker slots.
-
-    This is a structural compaction of the validated task graph.  It does not
-    inspect operators or estimate their cost: a family is moved only when all
-    of its explicit predecessors are placed in earlier worker positions, the
-    complete family fits in one resident wave, and the resulting schedule is
-    still acyclic.  Occupied partial waves are preferred so the pass closes
-    holes instead of merely renumbering empty positions.
-    """
-    event_graph = readiness.event_graph
-    if sum(domain.size for domain in event_graph.root_domains) > (
-        _EXPLICIT_SCHEDULE_TASK_LIMIT
-    ):
-        return worker_schedule
-    local_roots = frozenset(
-        event_graph.event(trigger.event_index).uses[trigger.use_index].consumer_root
-        for trigger in local_triggers
-    )
-    nested_roots = frozenset(
-        root
-        for plan in readiness.counted_events
-        for root, scope_id in (
-            *((contribution.producer_root, contribution.producer_scope_id)
-              for contribution in plan.contributors),
-            *((use.consumer_root, use.consumer_scope_id) for use in plan.uses),
-        )
-        if scope_id is not None
-    )
-    command_ranges: list[ClcCommandRange] = []
-    task_begin = 0
-    for root, domain in enumerate(event_graph.root_domains):
-        if root not in local_roots:
-            command_ranges.append(
-                ClcCommandRange(
-                    root=root,
-                    begin=task_begin,
-                    end=task_begin + domain.size,
-                )
-            )
-        task_begin += domain.size
-    try:
-        predecessors = _clc_explicit_task_predecessors(
-            readiness,
-            tuple(command_ranges),
-            max_edges=_EXPLICIT_SCHEDULE_EDGE_LIMIT,
-        )
-    except ClcCommandPlanUnavailable:
-        return worker_schedule
-
-    result = worker_schedule
-    for root, domain in enumerate(event_graph.root_domains):
-        if (
-            root in local_roots
-            or root in nested_roots
-            or domain.size > result.worker_count
-        ):
-            continue
-        current_bounds = result.position_bounds_for_root(root)
-        if current_bounds is None:
-            continue
-        root_predecessors = frozenset(
-            predecessor
-            for task in range(domain.size)
-            for predecessor in predecessors[(root, task)]
-        )
-        if not root_predecessors or any(
-            producer_root == root for producer_root, _task in root_predecessors
-        ):
-            continue
-        predecessor_placements = tuple(
-            result.placement(*predecessor) for predecessor in root_predecessors
-        )
-        if any(placement is None for placement in predecessor_placements):
-            continue
-        ready_after = max(
-            placement[1]
-            for placement in predecessor_placements
-            if placement is not None
-        )
-        candidates: list[tuple[bool, int, WorkerSchedule]] = []
-        for position in range(ready_after + 1, current_bounds[0]):
-            occupied_count = sum(
-                result.task_at(worker, position) is not None
-                for worker in range(result.worker_count)
-            )
-            placements = _family_placements_at_position(
-                result,
-                root=root,
-                task_domain=domain,
-                task_traversal=event_graph.root_traversals[root],
-                position=position,
-                pack_high=0 < occupied_count < domain.size,
-            )
-            if not placements:
-                continue
-            candidates.append((occupied_count > 0, position, placements[0]))
-        if not candidates:
-            continue
-        occupied_candidates = tuple(
-            candidate for candidate in candidates if candidate[0]
-        )
-        ordered_candidates = sorted(
-            occupied_candidates or tuple(candidates),
-            key=lambda candidate: candidate[1],
-            reverse=bool(occupied_candidates),
-        )
-        for _occupied, _position, candidate in ordered_candidates:
-            try:
-                validate_worker_schedule(
-                    event_graph,
-                    candidate,
-                    local_triggers,
-                )
-            except ValueError:
-                continue
-            result = candidate
-            break
-    return result
 
 
 def _validate_schedule_coverage(

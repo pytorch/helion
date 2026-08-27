@@ -428,6 +428,8 @@ qwen3_layer_tile_dependency, GENERATED_SOURCE = _build_composite_kernel()
 def _probe_matched_config(bound, args):
     """Map the winning Triton probe's arithmetic geometry onto Helion IDs."""
     values = dict(bound.config_spec.default_config())
+    values["indexing"] = ["pointer"] * len(values["indexing"])
+    values["atomic_indexing"] = ["pointer"] * len(values["atomic_indexing"])
     block_size_by_id = {
         1: 128,  # collaborative prefix reduction chunk
         2: 1,  # one prefix quant group per logical task

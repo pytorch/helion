@@ -1337,9 +1337,6 @@ def _config(bound, args):
                 strict=True,
             )
         ]
-        if args.source_mode == "grouped_task_major" and args.group_use_tma:
-            for index in (28, 30):
-                values["indexing"][index] = "tensor_descriptor"
         if values.get("static_ranges"):
             values["static_ranges"] = root_configs[2]["static_ranges"]
     elif args.config_mode == "matched":
@@ -1424,15 +1421,23 @@ def _config(bound, args):
             args.gate_l2_grouping,
             args.down_l2_grouping,
         ]
+    # This probe evaluates the pointer-indexed CLC variant. Grouped-TMA
+    # experiments may opt selected operations back into descriptors.
+    values["indexing"] = ["pointer"] * len(values["indexing"])
+    values["atomic_indexing"] = ["pointer"] * len(values["atomic_indexing"])
+    if args.source_mode == "grouped_task_major" and args.group_use_tma:
+        for index in (28, 30):
+            values["indexing"][index] = "tensor_descriptor"
     values.update(
         {
             "pid_type": "persistent_blocked",
             "num_sm_multiplier": args.worker_multiplier,
             "num_warps": args.num_warps,
             "num_stages": args.kernel_stages,
-            "cross_loop_num_workers": args.workers,
         }
     )
+    if args.workers:
+        values["cross_loop_num_workers"] = args.workers
     if args.maxnreg is not None:
         values["maxnreg"] = args.maxnreg
     if args.disable_warp_specialize:

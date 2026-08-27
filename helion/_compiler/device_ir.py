@@ -53,7 +53,6 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_read_writes import ReadWrites
 from .compile_environment import CompileEnvironment
-from .compile_environment import FixedBlockSizeSource
 from .host_function import HostFunction
 from .indexing_strategy import subscript_index_scale
 from .indexing_strategy import subscript_tile_info
@@ -92,6 +91,7 @@ if TYPE_CHECKING:
     from ..autotuner.config_spec import ConfigSpec
     from ..autotuner.config_spec import MemoryOpFact
     from .cute.layout import CuTeGridExecutionPlan
+    from .tile_dependency import ExecutionScope
     from .tile_dependency import TaskFamily
     from .tile_dependency import TileAccess
     from .tile_dependency import TileDependencyGraph
@@ -3545,6 +3545,8 @@ def _graph_peak_live_tiles(
 
 def _collect_memory_op_facts(
     device_ir: DeviceIR,
+    *,
+    execution_scopes: tuple[ExecutionScope, ...] | None = None,
 ) -> tuple[list[MemoryOpFact], dict[int, int], tuple[TileAccess, ...]]:
     """Walk every device graph once and record per-load/store metadata.
 
@@ -3568,7 +3570,8 @@ def _collect_memory_op_facts(
     from ..language.atomic_ops import ATOMIC_OPS
     from .inductor_lowering import ReductionLowering
     from .tile_dependency import TileAccess
-    from .tile_dependency import owner_root_by_graph_id
+    from .tile_dependency import build_execution_scopes
+    from .tile_dependency import execution_scopes_by_graph_id
 
     load_op = memory_ops.load
     store_op = memory_ops.store
@@ -3582,11 +3585,21 @@ def _collect_memory_op_facts(
     records: list[tuple[torch.fx.Node, MemoryOpFact]] = []
     tile_accesses: list[TileAccess] = []
     memory_op_index = 0
+    atomic_op_index = 0
     cross_loop_access_id = 0
     eviction_index = 0
     liveness_by_axis: dict[int, int] = {}
     collect_tile_accesses = len(device_ir.root_ids) > 1
-    graph_owners = owner_root_by_graph_id(device_ir) if collect_tile_accesses else ()
+    if collect_tile_accesses and execution_scopes is None:
+        execution_scopes = build_execution_scopes(device_ir)
+    graph_scopes = (
+        execution_scopes_by_graph_id(
+            device_ir,
+            execution_scopes=execution_scopes,
+        )
+        if collect_tile_accesses
+        else ()
+    )
     allocation_ids: dict[int, int] = {}
 
     for graph_info in device_ir.graphs:
@@ -3780,44 +3793,63 @@ def _collect_memory_op_facts(
 
             tensor_name = origin.root_rw_name() if origin else None
             if collect_tile_accesses:
-                owner_root = (
-                    graph_owners[graph_info.graph_id]
-                    if graph_info.graph_id < len(graph_owners)
-                    else -1
+                owner_scopes = (
+                    graph_scopes[graph_info.graph_id]
+                    if graph_info.graph_id < len(graph_scopes)
+                    else ()
                 )
+                if len(owner_scopes) > 1:
+                    raise exc.CrossLoopSchedulingError(
+                        f"DeviceIR graph {graph_info.graph_id} containing a memory "
+                        "access is reused by multiple execution scopes "
+                        f"{[(scope.scope_id, scope.root) for scope in owner_scopes]}; "
+                        "cross-loop dependency analysis "
+                        "requires callsite-specialized access facts"
+                    )
                 has_explicit_mask = (
                     not is_atomic
                     and len(node.args) > (2 if is_load else 3)
                     and node.args[2 if is_load else 3] is not None
                 )
-                tile_accesses.append(
-                    TileAccess(
-                        access_id=cross_loop_access_id,
-                        memory_op_index=memory_op_index if not is_atomic else -1,
-                        graph_id=graph_info.graph_id,
-                        root=owner_root,
-                        allocation_id=allocation_id,
-                        kind="load" if is_load else "store",
-                        tensor_name=tensor_name,
-                        tensor_shape=tensor_shape,
-                        tensor_strides=tensor_strides,
-                        storage_offset=storage_offset,
-                        subscript_dims=tile_subscript_dims,
-                        subscript_affine_block_ids=tile_subscript_affine_block_ids,
-                        subscript_index_scales=tile_subscript_index_scales,
-                        subscript_offsets=tile_subscript_offsets,
-                        subscript_is_scalar=tile_subscript_is_scalar,
-                        has_explicit_mask=has_explicit_mask,
-                        subscript_is_full_slice=tile_subscript_is_full_slice,
-                        subscript_static_extents=tile_subscript_static_extents,
-                        is_atomic=is_atomic,
-                        layout_is_static=layout_is_static,
-                        graph_node_index=graph_node_index,
+                if owner_scopes:
+                    (owner_scope,) = owner_scopes
+                    tile_accesses.append(
+                        TileAccess(
+                            access_id=cross_loop_access_id,
+                            memory_op_index=(
+                                memory_op_index if not is_atomic else -1
+                            ),
+                            atomic_op_index=(atomic_op_index if is_atomic else -1),
+                            graph_id=graph_info.graph_id,
+                            scope_id=owner_scope.scope_id,
+                            root=owner_scope.root,
+                            allocation_id=allocation_id,
+                            kind="load" if is_load else "store",
+                            tensor_name=tensor_name,
+                            tensor_shape=tensor_shape,
+                            tensor_strides=tensor_strides,
+                            storage_offset=storage_offset,
+                            subscript_dims=tile_subscript_dims,
+                            subscript_affine_block_ids=(
+                                tile_subscript_affine_block_ids
+                            ),
+                            subscript_index_scales=tile_subscript_index_scales,
+                            subscript_offsets=tile_subscript_offsets,
+                            subscript_is_scalar=tile_subscript_is_scalar,
+                            has_explicit_mask=has_explicit_mask,
+                            subscript_is_full_slice=tile_subscript_is_full_slice,
+                            subscript_static_extents=(
+                                tile_subscript_static_extents
+                            ),
+                            is_atomic=is_atomic,
+                            layout_is_static=layout_is_static,
+                            graph_node_index=graph_node_index,
+                        )
                     )
-                )
-                cross_loop_access_id += 1
+                    cross_loop_access_id += 1
 
             if is_atomic:
+                atomic_op_index += 1
                 continue
 
             records.append(
@@ -4091,26 +4123,6 @@ def _install_dependency_phases(
             graph_info.phase_index = phase_index
 
 
-def _maximum_axis_task_count(config_spec: ConfigSpec, block_id: int) -> int:
-    """Upper-bound one axis's task count across its legal block sizes."""
-    env = CompileEnvironment.current()
-    block_info = env.block_sizes[block_id]
-    try:
-        block_spec = config_spec.block_sizes.block_id_lookup(
-            env.canonical_block_id(block_id)
-        )
-        minimum_block = block_spec.min_size
-    except KeyError:
-        source = block_info.block_size_source
-        minimum_block = (
-            env.size_hint(source.value)
-            if isinstance(source, FixedBlockSizeSource)
-            else 1
-        )
-    extent = block_info.size_hint()
-    return (extent + minimum_block - 1) // minimum_block
-
-
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:
     device_ir = DeviceIR()
     device_ir.host_function = func
@@ -4330,15 +4342,25 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         )
                 config_spec.allowed_pid_types = non_persistent_pid_types
 
+        from .tile_dependency import build_execution_scopes
+        from .tile_dependency import build_tile_dependency_graph
+
+        execution_scopes = (
+            build_execution_scopes(device_ir)
+            if len(device_ir.task_families) > 1
+            else ()
+        )
         # Collect per-load/store metadata once so heuristics can map each Config.indexing slot to its
         # graph op; the same pass returns the reduction-body liveness (per-axis peak live tiles).
         (
             memory_op_facts,
             liveness_by_axis,
             tile_accesses,
-        ) = _collect_memory_op_facts(device_ir)
+        ) = _collect_memory_op_facts(
+            device_ir,
+            execution_scopes=execution_scopes,
+        )
         config_spec.memory_op_facts = memory_op_facts
-        from .tile_dependency import build_tile_dependency_graph
 
         if len(device_ir.task_families) > 1:
             device_ir.tile_dependency_graph = build_tile_dependency_graph(
@@ -4349,6 +4371,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 noncanonical_task_origin_block_ids=frozenset(
                     device_ir.noncanonical_task_origin_block_ids
                 ),
+                execution_scopes=execution_scopes,
             )
             _install_dependency_phases(
                 device_ir,
@@ -4361,25 +4384,17 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 from .cross_loop_scheduler import CROSS_LOOP_NUM_WORKERS_CONFIG
                 from .cross_loop_scheduler import CROSS_LOOP_NUM_WORKERS_DEFAULT
 
-                max_worker_count = max(
-                    (
-                        math.prod(
-                            _maximum_axis_task_count(config_spec, block_id)
-                            for block_id in family.logical_axis_order
-                        )
-                        for family in device_ir.task_families
-                    ),
-                    default=1,
-                )
                 if CROSS_LOOP_NUM_WORKERS_CONFIG in config_spec.user_defined_tunables:
                     raise exc.CrossLoopSchedulingError(
                         f"{CROSS_LOOP_NUM_WORKERS_CONFIG!r} is reserved for "
                         "compiler-derived cross-loop scheduling"
                     )
+                # Keep exact worker counts available as a manual diagnostic
+                # override without creating a second automatic search axis.
                 config_spec.user_defined_tunables[CROSS_LOOP_NUM_WORKERS_CONFIG] = (
                     IntegerFragment(
                         0,
-                        max_worker_count,
+                        0,
                         default_val=CROSS_LOOP_NUM_WORKERS_DEFAULT,
                     )
                 )

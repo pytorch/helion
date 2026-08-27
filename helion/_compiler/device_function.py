@@ -374,11 +374,6 @@ class DeviceFunction:
         # once per kernel/device/stream and appends it to the kernel arguments.
         self.triton_persistent_state_args: list[str] = []
         self.triton_persistent_state_specs: list[tuple[str, str, str]] = []
-        # Immutable compiler data materialized once on the launch device.  CLC
-        # uses this for its command tables; unlike mutable event/cursor
-        # state, the same buffer is safe to share across streams.
-        self.triton_constant_buffer_args: list[str] = []
-        self.triton_constant_buffer_specs: list[tuple[str, tuple[int, ...], str]] = []
         # Cross-grid polling is deadlock-free only when the schedule's required
         # worker cohort can be resident together.  The launcher validates this
         # after Triton has produced exact register/shared-memory metadata.
@@ -393,6 +388,10 @@ class DeviceFunction:
         # emitted kernel rather than the requested config because unsupported
         # shapes may fall back to a non-CLC cooperative schedule.
         self.triton_uses_clc = False
+        # Machine-readable launch diagnostics distinguish an emitted CLC plan
+        # from a safe static fallback without changing fallback semantics.
+        self.triton_cross_loop_dispatch_kind: str | None = None
+        self.triton_cross_loop_fallback_reason: str | None = None
         # Opaque tile bodies can be outlined behind Triton helper boundaries.
         # Most helpers are inlined; selected scheduling regions remain
         # ``noinline`` to bound register lifetimes in the fused kernel.
@@ -957,7 +956,6 @@ class DeviceFunction:
         # of which descriptor kind the kernel encounters first.
         remote_copy_params = set(self.triton_remote_copy_scratch_args)
         remote_copy_params.update(self.triton_persistent_state_args)
-        remote_copy_params.update(self.triton_constant_buffer_args)
         if self.triton_remote_copy_signal_arg is not None:
             remote_copy_params.add(self.triton_remote_copy_signal_arg)
         if self.triton_remote_barrier_signal_arg is not None:
@@ -971,7 +969,6 @@ class DeviceFunction:
             wrapper_only_params.append(self.triton_remote_barrier_signal_arg)
         wrapper_only_params.extend(self.triton_remote_copy_scratch_args)
         wrapper_only_params.extend(self.triton_persistent_state_args)
-        wrapper_only_params.extend(self.triton_constant_buffer_args)
         args.extend(create_arg(name) for name in wrapper_only_params)
 
         # Generate inlined constexpr assignments at module level

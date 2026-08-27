@@ -8,9 +8,10 @@ completed.
 
 The scheduler should:
 
-- Make the Qwen3 layer megakernel faster than the equivalent separate kernels.
-  The current target is approximately 74 microseconds versus approximately 80
-  microseconds for the separate-kernel baseline.
+- Emit one persistent megakernel and beat the equivalent standalone Helion
+  CUDA Graph on representative whole-layer and MoE workloads where fusion has
+  enough work to amortize dispatch. Quantify, rather than hide, the remaining
+  fixed overhead on very small graphs such as Qwen3 FFN.
 - Be correct for broader shapes, batch sizes, loop grids, indexing layouts, and
   producer/consumer topologies without recognizing Qwen-specific source shapes.
 - Preserve each root's existing code generation. Cross-loop scheduling may add
@@ -21,12 +22,130 @@ The scheduler should:
 - Become simpler by deriving scheduling from producer and consumer accesses,
   rather than accumulating topology matchers and exceptional cases.
 
-## Authoritative target architecture (2026-08-25)
+## Current CLC roadmap (2026-08-26)
 
-This section is the current design contract. All other descriptions of
-separate root-task, ordered-action, access-cohort, readiness-frontier, or
-counted-event IRs in this document are implementation history and do not
-define the target.
+The active implementation target is one persistent Triton megakernel driven by
+symbolic CLC command ranges. `TileDependencyGraph`, its `ReadinessPlan`, and the
+canonical `WorkerSchedule` are the only dependency and scheduling authorities.
+CLC does not rebuild a task-level dependency graph. It orders complete root
+families by their first canonical worker placement, preserves each root's
+symbolic task permutation, and checks that the resulting root order respects
+the existing readiness relations. Each physical CTA claims commands from a
+stream-local monotonic ticket cursor while a cancellation request is in flight.
+The ticket epoch preserves the existing no-reset counted-event protocol across
+stream-serialized CUDA Graph replays. Nested local continuations execute inline
+on the final-arriving producer CTA.
+
+Current constraints and fallbacks:
+
+- CLC is selected only on SM100+ Triton configurations with pointer indexing
+  and one-CTA clusters. Descriptor configurations retain the ordinary static
+  persistent lowering; the compiler does not silently rewrite the user's
+  indexing choice.
+- A schedule whose canonical task permutation cannot be represented by compact
+  relations retains the same single persistent megakernel and dependency
+  schedule but uses its static dispatcher. The generated launcher records the
+  dispatch kind and structural fallback reason.
+- Mutable cursor/event state is stream-local. CUDA Graph instances captured on
+  the same stream retain the same state pointers and must be replayed in serial;
+  independent streams receive independent state.
+- A memory-bearing graph reached from more than one static callsite is rejected
+  until access facts become callsite-specialized. Duplicating a graph-global
+  access would be unsound when callsite arguments differ, even if both
+  callsites belong to the same top-level root.
+- There is no model-specific region scheduler, cost-based grouping, cyclic
+  strand fast path, or second tile-dependency execution engine. CLC and static
+  dispatch lower the same canonical dependency schedule inside one megakernel.
+
+Pre-simplification benchmark checkpoint (B200, CUDA Graph replay, cold L2 before
+every observation):
+
+| Workload | CLC megakernel | Separate Helion | Status |
+| --- | ---: | ---: | --- |
+| Qwen3 FFN | 49.20 us | 48.05 us | Small fixed CLC/ticket overhead remains. |
+| Qwen3 whole layer, granular source | 96.29 us | 100.37 us | Faster than separate with the tuned worker cohort. |
+| Gemma4 A4B MoE | 53.20 us | 53.06 us | At parity with the existing `num_sm_multiplier=8`. |
+| DeepSeek V3 MoE | 147.50 us | 151.55 us | Faster than separate; 4 and 8 are equivalent. |
+| Nemotron MoE, original routing form | 106.27 us | 51.28 us | CLC improves static pointer dispatch (127.17 us), but fusion is resource-heavy. |
+| Nemotron MoE, iterative routing form | 85.49 us | 51.50 us | Best generic source form so far; 136-138 registers, no spills. |
+
+Nemotron's 592-worker setting (four CTAs per SM) is the best measured resident
+cohort. One, two, and three CTAs per SM measured roughly 182, 118, and 96 us;
+five CTAs per SM measured roughly 88 us. This rules out a simple worker-count
+problem. The iterative routing source reduces the fused register envelope from
+255 registers with six spills to about 138 registers without changing compiler
+scheduling policy.
+
+A cold-L2 Qwen FFN sweep over one through eight CTA cohorts per SM measured
+approximately 155.63, 86.05, 73.76, 55.36, 57.34, 55.30, 50.29, and 53.31 us.
+Seven CTAs per SM is the clear scheduling optimum in that sweep, while its
+remaining roughly 1 us gap to the separate graph is fixed CLC/dispatch overhead
+rather than a missed worker-count choice. `num_sm_multiplier` retains its
+existing power-of-two behavior. `cross_loop_num_workers` remains a manual
+exact-count diagnostic override and does not create a second autotuning
+dimension; the Qwen probes use it to request their measured seven-CTA-per-SM
+cohort without changing the general multiplier contract.
+
+The command-table experiment has now been superseded. The compiler emits the
+same command order through compact symbolic ranges and no longer allocates an
+immutable GPU command buffer. Fusing CLC initialization with the first
+cancellation request was neutral on
+  Qwen FFN, modestly positive on Nemotron, and did not recover A4B. The simpler
+  established request protocol is retained pending a broader backend design.
+
+Structural comparison against the saved command-table lowerings shows exact
+`(root, physical task)` sequence equality for Qwen3 FFN (2,048 commands), the
+whole Qwen3 layer (4,992), Gemma4 A4B MoE (774), and DeepSeek V3 MoE (4,477).
+Their scheduled task-body ASTs and synchronization-site counts are unchanged;
+the generated source is one line shorter because the constant-buffer launch
+argument disappeared.
+
+Hardening status:
+
+- [x] Exercise repeated and independent serialized CUDA Graph replays plus
+  distinct-stream state ownership.
+- [x] Serialize compiler-owned state allocation and mutable launch metadata;
+  preserve and restore cached residency targets under the launch lock.
+- [x] Reject first-time state or residency setup during graph capture while
+  retaining capture-safe reuse after warmup.
+- [x] Add direct regression coverage for shared graph ownership and the
+  observable descriptor/static fallback diagnostic.
+- [x] Test symbolic command-range coverage over randomized forward DAGs and
+  preserve each root's canonical worker-schedule permutation.
+- [x] Exercise a command stream larger than the resident worker cohort over 256
+  back-to-back same-stream graph replays without host synchronization.
+- [x] Remove the duplicate CLC task/event dependency projection and all three
+  arbitrary planner budgets.
+- [x] Re-run the priority cold-L2 matrix and focused compiler/runtime tests.
+- [x] Complete the final generality review and focused repository checks.
+- [x] Preserve the existing `num_sm_multiplier` contract and keep exact
+  non-power-of-two worker cohorts confined to the manual scheduler override.
+- [ ] Run repository lint/type checks when the development environment includes
+  its declared `ruff` and `pyrefly` tools.
+
+The whole-layer result above uses
+`helion_qwen3_granular_tile_dependency.py`, whose 15 roots preserve the useful
+resource partitioning of the standalone kernels. The coarser 12-root composite
+currently compiles to 255 registers with 340 spills and takes about 168 us; it
+is a source/resource-shape diagnostic, not evidence for a second scheduling
+policy.
+
+The next optimization target is the generic fixed overhead of command claiming
+and dispatch on small plans. The existing multiplier remains unchanged; exact
+worker cohorts are retained only as an explicit scheduling diagnostic.
+Nemotron remains a fused body lifetime/resource problem rather than a
+command-order problem; any source partitioning work must remain independent of
+model names and operator patterns.
+Descriptor-capable CLC, dynamic root domains, multi-CTA clusters, and reentrant
+same-state graph execution stay deferred until a workload requires them.
+
+## Archived pre-CLC architecture notes (2026-08-25)
+
+Everything below this heading records the design path that produced the
+canonical dependency/event/worker analyses. It is retained as rationale, but
+the current CLC roadmap above is normative where the two differ. The CLC
+backend now follows the same rule as the static scheduler: task order remains a
+compact symbolic relation rather than a flattened command table.
 
 The compiler should have one coordinate model and one relation algebra:
 

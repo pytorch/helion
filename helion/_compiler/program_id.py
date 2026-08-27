@@ -385,6 +385,7 @@ if TYPE_CHECKING:
     from .cute.cute_mma import _Tcgen05SchedPipelinePlan
     from .cute.device_state import CuteTcgen05MatmulPlan
     from .inductor_lowering import CodegenState
+    from .tile_dependency import TileAccess
 
 NUM_SM_VAR = "_NUM_SM"
 NUM_XCD_VAR = "_NUM_XCDS"
@@ -765,20 +766,30 @@ class ForEachProgramID(ProgramIDs):
         dependency_plan = HostFunction.current().device_ir.tile_dependency_graph
         assert dependency_plan is not None
         indexing = device_function.config.get("indexing", ())
+        atomic_indexing = device_function.config.get("atomic_indexing", ())
 
-        def uses_tensor_descriptor(memory_op_index: int) -> bool:
-            if isinstance(indexing, str):
-                return indexing == "tensor_descriptor"
+        def configured_as_tensor_descriptor(
+            indexing_config: object,
+            operation_index: int,
+        ) -> bool:
+            if isinstance(indexing_config, str):
+                return indexing_config == "tensor_descriptor"
             return (
-                isinstance(indexing, (list, tuple))
-                and 0 <= memory_op_index < len(indexing)
-                and indexing[memory_op_index] == "tensor_descriptor"
+                isinstance(indexing_config, (list, tuple))
+                and 0 <= operation_index < len(indexing_config)
+                and indexing_config[operation_index] == "tensor_descriptor"
+            )
+
+        def access_uses_tensor_descriptor(access: TileAccess) -> bool:
+            return configured_as_tensor_descriptor(
+                atomic_indexing if access.is_atomic else indexing,
+                access.atomic_op_index if access.is_atomic else access.memory_op_index,
             )
 
         unpublishable_scope_ids = frozenset(
             scope_id
             for access in dependency_plan.accesses
-            if access.kind == "store" and uses_tensor_descriptor(access.memory_op_index)
+            if access.kind == "store" and access_uses_tensor_descriptor(access)
             for scope_id in dependency_plan.scope_ids_by_access[access.access_id]
         )
         publishable_scope_ids = (
@@ -833,29 +844,40 @@ class ForEachProgramID(ProgramIDs):
             publishable_scope_ids=publishable_scope_ids,
         )
         cross_loop_schedule: CrossLoopSchedule | ClcCommandPlan = base_schedule
-        clc_backend_supported = (
-            CompileEnvironment.current().config_spec.automatic_clc_dispatch
-        )
-        indexing = device_function.config.get("indexing", ())
-        uses_tensor_descriptors = (
+        uses_tensor_descriptors = any(
             indexing == "tensor_descriptor"
             or isinstance(indexing, (list, tuple))
             and "tensor_descriptor" in indexing
-        )
-        if clc_backend_supported and uses_tensor_descriptors:
-            raise AssertionError(
-                "automatic CLC dispatch must normalize tensor descriptors to pointers"
+            for indexing in (
+                device_function.config.get("indexing", ()),
+                device_function.config.get("atomic_indexing", ()),
             )
+        )
+        clc_backend_supported = (
+            CompileEnvironment.current().config_spec.automatic_clc_dispatch
+            and not uses_tensor_descriptors
+        )
+        clc_fallback_reason: str | None = None
         if clc_backend_supported:
             try:
                 clc_plan = build_clc_command_plan(base_schedule)
-            except ClcCommandPlanUnavailable:
-                pass
+            except ClcCommandPlanUnavailable as error:
+                clc_fallback_reason = f"command_plan_unavailable: {error}"
             else:
                 if clc_plan.uses_cancellation:
                     cross_loop_schedule = clc_plan
                     device_function.triton_uses_clc = True
+                else:
+                    clc_fallback_reason = "no_cancellable_launch_tokens"
+        elif uses_tensor_descriptors:
+            clc_fallback_reason = "tensor_descriptor_indexing"
+        else:
+            clc_fallback_reason = "clc_backend_unavailable"
         is_clc = isinstance(cross_loop_schedule, ClcCommandPlan)
+        device_function.triton_cross_loop_dispatch_kind = (
+            "clc" if is_clc else "static"
+        )
+        device_function.triton_cross_loop_fallback_reason = clc_fallback_reason
         root_completion_edges = (
             set() if is_clc else set(cross_loop_schedule.root_completion_edges)
         )
@@ -2112,21 +2134,25 @@ class ForEachProgramID(ProgramIDs):
             )
             command_count = clc_plan.command_count
 
-            flat_physical_task = device_function.new_var(
-                "tile_dependency_clc_flat_physical_task", dce=True
-            )
-            command_tasks_arg = self._register_cross_loop_constant(
-                device_function,
-                name_hint="tile_dependency_clc_command_tasks",
-                values=clc_plan.task_order,
-                dtype=torch.uint32,
-            )
-            dispatch_flat_physical_task: list[ast.stmt] = []
+            dispatch_command_index: list[ast.stmt] = []
             for command_range in reversed(clc_plan.command_ranges):
                 root = command_range.root
                 root_ordinal = device_function.new_var(
                     f"tile_dependency_clc_root_{root}_task", dce=True
                 )
+                local_command = f"({command_index}) - {command_range.begin}"
+                physical_task, membership = relation_flat_target(
+                    command_range.physical_tasks,
+                    flat_task_coordinates(
+                        local_command,
+                        command_range.physical_tasks.source_domain.axis_order,
+                        command_range.physical_tasks.source_domain.axis_counts,
+                    ),
+                )
+                if membership != "True":
+                    raise AssertionError(
+                        "CLC command range must map every command to one physical task"
+                    )
                 root_body = task_scheduled_body(
                     root,
                     root_ordinal,
@@ -2134,42 +2160,32 @@ class ForEachProgramID(ProgramIDs):
                     (root_ordinal, epoch_var),
                     force_noinline=True,
                 )
-                dispatch_flat_physical_task = [
+                dispatch_command_index = [
                     create(
                         ast.If,
                         test=expr_from_string(
-                            f"{flat_physical_task} >= {command_range.begin} and "
-                            f"{flat_physical_task} < {command_range.end}"
+                            f"{command_index} >= {command_range.begin} and "
+                            f"{command_index} < {command_range.end}"
                         ),
                         body=cast(
                             "list[ast.stmt]",
                             [
                                 statement_from_string(
-                                    f"{root_ordinal} = ({flat_physical_task}) - "
-                                    f"{command_range.begin}"
+                                    f"{root_ordinal} = tl.cast({physical_task}, tl.int32)"
                                 ),
                                 *_clone_ast_value(root_body),
                             ],
                         ),
-                        orelse=dispatch_flat_physical_task,
+                        orelse=dispatch_command_index,
                     )
                 ]
             task_dispatch_call = self._outline_cross_loop_region(
                 device_function,
                 name_hint="tile_dependency_clc_task",
-                body=dispatch_flat_physical_task,
-                extra_argument_names=(flat_physical_task, epoch_var),
+                body=dispatch_command_index,
+                extra_argument_names=(command_index, epoch_var),
                 noinline=False,
             )
-
-            def dispatch_command(token: str) -> list[ast.stmt]:
-                return [
-                    statement_from_string(
-                        f"{flat_physical_task} = tl.cast("
-                        f"tl.load({command_tasks_arg} + ({token})), tl.int32)"
-                    ),
-                    _clone_stmt(task_dispatch_call),
-                ]
 
             epoch_u64 = device_function.new_var(
                 "tile_dependency_clc_epoch_u64", dce=False
@@ -2226,7 +2242,7 @@ class ForEachProgramID(ProgramIDs):
                         f"{command_index} = tl.cast("
                         f"{ticket} % {command_count}, tl.int32)"
                     ),
-                    *dispatch_command(command_index),
+                    _clone_stmt(task_dispatch_call),
                 ]
 
             result.extend(
@@ -2683,28 +2699,6 @@ class ForEachProgramID(ProgramIDs):
         device_function.triton_persistent_state_args.append(name)
         device_function.triton_persistent_state_specs.append(
             (like.host_str(), numel, str(dtype))
-        )
-        return name
-
-    @staticmethod
-    def _register_cross_loop_constant(
-        device_function: DeviceFunction,
-        *,
-        name_hint: str,
-        values: tuple[int, ...],
-        dtype: torch.dtype,
-    ) -> str:
-        """Register immutable compiler data as one hidden launch argument."""
-        like = next(
-            argument
-            for argument in device_function.arguments
-            if isinstance(argument, TensorArg) and argument._host_str is not None
-        )
-        name = device_function.new_var(name_hint, dce=False)
-        device_function.wrapper_only_params.append(name)
-        device_function.triton_constant_buffer_args.append(name)
-        device_function.triton_constant_buffer_specs.append(
-            (like.host_str(), values, str(dtype))
         )
         return name
 

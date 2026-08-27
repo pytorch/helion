@@ -108,9 +108,9 @@ class Config(Mapping[str, object]):
                 "flat", "persistent_blocked", and "persistent_interleaved"; composes with
                 ``l2_groupings``.
             cross_loop_num_workers: Target number of persistent workers used by
-                the cross-loop scheduler. The compiler snaps positive values to
-                complete event-key boundaries; ``0`` selects the ordinary
-                persistent grid.
+                the cross-loop scheduler. This is a manual diagnostic override;
+                ``0`` selects the ordinary persistent grid derived from
+                ``num_sm_multiplier``.
             **kwargs: Additional user-defined configuration parameters.
         """
         self.config = {}

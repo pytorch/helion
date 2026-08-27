@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import math
+import random
 from typing import Literal
 from unittest import mock
 
@@ -10,9 +11,9 @@ import sympy
 import torch
 
 import helion
+from helion import exc
 from helion._compiler.cross_loop_scheduler import CROSS_LOOP_NUM_WORKERS_CONFIG
 from helion._compiler.cross_loop_scheduler import ClcCommandPlan
-from helion._compiler.cross_loop_scheduler import ClcCommandPlanUnavailable
 from helion._compiler.cross_loop_scheduler import CountedEventPlan
 from helion._compiler.cross_loop_scheduler import EventContribution
 from helion._compiler.cross_loop_scheduler import EventGraph
@@ -20,7 +21,6 @@ from helion._compiler.cross_loop_scheduler import EventUse
 from helion._compiler.cross_loop_scheduler import KeyedEvent
 from helion._compiler.cross_loop_scheduler import WorkerSchedule
 from helion._compiler.cross_loop_scheduler import WorkerScheduleSegment
-from helion._compiler.cross_loop_scheduler import _clc_explicit_task_predecessors
 from helion._compiler.cross_loop_scheduler import _segmented_scope_event
 from helion._compiler.cross_loop_scheduler import _select_root_completion_edges
 from helion._compiler.cross_loop_scheduler import (
@@ -41,6 +41,8 @@ from helion._compiler.cross_loop_scheduler import derive_local_triggers
 from helion._compiler.cross_loop_scheduler import order_local_contributors_by_key
 from helion._compiler.cross_loop_scheduler import place_nested_scope_consumers
 from helion._compiler.cross_loop_scheduler import validate_worker_schedule
+from helion._compiler.device_ir import DeviceIR
+from helion._compiler.device_ir import _collect_memory_op_facts
 from helion._compiler.program_id import _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
 from helion._compiler.tile_dependency import AllocationRegion
 from helion._compiler.tile_dependency import ExecutionScope
@@ -54,6 +56,7 @@ from helion._compiler.tile_dependency import TileDependencyGraph
 from helion._compiler.tile_dependency import _LogicalRelationPiece
 from helion._compiler.tile_dependency import allocation_regions_may_overlap
 from helion._compiler.tile_dependency import build_tile_dependency_graph
+from helion._compiler.tile_dependency import execution_scopes_by_graph_id
 from helion._compiler.tile_dependency import instantiate_root_domains
 from helion._compiler.tile_dependency import instantiate_symbolic_dependencies
 from helion._compiler.tile_dependency import logical_axis_symbol
@@ -63,10 +66,12 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion.autotuner.config_fragment import IntegerFragment
 import helion.language as hl
+from helion.language import memory_ops
 
 
 @dataclasses.dataclass(frozen=True)
@@ -643,7 +648,9 @@ def _access(
     return TileAccess(
         access_id=access_id,
         memory_op_index=access_id,
+        atomic_op_index=-1,
         graph_id=root,
+        scope_id=None,
         root=root,
         allocation_id=allocation_id,
         kind=kind,
@@ -847,41 +854,66 @@ def build_clc_command_plan(*, task_families, **kwargs):
     return _build_clc_command_plan(schedule)
 
 
-def assert_valid_clc_command_quotient(
+def assert_valid_clc_command_ranges(
     testcase: TestCase,
     plan: ClcCommandPlan,
 ) -> None:
-    """Check that commands partition and topologically quotient the schedule."""
-    explicit_tasks = {
-        (command_range.root, task)
-        for command_range in plan.command_ranges
-        for task in range(command_range.task_count)
-    }
-    commanded_tasks = [command.task for command in plan.commands]
-    testcase.assertEqual(len(commanded_tasks), len(set(commanded_tasks)))
-    testcase.assertEqual(set(commanded_tasks), explicit_tasks)
-
-    task_location = {
-        command.task: command_rank
-        for command_rank, command in enumerate(plan.commands)
-    }
-    for command in plan.commands:
-        placement = plan.base_schedule.worker_schedule.placement(*command.task)
-        testcase.assertIsNotNone(placement)
-        assert placement is not None
-        testcase.assertEqual(placement[0], command.worker)
-        testcase.assertEqual(command.position_begin, placement[1])
-        testcase.assertEqual(command.position_end, placement[1] + 1)
-
-    predecessors = _clc_explicit_task_predecessors(
-        plan.readiness,
-        plan.command_ranges,
+    """Check source-root ranges and their symbolic physical permutations."""
+    testcase.assertEqual(
+        tuple(command_range.begin for command_range in plan.command_ranges),
+        tuple(
+            sum(previous.task_count for previous in plan.command_ranges[:index])
+            for index in range(len(plan.command_ranges))
+        ),
     )
-    for consumer, producer_tasks in predecessors.items():
-        consumer_command = task_location[consumer]
-        for producer in producer_tasks:
-            producer_command = task_location[producer]
-            testcase.assertLess(producer_command, consumer_command)
+    explicit_roots = tuple(dict.fromkeys(item.root for item in plan.command_ranges))
+    expected_roots = tuple(
+        sorted(
+            explicit_roots,
+            key=lambda root: min(
+                (
+                    placement[1],
+                    placement[0],
+                    root,
+                )
+                for segment in plan.base_schedule.worker_schedule.segments_for_root(
+                    root
+                )
+                for placement in (
+                    segment.placement(segment.task_for_offset(0)),
+                )
+                if placement is not None
+            ),
+        )
+    )
+    testcase.assertEqual(explicit_roots, expected_roots)
+    physical_tasks_by_root: dict[int, list[int]] = {}
+    for command_range in plan.command_ranges:
+        testcase.assertTrue(command_range.physical_tasks.is_total_function())
+        physical_tasks = physical_tasks_by_root.setdefault(command_range.root, [])
+        for command in range(command_range.task_count):
+            targets = command_range.physical_tasks.targets(command)
+            testcase.assertEqual(len(targets), 1)
+            physical_tasks.extend(targets)
+
+    event_graph = plan.event_graph
+    for root, physical_tasks in physical_tasks_by_root.items():
+        testcase.assertEqual(
+            sorted(physical_tasks),
+            list(range(event_graph.root_domains[root].size)),
+        )
+        logical_tasks = tuple(
+            next(iter(event_graph.root_traversals[root].targets(physical_task)))
+            for physical_task in physical_tasks
+        )
+        testcase.assertEqual(
+            logical_tasks,
+            plan.base_schedule.worker_schedule.task_order(root),
+        )
+    testcase.assertEqual(
+        plan.command_count,
+        sum(command_range.task_count for command_range in plan.command_ranges),
+    )
 
 
 def _one_dimensional_task_range(
@@ -920,6 +952,151 @@ def _expected_arrivals(
 
 
 class TestCrossLoopDependencies(TestCase):
+    def test_graph_scopes_preserve_reuse_and_unreachable_graphs(
+        self,
+    ) -> None:
+        device_ir = mock.Mock()
+        device_ir.graphs = (object(), object(), object())
+        device_ir.root_ids = (0, 1)
+        device_ir.task_families = (object(), object())
+        scopes = (
+            ExecutionScope(0, 0, 0, (), None, "root", (), (), True, False),
+            ExecutionScope(
+                1,
+                0,
+                0,
+                ((0, 0),),
+                0,
+                "loop",
+                (),
+                (),
+                True,
+                True,
+            ),
+            ExecutionScope(
+                2,
+                0,
+                1,
+                ((1, 0),),
+                0,
+                "loop",
+                (),
+                (),
+                True,
+                True,
+            ),
+            ExecutionScope(3, 1, 1, (), None, "root", (), (), True, False),
+        )
+        with mock.patch(
+            "helion._compiler.tile_dependency.build_execution_scopes",
+            return_value=scopes,
+        ):
+            scopes_by_graph = execution_scopes_by_graph_id(device_ir)
+
+        self.assertEqual(
+            tuple(
+                tuple(scope.scope_id for scope in graph_scopes)
+                for graph_scopes in scopes_by_graph
+            ),
+            ((0, 1), (2, 3), ()),
+        )
+
+    def test_dependency_graph_rejects_an_invalid_access_owner(self) -> None:
+        with self.assertRaisesRegex(ValueError, "references unknown root 2"):
+            build_tile_dependency_graph(
+                (_access(0, root=2, kind="store"),),
+                [[10], [20]],
+            )
+
+    def test_device_ir_access_requires_a_unique_scope(self) -> None:
+        graph = torch.fx.Graph()
+        graph.output(())
+        device_ir = DeviceIR()
+        device_ir.add_root_graph(graph)
+        device_ir.task_families = [TaskFamily((LogicalTaskAxis(10, None),))]
+
+        with self.assertRaisesRegex(ValueError, "has no execution scope"):
+            build_tile_dependency_graph(
+                (_access(0, root=0, kind="store"),),
+                [[10]],
+                device_ir=device_ir,
+            )
+
+    def test_memory_access_in_reused_graph_is_rejected(self) -> None:
+        graph = torch.fx.Graph()
+        tensor = graph.placeholder("tensor")
+        load = graph.call_function(memory_ops.load, (tensor, (), None, None))
+        graph.output(load)
+
+        device_ir = DeviceIR()
+        graph_id = device_ir.add_graph(graph)
+        unrelated_graph = torch.fx.Graph()
+        unrelated_graph.output(())
+        unrelated_graph_id = device_ir.add_graph(unrelated_graph)
+        device_ir.root_ids = [graph_id, unrelated_graph_id]
+        device_ir.task_families = [TaskFamily(()), TaskFamily(())]
+        fake_environment = mock.Mock()
+        fake_host = mock.Mock(tensor_to_origin={})
+        reused_scopes = (
+            ExecutionScope(0, 0, graph_id, (), None, "root", (), (), True, False),
+            ExecutionScope(
+                1,
+                0,
+                graph_id,
+                ((0, 0),),
+                0,
+                "loop",
+                (),
+                (),
+                True,
+                True,
+            ),
+            ExecutionScope(
+                2,
+                1,
+                unrelated_graph_id,
+                (),
+                None,
+                "root",
+                (),
+                (),
+                True,
+                False,
+            ),
+        )
+
+        with (
+            mock.patch(
+                "helion._compiler.device_ir.CompileEnvironment.current",
+                return_value=fake_environment,
+            ),
+            mock.patch(
+                "helion._compiler.device_ir.HostFunction.current",
+                return_value=fake_host,
+            ),
+            mock.patch(
+                "helion._compiler.device_ir._graph_peak_live_by_axis",
+                return_value={},
+            ),
+            mock.patch(
+                "helion._compiler.device_ir._accessed_tensor_fake",
+                return_value=None,
+            ),
+            mock.patch(
+                "helion._compiler.device_ir._load_needs_eviction_tunable",
+                return_value=False,
+            ),
+            mock.patch(
+                "helion._compiler.tile_dependency.build_execution_scopes",
+                return_value=reused_scopes,
+            ),
+            self.assertRaisesRegex(
+                exc.CrossLoopSchedulingError,
+                "memory access is reused by multiple execution scopes",
+            ),
+        ):
+            _collect_memory_op_facts(device_ir)
+
     def test_logical_domain_separates_geometry_from_traversal(self) -> None:
         domain = LogicalDomain(
             (10, 20),
@@ -4073,14 +4250,13 @@ class TestCrossLoopDependencies(TestCase):
             preordered_edges=frozenset(),
         )
 
-        assert_valid_clc_command_quotient(self, plan)
+        assert_valid_clc_command_ranges(self, plan)
 
         self.assertEqual(
             [(item.root, item.begin, item.end) for item in plan.command_ranges],
             [(0, 0, 8)],
         )
         self.assertEqual(plan.launch_token_count, 8)
-        self.assertEqual(plan.task_order, tuple(range(8)))
         self.assertEqual(
             tuple(command_range.root for command_range in plan.command_ranges),
             (0,),
@@ -4140,12 +4316,137 @@ class TestCrossLoopDependencies(TestCase):
             preordered_edges=frozenset(),
         )
 
-        assert_valid_clc_command_quotient(self, plan)
+        assert_valid_clc_command_ranges(self, plan)
 
-        self.assertEqual(plan.task_order, (0, 1, 2, 3, 4))
+    def test_clc_plan_uses_canonical_worker_order_for_independent_roots(
+        self,
+    ) -> None:
+        dependency_plan = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    allocation_id=0,
+                    kind="store",
+                    shape=(2,),
+                    block_ids=(10,),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    allocation_id=0,
+                    kind="load",
+                    shape=(2,),
+                    block_ids=(20,),
+                ),
+            ),
+            [[10], [20], [30]],
+        )
+        task_families = (
+            InstantiatedTaskFamily(
+                logical_axis_order=(10,),
+                physical_axis_order=(10,),
+                axis_counts_items=((10, 2),),
+                block_sizes_items=((10, 1),),
+            ),
+            InstantiatedTaskFamily(
+                logical_axis_order=(20,),
+                physical_axis_order=(20,),
+                axis_counts_items=((20, 1),),
+                block_sizes_items=((20, 2),),
+            ),
+            InstantiatedTaskFamily(
+                logical_axis_order=(30,),
+                physical_axis_order=(30,),
+                axis_counts_items=((30, 2),),
+                block_sizes_items=((30, 1),),
+            ),
+        )
 
-    def test_clc_plan_keeps_dense_family_dependency_compact(self) -> None:
-        task_count = 1025
+        plan = build_clc_command_plan(
+            dependency_plan=dependency_plan,
+            task_families=task_families,
+            axis_geometry={10: (2, 1), 20: (1, 2), 30: (2, 1)},
+            preordered_edges=frozenset(),
+            physical_worker_limit=4,
+        )
+
+        assert_valid_clc_command_ranges(self, plan)
+        self.assertEqual(
+            tuple(dict.fromkeys(item.root for item in plan.command_ranges)),
+            (0, 2, 1),
+        )
+
+    def test_clc_symbolic_ranges_cover_random_forward_dags(self) -> None:
+        rng = random.Random(0)
+        for case in range(64):
+            root_count = rng.randint(2, 7)
+            task_count = rng.randint(1, 8)
+            block_ids = tuple(10 * (root + 1) for root in range(root_count))
+            selected_edges = {
+                (producer, consumer)
+                for producer in range(root_count)
+                for consumer in range(producer + 1, root_count)
+                if rng.random() < 0.35
+            }
+            accesses = []
+            access_id = 0
+            for allocation_id, (producer, consumer) in enumerate(
+                sorted(selected_edges)
+            ):
+                for root, kind in ((producer, "store"), (consumer, "load")):
+                    accesses.append(
+                        _access(
+                            access_id,
+                            root=root,
+                            allocation_id=allocation_id,
+                            kind=kind,
+                            shape=(task_count,),
+                            block_ids=(block_ids[root],),
+                            tensor_name=f"edge_{allocation_id}",
+                        )
+                    )
+                    access_id += 1
+
+            dependency_plan = build_tile_dependency_graph(
+                tuple(accesses),
+                [[block_id] for block_id in block_ids],
+            )
+            self.assertEqual(
+                {
+                    (edge.producer_root, edge.consumer_root)
+                    for edge in dependency_plan.edges
+                },
+                selected_edges,
+            )
+            task_families = tuple(
+                InstantiatedTaskFamily(
+                    logical_axis_order=(block_id,),
+                    physical_axis_order=(block_id,),
+                    axis_counts_items=((block_id, task_count),),
+                    block_sizes_items=((block_id, 1),),
+                )
+                for block_id in block_ids
+            )
+            with self.subTest(
+                case=case,
+                roots=root_count,
+                tasks=task_count,
+                edges=sorted(selected_edges),
+            ):
+                plan = build_clc_command_plan(
+                    dependency_plan=dependency_plan,
+                    task_families=task_families,
+                    axis_geometry={
+                        block_id: (task_count, 1) for block_id in block_ids
+                    },
+                    preordered_edges=frozenset(),
+                    physical_worker_limit=max(1, root_count * task_count // 2),
+                )
+                assert_valid_clc_command_ranges(self, plan)
+
+    def test_clc_plan_keeps_large_family_order_symbolic(self) -> None:
+        task_count = 5000
         dependency_plan = build_tile_dependency_graph(
             (
                 _access(
@@ -4184,31 +4485,13 @@ class TestCrossLoopDependencies(TestCase):
         )
 
         self.assertEqual(plan.command_count, 2 * task_count)
+        self.assertEqual(len(plan.command_ranges), 2)
         self.assertTrue(
-            all(command.task[0] == 0 for command in plan.commands[:task_count])
-        )
-        self.assertTrue(
-            all(command.task[0] == 1 for command in plan.commands[task_count:])
-        )
-
-        with (
-            mock.patch(
-                "helion._compiler.cross_loop_scheduler."
-                "_EXPLICIT_SCHEDULE_EDGE_LIMIT",
-                6000,
-            ),
-            self.assertRaisesRegex(
-                ClcCommandPlanUnavailable,
-                "6000-item materialization budget",
-            ),
-        ):
-            build_clc_command_plan(
-                dependency_plan=dependency_plan,
-                task_families=task_families,
-                axis_geometry={10: (task_count, 1), 20: (task_count, 1)},
-                preordered_edges=frozenset(),
-                physical_worker_limit=task_count,
+            all(
+                command_range.physical_tasks.is_total_function()
+                for command_range in plan.command_ranges
             )
+        )
 
     def test_clc_command_quotient_handles_a_diamond_join(self) -> None:
         dependency_plan = build_tile_dependency_graph(
@@ -4247,7 +4530,7 @@ class TestCrossLoopDependencies(TestCase):
             physical_worker_limit=4,
         )
 
-        assert_valid_clc_command_quotient(self, plan)
+        assert_valid_clc_command_ranges(self, plan)
 
     def test_worker_schedule_derives_access_ready_overlap(self) -> None:
         dependency_plan = build_tile_dependency_graph(
@@ -5993,7 +6276,8 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, (x + 1) * 2)
         self.assertIn("tile_dependency_continuation_previous", code)
         if "_requires_clc=True" in code:
-            self.assertIn("tile_dependency_clc_command_tasks", code)
+            self.assertNotIn("tile_dependency_clc_command_tasks", code)
+            self.assertIn("tile_dependency_clc_command_index", code)
         else:
             self.assertIn("tile_dependency_scheduled_physical_task", code)
         self.assertNotIn("tile_dependency_root_completion", code)
@@ -6102,6 +6386,60 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="Cluster Launch Control requires CUDA capability >= 10.0"
+    )
+    def test_clc_large_command_stream_survives_many_unsynchronized_replays(
+        self,
+    ) -> None:
+        num_sms = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+        worker_count = 2 * num_sms
+        command_count = 4 * worker_count
+        x = torch.arange(
+            command_count * 8,
+            device=DEVICE,
+            dtype=torch.float32,
+        ).reshape(1, -1)
+        bound = cartesian_affine_chain.bind((x,))
+        config = helion.Config(
+            block_sizes=[1, 8, 1, 8],
+            pid_type="persistent_blocked",
+            num_sm_multiplier=2,
+            num_warps=1,
+            cross_loop_num_workers=worker_count,
+        )
+        compiled = bound.compile_config(config)
+        output = compiled(x)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, (x + 1) * 2)
+
+        triton_kernel = compiled.__globals__[f"_helion_{bound.kernel.name}"]
+        self.assertEqual(
+            triton_kernel._helion_cross_loop_dispatch,
+            ("clc", None),
+        )
+        self.assertGreater(command_count, worker_count)
+
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream):
+            compiled(x)
+        capture_stream.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=capture_stream):
+            captured = compiled(x)
+
+        replay_count = 256
+        with torch.cuda.stream(capture_stream):
+            for replay in range(replay_count):
+                x.fill_(float(replay % 17))
+                graph.replay()
+        capture_stream.synchronize()
+        torch.testing.assert_close(captured, (x + 1) * 2)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_task_events_are_capture_safe_and_stream_local(self) -> None:
         x = torch.arange(128, device=DEVICE, dtype=torch.float32).reshape(2, 64)
         bound = cartesian_affine_chain.bind((x,))
@@ -6131,6 +6469,20 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             torch.cuda.synchronize()
             torch.testing.assert_close(captured, (x + 1) * 2)
 
+        second_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(second_graph, stream=capture_stream):
+            second_captured = compiled(x)
+        for value, replay_graph, output in (
+            (5.0, graph, captured),
+            (13.0, second_graph, second_captured),
+            (17.0, graph, captured),
+            (29.0, second_graph, second_captured),
+        ):
+            x.fill_(value)
+            replay_graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(output, (x + 1) * 2)
+
         streams = (torch.cuda.Stream(), torch.cuda.Stream())
         inputs = (
             torch.full((2, 64), 11.0, device=DEVICE),
@@ -6143,6 +6495,23 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         for stream in streams:
             stream.synchronize()
         for input_value, output in zip(inputs, outputs, strict=True):
+            torch.testing.assert_close(output, (input_value + 1) * 2)
+
+        graphs = []
+        captured_outputs = []
+        for stream, input_value in zip(streams, inputs, strict=True):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                captured_output = compiled(input_value)
+            graphs.append(graph)
+            captured_outputs.append(captured_output)
+        for value, input_value in zip((23.0, 31.0), inputs, strict=True):
+            input_value.fill_(value)
+        for graph in graphs:
+            graph.replay()
+        for stream in streams:
+            stream.synchronize()
+        for input_value, output in zip(inputs, captured_outputs, strict=True):
             torch.testing.assert_close(output, (input_value + 1) * 2)
 
     @skipIfNotCUDA()
@@ -6285,7 +6654,8 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         workers = bound.config_spec.user_defined_tunables[CROSS_LOOP_NUM_WORKERS_CONFIG]
         self.assertIsInstance(workers, IntegerFragment)
         assert isinstance(workers, IntegerFragment)
-        self.assertEqual((workers.low, workers.high), (0, 256))
+        self.assertEqual((workers.low, workers.high), (0, 0))
+        self.assertEqual(workers.search_values(), [0])
         self.assertEqual(
             bound.config_spec.default_config()[CROSS_LOOP_NUM_WORKERS_CONFIG],
             0,

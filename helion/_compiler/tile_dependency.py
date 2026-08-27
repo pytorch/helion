@@ -38,14 +38,19 @@ def tile_dependency_scope_id(node: ast.AST) -> int | None:
     return scope_id if isinstance(scope_id, int) else None
 
 
-def owner_root_by_graph_id(device_ir: DeviceIR) -> tuple[int, ...]:
-    """Resolve every nested DeviceIR graph to its top-level root."""
-    roots_by_graph: list[set[int]] = [set() for _ in device_ir.graphs]
-    for scope in build_execution_scopes(device_ir):
-        roots_by_graph[scope.graph_id].add(scope.root)
-    return tuple(
-        next(iter(roots)) if len(roots) == 1 else -1 for roots in roots_by_graph
-    )
+def execution_scopes_by_graph_id(
+    device_ir: DeviceIR,
+    *,
+    execution_scopes: tuple[ExecutionScope, ...] | None = None,
+) -> tuple[tuple[ExecutionScope, ...], ...]:
+    """Resolve every DeviceIR graph to its static execution-scope occurrences."""
+    if execution_scopes is None:
+        execution_scopes = build_execution_scopes(device_ir)
+    _validate_execution_scopes(device_ir, execution_scopes)
+    scopes_by_graph: list[list[ExecutionScope]] = [[] for _ in device_ir.graphs]
+    for scope in execution_scopes:
+        scopes_by_graph[scope.graph_id].append(scope)
+    return tuple(tuple(scopes) for scopes in scopes_by_graph)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2952,6 +2957,59 @@ class ExecutionScope:
         return self.kind == "root"
 
 
+def _validate_execution_scopes(
+    device_ir: DeviceIR,
+    execution_scopes: tuple[ExecutionScope, ...],
+) -> None:
+    if len(device_ir.root_ids) != len(device_ir.task_families):
+        raise ValueError("DeviceIR roots and task families must have equal length")
+    if tuple(scope.scope_id for scope in execution_scopes) != tuple(
+        range(len(execution_scopes))
+    ):
+        raise ValueError("execution scope IDs must be contiguous and ordered")
+
+    root_scope_ids: dict[int, int] = {}
+    for scope in execution_scopes:
+        if not 0 <= scope.graph_id < len(device_ir.graphs):
+            raise ValueError(
+                f"execution scope {scope.scope_id} references unknown graph "
+                f"{scope.graph_id}"
+            )
+        if not 0 <= scope.root < len(device_ir.root_ids):
+            raise ValueError(
+                f"execution scope {scope.scope_id} references unknown root "
+                f"{scope.root}"
+            )
+        if scope.parent_scope_id is None:
+            if not scope.is_root or scope.callsite_path:
+                raise ValueError(
+                    f"execution scope {scope.scope_id} is not a valid root scope"
+                )
+            if device_ir.root_ids[scope.root] != scope.graph_id:
+                raise ValueError(
+                    f"execution scope {scope.scope_id} does not match root "
+                    f"{scope.root}'s graph"
+                )
+            if scope.root in root_scope_ids:
+                raise ValueError(f"root {scope.root} has multiple execution scopes")
+            root_scope_ids[scope.root] = scope.scope_id
+            continue
+        if not 0 <= scope.parent_scope_id < scope.scope_id:
+            raise ValueError(
+                f"execution scope {scope.scope_id} has invalid parent "
+                f"{scope.parent_scope_id}"
+            )
+        parent = execution_scopes[scope.parent_scope_id]
+        if parent.root != scope.root:
+            raise ValueError(
+                f"execution scope {scope.scope_id} and its parent have "
+                "different roots"
+            )
+
+    if frozenset(root_scope_ids) != frozenset(range(len(device_ir.root_ids))):
+        raise ValueError("each DeviceIR root must have exactly one execution scope")
+
+
 def build_execution_scopes(device_ir: DeviceIR) -> tuple[ExecutionScope, ...]:
     """Build the reachable DeviceIR callsite tree used by dependency actions.
 
@@ -2962,6 +3020,9 @@ def build_execution_scopes(device_ir: DeviceIR) -> tuple[ExecutionScope, ...]:
     """
     from ..language import _tracing_ops
     from .device_ir import ForLoopGraphInfo
+
+    if len(device_ir.root_ids) != len(device_ir.task_families):
+        raise ValueError("DeviceIR roots and task families must have equal length")
 
     scopes: list[ExecutionScope] = []
 
@@ -3092,7 +3153,9 @@ def build_execution_scopes(device_ir: DeviceIR) -> tuple[ExecutionScope, ...]:
             scope_id=root_scope_id,
             ancestor_graph_ids=frozenset((graph_id,)),
         )
-    return tuple(scopes)
+    result = tuple(scopes)
+    _validate_execution_scopes(device_ir, result)
+    return result
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3101,7 +3164,9 @@ class TileAccess:
 
     access_id: int
     memory_op_index: int
+    atomic_op_index: int
     graph_id: int
+    scope_id: int | None
     root: int
     allocation_id: int
     kind: Literal["load", "store"]
@@ -4173,6 +4238,7 @@ def build_tile_dependency_graph(
     task_families: tuple[TaskFamily, ...] | None = None,
     root_phases: tuple[int, ...] | None = None,
     noncanonical_task_origin_block_ids: frozenset[int] = frozenset(),
+    execution_scopes: tuple[ExecutionScope, ...] | None = None,
 ) -> TileDependencyGraph:
     """Build the minimal source-ordered allocation hazard graph.
 
@@ -4214,9 +4280,22 @@ def build_tile_dependency_graph(
     elif len(root_phases) != root_count:
         raise ValueError("root_phases must have one entry per task family")
     grid_block_ids = [list(family.logical_axis_order) for family in task_families]
+    invalid_access = next(
+        (
+            access
+            for access in accesses
+            if access.allocation_id >= 0 and not 0 <= access.root < root_count
+        ),
+        None,
+    )
+    if invalid_access is not None:
+        raise ValueError(
+            f"tile dependency access {invalid_access.access_id} references unknown "
+            f"root {invalid_access.root}; expected 0 <= root < {root_count}"
+        )
     accesses_by_root: list[list[TileAccess]] = [[] for _ in range(root_count)]
     for access in accesses:
-        if 0 <= access.root < root_count and access.allocation_id >= 0:
+        if access.allocation_id >= 0:
             accesses_by_root[access.root].append(access)
 
     # Views can carry different source names at different roots while still
@@ -4398,22 +4477,33 @@ def build_tile_dependency_graph(
             )
         )
 
-    execution_scopes = (
-        build_execution_scopes(device_ir) if device_ir is not None else ()
-    )
-    scope_ids_by_graph: dict[int, list[int]] = {}
-    for scope in execution_scopes:
-        scope_ids_by_graph.setdefault(scope.graph_id, []).append(scope.scope_id)
+    if execution_scopes is None:
+        execution_scopes = (
+            build_execution_scopes(device_ir) if device_ir is not None else ()
+        )
     scope_ids_by_access: list[tuple[int, ...]] = [
         ()
         for _ in range(max((access.access_id for access in accesses), default=-1) + 1)
     ]
     for access in accesses:
-        scope_ids_by_access[access.access_id] = tuple(
-            scope_id
-            for scope_id in scope_ids_by_graph.get(access.graph_id, ())
-            if execution_scopes[scope_id].root == access.root
-        )
+        if access.scope_id is None:
+            if device_ir is not None:
+                raise ValueError(
+                    f"tile dependency access {access.access_id} has no execution scope"
+                )
+            continue
+        if not 0 <= access.scope_id < len(execution_scopes):
+            raise ValueError(
+                f"tile dependency access {access.access_id} references unknown "
+                f"execution scope {access.scope_id}"
+            )
+        scope = execution_scopes[access.scope_id]
+        if scope.graph_id != access.graph_id or scope.root != access.root:
+            raise ValueError(
+                f"tile dependency access {access.access_id} references execution "
+                f"scope {access.scope_id} with incompatible graph or root"
+            )
+        scope_ids_by_access[access.access_id] = (access.scope_id,)
     return TileDependencyGraph(
         task_families=task_families,
         accesses=accesses,

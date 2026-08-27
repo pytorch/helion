@@ -76,12 +76,11 @@ def default_launcher(
     _remote_barrier_process_group_name: str | None = None,
     _remote_copy_scratch_specs: tuple[tuple[torch.Tensor, int], ...] = (),
     _persistent_state_specs: tuple[tuple[torch.Tensor, int, torch.dtype], ...] = (),
-    _constant_buffer_specs: tuple[
-        tuple[torch.Tensor, tuple[int, ...], torch.dtype], ...
-    ] = (),
     _minimum_resident_programs: int = 0,
     _target_resident_programs_per_sm: int = 0,
     _requires_clc: bool = False,
+    _cross_loop_dispatch_kind: str | None = None,
+    _cross_loop_fallback_reason: str | None = None,
     ptx_options: str | None = None,
     launch_cooperative_grid: bool = False,
     **kwargs: dict,
@@ -90,6 +89,11 @@ def default_launcher(
     :func:`helion.runtime.triton.launcher.default_launcher` that translates
     Triton's opaque "incompatible dimensions" error into
     :class:`helion.exc.ShapeMismatch`.
+
+    Compiler-managed persistent state is stream-local. CUDA Graph launches or
+    replays that retain the same state pointers, including distinct graphs
+    captured on one stream, must be serialized. Independent streams receive
+    independent state.
     """
     try:
         return _triton_default_launcher(
@@ -105,10 +109,11 @@ def default_launcher(
             _remote_barrier_process_group_name=_remote_barrier_process_group_name,
             _remote_copy_scratch_specs=_remote_copy_scratch_specs,
             _persistent_state_specs=_persistent_state_specs,
-            _constant_buffer_specs=_constant_buffer_specs,
             _minimum_resident_programs=_minimum_resident_programs,
             _target_resident_programs_per_sm=_target_resident_programs_per_sm,
             _requires_clc=_requires_clc,
+            _cross_loop_dispatch_kind=_cross_loop_dispatch_kind,
+            _cross_loop_fallback_reason=_cross_loop_fallback_reason,
             ptx_options=ptx_options,
             launch_cooperative_grid=launch_cooperative_grid,
             **kwargs,

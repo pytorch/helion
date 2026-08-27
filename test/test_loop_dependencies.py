@@ -69,6 +69,18 @@ def implicit_atomic_dependency(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(autotune_effort="none")
+def nested_atomic_dependency(x: torch.Tensor) -> torch.Tensor:
+    tmp = torch.zeros_like(x)
+    out = torch.empty(x.size(1), dtype=x.dtype, device=x.device)
+    for row in hl.tile(x.size(0), block_size=1):
+        for column in hl.tile(x.size(1)):
+            hl.atomic_add(tmp, [row, column], x[row, column])
+    for column in hl.tile(x.size(1)):
+        out[column] = tmp[:, column].sum(0) + 1
+    return out
+
+
 @helion.kernel(
     autotune_effort="none",
 )
@@ -418,6 +430,7 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
                 self.assertIn("clusterlaunchcontrol.try_cancel", code)
                 self.assertIn("_requires_clc=True", code)
                 self.assertIn("launch_pdl=True", code)
+                self.assertIn("_cross_loop_dispatch_kind='clc'", code)
 
     @skipIfRefEager("persistent tile-dependency codegen is unavailable in ref eager")
     def test_matmul_chain_allows_reused_accumulator_name(self) -> None:
@@ -439,7 +452,7 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
     @skipIfCudaCapabilityLessThan(
         (10, 0), reason="Cluster Launch Control requires CUDA capability >= 10.0"
     )
-    def test_clc_falls_back_from_tensor_descriptor_to_pointer(self) -> None:
+    def test_tensor_descriptor_config_uses_static_dispatch(self) -> None:
         a = torch.arange(512, device=DEVICE, dtype=torch.float32).reshape(32, 16)
         b = torch.eye(16, device=DEVICE)
         c = torch.eye(16, device=DEVICE)
@@ -460,9 +473,61 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(output, a, atol=0, rtol=0)
-        self.assertNotIn("make_tensor_descriptor", code)
-        self.assertIn("clusterlaunchcontrol.try_cancel", code)
-        self.assertIn("_requires_clc=True", code)
+        self.assertIn("make_tensor_descriptor", code)
+        self.assertNotIn("clusterlaunchcontrol.try_cancel", code)
+        self.assertNotIn("_requires_clc=True", code)
+        self.assertIn("_cross_loop_dispatch_kind='static'", code)
+        self.assertIn(
+            "_cross_loop_fallback_reason='tensor_descriptor_indexing'",
+            code,
+        )
+
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable in ref eager")
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="Cluster Launch Control requires CUDA capability >= 10.0"
+    )
+    def test_atomic_tensor_descriptor_config_uses_static_dispatch(self) -> None:
+        x = torch.arange(32, device=DEVICE, dtype=torch.float32)
+        code, output = code_and_output(
+            implicit_atomic_dependency,
+            (x,),
+            block_sizes=[8, 8],
+            indexing="pointer",
+            atomic_indexing="tensor_descriptor",
+            pid_type="persistent_blocked",
+            num_warps=4,
+        )
+
+        torch.testing.assert_close(output, x + 1)
+        self.assertNotIn("clusterlaunchcontrol.try_cancel", code)
+        self.assertNotIn("_requires_clc=True", code)
+        self.assertIn("_cross_loop_dispatch_kind='static'", code)
+        self.assertIn(
+            "_cross_loop_fallback_reason='tensor_descriptor_indexing'",
+            code,
+        )
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable in ref eager")
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="Cluster Launch Control requires CUDA capability >= 10.0"
+    )
+    def test_nested_atomic_descriptor_uses_root_completion(self) -> None:
+        x = torch.arange(512, device=DEVICE, dtype=torch.float32).reshape(16, 32)
+        code, output = code_and_output(
+            nested_atomic_dependency,
+            (x,),
+            block_sizes=[32, 32],
+            indexing="pointer",
+            atomic_indexing="tensor_descriptor",
+            pid_type="persistent_blocked",
+            num_warps=4,
+        )
+
+        torch.testing.assert_close(output, x.sum(0) + 1)
+        self.assertIn("tile_dependency_root_completion_wait", code)
+        self.assertNotIn("tile_dependency_keyed_event_wait", code)
+        self.assertNotIn("clusterlaunchcontrol.try_cancel", code)
 
 
 @onlyBackends(["cute"])

@@ -498,6 +498,8 @@ def _megakernel_args(tensors, shape, geometry, splits):
 
 def _megakernel_config(bound, args, geometry):
     values = dict(bound.config_spec.default_config())
+    values["indexing"] = ["pointer"] * len(values["indexing"])
+    values["atomic_indexing"] = ["pointer"] * len(values["atomic_indexing"])
     if args.config_mode in ("matched", "fused"):
         configs = json.loads(Path(args.config_path).read_text())
         q_projection = configs[
