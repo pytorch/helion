@@ -4975,6 +4975,18 @@ area for less explicit ownership.
   root-completion publication into one final lowering-event representation.
   This is a larger follow-up because it changes ownership across scheduling
   and lowering.
-- [ ] Replace the duplicate symbolic and hand-written L2 traversal formulas
-  only after introducing a compact traversal relation that cannot expand into
-  a `tl.where` cascade. Until then, retain differential tail/permutation tests.
+- [x] Centralize the existing L2 applicability rule and ordinary coordinate
+  flattening used by traversal construction and lowering. This removes three
+  independently maintained no-op checks and three copies of row-major
+  flattening without changing the emitted expressions.
+- [x] Use the DeviceIR `TaskFamily` as the sole source of top-level axis
+  extents during static-schedule admission. A missing family or axis now makes
+  that configuration invalid instead of silently falling back to the lowered
+  `PIDInfo` geometry and maintaining two potentially divergent coordinate
+  descriptions.
+- [ ] Replace the remaining symbolic and hand-written L2 forward/inverse
+  formulas only after introducing a compact bidirectional traversal relation.
+  A one-piece forward relation is renderable, but its `Min`/`Mod` inverse is
+  not representable by the current relation grammar; using it now would disable
+  completion-frontier proofs or expand back into a `tl.where` cascade. Retain
+  the differential tail/permutation tests until that representation exists.

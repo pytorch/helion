@@ -244,13 +244,15 @@ def _static_case_axes(
 ) -> list[tuple[int, int]] | None:
     env = CompileEnvironment.current()
     task_families = HostFunction.current().device_ir.task_families
-    task_family = task_families[root] if root < len(task_families) else None
+    if root >= len(task_families):
+        return None
+    task_family = task_families[root]
     result: list[tuple[int, int]] = []
     for info in _case_pid_info(owner.cases[root]):
-        logical_axis = (
-            task_family.axis(info.block_id) if task_family is not None else None
-        )
-        numel_expr = logical_axis.extent if logical_axis is not None else info.numel
+        logical_axis = task_family.axis(info.block_id)
+        if logical_axis is None:
+            return None
+        numel_expr = logical_axis.extent
         if isinstance(numel_expr, str) or numel_expr is None:
             return None
         if isinstance(numel_expr, int):
@@ -312,6 +314,20 @@ def _static_block_axis_geometry(
     return (numel + block - 1) // block, block
 
 
+def _effective_l2_group_size(
+    case: ProgramIDs,
+    axis_order: tuple[int, ...],
+    axis_counts: dict[int, int],
+) -> int | None:
+    """Return the nontrivial L2 grouping applied by one root traversal."""
+    if not isinstance(case, L2GroupingProgramIDs) or len(axis_order) < 2:
+        return None
+    first_axis, second_axis = axis_order[:2]
+    if axis_counts[second_axis] == 1 or case.group_size >= axis_counts[first_axis]:
+        return None
+    return case.group_size
+
+
 def _root_physical_traversals(
     owner: ForEachProgramID,
     root_domains: tuple[LogicalDomain, ...],
@@ -334,15 +350,11 @@ def _root_physical_traversals(
         ):
             return None
         case = owner.cases[root]
-        l2_group_size = None
-        if isinstance(case, L2GroupingProgramIDs) and not (
-            len(physical_axis_order) >= 2
-            and (
-                axis_counts[physical_axis_order[1]] == 1
-                or case.group_size >= axis_counts[physical_axis_order[0]]
-            )
-        ):
-            l2_group_size = case.group_size
+        l2_group_size = _effective_l2_group_size(
+            case,
+            physical_axis_order,
+            axis_counts,
+        )
         result.append(
             physical_traversal_relation(
                 domain,
@@ -888,6 +900,26 @@ def emit_cross_loop_schedule(
             multiplier *= counts[block_id]
         return coordinates
 
+    def flat_task_from_coordinates(
+        coordinates: dict[int, str],
+        axis_order: tuple[int, ...],
+        counts: dict[int, int],
+    ) -> str:
+        """Flatten logical coordinates in one declared axis order."""
+        terms: list[str] = []
+        multiplier = 1
+        for axis in axis_order:
+            count = counts[axis]
+            if count != 1:
+                coordinate = coordinates[axis]
+                terms.append(
+                    f"({coordinate})"
+                    if multiplier == 1
+                    else f"({coordinate}) * {multiplier}"
+                )
+            multiplier *= count
+        return " + ".join(terms) or "0"
+
     def relation_expression(
         expression: sympy.Expr,
         coordinates: dict[int, str],
@@ -1036,19 +1068,14 @@ def emit_cross_loop_schedule(
             relation,
             source_coordinates,
         )
-        terms: list[str] = []
-        multiplier = 1
-        for axis in relation.target_domain.axis_order:
-            count = relation.target_domain.axis_counts[axis]
-            if count != 1:
-                coordinate = target_coordinates[axis]
-                terms.append(
-                    f"({coordinate})"
-                    if multiplier == 1
-                    else f"({coordinate}) * {multiplier}"
-                )
-            multiplier *= count
-        return " + ".join(terms) or "0", membership
+        return (
+            flat_task_from_coordinates(
+                target_coordinates,
+                relation.target_domain.axis_order,
+                relation.target_domain.axis_counts,
+            ),
+            membership,
+        )
 
     def logical_coordinates_for_physical_task(
         root: int,
@@ -1058,17 +1085,13 @@ def emit_cross_loop_schedule(
         axis_order = root_physical_axis_order[root]
         counts = root_axis_counts[root]
         case = owner.cases[root]
-        if not isinstance(case, L2GroupingProgramIDs) or (
-            len(axis_order) >= 2
-            and (counts[axis_order[1]] == 1 or case.group_size >= counts[axis_order[0]])
-        ):
+        group_size = _effective_l2_group_size(case, axis_order, counts)
+        if group_size is None:
             return flat_task_coordinates(physical_task, axis_order, counts)
 
-        assert len(axis_order) >= 2
         first_axis, second_axis = axis_order[:2]
         first_count = counts[first_axis]
         second_count = counts[second_axis]
-        group_size = case.group_size
         inner_size = first_count * second_count
         group_span = group_size * second_count
         inner_task = (
@@ -1107,29 +1130,13 @@ def emit_cross_loop_schedule(
         axis_order = root_physical_axis_order[root]
         counts = root_axis_counts[root]
         case = owner.cases[root]
-        if not isinstance(case, L2GroupingProgramIDs) or (
-            len(axis_order) >= 2
-            and (counts[axis_order[1]] == 1 or case.group_size >= counts[axis_order[0]])
-        ):
-            terms: list[str] = []
-            multiplier = 1
-            for block_id in axis_order:
-                count = counts[block_id]
-                if count != 1:
-                    coordinate = coordinates[block_id]
-                    terms.append(
-                        f"({coordinate})"
-                        if multiplier == 1
-                        else f"({coordinate}) * {multiplier}"
-                    )
-                multiplier *= count
-            return " + ".join(terms) or "0"
+        group_size = _effective_l2_group_size(case, axis_order, counts)
+        if group_size is None:
+            return flat_task_from_coordinates(coordinates, axis_order, counts)
 
-        assert len(axis_order) >= 2
         first_axis, second_axis = axis_order[:2]
         first_count = counts[first_axis]
         second_count = counts[second_axis]
-        group_size = case.group_size
         first_coordinate = coordinates[first_axis]
         second_coordinate = coordinates[second_axis]
         group = f"(({first_coordinate}) // {group_size})"
@@ -1155,19 +1162,11 @@ def emit_cross_loop_schedule(
         root: int,
         coordinates: dict[int, str],
     ) -> str:
-        terms: list[str] = []
-        multiplier = 1
-        for block_id in root_logical_axis_order[root]:
-            count = root_axis_counts[root][block_id]
-            if count != 1:
-                coordinate = coordinates[block_id]
-                terms.append(
-                    f"({coordinate})"
-                    if multiplier == 1
-                    else f"({coordinate}) * {multiplier}"
-                )
-            multiplier *= count
-        return " + ".join(terms) or "0"
+        return flat_task_from_coordinates(
+            coordinates,
+            root_logical_axis_order[root],
+            root_axis_counts[root],
+        )
 
     def body_with_scope_waits(
         plan: CountedEventPlan,
