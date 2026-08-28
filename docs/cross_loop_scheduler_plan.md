@@ -4965,7 +4965,7 @@ the prior 1,776-worker static schedule after normalizing the now-symbolic
 `_NUM_SM * 12` launch expression.
 
 Relative to the preceding cleanup commit `7867e5a1`, this round currently
-removes 517 net production lines across `tile_dependency.py`,
+removes 505 net production lines across `tile_dependency.py`,
 `cross_loop_scheduler.py`, and `cross_loop_codegen.py`. The larger suggested
 event/placement merger is intentionally left as a follow-up: the remaining
 semantic-event and selected-lowering objects represent genuinely different
@@ -5010,6 +5010,12 @@ area for less explicit ownership.
   pre-canonical relation and then repeating the work on a rebuilt event. In a
   profiled Qwen lowering this reduced readiness analyses from 43 to 25 and
   cross-loop emission from 4.91 s to 4.31 s without adding a scheduler cache.
+- [x] Re-profile the remaining scheduler work before adding more memoization.
+  The largest remaining cost is the generic, schedule-sensitive completion-
+  frontier proof used for nested and early family placement. It is not a
+  duplicate representation, and worker placement changes its answer, so this
+  cleanup leaves it explicit rather than introducing another cache or a
+  model-specific shortcut.
 - [ ] Replace the remaining symbolic and hand-written L2 forward/inverse
   formulas only after introducing a compact bidirectional traversal relation.
   A one-piece forward relation is renderable, but its `Min`/`Mod` inverse is
