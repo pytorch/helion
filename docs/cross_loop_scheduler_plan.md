@@ -1914,8 +1914,9 @@ to historical tests or measurements.
 Tests should follow the same boundary:
 
 ```text
-test_tile_dependency.py         access/reaching-definition/event-graph proofs
-test_cross_loop_scheduler.py    readiness, liveness, placement, and codegen
+test_tile_dependency.py         access, reaching-definition, and relation proofs
+test_cross_loop_scheduler.py    readiness, liveness, and placement
+test_cross_loop_codegen.py      emitted Triton and runtime integration
 ```
 
 Perform these renames while introducing the new graph records rather than as a
@@ -1933,9 +1934,9 @@ frontier planner so the final compiler has one vocabulary.
   - Keep root-completion requirements for unknown relations.
 
 - `cross_loop_scheduler.py` (replacing `tile_dependency_planner.py`)
-  - Retain `InstantiatedTaskFamily` as the selected-configuration binding of a
-    semantic `TaskFamily`; do not move physical PID order into the dependency
-    graph.
+  - Bind selected configuration geometry with `LogicalDomain`; keep physical
+    PID order in a separate `LogicalRelation` traversal rather than duplicating
+    either concept in a scheduler-specific task-family type.
   - Make `KeyedEvent` independent of `key_root` and remove `on_ready_root`.
   - Replace `AccessCohortPlan`, `ReadinessFrontierPlan`, and
     `ReadinessFrontierSelection` with generic action event uses, one ordered
@@ -4873,9 +4874,9 @@ cached per immutable relation.
 
 Validation results:
 
-- The complete cross-loop dependency suites pass: 127 tests, 4 skips, and 29
-  subtests after the new mixed-radix, worker-snapping, and partitioned-totality
-  coverage.
+- The dependency, scheduler, and codegen coverage is split by compiler module:
+  115 focused tests and 31 subtests pass. Together with config and legacy loop
+  dependency coverage, 191 tests pass, 4 skip, and 55 subtests pass.
 - Qwen lowering completes in 13.6 seconds at batch 1 and 14.3 seconds at batch
   8 in fresh processes. Stress cases batch 64 and 128 complete in 18.1 and
   19.3 seconds with the granular source; no multi-minute compile remains.
