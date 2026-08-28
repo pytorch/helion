@@ -48,10 +48,13 @@ DENSE_VARIANTS = [
 ]
 
 # Variants that re-run another variant's module with a flag, mapped to the module
-# they borrow. Both take pre-activation inputs and so are forward-only, emitting no
-# "-bwd" row; kda_varlen additionally passes cu_seqlens.
+# they borrow. All take pre-activation inputs and so are forward-only, emitting no
+# "-bwd" row; the varlen ones additionally pass cu_seqlens.
 FUSED_PREAMBLE_VARIANTS = {"kda_fused": "kda"}
-VARLEN_VARIANTS = {"kda_varlen": "kda"}
+VARLEN_VARIANTS = {
+    "kda_varlen": "kda",
+    "gated_delta_rule_varlen": "gated_delta_rule",
+}
 
 VARIANTS = [*DENSE_VARIANTS, *FUSED_PREAMBLE_VARIANTS, *VARLEN_VARIANTS]
 

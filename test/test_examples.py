@@ -2990,6 +2990,13 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_linear_kda_varlen(self):
         self._run_linear_example("example_kda", method="test_varlen")
 
+    @pytest.mark.timeout(600)
+    @skipIfRefEager("linear examples assert against their own reference")
+    @skipIfNotCUDA()
+    @skipIfCute("linear-attention examples not supported on cute backend")
+    def test_linear_gated_delta_rule_varlen(self):
+        self._run_linear_example("example_gated_delta_rule", method="test_varlen")
+
     # ── Monkey-patch tests: plug our engine into FLA layers ──
 
     def _linear_attn_monkeypatch_test(

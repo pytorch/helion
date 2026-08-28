@@ -187,11 +187,52 @@ def make_gated_delta_rule_inputs(
     dtype: torch.dtype = DTYPE,
     device: str | torch.device = DEVICE,
     requires_grad: bool = False,
+    varlen: bool = False,
+    varlen_lengths: list[int] | None = None,
 ) -> Inputs:
+    if varlen:
+        assert varlen_lengths is not None, "varlen needs varlen_lengths"
+        return _make_gated_delta_rule_varlen_inputs(
+            varlen_lengths, H, D, DV, dtype, device
+        )
+
     q, k, v = _rand_q_norm_k_v(B, H, T, D, DV, dtype, device, requires_grad)
     beta = torch.sigmoid(torch.randn(B, H, T, device=device, dtype=dtype))
     g = F.logsigmoid(torch.randn(B, H, T, device=device, dtype=dtype))
     return Inputs(q=q, k=k, v=v, scale=1.0 / math.sqrt(D), g=g, beta=beta)
+
+
+def _make_gated_delta_rule_varlen_inputs(
+    lens: list[int],
+    H: int,
+    D: int,
+    DV: int,
+    dtype: torch.dtype = DTYPE,
+    device: str | torch.device = DEVICE,
+) -> Inputs:
+    """Gated Delta Rule inputs as the sequences in lens, under one cu_seqlens.
+
+    Token-major [1, T_total, H, *] as for KDA, with the gate one scalar per token and
+    head. q and k are raw: the l2 norm is the one transform this variant takes
+    in-kernel, so cu_seqlens rides in preamble beside that flag.
+    """
+    total = sum(lens)
+    cu_seqlens = torch.nn.functional.pad(
+        torch.tensor(lens, device=device, dtype=torch.int32).cumsum(0), (1, 0)
+    )
+    rand = lambda *shape: torch.randn(*shape, device=device, dtype=dtype)  # noqa: E731
+    return Inputs(
+        q=rand(1, total, H, D),
+        k=rand(1, total, H, D),
+        v=rand(1, total, H, DV),
+        scale=1.0 / math.sqrt(D),
+        g=F.logsigmoid(rand(1, total, H)),
+        beta=torch.sigmoid(rand(1, total, H)),
+        preamble={
+            "use_qk_l2norm_in_kernel": True,
+            "cu_seqlens": cu_seqlens,
+        },
+    )
 
 
 def make_kda_inputs(
@@ -338,7 +379,9 @@ _VARIANT_SPECS: dict[
 
 
 _FUSED_PREAMBLE_VARIANTS = frozenset({LinearAttentionVariant.KDA})
-_VARLEN_VARIANTS = frozenset({LinearAttentionVariant.KDA})
+_VARLEN_VARIANTS = frozenset(
+    {LinearAttentionVariant.KDA, LinearAttentionVariant.GATED_DELTA_RULE}
+)
 
 
 @dataclass

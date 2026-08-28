@@ -18,6 +18,9 @@ def main() -> None:
     print(f"=== {HARNESS.title} ===")
     HARNESS.test()
     print()
+    print(f"=== {HARNESS.title}: varlen ===")
+    HARNESS.test_varlen()
+    print()
     HARNESS.benchmark()
 
 

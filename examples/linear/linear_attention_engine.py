@@ -388,9 +388,12 @@ def chunk_cumsum_gc_varlen_helion(
       - use_lower_bound=False:
             gt = -exp(A_log[h]) * softplus(gt + dt_bias[h])
     The gate maps 0 to lower_bound * sigmoid(0) != 0, so the tail is masked again
-    after it, then the cumsum is the same triangular matmul as the dense kernel:
+    after it, then the running total is a prefix sum along the chunk:
         gt = gt * valid                  # [C, D]
-        gc[r] = L @ gt                   # [C, D], L the [C, C] lower-triangular ones
+        gc[r] = cumsum(gt, dim=0)        # [C, D]
+    The dense kernel's [C, C] lower-triangular matmul reaches the same values, but it
+    sums on the tensor cores in their reduced input precision and costs C times the
+    arithmetic.
     A zeroed tail holds the running sum flat, leaving the chunk total gc[C-1]
     unchanged. Separate from the dense kernel because the chunk axis must be
     block_size=1 for a scalar row, and hl.tile cannot sit inside a branch."""
@@ -398,7 +401,6 @@ def chunk_cumsum_gc_varlen_helion(
     C = hl.specialize(gc.size(1))
     for tile_r, tile_d in hl.tile([gc.size(0), g.size(2)], block_size=[1, None]):
         idx = hl.arange(C)
-        ltri = (idx[:, None] >= idx[None, :]).to(torch.float32)  # [C, C] incl. diag
         j = tile_r.begin % NT
         h = tile_r.begin // NT
         valid = idx < valid_len[j]
@@ -416,7 +418,7 @@ def chunk_cumsum_gc_varlen_helion(
                 sp = torch.clamp(gt, min=0.0) + torch.log1p(torch.exp(-torch.abs(gt)))
                 gt = -a * sp
             gt = torch.where(valid[:, None], gt, 0.0)
-        gc[tile_r.begin, :, tile_d] = hl.dot(ltri, gt)
+        gc[tile_r.begin, :, tile_d] = hl.cumsum(gt, dim=0)
 
 
 @helion.kernel()
@@ -610,6 +612,7 @@ def chunk_fwd_wy_delta_varlen_helion(
     w: torch.Tensor,
     u: torch.Tensor,
     k_state_out: torch.Tensor,
+    scalar_gate: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
 ) -> None:
     """chunk_fwd_wy_delta_helion's diag_anchored path over a varlen batch.
 
@@ -628,6 +631,10 @@ def chunk_fwd_wy_delta_varlen_helion(
         k_state_out = k_i * exp2(RCP_LN2 * (gc[C-1] - gc))    # [C, D]
     A zero beta_i row zeros that row of A, so T keeps an identity row there and w, u
     and k_state_out are all zero on it: the tail contributes nothing downstream.
+
+    scalar_gate=True takes g_cs one channel wide, the cumulative sum of a gate that is
+    one scalar per token. Both decays are then read once for the whole row rather than
+    per D tile, and each broadcasts over the channel axis.
 
     The dense kernel also returns T as A_inv for its backward; this path is forward
     only, so T is not stored. With DV == D the value loop rides the key loop, so u is
@@ -659,18 +666,30 @@ def chunk_fwd_wy_delta_varlen_helion(
             Apow = hl.dot(Apow, Apow)
             T = hl.dot(Apow, T, acc=T)
 
+        if scalar_gate:
+            g_col = g_cs[tile_r.begin, :, 0].to(torch.float32)  # [C]
+            g_last = g_cs[tile_r.begin, C - 1, 0].to(torch.float32)  # scalar
+            kt_gate = (beta_i * torch.exp2(g_col * RCP_LN2))[:, None]
+            k_state_gate = torch.exp2((g_last - g_col) * RCP_LN2)[:, None]
+
         for tile_d in hl.tile(D):
             raw_k = torch.where(
                 valid[:, None],
                 hl.load(k, [base + idx, h, tile_d], extra_mask=valid[:, None]),
                 0,
             ).to(torch.float32)
-            gc_d = g_cs[tile_r.begin, :, tile_d].to(torch.float32)
-            gc_last = g_cs[tile_r.begin, C - 1, tile_d].to(torch.float32)
-            kt = raw_k * beta_i[:, None] * torch.exp2(gc_d * RCP_LN2)
-            k_state_out[tile_r.begin, :, tile_d] = (
-                raw_k * torch.exp2((gc_last[None, :] - gc_d) * RCP_LN2)
-            ).to(k.dtype)
+            if scalar_gate:
+                kt = raw_k * kt_gate
+                k_state_out[tile_r.begin, :, tile_d] = (raw_k * k_state_gate).to(
+                    k.dtype
+                )
+            else:
+                gc_d = g_cs[tile_r.begin, :, tile_d].to(torch.float32)
+                gc_last = g_cs[tile_r.begin, C - 1, tile_d].to(torch.float32)
+                kt = raw_k * beta_i[:, None] * torch.exp2(gc_d * RCP_LN2)
+                k_state_out[tile_r.begin, :, tile_d] = (
+                    raw_k * torch.exp2((gc_last[None, :] - gc_d) * RCP_LN2)
+                ).to(k.dtype)
             w[tile_r.begin, :, tile_d] = hl.dot(T, kt).to(w.dtype)
             if fuse_v:
                 vt = (
@@ -2283,6 +2302,83 @@ def chunk_fwd_A_diag_anchored_varlen_helion(
 
 
 @helion.kernel()
+def chunk_fwd_A_intra_scalar_gate_varlen_helion(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    gc: torch.Tensor,
+    token_base: torch.Tensor,
+    valid_len: torch.Tensor,
+    A: torch.Tensor,
+    Akk: torch.Tensor,
+    scale: float,
+    l2norm_q: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+) -> None:
+    """Both intra-chunk grams in full, for a gate that is one scalar per token.
+
+    Replaces chunk_fwd_A_diag_anchored_varlen_helion on that gate, which is the one
+    gated_delta_rule has. Row r addresses its tokens as in
+    chunk_cumsum_gc_varlen_helion; gc, A and Akk are per-chunk and stay chunk-major
+    [H * NT, C, *], with gc one channel wide.
+
+    A per-channel gate has to carry its decay inside the reduction over D, which is
+    what forces the anchored kernel's sub-blocks: each folds exp2(gc - gc_n) into its
+    own operands, so the gram is written a tier at a time and the tail of each row is
+    left to the caller's zeroed buffers. A scalar gate is constant over D, so it
+    leaves the sum entirely:
+        A[i, j]   = scale * (q[i] @ k[j]) * exp2(RCP_LN2 * (gc[i] - gc[j]))
+    which is one matmul for the whole C-square gram and an elementwise [C, C] decay.
+    Every entry is written, the masked ones as zero, so this path needs no cleared
+    buffer to write into.
+
+    gc falls with the token index, so the exponent is non-positive everywhere the
+    causal mask keeps, and exp2 is bounded by 1 at any gate scale. It is clamped
+    there rather than masked afterwards, since rows past a sequence's end hold a gc
+    that does not follow the fall and would otherwise overflow before the mask.
+
+    A zeroed row of q or k gives a zero row and column, so no token from the next
+    sequence enters either gram."""
+    NT = token_base.size(0)
+    C = hl.specialize(gc.size(1))
+    D = hl.specialize(q.size(2))
+    for tile_r in hl.tile(A.size(0), block_size=1):
+        r = tile_r.begin
+        j = r % NT
+        h = r // NT
+        base = token_base[j]
+        vlen = valid_len[j]
+        rows = hl.arange(C)
+        # A gram's column index must be a separate arange from its row index.
+        cols = hl.arange(C)
+        m = (rows < vlen)[:, None]
+        dcols = hl.arange(D)
+        qi = torch.where(
+            m, hl.load(q, [base + rows, h, dcols], extra_mask=m), 0
+        ).float()
+        ki = torch.where(
+            m, hl.load(k, [base + rows, h, dcols], extra_mask=m), 0
+        ).float()
+        if l2norm_q:
+            qi = qi * torch.rsqrt((qi * qi).sum(dim=-1, keepdim=True) + 1e-6)
+        gr = hl.load(gc, [r, rows, 0]).float()
+        gk = hl.load(gc, [r, cols, 0]).float()
+        # The grams are stored in q's dtype, so the products are taken there, with
+        # hl.dot accumulating in fp32. The decay stays fp32 and applies after.
+        kt = ki.transpose(-2, -1).to(A.dtype)
+        gram_qk = hl.dot(qi.to(A.dtype), kt).float()
+        gram_kk = hl.dot(ki.to(A.dtype), kt).float()
+        diff = gr[:, None] - gk[None, :]
+        dec = torch.exp2(torch.where(diff < 0, diff, 0.0) * RCP_LN2)
+        # Akk excludes the diagonal, which the wy transform takes as zero; A keeps it,
+        # where the decay is exp2(0) = 1.
+        A[r, rows, cols] = torch.where(
+            rows[:, None] >= cols[None, :], gram_qk * dec * scale, 0.0
+        ).to(A.dtype)
+        Akk[r, rows, cols] = torch.where(
+            rows[:, None] > cols[None, :], gram_kk * dec, 0.0
+        ).to(Akk.dtype)
+
+
+@helion.kernel()
 def chunk_fwd_o_diag_anchored_helion(
     q: torch.Tensor,
     v: torch.Tensor,
@@ -2334,6 +2430,7 @@ def chunk_fwd_o_diag_anchored_varlen_helion(
     out: torch.Tensor,
     scale: float,
     l2norm_q: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+    scalar_gate: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
 ) -> None:
     """chunk_fwd_o_diag_anchored_helion over a varlen batch, q read and out written
     token-major.
@@ -2349,6 +2446,9 @@ def chunk_fwd_o_diag_anchored_varlen_helion(
     Storing under valid is what protects the boundary: a row past a sequence's end is
     never written, so it cannot overwrite the next sequence's first tokens. That makes
     the write the inverse of the token-major reads, with no scatter pass.
+
+    scalar_gate=True takes gc one channel wide, the cumulative sum of a gate that is
+    one scalar per token, and broadcasts it over the channel axis.
 
     A chunk owns one program and takes D and DV whole, so the body has no loop over
     either; a DV loop would re-read q, gc and A per iteration."""
@@ -2373,8 +2473,12 @@ def chunk_fwd_o_diag_anchored_varlen_helion(
         ).float()  # [C, D]
         if l2norm_q:
             qt = qt * torch.rsqrt((qt * qt).sum(dim=-1, keepdim=True) + 1e-6)
-        gct = gc[tile_r.begin, :, :]
-        qg = (qt * torch.exp2(gct * RCP_LN2)).to(q.dtype)
+        if scalar_gate:
+            g_col = gc[tile_r.begin, :, 0].float()  # [C]
+            qg = (qt * torch.exp2(g_col * RCP_LN2)[:, None]).to(q.dtype)
+        else:
+            gct = gc[tile_r.begin, :, :]
+            qg = (qt * torch.exp2(gct * RCP_LN2)).to(q.dtype)
         ht = h[tile_r.begin, :, :]
         o_cross = hl.dot(qg, ht.to(qg.dtype)) * scale
 
@@ -2926,6 +3030,7 @@ def _helion_chunked_fwd_kda_varlen(
     dt_bias: torch.Tensor | None = None,
     lower_bound: float | None = None,
     l2norm_q: bool = False,
+    scalar_gate: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """KDA forward over a varlen batch (cu_seqlens), forward only.
 
@@ -2939,6 +3044,13 @@ def _helion_chunked_fwd_kda_varlen(
         w, u, k_state = wy_delta_varlen(k, v, beta, gc, Akk)
         h_all, v_new, ht = h_delta_varlen(k_state, w, u, h0, gc[C-1], chunk_offsets)
         o             = o_diag_anchored_varlen(q, v_new, gc, h_all, Aqk)
+
+    scalar_gate=True is the gated_delta_rule case, where the gate is one scalar per
+    (token, head) and g arrives [T_total, H, 1]. Broadcast over the key dimension that
+    gate is diag(exp(g)) == exp(g) * I, so this same pipeline computes it: gc is one
+    channel wide throughout, and the gram pass is
+    A_intra_scalar_gate_varlen(q, k, gc), which takes each gram in a single matmul
+    because a decay constant over D leaves the reduction.
 
     q/k/v/g/beta are never copied: each kernel reads them where they lie and zeros
     the rows past a sequence's end. Only the intermediates above are materialized, as
@@ -2962,7 +3074,9 @@ def _helion_chunked_fwd_kda_varlen(
     chunk_offsets, token_base, valid_len, NT = _kda_varlen_chunk_tables(cu_seqlens, C)
 
     HNT = H * NT
-    g_cs = torch.empty(HNT, C, D, dtype=torch.float32, device=q.device)
+    # One channel on the scalar-gate path, where g arrives [T_total, H, 1], D on the
+    # per-channel one. Everything downstream reads g_cs at whichever width it lands.
+    g_cs = torch.empty(HNT, C, g.size(2), dtype=torch.float32, device=q.device)
     chunk_cumsum_gc_varlen_helion(
         g,
         token_base,
@@ -2977,17 +3091,35 @@ def _helion_chunked_fwd_kda_varlen(
     )
     decay_last = g_cs[:, C - 1, :]
 
-    Aqk = torch.zeros(HNT, C, C, dtype=q.dtype, device=q.device)
-    Akk = torch.zeros(HNT, C, C, dtype=q.dtype, device=q.device)
-    chunk_fwd_A_diag_anchored_varlen_helion(
-        q, k, g_cs, token_base, valid_len, Aqk, Akk, scale, l2norm_q=l2norm_q
-    )
+    # The anchored kernel writes only the causal blocks of each gram and leaves the
+    # rest to these zeros; the scalar-gate one writes every entry, so it needs none.
+    alloc_A = torch.empty if scalar_gate else torch.zeros
+    Aqk = alloc_A(HNT, C, C, dtype=q.dtype, device=q.device)
+    Akk = alloc_A(HNT, C, C, dtype=q.dtype, device=q.device)
+    if scalar_gate:
+        chunk_fwd_A_intra_scalar_gate_varlen_helion(
+            q, k, g_cs, token_base, valid_len, Aqk, Akk, scale, l2norm_q=l2norm_q
+        )
+    else:
+        chunk_fwd_A_diag_anchored_varlen_helion(
+            q, k, g_cs, token_base, valid_len, Aqk, Akk, scale, l2norm_q=l2norm_q
+        )
 
     w = torch.empty(HNT, C, D, dtype=k.dtype, device=k.device)
     u = torch.empty(HNT, C, DV, dtype=v.dtype, device=v.device)
     k_state = torch.empty(HNT, C, D, dtype=k.dtype, device=k.device)
     chunk_fwd_wy_delta_varlen_helion(
-        k, v, beta, g_cs, Akk, token_base, valid_len, w, u, k_state
+        k,
+        v,
+        beta,
+        g_cs,
+        Akk,
+        token_base,
+        valid_len,
+        w,
+        u,
+        k_state,
+        scalar_gate=scalar_gate,
     )
 
     # The chunk operands are head-major (row h * NT + j), so the state pass indexes
@@ -3012,7 +3144,17 @@ def _helion_chunked_fwd_kda_varlen(
     # to the real token count on return.
     o = q.new_zeros(q.size(0), H, DV)
     chunk_fwd_o_diag_anchored_varlen_helion(
-        q, v_new, g_cs, h_all, Aqk, token_base, valid_len, o, scale, l2norm_q=l2norm_q
+        q,
+        v_new,
+        g_cs,
+        h_all,
+        Aqk,
+        token_base,
+        valid_len,
+        o,
+        scale,
+        l2norm_q=l2norm_q,
+        scalar_gate=scalar_gate,
     )
     o = o[:T_total]
 
@@ -3718,6 +3860,85 @@ def helion_chunk_delta_rule(
     )
 
 
+def _varlen_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    C: int,
+    cu_seqlens: torch.Tensor,
+    *,
+    scale: float,
+    initial_state: torch.Tensor | None,
+    return_final_state: bool,
+    state_v_first: bool,
+    l2norm_q: bool = False,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
+    scalar_gate: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """The varlen entry both KDA and gated_delta_rule take: check, then dispatch.
+
+    Inputs are token-major [1, T_total, H, *] and initial_state is already in
+    [N, H, D, DV] order, whatever layout the caller was handed; state_v_first here
+    applies to the returned state alone.
+    """
+    if q.size(0) != 1:
+        raise ValueError(
+            f"The batch size is expected to be 1 rather than {q.size(0)} when "
+            "using `cu_seqlens`. Please flatten variable-length inputs before "
+            "processing."
+        )
+    # The gram kernels assert the same bound; this raises the caller-facing error
+    # before a kernel trace does.
+    if C not in (2 * BC_DIAG, 4 * BC_DIAG):
+        raise ValueError(
+            f"chunk size C must be {2 * BC_DIAG} or {4 * BC_DIAG} on the "
+            f"cu_seqlens path, got {C}"
+        )
+    # Every kernel indexes tokens through cu_seqlens, so a vector that does not
+    # partition [0, T_total) reads the wrong rows rather than failing: an end
+    # below T_total leaves that much of the output at its zero initialization.
+    if int(cu_seqlens[-1]) != q.size(1):
+        raise ValueError(
+            f"cu_seqlens must end at T_total={q.size(1)}, got {int(cu_seqlens[-1])}"
+        )
+    if int(cu_seqlens[0]) != 0 or not bool((cu_seqlens[1:] > cu_seqlens[:-1]).all()):
+        raise ValueError("cu_seqlens must start at 0 and strictly increase")
+    # Grouped-query: give every query head its own key/value head, matching what
+    # chunked_linear_attn does for the dense path.
+    H_kv = k.size(2)
+    if H_kv < q.size(2):
+        assert q.size(2) % H_kv == 0
+        n_rep = q.size(2) // H_kv
+        k = k.repeat_interleave(n_rep, dim=2)
+        v = v.repeat_interleave(n_rep, dim=2)
+    o, final_state = _helion_chunked_fwd_kda_varlen(
+        q[0],
+        k[0],
+        v[0],
+        g[0],
+        beta[0],
+        C,
+        cu_seqlens,
+        initial_state=initial_state,
+        return_final_state=return_final_state,
+        scale=scale,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
+        l2norm_q=l2norm_q,
+        scalar_gate=scalar_gate,
+    )
+    o = o.unsqueeze(0)
+    if return_final_state:
+        assert final_state is not None
+        return o, final_state.transpose(-2, -1) if state_v_first else final_state
+    return o
+
+
 def helion_chunk_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3729,10 +3950,79 @@ def helion_chunk_gated_delta_rule(
     scale: float = 1.0,
     initial_state: torch.Tensor | None = None,
     return_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    cu_seqlens: torch.Tensor | None = None,
+    state_v_first: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Gated DeltaNet, the delta rule under one scalar decay per token and head.
+
+    use_qk_l2norm_in_kernel=True takes q and k raw and norms them per head over D,
+    the transform the model applies before the call:
+            q = q / ||q||,  k = k / ||k||
+    It has no backward, so setting it on an input with requires_grad=True raises
+    NotImplementedError.
+
+    cu_seqlens [N+1] switches to a variable-length batch, as it does for KDA.
+    Inputs are then token-major [1, T_total, H, D] with g [1, T_total, H], one
+    scalar per token and head, rather than the head-first layout of the dense path:
+    sequence n spans tokens cu_seqlens[n] : cu_seqlens[n+1] and the recurrence
+    restarts at each boundary. The output matches its inputs, [1, T_total, H, DV],
+    and initial_state / the returned final state are [N, H, D, DV], one per
+    sequence. This path is forward only.
+
+    Broadcast over the key dimension the gate is diag(exp(g)) == exp(g) * I, so the
+    varlen KDA pipeline computes this variant exactly, reading g one channel wide;
+    _helion_chunked_fwd_kda_varlen documents what that saves.
+
+    state_v_first holds the state as [N, H, DV, D] instead of [N, H, D, DV], matching
+    what vLLM uses; the flag name is FLA's. It applies to initial_state and the
+    returned final state alike, so a returned state feeds straight back in.
+    """
     assert g is not None
     assert beta is not None
-    return chunked_linear_attn(
+    needs_grad = any(
+        t is not None and t.requires_grad for t in (q, k, v, g, beta, initial_state)
+    )
+    if use_qk_l2norm_in_kernel and needs_grad:
+        raise NotImplementedError(
+            "the in-kernel l2 norm is forward-only; call with the flag off and "
+            "norm the inputs outside the kernel to keep gradients"
+        )
+
+    if state_v_first and initial_state is not None:
+        initial_state = initial_state.transpose(-2, -1).contiguous()
+
+    # q's norm rides the gram kernel on the varlen path, so only k is normed here.
+    fuse_q_l2norm = use_qk_l2norm_in_kernel and cu_seqlens is not None
+    if use_qk_l2norm_in_kernel:
+        norm = lambda t: l2norm_fwd_helion(t.reshape(-1, t.size(-1))).view_as(t)  # noqa: E731
+        k = norm(k)
+        if not fuse_q_l2norm:
+            q = norm(q)
+
+    if cu_seqlens is not None:
+        if needs_grad:
+            raise NotImplementedError(
+                "the cu_seqlens path is forward-only; pass a dense batch "
+                "to keep gradients"
+            )
+        return _varlen_forward(
+            q,
+            k,
+            v,
+            g.unsqueeze(-1),
+            beta,
+            C,
+            cu_seqlens,
+            scale=scale,
+            initial_state=initial_state,
+            return_final_state=return_final_state,
+            state_v_first=state_v_first,
+            l2norm_q=fuse_q_l2norm,
+            scalar_gate=True,
+        )
+
+    out = chunked_linear_attn(
         q,
         k,
         v,
@@ -3743,6 +4033,10 @@ def helion_chunk_gated_delta_rule(
         initial_state=initial_state,
         return_final_state=return_final_state,
     )
+    if return_final_state and state_v_first:
+        o, final_state = out
+        return o, final_state.transpose(-2, -1)
+    return out
 
 
 def helion_chunk_kda(
@@ -3825,63 +4119,28 @@ def helion_chunk_kda(
         lower_bound = None
 
     if cu_seqlens is not None:
-        if q.size(0) != 1:
-            raise ValueError(
-                f"The batch size is expected to be 1 rather than {q.size(0)} when "
-                "using `cu_seqlens`. Please flatten variable-length inputs before "
-                "processing."
-            )
         if needs_grad:
             raise NotImplementedError(
                 "the cu_seqlens path is forward-only; pass a dense batch "
                 "to keep gradients"
             )
-        # chunk_fwd_A_diag_anchored_varlen_helion asserts the same bound; this raises
-        # the caller-facing error before a kernel trace does.
-        if C not in (2 * BC_DIAG, 4 * BC_DIAG):
-            raise ValueError(
-                f"chunk size C must be {2 * BC_DIAG} or {4 * BC_DIAG} for KDA, got {C}"
-            )
-        # Every kernel indexes tokens through cu_seqlens, so a vector that does not
-        # partition [0, T_total) reads the wrong rows rather than failing: an end
-        # below T_total leaves that much of the output at its zero initialization.
-        if int(cu_seqlens[-1]) != q.size(1):
-            raise ValueError(
-                f"cu_seqlens must end at T_total={q.size(1)}, got {int(cu_seqlens[-1])}"
-            )
-        if int(cu_seqlens[0]) != 0 or not bool(
-            (cu_seqlens[1:] > cu_seqlens[:-1]).all()
-        ):
-            raise ValueError("cu_seqlens must start at 0 and strictly increase")
-        # Grouped-query: give every query head its own key/value head, matching what
-        # chunked_linear_attn does for the dense path.
-        H_kv = k.size(2)
-        if H_kv < q.size(2):
-            assert q.size(2) % H_kv == 0
-            n_rep = q.size(2) // H_kv
-            k = k.repeat_interleave(n_rep, dim=2)
-            v = v.repeat_interleave(n_rep, dim=2)
-        o, final_state = _helion_chunked_fwd_kda_varlen(
-            q[0],
-            k[0],
-            v[0],
-            g[0],
-            beta[0],
+        return _varlen_forward(
+            q,
+            k,
+            v,
+            g,
+            beta,
             C,
             cu_seqlens,
+            scale=scale,
             initial_state=initial_state,
             return_final_state=return_final_state,
-            scale=scale,
+            state_v_first=state_v_first,
+            l2norm_q=fuse_q_l2norm,
             A_log=A_log,
             dt_bias=dt_bias,
             lower_bound=lower_bound,
-            l2norm_q=fuse_q_l2norm,
         )
-        o = o.unsqueeze(0)
-        if return_final_state:
-            assert final_state is not None
-            return o, final_state.transpose(-2, -1) if state_v_first else final_state
-        return o
 
     out = chunked_linear_attn(
         q,
