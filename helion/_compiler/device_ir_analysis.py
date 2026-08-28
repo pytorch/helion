@@ -24,13 +24,18 @@ from ..autotuner.config_spec import PointwiseElementwiseFact
 from ..autotuner.config_spec import ResidentRegion
 from ..autotuner.config_spec import ResolvedMatmulFact
 from ..autotuner.config_spec import RootGridFact
+from ..autotuner.config_spec import SymbolicLoopBound
 from ..language import _tracing_ops
 from .compile_environment import FixedBlockSizeSource
+from .compile_environment import _symint_free_symbols
+from .compile_environment import _symint_sympy_expr
 from .indexing_strategy import subscript_index_scale
 from .indexing_strategy import subscript_tile_info
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+
+    import sympy
 
     from ..autotuner.config_spec import ConfigSpec
     from .compile_environment import CompileEnvironment
@@ -51,6 +56,7 @@ def matmul_operand_positions() -> dict[object, tuple[int, int]]:
         matmul_ops.dot: (0, 1),
         torch.ops.aten.mm.default: (0, 1),
         torch.ops.aten.bmm.default: (0, 1),
+        torch.ops.aten.bmm.dtype: (0, 1),
         torch.ops.aten.addmm.default: (1, 2),
         torch.ops.aten.baddbmm.default: (1, 2),
     }
@@ -313,7 +319,6 @@ class GraphAnalysis:
     block_id_order: tuple[int, ...]
     live_tile_steps: tuple[tuple[LiveTile, ...], ...]
     peak_live_tiles: tuple[LiveTile, ...]
-    peak_dot_output_tiles: tuple[LiveTile, ...]
     dot_nodes: tuple[torch.fx.Node, ...]
     reduction_occurrences: tuple[int, ...]
     reduction_axis_by_node_id: dict[int, int]
@@ -427,37 +432,6 @@ class GraphAnalysis:
                     peak_live_tiles = step
             live = {value for value in live if last_use.get(value, -1) > index}
 
-        dot_details = {
-            node: tile
-            for node in dot_nodes
-            if (
-                tile := _tile_from_tensor(
-                    node.meta.get("val"),
-                    env,
-                    kind="dot_out",
-                )
-            )
-            is not None
-        }
-        best_dot_key = (-1, -1)
-        peak_dot_output_tiles: tuple[LiveTile, ...] = ()
-        live_dots: set[torch.fx.Node] = set()
-        for index, node in enumerate(nodes):
-            if node in dot_details:
-                live_dots.add(node)
-            if live_dots:
-                tiles = tuple(dot_details[value] for value in live_dots)
-                key = (
-                    sum(tile_rank(tile.dim_block_ids) for tile in tiles),
-                    len(tiles),
-                )
-                if key > best_dot_key:
-                    best_dot_key = key
-                    peak_dot_output_tiles = tiles
-            live_dots = {
-                value for value in live_dots if last_use.get(value, len(nodes)) > index
-            }
-
         return cls(
             graph_id=graph_info.graph_id,
             nodes=nodes,
@@ -466,7 +440,6 @@ class GraphAnalysis:
             block_id_order=tuple(getattr(graph_info, "block_ids", ()) or ()),
             live_tile_steps=tuple(live_tile_steps),
             peak_live_tiles=peak_live_tiles,
-            peak_dot_output_tiles=peak_dot_output_tiles,
             dot_nodes=tuple(dot_nodes),
             reduction_occurrences=tuple(reduction_occurrences),
             reduction_axis_by_node_id=reduction_axis_by_node_id,
@@ -650,56 +623,12 @@ class DeviceIRAnalysis:
                     itemsize = width
         return itemsize
 
-    def kernel_peak_live_tiles(self) -> tuple[LiveTile, ...]:
-        """Legacy max-by-rank-profile live set across original graphs."""
-        best: tuple[LiveTile, ...] = ()
-        best_key: tuple[int, ...] = ()
-        for graph in self.non_reduction_graphs:
-            tiles = graph.peak_live_tiles
-            max_rank = max(
-                (tile_rank(tile.dim_block_ids) for tile in tiles),
-                default=0,
-            )
-            key = tile_set_rank_profile(
-                (tile.dim_block_ids for tile in tiles),
-                max_rank,
-            )
-            if key > best_key:
-                best_key = key
-                best = tiles
-        return best
-
     def kernel_live_tile_steps(self) -> tuple[tuple[LiveTile, ...], ...]:
         return tuple(
             step
             for graph in self.non_reduction_graphs
             for step in graph.live_tile_steps
         )
-
-    def kernel_peak_dot_outputs(self) -> tuple[LiveTile, ...]:
-        """Peak dot-output set after adding accumulator ancestor chains."""
-        accumulator_of = {
-            graph.graph_id: graph.peak_dot_output_tiles
-            for graph in self.non_reduction_graphs
-        }
-        best: tuple[LiveTile, ...] = ()
-        best_key = (-1, -1)
-        for graph_id, own in accumulator_of.items():
-            chain = list(own)
-            current = self.parent_of.get(graph_id, -1)
-            seen = {graph_id}
-            while current in accumulator_of and current not in seen:
-                seen.add(current)
-                chain.extend(accumulator_of[current])
-                current = self.parent_of.get(current, -1)
-            key = (
-                sum(tile_rank(tile.dim_block_ids) for tile in chain),
-                len(chain),
-            )
-            if key > best_key:
-                best_key = key
-                best = tuple(chain)
-        return best
 
     def group_live_tiles(
         self,
@@ -1108,6 +1037,126 @@ class DeviceIRAnalysis:
         if not facts:
             return None
 
+        def axis_extent_or_none(block_id: int | None) -> int | None:
+            if block_id is not None and 0 <= block_id < len(env.block_sizes):
+                size = env.block_sizes[block_id].size
+                if isinstance(size, (int, torch.SymInt)):
+                    return max(1, env.size_hint(size))
+            return None
+
+        from ..language.matmul_ops import MATMUL_DIM_BLOCK_IDS_META
+        from ..language.matmul_ops import MATMUL_FACT_ID_META
+
+        nodes_by_fact_id: dict[int, tuple[int, torch.fx.Node]] = {}
+        for graph_id, node in self.dot_nodes:
+            fact_id = node.meta.get(MATMUL_FACT_ID_META)
+            if (
+                isinstance(fact_id, int)
+                and 0 <= fact_id < len(facts)
+                and fact_id not in nodes_by_fact_id
+            ):
+                nodes_by_fact_id[fact_id] = (graph_id, node)
+        attribution_complete = (
+            len(self.dot_nodes) == len(facts) == len(nodes_by_fact_id)
+        )
+
+        if attribution_complete:
+            operand_positions = matmul_operand_positions()
+
+            def shape_block_ids(node: torch.fx.Node) -> tuple[int | None, ...]:
+                value = node.meta.get("val")
+                if not isinstance(value, torch.Tensor):
+                    return ()
+                # Do not use ``resolve_block_id``: matching a concrete padded extent
+                # could assign an unrelated fixed dimension to a reduction axis.
+                result = [env.get_block_id(size) for size in value.shape]
+                annotated = node.meta.get(MATMUL_DIM_BLOCK_IDS_META)
+                if isinstance(annotated, (list, tuple)) and len(annotated) == len(
+                    result
+                ):
+                    for index, block_id in enumerate(annotated):
+                        if isinstance(block_id, int):
+                            result[index] = block_id
+                return tuple(result)
+
+            def choose_axis(
+                original: int | None,
+                *inferred: int | None,
+            ) -> int | None:
+                if original is not None:
+                    return original
+                candidates = {value for value in inferred if value is not None}
+                return candidates.pop() if len(candidates) == 1 else None
+
+            # Keep block identity separate from representative fake sizes. A dot
+            # establishes the identity of its output M/N dimensions; shape-preserving
+            # pointwise operations carry it until a later dot consumes that tensor.
+            for graph in self.graphs:
+                for node in graph.nodes:
+                    value = node.meta.get("val")
+                    if not isinstance(value, torch.Tensor):
+                        continue
+                    result_ids = list(shape_block_ids(node))
+                    fact_id = node.meta.get(MATMUL_FACT_ID_META)
+                    if isinstance(fact_id, int) and fact_id in nodes_by_fact_id:
+                        positions = operand_positions.get(node.target)
+                        if positions is None:
+                            continue
+                        lhs = node.args[positions[0]]
+                        rhs = node.args[positions[1]]
+                        assert isinstance(lhs, torch.fx.Node)
+                        assert isinstance(rhs, torch.fx.Node)
+                        lhs_ids = shape_block_ids(lhs)
+                        rhs_ids = shape_block_ids(rhs)
+                        fact = facts[fact_id]
+                        m_block_id = choose_axis(
+                            fact.m_block_id,
+                            lhs_ids[-2] if len(lhs_ids) >= 2 else None,
+                        )
+                        n_block_id = choose_axis(
+                            fact.n_block_id,
+                            rhs_ids[-1] if rhs_ids else None,
+                        )
+                        k_block_id = choose_axis(
+                            fact.k_block_id,
+                            lhs_ids[-1] if lhs_ids else None,
+                            rhs_ids[-2] if len(rhs_ids) >= 2 else None,
+                        )
+                        fact = fact._replace(
+                            m_block_id=m_block_id,
+                            n_block_id=n_block_id,
+                            k_block_id=k_block_id,
+                            static_m=axis_extent_or_none(m_block_id) or fact.static_m,
+                            static_n=axis_extent_or_none(n_block_id) or fact.static_n,
+                            static_k=axis_extent_or_none(k_block_id) or fact.static_k,
+                        )
+                        facts[fact_id] = fact
+                        if len(result_ids) >= 2:
+                            result_ids[-2:] = [m_block_id, n_block_id]
+                    elif torch.Tag.pointwise in getattr(node.target, "tags", ()):
+                        shape = tuple(map(str, value.shape))
+                        matching_inputs = [
+                            shape_block_ids(input_node)
+                            for input_node in node.all_input_nodes
+                            if isinstance(
+                                input_value := input_node.meta.get("val"), torch.Tensor
+                            )
+                            and tuple(map(str, input_value.shape)) == shape
+                        ]
+                        for index in range(len(result_ids)):
+                            if result_ids[index] is not None:
+                                continue
+                            candidates = {
+                                input_ids[index]
+                                for input_ids in matching_inputs
+                                if len(input_ids) == len(result_ids)
+                                and input_ids[index] is not None
+                            }
+                            if len(candidates) == 1:
+                                result_ids[index] = candidates.pop()
+                    if any(block_id is not None for block_id in result_ids):
+                        node.meta[MATMUL_DIM_BLOCK_IDS_META] = tuple(result_ids)
+
         valid_block_ids = set(spec.block_sizes.valid_block_ids())
 
         def classify_axis(
@@ -1150,18 +1199,44 @@ class DeviceIRAnalysis:
                 if block_id is not None and block_id in valid_block_ids:
                     knob_users.setdefault(block_id, []).append((index, axis))
 
-        def axis_extent_or_none(block_id: int) -> int | None:
-            if 0 <= block_id < len(env.block_sizes):
-                size = env.block_sizes[block_id].size
-                if isinstance(size, (int, torch.SymInt)):
-                    try:
-                        return max(1, int(env.size_hint(size)))
-                    except Exception:
-                        return None
-            return None
+        from .host_function import HostFunction
+        from .variable_origin import BlockSizeOrigin
+        from .variable_origin import TileIdOrigin
 
-        def axis_extent(block_id: int) -> int:
-            return axis_extent_or_none(block_id) or 1
+        origins = HostFunction.current().expr_to_origin
+
+        def symbolic_loop_bound(block_id: int) -> SymbolicLoopBound | None:
+            """Preserve candidate-dependent symbolic loop bounds."""
+            size = env.block_sizes[block_id].size
+            if not isinstance(size, torch.SymInt):
+                return None
+            expr = _symint_sympy_expr(size)
+
+            block_size_symbols: list[tuple[sympy.Symbol, int]] = []
+            tile_id_symbols: list[tuple[sympy.Symbol, int]] = []
+            for symbol in sorted(
+                _symint_free_symbols(size), key=lambda item: item.name
+            ):
+                origin_info = origins.get(symbol)
+                if origin_info is None:
+                    continue
+                origin = origin_info.origin
+                if isinstance(origin, BlockSizeOrigin):
+                    block_size_symbols.append((symbol, origin.block_id))
+                elif isinstance(origin, TileIdOrigin):
+                    tile_id_symbols.append((symbol, origin.block_id))
+            if not block_size_symbols and not tile_id_symbols:
+                return None
+            return SymbolicLoopBound(
+                expr,
+                tuple(block_size_symbols),
+                tuple(tile_id_symbols),
+            )
+
+        symbolic_loop_bounds = {
+            block_id: symbolic_loop_bound(block_id)
+            for block_id in range(len(env.block_sizes))
+        }
 
         grid_block_ids = set(spec.grid_block_ids)
         matmul_output_block_ids = {fact.m_block_id for fact in facts} | {
@@ -1170,50 +1245,61 @@ class DeviceIRAnalysis:
         outer_grid = 1
         for block_id in spec.grid_block_ids:
             if block_id not in matmul_output_block_ids:
-                outer_grid *= axis_extent(block_id)
+                outer_grid *= axis_extent_or_none(block_id) or 1
 
         bounded_by: dict[int, int] = {}
         bounded_extent: dict[int, int] = {}
         for slot in range(len(spec.block_sizes)):
             block_spec = spec.block_sizes[slot]
-            parent = getattr(block_spec, "bounded_by_block_id", None)
-            if isinstance(parent, int):
+            parent = block_spec.bounded_by_block_id
+            if parent is not None:
                 bounded_by[block_spec.block_id] = parent
                 if 0 <= parent < len(env.block_sizes):
                     source = env.block_sizes[parent].block_size_source
-                    value = getattr(source, "value", None)
                     if isinstance(source, FixedBlockSizeSource) and isinstance(
-                        value,
+                        source.value,
                         int,
                     ):
-                        bounded_extent[block_spec.block_id] = max(1, value)
+                        bounded_extent[block_spec.block_id] = max(1, source.value)
 
         def loop_axes_for(graph_id: int) -> tuple[LoopAxisFact, ...]:
             axes_out: list[LoopAxisFact] = []
-            seen_graphs: set[int] = set()
             seen_axes: set[int] = set()
             current = graph_id
-            while current in self.loop_block_ids and current not in seen_graphs:
-                seen_graphs.add(current)
+            while current in self.loop_block_ids:
                 for block_id in sorted(self.loop_block_ids[current]):
                     if block_id in grid_block_ids or block_id in seen_axes:
                         continue
                     seen_axes.add(block_id)
+                    bound = (
+                        None
+                        if block_id in bounded_by
+                        else symbolic_loop_bounds.get(block_id)
+                    )
                     axes_out.append(
                         LoopAxisFact(
-                            block_id,
-                            axis_extent_or_none(block_id),
-                            bounded_by.get(block_id),
-                            bounded_extent.get(block_id),
+                            block_id=block_id,
+                            extent=(
+                                None
+                                if bound is not None
+                                else axis_extent_or_none(block_id)
+                            ),
+                            bounded_by_block_id=bounded_by.get(block_id),
+                            bounded_extent=bounded_extent.get(block_id),
+                            symbolic_bound=bound,
                         )
                     )
                 current = self.parent_of.get(current, -1)
             return tuple(axes_out)
 
-        def trips_for(graph_id: int) -> int:
+        def max_trips_for(graph_id: int) -> int | None:
             trips = 1
             for axis in loop_axes_for(graph_id):
-                extent = axis.extent or 1
+                extent = axis.extent
+                if axis.symbolic_bound is not None:
+                    # There is no candidate-independent upper bound for arbitrary
+                    # symbolic arithmetic.
+                    return None
                 if axis.bounded_by_block_id is not None:
                     extent = (
                         axis.bounded_extent
@@ -1222,8 +1308,10 @@ class DeviceIRAnalysis:
                             spec,
                             axis.bounded_by_block_id,
                         )
-                        or axis_extent(axis.bounded_by_block_id)
+                        or axis_extent_or_none(axis.bounded_by_block_id)
                     )
+                if extent is None:
+                    return None
                 block = _immovable_extent(env, spec, axis.block_id)
                 trips *= max(1, -(-extent // block)) if block else extent
             return trips
@@ -1343,6 +1431,7 @@ class DeviceIRAnalysis:
                 if block_id not in grid_block_ids
                 and axis_extent_or_none(block_id) is None
                 and block_id not in bounded_by
+                and symbolic_loop_bounds.get(block_id) is None
             ]
             enclosing_axes = loop_axes_for(body_graph_id)
             if len(block_ids) != 1 or len(unresolved) != 1 or len(enclosing_axes) != 1:
@@ -1366,16 +1455,30 @@ class DeviceIRAnalysis:
             if len(trip_by_load) >= 2 and len(trips) == 1:
                 inferred_work_trips[(body_graph_id, block_id)] = trips.pop()
 
-        n_dot_nodes = len(self.dot_nodes)
-        attribution_complete = n_dot_nodes == len(facts)
         sites: list[DotSite] = []
         if attribution_complete:
-            for index, (graph_id, node) in enumerate(self.dot_nodes):
+            for index, fact in enumerate(facts):
+                graph_id, node = nodes_by_fact_id[index]
                 value = node.meta.get("val")
                 if isinstance(value, torch.Tensor) and value.ndim >= 2:
                     observed_extents: list[int] = []
-                    for dimension in value.shape[-2:]:
-                        block_id = env.resolve_block_id(dimension)
+                    annotated = node.meta.get(MATMUL_DIM_BLOCK_IDS_META)
+                    annotated_tail = (
+                        annotated[-2:]
+                        if isinstance(annotated, (list, tuple))
+                        and len(annotated) == value.ndim
+                        else (None, None)
+                    )
+                    for dimension, annotated_block_id in zip(
+                        value.shape[-2:],
+                        annotated_tail,
+                        strict=True,
+                    ):
+                        block_id = (
+                            annotated_block_id
+                            if isinstance(annotated_block_id, int)
+                            else env.resolve_block_id(dimension)
+                        )
                         if block_id is not None and 0 <= block_id < len(
                             env.block_sizes
                         ):
@@ -1383,13 +1486,10 @@ class DeviceIRAnalysis:
                         if not isinstance(dimension, (int, torch.SymInt)):
                             observed_extents.append(-1)
                             continue
-                        try:
-                            observed_extents.append(int(env.size_hint(dimension)))
-                        except Exception:
-                            observed_extents.append(-1)
+                        observed_extents.append(env.size_hint(dimension))
                     expected_extents = [
-                        facts[index].static_m,
-                        facts[index].static_n,
+                        fact.static_m,
+                        fact.static_n,
                     ]
                     if any(
                         expected is not None and observed != -1 and expected != observed
@@ -1413,23 +1513,22 @@ class DeviceIRAnalysis:
                 sites.append(
                     DotSite(
                         graph_id,
-                        trips_for(graph_id),
                         updates_carry,
                         loop_axes,
                         exact_loop_trips,
+                        max_trips_for(graph_id),
                     )
                 )
         if not attribution_complete:
-            sites = [DotSite(-1, 1, False, (), None) for _ in facts]
+            sites = [DotSite(-1, False, (), None, None) for _ in facts]
 
         sequential_loop_trips = 1
         for body_graph_id, block_ids in self.loop_block_ids.items():
             if any(block_id in spec.grid_block_ids for block_id in block_ids):
                 continue
-            sequential_loop_trips = max(
-                sequential_loop_trips,
-                trips_for(body_graph_id),
-            )
+            max_trips = max_trips_for(body_graph_id)
+            if max_trips is not None:
+                sequential_loop_trips = max(sequential_loop_trips, max_trips)
 
         pipelined_regions: list[PipelinedRegion] = []
         resident_regions: list[ResidentRegion] = []
@@ -1459,13 +1558,9 @@ class DeviceIRAnalysis:
                 (block_id, tuple(knob_users[block_id]))
                 for block_id in sorted(knob_users)
             ),
-            outer_grid=outer_grid,
             sequential_loop_trips=sequential_loop_trips,
-            live_tiles=tuple(self.kernel_peak_live_tiles()),
-            live_dot_outputs=tuple(self.kernel_peak_dot_outputs()),
             live_tile_steps=tuple(self.kernel_live_tile_steps()),
             pipelined_regions=tuple(pipelined_regions),
             resident_regions=tuple(resident_regions),
-            n_dot_nodes=max(n_dot_nodes, len(facts)),
             attribution_complete=attribution_complete,
         )

@@ -705,6 +705,205 @@ class TestMatmulFacts(TestCase):
                 self.assertEqual(fact.lhs_dtype, HALF_DTYPE)
                 self.assertEqual(fact.rhs_dtype, HALF_DTYPE)
 
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
+    def test_matmul_fact_identity_does_not_depend_on_graph_walk_order(self) -> None:
+        from helion._compiler.device_ir_analysis import DeviceIRAnalysis
+
+        @helion.kernel(backend="triton", static_shapes=True)
+        def two_matmuls(
+            x0: torch.Tensor,
+            y0: torch.Tensor,
+            x1: torch.Tensor,
+            y1: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m0, k0 = x0.shape
+            _, n0 = y0.shape
+            out0 = torch.empty([m0, n0], device=x0.device, dtype=x0.dtype)
+            m1, k1 = x1.shape
+            _, n1 = y1.shape
+            out1 = torch.empty([m1, n1], device=x1.device, dtype=x1.dtype)
+            for tile_m0, tile_n0 in hl.tile([m0, n0]):
+                out0[tile_m0, tile_n0] = hl.dot(
+                    x0[tile_m0, :],
+                    y0[:, tile_n0],
+                )
+
+            for tile_m1, tile_n1 in hl.tile([m1, n1]):
+                out1[tile_m1, tile_n1] = hl.dot(
+                    x1[tile_m1, :],
+                    y1[:, tile_n1],
+                )
+            return out0, out1
+
+        args = (
+            torch.empty([64, 32], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([32, 96], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([128, 64], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([64, 160], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        original = DeviceIRAnalysis.kernel_matmul_fact
+
+        def reverse_walk_order(
+            analysis: DeviceIRAnalysis,
+            *method_args: object,
+            **method_kwargs: object,
+        ) -> object:
+            analysis.dot_nodes = analysis.dot_nodes[::-1]
+            return original(analysis, *method_args, **method_kwargs)
+
+        with patch.object(DeviceIRAnalysis, "kernel_matmul_fact", reverse_walk_order):
+            spec = two_matmuls.bind(args).config_spec
+
+        fact = spec.kernel_matmul_fact
+        assert fact is not None
+        self.assertTrue(fact.attribution_complete)
+        self.assertEqual(
+            [
+                (resolved.fact.static_m, resolved.fact.static_n)
+                for resolved in fact.matmuls
+            ],
+            [(64, 96), (128, 160)],
+        )
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
+    def test_bmm_dtype_and_nested_loop_ancestry(self) -> None:
+        @helion.kernel(backend="triton", static_shapes=True)
+        def nested_attention(
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+        ) -> torch.Tensor:
+            batches = q.size(0)
+            heads = hl.specialize(q.size(1))
+            queries = q.size(2)
+            keys = k.size(2)
+            dim = hl.specialize(q.size(3))
+            out = torch.empty_like(q)
+            for batch in hl.grid(batches):
+                for tile_q in hl.tile(queries):
+                    query = q[batch, :, tile_q, :]
+                    acc = hl.zeros([heads, tile_q, dim], dtype=torch.float32)
+                    for tile_kv in hl.tile(keys):
+                        key = k[batch, :, tile_kv, :]
+                        value = v[batch, :, tile_kv, :]
+                        scores = torch.bmm(
+                            query,
+                            key.transpose(-2, -1),
+                            torch.float32,
+                        )
+                        acc = acc + torch.bmm(scores.to(value.dtype), value)
+                    out[batch, :, tile_q, :] = acc.to(out.dtype)
+            return out
+
+        args = tuple(
+            torch.empty([2, 4, 128, 64], device=DEVICE, dtype=HALF_DTYPE)
+            for _ in range(3)
+        )
+        spec = nested_attention.bind(args).config_spec
+        fact = spec.kernel_matmul_fact
+        assert fact is not None
+        self.assertEqual(len(spec.matmul_facts), 2)
+        self.assertTrue(fact.attribution_complete)
+
+        query_block_id = spec.matmul_facts[0].m_block_id
+        key_block_id = spec.matmul_facts[0].n_block_id
+        assert query_block_id is not None
+        assert key_block_id is not None
+        qk, pv = fact.matmuls
+        self.assertEqual(
+            (
+                qk.fact.m_block_id,
+                qk.fact.static_m,
+                qk.fact.n_block_id,
+                qk.fact.static_n,
+                qk.fact.k_block_id,
+                qk.fact.static_k,
+            ),
+            (query_block_id, 128, key_block_id, 128, None, 64),
+        )
+        self.assertEqual(
+            (
+                pv.fact.m_block_id,
+                pv.fact.static_m,
+                pv.fact.n_block_id,
+                pv.fact.static_n,
+                pv.fact.k_block_id,
+                pv.fact.static_k,
+            ),
+            (query_block_id, 128, None, 64, key_block_id, 128),
+        )
+        nested_axes = [
+            {axis.block_id for axis in region.loop_axes}
+            for region in fact.pipelined_regions
+        ]
+        self.assertTrue(
+            any({query_block_id, key_block_id}.issubset(axes) for axes in nested_axes)
+        )
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
+    def test_symbolic_loop_bound_retains_expression_and_origins(self) -> None:
+        @helion.kernel(backend="triton", static_shapes=True)
+        def prefix_matmul(
+            lhs: torch.Tensor,
+            rhs: torch.Tensor,
+        ) -> torch.Tensor:
+            rows, _ = lhs.shape
+            cols = hl.specialize(rhs.size(1))
+            block_m = hl.register_block_size(rows)
+            block_k = hl.register_block_size(64, 64)
+            out = torch.empty([rows, cols], device=lhs.device, dtype=lhs.dtype)
+            for tile_m in hl.tile(rows, block_size=block_m):
+                acc = hl.zeros([tile_m, cols], dtype=torch.float32)
+                for tile_k in hl.tile(
+                    (tile_m.id + 2) * block_m,
+                    block_size=block_k,
+                ):
+                    acc = hl.dot(
+                        lhs[tile_m, tile_k],
+                        rhs[tile_k, :],
+                        acc=acc,
+                    )
+                out[tile_m, :] = acc.to(out.dtype)
+            return out
+
+        args = (
+            torch.empty([256, 512], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([512, 64], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        spec = prefix_matmul.bind(args).config_spec
+        fact = spec.kernel_matmul_fact
+        assert fact is not None
+        resolved = fact.matmuls[0]
+        inner_block_id = resolved.fact.k_block_id
+        outer_block_id = resolved.fact.m_block_id
+        assert inner_block_id is not None
+        assert outer_block_id is not None
+        axis = next(
+            axis for axis in resolved.site.loop_axes if axis.block_id == inner_block_id
+        )
+        self.assertIsNone(axis.extent)
+        bound = axis.symbolic_bound
+        assert bound is not None
+        self.assertEqual(
+            {block_id for _symbol, block_id in bound.block_size_symbols},
+            {outer_block_id},
+        )
+        self.assertEqual(
+            {block_id for _symbol, block_id in bound.tile_id_symbols},
+            {outer_block_id},
+        )
+        recorded_symbols = {
+            symbol
+            for symbol, _block_id in (
+                *bound.block_size_symbols,
+                *bound.tile_id_symbols,
+            )
+        }
+        self.assertEqual(bound.expression.free_symbols, recorded_symbols)
+
 
 class TestTritonSkinnyGemmHeuristic(TestCase):
     def _make_triton_env_with_block_sizes(
@@ -964,6 +1163,14 @@ class TestTritonH100MatmulHeuristic(TestCase):
         env.settings = Settings()
         return env
 
+    def _attach_matmul(self, env: MagicMock, fact: MatmulFact) -> None:
+        env.config_spec.matmul_facts.append(fact)
+        site = MagicMock(graph_id=-1, loop_axes=(), max_loop_trips=None)
+        env.config_spec.kernel_matmul_fact = MagicMock(
+            matmuls=(MagicMock(site=site),),
+            sequential_loop_trips=1,
+        )
+
     def test_budget_formula_is_deterministic_per_regime(self) -> None:
         # Pure formula (fixed num_sm=132, H100), exercising every lever. Returns the tile
         # tuple (bm, bn, bk, num_warps, num_stages, l2_grouping).
@@ -1035,7 +1242,7 @@ class TestTritonH100MatmulHeuristic(TestCase):
         with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
             # rank-0 (Product A) == get_seed_config; the ranked list has diverse alternates.
             env = self._make_env()
-            env.config_spec.matmul_facts.append(self._matmul_fact())
+            self._attach_matmul(env, self._matmul_fact())
             ranked = TritonH100MatmulHeuristic.get_seed_configs(env, MagicMock())
             primary = TritonH100MatmulHeuristic.get_seed_config(env, MagicMock())
             assert ranked is not None and primary is not None
@@ -1047,13 +1254,9 @@ class TestTritonH100MatmulHeuristic(TestCase):
 
             # 16-bit merge: bf16 and fp16 produce the IDENTICAL seed (width key, not dtype kind).
             env_bf16 = self._make_env()
-            env_bf16.config_spec.matmul_facts.append(
-                self._matmul_fact(dtype=torch.bfloat16)
-            )
+            self._attach_matmul(env_bf16, self._matmul_fact(dtype=torch.bfloat16))
             env_fp16 = self._make_env()
-            env_fp16.config_spec.matmul_facts.append(
-                self._matmul_fact(dtype=torch.float16)
-            )
+            self._attach_matmul(env_fp16, self._matmul_fact(dtype=torch.float16))
             bf16 = TritonH100MatmulHeuristic.get_seed_config(env_bf16, MagicMock())
             fp16 = TritonH100MatmulHeuristic.get_seed_config(env_fp16, MagicMock())
             assert bf16 is not None and fp16 is not None
