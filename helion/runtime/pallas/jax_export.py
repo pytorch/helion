@@ -122,7 +122,9 @@ class _JaxExportTensor(torch.Tensor):
             return
         import jax.numpy as jnp
 
-        parent._replace_jax_array(jnp.reshape(jax_arr, tuple(parent.shape)))
+        parent._replace_jax_array(
+            jnp.reshape(jax_arr, tuple(parent.shape))  # type: ignore[arg-type]
+        )
 
     @property
     def device(self) -> torch.device:  # pyrefly: ignore[bad-override]
