@@ -21,7 +21,7 @@ import sys
 import torch
 
 import helion
-from helion._compiler.program_id import ForEachProgramID
+from helion._compiler import cross_loop_codegen
 import helion.language as hl
 
 FP8_MAX = 448.0
@@ -1059,11 +1059,9 @@ def main() -> None:
     _USE_TASK_ALIGNED_ATTENTION = args.task_aligned_attention
 
     if args.no_waits:
-        ForEachProgramID._wait_for_counter = staticmethod(
-            lambda **_kwargs: [ast.Pass()]
-        )
+        cross_loop_codegen._wait_for_counter = lambda **_kwargs: [ast.Pass()]
     elif args.skip_wait_prefix:
-        original_wait_for_counter = ForEachProgramID._wait_for_counter
+        original_wait_for_counter = cross_loop_codegen._wait_for_counter
 
         def filtered_wait_for_counter(**kwargs):
             if any(
@@ -1072,7 +1070,7 @@ def main() -> None:
                 return [ast.Pass()]
             return original_wait_for_counter(**kwargs)
 
-        ForEachProgramID._wait_for_counter = staticmethod(filtered_wait_for_counter)
+        cross_loop_codegen._wait_for_counter = filtered_wait_for_counter
     from probes.qwen3 import helion_qwen3_tile_dependency as probe
 
     probe.build_helion_reference = _build_helion_reference

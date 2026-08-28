@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import math
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -12,6 +13,7 @@ from ..autotuner.config_spec import CROSS_LOOP_SCHEDULE_BARRIER
 from ..autotuner.config_spec import CROSS_LOOP_SCHEDULE_CONFIG
 from ..autotuner.config_spec import CROSS_LOOP_SCHEDULE_DEFAULT
 from ..autotuner.config_spec import CROSS_LOOP_SCHEDULE_STATIC_PIPELINE
+from .ast_extension import ExtendedAST
 from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
@@ -20,20 +22,28 @@ from .cross_loop_scheduler import CountedEventPlan
 from .cross_loop_scheduler import EventContribution
 from .cross_loop_scheduler import EventUse
 from .cross_loop_scheduler import build_cross_loop_schedule
+from .device_function import TensorArg
 from .host_function import HostFunction
-from .program_id import _ast_fingerprint
 from .program_id import _clone_ast_value
-from .program_id import _clone_opaque_statements_with_loop_rewrite
-from .program_id import _clone_opaque_statements_with_scope_stages
+from .program_id import _clone_stmt
 from .program_id import typed_program_id
+from .tile_dependency import TILE_DEPENDENCY_SCOPE_ID_ATTR
+from .tile_dependency import LogicalDomain
 from .tile_dependency import LogicalRelation
 from .tile_dependency import instantiate_root_domains
 from .tile_dependency import logical_axis_symbol
+from .tile_dependency import physical_traversal_relation
+from .tile_dependency import tile_dependency_scope_id
+from .tile_strategy import L2GroupingProgramIDs
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from .device_function import DeviceFunction
     from .program_id import ForEachProgramID
     from .program_id import PersistentProgramIDs
+    from .program_id import PIDInfo
+    from .program_id import ProgramIDs
 
 
 # Independent keyed-event counters occupy distinct cache lines so polling one
@@ -46,6 +56,456 @@ _CROSS_LOOP_COUNTER_DTYPE = torch.uint32
 _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS = (
     _CROSS_LOOP_COUNTER_ALIGNMENT_BYTES // _CROSS_LOOP_COUNTER_DTYPE.itemsize
 )
+
+
+def _ast_fingerprint(nodes: list[ast.stmt]) -> tuple[str, ...]:
+    """Return a location-independent fingerprint for an opaque computation body."""
+    return tuple(
+        ast.dump(cast("ast.AST", _clone_ast_value(node)), include_attributes=False)
+        for node in nodes
+    )
+
+
+def _clone_opaque_statements(body: list[ast.stmt]) -> list[ast.stmt]:
+    """Clone a tile body while proving that no computation was rewritten."""
+    cloned = [_clone_stmt(statement) for statement in body]
+    if _ast_fingerprint(cloned) != _ast_fingerprint(body):
+        raise AssertionError("opaque tile-body cloning changed its computation")
+    return cloned
+
+
+def _clone_opaque_statements_with_loop_rewrite(
+    body: list[ast.stmt],
+    rewrite: Callable[[ast.For], list[ast.stmt] | None],
+) -> list[ast.stmt]:
+    """Clone an opaque body while replacing selected loops."""
+
+    def clone(value: object) -> object:
+        if isinstance(value, list):
+            result: list[object] = []
+            for item in value:
+                if (
+                    isinstance(item, ast.For)
+                    and (replacement := rewrite(item)) is not None
+                ):
+                    result.extend(replacement)
+                else:
+                    result.append(clone(item))
+            return result
+        if isinstance(value, tuple):
+            return tuple(clone(item) for item in value)
+        if isinstance(value, ast.AST):
+            fields = {field: clone(getattr(value, field)) for field in value._fields}
+            if isinstance(value, ExtendedAST):
+                cloned = value.copy(**fields)
+            else:
+                cloned = ast.copy_location(type(value)(**fields), value)
+            if (
+                scope_id := getattr(value, TILE_DEPENDENCY_SCOPE_ID_ATTR, None)
+            ) is not None:
+                setattr(cloned, TILE_DEPENDENCY_SCOPE_ID_ATTR, scope_id)
+            return cloned
+        return value
+
+    return cast("list[ast.stmt]", clone(body))
+
+
+def _clone_opaque_loop_segment(
+    loop: ast.For,
+    *,
+    begin: ast.expr | None = None,
+    end: ast.expr | None = None,
+) -> ast.For:
+    """Clone one existing loop, changing only scheduling range boundaries."""
+    cloned = cast("ast.For", _clone_ast_value(loop))
+    if not (
+        isinstance(cloned.iter, ast.Call)
+        and isinstance(loop.iter, ast.Call)
+        and len(cloned.iter.args) >= 2
+    ):
+        raise AssertionError("tile-dependency stages require a range-like loop")
+    if begin is not None:
+        cloned.iter.args[0] = begin
+    if end is not None:
+        cloned.iter.args[1] = end
+    if _ast_fingerprint(cloned.body) != _ast_fingerprint(loop.body):
+        raise AssertionError("tile-dependency staging changed an opaque loop body")
+    return cloned
+
+
+def _clone_opaque_statements_with_scope_stages(
+    body: list[ast.stmt],
+    *,
+    scope_id: int,
+    split_iteration_offsets: tuple[int, ...],
+    stage_waits: tuple[tuple[ast.stmt, ...], ...],
+) -> list[ast.stmt]:
+    """Split one stable DeviceIR scope loop and wait before each segment."""
+    if len(stage_waits) != len(split_iteration_offsets) + 1:
+        raise AssertionError("each scope-loop segment requires one wait")
+    scheduled = False
+
+    def rewrite(loop: ast.For) -> list[ast.stmt] | None:
+        nonlocal scheduled
+        if tile_dependency_scope_id(loop) != scope_id:
+            return None
+        if scheduled:
+            raise AssertionError("one dependency scope must identify one lowered loop")
+        if not isinstance(loop.iter, ast.Call) or len(loop.iter.args) < 2:
+            raise AssertionError("nested scope scheduling requires a range-like loop")
+        begin = ast.unparse(loop.iter.args[0])
+        step = ast.unparse(loop.iter.args[2]) if len(loop.iter.args) >= 3 else "1"
+        split_offsets = tuple(
+            f"({begin}) + ({offset}) * ({step})" for offset in split_iteration_offsets
+        )
+        boundaries = (None, *split_offsets, None)
+        result: list[ast.stmt] = []
+        for index, waits in enumerate(stage_waits):
+            result.extend(_clone_opaque_statements(list(waits)))
+            begin_text = boundaries[index]
+            end_text = boundaries[index + 1]
+            segment_begin = (
+                cast("ast.expr", expr_from_string(begin_text))
+                if begin_text is not None
+                else None
+            )
+            segment_end = (
+                cast("ast.expr", expr_from_string(end_text))
+                if end_text is not None
+                else None
+            )
+            result.append(
+                _clone_opaque_loop_segment(
+                    loop,
+                    begin=segment_begin,
+                    end=segment_end,
+                )
+            )
+        scheduled = True
+        return result
+
+    cloned = _clone_opaque_statements_with_loop_rewrite(body, rewrite)
+    if not scheduled:
+        present_scope_ids = sorted(
+            found_scope_id
+            for statement in body
+            for node in ast.walk(statement)
+            if isinstance(node, ast.For)
+            if (found_scope_id := tile_dependency_scope_id(node)) is not None
+        )
+        raise AssertionError(
+            f"missing dependency scope {scope_id}; found {present_scope_ids}"
+        )
+    return cloned
+
+
+def _stage_root_ranges(owner: ForEachProgramID) -> list[tuple[int, int]]:
+    result: list[tuple[int, int]] = []
+    begin = 0
+    for index in range(1, len(owner.case_phases) + 1):
+        if (
+            index == len(owner.case_phases)
+            or owner.case_phases[index] != owner.case_phases[index - 1]
+        ):
+            result.append((begin, index))
+            begin = index
+    return result
+
+
+def _extract_case_bodies(
+    owner: ForEachProgramID,
+    base_body: list[ast.stmt],
+) -> list[list[ast.stmt]]:
+    if len(owner.cases) == 1:
+        return [base_body]
+    assert len(base_body) >= 2
+    node = base_body[1]
+    result: list[list[ast.stmt]] = []
+    while isinstance(node, ast.If):
+        result.append(node.body)
+        if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
+            node = node.orelse[0]
+            continue
+        result.append(node.orelse)
+        break
+    assert len(result) == len(owner.cases)
+    return result
+
+
+def _case_pid_info(case: ProgramIDs) -> list[PIDInfo]:
+    if isinstance(case, L2GroupingProgramIDs):
+        assert case.parent_strategy is not None
+        return case.parent_strategy.pid_info
+    return case.pid_info
+
+
+def _static_case_axes(
+    owner: ForEachProgramID,
+    root: int,
+    device_function: DeviceFunction,
+) -> list[tuple[int, int]] | None:
+    env = CompileEnvironment.current()
+    task_families = HostFunction.current().device_ir.task_families
+    task_family = task_families[root] if root < len(task_families) else None
+    result: list[tuple[int, int]] = []
+    for info in _case_pid_info(owner.cases[root]):
+        logical_axis = (
+            task_family.axis(info.block_id) if task_family is not None else None
+        )
+        numel_expr = logical_axis.extent if logical_axis is not None else info.numel
+        if isinstance(numel_expr, str) or numel_expr is None:
+            return None
+        if isinstance(numel_expr, int):
+            numel = numel_expr
+        elif isinstance(numel_expr, torch.SymInt):
+            numel = int(env.size_hint(numel_expr))
+        elif getattr(numel_expr, "is_number", False):
+            numel = int(numel_expr)
+        else:
+            return None
+        try:
+            block = int(
+                env.block_sizes[info.block_id].from_config_assert(
+                    device_function.config
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        result.append((numel, block))
+    return result
+
+
+def _static_case_geometry(
+    owner: ForEachProgramID,
+    root: int,
+    device_function: DeviceFunction,
+) -> tuple[tuple[int, ...], dict[int, int], dict[int, int]] | None:
+    axes = _static_case_axes(owner, root, device_function)
+    if axes is None:
+        return None
+    infos = _case_pid_info(owner.cases[root])
+    axis_order = tuple(info.block_id for info in infos)
+    axis_counts = {
+        info.block_id: (numel + block - 1) // block
+        for info, (numel, block) in zip(infos, axes, strict=True)
+    }
+    block_sizes = {
+        info.block_id: block for info, (_, block) in zip(infos, axes, strict=True)
+    }
+    return axis_order, axis_counts, block_sizes
+
+
+def _static_block_axis_geometry(
+    block_id: int,
+    device_function: DeviceFunction,
+) -> tuple[int, int] | None:
+    """Return ``(task_count, block_size)`` for one statically sized axis."""
+    env = CompileEnvironment.current()
+    try:
+        numel_expr = env.block_sizes[block_id].numel
+        if not numel_expr.is_number:
+            return None
+        numel = int(numel_expr)
+        block = int(
+            env.block_sizes[block_id].from_config_assert(device_function.config)
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    return (numel + block - 1) // block, block
+
+
+def _root_physical_traversals(
+    owner: ForEachProgramID,
+    root_domains: tuple[LogicalDomain, ...],
+    case_geometries: tuple[tuple[tuple[int, ...], dict[int, int], dict[int, int]], ...],
+) -> tuple[LogicalRelation, ...] | None:
+    """Bind each logical root domain to its configured PID traversal."""
+    if len(root_domains) != len(case_geometries):
+        return None
+    result: list[LogicalRelation] = []
+    for root, (domain, geometry) in enumerate(
+        zip(root_domains, case_geometries, strict=True)
+    ):
+        physical_axis_order, axis_counts, block_sizes = geometry
+        if (
+            set(domain.axis_order) != set(physical_axis_order)
+            or domain.axis_counts
+            != {axis: axis_counts[axis] for axis in domain.axis_order}
+            or domain.block_sizes
+            != {axis: block_sizes[axis] for axis in domain.axis_order}
+        ):
+            return None
+        case = owner.cases[root]
+        l2_group_size = None
+        if isinstance(case, L2GroupingProgramIDs) and not (
+            len(physical_axis_order) >= 2
+            and (
+                axis_counts[physical_axis_order[1]] == 1
+                or case.group_size >= axis_counts[physical_axis_order[0]]
+            )
+        ):
+            l2_group_size = case.group_size
+        result.append(
+            physical_traversal_relation(
+                domain,
+                physical_axis_order,
+                l2_group_size=l2_group_size,
+            )
+        )
+    return tuple(result)
+
+
+def _wait_for_counter(
+    *,
+    device_function: DeviceFunction,
+    counter: str,
+    target: str,
+    prefix: str,
+) -> list[ast.stmt]:
+    value = device_function.new_var(prefix, dce=False)
+    sync = device_function.new_var(f"{prefix}_sync", dce=False)
+    load = (
+        "tl.inline_asm_elementwise("
+        "asm='ld.acquire.gpu.global.u32 $0, [$1];', "
+        "constraints='=r,l', "
+        f"args=[{counter}], dtype=tl.uint32, is_pure=False, pack=1)"
+    )
+    return [
+        statement_from_string(f"{value} = {load}"),
+        create(
+            ast.While,
+            test=expr_from_string(f"{value} != ({target})"),
+            body=[statement_from_string(f"{value} = {load}")],
+            orelse=[],
+        ),
+        statement_from_string(
+            f"{sync} = tl.inline_asm_elementwise("
+            "asm='bar.warp.sync 0xffffffff; mov.u32 $0, $1;', "
+            "constraints='=r,r', args=[tl.arange(0, 32)], "
+            "dtype=tl.uint32, is_pure=False, pack=1)"
+        ),
+    ]
+
+
+def _wait_for_dependencies(
+    *,
+    device_function: DeviceFunction,
+    dependencies: tuple[tuple[str, str], ...],
+    prefix: str,
+) -> list[ast.stmt]:
+    """Emit every acquire wait in one graph-derived dependency set."""
+    return [
+        statement
+        for counter, target in dependencies
+        for statement in _wait_for_counter(
+            device_function=device_function,
+            counter=counter,
+            target=target,
+            prefix=prefix,
+        )
+    ]
+
+
+def _emit_counted_event_on_ready(
+    *,
+    counter: str,
+    epoch: str,
+    expected_arrivals: int,
+    previous: str,
+    on_ready: list[ast.stmt],
+) -> list[ast.stmt]:
+    """Contribute once and run ``on_ready`` for the final arrival."""
+    return [
+        statement_from_string(
+            f"{previous} = tl.atomic_add({counter}, 1, sem='acq_rel', scope='gpu')"
+        ),
+        create(
+            ast.If,
+            test=expr_from_string(
+                f"{previous} == tl.cast({epoch}, tl.uint32) * "
+                f"tl.cast({expected_arrivals}, tl.uint32) - 1"
+            ),
+            body=on_ready,
+            orelse=[],
+        ),
+    ]
+
+
+def _publication_barrier(device_function: DeviceFunction) -> ast.stmt:
+    if cast("int", device_function.config.get("num_warps", 1)) != 1:
+        return statement_from_string("tl.debug_barrier()")
+    sync = device_function.new_var("tile_dependency_publication_sync", dce=False)
+    return statement_from_string(
+        f"{sync} = tl.inline_asm_elementwise("
+        "asm='bar.warp.sync 0xffffffff; mov.u32 $0, $1;', "
+        "constraints='=r,r', args=[tl.arange(0, 32)], "
+        "dtype=tl.uint32, is_pure=False, pack=1)"
+    )
+
+
+def _register_cross_loop_state(
+    device_function: DeviceFunction,
+    *,
+    name_hint: str,
+    numel: str,
+    dtype: torch.dtype,
+) -> str:
+    """Register launch-persistent global state owned by the Triton launcher."""
+    like = next(
+        argument
+        for argument in device_function.arguments
+        if isinstance(argument, TensorArg) and argument._host_str is not None
+    )
+    name = device_function.new_var(name_hint, dce=False)
+    device_function.wrapper_only_params.append(name)
+    device_function.triton_persistent_state_args.append(name)
+    device_function.triton_persistent_state_specs.append(
+        (like.host_str(), numel, str(dtype))
+    )
+    return name
+
+
+def _outline_cross_loop_region(
+    device_function: DeviceFunction,
+    *,
+    name_hint: str,
+    body: list[ast.stmt],
+    extra_argument_names: tuple[str, ...] = (),
+    noinline: bool = False,
+) -> ast.stmt:
+    """Outline a scheduled region while keeping its computation opaque."""
+    helper_name, arguments = device_function.register_triton_outlined_helper(
+        name_hint,
+        body,
+        extra_argument_names=extra_argument_names,
+        noinline=noinline,
+    )
+    return statement_from_string(f"{helper_name}({', '.join(arguments)})")
+
+
+def _outline_opaque_tile_body(
+    owner: ForEachProgramID,
+    device_function: DeviceFunction,
+    *,
+    root: int,
+    logical_pid: str,
+    body: list[ast.stmt],
+    name_suffix: str = "",
+    extra_argument_names: tuple[str, ...] = (),
+    noinline: bool = False,
+) -> ast.stmt:
+    """Create a call containing exactly one original tile body."""
+    suffix = f"_{name_suffix}" if name_suffix else ""
+    return _outline_cross_loop_region(
+        device_function,
+        name_hint=f"tile_dependency_root_{root}{suffix}",
+        body=[
+            statement_from_string(f"{owner.shared_pid_var} = {logical_pid}"),
+            *_clone_opaque_statements(body),
+        ],
+        extra_argument_names=extra_argument_names,
+        noinline=noinline,
+    )
 
 
 def emit_cross_loop_schedule(
@@ -73,13 +533,23 @@ def emit_cross_loop_schedule(
             f"unknown {CROSS_LOOP_SCHEDULE_CONFIG} value {schedule!r}"
         )
 
-    static_task_counts = owner._static_case_task_counts(device_function)
-    if static_task_counts is None:
+    configured_case_geometries = tuple(
+        _static_case_geometry(owner, root, device_function)
+        for root in range(len(owner.cases))
+    )
+    if any(geometry is None for geometry in configured_case_geometries):
         raise exc.InvalidConfig(
             f"{CROSS_LOOP_SCHEDULE_CONFIG}="
             f"{CROSS_LOOP_SCHEDULE_STATIC_PIPELINE!r} requires concrete "
             "top-level task counts"
         )
+    case_geometries = tuple(
+        geometry for geometry in configured_case_geometries if geometry is not None
+    )
+    static_task_counts = tuple(
+        math.prod(axis_counts.values())
+        for _axis_order, axis_counts, _block_sizes in case_geometries
+    )
 
     worker = typed_program_id(0)
     epoch_var = device_function.new_var("tile_dependency_epoch", dce=False)
@@ -88,7 +558,7 @@ def emit_cross_loop_schedule(
         device_function,
         strategy.virtual_pid_var,
     )
-    case_bodies = owner._extract_case_bodies(base_body)
+    case_bodies = _extract_case_bodies(owner, base_body)
     opaque_case_fingerprints = tuple(_ast_fingerprint(body) for body in case_bodies)
     case_offsets: list[int] = []
     running_offset = 0
@@ -126,12 +596,22 @@ def emit_cross_loop_schedule(
     configured_worker_count = CompileEnvironment.current().config_spec.num_sm * cast(
         "int", device_function.config.get("num_sm_multiplier", 1)
     )
-    axis_geometry = {
-        block_id: geometry
-        for block_id in range(len(CompileEnvironment.current().block_sizes))
-        if (geometry := owner._static_block_axis_geometry(block_id, device_function))
-        is not None
-    }
+    root_axis_geometry: dict[int, tuple[int, int]] = {}
+    for _axis_order, axis_counts, block_sizes in case_geometries:
+        for block_id, task_count in axis_counts.items():
+            geometry = (task_count, block_sizes[block_id])
+            previous = root_axis_geometry.setdefault(block_id, geometry)
+            if previous != geometry:
+                raise AssertionError(
+                    f"inconsistent configured geometry for block axis {block_id}"
+                )
+    axis_geometry: dict[int, tuple[int, int]] = {}
+    for block_id in range(len(CompileEnvironment.current().block_sizes)):
+        geometry = root_axis_geometry.get(block_id)
+        if geometry is None:
+            geometry = _static_block_axis_geometry(block_id, device_function)
+        if geometry is not None:
+            axis_geometry[block_id] = geometry
     configured_root_domains = instantiate_root_domains(
         dependency_plan,
         axis_geometry=axis_geometry,
@@ -145,9 +625,10 @@ def emit_cross_loop_schedule(
     root_domains = tuple(
         domain for domain in configured_root_domains if domain is not None
     )
-    root_traversals = owner._root_physical_traversals(
-        device_function,
+    root_traversals = _root_physical_traversals(
+        owner,
         root_domains,
+        case_geometries,
     )
     if root_traversals is None:
         raise exc.InvalidConfig(
@@ -155,7 +636,7 @@ def emit_cross_loop_schedule(
             f"{CROSS_LOOP_SCHEDULE_STATIC_PIPELINE!r} requires a "
             "representable root traversal"
         )
-    assert [domain.size for domain in root_domains] == static_task_counts
+    assert tuple(domain.size for domain in root_domains) == static_task_counts
     cross_loop_schedule = build_cross_loop_schedule(
         dependency_plan=dependency_plan,
         root_domains=root_domains,
@@ -246,7 +727,7 @@ def emit_cross_loop_schedule(
         // _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
         * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
     )
-    state_arg = owner._register_cross_loop_state(
+    state_arg = _register_cross_loop_state(
         device_function,
         name_hint="tile_dependency_state",
         numel=f"{static_state_base} + {state_count}",
@@ -262,7 +743,7 @@ def emit_cross_loop_schedule(
     counted_event_arg = state_section(counted_event_state_offset)
     root_completion_counter_arg = state_section(root_completion_state_offset)
 
-    stage_root_ranges = owner._cross_loop_stage_root_ranges()
+    stage_root_ranges = _stage_root_ranges(owner)
     result: list[ast.stmt] = [
         statement_from_string(f"{epoch_var} = tl.load({epoch_arg} + {worker}) + 1")
     ]
@@ -308,7 +789,7 @@ def emit_cross_loop_schedule(
             return []
         completion_counter = root_completion_counter(root)
         arrivals = root_completion_arrival_count(root)
-        result = [owner._cross_loop_publication_barrier(device_function)]
+        result = [_publication_barrier(device_function)]
         if arrivals == 1:
             result.append(
                 statement_from_string(
@@ -325,17 +806,9 @@ def emit_cross_loop_schedule(
             )
         return result
 
-    root_physical_axis_order: list[tuple[int, ...]] = []
-    root_logical_axis_order: list[tuple[int, ...]] = []
-    root_axis_counts: list[dict[int, int]] = []
-    for root, domain in enumerate(root_domains):
-        geometry = owner._static_case_geometry(root, device_function)
-        if geometry is None:
-            raise AssertionError("configured root geometry became dynamic")
-        physical_axis_order, _axis_counts, _block_sizes = geometry
-        root_physical_axis_order.append(physical_axis_order)
-        root_logical_axis_order.append(domain.axis_order)
-        root_axis_counts.append(domain.axis_counts)
+    root_physical_axis_order = [geometry[0] for geometry in case_geometries]
+    root_logical_axis_order = [domain.axis_order for domain in root_domains]
+    root_axis_counts = [domain.axis_counts for domain in root_domains]
     root_events_by_producer: dict[
         int,
         list[
@@ -747,7 +1220,7 @@ def emit_cross_loop_schedule(
                 raise AssertionError("nested scope stage has no event key")
             stage_waits.append(
                 tuple(
-                    owner._wait_for_counter(
+                    _wait_for_counter(
                         device_function=device_function,
                         counter=counted_event_counter(plan, event_key),
                         target=(
@@ -867,7 +1340,8 @@ def emit_cross_loop_schedule(
         previous = device_function.new_var(
             "tile_dependency_continuation_previous", dce=False
         )
-        consumer_call = owner._outline_opaque_tile_body(
+        consumer_call = _outline_opaque_tile_body(
+            owner,
             device_function,
             root=on_ready_root,
             logical_pid=consumer_logical_pid,
@@ -892,9 +1366,7 @@ def emit_cross_loop_schedule(
 
         last_arrival_body = [consumer_call]
         if consumer_publications:
-            last_arrival_body.append(
-                owner._cross_loop_publication_barrier(device_function)
-            )
+            last_arrival_body.append(_publication_barrier(device_function))
             last_arrival_body.extend(consumer_publications)
         last_arrival_body.extend(root_completion_publication(on_ready_root))
         expected_arrivals = counted_event_uniform_arrivals(plan)
@@ -905,7 +1377,7 @@ def emit_cross_loop_schedule(
         arrival_counter = counted_event_counter(plan, key)
         return [
             *assignments,
-            *owner._emit_counted_event_on_ready(
+            *_emit_counted_event_on_ready(
                 counter=arrival_counter,
                 epoch=epoch_var,
                 expected_arrivals=expected_arrivals,
@@ -1009,17 +1481,12 @@ def emit_cross_loop_schedule(
                     )
 
             cloned = cast("ast.For", _clone_ast_value(loop))
-            computation = _ast_fingerprint(cloned.body)
             cloned.body.extend(
                 [
-                    owner._cross_loop_publication_barrier(device_function),
+                    _publication_barrier(device_function),
                     *publications,
                 ]
             )
-            if _ast_fingerprint(cloned.body[: -len(publications) - 1]) != computation:
-                raise AssertionError(
-                    "nested scope publication changed the loop computation"
-                )
             emitted_scope_ids.add(scope_id)
             return [cloned]
 
@@ -1169,7 +1636,7 @@ def emit_cross_loop_schedule(
                 incoming_use.keys,
                 scheduled_coordinates,
             )
-            wait = owner._wait_for_counter(
+            wait = _wait_for_counter(
                 device_function=device_function,
                 counter=counted_event_counter(
                     incoming_counted_event,
@@ -1216,7 +1683,7 @@ def emit_cross_loop_schedule(
                     scheduled_root_body,
                     scheduled_coordinates,
                 )
-            opaque_call = owner._outline_cross_loop_region(
+            opaque_call = _outline_cross_loop_region(
                 device_function,
                 name_hint=f"tile_dependency_root_{root}",
                 body=[
@@ -1228,7 +1695,8 @@ def emit_cross_loop_schedule(
                 extra_argument_names=extra_argument_names,
             )
         else:
-            opaque_call = owner._outline_opaque_tile_body(
+            opaque_call = _outline_opaque_tile_body(
+                owner,
                 device_function,
                 root=root,
                 logical_pid=scheduled_logical_pid,
@@ -1241,11 +1709,9 @@ def emit_cross_loop_schedule(
                 noinline=force_noinline,
             )
         body.append(opaque_call)
-        publications: list[ast.stmt] = []
-        if publications or producer_events:
+        if producer_events:
             has_task_scheduling = True
-            body.append(owner._cross_loop_publication_barrier(device_function))
-            body.extend(publications)
+            body.append(_publication_barrier(device_function))
         for counted_event, contributor in producer_events:
             body.extend(
                 emit_counted_event_from_producer_coordinates(
@@ -1257,7 +1723,7 @@ def emit_cross_loop_schedule(
         if not has_task_scheduling:
             return body
         return [
-            owner._outline_cross_loop_region(
+            _outline_cross_loop_region(
                 device_function,
                 name_hint=f"tile_dependency_root_{root}_scheduled_task",
                 body=body,
@@ -1363,7 +1829,7 @@ def emit_cross_loop_schedule(
         ):
             return task_dispatch
 
-        active_body = owner._wait_for_dependencies(
+        active_body = _wait_for_dependencies(
             device_function=device_function,
             dependencies=root_completion_input_dependencies(root),
             prefix="tile_dependency_root_completion_wait",

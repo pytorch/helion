@@ -15,8 +15,8 @@ import torch
 
 from probes.qwen3 import helion_qwen3_granular_tile_dependency as granular
 
+from helion._compiler import cross_loop_codegen
 from helion._compiler.ast_extension import statement_from_string
-from helion._compiler.program_id import ForEachProgramID
 
 if TYPE_CHECKING:
     import ast
@@ -31,7 +31,7 @@ def _globaltimer_assignment(name: str) -> ast.stmt:
 
 
 def _trace_waits() -> dict[int, list[str]]:
-    original = ForEachProgramID._wait_for_counter
+    original = cross_loop_codegen._wait_for_counter
     sites_by_device_function: dict[int, list[str]] = {}
     trace_arg_by_device_function: dict[int, str] = {}
 
@@ -43,7 +43,7 @@ def _trace_waits() -> dict[int, list[str]]:
         sites.append(kwargs["prefix"])
         trace_arg = trace_arg_by_device_function.get(key)
         if trace_arg is None:
-            trace_arg = ForEachProgramID._register_cross_loop_state(
+            trace_arg = cross_loop_codegen._register_cross_loop_state(
                 device_function,
                 name_hint="tile_dependency_wait_profile",
                 numel="128",
@@ -62,7 +62,7 @@ def _trace_waits() -> dict[int, list[str]]:
             statement_from_string(f"tl.atomic_add({trace_arg} + {64 + site}, 1)"),
         ]
 
-    ForEachProgramID._wait_for_counter = staticmethod(traced_wait_for_counter)
+    cross_loop_codegen._wait_for_counter = traced_wait_for_counter
     return sites_by_device_function
 
 

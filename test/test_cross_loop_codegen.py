@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import ast
+from types import SimpleNamespace
+from typing import Any
+from typing import cast
+from unittest import mock
+
 import torch
 
 from test._cross_loop_test_kernels import cartesian_affine_chain
@@ -26,7 +32,16 @@ from test._cross_loop_test_kernels import streamed_singleton_reduction
 from test._cross_loop_test_kernels import three_way_affine_chain
 
 import helion
+from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cross_loop_codegen import _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
+from helion._compiler.cross_loop_codegen import _ast_fingerprint
+from helion._compiler.cross_loop_codegen import _clone_opaque_loop_segment
+from helion._compiler.cross_loop_codegen import _clone_opaque_statements
+from helion._compiler.cross_loop_codegen import (
+    _clone_opaque_statements_with_scope_stages,
+)
+from helion._compiler.device_function import DeviceFunction
+from helion._compiler.tile_dependency import TILE_DEPENDENCY_SCOPE_ID_ATTR
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -35,6 +50,119 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 import helion.language as hl
+
+
+class TestCrossLoopCodegenHelpers(TestCase):
+    def test_opaque_tile_body_clone_is_structurally_identical(self) -> None:
+        body = ast.parse("value = value * 2\nout[index] = value\n").body
+        cloned = _clone_opaque_statements(body)
+        self.assertEqual(_ast_fingerprint(cloned), _ast_fingerprint(body))
+        self.assertIsNot(cloned[0], body[0])
+
+    def test_tile_dependency_loop_staging_preserves_computation(self) -> None:
+        loop = ast.parse(
+            "for k in tl.range(0, 128, 16):\n"
+            "    partial = tl.load(pointer + k)\n"
+            "    accumulator = accumulator + partial\n"
+        ).body[0]
+        assert isinstance(loop, ast.For)
+        computation = _ast_fingerprint(loop.body)
+
+        first = _clone_opaque_loop_segment(loop, end=ast.parse("64", mode="eval").body)
+        second = _clone_opaque_loop_segment(
+            loop, begin=ast.parse("64", mode="eval").body
+        )
+        setattr(loop, TILE_DEPENDENCY_SCOPE_ID_ATTR, 7)
+        staged = _clone_opaque_statements_with_scope_stages(
+            [loop],
+            scope_id=7,
+            split_iteration_offsets=(4,),
+            stage_waits=(
+                tuple(ast.parse("first_ready = tl.load(counter)\n").body),
+                tuple(ast.parse("second_ready = tl.load(counter + 1)\n").body),
+            ),
+        )
+
+        self.assertEqual(_ast_fingerprint(first.body), computation)
+        self.assertEqual(_ast_fingerprint(second.body), computation)
+        self.assertIsInstance(staged[1], ast.For)
+        self.assertIsInstance(staged[3], ast.For)
+        self.assertEqual(_ast_fingerprint(staged[1].body), computation)
+        self.assertEqual(_ast_fingerprint(staged[3].body), computation)
+        self.assertEqual(ast.unparse(staged[0]), "first_ready = tl.load(counter)")
+        self.assertEqual(ast.unparse(staged[2]), "second_ready = tl.load(counter + 1)")
+
+    def test_opaque_tile_body_can_be_outlined_without_rewriting(self) -> None:
+        device_function = object.__new__(DeviceFunction)
+        device_function.arguments = []
+        device_function.wrapper_only_params = []
+        device_function.preamble = []
+        cast("Any", device_function).namespace = SimpleNamespace(
+            create_name=lambda name, _value: name
+        )
+        device_function.triton_outlined_helpers = []
+        device_function.triton_outlined_helper_constexprs = {}
+        device_function._variable_renames = {}
+        device_function.dce_vars = []
+        cast("Any", device_function).codegen = SimpleNamespace(module_statements=[])
+        cast("Any", device_function).helper_manager = SimpleNamespace(
+            codegen_helper_functions=list
+        )
+        body = ast.parse("value = tl.load(pointer)\ntl.store(output, value)\n").body
+        computation = _ast_fingerprint(body)
+        environment = SimpleNamespace(backend_name="triton")
+        with mock.patch.object(CompileEnvironment, "current", return_value=environment):
+            helper_name, arguments = device_function.register_triton_outlined_helper(
+                "opaque_tile", body, noinline=True
+            )
+            helper = device_function.codegen_helper_functions()[0]
+
+        self.assertEqual(helper_name, "opaque_tile")
+        self.assertEqual(arguments, ())
+        self.assertIsInstance(helper, ast.FunctionDef)
+        assert isinstance(helper, ast.FunctionDef)
+        self.assertEqual(_ast_fingerprint(helper.body), computation)
+        self.assertEqual(
+            ast.unparse(helper.decorator_list[0]), "triton.jit(noinline=True)"
+        )
+
+    def test_outlined_tile_body_captures_compiler_preamble_values(self) -> None:
+        device_function = object.__new__(DeviceFunction)
+        device_function.arguments = []
+        device_function.wrapper_only_params = []
+        device_function.preamble = cast(
+            "list[ast.AST]",
+            ast.parse(
+                "weight_desc = tl.make_tensor_descriptor(weight, [size], [1], [16])\n"
+            ).body,
+        )
+        cast("Any", device_function).namespace = SimpleNamespace(
+            create_name=lambda name, _value: name
+        )
+        device_function.triton_outlined_helpers = []
+        device_function.triton_outlined_helper_constexprs = {}
+        device_function._variable_renames = {}
+        device_function.dce_vars = []
+        cast("Any", device_function).codegen = SimpleNamespace(module_statements=[])
+        cast("Any", device_function).helper_manager = SimpleNamespace(
+            codegen_helper_functions=list
+        )
+        body = ast.parse("value = weight_desc.load([offset])\n").body
+        environment = SimpleNamespace(backend_name="triton")
+
+        with mock.patch.object(CompileEnvironment, "current", return_value=environment):
+            helper_name, arguments = device_function.register_triton_outlined_helper(
+                "descriptor_tile", body
+            )
+            helper = device_function.codegen_helper_functions()[0]
+
+        self.assertEqual(helper_name, "descriptor_tile")
+        self.assertEqual(arguments, ("weight_desc",))
+        self.assertIsInstance(helper, ast.FunctionDef)
+        assert isinstance(helper, ast.FunctionDef)
+        self.assertEqual(
+            [argument.arg for argument in helper.args.args], ["weight_desc"]
+        )
 
 
 @onlyBackends(["triton"])

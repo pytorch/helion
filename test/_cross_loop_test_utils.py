@@ -268,11 +268,8 @@ def _expected_arrivals(
 ) -> tuple[int, ...]:
     result = [0] * key_domain.size
     for contribution in contributions:
-        cardinality = contribution.predecessors.fiber_cardinality()
-        assert cardinality is not None
-        for key, values in enumerate(cardinality.materialize()):
-            assert len(values) == 1
-            result[key] += next(iter(values))
+        for key, predecessors in enumerate(contribution.predecessors.materialize()):
+            result[key] += len(predecessors)
     return tuple(result)
 
 

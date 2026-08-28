@@ -4888,3 +4888,29 @@ Validation results:
   versus 53.7 for the vLLM-boundary-preserving Gemma A4B MoE source. The
   155.7-microsecond Qwen result is the intentionally opaque fused-RMS stress
   source, which spills 456 bytes; it is not the performance source.
+
+### 2026-08-28 lowering ownership and duplication audit
+
+- [x] Move cross-loop-only AST staging, relation rendering, synchronization,
+  state allocation, traversal binding, and outlining helpers out of
+  `program_id.py` and into `cross_loop_codegen.py`. `program_id.py` now retains
+  the generic persistent-loop implementation and one cross-loop dispatch hook;
+  its branch delta is 26 additions and 6 deletions relative to `main`.
+- [x] Compute configured root geometry once in the emitter. Task counts,
+  offsets, root-domain geometry, and physical traversals are derived from the
+  same local tuple; nested-only axes are filled once from their block specs.
+- [x] Remove an empty publication path and a tautological local AST check.
+  Make the small-test arrival-count oracle enumerate predecessor fibers rather
+  than invoking the production cardinality proof it is meant to check.
+- [ ] Simplify `WorkerScheduleSegment` to its production relation-based task
+  ordering. The scalar/periodic task-order representation is test-only, while
+  codegen rejects the corresponding non-dense schedules.
+- [ ] Cache immutable relation facts such as fiber cardinality and avoid
+  rebuilding equivalent relations solely to attach event identity.
+- [ ] Consider unifying `KeyedEvent`, `CountedEventPlan`, local triggers, and
+  root-completion publication into one final lowering-event representation.
+  This is a larger follow-up because it changes ownership across scheduling
+  and lowering.
+- [ ] Replace the duplicate symbolic and hand-written L2 traversal formulas
+  only after introducing a compact traversal relation that cannot expand into
+  a `tl.where` cascade. Until then, retain differential tail/permutation tests.
