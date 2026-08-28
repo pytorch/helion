@@ -4,7 +4,8 @@ These are the output-only dense and causal attention kernels from
 ``examples/attention.py``. They are pretuned for shapes used by
 ``benchmarks/cute/compare_attention_backends.py`` and compare against a single
 cuDNN SDPA baseline. On B200 and GB300 the default sweep uses the long dense
-and causal sequence lengths from that benchmark's eight-shape comparison.
+and causal sequence lengths from that benchmark's eight-shape comparison, at
+both head_dim 64 and head_dim 128.
 """
 
 from __future__ import annotations
@@ -140,8 +141,9 @@ B200_SHAPES: tuple[AttentionShape, ...] = (
     (8, 32, 8192, 128, torch.bfloat16, False),
 )
 
-# The comparison harness's dense_causal8 suite. Dense shapes select
-# nonpersistent two-CTA configs; causal shapes select one-CTA configs.
+# The comparison harness's dense_causal8 suite at head_dim 64, plus the same
+# eight sequence lengths at head_dim 128. Every entry has its own checked-in
+# schedule, so the sweep never falls back to online autotuning.
 LONG_SHAPES: tuple[AttentionShape, ...] = (
     (2, 32, 32768, 64, torch.float16, False),
     (2, 32, 65536, 64, torch.float16, False),
@@ -151,6 +153,14 @@ LONG_SHAPES: tuple[AttentionShape, ...] = (
     (2, 32, 131072, 64, torch.float16, True),
     (2, 32, 262144, 64, torch.float16, True),
     (2, 32, 524288, 64, torch.float16, True),
+    (2, 32, 32768, 128, torch.float16, False),
+    (2, 32, 65536, 128, torch.float16, False),
+    (2, 32, 131072, 128, torch.float16, False),
+    (2, 32, 262144, 128, torch.float16, False),
+    (2, 32, 65536, 128, torch.float16, True),
+    (2, 32, 131072, 128, torch.float16, True),
+    (2, 32, 262144, 128, torch.float16, True),
+    (2, 32, 524288, 128, torch.float16, True),
 )
 
 
@@ -193,17 +203,18 @@ def correctness_check() -> None:
         ((1, 1, 8192, 64, torch.float16, False), attention),
     )
     if torch.cuda.get_device_capability() in ((10, 0), (10, 3)):
-        # Exercise all eight SM100/SM103 long-sequence selectors with a small
+        # Exercise all sixteen SM100/SM103 long-sequence selectors with a small
         # batch/head count so correctness does not require the benchmark's
         # full-size allocation.
-        checks += tuple(
-            ((1, 1, seq, 64, torch.float16, False), attention)
-            for seq in (32768, 65536, 131072, 262144)
-        )
-        checks += tuple(
-            ((1, 1, seq, 64, torch.float16, True), causal_attention)
-            for seq in (65536, 131072, 262144, 524288)
-        )
+        for head_dim in (64, 128):
+            checks += tuple(
+                ((1, 1, seq, head_dim, torch.float16, False), attention)
+                for seq in (32768, 65536, 131072, 262144)
+            )
+            checks += tuple(
+                ((1, 1, seq, head_dim, torch.float16, True), causal_attention)
+                for seq in (65536, 131072, 262144, 524288)
+            )
     for shape, kernel in checks:
         z, h, seq_len, head_dim, dtype, is_causal = shape
         args = _make_inputs(z, h, seq_len, head_dim, dtype)
