@@ -78,6 +78,12 @@ class TritonBackend(Backend):
         return host_str
 
     def supports_config_key(self, key: str) -> bool:
+        from ...autotuner.config_spec import CROSS_LOOP_SCHEDULE_CONFIG
+
+        if key == CROSS_LOOP_SCHEDULE_CONFIG:
+            from ..._compat import is_hip
+
+            return self.name == "triton" and not is_hip()
         if key in ("load_cache_modifiers", "store_cache_modifiers"):
             return True
         if key == "waves_per_eu":

@@ -51,6 +51,11 @@ python -m probes.gemma4.helion_gemma4_a4b_moe_megakernel \
 Use `--print-lowered` on either Gemma megakernel, or `--dump-triton` on the
 Qwen3 probe, to print the complete lowered Triton source.
 
+These recommended megakernel configurations explicitly select
+`cross_loop_schedule="static_pipeline"`. The compiler default is the safe
+whole-grid `"barrier"` schedule; eligible kernels expose both choices to the
+autotuner.
+
 ## Separate Helion baselines
 
 The comparison commands above already run these baselines. They can also be

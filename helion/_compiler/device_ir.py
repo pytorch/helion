@@ -4360,6 +4360,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             if device_ir.implicit_dependency_starts:
                 if (
                     CompileEnvironment.current().backend_name != "triton"
+                    or CompileEnvironment.current().device.type != "cuda"
                     or torch.version.hip is not None
                 ):
                     edge = next(
@@ -4376,6 +4377,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     "tile-dependency scheduling"
                 )
                 CompileEnvironment.current().require_persistent_blocked(reason)
+                config_spec.enable_cross_loop_schedule()
         if config_spec.supports_config_key("pallas_load_buffer_count"):
             config_spec.pallas_load_buffer_count.length = len(
                 LiftTensorArgs(dict(func.params.arguments)).get_tensor_args()

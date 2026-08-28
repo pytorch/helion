@@ -191,6 +191,8 @@ def _persistent_config(bound, args):
             "num_sm_multiplier": args.worker_multiplier,
         }
     )
+    if "cross_loop_schedule" in bound.config_spec.supported_config_keys():
+        values["cross_loop_schedule"] = "static_pipeline"
     config = helion.Config.from_dict(values)
     bound.config_spec.normalize(config.config)
     return config

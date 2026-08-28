@@ -25,6 +25,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
+from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
 
 
@@ -49,6 +50,25 @@ def implicit_tile_dependency_chain(x: torch.Tensor) -> torch.Tensor:
     for tile in hl.tile(x.size(0)):
         out[tile] = tmp[tile] * 2
     return out
+
+
+@helion.kernel(autotune_effort="none")
+def single_loop(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + 1
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def independent_loops(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    out0 = torch.empty_like(x)
+    out1 = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out0[tile] = x[tile] + 1
+    for tile in hl.tile(x.size(0)):
+        out1[tile] = x[tile] * 2
+    return out0, out1
 
 
 dynamic_implicit_tile_dependency_chain = helion.kernel(
@@ -280,9 +300,40 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         self.assertEqual(
             host_function.device_ir.implicit_dependency_starts, frozenset()
         )
+        self.assertNotIn("cross_loop_schedule", bound.config_spec._flat_fields())
+
+    @skipIfRefEager("compiled HostFunction metadata is unavailable in ref eager mode")
+    def test_regular_kernels_do_not_expose_cross_loop_schedule(self) -> None:
+        x = torch.empty(8, device=DEVICE)
+        for kernel in (single_loop, independent_loops):
+            bound = kernel.bind((x,))
+            self.assertNotIn(
+                "cross_loop_schedule",
+                bound.config_spec._flat_fields(),
+            )
+            config = dict(bound.config_spec.default_config())
+            config["cross_loop_schedule"] = "barrier"
+            with self.assertRaisesRegex(
+                exc.InvalidConfig,
+                "only for kernels with compiler-inferred cross-loop dependencies",
+            ):
+                bound.config_spec.normalize(config)
+
+    @skipIfRefEager("compiled HostFunction metadata is unavailable in ref eager mode")
+    def test_implicit_dependency_exposes_cross_loop_schedule(self) -> None:
+        x = torch.empty(8, device=DEVICE)
+        bound = implicit_tile_dependency_chain.bind((x,))
+        fragment = bound.config_spec._flat_fields()["cross_loop_schedule"]
+        self.assertIsInstance(fragment, EnumFragment)
+        assert isinstance(fragment, EnumFragment)
+        self.assertEqual(fragment.choices, ("barrier", "static_pipeline"))
+        self.assertEqual(
+            bound.config_spec.default_config()["cross_loop_schedule"],
+            "barrier",
+        )
 
     @skipIfRefEager("persistent grid-barrier codegen is unavailable in ref eager mode")
-    def test_implicit_dependency_is_scheduled_automatically(self) -> None:
+    def test_implicit_dependency_defaults_to_grid_barrier(self) -> None:
         x = torch.arange(8, device=DEVICE, dtype=torch.float32)
         code, output = code_and_output(
             implicit_tile_dependency_chain,
@@ -291,7 +342,22 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
             pid_type="persistent_blocked",
         )
         torch.testing.assert_close(output, (x + 1) * 2)
+        self.assertIn("triton_helpers.x_grid_barrier(", code)
+        self.assertIn("launch_cooperative_grid=True", code)
+
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable in ref eager")
+    def test_implicit_dependency_static_pipeline(self) -> None:
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        code, output = code_and_output(
+            implicit_tile_dependency_chain,
+            (x,),
+            block_sizes=[8, 8],
+            pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
+        )
+        torch.testing.assert_close(output, (x + 1) * 2)
         self.assertIn("tile_dependency_root_completion_wait", code)
+        self.assertNotIn("triton_helpers.x_grid_barrier(", code)
 
     @skipIfRefEager("persistent grid-barrier codegen is unavailable in ref eager mode")
     def test_allocation_graph_tracks_atomics_as_writes(self) -> None:
@@ -326,6 +392,7 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[8, 8, 8],
             pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
         )
         out0, out1 = outputs
         torch.testing.assert_close(out0, (x + 1) * 2)
@@ -343,6 +410,7 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[8, 8, 8],
             pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
             num_warps=1,
         )
         torch.testing.assert_close(output, (x + 1) * 2 - 3)
@@ -354,7 +422,7 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         self.assertNotIn("launch_cooperative_grid=True", code)
 
     @skipIfRefEager("persistent grid-barrier codegen is unavailable in ref eager")
-    def test_dynamic_shape_schedule_uses_safe_phase_fallback(self) -> None:
+    def test_dynamic_shape_defaults_to_grid_barrier(self) -> None:
         x = torch.arange(65, device=DEVICE, dtype=torch.float32)
         bound = dynamic_implicit_tile_dependency_chain.bind((x,))
         host_function = bound.host_function
@@ -376,6 +444,18 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         self.assertIn("triton_helpers.x_grid_barrier(", code)
         self.assertIn("launch_cooperative_grid=True", code)
         self.assertIn("_minimum_resident_programs=_NUM_SM", code)
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "requires concrete top-level task counts",
+        ):
+            code_and_output(
+                dynamic_implicit_tile_dependency_chain,
+                (x,),
+                block_sizes=[16, 32],
+                pid_type="persistent_blocked",
+                cross_loop_schedule="static_pipeline",
+                num_warps=1,
+            )
 
     @skipIfRefEager("persistent tile-dependency codegen is unavailable in ref eager")
     def test_matmul_chain_allows_reused_accumulator_name(self) -> None:
@@ -387,6 +467,7 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
             (a, b, c),
             block_sizes=[16, 16, 16, 16, 16, 16],
             pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
             num_warps=4,
         )
         torch.testing.assert_close(output, a, atol=0, rtol=0)
@@ -411,6 +492,7 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
                 "pointer",
             ],
             pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
             num_warps=4,
         )
 

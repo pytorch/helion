@@ -462,6 +462,14 @@ def shrink_block_sizes_for_numel_constraints(
 
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
+CROSS_LOOP_SCHEDULE_CONFIG = "cross_loop_schedule"
+CROSS_LOOP_SCHEDULE_BARRIER = "barrier"
+CROSS_LOOP_SCHEDULE_STATIC_PIPELINE = "static_pipeline"
+CROSS_LOOP_SCHEDULE_CHOICES = (
+    CROSS_LOOP_SCHEDULE_BARRIER,
+    CROSS_LOOP_SCHEDULE_STATIC_PIPELINE,
+)
+CROSS_LOOP_SCHEDULE_DEFAULT = CROSS_LOOP_SCHEDULE_CHOICES[0]
 
 # Upper bound (power of two) that a matmul tile dimension's block size may reach
 # even when the dimension itself is smaller. Applied only to dimensions that
@@ -509,6 +517,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     | _BACKEND_STRATEGY_CONFIG_KEYS
     | frozenset(FLASH_CONFIG_KEYS)
     | {
+        CROSS_LOOP_SCHEDULE_CONFIG,
         "num_threads",
         "cute_vector_widths",
         "load_cache_modifiers",
@@ -533,6 +542,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "range_multi_buffers",
         "range_flattens",
         "static_ranges",
+        CROSS_LOOP_SCHEDULE_CONFIG,
         "num_warps",
         "num_stages",
         "pid_type",
@@ -748,6 +758,9 @@ class ConfigSpec:
         self.epilogue_subtile_k_hint: int = 0
         self.has_pallas_inner_loops: bool = False
         self.has_symbolic_or_data_dependent_bounds: bool = False
+        # Enabled only after DeviceIR proves that this kernel contains an
+        # implicit cross-root dependency supported by the CUDA Triton backend.
+        self.cross_loop_schedule_enabled: bool = False
         self._cute_tcgen05_config = CuteTcgen05Config(self)
         # CuTe flash-attention autotune surface gating.
         # Default False so the flash knobs never appear in the search surface
@@ -1632,7 +1645,21 @@ class ConfigSpec:
         )
 
     def supports_config_key(self, key: str) -> bool:
+        if key == CROSS_LOOP_SCHEDULE_CONFIG:
+            return (
+                self.cross_loop_schedule_enabled
+                and self.backend.supports_config_key(key)
+            )
         return self.backend.supports_config_key(key)
+
+    def enable_cross_loop_schedule(self) -> None:
+        """Expose the compiler-owned cross-loop scheduling dimension."""
+        if not self.backend.supports_config_key(CROSS_LOOP_SCHEDULE_CONFIG):
+            raise InvalidConfig(
+                f"{CROSS_LOOP_SCHEDULE_CONFIG} is not supported by backend "
+                f"{self.backend_name!r}"
+            )
+        self.cross_loop_schedule_enabled = True
 
     def supported_config_keys(self) -> frozenset[str]:
         return frozenset(key for key in VALID_KEYS if self.supports_config_key(key))
@@ -1743,6 +1770,19 @@ class ConfigSpec:
                     config[names] = [value for _ in range(len(self.reduction_loops))]
                 else:
                     config[names] = [value]
+
+        if (
+            CROSS_LOOP_SCHEDULE_CONFIG in config
+            and not self.cross_loop_schedule_enabled
+            and self.backend.supports_config_key(CROSS_LOOP_SCHEDULE_CONFIG)
+        ):
+            if _fix_invalid:
+                config.pop(CROSS_LOOP_SCHEDULE_CONFIG)
+            else:
+                raise InvalidConfig(
+                    f"{CROSS_LOOP_SCHEDULE_CONFIG} is available only for kernels "
+                    "with compiler-inferred cross-loop dependencies"
+                )
 
         if unsupported := self.unsupported_config_keys(config):
             # Separate backend-specific keys (e.g. AMD tunables, TileIR tunables)
@@ -2042,6 +2082,20 @@ class ConfigSpec:
             config.setdefault("atomic_indexing", self.atomic_indexing.default())
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
+        if self.supports_config_key(CROSS_LOOP_SCHEDULE_CONFIG):
+            cross_loop_schedule = config.setdefault(
+                CROSS_LOOP_SCHEDULE_CONFIG,
+                CROSS_LOOP_SCHEDULE_DEFAULT,
+            )
+            if cross_loop_schedule not in CROSS_LOOP_SCHEDULE_CHOICES:
+                if _fix_invalid:
+                    config[CROSS_LOOP_SCHEDULE_CONFIG] = CROSS_LOOP_SCHEDULE_DEFAULT
+                else:
+                    raise InvalidConfig(
+                        f"{CROSS_LOOP_SCHEDULE_CONFIG} must be one of "
+                        f"{CROSS_LOOP_SCHEDULE_CHOICES!r}, got "
+                        f"{cross_loop_schedule!r}"
+                    )
         if self.backend_name == "cute":
             self._cute_tcgen05_config.normalize_pre_pid_type(
                 config,
@@ -2621,6 +2675,10 @@ class ConfigSpec:
             fields["pallas_load_buffer_count"] = self.pallas_load_buffer_count
         if self.supports_config_key("pid_type"):
             fields["pid_type"] = EnumFragment(self.allowed_pid_types)
+        if self.supports_config_key(CROSS_LOOP_SCHEDULE_CONFIG):
+            fields[CROSS_LOOP_SCHEDULE_CONFIG] = EnumFragment(
+                CROSS_LOOP_SCHEDULE_CHOICES
+            )
         if self.supports_config_key("xcd_remap") and self.num_xcd > 1:
             fields["xcd_remap"] = BooleanFragment()
         if self.supports_config_key("num_sm_multiplier"):

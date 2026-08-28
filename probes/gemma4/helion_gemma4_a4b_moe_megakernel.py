@@ -1447,6 +1447,10 @@ def _config(bound, args):
             "num_stages": args.kernel_stages,
         }
     )
+    if "cross_loop_schedule" in bound.config_spec.supported_config_keys():
+        values["cross_loop_schedule"] = (
+            "static_pipeline" if args.static_dispatch else "barrier"
+        )
     if args.pointer_indexing:
         values["indexing"] = ["pointer"] * len(values["indexing"])
         values["atomic_indexing"] = ["pointer"] * len(values["atomic_indexing"])

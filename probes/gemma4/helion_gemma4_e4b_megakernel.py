@@ -679,6 +679,8 @@ def _megakernel_config(bound, args, geometry):
             else (3 if geometry.layer_type == "full" else 4),
         }
     )
+    if "cross_loop_schedule" in bound.config_spec.supported_config_keys():
+        values["cross_loop_schedule"] = "static_pipeline"
     config = helion.Config.from_dict(values)
     bound.config_spec.normalize(config.config)
     return config

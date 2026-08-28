@@ -38,6 +38,7 @@ def main() -> None:
     config = helion.Config(
         block_sizes=[args.producer_block, args.consumer_block],
         pid_type="persistent_blocked",
+        cross_loop_schedule="static_pipeline",
         num_sm_multiplier=args.worker_multiplier,
         num_warps=1,
     )

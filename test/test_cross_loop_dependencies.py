@@ -5670,6 +5670,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                     nested_store_chain,
                     (x,),
                     pid_type="persistent_blocked",
+                    cross_loop_schedule="static_pipeline",
                     num_sm_multiplier=1,
                     **extra_config,
                 )
@@ -5689,6 +5690,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[1, 16],
             pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -5707,6 +5709,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[8, 8],
             pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -5740,6 +5743,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                         (x + launch,),
                         block_sizes=[1, producer_width, 1, consumer_width],
                         pid_type="persistent_blocked",
+                        cross_loop_schedule="static_pipeline",
                         num_sm_multiplier=1,
                         num_warps=1,
                     )
@@ -5762,6 +5766,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                 (x + launch,),
                 block_sizes=[1, 16, 1, 16],
                 pid_type="persistent_blocked",
+                cross_loop_schedule="static_pipeline",
                 num_sm_multiplier=1,
                 num_warps=1,
             )
@@ -5786,6 +5791,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                 counted_event_chain,
                 (x + launch,),
                 pid_type="persistent_blocked",
+                cross_loop_schedule="static_pipeline",
                 num_sm_multiplier=1,
                 num_warps=1,
             )
@@ -5816,6 +5822,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[1, 16, 1, 32],
             pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -5835,6 +5842,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                 (x + launch,),
                 block_sizes=[16, 32],
                 pid_type="persistent_blocked",
+                cross_loop_schedule="static_pipeline",
                 num_sm_multiplier=1,
                 num_warps=1,
             )
@@ -5854,6 +5862,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                 mixed_radix_continuation,
                 (x + launch,),
                 pid_type="persistent_blocked",
+                cross_loop_schedule="static_pipeline",
                 num_sm_multiplier=1,
                 num_warps=1,
             )
@@ -5875,6 +5884,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                 (x + launch,),
                 block_sizes=[16, 32, 16],
                 pid_type="persistent_blocked",
+                cross_loop_schedule="static_pipeline",
                 num_sm_multiplier=1,
                 num_warps=1,
             )
@@ -5897,6 +5907,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                 (x + launch, y + launch),
                 block_sizes=[16, 16, 16],
                 pid_type="persistent_blocked",
+                cross_loop_schedule="static_pipeline",
                 num_sm_multiplier=1,
                 num_warps=1,
             )
@@ -5915,6 +5926,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             coalesced_multi_producer_join,
             (x, y),
             pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -5950,6 +5962,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             coalesced_single_producer_fanout,
             (x,),
             pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -5969,6 +5982,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             direct_nested_continuation,
             (x,),
             pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -5987,6 +6001,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[1, 16, 1, 32],
             pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -6008,6 +6023,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                     block_sizes=[1, 16, 1, 32],
                     l2_groupings=[2, 2],
                     pid_type="persistent_blocked",
+                    cross_loop_schedule="static_pipeline",
                     num_sm_multiplier=1,
                     num_warps=1,
                 )
@@ -6026,6 +6042,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[4, 1, 4, 32],
             pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -6049,6 +6066,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[16, 16],
             pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -6065,6 +6083,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             specialized_quotient_chain,
             (x, 8, 2),
             pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -6086,6 +6105,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             block_sizes=[1, 16, 1, 32],
             loop_orders=[[1, 0], [0, 1]],
             pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -6104,6 +6124,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[1, 16, 1, 16, 1, 32],
             pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -6123,6 +6144,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[1, 16, 1, 16],
             pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -6144,6 +6166,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                     (x,),
                     block_sizes=[1, 16],
                     pid_type="persistent_blocked",
+                    cross_loop_schedule="static_pipeline",
                     num_sm_multiplier=1,
                     num_warps=1,
                 )
@@ -6162,6 +6185,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[1, 16],
             pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -6178,6 +6202,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[1, 16, 1, 16],
             pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -6197,6 +6222,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         config = helion.Config(
             block_sizes=[1, 16, 1, 32],
             pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
             num_sm_multiplier=4,
             num_warps=8,
         )
@@ -6279,6 +6305,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                     kernel_args,
                     block_sizes=block_sizes,
                     pid_type="persistent_blocked",
+                    cross_loop_schedule="static_pipeline",
                     num_sm_multiplier=1,
                     num_warps=4,
                     num_stages=2,
@@ -6330,7 +6357,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_default_schedule_uses_exact_nested_scope_wait(self) -> None:
+    def test_static_pipeline_uses_exact_nested_scope_wait(self) -> None:
         torch.manual_seed(0)
         x = torch.rand((1, 64), device=DEVICE, dtype=torch.float16)
         w13 = torch.rand((64, 256), device=DEVICE, dtype=torch.float16)
@@ -6351,6 +6378,7 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             kernel_args,
             block_sizes=[1, 16, 1, 16],
             pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
             num_sm_multiplier=1,
             num_warps=4,
             num_stages=2,

@@ -31,7 +31,18 @@ API surface and keeping task-count-sized materialization out of production.
 
 Required cleanup, in order:
 
-- [ ] Establish a runtime residency contract for static kernels containing
+- [x] Expose the synchronization policy as the kernel-local autotuner field
+  `cross_loop_schedule = "barrier" | "static_pipeline"`. Admit the field only
+  on NVIDIA Triton kernels whose DeviceIR contains at least two top-level task
+  families and a compiler-inferred cross-loop dependency. Do not require
+  statically instantiable task geometry merely to expose the choice. The safe
+  default is `"barrier"`; `"static_pipeline"` is an ordinary autotuner
+  candidate and raises `InvalidConfig` when the selected tile geometry cannot
+  produce a concrete legal schedule. Single-root kernels, independent roots,
+  explicit-barrier-only kernels, and unsupported backends do not expose the
+  field. A future CLC dispatcher may become a third value without changing the
+  dependency graph or event representation.
+- [ ] Follow-up: establish a runtime residency contract for static kernels containing
   cross-loop waits. The current launch-time occupancy calculation proves only
   theoretical capacity on an otherwise idle device; concurrent work on another
   stream can occupy slots after that calculation and leave a producer CTA
@@ -39,8 +50,10 @@ Required cleanup, in order:
   implemented and validated, but is deliberately reverted from this PR because
   it regresses the canonical cold-L2 workloads. A follow-up must provide a
   concurrency-safe execution contract, then add a bounded concurrent-launch
-  regression. The dynamic grid-barrier fallback remains cooperative because
-  the barrier intrinsically requires simultaneous residency.
+  regression. This is explicitly deferred from the static-first PR; its safe
+  default remains `cross_loop_schedule="barrier"`, which launches
+  cooperatively because a grid barrier intrinsically requires simultaneous
+  residency.
 - [x] Preserve accesses from DeviceIR graphs reachable through more than one
   top-level root. Instantiate access facts per `(root, execution callsite)` or
   reject unsupported graph sharing explicitly; never map ambiguous ownership
@@ -101,7 +114,8 @@ Required cleanup, in order:
   formatting, affine-chain compile scaling, structural lowering comparison,
   the shared-callsite regression, and cold-L2
   Qwen3/Gemma4/GPT-OSS/DeepSeek-V3 measurements. Concurrent-launch coverage is
-  blocked on the remaining static residency-contract work above.
+  deferred with the static residency contract above and is not a blocker for
+  this static-first PR.
 
 ### Worker-grid consolidation decision (2026-08-27)
 
@@ -113,8 +127,10 @@ placement and synchronization from that `W` and the symbolic event DAG.
 
 The first PR retains the existing power-of-two multiplier domain. This keeps
 the change focused and avoids expanding the autotuning space of every ordinary
-persistent kernel. A follow-up may make the multiplier a bounded integer-valued
-choice, preferably only for cross-loop schedules, after its search cost and
+persistent kernel. The multiplier composes with `cross_loop_schedule`; it
+controls the grid size for either admitted strategy but does not select the
+strategy. A follow-up may make the multiplier a bounded integer-valued choice,
+preferably only for cross-loop schedules, after its search cost and
 normalization behavior are reviewed independently.
 
 The current workload battery supports removal of the exact-worker knob, while
@@ -148,7 +164,7 @@ concurrent-residency contract explicitly deferred above:
   a configuration when post-ptxas occupancy cannot support its complete grid on
   an otherwise idle device, but this does not reserve capacity against other
   streams. CUDA Graph capture remains covered; concurrent submission is not yet
-  guaranteed. Dynamic phase-barrier fallback kernels still launch
+  guaranteed. Kernels selecting `cross_loop_schedule="barrier"` still launch
   cooperatively.
 - The launch-policy A/B holds the generated schedule and grid constant. Gemma
   A4B and GPT-OSS lowerings differ only by removal of
@@ -184,10 +200,23 @@ The generic-policy ablation does not justify new user knobs:
   transform rather than becoming a model switch or autotuner knob.
 - The 128-byte counter spacing remains a target hardware-layout invariant.
 
-The focused dependency, lowering, runtime, and Config validation suite
-currently passes 192 tests, 4 skips, and 55 subtests. The remaining
+The static schedule is no longer selected implicitly merely because static task
+counts happen to be available. `"barrier"` keeps the ordinary phased lowering
+and cooperative launch; `"static_pipeline"` opts into the event-based static
+dispatcher and its occupancy validation. This makes schedule selection visible
+to configuration search and prevents an unsupported static shape from silently
+changing semantics or falling back to another strategy.
+
+After the schedule-knob migration, the focused dependency, lowering, runtime,
+and Config validation suite passes 191 tests, 4 skips, and 55 subtests. The
+symbolic affine-chain probe still lowers in 0.143 seconds to 82 lines, and the
+explicit static configurations retain their cold-L2 behavior: Qwen3 is 93.16
+microseconds versus 104.73 for separate kernels, Gemma4 A4B is 47.80 versus
+53.33, Gemma4 E4B is 96.60 versus 91.04, and GPT-OSS MoE is 42.22 versus
+36.72. DeepSeek-V3 MoE is 174.66 versus 158.13. GPT-OSS is part of every
+subsequent cross-loop scheduler validation battery. The remaining
 PR-preparation work is scope reduction, rebase onto current `origin/main`, and
-rerunning this battery after conflict resolution.
+final validation after conflict resolution.
 
 ### Reviewer conclusions and PR boundaries (2026-08-27)
 

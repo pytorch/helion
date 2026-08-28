@@ -8,6 +8,10 @@ import sympy
 import torch
 
 from .. import exc
+from ..autotuner.config_spec import CROSS_LOOP_SCHEDULE_BARRIER
+from ..autotuner.config_spec import CROSS_LOOP_SCHEDULE_CONFIG
+from ..autotuner.config_spec import CROSS_LOOP_SCHEDULE_DEFAULT
+from ..autotuner.config_spec import CROSS_LOOP_SCHEDULE_STATIC_PIPELINE
 from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
@@ -56,11 +60,26 @@ def emit_cross_loop_schedule(
     corresponding counters. The targets are epoch-scaled, so fixed CUDA
     Graph arguments need neither a reset kernel nor a host-side epoch update.
     """
-    static_task_counts = owner._static_case_task_counts(device_function)
-    if static_task_counts is None:
+    schedule = device_function.config.get(
+        CROSS_LOOP_SCHEDULE_CONFIG,
+        CROSS_LOOP_SCHEDULE_DEFAULT,
+    )
+    if schedule == CROSS_LOOP_SCHEDULE_BARRIER:
         CompileEnvironment.current().has_barrier = True
         device_function.triton_minimum_resident_programs = strategy.grid_size_expr
         return owner._emit_phase_loops(strategy, device_function, total_expr)
+    if schedule != CROSS_LOOP_SCHEDULE_STATIC_PIPELINE:
+        raise exc.InvalidConfig(
+            f"unknown {CROSS_LOOP_SCHEDULE_CONFIG} value {schedule!r}"
+        )
+
+    static_task_counts = owner._static_case_task_counts(device_function)
+    if static_task_counts is None:
+        raise exc.InvalidConfig(
+            f"{CROSS_LOOP_SCHEDULE_CONFIG}="
+            f"{CROSS_LOOP_SCHEDULE_STATIC_PIPELINE!r} requires concrete "
+            "top-level task counts"
+        )
 
     worker = typed_program_id(0)
     epoch_var = device_function.new_var("tile_dependency_epoch", dce=False)
@@ -118,8 +137,10 @@ def emit_cross_loop_schedule(
         axis_geometry=axis_geometry,
     )
     if any(domain is None for domain in configured_root_domains):
-        raise exc.CrossLoopSchedulingError(
-            "cross-loop scheduling requires static root domains"
+        raise exc.InvalidConfig(
+            f"{CROSS_LOOP_SCHEDULE_CONFIG}="
+            f"{CROSS_LOOP_SCHEDULE_STATIC_PIPELINE!r} requires static "
+            "root domains"
         )
     root_domains = tuple(
         domain for domain in configured_root_domains if domain is not None
@@ -128,7 +149,12 @@ def emit_cross_loop_schedule(
         device_function,
         root_domains,
     )
-    assert root_traversals is not None
+    if root_traversals is None:
+        raise exc.InvalidConfig(
+            f"{CROSS_LOOP_SCHEDULE_CONFIG}="
+            f"{CROSS_LOOP_SCHEDULE_STATIC_PIPELINE!r} requires a "
+            "representable root traversal"
+        )
     assert [domain.size for domain in root_domains] == static_task_counts
     cross_loop_schedule = build_cross_loop_schedule(
         dependency_plan=dependency_plan,
@@ -1249,8 +1275,10 @@ def emit_cross_loop_schedule(
         if not segments:
             continue
         if sum(segment.task_count for segment in segments) != root_domain.size:
-            raise exc.CrossLoopSchedulingError(
-                "partially static task families are not supported yet"
+            raise exc.InvalidConfig(
+                f"{CROSS_LOOP_SCHEDULE_CONFIG}="
+                f"{CROSS_LOOP_SCHEDULE_STATIC_PIPELINE!r} does not "
+                "support partially scheduled task families"
             )
         worker_begin = segments[0].worker_begin
         worker_count = segments[0].worker_count
@@ -1261,8 +1289,10 @@ def emit_cross_loop_schedule(
             or segment.schedule_period is not None
             for segment in segments
         ):
-            raise exc.CrossLoopSchedulingError(
-                f"root {root} has a noncontiguous static worker assignment"
+            raise exc.InvalidConfig(
+                f"{CROSS_LOOP_SCHEDULE_CONFIG}="
+                f"{CROSS_LOOP_SCHEDULE_STATIC_PIPELINE!r} cannot lower "
+                f"root {root}'s noncontiguous worker assignment"
             )
         schedule_begin = segments[0].schedule_begin
         if schedule_begin % worker_count or any(
@@ -1271,8 +1301,10 @@ def emit_cross_loop_schedule(
             + sum(previous.task_count for previous in segments[:index])
             for index, segment in enumerate(segments)
         ):
-            raise exc.CrossLoopSchedulingError(
-                f"root {root} has a non-dense static worker schedule"
+            raise exc.InvalidConfig(
+                f"{CROSS_LOOP_SCHEDULE_CONFIG}="
+                f"{CROSS_LOOP_SCHEDULE_STATIC_PIPELINE!r} cannot lower "
+                f"root {root}'s non-dense worker schedule"
             )
         dense_assignment_by_root[root] = (
             worker_begin,
