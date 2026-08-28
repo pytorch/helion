@@ -365,10 +365,22 @@ def _family_placements_at_position(
     """Return dense placements for one complete family in free worker runs."""
     if task_domain.size > worker_schedule.worker_count:
         return ()
+    # Root bodies are emitted in source order. A modeled placement is therefore
+    # executable only if no earlier root still occupies this worker position or
+    # a later one; codegen cannot move this root ahead of that earlier body.
+    source_order_unavailable_workers = frozenset(
+        worker
+        for preceding_root in range(root)
+        for worker, last_position in worker_schedule.last_positions_for_root(
+            preceding_root
+        ).items()
+        if last_position >= position
+    )
     free_workers = [
         worker
         for worker in range(worker_schedule.worker_count)
         if worker not in unavailable_workers
+        and worker not in source_order_unavailable_workers
         and (
             (occupant_root := worker_schedule.root_at(worker, position)) is None
             or occupant_root == root
@@ -523,7 +535,6 @@ def build_worker_schedule(
     local_triggers = choose_local_triggers(
         event_graph,
         baseline,
-        worker_limit=worker_count,
         excluded_roots=nested_wait_roots,
     )
     ordered = order_local_contributors_by_key(
@@ -534,7 +545,6 @@ def build_worker_schedule(
     local_triggers = choose_local_triggers(
         event_graph,
         ordered,
-        worker_limit=worker_count,
         excluded_roots=nested_wait_roots,
     )
     local_roots = frozenset(
@@ -1488,20 +1498,14 @@ def choose_local_triggers(
     event_graph: EventGraph,
     worker_schedule: WorkerSchedule,
     *,
-    worker_limit: int,
     excluded_roots: frozenset[int] = frozenset(),
 ) -> tuple[LocalTrigger, ...]:
     """Choose final-arrival execution from complete exact task readiness.
 
     A one-task family has no task-level parallelism to expose, so it remains in
-    the static schedule. A family larger than the resident grid also remains
-    static when its completion is consumed coarsely.
+    the static schedule. Downstream event granularity does not change whether
+    an otherwise exact-ready family is eligible for local execution.
     """
-    family_done_roots = {
-        family_done_root
-        for event in event_graph.events
-        if (family_done_root := event.family_done_root) is not None and event.uses
-    }
     return tuple(
         trigger
         for trigger in derive_local_triggers(event_graph, worker_schedule)
@@ -1510,10 +1514,6 @@ def choose_local_triggers(
         ).consumer_root
         not in excluded_roots
         and event_graph.root_domains[use.consumer_root].size > 1
-        and not (
-            use.consumer_root in family_done_roots
-            and event_graph.root_domains[use.consumer_root].size > worker_limit
-        )
     )
 
 

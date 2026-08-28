@@ -40,6 +40,7 @@ from helion._compiler.cross_loop_scheduler import (
     build_baseline_worker_schedule as _build_baseline_worker_schedule,
 )
 from helion._compiler.cross_loop_scheduler import choose_counted_events
+from helion._compiler.cross_loop_scheduler import choose_local_triggers
 from helion._compiler.cross_loop_scheduler import derive_local_triggers
 from helion._compiler.cross_loop_scheduler import order_local_contributors_by_key
 from helion._compiler.cross_loop_scheduler import place_nested_scope_consumers
@@ -1023,6 +1024,52 @@ class TestCrossLoopScheduler(TestCase):
         self.assertIsNone(publication.canonical_single_valued())
         self.assertEqual(derive_local_triggers(event_graph, baseline), ())
         self.assertEqual(choose_counted_events(event_graph, ()), ())
+
+    def test_large_local_trigger_ignores_downstream_event_granularity(self) -> None:
+        graph = build_tile_dependency_graph(
+            (
+                _access(0, root=0, allocation_id=0, kind="store", block_ids=(10,)),
+                _access(1, root=1, allocation_id=0, kind="load", block_ids=(20,)),
+                _access(
+                    2,
+                    root=1,
+                    allocation_id=1,
+                    kind="store",
+                    block_ids=(20,),
+                    layout_is_static=False,
+                ),
+                _access(
+                    3,
+                    root=2,
+                    allocation_id=1,
+                    kind="load",
+                    block_ids=(30,),
+                    layout_is_static=False,
+                ),
+            ),
+            [[10], [20], [30]],
+        )
+        root_domains = _identify_root_domains(
+            (
+                LogicalDomain((10,), ((10, 8),), ((10, 1),)),
+                LogicalDomain((20,), ((20, 8),), ((20, 1),)),
+                LogicalDomain((30,), ((30, 1),), ((30, 1),)),
+            )
+        )
+        event_graph = _configured_event_graph(graph, root_domains)
+        baseline = _build_baseline_worker_schedule(
+            root_domains,
+            event_graph.root_traversals,
+            worker_count=4,
+        )
+
+        triggers = choose_local_triggers(event_graph, baseline)
+
+        self.assertGreater(root_domains[1].size, baseline.worker_count)
+        self.assertEqual(event_graph.events[1].family_done_root, 1)
+        self.assertEqual(len(triggers), 1)
+        use = event_graph.event(triggers[0].event_index).uses[triggers[0].use_index]
+        self.assertEqual(use.consumer_root, 1)
 
     def test_semantic_event_graph_represents_diamond_without_path_matching(
         self,
@@ -2412,6 +2459,98 @@ class TestCrossLoopScheduler(TestCase):
         # prerequisite of B task 3. Placing C there would form C -> B -> A
         # while A remains later on C's blocked worker. Worker 2 is safe.
         self.assertEqual(placement(placed, 2, 0), (2, 2))
+        self.assertEqual(len(plans), 1)
+        validate_worker_schedule(event_graph, placed)
+
+    def test_nested_scope_placement_preserves_source_order_on_each_worker(
+        self,
+    ) -> None:
+        root_domains = _identify_root_domains(
+            (
+                LogicalDomain((10,), ((10, 5),), ((10, 1),)),
+                LogicalDomain((20,), ((20, 4),), ((20, 1),)),
+                LogicalDomain((30,), ((30, 1),), ((30, 1),)),
+            )
+        )
+        action_domain = LogicalDomain(
+            (30, 31),
+            ((30, 1), (31, 5)),
+            ((30, 1), (31, 1)),
+            identity=7,
+        )
+        nested_key_domain = LogicalDomain(
+            (0,),
+            ((0, 5),),
+            kind="event",
+            identity=0,
+        )
+        producer_to_key = LogicalRelation.point_map(
+            root_domains[0],
+            nested_key_domain,
+            (
+                (
+                    ((10, 0, 5, 1),),
+                    (logical_axis_symbol(10),),
+                ),
+            ),
+        )
+        predecessors = producer_to_key.inverse()
+        assert predecessors is not None
+        action_to_key = LogicalRelation.point_map(
+            action_domain,
+            nested_key_domain,
+            (
+                (
+                    ((30, 0, 1, 1), (31, 0, 5, 1)),
+                    (logical_axis_symbol(31),),
+                ),
+            ),
+        )
+        family_done_domain = LogicalDomain(
+            (),
+            (),
+            kind="event",
+            identity=1,
+        )
+        event_graph = EventGraph(
+            root_traversals=_default_root_traversals(root_domains),
+            events=(
+                KeyedEvent(
+                    contributions=(EventContribution(0, predecessors),),
+                    uses=(EventUse(2, action_to_key, consumer_scope_id=7),),
+                ),
+                KeyedEvent(
+                    contributions=(
+                        EventContribution(
+                            1,
+                            LogicalRelation.total(
+                                family_done_domain,
+                                root_domains[1],
+                            ),
+                        ),
+                    ),
+                    uses=(
+                        EventUse(
+                            2,
+                            LogicalRelation.total(
+                                root_domains[2],
+                                family_done_domain,
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        baseline = _build_baseline_worker_schedule(
+            event_graph.root_domains,
+            event_graph.root_traversals,
+            worker_count=4,
+        )
+
+        placed, plans = place_nested_scope_consumers(event_graph, baseline, ())
+
+        self.assertEqual(placement(baseline, 2, 0), (0, 3))
+        self.assertEqual(placement(placed, 2, 0), (0, 3))
         self.assertEqual(len(plans), 1)
         validate_worker_schedule(event_graph, placed)
 

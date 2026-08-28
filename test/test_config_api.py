@@ -312,6 +312,7 @@ class TestConfigAPI(TestCase):
             "num_warps",
             "num_stages",
             "pid_type",
+            "cross_loop_schedule",
             "indexing",
         }
 
@@ -326,6 +327,12 @@ class TestConfigAPI(TestCase):
 
     def test_cross_loop_schedule_is_an_admitted_triton_field(self) -> None:
         from helion.autotuner.config_generation import ConfigGeneration
+
+        self.assertEqual(helion.Config().cross_loop_schedule, "barrier")
+        self.assertEqual(
+            helion.Config(cross_loop_schedule="static_pipeline").cross_loop_schedule,
+            "static_pipeline",
+        )
 
         with patch("helion._compat.is_hip", return_value=False):
             spec = ConfigSpec(backend=TritonBackend())

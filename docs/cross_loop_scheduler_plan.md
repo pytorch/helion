@@ -5022,3 +5022,32 @@ area for less explicit ownership.
   not representable by the current relation grammar; using it now would disable
   completion-frontier proofs or expand back into a `tl.where` cascade. Retain
   the differential tail/permutation tests until that representation exists.
+
+### 2026-08-28 final scheduling-policy review
+
+- [x] Make modeled worker positions agree with executable source order. When a
+  root family is considered for an earlier worker-stream position, exclude any
+  worker that still has work from a preceding source root at that position or
+  later. This preserves the compact `WorkerSchedule`; no new ordering IR or
+  codegen path is needed.
+- [x] Remove the rule that suppressed final-arrival execution solely when a
+  consumer family was larger than the worker grid and later published a
+  family-completion event. Exact readiness determines local-execution
+  eligibility; downstream event granularity is independent. Instrumented
+  Qwen3, Gemma4 A4B, GPT-OSS, and DeepSeek-V3 lowerings showed that the rule did
+  not fire. A same-session cold-L2 GPT-OSS A/B was neutral (35.15 us without
+  the rule and 35.36 us with it), and the normalized generated Triton was
+  unchanged. A focused scheduler test now covers a large exact-ready consumer
+  followed by family completion.
+- [x] Expose `cross_loop_schedule` as a typed `Config` keyword while retaining
+  conditional `ConfigSpec` admission. Ordinary kernels and unsupported
+  backends still reject the field; admitted Triton dependency kernels expose
+  only `"barrier"` and `"static_pipeline"`, with `"barrier"` as the default.
+
+Final validation passes 151 scheduler, codegen, configuration, and dependency
+tests with 4 expected skips and 42 subtests. Cold-L2 B200 checks after the
+policy cleanup measure Qwen3 at 96.61 us versus 103.98 us separately with the
+retained power-of-two 8x-SM grid; the exploratory 7x-SM point remains 92.13 us
+versus 103.15 us. Gemma4 A4B measures 48.26 us versus 53.65 us, GPT-OSS
+measures 35.15 us versus 34.64 us in the heuristic ablation run, and the
+known-static-gap DeepSeek-V3 probe measures 174.75 us versus 158.03 us.
