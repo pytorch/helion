@@ -6,6 +6,10 @@ from unittest import mock
 import sympy
 import torch
 
+from test._cross_loop_schedule_oracle import placement
+from test._cross_loop_schedule_oracle import segment_placement
+from test._cross_loop_schedule_oracle import segment_task_at
+from test._cross_loop_schedule_oracle import task_at
 from test._cross_loop_schedule_oracle import task_order
 from test._cross_loop_schedule_oracle import validate_worker_schedule
 from test._cross_loop_test_kernels import nested_store_chain
@@ -21,6 +25,7 @@ from test._cross_loop_test_utils import _one_dimensional_task_range
 from test._cross_loop_test_utils import _publication
 from test._cross_loop_test_utils import build_baseline_worker_schedule
 from test._cross_loop_test_utils import build_cross_loop_schedule
+from test._cross_loop_test_utils import build_keyed_events
 
 from helion._compiler.cross_loop_scheduler import CountedEventPlan
 from helion._compiler.cross_loop_scheduler import EventContribution
@@ -33,7 +38,6 @@ from helion._compiler.cross_loop_scheduler import _select_root_completion_edges
 from helion._compiler.cross_loop_scheduler import (
     build_baseline_worker_schedule as _build_baseline_worker_schedule,
 )
-from helion._compiler.cross_loop_scheduler import build_keyed_events
 from helion._compiler.cross_loop_scheduler import choose_counted_events
 from helion._compiler.cross_loop_scheduler import derive_local_triggers
 from helion._compiler.cross_loop_scheduler import order_local_contributors_by_key
@@ -44,7 +48,7 @@ from helion._compiler.tile_dependency import LogicalRelation
 from helion._compiler.tile_dependency import TileAccess
 from helion._compiler.tile_dependency import _LogicalRelationPiece
 from helion._compiler.tile_dependency import build_tile_dependency_graph
-from helion._compiler.tile_dependency import instantiate_root_domains
+from helion._compiler.tile_dependency import instantiate_logical_domains
 from helion._compiler.tile_dependency import instantiate_symbolic_dependencies
 from helion._compiler.tile_dependency import logical_axis_symbol
 from helion._compiler.tile_dependency import physical_traversal_relation
@@ -98,7 +102,7 @@ class TestCrossLoopScheduler(TestCase):
             sum(
                 len(contributor.predecessors.pieces)
                 for event in schedule.counted_events
-                for contributor in event.contributors
+                for contributor in event.contributions
             ),
             4,
         )
@@ -652,7 +656,7 @@ class TestCrossLoopScheduler(TestCase):
         ]
         self.assertEqual(len(unrelated), 1)
         self.assertEqual(unrelated[0].key_count, 2)
-        self.assertFalse(unrelated[0].is_family_done)
+        self.assertIsNone(unrelated[0].family_done_root)
 
     @skipIfNotCUDA()
     def test_device_ir_scopes_preserve_nested_producer_and_consumer_axes(
@@ -894,7 +898,6 @@ class TestCrossLoopScheduler(TestCase):
             )
 
         event_graph = EventGraph(
-            root_domains=domains,
             root_traversals=tuple(
                 physical_traversal_relation(domain, domain.axis_order)
                 for domain in domains
@@ -902,8 +905,6 @@ class TestCrossLoopScheduler(TestCase):
             scope_domains=(),
             events=(
                 KeyedEvent(
-                    event_id=0,
-                    key_domain=key_domains[0],
                     contributions=(
                         _event_contribution_from_publication(
                             0,
@@ -913,8 +914,6 @@ class TestCrossLoopScheduler(TestCase):
                     uses=(EventUse(1, keys(domains[1], key_domains[0], 0, 2)),),
                 ),
                 KeyedEvent(
-                    event_id=1,
-                    key_domain=key_domains[1],
                     contributions=(
                         _event_contribution_from_publication(
                             0,
@@ -990,7 +989,6 @@ class TestCrossLoopScheduler(TestCase):
             ),
         )
         event_graph = EventGraph(
-            root_domains=(producer_domain, consumer_domain),
             root_traversals=(
                 physical_traversal_relation(producer_domain, (10,)),
                 physical_traversal_relation(consumer_domain, (20,)),
@@ -998,8 +996,6 @@ class TestCrossLoopScheduler(TestCase):
             scope_domains=(),
             events=(
                 KeyedEvent(
-                    0,
-                    key_domain,
                     (contribution,),
                     (
                         EventUse(
@@ -1056,7 +1052,13 @@ class TestCrossLoopScheduler(TestCase):
                 for block_id in (10, 20, 30, 40)
             ),
         )
-        root_zero_event = configured.events_contributed_by(0)[0]
+        (root_zero_event,) = tuple(
+            event
+            for event in configured.events
+            if any(
+                contribution.producer_root == 0 for contribution in event.contributions
+            )
+        )
         self.assertEqual(
             {use.consumer_root for use in root_zero_event.uses},
             {1, 2},
@@ -1113,10 +1115,15 @@ class TestCrossLoopScheduler(TestCase):
                 for block_id in (10, 20, 30)
             ),
         )
-        configured_uses = configured.uses_for_root(2)
+        configured_uses = tuple(
+            use
+            for event in configured.events
+            for use in event.uses
+            if use.consumer_root == 2
+        )
         self.assertEqual(len(configured_uses), 2)
         family_event = next(
-            event for event in configured.events if event.is_family_done
+            event for event in configured.events if event.family_done_root is not None
         )
         self.assertEqual(family_event.family_done_root, 0)
         self.assertEqual(
@@ -1170,9 +1177,14 @@ class TestCrossLoopScheduler(TestCase):
             ),
         )
         axis_geometry = {10: (4, 32), 20: (4, 32)}
-        exact_dependencies = instantiate_symbolic_dependencies(
+        configured_root_domains, configured_scope_domains = instantiate_logical_domains(
             graph,
             axis_geometry=axis_geometry,
+        )
+        exact_dependencies = instantiate_symbolic_dependencies(
+            graph,
+            root_domains=configured_root_domains,
+            scope_domains=configured_scope_domains,
         )
         self.assertEqual(len(exact_dependencies), 1)
 
@@ -1181,8 +1193,10 @@ class TestCrossLoopScheduler(TestCase):
         self.assertIsNotNone(events)
         assert events is not None
         self.assertEqual(len(events), 2)
-        exact_event = next(event for event in events if not event.is_family_done)
-        family_event = next(event for event in events if event.is_family_done)
+        exact_event = next(event for event in events if event.family_done_root is None)
+        family_event = next(
+            event for event in events if event.family_done_root is not None
+        )
         dependency_id = access_dependency.dependency_id
         self.assertEqual(
             exact_event.uses[0].dependency_points,
@@ -1194,15 +1208,9 @@ class TestCrossLoopScheduler(TestCase):
         )
 
         root_domains = tuple(
-            domain
-            for domain in instantiate_root_domains(
-                graph,
-                axis_geometry=axis_geometry,
-            )
-            if domain is not None
+            domain for domain in configured_root_domains if domain is not None
         )
         event_graph = EventGraph(
-            root_domains=root_domains,
             root_traversals=tuple(
                 physical_traversal_relation(domain, domain.axis_order)
                 for domain in root_domains
@@ -1239,12 +1247,12 @@ class TestCrossLoopScheduler(TestCase):
 
         schedule = build_baseline_worker_schedule(root_domains, worker_count=4)
 
-        self.assertEqual(schedule.placement(0, 0), (0, 0))
-        self.assertEqual(schedule.placement(0, 2), (2, 0))
-        self.assertEqual(schedule.placement(1, 0), (0, 1))
-        self.assertEqual(schedule.placement(1, 4), (0, 2))
-        self.assertEqual(schedule.task_at(3, 0), None)
-        self.assertEqual(schedule.task_at(3, 1), (1, 3))
+        self.assertEqual(placement(schedule, 0, 0), (0, 0))
+        self.assertEqual(placement(schedule, 0, 2), (2, 0))
+        self.assertEqual(placement(schedule, 1, 0), (0, 1))
+        self.assertEqual(placement(schedule, 1, 4), (0, 2))
+        self.assertEqual(task_at(schedule, 3, 0), None)
+        self.assertEqual(task_at(schedule, 3, 1), (1, 3))
 
     def test_schedule_traversals_require_compatible_domains(self) -> None:
         task_domain = LogicalDomain((10,), ((10, 2),), identity=0)
@@ -1262,20 +1270,19 @@ class TestCrossLoopScheduler(TestCase):
 
         with self.assertRaisesRegex(ValueError, "compatible typed domains"):
             EventGraph(
-                root_domains=(task_domain,),
                 root_traversals=(wrong_size,),
                 scope_domains=(),
                 events=(),
             )
         with self.assertRaisesRegex(ValueError, "incompatible domains"):
+            inverse = wrong_size.inverse()
+            assert inverse is not None
             WorkerScheduleSegment(
                 root=0,
-                task_begin=0,
-                task_count=2,
+                task_relation=inverse,
                 worker_begin=0,
                 worker_count=2,
                 schedule_begin=0,
-                task_relation=wrong_size,
             )
 
     def test_baseline_worker_schedule_preserves_physical_traversal(self) -> None:
@@ -1301,61 +1308,46 @@ class TestCrossLoopScheduler(TestCase):
             root_traversals=(traversal,),
         )
 
-        self.assertEqual(schedule.placement(0, 0), (0, 0))
-        self.assertEqual(schedule.placement(0, 2), (1, 0))
-        self.assertEqual(schedule.placement(0, 1), (0, 1))
-        self.assertEqual(schedule.placement(0, 3), (1, 1))
+        self.assertEqual(placement(schedule, 0, 0), (0, 0))
+        self.assertEqual(placement(schedule, 0, 2), (1, 0))
+        self.assertEqual(placement(schedule, 0, 1), (0, 1))
+        self.assertEqual(placement(schedule, 0, 3), (1, 1))
 
-    def test_worker_schedule_segment_supports_multiple_rounds(self) -> None:
+    def test_worker_schedule_segment_uses_symbolic_order_across_rounds(self) -> None:
+        task_axis = 10
+        ordinal_axis = 20
+        task_domain = LogicalDomain(
+            (task_axis,),
+            ((task_axis, 15),),
+            identity=2,
+        )
+        ordinal_domain = LogicalDomain(
+            (ordinal_axis,),
+            ((ordinal_axis, 3),),
+            kind="worker",
+        )
         segment = WorkerScheduleSegment(
             root=2,
-            task_begin=10,
-            task_count=3,
-            task_step=2,
+            task_relation=LogicalRelation.point_map(
+                ordinal_domain,
+                task_domain,
+                (
+                    (
+                        ((ordinal_axis, 0, 3, 1),),
+                        (10 + 2 * logical_axis_symbol(ordinal_axis),),
+                    ),
+                ),
+            ),
             worker_begin=2,
             worker_count=2,
             schedule_begin=0,
         )
 
-        self.assertEqual(segment.placement(10), (2, 0))
-        self.assertEqual(segment.placement(12), (3, 0))
-        self.assertEqual(segment.placement(14), (2, 1))
-        self.assertEqual(segment.placement(11), None)
-        self.assertEqual(segment.task_at(2, 1), 14)
-
-        periodic = WorkerScheduleSegment(
-            root=3,
-            task_begin=0,
-            task_count=6,
-            task_step=1,
-            task_period=3,
-            task_period_step=10,
-            worker_begin=0,
-            worker_count=2,
-            schedule_begin=0,
-        )
-        self.assertEqual(
-            tuple(periodic.task_for_offset(offset) for offset in range(6)),
-            (0, 1, 2, 10, 11, 12),
-        )
-        self.assertEqual(periodic.placement(11), (0, 2))
-
-        rectangular = WorkerScheduleSegment(
-            root=4,
-            task_begin=0,
-            task_count=6,
-            task_step=1,
-            worker_begin=0,
-            worker_count=4,
-            schedule_begin=0,
-            schedule_period=2,
-            schedule_period_step=4,
-        )
-        self.assertEqual(
-            tuple(rectangular.schedule_for_offset(offset) for offset in range(6)),
-            (0, 1, 4, 5, 8, 9),
-        )
-        self.assertEqual(rectangular.task_at(1, 2), 5)
+        self.assertEqual(segment_placement(segment, 10), (2, 0))
+        self.assertEqual(segment_placement(segment, 12), (3, 0))
+        self.assertEqual(segment_placement(segment, 14), (2, 1))
+        self.assertEqual(segment_placement(segment, 11), None)
+        self.assertEqual(segment_task_at(segment, 2, 1), 14)
 
     def test_local_contributors_preserve_key_major_order(self) -> None:
         root_domains = (
@@ -1372,15 +1364,12 @@ class TestCrossLoopScheduler(TestCase):
         producer_axis = logical_axis_symbol(10)
         consumer_axis = logical_axis_symbol(20)
         event_graph = EventGraph(
-            root_domains=(producer_domain, consumer_domain),
             root_traversals=_default_root_traversals(
                 (producer_domain, consumer_domain)
             ),
             scope_domains=(),
             events=(
                 KeyedEvent(
-                    event_id=0,
-                    key_domain=key_domain,
                     contributions=(
                         _event_contribution_from_publication(
                             producer_root=0,
@@ -1454,8 +1443,20 @@ class TestCrossLoopScheduler(TestCase):
         reversed_schedule = WorkerSchedule(
             worker_count=1,
             segments=(
-                WorkerScheduleSegment(1, 0, 1, 0, 1, 0),
-                WorkerScheduleSegment(0, 0, 1, 0, 1, 1),
+                WorkerScheduleSegment(
+                    root=1,
+                    task_relation=event_graph.root_traversals[1],
+                    worker_begin=0,
+                    worker_count=1,
+                    schedule_begin=0,
+                ),
+                WorkerScheduleSegment(
+                    root=0,
+                    task_relation=event_graph.root_traversals[0],
+                    worker_begin=0,
+                    worker_count=1,
+                    schedule_begin=1,
+                ),
             ),
         )
         with self.assertRaisesRegex(ValueError, "dependency/order cycle"):
@@ -1467,7 +1468,7 @@ class TestCrossLoopScheduler(TestCase):
         second_consumer = LogicalDomain((30,), ((30, 2),), identity=2)
         key_domain = LogicalDomain((), (), kind="event", identity=0)
         event = CountedEventPlan(
-            contributors=(
+            contributions=(
                 _event_contribution_from_publication(
                     producer_root=0,
                     publication=LogicalRelation.total(producer_domain, key_domain),
@@ -1483,11 +1484,10 @@ class TestCrossLoopScheduler(TestCase):
                     keys=LogicalRelation.total(second_consumer, key_domain),
                 ),
             ),
-            key_domain=key_domain,
         )
 
         self.assertEqual(event.key_count, 1)
-        self.assertEqual(event.expected_arrivals, 2)
+        self.assertEqual(event.uniform_arrivals(), 2)
         self.assertIsNone(event.local_use)
         self.assertEqual(tuple(use.consumer_root for use in event.uses), (1, 2))
 
@@ -1498,13 +1498,10 @@ class TestCrossLoopScheduler(TestCase):
         root_domains = _identify_root_domains(root_domains)
         key_domain = LogicalDomain((0,), ((0, 2),), kind="event", identity=0)
         event_graph = EventGraph(
-            root_domains=root_domains,
             root_traversals=_default_root_traversals(root_domains),
             scope_domains=(),
             events=(
                 KeyedEvent(
-                    event_id=0,
-                    key_domain=key_domain,
                     contributions=(
                         _event_contribution_from_publication(
                             producer_root=0,
@@ -1559,13 +1556,10 @@ class TestCrossLoopScheduler(TestCase):
         root_domains = _identify_root_domains(root_domains)
         key_domain = LogicalDomain((0,), ((0, 2),), kind="event", identity=0)
         event_graph = EventGraph(
-            root_domains=root_domains,
             root_traversals=_default_root_traversals(root_domains),
             scope_domains=(),
             events=(
                 KeyedEvent(
-                    event_id=0,
-                    key_domain=key_domain,
                     contributions=(
                         _event_contribution_from_publication(
                             producer_root=0,
@@ -1610,7 +1604,7 @@ class TestCrossLoopScheduler(TestCase):
         (lowered,) = choose_counted_events(event_graph, triggers)
 
         self.assertEqual(
-            _publication(lowered.single_contributor).materialize(),
+            _publication(lowered.contributions[0]).materialize(),
             (
                 frozenset((0,)),
                 frozenset((0,)),
@@ -1622,7 +1616,7 @@ class TestCrossLoopScheduler(TestCase):
             lowered.uses[0].keys.materialize(),
             (frozenset((0,)), frozenset((1,))),
         )
-        self.assertEqual(lowered.expected_arrivals, 2)
+        self.assertEqual(lowered.uniform_arrivals(), 2)
         self.assertEqual(lowered.local_trigger_use, 0)
 
     def test_nonstatic_layout_falls_back_to_root_readiness(self) -> None:
@@ -1641,7 +1635,7 @@ class TestCrossLoopScheduler(TestCase):
         )
 
         (event,) = _configured_event_graph(plan, _one_dimensional_domains()).events
-        self.assertTrue(event.is_family_done)
+        self.assertIsNotNone(event.family_done_root)
         self.assertEqual(event.family_done_root, 0)
 
     def test_fanout_keeps_one_edge_per_consumer(self) -> None:
@@ -1666,8 +1660,14 @@ class TestCrossLoopScheduler(TestCase):
                 LogicalDomain((2,), ((2, 8),), ((2, 16),)),
             ),
         )
-        (event,) = configured.events_contributed_by(0)
-        self.assertFalse(event.is_family_done)
+        (event,) = tuple(
+            event
+            for event in configured.events
+            if any(
+                contribution.producer_root == 0 for contribution in event.contributions
+            )
+        )
+        self.assertIsNone(event.family_done_root)
         self.assertEqual(
             {use.consumer_root for use in event.uses},
             {1, 2},
@@ -1701,7 +1701,7 @@ class TestCrossLoopScheduler(TestCase):
         )
         self.assertEqual(len(configured.events), 2)
         family_event = next(
-            event for event in configured.events if event.is_family_done
+            event for event in configured.events if event.family_done_root is not None
         )
         self.assertEqual(family_event.family_done_root, 0)
 
@@ -1932,28 +1932,25 @@ class TestCrossLoopScheduler(TestCase):
             plan
             for plan in schedule.counted_events
             if all(use.consumer_scope_id is None for use in plan.uses)
-            and plan.graph_event_index is not None
-            and not schedule.event_graph.event(plan.graph_event_index).is_family_done
         )
         self.assertEqual(len(root_events), 1)
         event = root_events[0]
         self.assertEqual(
             (
-                event.producer_root,
+                event.contributions[0].producer_root,
                 event.uses[0].consumer_root,
                 event.local_use.consumer_root if event.local_use is not None else None,
-                event.expected_arrivals,
+                event.uniform_arrivals(),
             ),
             (0, 1, 1, 2),
         )
-        self.assertEqual(len(schedule.local_triggers), 1)
-        local_trigger = schedule.local_triggers[0]
-        local_event = schedule.event_graph.event(local_trigger.event_index)
-        self.assertEqual(local_trigger.use_index, 0)
-        self.assertEqual(
-            local_event.uses[local_trigger.use_index].consumer_root,
-            1,
+        local_events = tuple(
+            plan for plan in schedule.counted_events if plan.local_use is not None
         )
+        self.assertEqual(len(local_events), 1)
+        self.assertEqual(local_events[0].local_trigger_use, 0)
+        assert local_events[0].local_use is not None
+        self.assertEqual(local_events[0].local_use.consumer_root, 1)
         self.assertEqual(schedule.worker_schedule.worker_count, 6)
         nested_scope_events = tuple(
             plan
@@ -1964,28 +1961,19 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(
             _expected_arrivals(
                 nested_scope_events[0].key_domain,
-                nested_scope_events[0].contributors,
+                nested_scope_events[0].contributions,
             ),
             (3, 1),
         )
-        self.assertEqual(schedule.worker_schedule.placement(2, 0), (5, 1))
-        self.assertEqual(schedule.worker_schedule.placement(0, 6), (0, 1))
+        self.assertEqual(placement(schedule.worker_schedule, 2, 0), (5, 1))
+        self.assertEqual(placement(schedule.worker_schedule, 0, 6), (0, 1))
 
         exact = build_cross_loop_schedule(**{**kwargs, "worker_count": 7})
         self.assertEqual(exact.worker_schedule.worker_count, 7)
         self.assertNotEqual(exact.worker_schedule, schedule.worker_schedule)
 
         default_schedule = build_cross_loop_schedule(**kwargs)
-        self.assertEqual(
-            sum(
-                not default_schedule.event_graph.event(
-                    event.graph_event_index
-                ).is_family_done
-                for event in default_schedule.counted_events
-                if event.graph_event_index is not None
-            ),
-            2,
-        )
+        self.assertEqual(len(default_schedule.counted_events), 2)
         self.assertEqual(
             default_schedule.root_completion_edges,
             frozenset(),
@@ -2017,16 +2005,7 @@ class TestCrossLoopScheduler(TestCase):
                 },
             }
         )
-        self.assertEqual(
-            sum(
-                not short_schedule.event_graph.event(
-                    event.graph_event_index
-                ).is_family_done
-                for event in short_schedule.counted_events
-                if event.graph_event_index is not None
-            ),
-            2,
-        )
+        self.assertEqual(len(short_schedule.counted_events), 2)
         self.assertEqual(
             short_schedule.root_completion_edges,
             frozenset(),
@@ -2046,13 +2025,10 @@ class TestCrossLoopScheduler(TestCase):
         )
         key_domain = LogicalDomain((0,), ((0, 4),), kind="event", identity=0)
         event_graph = EventGraph(
-            root_domains=root_domains,
             root_traversals=_default_root_traversals(root_domains),
             scope_domains=(*(None for _ in range(7)), action_domain),
             events=(
                 KeyedEvent(
-                    event_id=0,
-                    key_domain=key_domain,
                     contributions=(
                         _event_contribution_from_publication(
                             producer_root=0,
@@ -2092,38 +2068,40 @@ class TestCrossLoopScheduler(TestCase):
             worker_count=4,
             segments=(
                 WorkerScheduleSegment(
-                    0,
-                    0,
-                    3,
-                    0,
-                    3,
-                    0,
+                    root=0,
                     task_relation=_one_dimensional_task_range(root_domains[0], 0, 3),
+                    worker_begin=0,
+                    worker_count=3,
+                    schedule_begin=0,
                 ),
                 WorkerScheduleSegment(
-                    0,
-                    3,
-                    1,
-                    0,
-                    1,
-                    1,
+                    root=0,
                     task_relation=_one_dimensional_task_range(root_domains[0], 3, 1),
+                    worker_begin=0,
+                    worker_count=1,
+                    schedule_begin=1,
                 ),
-                WorkerScheduleSegment(1, 0, 1, 3, 1, 2),
+                WorkerScheduleSegment(
+                    root=1,
+                    task_relation=event_graph.root_traversals[1],
+                    worker_begin=3,
+                    worker_count=1,
+                    schedule_begin=2,
+                ),
             ),
         )
 
         placed, plans = place_nested_scope_consumers(event_graph, schedule, ())
 
-        self.assertEqual(placed.placement(1, 0), (3, 1))
+        self.assertEqual(placement(placed, 1, 0), (3, 1))
         self.assertEqual(len(plans), 1)
         plan = plans[0]
         self.assertEqual(
-            _expected_arrivals(plan.key_domain, plan.contributors),
+            _expected_arrivals(plan.key_domain, plan.contributions),
             (3, 1),
         )
         self.assertEqual(
-            _publication(plan.contributors[0]).materialize(),
+            _publication(plan.contributions[0]).materialize(),
             (
                 frozenset((0,)),
                 frozenset((0,)),
@@ -2168,7 +2146,6 @@ class TestCrossLoopScheduler(TestCase):
             identity=0,
         )
         event_graph = EventGraph(
-            root_domains=(producer_domain, consumer_domain),
             root_traversals=(
                 physical_traversal_relation(producer_domain, (10, 11)),
                 physical_traversal_relation(consumer_domain, (20,)),
@@ -2176,8 +2153,6 @@ class TestCrossLoopScheduler(TestCase):
             scope_domains=(*(None for _ in range(7)), action_domain),
             events=(
                 KeyedEvent(
-                    event_id=0,
-                    key_domain=key_domain,
                     contributions=(
                         _event_contribution_from_publication(
                             producer_root=0,
@@ -2244,7 +2219,7 @@ class TestCrossLoopScheduler(TestCase):
                 self.assertEqual(
                     _expected_arrivals(
                         plans[0].key_domain,
-                        plans[0].contributors,
+                        plans[0].contributions,
                     ),
                     (4, 4),
                 )
@@ -2265,13 +2240,10 @@ class TestCrossLoopScheduler(TestCase):
         )
         key_domain = LogicalDomain((0,), ((0, 4),), kind="event", identity=0)
         event_graph = EventGraph(
-            root_domains=root_domains,
             root_traversals=_default_root_traversals(root_domains),
             scope_domains=(*(None for _ in range(7)), action_domain),
             events=(
                 KeyedEvent(
-                    event_id=0,
-                    key_domain=key_domain,
                     contributions=(
                         _event_contribution_from_publication(
                             producer_root=0,
@@ -2310,32 +2282,28 @@ class TestCrossLoopScheduler(TestCase):
             worker_count=4,
             segments=(
                 WorkerScheduleSegment(
-                    0,
-                    0,
-                    4,
-                    0,
-                    1,
-                    0,
+                    root=0,
                     task_relation=event_graph.root_traversals[0],
+                    worker_begin=0,
+                    worker_count=1,
+                    schedule_begin=0,
                 ),
                 WorkerScheduleSegment(
-                    1,
-                    0,
-                    1,
-                    3,
-                    1,
-                    5,
+                    root=1,
                     task_relation=event_graph.root_traversals[1],
+                    worker_begin=3,
+                    worker_count=1,
+                    schedule_begin=5,
                 ),
             ),
         )
 
         placed, plans = place_nested_scope_consumers(event_graph, schedule, ())
 
-        self.assertEqual(placed.placement(1, 0), (3, 1))
+        self.assertEqual(placement(placed, 1, 0), (3, 1))
         self.assertEqual(len(plans), 1)
         self.assertEqual(
-            _expected_arrivals(plans[0].key_domain, plans[0].contributors),
+            _expected_arrivals(plans[0].key_domain, plans[0].contributions),
             (1, 3),
         )
 
@@ -2386,21 +2354,16 @@ class TestCrossLoopScheduler(TestCase):
         second_keys, b_to_second = identity_keys(root_domains[1], 20, 1)
         _, nested_use = identity_keys(action_domain, 31, 1)
         event_graph = EventGraph(
-            root_domains=root_domains,
             root_traversals=_default_root_traversals(root_domains),
             scope_domains=(*(None for _ in range(7)), action_domain),
             events=(
                 KeyedEvent(
-                    event_id=0,
-                    key_domain=first_keys,
                     contributions=(
                         _event_contribution_from_publication(0, a_to_first),
                     ),
                     uses=(EventUse(1, first_use),),
                 ),
                 KeyedEvent(
-                    event_id=1,
-                    key_domain=second_keys,
                     contributions=(
                         _event_contribution_from_publication(1, b_to_second),
                     ),
@@ -2418,14 +2381,12 @@ class TestCrossLoopScheduler(TestCase):
         ) -> WorkerScheduleSegment:
             return WorkerScheduleSegment(
                 root=root,
-                task_begin=task_begin,
-                task_count=task_count,
-                worker_begin=worker,
-                worker_count=task_count,
-                schedule_begin=position * task_count,
                 task_relation=_one_dimensional_task_range(
                     root_domains[root], task_begin, task_count
                 ),
+                worker_begin=worker,
+                worker_count=task_count,
+                schedule_begin=position * task_count,
             )
 
         schedule = WorkerSchedule(
@@ -2444,7 +2405,7 @@ class TestCrossLoopScheduler(TestCase):
         # Worker 3 looks idle at position 2, but its A task at position 3 is a
         # prerequisite of B task 3. Placing C there would form C -> B -> A
         # while A remains later on C's blocked worker. Worker 2 is safe.
-        self.assertEqual(placed.placement(2, 0), (2, 2))
+        self.assertEqual(placement(placed, 2, 0), (2, 2))
         self.assertEqual(len(plans), 1)
         validate_worker_schedule(event_graph, placed)
 
@@ -2478,8 +2439,6 @@ class TestCrossLoopScheduler(TestCase):
             )
             events.append(
                 KeyedEvent(
-                    event_id=producer_root,
-                    key_domain=key_domain,
                     contributions=(
                         _event_contribution_from_publication(
                             producer_root=producer_root,
@@ -2533,7 +2492,6 @@ class TestCrossLoopScheduler(TestCase):
                 )
             )
         event_graph = EventGraph(
-            root_domains=root_domains,
             root_traversals=_default_root_traversals(root_domains),
             scope_domains=scope_domains,
             events=tuple(events),
@@ -2542,45 +2500,45 @@ class TestCrossLoopScheduler(TestCase):
             worker_count=4,
             segments=(
                 WorkerScheduleSegment(
-                    0,
-                    0,
-                    4,
-                    0,
-                    4,
-                    0,
+                    root=0,
                     task_relation=_one_dimensional_task_range(root_domains[0], 0, 4),
+                    worker_begin=0,
+                    worker_count=4,
+                    schedule_begin=0,
                 ),
                 WorkerScheduleSegment(
-                    1,
-                    0,
-                    3,
-                    0,
-                    4,
-                    4,
+                    root=1,
                     task_relation=_one_dimensional_task_range(root_domains[1], 0, 3),
+                    worker_begin=0,
+                    worker_count=4,
+                    schedule_begin=4,
                 ),
                 WorkerScheduleSegment(
-                    1,
-                    3,
-                    1,
-                    0,
-                    4,
-                    8,
+                    root=1,
                     task_relation=_one_dimensional_task_range(root_domains[1], 3, 1),
+                    worker_begin=0,
+                    worker_count=4,
+                    schedule_begin=8,
                 ),
-                WorkerScheduleSegment(2, 0, 1, 3, 1, 3),
+                WorkerScheduleSegment(
+                    root=2,
+                    task_relation=event_graph.root_traversals[2],
+                    worker_begin=3,
+                    worker_count=1,
+                    schedule_begin=3,
+                ),
             ),
         )
 
         placed, plans = place_nested_scope_consumers(event_graph, schedule, ())
 
-        self.assertEqual(placed.placement(2, 0), (3, 1))
+        self.assertEqual(placement(placed, 2, 0), (3, 1))
         self.assertEqual(len(plans), 2)
         plans_by_scope = {plan.uses[0].consumer_scope_id: plan for plan in plans}
         self.assertEqual(
             _expected_arrivals(
                 plans_by_scope[7].key_domain,
-                plans_by_scope[7].contributors,
+                plans_by_scope[7].contributions,
             ),
             (4,),
         )
@@ -2591,7 +2549,7 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(
             _expected_arrivals(
                 plans_by_scope[8].key_domain,
-                plans_by_scope[8].contributors,
+                plans_by_scope[8].contributions,
             ),
             (4,),
         )
@@ -2631,11 +2589,16 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(len(schedule.counted_events), 1)
         event = schedule.counted_events[0]
         self.assertEqual(event.uses[0].consumer_root, 2)
-        self.assertEqual(event.expected_arrivals, 2)
+        self.assertEqual(event.uniform_arrivals(), 2)
         self.assertEqual(
             [
-                (contributor.producer_root, contributor.expected_arrivals)
-                for contributor in event.contributors
+                (
+                    contributor.producer_root,
+                    contributor.arrivals_per_key.constant_value()
+                    if contributor.arrivals_per_key is not None
+                    else None,
+                )
+                for contributor in event.contributions
             ],
             [(0, 1), (1, 1)],
         )
@@ -2704,17 +2667,24 @@ class TestCrossLoopScheduler(TestCase):
 
         self.assertEqual(schedule.root_completion_edges, frozenset())
         self.assertEqual(len(schedule.counted_events), 1)
-        self.assertEqual(schedule.local_triggers, ())
+        self.assertFalse(
+            any(event.local_use is not None for event in schedule.counted_events)
+        )
         event = schedule.counted_events[0]
         self.assertIsNone(event.local_use)
         self.assertEqual(event.key_count, 8)
-        self.assertEqual(event.expected_arrivals, 5)
+        self.assertEqual(event.uniform_arrivals(), 5)
         self.assertEqual(
             event.uses[0].keys.materialize(),
             tuple(frozenset((i // 4,)) for i in range(32)),
         )
         self.assertEqual(
-            [contributor.expected_arrivals for contributor in event.contributors],
+            [
+                contributor.arrivals_per_key.constant_value()
+                if contributor.arrivals_per_key is not None
+                else None
+                for contributor in event.contributions
+            ],
             [4, 1],
         )
 
@@ -2772,12 +2742,12 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(len(schedule.counted_events), 1)
         event = schedule.counted_events[0]
         self.assertEqual(event.key_count, heads)
-        self.assertEqual(event.expected_arrivals, width)
+        self.assertEqual(event.uniform_arrivals(), width)
         self.assertEqual(
             event.uses[0].keys.materialize(),
             tuple(frozenset((task // splits,)) for task in range(heads * splits)),
         )
-        self.assertEqual(len(event.contributors[0].predecessors.pieces), 1)
+        self.assertEqual(len(event.contributions[0].predecessors.pieces), 1)
         self.assertEqual(len(event.uses[0].keys.pieces), 1)
 
     def test_strided_ready_groups_use_exact_coordinates_with_overlapping_hulls(
@@ -2830,7 +2800,7 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(len(schedule.counted_events), 1)
         event = schedule.counted_events[0]
         self.assertEqual(event.key_count, columns)
-        self.assertEqual(event.expected_arrivals, 1)
+        self.assertEqual(event.uniform_arrivals(), 1)
         self.assertEqual(
             event.uses[0].keys.materialize(),
             tuple(frozenset((task // splits,)) for task in range(columns * splits)),
@@ -3055,14 +3025,7 @@ class TestCrossLoopScheduler(TestCase):
         }
 
         schedule = build_cross_loop_schedule(**kwargs)
-        self.assertEqual(
-            sum(
-                not schedule.event_graph.event(event.graph_event_index).is_family_done
-                for event in schedule.counted_events
-                if event.graph_event_index is not None
-            ),
-            4,
-        )
+        self.assertEqual(len(schedule.counted_events), 4)
         self.assertEqual(
             schedule.root_completion_edges,
             frozenset(),
@@ -3077,14 +3040,14 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(
             [
                 (
-                    plan.producer_root,
+                    plan.contributions[0].producer_root,
                     plan.uses[0].consumer_root,
-                    _expected_arrivals(plan.key_domain, plan.contributors),
+                    _expected_arrivals(plan.key_domain, plan.contributions),
                 )
                 for plan in nested_scope_events
             ],
             [(1, 2, (3, 1)), (4, 5, (3, 1))],
         )
         self.assertEqual(overlapped.root_completion_edges, frozenset())
-        self.assertEqual(overlapped.worker_schedule.placement(2, 0), (5, 1))
-        self.assertEqual(overlapped.worker_schedule.placement(5, 0), (5, 5))
+        self.assertEqual(placement(overlapped.worker_schedule, 2, 0), (5, 1))
+        self.assertEqual(placement(overlapped.worker_schedule, 5, 0), (5, 5))

@@ -12,49 +12,37 @@ from .tile_dependency import DependencyPoint
 from .tile_dependency import LogicalDomain
 from .tile_dependency import LogicalRelation
 from .tile_dependency import TileDependencyGraph
-from .tile_dependency import instantiate_root_domains
-from .tile_dependency import instantiate_scope_domains
 from .tile_dependency import instantiate_symbolic_dependencies
 from .tile_dependency import logical_axis_symbol
+from .tile_dependency import nested_logical_axes
 from .tile_dependency import preceding_scope_relation
 
 
 @dataclasses.dataclass(frozen=True)
 class WorkerScheduleSegment:
-    """One compact task-family run in a static persistent-worker schedule.
+    """One symbolic task-family run in a static persistent-worker schedule.
 
-    ``schedule_begin`` is a linearized position over ``worker_count`` workers.
-    Task offset ``i`` is assigned through linear schedule offset::
+    ``task_relation`` maps dense segment ordinals to logical tasks.
+    ``schedule_begin`` places those ordinals in a linearized range over
+    ``worker_count`` workers::
 
-        offset = schedule_begin + i * schedule_step
+        offset = schedule_begin + ordinal
         worker = worker_begin + offset % worker_count
         position = offset // worker_count
 
-    Several segments can therefore describe arbitrary numbers of waves without
+    Several segments can describe arbitrary numbers of waves without
     materializing one schedule entry per runtime task.
     """
 
     root: int
-    task_begin: int
-    task_count: int
+    task_relation: LogicalRelation
     worker_begin: int
     worker_count: int
     schedule_begin: int
-    task_step: int = 1
-    schedule_step: int = 1
-    task_period: int | None = None
-    task_period_step: int | None = None
-    schedule_period: int | None = None
-    schedule_period_step: int | None = None
-    task_relation: LogicalRelation | None = None
 
     def __post_init__(self) -> None:
         if self.root < 0:
             raise ValueError(f"root must be nonnegative, got {self.root}")
-        if self.task_begin < 0:
-            raise ValueError(f"task_begin must be nonnegative, got {self.task_begin}")
-        if self.task_count <= 0:
-            raise ValueError(f"task_count must be positive, got {self.task_count}")
         if self.worker_begin < 0:
             raise ValueError(
                 f"worker_begin must be nonnegative, got {self.worker_begin}"
@@ -65,162 +53,35 @@ class WorkerScheduleSegment:
             raise ValueError(
                 f"schedule_begin must be nonnegative, got {self.schedule_begin}"
             )
-        if self.task_step == 0:
-            raise ValueError("task_step must be nonzero")
-        if self.schedule_step <= 0:
-            raise ValueError(
-                f"schedule_step must be positive, got {self.schedule_step}"
-            )
-        if (self.task_period is None) != (self.task_period_step is None):
-            raise ValueError("periodic task order requires both task period fields")
-        if self.task_period is not None and self.task_period <= 0:
-            raise ValueError(f"task_period must be positive, got {self.task_period}")
-        if (self.schedule_period is None) != (self.schedule_period_step is None):
-            raise ValueError(
-                "periodic schedule order requires both schedule period fields"
-            )
-        if self.schedule_period is not None and self.schedule_period <= 0:
-            raise ValueError(
-                f"schedule_period must be positive, got {self.schedule_period}"
-            )
-        if self.task_relation is not None:
-            if (
-                self.task_relation.source_domain.size != self.task_count
-                or self.task_relation.source_domain.kind != "worker"
-                or self.task_relation.target_domain.kind != "scope"
-                or not self.task_relation.pieces
-            ):
-                raise ValueError(
-                    "symbolic worker schedule relation has incompatible domains"
-                )
-        else:
-            tasks = tuple(
-                self.task_for_offset(offset) for offset in range(self.task_count)
-            )
-            if min(tasks) < 0:
-                raise ValueError("worker schedule segment contains a negative task")
-            if len(set(tasks)) != len(tasks):
-                raise ValueError("worker schedule segment repeats a task")
         if (
-            self.schedule_period is not None
-            and self.schedule_period_step is not None
-            and self.schedule_period_step
-            <= (self.schedule_period - 1) * self.schedule_step
+            self.task_relation.source_domain.size <= 0
+            or self.task_relation.source_domain.kind != "worker"
+            or self.task_relation.target_domain.kind != "scope"
+            or not self.task_relation.pieces
         ):
-            raise ValueError("periodic worker schedule must be strictly ordered")
+            raise ValueError(
+                "symbolic worker schedule relation has incompatible domains"
+            )
 
-    def task_for_offset(self, task_offset: int) -> int:
-        """Return the logical task at one offset within this segment."""
-        if not 0 <= task_offset < self.task_count:
-            raise IndexError(task_offset)
-        if self.task_relation is not None:
-            source_coordinates = self.task_relation.source_domain.coordinates(
-                task_offset
-            )
-            targets = self.task_relation.target_coordinates(source_coordinates)
-            if len(targets) != 1:
-                raise AssertionError(
-                    "symbolic schedule ordinal does not map to one logical task"
-                )
-            return self.task_relation.target_domain.index(
-                dict(
-                    zip(
-                        self.task_relation.target_domain.axis_order,
-                        next(iter(targets)),
-                        strict=True,
-                    )
-                )
-            )
-        if self.task_period is None:
-            return self.task_begin + task_offset * self.task_step
-        assert self.task_period_step is not None
-        return (
-            self.task_begin
-            + task_offset % self.task_period * self.task_step
-            + task_offset // self.task_period * self.task_period_step
-        )
+    @property
+    def task_count(self) -> int:
+        """Number of dense ordinals represented by this segment."""
+        return self.task_relation.source_domain.size
 
     def schedule_for_offset(self, task_offset: int) -> int:
         """Return the linearized worker-stream position for one task offset."""
         if not 0 <= task_offset < self.task_count:
             raise IndexError(task_offset)
-        if self.schedule_period is None:
-            return self.schedule_begin + task_offset * self.schedule_step
-        assert self.schedule_period_step is not None
-        return (
-            self.schedule_begin
-            + task_offset % self.schedule_period * self.schedule_step
-            + task_offset // self.schedule_period * self.schedule_period_step
-        )
+        return self.schedule_begin + task_offset
 
-    def placement(self, task: int) -> tuple[int, int] | None:
-        """Return ``(worker, position)`` when this segment owns ``task``."""
-        if self.task_relation is not None:
-            inverse = self.task_relation.inverse()
-            offsets = (
-                inverse.targets(task)
-                if inverse is not None
-                else frozenset(
-                    offset
-                    for offset in range(self.task_count)
-                    if self.task_for_offset(offset) == task
-                )
-            )
-            if len(offsets) > 1:
-                raise AssertionError("symbolic schedule maps one task more than once")
-            if not offsets:
-                return None
-            task_offset = next(iter(offsets))
-        elif self.task_period is None:
-            task_delta = task - self.task_begin
-            if task_delta % self.task_step:
-                return None
-            task_offset = task_delta // self.task_step
-            if not 0 <= task_offset < self.task_count:
-                return None
-        else:
-            task_offset = next(
-                (
-                    offset
-                    for offset in range(self.task_count)
-                    if self.task_for_offset(offset) == task
-                ),
-                None,
-            )
-            if task_offset is None:
-                return None
-        schedule_offset = self.schedule_for_offset(task_offset)
-        return (
-            self.worker_begin + schedule_offset % self.worker_count,
-            schedule_offset // self.worker_count,
-        )
-
-    def task_at(self, worker: int, position: int) -> int | None:
-        """Return the task at one worker position, if this segment owns it."""
+    def occupies(self, worker: int, position: int) -> bool:
+        """Return whether this segment occupies one worker-stream position."""
         worker_offset = worker - self.worker_begin
         if not 0 <= worker_offset < self.worker_count or position < 0:
-            return None
+            return False
         schedule_offset = position * self.worker_count + worker_offset
         schedule_delta = schedule_offset - self.schedule_begin
-        if schedule_delta < 0:
-            return None
-        if self.schedule_period is None:
-            if schedule_delta % self.schedule_step:
-                return None
-            task_offset = schedule_delta // self.schedule_step
-        else:
-            assert self.schedule_period_step is not None
-            outer = schedule_delta // self.schedule_period_step
-            inner_delta = schedule_delta % self.schedule_period_step
-            if inner_delta % self.schedule_step:
-                return None
-            inner = inner_delta // self.schedule_step
-            if inner >= self.schedule_period:
-                return None
-            task_offset = outer * self.schedule_period + inner
-        if task_offset >= self.task_count:
-            return None
-        return self.task_for_offset(task_offset)
+        return 0 <= schedule_delta < self.task_count
 
 
 def _flat_domain_index_expression(domain: LogicalDomain) -> sympy.Expr:
@@ -249,29 +110,18 @@ class WorkerSchedule:
                     "worker schedule segment exceeds the resident worker domain"
                 )
 
-    def placement(self, root: int, task: int) -> tuple[int, int] | None:
-        """Return one task's placement without expanding the full schedule."""
-        placements = tuple(
-            placement
-            for segment in self.segments_for_root(root)
-            if (placement := segment.placement(task)) is not None
-        )
-        if len(placements) > 1:
-            raise AssertionError(f"task ({root}, {task}) has multiple placements")
-        return placements[0] if placements else None
-
-    def task_at(self, worker: int, position: int) -> tuple[int, int] | None:
-        """Return the unique ``(root, task)`` at one static schedule position."""
-        tasks = tuple(
-            (segment.root, task)
+    def root_at(self, worker: int, position: int) -> int | None:
+        """Return the task family occupying one worker-stream position."""
+        roots = tuple(
+            segment.root
             for segment in self.segments
-            if (task := segment.task_at(worker, position)) is not None
+            if segment.occupies(worker, position)
         )
-        if len(tasks) > 1:
+        if len(roots) > 1:
             raise AssertionError(
                 f"worker {worker} position {position} has multiple tasks"
             )
-        return tasks[0] if tasks else None
+        return roots[0] if roots else None
 
     def segments_for_root(self, root: int) -> tuple[WorkerScheduleSegment, ...]:
         """Return the compressed static relation for one task family."""
@@ -293,7 +143,6 @@ class WorkerSchedule:
             (
                 axis
                 for segment in self.segments
-                if segment.task_relation is not None
                 for domain in (
                     segment.task_relation.source_domain,
                     segment.task_relation.target_domain,
@@ -341,22 +190,11 @@ class WorkerSchedule:
     def placement_relation(
         self,
         segment: WorkerScheduleSegment,
-    ) -> LogicalRelation | None:
+    ) -> LogicalRelation:
         """Map one segment's ordinal coordinates to worker and stream position."""
         relation = segment.task_relation
-        if relation is None:
-            return None
         ordinal = _flat_domain_index_expression(relation.source_domain)
-        if segment.schedule_period is None:
-            schedule_offset = segment.schedule_begin + ordinal * segment.schedule_step  # pyrefly: ignore[unsupported-operation]
-        else:
-            assert segment.schedule_period_step is not None
-            schedule_offset = (
-                segment.schedule_begin
-                + sympy.Mod(ordinal, segment.schedule_period) * segment.schedule_step  # pyrefly: ignore[unsupported-operation]
-                + sympy.floor(ordinal / segment.schedule_period)  # pyrefly: ignore[unsupported-operation]
-                * segment.schedule_period_step  # pyrefly: ignore[unsupported-operation]
-            )
+        schedule_offset = segment.schedule_begin + ordinal  # pyrefly: ignore[unsupported-operation]
         worker = segment.worker_begin + sympy.Mod(  # pyrefly: ignore[unsupported-operation]
             schedule_offset,
             segment.worker_count,
@@ -381,19 +219,12 @@ class WorkerSchedule:
         segment: WorkerScheduleSegment,
     ) -> LogicalRelation | None:
         """Project one symbolic placement relation to stream position."""
-        placement = self.placement_relation(segment)
-        return (
-            None
-            if placement is None
-            else placement.project_target(self.position_domain)
-        )
+        return self.placement_relation(segment).project_target(self.position_domain)
 
-    def last_positions_for_root(self, root: int) -> dict[int, int] | None:
+    def last_positions_for_root(self, root: int) -> dict[int, int]:
         """Return each participating worker's final stream position."""
         result: dict[int, int] = {}
         for segment in self.segments_for_root(root):
-            if segment.schedule_period is not None or segment.schedule_step != 1:
-                return None
             begin = segment.schedule_begin
             end = begin + segment.task_count
             for local_worker in range(segment.worker_count):
@@ -442,8 +273,6 @@ class WorkerSchedule:
             if (
                 segment.worker_begin != 0
                 or segment.worker_count != self.worker_count
-                or segment.schedule_period is not None
-                or segment.schedule_step != 1
                 or segment.schedule_begin != end
             ):
                 return None
@@ -502,12 +331,10 @@ def build_baseline_worker_schedule(
         segments.append(
             WorkerScheduleSegment(
                 root=root,
-                task_begin=0,
-                task_count=task_count,
+                task_relation=traversal,
                 worker_begin=0,
                 worker_count=active_workers,
                 schedule_begin=position_begin * active_workers,
-                task_relation=traversal,
             )
         )
         position_begin += (task_count + worker_count - 1) // worker_count
@@ -531,8 +358,8 @@ def _family_placements_at_position(
         for worker in range(worker_schedule.worker_count)
         if worker not in unavailable_workers
         and (
-            (occupant := worker_schedule.task_at(worker, position)) is None
-            or occupant[0] == root
+            (occupant_root := worker_schedule.root_at(worker, position)) is None
+            or occupant_root == root
         )
     ]
     result: list[WorkerSchedule] = []
@@ -549,12 +376,10 @@ def _family_placements_at_position(
                     (
                         WorkerScheduleSegment(
                             root=root,
-                            task_begin=0,
-                            task_count=task_domain.size,
+                            task_relation=task_traversal,
                             worker_begin=worker_begin,
                             worker_count=task_domain.size,
                             schedule_begin=position * task_domain.size,
-                            task_relation=task_traversal,
                         ),
                     ),
                 )
@@ -579,6 +404,7 @@ def place_ready_families(
     """
     result = worker_schedule
     remaining_triggers = local_triggers
+    local_trigger_by_root = _index_local_triggers(event_graph, local_triggers)
     candidate_roots = sorted(
         {
             event_graph.event(trigger.event_index).uses[trigger.use_index].consumer_root
@@ -606,30 +432,18 @@ def place_ready_families(
             event_graph,
             trigger_event,
             worker_schedule=result,
-            local_triggers=remaining_triggers,
+            local_trigger_by_root=local_trigger_by_root,
         )
         if completion is None:
             continue
-        completion_positions, static_relations = completion
+        completion_positions, prerequisite_roots = completion
         readiness = trigger_use.keys.then(completion_positions)
         readiness_bounds = None if readiness is None else readiness.value_bounds()
         if readiness_bounds is None:
             continue
-        if any(not relation.has_total_source() for _root, relation in static_relations):
-            continue
-        prerequisite_roots = _transitive_static_prerequisite_roots(
-            event_graph,
-            static_relations,
-            remaining_triggers,
-        )
-        if prerequisite_roots is None:
-            continue
         ancestor_placements: set[tuple[int, int]] = set()
         for prerequisite_root in prerequisite_roots:
             last_positions = result.last_positions_for_root(prerequisite_root)
-            if last_positions is None:
-                ancestor_placements.clear()
-                break
             ancestor_placements.update(last_positions.items())
         if not ancestor_placements:
             continue
@@ -667,6 +481,7 @@ def place_ready_families(
                 continue
             result = candidate
             remaining_triggers = remaining_without_root
+            local_trigger_by_root.pop(root)
             break
     return result, remaining_triggers
 
@@ -747,6 +562,19 @@ class LocalTrigger:
     use_index: int
 
 
+def _index_local_triggers(
+    event_graph: EventGraph,
+    local_triggers: tuple[LocalTrigger, ...],
+) -> dict[int, LocalTrigger]:
+    """Index final-arrival triggers by their consumer root."""
+    return {
+        event_graph.event(trigger.event_index)
+        .uses[trigger.use_index]
+        .consumer_root: trigger
+        for trigger in local_triggers
+    }
+
+
 @dataclasses.dataclass(frozen=True)
 class EventContribution:
     """A producer execution scope's symbolic contribution to one event."""
@@ -756,25 +584,35 @@ class EventContribution:
     producer_scope_id: int | None = None
 
     @cached_property
-    def producer_to_keys(self) -> LogicalRelation | None:
-        """Return the derived publication relation, when representable."""
-        return self.predecessors.publication_converse()
-
-    @cached_property
-    def arrivals_per_key(self) -> LogicalRelation | None:
-        """Return the exact symbolic number of arrivals for each event key."""
-        return self.predecessors.fiber_cardinality()
+    def _readiness_relations(
+        self,
+    ) -> tuple[LogicalRelation | None, LogicalRelation | None]:
+        """Derive publication and fan-in from one fiber analysis."""
+        return self.predecessors.fiber_analysis()
 
     @property
-    def expected_arrivals(self) -> int:
-        count = (
-            None
-            if self.arrivals_per_key is None
-            else self.arrivals_per_key.constant_value()
-        )
+    def producer_to_keys(self) -> LogicalRelation | None:
+        """Return the derived publication relation, when representable."""
+        return self._readiness_relations[0]
+
+    @property
+    def arrivals_per_key(self) -> LogicalRelation | None:
+        """Return the exact symbolic number of arrivals for each event key."""
+        return self._readiness_relations[1]
+
+
+def _uniform_arrivals(
+    contributions: tuple[EventContribution, ...],
+) -> int | None:
+    """Return one constant arrival count for an event, when it has one."""
+    total = 0
+    for contribution in contributions:
+        cardinality = contribution.arrivals_per_key
+        count = None if cardinality is None else cardinality.constant_value()
         if count is None:
-            raise ValueError("symbolic contributor has nonuniform fan-in")
-        return count
+            return None
+        total += count
+    return total
 
 
 @dataclasses.dataclass(frozen=True)
@@ -787,29 +625,51 @@ class EventUse:
     consumer_scope_id: int | None = None
 
 
+def _event_key_domain(
+    contributions: tuple[EventContribution, ...],
+    uses: tuple[EventUse, ...],
+) -> LogicalDomain:
+    """Validate and return the shared key domain of one event."""
+    if not contributions:
+        raise ValueError("an event requires at least one contributor")
+    key_domain = contributions[0].predecessors.source_domain
+    if any(
+        contributor.predecessors.source_domain != key_domain
+        for contributor in contributions[1:]
+    ) or any(use.keys.target_domain != key_domain for use in uses):
+        raise ValueError("event relations must share one key domain")
+    return key_domain
+
+
 @dataclasses.dataclass(frozen=True)
 class KeyedEvent:
     """One symbolic readiness event shared by scheduling and lowering."""
 
-    event_id: int
-    key_domain: LogicalDomain
     contributions: tuple[EventContribution, ...]
     uses: tuple[EventUse, ...]
 
     def __post_init__(self) -> None:
-        if self.key_domain.kind != "event":
+        key_domain = _event_key_domain(self.contributions, self.uses)
+        if key_domain.kind != "event":
             raise ValueError("event key domain must have event kind")
-        if self.key_domain.identity != self.event_id:
-            raise ValueError("event key domain identity must match its event ID")
-        if self.key_domain.axis_order != tuple(range(len(self.key_domain.axis_order))):
+        if key_domain.identity is None or key_domain.identity < 0:
+            raise ValueError("event key domain must have a nonnegative identity")
+        if key_domain.axis_order != tuple(range(len(key_domain.axis_order))):
             raise ValueError("event key axes must use canonical local ordinals")
-        if self.key_domain.block_sizes_items:
+        if key_domain.block_sizes_items:
             raise ValueError("event key domains must not inherit scope block sizes")
-        if any(
-            contribution.predecessors.source_domain != self.key_domain
-            for contribution in self.contributions
-        ) or any(use.keys.target_domain != self.key_domain for use in self.uses):
-            raise ValueError("event relations must use the event key domain")
+
+    @property
+    def key_domain(self) -> LogicalDomain:
+        """Return the key domain owned by every event relation."""
+        return self.contributions[0].predecessors.source_domain
+
+    @property
+    def event_id(self) -> int:
+        """Return the event identity owned by its key domain."""
+        identity = self.key_domain.identity
+        assert identity is not None
+        return identity
 
     @property
     def key_count(self) -> int:
@@ -826,32 +686,21 @@ class KeyedEvent:
             return self.contributions[0].producer_root
         return None
 
-    @property
-    def is_family_done(self) -> bool:
-        return self.family_done_root is not None
-
 
 @dataclasses.dataclass(frozen=True)
 class EventGraph:
     """Configured symbolic readiness DAG and its execution-scope domains."""
 
-    root_domains: tuple[LogicalDomain, ...]
     root_traversals: tuple[LogicalRelation, ...]
     scope_domains: tuple[LogicalDomain | None, ...]
     events: tuple[KeyedEvent, ...]
 
     def __post_init__(self) -> None:
-        if len(self.root_domains) != len(self.root_traversals):
-            raise ValueError("event graph root domains must match traversals")
-        for domain, traversal in zip(
-            self.root_domains,
-            self.root_traversals,
-            strict=True,
-        ):
+        for traversal in self.root_traversals:
             if (
-                traversal.target_domain != domain
-                or traversal.source_domain.size != domain.size
+                traversal.source_domain.size != traversal.target_domain.size
                 or traversal.source_domain.kind != "worker"
+                or traversal.target_domain.kind != "scope"
                 or not traversal.pieces
             ):
                 raise ValueError(
@@ -862,26 +711,13 @@ class EventGraph:
         ):
             raise ValueError("event IDs must be dense and source ordered")
 
+    @property
+    def root_domains(self) -> tuple[LogicalDomain, ...]:
+        """Return the task domains owned by the physical root traversals."""
+        return tuple(traversal.target_domain for traversal in self.root_traversals)
+
     def event(self, event_id: int) -> KeyedEvent:
         return self.events[event_id]
-
-    def events_contributed_by(self, root: int) -> tuple[KeyedEvent, ...]:
-        return tuple(
-            event
-            for event in self.events
-            if any(
-                contribution.producer_root == root
-                for contribution in event.contributions
-            )
-        )
-
-    def uses_for_root(self, root: int) -> tuple[EventUse, ...]:
-        return tuple(
-            use
-            for event in self.events
-            for use in event.uses
-            if use.consumer_root == root
-        )
 
     def scope_domain(self, scope_id: int) -> LogicalDomain:
         domain = self.scope_domains[scope_id]
@@ -890,11 +726,9 @@ class EventGraph:
         return domain
 
     def nested_axes(self, root: int, scope_id: int) -> tuple[int, ...]:
-        root_axes = frozenset(self.root_domains[root].axis_order)
-        return tuple(
-            axis
-            for axis in self.scope_domain(scope_id).axis_order
-            if axis not in root_axes
+        return nested_logical_axes(
+            self.root_domains[root],
+            self.scope_domain(scope_id),
         )
 
     def source_traversal(self, root: int, scope_id: int | None) -> tuple[int, ...]:
@@ -915,17 +749,6 @@ class EventGraph:
                 raise ValueError("root event use has the wrong source domain")
             return use.keys
         return use.keys.project_source(root_domain)
-
-    def uniform_expected_arrivals(self, event: KeyedEvent) -> int | None:
-        """Return constant fan-in without enumerating event keys."""
-        total = 0
-        for contribution in event.contributions:
-            cardinality = contribution.arrivals_per_key
-            count = None if cardinality is None else cardinality.constant_value()
-            if count is None:
-                return None
-            total += count
-        return total
 
 
 def _counted_contribution_is_lowerable(contribution: EventContribution) -> bool:
@@ -1026,14 +849,14 @@ def _canonical_event_predecessors(
 def _add_event_candidate(
     pending: dict[
         tuple[LogicalDomain, tuple[EventContribution, ...]],
-        list[EventUse],
+        KeyedEvent,
     ],
     *,
     key_domain: LogicalDomain,
     contributions: tuple[EventContribution, ...],
     uses: tuple[EventUse, ...],
 ) -> None:
-    """Group fanout by the complete producer partition before assigning IDs."""
+    """Group fanout by producer partition in final event-local coordinates."""
     canonical_domain = _canonical_event_domain(key_domain)
     canonical_contributions = tuple(
         dataclasses.replace(
@@ -1052,11 +875,33 @@ def _add_event_candidate(
         )
         for use in uses
     )
-    grouped_uses = pending.setdefault(
-        (canonical_domain, canonical_contributions),
-        [],
-    )
-    for use in canonical_uses:
+    signature = canonical_domain, canonical_contributions
+    previous_event = pending.get(signature)
+    if previous_event is None:
+        event_id = len(pending)
+        identified_domain = dataclasses.replace(canonical_domain, identity=event_id)
+        identified_contributions: list[EventContribution] = []
+        for contribution in canonical_contributions:
+            predecessors = contribution.predecessors.retype_source(identified_domain)
+            if predecessors is None:
+                raise AssertionError("event identity assignment changed key geometry")
+            identified_contributions.append(
+                dataclasses.replace(contribution, predecessors=predecessors)
+            )
+        event_contributions = tuple(identified_contributions)
+        previous_uses: tuple[EventUse, ...] = ()
+    else:
+        event_id = previous_event.event_id
+        identified_domain = previous_event.key_domain
+        event_contributions = previous_event.contributions
+        previous_uses = previous_event.uses
+
+    grouped_uses = list(previous_uses)
+    for canonical_use in canonical_uses:
+        keys = canonical_use.keys.retarget(identified_domain)
+        if keys is None:
+            raise AssertionError("event identity assignment changed key geometry")
+        use = dataclasses.replace(canonical_use, keys=keys)
         matching_index = next(
             (
                 index
@@ -1075,61 +920,10 @@ def _add_event_candidate(
             previous,
             dependency_points=previous.dependency_points | use.dependency_points,
         )
-
-
-def _finalize_keyed_events(
-    pending: dict[
-        tuple[LogicalDomain, tuple[EventContribution, ...]],
-        list[EventUse],
-    ],
-) -> tuple[KeyedEvent, ...]:
-    """Assign deterministic IDs after the readiness quotient is complete."""
-
-    def retarget_use(
-        relation: LogicalRelation,
-        domain: LogicalDomain,
-    ) -> LogicalRelation:
-        result = relation.retarget(domain)
-        if result is None:
-            raise AssertionError("event identity assignment changed key geometry")
-        return result
-
-    def retype_predecessors(
-        relation: LogicalRelation,
-        domain: LogicalDomain,
-    ) -> LogicalRelation:
-        result = relation.retype_source(domain)
-        if result is None:
-            raise AssertionError("event identity assignment changed key geometry")
-        return result
-
-    events: list[KeyedEvent] = []
-    for event_id, ((key_domain, contributions), uses) in enumerate(pending.items()):
-        identified_domain = dataclasses.replace(key_domain, identity=event_id)
-        events.append(
-            KeyedEvent(
-                event_id=event_id,
-                key_domain=identified_domain,
-                contributions=tuple(
-                    dataclasses.replace(
-                        contribution,
-                        predecessors=retype_predecessors(
-                            contribution.predecessors,
-                            identified_domain,
-                        ),
-                    )
-                    for contribution in contributions
-                ),
-                uses=tuple(
-                    dataclasses.replace(
-                        use,
-                        keys=retarget_use(use.keys, identified_domain),
-                    )
-                    for use in uses
-                ),
-            )
-        )
-    return tuple(events)
+    pending[signature] = KeyedEvent(
+        contributions=event_contributions,
+        uses=tuple(grouped_uses),
+    )
 
 
 def _without_root_uses_for_dependencies(
@@ -1164,11 +958,17 @@ class CountedEventPlan:
     identifies the optional use executed by the final arriving contributor.
     """
 
-    contributors: tuple[EventContribution, ...]
+    contributions: tuple[EventContribution, ...]
     uses: tuple[EventUse, ...]
-    key_domain: LogicalDomain
     local_trigger_use: int | None = None
-    graph_event_index: int | None = None
+
+    def __post_init__(self) -> None:
+        _event_key_domain(self.contributions, self.uses)
+
+    @property
+    def key_domain(self) -> LogicalDomain:
+        """Return the key domain owned by every event relation."""
+        return self.contributions[0].predecessors.source_domain
 
     @property
     def local_use(self) -> EventUse | None:
@@ -1181,23 +981,9 @@ class CountedEventPlan:
         """Return the complete event-key domain used by producers or consumers."""
         return self.key_domain.size
 
-    @property
-    def expected_arrivals(self) -> int:
-        return sum(contributor.expected_arrivals for contributor in self.contributors)
-
-    @property
-    def is_single_contributor(self) -> bool:
-        return len(self.contributors) == 1
-
-    @property
-    def single_contributor(self) -> EventContribution:
-        if not self.is_single_contributor:
-            raise ValueError("keyed event has multiple contributors")
-        return self.contributors[0]
-
-    @property
-    def producer_root(self) -> int:
-        return self.single_contributor.producer_root
+    def uniform_arrivals(self) -> int | None:
+        """Return constant fan-in without enumerating event keys."""
+        return _uniform_arrivals(self.contributions)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1275,14 +1061,8 @@ def _static_contribution_relations(
 def _event_static_contributions(
     event_graph: EventGraph,
     event: KeyedEvent,
-    local_triggers: tuple[LocalTrigger, ...],
+    local_trigger_by_root: dict[int, LocalTrigger],
 ) -> tuple[tuple[int, LogicalRelation], ...] | None:
-    local_trigger_by_root = {
-        event_graph.event(trigger.event_index)
-        .uses[trigger.use_index]
-        .consumer_root: trigger
-        for trigger in local_triggers
-    }
     expanded: list[tuple[int, LogicalRelation]] = []
     for contribution in event.contributions:
         publication = contribution.producer_to_keys
@@ -1304,7 +1084,7 @@ def _event_static_contributions(
 def _transitive_static_prerequisite_roots(
     event_graph: EventGraph,
     static_relations: tuple[tuple[int, LogicalRelation], ...],
-    local_triggers: tuple[LocalTrigger, ...],
+    local_trigger_by_root: dict[int, LocalTrigger],
 ) -> frozenset[int] | None:
     """Close static contributors through waits earlier on their task strands."""
     roots = {root for root, _relation in static_relations}
@@ -1317,7 +1097,7 @@ def _transitive_static_prerequisite_roots(
             upstream = _event_static_contributions(
                 event_graph,
                 event,
-                local_triggers,
+                local_trigger_by_root,
             )
             if upstream is None:
                 return None
@@ -1335,15 +1115,24 @@ def _event_completion_positions(
     event: KeyedEvent,
     *,
     worker_schedule: WorkerSchedule,
-    local_triggers: tuple[LocalTrigger, ...],
-) -> tuple[LogicalRelation, tuple[tuple[int, LogicalRelation], ...]] | None:
+    local_trigger_by_root: dict[int, LocalTrigger],
+) -> tuple[LogicalRelation, frozenset[int]] | None:
     """Return event-key frontiers and their ultimate static contributors."""
     static_relations = _event_static_contributions(
         event_graph,
         event,
-        local_triggers,
+        local_trigger_by_root,
     )
-    if static_relations is None:
+    if static_relations is None or any(
+        not relation.has_total_source() for _root, relation in static_relations
+    ):
+        return None
+    prerequisite_roots = _transitive_static_prerequisite_roots(
+        event_graph,
+        static_relations,
+        local_trigger_by_root,
+    )
+    if prerequisite_roots is None:
         return None
     maxima: list[LogicalRelation] = []
     for root, keys in static_relations:
@@ -1352,7 +1141,7 @@ def _event_completion_positions(
             return None
         for segment in worker_schedule.segments_for_root(root):
             task_relation = segment.task_relation
-            if task_relation is None or task_relation.target_domain != root_domain:
+            if task_relation.target_domain != root_domain:
                 return None
             ordinal_keys = task_relation.then(keys)
             inverse = None if ordinal_keys is None else ordinal_keys.inverse()
@@ -1378,7 +1167,7 @@ def _event_completion_positions(
         worker_schedule.position_domain,
     )
     maximum = combined.fiber_maximum(identity)
-    return None if maximum is None else (maximum, static_relations)
+    return None if maximum is None else (maximum, prerequisite_roots)
 
 
 def _scope_readiness(
@@ -1387,7 +1176,7 @@ def _scope_readiness(
     use: EventUse,
     *,
     worker_schedule: WorkerSchedule,
-    local_triggers: tuple[LocalTrigger, ...],
+    local_trigger_by_root: dict[int, LocalTrigger],
 ) -> _ScopeReadiness | None:
     """Project one exact action relation onto static worker completion positions."""
     assert use.consumer_scope_id is not None
@@ -1403,28 +1192,17 @@ def _scope_readiness(
         event_graph,
         event,
         worker_schedule=worker_schedule,
-        local_triggers=local_triggers,
+        local_trigger_by_root=local_trigger_by_root,
     )
     if completion is None:
         return None
-    completion_positions, static_relations = completion
+    completion_positions, prerequisite_roots = completion
     action_readiness = use.keys.then(completion_positions)
     if action_readiness is None or not action_readiness.is_total_function():
-        return None
-    if any(not relation.has_total_source() for _root, relation in static_relations):
-        return None
-    prerequisite_roots = _transitive_static_prerequisite_roots(
-        event_graph,
-        static_relations,
-        local_triggers,
-    )
-    if prerequisite_roots is None:
         return None
     ancestor_placements: set[tuple[int, int]] = set()
     for root in prerequisite_roots:
         last_positions = worker_schedule.last_positions_for_root(root)
-        if last_positions is None:
-            return None
         ancestor_placements.update(last_positions.items())
     return _ScopeReadiness(
         event=event,
@@ -1534,7 +1312,7 @@ def _segmented_scope_event(
         return None
 
     return CountedEventPlan(
-        contributors=tuple(
+        contributions=tuple(
             EventContribution(
                 producer_root=contribution.producer_root,
                 producer_scope_id=contribution.producer_scope_id,
@@ -1555,8 +1333,6 @@ def _segmented_scope_event(
                 keys=action_keys,
             ),
         ),
-        graph_event_index=event.event_id,
-        key_domain=key_domain,
     )
 
 
@@ -1660,6 +1436,7 @@ def place_nested_scope_consumers(
         int,
         list[tuple[KeyedEvent, EventUse]],
     ] = {}
+    local_trigger_by_root = _index_local_triggers(event_graph, local_triggers)
     for event in event_graph.events:
         for use in event.uses:
             if use.consumer_scope_id is not None:
@@ -1706,7 +1483,7 @@ def place_nested_scope_consumers(
                 event,
                 use,
                 worker_schedule=result,
-                local_triggers=local_triggers,
+                local_trigger_by_root=local_trigger_by_root,
             )
             for event, use in uncovered_event_uses
         )
@@ -1784,126 +1561,9 @@ def place_nested_scope_consumers(
 class CrossLoopSchedule:
     """Pure graph-derived choices consumed by persistent-kernel lowering."""
 
-    event_graph: EventGraph
     worker_schedule: WorkerSchedule
-    local_triggers: tuple[LocalTrigger, ...]
     counted_events: tuple[CountedEventPlan, ...]
-
-    @property
-    def root_completion_edges(self) -> frozenset[tuple[int, int]]:
-        """Return family-completion relations represented by one-key events."""
-        return frozenset(
-            (family_done_root, use.consumer_root)
-            for plan in self.counted_events
-            if plan.graph_event_index is not None
-            for event in (self.event_graph.event(plan.graph_event_index),)
-            if (family_done_root := event.family_done_root) is not None
-            for use in plan.uses
-        )
-
-
-def lower_family_done_events(
-    event_graph: EventGraph,
-    dependency_graph: TileDependencyGraph,
-    edges: frozenset[tuple[int, int]],
-) -> tuple[EventGraph, tuple[CountedEventPlan, ...]]:
-    """Represent selected whole-family waits as canonical one-key events.
-
-    The semantic event receives one contribution per logical task. Codegen is
-    free to aggregate those arrivals by worker after proving the worker's
-    complete task stream has finished.
-    """
-    consumers_by_producer: dict[int, set[int]] = {}
-    for producer_root, consumer_root in edges:
-        consumers_by_producer.setdefault(producer_root, set()).add(consumer_root)
-
-    events = [
-        dataclasses.replace(event, uses=())
-        if event.family_done_root is not None
-        else event
-        for event in event_graph.events
-    ]
-    family_event_by_root = {
-        family_done_root: event
-        for event in events
-        if (family_done_root := event.family_done_root) is not None
-    }
-    plans: list[CountedEventPlan] = []
-    for producer_root, consumer_roots in sorted(consumers_by_producer.items()):
-        selected_uses = tuple(
-            EventUse(
-                consumer_root=consumer_root,
-                consumer_scope_id=None,
-                keys=LogicalRelation.total(
-                    event_graph.root_domains[consumer_root],
-                    LogicalDomain(
-                        axis_order=(),
-                        axis_counts_items=(),
-                        kind="event",
-                        identity=(
-                            family_event_by_root[producer_root].event_id
-                            if producer_root in family_event_by_root
-                            else len(events)
-                        ),
-                    ),
-                ),
-                dependency_points=frozenset(
-                    dependency_point
-                    for dependency in dependency_graph.edges_between(
-                        producer_root, consumer_root
-                    )
-                    for access_dependency in dependency.access_dependencies
-                    for dependency_point in dependency_graph.dependency_points(
-                        access_dependency
-                    )
-                ),
-            )
-            for consumer_root in sorted(consumer_roots)
-        )
-        family_event = family_event_by_root.get(producer_root)
-        if family_event is None:
-            key_domain = selected_uses[0].keys.target_domain
-            family_event = KeyedEvent(
-                event_id=len(events),
-                key_domain=key_domain,
-                contributions=(
-                    EventContribution(
-                        producer_root=producer_root,
-                        producer_scope_id=None,
-                        predecessors=LogicalRelation.total(
-                            key_domain,
-                            event_graph.root_domains[producer_root],
-                        ),
-                    ),
-                ),
-                uses=selected_uses,
-            )
-            events.append(family_event)
-            family_event_by_root[producer_root] = family_event
-        else:
-            family_event = dataclasses.replace(family_event, uses=selected_uses)
-            events[family_event.event_id] = family_event
-        plans.append(
-            CountedEventPlan(
-                contributors=(
-                    EventContribution(
-                        producer_root=producer_root,
-                        predecessors=family_event.contributions[0].predecessors,
-                    ),
-                ),
-                uses=tuple(
-                    EventUse(
-                        consumer_root=use.consumer_root,
-                        dependency_points=use.dependency_points,
-                        keys=use.keys,
-                    )
-                    for use in selected_uses
-                ),
-                graph_event_index=family_event.event_id,
-                key_domain=family_event.key_domain,
-            )
-        )
-    return dataclasses.replace(event_graph, events=tuple(events)), tuple(plans)
+    root_completion_edges: frozenset[tuple[int, int]]
 
 
 def choose_local_triggers(
@@ -1931,10 +1591,6 @@ def choose_local_triggers(
             use := event_graph.event(trigger.event_index).uses[trigger.use_index]
         ).consumer_root
         not in excluded_roots
-        and event_graph.uniform_expected_arrivals(
-            event_graph.event(trigger.event_index)
-        )
-        is not None
         and event_graph.root_domains[use.consumer_root].size > 1
         and not (
             use.consumer_root in family_done_roots
@@ -2001,11 +1657,9 @@ def choose_counted_events(
             continue
         selected.append(
             CountedEventPlan(
-                contributors=event.contributions,
+                contributions=event.contributions,
                 uses=tuple(retained_uses),
                 local_trigger_use=local_trigger_use,
-                graph_event_index=event.event_id,
-                key_domain=event.key_domain,
             )
         )
     selected_local_count = sum(
@@ -2019,7 +1673,8 @@ def choose_counted_events(
 def build_keyed_events(
     dependency_graph: TileDependencyGraph,
     *,
-    axis_geometry: dict[int, tuple[int, int]],
+    root_domains: tuple[LogicalDomain, ...],
+    scope_domains: tuple[LogicalDomain | None, ...],
     publishable_scope_ids: frozenset[int] | None = None,
 ) -> tuple[KeyedEvent, ...]:
     """Build the canonical symbolic event graph from memory dependencies.
@@ -2028,18 +1683,10 @@ def build_keyed_events(
     predecessor set. Unsupported relations coarsen to one family-completion
     event for the affected root pair.
     """
-    root_domains = instantiate_root_domains(
-        dependency_graph,
-        axis_geometry=axis_geometry,
-    )
-    if any(domain is None for domain in root_domains):
-        raise ValueError("event construction requires static root domains")
-    concrete_root_domains = tuple(
-        domain for domain in root_domains if domain is not None
-    )
     symbolic_dependencies = instantiate_symbolic_dependencies(
         dependency_graph,
-        axis_geometry=axis_geometry,
+        root_domains=root_domains,
+        scope_domains=scope_domains,
     )
     scope_by_id = {scope.scope_id: scope for scope in dependency_graph.execution_scopes}
     exact_dependencies = tuple(
@@ -2056,10 +1703,6 @@ def build_keyed_events(
                 dependency_graph.dependency_points(access_dependency)
             )
 
-    scope_domains = instantiate_scope_domains(
-        dependency_graph,
-        axis_geometry=axis_geometry,
-    )
     implied_points: dict[DependencyPoint, set[DependencyPoint]] = {}
     for source in exact_dependencies:
         source_scope_id = source.consumer_scope_id
@@ -2178,14 +1821,14 @@ def build_keyed_events(
         root_relation = relation
         if not consumer_is_root:
             projected = root_relation.project_source(
-                concrete_root_domains[dependency.consumer_root]
+                root_domains[dependency.consumer_root]
             )
             if projected is None:
                 continue
             root_relation = projected
         if not producer_is_root:
             projected = root_relation.project_target(
-                concrete_root_domains[dependency.producer_root]
+                root_domains[dependency.producer_root]
             )
             if projected is None:
                 continue
@@ -2201,7 +1844,7 @@ def build_keyed_events(
 
     pending_events: dict[
         tuple[LogicalDomain, tuple[EventContribution, ...]],
-        list[EventUse],
+        KeyedEvent,
     ] = {}
     represented_dependency_points: set[DependencyPoint] = set()
 
@@ -2434,7 +2077,7 @@ def build_keyed_events(
             axis_counts_items=(),
             kind="event",
         )
-        producer_domain = concrete_root_domains[producer_root]
+        producer_domain = root_domains[producer_root]
         uses: list[EventUse] = []
         for consumer_root, dependency_points in sorted(consumer_points.items()):
             uses.append(
@@ -2442,7 +2085,7 @@ def build_keyed_events(
                     consumer_root=consumer_root,
                     consumer_scope_id=None,
                     keys=LogicalRelation.total(
-                        concrete_root_domains[consumer_root],
+                        root_domains[consumer_root],
                         key_domain,
                     ),
                     dependency_points=frozenset(dependency_points),
@@ -2463,40 +2106,27 @@ def build_keyed_events(
             ),
             uses=tuple(uses),
         )
-    return _finalize_keyed_events(pending_events)
+    return tuple(pending_events.values())
 
 
 def build_event_graph(
     dependency_graph: TileDependencyGraph,
     *,
-    root_domains: tuple[LogicalDomain, ...],
     root_traversals: tuple[LogicalRelation, ...],
-    axis_geometry: dict[int, tuple[int, int]],
+    scope_domains: tuple[LogicalDomain | None, ...],
     publishable_scope_ids: frozenset[int] | None = None,
 ) -> EventGraph:
     """Bind the symbolic readiness DAG for one selected configuration."""
-    configured_root_domains = instantiate_root_domains(
-        dependency_graph,
-        axis_geometry=axis_geometry,
-    )
-    if (
-        any(domain is None for domain in configured_root_domains)
-        or tuple(domain for domain in configured_root_domains if domain is not None)
-        != root_domains
-    ):
-        raise ValueError("configured root domains disagree with the dependency graph")
+    root_domains = tuple(traversal.target_domain for traversal in root_traversals)
     events = build_keyed_events(
         dependency_graph,
-        axis_geometry=axis_geometry,
+        root_domains=root_domains,
+        scope_domains=scope_domains,
         publishable_scope_ids=publishable_scope_ids,
     )
     return EventGraph(
-        root_domains=root_domains,
         root_traversals=root_traversals,
-        scope_domains=instantiate_scope_domains(
-            dependency_graph,
-            axis_geometry=axis_geometry,
-        ),
+        scope_domains=scope_domains,
         events=events,
     )
 
@@ -2543,7 +2173,7 @@ def derive_local_triggers(
         use = event.uses[use_index]
         if use.consumer_scope_id is not None:
             continue
-        fan_in = event_graph.uniform_expected_arrivals(event)
+        fan_in = _uniform_arrivals(event.contributions)
         if not event.key_count or fan_in is None or fan_in <= 0:
             continue
         inverse_use = use.keys.inverse()
@@ -2688,12 +2318,10 @@ def order_local_contributors_by_key(
         replacement_by_root[root] = (
             WorkerScheduleSegment(
                 root=root,
-                task_begin=0,
-                task_count=task_domain.size,
+                task_relation=task_relation,
                 worker_begin=0,
                 worker_count=worker_schedule.worker_count,
                 schedule_begin=schedule_interval[0],
-                task_relation=task_relation,
             ),
         )
 
@@ -2714,18 +2342,16 @@ def order_local_contributors_by_key(
 def build_cross_loop_schedule(
     *,
     dependency_plan: TileDependencyGraph,
-    root_domains: tuple[LogicalDomain, ...],
     root_traversals: tuple[LogicalRelation, ...],
-    axis_geometry: dict[int, tuple[int, int]],
+    scope_domains: tuple[LogicalDomain | None, ...],
     worker_count: int,
     publishable_scope_ids: frozenset[int] | None = None,
 ) -> CrossLoopSchedule:
     """Derive all generic readiness strategies without inspecting root bodies."""
     event_graph = build_event_graph(
         dependency_plan,
-        root_domains=root_domains,
         root_traversals=root_traversals,
-        axis_geometry=axis_geometry,
+        scope_domains=scope_domains,
         publishable_scope_ids=publishable_scope_ids,
     )
     try:
@@ -2786,7 +2412,7 @@ def build_cross_loop_schedule(
                     use.consumer_root,
                     root_order_edges,
                 )
-                for contributor in event.contributors
+                for contributor in event.contributions
             )
         )
         if not retained_use_indices:
@@ -2814,17 +2440,10 @@ def build_cross_loop_schedule(
         covered_dependency_points=covered_dependency_points,
         root_completion_edges=root_completion_edges,
     )
-    event_graph, family_done_events = lower_family_done_events(
-        event_graph,
-        dependency_plan,
-        root_completion_edges,
-    )
-    counted_events = (*counted_events, *family_done_events)
     return CrossLoopSchedule(
-        event_graph=event_graph,
         worker_schedule=worker_schedule,
-        local_triggers=local_triggers,
         counted_events=counted_events,
+        root_completion_edges=root_completion_edges,
     )
 
 

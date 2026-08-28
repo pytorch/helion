@@ -16,20 +16,27 @@ from test._cross_loop_test_utils import _symbolic_root_relation
 
 from helion._compiler.device_ir import _collect_memory_op_facts
 from helion._compiler.tile_dependency import AllocationRegion
+from helion._compiler.tile_dependency import ExecutionScope
 from helion._compiler.tile_dependency import LogicalDomain
 from helion._compiler.tile_dependency import LogicalRelation
 from helion._compiler.tile_dependency import LogicalTaskAxis
 from helion._compiler.tile_dependency import TaskFamily
+from helion._compiler.tile_dependency import TileDependency
 from helion._compiler.tile_dependency import TileDependencyKind
 from helion._compiler.tile_dependency import _LogicalRelationPiece
 from helion._compiler.tile_dependency import allocation_regions_may_overlap
 from helion._compiler.tile_dependency import build_tile_dependency_graph
+from helion._compiler.tile_dependency import instantiate_logical_domains
 from helion._compiler.tile_dependency import logical_axis_symbol
 from helion._compiler.tile_dependency import owner_roots_by_graph_id
 from helion._compiler.tile_dependency import physical_traversal_relation
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import skipIfNotCUDA
+
+
+def _dependency_kinds(edge: TileDependency) -> frozenset[TileDependencyKind]:
+    return frozenset(dependency.kind for dependency in edge.access_dependencies)
 
 
 class TestTileDependency(TestCase):
@@ -49,6 +56,33 @@ class TestTileDependency(TestCase):
             domain.index({10: 1, 20: 0}, traversal=(20, 10)),
             3,
         )
+
+    def test_configured_roots_reuse_their_execution_scope_domains(self) -> None:
+        graph = build_tile_dependency_graph(
+            (
+                _access(0, root=0, kind="store", block_ids=(10,)),
+                _access(1, root=1, kind="load", block_ids=(20,)),
+            ),
+            [[10], [20]],
+        )
+        graph = dataclasses.replace(
+            graph,
+            execution_scopes=(
+                ExecutionScope(0, 0, 0, (), None, "root", (), (10,), True, False),
+                ExecutionScope(1, 1, 1, (), None, "root", (), (20,), True, False),
+            ),
+            scope_ids_by_access=((0,), (1,)),
+        )
+
+        root_domains, scope_domains = instantiate_logical_domains(
+            graph,
+            axis_geometry={10: (8, 16), 20: (4, 32)},
+        )
+
+        root_scopes = tuple(scope for scope in graph.execution_scopes if scope.is_root)
+        self.assertEqual(len(root_scopes), 2)
+        for scope in root_scopes:
+            self.assertIs(root_domains[scope.root], scope_domains[scope.scope_id])
 
     def test_symbolic_physical_traversal_preserves_l2_tail_group(self) -> None:
         domain = LogicalDomain(
@@ -910,7 +944,10 @@ class TestTileDependency(TestCase):
 
         self.assertEqual(len(plan.edges), 1)
         edge = plan.edges[0]
-        self.assertTrue(edge.is_raw_only)
+        self.assertEqual(
+            _dependency_kinds(edge),
+            frozenset((TileDependencyKind.READ_AFTER_WRITE,)),
+        )
         self.assertEqual(
             _root_predecessors(plan, _one_dimensional_domains()),
             tuple(frozenset((task,)) for task in range(8)),
@@ -928,7 +965,7 @@ class TestTileDependency(TestCase):
 
         edge = plan.edges[0]
         self.assertEqual(
-            edge.kinds,
+            _dependency_kinds(edge),
             frozenset(
                 (
                     TileDependencyKind.READ_AFTER_WRITE,
@@ -952,7 +989,7 @@ class TestTileDependency(TestCase):
 
         edge = plan.edges[0]
         self.assertEqual(
-            edge.kinds,
+            _dependency_kinds(edge),
             frozenset((TileDependencyKind.WRITE_AFTER_READ,)),
         )
         self.assertEqual(
@@ -1435,7 +1472,7 @@ class TestTileDependency(TestCase):
 
         self.assertEqual(
             [
-                (edge.producer_root, edge.consumer_root, edge.kinds)
+                (edge.producer_root, edge.consumer_root, _dependency_kinds(edge))
                 for edge in plan.edges
             ],
             [
@@ -1490,7 +1527,7 @@ class TestTileDependency(TestCase):
                 (
                     edge.producer_root,
                     edge.consumer_root,
-                    edge.kinds,
+                    _dependency_kinds(edge),
                     tuple(
                         dependency.region.address_interval
                         for dependency in edge.access_dependencies

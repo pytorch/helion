@@ -30,8 +30,9 @@ from .program_id import typed_program_id
 from .tile_dependency import TILE_DEPENDENCY_SCOPE_ID_ATTR
 from .tile_dependency import LogicalDomain
 from .tile_dependency import LogicalRelation
-from .tile_dependency import instantiate_root_domains
+from .tile_dependency import instantiate_logical_domains
 from .tile_dependency import logical_axis_symbol
+from .tile_dependency import nested_logical_axes
 from .tile_dependency import physical_traversal_relation
 from .tile_dependency import tile_dependency_scope_id
 from .tile_strategy import L2GroupingProgramIDs
@@ -60,10 +61,7 @@ _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS = (
 
 def _ast_fingerprint(nodes: list[ast.stmt]) -> tuple[str, ...]:
     """Return a location-independent fingerprint for an opaque computation body."""
-    return tuple(
-        ast.dump(cast("ast.AST", _clone_ast_value(node)), include_attributes=False)
-        for node in nodes
-    )
+    return tuple(ast.dump(node, include_attributes=False) for node in nodes)
 
 
 def _clone_opaque_statements(body: list[ast.stmt]) -> list[ast.stmt]:
@@ -612,7 +610,7 @@ def emit_cross_loop_schedule(
             geometry = _static_block_axis_geometry(block_id, device_function)
         if geometry is not None:
             axis_geometry[block_id] = geometry
-    configured_root_domains = instantiate_root_domains(
+    configured_root_domains, scope_domains = instantiate_logical_domains(
         dependency_plan,
         axis_geometry=axis_geometry,
     )
@@ -639,19 +637,12 @@ def emit_cross_loop_schedule(
     assert tuple(domain.size for domain in root_domains) == static_task_counts
     cross_loop_schedule = build_cross_loop_schedule(
         dependency_plan=dependency_plan,
-        root_domains=root_domains,
         root_traversals=root_traversals,
-        axis_geometry=axis_geometry,
+        scope_domains=scope_domains,
         worker_count=configured_worker_count,
         publishable_scope_ids=publishable_scope_ids,
     )
-    root_completion_edges = set(cross_loop_schedule.root_completion_edges)
-    family_done_event_plans = tuple(
-        plan
-        for plan in cross_loop_schedule.counted_events
-        if plan.graph_event_index is not None
-        and cross_loop_schedule.event_graph.event(plan.graph_event_index).is_family_done
-    )
+    root_completion_edges = cross_loop_schedule.root_completion_edges
     nested_scope_event_plans = tuple(
         plan
         for plan in cross_loop_schedule.counted_events
@@ -660,12 +651,15 @@ def emit_cross_loop_schedule(
     counted_event_plans = tuple(
         plan
         for plan in cross_loop_schedule.counted_events
-        if plan not in family_done_event_plans and plan not in nested_scope_event_plans
+        if plan not in nested_scope_event_plans
     )
     all_counted_event_plans = (
         *counted_event_plans,
         *nested_scope_event_plans,
     )
+    uniform_arrivals_by_plan = {
+        plan: plan.uniform_arrivals() for plan in all_counted_event_plans
+    }
     launch_worker_count = cross_loop_schedule.worker_schedule.worker_count
 
     static_workers_by_root = {
@@ -673,9 +667,10 @@ def emit_cross_loop_schedule(
         for root in range(len(root_domains))
     }
     local_task_count_by_root: dict[int, int] = {}
-    for trigger in cross_loop_schedule.local_triggers:
-        event = cross_loop_schedule.event_graph.event(trigger.event_index)
-        use = event.uses[trigger.use_index]
+    for plan in counted_event_plans:
+        use = plan.local_use
+        if use is None:
+            continue
         if not use.keys.is_total_function():
             raise AssertionError("a local event must cover its complete root")
         local_task_count_by_root[use.consumer_root] = use.keys.source_domain.size
@@ -698,7 +693,7 @@ def emit_cross_loop_schedule(
         counted_event_offsets[plan] = counted_event_counter_count
         counted_event_counter_count += plan.key_count * counted_event_key_stride
     root_completion_producer_roots = sorted(
-        {producer for producer, _ in root_completion_edges}
+        {producer for producer, _consumer in root_completion_edges}
     )
     root_completion_indices = {
         root: index for index, root in enumerate(root_completion_producer_roots)
@@ -761,7 +756,7 @@ def emit_cross_loop_schedule(
                 if target == consumer
             )
         )
-        for consumer in {consumer for _, consumer in root_completion_edges}
+        for consumer in {consumer for _producer, consumer in root_completion_edges}
     }
 
     def root_completion_counter(root: int) -> str:
@@ -828,7 +823,7 @@ def emit_cross_loop_schedule(
         ],
     ] = {}
     for plan in all_counted_event_plans:
-        for contributor in plan.contributors:
+        for contributor in plan.contributions:
             if contributor.producer_scope_id is None:
                 root_events_by_producer.setdefault(
                     contributor.producer_root, []
@@ -1055,8 +1050,6 @@ def emit_cross_loop_schedule(
             multiplier *= count
         return " + ".join(terms) or "0", membership
 
-    from .tile_strategy import L2GroupingProgramIDs
-
     def logical_coordinates_for_physical_task(
         root: int,
         physical_task: str,
@@ -1183,11 +1176,8 @@ def emit_cross_loop_schedule(
         consumer_coordinates: dict[int, str],
     ) -> list[ast.stmt]:
         assert use.consumer_scope_id is not None
-        domain = cross_loop_schedule.event_graph.scope_domain(use.consumer_scope_id)
-        nested_axes = cross_loop_schedule.event_graph.nested_axes(
-            use.consumer_root,
-            use.consumer_scope_id,
-        )
+        domain = use.keys.source_domain
+        nested_axes = nested_logical_axes(root_domains[use.consumer_root], domain)
         if len(nested_axes) != 1:
             raise AssertionError(
                 "nested scope lowering currently requires one loop axis"
@@ -1245,23 +1235,11 @@ def emit_cross_loop_schedule(
             f"({key}) * {counted_event_key_stride}"
         )
 
-    def counted_event_uniform_arrivals(
-        plan: CountedEventPlan,
-    ) -> int | None:
-        total = 0
-        for contributor in plan.contributors:
-            cardinality = contributor.arrivals_per_key
-            count = None if cardinality is None else cardinality.constant_value()
-            if count is None:
-                return None
-            total += count
-        return total
-
     def counted_event_expected_arrivals(
         plan: CountedEventPlan,
         key: str,
     ) -> str:
-        uniform = counted_event_uniform_arrivals(plan)
+        uniform = uniform_arrivals_by_plan[plan]
         if uniform is not None:
             return str(uniform)
         key_coordinates = flat_task_coordinates(
@@ -1270,7 +1248,7 @@ def emit_cross_loop_schedule(
             plan.key_domain.axis_counts,
         )
         expressions: list[str] = []
-        for contributor in plan.contributors:
+        for contributor in plan.contributions:
             cardinality = contributor.arrivals_per_key
             if cardinality is None:
                 raise AssertionError("event fan-in is not symbolically known")
@@ -1288,7 +1266,7 @@ def emit_cross_loop_schedule(
         local_use = plan.local_use
         if local_use is None:
             counter = counted_event_counter(plan, key)
-            if counted_event_uniform_arrivals(plan) == 1:
+            if uniform_arrivals_by_plan[plan] == 1:
                 return [
                     statement_from_string(
                         f"tl.atomic_xchg({counter}, {epoch_var}, "
@@ -1369,7 +1347,7 @@ def emit_cross_loop_schedule(
             last_arrival_body.append(_publication_barrier(device_function))
             last_arrival_body.extend(consumer_publications)
         last_arrival_body.extend(root_completion_publication(on_ready_root))
-        expected_arrivals = counted_event_uniform_arrivals(plan)
+        expected_arrivals = uniform_arrivals_by_plan[plan]
         if expected_arrivals is None:
             raise AssertionError("local execution requires uniform event fan-in")
         if expected_arrivals == 1:
@@ -1416,8 +1394,6 @@ def emit_cross_loop_schedule(
         producer_coordinates: dict[int, str],
     ) -> list[ast.stmt]:
         """Publish nested scope events without moving the owning strand."""
-        from .tile_dependency import tile_dependency_scope_id
-
         scope_ids = {
             scope_id
             for scope_id, contributions in producer_events_by_scope.items()
@@ -1438,7 +1414,18 @@ def emit_cross_loop_schedule(
                 raise AssertionError(
                     "one dependency scope must identify one lowered loop"
                 )
-            nested_axes = cross_loop_schedule.event_graph.nested_axes(root, scope_id)
+            contributions = producer_events_by_scope[scope_id]
+            producer_scope_domains = {
+                contributor.predecessors.target_domain
+                for _plan, contributor in contributions
+                if contributor.producer_root == root
+            }
+            if len(producer_scope_domains) != 1:
+                raise AssertionError(
+                    "nested scope publications must share one producer domain"
+                )
+            (scope_domain,) = producer_scope_domains
+            nested_axes = nested_logical_axes(root_domains[root], scope_domain)
             if (
                 len(nested_axes) != 1
                 or not isinstance(loop.target, ast.Name)
@@ -1520,56 +1507,25 @@ def emit_cross_loop_schedule(
         for segment in reversed(segments):
             ordinal_begin = segment.schedule_begin - schedule_begin
             ordinal_delta = f"(({schedule_ordinal}) - {ordinal_begin})"
-            if segment.schedule_period is None:
-                task_offset = f"({ordinal_delta} // {segment.schedule_step})"
-                membership = (
-                    f"({ordinal_delta}) >= 0 and "
-                    f"({ordinal_delta} % {segment.schedule_step}) == 0 and "
-                    f"({task_offset}) < {segment.task_count}"
-                )
-            else:
-                assert segment.schedule_period_step is not None
-                within_period = f"({ordinal_delta} % {segment.schedule_period_step})"
-                inner = f"({within_period} // {segment.schedule_step})"
-                task_offset = (
-                    f"({ordinal_delta} // {segment.schedule_period_step}) * "
-                    f"{segment.schedule_period} + {inner}"
-                )
-                membership = (
-                    f"({ordinal_delta}) >= 0 and "
-                    f"({within_period} % {segment.schedule_step}) == 0 and "
-                    f"({inner}) < {segment.schedule_period} and "
-                    f"({task_offset}) < {segment.task_count}"
-                )
-            if segment.task_relation is not None:
-                ordinal_coordinates = flat_task_coordinates(
-                    task_offset,
-                    segment.task_relation.source_domain.axis_order,
-                    segment.task_relation.source_domain.axis_counts,
-                )
-                task_coordinates, relation_membership = relation_point_coordinates(
-                    segment.task_relation,
-                    ordinal_coordinates,
-                )
-                if relation_membership != "True":
-                    membership = f"({membership}) and ({relation_membership})"
-                segment_task = logical_task_from_coordinates(
-                    root,
-                    task_coordinates,
-                )
-            elif segment.task_period is None:
-                segment_task = (
-                    f"{segment.task_begin} + ({task_offset}) * {segment.task_step}"
-                )
-            else:
-                assert segment.task_period_step is not None
-                segment_task = (
-                    f"{segment.task_begin} + "
-                    f"(({task_offset}) % {segment.task_period}) * "
-                    f"{segment.task_step} + "
-                    f"(({task_offset}) // {segment.task_period}) * "
-                    f"{segment.task_period_step}"
-                )
+            task_offset = ordinal_delta
+            membership = (
+                f"({ordinal_delta}) >= 0 and ({task_offset}) < {segment.task_count}"
+            )
+            ordinal_coordinates = flat_task_coordinates(
+                task_offset,
+                segment.task_relation.source_domain.axis_order,
+                segment.task_relation.source_domain.axis_counts,
+            )
+            task_coordinates, relation_membership = relation_point_coordinates(
+                segment.task_relation,
+                ordinal_coordinates,
+            )
+            if relation_membership != "True":
+                membership = f"({membership}) and ({relation_membership})"
+            segment_task = logical_task_from_coordinates(
+                root,
+                task_coordinates,
+            )
             if not expression:
                 expression = segment_task
                 continue
@@ -1749,10 +1705,7 @@ def emit_cross_loop_schedule(
         worker_begin = segments[0].worker_begin
         worker_count = segments[0].worker_count
         if any(
-            segment.worker_begin != worker_begin
-            or segment.worker_count != worker_count
-            or segment.schedule_step != 1
-            or segment.schedule_period is not None
+            segment.worker_begin != worker_begin or segment.worker_count != worker_count
             for segment in segments
         ):
             raise exc.InvalidConfig(

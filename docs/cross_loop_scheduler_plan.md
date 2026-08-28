@@ -142,12 +142,13 @@ also documenting why the integer-domain follow-up matters:
 | Gemma4 A4B MoE | 4 | 592 | 47.63 us non-cooperative versus 52.35 us cooperative for the boundary-preserving unfused-GeGLU source |
 | Gemma4 E4B decode | 4 | 592 | 102.56 us versus 92.12 us separate; key-major ordering is material here |
 | DeepSeek-V3 MoE | 4 | 592 | 182.02 us versus 158.43 us separate; static scheduling remains a known performance gap |
-| GPT-OSS MoE | 8 | 1,184 | 42.30 us non-cooperative versus 43.50 us cooperative and 37.60 us separate; multiplier 12 remains a follow-up integer-domain result |
+| GPT-OSS MoE | 8 (12 follow-up) | 1,184 (1,776) | Multiplier 8 is about 42 us; the manually admitted multiplier 12 point is 36.35 us versus 37.02 us separate |
 
 Compiled occupancy remains a legality constraint, not a second tuning input.
 For example, GPT-OSS cannot residently support multiplier 16 with its selected
 root codegen, while multiplier 8 regresses to approximately 42.08 us and the
-future multiplier 12 is legal. Therefore GPT-OSS performance parity is a known
+future multiplier 12 is both legal and slightly faster than the separate
+baseline. Therefore GPT-OSS performance parity is a known
 limitation of the first power-of-two-only PR, not evidence for restoring an
 independent exact-worker knob. Invalid multiplier candidates are discarded
 through the same configuration-validity path used for other resource
@@ -4902,11 +4903,74 @@ Validation results:
 - [x] Remove an empty publication path and a tautological local AST check.
   Make the small-test arrival-count oracle enumerate predecessor fibers rather
   than invoking the production cardinality proof it is meant to check.
-- [ ] Simplify `WorkerScheduleSegment` to its production relation-based task
-  ordering. The scalar/periodic task-order representation is test-only, while
-  codegen rejects the corresponding non-dense schedules.
-- [ ] Cache immutable relation facts such as fiber cardinality and avoid
-  rebuilding equivalent relations solely to attach event identity.
+- [x] Simplify `WorkerScheduleSegment` to its production relation-based task
+  ordering. The test-only scalar/periodic task-order language and its dead
+  lowering branches are gone; a segment now contains one ordinal-to-task
+  relation, one worker interval, and one dense schedule offset. This removed
+  159 net production lines. The 191-test compiler battery passes, affine-chain
+  lowering remains compact (0 `tl.where`), and cold-L2 Qwen, Gemma A4B, and
+  GPT-OSS probes retain correct lowering and representative performance. The
+  GPT-OSS integer-domain validation at multiplier 12 measures 35.68 us versus
+  37.07 us for the separate Helion graph; multiplier 8 remains the known
+  slower 42-us point.
+- [x] Remove duplicate uniform-fan-in calculations at their source instead of
+  broadly caching relation queries. `CountedEventPlan.uniform_arrivals()` is
+  the sole derivation, and codegen evaluates it once for each retained plan;
+  speculative nested-placement candidates do no fan-in work. Its key domain
+  is likewise derived from the contributor relations instead of stored a
+  second time. Generic `LogicalRelation` queries remain uncached until
+  profiling demonstrates an independent need.
+- [x] Remove copied edge summaries from `TileDependency`. Hazard kinds now
+  derive from the authoritative `AccessDependency` records, and the unused
+  producer/consumer access tuples are gone. Remove test-only event lookup and
+  counted-event convenience APIs rather than maintaining parallel query
+  surfaces in production.
+- [x] Stop reconstructing root-completion edges in codegen. Family-completion
+  events remain part of semantic analysis, but the final schedule carries the
+  selected root-completion edges directly rather than manufacturing counted
+  events that codegen must decode again.
+- [x] Remove the exact task-placement oracle from production. Static placement
+  queries now ask only which root occupies a worker-stream position; exhaustive
+  task inversion and materialization live in `test/_cross_loop_schedule_oracle.py`.
+- [x] Bind configured domains once. `instantiate_logical_domains()` creates one
+  scope-indexed table and root families reuse their root-scope objects. Codegen
+  passes those same domains through dependency instantiation and scheduling;
+  the scheduler no longer reconstructs them from `axis_geometry`.
+- [x] Remove duplicated event identity and domain state. `KeyedEvent` derives
+  its key domain from its contributor relation and its ID from that domain;
+  `EventGraph` derives root domains from root traversals; `CountedEventPlan`
+  likewise derives its key domain. Event-local IDs are assigned when an event
+  candidate first enters the canonical table, eliminating the later relation
+  retargeting pass.
+- [x] Share mixed-radix fiber analysis at its source. Each event contribution
+  computes cardinality once and passes it into publication-converse discovery,
+  rather than rerunning the same source-cell proof for arrival counts.
+- [x] Share event and readiness-derived state rather than copying it. Semantic
+  and lowering events now use the same `contributions` vocabulary and one key-
+  domain validator. Event IDs, key domains, and root domains are derived from
+  their owning relations/traversals. Completion-frontier analysis computes the
+  local-trigger index, static contributors, total-support proof, and transitive
+  prerequisite roots once per query instead of rebuilding them in each caller.
+- [x] Make the canonical Qwen benchmark configuration the probe default. The
+  raw Helion default selects the barrier schedule and measures roughly 4 ms,
+  not the static-pipeline megakernel. Use `--default-config` only for that
+  explicit ablation; normal Qwen validation no longer depends on remembering
+  `--probe-config`.
+
+Current post-cleanup cold-L2 checks retain the intended schedules: the granular
+Qwen3 layer is 93.46 us versus 104.73 us separate, Gemma4 A4B is 47.60 us
+versus 53.20 us separate, and GPT-OSS at the separately validated multiplier
+12 point is 36.35 us versus 37.02 us separate. The GPT-OSS lowering matches
+the prior 1,776-worker static schedule after normalizing the now-symbolic
+`_NUM_SM * 12` launch expression.
+
+Relative to the preceding cleanup commit `7867e5a1`, this round currently
+removes 426 net production lines across `tile_dependency.py`,
+`cross_loop_scheduler.py`, and `cross_loop_codegen.py`. The larger suggested
+event/placement merger is intentionally left as a follow-up: the remaining
+semantic-event and selected-lowering objects represent genuinely different
+compiler phases, and collapsing them now would trade a small amount of surface
+area for less explicit ownership.
 - [ ] Consider unifying `KeyedEvent`, `CountedEventPlan`, local triggers, and
   root-completion publication into one final lowering-event representation.
   This is a larger follow-up because it changes ownership across scheduling

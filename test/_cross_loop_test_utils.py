@@ -16,10 +16,13 @@ from helion._compiler.cross_loop_scheduler import (
 from helion._compiler.cross_loop_scheduler import (
     build_event_graph as _build_event_graph,
 )
+from helion._compiler.cross_loop_scheduler import (
+    build_keyed_events as _build_keyed_events,
+)
 from helion._compiler.tile_dependency import LogicalDomain
 from helion._compiler.tile_dependency import LogicalRelation
 from helion._compiler.tile_dependency import TileAccess
-from helion._compiler.tile_dependency import instantiate_root_domains
+from helion._compiler.tile_dependency import instantiate_logical_domains
 from helion._compiler.tile_dependency import instantiate_symbolic_dependencies
 from helion._compiler.tile_dependency import logical_axis_symbol
 from helion._compiler.tile_dependency import physical_traversal_relation
@@ -41,6 +44,21 @@ def _identify_root_domains(
     return tuple(
         dataclasses.replace(domain, identity=root)
         for root, domain in enumerate(root_domains)
+    )
+
+
+def _configured_domains(
+    graph,
+    axis_geometry: dict[int, tuple[int, int]],
+) -> tuple[tuple[LogicalDomain, ...], tuple[LogicalDomain | None, ...]]:
+    configured_roots, scope_domains = instantiate_logical_domains(
+        graph,
+        axis_geometry=axis_geometry,
+    )
+    assert all(domain is not None for domain in configured_roots)
+    return (
+        tuple(domain for domain in configured_roots if domain is not None),
+        scope_domains,
     )
 
 
@@ -110,11 +128,13 @@ def _root_predecessors(
     pair: tuple[int, int] = (0, 1),
 ) -> tuple[frozenset[int], ...] | None:
     axis_geometry = _axis_geometry(root_domains)
+    configured_root_domains, scope_domains = _configured_domains(plan, axis_geometry)
     relations = tuple(
         dependency.relation
         for dependency in instantiate_symbolic_dependencies(
             plan,
-            axis_geometry=axis_geometry,
+            root_domains=configured_root_domains,
+            scope_domains=scope_domains,
         )
         if (dependency.producer_root, dependency.consumer_root) == pair
         and dependency.producer_scope_id is None
@@ -139,9 +159,11 @@ def _symbolic_root_relation(
     plan,
     axis_geometry: dict[int, tuple[int, int]],
 ):
+    root_domains, scope_domains = _configured_domains(plan, axis_geometry)
     dependencies = instantiate_symbolic_dependencies(
         plan,
-        axis_geometry=axis_geometry,
+        root_domains=root_domains,
+        scope_domains=scope_domains,
     )
     self_relations = tuple(
         dependency.relation
@@ -183,22 +205,30 @@ def _configured_event_graph(
 ) -> EventGraph:
     if axis_geometry is None:
         axis_geometry = _axis_geometry(root_domains)
-    configured_domains = instantiate_root_domains(
-        graph,
-        axis_geometry=axis_geometry,
-    )
-    assert all(domain is not None for domain in configured_domains)
-    configured_root_domains = tuple(
-        domain for domain in configured_domains if domain is not None
-    )
+    configured_root_domains, scope_domains = _configured_domains(graph, axis_geometry)
     return _build_event_graph(
         graph,
-        root_domains=configured_root_domains,
         root_traversals=_default_root_traversals(
             configured_root_domains,
             physical_axis_orders,
         ),
-        axis_geometry=axis_geometry,
+        scope_domains=scope_domains,
+        publishable_scope_ids=publishable_scope_ids,
+    )
+
+
+def build_keyed_events(
+    graph,
+    *,
+    axis_geometry: dict[int, tuple[int, int]],
+    publishable_scope_ids: frozenset[int] | None = None,
+):
+    """Bind configured domains once around the production event builder."""
+    root_domains, scope_domains = _configured_domains(graph, axis_geometry)
+    return _build_keyed_events(
+        graph,
+        root_domains=root_domains,
+        scope_domains=scope_domains,
         publishable_scope_ids=publishable_scope_ids,
     )
 
@@ -225,7 +255,9 @@ def build_baseline_worker_schedule(
 
 def build_cross_loop_schedule(
     *,
+    dependency_plan,
     root_domains: tuple[LogicalDomain, ...],
+    axis_geometry: dict[int, tuple[int, int]],
     root_traversals: tuple[LogicalRelation, ...] | None = None,
     physical_axis_orders: tuple[tuple[int, ...], ...] | None = None,
     **kwargs,
@@ -236,9 +268,14 @@ def build_cross_loop_schedule(
             root_domains,
             physical_axis_orders,
         )
+    scope_domains = instantiate_logical_domains(
+        dependency_plan,
+        axis_geometry=axis_geometry,
+    )[1]
     return _build_cross_loop_schedule(
-        root_domains=root_domains,
+        dependency_plan=dependency_plan,
         root_traversals=root_traversals,
+        scope_domains=scope_domains,
         **kwargs,
     )
 

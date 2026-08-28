@@ -173,6 +173,15 @@ def logical_axis_symbol(axis: int) -> sympy.Symbol:
     return sympy.Symbol(f"logical_axis_{suffix}", integer=True, nonnegative=True)
 
 
+def nested_logical_axes(
+    root_domain: LogicalDomain,
+    scope_domain: LogicalDomain,
+) -> tuple[int, ...]:
+    """Return scope axes that are not part of its owning root domain."""
+    root_axes = frozenset(root_domain.axis_order)
+    return tuple(axis for axis in scope_domain.axis_order if axis not in root_axes)
+
+
 @dataclasses.dataclass(frozen=True)
 class _LogicalRelationPiece:
     """One guarded source box mapped to a Cartesian target range."""
@@ -743,14 +752,25 @@ class LogicalRelation:
         fibers additionally need all pieces to be analyzed together: split
         ranges may encode digits that affect fan-in but not event identity.
         """
-        return self._cached_publication_converse
-
-    @cached_property
-    def _cached_publication_converse(self) -> LogicalRelation | None:
         inverse = self.inverse()
         if inverse is not None:
             return inverse
-        return _dense_mixed_radix_publication_converse(self)
+        cardinality = self.fiber_cardinality()
+        if cardinality is None:
+            return None
+        return _dense_mixed_radix_publication_converse(self, cardinality)
+
+    def fiber_analysis(
+        self,
+    ) -> tuple[LogicalRelation | None, LogicalRelation | None]:
+        """Return publication and cardinality relations from one fiber proof."""
+        cardinality = self.fiber_cardinality()
+        inverse = self.inverse()
+        if inverse is not None:
+            return inverse, cardinality
+        if cardinality is None:
+            return None, None
+        return _dense_mixed_radix_publication_converse(self, cardinality), cardinality
 
     @cached_property
     def _cached_inverse(self) -> LogicalRelation | None:
@@ -2541,6 +2561,7 @@ def _static_affine_coefficients(
 
 def _dense_mixed_radix_publication_converse(
     relation: LogicalRelation,
+    cardinality: LogicalRelation,
 ) -> LogicalRelation | None:
     """Invert a dense mixed-radix key-to-producer partition exactly.
 
@@ -2623,8 +2644,7 @@ def _dense_mixed_radix_publication_converse(
     coefficients = layouts[0][0]
     if any(piece_coefficients != coefficients for piece_coefficients, _, _ in layouts):
         return None
-    cardinality = relation.fiber_cardinality()
-    fan_in = None if cardinality is None else cardinality.constant_value()
+    fan_in = cardinality.constant_value()
     if fan_in is None or fan_in <= 0:
         return None
     support_begin = min(support_begins)
@@ -3282,14 +3302,7 @@ class TileDependency:
     consumer_root: int
     allocation_id: int
     tensor_names: frozenset[str]
-    kinds: frozenset[TileDependencyKind]
-    producer_accesses: tuple[TileAccess, ...]
-    consumer_accesses: tuple[TileAccess, ...]
     access_dependencies: tuple[AccessDependency, ...]
-
-    @property
-    def is_raw_only(self) -> bool:
-        return self.kinds == frozenset((TileDependencyKind.READ_AFTER_WRITE,))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3828,18 +3841,21 @@ def _logical_domain_for_axes(
     )
 
 
-def instantiate_scope_domains(
+def instantiate_logical_domains(
     dependency_graph: TileDependencyGraph,
     *,
     axis_geometry: dict[int, tuple[int, int]],
-) -> tuple[LogicalDomain | None, ...]:
-    """Bind every DeviceIR execution scope to the selected tile geometry.
+) -> tuple[
+    tuple[LogicalDomain | None, ...],
+    tuple[LogicalDomain | None, ...],
+]:
+    """Bind root and execution-scope domains to one selected tile geometry.
 
-    The tuple is indexed by ``ExecutionScope.scope_id``.  No traversal is
-    attached: these domains describe semantic coordinates, while physical PID
-    and within-strand order remain scheduler/lowering choices.
+    Root scopes reuse the same domain objects returned in the scope-indexed
+    table. No traversal is attached: these are semantic coordinates, while
+    physical PID and within-strand order remain scheduling choices.
     """
-    return tuple(
+    scope_domains = tuple(
         _logical_domain_for_axes(
             scope.logical_axis_order,
             axis_geometry=axis_geometry,
@@ -3847,48 +3863,51 @@ def instantiate_scope_domains(
         )
         for scope in dependency_graph.execution_scopes
     )
-
-
-def instantiate_root_domains(
-    dependency_graph: TileDependencyGraph,
-    *,
-    axis_geometry: dict[int, tuple[int, int]],
-) -> tuple[LogicalDomain | None, ...]:
-    """Bind top-level task families without attaching a physical traversal."""
     root_scope_ids = {
         scope.root: scope.scope_id
         for scope in dependency_graph.execution_scopes
         if scope.is_root
     }
-    return tuple(
-        _logical_domain_for_axes(
-            family.logical_axis_order,
-            axis_geometry=axis_geometry,
-            identity=root_scope_ids.get(root, root),
+    root_domains = tuple(
+        (
+            scope_domains[root_scope_ids[root]]
+            if root in root_scope_ids
+            else _logical_domain_for_axes(
+                family.logical_axis_order,
+                axis_geometry=axis_geometry,
+                identity=root,
+            )
         )
         for root, family in enumerate(dependency_graph.task_families)
     )
+    if any(
+        domain is not None and domain.axis_order != family.logical_axis_order
+        for domain, family in zip(
+            root_domains,
+            dependency_graph.task_families,
+            strict=True,
+        )
+    ):
+        raise ValueError("root scope axes disagree with the task-family domain")
+    return root_domains, scope_domains
 
 
 def instantiate_symbolic_dependencies(
     dependency_graph: TileDependencyGraph,
     *,
-    axis_geometry: dict[int, tuple[int, int]],
+    root_domains: tuple[LogicalDomain | None, ...],
+    scope_domains: tuple[LogicalDomain | None, ...],
 ) -> tuple[TileDependencyRelation, ...]:
     """Instantiate scope dependencies without enumerating task instances.
 
     Unsupported access geometry returns ``relation=None`` so the caller can
     monotonically retain family completion.
     """
-    scope_domains = instantiate_scope_domains(
-        dependency_graph,
-        axis_geometry=axis_geometry,
-    )
+    if len(root_domains) != len(dependency_graph.task_families):
+        raise ValueError("root domain count disagrees with the dependency graph")
+    if len(scope_domains) != len(dependency_graph.execution_scopes):
+        raise ValueError("scope domain count disagrees with the dependency graph")
     scope_by_id = {scope.scope_id: scope for scope in dependency_graph.execution_scopes}
-    root_domains = instantiate_root_domains(
-        dependency_graph,
-        axis_geometry=axis_geometry,
-    )
     access_by_id = {access.access_id: access for access in dependency_graph.accesses}
 
     def endpoints(
@@ -4342,7 +4361,6 @@ def build_tile_dependency_graph(
         for root_accesses in accesses_by_root
     ]
 
-    access_by_id = {access.access_id: access for access in accesses}
     region_by_access_id = {
         access.access_id: _access_region(access, task_families[access.root])
         for access in accesses
@@ -4473,19 +4491,6 @@ def build_tile_dependency_graph(
             for index, dependency in enumerate(ordered_dependencies)
         )
         next_dependency_id += len(access_dependencies)
-        kinds = frozenset(dependency.kind for dependency in access_dependencies)
-        producer_accesses = tuple(
-            access_by_id[access_id]
-            for access_id in sorted(
-                {dependency.producer_access_id for dependency in access_dependencies}
-            )
-        )
-        consumer_accesses = tuple(
-            access_by_id[access_id]
-            for access_id in sorted(
-                {dependency.consumer_access_id for dependency in access_dependencies}
-            )
-        )
         edges.append(
             TileDependency(
                 producer_root=producer_root,
@@ -4494,9 +4499,6 @@ def build_tile_dependency_graph(
                 tensor_names=frozenset(
                     tensor_names_by_allocation.get(allocation_id, ())
                 ),
-                kinds=kinds,
-                producer_accesses=producer_accesses,
-                consumer_accesses=consumer_accesses,
                 access_dependencies=access_dependencies,
             )
         )

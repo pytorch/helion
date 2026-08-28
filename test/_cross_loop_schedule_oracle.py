@@ -7,6 +7,104 @@ if TYPE_CHECKING:
     from helion._compiler.cross_loop_scheduler import EventGraph
     from helion._compiler.cross_loop_scheduler import LocalTrigger
     from helion._compiler.cross_loop_scheduler import WorkerSchedule
+    from helion._compiler.cross_loop_scheduler import WorkerScheduleSegment
+
+
+def segment_task_for_offset(
+    segment: WorkerScheduleSegment,
+    task_offset: int,
+) -> int:
+    """Materialize one segment ordinal for small scheduler tests."""
+    if not 0 <= task_offset < segment.task_count:
+        raise IndexError(task_offset)
+    source_coordinates = segment.task_relation.source_domain.coordinates(task_offset)
+    targets = segment.task_relation.target_coordinates(source_coordinates)
+    if len(targets) != 1:
+        raise AssertionError("symbolic schedule ordinal does not map to one task")
+    return segment.task_relation.target_domain.index(
+        dict(
+            zip(
+                segment.task_relation.target_domain.axis_order,
+                next(iter(targets)),
+                strict=True,
+            )
+        )
+    )
+
+
+def segment_placement(
+    segment: WorkerScheduleSegment,
+    task: int,
+) -> tuple[int, int] | None:
+    """Materialize one task's placement for small scheduler tests."""
+    inverse = segment.task_relation.inverse()
+    offsets = (
+        inverse.targets(task)
+        if inverse is not None
+        else frozenset(
+            offset
+            for offset in range(segment.task_count)
+            if segment_task_for_offset(segment, offset) == task
+        )
+    )
+    if len(offsets) > 1:
+        raise AssertionError("symbolic schedule maps one task more than once")
+    if not offsets:
+        return None
+    schedule_offset = segment.schedule_for_offset(next(iter(offsets)))
+    return (
+        segment.worker_begin + schedule_offset % segment.worker_count,
+        schedule_offset // segment.worker_count,
+    )
+
+
+def segment_task_at(
+    segment: WorkerScheduleSegment,
+    worker: int,
+    position: int,
+) -> int | None:
+    """Materialize the task at one segment position for small tests."""
+    worker_offset = worker - segment.worker_begin
+    if not 0 <= worker_offset < segment.worker_count or position < 0:
+        return None
+    schedule_delta = (
+        position * segment.worker_count + worker_offset - segment.schedule_begin
+    )
+    if not 0 <= schedule_delta < segment.task_count:
+        return None
+    return segment_task_for_offset(segment, schedule_delta)
+
+
+def placement(
+    schedule: WorkerSchedule,
+    root: int,
+    task: int,
+) -> tuple[int, int] | None:
+    """Materialize one task's placement for small scheduler tests."""
+    placements = tuple(
+        result
+        for segment in schedule.segments_for_root(root)
+        if (result := segment_placement(segment, task)) is not None
+    )
+    if len(placements) > 1:
+        raise AssertionError(f"task ({root}, {task}) has multiple placements")
+    return placements[0] if placements else None
+
+
+def task_at(
+    schedule: WorkerSchedule,
+    worker: int,
+    position: int,
+) -> tuple[int, int] | None:
+    """Materialize the task at one worker position for small tests."""
+    tasks = tuple(
+        (segment.root, task)
+        for segment in schedule.segments
+        if (task := segment_task_at(segment, worker, position)) is not None
+    )
+    if len(tasks) > 1:
+        raise AssertionError(f"worker {worker} position {position} has multiple tasks")
+    return tasks[0] if tasks else None
 
 
 def task_order(schedule: WorkerSchedule, root: int) -> tuple[int, ...]:
@@ -15,7 +113,7 @@ def task_order(schedule: WorkerSchedule, root: int) -> tuple[int, ...]:
     for segment in schedule.segments_for_root(root):
         for task_offset in range(segment.task_count):
             schedule_offset = segment.schedule_for_offset(task_offset)
-            task = segment.task_for_offset(task_offset)
+            task = segment_task_for_offset(segment, task_offset)
             placed_tasks.append((schedule_offset, task))
     placed_tasks.sort()
     if any(
@@ -86,7 +184,7 @@ def _static_ancestors(
 ) -> frozenset[tuple[int, int]]:
     if task in cache:
         return cache[task]
-    if worker_schedule.placement(*task) is not None:
+    if placement(worker_schedule, *task) is not None:
         result = frozenset((task,))
     elif task in visiting:
         raise ValueError("local trigger graph contains a cycle")
@@ -125,16 +223,16 @@ def validate_worker_schedule(
         [] for _ in range(worker_schedule.worker_count)
     ]
     for root, task in sorted(task_nodes):
-        placement = worker_schedule.placement(root, task)
+        task_placement = placement(worker_schedule, root, task)
         if (root, task) in local_predecessors:
-            if placement is not None:
+            if task_placement is not None:
                 raise ValueError(
                     f"locally executed task ({root}, {task}) also has a static placement"
                 )
             continue
-        if placement is None:
+        if task_placement is None:
             raise ValueError(f"task ({root}, {task}) has no static placement")
-        worker, position = placement
+        worker, position = task_placement
         tasks_by_worker[worker].append((position, (root, task)))
 
     graph_nodes = {("task", root, task) for root, task in static_tasks}

@@ -21,9 +21,13 @@ Qwen3-8B layer:
 
 ```bash
 python -m probes.qwen3.helion_qwen3_granular_tile_dependency \
-  --strict-validation --probe-config \
+  --strict-validation \
   --repeats 30 --batch-replays 20
 ```
+
+The Qwen probes use their matched static-pipeline configuration by default.
+Pass `--default-config` only when intentionally testing Helion's raw default
+configuration, which selects the barrier schedule.
 
 The optional `--task-aligned-attention` mode is a dependency-analysis stress
 probe; it is not the fastest batch-one lowering.
