@@ -130,12 +130,10 @@ class WorkerSchedule:
     def workers_for_root(self, root: int) -> frozenset[int]:
         """Return the compact worker support of one statically placed family."""
         return frozenset(
-            worker
+            segment.worker_begin
+            + (segment.schedule_begin + task_offset) % segment.worker_count
             for segment in self.segments_for_root(root)
-            for worker in range(
-                segment.worker_begin,
-                segment.worker_begin + segment.worker_count,
-            )
+            for task_offset in range(min(segment.task_count, segment.worker_count))
         )
 
     def _placement_axes(self) -> tuple[int, int]:

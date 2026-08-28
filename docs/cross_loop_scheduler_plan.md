@@ -4984,6 +4984,10 @@ area for less explicit ownership.
   that configuration invalid instead of silently falling back to the lowered
   `PIDInfo` geometry and maintaining two potentially divergent coordinate
   descriptions.
+- [x] Derive each root's active worker support from the tasks actually present
+  in every cyclic schedule segment, not from the segment's maximum worker
+  capacity. This prevents short or reordered families from over-counting
+  root-completion arrivals when `task_count < worker_count`.
 - [ ] Replace the remaining symbolic and hand-written L2 forward/inverse
   formulas only after introducing a compact bidirectional traversal relation.
   A one-piece forward relation is renderable, but its `Min`/`Mod` inverse is

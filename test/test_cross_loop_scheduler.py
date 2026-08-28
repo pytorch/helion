@@ -1349,6 +1349,23 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(segment_placement(segment, 11), None)
         self.assertEqual(segment_task_at(segment, 2, 1), 14)
 
+    def test_worker_support_excludes_unused_segment_capacity(self) -> None:
+        task_domain = LogicalDomain((10,), ((10, 2),), identity=0)
+        schedule = WorkerSchedule(
+            worker_count=6,
+            segments=(
+                WorkerScheduleSegment(
+                    root=0,
+                    task_relation=_one_dimensional_task_range(task_domain, 0, 2),
+                    worker_begin=1,
+                    worker_count=4,
+                    schedule_begin=2,
+                ),
+            ),
+        )
+
+        self.assertEqual(schedule.workers_for_root(0), frozenset((3, 4)))
+
     def test_local_contributors_preserve_key_major_order(self) -> None:
         root_domains = (
             LogicalDomain((10,), ((10, 4),), ((10, 1),)),

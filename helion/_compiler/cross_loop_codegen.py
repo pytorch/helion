@@ -674,8 +674,8 @@ def emit_cross_loop_schedule(
     }
     launch_worker_count = cross_loop_schedule.worker_schedule.worker_count
 
-    static_workers_by_root = {
-        root: cross_loop_schedule.worker_schedule.workers_for_root(root)
+    active_worker_counts_by_root = {
+        root: len(cross_loop_schedule.worker_schedule.workers_for_root(root))
         for root in range(len(root_domains))
     }
     local_task_count_by_root: dict[int, int] = {}
@@ -687,11 +687,10 @@ def emit_cross_loop_schedule(
             raise AssertionError("a local event must cover its complete root")
         local_task_count_by_root[use.consumer_root] = use.keys.source_domain.size
 
-    def active_worker_count(root: int) -> int:
-        return len(static_workers_by_root[root])
-
     def root_completion_arrival_count(root: int) -> int:
-        return active_worker_count(root) + local_task_count_by_root.get(root, 0)
+        return active_worker_counts_by_root[root] + local_task_count_by_root.get(
+            root, 0
+        )
 
     # Reject grids that cannot residently fit when the device is otherwise
     # idle. Concurrent-stream residency remains an explicit unresolved
@@ -814,7 +813,6 @@ def emit_cross_loop_schedule(
         return result
 
     root_physical_axis_order = [geometry[0] for geometry in case_geometries]
-    root_logical_axis_order = [domain.axis_order for domain in root_domains]
     root_axis_counts = [domain.axis_counts for domain in root_domains]
     root_events_by_producer: dict[
         int,
@@ -1164,7 +1162,7 @@ def emit_cross_loop_schedule(
     ) -> str:
         return flat_task_from_coordinates(
             coordinates,
-            root_logical_axis_order[root],
+            root_domains[root].axis_order,
             root_axis_counts[root],
         )
 
@@ -1306,7 +1304,7 @@ def emit_cross_loop_schedule(
         on_ready_root = local_use.consumer_root
         consumer_coordinates = flat_task_coordinates(
             consumer_task,
-            root_logical_axis_order[on_ready_root],
+            root_domains[on_ready_root].axis_order,
             root_axis_counts[on_ready_root],
         )
         consumer_logical_pid = (
@@ -1563,7 +1561,7 @@ def emit_cross_loop_schedule(
             )
             scheduled_coordinates = flat_task_coordinates(
                 scheduled_task,
-                root_logical_axis_order[root],
+                root_domains[root].axis_order,
                 root_axis_counts[root],
             )
             physical_task_expr = physical_task_for_logical_coordinates(
