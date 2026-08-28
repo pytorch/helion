@@ -724,12 +724,17 @@ def place_ready_families(
 
 
 def resolve_worker_count(
-    event_graph: EventGraph,
     *,
     default_worker_count: int,
     requested_worker_count: int,
 ) -> int:
-    """Resolve a tuning target to the nearest complete event-key boundary."""
+    """Honor an explicit resident-worker target.
+
+    WorkerSchedule supports families spanning multiple waves, and its graph
+    validator is the authority on progress safety. Rounding a requested cohort
+    to an event-key boundary can erase the partial wave that a later ready
+    family should occupy.
+    """
     if requested_worker_count < 0:
         raise exc.InvalidConfig(
             f"{CROSS_LOOP_NUM_WORKERS_CONFIG} must be nonnegative, got "
@@ -737,48 +742,12 @@ def resolve_worker_count(
         )
     if requested_worker_count == CROSS_LOOP_NUM_WORKERS_DEFAULT:
         return default_worker_count
-    candidates = {domain.size for domain in event_graph.root_domains}
-    for event in event_graph.events:
-        if any(
-            not _counted_contribution_is_lowerable(contribution)
-            for contribution in event.contributions
-        ):
-            continue
-        relations_by_root: dict[int, LogicalRelation] = {}
-        for contribution in event.contributions:
-            root = contribution.producer_root
-            relation = contribution.predecessors
-            previous = relations_by_root.get(root)
-            if previous is not None:
-                relation = previous.union(relation)
-                if relation is None:
-                    break
-            relations_by_root[root] = relation
-        else:
-            fan_in_by_root: list[int] = []
-            for relation in relations_by_root.values():
-                cardinality = relation.fiber_cardinality()
-                fan_in = None if cardinality is None else cardinality.constant_value()
-                if fan_in is None:
-                    break
-                fan_in_by_root.append(fan_in)
-            else:
-                if fan_in_by_root:
-                    tasks_per_key = max(fan_in_by_root)
-                    quotient, remainder = divmod(
-                        requested_worker_count,
-                        tasks_per_key,
-                    )
-                    for key_prefix in (quotient, quotient + bool(remainder)):
-                        if 1 <= key_prefix <= event.key_count:
-                            candidates.add(key_prefix * tasks_per_key)
-    return min(
-        candidates,
-        key=lambda worker_count: (
-            abs(worker_count - requested_worker_count),
-            worker_count,
-        ),
-    )
+    if requested_worker_count > default_worker_count:
+        raise exc.InvalidConfig(
+            f"{CROSS_LOOP_NUM_WORKERS_CONFIG}={requested_worker_count} exceeds "
+            f"the configured launch capacity {default_worker_count}"
+        )
+    return requested_worker_count
 
 
 def build_worker_schedule(
@@ -1564,6 +1533,131 @@ def _scope_readiness(
     )
 
 
+def _segmented_scope_event(
+    event_graph: EventGraph,
+    event: KeyedEvent,
+    use: EventUse,
+    boundaries: tuple[int, ...],
+) -> CountedEventPlan | None:
+    """Coarsen one exact nested dependency into contiguous action segments."""
+    consumer_scope_id = use.consumer_scope_id
+    assert consumer_scope_id is not None
+    domain = event_graph.scope_domain(consumer_scope_id)
+    nested_axes = event_graph.nested_axes(
+        use.consumer_root,
+        consumer_scope_id,
+    )
+    if len(nested_axes) != 1:
+        return None
+    (nested_axis,) = nested_axes
+    segments = tuple(itertools.pairwise(boundaries))
+    if not segments or any(begin >= end for begin, end in segments):
+        return None
+    used_axes = use.keys.source_axes_used()
+    if used_axes is None or nested_axis not in used_axes:
+        return None
+    reduced_domain = LogicalDomain(
+        axis_order=used_axes,
+        axis_counts_items=tuple((axis, domain.axis_counts[axis]) for axis in used_axes),
+        block_sizes_items=tuple(
+            (axis, domain.block_sizes[axis])
+            for axis in used_axes
+            if axis in domain.block_sizes
+        ),
+        kind="scope",
+        identity=domain.identity,
+    )
+    outer_axes = tuple(axis for axis in used_axes if axis != nested_axis)
+    key_domain = LogicalDomain(
+        axis_order=tuple(range(len(outer_axes) + 1)),
+        axis_counts_items=(
+            (0, len(segments)),
+            *(
+                (event_axis, reduced_domain.axis_counts[source_axis])
+                for event_axis, source_axis in enumerate(outer_axes, start=1)
+            ),
+        ),
+        kind="event",
+    )
+    stage_keys = LogicalRelation.point_map(
+        reduced_domain,
+        key_domain,
+        tuple(
+            (
+                tuple(
+                    (
+                        (axis, segment_begin, segment_end, 1)
+                        if axis == nested_axis
+                        else (axis, 0, reduced_domain.axis_counts[axis], 1)
+                    )
+                    for axis in reduced_domain.axis_order
+                ),
+                (
+                    sympy.Integer(stage),
+                    *(logical_axis_symbol(axis) for axis in outer_axes),
+                ),
+            )
+            for stage, (segment_begin, segment_end) in enumerate(segments)
+        ),
+    )
+    inverse_use = use.keys.inverse()
+    reduced_inverse = (
+        None if inverse_use is None else inverse_use.project_target(reduced_domain)
+    )
+    coarsening = None if reduced_inverse is None else reduced_inverse.then(stage_keys)
+    if coarsening is None:
+        return None
+    # This is a scheduling-derived coarsening of an already lowerable event,
+    # not a second dependency fact. Derive producer publication from the
+    # authoritative predecessor fibers, compose it with the stage map, then
+    # invert the exact result back into the representation owned by the plan.
+    publication_relations = tuple(
+        (
+            None
+            if contribution.producer_to_keys is None
+            else contribution.producer_to_keys.then(coarsening)
+        )
+        for contribution in event.contributions
+    )
+    if any(relation is None for relation in publication_relations):
+        return None
+    predecessor_relations = tuple(
+        None if relation is None else relation.inverse()
+        for relation in publication_relations
+    )
+    if any(relation is None for relation in predecessor_relations):
+        return None
+    action_keys = stage_keys.lift_source(domain)
+    if action_keys is None:
+        return None
+
+    return CountedEventPlan(
+        contributors=tuple(
+            EventContribution(
+                producer_root=contribution.producer_root,
+                producer_scope_id=contribution.producer_scope_id,
+                predecessors=relation,
+            )
+            for contribution, relation in zip(
+                event.contributions,
+                predecessor_relations,
+                strict=True,
+            )
+            if relation is not None
+        ),
+        uses=(
+            EventUse(
+                consumer_root=use.consumer_root,
+                dependency_points=use.dependency_points,
+                consumer_scope_id=use.consumer_scope_id,
+                keys=action_keys,
+            ),
+        ),
+        graph_event_index=event.event_id,
+        key_domain=key_domain,
+    )
+
+
 def _scope_milestones(
     event_graph: EventGraph,
     readiness: _ScopeReadiness,
@@ -1617,109 +1711,32 @@ def _scope_milestones(
                 upper = midpoint
         frontier = upper
     boundaries = tuple(sorted({0, frontier, actions_per_strand}))
-    segments = tuple(itertools.pairwise(boundaries))
-    used_axes = readiness.use.keys.source_axes_used()
-    if used_axes is None or nested_axis not in used_axes:
-        return None
-    reduced_domain = LogicalDomain(
-        axis_order=used_axes,
-        axis_counts_items=tuple((axis, domain.axis_counts[axis]) for axis in used_axes),
-        block_sizes_items=tuple(
-            (axis, domain.block_sizes[axis])
-            for axis in used_axes
-            if axis in domain.block_sizes
-        ),
-        kind="scope",
-        identity=domain.identity,
+    return _segmented_scope_event(
+        event_graph,
+        readiness.event,
+        readiness.use,
+        boundaries,
     )
-    outer_axes = tuple(axis for axis in used_axes if axis != nested_axis)
-    key_domain = LogicalDomain(
-        axis_order=tuple(range(len(outer_axes) + 1)),
-        axis_counts_items=(
-            (0, len(segments)),
-            *(
-                (event_axis, reduced_domain.axis_counts[source_axis])
-                for event_axis, source_axis in enumerate(outer_axes, start=1)
-            ),
-        ),
-        kind="event",
-    )
-    stage_keys = LogicalRelation.point_map(
-        reduced_domain,
-        key_domain,
-        tuple(
-            (
-                tuple(
-                    (
-                        (axis, segment_begin, segment_end, 1)
-                        if axis == nested_axis
-                        else (axis, 0, reduced_domain.axis_counts[axis], 1)
-                    )
-                    for axis in reduced_domain.axis_order
-                ),
-                (
-                    sympy.Integer(stage),
-                    *(logical_axis_symbol(axis) for axis in outer_axes),
-                ),
-            )
-            for stage, (segment_begin, segment_end) in enumerate(segments)
-        ),
-    )
-    inverse_use = readiness.use.keys.inverse()
-    reduced_inverse = (
-        None if inverse_use is None else inverse_use.project_target(reduced_domain)
-    )
-    coarsening = None if reduced_inverse is None else reduced_inverse.then(stage_keys)
-    if coarsening is None:
-        return None
-    # This is a scheduling-derived coarsening of an already lowerable event,
-    # not a second dependency fact. Derive producer publication from the
-    # authoritative predecessor fibers, compose it with the stage map, then
-    # invert the exact result back into the representation owned by the plan.
-    publication_relations = tuple(
-        (
-            None
-            if contribution.producer_to_keys is None
-            else contribution.producer_to_keys.then(coarsening)
-        )
-        for contribution in readiness.event.contributions
-    )
-    if any(relation is None for relation in publication_relations):
-        return None
-    predecessor_relations = tuple(
-        None if relation is None else relation.inverse()
-        for relation in publication_relations
-    )
-    if any(relation is None for relation in predecessor_relations):
-        return None
-    action_keys = stage_keys.lift_source(domain)
-    if action_keys is None:
-        return None
 
-    return CountedEventPlan(
-        contributors=tuple(
-            EventContribution(
-                producer_root=contribution.producer_root,
-                producer_scope_id=contribution.producer_scope_id,
-                predecessors=relation,
-            )
-            for contribution, relation in zip(
-                readiness.event.contributions,
-                predecessor_relations,
-                strict=True,
-            )
-            if relation is not None
-        ),
-        uses=(
-            EventUse(
-                consumer_root=readiness.use.consumer_root,
-                dependency_points=readiness.use.dependency_points,
-                consumer_scope_id=readiness.use.consumer_scope_id,
-                keys=action_keys,
-            ),
-        ),
-        graph_event_index=readiness.event.event_id,
-        key_domain=key_domain,
+
+def _scope_entry_event(
+    event_graph: EventGraph,
+    event: KeyedEvent,
+    use: EventUse,
+) -> CountedEventPlan | None:
+    """Coarsen exact action readiness to one wait per owning task strand."""
+    consumer_scope_id = use.consumer_scope_id
+    assert consumer_scope_id is not None
+    domain = event_graph.scope_domain(consumer_scope_id)
+    root_domain = event_graph.root_domains[use.consumer_root]
+    if domain.size % root_domain.size:
+        return None
+    actions_per_strand = domain.size // root_domain.size
+    return _segmented_scope_event(
+        event_graph,
+        event,
+        use,
+        (0, actions_per_strand),
     )
 
 
@@ -1748,8 +1765,6 @@ def place_nested_scope_consumers(
     plans: list[CountedEventPlan] = []
     for consumer_root, event_uses in sorted(uses_by_consumer.items()):
         task_domain = event_graph.root_domains[consumer_root]
-        if task_domain.size > result.worker_count:
-            continue
 
         # A preceding scope may already carry every dependency point needed by
         # a later scope.  The implication was proved from DeviceIR program
@@ -1772,6 +1787,15 @@ def place_nested_scope_consumers(
             uncovered_event_uses.append((event, use))
             preceding_dependency_points.update(use.dependency_points)
 
+        scope_entry_plans = tuple(
+            plan
+            for event, use in uncovered_event_uses
+            if (plan := _scope_entry_event(event_graph, event, use)) is not None
+        )
+        if task_domain.size > result.worker_count:
+            plans.extend(scope_entry_plans)
+            continue
+
         readiness = tuple(
             _scope_readiness(
                 event_graph,
@@ -1783,17 +1807,20 @@ def place_nested_scope_consumers(
             for event, use in uncovered_event_uses
         )
         if not readiness or any(item is None for item in readiness):
+            plans.extend(scope_entry_plans)
             continue
         ordered_readiness = tuple(item for item in readiness if item is not None)
 
         current_consumer_bounds = result.position_bounds_for_root(consumer_root)
         if current_consumer_bounds is None:
+            plans.extend(scope_entry_plans)
             continue
         original_position = current_consumer_bounds[0]
         readiness_bounds = tuple(
             item.readiness.value_bounds() for item in ordered_readiness
         )
         if any(bounds is None for bounds in readiness_bounds):
+            plans.extend(scope_entry_plans)
             continue
         earliest_readiness = min(
             bounds[0] for bounds in readiness_bounds if bounds is not None
@@ -1842,6 +1869,7 @@ def place_nested_scope_consumers(
             )
             break
         if chosen is None:
+            plans.extend(scope_entry_plans)
             continue
         result, scope_plans = chosen
         plans.extend(scope_plans)
@@ -2992,7 +3020,6 @@ def build_cross_loop_schedule(
         publishable_scope_ids=publishable_scope_ids,
     )
     worker_limit = resolve_worker_count(
-        event_graph,
         default_worker_count=physical_worker_limit,
         requested_worker_count=requested_worker_count,
     )

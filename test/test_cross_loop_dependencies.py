@@ -2496,72 +2496,34 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(derive_local_triggers(event_graph, baseline), ())
         self.assertEqual(choose_counted_events(event_graph, ()), ())
 
-    def test_worker_count_ignores_unlowerable_event_frontier(self) -> None:
-        producer_domain = LogicalDomain((10,), ((10, 12),), identity=0)
-        consumer_domain = LogicalDomain((20,), ((20, 3),), identity=1)
-        key_domain = LogicalDomain((0,), ((0, 3),), kind="event", identity=0)
-        predecessors = LogicalRelation(
-            key_domain,
-            producer_domain,
-            tuple(
-                _LogicalRelationPiece(
-                    ((0, key, key + 1, 1),),
-                    (
-                        (
-                            10,
-                            sympy.Integer(key),
-                            sympy.Integer(key + 2),
-                            1,
-                        ),
-                    ),
-                )
-                for key in range(3)
-            ),
-        )
-        contribution = EventContribution(0, predecessors)
-        event_graph = EventGraph(
-            root_domains=(producer_domain, consumer_domain),
-            root_traversals=(
-                physical_traversal_relation(producer_domain, (10,)),
-                physical_traversal_relation(consumer_domain, (20,)),
-            ),
-            scope_domains=(),
-            events=(
-                KeyedEvent(
-                    0,
-                    key_domain,
-                    (contribution,),
-                    (
-                        EventUse(
-                            1,
-                            LogicalRelation.point_map(
-                                consumer_domain,
-                                key_domain,
-                                (
-                                    (
-                                        ((20, 0, 3, 1),),
-                                        (logical_axis_symbol(20),),
-                                    ),
-                                ),
-                            ),
-                        ),
-                    ),
-                ),
-            ),
-        )
-
-        publication = contribution.producer_to_keys
-        self.assertIsNotNone(publication)
-        assert publication is not None
-        self.assertFalse(publication.is_single_valued())
+    def test_worker_count_honors_explicit_target(self) -> None:
         self.assertEqual(
             resolve_worker_count(
-                event_graph,
+                default_worker_count=12,
+                requested_worker_count=0,
+            ),
+            12,
+        )
+        self.assertEqual(
+            resolve_worker_count(
                 default_worker_count=12,
                 requested_worker_count=5,
             ),
-            3,
+            5,
         )
+        with self.assertRaisesRegex(
+            helion.exc.InvalidConfig,
+            "exceeds the configured launch capacity",
+        ):
+            resolve_worker_count(
+                default_worker_count=12,
+                requested_worker_count=13,
+            )
+        with self.assertRaisesRegex(helion.exc.InvalidConfig, "must be nonnegative"):
+            resolve_worker_count(
+                default_worker_count=12,
+                requested_worker_count=-1,
+            )
 
     def test_semantic_event_graph_represents_diamond_without_path_matching(
         self,
@@ -4397,9 +4359,9 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(schedule.worker_schedule.placement(2, 0), (5, 1))
         self.assertEqual(schedule.worker_schedule.placement(0, 6), (0, 1))
 
-        snapped = build_cross_loop_schedule(**kwargs, requested_worker_count=7)
-        self.assertEqual(snapped.worker_limit, 6)
-        self.assertEqual(snapped.worker_schedule, schedule.worker_schedule)
+        exact = build_cross_loop_schedule(**kwargs, requested_worker_count=7)
+        self.assertEqual(exact.worker_limit, 7)
+        self.assertNotEqual(exact.worker_schedule, schedule.worker_schedule)
 
         default_schedule = build_cross_loop_schedule(**kwargs, requested_worker_count=0)
         self.assertEqual(
@@ -4579,6 +4541,114 @@ class TestCrossLoopDependencies(TestCase):
             ),
         )
         self.assertEqual(plan.uses[0].consumer_scope_id, 7)
+
+    def test_nested_scope_entry_event_survives_without_early_placement(self) -> None:
+        producer_domain = LogicalDomain(
+            (10, 11),
+            ((10, 2), (11, 4)),
+            ((10, 1), (11, 1)),
+            identity=0,
+        )
+        consumer_domain = LogicalDomain(
+            (20,),
+            ((20, 2),),
+            ((20, 1),),
+            identity=1,
+        )
+        action_domain = LogicalDomain(
+            (20, 21),
+            ((20, 2), (21, 4)),
+            ((20, 1), (21, 1)),
+            identity=7,
+        )
+        key_domain = LogicalDomain(
+            (0, 1),
+            ((0, 2), (1, 4)),
+            kind="event",
+            identity=0,
+        )
+        event_graph = EventGraph(
+            root_domains=(producer_domain, consumer_domain),
+            root_traversals=(
+                physical_traversal_relation(producer_domain, (10, 11)),
+                physical_traversal_relation(consumer_domain, (20,)),
+            ),
+            scope_domains=(*(None for _ in range(7)), action_domain),
+            events=(
+                KeyedEvent(
+                    event_id=0,
+                    key_domain=key_domain,
+                    contributions=(
+                        _event_contribution_from_publication(
+                            producer_root=0,
+                            publication=LogicalRelation.point_map(
+                                producer_domain,
+                                key_domain,
+                                (
+                                    (
+                                        (
+                                            (10, 0, 2, 1),
+                                            (11, 0, 4, 1),
+                                        ),
+                                        (
+                                            logical_axis_symbol(10),
+                                            logical_axis_symbol(11),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                    uses=(
+                        EventUse(
+                            consumer_root=1,
+                            consumer_scope_id=7,
+                            keys=LogicalRelation.point_map(
+                                action_domain,
+                                key_domain,
+                                (
+                                    (
+                                        (
+                                            (20, 0, 2, 1),
+                                            (21, 0, 4, 1),
+                                        ),
+                                        (
+                                            logical_axis_symbol(20),
+                                            logical_axis_symbol(21),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        for worker_count in (1, 2):
+            with self.subTest(worker_count=worker_count):
+                schedule = _build_baseline_worker_schedule(
+                    event_graph.root_domains,
+                    event_graph.root_traversals,
+                    worker_count=worker_count,
+                )
+
+                placed, plans = place_nested_scope_consumers(
+                    event_graph,
+                    schedule,
+                    (),
+                )
+
+                self.assertEqual(placed, schedule)
+                self.assertEqual(len(plans), 1)
+                self.assertEqual(plans[0].key_count, 2)
+                self.assertEqual(
+                    _expected_arrivals(
+                        plans[0].key_domain,
+                        plans[0].contributors,
+                    ),
+                    (4, 4),
+                )
+                self.assertEqual(plans[0].uses[0].consumer_scope_id, 7)
 
     def test_nested_scope_identity_readiness_uses_one_admission_frontier(self) -> None:
         """Per-iteration readiness is coarsened to one compact frontier."""
