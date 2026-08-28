@@ -6,6 +6,7 @@ from unittest import mock
 import sympy
 import torch
 
+from test._cross_loop_schedule_oracle import event_source_traversal
 from test._cross_loop_schedule_oracle import placement
 from test._cross_loop_schedule_oracle import segment_placement
 from test._cross_loop_schedule_oracle import segment_task_at
@@ -808,10 +809,7 @@ class TestCrossLoopScheduler(TestCase):
         )
         (nested_use,) = nested_event.uses
         nested_keys = nested_use.keys.materialize(
-            source_traversal=consumer_events.source_traversal(
-                nested_use.consumer_root,
-                nested_use.consumer_scope_id,
-            )
+            source_traversal=event_source_traversal(consumer_events, nested_use)
         )
         self.assertTrue(all(len(keys) == 1 for keys in nested_keys))
         self.assertEqual(
@@ -902,7 +900,6 @@ class TestCrossLoopScheduler(TestCase):
                 physical_traversal_relation(domain, domain.axis_order)
                 for domain in domains
             ),
-            scope_domains=(),
             events=(
                 KeyedEvent(
                     contributions=(
@@ -993,7 +990,6 @@ class TestCrossLoopScheduler(TestCase):
                 physical_traversal_relation(producer_domain, (10,)),
                 physical_traversal_relation(consumer_domain, (20,)),
             ),
-            scope_domains=(),
             events=(
                 KeyedEvent(
                     (contribution,),
@@ -1215,7 +1211,6 @@ class TestCrossLoopScheduler(TestCase):
                 physical_traversal_relation(domain, domain.axis_order)
                 for domain in root_domains
             ),
-            scope_domains=(),
             events=events,
         )
         baseline = _build_baseline_worker_schedule(
@@ -1271,7 +1266,6 @@ class TestCrossLoopScheduler(TestCase):
         with self.assertRaisesRegex(ValueError, "compatible typed domains"):
             EventGraph(
                 root_traversals=(wrong_size,),
-                scope_domains=(),
                 events=(),
             )
         with self.assertRaisesRegex(ValueError, "incompatible domains"):
@@ -1365,6 +1359,8 @@ class TestCrossLoopScheduler(TestCase):
         )
 
         self.assertEqual(schedule.workers_for_root(0), frozenset((3, 4)))
+        self.assertEqual(schedule.dense_assignment(0), (1, 4, 2, 2))
+        self.assertIsNone(schedule.contiguous_global_interval(0))
 
     def test_local_contributors_preserve_key_major_order(self) -> None:
         root_domains = (
@@ -1384,7 +1380,6 @@ class TestCrossLoopScheduler(TestCase):
             root_traversals=_default_root_traversals(
                 (producer_domain, consumer_domain)
             ),
-            scope_domains=(),
             events=(
                 KeyedEvent(
                     contributions=(
@@ -1516,7 +1511,6 @@ class TestCrossLoopScheduler(TestCase):
         key_domain = LogicalDomain((0,), ((0, 2),), kind="event", identity=0)
         event_graph = EventGraph(
             root_traversals=_default_root_traversals(root_domains),
-            scope_domains=(),
             events=(
                 KeyedEvent(
                     contributions=(
@@ -1574,7 +1568,6 @@ class TestCrossLoopScheduler(TestCase):
         key_domain = LogicalDomain((0,), ((0, 2),), kind="event", identity=0)
         event_graph = EventGraph(
             root_traversals=_default_root_traversals(root_domains),
-            scope_domains=(),
             events=(
                 KeyedEvent(
                     contributions=(
@@ -2043,7 +2036,6 @@ class TestCrossLoopScheduler(TestCase):
         key_domain = LogicalDomain((0,), ((0, 4),), kind="event", identity=0)
         event_graph = EventGraph(
             root_traversals=_default_root_traversals(root_domains),
-            scope_domains=(*(None for _ in range(7)), action_domain),
             events=(
                 KeyedEvent(
                     contributions=(
@@ -2167,7 +2159,6 @@ class TestCrossLoopScheduler(TestCase):
                 physical_traversal_relation(producer_domain, (10, 11)),
                 physical_traversal_relation(consumer_domain, (20,)),
             ),
-            scope_domains=(*(None for _ in range(7)), action_domain),
             events=(
                 KeyedEvent(
                     contributions=(
@@ -2258,7 +2249,6 @@ class TestCrossLoopScheduler(TestCase):
         key_domain = LogicalDomain((0,), ((0, 4),), kind="event", identity=0)
         event_graph = EventGraph(
             root_traversals=_default_root_traversals(root_domains),
-            scope_domains=(*(None for _ in range(7)), action_domain),
             events=(
                 KeyedEvent(
                     contributions=(
@@ -2372,7 +2362,6 @@ class TestCrossLoopScheduler(TestCase):
         _, nested_use = identity_keys(action_domain, 31, 1)
         event_graph = EventGraph(
             root_traversals=_default_root_traversals(root_domains),
-            scope_domains=(*(None for _ in range(7)), action_domain),
             events=(
                 KeyedEvent(
                     contributions=(
@@ -2510,7 +2499,6 @@ class TestCrossLoopScheduler(TestCase):
             )
         event_graph = EventGraph(
             root_traversals=_default_root_traversals(root_domains),
-            scope_domains=scope_domains,
             events=tuple(events),
         )
         schedule = WorkerSchedule(

@@ -54,8 +54,7 @@ class WorkerScheduleSegment:
                 f"schedule_begin must be nonnegative, got {self.schedule_begin}"
             )
         if (
-            self.task_relation.source_domain.size <= 0
-            or self.task_relation.source_domain.kind != "worker"
+            self.task_relation.source_domain.kind != "worker"
             or self.task_relation.target_domain.kind != "scope"
             or not self.task_relation.pieces
         ):
@@ -257,25 +256,42 @@ class WorkerSchedule:
             max(end for _begin, end in positions),
         )
 
-    def contiguous_global_interval(self, root: int) -> tuple[int, int] | None:
-        """Return one dense global schedule interval without task expansion."""
+    def dense_assignment(self, root: int) -> tuple[int, int, int, int] | None:
+        """Return one root's dense worker and schedule interval.
+
+        The tuple contains ``worker_begin``, ``worker_count``,
+        ``schedule_begin``, and ``task_count``.  A root split across different
+        worker ranges or separated schedule intervals is not dense.
+        """
         segments = sorted(
             self.segments_for_root(root),
             key=lambda segment: segment.schedule_begin,
         )
         if not segments:
             return None
-        begin = segments[0].schedule_begin
-        end = begin
+        worker_begin = segments[0].worker_begin
+        worker_count = segments[0].worker_count
+        schedule_begin = segments[0].schedule_begin
+        schedule_end = schedule_begin
         for segment in segments:
             if (
-                segment.worker_begin != 0
-                or segment.worker_count != self.worker_count
-                or segment.schedule_begin != end
+                segment.worker_begin != worker_begin
+                or segment.worker_count != worker_count
+                or segment.schedule_begin != schedule_end
             ):
                 return None
-            end += segment.task_count
-        return begin, end
+            schedule_end += segment.task_count
+        return worker_begin, worker_count, schedule_begin, schedule_end - schedule_begin
+
+    def contiguous_global_interval(self, root: int) -> tuple[int, int] | None:
+        """Return one dense global schedule interval without task expansion."""
+        assignment = self.dense_assignment(root)
+        if assignment is None:
+            return None
+        worker_begin, worker_count, schedule_begin, task_count = assignment
+        if worker_begin or worker_count != self.worker_count:
+            return None
+        return schedule_begin, schedule_begin + task_count
 
     def without_roots(self, roots: frozenset[int]) -> WorkerSchedule:
         """Remove complete locally executed families without task expansion."""
@@ -323,8 +339,6 @@ def build_baseline_worker_schedule(
         zip(root_domains, root_traversals, strict=True)
     ):
         task_count = domain.size
-        if task_count <= 0:
-            continue
         active_workers = min(worker_count, task_count)
         segments.append(
             WorkerScheduleSegment(
@@ -687,10 +701,9 @@ class KeyedEvent:
 
 @dataclasses.dataclass(frozen=True)
 class EventGraph:
-    """Configured symbolic readiness DAG and its execution-scope domains."""
+    """Configured symbolic readiness DAG and physical root traversals."""
 
     root_traversals: tuple[LogicalRelation, ...]
-    scope_domains: tuple[LogicalDomain | None, ...]
     events: tuple[KeyedEvent, ...]
 
     def __post_init__(self) -> None:
@@ -716,37 +729,6 @@ class EventGraph:
 
     def event(self, event_id: int) -> KeyedEvent:
         return self.events[event_id]
-
-    def scope_domain(self, scope_id: int) -> LogicalDomain:
-        domain = self.scope_domains[scope_id]
-        if domain is None:
-            raise ValueError(f"execution scope {scope_id} has no configured domain")
-        return domain
-
-    def nested_axes(self, root: int, scope_id: int) -> tuple[int, ...]:
-        return nested_logical_axes(
-            self.root_domains[root],
-            self.scope_domain(scope_id),
-        )
-
-    def source_traversal(self, root: int, scope_id: int | None) -> tuple[int, ...]:
-        root_axes = self.root_domains[root].axis_order
-        if scope_id is None:
-            return root_axes
-        return (*self.nested_axes(root, scope_id), *root_axes)
-
-    def required_keys_by_strand(self, use: EventUse) -> LogicalRelation | None:
-        """Project a checkpoint's requirements onto its owning root strands.
-
-        Projection failure is a legality failure for strand-level scheduling;
-        it must not trigger enumeration of the nested action domain.
-        """
-        root_domain = self.root_domains[use.consumer_root]
-        if use.consumer_scope_id is None:
-            if use.keys.source_domain != root_domain:
-                raise ValueError("root event use has the wrong source domain")
-            return use.keys
-        return use.keys.project_source(root_domain)
 
 
 def _counted_contribution_is_lowerable(contribution: EventContribution) -> bool:
@@ -990,7 +972,6 @@ class _ScopeReadiness:
 
     event: KeyedEvent
     use: EventUse
-    domain: LogicalDomain
     readiness: LogicalRelation
     ancestor_placements: frozenset[tuple[int, int]]
 
@@ -1178,12 +1159,11 @@ def _scope_readiness(
 ) -> _ScopeReadiness | None:
     """Project one exact action relation onto static worker completion positions."""
     assert use.consumer_scope_id is not None
-    domain = event_graph.scope_domain(use.consumer_scope_id)
-    nested_axes = event_graph.nested_axes(
-        use.consumer_root,
-        use.consumer_scope_id,
+    domain = use.keys.source_domain
+    nested_axes = nested_logical_axes(
+        event_graph.root_domains[use.consumer_root], domain
     )
-    if len(nested_axes) != 1 or use.keys.source_domain != domain:
+    if len(nested_axes) != 1:
         return None
 
     completion = _event_completion_positions(
@@ -1205,7 +1185,6 @@ def _scope_readiness(
     return _ScopeReadiness(
         event=event,
         use=use,
-        domain=domain,
         readiness=action_readiness,
         ancestor_placements=frozenset(ancestor_placements),
     )
@@ -1220,10 +1199,9 @@ def _segmented_scope_event(
     """Coarsen one exact nested dependency into contiguous action segments."""
     consumer_scope_id = use.consumer_scope_id
     assert consumer_scope_id is not None
-    domain = event_graph.scope_domain(consumer_scope_id)
-    nested_axes = event_graph.nested_axes(
-        use.consumer_root,
-        consumer_scope_id,
+    domain = use.keys.source_domain
+    nested_axes = nested_logical_axes(
+        event_graph.root_domains[use.consumer_root], domain
     )
     if len(nested_axes) != 1:
         return None
@@ -1341,12 +1319,12 @@ def _scope_milestones(
     consumer_position: int,
 ) -> CountedEventPlan | None:
     """Split a nested scope loop at the selected schedule frontier."""
-    domain = readiness.domain
+    domain = readiness.use.keys.source_domain
     consumer_scope_id = readiness.use.consumer_scope_id
     assert consumer_scope_id is not None
-    nested_axes = event_graph.nested_axes(
-        readiness.use.consumer_root,
-        consumer_scope_id,
+    nested_axes = nested_logical_axes(
+        event_graph.root_domains[readiness.use.consumer_root],
+        domain,
     )
     if len(nested_axes) != 1:
         return None
@@ -1402,10 +1380,9 @@ def _scope_entry_event(
     """Coarsen exact action readiness to one wait per owning task strand."""
     consumer_scope_id = use.consumer_scope_id
     assert consumer_scope_id is not None
-    domain = event_graph.scope_domain(consumer_scope_id)
-    nested_axes = event_graph.nested_axes(
-        use.consumer_root,
-        consumer_scope_id,
+    domain = use.keys.source_domain
+    nested_axes = nested_logical_axes(
+        event_graph.root_domains[use.consumer_root], domain
     )
     if len(nested_axes) != 1:
         return None
@@ -1618,7 +1595,6 @@ def choose_counted_events(
     for event in event_graph.events:
         if (
             event.family_done_root is not None
-            or not event.key_count
             or any(
                 not _counted_contribution_is_lowerable(contribution)
                 for contribution in event.contributions
@@ -2124,7 +2100,6 @@ def build_event_graph(
     )
     return EventGraph(
         root_traversals=root_traversals,
-        scope_domains=scope_domains,
         events=events,
     )
 
@@ -2172,7 +2147,7 @@ def derive_local_triggers(
         if use.consumer_scope_id is not None:
             continue
         fan_in = _uniform_arrivals(event.contributions)
-        if not event.key_count or fan_in is None or fan_in <= 0:
+        if fan_in is None or fan_in <= 0:
             continue
         inverse_use = use.keys.inverse()
         if (

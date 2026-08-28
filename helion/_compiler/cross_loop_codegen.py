@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import math
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -556,11 +555,6 @@ def emit_cross_loop_schedule(
     case_geometries = tuple(
         geometry for geometry in configured_case_geometries if geometry is not None
     )
-    static_task_counts = tuple(
-        math.prod(axis_counts.values())
-        for _axis_order, axis_counts, _block_sizes in case_geometries
-    )
-
     worker = typed_program_id(0)
     epoch_var = device_function.new_var("tile_dependency_epoch", dce=False)
     base_body = owner._prepare_persistent_body(
@@ -570,11 +564,6 @@ def emit_cross_loop_schedule(
     )
     case_bodies = _extract_case_bodies(owner, base_body)
     opaque_case_fingerprints = tuple(_ast_fingerprint(body) for body in case_bodies)
-    case_offsets: list[int] = []
-    running_offset = 0
-    for task_count in static_task_counts:
-        case_offsets.append(running_offset)
-        running_offset += task_count
     dependency_plan = HostFunction.current().device_ir.tile_dependency_graph
     assert dependency_plan is not None
     indexing = device_function.config.get("indexing", ())
@@ -635,6 +624,11 @@ def emit_cross_loop_schedule(
     root_domains = tuple(
         domain for domain in configured_root_domains if domain is not None
     )
+    case_offsets: list[int] = []
+    running_offset = 0
+    for domain in root_domains:
+        case_offsets.append(running_offset)
+        running_offset += domain.size
     root_traversals = _root_physical_traversals(
         owner,
         root_domains,
@@ -646,7 +640,6 @@ def emit_cross_loop_schedule(
             f"{CROSS_LOOP_SCHEDULE_STATIC_PIPELINE!r} requires a "
             "representable root traversal"
         )
-    assert tuple(domain.size for domain in root_domains) == static_task_counts
     cross_loop_schedule = build_cross_loop_schedule(
         dependency_plan=dependency_plan,
         root_traversals=root_traversals,
@@ -655,23 +648,17 @@ def emit_cross_loop_schedule(
         publishable_scope_ids=publishable_scope_ids,
     )
     root_completion_edges = cross_loop_schedule.root_completion_edges
+    all_counted_event_plans = cross_loop_schedule.counted_events
     nested_scope_event_plans = tuple(
         plan
-        for plan in cross_loop_schedule.counted_events
+        for plan in all_counted_event_plans
         if any(use.consumer_scope_id is not None for use in plan.uses)
     )
     counted_event_plans = tuple(
         plan
-        for plan in cross_loop_schedule.counted_events
-        if plan not in nested_scope_event_plans
+        for plan in all_counted_event_plans
+        if all(use.consumer_scope_id is None for use in plan.uses)
     )
-    all_counted_event_plans = (
-        *counted_event_plans,
-        *nested_scope_event_plans,
-    )
-    uniform_arrivals_by_plan = {
-        plan: plan.uniform_arrivals() for plan in all_counted_event_plans
-    }
     launch_worker_count = cross_loop_schedule.worker_schedule.worker_count
 
     active_worker_counts_by_root = {
@@ -1236,7 +1223,7 @@ def emit_cross_loop_schedule(
         plan: CountedEventPlan,
         key: str,
     ) -> str:
-        uniform = uniform_arrivals_by_plan[plan]
+        uniform = plan.uniform_arrivals()
         if uniform is not None:
             return str(uniform)
         key_coordinates = flat_task_coordinates(
@@ -1263,7 +1250,7 @@ def emit_cross_loop_schedule(
         local_use = plan.local_use
         if local_use is None:
             counter = counted_event_counter(plan, key)
-            if uniform_arrivals_by_plan[plan] == 1:
+            if plan.uniform_arrivals() == 1:
                 return [
                     statement_from_string(
                         f"tl.atomic_xchg({counter}, {epoch_var}, "
@@ -1344,7 +1331,7 @@ def emit_cross_loop_schedule(
             last_arrival_body.append(_publication_barrier(device_function))
             last_arrival_body.extend(consumer_publications)
         last_arrival_body.extend(root_completion_publication(on_ready_root))
-        expected_arrivals = uniform_arrivals_by_plan[plan]
+        expected_arrivals = plan.uniform_arrivals()
         if expected_arrivals is None:
             raise AssertionError("local execution requires uniform event fan-in")
         if expected_arrivals == 1:
@@ -1489,16 +1476,21 @@ def emit_cross_loop_schedule(
             return None
         worker_schedule = cross_loop_schedule.worker_schedule
         root_domain = root_domains[root]
-        segments = worker_schedule.segments_for_root(root)
-        schedule_interval = worker_schedule.contiguous_global_interval(root)
+        assignment = worker_schedule.dense_assignment(root)
         if (
-            schedule_interval is None
-            or schedule_interval[1] - schedule_interval[0] != root_domain.size
+            assignment is None
+            or assignment[0] != 0
+            or assignment[1] != worker_schedule.worker_count
+            or assignment[3] != root_domain.size
         ):
             raise AssertionError(
                 f"root {root} does not occupy one contiguous schedule interval"
             )
-        schedule_begin = schedule_interval[0]
+        schedule_begin = assignment[2]
+        segments = sorted(
+            worker_schedule.segments_for_root(root),
+            key=lambda segment: segment.schedule_begin,
+        )
 
         expression = ""
         for segment in reversed(segments):
@@ -1687,40 +1679,21 @@ def emit_cross_loop_schedule(
 
     dense_assignment_by_root: dict[int, tuple[int, int, int]] = {}
     for root, root_domain in enumerate(root_domains):
-        segments = sorted(
-            cross_loop_schedule.worker_schedule.segments_for_root(root),
-            key=lambda segment: segment.schedule_begin,
-        )
-        if not segments:
+        assignment = cross_loop_schedule.worker_schedule.dense_assignment(root)
+        if assignment is None:
+            if cross_loop_schedule.worker_schedule.segments_for_root(root):
+                raise exc.InvalidConfig(
+                    f"{CROSS_LOOP_SCHEDULE_CONFIG}="
+                    f"{CROSS_LOOP_SCHEDULE_STATIC_PIPELINE!r} cannot lower "
+                    f"root {root}'s non-dense worker assignment"
+                )
             continue
-        if sum(segment.task_count for segment in segments) != root_domain.size:
+        worker_begin, worker_count, schedule_begin, task_count = assignment
+        if task_count != root_domain.size or schedule_begin % worker_count:
             raise exc.InvalidConfig(
                 f"{CROSS_LOOP_SCHEDULE_CONFIG}="
                 f"{CROSS_LOOP_SCHEDULE_STATIC_PIPELINE!r} does not "
-                "support partially scheduled task families"
-            )
-        worker_begin = segments[0].worker_begin
-        worker_count = segments[0].worker_count
-        if any(
-            segment.worker_begin != worker_begin or segment.worker_count != worker_count
-            for segment in segments
-        ):
-            raise exc.InvalidConfig(
-                f"{CROSS_LOOP_SCHEDULE_CONFIG}="
-                f"{CROSS_LOOP_SCHEDULE_STATIC_PIPELINE!r} cannot lower "
-                f"root {root}'s noncontiguous worker assignment"
-            )
-        schedule_begin = segments[0].schedule_begin
-        if schedule_begin % worker_count or any(
-            segment.schedule_begin
-            != schedule_begin
-            + sum(previous.task_count for previous in segments[:index])
-            for index, segment in enumerate(segments)
-        ):
-            raise exc.InvalidConfig(
-                f"{CROSS_LOOP_SCHEDULE_CONFIG}="
-                f"{CROSS_LOOP_SCHEDULE_STATIC_PIPELINE!r} cannot lower "
-                f"root {root}'s non-dense worker schedule"
+                f"support root {root}'s worker assignment"
             )
         dense_assignment_by_root[root] = (
             worker_begin,

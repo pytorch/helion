@@ -4958,14 +4958,14 @@ Validation results:
   `--probe-config`.
 
 Current post-cleanup cold-L2 checks retain the intended schedules: the granular
-Qwen3 layer is 93.46 us versus 104.73 us separate, Gemma4 A4B is 47.60 us
-versus 53.20 us separate, and GPT-OSS at the separately validated multiplier
-12 point is 36.35 us versus 37.02 us separate. The GPT-OSS lowering matches
+Qwen3 layer is 93.40 us versus 104.68 us separate, Gemma4 A4B is 47.51 us
+versus 53.27 us separate, and GPT-OSS at the separately validated multiplier
+12 point is 35.46 us versus 37.54 us separate. The GPT-OSS lowering matches
 the prior 1,776-worker static schedule after normalizing the now-symbolic
 `_NUM_SM * 12` launch expression.
 
 Relative to the preceding cleanup commit `7867e5a1`, this round currently
-removes 426 net production lines across `tile_dependency.py`,
+removes 483 net production lines across `tile_dependency.py`,
 `cross_loop_scheduler.py`, and `cross_loop_codegen.py`. The larger suggested
 event/placement merger is intentionally left as a follow-up: the remaining
 semantic-event and selected-lowering objects represent genuinely different
@@ -4988,6 +4988,17 @@ area for less explicit ownership.
   in every cyclic schedule segment, not from the segment's maximum worker
   capacity. This prevents short or reordered families from over-counting
   root-completion arrivals when `task_count < worker_count`.
+- [x] Remove configured scope domains from `EventGraph`. Each producer and
+  consumer relation already owns its exact scope domain, so retaining the
+  complete scope table duplicated identity and geometry after event
+  construction. Exhaustive source-order and strand-projection helpers now
+  live only in the test oracle.
+- [x] Centralize dense root-assignment derivation in `WorkerSchedule`. Scheduler
+  interval queries and codegen now share one linear validation rather than
+  independently sorting segments and rebuilding prefix sums. Derive root task
+  counts and case offsets from the instantiated root domains, and consume
+  uniform fan-in directly from each plan instead of maintaining a second
+  codegen dictionary.
 - [ ] Replace the remaining symbolic and hand-written L2 forward/inverse
   formulas only after introducing a compact bidirectional traversal relation.
   A one-piece forward relation is renderable, but its `Min`/`Mod` inverse is

@@ -5,9 +5,38 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from helion._compiler.cross_loop_scheduler import EventGraph
+    from helion._compiler.cross_loop_scheduler import EventUse
     from helion._compiler.cross_loop_scheduler import LocalTrigger
     from helion._compiler.cross_loop_scheduler import WorkerSchedule
     from helion._compiler.cross_loop_scheduler import WorkerScheduleSegment
+    from helion._compiler.tile_dependency import LogicalRelation
+
+
+def event_source_traversal(
+    event_graph: EventGraph,
+    use: EventUse,
+) -> tuple[int, ...]:
+    """Return one event use's exhaustive source order for test materialization."""
+    root_axes = event_graph.root_domains[use.consumer_root].axis_order
+    if use.consumer_scope_id is None:
+        return root_axes
+    nested_axes = tuple(
+        axis for axis in use.keys.source_domain.axis_order if axis not in root_axes
+    )
+    return (*nested_axes, *root_axes)
+
+
+def required_keys_by_strand(
+    event_graph: EventGraph,
+    use: EventUse,
+) -> LogicalRelation | None:
+    """Project a test event use onto its owning root task strands."""
+    root_domain = event_graph.root_domains[use.consumer_root]
+    if use.consumer_scope_id is None:
+        if use.keys.source_domain != root_domain:
+            raise ValueError("root event use has the wrong source domain")
+        return use.keys
+    return use.keys.project_source(root_domain)
 
 
 def segment_task_for_offset(
@@ -158,10 +187,7 @@ def _local_trigger_predecessors(
         )
         for consumer_task, required_keys in enumerate(
             use.keys.materialize(
-                source_traversal=event_graph.source_traversal(
-                    use.consumer_root,
-                    use.consumer_scope_id,
-                )
+                source_traversal=event_source_traversal(event_graph, use)
             )
         ):
             if len(required_keys) != 1:
@@ -281,7 +307,7 @@ def validate_worker_schedule(
             set() for _ in range(event.key_count)
         ]
         for use in event.uses:
-            strand_keys = event_graph.required_keys_by_strand(use)
+            strand_keys = required_keys_by_strand(event_graph, use)
             if strand_keys is None:
                 raise ValueError("event use cannot be projected onto consumer strands")
             for consumer_task, required_keys in enumerate(strand_keys.materialize()):
