@@ -764,8 +764,13 @@ def _add_event_candidate(
     key_domain: LogicalDomain,
     contributions: tuple[EventContribution, ...],
     uses: tuple[EventUse, ...],
-) -> None:
-    """Group fanout by producer partition in final event-local coordinates."""
+    require_counted_lowering: bool = False,
+) -> bool:
+    """Canonicalize and group one event candidate by producer partition.
+
+    Counted-lowering admission runs only after the final event identity is
+    assigned, so later scheduling phases reuse the same relation proofs.
+    """
     if _event_key_domain(contributions, uses) != key_domain:
         raise AssertionError("event relations do not share their quotient domain")
     canonical_domain = _canonical_event_domain(key_domain)
@@ -807,6 +812,12 @@ def _add_event_candidate(
         event_contributions = previous_event.contributions
         previous_uses = previous_event.uses
 
+    if require_counted_lowering and any(
+        not _counted_contribution_is_lowerable(contribution)
+        for contribution in event_contributions
+    ):
+        return False
+
     grouped_uses = list(previous_uses)
     for canonical_use in canonical_uses:
         keys = canonical_use.keys.rename_target_axes(identified_domain)
@@ -835,6 +846,7 @@ def _add_event_candidate(
         contributions=event_contributions,
         uses=tuple(grouped_uses),
     )
+    return True
 
 
 def _without_root_uses_for_dependencies(
@@ -1755,15 +1767,19 @@ def build_keyed_events(
         key_domain: LogicalDomain,
         contributions: tuple[EventContribution, ...],
         uses: tuple[EventUse, ...],
-    ) -> None:
-        _add_event_candidate(
+        require_counted_lowering: bool = False,
+    ) -> bool:
+        if not _add_event_candidate(
             pending_events,
             key_domain=key_domain,
             contributions=contributions,
             uses=uses,
-        )
+            require_counted_lowering=require_counted_lowering,
+        ):
+            return False
         for use in uses:
             represented_dependency_points.update(use.dependency_points)
+        return True
 
     def add_producer_keyed_events(
         *,
@@ -1930,23 +1946,19 @@ def build_keyed_events(
             )
             dependency_points.update(relation_points)
         else:
-            if all(
-                _counted_contribution_is_lowerable(contribution)
-                for contribution in contributions
-            ):
-                record_event_candidate(
-                    key_domain=key_domain,
-                    contributions=tuple(contributions),
-                    uses=(
-                        EventUse(
-                            consumer_root=consumer_root,
-                            consumer_scope_id=consumer_scope_id,
-                            keys=use_relation,
-                            dependency_points=frozenset(dependency_points),
-                        ),
+            if not record_event_candidate(
+                key_domain=key_domain,
+                contributions=tuple(contributions),
+                uses=(
+                    EventUse(
+                        consumer_root=consumer_root,
+                        consumer_scope_id=consumer_scope_id,
+                        keys=use_relation,
+                        dependency_points=frozenset(dependency_points),
                     ),
-                )
-            else:
+                ),
+                require_counted_lowering=True,
+            ):
                 add_producer_keyed_events(
                     consumer_root=consumer_root,
                     consumer_scope_id=consumer_scope_id,

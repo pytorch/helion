@@ -5004,6 +5004,12 @@ area for less explicit ownership.
   operations instead of maintaining separate scheduler-local rewrites. Source
   renaming substitutes symbols simultaneously; target renaming changes only
   codomain labels, and both reject positionally incompatible shapes.
+- [x] Perform counted-lowering admission after assigning canonical event-local
+  coordinates and identity. The accepted `EventContribution` objects now own
+  the proof reused by trigger selection and lowering instead of proving the
+  pre-canonical relation and then repeating the work on a rebuilt event. In a
+  profiled Qwen lowering this reduced readiness analyses from 43 to 25 and
+  cross-loop emission from 4.91 s to 4.31 s without adding a scheduler cache.
 - [ ] Replace the remaining symbolic and hand-written L2 forward/inverse
   formulas only after introducing a compact bidirectional traversal relation.
   A one-piece forward relation is renderable, but its `Min`/`Mod` inverse is
