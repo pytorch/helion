@@ -147,6 +147,7 @@ from .tcgen05_lifecycle import Tcgen05LifecycleContext
 from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
 if TYPE_CHECKING:
+    from ...autotuner.config_spec import ConfigSpec
     from ...autotuner.config_spec import MatmulFact
     from ...language.matmul_ops import CuteTcgen05SearchPlan
     from ...runtime.config import Config
@@ -2576,6 +2577,66 @@ def _tcgen05_fragment_epilogue_plan_output_supported(
     output_fake = output_node.meta.get("val") if isinstance(output_node, Node) else None
     return isinstance(output_fake, torch.Tensor) and (
         _tcgen05_tma_matrix_major(output_fake) == "row"
+    )
+
+
+def tcgen05_fragment_epilogue_source_tiles_reachable(
+    candidate: _CuteMmaNode,
+    plan: CuteTcgen05SearchPlan,
+    config_spec: ConfigSpec,
+) -> bool:
+    """Whether the search can reach a fragment source-tile layout.
+
+    Output layout and graph ownership are validated when a concrete fragment
+    plan is committed. This preflight only prevents a fragment-only graph from
+    enabling a search whose block-size fragments cannot produce any supported
+    source tile.
+    """
+    if not candidate.requires_fragment_epilogue:
+        return True
+
+    def reachable_values(block_id: int, low: int, high: int) -> tuple[int, ...]:
+        if block_id not in config_spec.block_sizes.valid_block_ids():
+            from ..compile_environment import CompileEnvironment
+            from ..compile_environment import FixedBlockSizeSource
+
+            source = (
+                CompileEnvironment.current().block_sizes[block_id].block_size_source
+            )
+            if isinstance(source, FixedBlockSizeSource) and isinstance(
+                source.value, int
+            ):
+                return (source.value,) if low <= source.value <= high else ()
+            return ()
+        fragment = config_spec.block_sizes.block_id_lookup(block_id)._fragment(
+            config_spec
+        )
+        values = fragment.search_values()
+        assert values is not None
+        return tuple(
+            value for value in values if isinstance(value, int) and low <= value <= high
+        )
+
+    analysis = candidate.operands
+    if not _tcgen05_fragment_epilogue_operands_supported(analysis):
+        return False
+    block_values = (
+        reachable_values(analysis.m_block_id, plan.min_search_m, plan.max_search_m),
+        reachable_values(analysis.n_block_id, plan.min_search_n, plan.max_search_n),
+        reachable_values(analysis.k_block_id, plan.mma_k, plan.max_search_k),
+    )
+    return any(
+        _tcgen05_fragment_source_layout_supported(
+            bm=bm,
+            bn=bn,
+            input_dtype=analysis.lhs.source_fake.dtype,
+        )
+        and plan.static_m % bm == 0
+        and plan.static_n % bn == 0
+        and plan.static_k % bk == 0
+        for bm in block_values[0]
+        for bn in block_values[1]
+        for bk in block_values[2]
     )
 
 

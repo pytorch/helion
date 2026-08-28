@@ -216,6 +216,23 @@ class LLMGuidedSearch(PopulationBasedSearch):
         self._benchmark_times: list[float] = []
         self._llm_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
+    def _algorithm_cache_policy(self) -> dict[str, object]:
+        return {
+            "llm_version": 1,
+            "provider": self.provider or _infer_provider(self.model),
+            "model": self.model,
+            "configs_per_round": self.configs_per_round,
+            "max_rounds": self.max_rounds,
+            "initial_random_configs": self.initial_random_configs,
+            "finishing_rounds": self.finishing_rounds,
+            "min_improvement_delta": self.min_improvement_delta,
+            "api_base": self.api_base,
+            "request_timeout_s": self.request_timeout_s,
+            "compile_timeout_s": self.compile_timeout_s,
+            "effort_level": self.effort_level,
+            "fast_mode": self.fast_mode,
+        }
+
     @classmethod
     def get_kwargs_from_profile(
         cls, profile: AutotuneEffortProfile, settings: Settings
@@ -428,6 +445,14 @@ class LLMGuidedSearch(PopulationBasedSearch):
         bench_t0 = time.perf_counter()
         results = self.benchmark_batch(configs, desc=desc)
         self._benchmark_times.append(time.perf_counter() - bench_t0)
+        repairs = self.benchmark_provider.take_effective_source_repairs()
+        if repairs:
+            self._apply_effective_source_repairs(repairs, self.population)
+            for config, repair in repairs.items():
+                self._latest_results_by_config_key[self._config_key(config)] = repair
+            self._all_benchmark_results = list(
+                self._latest_results_by_config_key.values()
+            )
         self._ingest_results(results)
 
     def _ingest_results(self, results: list[BenchmarkResult]) -> None:

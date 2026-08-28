@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import importlib
 
 import pytest
 
@@ -8,11 +9,22 @@ from helion._compiler.cute.flash_schedule import FlashEdge
 from helion._compiler.cute.flash_schedule import FlashOutputOrder
 from helion._compiler.cute.flash_schedule import FlashSchedule
 from helion._compiler.cute.flash_schedule import FlashScheduleError
+from helion._compiler.cute.flash_schedule import FlashScheduleLimits
 from helion._compiler.cute.flash_schedule import FlashScheduleSpec
 from helion._compiler.cute.flash_schedule import FlashStatReleaseMapping
 from helion._compiler.cute.flash_schedule import FlashSyncScope
 from helion._compiler.cute.flash_schedule import build_fa4_schedule
+from helion._compiler.cute.flash_schedule import max_fa4_kv_depth
 from helion._compiler.cute.flash_schedule import verify_flash_schedule
+
+pytest.importorskip("cutlass")
+pytest.importorskip("cutlass.cute")
+
+# ``_flash_runtime`` imports cutlass at module scope, so it must be loaded after
+# the skip gate above rather than with the normal top-of-file imports.
+flash_fa4_shared_storage = importlib.import_module(
+    "helion._compiler.cute._flash_runtime"
+).flash_fa4_shared_storage
 
 
 def _replace_edge(
@@ -82,6 +94,67 @@ def test_canonical_fa4_resources(
     assert verified.schedule is schedule
     assert schedule.shared_memory_bytes == shared_memory_bytes
     assert schedule.tmem_columns == tmem_columns
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "stage_output", "expected_cap"),
+    (
+        pytest.param(64, True, 10, id="d64-staged-output"),
+        pytest.param(64, False, 12, id="d64-direct-output"),
+        pytest.param(128, True, 3, id="d128-staged-output"),
+        pytest.param(128, False, 5, id="d128-direct-output"),
+    ),
+)
+def test_aliased_kv_depth_capacity(
+    head_dim: int,
+    stage_output: bool,
+    expected_cap: int,
+) -> None:
+    spec = FlashScheduleSpec(head_dim, 2, stage_output=stage_output)
+
+    assert max_fa4_kv_depth(spec) == expected_cap
+    verify_flash_schedule(
+        build_fa4_schedule(dataclasses.replace(spec, kv_depth=expected_cap))
+    )
+    with pytest.raises(FlashScheduleError, match="shared-memory capacity"):
+        verify_flash_schedule(
+            build_fa4_schedule(dataclasses.replace(spec, kv_depth=expected_cap + 1))
+        )
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "epi_tma", "expected_cap"),
+    (
+        pytest.param(64, False, 12, id="d64-direct-output"),
+        pytest.param(64, True, 10, id="d64-staged-output"),
+        pytest.param(128, False, 5, id="d128-direct-output"),
+        pytest.param(128, True, 3, id="d128-staged-output"),
+    ),
+)
+def test_runtime_aliased_storage_matches_capacity_boundary(
+    head_dim: int,
+    epi_tma: bool,
+    expected_cap: int,
+) -> None:
+    limit = FlashScheduleLimits().shared_memory_bytes
+    stage_bytes = 128 * head_dim * 2
+
+    assert (
+        flash_fa4_shared_storage(
+            head_dim,
+            expected_cap,
+            epi_tma=epi_tma,
+        ).size_in_bytes()
+        == limit
+    )
+    assert (
+        flash_fa4_shared_storage(
+            head_dim,
+            expected_cap + 1,
+            epi_tma=epi_tma,
+        ).size_in_bytes()
+        == limit + stage_bytes
+    )
 
 
 @pytest.mark.parametrize(

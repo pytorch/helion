@@ -211,14 +211,18 @@ class ShapeKey:
     kernel_name: str
     specialization_key: tuple[Any, ...]
     hardware_id: str
+    search_policy_hash: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to a JSON-serializable dict."""
-        return {
+        result = {
             "kernel_name": self.kernel_name,
             "specialization_key": _serialize_tuple(self.specialization_key),
             "hardware_id": self.hardware_id,
         }
+        if self.search_policy_hash:
+            result["search_policy_hash"] = self.search_policy_hash
+        return result
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ShapeKey:
@@ -227,6 +231,7 @@ class ShapeKey:
             kernel_name=data["kernel_name"],
             specialization_key=_deserialize_tuple(data["specialization_key"]),
             hardware_id=data["hardware_id"],
+            search_policy_hash=data.get("search_policy_hash", ""),
         )
 
     def stable_hash(self) -> str:
@@ -364,6 +369,20 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
     def _should_report_cache_hit(self) -> bool:
         return self.mode not in ("evaluate", "compile") or self._verbose
+
+    def _search_policy_allows_cache_io(self) -> bool:
+        # Evaluate/compile/disabled select an AOT heuristic or default config;
+        # they are not search-result cache reads and must never start tuning.
+        if self.mode in ("disabled", "evaluate", "compile"):
+            return True
+        return super()._search_policy_allows_cache_io()
+
+    def _search_policy_allows_cache_write(self) -> bool:
+        # Collect must record a newly tuned config even when its custom search
+        # policy is intentionally ineligible for later cache reuse.
+        if self.mode == "collect":
+            return True
+        return super()._search_policy_allows_cache_write()
 
     @property
     def _configs_file(self) -> Path:
@@ -506,10 +525,19 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
     def _create_shape_key(self) -> ShapeKey:
         """Create a shape key for the current kernel invocation."""
+        from .local_cache import _cute_flash_search_policy_hash
+
+        search_policy_hash = _cute_flash_search_policy_hash(
+            self.autotuner,
+            cute_flash_search_enabled=bool(
+                getattr(self.kernel.config_spec, "cute_flash_search_enabled", False)
+            ),
+        )
         return ShapeKey(
             kernel_name=self.kernel.kernel.name,
             specialization_key=self.kernel.kernel.specialization_key(self.args),
             hardware_id=self.hardware_id,
+            search_policy_hash=search_policy_hash,
         )
 
     def _extract_shape_features(

@@ -23,6 +23,7 @@ from helion._testing import TestCase
 from helion._testing import _bound_test_config
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfPallas
 from helion._testing import skipIfPallasInterpret
 from helion._testing import skipUnlessPallas
 from helion._testing import xfailIfPallas
@@ -2432,6 +2433,7 @@ class TestPallas(TestCase):
                 block_size=16,
             )
 
+    @skipIfPallas("indirect access is unsupported by both one-hot and DMA lowering")
     def test_scatter_store_multiple_tensor_indices_raises(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def scatter_store_multiple_tensor_indices(

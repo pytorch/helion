@@ -143,6 +143,8 @@ class LooseAutotuneCacheKey(BoundKernelInMemoryCacheKey):
         winning config across trials is the one cached. Default ``1`` (the
         historical single-trial path) is hidden from ``repr`` so K=1 cache
         hashes stay byte-identical to entries written before this field existed.
+    search_policy_hash: Hash of the effective CuTe-flash search policy. Empty
+        for every other search so their historical cache hashes stay unchanged.
     """
 
     kernel_source_hash: str
@@ -155,6 +157,7 @@ class LooseAutotuneCacheKey(BoundKernelInMemoryCacheKey):
     # ``__repr__`` below adds it only when it deviates from the default so the
     # K=1 hash matches historical bytes exactly.
     best_of_k: int = dataclasses.field(default=1, repr=False)
+    search_policy_hash: str = dataclasses.field(default="", repr=False)
 
     def __repr__(self) -> str:
         # Reproduce the dataclass-generated repr for all auto-repr fields, then
@@ -164,17 +167,23 @@ class LooseAutotuneCacheKey(BoundKernelInMemoryCacheKey):
         body = ", ".join(f"{f.name}={getattr(self, f.name)!r}" for f in auto_fields)
         if self.best_of_k != 1:
             body = f"{body}, best_of_k={self.best_of_k!r}"
+        if self.search_policy_hash:
+            body = f"{body}, search_policy_hash={self.search_policy_hash!r}"
         return f"{type(self).__name__}({body})"
 
     def stable_hash(self) -> str:
         return hashlib.sha256(repr(self).encode("utf-8")).hexdigest()
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, repr=False)
 class StrictAutotuneCacheKey(LooseAutotuneCacheKey):
     """
     Autotune Cache key to use for utmost strictness in terms of re-autotuning
     when library source code changes.
+
+    ``repr=False`` deliberately inherits the conditional loose-key repr. This
+    keeps the historical K=1 bytes while ensuring strict keys no longer ignore
+    non-default ``best_of_k`` or CuTe-flash search policies.
 
     This key includes (in addition to StrictAutotuneCacheKey):
 
@@ -258,6 +267,14 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         """Whether cache hits should be printed to stderr/autotune logs."""
         return True
 
+    def _search_policy_allows_cache_io(self) -> bool:
+        """Whether this wrapper may reuse a cached search result."""
+        return getattr(self.autotuner, "_search_policy_cacheable", True)
+
+    def _search_policy_allows_cache_write(self) -> bool:
+        """Whether this wrapper may persist the newly tuned result."""
+        return self._search_policy_allows_cache_io()
+
     @abc.abstractmethod
     def _get_cache_key(self) -> CacheKeyBase:
         """Return the cache key for this cache instance."""
@@ -275,7 +292,8 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         still writes back.  HELION_SKIP_CACHE skips both reading and writing.
         """
         skip_cache_env = should_skip_cache()
-        skip_read = skip_cache or skip_cache_env
+        search_policy_cacheable = self._search_policy_allows_cache_io()
+        skip_read = skip_cache or skip_cache_env or not search_policy_cacheable
 
         if not skip_read:
             if (config := self.get()) is not None:
@@ -336,7 +354,7 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
 
         self.autotuner.log("Starting autotuning process, this may take a while...")
 
-        config = self._run_autotune_trials()
+        config = self._run_autotune_trials(skip_cache=skip_read)
         if isinstance(self.args, _MultiShapeAutotuneArgs):
             if self.args.search_started and not self.args.found_valid_config:
                 raise exc.NoConfigFound
@@ -351,7 +369,7 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
             if summary is not None:
                 self._log_selected_multi_shape(summary)
 
-        if not skip_cache_env:
+        if not skip_cache_env and self._search_policy_allows_cache_write():
             self.put(config)
             counters["autotune"]["cache_put"] += 1
             log.debug("cache put: %s", str(config))
@@ -376,7 +394,14 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
-    def _run_one_trial(self, i: int, k: int, trial_seed: int) -> tuple[Config, float]:
+    def _run_one_trial(
+        self,
+        i: int,
+        k: int,
+        trial_seed: int,
+        *,
+        skip_cache: bool,
+    ) -> tuple[Config, float]:
         """Construct a fresh trial autotuner, run it, return its results.
 
         The trial autotuner is scoped to this helper's local frame so it
@@ -392,7 +417,7 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         # Swap so logging/error-reporting reflects the active trial.
         self.autotuner = trial_autotuner
         self.autotuner.log(f"Best-of-K trial {i + 1}/{k} starting (seed={trial_seed})")
-        trial_config = trial_autotuner.autotune()
+        trial_config = trial_autotuner.autotune(skip_cache=skip_cache)
         trial_low_water_perf = trial_autotuner.best_perf_so_far
         self.autotuner.log(
             f"Best-of-K trial {i + 1}/{k} complete: "
@@ -401,12 +426,13 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         )
         return trial_config, trial_low_water_perf
 
-    def _run_autotune_trials(self) -> Config:
+    def _run_autotune_trials(self, *, skip_cache: bool = False) -> Config:
         """Run the configured number of autotune trials and return the best config.
 
         When ``settings.autotune_best_of_k == 1`` (the default) this falls
-        through to a single ``self.autotuner.autotune()`` call, leaving
-        behavior byte-identical to the historical single-trial path.
+        through to a single ``self.autotuner.autotune()`` call. ``skip_cache``
+        carries the outer cache's effective read-bypass policy into every
+        search trial.
 
         When ``settings.autotune_best_of_k > 1`` this runs K independent
         autotune trials with deterministic per-trial seeds
@@ -436,7 +462,7 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         settings = self.autotuner.settings
         k = settings.autotune_best_of_k
         if k <= 1:
-            return self.autotuner.autotune()
+            return self.autotuner.autotune(skip_cache=skip_cache)
         if self._autotuner_factory is None:
             raise RuntimeError(
                 "autotune_best_of_k > 1 requires a registered _autotuner_factory; "
@@ -460,6 +486,14 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
 
         trial_results: list[tuple[int, Config, float]] = []
         is_multi_shape = isinstance(self.args, _MultiShapeAutotuneArgs)
+        cute_flash_search = bool(
+            getattr(
+                getattr(original_autotuner, "config_spec", None),
+                "cute_flash_search_enabled",
+                False,
+            )
+        )
+        tolerate_transient_trial_failure = is_multi_shape or cute_flash_search
         try:
             for i in range(k):
                 trial_seed = base_seed + i
@@ -468,16 +502,21 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
                     settings.autotune_compile_timeout = base_compile_timeout
                     try:
                         trial_config, trial_low_water_perf = self._run_one_trial(
-                            i, k, trial_seed
+                            i,
+                            k,
+                            trial_seed,
+                            skip_cache=skip_cache,
                         )
                     except exc.NoConfigFound:
-                        if not is_multi_shape:
+                        if not tolerate_transient_trial_failure:
                             raise
                         self.autotuner.log(
                             f"Best-of-K trial {i + 1}/{k} found no valid config"
                         )
                         continue
-                    if is_multi_shape and not math.isfinite(trial_low_water_perf):
+                    if tolerate_transient_trial_failure and not math.isfinite(
+                        trial_low_water_perf
+                    ):
                         self.autotuner.log(
                             f"Best-of-K trial {i + 1}/{k} returned no finite timing"
                         )
@@ -509,7 +548,22 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         rebench_perfs = self._rebench_trial_configs(
             [config for (_, config, _) in trial_results]
         )
-        if is_multi_shape and not any(math.isfinite(perf) for perf in rebench_perfs):
+        if cute_flash_search and any(not math.isfinite(perf) for perf in rebench_perfs):
+            failed_count = sum(not math.isfinite(perf) for perf in rebench_perfs)
+            self.autotuner.log(
+                f"{failed_count} CuTe-flash best-of-K finalist(s) failed the final "
+                "rebenchmark; retrying once in a fresh round"
+            )
+            retry_perfs = self._rebench_trial_configs(
+                [config for (_, config, _) in trial_results]
+            )
+            rebench_perfs = [
+                retry if math.isfinite(retry) else original
+                for original, retry in zip(rebench_perfs, retry_perfs, strict=True)
+            ]
+        if (is_multi_shape or cute_flash_search) and not any(
+            math.isfinite(perf) for perf in rebench_perfs
+        ):
             raise exc.NoConfigFound
 
         best_idx = min(

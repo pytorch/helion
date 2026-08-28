@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 from .. import exc
 from .base_search import BaseSearch
+from .benchmark_provider import LocalBenchmarkProvider
 from .benchmark_provider import _MultiShapeAutotuneArgs
 
 if TYPE_CHECKING:
@@ -48,6 +49,15 @@ class FiniteSearch(BaseSearch):
         self.configs: list[Config] = raw
         if len(self.configs) < 2:
             raise exc.NotEnoughConfigs(len(self.configs))
+
+    def _algorithm_cache_policy(self) -> dict[str, object] | None:
+        if self._benchmark_provider_cls is not LocalBenchmarkProvider:
+            return None
+        return {
+            "finite_version": 1,
+            "configs": tuple(self.configs),
+            "benchmark_provider": LocalBenchmarkProvider,
+        }
 
     def _generation_invalid_config_count(self) -> int:
         return self.config_gen.invalid_config_count

@@ -3831,6 +3831,8 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 config_spec.enable_cute_flash_search(
                     head_dim=flash_shape.head_dim,
                     num_kv=flash_shape.num_kv,
+                    num_bh=flash_shape.num_bh,
+                    tensor_4d_heads=flash_shape.tensor_4d_heads,
                     dtype=flash_shape.io_dtype,
                     block_size_targets=flash_shape.block_size_targets,
                     is_causal=flash_shape.is_causal,
@@ -3839,11 +3841,16 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     small_biased_candidate=flash_shape.small_biased_candidate,
                     standard_dense_output=flash_shape.standard_dense_output,
                     standard_causal_output=flash_shape.standard_causal_output,
+                    output_requires_tma=flash_shape.output_requires_tma,
+                    supports_tensor_4d_tma=flash_shape.supports_tensor_4d_tma,
                 )
             else:
                 from ..language.matmul_ops import enable_cute_tcgen05_search
                 from ..language.matmul_ops import plan_cute_tcgen05_search
                 from .cute.cute_mma import analyze_cute_mma_node
+                from .cute.cute_mma import (
+                    tcgen05_fragment_epilogue_source_tiles_reachable,
+                )
 
                 # The same structural analyzer gates tcgen05 search and codegen
                 # for every matrix rank. This prevents transformed loads from
@@ -3896,6 +3903,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     if (
                         search_plan is None
                         or not candidate.supports_tcgen05_search_plan(search_plan)
+                    ):
+                        continue
+                    if not tcgen05_fragment_epilogue_source_tiles_reachable(
+                        candidate, search_plan, config_spec
                     ):
                         continue
                     search_candidates.append((candidate, lhs, search_plan))

@@ -10,6 +10,7 @@ from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfPallas
 from helion._testing import skipUnlessPallas
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
@@ -758,6 +759,7 @@ class TestPallasClampedRefs(TestCase):
         _code, out = code_and_output(kernel, (x, y), block_sizes=[32])
         torch.testing.assert_close(out, torch.ones(10, device=DEVICE))
 
+    @skipIfPallas("indirect access is unsupported by both one-hot and DMA lowering")
     def test_masked_load_spanning_tensor(self) -> None:
         # Tile spans past the tensor's extent (concat pattern): the padded
         # load composes with extra_mask / where.

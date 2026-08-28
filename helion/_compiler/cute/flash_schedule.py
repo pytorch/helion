@@ -182,6 +182,18 @@ def _shared_memory_bytes(spec: FlashScheduleSpec) -> int:
     return q_bytes + kv_bytes + output_bytes + 3072
 
 
+def max_fa4_kv_depth(
+    spec: FlashScheduleSpec, limits: FlashScheduleLimits | None = None
+) -> int:
+    """Return the largest K/V depth allowed by the schedule's SMEM layout."""
+    if limits is None:
+        limits = FlashScheduleLimits()
+    base_bytes = _shared_memory_bytes(dataclasses.replace(spec, kv_depth=0))
+    tile_bytes = 128 * spec.head_dim * spec.dtype_bytes
+    bytes_per_stage = (2 if spec.separate_kv else 1) * tile_bytes
+    return max(0, (limits.shared_memory_bytes - base_bytes) // bytes_per_stage)
+
+
 def _output_tile(spec: FlashScheduleSpec, cta_rank: int, query_slot: int) -> int:
     if spec.output_order is FlashOutputOrder.CTA_CONTIGUOUS:
         return cta_rank * spec.query_slots_per_cta + query_slot
