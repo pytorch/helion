@@ -57,6 +57,55 @@ class TestTileDependency(TestCase):
             3,
         )
 
+    def test_relation_axis_renaming_preserves_positional_coordinates(self) -> None:
+        source = LogicalDomain((10, 20), ((10, 2), (20, 3)))
+        target = LogicalDomain((30, 40), ((30, 2), (40, 3)))
+        source_10 = logical_axis_symbol(10)
+        source_20 = logical_axis_symbol(20)
+        relation = LogicalRelation.point_map(
+            source,
+            target,
+            (
+                (
+                    ((10, 0, 2, 1), (20, 0, 3, 1)),
+                    (
+                        sympy.Mod(source_10 + source_20, 2),
+                        sympy.floor((source_10 + 2 * source_20) / 2),
+                    ),
+                ),
+            ),
+        )
+        renamed_source = LogicalDomain(
+            (20, 10),
+            ((20, 2), (10, 3)),
+            ((20, 4), (10, 8)),
+            kind="worker",
+            identity=7,
+        )
+        renamed_target = LogicalDomain(
+            (40, 30),
+            ((40, 2), (30, 3)),
+            kind="event",
+            identity=4,
+        )
+
+        renamed = relation.rename_source_axes(renamed_source)
+        self.assertIsNotNone(renamed)
+        assert renamed is not None
+        renamed = renamed.rename_target_axes(renamed_target)
+        self.assertIsNotNone(renamed)
+        assert renamed is not None
+
+        self.assertEqual(renamed.source_domain, renamed_source)
+        self.assertEqual(renamed.target_domain, renamed_target)
+        self.assertEqual(renamed.materialize(), relation.materialize())
+        self.assertIsNone(
+            relation.rename_source_axes(LogicalDomain((0, 1), ((0, 2), (1, 4))))
+        )
+        self.assertIsNone(
+            relation.rename_target_axes(LogicalDomain((0, 1), ((0, 2), (1, 4))))
+        )
+
     def test_configured_roots_reuse_their_execution_scope_domains(self) -> None:
         graph = build_tile_dependency_graph(
             (

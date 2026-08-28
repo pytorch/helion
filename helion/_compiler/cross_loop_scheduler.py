@@ -743,6 +743,8 @@ def _counted_contribution_is_lowerable(contribution: EventContribution) -> bool:
 
 def _canonical_event_domain(domain: LogicalDomain) -> LogicalDomain:
     """Name quotient coordinates locally rather than borrowing scope axes."""
+    if domain.kind != "event" or domain.identity is not None:
+        raise AssertionError("event quotient domain must be unidentified")
     return LogicalDomain(
         axis_order=tuple(range(len(domain.axis_order))),
         axis_counts_items=tuple(
@@ -750,79 +752,6 @@ def _canonical_event_domain(domain: LogicalDomain) -> LogicalDomain:
             for event_axis, (_scope_axis, count) in enumerate(domain.axis_counts_items)
         ),
         kind="event",
-    )
-
-
-def _canonical_event_use_relation(
-    relation: LogicalRelation,
-    key_domain: LogicalDomain,
-) -> LogicalRelation:
-    """Express one event use in its event-local coordinate chart."""
-    old_domain = relation.target_domain
-    if (
-        old_domain.kind != "event"
-        or old_domain.identity is not None
-        or tuple(old_domain.axis_counts.values())
-        != tuple(key_domain.axis_counts.values())
-    ):
-        raise AssertionError("event relation does not match its quotient geometry")
-    renamed_axes = dict(zip(old_domain.axis_order, key_domain.axis_order, strict=True))
-    return LogicalRelation(
-        source_domain=relation.source_domain,
-        target_domain=key_domain,
-        pieces=tuple(
-            dataclasses.replace(
-                piece,
-                target_ranges=tuple(
-                    (renamed_axes[axis], begin, end, step)
-                    for axis, begin, end, step in piece.target_ranges
-                ),
-            )
-            for piece in relation.pieces
-        ),
-    )
-
-
-def _canonical_event_predecessors(
-    relation: LogicalRelation,
-    key_domain: LogicalDomain,
-) -> LogicalRelation:
-    """Express key-to-producer fibers in event-local coordinates."""
-    old_domain = relation.source_domain
-    if (
-        old_domain.kind != "event"
-        or old_domain.identity is not None
-        or tuple(old_domain.axis_counts.values())
-        != tuple(key_domain.axis_counts.values())
-    ):
-        raise AssertionError("event relation does not match its quotient geometry")
-    renamed_axes = dict(zip(old_domain.axis_order, key_domain.axis_order, strict=True))
-    substitutions = {
-        logical_axis_symbol(axis): logical_axis_symbol(renamed_axes[axis])
-        for axis in old_domain.axis_order
-    }
-    return LogicalRelation(
-        source_domain=key_domain,
-        target_domain=relation.target_domain,
-        pieces=tuple(
-            dataclasses.replace(
-                piece,
-                source_bounds_items=tuple(
-                    (renamed_axes[axis], begin, end, step)
-                    for axis, begin, end, step in piece.source_bounds_items
-                ),
-                target_ranges=tuple(
-                    (
-                        axis,
-                        begin.xreplace(substitutions),
-                        end.xreplace(substitutions),
-                        step,
-                    )
-                    for axis, begin, end, step in piece.target_ranges
-                ),
-            )
-            for piece in relation.pieces
-        ),
     )
 
 
@@ -837,32 +766,34 @@ def _add_event_candidate(
     uses: tuple[EventUse, ...],
 ) -> None:
     """Group fanout by producer partition in final event-local coordinates."""
+    if _event_key_domain(contributions, uses) != key_domain:
+        raise AssertionError("event relations do not share their quotient domain")
     canonical_domain = _canonical_event_domain(key_domain)
-    canonical_contributions = tuple(
-        dataclasses.replace(
-            contribution,
-            predecessors=_canonical_event_predecessors(
-                contribution.predecessors,
-                canonical_domain,
-            ),
+    canonical_contributions: list[EventContribution] = []
+    for contribution in contributions:
+        predecessors = contribution.predecessors.rename_source_axes(canonical_domain)
+        if predecessors is None:
+            raise AssertionError("event relation does not match its quotient geometry")
+        canonical_contributions.append(
+            dataclasses.replace(contribution, predecessors=predecessors)
         )
-        for contribution in contributions
-    )
-    canonical_uses = tuple(
-        dataclasses.replace(
-            use,
-            keys=_canonical_event_use_relation(use.keys, canonical_domain),
-        )
-        for use in uses
-    )
-    signature = canonical_domain, canonical_contributions
+    canonical_uses: list[EventUse] = []
+    for use in uses:
+        keys = use.keys.rename_target_axes(canonical_domain)
+        if keys is None:
+            raise AssertionError("event relation does not match its quotient geometry")
+        canonical_uses.append(dataclasses.replace(use, keys=keys))
+    canonical_contributions_tuple = tuple(canonical_contributions)
+    signature = canonical_domain, canonical_contributions_tuple
     previous_event = pending.get(signature)
     if previous_event is None:
         event_id = len(pending)
         identified_domain = dataclasses.replace(canonical_domain, identity=event_id)
         identified_contributions: list[EventContribution] = []
-        for contribution in canonical_contributions:
-            predecessors = contribution.predecessors.retype_source(identified_domain)
+        for contribution in canonical_contributions_tuple:
+            predecessors = contribution.predecessors.rename_source_axes(
+                identified_domain
+            )
             if predecessors is None:
                 raise AssertionError("event identity assignment changed key geometry")
             identified_contributions.append(
@@ -878,7 +809,7 @@ def _add_event_candidate(
 
     grouped_uses = list(previous_uses)
     for canonical_use in canonical_uses:
-        keys = canonical_use.keys.retarget(identified_domain)
+        keys = canonical_use.keys.rename_target_axes(identified_domain)
         if keys is None:
             raise AssertionError("event identity assignment changed key geometry")
         use = dataclasses.replace(canonical_use, keys=keys)
@@ -1593,12 +1524,9 @@ def choose_counted_events(
     }
     selected: list[CountedEventPlan] = []
     for event in event_graph.events:
-        if (
-            event.family_done_root is not None
-            or any(
-                not _counted_contribution_is_lowerable(contribution)
-                for contribution in event.contributions
-            )
+        if event.family_done_root is not None or any(
+            not _counted_contribution_is_lowerable(contribution)
+            for contribution in event.contributions
         ):
             continue
         retained_uses: list[EventUse] = []
@@ -1857,7 +1785,7 @@ def build_keyed_events(
                 kind="event",
                 identity=None,
             )
-            use_relation = relation.retarget(key_domain)
+            use_relation = relation.rename_target_axes(key_domain)
             if use_relation is None:
                 raise AssertionError("producer-key event geometry must match")
             record_event_candidate(

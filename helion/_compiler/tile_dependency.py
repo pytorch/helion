@@ -114,8 +114,12 @@ class LogicalDomain:
         return dict(self.block_sizes_items)
 
     @property
+    def shape(self) -> tuple[int, ...]:
+        return tuple(count for _axis, count in self.axis_counts_items)
+
+    @property
     def size(self) -> int:
-        return math.prod(count for _axis, count in self.axis_counts_items)
+        return math.prod(self.shape)
 
     def _validate_traversal(self, traversal: tuple[int, ...]) -> None:
         if len(traversal) != len(self.axis_order) or set(traversal) != set(
@@ -366,30 +370,65 @@ class LogicalRelation:
             ),
         )
 
-    def retarget(self, target_domain: LogicalDomain) -> LogicalRelation | None:
-        """Retype the codomain without changing its coordinate geometry."""
-        if (
-            self.target_domain.axis_order != target_domain.axis_order
-            or self.target_domain.axis_counts_items != target_domain.axis_counts_items
-        ):
+    def rename_target_axes(
+        self, target_domain: LogicalDomain
+    ) -> LogicalRelation | None:
+        """Rename target axes positionally without changing coordinates."""
+        old_axes = self.target_domain.axis_order
+        new_axes = target_domain.axis_order
+        if self.target_domain.shape != target_domain.shape:
             return None
+        renamed_axes = dict(zip(old_axes, new_axes, strict=True))
         return LogicalRelation(
             source_domain=self.source_domain,
             target_domain=target_domain,
-            pieces=self.pieces,
+            pieces=tuple(
+                dataclasses.replace(
+                    piece,
+                    target_ranges=tuple(
+                        (renamed_axes[axis], begin, end, step)
+                        for axis, begin, end, step in piece.target_ranges
+                    ),
+                )
+                for piece in self.pieces
+            ),
         )
 
-    def retype_source(self, source_domain: LogicalDomain) -> LogicalRelation | None:
-        """Retype the source without changing its coordinate geometry."""
-        if (
-            self.source_domain.axis_order != source_domain.axis_order
-            or self.source_domain.axis_counts_items != source_domain.axis_counts_items
-        ):
+    def rename_source_axes(
+        self, source_domain: LogicalDomain
+    ) -> LogicalRelation | None:
+        """Rename source axes positionally without changing coordinates."""
+        old_axes = self.source_domain.axis_order
+        new_axes = source_domain.axis_order
+        if self.source_domain.shape != source_domain.shape:
             return None
+        renamed_axes = dict(zip(old_axes, new_axes, strict=True))
+        substitutions = {
+            logical_axis_symbol(axis): logical_axis_symbol(renamed_axes[axis])
+            for axis in old_axes
+        }
         return LogicalRelation(
             source_domain=source_domain,
             target_domain=self.target_domain,
-            pieces=self.pieces,
+            pieces=tuple(
+                dataclasses.replace(
+                    piece,
+                    source_bounds_items=tuple(
+                        (renamed_axes[axis], begin, end, step)
+                        for axis, begin, end, step in piece.source_bounds_items
+                    ),
+                    target_ranges=tuple(
+                        (
+                            axis,
+                            begin.xreplace(substitutions),
+                            end.xreplace(substitutions),
+                            step,
+                        )
+                        for axis, begin, end, step in piece.target_ranges
+                    ),
+                )
+                for piece in self.pieces
+            ),
         )
 
     def project_target(
@@ -1226,8 +1265,7 @@ class LogicalRelation:
         """Return whether coordinates are renamed position-for-position."""
         if (
             len(self.source_domain.axis_order) != len(self.target_domain.axis_order)
-            or tuple(self.source_domain.axis_counts.values())
-            != tuple(self.target_domain.axis_counts.values())
+            or self.source_domain.shape != self.target_domain.shape
             or len(self.pieces) != 1
         ):
             return False

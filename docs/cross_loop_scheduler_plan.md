@@ -4958,14 +4958,14 @@ Validation results:
   `--probe-config`.
 
 Current post-cleanup cold-L2 checks retain the intended schedules: the granular
-Qwen3 layer is 93.40 us versus 104.68 us separate, Gemma4 A4B is 47.51 us
-versus 53.27 us separate, and GPT-OSS at the separately validated multiplier
-12 point is 35.46 us versus 37.54 us separate. The GPT-OSS lowering matches
+Qwen3 layer is 93.38 us versus 104.48 us separate, Gemma4 A4B is 47.58 us
+versus 53.60 us separate, and GPT-OSS at the separately validated multiplier
+12 point is 35.06 us versus 36.93 us separate. The GPT-OSS lowering matches
 the prior 1,776-worker static schedule after normalizing the now-symbolic
 `_NUM_SM * 12` launch expression.
 
 Relative to the preceding cleanup commit `7867e5a1`, this round currently
-removes 483 net production lines across `tile_dependency.py`,
+removes 517 net production lines across `tile_dependency.py`,
 `cross_loop_scheduler.py`, and `cross_loop_codegen.py`. The larger suggested
 event/placement merger is intentionally left as a follow-up: the remaining
 semantic-event and selected-lowering objects represent genuinely different
@@ -4999,6 +4999,11 @@ area for less explicit ownership.
   counts and case offsets from the instantiated root domains, and consume
   uniform fan-in directly from each plan instead of maintaining a second
   codegen dictionary.
+- [x] Move positional coordinate renaming into `LogicalRelation`. Event
+  canonicalization now uses the same general source/target axis-isomorphism
+  operations instead of maintaining separate scheduler-local rewrites. Source
+  renaming substitutes symbols simultaneously; target renaming changes only
+  codomain labels, and both reject positionally incompatible shapes.
 - [ ] Replace the remaining symbolic and hand-written L2 forward/inverse
   formulas only after introducing a compact bidirectional traversal relation.
   A one-piece forward relation is renderable, but its `Min`/`Mod` inverse is
