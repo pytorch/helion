@@ -109,6 +109,8 @@ def default_launcher(
         message = str(error)
         if "Cannot make_shape_compatible: incompatible dimensions" in message:
             raise exc.ShapeMismatch("kernel operands", message) from error
+        if message.startswith("Cross-loop scheduling requires "):
+            raise exc.InvalidConfig(message) from error
         raise
 
 

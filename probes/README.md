@@ -7,6 +7,7 @@ root with exactly one idle GPU visible:
 ```bash
 export PYTHONPATH="$PWD"
 export CUDA_VISIBLE_DEVICES=0
+export MEGAKERNEL_CLEAR_L2=1
 ```
 
 Set `MEGAKERNEL_IDLE_MEMORY_LIMIT_MB` if the driver's idle allocation exceeds
@@ -31,7 +32,7 @@ Gemma 4 E4B layer:
 
 ```bash
 python -m probes.gemma4.helion_gemma4_e4b_megakernel \
-  --layer 0 --config-mode fused --cross-loop-workers 576 \
+  --layer 0 --config-mode fused --worker-multiplier 4 \
   --benchmark --repeats 30 --batch-replays 20
 ```
 
@@ -41,8 +42,9 @@ Gemma 4 26B-A4B MoE sub-layer, preserving the separate GeGLU boundary:
 python -m probes.gemma4.helion_gemma4_a4b_moe_megakernel \
   --batch 1 --route-skew 2 \
   --source-mode assignment_hierarchical_topk_unfused_geglu \
-  --config-mode matched --workers 444 --worker-multiplier 4 \
+  --config-mode matched --worker-multiplier 4 \
   --num-warps 4 --maxnreg 128 --reduce-block 256 \
+  --static-dispatch --cold-l2 \
   --benchmark --repeats 30 --batch-replays 50
 ```
 

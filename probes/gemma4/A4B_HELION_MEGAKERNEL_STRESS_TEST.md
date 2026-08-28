@@ -35,7 +35,6 @@ reduce_block=256
 num_warps=4
 maxnreg=128
 num_sm_multiplier=4
-cross_loop_num_workers=0
 ```
 
 Run it with:
@@ -46,7 +45,7 @@ CUDA_VISIBLE_DEVICES=0 \
 python -m probes.gemma4.helion_gemma4_a4b_moe_megakernel \
   --batch 1 --route-skew 2 \
   --source-mode assignment_hierarchical_topk --config-mode matched \
-  --workers 0 --worker-multiplier 4 --num-warps 4 --maxnreg 128 \
+  --worker-multiplier 4 --num-warps 4 --maxnreg 128 \
   --reduce-block 256 --benchmark --repeats 50 --batch-replays 100
 ```
 
@@ -88,8 +87,12 @@ down_stages=3
 num_warps=4
 maxnreg=256                 # compiles to 238 registers, no spills
 num_sm_multiplier=4
-cross_loop_num_workers=288 # normalized to the legal 286-worker candidate
 ```
+
+The original measurement used an exact 288-worker migration knob. That knob
+has been removed; the current static scheduler uses the complete
+`num_sm_multiplier=4` grid. Rebenchmark this exploratory batch-8 point before
+using the historical number as an acceptance result.
 
 Run it with:
 
@@ -99,7 +102,7 @@ CUDA_VISIBLE_DEVICES=0 \
 python -m probes.gemma4.helion_gemma4_a4b_moe_megakernel \
   --batch 8 --route-skew 2 \
   --source-mode grouped_task_major --config-mode matched \
-  --workers 288 --worker-multiplier 4 --num-warps 4 --maxnreg 256 \
+  --worker-multiplier 4 --num-warps 4 --maxnreg 256 \
   --group-down-block 256 --gate-stages 3 --down-stages 3 \
   --benchmark --repeats 30 --batch-replays 100
 ```

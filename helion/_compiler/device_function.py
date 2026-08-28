@@ -374,9 +374,9 @@ class DeviceFunction:
         # once per kernel/device/stream and appends it to the kernel arguments.
         self.triton_persistent_state_args: list[str] = []
         self.triton_persistent_state_specs: list[tuple[str, str, str]] = []
-        # Cross-grid polling is deadlock-free only when the schedule's required
-        # worker cohort can be resident together.  The launcher validates this
-        # after Triton has produced exact register/shared-memory metadata.
+        # Cross-grid polling is safe in isolation only when the required worker
+        # cohort can reside together. The launcher validates exact compiled
+        # occupancy, but does not reserve capacity against concurrent streams.
         self.triton_minimum_resident_programs: str | None = None
         # Opaque tile bodies can be outlined behind Triton helper boundaries.
         # Most helpers are inlined; selected scheduling regions remain

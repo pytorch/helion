@@ -1,4 +1,4 @@
-# ruff: noqa: ANN001, ANN202
+# ruff: noqa: ANN001, ANN202, E402
 # pyrefly: ignore-errors
 """Single-kernel Helion stress tests for the Gemma 4 26B-A4B MoE sub-layer.
 
@@ -13,7 +13,23 @@ import argparse
 import ast
 import json
 import linecache
+import os
 from pathlib import Path
+import sys
+
+SOURCE_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _compiler_root_from_argv() -> Path:
+    flag = "--compiler-root"
+    if flag in sys.argv:
+        index = sys.argv.index(flag)
+        return Path(sys.argv[index + 1]).resolve()
+    return Path(os.environ.get("HELION_COMPILER_ROOT", SOURCE_ROOT)).resolve()
+
+
+COMPILER_ROOT = _compiler_root_from_argv()
+sys.path.insert(0, str(COMPILER_ROOT))
 
 import torch
 
@@ -1429,9 +1445,11 @@ def _config(bound, args):
             "num_sm_multiplier": args.worker_multiplier,
             "num_warps": args.num_warps,
             "num_stages": args.kernel_stages,
-            "cross_loop_num_workers": args.workers,
         }
     )
+    if args.pointer_indexing:
+        values["indexing"] = ["pointer"] * len(values["indexing"])
+        values["atomic_indexing"] = ["pointer"] * len(values["atomic_indexing"])
     if args.maxnreg is not None:
         values["maxnreg"] = args.maxnreg
     if args.disable_warp_specialize:
@@ -1507,6 +1525,8 @@ def _prepare_hand_triton(
 
 
 def run(args) -> None:
+    if args.cold_l2:
+        os.environ.setdefault("MEGAKERNEL_CLEAR_L2", "1")
     if not args.allow_busy:
         separate.require_idle_visible_gpu()
     if args.source_mode == "matched" and args.batch != 1:
@@ -1520,6 +1540,8 @@ def run(args) -> None:
     kernel_args = _megakernel_args(tensors, shape)
     kernel, source = MEGAKERNELS[args.source_mode]
     bound = kernel.bind(kernel_args)
+    if args.static_dispatch:
+        bound.config_spec.automatic_clc_dispatch = False
     host_function = bound.host_function
     assert host_function is not None
     config = _config(bound, args)
@@ -1685,10 +1707,10 @@ def run(args) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--compiler-root", type=Path, default=COMPILER_ROOT)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--route-skew", type=float, default=2.0)
-    parser.add_argument("--workers", type=int, default=444)
     parser.add_argument("--worker-multiplier", type=int, default=4)
     parser.add_argument("--num-warps", type=int, default=4)
     parser.add_argument("--kernel-stages", type=int, default=1)
@@ -1737,6 +1759,9 @@ def main() -> None:
         default=str(Path(__file__).with_name("gemma4_a4b_moe_b200_configs.json")),
     )
     parser.add_argument("--allow-busy", action="store_true")
+    parser.add_argument("--cold-l2", action="store_true")
+    parser.add_argument("--pointer-indexing", action="store_true")
+    parser.add_argument("--static-dispatch", action="store_true")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--benchmark-fused-control", action="store_true")

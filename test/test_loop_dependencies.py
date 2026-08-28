@@ -258,11 +258,7 @@ class TestTileDependencyScheduling(unittest.TestCase):
 
     def test_tile_dependency_schedule_has_no_separate_public_object(self) -> None:
         self.assertFalse(hasattr(helion, "TileDependencySchedule"))
-        self.assertEqual(helion.Config().cross_loop_num_workers, 0)
-        self.assertEqual(
-            helion.Config(cross_loop_num_workers=3).cross_loop_num_workers,
-            3,
-        )
+        self.assertNotIn("cross_loop_num_workers", helion.Config())
 
 
 @onlyBackends(["triton"])
@@ -355,6 +351,7 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         self.assertIn("tile_dependency_root_2(tmp1, out", code)
         self.assertNotIn("tile_dependency_root_completion", code)
         self.assertNotIn("triton_helpers.x_grid_barrier(", code)
+        self.assertNotIn("launch_cooperative_grid=True", code)
 
     @skipIfRefEager("persistent grid-barrier codegen is unavailable in ref eager")
     def test_dynamic_shape_schedule_uses_safe_phase_fallback(self) -> None:
@@ -378,6 +375,7 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, (x + 1) * 2)
         self.assertIn("triton_helpers.x_grid_barrier(", code)
         self.assertIn("launch_cooperative_grid=True", code)
+        self.assertIn("_minimum_resident_programs=_NUM_SM", code)
 
     @skipIfRefEager("persistent tile-dependency codegen is unavailable in ref eager")
     def test_matmul_chain_allows_reused_accumulator_name(self) -> None:

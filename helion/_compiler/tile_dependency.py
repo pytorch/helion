@@ -38,14 +38,12 @@ def tile_dependency_scope_id(node: ast.AST) -> int | None:
     return scope_id if isinstance(scope_id, int) else None
 
 
-def owner_root_by_graph_id(device_ir: DeviceIR) -> tuple[int, ...]:
-    """Resolve every nested DeviceIR graph to its top-level root."""
+def owner_roots_by_graph_id(device_ir: DeviceIR) -> tuple[tuple[int, ...], ...]:
+    """Resolve every DeviceIR graph to all reachable top-level roots."""
     roots_by_graph: list[set[int]] = [set() for _ in device_ir.graphs]
     for scope in build_execution_scopes(device_ir):
         roots_by_graph[scope.graph_id].add(scope.root)
-    return tuple(
-        next(iter(roots)) if len(roots) == 1 else -1 for roots in roots_by_graph
-    )
+    return tuple(tuple(sorted(roots)) for roots in roots_by_graph)
 
 
 @dataclasses.dataclass(frozen=True)

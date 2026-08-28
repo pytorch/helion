@@ -679,8 +679,6 @@ def _megakernel_config(bound, args, geometry):
             else (3 if geometry.layer_type == "full" else 4),
         }
     )
-    if args.cross_loop_workers is not None:
-        values["cross_loop_num_workers"] = args.cross_loop_workers
     config = helion.Config.from_dict(values)
     bound.config_spec.normalize(config.config)
     return config
@@ -883,8 +881,7 @@ def main() -> None:
     parser.add_argument("--sliding-splits", type=int, default=16)
     parser.add_argument("--full-splits", type=int, default=64)
     parser.add_argument("--attention-block", type=int, default=32)
-    parser.add_argument("--worker-multiplier", type=int, default=2)
-    parser.add_argument("--cross-loop-workers", type=int)
+    parser.add_argument("--worker-multiplier", type=int, default=4)
     parser.add_argument("--num-warps", type=int)
     parser.add_argument("--kernel-stages", type=int)
     parser.add_argument(

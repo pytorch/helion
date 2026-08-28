@@ -514,8 +514,6 @@ def _probe_matched_config(bound, args):
             "num_sm_multiplier": args.worker_multiplier,
         }
     )
-    if args.cross_loop_workers is not None:
-        values["cross_loop_num_workers"] = args.cross_loop_workers
     config = helion.Config.from_dict(values)
     bound.config_spec.normalize(config.config)
     return config
@@ -773,7 +771,6 @@ def main() -> None:
     parser.add_argument("--projection-stages", type=int, default=4)
     parser.add_argument("--kernel-stages", type=int, default=2)
     parser.add_argument("--worker-multiplier", type=int, default=8)
-    parser.add_argument("--cross-loop-workers", type=int)
     parser.add_argument("--merge-split-block", type=int, default=32)
     parser.add_argument("--merge-q-block", type=int, default=4)
     parser.add_argument("--attention-context-block", type=int, default=32)

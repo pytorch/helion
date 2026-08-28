@@ -21,6 +21,212 @@ The scheduler should:
 - Become simpler by deriving scheduling from producer and consumer accesses,
   rather than accumulating topology matchers and exceptional cases.
 
+## Static-first submission cleanup (2026-08-27)
+
+The first upstream PR is based on `helion-cross-kernel` and contains only the
+static persistent dispatcher. CLC remains a separate follow-up built over the
+same dependency and readiness products. The cleanup must preserve the current
+Qwen3, Gemma4 A4B, GPT-OSS, and DeepSeek-V3 static schedules while reducing
+API surface and keeping task-count-sized materialization out of production.
+
+Required cleanup, in order:
+
+- [ ] Establish a runtime residency contract for static kernels containing
+  cross-loop waits. The current launch-time occupancy calculation proves only
+  theoretical capacity on an otherwise idle device; concurrent work on another
+  stream can occupy slots after that calculation and leave a producer CTA
+  queued behind resident consumers that are polling. Cooperative launch was
+  implemented and validated, but is deliberately reverted from this PR because
+  it regresses the canonical cold-L2 workloads. A follow-up must provide a
+  concurrency-safe execution contract, then add a bounded concurrent-launch
+  regression. The dynamic grid-barrier fallback remains cooperative because
+  the barrier intrinsically requires simultaneous residency.
+- [x] Preserve accesses from DeviceIR graphs reachable through more than one
+  top-level root. Instantiate access facts per `(root, execution callsite)` or
+  reject unsupported graph sharing explicitly; never map ambiguous ownership
+  to `-1` and silently omit the hazard. Add a source-level shared-callsite test.
+- [x] Localize symbolic-proof fallback. Failure to merge, quotient, or lower
+  one consumer dependency must coarsen only that dependency point or event to
+  `FamilyDone`; it must not discard exact events elsewhere in the graph. Add a
+  mixed regular/irregular graph test proving that unrelated readiness survives.
+- [x] Preserve nested-scope readiness when a consumer family cannot be moved
+  earlier. Coarsen the exact relation to one scope-entry wait per owning strand
+  instead of falling back to whole-family completion. Implemented in
+  `18499db5`.
+- [x] Honor an explicitly selected `cross_loop_num_workers` exactly. Progress
+  validation, rather than event-boundary snapping, determines whether that
+  worker count is legal. Implemented in `18499db5` as a migration step before
+  consolidating the worker-grid tuning surface.
+- [x] Remove `cross_loop_num_workers` and derive the static persistent grid
+  solely as `W = device_sm_count * num_sm_multiplier`. Make
+  `num_sm_multiplier` the sole worker-grid knob. Retain its existing
+  power-of-two autotuner domain for this first PR so ordinary persistent-kernel
+  search spaces do not change. Remove the exact-worker field atomically from
+  Config, ConfigSpec, DeviceIR/scheduler APIs, tests, and canonical probes;
+  there must be no second exact-worker escape hatch. Readiness keys, local
+  triggers, placement, and liveness remain deterministic products of the event
+  graph and the selected `W`. Relaxing the multiplier to a bounded integer
+  domain is a follow-up PR.
+- [x] Remove `preordered_edges`. Every production and test caller supplies an
+  empty set, so root-completion selection should depend only on emitted event
+  coverage and the root-completion edges selected by the scheduler.
+- [x] Make nested-scope geometry explicit. After proving that the renderer has
+  exactly one nested axis, use that axis's declared count rather than inferring
+  actions per strand from `scope_domain.size // root_domain.size`.
+- [x] Move the exact task-level schedule oracle out of production code.
+  `validate_worker_schedule()`, `_local_trigger_predecessors()`,
+  `_static_ancestors()`, `WorkerSchedule.task_order()`, and the
+  `EventGraph.materialized_*` helpers are test-only. Relocate them to test
+  support so production scheduling contains no `LogicalRelation.materialize()`
+  calls and compile-time work scales with relation pieces rather than task
+  count.
+- [x] Extract cross-loop emission from `program_id.py` into
+  `cross_loop_codegen.py`. Keep one shared event/body lowering and one static
+  dispatch backend; this is a mechanical module boundary, not a second
+  scheduler or event representation. Require structurally identical generated
+  Triton before and after the move.
+- [x] Ablate the remaining generic scheduling policies in the canonical probes:
+  automatic final-arrival execution, key-major producer reordering, greedy
+  complete-family placement, and one-axis milestone segmentation. Keep them as
+  compiler policy only when they are broadly useful and performance-neutral or
+  beneficial; do not replace them with model-specific toggles. The 128-byte
+  event-counter separation remains an ordinary hardware-layout policy.
+- [ ] Reduce submission scope. Keep canonical runnable Qwen3, Gemma4 A4B,
+  GPT-OSS, and DeepSeek-V3 benchmarks, but exclude generated PTX/results and
+  exploratory probes from the compiler PR. Condense this living log into a
+  short architecture document or move the historical record out of the PR.
+- [ ] Rebase onto current `origin/main` before final validation and resolve the
+  overlapping compiler changes there before judging the final diff size.
+- [ ] Run the final acceptance battery: complete dependency tests, Ruff and
+  formatting, affine-chain compile scaling, structural lowering comparison,
+  the shared-callsite regression, and cold-L2
+  Qwen3/Gemma4/GPT-OSS/DeepSeek-V3 measurements. Concurrent-launch coverage is
+  blocked on the remaining static residency-contract work above.
+
+### Worker-grid consolidation decision (2026-08-27)
+
+The cross-loop scheduler will expose one worker-grid tuning dimension:
+`num_sm_multiplier`. Static dispatch does not need an independently tuned
+absolute worker count. For a device with `S` SMs, the selected grid is exactly
+`W = S * num_sm_multiplier`; the ordinary scheduler then derives all task
+placement and synchronization from that `W` and the symbolic event DAG.
+
+The first PR retains the existing power-of-two multiplier domain. This keeps
+the change focused and avoids expanding the autotuning space of every ordinary
+persistent kernel. A follow-up may make the multiplier a bounded integer-valued
+choice, preferably only for cross-loop schedules, after its search cost and
+normalization behavior are reviewed independently.
+
+The current workload battery supports removal of the exact-worker knob, while
+also documenting why the integer-domain follow-up matters:
+
+| Workload | SM multiplier | Workers on B200 | Cold-L2 observation |
+| --- | ---: | ---: | --- |
+| Qwen3 decode | 8 | 1,184 | 93.29 us non-cooperative versus 95.40 us cooperative; exact 1,024-worker parent schedule was 89.74 us |
+| Gemma4 A4B MoE | 4 | 592 | 47.63 us non-cooperative versus 52.35 us cooperative for the boundary-preserving unfused-GeGLU source |
+| Gemma4 E4B decode | 4 | 592 | 102.56 us versus 92.12 us separate; key-major ordering is material here |
+| DeepSeek-V3 MoE | 4 | 592 | 182.02 us versus 158.43 us separate; static scheduling remains a known performance gap |
+| GPT-OSS MoE | 8 | 1,184 | 42.30 us non-cooperative versus 43.50 us cooperative and 37.60 us separate; multiplier 12 remains a follow-up integer-domain result |
+
+Compiled occupancy remains a legality constraint, not a second tuning input.
+For example, GPT-OSS cannot residently support multiplier 16 with its selected
+root codegen, while multiplier 8 regresses to approximately 42.08 us and the
+future multiplier 12 is legal. Therefore GPT-OSS performance parity is a known
+limitation of the first power-of-two-only PR, not evidence for restoring an
+independent exact-worker knob. Invalid multiplier candidates are discarded
+through the same configuration-validity path used for other resource
+constraints. This decision supersedes historical sections below that prescribe
+graph-snapped exact worker counts or treat `num_sm_multiplier` only as a
+capacity hint.
+
+### Cleanup implementation checkpoint (2026-08-27)
+
+The required first-PR simplification work is implemented, with the static
+concurrent-residency contract explicitly deferred above:
+
+- Static cross-loop polling kernels use ordinary launches. The launcher rejects
+  a configuration when post-ptxas occupancy cannot support its complete grid on
+  an otherwise idle device, but this does not reserve capacity against other
+  streams. CUDA Graph capture remains covered; concurrent submission is not yet
+  guaranteed. Dynamic phase-barrier fallback kernels still launch
+  cooperatively.
+- The launch-policy A/B holds the generated schedule and grid constant. Gemma
+  A4B and GPT-OSS lowerings differ only by removal of
+  `launch_cooperative_grid=True`; Qwen additionally has nondeterministic
+  constexpr declaration ordering. The event waits, publications, task ranges,
+  outlined root bodies, state layout, and minimum-residency check are otherwise
+  unchanged.
+- Shared DeviceIR graphs retain every owning root, and one failed symbolic
+  quotient now coarsens only the affected dependency rather than the complete
+  event graph.
+- `cross_loop_num_workers`, `preordered_edges`, inferred nested-axis geometry,
+  and production task materialization have been removed. The exhaustive
+  materialized schedule validator now lives only in test support.
+- Cross-loop emission moved out of `program_id.py` into
+  `cross_loop_codegen.py`; the scheduler and event relation remain the sole
+  semantic inputs to lowering.
+- Relative to `18499db5`, this cleanup removes about 355 net production lines:
+  `cross_loop_scheduler.py` shrinks by roughly 300 lines, while the large
+  `program_id.py` block is moved rather than duplicated.
+- The affine-chain compile check remains flat: 65,536 elements lower in
+  0.178 seconds to 82 lines, while 1,048,576 elements lower in 0.148 seconds to
+  82 lines, with no `tl.where` expansion.
+
+The generic-policy ablation does not justify new user knobs:
+
+- Final-arrival execution and one-axis nested milestones each save about
+  10--11 microseconds on Qwen and remain enabled.
+- Greedy complete-family placement is neutral on Qwen and Gemma A4B, so it
+  remains an internal deterministic policy for this PR.
+- Key-major producer ordering costs Qwen roughly 2--3 microseconds and is
+  neutral on Gemma A4B, but removing it regresses Gemma E4B from about 103 to
+  123 microseconds. It therefore remains as the generic readiness-exposure
+  transform rather than becoming a model switch or autotuner knob.
+- The 128-byte counter spacing remains a target hardware-layout invariant.
+
+The focused dependency, lowering, runtime, and Config validation suite
+currently passes 192 tests, 4 skips, and 55 subtests. The remaining
+PR-preparation work is scope reduction, rebase onto current `origin/main`, and
+rerunning this battery after conflict resolution.
+
+### Reviewer conclusions and PR boundaries (2026-08-27)
+
+The independent whole-branch review found no model names, model-specific task
+counts, or explicit FFN/attention/MoE topology matchers in the compiler path.
+Its required correctness work is captured above: runtime residency, callsite-
+aware graph ownership, edge-local fallback, explicit nested geometry, and
+removal of production task materialization. The review also confirmed that
+`preordered_edges` removal, codegen extraction, probe reduction, and worker-grid
+consolidation are appropriate first-PR cleanup.
+
+The current quotient discovery is intentionally narrower than a general
+polyhedral quotient: it primarily projects source axes already exposed by the
+logical tiling and does not always discover derived keys such as `axis // k`.
+Safe fallback makes this a non-blocking generalization gap. Documentation must
+describe the supported restricted relation algebra accurately; richer quotient
+discovery belongs in a follow-up driven by a concrete workload rather than in
+the first PR.
+
+Relevant conclusions from the `helion-clc` submission review:
+
+- Symbolic event cardinality and mixed-radix predecessor quotients are already
+  addressed by the newer `helion-cross-kernel` relation implementation. Do not
+  port CLC's enumerating `uniform_preimage_cardinality()` fallback.
+- CLC residency decoupling, CLC compatibility normalization, cancellation
+  usefulness policy, ticket state, and command-range construction are not part
+  of this PR.
+- The current one-nested-axis renderer remains a conservative supported subset.
+  Multi-axis rendering should be generalized only when a concrete exact
+  relation requires it; unsupported scopes continue to lift to an enclosing
+  event or `FamilyDone`.
+- Partial placement of large consumer families, such as batched Qwen W2, is a
+  future scheduling extension rather than submission cleanup. The current PR
+  must preserve compact symbolic expressions and safe fallback for those
+  shapes without adding another placement policy.
+- Static scheduling must never rewrite a root's indexing, epilogue, or compute
+  configuration. It may add only dispatch, waits, publications, fences, and
+  state required by the proven dependency schedule.
+
 ## Authoritative target architecture (2026-08-25)
 
 This section is the current design contract. All other descriptions of

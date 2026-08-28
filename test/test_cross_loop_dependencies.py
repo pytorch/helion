@@ -9,8 +9,11 @@ from unittest import mock
 import sympy
 import torch
 
+from test._cross_loop_schedule_oracle import task_order
+from test._cross_loop_schedule_oracle import validate_worker_schedule
+
 import helion
-from helion._compiler.cross_loop_scheduler import CROSS_LOOP_NUM_WORKERS_CONFIG
+from helion._compiler.cross_loop_codegen import _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
 from helion._compiler.cross_loop_scheduler import CountedEventPlan
 from helion._compiler.cross_loop_scheduler import EventContribution
 from helion._compiler.cross_loop_scheduler import EventGraph
@@ -33,9 +36,7 @@ from helion._compiler.cross_loop_scheduler import choose_counted_events
 from helion._compiler.cross_loop_scheduler import derive_local_triggers
 from helion._compiler.cross_loop_scheduler import order_local_contributors_by_key
 from helion._compiler.cross_loop_scheduler import place_nested_scope_consumers
-from helion._compiler.cross_loop_scheduler import resolve_worker_count
-from helion._compiler.cross_loop_scheduler import validate_worker_schedule
-from helion._compiler.program_id import _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
+from helion._compiler.device_ir import _collect_memory_op_facts
 from helion._compiler.tile_dependency import AllocationRegion
 from helion._compiler.tile_dependency import ExecutionScope
 from helion._compiler.tile_dependency import LogicalDomain
@@ -50,6 +51,7 @@ from helion._compiler.tile_dependency import build_tile_dependency_graph
 from helion._compiler.tile_dependency import instantiate_root_domains
 from helion._compiler.tile_dependency import instantiate_symbolic_dependencies
 from helion._compiler.tile_dependency import logical_axis_symbol
+from helion._compiler.tile_dependency import owner_roots_by_graph_id
 from helion._compiler.tile_dependency import physical_traversal_relation
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
@@ -58,7 +60,6 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
-from helion.autotuner.config_fragment import IntegerFragment
 import helion.language as hl
 
 
@@ -1519,8 +1520,7 @@ class TestCrossLoopDependencies(TestCase):
                 dependency_plan=plan,
                 task_families=task_families,
                 axis_geometry={10: (size // 16, 16), 20: (size // 512, 512)},
-                preordered_edges=frozenset(),
-                physical_worker_limit=148,
+                worker_count=148,
             )
 
         self.assertLessEqual(
@@ -2109,6 +2109,129 @@ class TestCrossLoopDependencies(TestCase):
             (frozenset((0,)),) * 2,
         )
 
+    def test_unsupported_event_quotient_does_not_coarsen_unrelated_edges(
+        self,
+    ) -> None:
+        plan = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    allocation_id=0,
+                    kind="store",
+                    shape=(64,),
+                    block_ids=(10,),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    allocation_id=0,
+                    kind="load",
+                    shape=(64,),
+                    block_ids=(20,),
+                ),
+                _access(
+                    2,
+                    root=1,
+                    allocation_id=0,
+                    kind="load",
+                    shape=(64,),
+                    block_ids=(20,),
+                ),
+                _access(
+                    3,
+                    root=2,
+                    allocation_id=1,
+                    kind="store",
+                    shape=(64,),
+                    block_ids=(30,),
+                ),
+                _access(
+                    4,
+                    root=3,
+                    allocation_id=1,
+                    kind="load",
+                    shape=(64,),
+                    block_ids=(40,),
+                ),
+            ),
+            [[10], [20], [30], [40]],
+        )
+
+        original_union = LogicalRelation.union
+        failed_once = False
+
+        def fail_first_union(
+            left: LogicalRelation,
+            right: LogicalRelation,
+        ) -> LogicalRelation | None:
+            nonlocal failed_once
+            if not failed_once:
+                failed_once = True
+                return None
+            return original_union(left, right)
+
+        with mock.patch.object(LogicalRelation, "union", fail_first_union):
+            events = build_keyed_events(
+                plan,
+                axis_geometry={
+                    10: (4, 16),
+                    20: (2, 32),
+                    30: (4, 16),
+                    40: (2, 32),
+                },
+            )
+
+        unrelated = [
+            event
+            for event in events
+            if any(
+                contribution.producer_root == 2 for contribution in event.contributions
+            )
+        ]
+        self.assertEqual(len(unrelated), 1)
+        self.assertEqual(unrelated[0].key_count, 2)
+        self.assertFalse(unrelated[0].is_family_done)
+
+    @skipIfNotCUDA()
+    def test_shared_device_graph_preserves_every_root_owner(self) -> None:
+        x = torch.empty((2, 64), device=DEVICE, dtype=torch.float32)
+        bound = cartesian_affine_chain.bind((x,))
+        assert bound.host_function is not None
+        device_ir = bound.host_function.device_ir
+        shared_graph_id = device_ir.root_ids[0]
+        shared_family = device_ir.task_families[0]
+        original_root_ids = device_ir.root_ids
+        original_task_families = device_ir.task_families
+        try:
+            device_ir.root_ids = [shared_graph_id, shared_graph_id]
+            device_ir.task_families = [shared_family, shared_family]
+            owners = owner_roots_by_graph_id(device_ir)
+            self.assertEqual(owners[shared_graph_id], (0, 1))
+            with bound.env, bound.host_function:
+                _facts, _liveness, accesses = _collect_memory_op_facts(device_ir)
+            self.assertEqual(
+                sorted((access.root, access.kind) for access in accesses),
+                [(0, "load"), (0, "store"), (1, "load"), (1, "store")],
+            )
+            dependency_graph = build_tile_dependency_graph(
+                accesses,
+                device_ir=device_ir,
+            )
+            self.assertTrue(dependency_graph.edges_between(0, 1))
+            self.assertTrue(
+                all(
+                    all(scope.root == access.root for scope in scopes)
+                    for access in dependency_graph.accesses
+                    for scopes in (
+                        dependency_graph.scopes_for_access(access.access_id),
+                    )
+                )
+            )
+        finally:
+            device_ir.root_ids = original_root_ids
+            device_ir.task_families = original_task_families
+
     @skipIfNotCUDA()
     def test_device_ir_scopes_preserve_nested_producer_and_consumer_axes(
         self,
@@ -2496,35 +2619,6 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(derive_local_triggers(event_graph, baseline), ())
         self.assertEqual(choose_counted_events(event_graph, ()), ())
 
-    def test_worker_count_honors_explicit_target(self) -> None:
-        self.assertEqual(
-            resolve_worker_count(
-                default_worker_count=12,
-                requested_worker_count=0,
-            ),
-            12,
-        )
-        self.assertEqual(
-            resolve_worker_count(
-                default_worker_count=12,
-                requested_worker_count=5,
-            ),
-            5,
-        )
-        with self.assertRaisesRegex(
-            helion.exc.InvalidConfig,
-            "exceeds the configured launch capacity",
-        ):
-            resolve_worker_count(
-                default_worker_count=12,
-                requested_worker_count=13,
-            )
-        with self.assertRaisesRegex(helion.exc.InvalidConfig, "must be nonnegative"):
-            resolve_worker_count(
-                default_worker_count=12,
-                requested_worker_count=-1,
-            )
-
     def test_semantic_event_graph_represents_diamond_without_path_matching(
         self,
     ) -> None:
@@ -2730,7 +2824,6 @@ class TestCrossLoopDependencies(TestCase):
             _select_root_completion_edges(
                 dependency_graph=graph,
                 covered_dependency_points=covered_points,
-                preordered_edges=frozenset(),
             ),
             frozenset(((0, 1),)),
         )
@@ -2929,7 +3022,7 @@ class TestCrossLoopDependencies(TestCase):
             triggers,
         )
 
-        self.assertEqual(schedule.task_order(0), (0, 1, 2, 3))
+        self.assertEqual(task_order(schedule, 0), (0, 1, 2, 3))
 
     def test_worker_schedule_detects_dependency_order_cycle(self) -> None:
         graph = build_tile_dependency_graph(
@@ -4105,8 +4198,7 @@ class TestCrossLoopDependencies(TestCase):
                 ),
             ),
             axis_geometry={10: (1, 1), 11: (4, 16), 20: (1, 1), 21: (4, 16)},
-            preordered_edges=frozenset(),
-            physical_worker_limit=2,
+            worker_count=2,
         )
 
         self.assertEqual(schedule.root_completion_edges, frozenset(((0, 1),)))
@@ -4136,8 +4228,7 @@ class TestCrossLoopDependencies(TestCase):
                 ),
             ),
             axis_geometry={10: (1, 128), 20: (4, 32)},
-            preordered_edges=frozenset(),
-            physical_worker_limit=4,
+            worker_count=4,
         )
 
         self.assertEqual(schedule.root_completion_edges, frozenset(((0, 1),)))
@@ -4195,8 +4286,7 @@ class TestCrossLoopDependencies(TestCase):
                 30: (8, 16),
                 40: (8, 16),
             },
-            preordered_edges=frozenset(),
-            physical_worker_limit=8,
+            worker_count=8,
         )
 
         self.assertEqual(
@@ -4310,11 +4400,10 @@ class TestCrossLoopDependencies(TestCase):
                 30: (1, 1),
                 31: (4, 32),
             },
-            "preordered_edges": frozenset(),
-            "physical_worker_limit": 8,
+            "worker_count": 8,
         }
 
-        schedule = build_cross_loop_schedule(**kwargs, requested_worker_count=6)
+        schedule = build_cross_loop_schedule(**{**kwargs, "worker_count": 6})
 
         root_events = tuple(
             plan
@@ -4342,7 +4431,7 @@ class TestCrossLoopDependencies(TestCase):
             local_event.uses[local_trigger.use_index].consumer_root,
             1,
         )
-        self.assertEqual(schedule.worker_limit, 6)
+        self.assertEqual(schedule.worker_schedule.worker_count, 6)
         nested_scope_events = tuple(
             plan
             for plan in schedule.counted_events
@@ -4359,11 +4448,11 @@ class TestCrossLoopDependencies(TestCase):
         self.assertEqual(schedule.worker_schedule.placement(2, 0), (5, 1))
         self.assertEqual(schedule.worker_schedule.placement(0, 6), (0, 1))
 
-        exact = build_cross_loop_schedule(**kwargs, requested_worker_count=7)
-        self.assertEqual(exact.worker_limit, 7)
+        exact = build_cross_loop_schedule(**{**kwargs, "worker_count": 7})
+        self.assertEqual(exact.worker_schedule.worker_count, 7)
         self.assertNotEqual(exact.worker_schedule, schedule.worker_schedule)
 
-        default_schedule = build_cross_loop_schedule(**kwargs, requested_worker_count=0)
+        default_schedule = build_cross_loop_schedule(**kwargs)
         self.assertEqual(
             sum(
                 not default_schedule.event_graph.event(
@@ -4378,12 +4467,6 @@ class TestCrossLoopDependencies(TestCase):
             default_schedule.root_completion_edges,
             frozenset(),
         )
-        with self.assertRaisesRegex(
-            helion.exc.InvalidConfig,
-            "must be nonnegative",
-        ):
-            build_cross_loop_schedule(**kwargs, requested_worker_count=-1)
-
         short_families = (
             dataclasses.replace(
                 task_families[0],
@@ -5047,8 +5130,7 @@ class TestCrossLoopDependencies(TestCase):
             dependency_plan=dependency_plan,
             task_families=task_families,
             axis_geometry={10: (8, 16), 20: (8, 16), 30: (8, 16)},
-            preordered_edges=frozenset(),
-            physical_worker_limit=8,
+            worker_count=8,
         )
 
         self.assertEqual(schedule.root_completion_edges, frozenset())
@@ -5126,8 +5208,7 @@ class TestCrossLoopDependencies(TestCase):
                 22: (4, 1),
                 30: (8, 1),
             },
-            preordered_edges=frozenset(),
-            physical_worker_limit=32,
+            worker_count=32,
         )
 
         self.assertEqual(schedule.root_completion_edges, frozenset())
@@ -5199,8 +5280,7 @@ class TestCrossLoopDependencies(TestCase):
                 21: (1, width),
                 22: (splits, 1),
             },
-            preordered_edges=frozenset(),
-            physical_worker_limit=128,
+            worker_count=128,
         )
 
         self.assertEqual(schedule.root_completion_edges, frozenset())
@@ -5263,8 +5343,7 @@ class TestCrossLoopDependencies(TestCase):
             dependency_plan=dependency_plan,
             task_families=task_families,
             axis_geometry={10: (columns, 1), 20: (columns, 1), 22: (splits, 1)},
-            preordered_edges=frozenset(),
-            physical_worker_limit=32,
+            worker_count=32,
         )
 
         self.assertEqual(schedule.root_completion_edges, frozenset())
@@ -5347,8 +5426,7 @@ class TestCrossLoopDependencies(TestCase):
                 31: (8, 16),
                 32: (8, 16),
             },
-            preordered_edges=frozenset(),
-            physical_worker_limit=4,
+            worker_count=4,
         )
 
         self.assertEqual(
@@ -5506,11 +5584,10 @@ class TestCrossLoopDependencies(TestCase):
             "dependency_plan": dependency_plan,
             "task_families": tuple(task_families),
             "axis_geometry": axis_geometry,
-            "preordered_edges": frozenset(),
-            "physical_worker_limit": 8,
+            "worker_count": 8,
         }
 
-        schedule = build_cross_loop_schedule(**kwargs, requested_worker_count=0)
+        schedule = build_cross_loop_schedule(**kwargs)
         self.assertEqual(
             sum(
                 not schedule.event_graph.event(event.graph_event_index).is_family_done
@@ -5523,8 +5600,8 @@ class TestCrossLoopDependencies(TestCase):
             schedule.root_completion_edges,
             frozenset(),
         )
-        overlapped = build_cross_loop_schedule(**kwargs, requested_worker_count=6)
-        self.assertEqual(overlapped.worker_limit, 6)
+        overlapped = build_cross_loop_schedule(**{**kwargs, "worker_count": 6})
+        self.assertEqual(overlapped.worker_schedule.worker_count, 6)
         nested_scope_events = tuple(
             plan
             for plan in overlapped.counted_events
@@ -6114,17 +6191,18 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_task_events_are_capture_safe_and_stream_local(self) -> None:
+    def test_task_events_are_capture_safe(self) -> None:
         x = torch.arange(128, device=DEVICE, dtype=torch.float32).reshape(2, 64)
         bound = cartesian_affine_chain.bind((x,))
-        compiled = bound.compile_config(
-            helion.Config(
-                block_sizes=[1, 16, 1, 32],
-                pid_type="persistent_blocked",
-                num_sm_multiplier=1,
-                num_warps=1,
-            )
+        config = helion.Config(
+            block_sizes=[1, 16, 1, 32],
+            pid_type="persistent_blocked",
+            num_sm_multiplier=4,
+            num_warps=8,
         )
+        code = bound.to_triton_code(config)
+        self.assertNotIn("launch_cooperative_grid=True", code)
+        compiled = bound.compile_config(config)
         compiled(x)
         torch.cuda.synchronize()
 
@@ -6136,20 +6214,6 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
             graph.replay()
             torch.cuda.synchronize()
             torch.testing.assert_close(captured, (x + 1) * 2)
-
-        streams = (torch.cuda.Stream(), torch.cuda.Stream())
-        inputs = (
-            torch.full((2, 64), 11.0, device=DEVICE),
-            torch.full((2, 64), 19.0, device=DEVICE),
-        )
-        outputs = []
-        for stream, input_value in zip(streams, inputs, strict=True):
-            with torch.cuda.stream(stream):
-                outputs.append(compiled(input_value))
-        for stream in streams:
-            stream.synchronize()
-        for input_value, output in zip(inputs, outputs, strict=True):
-            torch.testing.assert_close(output, (input_value + 1) * 2)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -6210,17 +6274,6 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                         if not scope.is_root
                     }
                     self.assertEqual(len(nested_scope_ids), 1)
-                worker_config = {}
-                if not reverse_groups and group_size == 32:
-                    producer_tasks = batch * (2 * intermediate // block_sizes[1])
-                    consumer_tasks = batch * (64 // block_sizes[3])
-                    arrivals_per_key = 2 * group_size // block_sizes[1]
-                    minimum_workers = (producer_tasks + consumer_tasks + 1) // 2
-                    worker_config[CROSS_LOOP_NUM_WORKERS_CONFIG] = (
-                        (minimum_workers + arrivals_per_key - 1)
-                        // arrivals_per_key
-                        * arrivals_per_key
-                    )
                 code, out = code_and_output(
                     grouped_affine_chain,
                     kernel_args,
@@ -6229,7 +6282,6 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
                     num_sm_multiplier=1,
                     num_warps=4,
                     num_stages=2,
-                    **worker_config,
                 )
 
                 gate_up = (x.float() @ w13.float()).half()
@@ -6285,14 +6337,14 @@ class TestCrossLoopDependencyIntegration(RefEagerTestBase, TestCase):
         w2 = torch.rand((128, 64), device=DEVICE, dtype=torch.float16)
         kernel_args = (x, w13, w2, 32, hl.constexpr(False))
         bound = grouped_affine_chain.bind(kernel_args)
-        workers = bound.config_spec.user_defined_tunables[CROSS_LOOP_NUM_WORKERS_CONFIG]
-        self.assertIsInstance(workers, IntegerFragment)
-        assert isinstance(workers, IntegerFragment)
-        self.assertEqual((workers.low, workers.high), (0, 256))
-        self.assertEqual(
-            bound.config_spec.default_config()[CROSS_LOOP_NUM_WORKERS_CONFIG],
-            0,
+        self.assertNotIn(
+            "cross_loop_num_workers",
+            bound.config_spec.user_defined_tunables,
         )
+        invalid_config = dict(bound.config_spec.default_config())
+        invalid_config["cross_loop_num_workers"] = 3
+        with self.assertRaisesRegex(helion.exc.InvalidConfig, "Invalid config keys"):
+            bound.config_spec.normalize(invalid_config)
 
         code, out = code_and_output(
             grouped_affine_chain,

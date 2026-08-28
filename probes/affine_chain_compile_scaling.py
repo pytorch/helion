@@ -29,7 +29,7 @@ def main() -> None:
     parser.add_argument("--size", type=int, default=65_536)
     parser.add_argument("--producer-block", type=int, default=16)
     parser.add_argument("--consumer-block", type=int, default=32)
-    parser.add_argument("--workers", type=int, default=148)
+    parser.add_argument("--worker-multiplier", type=int, default=1)
     parser.add_argument("--dump-triton", action="store_true")
     args = parser.parse_args()
 
@@ -38,7 +38,7 @@ def main() -> None:
     config = helion.Config(
         block_sizes=[args.producer_block, args.consumer_block],
         pid_type="persistent_blocked",
-        cross_loop_num_workers=args.workers,
+        num_sm_multiplier=args.worker_multiplier,
         num_warps=1,
     )
     bound.config_spec.normalize(config.config)

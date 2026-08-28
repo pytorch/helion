@@ -390,10 +390,8 @@ class CompileEnvironment:
         for pid_type in ("flat", "xyz"):
             self.config_spec.disallow_pid_type(pid_type, reason=reason)
 
-    def require_persistent_blocked_without_cooperative_barrier(
-        self, reason: str
-    ) -> None:
-        """Require blocked persistent PIDs without a cooperative-grid launch."""
+    def require_persistent_blocked(self, reason: str) -> None:
+        """Restrict program-ID selection to blocked persistent execution."""
         for pid_type in ("flat", "xyz", "persistent_interleaved"):
             self.config_spec.disallow_pid_type(pid_type, reason=reason)
 

@@ -19,9 +19,8 @@ PidTypeLiteral = Literal[
 EvictionPolicyLiteral = Literal["", "first", "last"]
 LoadCacheModifierLiteral = Literal["", ".cg"]
 StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
-NumSmMultiplierLiteral = Literal[1, 2, 4, 8]
+NumSmMultiplierLiteral = Literal[1, 2, 4, 8, 16, 32, 64, 128]
 MaxnregLiteral = Literal[32, 64, 128, 256] | None
-DEFAULT_CROSS_LOOP_NUM_WORKERS = 0
 
 
 class Config(Mapping[str, object]):
@@ -57,7 +56,6 @@ class Config(Mapping[str, object]):
         advanced_controls_file: str | None = None,
         epilogue_subtile: int | None = None,
         xcd_remap: bool | None = None,
-        cross_loop_num_workers: int | None = None,
         # For user-defined properties
         **kwargs: object,
     ) -> None:
@@ -85,7 +83,8 @@ class Config(Mapping[str, object]):
             num_warps: Number of warps per block.
             num_stages: Number of stages for software pipelining.
             pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved").
-            num_sm_multiplier: Multiplier for the number of SMs in persistent kernels (1, 2, 4, 8).
+            num_sm_multiplier: Power-of-two multiplier for the number of SMs in
+                persistent kernels (1 through 128).
                 Controls multi-occupancy by launching N * num_sms thread blocks instead of just num_sms.
             maxnreg: Maximum number of registers per thread (None, 32, 64, 128, 256).
                 Lower values allow higher occupancy but may hurt performance. Used with persistent kernels
@@ -107,10 +106,6 @@ class Config(Mapping[str, object]):
                 improve L2 locality on multi-XCD GPUs (MI300/MI350). Supported for pid_type
                 "flat", "persistent_blocked", and "persistent_interleaved"; composes with
                 ``l2_groupings``.
-            cross_loop_num_workers: Target number of persistent workers used by
-                the cross-loop scheduler. The compiler snaps positive values to
-                complete event-key boundaries; ``0`` selects the ordinary
-                persistent grid.
             **kwargs: Additional user-defined configuration parameters.
         """
         self.config = {}
@@ -141,7 +136,6 @@ class Config(Mapping[str, object]):
             "advanced_controls_file": advanced_controls_file,
             "epilogue_subtile": epilogue_subtile,
             "xcd_remap": xcd_remap,
-            "cross_loop_num_workers": cross_loop_num_workers,
         }
         for key, value in core_props.items():
             if value is not None:
@@ -370,13 +364,6 @@ class Config(Mapping[str, object]):
     @property
     def epilogue_subtile(self) -> int | None:
         return cast("int | None", self.config.get("epilogue_subtile", None))
-
-    @property
-    def cross_loop_num_workers(self) -> int:
-        return cast(
-            "int",
-            self.config.get("cross_loop_num_workers", DEFAULT_CROSS_LOOP_NUM_WORKERS),
-        )
 
 
 def _to_hashable(x: object) -> object:

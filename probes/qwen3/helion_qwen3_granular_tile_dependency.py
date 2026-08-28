@@ -21,7 +21,6 @@ import sys
 import torch
 
 import helion
-from helion._compiler.cross_loop_scheduler import CROSS_LOOP_NUM_WORKERS_CONFIG
 from helion._compiler.program_id import ForEachProgramID
 import helion.language as hl
 
@@ -915,7 +914,6 @@ def _build_helion_reference(args, tensors):
 def _probe_config(bound, args):
     """Map the retained one-warp probe geometry onto the granular source."""
     values = dict(bound.config_spec.default_config())
-    values.pop(CROSS_LOOP_NUM_WORKERS_CONFIG, None)
     uses_flat_qk = _USE_TASK_ALIGNED_ATTENTION or _USE_CANONICAL_ATTENTION_VIEWS
     downstream_shift = (
         2
@@ -1034,8 +1032,6 @@ def _probe_config(bound, args):
             "num_sm_multiplier": args.worker_multiplier,
         }
     )
-    if CROSS_LOOP_NUM_WORKERS_CONFIG in bound.config_spec.user_defined_tunables:
-        values[CROSS_LOOP_NUM_WORKERS_CONFIG] = 1024
     config = helion.Config.from_dict(values)
     bound.config_spec.normalize(config.config)
     return config

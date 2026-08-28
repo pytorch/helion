@@ -94,6 +94,24 @@ class TestTritonLauncher(unittest.TestCase):
             required_programs=7,
         )
 
+    def test_cross_loop_occupancy_failure_is_an_invalid_config(self) -> None:
+        with (
+            patch(
+                "helion.runtime._triton_default_launcher",
+                side_effect=RuntimeError(
+                    "Cross-loop scheduling requires 16 concurrently resident "
+                    "programs, but this kernel/device can residently execute only 12."
+                ),
+            ),
+            self.assertRaises(helion.exc.InvalidConfig),
+        ):
+            helion.runtime.default_launcher(
+                object(),
+                (16,),
+                num_warps=1,
+                num_stages=1,
+            )
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class TestPersistentTritonState(unittest.TestCase):
