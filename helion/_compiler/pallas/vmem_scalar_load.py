@@ -53,9 +53,12 @@ class VmemScalarLoad:
 
 def _is_scalar_index_pattern(pattern: object) -> bool:
     from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
+    from helion._compiler.pallas.plan_tiling import TensorIndexPattern
     from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
 
-    return isinstance(pattern, (ArbitraryIndexPattern, TileBeginWithOffsetPattern))
+    return isinstance(pattern, (ArbitraryIndexPattern, TileBeginWithOffsetPattern)) or (
+        isinstance(pattern, TensorIndexPattern) and pattern.index_ndim == 0
+    )
 
 
 def _is_32bit(dtype: torch.dtype) -> bool:
