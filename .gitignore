@@ -116,3 +116,6 @@ cute_sweep_results.jsonl
 # this file lives alongside it and is per-session local state.
 .claude/settings.local.json
 .claude/worktrees/*
+# Scratch home for hillclimb runs (cute-hillclimb skill): raw benchmark
+# output, autotuner configs, probe logs, and the goal file. Never committed.
+/artifacts/
