@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     from ..language.matmul_ops import _CuteTcgen05SearchPlanningResult
     from .cute.layout import CuTeGridExecutionPlan
     from .device_ir_analysis import DeviceIRAnalysis
+    from .tile_dependency import TaskFamily
 
     class _TLS(Protocol):
         device_irs: list[DeviceIR]
@@ -798,7 +799,9 @@ class DeviceIR:
         self.root_ids: list[int] = []
         self.rolled_reductions: list[RolledReductionInfo] = []
         self.phases: list[KernelPhase] = []
+        self.task_families: list[TaskFamily] = []
         self.grid_block_ids: list[list[int]] = []
+        self.noncanonical_task_origin_block_ids: set[int] = set()
         # Owning HostFunction (captured in ``lower_to_device_ir``).
         self.host_function: HostFunction | None = None
 
