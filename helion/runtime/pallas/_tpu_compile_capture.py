@@ -221,18 +221,32 @@ def _build_decoration_op(
         # Scalars are constexpr (compile-time constants for the Pallas kernel);
         # otherwise Helion materializes them as device buffers that orphan under
         # capture (torch_tpu aborts: "argument not provided").
-        return tuple(
-            constexpr(a) if k is not None else a
-            for a, k in zip(args, kinds, strict=True)
-        )
+        folded = []
+        for arg, kind in zip(args, kinds, strict=True):
+            if kind is None:
+                folded.append(arg)
+            else:
+                folded.append(constexpr(arg))
+        return tuple(folded)
 
     # validate=True: the AST eligibility check can't see view-aliasing or in-place
     # methods, so the fake re-validates per call and raises a clean compile error.
     fake, impl = _fake_and_impl(kernel, n_out, fold, validate=True)
     op = _define_op(kernel, decl, n_out, fake, impl)
+    parameters = tuple(kernel.signature.parameters.values())
+
+    def normalize_positional(args: tuple[Any, ...]) -> tuple[Any, ...]:
+        if len(args) == len(parameters):
+            return args
+        normalized = list(args)
+        for parameter in parameters[len(args) :]:
+            if parameter.default is inspect.Parameter.empty:
+                raise TypeError(f"missing required argument: {parameter.name}")
+            normalized.append(parameter.default)
+        return tuple(normalized)
 
     def captured(args: tuple[Any, ...]) -> object:
-        return op(*kernel.normalize_args(*args))
+        return op(*normalize_positional(args))
 
     return captured
 

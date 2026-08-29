@@ -218,3 +218,15 @@ class TestCompileCaptureRoundtrip(unittest.TestCase):
             x = torch.randn(m, n, device=DEVICE)
             y = torch.randn(m, n, device=DEVICE)
             torch.testing.assert_close(captured((x, y)), _cap_add(x, y))
+
+    def test_captured_callable_is_dynamo_traceable(self) -> None:
+        captured = register_decoration_op(_cap_add)
+        self.assertIsNotNone(captured)
+
+        def invoke(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            return captured((x, y))
+
+        compiled = torch.compile(invoke, backend="eager", fullgraph=True)
+        x = torch.randn(16, 16, device=DEVICE)
+        y = torch.randn(16, 16, device=DEVICE)
+        torch.testing.assert_close(compiled(x, y), x + y)
