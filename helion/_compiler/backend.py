@@ -440,6 +440,10 @@ class Backend(abc.ABC):
         """Called during `type_propagation` when processing a `load` memory op on fake tensors"""
         return
 
+    def normalize_input_fake_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Return the tensor metadata used while tracing a kernel input."""
+        return tensor
+
     def fake_subscript_shape(
         self,
         tensor: torch.Tensor,
