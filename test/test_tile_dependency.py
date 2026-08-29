@@ -13,29 +13,29 @@ from test._cross_loop_test_kernels import cartesian_affine_chain
 
 from helion._compiler.device_ir import _collect_memory_op_facts
 from helion._compiler.tile_dependency import AllocationRegion
-from helion._compiler.tile_dependency import ExecutionScope
-from helion._compiler.tile_dependency import LogicalDomain
-from helion._compiler.tile_dependency import LogicalRelation
-from helion._compiler.tile_dependency import LogicalTaskAxis
+from helion._compiler.tile_dependency import CoordinateDomain
+from helion._compiler.tile_dependency import CoordinateRelation
+from helion._compiler.tile_dependency import ExecutionSite
+from helion._compiler.tile_dependency import TaskAxis
 from helion._compiler.tile_dependency import TaskFamily
 from helion._compiler.tile_dependency import TileAccess
 from helion._compiler.tile_dependency import TileDependency
 from helion._compiler.tile_dependency import TileDependencyKind
-from helion._compiler.tile_dependency import _LogicalRelationPiece
+from helion._compiler.tile_dependency import _CoordinateRelationPiece
 from helion._compiler.tile_dependency import allocation_regions_may_overlap
 from helion._compiler.tile_dependency import build_tile_dependency_graph
-from helion._compiler.tile_dependency import instantiate_logical_domains
+from helion._compiler.tile_dependency import instantiate_coordinate_domains
 from helion._compiler.tile_dependency import instantiate_symbolic_dependencies
 from helion._compiler.tile_dependency import logical_axis_symbol
 from helion._compiler.tile_dependency import owner_roots_by_graph_id
-from helion._compiler.tile_dependency import physical_traversal_relation
+from helion._compiler.tile_dependency import pid_task_order
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import skipIfNotCUDA
 
 
 def _axis_geometry(
-    root_domains: tuple[LogicalDomain, ...],
+    root_domains: tuple[CoordinateDomain, ...],
 ) -> dict[int, tuple[int, int]]:
     return {
         axis: (domain.axis_counts[axis], domain.block_sizes[axis])
@@ -47,15 +47,15 @@ def _axis_geometry(
 def _configured_domains(
     graph,
     axis_geometry: dict[int, tuple[int, int]],
-) -> tuple[tuple[LogicalDomain, ...], tuple[LogicalDomain | None, ...]]:
-    configured_roots, scope_domains = instantiate_logical_domains(
+) -> tuple[tuple[CoordinateDomain, ...], tuple[CoordinateDomain | None, ...]]:
+    configured_roots, site_domains = instantiate_coordinate_domains(
         graph,
         axis_geometry=axis_geometry,
     )
     assert all(domain is not None for domain in configured_roots)
     return (
         tuple(domain for domain in configured_roots if domain is not None),
-        scope_domains,
+        site_domains,
     )
 
 
@@ -101,23 +101,23 @@ def _access(
     )
 
 
-def _root_predecessors(
+def _root_producers_by_consumer(
     plan,
-    root_domains: tuple[LogicalDomain, ...],
+    root_domains: tuple[CoordinateDomain, ...],
     pair: tuple[int, int] = (0, 1),
 ) -> tuple[frozenset[int], ...] | None:
     axis_geometry = _axis_geometry(root_domains)
-    configured_root_domains, scope_domains = _configured_domains(plan, axis_geometry)
+    configured_root_domains, site_domains = _configured_domains(plan, axis_geometry)
     relations = tuple(
         dependency.relation
         for dependency in instantiate_symbolic_dependencies(
             plan,
             root_domains=configured_root_domains,
-            scope_domains=scope_domains,
+            site_domains=site_domains,
         )
         if (dependency.producer_root, dependency.consumer_root) == pair
-        and dependency.producer_scope_id is None
-        and dependency.consumer_scope_id is None
+        and dependency.producer_site_id is None
+        and dependency.consumer_site_id is None
     )
     if not relations or any(relation is None for relation in relations):
         return None
@@ -129,8 +129,8 @@ def _root_predecessors(
             return None
         result = union
     return result.materialize(
-        source_traversal=root_domains[pair[1]].axis_order,
-        target_traversal=root_domains[pair[0]].axis_order,
+        source_axis_order=root_domains[pair[1]].axis_order,
+        target_axis_order=root_domains[pair[0]].axis_order,
     )
 
 
@@ -138,11 +138,11 @@ def _symbolic_root_relation(
     plan,
     axis_geometry: dict[int, tuple[int, int]],
 ):
-    root_domains, scope_domains = _configured_domains(plan, axis_geometry)
+    root_domains, site_domains = _configured_domains(plan, axis_geometry)
     dependencies = instantiate_symbolic_dependencies(
         plan,
         root_domains=root_domains,
-        scope_domains=scope_domains,
+        site_domains=site_domains,
     )
     self_relations = tuple(
         dependency.relation
@@ -159,14 +159,14 @@ def _one_dimensional_domains(
     consumer_count: int = 8,
     producer_block: int = 16,
     consumer_block: int = 16,
-) -> tuple[LogicalDomain, LogicalDomain]:
+) -> tuple[CoordinateDomain, CoordinateDomain]:
     return (
-        LogicalDomain(
+        CoordinateDomain(
             (10,),
             ((10, producer_count),),
             ((10, producer_block),),
         ),
-        LogicalDomain(
+        CoordinateDomain(
             (20,),
             ((20, consumer_count),),
             ((20, consumer_block),),
@@ -179,29 +179,31 @@ def _dependency_kinds(edge: TileDependency) -> frozenset[TileDependencyKind]:
 
 
 class TestTileDependency(TestCase):
-    def test_logical_domain_separates_geometry_from_traversal(self) -> None:
-        domain = LogicalDomain(
+    def test_coordinate_domain_separates_geometry_from_linearization_order(
+        self,
+    ) -> None:
+        domain = CoordinateDomain(
             (10, 20),
             ((10, 2), (20, 3)),
             ((10, 4), (20, 8)),
         )
         self.assertEqual(domain.coordinates(3), {10: 1, 20: 1})
         self.assertEqual(
-            domain.coordinates(3, traversal=(20, 10)),
+            domain.coordinates(3, linearization_order=(20, 10)),
             {10: 1, 20: 0},
         )
         self.assertEqual(domain.index({10: 1, 20: 1}), 3)
         self.assertEqual(
-            domain.index({10: 1, 20: 0}, traversal=(20, 10)),
+            domain.index({10: 1, 20: 0}, linearization_order=(20, 10)),
             3,
         )
 
     def test_relation_axis_renaming_preserves_positional_coordinates(self) -> None:
-        source = LogicalDomain((10, 20), ((10, 2), (20, 3)))
-        target = LogicalDomain((30, 40), ((30, 2), (40, 3)))
+        source = CoordinateDomain((10, 20), ((10, 2), (20, 3)))
+        target = CoordinateDomain((30, 40), ((30, 2), (40, 3)))
         source_10 = logical_axis_symbol(10)
         source_20 = logical_axis_symbol(20)
-        relation = LogicalRelation.point_map(
+        relation = CoordinateRelation.point_map(
             source,
             target,
             (
@@ -214,14 +216,14 @@ class TestTileDependency(TestCase):
                 ),
             ),
         )
-        renamed_source = LogicalDomain(
+        renamed_source = CoordinateDomain(
             (20, 10),
             ((20, 2), (10, 3)),
             ((20, 4), (10, 8)),
-            kind="worker",
+            kind="task_order",
             identity=7,
         )
-        renamed_target = LogicalDomain(
+        renamed_target = CoordinateDomain(
             (40, 30),
             ((40, 2), (30, 3)),
             kind="event",
@@ -239,13 +241,13 @@ class TestTileDependency(TestCase):
         self.assertEqual(renamed.target_domain, renamed_target)
         self.assertEqual(renamed.materialize(), relation.materialize())
         self.assertIsNone(
-            relation.rename_source_axes(LogicalDomain((0, 1), ((0, 2), (1, 4))))
+            relation.rename_source_axes(CoordinateDomain((0, 1), ((0, 2), (1, 4))))
         )
         self.assertIsNone(
-            relation.rename_target_axes(LogicalDomain((0, 1), ((0, 2), (1, 4))))
+            relation.rename_target_axes(CoordinateDomain((0, 1), ((0, 2), (1, 4))))
         )
 
-    def test_configured_roots_reuse_their_execution_scope_domains(self) -> None:
+    def test_configured_roots_reuse_their_execution_site_domains(self) -> None:
         graph = build_tile_dependency_graph(
             (
                 _access(0, root=0, kind="store", block_ids=(10,)),
@@ -255,30 +257,30 @@ class TestTileDependency(TestCase):
         )
         graph = dataclasses.replace(
             graph,
-            execution_scopes=(
-                ExecutionScope(0, 0, 0, (), None, "root", (), (10,), True, False),
-                ExecutionScope(1, 1, 1, (), None, "root", (), (20,), True, False),
+            execution_sites=(
+                ExecutionSite(0, 0, 0, (), None, "root", (), (10,), True, False),
+                ExecutionSite(1, 1, 1, (), None, "root", (), (20,), True, False),
             ),
-            scope_ids_by_access=((0,), (1,)),
+            site_ids_by_access=((0,), (1,)),
         )
 
-        root_domains, scope_domains = instantiate_logical_domains(
+        root_domains, site_domains = instantiate_coordinate_domains(
             graph,
             axis_geometry={10: (8, 16), 20: (4, 32)},
         )
 
-        root_scopes = tuple(scope for scope in graph.execution_scopes if scope.is_root)
-        self.assertEqual(len(root_scopes), 2)
-        for scope in root_scopes:
-            self.assertIs(root_domains[scope.root], scope_domains[scope.scope_id])
+        root_sites = tuple(site for site in graph.execution_sites if site.is_root)
+        self.assertEqual(len(root_sites), 2)
+        for site in root_sites:
+            self.assertIs(root_domains[site.root], site_domains[site.site_id])
 
-    def test_symbolic_physical_traversal_preserves_l2_tail_group(self) -> None:
-        domain = LogicalDomain(
+    def test_symbolic_pid_task_order_preserves_l2_tail_group(self) -> None:
+        domain = CoordinateDomain(
             (10, 20, 30),
             ((10, 5), (20, 3), (30, 2)),
             ((10, 1), (20, 1), (30, 1)),
         )
-        relation = physical_traversal_relation(
+        relation = pid_task_order(
             domain,
             domain.axis_order,
             l2_group_size=2,
@@ -290,53 +292,53 @@ class TestTileDependency(TestCase):
             tuple(next(iter(targets)) for targets in relation.materialize()),
             expected,
         )
-        inverse = relation.inverse()
-        self.assertIsNotNone(inverse)
-        assert inverse is not None
+        converse = relation.converse()
+        self.assertIsNotNone(converse)
+        assert converse is not None
         self.assertEqual(
-            tuple(next(iter(targets)) for targets in inverse.materialize()),
+            tuple(next(iter(targets)) for targets in converse.materialize()),
             tuple(expected.index(task) for task in range(len(expected))),
         )
 
-    def test_symbolic_physical_traversal_preserves_axis_permutation(self) -> None:
-        domain = LogicalDomain(
+    def test_symbolic_pid_task_order_preserves_axis_permutation(self) -> None:
+        domain = CoordinateDomain(
             (10, 20, 30),
             ((10, 2), (20, 3), (30, 4)),
             ((10, 1), (20, 1), (30, 1)),
         )
-        traversal = physical_traversal_relation(domain, (20, 10, 30))
-        physical_to_logical = tuple(
-            next(iter(targets)) for targets in traversal.materialize()
+        task_order = pid_task_order(domain, (20, 10, 30))
+        pid_to_logical = tuple(
+            next(iter(targets)) for targets in task_order.materialize()
         )
 
-        self.assertEqual(sorted(physical_to_logical), list(range(domain.size)))
-        inverse = traversal.inverse()
-        self.assertIsNotNone(inverse)
-        assert inverse is not None
-        logical_to_physical = tuple(
-            next(iter(targets)) for targets in inverse.materialize()
+        self.assertEqual(sorted(pid_to_logical), list(range(domain.size)))
+        converse = task_order.converse()
+        self.assertIsNotNone(converse)
+        assert converse is not None
+        logical_to_pid = tuple(
+            next(iter(targets)) for targets in converse.materialize()
         )
         self.assertEqual(
-            tuple(physical_to_logical[physical] for physical in logical_to_physical),
+            tuple(pid_to_logical[pid_task] for pid_task in logical_to_pid),
             tuple(range(domain.size)),
         )
 
-    def test_mixed_radix_predecessor_quotient_derives_publication(self) -> None:
+    def test_mixed_radix_readiness_quotient_derives_publication(self) -> None:
         for slots in (1, 2, 8, 64):
             with self.subTest(slots=slots):
-                consumer_domain = LogicalDomain(
+                consumer_domain = CoordinateDomain(
                     (20, 21),
                     ((20, slots), (21, 8)),
                     ((20, 1), (21, 256)),
                     identity=1,
                 )
-                producer_domain = LogicalDomain(
+                producer_domain = CoordinateDomain(
                     (10,),
                     ((10, slots * 256),),
                     ((10, 16),),
                     identity=0,
                 )
-                key_domain = dataclasses.replace(
+                readiness_key_domain = dataclasses.replace(
                     consumer_domain,
                     kind="event",
                     identity=None,
@@ -345,43 +347,43 @@ class TestTileDependency(TestCase):
                 activation_block = logical_axis_symbol(21)
                 begin = 256 * slot + 16 * activation_block
                 bounds = ((20, 0, slots, 1), (21, 0, 8, 1))
-                dependency = LogicalRelation(
+                dependency = CoordinateRelation(
                     consumer_domain,
                     producer_domain,
                     (
-                        _LogicalRelationPiece(
+                        _CoordinateRelationPiece(
                             bounds,
                             ((10, begin, begin + 16, 1),),
                         ),
-                        _LogicalRelationPiece(
+                        _CoordinateRelationPiece(
                             bounds,
                             ((10, begin + 128, begin + 144, 1),),
                         ),
                     ),
                 )
-                consumer_to_key = LogicalRelation.projection(
+                consumer_to_key = CoordinateRelation.projection(
                     consumer_domain,
-                    key_domain,
+                    readiness_key_domain,
                 )
                 assert consumer_to_key is not None
 
-                predecessors = dependency.factor_through(consumer_to_key)
+                producers_by_key = dependency.factor_through(consumer_to_key)
 
-                self.assertIsNotNone(predecessors)
-                assert predecessors is not None
-                self.assertEqual(len(predecessors.pieces), 2)
-                arrivals = predecessors.fiber_cardinality()
-                self.assertIsNotNone(arrivals)
-                assert arrivals is not None
-                self.assertEqual(arrivals.constant_value(), 32)
-                publication = predecessors.publication_converse()
-                self.assertIsNotNone(publication)
-                assert publication is not None
-                self.assertEqual(len(publication.pieces), 1)
-                self.assertTrue(publication.is_total_function())
+                self.assertIsNotNone(producers_by_key)
+                assert producers_by_key is not None
+                self.assertEqual(len(producers_by_key.pieces), 2)
+                arrival_count_by_key = producers_by_key.target_count_by_source()
+                self.assertIsNotNone(arrival_count_by_key)
+                assert arrival_count_by_key is not None
+                self.assertEqual(arrival_count_by_key.constant_value(), 32)
+                keys_by_producer = producers_by_key.converse()
+                self.assertIsNotNone(keys_by_producer)
+                assert keys_by_producer is not None
+                self.assertEqual(len(keys_by_producer.pieces), 1)
+                self.assertTrue(keys_by_producer.is_total_function())
                 for producer in (0, 15, 16, 127, 128, 255, slots * 256 - 1):
                     self.assertEqual(
-                        publication.target_coordinates({10: producer}),
+                        keys_by_producer.target_coordinates({10: producer}),
                         frozenset(
                             (
                                 (
@@ -394,74 +396,74 @@ class TestTileDependency(TestCase):
 
     def test_mixed_radix_partial_periodic_support_keeps_semantics(self) -> None:
         slots = 8
-        key_domain = LogicalDomain(
+        readiness_key_domain = CoordinateDomain(
             (20, 21),
             ((20, slots), (21, 8)),
             kind="event",
         )
-        producer_domain = LogicalDomain((10,), ((10, slots * 256),), identity=0)
+        producer_domain = CoordinateDomain((10,), ((10, slots * 256),), identity=0)
         slot = logical_axis_symbol(20)
         activation_block = logical_axis_symbol(21)
         begin = 256 * slot + 16 * activation_block
-        predecessors = LogicalRelation(
-            key_domain,
+        producers_by_key = CoordinateRelation(
+            readiness_key_domain,
             producer_domain,
             (
-                _LogicalRelationPiece(
+                _CoordinateRelationPiece(
                     ((20, 0, slots, 1), (21, 0, 8, 1)),
                     ((10, begin, begin + 16, 1),),
                 ),
             ),
         )
 
-        arrivals = predecessors.fiber_cardinality()
+        arrival_count_by_key = producers_by_key.target_count_by_source()
 
-        self.assertIsNotNone(arrivals)
-        assert arrivals is not None
-        self.assertEqual(arrivals.constant_value(), 16)
-        self.assertIsNone(predecessors.publication_converse())
+        self.assertIsNotNone(arrival_count_by_key)
+        assert arrival_count_by_key is not None
+        self.assertEqual(arrival_count_by_key.constant_value(), 16)
+        self.assertIsNone(producers_by_key.converse())
 
     def test_mixed_radix_converse_matches_reversed_axis_relation(self) -> None:
-        key_domain = LogicalDomain(
+        source_domain = CoordinateDomain(
             (21, 20),
             ((21, 3), (20, 2)),
-            kind="event",
+            kind="site",
         )
-        producer_domain = LogicalDomain((10,), ((10, 24),), identity=0)
+        target_domain = CoordinateDomain((10,), ((10, 24),), kind="allocation")
         inner = logical_axis_symbol(21)
         outer = logical_axis_symbol(20)
         begin = 2 * inner + 12 * outer
         bounds = ((21, 0, 3, 1), (20, 0, 2, 1))
-        predecessors = LogicalRelation(
-            key_domain,
-            producer_domain,
+        targets_by_source = CoordinateRelation(
+            source_domain,
+            target_domain,
             (
-                _LogicalRelationPiece(bounds, ((10, begin, begin + 2, 1),)),
-                _LogicalRelationPiece(bounds, ((10, begin + 6, begin + 8, 1),)),
+                _CoordinateRelationPiece(bounds, ((10, begin, begin + 2, 1),)),
+                _CoordinateRelationPiece(bounds, ((10, begin + 6, begin + 8, 1),)),
             ),
         )
 
-        publication = predecessors.publication_converse()
+        sources_by_target = targets_by_source.converse()
 
-        self.assertIsNotNone(publication)
-        assert publication is not None
+        self.assertIsNotNone(sources_by_target)
+        assert sources_by_target is not None
         expected = {
-            producer: frozenset(
-                key
-                for key, producers in enumerate(predecessors.materialize())
-                if producer in producers
+            target: frozenset(
+                source
+                for source, targets in enumerate(targets_by_source.materialize())
+                if target in targets
             )
-            for producer in range(producer_domain.size)
+            for target in range(target_domain.size)
         }
         self.assertEqual(
-            publication.materialize(),
-            tuple(expected[producer] for producer in range(producer_domain.size)),
+            sources_by_target.materialize(),
+            tuple(expected[target] for target in range(target_domain.size)),
         )
 
-    def test_fiber_enumeration_preserves_multi_piece_bijection(self) -> None:
-        producer = LogicalDomain((10,), ((10, 8),), identity=0)
-        keys = LogicalDomain((0,), ((0, 2),), kind="event", identity=0)
-        producer_to_key = LogicalRelation.point_map(
+    def test_target_enumeration_preserves_multi_piece_bijection(self) -> None:
+        producer = CoordinateDomain((10,), ((10, 8),), identity=0)
+        keys = CoordinateDomain((0,), ((0, 2),), kind="event", identity=0)
+        producer_to_key = CoordinateRelation.point_map(
             producer,
             keys,
             (
@@ -469,19 +471,19 @@ class TestTileDependency(TestCase):
                 (((10, 4, 8, 1),), (sympy.Integer(1),)),
             ),
         )
-        inverse = producer_to_key.inverse()
-        self.assertIsNotNone(inverse)
-        assert inverse is not None
-        traversal = inverse.fiber_enumeration()
-        self.assertIsNotNone(traversal)
-        assert traversal is not None
+        converse = producer_to_key.converse()
+        self.assertIsNotNone(converse)
+        assert converse is not None
+        task_order = converse.enumerate_targets_by_source()
+        self.assertIsNotNone(task_order)
+        assert task_order is not None
         self.assertEqual(
-            tuple(next(iter(targets)) for targets in traversal.materialize()),
+            tuple(next(iter(targets)) for targets in task_order.materialize()),
             tuple(range(producer.size)),
         )
 
-        tail_producer = LogicalDomain((10,), ((10, 7),), identity=0)
-        tail_relation = LogicalRelation.point_map(
+        tail_producer = CoordinateDomain((10,), ((10, 7),), identity=0)
+        tail_relation = CoordinateRelation.point_map(
             tail_producer,
             keys,
             (
@@ -489,10 +491,10 @@ class TestTileDependency(TestCase):
                 (((10, 4, 7, 1),), (sympy.Integer(1),)),
             ),
         )
-        tail_inverse = tail_relation.inverse()
-        self.assertIsNotNone(tail_inverse)
-        assert tail_inverse is not None
-        self.assertIsNone(tail_inverse.fiber_enumeration())
+        tail_converse = tail_relation.converse()
+        self.assertIsNotNone(tail_converse)
+        assert tail_converse is not None
+        self.assertIsNone(tail_converse.enumerate_targets_by_source())
 
     def test_symbolic_dependency_preserves_unequal_tile_range(self) -> None:
         elements = 65_536
@@ -534,7 +536,7 @@ class TestTileDependency(TestCase):
             frozenset((elements // 16 - 2, elements // 16 - 1)),
         )
 
-        cardinality = relation.fiber_cardinality()
+        cardinality = relation.target_count_by_source()
         self.assertIsNotNone(cardinality)
         assert cardinality is not None
         self.assertEqual(
@@ -542,7 +544,7 @@ class TestTileDependency(TestCase):
             tuple(frozenset((2,)) for _ in range(elements // 32)),
         )
 
-    def test_symbolic_fiber_cardinality_preserves_tail_pieces(self) -> None:
+    def test_symbolic_target_count_preserves_tail_pieces(self) -> None:
         elements = 65
         plan = build_tile_dependency_graph(
             (
@@ -575,7 +577,7 @@ class TestTileDependency(TestCase):
 
         self.assertIsNotNone(relation)
         assert relation is not None
-        cardinality = relation.fiber_cardinality()
+        cardinality = relation.target_count_by_source()
         self.assertIsNotNone(cardinality)
         assert cardinality is not None
         self.assertEqual(
@@ -620,7 +622,7 @@ class TestTileDependency(TestCase):
                 self.assertIsNotNone(relation)
                 assert relation is not None
                 self.assertLessEqual(len(relation.pieces), 3)
-                cardinality = relation.fiber_cardinality()
+                cardinality = relation.target_count_by_source()
                 self.assertIsNotNone(cardinality)
                 assert cardinality is not None
                 expected = tuple(
@@ -673,23 +675,23 @@ class TestTileDependency(TestCase):
         self.assertEqual(relation.materialize(), (frozenset((2, 3, 4, 5)),))
 
     def test_relation_coverage_preserves_stride_phase(self) -> None:
-        source = LogicalDomain((10,), ((10, 8),), identity=0)
-        key = LogicalDomain((0,), ((0, 8),), kind="event", identity=0)
-        even_sources = LogicalRelation(
+        source = CoordinateDomain((10,), ((10, 8),), identity=0)
+        key = CoordinateDomain((0,), ((0, 8),), kind="event", identity=0)
+        even_sources = CoordinateRelation(
             source,
             key,
             (
-                _LogicalRelationPiece(
+                _CoordinateRelationPiece(
                     ((10, 0, 8, 2),),
                     ((0, sympy.Integer(0), sympy.Integer(1), 1),),
                 ),
             ),
         )
-        odd_sources = LogicalRelation(
+        odd_sources = CoordinateRelation(
             source,
             key,
             (
-                _LogicalRelationPiece(
+                _CoordinateRelationPiece(
                     ((10, 1, 8, 2),),
                     ((0, sympy.Integer(0), sympy.Integer(1), 1),),
                 ),
@@ -702,22 +704,22 @@ class TestTileDependency(TestCase):
         assert source_union is not None
         self.assertEqual(source_union.materialize(), (frozenset((0,)),) * 8)
 
-        singleton = LogicalDomain((20,), ((20, 1),), identity=1)
-        even_targets = LogicalRelation(
+        singleton = CoordinateDomain((20,), ((20, 1),), identity=1)
+        even_targets = CoordinateRelation(
             singleton,
             key,
             (
-                _LogicalRelationPiece(
+                _CoordinateRelationPiece(
                     ((20, 0, 1, 1),),
                     ((0, sympy.Integer(0), sympy.Integer(8), 2),),
                 ),
             ),
         )
-        odd_targets = LogicalRelation(
+        odd_targets = CoordinateRelation(
             singleton,
             key,
             (
-                _LogicalRelationPiece(
+                _CoordinateRelationPiece(
                     ((20, 0, 1, 1),),
                     ((0, sympy.Integer(1), sympy.Integer(8), 2),),
                 ),
@@ -730,7 +732,7 @@ class TestTileDependency(TestCase):
         assert target_union is not None
         self.assertEqual(target_union.materialize(), (frozenset(range(8)),))
 
-    def test_symbolic_fiber_maximum_reduces_schedule_positions(self) -> None:
+    def test_symbolic_max_target_value_reduces_schedule_positions(self) -> None:
         elements = 128
         plan = build_tile_dependency_graph(
             (
@@ -760,12 +762,12 @@ class TestTileDependency(TestCase):
         self.assertIsNotNone(relation)
         assert relation is not None
         producer_axis = relation.target_domain.axis_order[0]
-        value_domain = LogicalDomain(
+        value_domain = CoordinateDomain(
             (0,),
             ((0, 4),),
             kind="value",
         )
-        positions = LogicalRelation.point_map(
+        worker_steps = CoordinateRelation.point_map(
             relation.target_domain,
             value_domain,
             (
@@ -776,22 +778,24 @@ class TestTileDependency(TestCase):
             ),
         )
 
-        maximum = relation.fiber_maximum(positions)
+        maximum = relation.max_target_value_by_source(worker_steps)
 
         self.assertIsNotNone(maximum)
         assert maximum is not None
         self.assertEqual(
             maximum.materialize(),
             tuple(
-                frozenset((max(max(positions.targets(task)) for task in producers),))
-                for producers in relation.materialize()
+                frozenset(
+                    (max(max(worker_steps.targets(task)) for task in producer_tasks),)
+                )
+                for producer_tasks in relation.materialize()
             ),
         )
 
     def test_out_of_domain_point_map_is_not_total(self) -> None:
-        source = LogicalDomain((10,), ((10, 6),), identity=0)
-        target = LogicalDomain((0,), ((0, 2),), kind="event", identity=0)
-        relation = LogicalRelation.point_map(
+        source = CoordinateDomain((10,), ((10, 6),), identity=0)
+        target = CoordinateDomain((0,), ((0, 2),), kind="event", identity=0)
+        relation = CoordinateRelation.point_map(
             source,
             target,
             (
@@ -807,9 +811,9 @@ class TestTileDependency(TestCase):
         self.assertEqual(relation.materialize()[-2:], (frozenset(), frozenset()))
 
     def test_partitioned_total_function_avoids_global_canonicalization(self) -> None:
-        source = LogicalDomain((10,), ((10, 128),), identity=0)
-        target = LogicalDomain((20,), ((20, 128),), identity=1)
-        relation = LogicalRelation.point_map(
+        source = CoordinateDomain((10,), ((10, 128),), identity=0)
+        target = CoordinateDomain((20,), ((20, 128),), identity=1)
+        relation = CoordinateRelation.point_map(
             source,
             target,
             tuple(
@@ -822,7 +826,7 @@ class TestTileDependency(TestCase):
         )
 
         with mock.patch.object(
-            LogicalRelation,
+            CoordinateRelation,
             "canonical_single_valued",
             side_effect=AssertionError("slow fallback should not run"),
         ):
@@ -881,7 +885,8 @@ class TestTileDependency(TestCase):
                 self.assertIsNotNone(relation)
                 assert relation is not None
                 self.assertEqual(
-                    relation.materialize(), _root_predecessors(plan, root_domains)
+                    relation.materialize(),
+                    _root_producers_by_consumer(plan, root_domains),
                 )
 
     def test_symbolic_dependency_keeps_batch_axis(self) -> None:
@@ -966,11 +971,9 @@ class TestTileDependency(TestCase):
             self.assertTrue(dependency_graph.edges_between(0, 1))
             self.assertTrue(
                 all(
-                    all(scope.root == access.root for scope in scopes)
+                    all(site.root == access.root for site in sites)
                     for access in dependency_graph.accesses
-                    for scopes in (
-                        dependency_graph.scopes_for_access(access.access_id),
-                    )
+                    for sites in (dependency_graph.sites_for_access(access.access_id),)
                 )
             )
         finally:
@@ -1025,10 +1028,10 @@ class TestTileDependency(TestCase):
         )
 
         root_domains = (
-            LogicalDomain((10, 11), ((10, 4), (11, 4)), ((10, 1), (11, 1))),
-            LogicalDomain((20, 21), ((20, 3), (21, 3)), ((20, 1), (21, 1))),
+            CoordinateDomain((10, 11), ((10, 4), (11, 4)), ((10, 1), (11, 1))),
+            CoordinateDomain((20, 21), ((20, 3), (21, 3)), ((20, 1), (21, 1))),
         )
-        self.assertIsNone(_root_predecessors(plan, root_domains))
+        self.assertIsNone(_root_producers_by_consumer(plan, root_domains))
 
     def test_one_dimensional_storage_offset_remains_task_ready(self) -> None:
         plan = build_tile_dependency_graph(
@@ -1055,7 +1058,7 @@ class TestTileDependency(TestCase):
         )
 
         self.assertEqual(
-            _root_predecessors(
+            _root_producers_by_consumer(
                 plan,
                 _one_dimensional_domains(
                     producer_count=8,
@@ -1072,8 +1075,8 @@ class TestTileDependency(TestCase):
                 _access(1, root=1, kind="load", block_ids=(20,)),
             ),
             task_families=(
-                TaskFamily((LogicalTaskAxis(10, None),)),
-                TaskFamily((LogicalTaskAxis(20, None),)),
+                TaskFamily((TaskAxis(10, None),)),
+                TaskFamily((TaskAxis(20, None),)),
             ),
             root_phases=(0, 1),
         )
@@ -1137,7 +1140,7 @@ class TestTileDependency(TestCase):
             frozenset((TileDependencyKind.READ_AFTER_WRITE,)),
         )
         self.assertEqual(
-            _root_predecessors(plan, _one_dimensional_domains()),
+            _root_producers_by_consumer(plan, _one_dimensional_domains()),
             tuple(frozenset((task,)) for task in range(8)),
         )
 
@@ -1162,7 +1165,7 @@ class TestTileDependency(TestCase):
             ),
         )
         self.assertEqual(
-            _root_predecessors(plan, _one_dimensional_domains()),
+            _root_producers_by_consumer(plan, _one_dimensional_domains()),
             tuple(frozenset((task,)) for task in range(8)),
         )
 
@@ -1181,7 +1184,7 @@ class TestTileDependency(TestCase):
             frozenset((TileDependencyKind.WRITE_AFTER_READ,)),
         )
         self.assertEqual(
-            _root_predecessors(plan, _one_dimensional_domains()),
+            _root_producers_by_consumer(plan, _one_dimensional_domains()),
             tuple(frozenset((task,)) for task in range(8)),
         )
 
@@ -1200,7 +1203,7 @@ class TestTileDependency(TestCase):
             [[10], [20]],
         )
 
-        relation = _root_predecessors(plan, _one_dimensional_domains())
+        relation = _root_producers_by_consumer(plan, _one_dimensional_domains())
         self.assertIsNone(relation)
 
     def test_reversed_mapping_falls_back_to_root(self) -> None:
@@ -1218,7 +1221,7 @@ class TestTileDependency(TestCase):
             [[10], [20]],
         )
 
-        relation = _root_predecessors(plan, _one_dimensional_domains())
+        relation = _root_producers_by_consumer(plan, _one_dimensional_domains())
         self.assertIsNone(relation)
 
     def test_batch_axis_is_part_of_task_mapping(self) -> None:
@@ -1249,10 +1252,10 @@ class TestTileDependency(TestCase):
         )
 
         root_domains = (
-            LogicalDomain((10, 11), ((10, 2), (11, 4)), ((10, 1), (11, 1))),
-            LogicalDomain((20, 21), ((20, 2), (21, 4)), ((20, 1), (21, 1))),
+            CoordinateDomain((10, 11), ((10, 2), (11, 4)), ((10, 1), (11, 1))),
+            CoordinateDomain((20, 21), ((20, 2), (21, 4)), ((20, 1), (21, 1))),
         )
-        relation = _root_predecessors(plan, root_domains)
+        relation = _root_producers_by_consumer(plan, root_domains)
         assert relation is not None
         consumer_task = 1 + 2 * 2
         (producer_task,) = relation[consumer_task]
@@ -1291,11 +1294,11 @@ class TestTileDependency(TestCase):
         )
 
         root_domains = (
-            LogicalDomain((10, 11), ((10, 32), (11, 8)), ((10, 1), (11, 16))),
-            LogicalDomain((20, 21), ((20, 32), (21, 8)), ((20, 1), (21, 16))),
+            CoordinateDomain((10, 11), ((10, 32), (11, 8)), ((10, 1), (11, 16))),
+            CoordinateDomain((20, 21), ((20, 32), (21, 8)), ((20, 1), (21, 16))),
         )
         self.assertEqual(
-            _root_predecessors(plan, root_domains),
+            _root_producers_by_consumer(plan, root_domains),
             tuple(frozenset((task,)) for task in range(256)),
         )
 
@@ -1327,10 +1330,10 @@ class TestTileDependency(TestCase):
         )
 
         root_domains = (
-            LogicalDomain((10, 11), ((10, 32), (11, 8)), ((10, 1), (11, 16))),
-            LogicalDomain((20,), ((20, 256),), ((20, 16),)),
+            CoordinateDomain((10, 11), ((10, 32), (11, 8)), ((10, 1), (11, 16))),
+            CoordinateDomain((20,), ((20, 256),), ((20, 16),)),
         )
-        relation = _root_predecessors(plan, root_domains)
+        relation = _root_producers_by_consumer(plan, root_domains)
         self.assertIsNone(relation)
 
     def test_unequal_tiles_map_to_every_overlapping_producer(self) -> None:
@@ -1342,7 +1345,7 @@ class TestTileDependency(TestCase):
             [[10], [20]],
         )
         self.assertEqual(
-            _root_predecessors(
+            _root_producers_by_consumer(
                 plan,
                 _one_dimensional_domains(
                     producer_count=8,
@@ -1391,13 +1394,13 @@ class TestTileDependency(TestCase):
             [[10, 11], [20, 21]],
         )
         root_domains = (
-            LogicalDomain((10, 11), ((10, 2), (11, 16)), ((10, 1), (11, 16))),
-            LogicalDomain((20, 21), ((20, 2), (21, 4)), ((20, 1), (21, 32))),
+            CoordinateDomain((10, 11), ((10, 2), (11, 16)), ((10, 1), (11, 16))),
+            CoordinateDomain((20, 21), ((20, 2), (21, 4)), ((20, 1), (21, 32))),
         )
-        relation = _root_predecessors(plan, root_domains)
+        relation = _root_producers_by_consumer(plan, root_domains)
         assert relation is not None
         self.assertEqual(len(relation), 8)
-        self.assertEqual({len(predecessors) for predecessors in relation}, {4})
+        self.assertEqual({len(producer_tasks) for producer_tasks in relation}, {4})
         self.assertEqual(frozenset().union(*relation), frozenset(range(32)))
         self.assertTrue(
             all(
@@ -1443,17 +1446,17 @@ class TestTileDependency(TestCase):
             [[10, 11], [20, 21]],
         )
         root_domains = (
-            LogicalDomain((10, 11), ((10, 2), (11, 16)), ((10, 1), (11, 16))),
-            LogicalDomain((20, 21), ((20, 2), (21, 4)), ((20, 1), (21, 32))),
+            CoordinateDomain((10, 11), ((10, 2), (11, 16)), ((10, 1), (11, 16))),
+            CoordinateDomain((20, 21), ((20, 2), (21, 4)), ((20, 1), (21, 32))),
         )
-        actual = _root_predecessors(plan, root_domains)
+        actual = _root_producers_by_consumer(plan, root_domains)
         assert actual is not None
-        for consumer_task, predecessors in enumerate(actual):
+        for consumer_task, producer_tasks in enumerate(actual):
             coordinates = root_domains[1].coordinates(consumer_task)
             batch = coordinates[20]
             group = coordinates[21]
             self.assertEqual(
-                predecessors,
+                producer_tasks,
                 frozenset(
                     batch + producer_group * 2
                     for producer_group in (
@@ -1474,7 +1477,7 @@ class TestTileDependency(TestCase):
             [[10], [20]],
         )
         self.assertEqual(
-            _root_predecessors(
+            _root_producers_by_consumer(
                 plan,
                 _one_dimensional_domains(
                     producer_count=6,
@@ -1504,7 +1507,7 @@ class TestTileDependency(TestCase):
             [[10], [20]],
         )
         self.assertEqual(
-            _root_predecessors(
+            _root_producers_by_consumer(
                 overlapping,
                 _one_dimensional_domains(
                     producer_count=8,
@@ -1528,7 +1531,7 @@ class TestTileDependency(TestCase):
             ),
             [[10], [20]],
         )
-        prefix = _root_predecessors(
+        prefix = _root_producers_by_consumer(
             identity,
             _one_dimensional_domains(
                 producer_count=8,
@@ -1556,7 +1559,7 @@ class TestTileDependency(TestCase):
             ),
             [[10], [20]],
         )
-        suffix_relation = _root_predecessors(
+        suffix_relation = _root_producers_by_consumer(
             suffix,
             _one_dimensional_domains(
                 producer_count=8,
@@ -1591,7 +1594,7 @@ class TestTileDependency(TestCase):
             [[10], [20]],
         )
         self.assertEqual(
-            _root_predecessors(
+            _root_producers_by_consumer(
                 plan,
                 _one_dimensional_domains(
                     producer_count=4,
@@ -1614,7 +1617,7 @@ class TestTileDependency(TestCase):
         )
 
         self.assertEqual(
-            _root_predecessors(plan, _one_dimensional_domains()),
+            _root_producers_by_consumer(plan, _one_dimensional_domains()),
             tuple(frozenset((task,)) for task in range(8)),
         )
 
@@ -1627,7 +1630,7 @@ class TestTileDependency(TestCase):
             [[10], [20]],
         )
 
-        self.assertIsNone(_root_predecessors(plan, _one_dimensional_domains()))
+        self.assertIsNone(_root_producers_by_consumer(plan, _one_dimensional_domains()))
 
     def test_nonzero_or_dynamic_grid_start_falls_back_to_root(self) -> None:
         plan = build_tile_dependency_graph(
@@ -1639,12 +1642,12 @@ class TestTileDependency(TestCase):
             noncanonical_task_origin_block_ids=frozenset((10,)),
         )
 
-        self.assertIsNone(_root_predecessors(plan, _one_dimensional_domains()))
+        self.assertIsNone(_root_producers_by_consumer(plan, _one_dimensional_domains()))
 
     def test_tracks_latest_writer_and_intervening_readers(self) -> None:
         task_families = tuple(
             TaskFamily(
-                axes=(LogicalTaskAxis(root, 128),),
+                axes=(TaskAxis(root, 128),),
             )
             for root in range(4)
         )
@@ -1704,9 +1707,9 @@ class TestTileDependency(TestCase):
                 ),
             ),
             task_families=(
-                TaskFamily((LogicalTaskAxis(10, 96),)),
-                TaskFamily((LogicalTaskAxis(20, 64),)),
-                TaskFamily((LogicalTaskAxis(30, 96),)),
+                TaskFamily((TaskAxis(10, 96),)),
+                TaskFamily((TaskAxis(20, 64),)),
+                TaskFamily((TaskAxis(30, 96),)),
             ),
         )
 

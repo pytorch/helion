@@ -5082,3 +5082,73 @@ known-static-gap DeepSeek-V3 probe measures 174.75 us versus 158.03 us.
   complete sequential cold-L2 run rather than interleaving implementations.
 - [x] Remove superseded probe artifacts from the eventual PR while retaining
   the local files for future experiments.
+
+### Approved terminology decisions
+
+This table is the authoritative running terminology record. Historical notes
+above may retain the names that were current when the work was performed;
+proposed names are added here only after approval.
+
+| Previous terminology | Approved terminology | Decision |
+|---|---|---|
+| `root` | `root` | Retain Helion's established name for a top-level DeviceIR loop/graph; root IDs follow source order. |
+| `root completion` | `root barrier` | Describe the synchronization mechanism directly: consumers wait until all work assigned to the producer root has arrived. |
+| `root_completion_edges` | `root_barrier_edges` | Rename the selected coarse dependency edges consistently with `root barrier`. |
+| `_select_root_completion_edges` | `_select_root_barrier_edges` | Rename the scheduler selection helper consistently with `root barrier`. |
+| `_is_ordered_by_root_completion` | `_is_ordered_by_root_barrier` | Describe transitive ordering through selected root barriers. |
+| `root_completion_*` codegen names | `root_barrier_*` | Apply the same terminology to counters, waits, publications, state, and generated variable prefixes. |
+| `guaranteed` | `executes_unconditionally` | State directly whether every instance of the parent execution site reaches this site. |
+| `segmentable` | `can_split_loop` | State directly whether lowering may split this nested loop at proved synchronization boundaries. |
+| event `key` | `readiness_key` | Qualify the coordinate as indexing one independently completable readiness condition. |
+| `key_domain` | `readiness_key_domain` | Name the complete coordinate domain indexing one readiness event's counters. |
+| `predecessors` | `producers_by_key` | Name the relation direction explicitly: readiness key to required producer instances. |
+| `producer_to_keys` | `keys_by_producer` | Name the publication relation direction explicitly: producer instance to readiness keys. |
+| `arrivals_per_key` | `arrival_count_by_key` | Name the per-readiness-key counter target directly. |
+| `contributions` / `uses` | `producers` / `consumers` | Describe the two semantic sides of a readiness event; a final-arrival continuation selects one consumer and does not change this ownership. |
+| `dependency_points` | `covered_obligations` | Identify the exact memory-ordering obligations represented by a readiness consumer. |
+| `task_relation` | `task_order` | Represent the mapping from task-order coordinates to logical task coordinates. |
+| `root_traversals` | `root_task_orders` | Name each root's configured ordering of logical tasks. |
+| `physical_traversal_relation()` | `pid_task_order()` | Build the configured PID/L2 ordering that maps execution-order coordinates to logical root tasks. |
+| `physical_axis_order` | `pid_axis_order` | Name the configured fastest-to-slowest axis order used by program IDs. |
+| generic relation `traversal` arguments | `linearization_order` / `source_axis_order` / `target_axis_order` | Reserve task-order terminology for scheduling while naming test-only coordinate flattening directly. |
+| scheduler `ordinal` | `task_order_index` | Identify a task's index within a configured or schedule-derived task order. |
+| `schedule_begin` | `dispatch_offset` | Identify the linear worker-schedule offset at which a dispatch segment starts. |
+| scheduler `position` | `worker_step` | Identify the sequential execution step on one persistent worker, without renaming unrelated uses of position. |
+| scheduler `frontier` | `ready_prefix_length` or `split_iteration` | Name whether the value is a count of already-ready work or the concrete nested-loop split point instead of using one overloaded abstraction. |
+| `fiber_cardinality()` | `target_count_by_source()` | Return the symbolic number of target coordinates associated with each source coordinate. |
+| `fiber_maximum()` | `max_target_value_by_source()` | Map each source coordinate to the maximum scalar value associated with any of its targets. |
+| `fiber_enumeration()` | `enumerate_targets_by_source()` | Construct a compact symbolic ordering of each source coordinate's target set. |
+| `fiber_analysis()` | `derive_converse_and_target_counts()` | Derive the representable converse and per-source target-count relation from one shared proof. |
+| `source_axes_used()` | `source_axes_affecting_targets()` | Return exactly the source axes that can change the relation's target set or support. |
+| `inverse()` | `converse()` | Use the correct relation-algebra term for exchanging source and target coordinates. |
+| `publication_converse()` | Fold into `converse()` | Keep one exact converse operation, including the existing joint mixed-radix proof, rather than a publication-specific relation API. |
+| producer `fiber` | producer set for one readiness key | Describe the concrete semantic set instead of using opaque relation-algebra jargon. |
+| worker `strand` | worker sequence | Describe the ordered tasks executed by one persistent worker. |
+| task `strand` | task-local program order | Describe nested execution that remains ordered within its owning root task. |
+| `actions_per_strand` | `nested_iterations_per_task` | Name the counted nested-loop iterations directly. |
+| `LocalTrigger` | `FinalArrivalContinuation` | Select a consumer task to execute inline on the producer's final arrival. |
+| `EventContribution` | `ReadinessProducer` | Describe one producer root/execution site's requirements for each readiness key. |
+| `EventUse` | `ReadinessConsumer` | Map consumer instances to the readiness keys they require. |
+| `KeyedEvent` | `ReadinessEvent` | Represent a semantic readiness condition indexed by independently completable keys. |
+| `EventGraph` | `ReadinessGraph` | Hold configured readiness events plus PID-to-logical root task orders. |
+| `CountedEventPlan` | `ReadinessCounterPlan` | Represent the runtime counter lowering selected for a semantic readiness event. |
+| `uniform_arrivals()` | `uniform_arrival_count()` | Return the one constant counter target shared by every readiness key, when it exists. |
+| `build_keyed_events()` | `build_readiness_events()` | Construct semantic readiness events from exact tile-dependency relations. |
+| `build_event_graph()` | `build_readiness_graph()` | Bind readiness events to the configured root task orders. |
+| `choose_counted_events()` | `choose_readiness_counters()` | Select the readiness events that admit counter-based lowering. |
+| `_ScopeReadiness` | `_NestedLoopReadiness` | Describe when iterations of one nested consumer loop become ready. |
+| `CrossLoopSchedule` | `StaticPipelinePlan` | Hold the final worker schedule, readiness counters, continuations, and root barriers. |
+| `build_cross_loop_schedule()` | `build_static_pipeline_plan()` | Derive the complete static pipeline plan from the dependency graph and selected configuration. |
+| `LogicalTaskAxis` | `TaskAxis` | Represent one source-level tiled axis and its logical extent. |
+| `TaskFamily` | `TaskFamily` | Retain the name for all independently schedulable tasks generated by one top-level `hl.tile` loop. |
+| `LogicalDomain` | `CoordinateDomain` | Represent a finite Cartesian coordinate space for tasks, execution sites, task orders, readiness keys, workers, or values. |
+| task-order domain kind `"worker"` | `"task_order"` | Distinguish dense PID/task-order coordinates from actual persistent-worker placement coordinates. |
+| `_LogicalRelationPiece` | `_CoordinateRelationPiece` | Represent one guarded source-coordinate box mapped to symbolic target ranges. |
+| `LogicalRelation` | `CoordinateRelation` | Represent an exact piecewise symbolic relation between two coordinate domains. |
+| `ExecutionScope` | `ExecutionSite` | Identify one stable reachable DeviceIR callsite, including nested loops and control-flow bodies. |
+| relation `source` / `target` | retain | These are conventional relation-algebra terms: a `CoordinateRelation` maps each source coordinate to a set of target coordinates. Domain-specific fields qualify the direction where it matters, such as `producers_by_key` and `keys_by_consumer`. |
+
+The approved terminology is now implemented across dependency analysis,
+static-pipeline scheduling, code generation, and their focused tests. Historical
+design notes above intentionally remain a record of the names used when each
+experiment was performed.

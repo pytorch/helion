@@ -8,8 +8,8 @@ from unittest import mock
 import sympy
 import torch
 
-from test._cross_loop_schedule_oracle import event_source_traversal
 from test._cross_loop_schedule_oracle import placement
+from test._cross_loop_schedule_oracle import readiness_consumer_source_order
 from test._cross_loop_schedule_oracle import segment_placement
 from test._cross_loop_schedule_oracle import segment_task_at
 from test._cross_loop_schedule_oracle import task_at
@@ -18,48 +18,48 @@ from test._cross_loop_schedule_oracle import validate_worker_schedule
 from test._cross_loop_test_kernels import nested_store_chain
 from test._cross_loop_test_kernels import streamed_singleton_reduction
 
-from helion._compiler.cross_loop_scheduler import CountedEventPlan
-from helion._compiler.cross_loop_scheduler import EventContribution
-from helion._compiler.cross_loop_scheduler import EventGraph
-from helion._compiler.cross_loop_scheduler import EventUse
-from helion._compiler.cross_loop_scheduler import KeyedEvent
+from helion._compiler.cross_loop_scheduler import ReadinessConsumer
+from helion._compiler.cross_loop_scheduler import ReadinessCounterPlan
+from helion._compiler.cross_loop_scheduler import ReadinessEvent
+from helion._compiler.cross_loop_scheduler import ReadinessGraph
+from helion._compiler.cross_loop_scheduler import ReadinessProducer
 from helion._compiler.cross_loop_scheduler import WorkerSchedule
 from helion._compiler.cross_loop_scheduler import WorkerScheduleSegment
-from helion._compiler.cross_loop_scheduler import _select_root_completion_edges
+from helion._compiler.cross_loop_scheduler import _select_root_barrier_edges
 from helion._compiler.cross_loop_scheduler import (
     build_baseline_worker_schedule as _build_baseline_worker_schedule,
 )
 from helion._compiler.cross_loop_scheduler import (
-    build_cross_loop_schedule as _build_cross_loop_schedule,
+    build_readiness_events as _build_readiness_events,
 )
 from helion._compiler.cross_loop_scheduler import (
-    build_event_graph as _build_event_graph,
+    build_readiness_graph as _build_readiness_graph,
 )
 from helion._compiler.cross_loop_scheduler import (
-    build_keyed_events as _build_keyed_events,
+    build_static_pipeline_plan as _build_static_pipeline_plan,
 )
-from helion._compiler.cross_loop_scheduler import choose_counted_events
-from helion._compiler.cross_loop_scheduler import choose_local_triggers
-from helion._compiler.cross_loop_scheduler import derive_local_triggers
-from helion._compiler.cross_loop_scheduler import order_local_contributors_by_key
-from helion._compiler.cross_loop_scheduler import place_nested_scope_consumers
-from helion._compiler.tile_dependency import ExecutionScope
-from helion._compiler.tile_dependency import LogicalDomain
-from helion._compiler.tile_dependency import LogicalRelation
+from helion._compiler.cross_loop_scheduler import choose_final_arrival_continuations
+from helion._compiler.cross_loop_scheduler import choose_readiness_counters
+from helion._compiler.cross_loop_scheduler import derive_final_arrival_continuations
+from helion._compiler.cross_loop_scheduler import order_continuation_producers_by_key
+from helion._compiler.cross_loop_scheduler import place_nested_loop_consumers
+from helion._compiler.tile_dependency import CoordinateDomain
+from helion._compiler.tile_dependency import CoordinateRelation
+from helion._compiler.tile_dependency import ExecutionSite
 from helion._compiler.tile_dependency import TileAccess
-from helion._compiler.tile_dependency import _LogicalRelationPiece
+from helion._compiler.tile_dependency import _CoordinateRelationPiece
 from helion._compiler.tile_dependency import build_tile_dependency_graph
-from helion._compiler.tile_dependency import instantiate_logical_domains
+from helion._compiler.tile_dependency import instantiate_coordinate_domains
 from helion._compiler.tile_dependency import instantiate_symbolic_dependencies
 from helion._compiler.tile_dependency import logical_axis_symbol
-from helion._compiler.tile_dependency import physical_traversal_relation
+from helion._compiler.tile_dependency import pid_task_order
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import skipIfNotCUDA
 
 
 def _axis_geometry(
-    root_domains: tuple[LogicalDomain, ...],
+    root_domains: tuple[CoordinateDomain, ...],
 ) -> dict[int, tuple[int, int]]:
     return {
         axis: (domain.axis_counts[axis], domain.block_sizes[axis])
@@ -69,8 +69,8 @@ def _axis_geometry(
 
 
 def _identify_root_domains(
-    root_domains: tuple[LogicalDomain, ...],
-) -> tuple[LogicalDomain, ...]:
+    root_domains: tuple[CoordinateDomain, ...],
+) -> tuple[CoordinateDomain, ...]:
     return tuple(
         dataclasses.replace(domain, identity=root)
         for root, domain in enumerate(root_domains)
@@ -80,30 +80,30 @@ def _identify_root_domains(
 def _configured_domains(
     graph,
     axis_geometry: dict[int, tuple[int, int]],
-) -> tuple[tuple[LogicalDomain, ...], tuple[LogicalDomain | None, ...]]:
-    configured_roots, scope_domains = instantiate_logical_domains(
+) -> tuple[tuple[CoordinateDomain, ...], tuple[CoordinateDomain | None, ...]]:
+    configured_roots, site_domains = instantiate_coordinate_domains(
         graph,
         axis_geometry=axis_geometry,
     )
     assert all(domain is not None for domain in configured_roots)
     return (
         tuple(domain for domain in configured_roots if domain is not None),
-        scope_domains,
+        site_domains,
     )
 
 
-def _default_root_traversals(
-    root_domains: tuple[LogicalDomain, ...],
-    physical_axis_orders: tuple[tuple[int, ...], ...] | None = None,
-) -> tuple[LogicalRelation, ...]:
-    if physical_axis_orders is None:
-        physical_axis_orders = tuple(domain.axis_order for domain in root_domains)
+def _default_root_task_orders(
+    root_domains: tuple[CoordinateDomain, ...],
+    pid_axis_orders: tuple[tuple[int, ...], ...] | None = None,
+) -> tuple[CoordinateRelation, ...]:
+    if pid_axis_orders is None:
+        pid_axis_orders = tuple(domain.axis_order for domain in root_domains)
     return tuple(
         itertools.starmap(
-            physical_traversal_relation,
+            pid_task_order,
             zip(
                 root_domains,
-                physical_axis_orders,
+                pid_axis_orders,
                 strict=True,
             ),
         )
@@ -158,14 +158,14 @@ def _one_dimensional_domains(
     consumer_count: int = 8,
     producer_block: int = 16,
     consumer_block: int = 16,
-) -> tuple[LogicalDomain, LogicalDomain]:
+) -> tuple[CoordinateDomain, CoordinateDomain]:
     return (
-        LogicalDomain(
+        CoordinateDomain(
             (10,),
             ((10, producer_count),),
             ((10, producer_block),),
         ),
-        LogicalDomain(
+        CoordinateDomain(
             (20,),
             ((20, consumer_count),),
             ((20, consumer_block),),
@@ -173,99 +173,99 @@ def _one_dimensional_domains(
     )
 
 
-def _configured_event_graph(
+def _configured_readiness_graph(
     graph,
-    root_domains: tuple[LogicalDomain, ...],
+    root_domains: tuple[CoordinateDomain, ...],
     *,
     axis_geometry: dict[int, tuple[int, int]] | None = None,
-    physical_axis_orders: tuple[tuple[int, ...], ...] | None = None,
-    publishable_scope_ids: frozenset[int] | None = None,
-) -> EventGraph:
+    pid_axis_orders: tuple[tuple[int, ...], ...] | None = None,
+    publishable_site_ids: frozenset[int] | None = None,
+) -> ReadinessGraph:
     if axis_geometry is None:
         axis_geometry = _axis_geometry(root_domains)
-    configured_root_domains, scope_domains = _configured_domains(graph, axis_geometry)
-    return _build_event_graph(
+    configured_root_domains, site_domains = _configured_domains(graph, axis_geometry)
+    return _build_readiness_graph(
         graph,
-        root_traversals=_default_root_traversals(
+        root_task_orders=_default_root_task_orders(
             configured_root_domains,
-            physical_axis_orders,
+            pid_axis_orders,
         ),
-        scope_domains=scope_domains,
-        publishable_scope_ids=publishable_scope_ids,
+        site_domains=site_domains,
+        publishable_site_ids=publishable_site_ids,
     )
 
 
-def build_keyed_events(
+def build_readiness_events(
     graph,
     *,
     axis_geometry: dict[int, tuple[int, int]],
-    publishable_scope_ids: frozenset[int] | None = None,
+    publishable_site_ids: frozenset[int] | None = None,
 ):
-    root_domains, scope_domains = _configured_domains(graph, axis_geometry)
-    return _build_keyed_events(
+    root_domains, site_domains = _configured_domains(graph, axis_geometry)
+    return _build_readiness_events(
         graph,
         root_domains=root_domains,
-        scope_domains=scope_domains,
-        publishable_scope_ids=publishable_scope_ids,
+        site_domains=site_domains,
+        publishable_site_ids=publishable_site_ids,
     )
 
 
 def build_baseline_worker_schedule(
-    root_domains: tuple[LogicalDomain, ...],
+    root_domains: tuple[CoordinateDomain, ...],
     worker_count: int,
     *,
-    root_traversals: tuple[LogicalRelation, ...] | None = None,
-    physical_axis_orders: tuple[tuple[int, ...], ...] | None = None,
+    root_task_orders: tuple[CoordinateRelation, ...] | None = None,
+    pid_axis_orders: tuple[tuple[int, ...], ...] | None = None,
 ) -> WorkerSchedule:
     root_domains = _identify_root_domains(root_domains)
-    if root_traversals is None:
-        root_traversals = _default_root_traversals(
+    if root_task_orders is None:
+        root_task_orders = _default_root_task_orders(
             root_domains,
-            physical_axis_orders,
+            pid_axis_orders,
         )
     return _build_baseline_worker_schedule(
         root_domains,
-        root_traversals,
+        root_task_orders,
         worker_count,
     )
 
 
-def build_cross_loop_schedule(
+def build_static_pipeline_plan(
     *,
-    dependency_plan,
-    root_domains: tuple[LogicalDomain, ...],
+    dependency_graph,
+    root_domains: tuple[CoordinateDomain, ...],
     axis_geometry: dict[int, tuple[int, int]],
-    root_traversals: tuple[LogicalRelation, ...] | None = None,
-    physical_axis_orders: tuple[tuple[int, ...], ...] | None = None,
+    root_task_orders: tuple[CoordinateRelation, ...] | None = None,
+    pid_axis_orders: tuple[tuple[int, ...], ...] | None = None,
     **kwargs,
 ):
     root_domains = _identify_root_domains(root_domains)
-    if root_traversals is None:
-        root_traversals = _default_root_traversals(
+    if root_task_orders is None:
+        root_task_orders = _default_root_task_orders(
             root_domains,
-            physical_axis_orders,
+            pid_axis_orders,
         )
-    scope_domains = instantiate_logical_domains(
-        dependency_plan,
+    site_domains = instantiate_coordinate_domains(
+        dependency_graph,
         axis_geometry=axis_geometry,
     )[1]
-    return _build_cross_loop_schedule(
-        dependency_plan=dependency_plan,
-        root_traversals=root_traversals,
-        scope_domains=scope_domains,
+    return _build_static_pipeline_plan(
+        dependency_graph=dependency_graph,
+        root_task_orders=root_task_orders,
+        site_domains=site_domains,
         **kwargs,
     )
 
 
 def _one_dimensional_task_range(
-    domain: LogicalDomain,
+    domain: CoordinateDomain,
     begin: int,
     count: int,
-) -> LogicalRelation:
+) -> CoordinateRelation:
     (axis,) = domain.axis_order
-    ordinal_domain = LogicalDomain((axis,), ((axis, count),), kind="worker")
-    return LogicalRelation.point_map(
-        ordinal_domain,
+    task_order_domain = CoordinateDomain((axis,), ((axis, count),), kind="task_order")
+    return CoordinateRelation.point_map(
+        task_order_domain,
         domain,
         (
             (
@@ -277,38 +277,40 @@ def _one_dimensional_task_range(
 
 
 def _expected_arrivals(
-    key_domain: LogicalDomain,
-    contributions: tuple[EventContribution, ...],
+    readiness_key_domain: CoordinateDomain,
+    producers: tuple[ReadinessProducer, ...],
 ) -> tuple[int, ...]:
-    result = [0] * key_domain.size
-    for contribution in contributions:
-        for key, predecessors in enumerate(contribution.predecessors.materialize()):
-            result[key] += len(predecessors)
+    result = [0] * readiness_key_domain.size
+    for readiness_producer in producers:
+        for readiness_key, producer_tasks in enumerate(
+            readiness_producer.producers_by_key.materialize()
+        ):
+            result[readiness_key] += len(producer_tasks)
     return tuple(result)
 
 
-def _event_contribution_from_publication(
+def _readiness_producer_from_publication(
     producer_root: int,
-    publication: LogicalRelation,
-    producer_scope_id: int | None = None,
-) -> EventContribution:
-    predecessors = publication.inverse()
-    assert predecessors is not None
-    return EventContribution(
+    publication: CoordinateRelation,
+    producer_site_id: int | None = None,
+) -> ReadinessProducer:
+    producers_by_key = publication.converse()
+    assert producers_by_key is not None
+    return ReadinessProducer(
         producer_root=producer_root,
-        producer_scope_id=producer_scope_id,
-        predecessors=predecessors,
+        producer_site_id=producer_site_id,
+        producers_by_key=producers_by_key,
     )
 
 
-def _publication(contribution: EventContribution) -> LogicalRelation:
-    publication = contribution.producer_to_keys
+def _publication(readiness_producer: ReadinessProducer) -> CoordinateRelation:
+    publication = readiness_producer.keys_by_producer
     assert publication is not None
     return publication
 
 
 class TestCrossLoopScheduler(TestCase):
-    def test_large_affine_schedule_never_materializes_task_relations(self) -> None:
+    def test_large_affine_schedule_never_materializes_task_orders(self) -> None:
         size = 319_488
         plan = build_tile_dependency_graph(
             (
@@ -337,12 +339,12 @@ class TestCrossLoopScheduler(TestCase):
         )
 
         with mock.patch.object(
-            LogicalRelation,
+            CoordinateRelation,
             "materialize",
             side_effect=AssertionError("production scheduling expanded a relation"),
         ):
-            schedule = build_cross_loop_schedule(
-                dependency_plan=plan,
+            schedule = build_static_pipeline_plan(
+                dependency_graph=plan,
                 root_domains=root_domains,
                 axis_geometry={10: (size // 16, 16), 20: (size // 512, 512)},
                 worker_count=148,
@@ -350,14 +352,14 @@ class TestCrossLoopScheduler(TestCase):
 
         self.assertLessEqual(
             sum(
-                len(contributor.predecessors.pieces)
-                for event in schedule.counted_events
-                for contributor in event.contributions
+                len(readiness_producer.producers_by_key.pieces)
+                for event in schedule.readiness_counters
+                for readiness_producer in event.producers
             ),
             4,
         )
 
-    def test_symbolic_keyed_event_keeps_relations_compact(self) -> None:
+    def test_symbolic_readiness_event_keeps_relations_compact(self) -> None:
         plan = build_tile_dependency_graph(
             (
                 _access(
@@ -380,7 +382,7 @@ class TestCrossLoopScheduler(TestCase):
             [[10], [20]],
         )
 
-        events = build_keyed_events(
+        events = build_readiness_events(
             plan,
             axis_geometry={10: (5, 16), 20: (3, 32)},
         )
@@ -388,15 +390,15 @@ class TestCrossLoopScheduler(TestCase):
         self.assertIsNotNone(events)
         assert events is not None
         (event,) = events
-        self.assertEqual(event.key_count, 3)
-        self.assertEqual(len(event.contributions[0].predecessors.pieces), 1)
-        self.assertEqual(len(event.uses[0].keys.pieces), 1)
+        self.assertEqual(event.readiness_key_count, 3)
+        self.assertEqual(len(event.producers[0].producers_by_key.pieces), 1)
+        self.assertEqual(len(event.consumers[0].keys_by_consumer.pieces), 1)
         self.assertEqual(
-            event.uses[0].keys.materialize(),
+            event.consumers[0].keys_by_consumer.materialize(),
             (frozenset((0,)), frozenset((1,)), frozenset((2,))),
         )
         self.assertEqual(
-            _publication(event.contributions[0]).materialize(),
+            _publication(event.producers[0]).materialize(),
             (
                 frozenset((0,)),
                 frozenset((0,)),
@@ -406,7 +408,7 @@ class TestCrossLoopScheduler(TestCase):
             ),
         )
 
-    def test_symbolic_keyed_event_joins_multiple_producers(self) -> None:
+    def test_symbolic_readiness_event_joins_multiple_producers(self) -> None:
         plan = build_tile_dependency_graph(
             (
                 _access(
@@ -445,7 +447,7 @@ class TestCrossLoopScheduler(TestCase):
             [[10], [20], [30]],
         )
 
-        events = build_keyed_events(
+        events = build_readiness_events(
             plan,
             axis_geometry={10: (4, 16), 20: (4, 16), 30: (2, 32)},
         )
@@ -453,12 +455,12 @@ class TestCrossLoopScheduler(TestCase):
         self.assertIsNotNone(events)
         assert events is not None
         (event,) = events
-        self.assertEqual(event.key_count, 2)
-        self.assertEqual(len(event.contributions), 2)
+        self.assertEqual(event.readiness_key_count, 2)
+        self.assertEqual(len(event.producers), 2)
         self.assertEqual(
             tuple(
-                _publication(contribution).materialize()
-                for contribution in event.contributions
+                _publication(readiness_producer).materialize()
+                for readiness_producer in event.producers
             ),
             (
                 (
@@ -470,9 +472,9 @@ class TestCrossLoopScheduler(TestCase):
             )
             * 2,
         )
-        self.assertEqual(len(event.uses[0].dependency_points), 2)
+        self.assertEqual(len(event.consumers[0].covered_obligations), 2)
 
-    def test_symbolic_keyed_event_drops_irrelevant_consumer_axis(self) -> None:
+    def test_symbolic_readiness_event_drops_irrelevant_consumer_axis(self) -> None:
         plan = build_tile_dependency_graph(
             (
                 _access(
@@ -501,7 +503,7 @@ class TestCrossLoopScheduler(TestCase):
             [[10, 11], [20, 21, 22]],
         )
 
-        events = build_keyed_events(
+        events = build_readiness_events(
             plan,
             axis_geometry={
                 10: (2, 1),
@@ -515,20 +517,22 @@ class TestCrossLoopScheduler(TestCase):
         self.assertIsNotNone(events)
         assert events is not None
         (event,) = events
-        self.assertEqual(event.key_domain.axis_order, (0, 1))
-        self.assertEqual(event.key_domain.block_sizes_items, ())
-        self.assertEqual(event.key_count, 8)
-        for consumer_task in range(event.uses[0].keys.source_domain.size):
-            consumer_coordinates = event.uses[0].keys.source_domain.coordinates(
-                consumer_task
-            )
+        self.assertEqual(event.readiness_key_domain.axis_order, (0, 1))
+        self.assertEqual(event.readiness_key_domain.block_sizes_items, ())
+        self.assertEqual(event.readiness_key_count, 8)
+        for consumer_task in range(
+            event.consumers[0].keys_by_consumer.source_domain.size
+        ):
+            consumer_coordinates = event.consumers[
+                0
+            ].keys_by_consumer.source_domain.coordinates(consumer_task)
             expected_key = consumer_coordinates[20] + 2 * consumer_coordinates[22]
             self.assertEqual(
-                event.uses[0].keys.targets(consumer_task),
+                event.consumers[0].keys_by_consumer.targets(consumer_task),
                 frozenset((expected_key,)),
             )
 
-    def test_symbolic_keyed_event_coalesces_equivalent_fanout(self) -> None:
+    def test_symbolic_readiness_event_coalesces_equivalent_fanout(self) -> None:
         plan = build_tile_dependency_graph(
             (
                 _access(
@@ -568,7 +572,7 @@ class TestCrossLoopScheduler(TestCase):
             [[10, 11], [20, 21, 22], [30, 31, 32]],
         )
 
-        events = build_keyed_events(
+        events = build_readiness_events(
             plan,
             axis_geometry={
                 10: (2, 1),
@@ -585,11 +589,17 @@ class TestCrossLoopScheduler(TestCase):
         self.assertIsNotNone(events)
         assert events is not None
         (event,) = events
-        self.assertEqual(event.key_domain.axis_order, (0, 1))
-        self.assertEqual(event.key_count, 8)
-        self.assertEqual({use.consumer_root for use in event.uses}, {1, 2})
+        self.assertEqual(event.readiness_key_domain.axis_order, (0, 1))
+        self.assertEqual(event.readiness_key_count, 8)
+        self.assertEqual(
+            {
+                readiness_consumer.consumer_root
+                for readiness_consumer in event.consumers
+            },
+            {1, 2},
+        )
 
-    def test_symbolic_keyed_event_does_not_coalesce_swapped_axes(self) -> None:
+    def test_symbolic_readiness_event_does_not_coalesce_swapped_axes(self) -> None:
         plan = build_tile_dependency_graph(
             (
                 _access(
@@ -629,7 +639,7 @@ class TestCrossLoopScheduler(TestCase):
             [[10, 11], [20, 21], [30, 31]],
         )
 
-        events = build_keyed_events(
+        events = build_readiness_events(
             plan,
             axis_geometry=dict.fromkeys((10, 11, 20, 21, 30, 31), (2, 1)),
         )
@@ -638,15 +648,21 @@ class TestCrossLoopScheduler(TestCase):
         assert events is not None
         self.assertEqual(len(events), 2)
         self.assertEqual(
-            [{use.consumer_root for use in event.uses} for event in events],
+            [
+                {
+                    readiness_consumer.consumer_root
+                    for readiness_consumer in event.consumers
+                }
+                for event in events
+            ],
             [{1}, {2}],
         )
         self.assertNotEqual(
-            events[0].contributions[0].predecessors,
-            events[1].contributions[0].predecessors,
+            events[0].producers[0].producers_by_key,
+            events[1].producers[0].producers_by_key,
         )
 
-    def test_symbolic_keyed_event_uses_one_chart_for_multi_producer_join(
+    def test_symbolic_readiness_event_uses_one_chart_for_multi_producer_join(
         self,
     ) -> None:
         plan = build_tile_dependency_graph(
@@ -721,7 +737,7 @@ class TestCrossLoopScheduler(TestCase):
             [[10, 11], [20, 21], [30, 31], [40, 41]],
         )
 
-        events = build_keyed_events(
+        events = build_readiness_events(
             plan,
             axis_geometry=dict.fromkeys((10, 11, 20, 21, 30, 31, 40, 41), (2, 1)),
         )
@@ -729,13 +745,19 @@ class TestCrossLoopScheduler(TestCase):
         self.assertIsNotNone(events)
         assert events is not None
         self.assertEqual(len(events), 2)
-        self.assertTrue(all(len(event.contributions) == 2 for event in events))
+        self.assertTrue(all(len(event.producers) == 2 for event in events))
         self.assertEqual(
-            [{use.consumer_root for use in event.uses} for event in events],
+            [
+                {
+                    readiness_consumer.consumer_root
+                    for readiness_consumer in event.consumers
+                }
+                for event in events
+            ],
             [{2}, {3}],
         )
 
-    def test_symbolic_keyed_event_unions_disjoint_producer_ranges(self) -> None:
+    def test_symbolic_readiness_event_unions_disjoint_producer_ranges(self) -> None:
         plan = build_tile_dependency_graph(
             (
                 _access(
@@ -767,7 +789,7 @@ class TestCrossLoopScheduler(TestCase):
             [[10], [20]],
         )
 
-        events = build_keyed_events(
+        events = build_readiness_events(
             plan,
             axis_geometry={10: (32, 2), 20: (2, 16)},
         )
@@ -775,11 +797,11 @@ class TestCrossLoopScheduler(TestCase):
         self.assertIsNotNone(events)
         assert events is not None
         (event,) = events
-        self.assertEqual(event.key_count, 2)
-        self.assertEqual(len(event.contributions), 1)
-        self.assertEqual(len(event.contributions[0].predecessors.pieces), 2)
+        self.assertEqual(event.readiness_key_count, 2)
+        self.assertEqual(len(event.producers), 1)
+        self.assertEqual(len(event.producers[0].producers_by_key.pieces), 2)
         expected = tuple(frozenset((producer // 8 % 2,)) for producer in range(32))
-        self.assertEqual(_publication(event.contributions[0]).materialize(), expected)
+        self.assertEqual(_publication(event.producers[0]).materialize(), expected)
 
     def test_unsupported_symbolic_event_coarsens_to_family_done(self) -> None:
         plan = build_tile_dependency_graph(
@@ -805,7 +827,7 @@ class TestCrossLoopScheduler(TestCase):
             [[10], [20]],
         )
 
-        events = build_keyed_events(
+        events = build_readiness_events(
             plan,
             axis_geometry={10: (4, 16), 20: (2, 32)},
         )
@@ -813,14 +835,14 @@ class TestCrossLoopScheduler(TestCase):
         self.assertIsNotNone(events)
         assert events is not None
         (event,) = events
-        self.assertEqual(event.key_count, 1)
-        self.assertEqual(event.contributions[0].producer_root, 0)
+        self.assertEqual(event.readiness_key_count, 1)
+        self.assertEqual(event.producers[0].producer_root, 0)
         self.assertEqual(
-            _publication(event.contributions[0]).materialize(),
+            _publication(event.producers[0]).materialize(),
             (frozenset((0,)),) * 4,
         )
         self.assertEqual(
-            event.uses[0].keys.materialize(),
+            event.consumers[0].keys_by_consumer.materialize(),
             (frozenset((0,)),) * 2,
         )
 
@@ -873,21 +895,21 @@ class TestCrossLoopScheduler(TestCase):
             [[10], [20], [30], [40]],
         )
 
-        original_union = LogicalRelation.union
+        original_union = CoordinateRelation.union
         failed_once = False
 
         def fail_first_union(
-            left: LogicalRelation,
-            right: LogicalRelation,
-        ) -> LogicalRelation | None:
+            left: CoordinateRelation,
+            right: CoordinateRelation,
+        ) -> CoordinateRelation | None:
             nonlocal failed_once
             if not failed_once:
                 failed_once = True
                 return None
             return original_union(left, right)
 
-        with mock.patch.object(LogicalRelation, "union", fail_first_union):
-            events = build_keyed_events(
+        with mock.patch.object(CoordinateRelation, "union", fail_first_union):
+            events = build_readiness_events(
                 plan,
                 axis_geometry={
                     10: (4, 16),
@@ -901,15 +923,16 @@ class TestCrossLoopScheduler(TestCase):
             event
             for event in events
             if any(
-                contribution.producer_root == 2 for contribution in event.contributions
+                readiness_producer.producer_root == 2
+                for readiness_producer in event.producers
             )
         ]
         self.assertEqual(len(unrelated), 1)
-        self.assertEqual(unrelated[0].key_count, 2)
-        self.assertIsNone(unrelated[0].family_done_root)
+        self.assertEqual(unrelated[0].readiness_key_count, 2)
+        self.assertIsNone(unrelated[0].root_barrier_source)
 
     @skipIfNotCUDA()
-    def test_device_ir_scopes_preserve_nested_producer_and_consumer_axes(
+    def test_device_ir_sites_preserve_nested_producer_and_consumer_axes(
         self,
     ) -> None:
         x = torch.empty((2, 64), device=DEVICE, dtype=torch.float32)
@@ -922,30 +945,30 @@ class TestCrossLoopScheduler(TestCase):
             for access in producer_graph.accesses
             if access.root == 0 and access.kind == "store"
         )
-        (producer_scope,) = producer_graph.scopes_for_access(producer_store.access_id)
-        self.assertEqual(producer_scope.kind, "loop")
-        self.assertEqual(len(producer_scope.callsite_path), 1)
+        (producer_site,) = producer_graph.sites_for_access(producer_store.access_id)
+        self.assertEqual(producer_site.kind, "loop")
+        self.assertEqual(len(producer_site.callsite_path), 1)
         self.assertEqual(
-            producer_scope.logical_axis_order,
+            producer_site.logical_axis_order,
             (
                 *producer_ir.task_families[0].logical_axis_order,
-                *producer_scope.local_axis_order,
+                *producer_site.local_axis_order,
             ),
         )
-        self.assertTrue(producer_scope.guaranteed)
-        self.assertTrue(producer_scope.segmentable)
+        self.assertTrue(producer_site.executes_unconditionally)
+        self.assertTrue(producer_site.can_split_loop)
 
         producer_outer_axis = producer_ir.task_families[0].logical_axis_order[0]
         consumer_batch_axis, consumer_width_axis = producer_ir.task_families[
             1
         ].logical_axis_order
         producer_domains = (
-            LogicalDomain(
+            CoordinateDomain(
                 (producer_outer_axis,),
                 ((producer_outer_axis, 2),),
                 ((producer_outer_axis, 1),),
             ),
-            LogicalDomain(
+            CoordinateDomain(
                 (consumer_batch_axis, consumer_width_axis),
                 ((consumer_batch_axis, 2), (consumer_width_axis, 4)),
                 ((consumer_batch_axis, 1), (consumer_width_axis, 16)),
@@ -953,11 +976,11 @@ class TestCrossLoopScheduler(TestCase):
         )
         producer_axis_geometry = {
             producer_outer_axis: (2, 1),
-            producer_scope.local_axis_order[0]: (4, 16),
+            producer_site.local_axis_order[0]: (4, 16),
             consumer_batch_axis: (2, 1),
             consumer_width_axis: (4, 16),
         }
-        producer_events = _configured_event_graph(
+        producer_events = _configured_readiness_graph(
             producer_graph,
             root_domains=producer_domains,
             axis_geometry=producer_axis_geometry,
@@ -966,28 +989,30 @@ class TestCrossLoopScheduler(TestCase):
             event
             for event in producer_events.events
             if any(
-                contribution.producer_scope_id == producer_scope.scope_id
-                for contribution in event.contributions
+                readiness_producer.producer_site_id == producer_site.site_id
+                for readiness_producer in event.producers
             )
         )
-        self.assertEqual(producer_event.key_count, 8)
+        self.assertEqual(producer_event.readiness_key_count, 8)
         self.assertEqual(
-            _expected_arrivals(producer_event.key_domain, producer_event.contributions),
+            _expected_arrivals(
+                producer_event.readiness_key_domain, producer_event.producers
+            ),
             (1,) * 8,
         )
-        self.assertEqual(producer_event.uses[0].consumer_scope_id, None)
+        self.assertEqual(producer_event.consumers[0].consumer_site_id, None)
 
-        synchronous_events = _configured_event_graph(
+        synchronous_events = _configured_readiness_graph(
             producer_graph,
             root_domains=producer_domains,
             axis_geometry=producer_axis_geometry,
-            publishable_scope_ids=frozenset(),
+            publishable_site_ids=frozenset(),
         )
         self.assertFalse(
             any(
-                contribution.producer_scope_id is not None
+                readiness_producer.producer_site_id is not None
                 for event in synchronous_events.events
-                for contribution in event.contributions
+                for readiness_producer in event.producers
             )
         )
 
@@ -1000,34 +1025,34 @@ class TestCrossLoopScheduler(TestCase):
             if access.root == 1
             and access.kind == "load"
             and any(
-                scope.kind == "loop"
-                for scope in consumer_graph.scopes_for_access(access.access_id)
+                site.kind == "loop"
+                for site in consumer_graph.sites_for_access(access.access_id)
             )
         )
-        (consumer_scope,) = consumer_graph.scopes_for_access(consumer_load.access_id)
-        self.assertEqual(consumer_scope.kind, "loop")
-        self.assertEqual(len(consumer_scope.callsite_path), 1)
+        (consumer_site,) = consumer_graph.sites_for_access(consumer_load.access_id)
+        self.assertEqual(consumer_site.kind, "loop")
+        self.assertEqual(len(consumer_site.callsite_path), 1)
         self.assertEqual(
-            consumer_scope.logical_axis_order,
+            consumer_site.logical_axis_order,
             (
                 *consumer_ir.task_families[1].logical_axis_order,
-                *consumer_scope.local_axis_order,
+                *consumer_site.local_axis_order,
             ),
         )
-        self.assertTrue(consumer_scope.guaranteed)
-        self.assertTrue(consumer_scope.segmentable)
+        self.assertTrue(consumer_site.executes_unconditionally)
+        self.assertTrue(consumer_site.can_split_loop)
 
         producer_batch_axis, producer_width_axis = consumer_ir.task_families[
             0
         ].logical_axis_order
         consumer_outer_axis = consumer_ir.task_families[1].logical_axis_order[0]
         consumer_domains = (
-            LogicalDomain(
+            CoordinateDomain(
                 (producer_batch_axis, producer_width_axis),
                 ((producer_batch_axis, 2), (producer_width_axis, 4)),
                 ((producer_batch_axis, 1), (producer_width_axis, 16)),
             ),
-            LogicalDomain(
+            CoordinateDomain(
                 (consumer_outer_axis,),
                 ((consumer_outer_axis, 2),),
                 ((consumer_outer_axis, 1),),
@@ -1037,9 +1062,9 @@ class TestCrossLoopScheduler(TestCase):
             producer_batch_axis: (2, 1),
             producer_width_axis: (4, 16),
             consumer_outer_axis: (2, 1),
-            consumer_scope.local_axis_order[0]: (4, 16),
+            consumer_site.local_axis_order[0]: (4, 16),
         }
-        consumer_events = _configured_event_graph(
+        consumer_events = _configured_readiness_graph(
             consumer_graph,
             root_domains=consumer_domains,
             axis_geometry=consumer_axis_geometry,
@@ -1048,17 +1073,22 @@ class TestCrossLoopScheduler(TestCase):
             event
             for event in consumer_events.events
             if any(
-                use.consumer_scope_id == consumer_scope.scope_id for use in event.uses
+                readiness_consumer.consumer_site_id == consumer_site.site_id
+                for readiness_consumer in event.consumers
             )
         )
-        self.assertEqual(nested_event.key_count, 8)
+        self.assertEqual(nested_event.readiness_key_count, 8)
         self.assertEqual(
-            _expected_arrivals(nested_event.key_domain, nested_event.contributions),
+            _expected_arrivals(
+                nested_event.readiness_key_domain, nested_event.producers
+            ),
             (1,) * 8,
         )
-        (nested_use,) = nested_event.uses
-        nested_keys = nested_use.keys.materialize(
-            source_traversal=event_source_traversal(consumer_events, nested_use)
+        (nested_keys_by_consumer,) = nested_event.consumers
+        nested_keys = nested_keys_by_consumer.keys_by_consumer.materialize(
+            source_axis_order=readiness_consumer_source_order(
+                consumer_events, nested_keys_by_consumer
+            )
         )
         self.assertTrue(all(len(keys) == 1 for keys in nested_keys))
         self.assertEqual(
@@ -1066,7 +1096,7 @@ class TestCrossLoopScheduler(TestCase):
             set(range(8)),
         )
 
-    def test_semantic_event_graph_composes_arbitrary_chain_depth(self) -> None:
+    def test_semantic_readiness_graph_composes_arbitrary_chain_depth(self) -> None:
         graph = build_tile_dependency_graph(
             (
                 _access(0, root=0, allocation_id=0, kind="store", block_ids=(10,)),
@@ -1080,62 +1110,64 @@ class TestCrossLoopScheduler(TestCase):
         )
 
         self.assertEqual(len(graph.task_families), 4)
-        configured = _configured_event_graph(
+        configured = _configured_readiness_graph(
             graph,
             tuple(
-                LogicalDomain((block_id,), ((block_id, 4),), ((block_id, 1),))
+                CoordinateDomain((block_id,), ((block_id, 4),), ((block_id, 1),))
                 for block_id in (10, 20, 30, 40)
             ),
         )
         self.assertEqual(len(configured.events), 3)
         self.assertEqual(
             tuple(
-                _expected_arrivals(event.key_domain, event.contributions)
+                _expected_arrivals(event.readiness_key_domain, event.producers)
                 for event in configured.events
             ),
             ((1, 1, 1, 1),) * 3,
         )
         baseline = _build_baseline_worker_schedule(
             configured.root_domains,
-            configured.root_traversals,
+            configured.root_task_orders,
             worker_count=4,
         )
-        local_triggers = derive_local_triggers(configured, baseline)
+        continuations = derive_final_arrival_continuations(configured, baseline)
         self.assertEqual(
             tuple(
-                configured.event(trigger.event_index)
-                .uses[trigger.use_index]
+                configured.event(continuation.event_index)
+                .consumers[continuation.consumer_index]
                 .consumer_root
-                for trigger in local_triggers
+                for continuation in continuations
             ),
             (1, 2, 3),
         )
         validate_worker_schedule(
             configured,
             baseline.without_roots(frozenset((1, 2, 3))),
-            local_triggers,
+            continuations,
         )
 
-    def test_local_triggers_allow_disjoint_uses_of_one_producer_family(self) -> None:
+    def test_final_arrival_continuations_allow_disjoint_uses_of_one_producer_family(
+        self,
+    ) -> None:
         domains = tuple(
-            LogicalDomain((axis,), ((axis, count),), identity=root)
+            CoordinateDomain((axis,), ((axis, count),), identity=root)
             for root, (axis, count) in enumerate(((10, 4), (20, 2), (30, 2)))
         )
         key_domains = tuple(
-            LogicalDomain((0,), ((0, 2),), kind="event", identity=event)
+            CoordinateDomain((0,), ((0, 2),), kind="event", identity=event)
             for event in range(2)
         )
 
         def keys(
-            domain: LogicalDomain,
-            key_domain: LogicalDomain,
+            domain: CoordinateDomain,
+            readiness_key_domain: CoordinateDomain,
             begin: int,
             end: int,
-        ) -> LogicalRelation:
+        ) -> CoordinateRelation:
             (axis,) = domain.axis_order
-            return LogicalRelation.point_map(
+            return CoordinateRelation.point_map(
                 domain,
-                key_domain,
+                readiness_key_domain,
                 (
                     (
                         ((axis, begin, end, 1),),
@@ -1144,83 +1176,90 @@ class TestCrossLoopScheduler(TestCase):
                 ),
             )
 
-        event_graph = EventGraph(
-            root_traversals=tuple(
-                physical_traversal_relation(domain, domain.axis_order)
-                for domain in domains
+        readiness_graph = ReadinessGraph(
+            root_task_orders=tuple(
+                pid_task_order(domain, domain.axis_order) for domain in domains
             ),
             events=(
-                KeyedEvent(
-                    contributions=(
-                        _event_contribution_from_publication(
+                ReadinessEvent(
+                    producers=(
+                        _readiness_producer_from_publication(
                             0,
                             keys(domains[0], key_domains[0], 0, 2),
                         ),
                     ),
-                    uses=(EventUse(1, keys(domains[1], key_domains[0], 0, 2)),),
+                    consumers=(
+                        ReadinessConsumer(1, keys(domains[1], key_domains[0], 0, 2)),
+                    ),
                 ),
-                KeyedEvent(
-                    contributions=(
-                        _event_contribution_from_publication(
+                ReadinessEvent(
+                    producers=(
+                        _readiness_producer_from_publication(
                             0,
                             keys(domains[0], key_domains[1], 2, 4),
                         ),
-                        _event_contribution_from_publication(
+                        _readiness_producer_from_publication(
                             1,
                             keys(domains[1], key_domains[1], 0, 2),
                         ),
                     ),
-                    uses=(EventUse(2, keys(domains[2], key_domains[1], 0, 2)),),
+                    consumers=(
+                        ReadinessConsumer(2, keys(domains[2], key_domains[1], 0, 2)),
+                    ),
                 ),
             ),
         )
         baseline = _build_baseline_worker_schedule(
             domains,
-            event_graph.root_traversals,
+            readiness_graph.root_task_orders,
             worker_count=4,
         )
 
-        triggers = derive_local_triggers(event_graph, baseline)
+        continuations = derive_final_arrival_continuations(readiness_graph, baseline)
 
         self.assertEqual(
             tuple(
-                event_graph.event(trigger.event_index)
-                .uses[trigger.use_index]
+                readiness_graph.event(continuation.event_index)
+                .consumers[continuation.consumer_index]
                 .consumer_root
-                for trigger in triggers
+                for continuation in continuations
             ),
             (1, 2),
         )
 
         overlapping = dataclasses.replace(
-            event_graph,
+            readiness_graph,
             events=(
-                event_graph.events[0],
+                readiness_graph.events[0],
                 dataclasses.replace(
-                    event_graph.events[1],
-                    contributions=(
-                        _event_contribution_from_publication(
+                    readiness_graph.events[1],
+                    producers=(
+                        _readiness_producer_from_publication(
                             0,
                             keys(domains[0], key_domains[1], 1, 3),
                         ),
-                        event_graph.events[1].contributions[1],
+                        readiness_graph.events[1].producers[1],
                     ),
                 ),
             ),
         )
-        self.assertEqual(derive_local_triggers(overlapping, baseline), ())
+        self.assertEqual(derive_final_arrival_continuations(overlapping, baseline), ())
 
-    def test_local_trigger_requires_counted_event_lowerability(self) -> None:
-        producer_domain = LogicalDomain((10,), ((10, 4),), identity=0)
-        consumer_domain = LogicalDomain((20,), ((20, 2),), identity=1)
-        key_domain = LogicalDomain((0,), ((0, 2),), kind="event", identity=0)
-        contribution = EventContribution(
+    def test_final_arrival_continuation_requires_counter_lowerability(
+        self,
+    ) -> None:
+        producer_domain = CoordinateDomain((10,), ((10, 4),), identity=0)
+        consumer_domain = CoordinateDomain((20,), ((20, 2),), identity=1)
+        readiness_key_domain = CoordinateDomain(
+            (0,), ((0, 2),), kind="event", identity=0
+        )
+        readiness_producer = ReadinessProducer(
             producer_root=0,
-            predecessors=LogicalRelation(
-                key_domain,
+            producers_by_key=CoordinateRelation(
+                readiness_key_domain,
                 producer_domain,
                 (
-                    _LogicalRelationPiece(
+                    _CoordinateRelationPiece(
                         ((0, 0, 2, 1),),
                         (
                             (
@@ -1234,20 +1273,20 @@ class TestCrossLoopScheduler(TestCase):
                 ),
             ),
         )
-        event_graph = EventGraph(
-            root_traversals=(
-                physical_traversal_relation(producer_domain, (10,)),
-                physical_traversal_relation(consumer_domain, (20,)),
+        readiness_graph = ReadinessGraph(
+            root_task_orders=(
+                pid_task_order(producer_domain, (10,)),
+                pid_task_order(consumer_domain, (20,)),
             ),
             events=(
-                KeyedEvent(
-                    (contribution,),
+                ReadinessEvent(
+                    (readiness_producer,),
                     (
-                        EventUse(
+                        ReadinessConsumer(
                             1,
-                            LogicalRelation.point_map(
+                            CoordinateRelation.point_map(
                                 consumer_domain,
-                                key_domain,
+                                readiness_key_domain,
                                 (
                                     (
                                         ((20, 0, 2, 1),),
@@ -1261,19 +1300,23 @@ class TestCrossLoopScheduler(TestCase):
             ),
         )
         baseline = _build_baseline_worker_schedule(
-            event_graph.root_domains,
-            event_graph.root_traversals,
+            readiness_graph.root_domains,
+            readiness_graph.root_task_orders,
             worker_count=4,
         )
 
-        publication = contribution.producer_to_keys
+        publication = readiness_producer.keys_by_producer
         self.assertIsNotNone(publication)
         assert publication is not None
         self.assertIsNone(publication.canonical_single_valued())
-        self.assertEqual(derive_local_triggers(event_graph, baseline), ())
-        self.assertEqual(choose_counted_events(event_graph, ()), ())
+        self.assertEqual(
+            derive_final_arrival_continuations(readiness_graph, baseline), ()
+        )
+        self.assertEqual(choose_readiness_counters(readiness_graph, ()), ())
 
-    def test_large_local_trigger_ignores_downstream_event_granularity(self) -> None:
+    def test_large_final_arrival_continuation_ignores_downstream_event_granularity(
+        self,
+    ) -> None:
         graph = build_tile_dependency_graph(
             (
                 _access(0, root=0, allocation_id=0, kind="store", block_ids=(10,)),
@@ -1299,27 +1342,29 @@ class TestCrossLoopScheduler(TestCase):
         )
         root_domains = _identify_root_domains(
             (
-                LogicalDomain((10,), ((10, 8),), ((10, 1),)),
-                LogicalDomain((20,), ((20, 8),), ((20, 1),)),
-                LogicalDomain((30,), ((30, 1),), ((30, 1),)),
+                CoordinateDomain((10,), ((10, 8),), ((10, 1),)),
+                CoordinateDomain((20,), ((20, 8),), ((20, 1),)),
+                CoordinateDomain((30,), ((30, 1),), ((30, 1),)),
             )
         )
-        event_graph = _configured_event_graph(graph, root_domains)
+        readiness_graph = _configured_readiness_graph(graph, root_domains)
         baseline = _build_baseline_worker_schedule(
             root_domains,
-            event_graph.root_traversals,
+            readiness_graph.root_task_orders,
             worker_count=4,
         )
 
-        triggers = choose_local_triggers(event_graph, baseline)
+        continuations = choose_final_arrival_continuations(readiness_graph, baseline)
 
         self.assertGreater(root_domains[1].size, baseline.worker_count)
-        self.assertEqual(event_graph.events[1].family_done_root, 1)
-        self.assertEqual(len(triggers), 1)
-        use = event_graph.event(triggers[0].event_index).uses[triggers[0].use_index]
-        self.assertEqual(use.consumer_root, 1)
+        self.assertEqual(readiness_graph.events[1].root_barrier_source, 1)
+        self.assertEqual(len(continuations), 1)
+        readiness_consumer = readiness_graph.event(
+            continuations[0].event_index
+        ).consumers[continuations[0].consumer_index]
+        self.assertEqual(readiness_consumer.consumer_root, 1)
 
-    def test_semantic_event_graph_represents_diamond_without_path_matching(
+    def test_semantic_readiness_graph_represents_diamond_without_path_matching(
         self,
     ) -> None:
         graph = build_tile_dependency_graph(
@@ -1336,10 +1381,10 @@ class TestCrossLoopScheduler(TestCase):
             [[10], [20], [30], [40]],
         )
 
-        configured = _configured_event_graph(
+        configured = _configured_readiness_graph(
             graph,
             tuple(
-                LogicalDomain((block_id,), ((block_id, 4),), ((block_id, 1),))
+                CoordinateDomain((block_id,), ((block_id, 4),), ((block_id, 1),))
                 for block_id in (10, 20, 30, 40)
             ),
         )
@@ -1347,27 +1392,31 @@ class TestCrossLoopScheduler(TestCase):
             event
             for event in configured.events
             if any(
-                contribution.producer_root == 0 for contribution in event.contributions
+                readiness_producer.producer_root == 0
+                for readiness_producer in event.producers
             )
         )
         self.assertEqual(
-            {use.consumer_root for use in root_zero_event.uses},
+            {
+                readiness_consumer.consumer_root
+                for readiness_consumer in root_zero_event.consumers
+            },
             {1, 2},
         )
-        local_triggers = derive_local_triggers(
+        continuations = derive_final_arrival_continuations(
             configured,
             _build_baseline_worker_schedule(
                 configured.root_domains,
-                configured.root_traversals,
+                configured.root_task_orders,
                 worker_count=4,
             ),
         )
         self.assertEqual(
             {
-                configured.event(trigger.event_index)
-                .uses[trigger.use_index]
+                configured.event(continuation.event_index)
+                .consumers[continuation.consumer_index]
                 .consumer_root
-                for trigger in local_triggers
+                for continuation in continuations
             },
             {3},
         )
@@ -1399,34 +1448,38 @@ class TestCrossLoopScheduler(TestCase):
             [[10], [20], [30]],
         )
 
-        configured = _configured_event_graph(
+        configured = _configured_readiness_graph(
             graph,
             tuple(
-                LogicalDomain((block_id,), ((block_id, 4),), ((block_id, 1),))
+                CoordinateDomain((block_id,), ((block_id, 4),), ((block_id, 1),))
                 for block_id in (10, 20, 30)
             ),
         )
         configured_uses = tuple(
-            use
+            readiness_consumer
             for event in configured.events
-            for use in event.uses
-            if use.consumer_root == 2
+            for readiness_consumer in event.consumers
+            if readiness_consumer.consumer_root == 2
         )
         self.assertEqual(len(configured_uses), 2)
         family_event = next(
-            event for event in configured.events if event.family_done_root is not None
+            event
+            for event in configured.events
+            if event.root_barrier_source is not None
         )
-        self.assertEqual(family_event.family_done_root, 0)
+        self.assertEqual(family_event.root_barrier_source, 0)
         self.assertEqual(
-            _expected_arrivals(family_event.key_domain, family_event.contributions),
+            _expected_arrivals(
+                family_event.readiness_key_domain, family_event.producers
+            ),
             (4,),
         )
         baseline = _build_baseline_worker_schedule(
             configured.root_domains,
-            configured.root_traversals,
+            configured.root_task_orders,
             worker_count=4,
         )
-        self.assertEqual(derive_local_triggers(configured, baseline), ())
+        self.assertEqual(derive_final_arrival_continuations(configured, baseline), ())
 
     def test_dependency_coverage_distinguishes_producer_callsites(self) -> None:
         graph = build_tile_dependency_graph(
@@ -1436,9 +1489,9 @@ class TestCrossLoopScheduler(TestCase):
             ),
             [[10], [20]],
         )
-        scopes = (
-            ExecutionScope(0, 0, 0, (), None, "root", (), (10,), True, False),
-            ExecutionScope(
+        sites = (
+            ExecutionSite(0, 0, 0, (), None, "root", (), (10,), True, False),
+            ExecutionSite(
                 1,
                 0,
                 0,
@@ -1450,16 +1503,16 @@ class TestCrossLoopScheduler(TestCase):
                 False,
                 False,
             ),
-            ExecutionScope(2, 1, 1, (), None, "root", (), (20,), True, False),
+            ExecutionSite(2, 1, 1, (), None, "root", (), (20,), True, False),
         )
         graph = dataclasses.replace(
             graph,
-            execution_scopes=scopes,
-            scope_ids_by_access=((0, 1), (2,)),
+            execution_sites=sites,
+            site_ids_by_access=((0, 1), (2,)),
         )
         access_dependency = graph.edges[0].access_dependencies[0]
         self.assertEqual(
-            graph.dependency_points(access_dependency),
+            graph.dependency_obligations(access_dependency),
             frozenset(
                 (
                     (access_dependency.dependency_id, 0, 2),
@@ -1468,71 +1521,76 @@ class TestCrossLoopScheduler(TestCase):
             ),
         )
         axis_geometry = {10: (4, 32), 20: (4, 32)}
-        configured_root_domains, configured_scope_domains = instantiate_logical_domains(
-            graph,
-            axis_geometry=axis_geometry,
+        configured_root_domains, configured_site_domains = (
+            instantiate_coordinate_domains(
+                graph,
+                axis_geometry=axis_geometry,
+            )
         )
         exact_dependencies = instantiate_symbolic_dependencies(
             graph,
             root_domains=configured_root_domains,
-            scope_domains=configured_scope_domains,
+            site_domains=configured_site_domains,
         )
         self.assertEqual(len(exact_dependencies), 1)
 
-        events = build_keyed_events(graph, axis_geometry=axis_geometry)
+        events = build_readiness_events(graph, axis_geometry=axis_geometry)
 
         self.assertIsNotNone(events)
         assert events is not None
         self.assertEqual(len(events), 2)
-        exact_event = next(event for event in events if event.family_done_root is None)
+        exact_event = next(
+            event for event in events if event.root_barrier_source is None
+        )
         family_event = next(
-            event for event in events if event.family_done_root is not None
+            event for event in events if event.root_barrier_source is not None
         )
         dependency_id = access_dependency.dependency_id
         self.assertEqual(
-            exact_event.uses[0].dependency_points,
+            exact_event.consumers[0].covered_obligations,
             frozenset(((dependency_id, 0, 2),)),
         )
         self.assertEqual(
-            family_event.uses[0].dependency_points,
+            family_event.consumers[0].covered_obligations,
             frozenset(((dependency_id, 1, 2),)),
         )
 
         root_domains = tuple(
             domain for domain in configured_root_domains if domain is not None
         )
-        event_graph = EventGraph(
-            root_traversals=tuple(
-                physical_traversal_relation(domain, domain.axis_order)
-                for domain in root_domains
+        readiness_graph = ReadinessGraph(
+            root_task_orders=tuple(
+                pid_task_order(domain, domain.axis_order) for domain in root_domains
             ),
             events=events,
         )
         baseline = _build_baseline_worker_schedule(
             root_domains,
-            event_graph.root_traversals,
+            readiness_graph.root_task_orders,
             worker_count=4,
         )
-        self.assertEqual(derive_local_triggers(event_graph, baseline), ())
-        counted_events = choose_counted_events(event_graph, ())
-        covered_points = frozenset(
-            point
-            for event in counted_events
-            for use in event.uses
-            for point in use.dependency_points
+        self.assertEqual(
+            derive_final_arrival_continuations(readiness_graph, baseline), ()
+        )
+        readiness_counters = choose_readiness_counters(readiness_graph, ())
+        covered_obligations = frozenset(
+            obligation
+            for counter_plan in readiness_counters
+            for readiness_consumer in counter_plan.consumers
+            for obligation in readiness_consumer.covered_obligations
         )
         self.assertEqual(
-            _select_root_completion_edges(
+            _select_root_barrier_edges(
                 dependency_graph=graph,
-                covered_dependency_points=covered_points,
+                covered_obligations=covered_obligations,
             ),
             frozenset(((0, 1),)),
         )
 
     def test_baseline_worker_schedule_preserves_source_order(self) -> None:
         root_domains = (
-            LogicalDomain((10,), ((10, 3),), ((10, 1),)),
-            LogicalDomain((20,), ((20, 5),), ((20, 1),)),
+            CoordinateDomain((10,), ((10, 3),), ((10, 1),)),
+            CoordinateDomain((20,), ((20, 5),), ((20, 1),)),
         )
 
         schedule = build_baseline_worker_schedule(root_domains, worker_count=4)
@@ -1544,57 +1602,60 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(task_at(schedule, 3, 0), None)
         self.assertEqual(task_at(schedule, 3, 1), (1, 3))
 
-    def test_schedule_traversals_require_compatible_domains(self) -> None:
-        task_domain = LogicalDomain((10,), ((10, 2),), identity=0)
-        ordinal_domain = LogicalDomain(
+    def test_root_task_orders_require_compatible_domains(self) -> None:
+        task_domain = CoordinateDomain((10,), ((10, 2),), identity=0)
+        task_order_domain = CoordinateDomain(
             (-1,),
             ((-1, 1),),
-            kind="worker",
+            kind="task_order",
             identity=0,
         )
-        wrong_size = LogicalRelation.point_map(
-            ordinal_domain,
+        wrong_size = CoordinateRelation.point_map(
+            task_order_domain,
             task_domain,
             ((((-1, 0, 1, 1),), (sympy.Integer(0),)),),
         )
 
         with self.assertRaisesRegex(ValueError, "compatible typed domains"):
-            EventGraph(
-                root_traversals=(wrong_size,),
+            ReadinessGraph(
+                root_task_orders=(wrong_size,),
                 events=(),
             )
         with self.assertRaisesRegex(ValueError, "incompatible domains"):
-            inverse = wrong_size.inverse()
-            assert inverse is not None
+            converse = wrong_size.converse()
+            assert converse is not None
             WorkerScheduleSegment(
                 root=0,
-                task_relation=inverse,
+                task_order=converse,
                 worker_begin=0,
                 worker_count=2,
-                schedule_begin=0,
+                dispatch_offset=0,
             )
 
-    def test_baseline_worker_schedule_preserves_physical_traversal(self) -> None:
-        root_domains = (LogicalDomain((10,), ((10, 4),), ((10, 1),), identity=0),)
-        ordinal_domain = LogicalDomain(
+    def test_baseline_worker_schedule_preserves_pid_task_order(self) -> None:
+        root_domains = (CoordinateDomain((10,), ((10, 4),), ((10, 1),), identity=0),)
+        task_order_domain = CoordinateDomain(
             (-1,),
             ((-1, 4),),
-            kind="worker",
+            kind="task_order",
             identity=0,
         )
-        traversal = LogicalRelation.point_map(
-            ordinal_domain,
+        task_order_relation = CoordinateRelation.point_map(
+            task_order_domain,
             root_domains[0],
             tuple(
-                (((-1, ordinal, ordinal + 1, 1),), (sympy.Integer(task),))
-                for ordinal, task in enumerate((0, 2, 1, 3))
+                (
+                    ((-1, task_order_index, task_order_index + 1, 1),),
+                    (sympy.Integer(task),),
+                )
+                for task_order_index, task in enumerate((0, 2, 1, 3))
             ),
         )
 
         schedule = build_baseline_worker_schedule(
             root_domains,
             worker_count=2,
-            root_traversals=(traversal,),
+            root_task_orders=(task_order_relation,),
         )
 
         self.assertEqual(placement(schedule, 0, 0), (0, 0))
@@ -1604,32 +1665,32 @@ class TestCrossLoopScheduler(TestCase):
 
     def test_worker_schedule_segment_uses_symbolic_order_across_rounds(self) -> None:
         task_axis = 10
-        ordinal_axis = 20
-        task_domain = LogicalDomain(
+        task_order_axis = 20
+        task_domain = CoordinateDomain(
             (task_axis,),
             ((task_axis, 15),),
             identity=2,
         )
-        ordinal_domain = LogicalDomain(
-            (ordinal_axis,),
-            ((ordinal_axis, 3),),
-            kind="worker",
+        task_order_domain = CoordinateDomain(
+            (task_order_axis,),
+            ((task_order_axis, 3),),
+            kind="task_order",
         )
         segment = WorkerScheduleSegment(
             root=2,
-            task_relation=LogicalRelation.point_map(
-                ordinal_domain,
+            task_order=CoordinateRelation.point_map(
+                task_order_domain,
                 task_domain,
                 (
                     (
-                        ((ordinal_axis, 0, 3, 1),),
-                        (10 + 2 * logical_axis_symbol(ordinal_axis),),
+                        ((task_order_axis, 0, 3, 1),),
+                        (10 + 2 * logical_axis_symbol(task_order_axis),),
                     ),
                 ),
             ),
             worker_begin=2,
             worker_count=2,
-            schedule_begin=0,
+            dispatch_offset=0,
         )
 
         self.assertEqual(segment_placement(segment, 10), (2, 0))
@@ -1639,16 +1700,16 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(segment_task_at(segment, 2, 1), 14)
 
     def test_worker_support_excludes_unused_segment_capacity(self) -> None:
-        task_domain = LogicalDomain((10,), ((10, 2),), identity=0)
+        task_domain = CoordinateDomain((10,), ((10, 2),), identity=0)
         schedule = WorkerSchedule(
             worker_count=6,
             segments=(
                 WorkerScheduleSegment(
                     root=0,
-                    task_relation=_one_dimensional_task_range(task_domain, 0, 2),
+                    task_order=_one_dimensional_task_range(task_domain, 0, 2),
                     worker_begin=1,
                     worker_count=4,
-                    schedule_begin=2,
+                    dispatch_offset=2,
                 ),
             ),
         )
@@ -1657,13 +1718,13 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(schedule.dense_assignment(0), (1, 4, 2, 2))
         self.assertIsNone(schedule.contiguous_global_interval(0))
 
-    def test_local_contributors_preserve_key_major_order(self) -> None:
+    def test_continuation_producers_preserve_key_major_order(self) -> None:
         root_domains = (
-            LogicalDomain((10,), ((10, 4),), ((10, 1),)),
-            LogicalDomain((20,), ((20, 2),), ((20, 1),)),
+            CoordinateDomain((10,), ((10, 4),), ((10, 1),)),
+            CoordinateDomain((20,), ((20, 2),), ((20, 1),)),
         )
         producer_domain, consumer_domain = _identify_root_domains(root_domains)
-        key_domain = LogicalDomain(
+        readiness_key_domain = CoordinateDomain(
             (0,),
             ((0, 2),),
             kind="event",
@@ -1671,19 +1732,19 @@ class TestCrossLoopScheduler(TestCase):
         )
         producer_axis = logical_axis_symbol(10)
         consumer_axis = logical_axis_symbol(20)
-        event_graph = EventGraph(
-            root_traversals=_default_root_traversals(
+        readiness_graph = ReadinessGraph(
+            root_task_orders=_default_root_task_orders(
                 (producer_domain, consumer_domain)
             ),
             events=(
-                KeyedEvent(
-                    contributions=(
-                        _event_contribution_from_publication(
+                ReadinessEvent(
+                    producers=(
+                        _readiness_producer_from_publication(
                             producer_root=0,
-                            producer_scope_id=None,
-                            publication=LogicalRelation.point_map(
+                            producer_site_id=None,
+                            publication=CoordinateRelation.point_map(
                                 producer_domain,
-                                key_domain,
+                                readiness_key_domain,
                                 (
                                     (
                                         ((10, 0, 4, 1),),
@@ -1693,13 +1754,13 @@ class TestCrossLoopScheduler(TestCase):
                             ),
                         ),
                     ),
-                    uses=(
-                        EventUse(
+                    consumers=(
+                        ReadinessConsumer(
                             consumer_root=1,
-                            consumer_scope_id=None,
-                            keys=LogicalRelation.point_map(
+                            consumer_site_id=None,
+                            keys_by_consumer=CoordinateRelation.point_map(
                                 consumer_domain,
-                                key_domain,
+                                readiness_key_domain,
                                 (
                                     (
                                         ((20, 0, 2, 1),),
@@ -1713,15 +1774,15 @@ class TestCrossLoopScheduler(TestCase):
             ),
         )
         baseline = build_baseline_worker_schedule(
-            event_graph.root_domains,
+            readiness_graph.root_domains,
             worker_count=2,
         )
-        triggers = derive_local_triggers(event_graph, baseline)
+        continuations = derive_final_arrival_continuations(readiness_graph, baseline)
 
-        schedule = order_local_contributors_by_key(
-            event_graph,
+        schedule = order_continuation_producers_by_key(
+            readiness_graph,
             baseline,
-            triggers,
+            continuations,
         )
 
         self.assertEqual(task_order(schedule, 0), (0, 1, 2, 3))
@@ -1735,15 +1796,15 @@ class TestCrossLoopScheduler(TestCase):
             [[10], [20]],
         )
         root_domains = (
-            LogicalDomain((10,), ((10, 1),), ((10, 1),)),
-            LogicalDomain((20,), ((20, 1),), ((20, 1),)),
+            CoordinateDomain((10,), ((10, 1),), ((10, 1),)),
+            CoordinateDomain((20,), ((20, 1),), ((20, 1),)),
         )
-        event_graph = _configured_event_graph(graph, root_domains)
+        readiness_graph = _configured_readiness_graph(graph, root_domains)
 
         validate_worker_schedule(
-            event_graph,
+            readiness_graph,
             build_baseline_worker_schedule(
-                event_graph.root_domains,
+                readiness_graph.root_domains,
                 worker_count=1,
             ),
         )
@@ -1752,69 +1813,86 @@ class TestCrossLoopScheduler(TestCase):
             segments=(
                 WorkerScheduleSegment(
                     root=1,
-                    task_relation=event_graph.root_traversals[1],
+                    task_order=readiness_graph.root_task_orders[1],
                     worker_begin=0,
                     worker_count=1,
-                    schedule_begin=0,
+                    dispatch_offset=0,
                 ),
                 WorkerScheduleSegment(
                     root=0,
-                    task_relation=event_graph.root_traversals[0],
+                    task_order=readiness_graph.root_task_orders[0],
                     worker_begin=0,
                     worker_count=1,
-                    schedule_begin=1,
+                    dispatch_offset=1,
                 ),
             ),
         )
         with self.assertRaisesRegex(ValueError, "dependency/order cycle"):
-            validate_worker_schedule(event_graph, reversed_schedule)
+            validate_worker_schedule(readiness_graph, reversed_schedule)
 
-    def test_counted_event_supports_independent_consumer_uses(self) -> None:
-        producer_domain = LogicalDomain((10,), ((10, 2),), identity=0)
-        first_consumer = LogicalDomain((20,), ((20, 1),), identity=1)
-        second_consumer = LogicalDomain((30,), ((30, 2),), identity=2)
-        key_domain = LogicalDomain((), (), kind="event", identity=0)
-        event = CountedEventPlan(
-            contributions=(
-                _event_contribution_from_publication(
+    def test_readiness_counter_supports_independent_consumers(self) -> None:
+        producer_domain = CoordinateDomain((10,), ((10, 2),), identity=0)
+        first_consumer = CoordinateDomain((20,), ((20, 1),), identity=1)
+        second_consumer = CoordinateDomain((30,), ((30, 2),), identity=2)
+        readiness_key_domain = CoordinateDomain((), (), kind="event", identity=0)
+        event = ReadinessCounterPlan(
+            producers=(
+                _readiness_producer_from_publication(
                     producer_root=0,
-                    publication=LogicalRelation.total(producer_domain, key_domain),
+                    publication=CoordinateRelation.total(
+                        producer_domain, readiness_key_domain
+                    ),
                 ),
             ),
-            uses=(
-                EventUse(
+            consumers=(
+                ReadinessConsumer(
                     consumer_root=1,
-                    keys=LogicalRelation.total(first_consumer, key_domain),
+                    keys_by_consumer=CoordinateRelation.total(
+                        first_consumer, readiness_key_domain
+                    ),
                 ),
-                EventUse(
+                ReadinessConsumer(
                     consumer_root=2,
-                    keys=LogicalRelation.total(second_consumer, key_domain),
+                    keys_by_consumer=CoordinateRelation.total(
+                        second_consumer, readiness_key_domain
+                    ),
                 ),
             ),
         )
 
-        self.assertEqual(event.key_count, 1)
-        self.assertEqual(event.uniform_arrivals(), 2)
-        self.assertIsNone(event.local_use)
-        self.assertEqual(tuple(use.consumer_root for use in event.uses), (1, 2))
+        self.assertEqual(event.readiness_key_count, 1)
+        self.assertEqual(event.uniform_arrival_count(), 2)
+        self.assertIsNone(event.continuation_consumer)
+        self.assertEqual(
+            tuple(
+                readiness_consumer.consumer_root
+                for readiness_consumer in event.consumers
+            ),
+            (1, 2),
+        )
 
-    def test_counted_event_selection_keeps_independent_direct_uses(self) -> None:
+    def test_readiness_counter_selection_keeps_independent_direct_consumers(
+        self,
+    ) -> None:
         root_domains = tuple(
-            LogicalDomain((axis,), ((axis, 2),), ((axis, 1),)) for axis in (10, 20, 30)
+            CoordinateDomain((axis,), ((axis, 2),), ((axis, 1),))
+            for axis in (10, 20, 30)
         )
         root_domains = _identify_root_domains(root_domains)
-        key_domain = LogicalDomain((0,), ((0, 2),), kind="event", identity=0)
-        event_graph = EventGraph(
-            root_traversals=_default_root_traversals(root_domains),
+        readiness_key_domain = CoordinateDomain(
+            (0,), ((0, 2),), kind="event", identity=0
+        )
+        readiness_graph = ReadinessGraph(
+            root_task_orders=_default_root_task_orders(root_domains),
             events=(
-                KeyedEvent(
-                    contributions=(
-                        _event_contribution_from_publication(
+                ReadinessEvent(
+                    producers=(
+                        _readiness_producer_from_publication(
                             producer_root=0,
-                            producer_scope_id=None,
-                            publication=LogicalRelation.point_map(
+                            producer_site_id=None,
+                            publication=CoordinateRelation.point_map(
                                 root_domains[0],
-                                key_domain,
+                                readiness_key_domain,
                                 (
                                     (
                                         ((10, 0, 2, 1),),
@@ -1824,13 +1902,13 @@ class TestCrossLoopScheduler(TestCase):
                             ),
                         ),
                     ),
-                    uses=tuple(
-                        EventUse(
+                    consumers=tuple(
+                        ReadinessConsumer(
                             consumer_root=root,
-                            consumer_scope_id=None,
-                            keys=LogicalRelation.point_map(
+                            consumer_site_id=None,
+                            keys_by_consumer=CoordinateRelation.point_map(
                                 root_domains[root],
-                                key_domain,
+                                readiness_key_domain,
                                 (
                                     (
                                         ((10 * (root + 1), 0, 2, 1),),
@@ -1838,40 +1916,50 @@ class TestCrossLoopScheduler(TestCase):
                                     ),
                                 ),
                             ),
-                            dependency_points=frozenset(((root - 1, None, None),)),
+                            covered_obligations=frozenset(((root - 1, None, None),)),
                         )
                         for root in (1, 2)
                     ),
                 ),
             ),
         )
-        (selected,) = choose_counted_events(
-            event_graph,
+        (selected,) = choose_readiness_counters(
+            readiness_graph,
             (),
-            excluded_dependency_points=frozenset(((0, None, None),)),
+            excluded_obligations=frozenset(((0, None, None),)),
         )
 
-        self.assertEqual(selected.key_count, 2)
-        self.assertEqual(tuple(use.consumer_root for use in selected.uses), (2,))
+        self.assertEqual(selected.readiness_key_count, 2)
+        self.assertEqual(
+            tuple(
+                readiness_consumer.consumer_root
+                for readiness_consumer in selected.consumers
+            ),
+            (2,),
+        )
 
-    def test_counted_event_lowering_is_derived_from_the_semantic_graph(self) -> None:
+    def test_readiness_counter_lowering_is_derived_from_the_semantic_graph(
+        self,
+    ) -> None:
         root_domains = (
-            LogicalDomain((10,), ((10, 4),), ((10, 1),)),
-            LogicalDomain((20,), ((20, 2),), ((20, 2),)),
+            CoordinateDomain((10,), ((10, 4),), ((10, 1),)),
+            CoordinateDomain((20,), ((20, 2),), ((20, 2),)),
         )
         root_domains = _identify_root_domains(root_domains)
-        key_domain = LogicalDomain((0,), ((0, 2),), kind="event", identity=0)
-        event_graph = EventGraph(
-            root_traversals=_default_root_traversals(root_domains),
+        readiness_key_domain = CoordinateDomain(
+            (0,), ((0, 2),), kind="event", identity=0
+        )
+        readiness_graph = ReadinessGraph(
+            root_task_orders=_default_root_task_orders(root_domains),
             events=(
-                KeyedEvent(
-                    contributions=(
-                        _event_contribution_from_publication(
+                ReadinessEvent(
+                    producers=(
+                        _readiness_producer_from_publication(
                             producer_root=0,
-                            producer_scope_id=None,
-                            publication=LogicalRelation.point_map(
+                            producer_site_id=None,
+                            publication=CoordinateRelation.point_map(
                                 root_domains[0],
-                                key_domain,
+                                readiness_key_domain,
                                 (
                                     (
                                         ((10, 0, 4, 1),),
@@ -1881,13 +1969,13 @@ class TestCrossLoopScheduler(TestCase):
                             ),
                         ),
                     ),
-                    uses=(
-                        EventUse(
+                    consumers=(
+                        ReadinessConsumer(
                             consumer_root=1,
-                            consumer_scope_id=None,
-                            keys=LogicalRelation.point_map(
+                            consumer_site_id=None,
+                            keys_by_consumer=CoordinateRelation.point_map(
                                 root_domains[1],
-                                key_domain,
+                                readiness_key_domain,
                                 (
                                     (
                                         ((20, 0, 2, 1),),
@@ -1904,12 +1992,12 @@ class TestCrossLoopScheduler(TestCase):
             root_domains,
             worker_count=4,
         )
-        triggers = derive_local_triggers(event_graph, baseline)
+        continuations = derive_final_arrival_continuations(readiness_graph, baseline)
 
-        (lowered,) = choose_counted_events(event_graph, triggers)
+        (lowered,) = choose_readiness_counters(readiness_graph, continuations)
 
         self.assertEqual(
-            _publication(lowered.contributions[0]).materialize(),
+            _publication(lowered.producers[0]).materialize(),
             (
                 frozenset((0,)),
                 frozenset((0,)),
@@ -1918,11 +2006,11 @@ class TestCrossLoopScheduler(TestCase):
             ),
         )
         self.assertEqual(
-            lowered.uses[0].keys.materialize(),
+            lowered.consumers[0].keys_by_consumer.materialize(),
             (frozenset((0,)), frozenset((1,))),
         )
-        self.assertEqual(lowered.uniform_arrivals(), 2)
-        self.assertEqual(lowered.local_trigger_use, 0)
+        self.assertEqual(lowered.uniform_arrival_count(), 2)
+        self.assertEqual(lowered.continuation_consumer_index, 0)
 
     def test_nonstatic_layout_falls_back_to_root_readiness(self) -> None:
         plan = build_tile_dependency_graph(
@@ -1939,9 +2027,9 @@ class TestCrossLoopScheduler(TestCase):
             [[10], [20]],
         )
 
-        (event,) = _configured_event_graph(plan, _one_dimensional_domains()).events
-        self.assertIsNotNone(event.family_done_root)
-        self.assertEqual(event.family_done_root, 0)
+        (event,) = _configured_readiness_graph(plan, _one_dimensional_domains()).events
+        self.assertIsNotNone(event.root_barrier_source)
+        self.assertEqual(event.root_barrier_source, 0)
 
     def test_fanout_keeps_one_edge_per_consumer(self) -> None:
         plan = build_tile_dependency_graph(
@@ -1957,24 +2045,28 @@ class TestCrossLoopScheduler(TestCase):
             [(edge.producer_root, edge.consumer_root) for edge in plan.edges],
             [(0, 1), (0, 2)],
         )
-        configured = _configured_event_graph(
+        configured = _configured_readiness_graph(
             plan,
             (
-                LogicalDomain((0,), ((0, 8),), ((0, 16),)),
-                LogicalDomain((1,), ((1, 8),), ((1, 16),)),
-                LogicalDomain((2,), ((2, 8),), ((2, 16),)),
+                CoordinateDomain((0,), ((0, 8),), ((0, 16),)),
+                CoordinateDomain((1,), ((1, 8),), ((1, 16),)),
+                CoordinateDomain((2,), ((2, 8),), ((2, 16),)),
             ),
         )
         (event,) = tuple(
             event
             for event in configured.events
             if any(
-                contribution.producer_root == 0 for contribution in event.contributions
+                readiness_producer.producer_root == 0
+                for readiness_producer in event.producers
             )
         )
-        self.assertIsNone(event.family_done_root)
+        self.assertIsNone(event.root_barrier_source)
         self.assertEqual(
-            {use.consumer_root for use in event.uses},
+            {
+                readiness_consumer.consumer_root
+                for readiness_consumer in event.consumers
+            },
             {1, 2},
         )
 
@@ -1997,21 +2089,23 @@ class TestCrossLoopScheduler(TestCase):
         )
 
         self.assertEqual(len(plan.edges), 2)
-        configured = _configured_event_graph(
+        configured = _configured_readiness_graph(
             plan,
             (
-                LogicalDomain((0,), ((0, 8),), ((0, 16),)),
-                LogicalDomain((1,), ((1, 8),), ((1, 16),)),
+                CoordinateDomain((0,), ((0, 8),), ((0, 16),)),
+                CoordinateDomain((1,), ((1, 8),), ((1, 16),)),
             ),
         )
         self.assertEqual(len(configured.events), 2)
         family_event = next(
-            event for event in configured.events if event.family_done_root is not None
+            event
+            for event in configured.events
+            if event.root_barrier_source is not None
         )
-        self.assertEqual(family_event.family_done_root, 0)
+        self.assertEqual(family_event.root_barrier_source, 0)
 
-    def test_mixed_exact_and_unknown_accesses_use_root_completion(self) -> None:
-        dependency_plan = build_tile_dependency_graph(
+    def test_mixed_exact_and_unknown_accesses_use_root_barrier(self) -> None:
+        dependency_graph = build_tile_dependency_graph(
             (
                 _access(
                     0,
@@ -2047,40 +2141,40 @@ class TestCrossLoopScheduler(TestCase):
             ),
             [[10, 11], [20]],
         )
-        schedule = build_cross_loop_schedule(
-            dependency_plan=dependency_plan,
+        schedule = build_static_pipeline_plan(
+            dependency_graph=dependency_graph,
             root_domains=(
-                LogicalDomain((10, 11), ((10, 1), (11, 4)), ((10, 1), (11, 16))),
-                LogicalDomain((20,), ((20, 1),), ((20, 1),)),
+                CoordinateDomain((10, 11), ((10, 1), (11, 4)), ((10, 1), (11, 16))),
+                CoordinateDomain((20,), ((20, 1),), ((20, 1),)),
             ),
             axis_geometry={10: (1, 1), 11: (4, 16), 20: (1, 1), 21: (4, 16)},
             worker_count=2,
         )
 
-        self.assertEqual(schedule.root_completion_edges, frozenset(((0, 1),)))
+        self.assertEqual(schedule.root_barrier_edges, frozenset(((0, 1),)))
 
-    def test_singleton_producer_uses_root_completion(self) -> None:
-        dependency_plan = build_tile_dependency_graph(
+    def test_singleton_producer_uses_root_barrier(self) -> None:
+        dependency_graph = build_tile_dependency_graph(
             (
                 _access(0, root=0, kind="store", block_ids=(10,)),
                 _access(1, root=1, kind="load", block_ids=(20,)),
             ),
             [[10], [20]],
         )
-        schedule = build_cross_loop_schedule(
-            dependency_plan=dependency_plan,
+        schedule = build_static_pipeline_plan(
+            dependency_graph=dependency_graph,
             root_domains=(
-                LogicalDomain((10,), ((10, 1),), ((10, 128),)),
-                LogicalDomain((20,), ((20, 4),), ((20, 32),)),
+                CoordinateDomain((10,), ((10, 1),), ((10, 128),)),
+                CoordinateDomain((20,), ((20, 4),), ((20, 32),)),
             ),
             axis_geometry={10: (1, 128), 20: (4, 32)},
             worker_count=4,
         )
 
-        self.assertEqual(schedule.root_completion_edges, frozenset(((0, 1),)))
+        self.assertEqual(schedule.root_barrier_edges, frozenset(((0, 1),)))
 
-    def test_root_completion_path_elides_redundant_exact_task_wait(self) -> None:
-        dependency_plan = build_tile_dependency_graph(
+    def test_root_barrier_path_elides_redundant_exact_task_wait(self) -> None:
+        dependency_graph = build_tile_dependency_graph(
             (
                 _access(0, root=0, allocation_id=0, kind="store", block_ids=(10,)),
                 _access(
@@ -2114,14 +2208,14 @@ class TestCrossLoopScheduler(TestCase):
             [[10], [20], [30], [40]],
         )
         root_domains = tuple(
-            LogicalDomain(
+            CoordinateDomain(
                 (10 + root * 10,), ((10 + root * 10, 8),), ((10 + root * 10, 16),)
             )
             for root in range(4)
         )
 
-        schedule = build_cross_loop_schedule(
-            dependency_plan=dependency_plan,
+        schedule = build_static_pipeline_plan(
+            dependency_graph=dependency_graph,
             root_domains=root_domains,
             axis_geometry={
                 10: (8, 16),
@@ -2133,12 +2227,12 @@ class TestCrossLoopScheduler(TestCase):
         )
 
         self.assertEqual(
-            schedule.root_completion_edges,
+            schedule.root_barrier_edges,
             frozenset(((0, 1), (1, 2), (2, 3))),
         )
 
     def test_worker_schedule_derives_access_ready_overlap(self) -> None:
-        dependency_plan = build_tile_dependency_graph(
+        dependency_graph = build_tile_dependency_graph(
             (
                 _access(
                     0,
@@ -2187,17 +2281,17 @@ class TestCrossLoopScheduler(TestCase):
             ),
             [[10, 11], [20, 21], [30]],
         )
-        dependency_plan = dataclasses.replace(
-            dependency_plan,
-            execution_scopes=(
-                ExecutionScope(
+        dependency_graph = dataclasses.replace(
+            dependency_graph,
+            execution_sites=(
+                ExecutionSite(
                     0, 0, 0, (), None, "root", (10, 11), (10, 11), True, False
                 ),
-                ExecutionScope(
+                ExecutionSite(
                     1, 1, 1, (), None, "root", (20, 21), (20, 21), True, False
                 ),
-                ExecutionScope(2, 2, 2, (), None, "root", (30,), (30,), True, False),
-                ExecutionScope(
+                ExecutionSite(2, 2, 2, (), None, "root", (30,), (30,), True, False),
+                ExecutionSite(
                     3,
                     2,
                     3,
@@ -2210,15 +2304,15 @@ class TestCrossLoopScheduler(TestCase):
                     True,
                 ),
             ),
-            scope_ids_by_access=((0,), (1,), (1,), (3,)),
+            site_ids_by_access=((0,), (1,), (1,), (3,)),
         )
         root_domains = (
-            LogicalDomain((10, 11), ((10, 1), (11, 8)), ((10, 1), (11, 16))),
-            LogicalDomain((20, 21), ((20, 1), (21, 4)), ((20, 1), (21, 32))),
-            LogicalDomain((30,), ((30, 1),), ((30, 1),)),
+            CoordinateDomain((10, 11), ((10, 1), (11, 8)), ((10, 1), (11, 16))),
+            CoordinateDomain((20, 21), ((20, 1), (21, 4)), ((20, 1), (21, 32))),
+            CoordinateDomain((30,), ((30, 1),), ((30, 1),)),
         )
         kwargs = {
-            "dependency_plan": dependency_plan,
+            "dependency_graph": dependency_graph,
             "root_domains": root_domains,
             "axis_geometry": {
                 10: (1, 1),
@@ -2231,56 +2325,66 @@ class TestCrossLoopScheduler(TestCase):
             "worker_count": 8,
         }
 
-        schedule = build_cross_loop_schedule(**{**kwargs, "worker_count": 6})
+        schedule = build_static_pipeline_plan(**{**kwargs, "worker_count": 6})
 
         root_events = tuple(
             plan
-            for plan in schedule.counted_events
-            if all(use.consumer_scope_id is None for use in plan.uses)
+            for plan in schedule.readiness_counters
+            if all(
+                readiness_consumer.consumer_site_id is None
+                for readiness_consumer in plan.consumers
+            )
         )
         self.assertEqual(len(root_events), 1)
         event = root_events[0]
         self.assertEqual(
             (
-                event.contributions[0].producer_root,
-                event.uses[0].consumer_root,
-                event.local_use.consumer_root if event.local_use is not None else None,
-                event.uniform_arrivals(),
+                event.producers[0].producer_root,
+                event.consumers[0].consumer_root,
+                event.continuation_consumer.consumer_root
+                if event.continuation_consumer is not None
+                else None,
+                event.uniform_arrival_count(),
             ),
             (0, 1, 1, 2),
         )
         local_events = tuple(
-            plan for plan in schedule.counted_events if plan.local_use is not None
+            plan
+            for plan in schedule.readiness_counters
+            if plan.continuation_consumer is not None
         )
         self.assertEqual(len(local_events), 1)
-        self.assertEqual(local_events[0].local_trigger_use, 0)
-        assert local_events[0].local_use is not None
-        self.assertEqual(local_events[0].local_use.consumer_root, 1)
+        self.assertEqual(local_events[0].continuation_consumer_index, 0)
+        assert local_events[0].continuation_consumer is not None
+        self.assertEqual(local_events[0].continuation_consumer.consumer_root, 1)
         self.assertEqual(schedule.worker_schedule.worker_count, 6)
-        nested_scope_events = tuple(
+        nested_loop_events = tuple(
             plan
-            for plan in schedule.counted_events
-            if any(use.consumer_scope_id is not None for use in plan.uses)
+            for plan in schedule.readiness_counters
+            if any(
+                readiness_consumer.consumer_site_id is not None
+                for readiness_consumer in plan.consumers
+            )
         )
-        self.assertEqual(len(nested_scope_events), 1)
+        self.assertEqual(len(nested_loop_events), 1)
         self.assertEqual(
             _expected_arrivals(
-                nested_scope_events[0].key_domain,
-                nested_scope_events[0].contributions,
+                nested_loop_events[0].readiness_key_domain,
+                nested_loop_events[0].producers,
             ),
             (3, 1),
         )
         self.assertEqual(placement(schedule.worker_schedule, 2, 0), (5, 1))
         self.assertEqual(placement(schedule.worker_schedule, 0, 6), (0, 1))
 
-        exact = build_cross_loop_schedule(**{**kwargs, "worker_count": 7})
+        exact = build_static_pipeline_plan(**{**kwargs, "worker_count": 7})
         self.assertEqual(exact.worker_schedule.worker_count, 7)
         self.assertNotEqual(exact.worker_schedule, schedule.worker_schedule)
 
-        default_schedule = build_cross_loop_schedule(**kwargs)
-        self.assertEqual(len(default_schedule.counted_events), 2)
+        default_schedule = build_static_pipeline_plan(**kwargs)
+        self.assertEqual(len(default_schedule.readiness_counters), 2)
         self.assertEqual(
-            default_schedule.root_completion_edges,
+            default_schedule.root_barrier_edges,
             frozenset(),
         )
         short_domains = (
@@ -2296,7 +2400,7 @@ class TestCrossLoopScheduler(TestCase):
             ),
             root_domains[2],
         )
-        short_schedule = build_cross_loop_schedule(
+        short_schedule = build_static_pipeline_plan(
             **{
                 **kwargs,
                 "root_domains": short_domains,
@@ -2310,36 +2414,40 @@ class TestCrossLoopScheduler(TestCase):
                 },
             }
         )
-        self.assertEqual(len(short_schedule.counted_events), 2)
+        self.assertEqual(len(short_schedule.readiness_counters), 2)
         self.assertEqual(
-            short_schedule.root_completion_edges,
+            short_schedule.root_barrier_edges,
             frozenset(),
         )
 
-    def test_nested_scope_milestones_follow_worker_readiness(self) -> None:
+    def test_nested_split_nested_loop_at_readiness_follow_worker_readiness(
+        self,
+    ) -> None:
         root_domains = (
-            LogicalDomain((10,), ((10, 4),), ((10, 1),)),
-            LogicalDomain((20,), ((20, 1),), ((20, 1),)),
+            CoordinateDomain((10,), ((10, 4),), ((10, 1),)),
+            CoordinateDomain((20,), ((20, 1),), ((20, 1),)),
         )
         root_domains = _identify_root_domains(root_domains)
-        action_domain = LogicalDomain(
+        nested_loop_domain = CoordinateDomain(
             (20, 21),
             ((20, 1), (21, 4)),
             ((20, 1), (21, 1)),
             identity=7,
         )
-        key_domain = LogicalDomain((0,), ((0, 4),), kind="event", identity=0)
-        event_graph = EventGraph(
-            root_traversals=_default_root_traversals(root_domains),
+        readiness_key_domain = CoordinateDomain(
+            (0,), ((0, 4),), kind="event", identity=0
+        )
+        readiness_graph = ReadinessGraph(
+            root_task_orders=_default_root_task_orders(root_domains),
             events=(
-                KeyedEvent(
-                    contributions=(
-                        _event_contribution_from_publication(
+                ReadinessEvent(
+                    producers=(
+                        _readiness_producer_from_publication(
                             producer_root=0,
-                            producer_scope_id=None,
-                            publication=LogicalRelation.point_map(
+                            producer_site_id=None,
+                            publication=CoordinateRelation.point_map(
                                 root_domains[0],
-                                key_domain,
+                                readiness_key_domain,
                                 (
                                     (
                                         ((10, 0, 4, 1),),
@@ -2349,13 +2457,13 @@ class TestCrossLoopScheduler(TestCase):
                             ),
                         ),
                     ),
-                    uses=(
-                        EventUse(
+                    consumers=(
+                        ReadinessConsumer(
                             consumer_root=1,
-                            consumer_scope_id=7,
-                            keys=LogicalRelation.point_map(
-                                action_domain,
-                                key_domain,
+                            consumer_site_id=7,
+                            keys_by_consumer=CoordinateRelation.point_map(
+                                nested_loop_domain,
+                                readiness_key_domain,
                                 (
                                     (
                                         ((20, 0, 1, 1), (21, 0, 4, 1)),
@@ -2373,39 +2481,39 @@ class TestCrossLoopScheduler(TestCase):
             segments=(
                 WorkerScheduleSegment(
                     root=0,
-                    task_relation=_one_dimensional_task_range(root_domains[0], 0, 3),
+                    task_order=_one_dimensional_task_range(root_domains[0], 0, 3),
                     worker_begin=0,
                     worker_count=3,
-                    schedule_begin=0,
+                    dispatch_offset=0,
                 ),
                 WorkerScheduleSegment(
                     root=0,
-                    task_relation=_one_dimensional_task_range(root_domains[0], 3, 1),
+                    task_order=_one_dimensional_task_range(root_domains[0], 3, 1),
                     worker_begin=0,
                     worker_count=1,
-                    schedule_begin=1,
+                    dispatch_offset=1,
                 ),
                 WorkerScheduleSegment(
                     root=1,
-                    task_relation=event_graph.root_traversals[1],
+                    task_order=readiness_graph.root_task_orders[1],
                     worker_begin=3,
                     worker_count=1,
-                    schedule_begin=2,
+                    dispatch_offset=2,
                 ),
             ),
         )
 
-        placed, plans = place_nested_scope_consumers(event_graph, schedule, ())
+        placed, plans = place_nested_loop_consumers(readiness_graph, schedule, ())
 
         self.assertEqual(placement(placed, 1, 0), (3, 1))
         self.assertEqual(len(plans), 1)
         plan = plans[0]
         self.assertEqual(
-            _expected_arrivals(plan.key_domain, plan.contributions),
+            _expected_arrivals(plan.readiness_key_domain, plan.producers),
             (3, 1),
         )
         self.assertEqual(
-            _publication(plan.contributions[0]).materialize(),
+            _publication(plan.producers[0]).materialize(),
             (
                 frozenset((0,)),
                 frozenset((0,)),
@@ -2414,7 +2522,7 @@ class TestCrossLoopScheduler(TestCase):
             ),
         )
         self.assertEqual(
-            plan.uses[0].keys.materialize(),
+            plan.consumers[0].keys_by_consumer.materialize(),
             (
                 frozenset((0,)),
                 frozenset((0,)),
@@ -2422,46 +2530,48 @@ class TestCrossLoopScheduler(TestCase):
                 frozenset((1,)),
             ),
         )
-        self.assertEqual(plan.uses[0].consumer_scope_id, 7)
+        self.assertEqual(plan.consumers[0].consumer_site_id, 7)
 
-    def test_nested_scope_entry_event_survives_without_early_placement(self) -> None:
-        producer_domain = LogicalDomain(
+    def test_nested_nested_loop_entry_event_survives_without_early_placement(
+        self,
+    ) -> None:
+        producer_domain = CoordinateDomain(
             (10, 11),
             ((10, 2), (11, 4)),
             ((10, 1), (11, 1)),
             identity=0,
         )
-        consumer_domain = LogicalDomain(
+        consumer_domain = CoordinateDomain(
             (20,),
             ((20, 2),),
             ((20, 1),),
             identity=1,
         )
-        action_domain = LogicalDomain(
+        nested_loop_domain = CoordinateDomain(
             (20, 21),
             ((20, 2), (21, 4)),
             ((20, 1), (21, 1)),
             identity=7,
         )
-        key_domain = LogicalDomain(
+        readiness_key_domain = CoordinateDomain(
             (0, 1),
             ((0, 2), (1, 4)),
             kind="event",
             identity=0,
         )
-        event_graph = EventGraph(
-            root_traversals=(
-                physical_traversal_relation(producer_domain, (10, 11)),
-                physical_traversal_relation(consumer_domain, (20,)),
+        readiness_graph = ReadinessGraph(
+            root_task_orders=(
+                pid_task_order(producer_domain, (10, 11)),
+                pid_task_order(consumer_domain, (20,)),
             ),
             events=(
-                KeyedEvent(
-                    contributions=(
-                        _event_contribution_from_publication(
+                ReadinessEvent(
+                    producers=(
+                        _readiness_producer_from_publication(
                             producer_root=0,
-                            publication=LogicalRelation.point_map(
+                            publication=CoordinateRelation.point_map(
                                 producer_domain,
-                                key_domain,
+                                readiness_key_domain,
                                 (
                                     (
                                         (
@@ -2477,13 +2587,13 @@ class TestCrossLoopScheduler(TestCase):
                             ),
                         ),
                     ),
-                    uses=(
-                        EventUse(
+                    consumers=(
+                        ReadinessConsumer(
                             consumer_root=1,
-                            consumer_scope_id=7,
-                            keys=LogicalRelation.point_map(
-                                action_domain,
-                                key_domain,
+                            consumer_site_id=7,
+                            keys_by_consumer=CoordinateRelation.point_map(
+                                nested_loop_domain,
+                                readiness_key_domain,
                                 (
                                     (
                                         (
@@ -2505,53 +2615,55 @@ class TestCrossLoopScheduler(TestCase):
         for worker_count in (1, 2):
             with self.subTest(worker_count=worker_count):
                 schedule = _build_baseline_worker_schedule(
-                    event_graph.root_domains,
-                    event_graph.root_traversals,
+                    readiness_graph.root_domains,
+                    readiness_graph.root_task_orders,
                     worker_count=worker_count,
                 )
 
-                placed, plans = place_nested_scope_consumers(
-                    event_graph,
+                placed, plans = place_nested_loop_consumers(
+                    readiness_graph,
                     schedule,
                     (),
                 )
 
                 self.assertEqual(placed, schedule)
                 self.assertEqual(len(plans), 1)
-                self.assertEqual(plans[0].key_count, 2)
+                self.assertEqual(plans[0].readiness_key_count, 2)
                 self.assertEqual(
                     _expected_arrivals(
-                        plans[0].key_domain,
-                        plans[0].contributions,
+                        plans[0].readiness_key_domain,
+                        plans[0].producers,
                     ),
                     (4, 4),
                 )
-                self.assertEqual(plans[0].uses[0].consumer_scope_id, 7)
+                self.assertEqual(plans[0].consumers[0].consumer_site_id, 7)
 
-    def test_nested_scope_identity_readiness_uses_one_admission_frontier(self) -> None:
-        """Per-iteration readiness is coarsened to one compact frontier."""
+    def test_nested_site_identity_readiness_uses_one_split_point(self) -> None:
+        """Per-iteration readiness is coarsened to one compact split point."""
         root_domains = (
-            LogicalDomain((10,), ((10, 4),), ((10, 1),)),
-            LogicalDomain((20,), ((20, 1),), ((20, 1),)),
+            CoordinateDomain((10,), ((10, 4),), ((10, 1),)),
+            CoordinateDomain((20,), ((20, 1),), ((20, 1),)),
         )
         root_domains = _identify_root_domains(root_domains)
-        action_domain = LogicalDomain(
+        nested_loop_domain = CoordinateDomain(
             (20, 21),
             ((20, 1), (21, 4)),
             ((20, 1), (21, 1)),
             identity=7,
         )
-        key_domain = LogicalDomain((0,), ((0, 4),), kind="event", identity=0)
-        event_graph = EventGraph(
-            root_traversals=_default_root_traversals(root_domains),
+        readiness_key_domain = CoordinateDomain(
+            (0,), ((0, 4),), kind="event", identity=0
+        )
+        readiness_graph = ReadinessGraph(
+            root_task_orders=_default_root_task_orders(root_domains),
             events=(
-                KeyedEvent(
-                    contributions=(
-                        _event_contribution_from_publication(
+                ReadinessEvent(
+                    producers=(
+                        _readiness_producer_from_publication(
                             producer_root=0,
-                            publication=LogicalRelation.point_map(
+                            publication=CoordinateRelation.point_map(
                                 root_domains[0],
-                                key_domain,
+                                readiness_key_domain,
                                 (
                                     (
                                         ((10, 0, 4, 1),),
@@ -2561,13 +2673,13 @@ class TestCrossLoopScheduler(TestCase):
                             ),
                         ),
                     ),
-                    uses=(
-                        EventUse(
+                    consumers=(
+                        ReadinessConsumer(
                             consumer_root=1,
-                            consumer_scope_id=7,
-                            keys=LogicalRelation.point_map(
-                                action_domain,
-                                key_domain,
+                            consumer_site_id=7,
+                            keys_by_consumer=CoordinateRelation.point_map(
+                                nested_loop_domain,
+                                readiness_key_domain,
                                 (
                                     (
                                         ((20, 0, 1, 1), (21, 0, 4, 1)),
@@ -2585,41 +2697,41 @@ class TestCrossLoopScheduler(TestCase):
             segments=(
                 WorkerScheduleSegment(
                     root=0,
-                    task_relation=event_graph.root_traversals[0],
+                    task_order=readiness_graph.root_task_orders[0],
                     worker_begin=0,
                     worker_count=1,
-                    schedule_begin=0,
+                    dispatch_offset=0,
                 ),
                 WorkerScheduleSegment(
                     root=1,
-                    task_relation=event_graph.root_traversals[1],
+                    task_order=readiness_graph.root_task_orders[1],
                     worker_begin=3,
                     worker_count=1,
-                    schedule_begin=5,
+                    dispatch_offset=5,
                 ),
             ),
         )
 
-        placed, plans = place_nested_scope_consumers(event_graph, schedule, ())
+        placed, plans = place_nested_loop_consumers(readiness_graph, schedule, ())
 
         self.assertEqual(placement(placed, 1, 0), (3, 1))
         self.assertEqual(len(plans), 1)
         self.assertEqual(
-            _expected_arrivals(plans[0].key_domain, plans[0].contributions),
+            _expected_arrivals(plans[0].readiness_key_domain, plans[0].producers),
             (1, 3),
         )
 
-    def test_nested_scope_placement_keeps_transitive_worker_liveness(
+    def test_nested_loop_placement_keeps_transitive_worker_liveness(
         self,
     ) -> None:
         """A moved wait must not block an upstream prerequisite on its worker."""
         root_domains = (
-            LogicalDomain((10,), ((10, 4),), ((10, 1),)),
-            LogicalDomain((20,), ((20, 4),), ((20, 1),)),
-            LogicalDomain((30,), ((30, 1),), ((30, 1),)),
+            CoordinateDomain((10,), ((10, 4),), ((10, 1),)),
+            CoordinateDomain((20,), ((20, 4),), ((20, 1),)),
+            CoordinateDomain((30,), ((30, 1),), ((30, 1),)),
         )
         root_domains = _identify_root_domains(root_domains)
-        action_domain = LogicalDomain(
+        nested_loop_domain = CoordinateDomain(
             (30, 31),
             ((30, 1), (31, 4)),
             ((30, 1), (31, 1)),
@@ -2627,19 +2739,19 @@ class TestCrossLoopScheduler(TestCase):
         )
 
         def identity_keys(
-            source_domain: LogicalDomain,
+            source_domain: CoordinateDomain,
             source_axis: int,
             event_id: int,
-        ) -> tuple[LogicalDomain, LogicalRelation]:
-            key_domain = LogicalDomain(
+        ) -> tuple[CoordinateDomain, CoordinateRelation]:
+            readiness_key_domain = CoordinateDomain(
                 (0,),
                 ((0, 4),),
                 kind="event",
                 identity=event_id,
             )
-            return key_domain, LogicalRelation.point_map(
+            return readiness_key_domain, CoordinateRelation.point_map(
                 source_domain,
-                key_domain,
+                readiness_key_domain,
                 (
                     (
                         tuple(
@@ -2654,21 +2766,21 @@ class TestCrossLoopScheduler(TestCase):
         first_keys, a_to_first = identity_keys(root_domains[0], 10, 0)
         _, first_use = identity_keys(root_domains[1], 20, 0)
         second_keys, b_to_second = identity_keys(root_domains[1], 20, 1)
-        _, nested_use = identity_keys(action_domain, 31, 1)
-        event_graph = EventGraph(
-            root_traversals=_default_root_traversals(root_domains),
+        _, nested_keys_by_consumer = identity_keys(nested_loop_domain, 31, 1)
+        readiness_graph = ReadinessGraph(
+            root_task_orders=_default_root_task_orders(root_domains),
             events=(
-                KeyedEvent(
-                    contributions=(
-                        _event_contribution_from_publication(0, a_to_first),
-                    ),
-                    uses=(EventUse(1, first_use),),
+                ReadinessEvent(
+                    producers=(_readiness_producer_from_publication(0, a_to_first),),
+                    consumers=(ReadinessConsumer(1, first_use),),
                 ),
-                KeyedEvent(
-                    contributions=(
-                        _event_contribution_from_publication(1, b_to_second),
+                ReadinessEvent(
+                    producers=(_readiness_producer_from_publication(1, b_to_second),),
+                    consumers=(
+                        ReadinessConsumer(
+                            2, nested_keys_by_consumer, consumer_site_id=7
+                        ),
                     ),
-                    uses=(EventUse(2, nested_use, consumer_scope_id=7),),
                 ),
             ),
         )
@@ -2678,16 +2790,16 @@ class TestCrossLoopScheduler(TestCase):
             task_begin: int,
             task_count: int,
             worker: int,
-            position: int,
+            worker_step: int,
         ) -> WorkerScheduleSegment:
             return WorkerScheduleSegment(
                 root=root,
-                task_relation=_one_dimensional_task_range(
+                task_order=_one_dimensional_task_range(
                     root_domains[root], task_begin, task_count
                 ),
                 worker_begin=worker,
                 worker_count=task_count,
-                schedule_begin=position * task_count,
+                dispatch_offset=worker_step * task_count,
             )
 
         schedule = WorkerSchedule(
@@ -2701,38 +2813,38 @@ class TestCrossLoopScheduler(TestCase):
             ),
         )
 
-        placed, plans = place_nested_scope_consumers(event_graph, schedule, ())
+        placed, plans = place_nested_loop_consumers(readiness_graph, schedule, ())
 
-        # Worker 3 looks idle at position 2, but its A task at position 3 is a
+        # Worker 3 looks idle at step 2, but its A task at step 3 is a
         # prerequisite of B task 3. Placing C there would form C -> B -> A
         # while A remains later on C's blocked worker. Worker 2 is safe.
         self.assertEqual(placement(placed, 2, 0), (2, 2))
         self.assertEqual(len(plans), 1)
-        validate_worker_schedule(event_graph, placed)
+        validate_worker_schedule(readiness_graph, placed)
 
-    def test_nested_scope_placement_preserves_source_order_on_each_worker(
+    def test_nested_loop_placement_preserves_source_order_on_each_worker(
         self,
     ) -> None:
         root_domains = _identify_root_domains(
             (
-                LogicalDomain((10,), ((10, 5),), ((10, 1),)),
-                LogicalDomain((20,), ((20, 4),), ((20, 1),)),
-                LogicalDomain((30,), ((30, 1),), ((30, 1),)),
+                CoordinateDomain((10,), ((10, 5),), ((10, 1),)),
+                CoordinateDomain((20,), ((20, 4),), ((20, 1),)),
+                CoordinateDomain((30,), ((30, 1),), ((30, 1),)),
             )
         )
-        action_domain = LogicalDomain(
+        nested_loop_domain = CoordinateDomain(
             (30, 31),
             ((30, 1), (31, 5)),
             ((30, 1), (31, 1)),
             identity=7,
         )
-        nested_key_domain = LogicalDomain(
+        nested_key_domain = CoordinateDomain(
             (0,),
             ((0, 5),),
             kind="event",
             identity=0,
         )
-        producer_to_key = LogicalRelation.point_map(
+        producer_to_key = CoordinateRelation.point_map(
             root_domains[0],
             nested_key_domain,
             (
@@ -2742,10 +2854,10 @@ class TestCrossLoopScheduler(TestCase):
                 ),
             ),
         )
-        predecessors = producer_to_key.inverse()
-        assert predecessors is not None
-        action_to_key = LogicalRelation.point_map(
-            action_domain,
+        producers_by_key = producer_to_key.converse()
+        assert producers_by_key is not None
+        keys_by_nested_iteration = CoordinateRelation.point_map(
+            nested_loop_domain,
             nested_key_domain,
             (
                 (
@@ -2754,33 +2866,37 @@ class TestCrossLoopScheduler(TestCase):
                 ),
             ),
         )
-        family_done_domain = LogicalDomain(
+        family_done_domain = CoordinateDomain(
             (),
             (),
             kind="event",
             identity=1,
         )
-        event_graph = EventGraph(
-            root_traversals=_default_root_traversals(root_domains),
+        readiness_graph = ReadinessGraph(
+            root_task_orders=_default_root_task_orders(root_domains),
             events=(
-                KeyedEvent(
-                    contributions=(EventContribution(0, predecessors),),
-                    uses=(EventUse(2, action_to_key, consumer_scope_id=7),),
+                ReadinessEvent(
+                    producers=(ReadinessProducer(0, producers_by_key),),
+                    consumers=(
+                        ReadinessConsumer(
+                            2, keys_by_nested_iteration, consumer_site_id=7
+                        ),
+                    ),
                 ),
-                KeyedEvent(
-                    contributions=(
-                        EventContribution(
+                ReadinessEvent(
+                    producers=(
+                        ReadinessProducer(
                             1,
-                            LogicalRelation.total(
+                            CoordinateRelation.total(
                                 family_done_domain,
                                 root_domains[1],
                             ),
                         ),
                     ),
-                    uses=(
-                        EventUse(
+                    consumers=(
+                        ReadinessConsumer(
                             2,
-                            LogicalRelation.total(
+                            CoordinateRelation.total(
                                 root_domains[2],
                                 family_done_domain,
                             ),
@@ -2790,55 +2906,55 @@ class TestCrossLoopScheduler(TestCase):
             ),
         )
         baseline = _build_baseline_worker_schedule(
-            event_graph.root_domains,
-            event_graph.root_traversals,
+            readiness_graph.root_domains,
+            readiness_graph.root_task_orders,
             worker_count=4,
         )
 
-        placed, plans = place_nested_scope_consumers(event_graph, baseline, ())
+        placed, plans = place_nested_loop_consumers(readiness_graph, baseline, ())
 
         self.assertEqual(placement(baseline, 2, 0), (0, 3))
         self.assertEqual(placement(placed, 2, 0), (0, 3))
         self.assertEqual(len(plans), 1)
-        validate_worker_schedule(event_graph, placed)
+        validate_worker_schedule(readiness_graph, placed)
 
-    def test_nested_scope_milestones_compose_sibling_scopes(self) -> None:
+    def test_nested_split_nested_loop_at_readiness_compose_sibling_sites(self) -> None:
         root_domains = (
-            LogicalDomain((10,), ((10, 4),), ((10, 1),)),
-            LogicalDomain((20,), ((20, 4),), ((20, 1),)),
-            LogicalDomain((30,), ((30, 1),), ((30, 1),)),
+            CoordinateDomain((10,), ((10, 4),), ((10, 1),)),
+            CoordinateDomain((20,), ((20, 4),), ((20, 1),)),
+            CoordinateDomain((30,), ((30, 1),), ((30, 1),)),
         )
         root_domains = _identify_root_domains(root_domains)
-        action_domains = tuple(
-            LogicalDomain(
+        nested_loop_domains = tuple(
+            CoordinateDomain(
                 (30, nested_axis),
                 ((30, 1), (nested_axis, 4)),
                 ((30, 1), (nested_axis, 1)),
-                identity=scope_id,
+                identity=site_id,
             )
-            for scope_id, nested_axis in ((7, 31), (8, 32))
+            for site_id, nested_axis in ((7, 31), (8, 32))
         )
-        scope_domains: tuple[LogicalDomain | None, ...] = (
+        site_domains: tuple[CoordinateDomain | None, ...] = (
             *(None for _ in range(7)),
-            *action_domains,
+            *nested_loop_domains,
         )
         events = []
-        for producer_root, scope_id, nested_axis in ((0, 7, 31), (1, 8, 32)):
-            key_domain = LogicalDomain(
+        for producer_root, site_id, nested_axis in ((0, 7, 31), (1, 8, 32)):
+            readiness_key_domain = CoordinateDomain(
                 (0,),
                 ((0, 4),),
                 kind="event",
                 identity=producer_root,
             )
             events.append(
-                KeyedEvent(
-                    contributions=(
-                        _event_contribution_from_publication(
+                ReadinessEvent(
+                    producers=(
+                        _readiness_producer_from_publication(
                             producer_root=producer_root,
-                            producer_scope_id=None,
-                            publication=LogicalRelation.point_map(
+                            producer_site_id=None,
+                            publication=CoordinateRelation.point_map(
                                 root_domains[producer_root],
-                                key_domain,
+                                readiness_key_domain,
                                 (
                                     (
                                         (
@@ -2863,13 +2979,13 @@ class TestCrossLoopScheduler(TestCase):
                             ),
                         ),
                     ),
-                    uses=(
-                        EventUse(
+                    consumers=(
+                        ReadinessConsumer(
                             consumer_root=2,
-                            consumer_scope_id=scope_id,
-                            keys=LogicalRelation.point_map(
-                                scope_domains[scope_id],
-                                key_domain,
+                            consumer_site_id=site_id,
+                            keys_by_consumer=CoordinateRelation.point_map(
+                                site_domains[site_id],
+                                readiness_key_domain,
                                 (
                                     (
                                         ((30, 0, 1, 1), (nested_axis, 0, 4, 1)),
@@ -2877,15 +2993,15 @@ class TestCrossLoopScheduler(TestCase):
                                     ),
                                 ),
                             ),
-                            dependency_points=frozenset(
-                                ((producer_root, None, scope_id),)
+                            covered_obligations=frozenset(
+                                ((producer_root, None, site_id),)
                             ),
                         ),
                     ),
                 )
             )
-        event_graph = EventGraph(
-            root_traversals=_default_root_traversals(root_domains),
+        readiness_graph = ReadinessGraph(
+            root_task_orders=_default_root_task_orders(root_domains),
             events=tuple(events),
         )
         schedule = WorkerSchedule(
@@ -2893,60 +3009,60 @@ class TestCrossLoopScheduler(TestCase):
             segments=(
                 WorkerScheduleSegment(
                     root=0,
-                    task_relation=_one_dimensional_task_range(root_domains[0], 0, 4),
+                    task_order=_one_dimensional_task_range(root_domains[0], 0, 4),
                     worker_begin=0,
                     worker_count=4,
-                    schedule_begin=0,
+                    dispatch_offset=0,
                 ),
                 WorkerScheduleSegment(
                     root=1,
-                    task_relation=_one_dimensional_task_range(root_domains[1], 0, 3),
+                    task_order=_one_dimensional_task_range(root_domains[1], 0, 3),
                     worker_begin=0,
                     worker_count=4,
-                    schedule_begin=4,
+                    dispatch_offset=4,
                 ),
                 WorkerScheduleSegment(
                     root=1,
-                    task_relation=_one_dimensional_task_range(root_domains[1], 3, 1),
+                    task_order=_one_dimensional_task_range(root_domains[1], 3, 1),
                     worker_begin=0,
                     worker_count=4,
-                    schedule_begin=8,
+                    dispatch_offset=8,
                 ),
                 WorkerScheduleSegment(
                     root=2,
-                    task_relation=event_graph.root_traversals[2],
+                    task_order=readiness_graph.root_task_orders[2],
                     worker_begin=3,
                     worker_count=1,
-                    schedule_begin=3,
+                    dispatch_offset=3,
                 ),
             ),
         )
 
-        placed, plans = place_nested_scope_consumers(event_graph, schedule, ())
+        placed, plans = place_nested_loop_consumers(readiness_graph, schedule, ())
 
         self.assertEqual(placement(placed, 2, 0), (3, 1))
         self.assertEqual(len(plans), 2)
-        plans_by_scope = {plan.uses[0].consumer_scope_id: plan for plan in plans}
+        plans_by_site = {plan.consumers[0].consumer_site_id: plan for plan in plans}
         self.assertEqual(
             _expected_arrivals(
-                plans_by_scope[7].key_domain,
-                plans_by_scope[7].contributions,
+                plans_by_site[7].readiness_key_domain,
+                plans_by_site[7].producers,
             ),
             (4,),
         )
         self.assertEqual(
-            plans_by_scope[7].uses[0].keys.materialize(),
+            plans_by_site[7].consumers[0].keys_by_consumer.materialize(),
             (frozenset((0,)),) * 4,
         )
         self.assertEqual(
             _expected_arrivals(
-                plans_by_scope[8].key_domain,
-                plans_by_scope[8].contributions,
+                plans_by_site[8].readiness_key_domain,
+                plans_by_site[8].producers,
             ),
             (4,),
         )
         self.assertEqual(
-            plans_by_scope[8].uses[0].keys.materialize(),
+            plans_by_site[8].consumers[0].keys_by_consumer.materialize(),
             (
                 frozenset((0,)),
                 frozenset((0,)),
@@ -2955,8 +3071,8 @@ class TestCrossLoopScheduler(TestCase):
             ),
         )
 
-    def test_multi_producer_join_uses_one_keyed_event(self) -> None:
-        dependency_plan = build_tile_dependency_graph(
+    def test_multi_producer_join_uses_one_readiness_event(self) -> None:
+        dependency_graph = build_tile_dependency_graph(
             (
                 _access(0, root=0, allocation_id=0, kind="store", block_ids=(10,)),
                 _access(1, root=1, allocation_id=1, kind="store", block_ids=(20,)),
@@ -2966,37 +3082,37 @@ class TestCrossLoopScheduler(TestCase):
             [[10], [20], [30]],
         )
         root_domains = tuple(
-            LogicalDomain((block_id,), ((block_id, 8),), ((block_id, 16),))
+            CoordinateDomain((block_id,), ((block_id, 8),), ((block_id, 16),))
             for root, block_id in enumerate((10, 20, 30))
         )
 
-        schedule = build_cross_loop_schedule(
-            dependency_plan=dependency_plan,
+        schedule = build_static_pipeline_plan(
+            dependency_graph=dependency_graph,
             root_domains=root_domains,
             axis_geometry={10: (8, 16), 20: (8, 16), 30: (8, 16)},
             worker_count=8,
         )
 
-        self.assertEqual(schedule.root_completion_edges, frozenset())
-        self.assertEqual(len(schedule.counted_events), 1)
-        event = schedule.counted_events[0]
-        self.assertEqual(event.uses[0].consumer_root, 2)
-        self.assertEqual(event.uniform_arrivals(), 2)
+        self.assertEqual(schedule.root_barrier_edges, frozenset())
+        self.assertEqual(len(schedule.readiness_counters), 1)
+        event = schedule.readiness_counters[0]
+        self.assertEqual(event.consumers[0].consumer_root, 2)
+        self.assertEqual(event.uniform_arrival_count(), 2)
         self.assertEqual(
             [
                 (
-                    contributor.producer_root,
-                    contributor.arrivals_per_key.constant_value()
-                    if contributor.arrivals_per_key is not None
+                    readiness_producer.producer_root,
+                    readiness_producer.arrival_count_by_key.constant_value()
+                    if readiness_producer.arrival_count_by_key is not None
                     else None,
                 )
-                for contributor in event.contributions
+                for readiness_producer in event.producers
             ],
             [(0, 1), (1, 1)],
         )
 
-    def test_repeated_join_predecessors_coalesce_consumer_tasks(self) -> None:
-        dependency_plan = build_tile_dependency_graph(
+    def test_repeated_join_producers_coalesce_consumer_tasks(self) -> None:
+        dependency_graph = build_tile_dependency_graph(
             (
                 _access(
                     0,
@@ -3037,15 +3153,15 @@ class TestCrossLoopScheduler(TestCase):
             [[10], [30], [22, 20, 21]],
         )
         root_domains = (
-            LogicalDomain((10,), ((10, 32),), ((10, 1),)),
-            LogicalDomain((30,), ((30, 8),), ((30, 1),)),
-            LogicalDomain(
+            CoordinateDomain((10,), ((10, 32),), ((10, 1),)),
+            CoordinateDomain((30,), ((30, 8),), ((30, 1),)),
+            CoordinateDomain(
                 (22, 20, 21), ((22, 4), (20, 8), (21, 1)), ((22, 1), (20, 1), (21, 4))
             ),
         )
 
-        schedule = build_cross_loop_schedule(
-            dependency_plan=dependency_plan,
+        schedule = build_static_pipeline_plan(
+            dependency_graph=dependency_graph,
             root_domains=root_domains,
             axis_geometry={
                 10: (32, 1),
@@ -3057,25 +3173,28 @@ class TestCrossLoopScheduler(TestCase):
             worker_count=32,
         )
 
-        self.assertEqual(schedule.root_completion_edges, frozenset())
-        self.assertEqual(len(schedule.counted_events), 1)
+        self.assertEqual(schedule.root_barrier_edges, frozenset())
+        self.assertEqual(len(schedule.readiness_counters), 1)
         self.assertFalse(
-            any(event.local_use is not None for event in schedule.counted_events)
+            any(
+                event.continuation_consumer is not None
+                for event in schedule.readiness_counters
+            )
         )
-        event = schedule.counted_events[0]
-        self.assertIsNone(event.local_use)
-        self.assertEqual(event.key_count, 8)
-        self.assertEqual(event.uniform_arrivals(), 5)
+        event = schedule.readiness_counters[0]
+        self.assertIsNone(event.continuation_consumer)
+        self.assertEqual(event.readiness_key_count, 8)
+        self.assertEqual(event.uniform_arrival_count(), 5)
         self.assertEqual(
-            event.uses[0].keys.materialize(),
+            event.consumers[0].keys_by_consumer.materialize(),
             tuple(frozenset((i // 4,)) for i in range(32)),
         )
         self.assertEqual(
             [
-                contributor.arrivals_per_key.constant_value()
-                if contributor.arrivals_per_key is not None
+                readiness_producer.arrival_count_by_key.constant_value()
+                if readiness_producer.arrival_count_by_key is not None
                 else None
-                for contributor in event.contributions
+                for readiness_producer in event.producers
             ],
             [4, 1],
         )
@@ -3085,7 +3204,7 @@ class TestCrossLoopScheduler(TestCase):
         width = 4
         splits = 4
         elements = heads * width
-        dependency_plan = build_tile_dependency_graph(
+        dependency_graph = build_tile_dependency_graph(
             (
                 _access(
                     0,
@@ -3110,16 +3229,16 @@ class TestCrossLoopScheduler(TestCase):
             [[10], [22, 20, 21]],
         )
         root_domains = (
-            LogicalDomain((10,), ((10, elements),), ((10, 1),)),
-            LogicalDomain(
+            CoordinateDomain((10,), ((10, elements),), ((10, 1),)),
+            CoordinateDomain(
                 (22, 20, 21),
                 ((22, splits), (20, heads), (21, 1)),
                 ((22, 1), (20, 1), (21, width)),
             ),
         )
 
-        schedule = build_cross_loop_schedule(
-            dependency_plan=dependency_plan,
+        schedule = build_static_pipeline_plan(
+            dependency_graph=dependency_graph,
             root_domains=root_domains,
             axis_geometry={
                 10: (elements, 1),
@@ -3130,24 +3249,24 @@ class TestCrossLoopScheduler(TestCase):
             worker_count=128,
         )
 
-        self.assertEqual(schedule.root_completion_edges, frozenset())
-        self.assertEqual(len(schedule.counted_events), 1)
-        event = schedule.counted_events[0]
-        self.assertEqual(event.key_count, heads)
-        self.assertEqual(event.uniform_arrivals(), width)
+        self.assertEqual(schedule.root_barrier_edges, frozenset())
+        self.assertEqual(len(schedule.readiness_counters), 1)
+        event = schedule.readiness_counters[0]
+        self.assertEqual(event.readiness_key_count, heads)
+        self.assertEqual(event.uniform_arrival_count(), width)
         self.assertEqual(
-            event.uses[0].keys.materialize(),
+            event.consumers[0].keys_by_consumer.materialize(),
             tuple(frozenset((task // splits,)) for task in range(heads * splits)),
         )
-        self.assertEqual(len(event.contributions[0].predecessors.pieces), 1)
-        self.assertEqual(len(event.uses[0].keys.pieces), 1)
+        self.assertEqual(len(event.producers[0].producers_by_key.pieces), 1)
+        self.assertEqual(len(event.consumers[0].keys_by_consumer.pieces), 1)
 
     def test_strided_ready_groups_use_exact_coordinates_with_overlapping_hulls(
         self,
     ) -> None:
         columns = 8
         splits = 4
-        dependency_plan = build_tile_dependency_graph(
+        dependency_graph = build_tile_dependency_graph(
             (
                 _access(
                     0,
@@ -3177,29 +3296,31 @@ class TestCrossLoopScheduler(TestCase):
             [[10], [22, 20]],
         )
         root_domains = (
-            LogicalDomain((10,), ((10, columns),), ((10, 1),)),
-            LogicalDomain((22, 20), ((22, splits), (20, columns)), ((22, 1), (20, 1))),
+            CoordinateDomain((10,), ((10, columns),), ((10, 1),)),
+            CoordinateDomain(
+                (22, 20), ((22, splits), (20, columns)), ((22, 1), (20, 1))
+            ),
         )
 
-        schedule = build_cross_loop_schedule(
-            dependency_plan=dependency_plan,
+        schedule = build_static_pipeline_plan(
+            dependency_graph=dependency_graph,
             root_domains=root_domains,
             axis_geometry={10: (columns, 1), 20: (columns, 1), 22: (splits, 1)},
             worker_count=32,
         )
 
-        self.assertEqual(schedule.root_completion_edges, frozenset())
-        self.assertEqual(len(schedule.counted_events), 1)
-        event = schedule.counted_events[0]
-        self.assertEqual(event.key_count, columns)
-        self.assertEqual(event.uniform_arrivals(), 1)
+        self.assertEqual(schedule.root_barrier_edges, frozenset())
+        self.assertEqual(len(schedule.readiness_counters), 1)
+        event = schedule.readiness_counters[0]
+        self.assertEqual(event.readiness_key_count, columns)
+        self.assertEqual(event.uniform_arrival_count(), 1)
         self.assertEqual(
-            event.uses[0].keys.materialize(),
+            event.consumers[0].keys_by_consumer.materialize(),
             tuple(frozenset((task // splits,)) for task in range(columns * splits)),
         )
 
     def test_multiple_access_events_in_one_root_fall_back_together(self) -> None:
-        dependency_plan = build_tile_dependency_graph(
+        dependency_graph = build_tile_dependency_graph(
             (
                 _access(
                     0,
@@ -3241,13 +3362,13 @@ class TestCrossLoopScheduler(TestCase):
             [[10, 11], [20, 21], [30]],
         )
         root_domains = (
-            LogicalDomain((10, 11), ((10, 1), (11, 8)), ((10, 1), (11, 16))),
-            LogicalDomain((20, 21), ((20, 1), (21, 8)), ((20, 1), (21, 16))),
-            LogicalDomain((30,), ((30, 1),), ((30, 1),)),
+            CoordinateDomain((10, 11), ((10, 1), (11, 8)), ((10, 1), (11, 16))),
+            CoordinateDomain((20, 21), ((20, 1), (21, 8)), ((20, 1), (21, 16))),
+            CoordinateDomain((30,), ((30, 1),), ((30, 1),)),
         )
 
-        schedule = build_cross_loop_schedule(
-            dependency_plan=dependency_plan,
+        schedule = build_static_pipeline_plan(
+            dependency_graph=dependency_graph,
             root_domains=root_domains,
             axis_geometry={
                 10: (1, 1),
@@ -3262,13 +3383,13 @@ class TestCrossLoopScheduler(TestCase):
         )
 
         self.assertEqual(
-            schedule.root_completion_edges,
+            schedule.root_barrier_edges,
             frozenset(((0, 2), (1, 2))),
         )
 
     def test_worker_schedule_handles_independent_components(self) -> None:
         accesses: list[TileAccess] = []
-        root_domains: list[LogicalDomain] = []
+        root_domains: list[CoordinateDomain] = []
         axis_geometry: dict[int, tuple[int, int]] = {}
         for component in range(2):
             root_base = component * 3
@@ -3325,12 +3446,12 @@ class TestCrossLoopScheduler(TestCase):
             )
             root_domains.extend(
                 (
-                    LogicalDomain(
+                    CoordinateDomain(
                         (block_base, block_base + 1),
                         ((block_base, 1), (block_base + 1, 8)),
                         ((block_base, 1), (block_base + 1, 16)),
                     ),
-                    LogicalDomain(
+                    CoordinateDomain(
                         (block_base + 10, block_base + 11),
                         (
                             (block_base + 10, 1),
@@ -3341,7 +3462,7 @@ class TestCrossLoopScheduler(TestCase):
                             (block_base + 11, 32),
                         ),
                     ),
-                    LogicalDomain(
+                    CoordinateDomain(
                         (block_base + 20,),
                         ((block_base + 20, 1),),
                         ((block_base + 20, 1),),
@@ -3359,87 +3480,90 @@ class TestCrossLoopScheduler(TestCase):
                 }
             )
 
-        dependency_plan = build_tile_dependency_graph(
+        dependency_graph = build_tile_dependency_graph(
             tuple(accesses),
             [list(domain.axis_order) for domain in root_domains],
         )
-        root_scopes = tuple(
-            ExecutionScope(
-                scope_id=root,
+        root_sites = tuple(
+            ExecutionSite(
+                site_id=root,
                 root=root,
                 graph_id=root,
                 callsite_path=(),
-                parent_scope_id=None,
+                parent_site_id=None,
                 kind="root",
                 local_axis_order=domain.axis_order,
                 logical_axis_order=domain.axis_order,
-                guaranteed=True,
-                segmentable=False,
+                executes_unconditionally=True,
+                can_split_loop=False,
             )
             for root, domain in enumerate(root_domains)
         )
-        nested_scopes = tuple(
-            ExecutionScope(
-                scope_id=6 + component,
+        nested_loops = tuple(
+            ExecutionSite(
+                site_id=6 + component,
                 root=component * 3 + 2,
                 graph_id=6 + component,
                 callsite_path=((0, 0),),
-                parent_scope_id=component * 3 + 2,
+                parent_site_id=component * 3 + 2,
                 kind="loop",
                 local_axis_order=(10 + component * 30 + 21,),
                 logical_axis_order=(
                     10 + component * 30 + 20,
                     10 + component * 30 + 21,
                 ),
-                guaranteed=True,
-                segmentable=True,
+                executes_unconditionally=True,
+                can_split_loop=True,
             )
             for component in range(2)
         )
-        scope_ids_by_access: list[tuple[int, ...]] = [()] * len(accesses)
+        site_ids_by_access: list[tuple[int, ...]] = [()] * len(accesses)
         for component in range(2):
             root_base = component * 3
             access_base = component * 4
-            scope_ids_by_access[access_base] = (root_base,)
-            scope_ids_by_access[access_base + 1] = (root_base + 1,)
-            scope_ids_by_access[access_base + 2] = (root_base + 1,)
-            scope_ids_by_access[access_base + 3] = (6 + component,)
-        dependency_plan = dataclasses.replace(
-            dependency_plan,
-            execution_scopes=(*root_scopes, *nested_scopes),
-            scope_ids_by_access=tuple(scope_ids_by_access),
+            site_ids_by_access[access_base] = (root_base,)
+            site_ids_by_access[access_base + 1] = (root_base + 1,)
+            site_ids_by_access[access_base + 2] = (root_base + 1,)
+            site_ids_by_access[access_base + 3] = (6 + component,)
+        dependency_graph = dataclasses.replace(
+            dependency_graph,
+            execution_sites=(*root_sites, *nested_loops),
+            site_ids_by_access=tuple(site_ids_by_access),
         )
         kwargs = {
-            "dependency_plan": dependency_plan,
+            "dependency_graph": dependency_graph,
             "root_domains": tuple(root_domains),
             "axis_geometry": axis_geometry,
             "worker_count": 8,
         }
 
-        schedule = build_cross_loop_schedule(**kwargs)
-        self.assertEqual(len(schedule.counted_events), 4)
+        schedule = build_static_pipeline_plan(**kwargs)
+        self.assertEqual(len(schedule.readiness_counters), 4)
         self.assertEqual(
-            schedule.root_completion_edges,
+            schedule.root_barrier_edges,
             frozenset(),
         )
-        overlapped = build_cross_loop_schedule(**{**kwargs, "worker_count": 6})
+        overlapped = build_static_pipeline_plan(**{**kwargs, "worker_count": 6})
         self.assertEqual(overlapped.worker_schedule.worker_count, 6)
-        nested_scope_events = tuple(
+        nested_loop_events = tuple(
             plan
-            for plan in overlapped.counted_events
-            if any(use.consumer_scope_id is not None for use in plan.uses)
+            for plan in overlapped.readiness_counters
+            if any(
+                readiness_consumer.consumer_site_id is not None
+                for readiness_consumer in plan.consumers
+            )
         )
         self.assertEqual(
             [
                 (
-                    plan.contributions[0].producer_root,
-                    plan.uses[0].consumer_root,
-                    _expected_arrivals(plan.key_domain, plan.contributions),
+                    plan.producers[0].producer_root,
+                    plan.consumers[0].consumer_root,
+                    _expected_arrivals(plan.readiness_key_domain, plan.producers),
                 )
-                for plan in nested_scope_events
+                for plan in nested_loop_events
             ],
             [(1, 2, (3, 1)), (4, 5, (3, 1))],
         )
-        self.assertEqual(overlapped.root_completion_edges, frozenset())
+        self.assertEqual(overlapped.root_barrier_edges, frozenset())
         self.assertEqual(placement(overlapped.worker_schedule, 2, 0), (5, 1))
         self.assertEqual(placement(overlapped.worker_schedule, 5, 0), (5, 5))

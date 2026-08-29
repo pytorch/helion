@@ -166,10 +166,10 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         bound = tile_dependency_info_across_barrier.bind((x,))
         host_function = bound.host_function
         assert host_function is not None
-        dependency_plan = host_function.device_ir.tile_dependency_graph
-        assert dependency_plan is not None
-        self.assertTrue(dependency_plan.accesses)
-        self.assertEqual(dependency_plan.edges, ())
+        dependency_graph = host_function.device_ir.tile_dependency_graph
+        assert dependency_graph is not None
+        self.assertTrue(dependency_graph.accesses)
+        self.assertEqual(dependency_graph.edges, ())
         self.assertEqual(
             tuple(host_function.device_ir.phase_for_root(root) for root in range(2)),
             (0, 1),
@@ -233,7 +233,7 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
             cross_loop_schedule="static_pipeline",
         )
         torch.testing.assert_close(output, (x + 1) * 2)
-        self.assertIn("tile_dependency_root_completion_wait", code)
+        self.assertIn("tile_dependency_root_barrier_wait", code)
         self.assertNotIn("triton_helpers.x_grid_barrier(", code)
 
     @skipIfRefEager("persistent grid-barrier codegen is unavailable in ref eager mode")
@@ -275,7 +275,7 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out0, (x + 1) * 2)
         torch.testing.assert_close(out1, (x + 1) * 3)
         self.assertEqual(code.count("sem='release'"), 1)
-        self.assertGreaterEqual(code.count("tile_dependency_keyed_event_wait"), 2)
+        self.assertGreaterEqual(code.count("tile_dependency_readiness_wait"), 2)
         self.assertIn("ld.acquire.gpu.global.u32", code)
         self.assertNotIn("triton_helpers.x_grid_barrier(", code)
 
@@ -294,7 +294,7 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         self.assertNotIn("tl.atomic_", code)
         self.assertIn("tile_dependency_root_1(tmp0, tmp1", code)
         self.assertIn("tile_dependency_root_2(tmp1, out", code)
-        self.assertNotIn("tile_dependency_root_completion", code)
+        self.assertNotIn("tile_dependency_root_barrier", code)
         self.assertNotIn("triton_helpers.x_grid_barrier(", code)
         self.assertNotIn("launch_cooperative_grid=True", code)
 
@@ -304,11 +304,11 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         bound = dynamic_implicit_tile_dependency_chain.bind((x,))
         host_function = bound.host_function
         assert host_function is not None
-        dependency_plan = host_function.device_ir.tile_dependency_graph
-        assert dependency_plan is not None
-        self.assertTrue(dependency_plan.accesses)
+        dependency_graph = host_function.device_ir.tile_dependency_graph
+        assert dependency_graph is not None
+        self.assertTrue(dependency_graph.accesses)
         self.assertTrue(
-            all(not access.layout_is_static for access in dependency_plan.accesses)
+            all(not access.layout_is_static for access in dependency_graph.accesses)
         )
         code, output = code_and_output(
             dynamic_implicit_tile_dependency_chain,

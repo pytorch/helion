@@ -350,12 +350,12 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
             state, self.block_ids
         )
         if state.fx_node is not None:
-            from .tile_dependency import TILE_DEPENDENCY_SCOPE_ID_ATTR
-            from .tile_dependency import TILE_DEPENDENCY_SCOPE_IDS_META
+            from .tile_dependency import TILE_DEPENDENCY_SITE_ID_ATTR
+            from .tile_dependency import TILE_DEPENDENCY_SITE_IDS_META
 
-            scope_ids = dict(state.fx_node.meta.get(TILE_DEPENDENCY_SCOPE_IDS_META, ()))
-            if (scope_id := scope_ids.get(0)) is not None:
-                setattr(device_loop.for_node, TILE_DEPENDENCY_SCOPE_ID_ATTR, scope_id)
+            site_ids = dict(state.fx_node.meta.get(TILE_DEPENDENCY_SITE_IDS_META, ()))
+            if (site_id := site_ids.get(0)) is not None:
+                setattr(device_loop.for_node, TILE_DEPENDENCY_SITE_ID_ATTR, site_id)
         # Make the active graph reachable by the strategy so it can pick
         # different lane-loop shapes for the reduce vs consume sweeps.
         # pyrefly: ignore [missing-attribute]
@@ -3191,14 +3191,14 @@ class WalkHostAST(NodeVisitor):
             )
             if not canonical_origin:
                 self.device_ir.noncanonical_task_origin_block_ids.update(block_ids)
-            from .tile_dependency import LogicalTaskAxis
+            from .tile_dependency import TaskAxis
             from .tile_dependency import TaskFamily
 
             env = CompileEnvironment.current()
             self.device_ir.task_families.append(
                 TaskFamily(
                     axes=tuple(
-                        LogicalTaskAxis(
+                        TaskAxis(
                             block_id=block_id,
                             extent=env.block_sizes[block_id].numel,
                             canonical_origin=canonical_origin,
@@ -4047,17 +4047,17 @@ def _root_phases(phases: list[KernelPhase], root_count: int) -> tuple[int, ...]:
 def _install_dependency_phases(
     device_ir: DeviceIR,
     root_nodes: list[ast.For],
-    dependency_plan: TileDependencyGraph,
+    dependency_graph: TileDependencyGraph,
     source_phase_starts: frozenset[int],
 ) -> None:
-    if dependency_plan.edges and source_phase_starts:
+    if dependency_graph.edges and source_phase_starts:
         raise exc.CrossLoopSchedulingError(
             "mixing explicit hl.barrier() phases with implicit "
             "tile-dependency stages is not supported yet"
         )
 
     predecessors_by_consumer: list[list[int]] = [[] for _ in device_ir.task_families]
-    for edge in dependency_plan.edges:
+    for edge in dependency_graph.edges:
         predecessors_by_consumer[edge.consumer_root].append(edge.producer_root)
     stage_by_root: list[int] = []
     implicit_starts: set[int] = set()

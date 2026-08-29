@@ -62,7 +62,7 @@ def _clone_ast_value(value: object) -> object:
     if isinstance(value, tuple):
         return tuple(_clone_ast_value(item) for item in value)
     if isinstance(value, ast.AST):
-        from .tile_dependency import TILE_DEPENDENCY_SCOPE_ID_ATTR
+        from .tile_dependency import TILE_DEPENDENCY_SITE_ID_ATTR
 
         fields = {
             field: _clone_ast_value(getattr(value, field)) for field in value._fields
@@ -71,10 +71,8 @@ def _clone_ast_value(value: object) -> object:
             cloned = value.copy(**fields)
         else:
             cloned = ast.copy_location(type(value)(**fields), value)
-        if (
-            scope_id := getattr(value, TILE_DEPENDENCY_SCOPE_ID_ATTR, None)
-        ) is not None:
-            setattr(cloned, TILE_DEPENDENCY_SCOPE_ID_ATTR, scope_id)
+        if (site_id := getattr(value, TILE_DEPENDENCY_SITE_ID_ATTR, None)) is not None:
+            setattr(cloned, TILE_DEPENDENCY_SITE_ID_ATTR, site_id)
         return cloned
     return value
 

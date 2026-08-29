@@ -17,11 +17,11 @@ if TYPE_CHECKING:
     from .device_ir import DeviceIR
 
 
-TILE_DEPENDENCY_SCOPE_IDS_META = "_tile_dependency_scope_ids"
-TILE_DEPENDENCY_SCOPE_ID_ATTR = "_tile_dependency_scope_id"
+TILE_DEPENDENCY_SITE_IDS_META = "_tile_dependency_site_ids"
+TILE_DEPENDENCY_SITE_ID_ATTR = "_tile_dependency_site_id"
 _ALLOCATION_ADDRESS_AXIS = -1
 # A memory hazard at one concrete producer/consumer callsite pairing.
-DependencyPoint = tuple[int, int | None, int | None]
+DependencyObligation = tuple[int, int | None, int | None]
 
 
 class TileDependencyKind(enum.Enum):
@@ -32,27 +32,27 @@ class TileDependencyKind(enum.Enum):
     WRITE_AFTER_WRITE = "write_after_write"
 
 
-def tile_dependency_scope_id(node: ast.AST) -> int | None:
-    """Return the stable DeviceIR execution scope attached to a lowered loop."""
-    scope_id = getattr(node, TILE_DEPENDENCY_SCOPE_ID_ATTR, None)
-    return scope_id if isinstance(scope_id, int) else None
+def tile_dependency_site_id(node: ast.AST) -> int | None:
+    """Return the stable DeviceIR execution site attached to a lowered loop."""
+    site_id = getattr(node, TILE_DEPENDENCY_SITE_ID_ATTR, None)
+    return site_id if isinstance(site_id, int) else None
 
 
 def owner_roots_by_graph_id(device_ir: DeviceIR) -> tuple[tuple[int, ...], ...]:
     """Resolve every DeviceIR graph to all reachable top-level roots."""
     roots_by_graph: list[set[int]] = [set() for _ in device_ir.graphs]
-    for scope in build_execution_scopes(device_ir):
-        roots_by_graph[scope.graph_id].add(scope.root)
+    for site in build_execution_sites(device_ir):
+        roots_by_graph[site.graph_id].add(site.root)
     return tuple(tuple(sorted(roots)) for roots in roots_by_graph)
 
 
 @dataclasses.dataclass(frozen=True)
-class LogicalTaskAxis:
+class TaskAxis:
     """One source-level axis in a root's logical task space.
 
     ``extent`` comes directly from the block-size registration performed while
-    tracing ``hl.tile``.  It is independent of the later physical PID order or
-    an L2 traversal chosen by a concrete configuration.
+    tracing ``hl.tile``. It is independent of the later PID task order or an
+    L2 grouping chosen by a concrete configuration.
     """
 
     block_id: int
@@ -64,46 +64,48 @@ class LogicalTaskAxis:
 class TaskFamily:
     """One opaque top-level loop and its authoritative logical task domain."""
 
-    axes: tuple[LogicalTaskAxis, ...]
+    axes: tuple[TaskAxis, ...]
 
     @property
     def logical_axis_order(self) -> tuple[int, ...]:
         return tuple(axis.block_id for axis in self.axes)
 
-    def axis(self, block_id: int) -> LogicalTaskAxis | None:
+    def axis(self, block_id: int) -> TaskAxis | None:
         return next((axis for axis in self.axes if axis.block_id == block_id), None)
 
 
 @dataclasses.dataclass(frozen=True)
-class LogicalDomain:
+class CoordinateDomain:
     """One configured Cartesian domain in canonical logical coordinates.
 
-    Axis identity and geometry belong here.  Linear traversal is deliberately
+    Axis identity and geometry belong here. Linearization order is deliberately
     supplied to :meth:`coordinates` and :meth:`index` by the caller so event
-    identity, action order, and physical PID traversal cannot accidentally
+    identity, task-local program order, and PID task order cannot accidentally
     become the same policy.
     """
 
     axis_order: tuple[int, ...]
     axis_counts_items: tuple[tuple[int, int], ...]
     block_sizes_items: tuple[tuple[int, int], ...] = ()
-    kind: Literal["scope", "allocation", "event", "worker", "value"] = "scope"
+    kind: Literal["site", "allocation", "event", "task_order", "worker", "value"] = (
+        "site"
+    )
     identity: int | None = None
 
     def __post_init__(self) -> None:
         if len(set(self.axis_order)) != len(self.axis_order):
-            raise ValueError("logical domain axes must be unique")
+            raise ValueError("coordinate-domain axes must be unique")
         if tuple(axis for axis, _count in self.axis_counts_items) != self.axis_order:
-            raise ValueError("logical domain counts must follow axis order")
+            raise ValueError("coordinate-domain counts must follow axis order")
         if (
             self.block_sizes_items
             and tuple(axis for axis, _size in self.block_sizes_items) != self.axis_order
         ):
-            raise ValueError("logical domain block sizes must follow axis order")
+            raise ValueError("coordinate-domain block sizes must follow axis order")
         if any(count <= 0 for _axis, count in self.axis_counts_items):
-            raise ValueError("logical domain axis counts must be positive")
+            raise ValueError("coordinate-domain axis counts must be positive")
         if any(size <= 0 for _axis, size in self.block_sizes_items):
-            raise ValueError("logical domain block sizes must be positive")
+            raise ValueError("coordinate-domain block sizes must be positive")
 
     @property
     def axis_counts(self) -> dict[int, int]:
@@ -121,47 +123,54 @@ class LogicalDomain:
     def size(self) -> int:
         return math.prod(self.shape)
 
-    def _validate_traversal(self, traversal: tuple[int, ...]) -> None:
-        if len(traversal) != len(self.axis_order) or set(traversal) != set(
-            self.axis_order
-        ):
-            raise ValueError("logical traversal must permute the domain axes")
+    def _validate_linearization_order(
+        self,
+        linearization_order: tuple[int, ...],
+    ) -> None:
+        if len(linearization_order) != len(self.axis_order) or set(
+            linearization_order
+        ) != set(self.axis_order):
+            raise ValueError("linearization order must permute the domain axes")
 
     def coordinates(
         self,
         index: int,
         *,
-        traversal: tuple[int, ...] | None = None,
+        linearization_order: tuple[int, ...] | None = None,
     ) -> dict[int, int]:
         """Decode an integer using the requested fastest-to-slowest axes."""
         if not 0 <= index < self.size:
             raise IndexError(index)
-        traversal = self.axis_order if traversal is None else traversal
-        self._validate_traversal(traversal)
+        linearization_order = (
+            self.axis_order if linearization_order is None else linearization_order
+        )
+        self._validate_linearization_order(linearization_order)
         counts = self.axis_counts
         coordinates: dict[int, int] = {}
         remainder = index
-        for axis in traversal:
+        for axis in linearization_order:
             count = counts[axis]
             coordinates[axis] = remainder % count
             remainder //= count
         if remainder:
-            raise AssertionError("index exceeds its logical coordinate domain")
+            raise AssertionError("index exceeds its coordinate domain")
         return coordinates
 
     def index(
         self,
         coordinates: dict[int, int],
         *,
-        traversal: tuple[int, ...] | None = None,
+        linearization_order: tuple[int, ...] | None = None,
     ) -> int:
         """Encode coordinates using the requested fastest-to-slowest axes."""
-        traversal = self.axis_order if traversal is None else traversal
-        self._validate_traversal(traversal)
+        linearization_order = (
+            self.axis_order if linearization_order is None else linearization_order
+        )
+        self._validate_linearization_order(linearization_order)
         counts = self.axis_counts
         result = 0
         multiplier = 1
-        for axis in traversal:
+        for axis in linearization_order:
             coordinate = coordinates[axis]
             count = counts[axis]
             if not 0 <= coordinate < count:
@@ -172,22 +181,22 @@ class LogicalDomain:
 
 
 def logical_axis_symbol(axis: int) -> sympy.Symbol:
-    """Return the canonical integer symbol for one logical-domain axis."""
+    """Return the canonical integer symbol for one coordinate-domain axis."""
     suffix = str(axis) if axis >= 0 else f"m{-axis}"
     return sympy.Symbol(f"logical_axis_{suffix}", integer=True, nonnegative=True)
 
 
 def nested_logical_axes(
-    root_domain: LogicalDomain,
-    scope_domain: LogicalDomain,
+    root_domain: CoordinateDomain,
+    site_domain: CoordinateDomain,
 ) -> tuple[int, ...]:
-    """Return scope axes that are not part of its owning root domain."""
+    """Return site axes that are not part of its owning root domain."""
     root_axes = frozenset(root_domain.axis_order)
-    return tuple(axis for axis in scope_domain.axis_order if axis not in root_axes)
+    return tuple(axis for axis in site_domain.axis_order if axis not in root_axes)
 
 
 @dataclasses.dataclass(frozen=True)
-class _LogicalRelationPiece:
+class _CoordinateRelationPiece:
     """One guarded source box mapped to a Cartesian target range."""
 
     source_bounds_items: tuple[tuple[int, int, int, int], ...]
@@ -201,7 +210,7 @@ class _LogicalRelationPiece:
 
 
 @dataclasses.dataclass(frozen=True)
-class LogicalRelation:
+class CoordinateRelation:
     """Restricted symbolic relation between two Cartesian integer domains.
 
     Each piece maps one guarded source box to a Cartesian product of target
@@ -211,9 +220,9 @@ class LogicalRelation:
     instances.
     """
 
-    source_domain: LogicalDomain
-    target_domain: LogicalDomain
-    pieces: tuple[_LogicalRelationPiece, ...]
+    source_domain: CoordinateDomain
+    target_domain: CoordinateDomain
+    pieces: tuple[_CoordinateRelationPiece, ...]
 
     def __post_init__(self) -> None:
         for piece in self.pieces:
@@ -237,9 +246,9 @@ class LogicalRelation:
     @classmethod
     def identity(
         cls,
-        source_domain: LogicalDomain,
-        target_domain: LogicalDomain,
-    ) -> LogicalRelation:
+        source_domain: CoordinateDomain,
+        target_domain: CoordinateDomain,
+    ) -> CoordinateRelation:
         """Return the pointwise identity between equivalent coordinate spaces."""
         if (
             source_domain.axis_order != target_domain.axis_order
@@ -250,7 +259,7 @@ class LogicalRelation:
             source_domain=source_domain,
             target_domain=target_domain,
             pieces=(
-                _LogicalRelationPiece(
+                _CoordinateRelationPiece(
                     source_bounds_items=tuple(
                         (axis, 0, source_domain.axis_counts[axis], 1)
                         for axis in source_domain.axis_order
@@ -271,8 +280,8 @@ class LogicalRelation:
     @classmethod
     def point_map(
         cls,
-        source_domain: LogicalDomain,
-        target_domain: LogicalDomain,
+        source_domain: CoordinateDomain,
+        target_domain: CoordinateDomain,
         pieces: tuple[
             tuple[
                 tuple[tuple[int, int, int, int], ...],
@@ -280,13 +289,13 @@ class LogicalRelation:
             ],
             ...,
         ],
-    ) -> LogicalRelation:
+    ) -> CoordinateRelation:
         """Build a piecewise single-valued relation in domain axis order."""
         return cls(
             source_domain=source_domain,
             target_domain=target_domain,
             pieces=tuple(
-                _LogicalRelationPiece(
+                _CoordinateRelationPiece(
                     source_bounds_items=source_bounds,
                     target_ranges=tuple(
                         (
@@ -309,15 +318,15 @@ class LogicalRelation:
     @classmethod
     def total(
         cls,
-        source_domain: LogicalDomain,
-        target_domain: LogicalDomain,
-    ) -> LogicalRelation:
+        source_domain: CoordinateDomain,
+        target_domain: CoordinateDomain,
+    ) -> CoordinateRelation:
         """Return the complete relation between two bounded domains."""
         return cls(
             source_domain=source_domain,
             target_domain=target_domain,
             pieces=(
-                _LogicalRelationPiece(
+                _CoordinateRelationPiece(
                     source_bounds_items=tuple(
                         (axis, 0, source_domain.axis_counts[axis], 1)
                         for axis in source_domain.axis_order
@@ -338,9 +347,9 @@ class LogicalRelation:
     @classmethod
     def projection(
         cls,
-        source_domain: LogicalDomain,
-        target_domain: LogicalDomain,
-    ) -> LogicalRelation | None:
+        source_domain: CoordinateDomain,
+        target_domain: CoordinateDomain,
+    ) -> CoordinateRelation | None:
         """Project a domain onto a coordinate-compatible subdomain."""
         source_counts = source_domain.axis_counts
         if any(
@@ -352,7 +361,7 @@ class LogicalRelation:
             source_domain=source_domain,
             target_domain=target_domain,
             pieces=(
-                _LogicalRelationPiece(
+                _CoordinateRelationPiece(
                     source_bounds_items=tuple(
                         (axis, 0, source_counts[axis], 1)
                         for axis in source_domain.axis_order
@@ -371,15 +380,15 @@ class LogicalRelation:
         )
 
     def rename_target_axes(
-        self, target_domain: LogicalDomain
-    ) -> LogicalRelation | None:
+        self, target_domain: CoordinateDomain
+    ) -> CoordinateRelation | None:
         """Rename target axes positionally without changing coordinates."""
         old_axes = self.target_domain.axis_order
         new_axes = target_domain.axis_order
         if self.target_domain.shape != target_domain.shape:
             return None
         renamed_axes = dict(zip(old_axes, new_axes, strict=True))
-        return LogicalRelation(
+        return CoordinateRelation(
             source_domain=self.source_domain,
             target_domain=target_domain,
             pieces=tuple(
@@ -395,8 +404,8 @@ class LogicalRelation:
         )
 
     def rename_source_axes(
-        self, source_domain: LogicalDomain
-    ) -> LogicalRelation | None:
+        self, source_domain: CoordinateDomain
+    ) -> CoordinateRelation | None:
         """Rename source axes positionally without changing coordinates."""
         old_axes = self.source_domain.axis_order
         new_axes = source_domain.axis_order
@@ -407,7 +416,7 @@ class LogicalRelation:
             logical_axis_symbol(axis): logical_axis_symbol(renamed_axes[axis])
             for axis in old_axes
         }
-        return LogicalRelation(
+        return CoordinateRelation(
             source_domain=source_domain,
             target_domain=self.target_domain,
             pieces=tuple(
@@ -433,8 +442,8 @@ class LogicalRelation:
 
     def project_target(
         self,
-        target_domain: LogicalDomain,
-    ) -> LogicalRelation | None:
+        target_domain: CoordinateDomain,
+    ) -> CoordinateRelation | None:
         """Existentially drop target axes while preserving the remaining map."""
         current_counts = self.target_domain.axis_counts
         if any(
@@ -443,11 +452,11 @@ class LogicalRelation:
         ):
             return None
         retained_axes = frozenset(target_domain.axis_order)
-        return LogicalRelation(
+        return CoordinateRelation(
             source_domain=self.source_domain,
             target_domain=target_domain,
             pieces=tuple(
-                _LogicalRelationPiece(
+                _CoordinateRelationPiece(
                     source_bounds_items=piece.source_bounds_items,
                     target_ranges=tuple(
                         target_range
@@ -461,8 +470,8 @@ class LogicalRelation:
 
     def project_source(
         self,
-        source_domain: LogicalDomain,
-    ) -> LogicalRelation | None:
+        source_domain: CoordinateDomain,
+    ) -> CoordinateRelation | None:
         """Union dropped source axes when their images remain rectilinear."""
         current_counts = self.source_domain.axis_counts
         if any(
@@ -472,7 +481,7 @@ class LogicalRelation:
             return None
         retained_axes = frozenset(source_domain.axis_order)
         dropped_axes = frozenset(self.source_domain.axis_order) - retained_axes
-        pieces: list[_LogicalRelationPiece] = []
+        pieces: list[_CoordinateRelationPiece] = []
         for piece in self.pieces:
             source_bounds = {
                 axis: (begin, end, step)
@@ -536,7 +545,7 @@ class LogicalRelation:
                     )
                 )
             pieces.append(
-                _LogicalRelationPiece(
+                _CoordinateRelationPiece(
                     source_bounds_items=tuple(
                         (axis, *source_bounds[axis])
                         for axis in source_domain.axis_order
@@ -544,14 +553,14 @@ class LogicalRelation:
                     target_ranges=tuple(target_ranges),
                 )
             )
-        return LogicalRelation(
+        return CoordinateRelation(
             source_domain=source_domain,
             target_domain=self.target_domain,
             pieces=tuple(dict.fromkeys(pieces)),
         )
 
-    def lift_source(self, source_domain: LogicalDomain) -> LogicalRelation | None:
-        """Add unused source axes without changing any relation fiber."""
+    def lift_source(self, source_domain: CoordinateDomain) -> CoordinateRelation | None:
+        """Add unused source axes without changing any related target set."""
         source_counts = source_domain.axis_counts
         if any(
             axis not in source_counts or source_counts[axis] != count
@@ -559,14 +568,14 @@ class LogicalRelation:
         ):
             return None
         current_axes = frozenset(self.source_domain.axis_order)
-        pieces: list[_LogicalRelationPiece] = []
+        pieces: list[_CoordinateRelationPiece] = []
         for piece in self.pieces:
             bounds = {
                 axis: (begin, end, step)
                 for axis, begin, end, step in piece.source_bounds_items
             }
             pieces.append(
-                _LogicalRelationPiece(
+                _CoordinateRelationPiece(
                     source_bounds_items=tuple(
                         (
                             (axis, *bounds[axis])
@@ -578,18 +587,18 @@ class LogicalRelation:
                     target_ranges=piece.target_ranges,
                 )
             )
-        return LogicalRelation(
+        return CoordinateRelation(
             source_domain=source_domain,
             target_domain=self.target_domain,
             pieces=tuple(dict.fromkeys(pieces)),
         )
 
-    def then(self, following: LogicalRelation) -> LogicalRelation | None:
-        """Compose a projection/full-fiber relation with another relation.
+    def then(self, following: CoordinateRelation) -> CoordinateRelation | None:
+        """Compose a projection/full-target-set relation with another relation.
 
         This is the program-order composition needed for nested checkpoints.
-        ``self`` maps a later scope to preceding scope instances; ``following``
-        maps those preceding instances to their acquired predecessors.
+        ``self`` maps a later site to preceding site instances; ``following``
+        maps those preceding instances to their acquired producer instances.
         """
         if self.target_domain != following.source_domain:
             return None
@@ -624,7 +633,7 @@ class LogicalRelation:
             ):
                 return None
 
-        retained_domain = LogicalDomain(
+        retained_domain = CoordinateDomain(
             axis_order=tuple(retained_axes),
             axis_counts_items=tuple(
                 (axis, source_counts[axis]) for axis in retained_axes
@@ -642,8 +651,8 @@ class LogicalRelation:
 
     def factor_through(
         self,
-        quotient: LogicalRelation,
-    ) -> LogicalRelation | None:
+        quotient: CoordinateRelation,
+    ) -> CoordinateRelation | None:
         """Factor this relation through an exact source-coordinate quotient.
 
         Given ``self: C -> P`` and ``quotient: C -> K``, return ``F: K -> P``
@@ -695,7 +704,7 @@ class LogicalRelation:
             logical_axis_symbol(source_axis): logical_axis_symbol(key_axis)
             for source_axis, key_axis in key_axis_by_source_axis.items()
         }
-        pieces: list[_LogicalRelationPiece] = []
+        pieces: list[_CoordinateRelationPiece] = []
         for piece in self.pieces:
             source_bounds = {
                 axis: (begin, end, step)
@@ -714,7 +723,7 @@ class LogicalRelation:
             ):
                 return None
             pieces.append(
-                _LogicalRelationPiece(
+                _CoordinateRelationPiece(
                     source_bounds_items=tuple(
                         (
                             key_axis,
@@ -733,13 +742,13 @@ class LogicalRelation:
                     ),
                 )
             )
-        return LogicalRelation(
+        return CoordinateRelation(
             source_domain=quotient.target_domain,
             target_domain=self.target_domain,
             pieces=tuple(dict.fromkeys(pieces)),
         )
 
-    def covers(self, required: LogicalRelation) -> bool:
+    def covers(self, required: CoordinateRelation) -> bool:
         """Conservatively prove that this relation contains ``required``."""
         if (
             self.source_domain != required.source_domain
@@ -758,8 +767,8 @@ class LogicalRelation:
             for needed in required.pieces
         )
 
-    def source_axes_used(self) -> tuple[int, ...] | None:
-        """Return source axes that can change a relation fiber."""
+    def source_axes_affecting_targets(self) -> tuple[int, ...] | None:
+        """Return source axes that can change the related target set."""
         symbols: dict[sympy.Basic, int] = {
             logical_axis_symbol(axis): axis for axis in self.source_domain.axis_order
         }
@@ -780,40 +789,31 @@ class LogicalRelation:
                     used.add(source_axis)
         return tuple(axis for axis in self.source_domain.axis_order if axis in used)
 
-    def inverse(self) -> LogicalRelation | None:
-        """Invert supported affine point/range maps without enumeration."""
-        return self._cached_inverse
-
-    def publication_converse(self) -> LogicalRelation | None:
-        """Return the exact converse needed to publish keyed readiness.
-
-        Ordinary inverses are attempted first.  Dense mixed-radix predecessor
-        fibers additionally need all pieces to be analyzed together: split
-        ranges may encode digits that affect fan-in but not event identity.
-        """
-        inverse = self.inverse()
-        if inverse is not None:
-            return inverse
-        cardinality = self.fiber_cardinality()
-        if cardinality is None:
+    def converse(self) -> CoordinateRelation | None:
+        """Return the exact converse when representable without enumeration."""
+        converse = self._cached_converse
+        if converse is not None:
+            return converse
+        target_counts = self.target_count_by_source()
+        if target_counts is None:
             return None
-        return _dense_mixed_radix_publication_converse(self, cardinality)
+        return _dense_mixed_radix_converse(self, target_counts)
 
-    def fiber_analysis(
+    def derive_converse_and_target_counts(
         self,
-    ) -> tuple[LogicalRelation | None, LogicalRelation | None]:
-        """Return publication and cardinality relations from one fiber proof."""
-        cardinality = self.fiber_cardinality()
-        inverse = self.inverse()
-        if inverse is not None:
-            return inverse, cardinality
-        if cardinality is None:
+    ) -> tuple[CoordinateRelation | None, CoordinateRelation | None]:
+        """Derive the converse and per-source target counts from one proof."""
+        target_counts = self.target_count_by_source()
+        converse = self._cached_converse
+        if converse is not None:
+            return converse, target_counts
+        if target_counts is None:
             return None, None
-        return _dense_mixed_radix_publication_converse(self, cardinality), cardinality
+        return _dense_mixed_radix_converse(self, target_counts), target_counts
 
     @cached_property
-    def _cached_inverse(self) -> LogicalRelation | None:
-        pieces: list[_LogicalRelationPiece] = []
+    def _cached_converse(self) -> CoordinateRelation | None:
+        pieces: list[_CoordinateRelationPiece] = []
         for piece in self.pieces:
             lower_bounds: dict[int, list[sympy.Expr]] = {}
             upper_bounds: dict[int, list[sympy.Expr]] = {}
@@ -832,7 +832,7 @@ class LogicalRelation:
                     upper_bounds[axis] = [sympy.Integer(end)]
                     target_steps[axis] = step
 
-            inverse_source_bounds = {
+            converse_source_bounds = {
                 axis: [0, self.target_domain.axis_counts[axis], 1]
                 for axis in self.target_domain.axis_order
             }
@@ -901,11 +901,11 @@ class LogicalRelation:
                         continue
                     if begin.free_symbols or end.free_symbols:
                         return None
-                    inverse_source_bounds[target_axis][0] = max(
-                        inverse_source_bounds[target_axis][0], int(begin)
+                    converse_source_bounds[target_axis][0] = max(
+                        converse_source_bounds[target_axis][0], int(begin)
                     )
-                    inverse_source_bounds[target_axis][1] = min(
-                        inverse_source_bounds[target_axis][1], int(end)
+                    converse_source_bounds[target_axis][1] = min(
+                        converse_source_bounds[target_axis][1], int(end)
                     )
                     continue
                 source_axis, stride, offset, width = interval
@@ -918,12 +918,12 @@ class LogicalRelation:
                     source_begin
                     + (source_end - source_begin - 1) // source_step * source_step
                 )
-                inverse_source_bounds[target_axis][0] = max(
-                    inverse_source_bounds[target_axis][0],
+                converse_source_bounds[target_axis][0] = max(
+                    converse_source_bounds[target_axis][0],
                     offset + source_begin * stride,
                 )
-                inverse_source_bounds[target_axis][1] = min(
-                    inverse_source_bounds[target_axis][1],
+                converse_source_bounds[target_axis][1] = min(
+                    converse_source_bounds[target_axis][1],
                     offset + final_source * stride + width,
                 )
                 target_coordinate = logical_axis_symbol(target_axis)
@@ -955,13 +955,13 @@ class LogicalRelation:
                     )
 
             pieces.append(
-                _LogicalRelationPiece(
+                _CoordinateRelationPiece(
                     source_bounds_items=tuple(
                         (
                             axis,
-                            inverse_source_bounds[axis][0],
-                            inverse_source_bounds[axis][1],
-                            inverse_source_bounds[axis][2],
+                            converse_source_bounds[axis][0],
+                            converse_source_bounds[axis][1],
+                            converse_source_bounds[axis][2],
                         )
                         for axis in self.target_domain.axis_order
                     ),
@@ -984,7 +984,7 @@ class LogicalRelation:
                     ),
                 )
             )
-        return LogicalRelation(
+        return CoordinateRelation(
             source_domain=self.target_domain,
             target_domain=self.source_domain,
             pieces=tuple(dict.fromkeys(pieces)),
@@ -1028,18 +1028,18 @@ class LogicalRelation:
         self,
         source_index: int,
         *,
-        source_traversal: tuple[int, ...] | None = None,
-        target_traversal: tuple[int, ...] | None = None,
+        source_axis_order: tuple[int, ...] | None = None,
+        target_axis_order: tuple[int, ...] | None = None,
     ) -> frozenset[int]:
-        """Enumerate one source fiber for differential testing."""
+        """Enumerate one source coordinate's targets for differential testing."""
         source_coordinates = self.source_domain.coordinates(
             source_index,
-            traversal=source_traversal,
+            linearization_order=source_axis_order,
         )
         return frozenset(
             self.target_domain.index(
                 dict(zip(self.target_domain.axis_order, coordinates, strict=True)),
-                traversal=target_traversal,
+                linearization_order=target_axis_order,
             )
             for coordinates in self.target_coordinates(source_coordinates)
         )
@@ -1047,20 +1047,20 @@ class LogicalRelation:
     def materialize(
         self,
         *,
-        source_traversal: tuple[int, ...] | None = None,
-        target_traversal: tuple[int, ...] | None = None,
+        source_axis_order: tuple[int, ...] | None = None,
+        target_axis_order: tuple[int, ...] | None = None,
     ) -> tuple[frozenset[int], ...]:
         """Enumerate the relation only for tests and small-domain validation."""
         return tuple(
             self.targets(
                 index,
-                source_traversal=source_traversal,
-                target_traversal=target_traversal,
+                source_axis_order=source_axis_order,
+                target_axis_order=target_axis_order,
             )
             for index in range(self.source_domain.size)
         )
 
-    def union(self, other: LogicalRelation) -> LogicalRelation | None:
+    def union(self, other: CoordinateRelation) -> CoordinateRelation | None:
         """Return an exact finite union when both relations share typed domains."""
         if (
             self.source_domain != other.source_domain
@@ -1071,13 +1071,13 @@ class LogicalRelation:
             return self
         if other.covers(self):
             return other
-        return LogicalRelation(
+        return CoordinateRelation(
             source_domain=self.source_domain,
             target_domain=self.target_domain,
             pieces=tuple(dict.fromkeys((*self.pieces, *other.pieces))),
         )
 
-    def has_disjoint_source_support(self, other: LogicalRelation) -> bool:
+    def has_disjoint_source_support(self, other: CoordinateRelation) -> bool:
         """Prove that no source coordinate participates in both relations."""
         if self.source_domain != other.source_domain:
             return False
@@ -1165,7 +1165,7 @@ class LogicalRelation:
                     return False
         return True
 
-    def canonical_single_valued(self) -> LogicalRelation | None:
+    def canonical_single_valued(self) -> CoordinateRelation | None:
         """Return a disjoint-source form for an at-most-one-valued relation.
 
         The transformation partitions only at the constant boundaries already
@@ -1177,11 +1177,11 @@ class LogicalRelation:
         return self._cached_canonical_single_valued
 
     @cached_property
-    def _cached_canonical_single_valued(self) -> LogicalRelation | None:
+    def _cached_canonical_single_valued(self) -> CoordinateRelation | None:
         cells = _relation_source_cells(self)
         if cells is None:
             return None
-        pieces: list[_LogicalRelationPiece] = []
+        pieces: list[_CoordinateRelationPiece] = []
         for bounds in cells:
             active_targets = tuple(
                 tuple(
@@ -1217,12 +1217,12 @@ class LogicalRelation:
             ):
                 return None
             pieces.append(
-                _LogicalRelationPiece(
+                _CoordinateRelationPiece(
                     source_bounds_items=bounds,
                     target_ranges=target_ranges,
                 )
             )
-        return LogicalRelation(
+        return CoordinateRelation(
             source_domain=self.source_domain,
             target_domain=self.target_domain,
             pieces=tuple(pieces),
@@ -1293,10 +1293,10 @@ class LogicalRelation:
             )
         )
 
-    def fiber_cardinality(self) -> LogicalRelation | None:
-        """Return the exact number of distinct targets in every source fiber.
+    def target_count_by_source(self) -> CoordinateRelation | None:
+        """Return the exact number of distinct targets for every source.
 
-        The result is another single-valued ``LogicalRelation`` whose one
+        The result is another single-valued ``CoordinateRelation`` whose one
         target coordinate is the cardinality.  This keeps aggregation inside
         the relation algebra while avoiding a separate scalar-expression IR.
         Source boxes are partitioned only at existing structural boundaries.
@@ -1306,12 +1306,12 @@ class LogicalRelation:
         if cells is None:
             return None
         value_axis = 0
-        value_domain = LogicalDomain(
+        value_domain = CoordinateDomain(
             axis_order=(value_axis,),
             axis_counts_items=((value_axis, self.target_domain.size + 1),),
             kind="value",
         )
-        pieces: list[_LogicalRelationPiece] = []
+        pieces: list[_CoordinateRelationPiece] = []
         for bounds in cells:
             active_targets = tuple(
                 dict.fromkeys(
@@ -1344,7 +1344,7 @@ class LogicalRelation:
             )
             cardinality = sympy.simplify(cardinality)
             pieces.append(
-                _LogicalRelationPiece(
+                _CoordinateRelationPiece(
                     source_bounds_items=bounds,
                     target_ranges=(
                         (
@@ -1356,21 +1356,21 @@ class LogicalRelation:
                     ),
                 )
             )
-        return LogicalRelation(
+        return CoordinateRelation(
             source_domain=self.source_domain,
             target_domain=value_domain,
             pieces=tuple(pieces),
         )
 
-    def fiber_maximum(
+    def max_target_value_by_source(
         self,
-        values: LogicalRelation,
-    ) -> LogicalRelation | None:
-        """Reduce each target fiber through a single-valued integer map.
+        values: CoordinateRelation,
+    ) -> CoordinateRelation | None:
+        """Find the maximum mapped value among each source's targets.
 
         ``self`` maps source coordinates to a set of target coordinates and
         ``values`` maps those target coordinates to one scalar value.  The
-        result maps every nonempty source fiber to its maximum value without
+        result maps every source with targets to its maximum value without
         enumerating either domain.  Unsupported intersections decline rather
         than approximating the dependency.
         """
@@ -1382,7 +1382,7 @@ class LogicalRelation:
             return None
         pieces_by_source_bounds: dict[
             tuple[tuple[int, int, int, int], ...],
-            list[_LogicalRelationPiece],
+            list[_CoordinateRelationPiece],
         ] = {}
         for piece in self.pieces:
             pieces_by_source_bounds.setdefault(piece.source_bounds_items, []).append(
@@ -1412,7 +1412,7 @@ class LogicalRelation:
                 for bounds in cells
             )
         value_axis = values.target_domain.axis_order[0]
-        pieces: list[_LogicalRelationPiece] = []
+        pieces: list[_CoordinateRelationPiece] = []
         for source_bounds, active_pieces in active_pieces_by_cell:
             maxima: list[sympy.Expr] = []
             for relation_piece in active_pieces:
@@ -1450,13 +1450,13 @@ class LogicalRelation:
                     maxima.append(maximum)
             if not maxima:
                 continue
-            maximum = _fiber_maximum_expression(
+            maximum = _max_target_value_expression(
                 tuple(maxima),
                 source_domain=self.source_domain,
                 source_bounds=source_bounds,
             )
             pieces.append(
-                _LogicalRelationPiece(
+                _CoordinateRelationPiece(
                     source_bounds_items=source_bounds,
                     target_ranges=(
                         (
@@ -1468,18 +1468,18 @@ class LogicalRelation:
                     ),
                 )
             )
-        return LogicalRelation(
+        return CoordinateRelation(
             source_domain=self.source_domain,
             target_domain=values.target_domain,
             pieces=tuple(pieces),
         )
 
-    def fiber_enumeration(self) -> LogicalRelation | None:
-        """Enumerate uniform rectangular fibers with one symbolic local axis.
+    def enumerate_targets_by_source(self) -> CoordinateRelation | None:
+        """Enumerate uniform rectangular target sets by source coordinate.
 
-        The returned relation maps ``(within_fiber, source coordinates)`` to
+        The returned relation maps ``(target_index, source coordinates)`` to
         one target coordinate.  It is a compact bijection when this relation's
-        target boxes are disjoint and every source fiber has the same static
+        target boxes are disjoint and every source has the same static target
         cardinality.  No source or target instance is materialized.
         """
         cells = _relation_source_cells(self, include_domain=True)
@@ -1497,7 +1497,7 @@ class LogicalRelation:
                 ],
             ]
         ] = []
-        fiber_size: int | None = None
+        targets_per_source: int | None = None
         for bounds in cells:
             active_targets = tuple(
                 dict.fromkeys(
@@ -1539,32 +1539,34 @@ class LogicalRelation:
                     continue
                 boxes.append((target_ranges, count))
             total = sum(count for _ranges, count in boxes)
-            if not total or (fiber_size is not None and total != fiber_size):
+            if not total or (
+                targets_per_source is not None and total != targets_per_source
+            ):
                 return None
-            fiber_size = total
+            targets_per_source = total
             cell_targets.append((bounds, tuple(boxes)))
-        if fiber_size is None:
+        if targets_per_source is None:
             return None
 
         all_axes = {
             *self.source_domain.axis_order,
             *self.target_domain.axis_order,
         }
-        within_axis = min(all_axes, default=0) - 1
-        enumeration_domain = LogicalDomain(
-            axis_order=(within_axis, *self.source_domain.axis_order),
+        target_index_axis = min(all_axes, default=0) - 1
+        enumeration_domain = CoordinateDomain(
+            axis_order=(target_index_axis, *self.source_domain.axis_order),
             axis_counts_items=(
-                (within_axis, fiber_size),
+                (target_index_axis, targets_per_source),
                 *self.source_domain.axis_counts_items,
             ),
-            kind="worker",
+            kind="task_order",
         )
-        within = logical_axis_symbol(within_axis)
-        pieces: list[_LogicalRelationPiece] = []
+        target_index = logical_axis_symbol(target_index_axis)
+        pieces: list[_CoordinateRelationPiece] = []
         for source_bounds, target_boxes in cell_targets:
-            within_begin = 0
+            target_index_begin = 0
             for target_ranges, count in target_boxes:
-                local = within - within_begin  # pyrefly: ignore[unsupported-operation]
+                local = target_index - target_index_begin  # pyrefly: ignore[unsupported-operation]
                 multiplier = 1
                 target_points: list[tuple[int, sympy.Expr, sympy.Expr, int]] = []
                 for axis, begin, end, step in target_ranges:
@@ -1603,18 +1605,23 @@ class LogicalRelation:
                 if multiplier != count:
                     return None
                 pieces.append(
-                    _LogicalRelationPiece(
+                    _CoordinateRelationPiece(
                         source_bounds_items=(
-                            (within_axis, within_begin, within_begin + count, 1),
+                            (
+                                target_index_axis,
+                                target_index_begin,
+                                target_index_begin + count,
+                                1,
+                            ),
                             *source_bounds,
                         ),
                         target_ranges=tuple(target_points),
                     )
                 )
-                within_begin += count
-            if within_begin != fiber_size:
+                target_index_begin += count
+            if target_index_begin != targets_per_source:
                 return None
-        return LogicalRelation(
+        return CoordinateRelation(
             source_domain=enumeration_domain,
             target_domain=self.target_domain,
             pieces=tuple(pieces),
@@ -1721,8 +1728,8 @@ class LogicalRelation:
 
     def overlapping_sources(
         self,
-        other: LogicalRelation,
-    ) -> LogicalRelation | None:
+        other: CoordinateRelation,
+    ) -> CoordinateRelation | None:
         """Relate ``other`` sources to ``self`` sources by target overlap.
 
         This is the dependency composition used by memory accesses: ``self``
@@ -1733,7 +1740,7 @@ class LogicalRelation:
         if self.target_domain != other.target_domain:
             return None
         target_counts = self.source_domain.axis_counts
-        pieces: list[_LogicalRelationPiece] = []
+        pieces: list[_CoordinateRelationPiece] = []
         for producer_piece in self.pieces:
             full_producer_bounds = tuple(
                 (axis, 0, self.source_domain.axis_counts[axis], 1)
@@ -1820,7 +1827,7 @@ class LogicalRelation:
                         )
                     )
                 pieces.append(
-                    _LogicalRelationPiece(
+                    _CoordinateRelationPiece(
                         source_bounds_items=consumer_piece.source_bounds_items,
                         target_ranges=tuple(
                             (
@@ -1841,7 +1848,7 @@ class LogicalRelation:
                         ),
                     )
                 )
-        return LogicalRelation(
+        return CoordinateRelation(
             source_domain=other.source_domain,
             target_domain=self.source_domain,
             pieces=tuple(dict.fromkeys(pieces)),
@@ -1849,8 +1856,8 @@ class LogicalRelation:
 
 
 def _source_boxes_are_disjoint(
-    left: _LogicalRelationPiece,
-    right: _LogicalRelationPiece,
+    left: _CoordinateRelationPiece,
+    right: _CoordinateRelationPiece,
 ) -> bool:
     """Prove two concrete strided source boxes have no common point."""
     return _source_bounds_are_disjoint(
@@ -1884,7 +1891,7 @@ def _source_bounds_are_disjoint(
 
 def _source_boxes_partition_domain(
     boxes: tuple[tuple[tuple[int, int, int, int], ...], ...],
-    domain: LogicalDomain,
+    domain: CoordinateDomain,
 ) -> bool:
     """Prove that distinct unit-stride boxes partition a finite domain."""
     if not boxes:
@@ -1946,7 +1953,7 @@ def _source_box_covers(
 
 
 def _relation_source_cells(
-    relation: LogicalRelation,
+    relation: CoordinateRelation,
     *,
     include_domain: bool = False,
 ) -> tuple[tuple[tuple[int, int, int, int], ...], ...] | None:
@@ -1989,7 +1996,7 @@ def _target_boxes_are_disjoint(
     left: tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...],
     right: tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...],
     *,
-    source_domain: LogicalDomain,
+    source_domain: CoordinateDomain,
     source_bounds: tuple[tuple[int, int, int, int], ...],
 ) -> bool:
     """Conservatively prove two symbolic Cartesian target boxes disjoint."""
@@ -2031,7 +2038,7 @@ def _target_boxes_are_disjoint(
 def _logical_expression_bounds(
     expression: sympy.Expr,
     *,
-    domain: LogicalDomain,
+    domain: CoordinateDomain,
     source_bounds: tuple[tuple[int, int, int, int], ...],
     symbol_substitutions: dict[sympy.Basic, sympy.Expr] | None = None,
 ) -> tuple[sympy.Expr, sympy.Expr] | None:
@@ -2142,7 +2149,7 @@ def _intersect_target_with_source_box(
     target_ranges: tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...],
     value_source_bounds: tuple[tuple[int, int, int, int], ...],
     *,
-    source_domain: LogicalDomain,
+    source_domain: CoordinateDomain,
     relation_source_bounds: tuple[tuple[int, int, int, int], ...],
 ) -> tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...] | bool | None:
     """Return a contained target box, ``False`` if disjoint, else unknown."""
@@ -2190,7 +2197,7 @@ def _intersect_target_with_source_box(
 def _target_box_expression_extreme(
     expression: sympy.Expr,
     *,
-    target_domain: LogicalDomain,
+    target_domain: CoordinateDomain,
     target_ranges: tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...],
     maximize: bool,
 ) -> sympy.Expr | None:
@@ -2257,13 +2264,13 @@ def _target_box_expression_extreme(
     return None
 
 
-def _fiber_maximum_expression(
+def _max_target_value_expression(
     expressions: tuple[sympy.Expr, ...],
     *,
-    source_domain: LogicalDomain,
+    source_domain: CoordinateDomain,
     source_bounds: tuple[tuple[int, int, int, int], ...],
 ) -> sympy.Expr:
-    """Select a provably dominant fiber value without a costly symbolic Max."""
+    """Select a provably dominant target value without a costly symbolic Max."""
     unique = tuple(dict.fromkeys(expressions))
     if len(unique) == 1:
         return unique[0]
@@ -2293,7 +2300,7 @@ def _fiber_maximum_expression(
 def _simplify_logical_expression(
     expression: sympy.Expr,
     *,
-    domain: LogicalDomain,
+    domain: CoordinateDomain,
     source_bounds: tuple[tuple[int, int, int, int], ...],
 ) -> sympy.Expr:
     """Simplify min/max expressions using the relation source bounds."""
@@ -2356,8 +2363,8 @@ def _simplify_logical_expression(
 def _target_box_cardinality(
     target_ranges: tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...],
     *,
-    target_domain: LogicalDomain,
-    source_domain: LogicalDomain,
+    target_domain: CoordinateDomain,
+    source_domain: CoordinateDomain,
     source_bounds: tuple[tuple[int, int, int, int], ...],
 ) -> sympy.Expr:
     """Return the clipped Cartesian cardinality of one target box."""
@@ -2415,9 +2422,9 @@ def _target_box_cardinality(
 def _target_box_is_nonempty_for_all_sources(
     target_ranges: tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...],
     *,
-    source_domain: LogicalDomain,
+    source_domain: CoordinateDomain,
     source_bounds: tuple[tuple[int, int, int, int], ...],
-    target_domain: LogicalDomain,
+    target_domain: CoordinateDomain,
 ) -> bool:
     """Prove that a clipped target box is nonempty for every source point."""
     for axis, begin, end, step in target_ranges:
@@ -2453,9 +2460,9 @@ def _target_box_is_nonempty_for_all_sources(
 def _target_point_is_in_domain(
     target_ranges: tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...],
     *,
-    source_domain: LogicalDomain,
+    source_domain: CoordinateDomain,
     source_bounds: tuple[tuple[int, int, int, int], ...],
-    target_domain: LogicalDomain,
+    target_domain: CoordinateDomain,
 ) -> bool:
     """Prove that a single-valued target remains inside its typed domain."""
     for axis, begin, end, step in target_ranges:
@@ -2480,10 +2487,10 @@ def _target_point_is_in_domain(
 
 
 def _relation_piece_covers(
-    available: _LogicalRelationPiece,
-    required: _LogicalRelationPiece,
+    available: _CoordinateRelationPiece,
+    required: _CoordinateRelationPiece,
     *,
-    target_domain: LogicalDomain,
+    target_domain: CoordinateDomain,
 ) -> bool:
     available_bounds = {
         axis: (begin, end, step)
@@ -2538,7 +2545,7 @@ def _single_axis_interval(
     begin: sympy.Expr,
     end: sympy.Expr,
     *,
-    domain: LogicalDomain,
+    domain: CoordinateDomain,
 ) -> tuple[int, int, int, int] | None:
     """Recognize ``[stride * axis + offset, ... + width)`` exactly."""
     source_symbols: dict[sympy.Basic, int] = {
@@ -2575,7 +2582,7 @@ def _single_axis_interval(
 def _static_affine_coefficients(
     expression: sympy.Expr,
     *,
-    domain: LogicalDomain,
+    domain: CoordinateDomain,
 ) -> tuple[dict[int, int], int] | None:
     """Return nonnegative static coefficients for one affine expression."""
     expanded = sympy.expand(expression)
@@ -2597,26 +2604,26 @@ def _static_affine_coefficients(
     return coefficients, int(remainder)
 
 
-def _dense_mixed_radix_publication_converse(
-    relation: LogicalRelation,
-    cardinality: LogicalRelation,
-) -> LogicalRelation | None:
-    """Invert a dense mixed-radix key-to-producer partition exactly.
+def _dense_mixed_radix_converse(
+    relation: CoordinateRelation,
+    target_counts: CoordinateRelation,
+) -> CoordinateRelation | None:
+    """Reverse a dense mixed-radix source-to-target partition exactly.
 
-    ``relation`` maps event keys to a bounded union of contiguous producer
-    ranges.  Every range must share one affine key layout.  The ranges are
-    considered jointly, allowing omitted producer digits (for example a
-    gate/up half) to contribute to fan-in without becoming event-key axes.
+    ``relation`` maps source coordinates to a bounded union of contiguous
+    ranges on one target axis. Every range must share one affine source layout.
+    The ranges are considered jointly, allowing target-coordinate digits that
+    do not affect source identity to contribute to the target count.
 
-    This intentionally recognizes only a total, disjoint producer partition.
+    This intentionally recognizes only a total, disjoint target partition.
     Partial or overlapping relations remain valid dependency relations, but
-    their publication converse is left unavailable unless ordinary
-    :meth:`LogicalRelation.inverse` already represents it.
+    their exact converse is left unavailable unless ordinary
+    :meth:`CoordinateRelation.converse` already represents it.
     """
     if len(relation.target_domain.axis_order) != 1 or not relation.pieces:
         return None
-    producer_axis = relation.target_domain.axis_order[0]
-    full_key_bounds = tuple(
+    target_axis = relation.target_domain.axis_order[0]
+    full_source_bounds = tuple(
         (axis, 0, relation.source_domain.axis_counts[axis], 1)
         for axis in relation.source_domain.axis_order
     )
@@ -2624,12 +2631,12 @@ def _dense_mixed_radix_publication_converse(
     support_begins: list[int] = []
     support_ends: list[int] = []
     for piece in relation.pieces:
-        if piece.source_bounds_items != full_key_bounds:
+        if piece.source_bounds_items != full_source_bounds:
             return None
         if len(piece.target_ranges) != 1:
             return None
-        target_axis, begin, end, step = piece.target_ranges[0]
-        if target_axis != producer_axis or step != 1:
+        piece_target_axis, begin, end, step = piece.target_ranges[0]
+        if piece_target_axis != target_axis or step != 1:
             return None
         begin = _simplify_logical_expression(
             begin,
@@ -2671,7 +2678,7 @@ def _dense_mixed_radix_publication_converse(
             or expression_bounds[0].is_integer is not True
             or end_bounds[1].is_integer is not True
             or expression_bounds[0] < 0  # pyrefly: ignore[unsupported-operation]
-            or end_bounds[1] > relation.target_domain.axis_counts[producer_axis]  # pyrefly: ignore[unsupported-operation]
+            or end_bounds[1] > relation.target_domain.axis_counts[target_axis]  # pyrefly: ignore[unsupported-operation]
         ):
             return None
         support_begins.append(int(expression_bounds[0]))
@@ -2682,22 +2689,22 @@ def _dense_mixed_radix_publication_converse(
     coefficients = layouts[0][0]
     if any(piece_coefficients != coefficients for piece_coefficients, _, _ in layouts):
         return None
-    fan_in = cardinality.constant_value()
-    if fan_in is None or fan_in <= 0:
+    targets_per_source = target_counts.constant_value()
+    if targets_per_source is None or targets_per_source <= 0:
         return None
     support_begin = min(support_begins)
     support_end = max(support_ends)
-    if fan_in * relation.source_domain.size != support_end - support_begin:
+    if targets_per_source * relation.source_domain.size != support_end - support_begin:
         return None
 
-    producer = logical_axis_symbol(producer_axis)
-    key_expressions: list[sympy.Expr] = []
-    for key_axis in relation.source_domain.axis_order:
-        count = relation.source_domain.axis_counts[key_axis]
+    target_coordinate = logical_axis_symbol(target_axis)
+    source_expressions: list[sympy.Expr] = []
+    for source_axis in relation.source_domain.axis_order:
+        count = relation.source_domain.axis_counts[source_axis]
         if count == 1:
-            key_expressions.append(sympy.Integer(0))
+            source_expressions.append(sympy.Integer(0))
             continue
-        stride = coefficients[key_axis]
+        stride = coefficients[source_axis]
         if stride <= 0:
             return None
         period = stride * count
@@ -2705,7 +2712,7 @@ def _dense_mixed_radix_publication_converse(
             residual_min = (offset - support_begin) % period
             residual_max = residual_min + width - 1
             for other_axis in relation.source_domain.axis_order:
-                if other_axis == key_axis:
+                if other_axis == source_axis:
                     continue
                 other_stride = piece_coefficients[other_axis]
                 if other_stride % period == 0:
@@ -2716,35 +2723,35 @@ def _dense_mixed_radix_publication_converse(
             maximum_digit = residual_max // stride
             if minimum_digit != maximum_digit or minimum_digit % count != 0:
                 return None
-        key_expressions.append(
+        source_expressions.append(
             sympy.Mod(  # pyrefly: ignore[bad-argument-type]
-                sympy.floor(producer / stride),  # pyrefly: ignore[bad-argument-type, unsupported-operation]
+                sympy.floor(target_coordinate / stride),  # pyrefly: ignore[bad-argument-type, unsupported-operation]
                 count,
             )
         )
 
     if support_begin:
-        key_expressions = [
+        source_expressions = [
             expression.xreplace(
                 {
-                    producer: producer - support_begin  # pyrefly: ignore[unsupported-operation]
+                    target_coordinate: target_coordinate - support_begin  # pyrefly: ignore[unsupported-operation]
                 }
             )
-            for expression in key_expressions
+            for expression in source_expressions
         ]
 
-    producer_bounds = (
+    target_bounds = (
         (
-            producer_axis,
+            target_axis,
             support_begin,
             support_end,
             1,
         ),
     )
-    result = LogicalRelation.point_map(
+    result = CoordinateRelation.point_map(
         relation.target_domain,
         relation.source_domain,
-        ((producer_bounds, tuple(key_expressions)),),
+        ((target_bounds, tuple(source_expressions)),),
     )
     return result if result.canonical_single_valued() is not None else None
 
@@ -2753,7 +2760,7 @@ def _single_axis_floor_point(
     begin: sympy.Expr,
     end: sympy.Expr,
     *,
-    domain: LogicalDomain,
+    domain: CoordinateDomain,
 ) -> tuple[int, int, int, int, int] | None:
     """Recognize ``floor((a * axis + b) / d) + c`` point mappings."""
     if end != begin + 1 and sympy.simplify(end - begin) != 1:  # pyrefly: ignore[unsupported-operation]
@@ -2820,7 +2827,7 @@ def _point_expression_preimage(
     *,
     lower: int,
     upper: int,
-    domain: LogicalDomain,
+    domain: CoordinateDomain,
 ) -> tuple[int, int, int] | bool | None:
     """Invert one point expression over a constant half-open target interval."""
     if not expression.free_symbols:
@@ -2864,7 +2871,7 @@ def _substitute_composed_expression(
     expression: sympy.Expr,
     *,
     substitutions: dict[sympy.Basic, sympy.Expr],
-    source_domain: LogicalDomain,
+    source_domain: CoordinateDomain,
     source_bounds: tuple[tuple[int, int, int, int], ...],
 ) -> sympy.Expr:
     """Substitute a point map, simplifying only bounded piecewise operators."""
@@ -2887,14 +2894,14 @@ def _substitute_composed_expression(
 
 
 def _compose_point_relations(
-    first: LogicalRelation,
-    following: LogicalRelation,
-) -> LogicalRelation | None:
+    first: CoordinateRelation,
+    following: CoordinateRelation,
+) -> CoordinateRelation | None:
     """Compose point-valued relation pieces by exact box preimage.
 
     Composition is distributive over the union of relation pieces, so it does
     not require globally canonicalizing either relation.  Avoiding that
-    partitioning is important for compact physical traversals, whose pieces
+    partitioning is important for compact PID task orders, whose pieces
     are already disjoint by construction but can number in the thousands.
     """
     if any(
@@ -2908,7 +2915,7 @@ def _compose_point_relations(
         for _axis, begin, end, step in piece.target_ranges
     ):
         return None
-    pieces: list[_LogicalRelationPiece] = []
+    pieces: list[_CoordinateRelationPiece] = []
     for first_piece in first.pieces:
         first_targets = {
             axis: begin for axis, begin, _end, _step in first_piece.target_ranges
@@ -2979,7 +2986,7 @@ def _compose_point_relations(
             )
 
             pieces.append(
-                _LogicalRelationPiece(
+                _CoordinateRelationPiece(
                     source_bounds_items=source_bounds,
                     target_ranges=tuple(
                         (
@@ -3002,38 +3009,36 @@ def _compose_point_relations(
                     ),
                 )
             )
-    return LogicalRelation(
+    return CoordinateRelation(
         source_domain=first.source_domain,
         target_domain=following.target_domain,
         pieces=tuple(dict.fromkeys(pieces)),
     )
 
 
-def physical_traversal_relation(
-    logical_domain: LogicalDomain,
-    physical_axis_order: tuple[int, ...],
+def pid_task_order(
+    logical_domain: CoordinateDomain,
+    pid_axis_order: tuple[int, ...],
     *,
     l2_group_size: int | None = None,
-) -> LogicalRelation:
-    """Map a configured physical PID traversal to logical task coordinates."""
-    if set(logical_domain.axis_order) != set(physical_axis_order):
-        raise ValueError("physical traversal must permute the logical axes")
+) -> CoordinateRelation:
+    """Map configured PID task-order coordinates to logical tasks."""
+    if set(logical_domain.axis_order) != set(pid_axis_order):
+        raise ValueError("PID axis order must permute the logical task axes")
     counts = logical_domain.axis_counts
-    if l2_group_size is None or len(physical_axis_order) < 2:
-        source_domain = LogicalDomain(
-            axis_order=physical_axis_order,
-            axis_counts_items=tuple(
-                (axis, counts[axis]) for axis in physical_axis_order
-            ),
-            kind="worker",
+    if l2_group_size is None or len(pid_axis_order) < 2:
+        source_domain = CoordinateDomain(
+            axis_order=pid_axis_order,
+            axis_counts_items=tuple((axis, counts[axis]) for axis in pid_axis_order),
+            kind="task_order",
             identity=logical_domain.identity,
         )
-        return LogicalRelation.point_map(
+        return CoordinateRelation.point_map(
             source_domain,
             logical_domain,
             (
                 (
-                    tuple((axis, 0, counts[axis], 1) for axis in physical_axis_order),
+                    tuple((axis, 0, counts[axis], 1) for axis in pid_axis_order),
                     tuple(
                         logical_axis_symbol(axis) for axis in logical_domain.axis_order
                     ),
@@ -3041,19 +3046,19 @@ def physical_traversal_relation(
             ),
         )
 
-    first_axis, second_axis, *outer_axes = physical_axis_order
+    first_axis, second_axis, *outer_axes = pid_axis_order
     first_count = counts[first_axis]
     second_count = counts[second_axis]
     inner_axis = min(logical_domain.axis_order, default=0) - 1
     while inner_axis in logical_domain.axis_order:
         inner_axis -= 1
-    source_domain = LogicalDomain(
+    source_domain = CoordinateDomain(
         axis_order=(inner_axis, *outer_axes),
         axis_counts_items=(
             (inner_axis, first_count * second_count),
             *((axis, counts[axis]) for axis in outer_axes),
         ),
-        kind="worker",
+        kind="task_order",
         identity=logical_domain.identity,
     )
     inner = logical_axis_symbol(inner_axis)
@@ -3083,38 +3088,38 @@ def physical_traversal_relation(
                     tuple(expressions[axis] for axis in logical_domain.axis_order),
                 )
             )
-    return LogicalRelation.point_map(source_domain, logical_domain, tuple(pieces))
+    return CoordinateRelation.point_map(source_domain, logical_domain, tuple(pieces))
 
 
 @dataclasses.dataclass(frozen=True)
-class ExecutionScope:
-    """One reachable DeviceIR callsite in an outer task's execution strand.
+class ExecutionSite:
+    """One reachable DeviceIR callsite in an outer task's program order.
 
     ``graph_id`` identifies the called body, while ``callsite_path`` identifies
-    this particular invocation of that body.  Nested loop actions inherit the
+    this particular invocation of that body. Nested loop iterations inherit the
     worker assigned to their owning root task; this record describes their
     logical coordinate domain and program-order identity, not an independently
     movable scheduling unit.
     """
 
-    scope_id: int
+    site_id: int
     root: int
     graph_id: int
     callsite_path: tuple[tuple[int, int], ...]
-    parent_scope_id: int | None
+    parent_site_id: int | None
     kind: Literal["root", "loop", "branch", "while_condition", "while_body"]
     local_axis_order: tuple[int, ...]
     logical_axis_order: tuple[int, ...]
-    guaranteed: bool
-    segmentable: bool
+    executes_unconditionally: bool
+    can_split_loop: bool
 
     @property
     def is_root(self) -> bool:
         return self.kind == "root"
 
 
-def build_execution_scopes(device_ir: DeviceIR) -> tuple[ExecutionScope, ...]:
-    """Build the reachable DeviceIR callsite tree used by dependency actions.
+def build_execution_sites(device_ir: DeviceIR) -> tuple[ExecutionSite, ...]:
+    """Build the reachable DeviceIR callsite tree used by dependency analysis.
 
     A DeviceIR graph body is not itself a unique execution point: one body may
     be referenced by several callsites, and control-flow graphs have different
@@ -3124,45 +3129,45 @@ def build_execution_scopes(device_ir: DeviceIR) -> tuple[ExecutionScope, ...]:
     from ..language import _tracing_ops
     from .device_ir import ForLoopGraphInfo
 
-    scopes: list[ExecutionScope] = []
+    sites: list[ExecutionSite] = []
 
-    def add_scope(
+    def add_site(
         *,
         root: int,
         graph_id: int,
         callsite_path: tuple[tuple[int, int], ...],
-        parent_scope_id: int | None,
+        parent_site_id: int | None,
         kind: Literal["root", "loop", "branch", "while_condition", "while_body"],
         local_axis_order: tuple[int, ...],
         logical_axis_order: tuple[int, ...],
-        guaranteed: bool,
-        segmentable: bool,
+        executes_unconditionally: bool,
+        can_split_loop: bool,
     ) -> int:
-        scope_id = len(scopes)
-        scopes.append(
-            ExecutionScope(
-                scope_id=scope_id,
+        site_id = len(sites)
+        sites.append(
+            ExecutionSite(
+                site_id=site_id,
                 root=root,
                 graph_id=graph_id,
                 callsite_path=callsite_path,
-                parent_scope_id=parent_scope_id,
+                parent_site_id=parent_site_id,
                 kind=kind,
                 local_axis_order=local_axis_order,
                 logical_axis_order=logical_axis_order,
-                guaranteed=guaranteed,
-                segmentable=segmentable,
+                executes_unconditionally=executes_unconditionally,
+                can_split_loop=can_split_loop,
             )
         )
-        return scope_id
+        return site_id
 
     def walk(
         *,
         root: int,
-        scope_id: int,
+        site_id: int,
         ancestor_graph_ids: frozenset[int],
     ) -> None:
-        scope = scopes[scope_id]
-        graph = device_ir.graphs[scope.graph_id].graph
+        site = sites[site_id]
+        graph = device_ir.graphs[site.graph_id].graph
         for node_index, node in enumerate(graph.nodes):
             if node.op != "call_function":
                 continue
@@ -3180,7 +3185,9 @@ def build_execution_scopes(device_ir: DeviceIR) -> tuple[ExecutionScope, ...]:
                 and node.args
                 and isinstance(node.args[0], int)
             ):
-                child_specs.append((0, node.args[0], "loop", scope.guaranteed))
+                child_specs.append(
+                    (0, node.args[0], "loop", site.executes_unconditionally)
+                )
             elif node.target is _tracing_ops._if and len(node.args) >= 3:
                 if isinstance(node.args[1], int):
                     child_specs.append((1, node.args[1], "branch", False))
@@ -3192,8 +3199,13 @@ def build_execution_scopes(device_ir: DeviceIR) -> tuple[ExecutionScope, ...]:
                 if isinstance(node.args[1], int):
                     child_specs.append((1, node.args[1], "while_body", False))
 
-            callsite_scope_ids: list[tuple[int, int]] = []
-            for child_slot, child_graph_id, kind, guaranteed in child_specs:
+            callsite_site_ids: list[tuple[int, int]] = []
+            for (
+                child_slot,
+                child_graph_id,
+                kind,
+                executes_unconditionally,
+            ) in child_specs:
                 if not 0 <= child_graph_id < len(device_ir.graphs):
                     continue
                 child_info = device_ir.graphs[child_graph_id]
@@ -3203,20 +3215,20 @@ def build_execution_scopes(device_ir: DeviceIR) -> tuple[ExecutionScope, ...]:
                     else ()
                 )
                 axes_are_unique = not set(local_axes).intersection(
-                    scope.logical_axis_order
+                    site.logical_axis_order
                 )
-                child_scope_id = add_scope(
+                child_site_id = add_site(
                     root=root,
                     graph_id=child_graph_id,
-                    callsite_path=(*scope.callsite_path, (node_index, child_slot)),
-                    parent_scope_id=scope_id,
+                    callsite_path=(*site.callsite_path, (node_index, child_slot)),
+                    parent_site_id=site_id,
                     kind=kind,
                     local_axis_order=local_axes,
-                    logical_axis_order=(*scope.logical_axis_order, *local_axes),
-                    guaranteed=guaranteed,
-                    segmentable=(
+                    logical_axis_order=(*site.logical_axis_order, *local_axes),
+                    executes_unconditionally=executes_unconditionally,
+                    can_split_loop=(
                         kind == "loop"
-                        and guaranteed
+                        and executes_unconditionally
                         and axes_are_unique
                         and not any(
                             axis in device_ir.noncanonical_task_origin_block_ids
@@ -3224,36 +3236,36 @@ def build_execution_scopes(device_ir: DeviceIR) -> tuple[ExecutionScope, ...]:
                         )
                     ),
                 )
-                callsite_scope_ids.append((child_slot, child_scope_id))
+                callsite_site_ids.append((child_slot, child_site_id))
                 if child_graph_id not in ancestor_graph_ids:
                     walk(
                         root=root,
-                        scope_id=child_scope_id,
+                        site_id=child_site_id,
                         ancestor_graph_ids=ancestor_graph_ids
                         | frozenset((child_graph_id,)),
                     )
-            if callsite_scope_ids:
-                node.meta[TILE_DEPENDENCY_SCOPE_IDS_META] = tuple(callsite_scope_ids)
+            if callsite_site_ids:
+                node.meta[TILE_DEPENDENCY_SITE_IDS_META] = tuple(callsite_site_ids)
 
     for root, graph_id in enumerate(device_ir.root_ids):
         family = device_ir.task_families[root]
-        root_scope_id = add_scope(
+        root_site_id = add_site(
             root=root,
             graph_id=graph_id,
             callsite_path=(),
-            parent_scope_id=None,
+            parent_site_id=None,
             kind="root",
             local_axis_order=family.logical_axis_order,
             logical_axis_order=family.logical_axis_order,
-            guaranteed=True,
-            segmentable=False,
+            executes_unconditionally=True,
+            can_split_loop=False,
         )
         walk(
             root=root,
-            scope_id=root_scope_id,
+            site_id=root_site_id,
             ancestor_graph_ids=frozenset((graph_id,)),
         )
-    return tuple(scopes)
+    return tuple(sites)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3314,11 +3326,11 @@ class AccessDependency:
 
 @dataclasses.dataclass(frozen=True)
 class TileDependencyRelation:
-    """One symbolic dependency between execution-scope instance domains.
+    """One symbolic dependency between execution-site instance domains.
 
     ``relation`` maps each consumer instance to the producer instances it must
     observe.  A missing relation means that dependency scheduling must lift to
-    an enclosing scope or family completion.
+    an enclosing site or root barrier.
     """
 
     kind: TileDependencyKind
@@ -3327,9 +3339,9 @@ class TileDependencyRelation:
     consumer_access_id: int
     producer_root: int
     consumer_root: int
-    producer_scope_id: int | None
-    consumer_scope_id: int | None
-    relation: LogicalRelation | None
+    producer_site_id: int | None
+    consumer_site_id: int | None
+    relation: CoordinateRelation | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3345,25 +3357,25 @@ class TileDependency:
 
 @dataclasses.dataclass(frozen=True)
 class TileDependencyGraph:
-    """Allocation-derived dependencies and DeviceIR execution scopes."""
+    """Allocation-derived dependencies and DeviceIR execution sites."""
 
     task_families: tuple[TaskFamily, ...]
     accesses: tuple[TileAccess, ...]
     edges: tuple[TileDependency, ...]
-    execution_scopes: tuple[ExecutionScope, ...] = ()
-    scope_ids_by_access: tuple[tuple[int, ...], ...] = ()
+    execution_sites: tuple[ExecutionSite, ...] = ()
+    site_ids_by_access: tuple[tuple[int, ...], ...] = ()
 
     def __post_init__(self) -> None:
-        if tuple(scope.scope_id for scope in self.execution_scopes) != tuple(
-            range(len(self.execution_scopes))
+        if tuple(site.site_id for site in self.execution_sites) != tuple(
+            range(len(self.execution_sites))
         ):
-            raise ValueError("execution scope IDs must be contiguous")
+            raise ValueError("execution site IDs must be contiguous")
         if any(
-            not 0 <= scope_id < len(self.execution_scopes)
-            for scope_ids in self.scope_ids_by_access
-            for scope_id in scope_ids
+            not 0 <= site_id < len(self.execution_sites)
+            for site_ids in self.site_ids_by_access
+            for site_id in site_ids
         ):
-            raise ValueError("access references an unknown execution scope")
+            raise ValueError("access references an unknown execution site")
 
     def edges_between(
         self,
@@ -3377,34 +3389,34 @@ class TileDependencyGraph:
             and edge.consumer_root == consumer_root
         )
 
-    def scopes_for_access(self, access_id: int) -> tuple[ExecutionScope, ...]:
-        if not 0 <= access_id < len(self.scope_ids_by_access):
+    def sites_for_access(self, access_id: int) -> tuple[ExecutionSite, ...]:
+        if not 0 <= access_id < len(self.site_ids_by_access):
             return ()
         return tuple(
-            self.execution_scopes[scope_id]
-            for scope_id in self.scope_ids_by_access[access_id]
+            self.execution_sites[site_id]
+            for site_id in self.site_ids_by_access[access_id]
         )
 
-    def dependency_points(
+    def dependency_obligations(
         self,
         dependency: AccessDependency,
-    ) -> frozenset[DependencyPoint]:
+    ) -> frozenset[DependencyObligation]:
         """Return every producer/consumer callsite obligation for one hazard."""
 
-        def access_scope_ids(access_id: int) -> tuple[int | None, ...]:
-            if not 0 <= access_id < len(self.scope_ids_by_access):
+        def access_site_ids(access_id: int) -> tuple[int | None, ...]:
+            if not 0 <= access_id < len(self.site_ids_by_access):
                 return (None,)
-            scope_ids = self.scope_ids_by_access[access_id]
-            return scope_ids or (None,)
+            site_ids = self.site_ids_by_access[access_id]
+            return site_ids or (None,)
 
         return frozenset(
             (
                 dependency.dependency_id,
-                producer_scope_id,
-                consumer_scope_id,
+                producer_site_id,
+                consumer_site_id,
             )
-            for producer_scope_id in access_scope_ids(dependency.producer_access_id)
-            for consumer_scope_id in access_scope_ids(dependency.consumer_access_id)
+            for producer_site_id in access_site_ids(dependency.producer_access_id)
+            for consumer_site_id in access_site_ids(dependency.consumer_access_id)
         )
 
 
@@ -3523,7 +3535,7 @@ def _access_interval_expression(
     access: TileAccess,
     *,
     position: int,
-    domain: LogicalDomain,
+    domain: CoordinateDomain,
 ) -> tuple[sympy.Expr, sympy.Expr] | None:
     if position >= len(access.subscript_is_full_slice):
         return None
@@ -3583,11 +3595,11 @@ def _access_interval_expression(
 def _symbolic_coordinate_access_relation(
     access: TileAccess,
     *,
-    source_domain: LogicalDomain,
-    allocation_domain: LogicalDomain,
+    source_domain: CoordinateDomain,
+    allocation_domain: CoordinateDomain,
     tensor_dimensions: tuple[int, ...],
-) -> LogicalRelation | None:
-    """Map one access scope to its exact allocation-coordinate footprint."""
+) -> CoordinateRelation | None:
+    """Map one access site to its exact allocation-coordinate footprint."""
     if (
         not access.layout_is_static
         or access.has_explicit_mask
@@ -3626,11 +3638,11 @@ def _symbolic_coordinate_access_relation(
             return None
         begin, end = interval
         target_ranges.append((allocation_axis, begin, end, 1))
-    return LogicalRelation(
+    return CoordinateRelation(
         source_domain=source_domain,
         target_domain=allocation_domain,
         pieces=(
-            _LogicalRelationPiece(
+            _CoordinateRelationPiece(
                 source_bounds_items=tuple(
                     (axis, 0, source_domain.axis_counts[axis], 1)
                     for axis in source_domain.axis_order
@@ -3682,9 +3694,9 @@ def _normalized_coordinate_layout(
 def _symbolic_linear_access_relation(
     access: TileAccess,
     *,
-    source_domain: LogicalDomain,
-    allocation_domain: LogicalDomain,
-) -> LogicalRelation | None:
+    source_domain: CoordinateDomain,
+    allocation_domain: CoordinateDomain,
+) -> CoordinateRelation | None:
     """Map a provably contiguous view tile to linear allocation addresses."""
     if (
         not access.layout_is_static
@@ -3757,11 +3769,11 @@ def _symbolic_linear_access_relation(
         strict=True,
     ):
         begin += dimension_begin * stride  # pyrefly: ignore[unsupported-operation]
-    return LogicalRelation(
+    return CoordinateRelation(
         source_domain=source_domain,
         target_domain=allocation_domain,
         pieces=(
-            _LogicalRelationPiece(
+            _CoordinateRelationPiece(
                 source_bounds_items=tuple(
                     (axis, 0, source_domain.axis_counts[axis], 1)
                     for axis in source_domain.axis_order
@@ -3782,11 +3794,11 @@ def _symbolic_linear_access_relation(
 def _symbolic_access_predecessors(
     *,
     producer_access: TileAccess,
-    producer_domain: LogicalDomain,
+    producer_domain: CoordinateDomain,
     consumer_access: TileAccess,
-    consumer_domain: LogicalDomain,
-) -> LogicalRelation | None:
-    """Compose two scope-to-allocation maps into exact predecessors."""
+    consumer_domain: CoordinateDomain,
+) -> CoordinateRelation | None:
+    """Compose two site-to-allocation maps into exact producer dependencies."""
     if not producer_access.layout_is_static or not consumer_access.layout_is_static:
         return None
     producer_layout = _normalized_coordinate_layout(producer_access)
@@ -3799,7 +3811,7 @@ def _symbolic_access_predecessors(
     ):
         producer_dimensions, normalized_layout = producer_layout
         consumer_dimensions, _ = consumer_layout
-        coordinate_domain = LogicalDomain(
+        coordinate_domain = CoordinateDomain(
             axis_order=tuple(range(len(normalized_layout))),
             axis_counts_items=tuple(
                 (axis, size) for axis, (size, _stride) in enumerate(normalized_layout)
@@ -3828,7 +3840,7 @@ def _symbolic_access_predecessors(
     consumer_storage_size = _allocation_storage_size(consumer_access)
     if producer_storage_size is None or consumer_storage_size is None:
         return None
-    linear_domain = LogicalDomain(
+    linear_domain = CoordinateDomain(
         axis_order=(_ALLOCATION_ADDRESS_AXIS,),
         axis_counts_items=(
             (
@@ -3854,19 +3866,19 @@ def _symbolic_access_predecessors(
     return producer_relation.overlapping_sources(consumer_relation)
 
 
-def _logical_domain_for_axes(
+def _coordinate_domain_for_axes(
     axis_order: tuple[int, ...],
     *,
     axis_geometry: dict[int, tuple[int, int]],
     identity: int,
-) -> LogicalDomain | None:
+) -> CoordinateDomain | None:
     geometry = tuple(axis_geometry.get(axis) for axis in axis_order)
     if any(item is None for item in geometry):
         return None
     concrete_geometry = tuple(item for item in geometry if item is not None)
     if any(count <= 0 or block_size <= 0 for count, block_size in concrete_geometry):
         return None
-    return LogicalDomain(
+    return CoordinateDomain(
         axis_order=axis_order,
         axis_counts_items=tuple(
             (axis, concrete_geometry[index][0]) for index, axis in enumerate(axis_order)
@@ -3874,43 +3886,43 @@ def _logical_domain_for_axes(
         block_sizes_items=tuple(
             (axis, concrete_geometry[index][1]) for index, axis in enumerate(axis_order)
         ),
-        kind="scope",
+        kind="site",
         identity=identity,
     )
 
 
-def instantiate_logical_domains(
+def instantiate_coordinate_domains(
     dependency_graph: TileDependencyGraph,
     *,
     axis_geometry: dict[int, tuple[int, int]],
 ) -> tuple[
-    tuple[LogicalDomain | None, ...],
-    tuple[LogicalDomain | None, ...],
+    tuple[CoordinateDomain | None, ...],
+    tuple[CoordinateDomain | None, ...],
 ]:
-    """Bind root and execution-scope domains to one selected tile geometry.
+    """Bind root and execution-site domains to one selected tile geometry.
 
-    Root scopes reuse the same domain objects returned in the scope-indexed
-    table. No traversal is attached: these are semantic coordinates, while
-    physical PID and within-strand order remain scheduling choices.
+    Root sites reuse the same domain objects returned in the site-indexed
+    table. No task order is attached: these are semantic coordinates, while
+    PID task order and task-local program order remain scheduling choices.
     """
-    scope_domains = tuple(
-        _logical_domain_for_axes(
-            scope.logical_axis_order,
+    site_domains = tuple(
+        _coordinate_domain_for_axes(
+            site.logical_axis_order,
             axis_geometry=axis_geometry,
-            identity=scope.scope_id,
+            identity=site.site_id,
         )
-        for scope in dependency_graph.execution_scopes
+        for site in dependency_graph.execution_sites
     )
-    root_scope_ids = {
-        scope.root: scope.scope_id
-        for scope in dependency_graph.execution_scopes
-        if scope.is_root
+    root_site_ids = {
+        site.root: site.site_id
+        for site in dependency_graph.execution_sites
+        if site.is_root
     }
     root_domains = tuple(
         (
-            scope_domains[root_scope_ids[root]]
-            if root in root_scope_ids
-            else _logical_domain_for_axes(
+            site_domains[root_site_ids[root]]
+            if root in root_site_ids
+            else _coordinate_domain_for_axes(
                 family.logical_axis_order,
                 axis_geometry=axis_geometry,
                 identity=root,
@@ -3926,45 +3938,45 @@ def instantiate_logical_domains(
             strict=True,
         )
     ):
-        raise ValueError("root scope axes disagree with the task-family domain")
-    return root_domains, scope_domains
+        raise ValueError("root site axes disagree with the task-family domain")
+    return root_domains, site_domains
 
 
 def instantiate_symbolic_dependencies(
     dependency_graph: TileDependencyGraph,
     *,
-    root_domains: tuple[LogicalDomain | None, ...],
-    scope_domains: tuple[LogicalDomain | None, ...],
+    root_domains: tuple[CoordinateDomain | None, ...],
+    site_domains: tuple[CoordinateDomain | None, ...],
 ) -> tuple[TileDependencyRelation, ...]:
-    """Instantiate scope dependencies without enumerating task instances.
+    """Instantiate site dependencies without enumerating task instances.
 
     Unsupported access geometry returns ``relation=None`` so the caller can
-    monotonically retain family completion.
+    monotonically retain root barrier.
     """
     if len(root_domains) != len(dependency_graph.task_families):
         raise ValueError("root domain count disagrees with the dependency graph")
-    if len(scope_domains) != len(dependency_graph.execution_scopes):
-        raise ValueError("scope domain count disagrees with the dependency graph")
-    scope_by_id = {scope.scope_id: scope for scope in dependency_graph.execution_scopes}
+    if len(site_domains) != len(dependency_graph.execution_sites):
+        raise ValueError("site domain count disagrees with the dependency graph")
+    site_by_id = {site.site_id: site for site in dependency_graph.execution_sites}
     access_by_id = {access.access_id: access for access in dependency_graph.accesses}
 
     def endpoints(
         access: TileAccess,
-    ) -> tuple[tuple[int | None, LogicalDomain], ...]:
-        scope_ids = (
-            dependency_graph.scope_ids_by_access[access.access_id]
-            if 0 <= access.access_id < len(dependency_graph.scope_ids_by_access)
+    ) -> tuple[tuple[int | None, CoordinateDomain], ...]:
+        site_ids = (
+            dependency_graph.site_ids_by_access[access.access_id]
+            if 0 <= access.access_id < len(dependency_graph.site_ids_by_access)
             else ()
         )
-        if not scope_ids:
+        if not site_ids:
             root_domain = root_domains[access.root]
             return () if root_domain is None else ((None, root_domain),)
-        result: list[tuple[int | None, LogicalDomain]] = []
-        for scope_id in scope_ids:
-            scope = scope_by_id[scope_id]
-            domain = scope_domains[scope_id]
-            if domain is not None and scope.guaranteed:
-                result.append((scope_id, domain))
+        result: list[tuple[int | None, CoordinateDomain]] = []
+        for site_id in site_ids:
+            site = site_by_id[site_id]
+            domain = site_domains[site_id]
+            if domain is not None and site.executes_unconditionally:
+                result.append((site_id, domain))
         return tuple(result)
 
     result: list[TileDependencyRelation] = []
@@ -3988,14 +4000,14 @@ def instantiate_symbolic_dependencies(
                         consumer_access_id=consumer_access.access_id,
                         producer_root=edge.producer_root,
                         consumer_root=edge.consumer_root,
-                        producer_scope_id=None,
-                        consumer_scope_id=None,
+                        producer_site_id=None,
+                        consumer_site_id=None,
                         relation=None,
                     )
                 )
                 continue
-            for producer_scope_id, producer_domain in producer_endpoints:
-                for consumer_scope_id, consumer_domain in consumer_endpoints:
+            for producer_site_id, producer_domain in producer_endpoints:
+                for consumer_site_id, consumer_domain in consumer_endpoints:
                     result.append(
                         TileDependencyRelation(
                             kind=access_dependency.kind,
@@ -4004,8 +4016,8 @@ def instantiate_symbolic_dependencies(
                             consumer_access_id=consumer_access.access_id,
                             producer_root=edge.producer_root,
                             consumer_root=edge.consumer_root,
-                            producer_scope_id=producer_scope_id,
-                            consumer_scope_id=consumer_scope_id,
+                            producer_site_id=producer_site_id,
+                            consumer_site_id=consumer_site_id,
                             relation=(
                                 _symbolic_access_predecessors(
                                     producer_access=producer_access,
@@ -4021,30 +4033,30 @@ def instantiate_symbolic_dependencies(
     return tuple(result)
 
 
-def preceding_scope_relation(
+def preceding_site_relation(
     dependency_graph: TileDependencyGraph,
     *,
-    scope_domains: tuple[LogicalDomain | None, ...],
-    source_scope_id: int,
-    consumer_scope_id: int,
+    site_domains: tuple[CoordinateDomain | None, ...],
+    source_site_id: int,
+    consumer_site_id: int,
     consumer_access_id: int,
-) -> LogicalRelation | None:
-    """Map a consumer scope to a preceding scope in the same task strand.
+) -> CoordinateRelation | None:
+    """Map a consumer site to a preceding site in task-local program order.
 
     An ancestor maps to its single enclosing instance.  A lexically earlier
     sibling subtree maps to every source instance under the shared enclosing
-    instance.  Both are ordinary relations; no flattened action IDs are
+    instance. Both are ordinary relations; no flattened iteration IDs are
     constructed.
     """
-    scopes = dependency_graph.execution_scopes
-    if len(scope_domains) != len(scopes):
-        raise ValueError("scope domain count disagrees with the dependency graph")
-    source_scope = scopes[source_scope_id]
-    consumer_scope = scopes[consumer_scope_id]
-    source_domain = scope_domains[source_scope_id]
-    consumer_domain = scope_domains[consumer_scope_id]
+    sites = dependency_graph.execution_sites
+    if len(site_domains) != len(sites):
+        raise ValueError("site domain count disagrees with the dependency graph")
+    source_site = sites[source_site_id]
+    consumer_site = sites[consumer_site_id]
+    source_domain = site_domains[source_site_id]
+    consumer_domain = site_domains[consumer_site_id]
     if (
-        source_scope.root != consumer_scope.root
+        source_site.root != consumer_site.root
         or source_domain is None
         or consumer_domain is None
     ):
@@ -4060,17 +4072,17 @@ def preceding_scope_relation(
     if consumer_access.graph_node_index < 0:
         return None
 
-    def lineage(scope_id: int) -> tuple[int, ...]:
+    def lineage(site_id: int) -> tuple[int, ...]:
         result: list[int] = []
-        current: int | None = scope_id
+        current: int | None = site_id
         while current is not None:
             result.append(current)
-            current = scopes[current].parent_scope_id
+            current = sites[current].parent_site_id
         result.reverse()
         return tuple(result)
 
-    source_lineage = lineage(source_scope_id)
-    consumer_lineage = lineage(consumer_scope_id)
+    source_lineage = lineage(source_site_id)
+    consumer_lineage = lineage(consumer_site_id)
     common_length = 0
     for source_ancestor, consumer_ancestor in zip(
         source_lineage, consumer_lineage, strict=False
@@ -4084,17 +4096,17 @@ def preceding_scope_relation(
     if common_length == len(source_lineage):
         equal_axes = source_domain.axis_order
     else:
-        source_child = scopes[source_lineage[common_length]]
+        source_child = sites[source_lineage[common_length]]
         source_node_index = source_child.callsite_path[-1][0]
         if common_length == len(consumer_lineage):
             consumer_node_index = consumer_access.graph_node_index
         else:
-            consumer_child = scopes[consumer_lineage[common_length]]
+            consumer_child = sites[consumer_lineage[common_length]]
             consumer_node_index = consumer_child.callsite_path[-1][0]
         if source_node_index >= consumer_node_index:
             return None
-        common_scope_id = source_lineage[common_length - 1]
-        common_domain = scope_domains[common_scope_id]
+        common_site_id = source_lineage[common_length - 1]
+        common_domain = site_domains[common_site_id]
         if common_domain is None:
             return None
         equal_axes = common_domain.axis_order
@@ -4102,11 +4114,11 @@ def preceding_scope_relation(
     if any(axis not in consumer_domain.axis_counts for axis in equal_axes):
         return None
     equal_axis_set = frozenset(equal_axes)
-    return LogicalRelation(
+    return CoordinateRelation(
         source_domain=consumer_domain,
         target_domain=source_domain,
         pieces=(
-            _LogicalRelationPiece(
+            _CoordinateRelationPiece(
                 source_bounds_items=tuple(
                     (axis, 0, consumer_domain.axis_counts[axis], 1)
                     for axis in consumer_domain.axis_order
@@ -4339,7 +4351,7 @@ def build_tile_dependency_graph(
     This pass is deliberately independent of code generation. It identifies the
     most recent writer and intervening readers of every allocation, then proves
     task readiness for the strict affine subset. Anything else remains a
-    root-completion dependency.
+    root-barrier dependency.
     """
     if task_families is None and device_ir is not None:
         task_families = tuple(device_ir.task_families)
@@ -4351,7 +4363,7 @@ def build_tile_dependency_graph(
         task_families = tuple(
             TaskFamily(
                 axes=tuple(
-                    LogicalTaskAxis(
+                    TaskAxis(
                         block_id=block_id,
                         extent=None,
                         canonical_origin=(
@@ -4541,28 +4553,26 @@ def build_tile_dependency_graph(
             )
         )
 
-    execution_scopes = (
-        build_execution_scopes(device_ir) if device_ir is not None else ()
-    )
-    scope_ids_by_graph: dict[int, list[int]] = {}
-    for scope in execution_scopes:
-        scope_ids_by_graph.setdefault(scope.graph_id, []).append(scope.scope_id)
-    scope_ids_by_access: list[tuple[int, ...]] = [
+    execution_sites = build_execution_sites(device_ir) if device_ir is not None else ()
+    site_ids_by_graph: dict[int, list[int]] = {}
+    for site in execution_sites:
+        site_ids_by_graph.setdefault(site.graph_id, []).append(site.site_id)
+    site_ids_by_access: list[tuple[int, ...]] = [
         ()
         for _ in range(max((access.access_id for access in accesses), default=-1) + 1)
     ]
     for access in accesses:
-        scope_ids_by_access[access.access_id] = tuple(
-            scope_id
-            for scope_id in scope_ids_by_graph.get(access.graph_id, ())
-            if execution_scopes[scope_id].root == access.root
+        site_ids_by_access[access.access_id] = tuple(
+            site_id
+            for site_id in site_ids_by_graph.get(access.graph_id, ())
+            if execution_sites[site_id].root == access.root
         )
     return TileDependencyGraph(
         task_families=task_families,
         accesses=accesses,
         edges=tuple(edges),
-        execution_scopes=execution_scopes,
-        scope_ids_by_access=tuple(scope_ids_by_access),
+        execution_sites=execution_sites,
+        site_ids_by_access=tuple(site_ids_by_access),
     )
 
 

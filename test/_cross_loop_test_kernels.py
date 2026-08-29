@@ -121,7 +121,7 @@ def three_way_affine_chain(x: torch.Tensor) -> torch.Tensor:
     static_shapes=True,
     autotune_effort="none",
 )
-def counted_event_chain(x: torch.Tensor) -> torch.Tensor:
+def readiness_counter_chain(x: torch.Tensor) -> torch.Tensor:
     rows, columns = x.size()
     assert rows == 8
     assert columns == 4
@@ -238,7 +238,7 @@ def prewait_singleton_reduction(x: torch.Tensor) -> torch.Tensor:
     autotune_effort="none",
 )
 def streamed_sibling_reductions(x: torch.Tensor) -> torch.Tensor:
-    """Exercise two independently ready nested scopes in one consumer strand."""
+    """Exercise two independently ready nested sites in one consumer root task."""
     batch, width = x.size()
     left = torch.empty_like(x)
     right = torch.empty_like(x)

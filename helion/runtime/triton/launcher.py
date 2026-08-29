@@ -433,6 +433,6 @@ def _validate_resident_program_capacity(
             "Cross-loop scheduling requires "
             f"{required_programs} concurrently resident programs, but this "
             f"kernel/device can residently execute only {capacity}. Choose a "
-            "lower-resource configuration, an earlier dependency frontier, "
-            "or root completion."
+            "lower-resource configuration, a smaller ready prefix, or a "
+            "root barrier."
         )
