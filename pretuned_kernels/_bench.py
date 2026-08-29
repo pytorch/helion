@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 
 
 ShapeT = TypeVar("ShapeT")
+OutputT = TypeVar("OutputT")
 
 
 def geomean(values: Iterable[float]) -> float:
@@ -64,8 +65,35 @@ def bench_cudagraph(call: Callable[[], object], rep: int = 100) -> float:
     return _do_bench_cudagraph_with_cache_clear(call, rep=rep, return_mode="median")
 
 
+def capture_cuda_graph(
+    call: Callable[[], OutputT],
+    reset: Callable[[], object] | None = None,
+) -> tuple[torch.cuda.CUDAGraph, OutputT]:
+    """Warm up and capture one CUDA graph, optionally restoring mutable inputs."""
+    capture_stream = torch.cuda.Stream()
+    current_stream = torch.cuda.current_stream()
+    capture_stream.wait_stream(current_stream)
+    with torch.cuda.stream(capture_stream):
+        for _ in range(3):
+            if reset is not None:
+                reset()
+            output = call()
+        if reset is not None:
+            reset()
+    current_stream.wait_stream(capture_stream)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        output = call()
+    torch.cuda.synchronize()
+    return graph, output
+
+
 def bench_pre_captured_cudagraphs(
-    calls: Sequence[Callable[[], object]], rep: int = 100
+    calls: Sequence[Callable[[], object]],
+    rep: int = 100,
+    resets: Sequence[Callable[[], object] | None] | None = None,
 ) -> list[float]:
     """Median graph device latencies (ms), with cold L2 and balanced ordering.
 
@@ -89,6 +117,10 @@ def bench_pre_captured_cudagraphs(
         raise ValueError("calls must not be empty")
     if rep <= 0:
         raise ValueError("rep must be positive")
+    if resets is None:
+        resets = (None,) * len(calls)
+    elif len(resets) != len(calls):
+        raise ValueError("resets must have one entry per call")
 
     driver = triton.runtime.driver.active
     device_interface = driver.get_device_interface()  # pyrefly: ignore[missing-attribute]
@@ -104,6 +136,9 @@ def bench_pre_captured_cudagraphs(
 
     for sample in range(cycle):
         for index in call_order(sample):
+            reset = resets[index]
+            if reset is not None:
+                reset()
             calls[index]()
     device_interface.synchronize()
 
@@ -117,6 +152,9 @@ def bench_pre_captured_cudagraphs(
     ]
     for sample in range(repetitions):
         for index in call_order(sample):
+            reset = resets[index]
+            if reset is not None:
+                reset()
             driver.clear_cache(cache)  # pyrefly: ignore[missing-attribute]
             starts[index][sample].record()
             calls[index]()
@@ -228,6 +266,9 @@ def run_sweep(
     *,
     use_cudagraph: bool,
     pre_captured_cudagraph: bool = False,
+    interleave_pre_captured: bool = True,
+    make_resets: Callable[[ShapeT], Sequence[Callable[[], object] | None]]
+    | None = None,
     shape_header: str,
     warmup: int = 25,
     rep: int = 100,
@@ -239,6 +280,8 @@ def run_sweep(
     ``make_calls(shape)`` returns ``(helion_call, [(baseline_name, baseline_call)],
     shape_cells)`` where the calls are zero-arg closures over freshly built inputs
     and ``shape_cells`` is the preformatted leading column(s) for the table row.
+    Set ``interleave_pre_captured=False`` to finish one cold-L2 graph benchmark
+    before starting the next implementation.
     The metrics dict is always returned; the per-shape table is printed only when
     ``verbose``.
     """
@@ -246,6 +289,8 @@ def run_sweep(
         raise ValueError(
             "use_cudagraph and pre_captured_cudagraph are mutually exclusive"
         )
+    if make_resets is not None and not pre_captured_cudagraph:
+        raise ValueError("make_resets requires pre_captured_cudagraph=True")
 
     def _p(*args: object) -> None:
         if verbose:
@@ -269,10 +314,35 @@ def run_sweep(
             header_printed = True
 
         if pre_captured_cudagraph:
-            thermal_warmup(thermal_warmup_ms)
-            timings = bench_pre_captured_cudagraphs(
-                [helion_call, *(call for _name, call in baseline_calls)], rep=rep
+            calls = [helion_call, *(call for _name, call in baseline_calls)]
+            resets = (
+                list(make_resets(shape))
+                if make_resets is not None
+                else [None] * len(calls)
             )
+            if len(resets) != len(calls):
+                raise ValueError("make_resets must return one entry per call")
+            if interleave_pre_captured:
+                thermal_warmup(thermal_warmup_ms)
+                if make_resets is None:
+                    timings = bench_pre_captured_cudagraphs(calls, rep=rep)
+                else:
+                    timings = bench_pre_captured_cudagraphs(
+                        calls,
+                        rep=rep,
+                        resets=resets,
+                    )
+            else:
+                timings = []
+                for call, reset in zip(calls, resets, strict=True):
+                    thermal_warmup(thermal_warmup_ms)
+                    timings.extend(
+                        bench_pre_captured_cudagraphs(
+                            [call],
+                            rep=rep,
+                            resets=[reset],
+                        )
+                    )
             ms_helion, *baseline_timings = timings
             base_ms = dict(zip(names, baseline_timings, strict=True))
         else:
