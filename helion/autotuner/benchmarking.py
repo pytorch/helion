@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import functools
 import glob
 import logging
@@ -28,6 +29,34 @@ T = TypeVar("T")
 
 _log = logging.getLogger(__name__)
 _BENCHMARK_CUDAGRAPH_ENV = "HELION_BENCHMARK_CUDAGRAPH"
+_MIRRORED_BENCH_MAX_SWEEPS = 64
+
+
+@dataclasses.dataclass(frozen=True)
+class MirroredBenchmarkTrace:
+    """Bounded wall-clock samples from deterministic mirrored benchmark sweeps."""
+
+    orders: list[list[int]]
+    elapsed_ms: list[list[float]]
+    medians_ms: list[float]
+    target_ms: float | None = None
+    repeat_reference_perf_ms: float | None = None
+    sweep_count: int | None = None
+    calls_per_sample: int | None = None
+    total_calls: int | None = None
+
+
+def _mirrored_bench_call_layout(desired_calls: int) -> tuple[int, int, int]:
+    """Return balanced sweep, batch, and actual timed-call counts."""
+    desired_calls = max(2, desired_calls)
+    if desired_calls % 2:
+        desired_calls += 1
+    calls_per_sample = max(1, math.ceil(desired_calls / _MIRRORED_BENCH_MAX_SWEEPS))
+    sweep_count = math.ceil(desired_calls / calls_per_sample)
+    if sweep_count % 2:
+        sweep_count += 1
+    total_calls = sweep_count * calls_per_sample
+    return sweep_count, calls_per_sample, total_calls
 
 
 def _make_l2_cache_clearer() -> Callable[[], None]:
@@ -313,6 +342,79 @@ def interleaved_bench_generic(
     return [statistics.median(times) for times in all_times]
 
 
+def mirrored_bench_generic(
+    fns: list[Callable[[], object]],
+    *,
+    repeat: int,
+    desc: str | None = None,
+    after_call: Callable[[int], None] | None = None,
+) -> MirroredBenchmarkTrace:
+    """Benchmark functions in bounded, rotated forward/reverse sample pairs."""
+    if not fns:
+        return MirroredBenchmarkTrace([], [], [])
+
+    # Every forward sweep is paired with its exact reverse so each function has
+    # the same mean position within a pair. Rotate successive pairs to spread
+    # any nonlinear thermal drift across the candidate set. Fast kernels batch
+    # multiple individually timed calls into each retained sample so the trace is
+    # bounded without reducing the requested timing work.
+    sweep_count, calls_per_sample, total_calls = _mirrored_bench_call_layout(repeat)
+
+    _output: object = None
+    for index, fn in enumerate(fns):
+        try:
+            _output = fn()
+            synchronize_device()
+        finally:
+            if after_call is not None:
+                after_call(index)
+
+    clear_l2 = _make_l2_cache_clearer()
+    all_times: list[list[float]] = [[] for _ in fns]
+    orders: list[list[int]] = []
+    elapsed_ms: list[list[float]] = []
+    indices = list(range(len(fns)))
+    iterator = iter_with_progress(
+        range(sweep_count),
+        total=sweep_count,
+        description=desc,
+        enabled=desc is not None,
+    )
+    for sweep in iterator:
+        offset = (sweep // 2) % len(indices)
+        rotated = indices[offset:] + indices[:offset]
+        order = rotated if sweep % 2 == 0 else list(reversed(rotated))
+        sweep_times: list[float] = []
+        for index in order:
+            elapsed = 0.0
+            for _ in range(calls_per_sample):
+                clear_l2()
+                synchronize_device()
+                start = time.perf_counter()
+                try:
+                    output = fns[index]()
+                    synchronize_device()
+                    elapsed += (time.perf_counter() - start) * 1000
+                    _output = output
+                finally:
+                    if after_call is not None:
+                        after_call(index)
+            sample = elapsed / calls_per_sample
+            all_times[index].append(sample)
+            sweep_times.append(sample)
+        orders.append(order)
+        elapsed_ms.append(sweep_times)
+
+    return MirroredBenchmarkTrace(
+        orders,
+        elapsed_ms,
+        [statistics.median(times) for times in all_times],
+        sweep_count=sweep_count,
+        calls_per_sample=calls_per_sample,
+        total_calls=total_calls,
+    )
+
+
 def paired_device_micros_bench(
     fns: list[Callable[..., object]],
     reference_fn: Callable[..., object],
@@ -492,6 +594,30 @@ def _summarize_statistics_fallback(
     return statistics.median(times)
 
 
+def _estimate_runtime_and_warmup(
+    run_batch: Callable[[int], float],
+    *,
+    warmup: int,
+    rep: int,
+    process_group_name: str | None,
+) -> tuple[float, int]:
+    """Estimate one launch and avoid redundant work for long-running kernels."""
+    first_elapsed_ms = run_batch(1)
+    first_estimate_ms = sync_object(
+        first_elapsed_ms, process_group_name=process_group_name
+    )
+    if first_estimate_ms >= max(warmup, rep):
+        # The setup and estimate calls have already warmed the kernel.
+        return first_estimate_ms, 0
+
+    remaining_elapsed_ms = run_batch(4)
+    estimate_ms = sync_object(
+        (first_elapsed_ms + remaining_elapsed_ms) / 5,
+        process_group_name=process_group_name,
+    )
+    return estimate_ms, max(1, int(warmup / estimate_ms))
+
+
 # This function is copied from triton._testing.do_bench with modification
 # to make sure different ranks run the benchmark for the same number
 # of times.
@@ -604,12 +730,15 @@ def do_bench_generic(
     *,
     default_cudagraph: bool = False,  # accepted for API symmetry; wall-clock timing doesn't use CG
     fixed_repetitions: int | None = None,
+    probe_long_kernel: bool = False,
 ) -> float | tuple[float, ...]:
     """
     Benchmark using wall-clock timing for backends without Triton event timing.
 
     ``fixed_repetitions`` skips adaptive estimation and times exactly that many
-    calls after the initial setup call.
+    calls after the initial setup call. ``probe_long_kernel`` avoids four
+    redundant estimate calls when the first call already exceeds both timing
+    windows; CuTe flash enables it for multi-second attention candidates.
     """
     assert return_mode in ["min", "max", "mean", "median", "all"]
 
@@ -618,21 +747,39 @@ def do_bench_generic(
 
     clear_l2 = _make_l2_cache_clearer()
 
-    if fixed_repetitions is None:
-        # Estimate the runtime of the function
+    if fixed_repetitions is None and probe_long_kernel:
+
+        def run_estimate_batch(count: int) -> float:
+            nonlocal _output
+            synchronize_device()
+            start = time.perf_counter()
+            for _ in range(count):
+                clear_l2()
+                # Keep the latest asynchronous output alive through synchronization.
+                _output = fn()
+            synchronize_device()
+            end = time.perf_counter()
+            return (end - start) * 1000
+
+        estimate_ms, n_warmup = _estimate_runtime_and_warmup(
+            run_estimate_batch,
+            warmup=warmup,
+            rep=rep,
+            process_group_name=process_group_name,
+        )
+        n_repeat = max(1, int(rep / estimate_ms))
+    elif fixed_repetitions is None:
         synchronize_device()
         start = time.perf_counter()
         for _ in range(5):
             clear_l2()
-            # Keep the latest asynchronous output alive through synchronization.
             _output = fn()
         synchronize_device()
         end = time.perf_counter()
         estimate_ms = sync_object(
-            (end - start) * 1000 / 5, process_group_name=process_group_name
+            (end - start) * 1000 / 5,
+            process_group_name=process_group_name,
         )
-
-        # compute number of warmup and repeat
         n_warmup = max(1, int(warmup / estimate_ms))
         n_repeat = max(1, int(rep / estimate_ms))
     else:

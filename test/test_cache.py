@@ -226,6 +226,14 @@ KERNELS = {
 
 @onlyBackends(["triton", "cute"])
 class TestCache(RefEagerTestDisabled, TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        cache_dir = self._test_stack.enter_context(tempfile.TemporaryDirectory())
+        self._test_stack.enter_context(
+            patch.dict(os.environ, {"HELION_CACHE_DIR": cache_dir}, clear=False)
+        )
+        os.environ.pop(_backend_cache_dir_env(), None)
+
     @parametrize(
         "name",
         ("add", "matmul", "welford", "list_tensor", "list_tensor_different_shapes"),
@@ -793,6 +801,14 @@ class FailingBackend(RemoteCacheBackend):
 
 @onlyBackends(["triton"])
 class TestRemoteCache(RefEagerTestDisabled, TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        cache_dir = self._test_stack.enter_context(tempfile.TemporaryDirectory())
+        self._test_stack.enter_context(
+            patch.dict(os.environ, {"HELION_CACHE_DIR": cache_dir}, clear=False)
+        )
+        os.environ.pop(_backend_cache_dir_env(), None)
+
     def _make_remote_cache_fn(self, backend):
         from helion.autotuner.remote_cache import RemoteAutotuneCache
 

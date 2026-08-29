@@ -369,7 +369,7 @@ class _CuteFuseTwoPassLoads:
         Currently handles:
           - LoopedReductionStrategy ``unroll`` mode:
             ``reduction_lane_base_<N>``, ``reduction_vec_lane_<N>``.
-          - CuteNDTileStrategy lane / vec naming:
+          - PerThreadNDTileStrategy lane / vec naming:
             ``lane_base_<N>``, ``_tile_unroll_vec_<N>_<sweep>``,
             ``vec_lane_<N>``.
         """

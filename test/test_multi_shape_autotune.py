@@ -19,6 +19,7 @@ from helion import exc
 from helion._compiler.backend import TritonBackend
 from helion._testing import DEVICE
 from helion._testing import skipIfRefEager
+from helion.autotuner import PatternSearch
 from helion.autotuner import benchmark_provider as benchmark_provider_module
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.base_search import PopulationBasedSearch
@@ -216,6 +217,11 @@ class _RuntimeConfigSpec:
     ) -> str:
         return "fake-config-spec"
 
+    def cache_fingerprint_hash(
+        self, *, advanced_controls_files: list[str] | None
+    ) -> str:
+        return "fake-config-spec"
+
     def normalize(self, config: Config) -> None:
         config.config.setdefault("num_warps", 4)
 
@@ -293,6 +299,12 @@ class TestMultiShapeRuntime(unittest.TestCase):
     ) -> None:
         settings = _runtime_settings()
         bound = _RuntimeBoundKernel(_RuntimeBackend(), settings)
+        bound.config_spec.cache_fingerprint_hash = Mock(  # pyrefly: ignore[bad-assignment]
+            return_value="cache-policy-fingerprint"
+        )
+        bound.config_spec.structural_fingerprint_hash = Mock(  # pyrefly: ignore[bad-assignment]
+            side_effect=AssertionError("structural-only cache key used")
+        )
         workload_key = (
             "multi_shape:v1",
             "max",
@@ -314,6 +326,11 @@ class TestMultiShapeRuntime(unittest.TestCase):
 
         self.assertEqual(key.specialization_key, workload_key)
         self.assertEqual(key.extra_results, ())
+        self.assertEqual(key.config_spec_hash, "cache-policy-fingerprint")
+        bound.config_spec.cache_fingerprint_hash.assert_called_once_with(  # pyrefly: ignore[missing-attribute]
+            advanced_controls_files=None
+        )
+        bound.config_spec.structural_fingerprint_hash.assert_not_called()  # pyrefly: ignore[missing-attribute]
         bound.kernel._base_specialization_key.assert_not_called()
         bound.kernel._create_bound_kernel_cache_key.assert_not_called()
 
@@ -520,6 +537,7 @@ class _FakeLocalBenchmarkProvider:
         self.cleanup_count = 0
         self.budget_exceeded_fn: Callable[[], bool] = lambda: False
         self.fns = [lambda: None for _ in kernel.timings]
+        self.effective_source_repairs: dict[Config, BenchmarkResult] = {}
 
     def set_budget_exceeded_fn(self, fn: Callable[[], bool]) -> None:
         self.budget_exceeded_fn = fn
@@ -532,6 +550,11 @@ class _FakeLocalBenchmarkProvider:
 
     def cleanup(self) -> None:
         self.cleanup_count += 1
+
+    def take_effective_source_repairs(self) -> dict[Config, BenchmarkResult]:
+        repairs = self.effective_source_repairs
+        self.effective_source_repairs = {}
+        return repairs
 
     def benchmark(
         self, configs: list[Config], *, desc: str = "Benchmarking"
@@ -625,6 +648,7 @@ class TestMultiShapeBenchmarkProvider(unittest.TestCase):
         self.assertIs(results[0].config, configs[0])
         self.assertIs(results[1].config, configs[1])
         self.assertEqual(metrics.num_configs_tested, 2)
+        self.assertEqual(metrics.num_successful_candidate_measurements, 2)
         self.assertTrue(provider.args.found_valid_config)
         children = cast("list[_FakeLocalBenchmarkProvider]", provider.children)
         self.assertTrue(
@@ -665,6 +689,119 @@ class TestMultiShapeBenchmarkProvider(unittest.TestCase):
         self.assertIn("latency=1.000000 ms, status=deduplicated", summary)
         self.assertIn("ratio=2.000000x", summary)
 
+    def test_later_child_source_repair_updates_aggregate_measurement(self) -> None:
+        spec = _make_config_spec()
+        provider, _ = self._make_provider(
+            [
+                _FakeBoundKernel(spec, [math.inf], statuses=["timeout"]),
+                _FakeBoundKernel(spec, [math.inf], statuses=["error"]),
+            ]
+        )
+        provider._collect_effective_source_repairs = True
+        failed = Config(block_sizes=[64])
+        first = provider.benchmark([failed])[0]
+        materialized = _materialize_multi_shape_config(spec, failed)
+        children = cast("list[_FakeLocalBenchmarkProvider]", provider.children)
+        replacement_fn = Mock()
+        children[0].effective_source_repairs[materialized] = BenchmarkResult(
+            materialized,
+            replacement_fn,
+            1.0,
+            "deduplicated",
+            None,
+        )
+        children[1].effective_source_repairs[materialized] = BenchmarkResult(
+            materialized,
+            Mock(),
+            2.0,
+            "deduplicated",
+            None,
+        )
+
+        provider.benchmark([Config(block_sizes=[128])])
+        repairs = provider.take_effective_source_repairs()
+
+        self.assertEqual(first.status, "timeout")
+        repaired = repairs[failed]
+        self.assertEqual(repaired.status, "deduplicated")
+        self.assertAlmostEqual(repaired.perf, math.sqrt(2.0))
+        self.assertIs(repaired.fn, replacement_fn)
+        timings, objective, statuses = provider.args.measurements[repr(materialized)]
+        self.assertEqual(timings, (1.0, 2.0))
+        self.assertAlmostEqual(objective, math.sqrt(2.0))
+        self.assertEqual(
+            statuses,
+            ("deduplicated", "deduplicated"),
+        )
+
+    def test_same_config_retry_does_not_hide_prior_aggregate_repair(self) -> None:
+        spec = _make_config_spec()
+        cases = [
+            _FakeBoundKernel(spec, [math.inf], statuses=["timeout"]),
+            _FakeBoundKernel(spec, [math.inf], statuses=["error"]),
+        ]
+        provider, _ = self._make_provider(cases)
+        provider._collect_effective_source_repairs = True
+        failed = Config(block_sizes=[64])
+        provider.benchmark([failed])
+        materialized = _materialize_multi_shape_config(spec, failed)
+        children = cast("list[_FakeLocalBenchmarkProvider]", provider.children)
+        for child, perf in zip(children, (1.0, 2.0), strict=True):
+            child.effective_source_repairs[materialized] = BenchmarkResult(
+                materialized,
+                child.fns[0],
+                perf,
+                "deduplicated",
+                None,
+            )
+        cases[0].timings = [1.0]
+        cases[0].statuses = ["ok"]
+        cases[1].timings = [2.0]
+        cases[1].statuses = ["ok"]
+
+        retried = provider.benchmark([failed])[0]
+        repairs = provider.take_effective_source_repairs()
+
+        self.assertAlmostEqual(retried.perf, math.sqrt(2.0))
+        self.assertAlmostEqual(repairs[failed].perf, math.sqrt(2.0))
+        self.assertFalse(provider._original_configs_by_materialized_key)
+        self.assertFalse(provider._anchor_fns_by_materialized_key)
+
+    def test_repair_covers_distinct_configs_with_same_materialized_key(self) -> None:
+        spec = _make_config_spec()
+        provider, _ = self._make_provider(
+            [
+                _FakeBoundKernel(
+                    spec, [math.inf, math.inf], statuses=["error", "error"]
+                ),
+                _FakeBoundKernel(
+                    spec, [math.inf, math.inf], statuses=["timeout", "timeout"]
+                ),
+            ]
+        )
+        provider._collect_effective_source_repairs = True
+        first = Config(block_size=64)
+        second = Config(block_sizes=[64])
+        self.assertNotEqual(first, second)
+        provider.benchmark([first, second])
+        materialized = _materialize_multi_shape_config(spec, first)
+        children = cast("list[_FakeLocalBenchmarkProvider]", provider.children)
+        for child, perf in zip(children, (1.0, 2.0), strict=True):
+            child.effective_source_repairs[materialized] = BenchmarkResult(
+                materialized,
+                child.fns[0],
+                perf,
+                "deduplicated",
+                None,
+            )
+
+        provider._collect_child_effective_source_repairs()
+        repairs = provider.take_effective_source_repairs()
+
+        self.assertAlmostEqual(repairs[first].perf, math.sqrt(2.0))
+        self.assertAlmostEqual(repairs[second].perf, math.sqrt(2.0))
+        self.assertFalse(provider._original_configs_by_materialized_key)
+
     def test_deduplicated_default_reference_is_successful(self) -> None:
         spec = _make_config_spec()
         provider, _ = self._make_provider(
@@ -692,6 +829,28 @@ class TestMultiShapeBenchmarkProvider(unittest.TestCase):
         self.assertEqual(
             [child.compiler_seed_config_calls for child in children],
             [[configs], [configs]],
+        )
+
+    def test_compiler_seed_retry_claims_are_independent_per_child(
+        self,
+    ) -> None:
+        children = []
+        for _ in range(2):
+            child = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+            child.config_spec = SimpleNamespace(
+                compiler_seed_timeout_retry_repetitions=3
+            )
+            children.append(child)
+        provider = MultiShapeBenchmarkProvider.__new__(MultiShapeBenchmarkProvider)
+        provider.children = children
+
+        provider.set_compiler_seed_configs(
+            [Config(block_sizes=[64]), Config(block_sizes=[128])]
+        )
+
+        self.assertEqual(
+            [child._compiler_seed_timeout_retry_claims for child in children],
+            [set(), set()],
         )
 
     def test_raw_and_relative_max_choose_different_configs(self) -> None:
@@ -841,6 +1000,7 @@ class TestMultiShapeBenchmarkProvider(unittest.TestCase):
         self.assertEqual(metrics.num_accuracy_failures, 3)
         self.assertEqual(metrics.num_compile_failures, 2)
         self.assertEqual(metrics.num_worker_failures, 3)
+        self.assertEqual(metrics.num_successful_candidate_measurements, 0)
 
     def test_source_metrics_sum_child_deltas(self) -> None:
         spec = _make_config_spec()
@@ -875,6 +1035,7 @@ class TestMultiShapeBenchmarkProvider(unittest.TestCase):
 
         self.assertEqual([result.perf for result in results], [math.inf, 4.0])
         self.assertEqual(metrics.num_configs_tested, 2)
+        self.assertEqual(metrics.num_successful_candidate_measurements, 1)
         for child in provider.children:
             self.assertEqual(len(child.benchmark_calls[0][0]), 1)
 
@@ -1045,12 +1206,11 @@ class TestMultiShapeBenchmarkProvider(unittest.TestCase):
         members = [
             PopulationMember(lambda: None, [2.0], [], config) for config in configs
         ]
-        search = SimpleNamespace(
-            benchmark_provider=provider,
-            best_perf_so_far=2.0,
-        )
+        search = object.__new__(PatternSearch)
+        search.benchmark_provider = provider
+        search.best_perf_so_far = 2.0
 
-        PopulationBasedSearch.rebenchmark(cast("object", search), members, desc="again")  # type: ignore[arg-type]
+        search.rebenchmark(members, desc="again")
 
         self.assertEqual([member.perfs for member in members], [[2.0, 3.0], [2.0, 1.0]])
         self.assertEqual(search.best_perf_so_far, 1.0)
@@ -1201,7 +1361,7 @@ class TestMultiShapeBestOfK(unittest.TestCase):
                 self.log = _TrialLog()
                 self.best_perf_so_far = math.inf
 
-            def autotune(self) -> Config:
+            def autotune(self, *, skip_cache: bool = False) -> Config:
                 outcome = next(outcome_iter)
                 if outcome is exc.NoConfigFound:
                     raise exc.NoConfigFound

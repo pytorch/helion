@@ -32,6 +32,7 @@ from pathlib import Path
 import sys
 import threading
 import traceback
+import types
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
@@ -210,14 +211,18 @@ class ShapeKey:
     kernel_name: str
     specialization_key: tuple[Any, ...]
     hardware_id: str
+    search_policy_hash: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to a JSON-serializable dict."""
-        return {
+        result = {
             "kernel_name": self.kernel_name,
             "specialization_key": _serialize_tuple(self.specialization_key),
             "hardware_id": self.hardware_id,
         }
+        if self.search_policy_hash:
+            result["search_policy_hash"] = self.search_policy_hash
+        return result
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ShapeKey:
@@ -226,6 +231,7 @@ class ShapeKey:
             kernel_name=data["kernel_name"],
             specialization_key=_deserialize_tuple(data["specialization_key"]),
             hardware_id=data["hardware_id"],
+            search_policy_hash=data.get("search_policy_hash", ""),
         )
 
     def stable_hash(self) -> str:
@@ -363,6 +369,20 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
     def _should_report_cache_hit(self) -> bool:
         return self.mode not in ("evaluate", "compile") or self._verbose
+
+    def _search_policy_allows_cache_io(self) -> bool:
+        # Evaluate/compile/disabled select an AOT heuristic or default config;
+        # they are not search-result cache reads and must never start tuning.
+        if self.mode in ("disabled", "evaluate", "compile"):
+            return True
+        return super()._search_policy_allows_cache_io()
+
+    def _search_policy_allows_cache_write(self) -> bool:
+        # Collect must record a newly tuned config even when its custom search
+        # policy is intentionally ineligible for later cache reuse.
+        if self.mode == "collect":
+            return True
+        return super()._search_policy_allows_cache_write()
 
     @property
     def _configs_file(self) -> Path:
@@ -505,10 +525,19 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
     def _create_shape_key(self) -> ShapeKey:
         """Create a shape key for the current kernel invocation."""
+        from .local_cache import _cute_flash_search_policy_hash
+
+        search_policy_hash = _cute_flash_search_policy_hash(
+            self.autotuner,
+            cute_flash_search_enabled=bool(
+                getattr(self.kernel.config_spec, "cute_flash_search_enabled", False)
+            ),
+        )
         return ShapeKey(
             kernel_name=self.kernel.kernel.name,
             specialization_key=self.kernel.kernel.specialization_key(self.args),
             hardware_id=self.hardware_id,
+            search_policy_hash=search_policy_hash,
         )
 
     def _extract_shape_features(
@@ -1144,11 +1173,18 @@ class AOTAutotuneCache(AutotuneCacheBase):
         return super().autotune(skip_cache=skip_cache)
 
 
+def _code_identity(
+    code: types.CodeType,
+) -> tuple[bytes, tuple[Any, ...], tuple[str, ...]]:
+    """Semantic identity of a code object: bytecode + constants + referenced names."""
+    return (code.co_code, code.co_consts, code.co_names)
+
+
 def _serialize_value(val: object) -> object:
     """Serialize a single value to JSON-compatible format.
 
     Supports: None, bool, int, float, str, type, tuple, frozenset, set,
-    torch.dtype, torch.device, list, dict.
+    torch.dtype, torch.device, list, dict, code, bytes, ellipsis, complex.
     """
     if val is None:
         return None
@@ -1170,13 +1206,25 @@ def _serialize_value(val: object) -> object:
         return [_serialize_value(v) for v in val]
     if isinstance(val, dict):
         return {k: _serialize_value(v) for k, v in val.items()}
+    if isinstance(val, types.CodeType):
+        return _serialize_value(_code_identity(val))
+    if isinstance(val, bytes):
+        return {"__bytes__": val.hex()}
+    if isinstance(val, types.EllipsisType):
+        return {"__ellipsis__": True}
+    if isinstance(val, complex):
+        return {"__complex__": [val.real, val.imag]}
     raise TypeError(f"Cannot serialize type: {type(val).__name__}")
 
 
 def _deserialize_value(val: object) -> object:
     """Deserialize a JSON value back to Python object.
 
-    Handles tagged dicts: __tuple__, __frozenset__, __set__, __dtype__, __device__, __type__.
+    Handles tagged dicts: __tuple__, __frozenset__, __set__, __dtype__, __device__,
+    __type__, __bytes__, __ellipsis__, __complex__.
+
+    Note: __code__ is not turned back into a code object. This is fine because the AOT
+    cache only compares specialization keys, it never calls the original function.
     """
     if isinstance(val, dict):
         if "__tuple__" in val:
@@ -1192,6 +1240,13 @@ def _deserialize_value(val: object) -> object:
             return torch.device(val["__device__"])
         if "__type__" in val:
             return _import_type(val["__type__"])
+        if "__bytes__" in val:
+            return bytes.fromhex(val["__bytes__"])
+        if "__ellipsis__" in val:
+            return ...
+        if "__complex__" in val:
+            real, imag = _deserialize_tuple(val["__complex__"])
+            return complex(real, imag)
         return {k: _deserialize_value(v) for k, v in val.items()}
     if isinstance(val, list):
         return [_deserialize_value(v) for v in val]

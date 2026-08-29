@@ -5,8 +5,10 @@ import copy
 import dataclasses
 import datetime
 import functools
+import hashlib
 from itertools import count
 from itertools import starmap
+import json
 import math
 from math import inf
 import os
@@ -37,6 +39,7 @@ from .benchmark_job import BenchmarkJob
 from .benchmark_worker import BenchmarkSubprocessError
 from .benchmark_worker import BenchmarkTimeout
 from .benchmark_worker import BenchmarkWorker
+from .benchmark_worker import BenchmarkWorkerUnkillable
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
@@ -77,10 +80,20 @@ if TYPE_CHECKING:
 MultiShapeAggregation = Literal["geomean", "max"]
 MultiShapeReference = Literal["default", "baseline"] | None
 _SUCCESSFUL_BENCHMARK_STATUSES = frozenset(("ok", "deduplicated"))
+_COMPILER_SEED_TIMEOUT_RETRY_LIMIT = 1
+_COMPILE_CONFIG_FAILURE_SOURCE_DOMAIN = b"helion.compile_config_failure.v1\0"
 
 
 def _benchmark_status_succeeded(status: str) -> bool:
     return status in _SUCCESSFUL_BENCHMARK_STATUSES
+
+
+def _compile_config_failure_source_hash(config: Config) -> str:
+    """Return a stable ledger identity when compilation produced no callable."""
+    canonical = json.dumps(config.config, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(
+        _COMPILE_CONFIG_FAILURE_SOURCE_DOMAIN + canonical.encode("utf-8")
+    ).hexdigest()
 
 
 @dataclasses.dataclass
@@ -352,8 +365,35 @@ class BenchmarkResult(NamedTuple):
     fn: Callable[..., object]
     perf: float
     status: Literal[
-        "ok", "error", "timeout", "peer_compilation_fail", "filtered", "deduplicated"
+        "ok",
+        "error",
+        "timeout",
+        "peer_compilation_fail",
+        "filtered",
+        "deduplicated",
+        "accuracy_error",
+        "source_rejected",
     ]
+    compile_time: float | None
+
+
+class IsolatedBenchmarkFailure(NamedTuple):
+    """A conclusive failure while rechecking an already-validated function.
+
+    ``None`` remains the provider's backward-compatible signal that isolated
+    timing was unavailable and the caller should retain its prior timing.
+    """
+
+    status: Literal["error", "timeout"]
+
+
+IsolatedBenchmarkTiming = float | None | IsolatedBenchmarkFailure
+
+
+@dataclasses.dataclass(frozen=True)
+class _PendingEffectiveSourceFailure:
+    config: Config
+    config_id: str | None
     compile_time: float | None
 
 
@@ -419,6 +459,18 @@ class BenchmarkProvider(abc.ABC):
         """Register normalized compiler-owned seeds, if the provider needs them."""
         return None
 
+    def has_measured_source_hash(self, source_hash: str) -> bool:
+        """Return whether a successful measurement produced ``source_hash``."""
+        return False
+
+    def take_effective_source_repairs(self) -> dict[Config, BenchmarkResult]:
+        """Return and clear source-equivalent repairs discovered since last read."""
+        return {}
+
+    def invalidate_effective_source_hash(self, source_hash: str) -> None:
+        """Prevent a failed rebenchmark source from being reused as an alias."""
+        return None
+
     @abc.abstractmethod
     def benchmark(
         self,
@@ -443,12 +495,14 @@ class BenchmarkProvider(abc.ABC):
         warmup: int,
         rep: int,
         desc: str = "Benchmarking",
-    ) -> list[float | None] | None:
+    ) -> list[IsolatedBenchmarkTiming] | None:
         """Benchmark already-validated functions in an isolated subprocess.
 
         Return ``None`` when the provider cannot support the isolated path or
         per-function ``None`` when a timing could not be confirmed and callers
-        should keep the prior timing for that function.
+        should keep the prior timing for that function. A returned
+        :class:`IsolatedBenchmarkFailure` is conclusive and lets search policy
+        decide whether that candidate must be invalidated.
         """
         return None
 
@@ -501,8 +555,14 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._last_benchmark_failure_status: Literal["error", "timeout"] | None = None
         self._effective_source_hashes: set[str] = set()
         self._effective_source_results: dict[str, BenchmarkResult] = {}
+        self._invalid_effective_source_hashes: set[str] = set()
+        self._pending_effective_source_failures: dict[
+            str, list[_PendingEffectiveSourceFailure]
+        ] = {}
+        self._effective_source_repairs: dict[Config, BenchmarkResult] = {}
         self._compiler_seed_configs: set[Config] = set()
         self._compiler_seed_source_hashes: set[str] = set()
+        self._compiler_seed_timeout_retry_claims: set[tuple[str, object]] = set()
         # budget_exceeded_fn inherits the class-level _never_exceeded default
         # until BaseSearch._prepare installs the search's real hook.
 
@@ -525,21 +585,81 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._autotune_metrics.num_accuracy_failures += 1
         self._accuracy_failure_config_ids.append(id(config))
 
-    def _record_compile_failure(self, config: Config) -> None:
-        self._autotune_metrics.num_compile_failures += 1
-        self._compile_failure_config_ids.append(id(config))
+    def has_measured_source_hash(self, source_hash: str) -> bool:
+        result = self._effective_source_results.get(source_hash)
+        return (
+            result is not None
+            and result.status in ("ok", "deduplicated")
+            and math.isfinite(result.perf)
+        )
 
-    def _record_worker_failure(
+    def take_effective_source_repairs(self) -> dict[Config, BenchmarkResult]:
+        repairs = self._effective_source_repairs
+        self._effective_source_repairs = {}
+        return repairs
+
+    def invalidate_effective_source_hash(self, source_hash: str) -> None:
+        self._invalid_effective_source_hashes.add(source_hash)
+        self._effective_source_results.pop(source_hash, None)
+        self._pending_effective_source_failures.pop(source_hash, None)
+        backend = self.config_spec.backend
+        for config, repair in list(self._effective_source_repairs.items()):
+            if backend.generated_source_hash(repair.fn) == source_hash:
+                del self._effective_source_repairs[config]
+
+    def _remember_effective_source_failure(
         self,
+        source_hash: str,
         config: Config,
-        status: Literal["error", "timeout"],
+        config_id: str | None,
+        compile_time: float | None,
     ) -> None:
-        self._last_benchmark_failure_status = status
-        self._autotune_metrics.num_worker_failures += 1
-        self._worker_failure_config_ids.append(id(config))
+        stored_config = copy.deepcopy(config)
+        self._pending_effective_source_failures.setdefault(source_hash, []).append(
+            _PendingEffectiveSourceFailure(
+                config=stored_config,
+                config_id=config_id,
+                compile_time=compile_time,
+            )
+        )
+
+    def _resolve_effective_source_failures(
+        self,
+        source_hash: str,
+        source_result: BenchmarkResult,
+    ) -> dict[Config, BenchmarkResult]:
+        repaired: dict[Config, BenchmarkResult] = {}
+        for pending in self._pending_effective_source_failures.pop(source_hash, []):
+            repair = BenchmarkResult(
+                config=pending.config,
+                fn=source_result.fn,
+                perf=source_result.perf,
+                status="deduplicated",
+                compile_time=None,
+            )
+            repaired[pending.config] = repair
+            self._effective_source_repairs[pending.config] = repair
+            self._autotune_metrics.num_source_deduplications += 1
+            if pending.config_id is not None:
+                self.log.record_autotune_entry(
+                    AutotuneLogEntry(
+                        # The original failure already has its own terminal row.
+                        # Attribute this repair to the generation whose successful
+                        # alias proved the source, including across benchmark batches.
+                        generation=self._autotune_metrics.num_generations,
+                        status="deduplicated",
+                        perf_ms=source_result.perf,
+                        compile_time=None,
+                        config_id=pending.config_id,
+                        config=pending.config,
+                        source_hash=source_hash,
+                    )
+                )
+        return repaired
 
     def set_compiler_seed_configs(self, configs: Sequence[Config]) -> None:
         self._compiler_seed_source_hashes = set()
+        self._compiler_seed_timeout_retry_claims = set()
         if self._compiler_seed_timeout_retry_repetitions() is None:
             self._compiler_seed_configs = set()
             return
@@ -554,6 +674,37 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             self._compiler_seed_timeout_retry_repetitions() is not None
             and config in self._compiler_seed_configs
         )
+
+    def _claim_compiler_seed_timeout_retry(
+        self,
+        config: Config,
+        effective_source_hash: str | None,
+    ) -> bool:
+        """Claim one budget-gated retry for this distinct seed source."""
+        key: tuple[str, object] = (
+            ("source", effective_source_hash)
+            if effective_source_hash is not None
+            else ("config", config)
+        )
+        if key in self._compiler_seed_timeout_retry_claims:
+            return False
+        if self.budget_exceeded_fn():
+            return False
+        self._compiler_seed_timeout_retry_claims.add(key)
+        return True
+
+    def _record_compile_failure(self, config: Config) -> None:
+        self._autotune_metrics.num_compile_failures += 1
+        self._compile_failure_config_ids.append(id(config))
+
+    def _record_worker_failure(
+        self,
+        config: Config,
+        status: Literal["error", "timeout"],
+    ) -> None:
+        self._last_benchmark_failure_status = status
+        self._autotune_metrics.num_worker_failures += 1
+        self._worker_failure_config_ids.append(id(config))
 
     def _compute_baseline(
         self,
@@ -787,7 +938,11 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._precompile_result_counter = count()
         self._effective_source_hashes.clear()
         self._effective_source_results.clear()
+        self._invalid_effective_source_hashes.clear()
+        self._pending_effective_source_failures.clear()
+        self._effective_source_repairs.clear()
         self._compiler_seed_source_hashes.clear()
+        self._compiler_seed_timeout_retry_claims.clear()
         # Drop the baseline tensors (GPU memory) so refcount frees them
         # the moment the provider loses its last external reference.
         self._baseline_output = None
@@ -804,6 +959,12 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             return False
         custom_bench = backend.get_do_bench()
         return backend.name == "cute" and custom_bench is do_bench_generic
+
+    def _probe_long_cute_flash_kernel(self) -> bool:
+        return bool(
+            self.config_spec.cute_flash_search_enabled
+            and self._subprocess_benchmark_uses_wall_clock()
+        )
 
     def _effective_source_dedup_enabled(self) -> bool:
         """Whether this provider may collapse source-identical candidates.
@@ -967,6 +1128,11 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             for c in all_configs
         ]
 
+        deduplicate_sources = self._effective_source_dedup_enabled()
+        backend = self.config_spec.backend if deduplicate_sources else None
+        source_hashes: dict[int, str] = {}
+        seen_sources = self._effective_source_hashes
+
         # Compilation phase
         for i, config in enumerate(all_configs):
             if self._budget_exceeded_synced():
@@ -978,8 +1144,33 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 with capture_output() as captured:
                     compiled[i] = self.kernel.compile_config(config, allow_print=False)
             except Exception as e:
-                if not compiled and i == len(all_configs) - 1:
-                    raise
+                raise_if_no_viable_config = (
+                    not compiled
+                    and i == len(all_configs) - 1
+                    and self._autotune_metrics.num_successful_candidate_measurements
+                    == 0
+                )
+                self._record_compile_failure(config)
+                if deduplicate_sources:
+                    # No callable exists to carry generated-source identity, but
+                    # strict source ledgers still need an auditable terminal row.
+                    source_hash = _compile_config_failure_source_hash(config)
+                    if source_hash not in seen_sources:
+                        seen_sources.add(source_hash)
+                        self._autotune_metrics.num_unique_sources += 1
+                    config_id = self.log.register_config(config)
+                    if config_id is not None:
+                        self.log.record_autotune_entry(
+                            AutotuneLogEntry(
+                                generation=self._autotune_metrics.num_generations,
+                                status="error",
+                                perf_ms=None,
+                                compile_time=None,
+                                config_id=config_id,
+                                config=config,
+                                source_hash=source_hash,
+                            )
+                        )
                 maybe_dump_triton_failure(
                     self.kernel, config, e, captured_output=captured[0] or None
                 )
@@ -988,16 +1179,56 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     f"{self.kernel.format_kernel_decorator(config, self.settings)}",
                     exc_info=True,
                 )
+                if raise_if_no_viable_config:
+                    raise
 
-        source_hashes: dict[int, str] = {}
-        aliases_by_representative: dict[int, list[int]] = {}
         deduplicated_indices: set[int] = set()
+        recorded_deduplicated_indices: set[int] = set()
+        batch_repairs: dict[Config, BenchmarkResult] = {}
         unique_compiled: dict[int, Callable[..., object]] = {}
-        representative_by_hash: dict[str, int] = {}
-        deduplicate_sources = self._effective_source_dedup_enabled()
-        backend = self.config_spec.backend if deduplicate_sources else None
-        seen_sources = self._effective_source_hashes
         cached_source_results = self._effective_source_results
+        invalid_sources = self._invalid_effective_source_hashes
+
+        def record_final_result(
+            index: int,
+            config_id: str | None,
+            compile_time: float | None,
+        ) -> None:
+            if config_id is None:
+                return
+            result = results[index]
+            self.log.record_autotune_entry(
+                AutotuneLogEntry(
+                    generation=self._autotune_metrics.num_generations,
+                    status=result.status,
+                    perf_ms=result.perf if math.isfinite(result.perf) else None,
+                    compile_time=(
+                        None if result.status == "deduplicated" else compile_time
+                    ),
+                    config_id=config_id,
+                    config=all_configs[index],
+                    source_hash=source_hashes.get(index),
+                )
+            )
+
+        def record_started_result(
+            index: int,
+            config_id: str | None,
+            compile_time: float | None,
+        ) -> None:
+            if config_id is None:
+                return
+            self.log.record_autotune_entry(
+                AutotuneLogEntry(
+                    generation=self._autotune_metrics.num_generations,
+                    status="started",
+                    perf_ms=None,
+                    compile_time=compile_time,
+                    config_id=config_id,
+                    config=all_configs[index],
+                    source_hash=source_hashes.get(index),
+                )
+            )
 
         for index, fn in compiled.items():
             source_hash = (
@@ -1026,13 +1257,6 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 deduplicated_indices.add(index)
                 self._autotune_metrics.num_source_deduplications += 1
                 continue
-            representative = representative_by_hash.get(source_hash)
-            if representative is not None:
-                aliases_by_representative.setdefault(representative, []).append(index)
-                deduplicated_indices.add(index)
-                self._autotune_metrics.num_source_deduplications += 1
-                continue
-            representative_by_hash[source_hash] = index
             unique_compiled[index] = fn
 
         compiled = unique_compiled
@@ -1086,34 +1310,66 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             else:
                 compile_time = None
             status: Literal[
-                "ok", "error", "timeout", "peer_compilation_fail", "filtered"
+                "ok",
+                "error",
+                "timeout",
+                "peer_compilation_fail",
+                "filtered",
+                "deduplicated",
+                "accuracy_error",
+                "source_rejected",
             ]
-            # config_id is None when no log sink is active (skip recording). The
-            # started and result rows share it so they join to one config, and
-            # every config that reaches the benchmark loop is logged -- including
-            # ones that never benchmark because they (or a peer) failed to compile.
+            # config_id is None when no log sink is active. A started row is
+            # emitted only for an actual benchmark attempt; source aliases that
+            # reuse a completed result get a standalone deduplicated row.
             config_id = self.log.register_config(config)
-            if config_id is not None:
-                self.log.record_autotune_entry(
-                    AutotuneLogEntry(
-                        generation=self._autotune_metrics.num_generations,
-                        status="started",
-                        perf_ms=None,
-                        compile_time=compile_time,
-                        config_id=config_id,
-                        config=config,
-                        source_hash=source_hashes.get(valid_indices[index]),
+            result_index = valid_indices[index]
+            source_hash = source_hashes.get(result_index)
+            current_accuracy_failure = False
+            source_result = (
+                cached_source_results.get(source_hash)
+                if source_hash is not None
+                else None
+            )
+            if source_hash is not None and source_hash in invalid_sources:
+                status = "source_rejected"
+                results[result_index] = BenchmarkResult(
+                    config=config,
+                    fn=fn,
+                    perf=inf,
+                    status=status,
+                    compile_time=compile_time,
+                )
+                self._autotune_metrics.num_source_deduplications += 1
+                record_final_result(result_index, config_id, compile_time)
+            elif source_result is not None:
+                status = "deduplicated"
+                results[result_index] = BenchmarkResult(
+                    config=config,
+                    fn=source_result.fn,
+                    perf=source_result.perf,
+                    status=status,
+                    compile_time=None,
+                )
+                deduplicated_indices.add(result_index)
+                self._autotune_metrics.num_source_deduplications += 1
+                self.log.debug(
+                    lambda config=config, source_hash=source_hash: (
+                        f"Reusing effective generated source {source_hash} "
+                        f"for {config!r}"
                     )
                 )
-            if all(
+                record_final_result(result_index, config_id, compile_time)
+                recorded_deduplicated_indices.add(result_index)
+            elif all(
                 all_gather_object(
                     is_working,
                     process_group_name=self.kernel.env.process_group_name,
                 )
             ):
+                record_started_result(result_index, config_id, compile_time)
                 self._last_benchmark_failure_status = None
-                representative_index = valid_indices[index]
-                source_hash = source_hashes.get(representative_index)
+                accuracy_failure_count = len(self._accuracy_failure_config_ids)
                 compiler_seed_source = self._is_compiler_seed_config(config) or (
                     source_hash is not None
                     and source_hash in self._compiler_seed_source_hashes
@@ -1126,66 +1382,76 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     )
                 else:
                     perf = self._benchmark_function(config, fn)
+                current_accuracy_failure = (
+                    deduplicate_sources
+                    and len(self._accuracy_failure_config_ids) > accuracy_failure_count
+                )
                 status = (
                     "ok"
                     if math.isfinite(perf)
-                    else self._last_benchmark_failure_status or "error"
+                    else (
+                        "accuracy_error"
+                        if current_accuracy_failure
+                        else self._last_benchmark_failure_status or "error"
+                    )
                 )
-                recorded_perf = perf if math.isfinite(perf) else None
-                results[valid_indices[index]] = BenchmarkResult(
+                results[result_index] = BenchmarkResult(
                     config=config,
                     fn=fn,
                     perf=perf,
                     status=status,
                     compile_time=compile_time,
                 )
+                # Keep the actual terminal outcome even when a later source
+                # alias repairs this candidate. The repair is logged as a
+                # separate deduplication event below.
+                record_final_result(result_index, config_id, compile_time)
             else:
                 status = "timeout" if reason == "timeout" else "error"
                 if is_working:
                     status = "peer_compilation_fail"
-                recorded_perf = None
-                results[valid_indices[index]] = BenchmarkResult(
+                results[result_index] = BenchmarkResult(
                     config=config,
                     fn=fn,
                     perf=inf,
                     status=status,
                     compile_time=compile_time,
                 )
-            representative_index = valid_indices[index]
-            representative_result = results[representative_index]
-            source_hash = source_hashes.get(representative_index)
+                record_final_result(result_index, config_id, compile_time)
+            result = results[result_index]
+            if result.status == "ok" and math.isfinite(result.perf):
+                self._autotune_metrics.num_successful_candidate_measurements += 1
             if (
                 source_hash is not None
-                and representative_result.status == "ok"
-                and math.isfinite(representative_result.perf)
+                and result.status == "ok"
+                and math.isfinite(result.perf)
             ):
-                cached_source_results[source_hash] = representative_result
-            for alias_index in aliases_by_representative.get(representative_index, ()):
-                results[alias_index] = BenchmarkResult(
-                    config=all_configs[alias_index],
-                    fn=representative_result.fn,
-                    perf=representative_result.perf,
-                    status=(
-                        "deduplicated"
-                        if math.isfinite(representative_result.perf)
-                        else representative_result.status
-                    ),
-                    compile_time=None,
+                cached_source_results[source_hash] = result
+                batch_repairs.update(
+                    self._resolve_effective_source_failures(source_hash, result)
                 )
-            if config_id is not None:
-                self.log.record_autotune_entry(
-                    AutotuneLogEntry(
-                        generation=self._autotune_metrics.num_generations,
-                        status=status,
-                        perf_ms=recorded_perf,
-                        compile_time=compile_time,
-                        config_id=config_id,
-                        config=config,
-                        source_hash=source_hash,
-                    )
+            if source_hash is not None and current_accuracy_failure:
+                invalid_sources.add(source_hash)
+                cached_source_results.pop(source_hash, None)
+                self._pending_effective_source_failures.pop(source_hash, None)
+            elif source_hash is not None and result.status in (
+                "error",
+                "timeout",
+                "peer_compilation_fail",
+            ):
+                self._remember_effective_source_failure(
+                    source_hash, config, config_id, compile_time
                 )
 
-        for index in deduplicated_indices:
+        # Repairs discovered in this batch update its positional results. The
+        # provider also retains them for the search to apply to members and
+        # surrogate targets produced by earlier benchmark batches.
+        for index, result in enumerate(results):
+            repair = batch_repairs.get(result.config)
+            if repair is not None and not math.isfinite(result.perf):
+                results[index] = repair
+
+        for index in deduplicated_indices - recorded_deduplicated_indices:
             result = results[index]
             config = all_configs[index]
             source_hash = source_hashes[index]
@@ -1331,13 +1597,26 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 benchmark_runner = (
                     _backend.get_do_bench() if _backend is not None else None
                 ) or do_bench
-                res = benchmark_runner(
-                    functools.partial(benchmark_function, *working_args),
-                    return_mode="median",
-                    warmup=1,  # we are already warmed up above
-                    rep=50,
-                    process_group_name=self.kernel.env.process_group_name,
-                )
+                if (
+                    benchmark_runner is do_bench_generic
+                    and self._probe_long_cute_flash_kernel()
+                ):
+                    res = do_bench_generic(
+                        functools.partial(benchmark_function, *working_args),
+                        return_mode="median",
+                        warmup=1,  # we are already warmed up above
+                        rep=50,
+                        process_group_name=self.kernel.env.process_group_name,
+                        probe_long_kernel=True,
+                    )
+                else:
+                    res = benchmark_runner(
+                        functools.partial(benchmark_function, *working_args),
+                        return_mode="median",
+                        warmup=1,  # we are already warmed up above
+                        rep=50,
+                        process_group_name=self.kernel.env.process_group_name,
+                    )
             res = sync_object(
                 res, process_group_name=self.kernel.env.process_group_name
             )
@@ -1445,7 +1724,12 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             try:
                 latency = self._run_subprocess_benchmark_job(fn, warmup=1, rep=50)
             except BenchmarkTimeout:
-                if not retry_compiler_seed_timeout or self.budget_exceeded_fn():
+                if (
+                    not retry_compiler_seed_timeout
+                    or not self._claim_compiler_seed_timeout_retry(
+                        config, effective_source_hash
+                    )
+                ):
                     raise
                 assert retry_repetitions is not None
                 self.log.debug(
@@ -1463,6 +1747,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 )
             if latency is None:
                 return None
+        except BenchmarkWorkerUnkillable:
+            raise
         except BenchmarkSubprocessError as e:
             # Timeout or unexpected worker exit; skip config and continue.
             self.log.warning(f"Benchmark subprocess failed for {config!r}: {e}")
@@ -1494,6 +1780,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         if self.settings.autotune_accuracy_check:
             try:
                 accuracy_result = self._run_subprocess_accuracy_check_job(fn)
+            except BenchmarkWorkerUnkillable:
+                raise
             except BenchmarkSubprocessError as e:
                 self.log.warning(
                     f"Accuracy check subprocess failed for {config!r}: {e}"
@@ -1626,6 +1914,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             warmup=warmup,
             rep=rep,
             use_wall_clock=self._subprocess_benchmark_uses_wall_clock(),
+            probe_long_kernel=self._probe_long_cute_flash_kernel(),
             fixed_repetitions=fixed_repetitions,
         )
         return float(
@@ -1642,13 +1931,13 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         warmup: int,
         rep: int,
         desc: str = "Benchmarking",
-    ) -> list[float | None] | None:
+    ) -> list[IsolatedBenchmarkTiming] | None:
         if not self._subprocess_benchmark_enabled():
             return None
         if self.settings.autotune_benchmark_fn is not None:
             return None
 
-        timings: list[float | None] = []
+        timings: list[IsolatedBenchmarkTiming] = []
         for fn in fns:
             try:
                 timing = self._run_subprocess_benchmark_job(
@@ -1656,6 +1945,13 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     warmup=warmup,
                     rep=rep,
                 )
+            except BenchmarkWorkerUnkillable:
+                raise
+            except BenchmarkTimeout as e:
+                self.log.warning(f"{desc} subprocess failed: {e}")
+                self._autotune_metrics.num_isolated_rebenchmark_timeouts += 1
+                timings.append(IsolatedBenchmarkFailure("timeout"))
+                continue
             except BenchmarkSubprocessError as e:
                 self.log.warning(f"{desc} subprocess failed: {e}")
                 timing = None
@@ -1666,10 +1962,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     # The confirmation re-ran a previously accepted candidate in
                     # an isolated worker; a sticky CUDA error means that config is
                     # still unsafe, so remove it from contention.
-                    timing = inf
-                else:
-                    self.log.debug(f"{desc} subprocess raised: {type(e).__name__}: {e}")
-                    timing = None
+                    timings.append(IsolatedBenchmarkFailure("error"))
+                    continue
+                self.log.debug(f"{desc} subprocess raised: {type(e).__name__}: {e}")
+                timing = None
             timings.append(None if timing is None else float(timing))
         return timings
 
@@ -1700,6 +1996,10 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
         self._autotune_metrics = autotune_metrics
         self.args.search_started = True
         self.children: list[LocalBenchmarkProvider] = []
+        self._collect_effective_source_repairs = config_spec.cute_flash_search_enabled
+        self._original_configs_by_materialized_key: dict[str, list[Config]] = {}
+        self._anchor_fns_by_materialized_key: dict[str, Callable[..., object]] = {}
+        self._effective_source_repairs: dict[Config, BenchmarkResult] = {}
         child_log = copy.copy(log)
         child_log._log_sink = None
         case_index = 0
@@ -1719,8 +2019,7 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                 child.set_budget_exceeded_fn(_never_exceeded)
                 self.children.append(child)
         except Exception as error:
-            for child in reversed(self.children):
-                child.cleanup()
+            self._cleanup_children()
             if f"arg_sets[{case_index}]" in str(error):
                 raise
             raise exc.AutotuneError(
@@ -1736,6 +2035,11 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
     def set_compiler_seed_configs(self, configs: Sequence[Config]) -> None:
         for child in self.children:
             child.set_compiler_seed_configs(configs)
+
+    def take_effective_source_repairs(self) -> dict[Config, BenchmarkResult]:
+        repairs = self._effective_source_repairs
+        self._effective_source_repairs = {}
+        return repairs
 
     def setup(self) -> None:
         case_index = 0
@@ -1757,8 +2061,7 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                     )
                 self.args.reference_latencies = references
         except Exception as error:
-            for child in reversed(self.children):
-                child.cleanup()
+            self._cleanup_children()
             if f"arg_sets[{case_index}]" in str(error):
                 raise
             raise exc.AutotuneError(
@@ -1766,9 +2069,30 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
             ) from error
 
     def cleanup(self) -> None:
+        try:
+            self._cleanup_children()
+        finally:
+            self._original_configs_by_materialized_key.clear()
+            self._anchor_fns_by_materialized_key.clear()
+            self._effective_source_repairs.clear()
+            self.budget_exceeded_fn = _never_exceeded
+
+    def _cleanup_children(self) -> None:
+        first_error: Exception | None = None
+        fatal_error: BenchmarkWorkerUnkillable | None = None
         for child in reversed(self.children):
-            child.cleanup()
-        self.budget_exceeded_fn = _never_exceeded
+            try:
+                child.cleanup()
+            except BenchmarkWorkerUnkillable as error:
+                if fatal_error is None:
+                    fatal_error = error
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+        if fatal_error is not None:
+            raise fatal_error
+        if first_error is not None:
+            raise first_error
 
     def _measure_reference(
         self, child: LocalBenchmarkProvider, case_index: int
@@ -1894,6 +2218,11 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
             )
             for index, child in enumerate(self.children)
         ]
+        # Child retries can repair an aggregate result from an earlier batch.
+        # Consume those repairs before the current row replaces the stored
+        # multi-shape measurement for the same materialized config.
+        if self._collect_effective_source_repairs:
+            self._collect_child_effective_source_repairs()
         if record_results:
             accuracy_failure_ids: set[int] = set()
             compile_failure_ids: set[int] = set()
@@ -2001,6 +2330,14 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                 compile_time=compile_time,
             )
             results[config_index] = result
+            if self._collect_effective_source_repairs and not math.isfinite(perf):
+                measurement_key = materialized_keys[child_config_index]
+                originals = self._original_configs_by_materialized_key.setdefault(
+                    measurement_key, []
+                )
+                if original not in originals:
+                    originals.append(copy.deepcopy(original))
+                self._anchor_fns_by_materialized_key[measurement_key] = anchor_fn
             if math.isfinite(perf):
                 self.args.found_valid_config = True
             if record_results:
@@ -2010,6 +2347,61 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                     timings=timings,
                 )
         return results
+
+    def _collect_child_effective_source_repairs(self) -> None:
+        """Promote child source repairs once every shape has a finite timing."""
+        for case_index, child in enumerate(self.children):
+            for materialized, repair in child.take_effective_source_repairs().items():
+                key = repr(materialized)
+                measurement = self.args.measurements.get(key)
+                if measurement is None:
+                    continue
+                if case_index == 0:
+                    self._anchor_fns_by_materialized_key[key] = repair.fn
+                timings, previous_perf, statuses = measurement
+                repaired_timings = list(timings)
+                repaired_statuses = list(statuses)
+                repaired_timings[case_index] = repair.perf
+                repaired_statuses[case_index] = repair.status
+                valid = all(
+                    _benchmark_status_succeeded(status)
+                    and math.isfinite(timing)
+                    and timing > 0
+                    for timing, status in zip(
+                        repaired_timings, repaired_statuses, strict=True
+                    )
+                )
+                perf = (
+                    _aggregate_multi_shape_timings(
+                        repaired_timings,
+                        aggregation=self.args.aggregation,
+                        references=self.args.reference_latencies,
+                    )
+                    if valid
+                    else inf
+                )
+                self.args.measurements[key] = (
+                    tuple(repaired_timings),
+                    perf,
+                    tuple(repaired_statuses),
+                )
+                if math.isfinite(previous_perf) or not math.isfinite(perf):
+                    continue
+                originals = self._original_configs_by_materialized_key.get(key)
+                anchor_fn = self._anchor_fns_by_materialized_key.get(key)
+                if not originals or anchor_fn is None:
+                    continue
+                for original in originals:
+                    self._effective_source_repairs[original] = BenchmarkResult(
+                        config=original,
+                        fn=anchor_fn,
+                        perf=perf,
+                        status="deduplicated",
+                        compile_time=None,
+                    )
+                self._original_configs_by_materialized_key.pop(key, None)
+                self._anchor_fns_by_materialized_key.pop(key, None)
+                self.args.found_valid_config = True
 
     def _benchmark_child(
         self,
@@ -2037,6 +2429,8 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
     def _is_skippable_child_failure(
         child: LocalBenchmarkProvider, error: Exception
     ) -> bool:
+        if isinstance(error, BenchmarkWorkerUnkillable):
+            return False
         if match_unrecoverable_runtime_error(error):
             return False
         if isinstance(error, exc.InvalidConfig):
@@ -2055,6 +2449,8 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
         timings: Sequence[float] | None = None,
     ) -> None:
         self._autotune_metrics.num_configs_tested += 1
+        if result.status == "ok" and math.isfinite(result.perf):
+            self._autotune_metrics.num_successful_candidate_measurements += 1
         config_id = self.log.register_config(config)
         if config_id is None:
             return

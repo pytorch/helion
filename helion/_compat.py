@@ -219,7 +219,7 @@ if triton_is_available():
             if not torch.xpu.is_available():
                 return False
 
-            return version.parse(triton.__version__) >= version.parse("3.5")
+            return get_triton_version() >= version.parse("3.5")
 
         if not (_cuda_tensor_desc_available() or _xpu_tensor_desc_available()):
             return False
@@ -340,6 +340,14 @@ else:
 
     def use_tileir_tunables() -> bool:  # type: ignore[misc]
         return False
+
+
+@functools.cache
+def get_triton_version() -> version.Version:
+    """Return the installed Triton version as a parsed, cached value."""
+    import triton
+
+    return version.parse(triton.__version__)
 
 
 def supports_tensor_descriptor() -> bool:
@@ -605,9 +613,7 @@ def _fp8_block_ptr_padding_broken() -> bool:
     """
     if not triton_is_available():
         return False
-    import triton
-
-    triton_version = version.parse(triton.__version__)
+    triton_version = get_triton_version()
     return version.parse("3.8.0") <= triton_version < version.parse("3.9.0")
 
 

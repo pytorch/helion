@@ -4,7 +4,6 @@ import logging
 from typing import TYPE_CHECKING
 
 from .common import dedupe_configs
-from .cute import CuteFlashAttentionCausalLptHeuristic
 from .cute import CuteFlashAttentionHeuristic
 from .cute import CuteFp8GemmSkinnyMHeuristic
 from .cute import CuteReductionTileHeuristic
@@ -13,6 +12,7 @@ from .cute import CuteTcgen05ClusterM2FfiHeuristic
 from .cute import CuteTcgen05ClusterM2Heuristic
 from .cute import CuteTcgen05GroupedDynamicBk64Heuristic
 from .cute import CuteTcgen05GroupedStaticCommonKHeuristic
+from .cute import CuteTcgen05ThreadLocalEpilogueHeuristic
 from .cute import CuteTileVecHeuristic
 from .cute import CuteTileVecWarpPerRowHeuristic
 from .cute import CuteTileVecWarpReduceHeuristic
@@ -20,6 +20,7 @@ from .pallas import PallasMatmulF32NoTilingSeedHeuristic
 from .pallas import PallasMatmulNoTilingSeedHeuristic
 from .triton import TritonB200FormulaMatmulHeuristic
 from .triton import TritonB200MatmulHeuristic
+from .triton import TritonB200MultiMatmulHeuristic
 from .triton import TritonH100MatmulHeuristic
 from .triton import TritonMatmulReductionEpilogueHeuristic
 from .triton import TritonNarrowReductionHeuristic
@@ -41,11 +42,11 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
     "cute": (
         CuteFp8GemmSkinnyMHeuristic,
         CuteFlashAttentionHeuristic,
-        CuteFlashAttentionCausalLptHeuristic,
         CuteTcgen05ClusterM2FfiHeuristic,
         CuteTcgen05ClusterM2Heuristic,
         CuteTcgen05GroupedStaticCommonKHeuristic,
         CuteTcgen05GroupedDynamicBk64Heuristic,
+        CuteTcgen05ThreadLocalEpilogueHeuristic,
         CuteReductionTileHeuristic,
         CuteReductionWideChunkHeuristic,
         CuteTileVecHeuristic,
@@ -62,6 +63,9 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         # The sm100 formula, promoted; registered after the table so it wins the
         # last-promote-wins compiler_default_config loop.
         TritonB200FormulaMatmulHeuristic,
+        # Front end 2: the seed-only multi-contraction path. It declines whenever
+        # front end 1 fires, so the two paths remain structurally disjoint.
+        TritonB200MultiMatmulHeuristic,
         TritonMatmulReductionEpilogueHeuristic,
         TritonStandardReductionHeuristicSM90,
         TritonStandardReductionHeuristicSM100,

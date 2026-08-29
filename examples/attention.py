@@ -147,6 +147,20 @@ def _causal_attention_output_baseline(
     return torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
 
 
+def _attention_relu_output_baseline(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    return torch.relu(torch.nn.functional.scaled_dot_product_attention(q, k, v))
+
+
+def _causal_attention_relu_output_baseline(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    return torch.relu(
+        torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+    )
+
+
 def _biased_attention_baseline(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -409,6 +423,108 @@ def causal_attention_output(
             m_i = m_ij
         acc = acc / l_i[:, :, None]
         out[tile_b, tile_m, :] = acc.to(out.dtype)
+    return out.view(q_in.size())
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_baseline_fn=_baseline_unless_tpu(_attention_relu_output_baseline),
+    autotune_baseline_atol=5e-2,
+    autotune_baseline_rtol=2e-2,
+)
+def attention_relu_output(
+    q_in: torch.Tensor,
+    k_in: torch.Tensor,
+    v_in: torch.Tensor,
+) -> torch.Tensor:
+    """Computes attention with a fused ReLU and returns only the output tensor."""
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    assert n_dim == v_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
+    assert head_dim == k_in.size(-1) == v_in.size(-1)
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim])
+    out = torch.empty_like(q_view)
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    qk_scale = sm_scale * 1.44269504  # 1/log(2)
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        q = q_view[tile_b, tile_m, :]
+        for tile_n in hl.tile(v_view.size(1)):
+            q_scaled = q * qk_scale
+            k = k_view[tile_b, tile_n, :]
+            qk = torch.bmm(q_scaled, k.transpose(1, 2), torch.float32)
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            qk = qk - m_ij[:, :, None]
+            p = torch.exp2(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            v = v_view[tile_b, tile_n, :]
+            p = p.to(v.dtype)
+            acc = torch.baddbmm(acc, p, v)
+            m_i = m_ij
+        out[tile_b, tile_m, :] = torch.relu(acc / l_i[:, :, None]).to(out.dtype)
+    return out.view(q_in.size())
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_baseline_fn=_baseline_unless_tpu(_causal_attention_relu_output_baseline),
+    autotune_baseline_atol=5e-2,
+    autotune_baseline_rtol=2e-2,
+)
+def causal_attention_relu_output(
+    q_in: torch.Tensor,
+    k_in: torch.Tensor,
+    v_in: torch.Tensor,
+) -> torch.Tensor:
+    """Computes causal attention with a fused ReLU and returns only the output."""
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    assert n_dim == v_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
+    assert head_dim == k_in.size(-1) == v_in.size(-1)
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim])
+    out = torch.empty_like(q_view)
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    qk_scale = sm_scale * 1.44269504  # 1/log(2)
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        q = q_view[tile_b, tile_m, :]
+        for tile_n in hl.tile(v_view.size(1)):
+            q_scaled = q * qk_scale
+            k = k_view[tile_b, tile_n, :]
+            qk = torch.bmm(q_scaled, k.transpose(1, 2), torch.float32)
+            qk = torch.where(
+                tile_m.index[None, :, None] >= tile_n.index[None, None, :],
+                qk,
+                float("-inf"),
+            )
+            m_ij_keepdim = torch.maximum(
+                m_i[:, :, None], torch.amax(qk, -1, keepdim=True)
+            )
+            qk = qk - m_ij_keepdim
+            m_ij = m_ij_keepdim.squeeze(-1)
+            p = torch.exp2(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            v = v_view[tile_b, tile_n, :]
+            p = p.to(v.dtype)
+            acc = torch.baddbmm(acc, p, v)
+            m_i = m_ij
+        out[tile_b, tile_m, :] = torch.relu(acc / l_i[:, :, None]).to(out.dtype)
     return out.view(q_in.size())
 
 

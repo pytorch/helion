@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from ..runtime.settings import DotPrecision
+    from .aten_lowering import Lowering
     from .compile_environment import CompileEnvironment
     from .cute.cute_mma import _CuteMmaNode
     from .device_function import Argument
@@ -61,6 +62,8 @@ log: logging.Logger = logging.getLogger(__name__)
 class FlashSearchSurface(NamedTuple):
     head_dim: int
     num_kv: int
+    num_bh: int
+    tensor_4d_heads: int | None
     io_dtype: torch.dtype
     block_size_targets: dict[int, int]
     is_causal: bool
@@ -69,6 +72,8 @@ class FlashSearchSurface(NamedTuple):
     small_biased_candidate: bool
     standard_dense_output: bool
     standard_causal_output: bool
+    output_requires_tma: bool
+    supports_tensor_4d_tma: bool
 
 
 class AttentionSoftmaxPattern(NamedTuple):
@@ -897,6 +902,15 @@ class Backend(abc.ABC):
         Called after static loop unrolling but before type propagation
         and tracing.  Backends can override this to rewrite the user's
         AST for algorithmic transformations that change loop structure.
+        """
+        return None
+
+    def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
+        """Return a backend-owned lowering that must bypass Inductor IR.
+
+        Most ATen operations use Helion's shared Inductor lowering. Backends may
+        override this for operations whose Inductor representation cannot be
+        consumed by that shared path.
         """
         return None
 
@@ -2850,6 +2864,21 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
     if len(root_grid_ids) != 2:
         return None
     env = CompileEnvironment.current()
+
+    def block_sizes_reachable(targets: dict[int, int]) -> bool:
+        if set(env.config_spec.block_sizes.valid_block_ids()) != set(targets):
+            return False
+        for block_id, target in targets.items():
+            block_spec = env.config_spec.block_sizes.block_id_lookup(block_id)
+            fragment = block_spec._fragment(env.config_spec)
+            assert isinstance(fragment, BlockSizeFragment)
+            if not fragment.low <= target <= fragment.high:
+                return False
+        return True
+
+    flash_surface: FlashSearchSurface | None = None
+    generic_fallback_required = False
+    generic_fallback_targets: dict[int, int] | None = None
     for graph_info in device_ir.graphs:
         if not isinstance(graph_info, ForLoopGraphInfo):
             continue
@@ -2862,6 +2891,7 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
         )
         if pattern is None:
             continue
+        from .cute.cute_flash import _flash_output_requires_tma
         from .cute.cute_flash import flash_attention_graph_lse_plan_valid_from_graphs
         from .cute.cute_flash import (
             flash_attention_graph_small_biased_candidate_from_graphs,
@@ -2871,6 +2901,12 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
         )
         from .cute.cute_flash import (
             flash_attention_graph_standard_dense_output_from_graphs,
+        )
+        from .cute.cute_flash import (
+            flash_attention_graph_supports_tensor_4d_tma_from_graphs,
+        )
+        from .cute.cute_flash import (
+            flash_attention_graph_tensor_4d_batch_heads_from_graphs,
         )
 
         if not flash_attention_graph_lse_plan_valid_from_graphs(
@@ -2902,48 +2938,87 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
                 score_plan=pattern.score_plan,
             )
         )
+        supports_tensor_4d_tma = (
+            flash_attention_graph_supports_tensor_4d_tma_from_graphs(
+                device_ir.graphs,
+                root_block_ids=root_grid_ids,
+                kv_block_id=block_ids[0],
+                score_plan=pattern.score_plan,
+            )
+        )
+        tensor_4d_batch_heads = flash_attention_graph_tensor_4d_batch_heads_from_graphs(
+            device_ir.graphs,
+            root_block_ids=root_grid_ids,
+            kv_block_id=block_ids[0],
+            score_plan=pattern.score_plan,
+        )
+        num_bh = env.block_sizes[root_grid_ids[0]].size
         q_seq = env.block_sizes[root_grid_ids[1]].size
         kv_seq = env.block_sizes[block_ids[0]].size
-        if not (isinstance(q_seq, int) and isinstance(kv_seq, int) and q_seq == kv_seq):
+        if not (
+            isinstance(num_bh, int)
+            and isinstance(q_seq, int)
+            and isinstance(kv_seq, int)
+            and q_seq == kv_seq
+        ):
             continue
         if q_seq % 128 != 0:
+            continue
+        num_kv = (kv_seq + 127) // 128
+        output_requires_tma = _flash_output_requires_tma(
+            num_bh, q_seq, pattern.head_dim
+        )
+        # TMA output is currently FA4-only. Do not expose a flash search whose
+        # only legal output path is unavailable; the generic CuTe search can
+        # still handle these uncommon large-output shapes.
+        if output_requires_tma and (
+            num_kv % 2 != 0 or pattern.score_plan.requires_ws_overlap
+        ):
+            generic_fallback_required = True
+            fallback_targets = {
+                root_grid_ids[0]: 1,
+                root_grid_ids[1]: 64,
+                block_ids[0]: 64,
+            }
+            if generic_fallback_targets is None and block_sizes_reachable(
+                fallback_targets
+            ):
+                generic_fallback_targets = fallback_targets
             continue
         block_size_targets = {
             root_grid_ids[0]: 1,
             root_grid_ids[1]: 128,
             block_ids[0]: 128,
         }
-        if set(env.config_spec.block_sizes.valid_block_ids()) != set(
-            block_size_targets
-        ):
+        if not block_sizes_reachable(block_size_targets):
             continue
-        reachable = True
-        for block_id, target in block_size_targets.items():
-            try:
-                block_spec = env.config_spec.block_sizes.block_id_lookup(block_id)
-            except KeyError:
-                reachable = False
-                break
-            fragment = block_spec._fragment(env.config_spec)
-            assert isinstance(fragment, BlockSizeFragment)
-            if not fragment.low <= target <= fragment.high:
-                reachable = False
-                break
-        if not reachable:
-            continue
-        return FlashSearchSurface(
-            head_dim=pattern.head_dim,
-            num_kv=(kv_seq + 127) // 128,
-            io_dtype=pattern.io_dtype,
-            block_size_targets=block_size_targets,
-            is_causal=pattern.is_causal,
-            has_kv_tile_pruning=pattern.score_plan.has_kv_tile_pruning,
-            requires_ws_overlap=pattern.score_plan.requires_ws_overlap,
-            small_biased_candidate=small_biased_candidate,
-            standard_dense_output=standard_dense_output,
-            standard_causal_output=standard_causal_output,
+        if flash_surface is None:
+            flash_surface = FlashSearchSurface(
+                head_dim=pattern.head_dim,
+                num_kv=num_kv,
+                num_bh=num_bh,
+                tensor_4d_heads=(
+                    tensor_4d_batch_heads[1]
+                    if tensor_4d_batch_heads is not None
+                    else None
+                ),
+                io_dtype=pattern.io_dtype,
+                block_size_targets=block_size_targets,
+                is_causal=pattern.is_causal,
+                has_kv_tile_pruning=pattern.score_plan.has_kv_tile_pruning,
+                requires_ws_overlap=pattern.score_plan.requires_ws_overlap,
+                small_biased_candidate=small_biased_candidate,
+                standard_dense_output=standard_dense_output,
+                standard_causal_output=standard_causal_output,
+                output_requires_tma=output_requires_tma,
+                supports_tensor_4d_tma=supports_tensor_4d_tma,
+            )
+    if generic_fallback_required:
+        env.config_spec.enable_cute_attention_generic_fallback(
+            block_size_targets=generic_fallback_targets
         )
-    return None
+        return None
+    return flash_surface
 
 
 class _SpecializedMmaPlan(NamedTuple):
@@ -3030,7 +3105,7 @@ def _analyzed_specialized_mma_plan(
     from .cute.cute_mma import _choose_mma_impl
     from .cute.cute_mma import _mma_tiles_are_static_full
     from .cute.cute_mma import analyze_cute_mma_node
-    from .cute.cute_mma import ensure_tcgen05_pair_epilogue_plan
+    from .cute.cute_mma import ensure_tcgen05_fragment_epilogue_plan
 
     candidate = analyze_cute_mma_node(node)
     if (
@@ -3061,7 +3136,7 @@ def _analyzed_specialized_mma_plan(
     )
     if mma_impl == "universal":
         return None
-    if mma_impl == "tcgen05" and not ensure_tcgen05_pair_epilogue_plan(
+    if mma_impl == "tcgen05" and not ensure_tcgen05_fragment_epilogue_plan(
         fn,
         node,
         candidate,

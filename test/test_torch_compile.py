@@ -3807,6 +3807,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     ):
         """Test: kernel returning (tensor, scalar) called twice with different scalar literals
         inside the compile region. Verifies no helion recompilation."""
+        if not allow_torch_compile_fusion and not supports_torch_compile_fusion():
+            self.skipTest("fullgraph capture requires Helion's fusion integration")
 
         def f(
             x: torch.Tensor, *, _kernels=(k_scale_with_scalar_output,)
@@ -4452,6 +4454,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_tuple_input(self, allow_torch_compile_fusion):
         """Test: kernel with tuple of tensors as input."""
+        if not allow_torch_compile_fusion and not supports_torch_compile_fusion():
+            self.skipTest("fullgraph capture requires Helion's fusion integration")
 
         @helion.kernel(autotune_effort="none")
         def k_sum_tuple(tensors: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
@@ -4524,6 +4528,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_dict_input(self, allow_torch_compile_fusion):
         """Test: kernel with dict of tensors as input."""
+        if not allow_torch_compile_fusion and not supports_torch_compile_fusion():
+            self.skipTest("fullgraph capture requires Helion's fusion integration")
 
         @helion.kernel(autotune_effort="none")
         def k_sum_dict(tensors: dict[str, torch.Tensor]) -> torch.Tensor:

@@ -135,6 +135,19 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         # Track all evaluations for surrogate training
         self.all_observations: list[tuple[FlatConfig, float]] = []
 
+    def _algorithm_cache_policy(self) -> dict[str, object]:
+        policy = super()._algorithm_cache_policy()
+        policy.update(
+            {
+                "surrogate_version": 1,
+                "surrogate_threshold": self.surrogate_threshold,
+                "candidate_ratio": self.candidate_ratio,
+                "refit_frequency": self.refit_frequency,
+                "n_estimators": self.n_estimators,
+            }
+        )
+        return policy
+
     def _autotune(self) -> Config:
         """
         Run DE with surrogate-assisted selection.

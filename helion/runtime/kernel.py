@@ -134,6 +134,79 @@ class _FastDispatchEntry(NamedTuple):
     specialization_generation: int
 
 
+def _nested_fast_dispatch_key(
+    value: object, *, specialize_numeric: bool = False
+) -> tuple[Hashable, bool] | None:
+    """Return a specialization-safe key and whether ``value`` contains a tensor."""
+    value_type = type(value)
+    if value_type is torch.Tensor or value_type is torch.nn.Parameter:
+        if specialize_numeric:
+            # A constexpr-annotated argument specializes on the raw container,
+            # so tensor identity (not metadata) drives the full key; a
+            # metadata-based fast key would conflate keys the full key
+            # distinguishes.
+            return None
+        tensor = cast("torch.Tensor", value)
+        static_indices = getattr(tensor, "_dynamo_static_indices", None)
+        return (
+            (
+                tensor.dtype,
+                tensor.shape,
+                tensor.stride(),
+                tensor.device,
+                None if static_indices is None else frozenset(static_indices),
+            ),
+            True,
+        )
+    if value_type in (int, float, bool):
+        return ((value_type, value) if specialize_numeric else value_type), False
+    if value_type is str:
+        return (value_type, value), False
+    if isinstance(value, ConstExpr):
+        try:
+            hash(value.value)
+        except TypeError:
+            return None
+        return (value_type, value.value), False
+    if value is None:
+        return None, False
+    if value_type is torch.dtype or value_type is torch.device:
+        return cast("Hashable", value), False
+    if value_type is tuple or value_type is list:
+        items: list[Hashable] = []
+        has_tensor = False
+        for item in cast("Sequence[object]", value):
+            nested = _nested_fast_dispatch_key(
+                item, specialize_numeric=specialize_numeric
+            )
+            if nested is None:
+                return None
+            item_key, item_has_tensor = nested
+            items.append(item_key)
+            has_tensor = has_tensor or item_has_tensor
+        return (value_type, tuple(items)), has_tensor
+    if value_type is dict:
+        entries: list[tuple[str | int, Hashable]] = []
+        has_tensor = False
+        for item_key, item_value in cast("dict[object, object]", value).items():
+            if type(item_key) not in (str, int):
+                return None
+            nested = _nested_fast_dispatch_key(
+                item_value, specialize_numeric=specialize_numeric
+            )
+            if nested is None:
+                return None
+            value_key, value_has_tensor = nested
+            entries.append((cast("str | int", item_key), value_key))
+            has_tensor = has_tensor or value_has_tensor
+        try:
+            entries.sort()
+        except TypeError:
+            return None
+        return (value_type, tuple(entries)), has_tensor
+    return None
+
+
 class _SpecializationAlias:
     """An omitted-default signature backed by a normalized signature."""
 
@@ -163,59 +236,105 @@ def _make_prepared_arg_guard(
 ) -> Callable[[tuple[object, ...]], bool]:
     namespace: dict[str, object] = {}
     checks = [f"len(args) == {len(args)}"]
-    for index, arg in enumerate(args):
-        prefix = f"args[{index}]"
-        namespace[f"type_{index}"] = type(arg)
-        checks.append(f"type({prefix}) is type_{index}")
-        if type(arg) in (torch.Tensor, torch.nn.Parameter):
-            assert isinstance(arg, torch.Tensor)
-            namespace[f"dtype_{index}"] = arg.dtype
-            namespace[f"shape_{index}"] = arg.shape
-            namespace[f"stride_{index}"] = arg.stride()
-            namespace[f"device_{index}"] = arg.device
+    counter = itertools.count()
+
+    def append_checks(
+        value: object,
+        prefix: str,
+        annotation: object | None = None,
+    ) -> None:
+        token = next(counter)
+        value_type = type(value)
+        namespace[f"type_{token}"] = value_type
+        checks.append(f"type({prefix}) is type_{token}")
+        if value_type in (torch.Tensor, torch.nn.Parameter):
+            assert isinstance(value, torch.Tensor)
+            namespace[f"dtype_{token}"] = value.dtype
+            namespace[f"shape_{token}"] = value.shape
+            namespace[f"stride_{token}"] = value.stride()
+            namespace[f"device_{token}"] = value.device
             checks.extend(
                 (
-                    f"{prefix}.dtype is dtype_{index}",
-                    f"{prefix}.shape == shape_{index}",
-                    f"{prefix}.stride() == stride_{index}",
-                    f"{prefix}.device == device_{index}",
+                    f"{prefix}.dtype is dtype_{token}",
+                    f"{prefix}.shape == shape_{token}",
+                    f"{prefix}.stride() == stride_{token}",
+                    f"{prefix}.device == device_{token}",
                 )
             )
-            static_indices = getattr(arg, "_dynamo_static_indices", None)
+            static_indices = getattr(value, "_dynamo_static_indices", None)
             if static_indices is None:
                 checks.append(
                     f"getattr({prefix}, '_dynamo_static_indices', None) is None"
                 )
             else:
-                namespace[f"static_indices_{index}"] = frozenset(static_indices)
+                namespace[f"static_indices_{token}"] = frozenset(static_indices)
                 checks.extend(
                     (
                         f"getattr({prefix}, '_dynamo_static_indices', None) is not None",
-                        f"frozenset({prefix}._dynamo_static_indices) == static_indices_{index}",
+                        f"frozenset({prefix}._dynamo_static_indices) == static_indices_{token}",
                     )
                 )
-        elif type(arg) in (bool, int, float):
+        elif value_type is tuple or value_type is list:
+            sequence = cast("Sequence[object]", value)
+            checks.append(f"len({prefix}) == {len(sequence)}")
+            for item_index, item in enumerate(sequence):
+                append_checks(
+                    item,
+                    f"{prefix}[{item_index}]",
+                    annotation,
+                )
+        elif value_type is dict:
+            mapping = cast("dict[str | int, object]", value)
+            checks.append(f"len({prefix}) == {len(mapping)}")
+            for item_key, item_value in mapping.items():
+                key_name = f"key_{token}_{len(namespace)}"
+                namespace[key_name] = item_key
+                checks.append(f"{key_name} in {prefix}")
+                append_checks(
+                    item_value,
+                    f"{prefix}[{key_name}]",
+                    annotation,
+                )
+        elif value_type in (bool, int, float):
             # Ordinary numeric arguments are runtime values in Helion's base
             # specialization.  A constexpr annotation is the one exception;
             # hl.specialize() constraints are covered by ``_extra_guards``.
-            if kernel._annotations[index] is ConstExpr:
-                if type(arg) is float and arg != arg:
+            if annotation is ConstExpr:
+                if value_type is float and value != value:
                     # Python's equality/hash behavior does not provide a stable
                     # equivalence class for constexpr NaNs.  Keep those calls on
                     # the regular specialization path rather than weakening its
                     # semantics in the prepared guard.
                     raise TypeError("constexpr NaN cannot use a prepared call")
-                namespace[f"value_{index}"] = arg.hex() if type(arg) is float else arg
-                checks.append(
-                    f"{prefix}.hex() == value_{index}"
-                    if type(arg) is float
-                    else f"{prefix} == value_{index}"
+                namespace[f"value_{token}"] = (
+                    cast("float", value).hex() if value_type is float else value
                 )
-        elif type(arg) in (str, type(None), torch.dtype, torch.device):
-            namespace[f"value_{index}"] = arg
-            checks.append(f"{prefix} == value_{index}")
+                checks.append(
+                    f"{prefix}.hex() == value_{token}"
+                    if value_type is float
+                    else f"{prefix} == value_{token}"
+                )
+        elif value_type in (str, type(None), torch.dtype, torch.device):
+            namespace[f"value_{token}"] = value
+            checks.append(f"{prefix} == value_{token}")
+        elif isinstance(value, ConstExpr):
+            inner = value.value
+            if type(inner) is float:
+                if inner != inner:
+                    # Match the constexpr-annotation path above: NaN has no
+                    # stable equivalence class, so keep those calls on the
+                    # regular specialization path.
+                    raise TypeError("constexpr NaN cannot use a prepared call")
+                namespace[f"value_{token}"] = inner.hex()
+                checks.append(f"{prefix}.value.hex() == value_{token}")
+            else:
+                namespace[f"value_{token}"] = inner
+                checks.append(f"{prefix}.value == value_{token}")
         else:
-            raise TypeError(f"unsupported prepared-call argument: {type(arg)!r}")
+            raise TypeError(f"unsupported prepared-call argument: {value_type!r}")
+
+    for index, arg in enumerate(args):
+        append_checks(arg, f"args[{index}]", kernel._annotations[index])
     return eval(f"lambda args: {' and '.join(checks)}", namespace)
 
 
@@ -729,11 +848,12 @@ class Kernel(Generic[_R]):
         _extra_guards: list[tuple[Callable[[Sequence[object]], Hashable], Hashable]]
         | None = None,
     ) -> tuple[Hashable, ...] | None:
-        """Build the exact eager dispatch key, optionally collecting its guards."""
+        """Build a specialization-safe eager key, optionally collecting guards."""
         key: list[Hashable] = []
         has_tensor = False
-        for a in args:
+        for index, a in enumerate(args):
             t = type(a)
+            annotation = self._annotations[index] if index < self._num_params else None
             if t is torch.Tensor or t is torch.nn.Parameter:
                 tensor = cast("torch.Tensor", a)
                 has_tensor = True
@@ -747,12 +867,30 @@ class Kernel(Generic[_R]):
                         None if si is None else frozenset(si),
                     )
                 )
-            elif t is int or t is float or t is bool or t is str:
+            elif t is int or t is float or t is bool:
+                key.append((t, a) if annotation is ConstExpr else t)
+            elif t is str:
                 key.append((t, a))
+            elif isinstance(a, ConstExpr):
+                try:
+                    hash(a.value)
+                except TypeError:
+                    return None
+                key.append((t, a.value))
             elif a is None:
                 key.append(None)
             elif t is torch.dtype or t is torch.device:
                 key.append(a)
+            elif t is tuple or t is list or t is dict:
+                nested = _nested_fast_dispatch_key(
+                    a,
+                    specialize_numeric=annotation is ConstExpr,
+                )
+                if nested is None:
+                    return None
+                nested_key, nested_has_tensor = nested
+                key.append(nested_key)
+                has_tensor = has_tensor or nested_has_tensor
             else:
                 return None
         if not has_tensor:
@@ -789,19 +927,21 @@ class Kernel(Generic[_R]):
         Build a cheap dispatch key for the fast-path cache in ``__call__``.
 
         The key records exact per-argument metadata (dtype/shape/stride/device
-        for tensors, type and value for scalars), which is strictly finer than
-        the full specialization key: any two argument lists that produce
-        different full keys also produce different fast keys.  That makes it
-        safe to map a fast key directly to the BoundKernel that a full
-        ``bind()`` resolved for the same arguments.
+        for tensors), exact values for specialized arguments, and types for
+        ordinary runtime numeric values. It refines the full specialization
+        key: any two argument lists that produce different full keys also
+        produce different fast keys. That makes it safe to map a fast key
+        directly to the BoundKernel that a full ``bind()`` resolved for the
+        same arguments.
 
         If a base signature has extra specialization extractors, their results
         are appended to preserve the same no-collision invariant for
         value-based specializations.
 
-        Returns None when an argument type is not handled (tensor subclasses,
-        containers, ...), or when there is no tensor argument to pin down the
-        device; callers must then take the regular ``bind()`` path.
+        Returns None when an argument type is not handled (for example, tensor
+        subclasses or unsupported objects nested in a container), or when there
+        is no tensor argument to pin down the device; callers must then take the
+        regular ``bind()`` path.
         """
         specialization_generation = self._specialization_generation
         extra_guards: list[tuple[Callable[[Sequence[object]], Hashable], Hashable]] = []

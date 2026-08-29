@@ -27,13 +27,19 @@ if TYPE_CHECKING:
 
 @_decorators.codegen(store, "pallas")
 def _(state: CodegenState) -> None:
+    from ... import exc
+    from .dma import emit_grid_indirect_transfer
+    from .tensorcore_plan import TENSORCORE_PLAN_META
+    from .tensorcore_plan import DmaScatterPlan
+    from .tensorcore_plan import OneHotScatterPlan
+
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
     value = state.ast_arg(2)
     assert isinstance(tensor, torch.Tensor)
-    name = state.device_function.tensor_arg(tensor).name
-    name = pallas_codegen.vmem_name(state, name)
+    arg_name = state.device_function.tensor_arg(tensor).name
+    name = pallas_codegen.vmem_name(state, arg_name)
     # Increment memory op index to stay in sync with triton backend
     device_fn = state.device_function
     device_fn.device_store_index += 1
@@ -43,11 +49,22 @@ def _(state: CodegenState) -> None:
         state, tensor, subscript, parts, value
     )
     idx_str = ", ".join(parts)
-    from .gather import emit_scatter_store
-    from .tensorcore_plan import TENSORCORE_PLAN_META
-    from .tensorcore_plan import OneHotScatterPlan
-
     plan = state.fx_node.meta.get(TENSORCORE_PLAN_META) if state.fx_node else None
+    if isinstance(plan, DmaScatterPlan):
+        dma_ref = pallas_codegen.memory_op_dma_scratch(state)
+        if dma_ref is None:
+            raise exc.InvalidConfig(
+                "indirect DMA store was not admitted by the active scheduler"
+            )
+        state.codegen.add_statement(
+            statement_from_string(f"{dma_ref}[...] = {{value}}", value=value)
+        )
+        # The fori scheduler emits the writeback after the body. Root grids
+        # have no enclosing scheduler, so this call emits it immediately.
+        emit_grid_indirect_transfer(state, plan, arg_name)
+        return
+    from .gather import emit_scatter_store
+
     is_scatter = isinstance(plan, OneHotScatterPlan)
     if is_scatter:
         value = emit_scatter_store(state, plan.plan, name, idx_str, value)

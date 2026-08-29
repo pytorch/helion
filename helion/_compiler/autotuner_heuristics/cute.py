@@ -27,6 +27,7 @@ from .common import is_canonical_row_reduction
 from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
+    from ...autotuner.config_fragment import BlockSizeFragment
     from ...autotuner.config_spec import ConfigSpec
     from ...autotuner.config_spec import MatmulFact
     from ...autotuner.config_spec import ReductionLoopSpec
@@ -127,7 +128,7 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
 
 
 def _cute_tile_seed_vec_width_for_dtype(dtype: torch.dtype | None) -> int:
-    """V seed for ``CuteNDTileStrategy`` lane-loop vec on a given dtype.
+    """V seed for ``PerThreadNDTileStrategy`` lane-loop vec on a given dtype.
 
     Returns 4 for fp32 (LDG.128 = 16 bytes), 4 for fp16/bf16 (LDG.64,
     8 bytes per thread per outer iter).  Note: V=8 for fp16/bf16 IS now
@@ -709,11 +710,11 @@ class CuteTcgen05GroupedDynamicBk64Heuristic(AutotunerHeuristic):
 
 
 class CuteFlashAttentionHeuristic(AutotunerHeuristic):
-    """Seed ``block_sizes=[1, 128, 128]`` for detected fp16 flash-attention.
+    """Seed ``block_sizes=[1, 128, 128]`` for detected flash attention.
 
     When ``HELION_CUTE_FLASH`` is on (the default), a dense online-softmax
-    attention kernel at [tile_b=1, tile_m=128, tile_n=128], fp16, head_dim in
-    {64, 128} lowers to the fused tcgen05 flash path
+    attention kernel at [tile_b=1, tile_m=128, tile_n=128], FP16/BF16, head_dim
+    in {64, 128} lowers to the fused tcgen05 flash path
     (``cute_flash.codegen_attention_flash``) -- orders of magnitude faster than
     the scalar fallback. The flash detector fires at EXACTLY 128x128 tiles, so
     unless that config is in the autotuner population the fast path is never
@@ -730,82 +731,119 @@ class CuteFlashAttentionHeuristic(AutotunerHeuristic):
         return env.config_spec.cute_flash_search_enabled
 
     @classmethod
-    def get_seed_config(
+    def get_seed_configs(
         cls, env: CompileEnvironment, device_ir: DeviceIR
-    ) -> Config | None:
+    ) -> list[Config] | None:
         spec = env.config_spec
         if not spec.cute_flash_search_enabled:
             return None
-        from ..cute.cute_flash import flash_attention_seed_config
+        from ..cute.cute_flash import flash_attention_seed_configs
 
         assert spec._cute_flash_head_dim is not None
-        seed = flash_attention_seed_config(
-            spec._cute_flash_head_dim,
-            spec._cute_flash_num_kv,
-            dtype=spec._cute_flash_dtype,
-            is_causal=spec._cute_flash_is_causal,
-            has_kv_tile_pruning=spec._cute_flash_has_kv_tile_pruning,
-            requires_ws_overlap=spec._cute_flash_requires_ws_overlap,
-            small_biased_candidate=spec._cute_flash_small_biased_candidate,
-            block_size_targets=spec._cute_flash_block_size_target_list(),
+        assert spec._cute_flash_num_kv is not None
+        common = {
+            "num_bh": spec._cute_flash_num_bh,
+            "tensor_4d_heads": spec._cute_flash_tensor_4d_heads,
+            "dtype": spec._cute_flash_dtype,
+            "is_causal": spec._cute_flash_is_causal,
+            "has_kv_tile_pruning": spec._cute_flash_has_kv_tile_pruning,
+            "requires_ws_overlap": spec._cute_flash_requires_ws_overlap,
+            "small_biased_candidate": spec._cute_flash_small_biased_candidate,
+            "supports_tensor_4d_tma": spec._cute_flash_supports_tensor_4d_tma,
+            "target_device_capability": spec.target_device_capability,
+            "block_size_targets": spec._cute_flash_block_size_target_list(),
+        }
+        seeds = spec._legalize_cute_flash_compiler_seeds(
+            flash_attention_seed_configs(
+                spec._cute_flash_head_dim,
+                spec._cute_flash_num_kv,
+                standard_dense_output=spec._cute_flash_standard_dense_output,
+                standard_causal_output=spec._cute_flash_standard_causal_output,
+                **common,
+            )
         )
-        if seed is not None:
-            # A fresh worker retry uses one setup launch plus three timed
-            # launches. The median is robust while using half the launches of
-            # the normal path that timed out.
+        if seeds:
+            # Slow but valid flash seeds can exceed the normal subprocess
+            # timing window. Retry once with three measured launches so a
+            # transient timeout does not remove a structural family.
             spec.compiler_seed_timeout_retry_repetitions = 3
-        return seed
+        return seeds
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
 
 
-class CuteFlashAttentionCausalLptHeuristic(AutotunerHeuristic):
-    """Seed best-known causal hd64 LPT swizzle points for large-token rows."""
+class CuteTcgen05ThreadLocalEpilogueHeuristic(AutotunerHeuristic):
+    """Seed the one-CTA tile used by tcgen05 thread-local epilogues.
 
-    name = "cute_flash_attention_causal_lpt"
+    The structural region analysis only decides whether this seed is useful.
+    The exhaustive, per-config ownership proof remains authoritative for
+    codegen, so planting the seed does not widen the accepted kernel surface.
+    """
+
+    name = "cute_tcgen05_thread_local_epilogue"
     backend = "cute"
+    promote_seed_to_default = True
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        from ..cute.cute_flash import flash_attention_seed_config
+        from ..cute.cute_mma import tcgen05_fragment_epilogue_has_unique_anchor
+        from ..cute.cute_mma import tcgen05_fragment_epilogue_present
 
         spec = env.config_spec
-        if not spec.cute_flash_search_enabled or spec._cute_flash_head_dim is None:
-            return False
         return (
-            flash_attention_seed_config(
-                spec._cute_flash_head_dim,
-                spec._cute_flash_num_kv,
-                dtype=spec._cute_flash_dtype,
-                is_causal=spec._cute_flash_is_causal,
-                has_kv_tile_pruning=spec._cute_flash_has_kv_tile_pruning,
-                requires_ws_overlap=spec._cute_flash_requires_ws_overlap,
-                small_biased_candidate=spec._cute_flash_small_biased_candidate,
-                block_size_targets=spec._cute_flash_block_size_target_list(),
-                seed_kind="causal_lpt",
+            spec.cute_tcgen05_search_enabled
+            and TCGEN05_TWO_CTA_SEED_PID_TYPE in spec.allowed_pid_types
+            and tcgen05_fragment_epilogue_present(device_ir.graphs)
+            and tcgen05_fragment_epilogue_has_unique_anchor(
+                device_ir.graphs,
+                device_ir=device_ir,
             )
-            is not None
         )
 
     @classmethod
     def get_seed_config(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
-        if not cls.is_eligible(env, device_ir):
-            return None
-
-        from ..cute.cute_flash import flash_attention_seed_config
-
         spec = env.config_spec
-        assert spec._cute_flash_head_dim is not None
-        return flash_attention_seed_config(
-            spec._cute_flash_head_dim,
-            spec._cute_flash_num_kv,
-            dtype=spec._cute_flash_dtype,
-            is_causal=spec._cute_flash_is_causal,
-            has_kv_tile_pruning=spec._cute_flash_has_kv_tile_pruning,
-            requires_ws_overlap=spec._cute_flash_requires_ws_overlap,
-            small_biased_candidate=spec._cute_flash_small_biased_candidate,
-            block_size_targets=spec._cute_flash_block_size_target_list(),
-            seed_kind="causal_lpt",
+        fragments = spec._tcgen05_matmul_block_fragments()
+        if fragments is None:
+            return None
+        bm_fragment, bn_fragment, bk_fragment = fragments
+
+        def select(fragment: BlockSizeFragment, choices: tuple[int, ...]) -> int | None:
+            return next(
+                (value for value in choices if fragment.low <= value <= fragment.high),
+                None,
+            )
+
+        bm = select(bm_fragment, (128,))
+        bn = select(bn_fragment, (128, 64))
+        bk = select(bk_fragment, (128, 64, 32, 16))
+        if bm is None or bn is None or bk is None:
+            return None
+        block_sizes = spec._tcgen05_matmul_seed_block_sizes(
+            bm=bm,
+            bn=bn,
+            bk=bk,
+        )
+        if block_sizes is None:
+            return None
+        return Config(
+            block_sizes=block_sizes,
+            num_stages=2,
+            num_warps=8,
+            pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
         )
 
 

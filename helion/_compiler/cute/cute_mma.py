@@ -55,9 +55,12 @@ from .device_state import CuteTcgen05MatmulPlan
 from .device_state import CuteTcgen05StoreValue
 from .device_state import Tcgen05GroupedDMode
 from .device_state import Tcgen05Orientation
-from .fragment_epilogue import Tcgen05PairEpiloguePlan
-from .fragment_epilogue import analyze_tcgen05_pair_epilogue_candidate
-from .fragment_epilogue import analyze_tcgen05_pair_epilogue_plan
+from .fragment_epilogue import Tcgen05FragmentEpiloguePlan
+from .fragment_epilogue import _tcgen05_fragment_dtype_supported
+from .fragment_epilogue import _tcgen05_fragment_source_layout_reachable
+from .fragment_epilogue import _tcgen05_fragment_source_layout_supported
+from .fragment_epilogue import analyze_tcgen05_fragment_epilogue_candidate
+from .fragment_epilogue import analyze_tcgen05_fragment_epilogue_plan
 from .layout import MatmulExecutionKind
 from .layout import MatmulExecutionPlan
 from .matmul_utils import analyze_direct_grouped_n_loads
@@ -144,7 +147,9 @@ from .tcgen05_lifecycle import Tcgen05LifecycleContext
 from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
 if TYPE_CHECKING:
+    from ...autotuner.config_spec import ConfigSpec
     from ...autotuner.config_spec import MatmulFact
+    from ...language.matmul_ops import CuteTcgen05SearchPlan
     from ...runtime.config import Config
     from ..aten_lowering import LoweringContext
     from ..compile_environment import CompileEnvironment
@@ -2494,8 +2499,7 @@ class _MmaSearchGraphView:
 class _MmaOutputStoreAnalysis:
     explicit_epi_tile_compatible: bool
     output_column_major: bool
-    requires_pair_epilogue: bool = False
-    requires_pair_layout: bool = False
+    requires_fragment_epilogue: bool = False
 
 
 def _mma_tiles_are_static_full(
@@ -2541,20 +2545,33 @@ def _unwrap_mma_operand_permute(
     return node.args[0], normalized
 
 
-def _tcgen05_pair_epilogue_operands_supported(
+def _tcgen05_fragment_epilogue_operands_supported(
     analysis: _MmaOperandAnalysis,
 ) -> bool:
-    """Check the config-independent operand envelope for pair epilogues."""
+    """Check the config-independent operand envelope for fragment epilogues."""
     return (
         analysis.has_leading_passthrough
-        and analysis.lhs.source_fake.dtype in (torch.float16, torch.bfloat16)
+        and _tcgen05_fragment_dtype_supported(analysis.lhs.source_fake.dtype)
         and _tcgen05_tma_matrix_major(analysis.lhs.source_fake) == "row"
         and _tcgen05_tma_matrix_major(analysis.rhs.source_fake) in ("row", "col")
     )
 
 
-def _tcgen05_pair_epilogue_plan_output_supported(
-    plan: Tcgen05PairEpiloguePlan,
+def _tcgen05_fragment_epilogue_source_global_shape(
+    analysis: _MmaOperandAnalysis,
+) -> tuple[int | torch.SymInt, ...]:
+    leading_operand = (
+        analysis.lhs if analysis.lhs.is_leading_passthrough else analysis.rhs
+    )
+    return (
+        *leading_operand.logical_fake.shape[:-2],
+        analysis.lhs.matrix_rows,
+        analysis.rhs.matrix_cols,
+    )
+
+
+def _tcgen05_fragment_epilogue_plan_output_supported(
+    plan: Tcgen05FragmentEpiloguePlan,
 ) -> bool:
     output_node = plan.store_node.args[0] if plan.store_node.args else None
     output_fake = output_node.meta.get("val") if isinstance(output_node, Node) else None
@@ -2563,60 +2580,67 @@ def _tcgen05_pair_epilogue_plan_output_supported(
     )
 
 
-def tcgen05_pair_epilogue_can_shape_search(
-    graphs: list[GraphInfo],
-    anchor: Node,
+def tcgen05_fragment_epilogue_source_tiles_reachable(
     candidate: _CuteMmaNode,
-    *,
-    min_search_m: int,
-    max_search_m: int,
-    max_search_n: int,
+    plan: CuteTcgen05SearchPlan,
+    config_spec: ConfigSpec,
 ) -> bool:
-    """Whether the search surface contains a possible pair-plan config."""
-    if not candidate.requires_pair_epilogue:
+    """Whether the search can reach a fragment source-tile layout.
+
+    Output layout and graph ownership are validated when a concrete fragment
+    plan is committed. This preflight only prevents a fragment-only graph from
+    enabling a search whose block-size fragments cannot produce any supported
+    source tile.
+    """
+    if not candidate.requires_fragment_epilogue:
         return True
-    analysis = candidate.operands
-    if not (
-        min_search_m <= 128 <= max_search_m
-        and max_search_n >= 64
-        and _tcgen05_pair_epilogue_operands_supported(analysis)
-    ):
-        return False
 
-    # Search shaping must use the same exhaustive locality proof as codegen.
-    # Probe only the pair-capable tile shapes that are reachable in this
-    # surface; a cheaper structural approximation can admit cross-pair
-    # reshapes and recreate a tcgen05-only-search/universal-codegen mismatch.
-    from ..compile_environment import CompileEnvironment
+    def reachable_values(block_id: int, low: int, high: int) -> tuple[int, ...]:
+        if block_id not in config_spec.block_sizes.valid_block_ids():
+            from ..compile_environment import CompileEnvironment
+            from ..compile_environment import FixedBlockSizeSource
 
-    env = CompileEnvironment.current()
-    for bn in (64, 128):
-        if bn > max_search_n:
-            continue
-        probe_config = env.config_spec.default_config()
-        block_sizes = [*probe_config.block_sizes]
-        for block_id, block_size in (
-            (analysis.leading_passthrough_block_id, 1),
-            (analysis.m_block_id, 128),
-            (analysis.n_block_id, bn),
-        ):
-            assert block_id is not None
-            block_sizes[env.config_spec.block_sizes.block_id_to_index(block_id)] = (
-                block_size
+            source = (
+                CompileEnvironment.current().block_sizes[block_id].block_size_source
             )
-        probe_config.config["block_sizes"] = block_sizes
-        plan = analyze_tcgen05_pair_epilogue_plan(
-            graphs,
-            anchor,
-            expected_output_block_ids=analysis.output_block_ids,
-            config=probe_config,
+            if isinstance(source, FixedBlockSizeSource) and isinstance(
+                source.value, int
+            ):
+                return (source.value,) if low <= source.value <= high else ()
+            return ()
+        fragment = config_spec.block_sizes.block_id_lookup(block_id)._fragment(
+            config_spec
         )
-        if plan is not None and _tcgen05_pair_epilogue_plan_output_supported(plan):
-            return True
-    return False
+        values = fragment.search_values()
+        assert values is not None
+        return tuple(
+            value for value in values if isinstance(value, int) and low <= value <= high
+        )
+
+    analysis = candidate.operands
+    if not _tcgen05_fragment_epilogue_operands_supported(analysis):
+        return False
+    block_values = (
+        reachable_values(analysis.m_block_id, plan.min_search_m, plan.max_search_m),
+        reachable_values(analysis.n_block_id, plan.min_search_n, plan.max_search_n),
+        reachable_values(analysis.k_block_id, plan.mma_k, plan.max_search_k),
+    )
+    return any(
+        _tcgen05_fragment_source_layout_supported(
+            bm=bm,
+            bn=bn,
+            input_dtype=analysis.lhs.source_fake.dtype,
+        )
+        and plan.static_m % bm == 0
+        and plan.static_n % bn == 0
+        and plan.static_k % bk == 0
+        for bm in block_values[0]
+        for bn in block_values[1]
+        for bk in block_values[2]
+    )
 
 
-def ensure_tcgen05_pair_epilogue_plan(
+def ensure_tcgen05_fragment_epilogue_plan(
     fn: DeviceFunction,
     node: Node,
     candidate: _CuteMmaNode,
@@ -2626,17 +2650,19 @@ def ensure_tcgen05_pair_epilogue_plan(
     bk: int,
     config: Config,
 ) -> bool:
-    """Commit a validated pair plan before tcgen05 removes scalar lanes."""
-    if not candidate.requires_pair_epilogue:
+    """Commit a validated fragment plan before tcgen05 removes scalar lanes."""
+    if not candidate.requires_fragment_epilogue:
         return True
     cute_state = fn.cute_state
-    if cute_state.tcgen05_pair_epilogue_plan_for_anchor(node) is not None:
+    if cute_state.tcgen05_fragment_epilogue_plan_for_anchor(node) is not None:
         return True
-    if cute_state.tcgen05_pair_epilogue_plan_was_rejected(node, bm=bm, bn=bn, bk=bk):
+    if cute_state.tcgen05_fragment_epilogue_plan_was_rejected(
+        node, bm=bm, bn=bn, bk=bk
+    ):
         return False
 
     def reject() -> bool:
-        cute_state.reject_tcgen05_pair_epilogue_plan(node, bm=bm, bn=bn, bk=bk)
+        cute_state.reject_tcgen05_fragment_epilogue_plan(node, bm=bm, bn=bn, bk=bk)
         return False
 
     analysis = candidate.operands
@@ -2649,9 +2675,12 @@ def ensure_tcgen05_pair_epilogue_plan(
     if anchors != [node]:
         return reject()
     if not (
-        _tcgen05_pair_epilogue_operands_supported(analysis)
-        and bm == 128
-        and bn in (64, 128)
+        _tcgen05_fragment_epilogue_operands_supported(analysis)
+        and _tcgen05_fragment_source_layout_supported(
+            bm=bm,
+            bn=bn,
+            input_dtype=analysis.lhs.source_fake.dtype,
+        )
         and _mma_tiles_are_static_full(analysis, bm=bm, bn=bn, bk=bk)
         and _tcgen05_cluster_m(config) == 1
         and _tcgen05_cluster_n(config) == 1
@@ -2664,22 +2693,28 @@ def ensure_tcgen05_pair_epilogue_plan(
             Tcgen05LayoutStrategy.DEFAULT.value,
         )
         == Tcgen05LayoutStrategy.DEFAULT.value
+        and warp_spec_from_config(config).store_warps == 0
         and not is_pure_matmul_role_lifecycle_config(config)
     ):
         return reject()
-    plan = analyze_tcgen05_pair_epilogue_plan(
+    plan = analyze_tcgen05_fragment_epilogue_plan(
         fn.codegen.codegen_graphs,
         node,
         expected_output_block_ids=analysis.output_block_ids,
         config=config,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        input_dtype=analysis.lhs.source_fake.dtype,
+        source_global_shape=_tcgen05_fragment_epilogue_source_global_shape(analysis),
     )
     if plan is None:
         return reject()
-    if not _tcgen05_pair_epilogue_plan_output_supported(plan) or any(
+    if not _tcgen05_fragment_epilogue_plan_output_supported(plan) or any(
         "codegen" in owned.meta for owned in plan.owned_nodes
     ):
         return reject()
-    cute_state.register_tcgen05_pair_epilogue_plan(plan)
+    cute_state.register_tcgen05_fragment_epilogue_plan(plan)
     return True
 
 
@@ -2976,8 +3011,7 @@ class _CuteMmaNode(_CuteMmaTarget):
     output_store_analysis: _MmaOutputStoreAnalysis | None
     explicit_epi_tile_compatible: bool
     output_column_major: bool
-    requires_pair_epilogue: bool = False
-    requires_pair_layout: bool = False
+    requires_fragment_epilogue: bool = False
 
     @property
     def requires_scalar_fallback(self) -> bool:
@@ -2999,6 +3033,20 @@ class _CuteMmaNode(_CuteMmaTarget):
             not self.operands.has_leading_passthrough
             and self.output_store_analysis is not None
             and self.operands.scalar_loads_use_identity_axis_mapping
+        )
+
+    def supports_tcgen05_search_plan(self, plan: CuteTcgen05SearchPlan) -> bool:
+        """Whether the search contains a usable tile for this MMA candidate."""
+        if not self.requires_fragment_epilogue:
+            return True
+        return _tcgen05_fragment_epilogue_operands_supported(
+            self.operands
+        ) and _tcgen05_fragment_source_layout_reachable(
+            min_bm=plan.min_search_m,
+            max_bm=plan.max_search_m,
+            min_bn=plan.min_search_n,
+            max_bn=plan.max_search_n,
+            input_dtype=self.operands.lhs.source_fake.dtype,
         )
 
 
@@ -3079,12 +3127,12 @@ def _decode_cute_mma_target(
     )
 
 
-def tcgen05_pair_epilogue_has_unique_anchor(
+def tcgen05_fragment_epilogue_has_unique_anchor(
     graphs: list[GraphInfo],
     *,
     device_ir: DeviceIR | None = None,
 ) -> bool:
-    """Whether pair-plan commitment can own the complete MMA function."""
+    """Whether fragment-plan commitment can own the complete MMA function."""
     return (
         sum(
             _decode_cute_mma_target(node, device_ir=device_ir) is not None
@@ -3095,14 +3143,14 @@ def tcgen05_pair_epilogue_has_unique_anchor(
     )
 
 
-def tcgen05_pair_epilogue_present(graphs: list[GraphInfo]) -> bool:
-    """Whether structural analysis found any pair-owned epilogue region."""
+def tcgen05_fragment_epilogue_present(graphs: list[GraphInfo]) -> bool:
+    """Whether structural analysis found any thread-local epilogue region."""
     return any(
         isinstance(
             output_analysis := node.meta.get(_MMA_OUTPUT_STORE_ANALYSIS_META_KEY),
             _MmaOutputStoreAnalysis,
         )
-        and output_analysis.requires_pair_epilogue
+        and output_analysis.requires_fragment_epilogue
         for graph_info in graphs
         for node in graph_info.graph.nodes
     )
@@ -3250,13 +3298,8 @@ def analyze_cute_mma_node(
             if output_store_analysis is not None
             else False
         ),
-        requires_pair_epilogue=(
-            output_store_analysis.requires_pair_epilogue
-            if output_store_analysis is not None
-            else False
-        ),
-        requires_pair_layout=(
-            output_store_analysis.requires_pair_layout
+        requires_fragment_epilogue=(
+            output_store_analysis.requires_fragment_epilogue
             if output_store_analysis is not None
             else False
         ),
@@ -3941,11 +3984,11 @@ def prepare_cute_collective_lane_loop_suppression(
         return
     allow_grouped_k_mask = _tcgen05_grouped_mode(cg.device_function.config) is not None
     cute_state = cg.device_function.cute_state
-    if not tcgen05_pair_epilogue_has_unique_anchor(
+    if not tcgen05_fragment_epilogue_has_unique_anchor(
         cg.codegen_graphs
-    ) and tcgen05_pair_epilogue_present(cg.codegen_graphs):
+    ) and tcgen05_fragment_epilogue_present(cg.codegen_graphs):
         # Root lane-loop suppression is shared across the device-function
-        # planning state. Pair-plan commitment is deliberately limited to a
+        # planning state. Fragment-plan commitment is deliberately limited to a
         # unique MMA anchor, so a mixed function must reject tcgen05 atomically.
         cute_state.veto_collective_lane_loop_suppression()
     if cute_state.collective_lane_loop_suppression_is_vetoed():
@@ -4020,7 +4063,7 @@ def prepare_cute_collective_lane_loop_suppression(
             )
             if _has_non_root_lane_loops(cg, allowed_loop_states=allowed_k_lane_loops):
                 continue
-            if not ensure_tcgen05_pair_epilogue_plan(
+            if not ensure_tcgen05_fragment_epilogue_plan(
                 cg.device_function,
                 node,
                 candidate,
@@ -5089,18 +5132,15 @@ def _analyze_mma_output_stores(
 
     analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
     if analyzed_stores is None:
-        if (
-            pair_candidate := analyze_tcgen05_pair_epilogue_candidate(
-                graphs,
-                mma_node,
-                expected_output_block_ids=analysis.output_block_ids,
-            )
-        ) is not None:
+        if analyze_tcgen05_fragment_epilogue_candidate(
+            graphs,
+            mma_node,
+            expected_output_block_ids=analysis.output_block_ids,
+        ):
             return _MmaOutputStoreAnalysis(
                 explicit_epi_tile_compatible=False,
                 output_column_major=False,
-                requires_pair_epilogue=True,
-                requires_pair_layout=pair_candidate.requires_pair_layout,
+                requires_fragment_epilogue=True,
             )
         return None
     env = CompileEnvironment.current()
@@ -5125,7 +5165,7 @@ def _analyze_mma_output_stores(
             return None
         explicit_epi_tile_compatible &= (
             tensor_fake.dtype == analysis.lhs.source_fake.dtype
-            and all(step.broadcast_axis == 1 for step in chain.auxiliary_tensor_steps)
+            and all(step.broadcast_axis == 1 for step in chain.auxiliary_tensor_loads)
         )
         store_major = _tcgen05_tma_matrix_major(tensor_fake)
         if store_major is None:
@@ -6164,31 +6204,30 @@ def _emit_mma_pipeline(
     ):
         raise exc.BackendUnsupported(
             "cute",
-            "tcgen05 pair epilogue requires a unique MMA anchor before root "
+            "tcgen05 thread-local epilogue requires a unique MMA anchor before root "
             "lane loops can be suppressed",
         )
-    unplanned_pair_candidate = (
+    unplanned_fragment_candidate = (
         candidate
         if candidate is not None
-        and candidate.requires_pair_epilogue
+        and candidate.requires_fragment_epilogue
         and fx_node is not None
-        and df.cute_state.tcgen05_pair_epilogue_plan_for_anchor(fx_node) is None
+        and df.cute_state.tcgen05_fragment_epilogue_plan_for_anchor(fx_node) is None
         else None
     )
-    if unplanned_pair_candidate is not None:
-        if (
-            env.config_spec.cute_tcgen05_search_enabled
-            or unplanned_pair_candidate.requires_pair_layout
-        ):
-            # Search-shaped lane mapping and logical shape transforms can both
-            # require a rendezvous between values assigned to sequential root
-            # lanes. Refuse configs that have not committed the exhaustive plan.
+    if unplanned_fragment_candidate is not None:
+        if env.config_spec.cute_tcgen05_search_enabled:
+            # A thread-local tcgen05 config suppresses root lane loops on the
+            # promise that the exhaustive plan can rendezvous all demanded values.
+            # Refuse that config if the plan was not committed.
             raise exc.BackendUnsupported(
-                "cute", "tcgen05 pair epilogue locality proof rejected this config"
+                "cute",
+                "tcgen05 thread-local epilogue ownership proof rejected this config",
             )
         if mma_impl == "tcgen05":
-            # A pointwise-only fragment outside the pair envelope can retain the
-            # established scalar lowering (notably the static N=8 fallback).
+            # Search preflight declined this kernel, so the K loop retained its
+            # scalar lane loop.  Falling back here is safe even for logical
+            # shape transforms; the generic CuTe reshape lowering owns them.
             return None
     mma_tiles_are_static_full = (
         _mma_tiles_are_static_full(analysis, bm=bm, bn=bn, bk=bk)
@@ -6724,6 +6763,10 @@ def _emit_mma_pipeline(
         and tcgen05_role_local_codegen_allowed
         and (not _is_persistent_pid_config(df.config) or tcgen05_use_role_local_epi)
     )
+    # A proven compact fragment destination can use the same SMEM-staged TMA
+    # store pipeline as a same-shape epilogue.  The store renderer builds the
+    # destination-sized TMA descriptor and keeps the source T2R ownership
+    # separate from the compact destination partition.
 
     def tcgen05_tma_store_full_tiles_only_for(
         partial_output_tma_store: bool,
@@ -8157,13 +8200,19 @@ def _emit_mma_pipeline(
         tcgen05_persistence_model_for_plan = tcgen05_persistence_model_str
 
         # When the entire grid fits in one wave, every persistent CTA receives
-        # exactly one tile.
-        one_shot_m_slots = (m_size // bm) * (2 if tcgen05_is_two_cta else 1)
-        one_shot_n_slots = n_size // bn
+        # exactly one tile. Use ceiling counts so the same proof covers both
+        # static-full grids and the validated FP8 role-local N-edge path.
+        one_shot_m_slots = ((m_size + bm - 1) // bm) * (2 if tcgen05_is_two_cta else 1)
+        one_shot_n_slots = (n_size + bn - 1) // bn
         one_shot_work_ctas = one_shot_m_slots * one_shot_n_slots
         tcgen05_one_shot_role_scheduler = (
             tcgen05_pid_is_persistent
-            and tcgen05_static_full_tiles
+            and (
+                tcgen05_static_full_tiles
+                or (
+                    tcgen05_role_local_n_edge_tma and input_dtype == torch.float8_e4m3fn
+                )
+            )
             and (analysis is None or not analysis.has_leading_passthrough)
             and one_shot_work_ctas <= env.config_spec.num_sm
             # A partial cluster could access out of bounds.

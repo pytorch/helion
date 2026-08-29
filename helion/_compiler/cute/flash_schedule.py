@@ -46,6 +46,11 @@ class FlashOutputOrder(enum.Enum):
     CTA_CONTIGUOUS = "cta_contiguous"
 
 
+class FlashStatReleaseMapping(enum.Enum):
+    CROSS_SLOT = "cross_slot"
+    SAME_SLOT = "same_slot"
+
+
 @dataclasses.dataclass(frozen=True)
 class FlashScheduleSpec:
     head_dim: int
@@ -66,6 +71,8 @@ class FlashScheduleSpec:
     stat_depth: int = 2
     pipelined_stat_handoff: bool = False
     final_only_stat_handoff: bool = False
+    stat_release_mapping: FlashStatReleaseMapping = FlashStatReleaseMapping.CROSS_SLOT
+    query_slots_have_equal_kv_iterations: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -175,10 +182,46 @@ def _shared_memory_bytes(spec: FlashScheduleSpec) -> int:
     return q_bytes + kv_bytes + output_bytes + 3072
 
 
+def max_fa4_kv_depth(
+    spec: FlashScheduleSpec, limits: FlashScheduleLimits | None = None
+) -> int:
+    """Return the largest K/V depth allowed by the schedule's SMEM layout."""
+    if limits is None:
+        limits = FlashScheduleLimits()
+    base_bytes = _shared_memory_bytes(dataclasses.replace(spec, kv_depth=0))
+    tile_bytes = 128 * spec.head_dim * spec.dtype_bytes
+    bytes_per_stage = (2 if spec.separate_kv else 1) * tile_bytes
+    return max(0, (limits.shared_memory_bytes - base_bytes) // bytes_per_stage)
+
+
 def _output_tile(spec: FlashScheduleSpec, cta_rank: int, query_slot: int) -> int:
     if spec.output_order is FlashOutputOrder.CTA_CONTIGUOUS:
         return cta_rank * spec.query_slots_per_cta + query_slot
     return query_slot * spec.cta_count + cta_rank
+
+
+def _pipelined_stat_release(
+    spec: FlashScheduleSpec, source_slot: int
+) -> tuple[int, int]:
+    if spec.stat_release_mapping is FlashStatReleaseMapping.SAME_SLOT:
+        return source_slot, 1
+    # The acknowledged correction loop visits slot 0 before slot 1. Slot 0
+    # releases slot 1's held prologue value in the current loop iteration;
+    # slot 1 then releases slot 0 for the next iteration.
+    return source_slot ^ 1, source_slot
+
+
+def _pipelined_stat_releaser(
+    spec: FlashScheduleSpec, target_slot: int
+) -> tuple[int, int]:
+    source_slot = (
+        target_slot
+        if spec.stat_release_mapping is FlashStatReleaseMapping.SAME_SLOT
+        else target_slot ^ 1
+    )
+    mapped_target, iteration_delta = _pipelined_stat_release(spec, source_slot)
+    assert mapped_target == target_slot
+    return source_slot, iteration_delta
 
 
 def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
@@ -205,13 +248,30 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
         raise FlashScheduleError("a private causal tail requires causal K/V multicast")
     if not isinstance(spec.output_order, FlashOutputOrder):
         raise FlashScheduleError("output order is invalid")
+    if not isinstance(spec.stat_release_mapping, FlashStatReleaseMapping):
+        raise FlashScheduleError("stat release mapping is invalid")
     if spec.dtype_bytes <= 0:
         raise FlashScheduleError("dtype size must be positive")
     if spec.stat_depth not in (1, 2):
         raise FlashScheduleError("stat transport depth must be one or two")
-    if spec.pipelined_stat_handoff and (spec.stat_depth != 1 or spec.causal):
+    if spec.pipelined_stat_handoff and spec.stat_depth != 1:
+        raise FlashScheduleError("pipelined stat handoff requires depth one")
+    if (
+        spec.pipelined_stat_handoff
+        and spec.causal
+        and spec.stat_release_mapping is FlashStatReleaseMapping.CROSS_SLOT
+        and not spec.query_slots_have_equal_kv_iterations
+    ):
         raise FlashScheduleError(
-            "pipelined stat handoff requires depth one and a noncausal schedule"
+            "causal cross-slot stat releases require proof of equal query-slot "
+            "K/V iteration counts"
+        )
+    if (
+        not spec.pipelined_stat_handoff
+        and spec.stat_release_mapping is FlashStatReleaseMapping.SAME_SLOT
+    ):
+        raise FlashScheduleError(
+            "same-slot stat releases require pipelined stat handoff"
         )
     if spec.final_only_stat_handoff and (spec.stat_depth != 1 or spec.causal):
         raise FlashScheduleError(
@@ -489,12 +549,18 @@ def build_fa4_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
                 ]
             )
             if not spec.final_only_stat_handoff:
+                stat_release_slot = slot
+                stat_release_delta = spec.stat_depth
+                if spec.pipelined_stat_handoff:
+                    stat_release_slot, stat_release_delta = _pipelined_stat_release(
+                        spec, slot
+                    )
                 edges.append(
                     FlashEdge(
                         correction,
-                        stat,
-                        iteration_delta=spec.stat_depth,
-                        barrier=stat_empty,
+                        _node_name("stat", rank, stat_release_slot),
+                        iteration_delta=stat_release_delta,
+                        barrier=f"stat_empty_r{rank}_q{stat_release_slot}",
                         arrival_count=1,
                     )
                 )
@@ -906,6 +972,34 @@ def verify_flash_schedule(
                 f"barrier {barrier.name} expected {barrier.expected_arrivals} "
                 f"arrivals, got {arrivals[barrier.name]}"
             )
+    if schedule.spec.pipelined_stat_handoff:
+        expected_releases = {
+            FlashEdge(
+                _node_name("correction", rank, source_slot),
+                _node_name("stat", rank, target_slot),
+                iteration_delta,
+                f"stat_empty_r{rank}_q{target_slot}",
+                1,
+            )
+            for rank in range(schedule.spec.cta_count)
+            for source_slot in range(schedule.spec.query_slots_per_cta)
+            for target_slot, iteration_delta in (
+                (_pipelined_stat_release(schedule.spec, source_slot),)
+            )
+        }
+        release_edges = [
+            edge
+            for edge in schedule.edges
+            if edge.barrier is not None and edge.barrier.startswith("stat_empty_")
+        ]
+        if (
+            len(release_edges) != len(expected_releases)
+            or set(release_edges) != expected_releases
+        ):
+            raise FlashScheduleError(
+                "pipelined stat releases do not match the selected "
+                f"{schedule.spec.stat_release_mapping.value} mapping"
+            )
     if schedule.spec.final_only_stat_handoff:
         edge_keys = {
             (edge.source, edge.target, edge.iteration_delta, edge.barrier)
@@ -1048,11 +1142,34 @@ def verify_flash_schedule(
                         f"memory region {region.name} is reused before all consumers"
                     )
             if region.reuse_barrier is not None:
-                for consumer in region.consumers:
+                reuse_releases = tuple(
+                    (consumer, region.reuse_distance) for consumer in region.consumers
+                )
+                writer = node_by_name[region.writer]
+                if (
+                    schedule.spec.pipelined_stat_handoff
+                    and writer.kind is FlashNodeKind.STAT_PUBLISH
+                ):
+                    assert writer.cta_rank is not None
+                    assert writer.query_slot is not None
+                    source_slot, iteration_delta = _pipelined_stat_releaser(
+                        schedule.spec, writer.query_slot
+                    )
+                    reuse_releases = (
+                        (
+                            _node_name(
+                                "correction",
+                                writer.cta_rank,
+                                source_slot,
+                            ),
+                            iteration_delta,
+                        ),
+                    )
+                for release_source, iteration_delta in reuse_releases:
                     if not any(
-                        edge.source == consumer
+                        edge.source == release_source
                         and edge.target == region.writer
-                        and edge.iteration_delta == region.reuse_distance
+                        and edge.iteration_delta == iteration_delta
                         and edge.barrier == region.reuse_barrier
                         for edge in schedule.edges
                     ):

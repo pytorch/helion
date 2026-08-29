@@ -39,10 +39,12 @@ import torch
 
 from ...autotuner.config_fragment import ConfigSpecFragment
 from ...autotuner.config_fragment import EnumFragment
+from ...exc import InvalidConfig
 from ...runtime.config import Config
 from ..device_function import TensorArg
 from .attention_plan import ALIBI_BIAS_KIND
 from .attention_plan import CAUSAL_MASK_KIND
+from .attention_plan import DENSE_SCORE_KIND
 from .attention_plan import DOCUMENT_MASK_KIND
 from .attention_plan import PREFIX_LM_MASK_KIND
 from .attention_plan import RELATIVE_BIAS_KIND
@@ -54,9 +56,15 @@ from .causal_range import CausalRangeProof
 from .causal_range import IntegerInterval
 from .causal_range import TileLayout
 from .causal_range import prove_descending_causal_prefix_unmasked
+from .flash_policy import get_flash_target_policy
 from .flash_schedule import FlashScheduleSpec
+from .flash_schedule import FlashStatReleaseMapping
 from .flash_schedule import build_fa4_schedule
+from .flash_schedule import max_fa4_kv_depth
 from .flash_schedule import verify_flash_schedule
+from .flash_tuning import FlashCausalSeedTemplate
+from .flash_tuning import FlashPackedExp2Mode
+from .flash_tuning import FlashSoftmaxLowering
 
 _T = TypeVar("_T")
 
@@ -64,6 +72,9 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
     from collections.abc import Mapping
     from collections.abc import Sequence
+
+    from .flash_tuning import FlashCausalTuningPolicy
+    from .flash_tuning import FlashDenseTuningPolicy
 
 
 class FlashGraphOutputPlan(NamedTuple):
@@ -73,6 +84,7 @@ class FlashGraphOutputPlan(NamedTuple):
     k_name: str
     v_name: str
     o_name: str
+    output_epilogue: str
     lse_name: str | None
     lse_log_base: str | None
     bias_names: tuple[str, ...]
@@ -434,46 +446,81 @@ def _flash_kv_load_has_canonical_indices(
 
 
 def _flash_store_value_is_output(node: torch.fx.Node) -> bool:
+    return _flash_store_value_output_epilogue(node) is not None
+
+
+_FLASH_OUTPUT_EPILOGUE_IDENTITY = "identity"
+_FLASH_OUTPUT_EPILOGUE_RELU = "relu"
+
+
+def _flash_output_relu_enabled(output_epilogue: str) -> bool:
+    if output_epilogue == _FLASH_OUTPUT_EPILOGUE_IDENTITY:
+        return False
+    if output_epilogue == _FLASH_OUTPUT_EPILOGUE_RELU:
+        return True
+    raise AssertionError(f"unsupported flash output epilogue: {output_epilogue!r}")
+
+
+def _flash_store_value_output_epilogue(node: torch.fx.Node) -> str | None:
     from ...language import memory_ops
     from ...language import view_ops
 
     if node.op != "call_function" or node.target is not memory_ops.store:
-        return False
+        return None
     if len(node.args) < 3 or not isinstance(node.args[2], torch.fx.Node):
-        return False
+        return None
     value = node.args[2]
     if (
         value.op == "call_function"
         and value.target is torch.ops.prims.convert_element_type.default
-        and value.args
-        and isinstance(value.args[0], torch.fx.Node)
     ):
+        output = node.args[0]
+        if (
+            value.kwargs
+            or len(value.args) != 2
+            or not isinstance(value.args[0], torch.fx.Node)
+            or not isinstance(output, torch.fx.Node)
+            or value.args[1] != getattr(output.meta.get("val"), "dtype", None)
+        ):
+            return None
+        value = value.args[0]
+    output_epilogue = _FLASH_OUTPUT_EPILOGUE_IDENTITY
+    if value.op == "call_function" and value.target is torch.ops.aten.relu.default:
+        if (
+            value.kwargs
+            or len(value.args) != 1
+            or not isinstance(value.args[0], torch.fx.Node)
+        ):
+            return None
+        output_epilogue = _FLASH_OUTPUT_EPILOGUE_RELU
         value = value.args[0]
     if value.op != "call_function" or value.target is not torch.ops.aten.div.Tensor:
-        return False
+        return None
     if len(value.args) < 2:
-        return False
+        return None
     acc_node, sum_view = value.args[:2]
     if not isinstance(acc_node, torch.fx.Node) or not isinstance(
         sum_view, torch.fx.Node
     ):
-        return False
+        return None
     acc_loop = _flash_phi_loop_result(acc_node, 2)
     if acc_loop is None:
-        return False
+        return None
     if sum_view.op != "call_function" or sum_view.target is not view_ops.subscript:
-        return False
+        return None
     if not sum_view.args or not isinstance(sum_view.args[0], torch.fx.Node):
-        return False
+        return None
     sum_loop = _flash_phi_loop_result(sum_view.args[0], 1)
     if sum_loop is not acc_loop:
-        return False
+        return None
     indices = sum_view.args[1] if len(sum_view.args) > 1 else None
     if not isinstance(indices, (list, tuple)) or len(indices) != 3:
-        return False
-    return (
+        return None
+    if not (
         _is_full_slice(indices[0]) and _is_full_slice(indices[1]) and indices[2] is None
-    )
+    ):
+        return None
+    return output_epilogue
 
 
 def _flash_phi_loop_result(node: torch.fx.Node, index: int) -> torch.fx.Node | None:
@@ -594,6 +641,7 @@ def _flash_graph_output_plan_from_graphs(
         return None
 
     o_store_names: list[str] = []
+    o_store_epilogues: list[str] = []
     lse_store_names: list[str] = []
     lse_log_bases: list[str] = []
     for node, name in store_nodes:
@@ -607,9 +655,11 @@ def _flash_graph_output_plan_from_graphs(
         ):
             if not _flash_store_has_canonical_indices(node, 3, index_pair):
                 return None
-            if not _flash_store_value_is_output(node):
+            output_epilogue = _flash_store_value_output_epilogue(node)
+            if output_epilogue is None:
                 return None
             o_store_names.append(name)
+            o_store_epilogues.append(output_epilogue)
             continue
         if value.ndim == 2 and value.dtype == torch.float32 and value.is_contiguous():
             if not _flash_store_has_canonical_indices(node, 2, index_pair):
@@ -623,6 +673,8 @@ def _flash_graph_output_plan_from_graphs(
         return None
 
     if len(o_store_names) != 1 or len(set(o_store_names)) != 1:
+        return None
+    if len(o_store_epilogues) != 1:
         return None
     if len(lse_store_names) > 1 or len(set(lse_store_names)) != len(lse_store_names):
         return None
@@ -745,11 +797,26 @@ def _flash_graph_output_plan_from_graphs(
         allowed_host_names.add(lse_name)
     if set(host_tensors) != allowed_host_names:
         return None
+    output_epilogue = o_store_epilogues[0]
+    if output_epilogue == _FLASH_OUTPUT_EPILOGUE_RELU and (
+        io_dtype is not torch.bfloat16
+        or lse_name is not None
+        or bias_names
+        or alibi_names
+        or document_names
+        or score_plan is None
+        or not (
+            _standard_dense_score_plan_supported(score_plan)
+            or _standard_causal_score_plan_supported(score_plan)
+        )
+    ):
+        return None
     return FlashGraphOutputPlan(
         q_name,
         k_name,
         v_name,
         o_name,
+        output_epilogue,
         lse_name,
         lse_log_base,
         bias_names,
@@ -762,6 +829,173 @@ def _flash_graph_output_plan_from_graphs(
     )
 
 
+def _flash_4d_value_base_batch_heads(
+    value: torch.Tensor,
+    *,
+    batch: int,
+    seq: int,
+    head_dim: int,
+    dtype: torch.dtype,
+) -> tuple[int, int] | None:
+    """Return ``(z, h)`` when a flattened flash input has a BHSD base."""
+    base = value._base
+    if base is None:
+        return None
+    if (
+        base.ndim != 4
+        or base.dtype != dtype
+        or not base.is_contiguous()
+        or int(base.shape[2]) != seq
+        or int(base.shape[3]) != head_dim
+        or int(value.storage_offset()) != 0
+        or int(base.storage_offset()) != 0
+    ):
+        return None
+    tensor_4d_batch = int(base.shape[0])
+    tensor_4d_heads = int(base.shape[1])
+    if tensor_4d_batch <= 0 or tensor_4d_heads <= 0:
+        return None
+    if tensor_4d_batch * tensor_4d_heads != batch:
+        return None
+    return tensor_4d_batch, tensor_4d_heads
+
+
+def _flash_values_support_tensor_4d_tma(
+    q_value: torch.Tensor,
+    k_value: torch.Tensor,
+    v_value: torch.Tensor,
+    *,
+    score_plan: AttentionScorePlan,
+    batch: int,
+    seq: int,
+    head_dim: int,
+    dtype: torch.dtype,
+) -> bool:
+    """Mirror the emitter's proof that Q/K/V can use BHSD TMA descriptors."""
+    if score_plan.modifiers or dtype is not torch.float16 or head_dim != 64:
+        return False
+    return (
+        _flash_values_tensor_4d_batch_heads(
+            q_value,
+            k_value,
+            v_value,
+            batch=batch,
+            seq=seq,
+            head_dim=head_dim,
+            dtype=dtype,
+        )
+        is not None
+    )
+
+
+def _flash_values_tensor_4d_batch_heads(
+    q_value: torch.Tensor,
+    k_value: torch.Tensor,
+    v_value: torch.Tensor,
+    *,
+    batch: int,
+    seq: int,
+    head_dim: int,
+    dtype: torch.dtype,
+) -> tuple[int, int] | None:
+    """Return common BHSD base geometry independently of TMA eligibility."""
+    q_base_shape = _flash_4d_value_base_batch_heads(
+        q_value,
+        batch=batch,
+        seq=seq,
+        head_dim=head_dim,
+        dtype=dtype,
+    )
+    if q_base_shape is None:
+        return None
+    if not all(
+        _flash_4d_value_base_batch_heads(
+            value,
+            batch=batch,
+            seq=seq,
+            head_dim=head_dim,
+            dtype=dtype,
+        )
+        == q_base_shape
+        for value in (k_value, v_value)
+    ):
+        return None
+    return q_base_shape
+
+
+def flash_attention_graph_tensor_4d_batch_heads_from_graphs(
+    graphs: Iterable[GraphInfo],
+    *,
+    root_block_ids: Sequence[int] | None = None,
+    kv_block_id: int | None = None,
+    score_plan: AttentionScorePlan,
+) -> tuple[int, int] | None:
+    """Return common input BHSD geometry without imposing 4D-TMA gates."""
+    graphs = tuple(graphs)
+    graph_plan = _flash_graph_output_plan_from_graphs(
+        graphs,
+        root_block_ids=root_block_ids,
+        kv_block_id=kv_block_id,
+        score_plan=score_plan,
+    )
+    if graph_plan is None:
+        return None
+    host_tensors = _flash_graph_host_tensors(graphs)
+    values = tuple(
+        host_tensors.get(name)
+        for name in (graph_plan.q_name, graph_plan.k_name, graph_plan.v_name)
+    )
+    if not all(isinstance(value, torch.Tensor) for value in values):
+        return None
+    q_value, k_value, v_value = cast("tuple[torch.Tensor, ...]", values)
+    return _flash_values_tensor_4d_batch_heads(
+        q_value,
+        k_value,
+        v_value,
+        batch=graph_plan.batch,
+        seq=graph_plan.seq,
+        head_dim=graph_plan.head_dim,
+        dtype=graph_plan.dtype,
+    )
+
+
+def flash_attention_graph_supports_tensor_4d_tma_from_graphs(
+    graphs: Iterable[GraphInfo],
+    *,
+    root_block_ids: Sequence[int] | None = None,
+    kv_block_id: int | None = None,
+    score_plan: AttentionScorePlan,
+) -> bool:
+    """Return whether this graph can emit real 4D Q/K/V TMA descriptors."""
+    graphs = tuple(graphs)
+    graph_plan = _flash_graph_output_plan_from_graphs(
+        graphs,
+        root_block_ids=root_block_ids,
+        kv_block_id=kv_block_id,
+        score_plan=score_plan,
+    )
+    if graph_plan is None:
+        return False
+    host_tensors = _flash_graph_host_tensors(graphs)
+    values = tuple(
+        host_tensors.get(name)
+        for name in (graph_plan.q_name, graph_plan.k_name, graph_plan.v_name)
+    )
+    if not all(isinstance(value, torch.Tensor) for value in values):
+        return False
+    q_value, k_value, v_value = cast("tuple[torch.Tensor, ...]", values)
+    return _flash_values_support_tensor_4d_tma(
+        q_value,
+        k_value,
+        v_value,
+        score_plan=score_plan,
+        batch=graph_plan.batch,
+        seq=graph_plan.seq,
+        head_dim=graph_plan.head_dim,
+        dtype=graph_plan.dtype,
+    )
+
+
 def flash_attention_graph_lse_plan_valid_from_graphs(
     graphs: Iterable[GraphInfo],
     *,
@@ -769,15 +1003,17 @@ def flash_attention_graph_lse_plan_valid_from_graphs(
     kv_block_id: int | None = None,
     score_plan: AttentionScorePlan | None = None,
 ) -> bool:
-    return (
-        _flash_graph_output_plan_from_graphs(
-            graphs,
-            root_block_ids=root_block_ids,
-            kv_block_id=kv_block_id,
-            score_plan=score_plan,
-        )
-        is not None
+    graph_plan = _flash_graph_output_plan_from_graphs(
+        graphs,
+        root_block_ids=root_block_ids,
+        kv_block_id=kv_block_id,
+        score_plan=score_plan,
     )
+    if graph_plan is None:
+        return False
+    # LSE uses a direct layout with signed Int32 element coordinates. Unlike O,
+    # it has no TMA store path to carry a wider address.
+    return graph_plan.lse_name is None or graph_plan.batch * graph_plan.seq <= 1 << 31
 
 
 def flash_attention_graph_small_biased_candidate_from_graphs(
@@ -812,6 +1048,21 @@ def _standard_dense_score_plan_supported(score_plan: AttentionScorePlan) -> bool
         rel_tol=1e-8,
         abs_tol=1e-8,
     )
+
+
+def _standard_causal_score_plan_supported(score_plan: AttentionScorePlan) -> bool:
+    return score_plan.modifier_kinds == (CAUSAL_MASK_KIND,) and math.isclose(
+        score_plan.qk_scale_log2,
+        math.log2(math.e) / math.sqrt(score_plan.head_dim),
+        rel_tol=1e-8,
+        abs_tol=1e-8,
+    )
+
+
+def _flash_output_requires_tma(num_bh: int, seq: int, head_dim: int) -> bool:
+    # Direct/STG output layouts use signed Int32 element coordinates. The
+    # largest valid coordinate is numel - 1, so exactly 2**31 elements is safe.
+    return num_bh * seq * head_dim > 1 << 31
 
 
 def flash_attention_graph_standard_dense_output_from_graphs(
@@ -858,13 +1109,7 @@ def flash_attention_graph_standard_causal_output_from_graphs(
         and not graph_plan.bias_names
         and not graph_plan.alibi_names
         and not graph_plan.document_names
-        and score_plan.modifier_kinds == (CAUSAL_MASK_KIND,)
-        and math.isclose(
-            score_plan.qk_scale_log2,
-            math.log2(math.e) / math.sqrt(score_plan.head_dim),
-            rel_tol=1e-8,
-            abs_tol=1e-8,
-        )
+        and _standard_causal_score_plan_supported(score_plan)
     )
 
 
@@ -925,6 +1170,17 @@ def _flash_deep_1cta_kv_stage_cap(head_dim: int) -> int:
     if head_dim == 128:
         return 2
     return 0
+
+
+def _flash_aliased_kv_stage_cap(head_dim: int, *, stage_output: bool) -> int:
+    """Largest legal aliased K/V depth for the requested output storage."""
+    return max_fa4_kv_depth(
+        FlashScheduleSpec(
+            head_dim=head_dim,
+            kv_depth=2,
+            stage_output=stage_output,
+        )
+    )
 
 
 def _flash_persistent() -> bool:
@@ -1015,12 +1271,7 @@ FLASH_PIPELINE_FAMILY_FLAGS: dict[str, FlashPipelineFamilyFlags] = {
     ),
 }
 FLASH_PIPELINE_FAMILIES = tuple(FLASH_PIPELINE_FAMILY_FLAGS)
-FLASH_MANUAL_ONLY_PIPELINE_FAMILIES = frozenset({"fa4_deep_1cta", "fa4_2cta_causal"})
-FLASH_AUTOTUNE_PIPELINE_FAMILIES = tuple(
-    family
-    for family in FLASH_PIPELINE_FAMILIES
-    if family not in FLASH_MANUAL_ONLY_PIPELINE_FAMILIES
-)
+FLASH_AUTOTUNE_PIPELINE_FAMILIES = FLASH_PIPELINE_FAMILIES
 
 
 def _flash_pipeline_family_flags(
@@ -1080,6 +1331,15 @@ class FlashAttentionConfig:
     recompute_tile_coords: bool
     num_regs_producer: int
     num_regs_consumer: int
+
+    # Source-level scheduling choices must be explicit config dimensions.  In
+    # particular, do not select these from sequence-length thresholds in the
+    # emitter: doing so makes one nominal config mean different programs for
+    # neighboring shapes and prevents the autotuner from measuring both.
+    persistent_loop: str = "while"
+    sp_row_sum: str = "fragment"
+    softmax_setup: str = "shared"
+    epi_tma_setup: str = "shared"
 
     # Stage B/C topology fields (consumed by the fa4 emitter)
     topology: str = "ws_overlap"
@@ -1163,8 +1423,7 @@ class FlashAttentionConfig:
     # per-call descriptor mutation, matching the FA4 static-Q descriptor lever.
     precompute_qk_desc: bool = False
     # Initial TMA prologue order for the FA4 load warp. 0 preserves Helion's
-    # original Q0/K/Q1/V order; 4 keeps the measured K/Q0/Q1/V variant for
-    # long-shape seeds. The remaining values are available as manual overrides.
+    # original Q0/K/Q1/V order; the other values expose legal load orderings.
     first_load_order: int = 0
     # KV traversal order for FA4. Upstream FA4 walks dense non-causal KV blocks
     # from the end toward the beginning; Helion's original path was ascending.
@@ -1235,17 +1494,20 @@ class FlashAttentionConfig:
     # Small contiguous [BH, 128, 64] biased-attention SIMT path. Kept as a config
     # knob so benchmarks/autotune can opt back to the general flash emitter.
     small_biased: bool = True
-    # Causal FA4 launch-order swizzle. 0 keeps the shape-derived L2 heuristic;
-    # positive values force the batch/head interleave group size.
+    # Causal FA4 launch-order swizzle. Legacy 0 canonicalizes to the no-swizzle
+    # group size 1; larger values set the batch/head interleave explicitly.
     causal_lpt_swizzle: int = 0
     # Causal FA4 KV traversal order. ``ascending`` preserves Helion's original
     # left-to-right stream; ``descending`` matches upstream FA4's diagonal-first
-    # stream and is searchable because it is shape-sensitive.
+    # stream and is searchable because workload characteristics can favor it.
     causal_kv_order: str = "ascending"
     # Warp-role assignment inside the last FA4 warpgroup. ``helion`` preserves
     # the original transcription; ``fa4`` matches upstream's load/epilogue warp
     # ordering.
     role_map: str = "helion"
+    # Chain mutually exclusive warp roles through one if/elif dispatch. This is
+    # source-visible and must be captured by saved autotune configurations.
+    role_chain: bool = False
     # One-CTA pipeline variant: K and V have distinct shared-memory rings and
     # independent producer/consumer barriers. The score topology stays fixed at
     # FA4's two local query stages.
@@ -1300,95 +1562,14 @@ def _flash_e2e_schedule_default(topology: str, head_dim: int) -> str:
     return "16/4" if topology == "fa4" and head_dim == 64 else "8/2"
 
 
-def _flash_causal_hd64_seed_num_kv_supported(num_kv: int | None) -> bool:
-    return isinstance(num_kv, int) and num_kv >= 32 and (num_kv & (num_kv - 1)) == 0
+def _flash_causal_hd64_num_kv_supported(num_kv: int | None) -> bool:
+    """Return whether paired-query causal FA4 can cover this KV extent."""
+    return isinstance(num_kv, int) and num_kv >= 2 and num_kv % 2 == 0
 
 
-_FLASH_CAUSAL_HD64_LONG_AUTOTUNE_MIN_KV = 4096
-
-
-class _FlashCausalDegree2SeedParams(NamedTuple):
-    role_map: str
-    e2e_offset: int
-    e2e_offset0: int
-    epi_tma: bool
-
-
-def _flash_causal_degree2_seed_params(
-    num_kv: int,
-) -> _FlashCausalDegree2SeedParams | None:
-    """Transfer validated causal schedules to neighboring power-of-two lengths."""
-    if not _flash_causal_hd64_seed_num_kv_supported(num_kv) or num_kv < 512:
-        return None
-    if num_kv == 512:
-        return _FlashCausalDegree2SeedParams("fa4", 15, 3, True)
-    if num_kv == 1024:
-        return _FlashCausalDegree2SeedParams("fa4", 1, 14, False)
-    if num_kv == 2048:
-        return _FlashCausalDegree2SeedParams("fa4", 14, 12, False)
-    return _FlashCausalDegree2SeedParams("helion", 14, 12, False)
-
-
-def _flash_causal_hd64_seed_params(num_kv: int) -> tuple[int, int, int, int]:
-    """Return best-known causal hd64 FA4 knobs as (offset, disc, regs, lpt)."""
-    if num_kv <= 64:
-        e2e_offset = 0
-        disc_pipe = 2
-        softmax_regs = 200
-        lpt_swizzle = 8
-    elif num_kv <= 128:
-        e2e_offset = 0
-        disc_pipe = 2
-        softmax_regs = 192
-        lpt_swizzle = 8
-    elif num_kv <= 256:
-        e2e_offset = 1
-        disc_pipe = 4
-        softmax_regs = 184
-        lpt_swizzle = 4
-    else:
-        e2e_offset = 9
-        disc_pipe = 4
-        softmax_regs = 184
-        lpt_swizzle = 1
-    return e2e_offset, disc_pipe, softmax_regs, lpt_swizzle
-
-
-def _flash_causal_hd64_seed_masked_schedule(num_kv: int) -> str:
-    return "inherit" if num_kv <= 64 else "16/4"
-
-
-def _flash_causal_hd64_seed_role_map(num_kv: int) -> str:
-    if num_kv == 128:
-        return "fa4"
-    return "helion"
-
-
-def _flash_causal_hd64_seed_epi_tma(num_kv: int) -> bool:
-    return num_kv <= 128
-
-
-def _flash_causal_hd64_seed_rescale_chunk_cols(num_kv: int) -> int:
-    return 16 if num_kv <= 256 else 32
-
-
-def _flash_causal_hd64_seed_offset0(num_kv: int) -> int:
-    if num_kv <= 64:
-        return 1
-    if num_kv <= 128:
-        return 0
-    if num_kv <= 256:
-        return 11
-    return 3
-
-
-def _flash_causal_hd64_kv_order_weights(num_kv: int) -> dict[str, float]:
-    return {"descending": 4.0, "ascending": 1.0}
-
-
-def _flash_causal_hd64_seed_kv_order(num_kv: int) -> str:
-    weights = _flash_causal_hd64_kv_order_weights(num_kv)
-    return "descending" if weights["descending"] > weights["ascending"] else "ascending"
+def _flash_causal_degree2_num_kv_supported(num_kv: int | None) -> bool:
+    """Return whether the causal degree-2 packet can cover this KV extent."""
+    return _flash_causal_hd64_num_kv_supported(num_kv)
 
 
 def _flash_parse_e2e_schedule(schedule: str, fallback: str) -> tuple[str, int, int]:
@@ -1436,33 +1617,260 @@ _FLASH_DEG2_EXP2_PACKET = "deg2_16x6"
 _FLASH_HYBRID_EXP2_PACKET = "hybrid_deg1_16x8"
 _FLASH_DEG1_EXP2_PACKET = "deg1_16x8"
 _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET = "deg1_8x2_corr10"
+_FLASH_CAUSAL_HD128_RESIDENT3_013_PREFETCH2_DEG2_EARLY_ACQUIRE_EXP2_PACKET = (
+    "causal_hd128_resident3_013_prefetch2_deg2_early_acquire"
+)
+_FLASH_CAUSAL_HD128_RESIDENT_EXP2_PACKETS = frozenset(
+    (_FLASH_CAUSAL_HD128_RESIDENT3_013_PREFETCH2_DEG2_EARLY_ACQUIRE_EXP2_PACKET,)
+)
 _FLASH_DEG1_EXP2_PACKETS = frozenset(
     (_FLASH_DEG1_EXP2_PACKET, _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET)
 )
 _FLASH_DEG1_EXP2_OFFSET = 0
 _FLASH_DEG1_EXP2_OFFSET0 = 10
-# Dense hd64 two-CTA uses fixed per-CTA resources, so sequence length does not
-# impose an upper bound.  The degree-1 packets require at least this many
-# aligned KV tiles to stay within their validated numerical envelope.
-_FLASH_DENSE_HD64_2CTA_MIN_KV = 256
-_FLASH_DENSE_DEG1_LONG_PACKET_MIN_KV = 2048
 _FLASH_MANUAL_EXP2_PACKET_PARAMS: dict[str, tuple[int, int]] = {
     _FLASH_DEG2_EXP2_PACKET: (8, 3),
     _FLASH_HYBRID_EXP2_PACKET: (8, 4),
     _FLASH_DEG1_EXP2_PACKET: (8, 4),
     _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET: (8, 2),
+    _FLASH_CAUSAL_HD128_RESIDENT3_013_PREFETCH2_DEG2_EARLY_ACQUIRE_EXP2_PACKET: (
+        8,
+        3,
+    ),
 }
 _FLASH_MANUAL_EXP2_PACKET_SCHEDULES: dict[str, tuple[int, int]] = {
     _FLASH_DEG2_EXP2_PACKET: (16, 6),
     _FLASH_HYBRID_EXP2_PACKET: (16, 8),
     _FLASH_DEG1_EXP2_PACKET: (16, 8),
     _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET: (8, 2),
+    _FLASH_CAUSAL_HD128_RESIDENT3_013_PREFETCH2_DEG2_EARLY_ACQUIRE_EXP2_PACKET: (
+        16,
+        6,
+    ),
 }
+
+
+def flash_exp2_packet_is_compound(packet: object) -> bool:
+    """Return whether a packet owns structural schedule requirements."""
+    return packet in _FLASH_MANUAL_EXP2_PACKET_PARAMS
 
 
 def _flash_dense_hd64_2cta_num_kv_supported(num_kv: int) -> bool:
     """Return whether ``num_kv`` is in the aligned dense hd64 2CTA envelope."""
-    return num_kv >= _FLASH_DENSE_HD64_2CTA_MIN_KV and num_kv % 4 == 0
+    return num_kv >= 4 and num_kv % 4 == 0
+
+
+def _flash_dense_hd128_degree2_num_kv_supported(num_kv: int) -> bool:
+    """Return whether dense D128 can use the paired-CTA degree-2 schedule."""
+    return num_kv >= 4 and num_kv % 4 == 0
+
+
+def _flash_paired_num_kv_supported(num_kv: int, *, minimum: int) -> bool:
+    """Return whether a two-query-tile schedule covers an aligned KV extent."""
+    return num_kv >= minimum and num_kv % 2 == 0
+
+
+def _flash_causal_hd128_resident_num_kv_supported(num_kv: int) -> bool:
+    """Return whether BF16 D128 can use the resident-score schedule."""
+    return _flash_paired_num_kv_supported(num_kv, minimum=2)
+
+
+def _flash_causal_hd64_hybrid_num_kv_supported(num_kv: int) -> bool:
+    """Return whether D64 can use the causal hybrid schedule."""
+    return _flash_paired_num_kv_supported(num_kv, minimum=2)
+
+
+def _flash_causal_hd64_hybrid_family_eligible(
+    head_dim: int,
+    num_kv: int,
+    *,
+    dtype: torch.dtype,
+    is_causal: bool,
+    has_kv_tile_pruning: bool = False,
+    requires_ws_overlap: bool = False,
+    small_biased_candidate: bool = False,
+    standard_causal_output: bool,
+) -> bool:
+    """Return whether the hybrid packet is structurally legal."""
+    return (
+        standard_causal_output
+        and is_causal
+        and _flash_supported_io_dtype(dtype)
+        and head_dim == 64
+        and _flash_causal_hd64_hybrid_num_kv_supported(num_kv)
+        and not has_kv_tile_pruning
+        and not requires_ws_overlap
+        and not small_biased_candidate
+    )
+
+
+def _flash_compound_exp2_packet_overrides(
+    head_dim: int,
+    num_kv: int,
+    config: Mapping[str, object],
+    *,
+    dtype: torch.dtype,
+    is_causal: bool,
+    has_kv_tile_pruning: bool = False,
+    requires_ws_overlap: bool = False,
+    small_biased_candidate: bool = False,
+    standard_dense_output: bool = False,
+    standard_causal_output: bool = False,
+) -> dict[str, object]:
+    """Canonicalize only the structural requirements of a polynomial packet.
+
+    Packet cadence and barrier prerequisites are part of the algorithm.  Phase
+    offsets, register budgets, wait policy, pipeline depth, and other
+    performance choices deliberately remain untouched so autotuning must
+    measure them rather than receiving an embedded winner preset.
+    """
+    packet = config.get(FLASH_EXP2_PACKET_KEY)
+    common: dict[str, object] = {
+        FLASH_Q_TILE_COUNT_KEY: 2,
+        FLASH_P_STORE_REP_KEY: 16,
+        FLASH_S_LOAD_REP_KEY: 32,
+    }
+    if packet not in _FLASH_MANUAL_EXP2_PACKET_PARAMS:
+        return {}
+
+    def with_required_family(
+        family: str, overrides: Mapping[str, object]
+    ) -> dict[str, object]:
+        requested_family = config.get(FLASH_PIPELINE_FAMILY_KEY)
+        if requested_family is not None and requested_family != family:
+            # The family is the parent schedule choice. A packet that requires a
+            # different family is inactive under a pinned/hierarchical family,
+            # rather than silently changing the requested search space.
+            return {FLASH_EXP2_PACKET_KEY: "1x1"}
+        return {**overrides, FLASH_PIPELINE_FAMILY_KEY: family}
+
+    if (
+        packet in _FLASH_CAUSAL_HD128_RESIDENT_EXP2_PACKETS
+        and standard_causal_output
+        and is_causal
+        and dtype is torch.bfloat16
+        and head_dim == 128
+        and _flash_causal_hd128_resident_num_kv_supported(num_kv)
+        and not has_kv_tile_pruning
+        and not requires_ws_overlap
+        and not small_biased_candidate
+    ):
+        return with_required_family(
+            "fa4",
+            {
+                **common,
+                FLASH_E2E_SCHEDULE_KEY: "16/6",
+                FLASH_MASKED_E2E_SCHEDULE_KEY: "16/6",
+                FLASH_SOFTMAX_DISC_KEY: True,
+                FLASH_DISC_PIPE_KEY: 2,
+                FLASH_SPLIT_P_ARRIVE_KEY: True,
+                FLASH_CAUSAL_KV_ORDER_KEY: "descending",
+                FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
+            },
+        )
+    if (
+        packet == _FLASH_DEG2_EXP2_PACKET
+        and standard_dense_output
+        and not is_causal
+        and dtype is torch.bfloat16
+        and head_dim == 128
+        and _flash_dense_hd128_degree2_num_kv_supported(num_kv)
+        and not has_kv_tile_pruning
+        and not requires_ws_overlap
+        and not small_biased_candidate
+    ):
+        return with_required_family(
+            "fa4_2cta",
+            {
+                **common,
+                FLASH_E2E_SCHEDULE_KEY: "16/6",
+                FLASH_SOFTMAX_DISC_KEY: True,
+            },
+        )
+    if (
+        packet == _FLASH_HYBRID_EXP2_PACKET
+        and _flash_causal_hd64_hybrid_family_eligible(
+            head_dim,
+            num_kv,
+            dtype=dtype,
+            is_causal=is_causal,
+            has_kv_tile_pruning=has_kv_tile_pruning,
+            requires_ws_overlap=requires_ws_overlap,
+            small_biased_candidate=small_biased_candidate,
+            standard_causal_output=standard_causal_output,
+        )
+    ):
+        requested_disc_pipe = config.get(FLASH_DISC_PIPE_KEY)
+        disc_pipe = (
+            requested_disc_pipe
+            if isinstance(requested_disc_pipe, int) and requested_disc_pipe >= 2
+            else 2
+        )
+        return with_required_family(
+            "fa4",
+            {
+                **common,
+                FLASH_E2E_SCHEDULE_KEY: "16/8",
+                FLASH_MASKED_E2E_SCHEDULE_KEY: "16/8",
+                FLASH_SOFTMAX_DISC_KEY: True,
+                FLASH_DISC_PIPE_KEY: disc_pipe,
+                FLASH_SPLIT_P_ARRIVE_KEY: True,
+                FLASH_CAUSAL_KV_ORDER_KEY: "descending",
+                FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
+            },
+        )
+    if (
+        dtype is torch.float16
+        and head_dim == 64
+        and not has_kv_tile_pruning
+        and not requires_ws_overlap
+        and not small_biased_candidate
+    ):
+        if (
+            standard_dense_output
+            and not is_causal
+            and _flash_dense_hd64_2cta_num_kv_supported(num_kv)
+            and packet
+            in (
+                _FLASH_DEG2_EXP2_PACKET,
+                _FLASH_DEG1_EXP2_PACKET,
+                _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET,
+            )
+        ):
+            cadence = _FLASH_MANUAL_EXP2_PACKET_SCHEDULES[str(packet)]
+            return with_required_family(
+                "fa4_2cta",
+                {
+                    **common,
+                    FLASH_E2E_SCHEDULE_KEY: f"{cadence[0]}/{cadence[1]}",
+                    FLASH_SOFTMAX_DISC_KEY: False,
+                },
+            )
+        if (
+            packet == _FLASH_DEG2_EXP2_PACKET
+            and standard_causal_output
+            and is_causal
+            and _flash_causal_degree2_num_kv_supported(num_kv)
+        ):
+            requested_disc_pipe = config.get(FLASH_DISC_PIPE_KEY)
+            disc_pipe = (
+                requested_disc_pipe
+                if isinstance(requested_disc_pipe, int) and requested_disc_pipe >= 2
+                else 2
+            )
+            return with_required_family(
+                "fa4",
+                {
+                    **common,
+                    FLASH_E2E_SCHEDULE_KEY: "16/6",
+                    FLASH_MASKED_E2E_SCHEDULE_KEY: "16/6",
+                    FLASH_SOFTMAX_DISC_KEY: True,
+                    FLASH_DISC_PIPE_KEY: disc_pipe,
+                    FLASH_CAUSAL_KV_ORDER_KEY: "descending",
+                    FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
+                },
+            )
+    return {}
 
 
 class _FlashDiscExp2CodegenParams(NamedTuple):
@@ -1581,8 +1989,14 @@ def resolve_flash_config(
     config: Mapping[str, object] | None = None,
     dtype: torch.dtype = torch.float16,
     *,
+    num_bh: int | None = None,
     is_causal: bool = False,
+    has_kv_tile_pruning: bool = False,
+    requires_ws_overlap: bool = False,
+    small_biased_candidate: bool = False,
     standard_dense_output: bool = False,
+    standard_causal_output: bool = False,
+    supports_tensor_4d_tma: bool = True,
     prefer_packed_reduce: bool = False,
 ) -> FlashAttentionConfig:
     """Resolve the flash-attention topology config from shape, env vars and config.
@@ -1595,7 +2009,35 @@ def resolve_flash_config(
     default-off gating path) or unset.
     """
 
+    packet_config = config
+    env_exp2_packet = os.environ.get("HELION_CUTE_FLASH_EXP2_PACKET")
+    if env_exp2_packet is not None and (
+        packet_config is None or FLASH_EXP2_PACKET_KEY not in packet_config
+    ):
+        packet_config = {
+            **({} if packet_config is None else packet_config),
+            FLASH_EXP2_PACKET_KEY: env_exp2_packet,
+        }
+    compound_packet_overrides = (
+        _flash_compound_exp2_packet_overrides(
+            head_dim,
+            num_kv,
+            packet_config,
+            dtype=dtype,
+            is_causal=is_causal,
+            has_kv_tile_pruning=has_kv_tile_pruning,
+            requires_ws_overlap=requires_ws_overlap,
+            small_biased_candidate=small_biased_candidate,
+            standard_dense_output=standard_dense_output,
+            standard_causal_output=standard_causal_output,
+        )
+        if packet_config is not None
+        else {}
+    )
+
     def _cfg(key: str) -> object | None:
+        if key in compound_packet_overrides:
+            return compound_packet_overrides[key]
         if config is None:
             return None
         return config.get(key)
@@ -1610,7 +2052,7 @@ def resolve_flash_config(
     if s_stage_cfg is not None and num_kv >= 2:
         s_stage = int(s_stage_cfg)  # type: ignore[arg-type]
     kv_stage_cfg = _cfg(FLASH_KV_STAGE_KEY)
-    if kv_stage_cfg is not None:
+    if kv_stage_cfg is not None and num_kv >= 2:
         kv_stage = int(kv_stage_cfg)  # type: ignore[arg-type]
     persistent = _flash_persistent() and s_stage == 2
     persistent_cfg = _cfg(FLASH_PERSISTENT_KEY)
@@ -1647,19 +2089,9 @@ def resolve_flash_config(
         topology = "ws_overlap"
     if topology == "fa4" and num_kv % 2 != 0:
         topology = "ws_overlap"
-    long_dense_hd64_fa4 = (
-        topology == "fa4" and not is_causal and head_dim == 64 and num_kv >= 64
-    )
+    dense_hd64_fa4 = topology == "fa4" and not is_causal and head_dim == 64
     causal_hd64_fa4 = topology == "fa4" and is_causal and head_dim == 64
-    causal_hd64_seeded_fa4 = (
-        causal_hd64_fa4 and _flash_causal_hd64_seed_num_kv_supported(num_kv)
-    )
-    (
-        causal_e2e_offset_default,
-        causal_disc_pipe_default,
-        causal_softmax_regs_default,
-        causal_lpt_swizzle_default,
-    ) = _flash_causal_hd64_seed_params(num_kv)
+    causal_e2e_offset_default = 2
     # The fa4 topology persistence (Stage 2a) follows the HELION_CUTE_FLASH_PERSISTENT
     # env knob (default ON) WITHOUT the ws-only s_stage==2 gate: the fa4 device body
     # carries the raw-mbarrier phases (s_full/pfor/pfor2/o_full) across work-items in
@@ -1670,13 +2102,11 @@ def resolve_flash_config(
         else:
             persistent = _flash_persistent() and not is_causal
         if (
-            (is_causal or long_dense_hd64_fa4)
+            (is_causal or dense_hd64_fa4)
             and kv_stage_cfg is None
             and os.environ.get("HELION_CUTE_FLASH_KV_STAGE") is None
         ):
-            kv_stage = (
-                _flash_dense_hd64_seed_params(num_kv)[0] if long_dense_hd64_fa4 else 2
-            )
+            kv_stage = 3 if dense_hd64_fa4 else 2
         # fa4 is 2-Q-tile (sQ holds q_stage=2 tiles) and uses one aliased K/V
         # shared-memory ring, matching FA4. That keeps kv_stage=3 within the
         # sm_100a shared-memory budget even for head_dim 128.
@@ -1685,11 +2115,14 @@ def resolve_flash_config(
             # cannot hold V_i while prefetching K_{i+1}, so clamp user/env
             # overrides to the minimum safe ring depth.
             kv_stage = 2
-    persistent_ctas_per_sm_default = (
-        _flash_dense_hd64_seed_persistent_ctas_per_sm(num_kv)
-        if long_dense_hd64_fa4 and persistent
-        else 1
-    )
+    elif num_kv >= 2:
+        # WS stores K and V in distinct shared-memory rings. Bound inherited
+        # family-agnostic requests by the storage-derived per-ring capacity;
+        # deeper FA4 aliased-ring values otherwise fail at launch.
+        ws_kv_stage_cap = _flash_deep_1cta_kv_stage_cap(head_dim)
+        if ws_kv_stage_cap > 0:
+            kv_stage = min(max(kv_stage, 2), ws_kv_stage_cap)
+    persistent_ctas_per_sm_default = 1
     persistent_ctas_per_sm = int(
         os.environ.get(
             "HELION_CUTE_FLASH_PERSISTENT_CTAS_PER_SM",
@@ -1703,11 +2136,7 @@ def resolve_flash_config(
         persistent_ctas_per_sm = 1
     else:
         persistent_ctas_per_sm = min(max(persistent_ctas_per_sm, 1), 4)
-    recompute_tile_coords_default = (
-        _flash_dense_hd64_seed_recompute_tile_coords(num_kv)
-        if long_dense_hd64_fa4 and persistent
-        else False
-    )
+    recompute_tile_coords_default = False
     recompute_tile_coords = _flash_bool_env(
         "HELION_CUTE_FLASH_RECOMPUTE_TILE_COORDS",
         recompute_tile_coords_default,
@@ -1748,13 +2177,7 @@ def resolve_flash_config(
     # Exp2 pipe-split schedule. The autotuner sees this as one paired schedule
     # knob so it never searches meaningless combinations like exp2_impl="xu"
     # with independent e2e cadence values, or regressive res/freq pairings.
-    e2e_schedule_default = (
-        _flash_dense_hd64_seed_e2e_schedule(num_kv)
-        if long_dense_hd64_fa4
-        else "8/2"
-        if causal_hd64_seeded_fa4
-        else _flash_e2e_schedule_default(topology, head_dim)
-    )
+    e2e_schedule_default = _flash_e2e_schedule_default(topology, head_dim)
     e2e_schedule = os.environ.get(
         "HELION_CUTE_FLASH_E2E_SCHEDULE", e2e_schedule_default
     )
@@ -1786,11 +2209,7 @@ def resolve_flash_config(
     exp2_impl, e2e_freq, e2e_res, e2e_schedule = _flash_normalize_e2e_params(
         exp2_impl, e2e_freq, e2e_res, e2e_schedule_default
     )
-    masked_e2e_schedule_default = (
-        _flash_causal_hd64_seed_masked_schedule(num_kv)
-        if causal_hd64_seeded_fa4
-        else "inherit"
-    )
+    masked_e2e_schedule_default = "inherit"
     masked_e2e_schedule = os.environ.get(
         "HELION_CUTE_FLASH_MASKED_E2E_SCHEDULE", masked_e2e_schedule_default
     )
@@ -1815,19 +2234,12 @@ def resolve_flash_config(
         masked_e2e_freq,
         masked_e2e_res,
     )
-    if long_dense_hd64_fa4 and e2e_offset_period > 0:
-        e2e_offset_default = (
-            _flash_dense_hd64_seed_params(num_kv)[1] % e2e_offset_period
-        )
-    elif causal_hd64_seeded_fa4 and e2e_offset_period > 0:
-        e2e_offset_default = causal_e2e_offset_default % e2e_offset_period
-    else:
-        split_default_freq = e2e_freq if e2e_res > 0 else masked_e2e_freq
-        e2e_offset_default = (
-            split_default_freq // 8
-            if topology == "fa4" and head_dim == 64 and e2e_offset_period > 0
-            else 0
-        )
+    split_default_freq = e2e_freq if e2e_res > 0 else masked_e2e_freq
+    e2e_offset_default = (
+        split_default_freq // 8
+        if topology == "fa4" and head_dim == 64 and e2e_offset_period > 0
+        else 0
+    )
     e2e_offset = int(
         os.environ.get("HELION_CUTE_FLASH_E2E_OFFSET", str(e2e_offset_default))
     )
@@ -1837,13 +2249,7 @@ def resolve_flash_config(
     e2e_offset = _flash_normalize_e2e_offset(
         e2e_offset, e2e_offset_default, e2e_offset_period
     )
-    e2e_offset0_default = (
-        _flash_dense_hd64_seed_params(num_kv)[2]
-        if long_dense_hd64_fa4 and e2e_offset_period > 0
-        else _flash_causal_hd64_seed_offset0(num_kv)
-        if causal_hd64_seeded_fa4 and e2e_offset_period > 0
-        else 0
-    )
+    e2e_offset0_default = 0
     e2e_offset0 = int(
         os.environ.get("HELION_CUTE_FLASH_E2E_OFFSET0", str(e2e_offset0_default))
     )
@@ -1866,9 +2272,7 @@ def resolve_flash_config(
         mma_interleave = True
     # fa4 Step 2: chunked-t2r ("disc") softmax body (default ON for fa4).
     # HELION_CUTE_FLASH_SOFTMAX_DISC=0 reverts to the whole-row body for A/B.
-    softmax_disc_default = (
-        _flash_dense_hd64_seed_softmax_disc(num_kv) if long_dense_hd64_fa4 else True
-    )
+    softmax_disc_default = True
     softmax_disc = _flash_bool_env(
         "HELION_CUTE_FLASH_SOFTMAX_DISC", softmax_disc_default
     )
@@ -1877,21 +2281,15 @@ def resolve_flash_config(
         softmax_disc = bool(softmax_disc_cfg)
     if topology != "fa4":
         softmax_disc = True
-    # fa4 Step 3 (L1): disc PASS2 software-pipeline depth. The best measured
-    # depth is shape-sensitive: dense hd64 benefits from prefetching all four
-    # PASS2 chunks in the prologue, while causal hd64 and hd128 only tolerate one
-    # extra prefetched fragment before pressure dominates. Env/config overrides
-    # still win.
+    elif is_causal:
+        # Causal correction has no acknowledged single-slot statistics handoff.
+        # The whole-row/ring2 protocol can lap after a sufficiently long KV
+        # traversal, so causal FA4 uses the chunked pipeline unconditionally.
+        softmax_disc = True
+    # fa4 Step 3 (L1): disc PASS2 software-pipeline depth. Keep one neutral
+    # default; the autotuner measures the legal depths for each workload.
     if topology == "fa4" and softmax_disc:
-        disc_pipe_default = (
-            3
-            if long_dense_hd64_fa4
-            else causal_disc_pipe_default
-            if causal_hd64_seeded_fa4
-            else 2
-            if is_causal or head_dim == 128
-            else 4
-        )
+        disc_pipe_default = 2
     else:
         disc_pipe_default = 1
     disc_pipe_depth = int(
@@ -1900,10 +2298,8 @@ def resolve_flash_config(
     disc_pipe_depth_cfg = _cfg(FLASH_DISC_PIPE_KEY)
     if disc_pipe_depth_cfg is not None:
         disc_pipe_depth = int(disc_pipe_depth_cfg)  # type: ignore[arg-type]
-    split_p_arrive_default = (
-        _flash_dense_hd64_seed_split_p_arrive(num_kv)
-        if long_dense_hd64_fa4
-        else not (topology == "fa4" and not is_causal and head_dim <= 64)
+    split_p_arrive_default = not (
+        topology == "fa4" and not is_causal and head_dim <= 64
     )
     split_p_arrive = _flash_bool_env(
         "HELION_CUTE_FLASH_SPLIT_P_ARRIVE", split_p_arrive_default
@@ -1913,9 +2309,7 @@ def resolve_flash_config(
         split_p_arrive = bool(split_p_arrive_cfg)
     if topology != "fa4" or not mma_ptx:
         split_p_arrive = True
-    p_store_repetition_default = (
-        _flash_dense_hd64_seed_p_store_rep(num_kv) if long_dense_hd64_fa4 else 16
-    )
+    p_store_repetition_default = 16
     p_store_repetition = int(
         os.environ.get("HELION_CUTE_FLASH_P_STORE_REP", str(p_store_repetition_default))
     )
@@ -1924,9 +2318,12 @@ def resolve_flash_config(
         p_store_repetition = int(p_store_repetition_cfg)  # type: ignore[arg-type]
     if p_store_repetition not in (16, 32) or topology != "fa4":
         p_store_repetition = 16
-    s_load_repetition_default = (
-        _flash_dense_hd64_seed_s_load_rep(num_kv) if long_dense_hd64_fa4 else 32
-    )
+    if is_causal and split_p_arrive and p_store_repetition == 32:
+        # Long-sequence stress found the causal mixed Rep32/Rep16 publication
+        # helper can fail to complete. Keep Rep32 available with one P arrival,
+        # but use the established Rep16 helper when causal publication is split.
+        p_store_repetition = 16
+    s_load_repetition_default = 32
     s_load_repetition = int(
         os.environ.get("HELION_CUTE_FLASH_S_LOAD_REP", str(s_load_repetition_default))
     )
@@ -1939,11 +2336,7 @@ def resolve_flash_config(
         or p_store_repetition != 16
     ):
         s_load_repetition = 32
-    precompute_qk_desc_default = (
-        _flash_dense_hd64_seed_precompute_qk_desc(num_kv)
-        if long_dense_hd64_fa4
-        else False
-    )
+    precompute_qk_desc_default = False
     precompute_qk_desc = _flash_bool_env(
         "HELION_CUTE_FLASH_PRECOMPUTE_QK_DESC", precompute_qk_desc_default
     )
@@ -1952,9 +2345,7 @@ def resolve_flash_config(
         precompute_qk_desc = bool(precompute_qk_desc_cfg)
     if topology != "fa4" or not mma_ptx:
         precompute_qk_desc = False
-    first_load_order_default = (
-        _flash_dense_hd64_seed_first_load_order(num_kv) if long_dense_hd64_fa4 else 0
-    )
+    first_load_order_default = 0
     first_load_order = int(
         os.environ.get(
             "HELION_CUTE_FLASH_FIRST_LOAD_ORDER", str(first_load_order_default)
@@ -1965,33 +2356,22 @@ def resolve_flash_config(
         first_load_order = int(first_load_order_cfg)  # type: ignore[arg-type]
     if topology != "fa4" or first_load_order not in (0, 1, 2, 3, 4):
         first_load_order = 0
-    kv_order_default = (
-        _flash_dense_hd64_seed_kv_order(num_kv) if long_dense_hd64_fa4 else "ascending"
-    )
+    kv_order_default = "ascending"
     kv_order = os.environ.get("HELION_CUTE_FLASH_KV_ORDER", kv_order_default)
     kv_order_cfg = _cfg(FLASH_KV_ORDER_KEY)
     if kv_order_cfg is not None:
         kv_order = str(kv_order_cfg)
-    if topology != "fa4" or kv_order not in ("ascending", "descending"):
+    if topology != "fa4" or is_causal or kv_order not in ("ascending", "descending"):
         kv_order = "ascending"
-    # fa4 Step 3 (Lever A): epilogue TMA-store. With a dedicated epilogue warp,
-    # this is a measured win for hd128 and for the very-long dense hd64 family;
-    # shorter hd64 families keep their characterized seed choices. fa4-only.
-    epi_tma_default = (
-        _flash_dense_hd64_seed_params(num_kv)[4]
-        if long_dense_hd64_fa4
-        else _flash_causal_hd64_seed_epi_tma(num_kv)
-        if causal_hd64_seeded_fa4
-        else topology == "fa4" and head_dim == 128
-    )
+    # fa4 Step 3 (Lever A): epilogue TMA-store. D128 uses the resource-safe TMA
+    # default; D64 searches both output paths. fa4-only.
+    epi_tma_default = topology == "fa4" and head_dim == 128
     epi_tma = _flash_bool_env("HELION_CUTE_FLASH_EPI_TMA", epi_tma_default)
     epi_tma_cfg = _cfg(FLASH_EPI_TMA_KEY)
     if epi_tma_cfg is not None:
         epi_tma = bool(epi_tma_cfg)
     epi_tma = epi_tma and topology == "fa4"
-    epi_stg_default = (
-        _flash_dense_hd64_seed_epi_stg(num_kv) if long_dense_hd64_fa4 else False
-    )
+    epi_stg_default = False
     epi_stg = _flash_bool_env("HELION_CUTE_FLASH_EPI_STG", epi_stg_default)
     epi_stg_cfg = _cfg(FLASH_EPI_STG_KEY)
     if epi_stg_cfg is not None:
@@ -2016,11 +2396,7 @@ def resolve_flash_config(
     dtype_rescale_threshold_default = (
         8.0 if dtype in (torch.float16, torch.bfloat16) else 0.0
     )
-    rescale_threshold_default = (
-        _flash_dense_hd64_seed_rescale_threshold(num_kv, dtype)
-        if long_dense_hd64_fa4 and dtype in (torch.float16, torch.bfloat16)
-        else dtype_rescale_threshold_default
-    )
+    rescale_threshold_default = dtype_rescale_threshold_default
     rescale_threshold = float(
         os.environ.get("HELION_CUTE_FLASH_RESCALE_THRESHOLD", rescale_threshold_default)
     )
@@ -2034,11 +2410,7 @@ def resolve_flash_config(
         # probabilities are cast to the I/O dtype. Reject stale/manual values
         # that can overflow that cast; the shape default is always safe.
         rescale_threshold = rescale_threshold_default
-    skip_rescale_stats_default = (
-        _flash_dense_hd64_seed_skip_rescale_stats(num_kv)
-        if long_dense_hd64_fa4
-        else False
-    )
+    skip_rescale_stats_default = False
     skip_rescale_stats = _flash_bool_env(
         "HELION_CUTE_FLASH_SKIP_RESCALE_STATS", skip_rescale_stats_default
     )
@@ -2051,19 +2423,9 @@ def resolve_flash_config(
         # Keep the knob in the schema for cached/manual config compatibility but
         # compile the correct rescale path until a safe dynamic fallback exists.
         skip_rescale_stats = False
-    rescale_chunk_cols = (
-        _flash_dense_hd64_seed_params(num_kv)[6]
-        if long_dense_hd64_fa4
-        else _flash_causal_hd64_seed_rescale_chunk_cols(num_kv)
-        if causal_hd64_seeded_fa4
-        else 32
-        if head_dim == 64
-        else 16
-    )
-    softmax_regs = (
-        _flash_dense_hd64_seed_softmax_regs(num_kv) if long_dense_hd64_fa4 else 200
-    )
-    corr_regs = _flash_dense_hd64_seed_corr_regs(num_kv) if long_dense_hd64_fa4 else 64
+    rescale_chunk_cols = 32 if head_dim == 64 else 16
+    softmax_regs = 200
+    corr_regs = 64
     if topology == "fa4":
         rescale_chunk_default = rescale_chunk_cols
         rescale_chunk_cols = int(
@@ -2074,19 +2436,13 @@ def resolve_flash_config(
         rescale_chunk_cols_cfg = _cfg(FLASH_RESCALE_CHUNK_COLS_KEY)
         if rescale_chunk_cols_cfg is not None:
             rescale_chunk_cols = int(rescale_chunk_cols_cfg)  # type: ignore[arg-type]
-        if (
-            rescale_chunk_cols not in (8, 16, 32, 64)
-            or head_dim % rescale_chunk_cols != 0
-        ):
+        valid_rescale_chunks = (8, 16, 32, 64) if head_dim == 64 else (8, 16, 32)
+        if rescale_chunk_cols not in valid_rescale_chunks:
             rescale_chunk_cols = rescale_chunk_default
         softmax_regs = int(
             os.environ.get(
                 "HELION_CUTE_FLASH_SOFTMAX_REGS",
-                str(
-                    causal_softmax_regs_default
-                    if causal_hd64_seeded_fa4
-                    else softmax_regs
-                ),
+                str(softmax_regs),
             )
         )
         softmax_regs_cfg = _cfg(FLASH_SOFTMAX_REGS_KEY)
@@ -2103,9 +2459,7 @@ def resolve_flash_config(
             corr_regs = int(corr_regs_cfg)  # type: ignore[arg-type]
         if corr_regs % 8 != 0 or corr_regs <= 0:
             corr_regs = corr_regs_default
-        other_regs_default = (
-            _flash_dense_hd64_seed_other_regs(num_kv) if long_dense_hd64_fa4 else 48
-        )
+        other_regs_default = 48
         other_regs = int(
             os.environ.get("HELION_CUTE_FLASH_OTHER_REGS", str(other_regs_default))
         )
@@ -2114,13 +2468,7 @@ def resolve_flash_config(
             other_regs = int(other_regs_cfg)  # type: ignore[arg-type]
         if other_regs % 8 != 0 or other_regs < 24:
             other_regs = other_regs_default
-        corr_tile_size_default = (
-            _flash_dense_hd64_seed_corr_tile_size(num_kv)
-            if long_dense_hd64_fa4
-            else 8
-            if not is_causal and head_dim <= 64
-            else 16
-        )
+        corr_tile_size_default = 8 if not is_causal and head_dim <= 64 else 16
         corr_tile_size = int(
             os.environ.get(
                 "HELION_CUTE_FLASH_CORR_TILE_SIZE",
@@ -2137,7 +2485,7 @@ def resolve_flash_config(
         corr_tile_size = 16
     packed_reduce = _flash_bool_env(
         "HELION_CUTE_FLASH_PACKED_REDUCE",
-        prefer_packed_reduce or long_dense_hd64_fa4 or causal_hd64_seeded_fa4,
+        prefer_packed_reduce or dense_hd64_fa4 or causal_hd64_fa4,
     )
     packed_reduce_cfg = _cfg(FLASH_PACKED_REDUCE_KEY)
     if packed_reduce_cfg is not None:
@@ -2146,10 +2494,12 @@ def resolve_flash_config(
     small_biased_cfg = _cfg(FLASH_SMALL_BIASED_KEY)
     if small_biased_cfg is not None:
         small_biased = bool(small_biased_cfg)
+    if not small_biased_candidate:
+        small_biased = True
     causal_lpt_swizzle = int(
         os.environ.get(
             "HELION_CUTE_FLASH_CAUSAL_LPT_SWIZZLE",
-            str(causal_lpt_swizzle_default if causal_hd64_seeded_fa4 else 0),
+            "0",
         )
     )
     causal_lpt_swizzle_cfg = _cfg(FLASH_CAUSAL_LPT_SWIZZLE_KEY)
@@ -2157,11 +2507,14 @@ def resolve_flash_config(
         causal_lpt_swizzle = int(causal_lpt_swizzle_cfg)  # type: ignore[arg-type]
     if not is_causal:
         causal_lpt_swizzle = 0
-    causal_kv_order_default = (
-        _flash_causal_hd64_seed_kv_order(num_kv)
-        if causal_hd64_seeded_fa4
-        else "ascending"
-    )
+    else:
+        # Wider same-length CTA waves expose an unresolved, nondeterministic
+        # long-running causal barrier race. Only the serial head ordering is
+        # safe, so canonicalize both fresh and cached configs to it.
+        causal_lpt_swizzle = 1
+        if num_bh is not None:
+            causal_lpt_swizzle = min(causal_lpt_swizzle, max(num_bh, 1))
+    causal_kv_order_default = "ascending"
     causal_kv_order = os.environ.get(
         "HELION_CUTE_FLASH_CAUSAL_KV_ORDER", causal_kv_order_default
     )
@@ -2174,13 +2527,16 @@ def resolve_flash_config(
         or causal_kv_order not in ("ascending", "descending")
     ):
         causal_kv_order = "ascending"
-    role_map_default = (
-        _flash_causal_hd64_seed_role_map(num_kv)
-        if causal_hd64_seeded_fa4
-        else _flash_dense_hd64_seed_role_map(num_kv)
-        if long_dense_hd64_fa4
-        else "helion"
+    causal_loop_split_default = False
+    causal_loop_split = _flash_bool_env(
+        "HELION_CUTE_FLASH_CAUSAL_LOOP_SPLIT", causal_loop_split_default
     )
+    causal_loop_split_cfg = _cfg(FLASH_CAUSAL_LOOP_SPLIT_KEY)
+    if causal_loop_split_cfg is not None:
+        causal_loop_split = bool(causal_loop_split_cfg)
+    if not is_causal or topology != "fa4" or causal_kv_order != "descending":
+        causal_loop_split = False
+    role_map_default = "helion"
     role_map = os.environ.get("HELION_CUTE_FLASH_ROLE_MAP", role_map_default)
     role_map_cfg = _cfg(FLASH_ROLE_MAP_KEY)
     if role_map_cfg is not None:
@@ -2217,7 +2573,7 @@ def resolve_flash_config(
     dense_hd64_2cta = (
         head_dim == 64
         and _flash_dense_hd64_2cta_num_kv_supported(num_kv)
-        and dtype is torch.float16
+        and _flash_supported_io_dtype(dtype)
     )
     if (
         topology != "fa4"
@@ -2239,21 +2595,7 @@ def resolve_flash_config(
     if causal_two_cta:
         # The causal cluster decoder currently uses contiguous cluster work.
         causal_lpt_swizzle = 1
-    if use_2cta_instrs and dense_hd64_2cta and not is_causal:
-        # This family was characterized as a unit: the TMA epilogue and Rep16
-        # split publication are required to beat the established one-CTA seed.
-        epi_tma = True
-        epi_stg = False
-        epi_stg_store = "slice"
-        epi_stg_gmem = "stage"
-        p_store_repetition = 16
-        split_p_arrive = True
-        softmax_disc = False
-        s_load_repetition = 32
-        precompute_qk_desc = True
-    use_cga2_local_default = (
-        _flash_dense_hd64_seed_cga2_local(num_kv) if long_dense_hd64_fa4 else False
-    )
+    use_cga2_local_default = False
     use_cga2_local_cfg = _cfg(FLASH_CGA2_LOCAL_KEY)
     if requested_family_flags is not None:
         use_cga2_local_cta = requested_family_flags.use_cga2_local_cta
@@ -2277,9 +2619,11 @@ def resolve_flash_config(
         or separate_kv_rings
     ):
         use_cga2_local_cta = False
-    use_clc_scheduler_default = (
-        _flash_dense_hd64_seed_clc(num_kv) if long_dense_hd64_fa4 else False
-    )
+    if use_cga2_local_cta and persistent and epi_stg_gmem == "pair":
+        # CGA2-local still launches a two-CTA cluster. Pair destinations make
+        # both ranks alias one output half when the persistent grid reuses work.
+        epi_stg_gmem = "stage"
+    use_clc_scheduler_default = False
     if requested_family_flags is not None:
         use_clc_scheduler = requested_family_flags.use_clc_scheduler
     else:
@@ -2302,16 +2646,26 @@ def resolve_flash_config(
         or separate_kv_rings
     ):
         use_clc_scheduler = False
-    clc_heads_per_batch_default = (
-        _flash_dense_hd64_seed_clc_heads_per_batch(num_kv) if long_dense_hd64_fa4 else 0
-    )
+    if use_clc_scheduler and rescale_chunk_cols == 64:
+        # The 64-column chunk expands the CLC softmax body beyond what NVVM can
+        # compile on Blackwell. Preserve legacy configs via the safe D64 form.
+        rescale_chunk_cols = 32
+    clc_heads_per_batch_default = 0
     clc_heads_per_batch = int(
         os.environ.get("HELION_CUTE_FLASH_CLC_HEADS", str(clc_heads_per_batch_default))
     )
     clc_heads_per_batch_cfg = _cfg(FLASH_CLC_HEADS_PER_BATCH_KEY)
     if clc_heads_per_batch_cfg is not None:
         clc_heads_per_batch = int(clc_heads_per_batch_cfg)  # type: ignore[arg-type]
-    if clc_heads_per_batch < 0 or not use_clc_scheduler:
+    if (
+        clc_heads_per_batch < 0
+        or not use_clc_scheduler
+        or (
+            num_bh is not None
+            and clc_heads_per_batch > 0
+            and num_bh % clc_heads_per_batch != 0
+        )
+    ):
         clc_heads_per_batch = 0
     clc_use_pdl = _flash_bool_env("HELION_CUTE_FLASH_CLC_PDL", False)
     clc_use_pdl_cfg = _cfg(FLASH_CLC_PDL_KEY)
@@ -2334,6 +2688,10 @@ def resolve_flash_config(
         # contend for the GPU. Two stages is performance-neutral and keeps the
         # producer from reusing the only response slot while roles retire it.
         clc_stages = 2
+    if use_clc_scheduler:
+        # CLC owns the grid residency policy; this field is consumed only by
+        # the static-persistent launcher and must not create distinct aliases.
+        persistent_ctas_per_sm = 1
     if (
         topology != "fa4"
         or not persistent
@@ -2342,11 +2700,7 @@ def resolve_flash_config(
         or use_cga2_local_cta
     ):
         recompute_tile_coords = False
-    local_tma_partition_default = (
-        _flash_dense_hd64_seed_local_tma_partition(num_kv)
-        if long_dense_hd64_fa4
-        else False
-    )
+    local_tma_partition_default = False
     if requested_family_flags is not None:
         local_tma_partition = requested_family_flags.local_tma_partition
     else:
@@ -2364,9 +2718,7 @@ def resolve_flash_config(
         and not use_cga2_local_cta
         and not separate_kv_rings
     )
-    tensor_4d_tma_default = (
-        _flash_dense_hd64_seed_tensor_4d_tma(num_kv) if long_dense_hd64_fa4 else False
-    )
+    tensor_4d_tma_default = False
     if requested_family_flags is not None:
         tensor_4d_tma = requested_family_flags.tensor_4d_tma
     else:
@@ -2378,6 +2730,7 @@ def resolve_flash_config(
             tensor_4d_tma = bool(tensor_4d_tma_cfg)
     tensor_4d_tma = (
         tensor_4d_tma
+        and supports_tensor_4d_tma
         and topology == "fa4"
         and not is_causal
         and head_dim == 64
@@ -2402,65 +2755,114 @@ def resolve_flash_config(
             epi_stg_store = "slice"
             epi_stg_gmem = "stage"
         kv_stage = min(max(kv_stage, 2), _flash_deep_1cta_kv_stage_cap(head_dim))
-    dense_degree1_packet = (
-        None
-        if not _flash_dense_hd64_2cta_num_kv_supported(num_kv)
-        else _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET
-        if num_kv < _FLASH_DENSE_DEG1_LONG_PACKET_MIN_KV
-        else _FLASH_DEG1_EXP2_PACKET
-    )
     dense_degree1_eligible = (
         standard_dense_output
-        and dense_degree1_packet is not None
+        and _flash_dense_hd64_2cta_num_kv_supported(num_kv)
         and use_2cta_instrs
         and not is_causal
         and head_dim == 64
         and dtype is torch.float16
+        and not has_kv_tile_pruning
+        and not requires_ws_overlap
+        and not small_biased_candidate
+    )
+    causal_hd64_hybrid_eligible = _flash_causal_hd64_hybrid_family_eligible(
+        head_dim,
+        num_kv,
+        dtype=dtype,
+        is_causal=is_causal,
+        has_kv_tile_pruning=has_kv_tile_pruning,
+        requires_ws_overlap=requires_ws_overlap,
+        small_biased_candidate=small_biased_candidate,
+        standard_causal_output=standard_causal_output,
     )
     exp2_packet_default = (
         "8x2"
         if use_2cta_instrs
         and not is_causal
         and head_dim == 64
-        and dtype is torch.float16
+        and _flash_supported_io_dtype(dtype)
         else "1x1"
     )
     exp2_packet = os.environ.get("HELION_CUTE_FLASH_EXP2_PACKET", exp2_packet_default)
     exp2_packet_cfg = _cfg(FLASH_EXP2_PACKET_KEY)
     if exp2_packet_cfg is not None:
         exp2_packet = str(exp2_packet_cfg)
-    if dense_degree1_eligible and exp2_packet in _FLASH_DEG1_EXP2_PACKETS:
-        assert dense_degree1_packet is not None
-        exp2_packet = dense_degree1_packet
     manual_exp2_common = (
         topology == "fa4"
-        and head_dim == 64
-        and dtype is torch.float16
+        and (
+            (head_dim == 64 and dtype is torch.float16)
+            or (head_dim == 128 and dtype is torch.bfloat16)
+            or causal_hd64_hybrid_eligible
+        )
         and exp2_impl == "split"
         and q_tile_count == 2
         and not use_cga2_local_cta
         and not separate_kv_rings
+        and not has_kv_tile_pruning
+        and not requires_ws_overlap
+        and not small_biased_candidate
         and p_store_repetition == 16
         and s_load_repetition == 32
     )
     manual_exp2_eligible = manual_exp2_common and (
         (
-            is_causal
+            standard_causal_output
+            and is_causal
+            and head_dim == 64
+            and dtype is torch.float16
             and not use_2cta_instrs
             and softmax_disc
             and disc_pipe_depth >= 2
+            and exp2_packet != _FLASH_HYBRID_EXP2_PACKET
             and exp2_packet not in _FLASH_DEG1_EXP2_PACKETS
+            and exp2_packet not in _FLASH_CAUSAL_HD128_RESIDENT_EXP2_PACKETS
+        )
+        or (
+            causal_hd64_hybrid_eligible
+            and not use_2cta_instrs
+            and softmax_disc
+            and disc_pipe_depth >= 2
+            and split_p_arrive
+            and causal_kv_order == "descending"
+            and causal_loop_split
+            and exp2_packet == _FLASH_HYBRID_EXP2_PACKET
         )
         or (
             not is_causal
+            and head_dim == 64
+            and dtype is torch.float16
             and use_2cta_instrs
             and not softmax_disc
             and dense_degree1_eligible
-            and exp2_packet
-            in (
-                dense_degree1_packet,
-                _FLASH_DEG2_EXP2_PACKET,
-            )
+            and exp2_packet in (*_FLASH_DEG1_EXP2_PACKETS, _FLASH_DEG2_EXP2_PACKET)
+        )
+        or (
+            standard_dense_output
+            and not is_causal
+            and use_2cta_instrs
+            and softmax_disc
+            and head_dim == 128
+            and dtype is torch.bfloat16
+            and _flash_dense_hd128_degree2_num_kv_supported(num_kv)
+            and exp2_packet == _FLASH_DEG2_EXP2_PACKET
+        )
+        or (
+            standard_causal_output
+            and is_causal
+            and head_dim == 128
+            and dtype is torch.bfloat16
+            and _flash_causal_hd128_resident_num_kv_supported(num_kv)
+            and not use_2cta_instrs
+            and softmax_disc
+            and disc_pipe_depth == 2
+            and split_p_arrive
+            and causal_kv_order == "descending"
+            and causal_loop_split
+            and not use_clc_scheduler
+            and not local_tma_partition
+            and not tensor_4d_tma
+            and exp2_packet in _FLASH_CAUSAL_HD128_RESIDENT_EXP2_PACKETS
         )
     )
     if exp2_packet in _FLASH_MANUAL_EXP2_PACKET_PARAMS:
@@ -2468,7 +2870,19 @@ def resolve_flash_config(
             exp2_packet = exp2_packet_default
     elif exp2_packet not in _FLASH_EXP2_PACKET_PARAMS:
         exp2_packet = exp2_packet_default
-    if topology != "fa4" or exp2_impl != "split" or head_dim != 64:
+    if (
+        topology != "fa4"
+        or exp2_impl != "split"
+        or head_dim not in (64, 128)
+        or (
+            head_dim == 128
+            and exp2_packet
+            not in (
+                _FLASH_DEG2_EXP2_PACKET,
+                *_FLASH_CAUSAL_HD128_RESIDENT_EXP2_PACKETS,
+            )
+        )
+    ):
         exp2_packet = "1x1"
     manual_exp2_schedule = _FLASH_MANUAL_EXP2_PACKET_SCHEDULES.get(exp2_packet)
     if manual_exp2_schedule is not None:
@@ -2501,9 +2915,7 @@ def resolve_flash_config(
             e2e_offset, e2e_offset_default, e2e_offset_period
         )
         e2e_offset0_default = (
-            _FLASH_DEG1_EXP2_OFFSET0
-            if exp2_packet in _FLASH_DEG1_EXP2_PACKETS
-            else _flash_causal_hd64_seed_offset0(num_kv) % e2e_offset_period
+            _FLASH_DEG1_EXP2_OFFSET0 if exp2_packet in _FLASH_DEG1_EXP2_PACKETS else 0
         )
         e2e_offset0 = int(
             os.environ.get("HELION_CUTE_FLASH_E2E_OFFSET0", str(e2e_offset0_default))
@@ -2513,9 +2925,30 @@ def resolve_flash_config(
         e2e_offset0 = _flash_normalize_e2e_offset(
             e2e_offset0, e2e_offset0_default, e2e_offset_period
         )
-    stat_transport_eligible = (
-        topology == "fa4" and not is_causal and head_dim == 64 and exp2_impl == "split"
-    )
+    if is_causal and (not causal_loop_split or not standard_causal_output):
+        # A runtime causal loop can alternate masked and unmasked tiles. Its
+        # shared PASS2 pipeline has one static cadence, so distinct cadences are
+        # safe only when codegen proves separate loop regions.
+        masked_e2e_schedule = "inherit"
+        masked_e2e_freq = e2e_freq
+        masked_e2e_res = e2e_res
+        e2e_offset_period = _flash_e2e_offset_period(
+            e2e_freq,
+            e2e_res,
+            masked_e2e_freq,
+            masked_e2e_res,
+        )
+        e2e_offset = _flash_normalize_e2e_offset(
+            e2e_offset, e2e_offset_default, e2e_offset_period
+        )
+        e2e_offset0 = _flash_normalize_e2e_offset(
+            e2e_offset0, e2e_offset0_default, e2e_offset_period
+        )
+    if p_store_repetition == 32 and split_p_arrive:
+        # The mixed Rep32/Rep16 publication helper owns a fixed PASS2 pipeline
+        # and does not consume the generic pipeline-depth argument.
+        disc_pipe_depth = 1
+    stat_transport_eligible = topology == "fa4" and not is_causal and head_dim == 64
     legacy_stat_handoff = _flash_bool_env("HELION_CUTE_FLASH_FA4_STAT_HANDOFF", True)
     stat_transport_default = (
         "single" if stat_transport_eligible and legacy_stat_handoff else "ring2"
@@ -2532,6 +2965,7 @@ def resolve_flash_config(
         stat_transport = "ring2"
     single_final_stat_eligible = (
         stat_transport_eligible
+        and exp2_impl == "split"
         and standard_dense_output
         and (not persistent or use_2cta_instrs)
         and not softmax_disc
@@ -2540,17 +2974,24 @@ def resolve_flash_config(
     )
     if stat_transport == "single_final" and not single_final_stat_eligible:
         stat_transport = "single"
-    causal_loop_split_default = (
-        causal_hd64_seeded_fa4 and causal_kv_order == "descending"
-    )
-    causal_loop_split = _flash_bool_env(
-        "HELION_CUTE_FLASH_CAUSAL_LOOP_SPLIT", causal_loop_split_default
-    )
-    causal_loop_split_cfg = _cfg(FLASH_CAUSAL_LOOP_SPLIT_KEY)
-    if causal_loop_split_cfg is not None:
-        causal_loop_split = bool(causal_loop_split_cfg)
-    if not is_causal or topology != "fa4" or causal_kv_order != "descending":
-        causal_loop_split = False
+    if (
+        stat_transport_eligible
+        and not softmax_disc
+        and stat_transport == "ring2"
+        and mma_ptx
+    ):
+        # Whole-row PTX softmax can let the two-slot stats ring lap its consumer,
+        # including without split-P publication. Use the established single-slot
+        # acknowledgement for both split and hardware-XU exp2. The CuTe-GEMM
+        # fallback retains its ring2 handoff.
+        stat_transport = "single"
+    if topology == "fa4" and not softmax_disc and stat_transport == "ring2":
+        # The two-slot statistics handoff can lap a K/V pipeline deeper than two
+        # stages after enough KV iterations, leaving correction and
+        # softmax waiting on opposite barrier phases. Single-slot handoff has an
+        # explicit acknowledgement and can use deeper rings; ring2 whole-row
+        # schedules must retain the proven two-stage depth.
+        kv_stage = 2
     if topology == "fa4":
         # FA4 has a fixed two-query score pipeline. The generic WS s-stage and
         # row-reduction choices do not participate in its emitted source.
@@ -2565,6 +3006,12 @@ def resolve_flash_config(
         e2e_offset = 0
         e2e_offset0 = 0
         causal_lpt_swizzle = 0
+    if topology == "fa4" and not separate_kv_rings and head_dim in (64, 128):
+        aliased_kv_stage_cap = _flash_aliased_kv_stage_cap(
+            head_dim,
+            stage_output=epi_tma or epi_stg,
+        )
+        kv_stage = min(max(kv_stage, 2), aliased_kv_stage_cap)
     pipeline_family = _flash_pipeline_family_from_flags(
         topology=topology,
         separate_kv_rings=separate_kv_rings,
@@ -2575,6 +3022,94 @@ def resolve_flash_config(
         local_tma_partition=local_tma_partition,
         tensor_4d_tma=tensor_4d_tma,
     )
+    role_chain_default = _flash_role_chain_default(
+        hd=head_dim, is_causal=is_causal, role_map=role_map
+    ) or (use_2cta_instrs and not is_causal and head_dim == 64)
+    role_chain = _flash_bool_env("HELION_CUTE_FLASH_ROLE_CHAIN", role_chain_default)
+    role_chain_cfg = _cfg(FLASH_ROLE_CHAIN_KEY)
+    if role_chain_cfg is not None:
+        role_chain = bool(role_chain_cfg)
+    if (
+        topology != "fa4"
+        or is_causal
+        or head_dim != 64
+        or not _flash_supported_io_dtype(dtype)
+        or use_cga2_local_cta
+        or use_clc_scheduler
+    ):
+        role_chain = False
+
+    persistent_loop = os.environ.get("HELION_CUTE_FLASH_PERSISTENT_LOOP", "while")
+    persistent_loop_cfg = _cfg(FLASH_PERSISTENT_LOOP_KEY)
+    if persistent_loop_cfg is not None:
+        persistent_loop = str(persistent_loop_cfg)
+    if persistent_loop not in ("while", "counted") or not (
+        topology == "fa4" and persistent and not use_clc_scheduler
+    ):
+        persistent_loop = "while"
+
+    sp_row_sum = os.environ.get("HELION_CUTE_FLASH_SP_ROW_SUM", "fragment")
+    sp_row_sum_cfg = _cfg(FLASH_SP_ROW_SUM_KEY)
+    if sp_row_sum_cfg is not None:
+        sp_row_sum = str(sp_row_sum_cfg)
+    sp_row_sum_eligible = (
+        topology == "fa4"
+        and not softmax_disc
+        and not is_causal
+        and head_dim == 64
+        and dtype is torch.float16
+    )
+    if sp_row_sum not in ("fragment", "whole") or not sp_row_sum_eligible:
+        sp_row_sum = "fragment"
+
+    softmax_setup = (
+        "stage_local"
+        if _flash_bool_env("HELION_CUTE_FLASH_STAGE_LOCAL_SOFTMAX_SETUP", False)
+        else "shared"
+    )
+    softmax_setup_cfg = _cfg(FLASH_SOFTMAX_SETUP_KEY)
+    if softmax_setup_cfg is not None:
+        softmax_setup = str(softmax_setup_cfg)
+    softmax_setup_eligible = (
+        topology == "fa4"
+        and not is_causal
+        and head_dim == 64
+        and dtype is torch.float16
+        and p_store_repetition == 16
+    )
+    if softmax_setup not in ("shared", "stage_local") or not softmax_setup_eligible:
+        softmax_setup = "shared"
+    if (
+        softmax_setup == "stage_local"
+        and use_cga2_local_cta
+        and persistent
+        and softmax_disc
+        and stat_transport == "single"
+        and rescale_threshold <= 0.0
+    ):
+        # This long-lived CGA2-local combination has wedged a persistent kernel.
+        # Keep the arithmetic policy intact and use the established shared
+        # descriptor setup.
+        softmax_setup = "shared"
+
+    epi_tma_setup = os.environ.get("HELION_CUTE_FLASH_EPI_TMA_SETUP", "shared")
+    epi_tma_setup_cfg = _cfg(FLASH_EPI_TMA_SETUP_KEY)
+    if epi_tma_setup_cfg is not None:
+        epi_tma_setup = str(epi_tma_setup_cfg)
+    epi_tma_setup_eligible = (
+        topology == "fa4"
+        and epi_tma
+        and not is_causal
+        and head_dim == 64
+        and standard_dense_output
+    )
+    if epi_tma_setup not in ("shared", "role_local") or not epi_tma_setup_eligible:
+        epi_tma_setup = "shared"
+
+    if exp2_packet in _FLASH_CAUSAL_HD128_RESIDENT_EXP2_PACKETS and (
+        pipeline_family != "fa4" or not causal_loop_split
+    ):
+        exp2_packet = "1x1"
     return FlashAttentionConfig(
         s_stage=s_stage,
         kv_stage=kv_stage,
@@ -2583,6 +3118,10 @@ def resolve_flash_config(
         recompute_tile_coords=recompute_tile_coords,
         num_regs_producer=_FLASH_NUM_REGS_PRODUCER,
         num_regs_consumer=_FLASH_NUM_REGS_CONSUMER,
+        persistent_loop=persistent_loop,
+        sp_row_sum=sp_row_sum,
+        softmax_setup=softmax_setup,
+        epi_tma_setup=epi_tma_setup,
         topology=topology,
         pipeline_family=pipeline_family,
         num_softmax_warpgroups=num_softmax_warpgroups,
@@ -2633,6 +3172,7 @@ def resolve_flash_config(
         causal_lpt_swizzle=causal_lpt_swizzle,
         causal_kv_order=causal_kv_order,
         role_map=role_map,
+        role_chain=role_chain,
         separate_kv_rings=separate_kv_rings,
         causal_two_cta=causal_two_cta,
         use_2cta_instrs=use_2cta_instrs,
@@ -2708,6 +3248,7 @@ FLASH_SMALL_BIASED_KEY = "cute_flash_small_biased"
 FLASH_CAUSAL_LPT_SWIZZLE_KEY = "cute_flash_causal_lpt_swizzle"
 FLASH_CAUSAL_KV_ORDER_KEY = "cute_flash_causal_kv_order"
 FLASH_ROLE_MAP_KEY = "cute_flash_role_map"
+FLASH_ROLE_CHAIN_KEY = "cute_flash_role_chain"
 FLASH_USE_2CTA_KEY = "cute_flash_use_2cta"
 FLASH_CGA2_LOCAL_KEY = "cute_flash_cga2_local"
 FLASH_CLC_KEY = "cute_flash_clc"
@@ -2717,6 +3258,53 @@ FLASH_CLC_STAGES_KEY = "cute_flash_clc_stages"
 FLASH_LOCAL_TMA_PARTITION_KEY = "cute_flash_local_tma_partition"
 FLASH_TENSOR_4D_TMA_KEY = "cute_flash_tensor_4d_tma"
 FLASH_CAUSAL_LOOP_SPLIT_KEY = "cute_flash_causal_loop_split"
+FLASH_PERSISTENT_LOOP_KEY = "cute_flash_persistent_loop"
+FLASH_SP_ROW_SUM_KEY = "cute_flash_sp_row_sum"
+FLASH_SOFTMAX_SETUP_KEY = "cute_flash_softmax_setup"
+FLASH_EPI_TMA_SETUP_KEY = "cute_flash_epi_tma_setup"
+
+
+class FlashStructuralLeaf(NamedTuple):
+    """Exact structural schedule ranked by hierarchical flash tuning.
+
+    Ordinary exp2 packets are arithmetic children of a pipeline family. A
+    compound packet owns additional scheduling requirements, so each such
+    packet is a distinct leaf under its normalized parent family.  The
+    whole-row and chunked softmax implementations use different barrier and
+    statistics-transport protocols, so they must also be qualified as
+    separate leaves instead of competing as an ordinary Boolean child.
+    """
+
+    pipeline_family: str
+    compound_exp2_packet: str | None
+    softmax_disc: bool = True
+
+
+def flash_structural_leaf_from_config(
+    config: Mapping[str, object],
+) -> FlashStructuralLeaf | None:
+    """Return the exact normalized structural leaf represented by ``config``."""
+    family = config.get(FLASH_PIPELINE_FAMILY_KEY)
+    if not isinstance(family, str) or family not in FLASH_PIPELINE_FAMILY_FLAGS:
+        return None
+    packet = config.get(FLASH_EXP2_PACKET_KEY)
+    return FlashStructuralLeaf(
+        family,
+        cast("str", packet) if flash_exp2_packet_is_compound(packet) else None,
+        bool(config.get(FLASH_SOFTMAX_DISC_KEY, True)),
+    )
+
+
+# These fields form one staged-output schedule. Marginal coverage is insufficient:
+# all effective combinations emit different producer/consumer code.
+FLASH_AUTOTUNE_INTERACTION_KEY_GROUPS: tuple[tuple[str, ...], ...] = (
+    (
+        FLASH_EPI_TMA_KEY,
+        FLASH_EPI_STG_KEY,
+        FLASH_EPI_STG_STORE_KEY,
+        FLASH_EPI_STG_GMEM_KEY,
+    ),
+)
 
 FLASH_AUTOTUNE_CONFIG_KEYS: tuple[str, ...] = (
     FLASH_S_STAGE_KEY,
@@ -2757,10 +3345,15 @@ FLASH_AUTOTUNE_CONFIG_KEYS: tuple[str, ...] = (
     FLASH_CAUSAL_LPT_SWIZZLE_KEY,
     FLASH_CAUSAL_KV_ORDER_KEY,
     FLASH_ROLE_MAP_KEY,
+    FLASH_ROLE_CHAIN_KEY,
     FLASH_CLC_HEADS_PER_BATCH_KEY,
     FLASH_CLC_PDL_KEY,
     FLASH_CLC_STAGES_KEY,
     FLASH_CAUSAL_LOOP_SPLIT_KEY,
+    FLASH_PERSISTENT_LOOP_KEY,
+    FLASH_SP_ROW_SUM_KEY,
+    FLASH_SOFTMAX_SETUP_KEY,
+    FLASH_EPI_TMA_SETUP_KEY,
 )
 
 FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS: tuple[str, ...] = (
@@ -2833,10 +3426,15 @@ def flash_effective_config_values(
         FLASH_CAUSAL_LPT_SWIZZLE_KEY: config.causal_lpt_swizzle,
         FLASH_CAUSAL_KV_ORDER_KEY: config.causal_kv_order,
         FLASH_ROLE_MAP_KEY: config.role_map,
+        FLASH_ROLE_CHAIN_KEY: config.role_chain,
         FLASH_CLC_HEADS_PER_BATCH_KEY: config.clc_heads_per_batch,
         FLASH_CLC_PDL_KEY: config.clc_use_pdl,
         FLASH_CLC_STAGES_KEY: config.clc_stages,
         FLASH_CAUSAL_LOOP_SPLIT_KEY: config.causal_loop_split,
+        FLASH_PERSISTENT_LOOP_KEY: config.persistent_loop,
+        FLASH_SP_ROW_SUM_KEY: config.sp_row_sum,
+        FLASH_SOFTMAX_SETUP_KEY: config.softmax_setup,
+        FLASH_EPI_TMA_SETUP_KEY: config.epi_tma_setup,
     }
 
 
@@ -2848,10 +3446,74 @@ def _flash_choices_with_default(default: _T, choices: Iterable[_T]) -> tuple[_T,
     return tuple(ordered)
 
 
+def _flash_clc_heads_per_batch_candidates(num_bh: int | None) -> tuple[int, ...]:
+    """Return non-aliasing CLC decompositions for the detected work grid."""
+    if num_bh is None or num_bh <= 0:
+        return (1, 2, 4, 8, 16, 32, 64)
+
+    divisors: set[int] = set()
+    for lower in range(1, math.isqrt(num_bh) + 1):
+        if num_bh % lower == 0:
+            divisors.add(lower)
+            divisors.add(num_bh // lower)
+    return tuple(sorted(divisors))
+
+
+def _flash_clc_heads_per_batch_coverage_candidates(
+    num_bh: int | None,
+    *,
+    tensor_4d_heads: int | None = None,
+    effective_default: int | None = None,
+    limit: int = 8,
+) -> tuple[int, ...]:
+    """Bound deterministic CLC coverage while preserving input geometry."""
+    candidates = _flash_clc_heads_per_batch_candidates(num_bh)
+    if effective_default is not None and effective_default not in candidates:
+        raise ValueError("CLC effective default must be a legal decomposition")
+    if len(candidates) <= limit:
+        return candidates
+
+    mandatory = {candidates[0], candidates[-1]}
+    if effective_default is not None:
+        mandatory.add(effective_default)
+    if (
+        num_bh is not None
+        and tensor_4d_heads is not None
+        and tensor_4d_heads > 0
+        and num_bh % tensor_4d_heads == 0
+    ):
+        mandatory.add(tensor_4d_heads)
+        mandatory.add(num_bh // tensor_4d_heads)
+    if len(mandatory) > limit:
+        raise ValueError("CLC coverage limit cannot hold the mandatory decompositions")
+
+    selected = set(mandatory)
+    candidate_logs = {candidate: math.log(candidate) for candidate in candidates}
+    while len(selected) < limit:
+        remaining = [candidate for candidate in candidates if candidate not in selected]
+        if not remaining:
+            break
+        selected.add(
+            max(
+                remaining,
+                key=lambda candidate: (
+                    min(
+                        abs(candidate_logs[candidate] - candidate_logs[chosen])
+                        for chosen in selected
+                    ),
+                    -candidate,
+                ),
+            )
+        )
+    return tuple(candidate for candidate in candidates if candidate in selected)
+
+
+def _flash_causal_lpt_candidates() -> tuple[int, ...]:
+    """Return causal launch-order groups in the stress-tested safe envelope."""
+    return (1,)
+
+
 _FLASH_SEED_BLOCK_SIZE_TARGETS = (1, 128, 128)
-_FLASH_DENSE_HD64_MID_MIN_KV = 16
-_FLASH_DENSE_HD64_LONG_MIN_KV = 64
-_FLASH_DENSE_HD64_VERY_LONG_MIN_KV = 256
 _FLASH_RESCALE_THRESHOLD_VALUES = (0.0, 4.0, 8.0, 12.0, 16.0, 32.0)
 
 
@@ -2865,503 +3527,52 @@ def _flash_safe_rescale_threshold_values(dtype: torch.dtype) -> tuple[float, ...
     )
 
 
-def _flash_dense_hd64_seed_params(
-    num_kv: int,
-) -> tuple[int, int, int, int, bool, float, int, bool]:
-    """Return dense hd64 FA4 seed knobs.
-
-    The families track the configs found by full no-seed search for the
-    4K/8K/16K/32K dense sweep without baking in an exact shape-only config.
-    """
-    if num_kv < _FLASH_DENSE_HD64_LONG_MIN_KV:
-        return 3, 2, 2, 4, True, 8.0, 16, False
-    if num_kv < 128:
-        return 2, 2, 2, 3, True, 8.0, 16, True
-    if num_kv < _FLASH_DENSE_HD64_VERY_LONG_MIN_KV:
-        return 2, 3, 2, 3, False, 8.0, 16, True
-    if num_kv < 512:
-        if num_kv == _FLASH_DENSE_HD64_VERY_LONG_MIN_KV:
-            return 2, 0, 1, 1, True, 8.0, 8, True
-        return 2, 0, 3, 1, True, 32.0, 8, True
-    if num_kv == 512:
-        return 2, 0, 0, 3, False, 8.0, 8, True
-    if num_kv < 1024:
-        return 2, 0, 0, 3, False, 8.0, 8, True
-    if num_kv == 1024:
-        return 2, 0, 0, 1, True, 8.0, 8, True
-    if num_kv < 2048:
-        return 2, 0, 0, 1, False, 8.0, 8, True
-    if num_kv == 2048:
-        return 3, 0, 0, 1, False, 8.0, 8, True
-    return 3, 0, 0, 1, False, 8.0, 8, True
+def _flash_role_chain_default(*, hd: int, is_causal: bool, role_map: str) -> bool:
+    """Make dense role chaining follow the autotuned role-map choice."""
+    return not is_causal and hd == 64 and role_map == "fa4"
 
 
-def _flash_dense_hd64_seed_rescale_threshold(
-    num_kv: int, dtype: torch.dtype = torch.float16
-) -> float:
-    threshold = 32.0 if num_kv == 2048 else _flash_dense_hd64_seed_params(num_kv)[5]
-    if threshold >= math.log2(torch.finfo(dtype).max):
-        return 8.0
-    return threshold
+def _flash_seed_block_sizes(
+    block_size_targets: Sequence[int],
+) -> list[int] | None:
+    targets = tuple(block_size_targets)
+    if targets != _FLASH_SEED_BLOCK_SIZE_TARGETS:
+        return None
+    return [*targets]
 
 
-def _flash_dense_hd64_seed_e2e_schedule(num_kv: int) -> str:
-    if num_kv == 1024 or num_kv >= 2048:
-        return "16/4"
-    return "8/2"
-
-
-def _flash_dense_hd64_seed_p_store_rep(num_kv: int) -> int:
-    return 16
-
-
-def _flash_dense_hd64_seed_s_load_rep(num_kv: int) -> int:
-    return 32
-
-
-def _flash_dense_hd64_seed_split_p_arrive(num_kv: int) -> bool:
-    return num_kv == 512
-
-
-def _flash_dense_hd64_seed_precompute_qk_desc(num_kv: int) -> bool:
-    return num_kv == 512
-
-
-def _flash_dense_hd64_seed_first_load_order(num_kv: int) -> int:
-    if num_kv < _FLASH_DENSE_HD64_VERY_LONG_MIN_KV:
-        return 0
-    if num_kv < 512:
-        return 0
-    if num_kv == 512:
-        return 4
-    if num_kv < 1024:
-        return 0
-    if num_kv == 1024:
-        return 0
-    if num_kv < 2048:
-        return 1
-    return 4
-
-
-def _flash_dense_hd64_seed_kv_order(num_kv: int) -> str:
-    if num_kv in (_FLASH_DENSE_HD64_VERY_LONG_MIN_KV, 512, 1024) or num_kv >= 2048:
-        return "descending"
-    return "ascending"
-
-
-def _flash_dense_hd64_seed_epi_stg(num_kv: int) -> bool:
-    return num_kv >= 512
-
-
-def _flash_dense_hd64_seed_corr_tile_size(num_kv: int) -> int:
-    if num_kv == 512:
-        return 16
-    if num_kv > 2048:
-        return 8
-    return 8 if num_kv >= _FLASH_DENSE_HD64_VERY_LONG_MIN_KV else 16
-
-
-def _flash_dense_hd64_seed_skip_rescale_stats(num_kv: int) -> bool:
-    return False
-
-
-def _flash_dense_hd64_seed_clc(num_kv: int) -> bool:
-    return num_kv == 1024
-
-
-def _flash_dense_hd64_seed_clc_heads_per_batch(num_kv: int) -> int:
-    return 32 if _flash_dense_hd64_seed_clc(num_kv) else 0
-
-
-def _flash_dense_hd64_seed_persistent_ctas_per_sm(num_kv: int) -> int:
-    return 1
-
-
-def _flash_dense_hd64_seed_recompute_tile_coords(num_kv: int) -> bool:
-    return False
-
-
-def _flash_dense_hd64_seed_softmax_disc(num_kv: int) -> bool:
-    return num_kv < _FLASH_DENSE_HD64_VERY_LONG_MIN_KV
-
-
-def _flash_dense_hd64_seed_role_map(num_kv: int) -> str:
-    if num_kv == 512:
-        return "fa4"
-    return "helion"
-
-
-def _flash_role_chain_default(
-    *, hd: int, num_kv: int, is_causal: bool, role_map: str
-) -> bool:
-    return not is_causal and hd == 64 and num_kv == 512 and role_map == "fa4"
-
-
-def _flash_dense_hd64_seed_cga2_local(num_kv: int) -> bool:
-    return False
-
-
-def _flash_dense_hd64_seed_softmax_regs(num_kv: int) -> int:
-    if num_kv == 2048:
-        return 192
-    return 200 if num_kv >= _FLASH_DENSE_HD64_VERY_LONG_MIN_KV else 184
-
-
-def _flash_dense_hd64_seed_corr_regs(num_kv: int) -> int:
-    if num_kv == 512 or num_kv >= 2048:
-        return 80
-    if num_kv == _FLASH_DENSE_HD64_VERY_LONG_MIN_KV:
-        return 64
-    return 72 if num_kv > _FLASH_DENSE_HD64_VERY_LONG_MIN_KV else 64
-
-
-def _flash_dense_hd64_seed_other_regs(num_kv: int) -> int:
-    if num_kv >= 2048:
-        return 32
-    if _FLASH_DENSE_HD64_VERY_LONG_MIN_KV < num_kv <= 512:
-        return 32
-    return 40 if num_kv >= _FLASH_DENSE_HD64_VERY_LONG_MIN_KV else 48
-
-
-def _flash_dense_hd64_seed_local_tma_partition(num_kv: int) -> bool:
-    return False
-
-
-def _flash_dense_hd64_seed_tensor_4d_tma(num_kv: int) -> bool:
-    return False
-
-
-def flash_attention_value_prior_weights(
+def _flash_seed_values(
     head_dim: int,
-    num_kv: int | None,
+    num_kv: int,
     *,
-    dtype: torch.dtype = torch.float16,
-    is_causal: bool = False,
-    has_kv_tile_pruning: bool = False,
-    requires_ws_overlap: bool = False,
-) -> dict[str, dict[object, float]]:
-    """Return per-key sampling weights for flash-attention shape families.
-
-    These weights bias random search toward measured-good FA4 families without
-    injecting a complete fixed config. Exact fragment validation happens when
-    the backend converts the weights to ``ValuePrior`` objects.
-    """
-    if head_dim != 64 or num_kv is None:
-        return {}
-    if requires_ws_overlap or num_kv % 2 != 0:
-        return {}
-
-    if not is_causal and not has_kv_tile_pruning:
-        if num_kv < _FLASH_DENSE_HD64_MID_MIN_KV:
-            return {}
-        (
-            kv_stage,
-            e2e_offset,
-            e2e_offset0,
-            disc_pipe,
-            epi_tma,
-            rescale_threshold,
-            rescale_chunk_cols,
-            packed_reduce,
-        ) = _flash_dense_hd64_seed_params(num_kv)
-        rescale_threshold = _flash_dense_hd64_seed_rescale_threshold(num_kv, dtype)
-        rescale_threshold_priors = (
-            (8.0, 16.0, 32.0) if dtype is torch.bfloat16 else (8.0, 12.0)
-        )
-        p_store_rep = _flash_dense_hd64_seed_p_store_rep(num_kv)
-        s_load_rep = _flash_dense_hd64_seed_s_load_rep(num_kv)
-        split_p_arrive = _flash_dense_hd64_seed_split_p_arrive(num_kv)
-        precompute_qk_desc = _flash_dense_hd64_seed_precompute_qk_desc(num_kv)
-        first_load_order = _flash_dense_hd64_seed_first_load_order(num_kv)
-        kv_order = _flash_dense_hd64_seed_kv_order(num_kv)
-        epi_stg = _flash_dense_hd64_seed_epi_stg(num_kv) and not epi_tma
-        corr_tile_size = _flash_dense_hd64_seed_corr_tile_size(num_kv)
-        softmax_disc = _flash_dense_hd64_seed_softmax_disc(num_kv)
-        softmax_regs = _flash_dense_hd64_seed_softmax_regs(num_kv)
-        corr_regs = _flash_dense_hd64_seed_corr_regs(num_kv)
-        other_regs = _flash_dense_hd64_seed_other_regs(num_kv)
-        e2e_schedule = _flash_dense_hd64_seed_e2e_schedule(num_kv)
-        softmax_regs_alternates = (
-            (176, 184, 192, 200)
-            if num_kv >= _FLASH_DENSE_HD64_VERY_LONG_MIN_KV
-            else (184, 200)
-        )
-        skip_rescale_stats = _flash_dense_hd64_seed_skip_rescale_stats(num_kv)
-        clc = _flash_dense_hd64_seed_clc(num_kv)
-        clc_heads_per_batch = _flash_dense_hd64_seed_clc_heads_per_batch(num_kv)
-        persistent_ctas_per_sm = _flash_dense_hd64_seed_persistent_ctas_per_sm(num_kv)
-        recompute_tile_coords = _flash_dense_hd64_seed_recompute_tile_coords(num_kv)
-        pipeline_family = _flash_pipeline_family_from_flags(
-            topology="fa4",
-            separate_kv_rings=False,
-            causal_two_cta=False,
-            use_2cta_instrs=False,
-            use_cga2_local_cta=_flash_dense_hd64_seed_cga2_local(num_kv),
-            use_clc_scheduler=clc,
-            local_tma_partition=_flash_dense_hd64_seed_local_tma_partition(num_kv),
-            tensor_4d_tma=_flash_dense_hd64_seed_tensor_4d_tma(num_kv),
-        )
-        pipeline_family_priors: dict[object, float] = {
-            pipeline_family: 4.0,
-            "ws_overlap": 1.0,
-        }
-        if pipeline_family != "fa4":
-            pipeline_family_priors["fa4"] = 1.0
-        if _flash_dense_hd64_2cta_num_kv_supported(num_kv) and dtype is torch.float16:
-            pipeline_family_priors["fa4_2cta"] = 4.0
-        very_long_dense_hd64_fa4 = num_kv >= _FLASH_DENSE_HD64_VERY_LONG_MIN_KV
-        priors = cast(
-            "dict[str, dict[object, float]]",
-            {
-                FLASH_S_STAGE_KEY: {2: 1.0},
-                FLASH_PIPELINE_FAMILY_KEY: pipeline_family_priors,
-                FLASH_PERSISTENT_KEY: {True: 1.0},
-                FLASH_PERSISTENT_CTAS_PER_SM_KEY: {
-                    persistent_ctas_per_sm: 4.0,
-                    **{
-                        ctas_per_sm: 2.0
-                        for ctas_per_sm in (1, 2, 3, 4)
-                        if ctas_per_sm != persistent_ctas_per_sm
-                    },
-                },
-                FLASH_RECOMPUTE_TILE_COORDS_KEY: {
-                    recompute_tile_coords: 4.0,
-                    not recompute_tile_coords: 1.0,
-                },
-                FLASH_E2E_SCHEDULE_KEY: {
-                    e2e_schedule: 4.0,
-                    **{
-                        schedule: 2.0
-                        for schedule in ("8/2", "16/4")
-                        if schedule != e2e_schedule
-                    },
-                },
-                FLASH_SOFTMAX_DISC_KEY: {
-                    softmax_disc: 5.0,
-                    not softmax_disc: 1.0,
-                },
-                FLASH_DISC_PIPE_KEY: {
-                    disc_pipe: 4.0,
-                    **{depth: 2.0 for depth in (2, 3, 4) if depth != disc_pipe},
-                },
-                FLASH_SPLIT_P_ARRIVE_KEY: {
-                    split_p_arrive: 4.0,
-                    not split_p_arrive: 2.0,
-                },
-                FLASH_P_STORE_REP_KEY: {
-                    p_store_rep: 4.0,
-                    **{rep: 2.0 for rep in (16, 32) if rep != p_store_rep},
-                },
-                FLASH_S_LOAD_REP_KEY: {
-                    s_load_rep: 4.0,
-                    **{rep: 2.0 for rep in (16, 32) if rep != s_load_rep},
-                },
-                FLASH_PRECOMPUTE_QK_DESC_KEY: {
-                    precompute_qk_desc: 4.0,
-                    not precompute_qk_desc: 1.0,
-                },
-                FLASH_FIRST_LOAD_ORDER_KEY: {
-                    first_load_order: 4.0,
-                    **{
-                        order: 1.0
-                        for order in (0, 1, 2, 3, 4)
-                        if order != first_load_order
-                    },
-                },
-                FLASH_KV_ORDER_KEY: {
-                    kv_order: 4.0,
-                    **{
-                        order: 1.0
-                        for order in ("ascending", "descending")
-                        if order != kv_order
-                    },
-                },
-                FLASH_RESCALE_THRESHOLD_KEY: (
-                    {
-                        rescale_threshold: 4.0,
-                        **{
-                            threshold: 3.0
-                            for threshold in rescale_threshold_priors
-                            if threshold != rescale_threshold
-                        },
-                    }
-                    if num_kv >= _FLASH_DENSE_HD64_VERY_LONG_MIN_KV
-                    else {8.0: 1.0}
-                ),
-                FLASH_RESCALE_CHUNK_COLS_KEY: {
-                    rescale_chunk_cols: 4.0,
-                    **{
-                        cols: 2.0
-                        for cols in (
-                            (8, 16, 32)
-                            if num_kv >= _FLASH_DENSE_HD64_VERY_LONG_MIN_KV
-                            else (16, 32)
-                        )
-                        if cols != rescale_chunk_cols
-                    },
-                },
-                FLASH_CORR_REGS_KEY: {
-                    corr_regs: 4.0,
-                    **{regs: 1.0 for regs in (64, 72, 80, 88) if regs != corr_regs},
-                },
-                FLASH_OTHER_REGS_KEY: {
-                    other_regs: 4.0,
-                    **{
-                        regs: 2.0
-                        for regs in (32, 40, 48, 56, 64, 80)
-                        if regs != other_regs
-                    },
-                },
-                FLASH_CORR_TILE_SIZE_KEY: {
-                    corr_tile_size: 4.0,
-                    **{tile: 2.0 for tile in (8, 16, 32) if tile != corr_tile_size},
-                },
-                FLASH_EPI_TMA_KEY: {epi_tma: 4.0, not epi_tma: 1.0},
-                FLASH_EPI_STG_KEY: {epi_stg: 4.0, not epi_stg: 1.0},
-                FLASH_EPI_STG_STORE_KEY: {"slice": 3.0, "whole": 2.0},
-                FLASH_EPI_STG_GMEM_KEY: {"stage": 3.0, "pair": 2.0},
-                FLASH_SKIP_RESCALE_STATS_KEY: {
-                    skip_rescale_stats: 4.0,
-                    not skip_rescale_stats: 1.0,
-                },
-                FLASH_SOFTMAX_REGS_KEY: {
-                    softmax_regs: 4.0,
-                    **{
-                        regs: 2.0
-                        for regs in softmax_regs_alternates
-                        if regs != softmax_regs
-                    },
-                },
-                FLASH_KV_STAGE_KEY: {
-                    kv_stage: 4.0,
-                    **{stage: 2.0 for stage in (2, 3) if stage != kv_stage},
-                },
-                FLASH_PACKED_REDUCE_KEY: {packed_reduce: 4.0, not packed_reduce: 1.0},
-                FLASH_CLC_HEADS_PER_BATCH_KEY: {
-                    clc_heads_per_batch: 4.0,
-                    **{heads: 2.0 for heads in (0, 32) if heads != clc_heads_per_batch},
-                },
-                FLASH_CLC_PDL_KEY: {False: 4.0, True: 1.0},
-                FLASH_CLC_STAGES_KEY: {2: 4.0, 3: 1.0, 1: 1.0},
-                FLASH_E2E_OFFSET_KEY: {
-                    e2e_offset: 4.0,
-                    **{offset: 2.0 for offset in (0, 1, 2, 3) if offset != e2e_offset},
-                },
-                FLASH_E2E_OFFSET0_KEY: {
-                    e2e_offset0: 4.0,
-                    **{offset: 2.0 for offset in (0, 1, 2, 3) if offset != e2e_offset0},
-                },
-            },
-        )
-        if very_long_dense_hd64_fa4:
-            priors.update(
-                {
-                    FLASH_EPI_STG_KEY: {epi_stg: 1.0},
-                    FLASH_EPI_STG_STORE_KEY: {"slice": 1.0},
-                    FLASH_EPI_STG_GMEM_KEY: {"stage": 1.0},
-                    FLASH_PACKED_REDUCE_KEY: {packed_reduce: 1.0},
-                    FLASH_SKIP_RESCALE_STATS_KEY: {False: 1.0},
-                }
-            )
-        return priors
-
-    if (
-        is_causal
-        and not has_kv_tile_pruning
-        and _flash_causal_hd64_seed_num_kv_supported(num_kv)
-    ):
-        e2e_offset, disc_pipe, softmax_regs, lpt_swizzle = (
-            _flash_causal_hd64_seed_params(num_kv)
-        )
-        masked_schedule = _flash_causal_hd64_seed_masked_schedule(num_kv)
-        role_map = _flash_causal_hd64_seed_role_map(num_kv)
-        epi_tma = _flash_causal_hd64_seed_epi_tma(num_kv)
-        rescale_chunk_cols = _flash_causal_hd64_seed_rescale_chunk_cols(num_kv)
-        e2e_offset0 = _flash_causal_hd64_seed_offset0(num_kv)
-        secondary_offsets = {
-            offset: 2.0 for offset in (0, 1, 2, 3, 4, 7, 9, 11) if offset != e2e_offset
-        }
-        causal_offset_weights = {
-            e2e_offset: 4.0,
-            **secondary_offsets,
-            **{
-                offset: 1.0
-                for offset in range(16)
-                if offset != e2e_offset and offset not in secondary_offsets
-            },
-        }
-        causal_lpt_weights = {
-            lpt_swizzle: 4.0,
-            **{
-                swizzle: 1.0
-                for swizzle in (0, 1, 2, 4, 8, 16)
-                if swizzle != lpt_swizzle
-            },
-        }
-        causal_disc_weights = {
-            disc_pipe: 4.0,
-            **{depth: 2.0 for depth in (2, 3, 4) if depth != disc_pipe},
-        }
-        causal_softmax_weights = {
-            softmax_regs: 4.0,
-            **{regs: 2.0 for regs in (184, 200) if regs != softmax_regs},
-            **({192: 1.0} if softmax_regs != 192 else {}),
-        }
-        masked_schedule_weights = {
-            masked_schedule: 4.0,
-            **{
-                schedule: 2.0
-                for schedule in ("inherit", "xu", "16/4", "8/2")
-                if schedule != masked_schedule
-            },
-        }
-        role_map_weights = {
-            role_map: 4.0,
-            **{role: 1.0 for role in ("helion", "fa4") if role != role_map},
-        }
-        epi_tma_weights = {epi_tma: 4.0, not epi_tma: 1.0}
-        rescale_chunk_weights = {
-            rescale_chunk_cols: 4.0,
-            **{cols: 2.0 for cols in (16, 32) if cols != rescale_chunk_cols},
-        }
-        return cast(
-            "dict[str, dict[object, float]]",
-            {
-                FLASH_PIPELINE_FAMILY_KEY: {"fa4": 4.0, "ws_overlap": 1.0},
-                FLASH_PERSISTENT_KEY: {False: 1.0},
-                FLASH_KV_STAGE_KEY: {
-                    2: 4.0,
-                    3: 2.0,
-                    4: 1.0,
-                    6: 2.0,
-                    8: 2.0,
-                    10: 2.0,
-                },
-                FLASH_E2E_SCHEDULE_KEY: {"8/2": 4.0, "16/4": 2.0, "xu": 1.0},
-                FLASH_MASKED_E2E_SCHEDULE_KEY: masked_schedule_weights,
-                FLASH_SOFTMAX_DISC_KEY: {True: 1.0},
-                FLASH_PACKED_REDUCE_KEY: {True: 1.0},
-                FLASH_EPI_TMA_KEY: epi_tma_weights,
-                FLASH_RESCALE_CHUNK_COLS_KEY: rescale_chunk_weights,
-                FLASH_ROLE_MAP_KEY: role_map_weights,
-                FLASH_CAUSAL_LOOP_SPLIT_KEY: {True: 4.0, False: 1.0},
-                FLASH_CAUSAL_LPT_SWIZZLE_KEY: causal_lpt_weights,
-                FLASH_DISC_PIPE_KEY: causal_disc_weights,
-                FLASH_SOFTMAX_REGS_KEY: causal_softmax_weights,
-                FLASH_E2E_OFFSET_KEY: causal_offset_weights,
-                FLASH_E2E_OFFSET0_KEY: {
-                    e2e_offset0: 4.0,
-                    **{
-                        offset: 2.0
-                        for offset in (0, 1, 2, 3, 4, 8, 11)
-                        if offset != e2e_offset0
-                    },
-                },
-                FLASH_CAUSAL_KV_ORDER_KEY: _flash_causal_hd64_kv_order_weights(num_kv),
-            },
-        )
-
-    return {}
+    num_bh: int | None,
+    tensor_4d_heads: int | None,
+    dtype: torch.dtype,
+    is_causal: bool,
+    has_kv_tile_pruning: bool,
+    requires_ws_overlap: bool,
+    small_biased_candidate: bool,
+    standard_dense_output: bool,
+    standard_causal_output: bool,
+    supports_tensor_4d_tma: bool,
+    pipeline_family_override: str | None = None,
+) -> dict[str, object]:
+    fragments = flash_autotune_fragments(
+        head_dim,
+        num_kv,
+        num_bh=num_bh,
+        tensor_4d_heads=tensor_4d_heads,
+        dtype=dtype,
+        is_causal=is_causal,
+        has_kv_tile_pruning=has_kv_tile_pruning,
+        requires_ws_overlap=requires_ws_overlap,
+        small_biased_candidate=small_biased_candidate,
+        standard_dense_output=standard_dense_output,
+        standard_causal_output=standard_causal_output,
+        supports_tensor_4d_tma=supports_tensor_4d_tma,
+        pipeline_family_override=pipeline_family_override,
+    )
+    return {key: fragment.default() for key, fragment in fragments.items()}
 
 
 def _flash_seed_set(
@@ -3389,625 +3600,463 @@ def _flash_seed_set_all(
     return True
 
 
-def _flash_seed_fragments(
+def _flash_config_with_values(
+    block_sizes: Sequence[int],
+    values: Mapping[str, object],
+) -> Config:
+    return Config.from_dict({"block_sizes": list(block_sizes), **values})
+
+
+def _flash_causal_degree2_template_values(
+    *,
+    e2e_offset: int,
+    e2e_offset0: int,
+    role_map: str,
+    epi_tma: bool,
+) -> dict[str, object]:
+    """Return explicit values for the shared causal degree-2 seed template."""
+    return {
+        FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        FLASH_E2E_SCHEDULE_KEY: "16/6",
+        FLASH_MASKED_E2E_SCHEDULE_KEY: "16/6",
+        FLASH_E2E_OFFSET_KEY: e2e_offset,
+        FLASH_E2E_OFFSET0_KEY: e2e_offset0,
+        FLASH_EXP2_PACKET_KEY: _FLASH_DEG2_EXP2_PACKET,
+        FLASH_WAIT_HINT_KEY: 0,
+        FLASH_DISC_PIPE_KEY: 3,
+        FLASH_EPI_TMA_KEY: epi_tma,
+        FLASH_RESCALE_CHUNK_COLS_KEY: 16,
+        FLASH_CAUSAL_LPT_SWIZZLE_KEY: 1,
+        FLASH_ROLE_MAP_KEY: role_map,
+    }
+
+
+def _flash_dense_tuning_overrides(
+    policy: FlashDenseTuningPolicy,
+) -> dict[str, object]:
+    values: dict[str, object] = {
+        FLASH_PIPELINE_FAMILY_KEY: policy.pipeline_family,
+        FLASH_KV_STAGE_KEY: policy.kv_stage,
+        FLASH_PERSISTENT_KEY: policy.persistent,
+        FLASH_E2E_SCHEDULE_KEY: policy.e2e_schedule,
+        FLASH_E2E_OFFSET_KEY: policy.e2e_offset,
+        FLASH_E2E_OFFSET0_KEY: policy.e2e_offset0,
+        FLASH_EXP2_PACKET_KEY: policy.exp2_packet,
+        FLASH_STAT_TRANSPORT_KEY: policy.stat_transport,
+        FLASH_RESCALE_THRESHOLD_KEY: policy.rescale_threshold,
+    }
+    optional_values = {
+        FLASH_EPI_TMA_KEY: policy.epi_tma,
+        FLASH_KV_ORDER_KEY: policy.kv_order,
+        FLASH_PRECOMPUTE_QK_DESC_KEY: policy.precompute_qk_desc,
+        FLASH_RESCALE_CHUNK_COLS_KEY: policy.rescale_chunk_cols,
+        FLASH_FIRST_LOAD_ORDER_KEY: policy.first_load_order,
+        FLASH_CORR_TILE_SIZE_KEY: policy.corr_tile_size,
+        FLASH_ROLE_MAP_KEY: policy.role_map,
+        FLASH_SOFTMAX_REGS_KEY: policy.softmax_regs,
+        FLASH_SPLIT_P_ARRIVE_KEY: policy.split_p_arrive,
+        FLASH_SOFTMAX_DISC_KEY: policy.softmax_disc,
+        FLASH_DISC_PIPE_KEY: policy.disc_pipe_depth,
+        FLASH_SP_ROW_SUM_KEY: policy.sp_row_sum,
+    }
+    values.update(
+        {key: value for key, value in optional_values.items() if value is not None}
+    )
+    if policy.corr_regs is not None:
+        values[FLASH_CORR_REGS_KEY] = policy.corr_regs
+    if policy.other_regs is not None:
+        values[FLASH_OTHER_REGS_KEY] = policy.other_regs
+    return values
+
+
+def _flash_causal_tuning_overrides(
+    policy: FlashCausalTuningPolicy,
+) -> dict[str, object]:
+    if policy.seed_template is not FlashCausalSeedTemplate.DEGREE2_V1:
+        raise AssertionError(
+            f"unsupported causal seed template: {policy.seed_template!r}"
+        )
+    overrides = {
+        **_flash_causal_degree2_template_values(
+            e2e_offset=policy.e2e_offset,
+            e2e_offset0=policy.e2e_offset0,
+            role_map=policy.role_map,
+            epi_tma=policy.epi_tma,
+        ),
+        FLASH_KV_STAGE_KEY: policy.kv_stage,
+        FLASH_CAUSAL_LOOP_SPLIT_KEY: policy.causal_loop_split,
+        FLASH_CAUSAL_KV_ORDER_KEY: policy.causal_kv_order,
+    }
+    if policy.softmax_regs is not None:
+        overrides[FLASH_SOFTMAX_REGS_KEY] = policy.softmax_regs
+    if policy.first_load_order is not None:
+        overrides[FLASH_FIRST_LOAD_ORDER_KEY] = policy.first_load_order
+    return overrides
+
+
+def _flash_config_matches_tuning_values(
+    cfg: FlashAttentionConfig,
+    expected: Mapping[str, object],
+) -> bool:
+    actual = flash_effective_config_values(cfg)
+    return all(actual.get(key) == value for key, value in expected.items())
+
+
+def _flash_dense_target_seed_matches(
+    cfg: FlashAttentionConfig,
+    policy: FlashDenseTuningPolicy | None,
+) -> bool:
+    """Return whether ``cfg`` is the validated target-promoted dense seed."""
+    if policy is None:
+        return False
+    return _flash_config_matches_tuning_values(
+        cfg,
+        {
+            **_flash_dense_tuning_overrides(policy),
+            FLASH_Q_TILE_COUNT_KEY: 2,
+        },
+    )
+
+
+def _flash_resident_softmax_config(
+    requested: FlashAttentionConfig,
+) -> FlashAttentionConfig:
+    """Return the effective config for the resident causal softmax lowering."""
+    return dataclasses.replace(
+        requested,
+        softmax_disc=False,
+        disc_pipe_depth=1,
+        exp2_impl="xu",
+        e2e_freq=8,
+        e2e_res=0,
+        e2e_schedule="xu",
+        masked_e2e_schedule="xu",
+        masked_e2e_freq=8,
+        masked_e2e_res=0,
+        e2e_offset=0,
+        e2e_offset0=0,
+        exp2_packet="1x1",
+        stat_transport="single",
+    )
+
+
+def _flash_causal_resident_native_seed_matches(
+    cfg: FlashAttentionConfig,
+    policy: FlashCausalTuningPolicy | None,
+) -> bool:
+    """Return whether ``cfg`` is the validated causal resident seed shape."""
+    return policy is not None and _flash_config_matches_tuning_values(
+        cfg,
+        {
+            **_flash_causal_tuning_overrides(policy),
+            FLASH_Q_TILE_COUNT_KEY: 2,
+        },
+    )
+
+
+def _flash_validated_target_seed(
+    *,
     head_dim: int,
     num_kv: int,
-    *,
     dtype: torch.dtype,
+    num_bh: int | None,
     is_causal: bool,
-    has_kv_tile_pruning: bool,
-    requires_ws_overlap: bool,
-    small_biased_candidate: bool,
-    standard_dense_output: bool = False,
-    topology_override: str | None,
-) -> dict[str, ConfigSpecFragment]:
-    return flash_autotune_fragments(
+    standard_dense_output: bool,
+    standard_causal_output: bool,
+    supports_tensor_4d_tma: bool,
+    values: Mapping[str, object],
+    expected: Mapping[str, object],
+) -> Config:
+    """Build a target seed and reject policies normalized by config resolution."""
+    seed = Config.from_dict(dict(values))
+    resolved = resolve_flash_config(
         head_dim,
         num_kv,
+        seed.config,
         dtype=dtype,
+        num_bh=num_bh,
         is_causal=is_causal,
-        has_kv_tile_pruning=has_kv_tile_pruning,
-        requires_ws_overlap=requires_ws_overlap,
-        small_biased_candidate=small_biased_candidate,
         standard_dense_output=standard_dense_output,
-        topology_override=topology_override,
+        standard_causal_output=standard_causal_output,
+        supports_tensor_4d_tma=supports_tensor_4d_tma,
     )
+    actual = flash_effective_config_values(resolved)
+    mismatches = {
+        key: (value, actual.get(key))
+        for key, value in expected.items()
+        if actual.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(
+            "flash target tuning policy does not round-trip through config "
+            f"resolution: {mismatches!r}"
+        )
+    return seed
 
 
-def _flash_seed_block_sizes(block_size_targets: Sequence[int]) -> list[int] | None:
-    targets = tuple(block_size_targets)
-    if targets != _FLASH_SEED_BLOCK_SIZE_TARGETS:
-        return None
-    return [*targets]
-
-
-def _flash_default_seed_config(
+def _flash_target_seed_config(
     head_dim: int,
     num_kv: int,
     *,
     dtype: torch.dtype,
-    is_causal: bool,
-    has_kv_tile_pruning: bool,
-    requires_ws_overlap: bool,
-    small_biased_candidate: bool,
-    block_size_targets: Sequence[int],
-) -> Config | None:
-    block_sizes = _flash_seed_block_sizes(block_size_targets)
-    if block_sizes is None:
-        return None
-
-    topology = (
-        "ws_overlap" if requires_ws_overlap else "fa4" if num_kv % 2 == 0 else None
-    )
-    fragments = _flash_seed_fragments(
-        head_dim,
-        num_kv,
-        dtype=dtype,
-        is_causal=is_causal,
-        has_kv_tile_pruning=has_kv_tile_pruning,
-        requires_ws_overlap=requires_ws_overlap,
-        small_biased_candidate=small_biased_candidate,
-        topology_override=topology,
-    )
-    seed: dict[str, object] = {"block_sizes": block_sizes}
-
-    if small_biased_candidate:
-        _flash_seed_set(seed, fragments, FLASH_SMALL_BIASED_KEY, True)
-    if topology is not None and not _flash_seed_set(
-        seed, fragments, FLASH_PIPELINE_FAMILY_KEY, topology
-    ):
-        return None
-
-    dense_hd64_fa4 = (
-        topology == "fa4"
-        and not is_causal
-        and head_dim == 64
-        and num_kv >= _FLASH_DENSE_HD64_MID_MIN_KV
-    )
-    if dense_hd64_fa4:
-        (
-            kv_stage,
-            e2e_offset,
-            e2e_offset0,
-            disc_pipe,
-            epi_tma,
-            rescale_threshold,
-            rescale_chunk_cols,
-            packed_reduce,
-        ) = _flash_dense_hd64_seed_params(num_kv)
-        rescale_threshold = _flash_dense_hd64_seed_rescale_threshold(num_kv, dtype)
-        family_values = {
-            FLASH_PIPELINE_FAMILY_KEY: _flash_pipeline_family_from_flags(
-                topology="fa4",
-                separate_kv_rings=False,
-                causal_two_cta=False,
-                use_2cta_instrs=False,
-                use_cga2_local_cta=_flash_dense_hd64_seed_cga2_local(num_kv),
-                use_clc_scheduler=_flash_dense_hd64_seed_clc(num_kv),
-                local_tma_partition=_flash_dense_hd64_seed_local_tma_partition(num_kv),
-                tensor_4d_tma=_flash_dense_hd64_seed_tensor_4d_tma(num_kv),
-            ),
-            FLASH_S_STAGE_KEY: 2,
-            FLASH_KV_STAGE_KEY: kv_stage,
-            FLASH_PERSISTENT_KEY: True,
-            FLASH_PERSISTENT_CTAS_PER_SM_KEY: (
-                _flash_dense_hd64_seed_persistent_ctas_per_sm(num_kv)
-            ),
-            FLASH_RECOMPUTE_TILE_COORDS_KEY: (
-                _flash_dense_hd64_seed_recompute_tile_coords(num_kv)
-            ),
-            FLASH_E2E_SCHEDULE_KEY: _flash_dense_hd64_seed_e2e_schedule(num_kv),
-            FLASH_E2E_OFFSET_KEY: e2e_offset,
-            FLASH_E2E_OFFSET0_KEY: e2e_offset0,
-            FLASH_SOFTMAX_DISC_KEY: _flash_dense_hd64_seed_softmax_disc(num_kv),
-            FLASH_DISC_PIPE_KEY: disc_pipe,
-            FLASH_SPLIT_P_ARRIVE_KEY: _flash_dense_hd64_seed_split_p_arrive(num_kv),
-            FLASH_P_STORE_REP_KEY: _flash_dense_hd64_seed_p_store_rep(num_kv),
-            FLASH_S_LOAD_REP_KEY: _flash_dense_hd64_seed_s_load_rep(num_kv),
-            FLASH_PRECOMPUTE_QK_DESC_KEY: _flash_dense_hd64_seed_precompute_qk_desc(
-                num_kv
-            ),
-            FLASH_FIRST_LOAD_ORDER_KEY: _flash_dense_hd64_seed_first_load_order(num_kv),
-            FLASH_KV_ORDER_KEY: _flash_dense_hd64_seed_kv_order(num_kv),
-            FLASH_SOFTMAX_REGS_KEY: _flash_dense_hd64_seed_softmax_regs(num_kv),
-            FLASH_CORR_REGS_KEY: _flash_dense_hd64_seed_corr_regs(num_kv),
-            FLASH_OTHER_REGS_KEY: _flash_dense_hd64_seed_other_regs(num_kv),
-            FLASH_EPI_TMA_KEY: epi_tma,
-            FLASH_EPI_STG_KEY: _flash_dense_hd64_seed_epi_stg(num_kv) and not epi_tma,
-            FLASH_EPI_STG_STORE_KEY: "slice",
-            FLASH_EPI_STG_GMEM_KEY: "stage",
-            FLASH_CORR_TILE_SIZE_KEY: _flash_dense_hd64_seed_corr_tile_size(num_kv),
-            FLASH_RESCALE_THRESHOLD_KEY: rescale_threshold,
-            FLASH_SKIP_RESCALE_STATS_KEY: _flash_dense_hd64_seed_skip_rescale_stats(
-                num_kv
-            ),
-            FLASH_RESCALE_CHUNK_COLS_KEY: rescale_chunk_cols,
-            FLASH_PACKED_REDUCE_KEY: packed_reduce,
-            FLASH_CLC_HEADS_PER_BATCH_KEY: _flash_dense_hd64_seed_clc_heads_per_batch(
-                num_kv
-            ),
-            FLASH_CLC_PDL_KEY: False,
-            FLASH_CLC_STAGES_KEY: 2 if _flash_dense_hd64_seed_clc(num_kv) else 1,
-        }
-        role_map = _flash_dense_hd64_seed_role_map(num_kv)
-        if role_map != "helion":
-            family_values[FLASH_ROLE_MAP_KEY] = role_map
-        if not _flash_seed_set_all(seed, fragments, family_values):
-            return None
-
-    if is_causal:
-        if head_dim == 64:
-            _flash_seed_set(seed, fragments, FLASH_PACKED_REDUCE_KEY, True)
-        elif head_dim == 128:
-            _flash_seed_set(seed, fragments, FLASH_KV_STAGE_KEY, 2)
-    if has_kv_tile_pruning:
-        _flash_seed_set(seed, fragments, FLASH_PACKED_REDUCE_KEY, True)
-    return Config.from_dict(seed)
-
-
-def _flash_dense_degree2_seed_config(
-    head_dim: int,
-    num_kv: int,
-    *,
-    dtype: torch.dtype,
+    num_bh: int | None,
+    tensor_4d_heads: int | None,
     is_causal: bool,
     has_kv_tile_pruning: bool,
     requires_ws_overlap: bool,
     small_biased_candidate: bool,
     standard_dense_output: bool,
-    block_size_targets: Sequence[int],
-) -> Config | None:
-    """Return the validated long-dense degree-2 seed."""
-    if (
-        not standard_dense_output
-        or is_causal
-        or dtype is not torch.float16
-        or head_dim != 64
-        or has_kv_tile_pruning
-        or requires_ws_overlap
-        or small_biased_candidate
-        or not _flash_dense_hd64_2cta_num_kv_supported(num_kv)
-    ):
-        return None
-    block_sizes = _flash_seed_block_sizes(block_size_targets)
-    if block_sizes is None:
-        return None
-
-    fragments = flash_autotune_fragments(
-        head_dim,
-        num_kv,
-        dtype=dtype,
-        is_causal=is_causal,
-        has_kv_tile_pruning=has_kv_tile_pruning,
-        requires_ws_overlap=requires_ws_overlap,
-        small_biased_candidate=small_biased_candidate,
-        standard_dense_output=standard_dense_output,
-        pipeline_family_override="fa4_2cta",
-    )
-    values = {key: fragment.default() for key, fragment in fragments.items()}
-    short_degree2_seed = num_kv <= 512
-    packet_values: dict[str, object] = {
-        FLASH_EXP2_PACKET_KEY: _FLASH_DEG2_EXP2_PACKET,
-        FLASH_E2E_SCHEDULE_KEY: "16/6",
-        FLASH_E2E_OFFSET_KEY: 14 if short_degree2_seed else 12,
-        FLASH_E2E_OFFSET0_KEY: 0 if short_degree2_seed else 2,
-        FLASH_KV_STAGE_KEY: 2,
-        FLASH_PERSISTENT_KEY: False,
-        FLASH_STAT_TRANSPORT_KEY: "single_final",
-        FLASH_WAIT_HINT_KEY: 0,
-        FLASH_SOFTMAX_REGS_KEY: 192,
-        FLASH_CORR_REGS_KEY: 72,
-        FLASH_OTHER_REGS_KEY: 40,
-        FLASH_ROLE_MAP_KEY: "fa4",
-        FLASH_FIRST_LOAD_ORDER_KEY: 4,
-        FLASH_CORR_TILE_SIZE_KEY: 16 if short_degree2_seed else 8,
-        FLASH_RESCALE_THRESHOLD_KEY: 8.0,
-        FLASH_RESCALE_CHUNK_COLS_KEY: 8,
-    }
-    packet_values[FLASH_PIPELINE_FAMILY_KEY] = "fa4_2cta"
-    if not _flash_seed_set_all(values, fragments, packet_values):
-        return None
-    return Config.from_dict({"block_sizes": block_sizes, **values})
-
-
-def _flash_dense_sp_seed_config(
-    head_dim: int,
-    num_kv: int,
-    *,
-    dtype: torch.dtype,
-    is_causal: bool,
-    has_kv_tile_pruning: bool,
-    requires_ws_overlap: bool,
-    small_biased_candidate: bool,
-    block_size_targets: Sequence[int],
-) -> Config | None:
-    # This is an explicit seed for the resident softmax variant. It is
-    # intentionally not emitted by flash_attention_seed_configs() until that
-    # family is faster and stable enough for automatic autotune exploration.
-    if (
-        is_causal
-        or has_kv_tile_pruning
-        or requires_ws_overlap
-        or small_biased_candidate
-        or head_dim != 64
-        or num_kv < _FLASH_DENSE_HD64_VERY_LONG_MIN_KV
-    ):
-        return None
-    block_sizes = _flash_seed_block_sizes(block_size_targets)
-    if block_sizes is None:
-        return None
-
-    fragments = _flash_seed_fragments(
-        head_dim,
-        num_kv,
-        dtype=dtype,
-        is_causal=is_causal,
-        has_kv_tile_pruning=has_kv_tile_pruning,
-        requires_ws_overlap=requires_ws_overlap,
-        small_biased_candidate=small_biased_candidate,
-        topology_override="fa4",
-    )
-    (
-        kv_stage,
-        e2e_offset,
-        e2e_offset0,
-        _disc_pipe,
-        epi_tma,
-        rescale_threshold,
-        rescale_chunk_cols,
-        packed_reduce,
-    ) = _flash_dense_hd64_seed_params(num_kv)
-    rescale_threshold = _flash_dense_hd64_seed_rescale_threshold(num_kv, dtype)
-    seed: dict[str, object] = {"block_sizes": block_sizes}
-    family_values: dict[str, object] = {
-        FLASH_PIPELINE_FAMILY_KEY: "fa4_local_tma_4d",
-        FLASH_S_STAGE_KEY: 2,
-        FLASH_KV_STAGE_KEY: kv_stage,
-        FLASH_PERSISTENT_KEY: True,
-        FLASH_PERSISTENT_CTAS_PER_SM_KEY: (
-            _flash_dense_hd64_seed_persistent_ctas_per_sm(num_kv)
-        ),
-        FLASH_RECOMPUTE_TILE_COORDS_KEY: (
-            _flash_dense_hd64_seed_recompute_tile_coords(num_kv)
-        ),
-        FLASH_E2E_SCHEDULE_KEY: "8/2",
-        FLASH_E2E_OFFSET_KEY: e2e_offset,
-        FLASH_E2E_OFFSET0_KEY: e2e_offset0,
-        FLASH_SOFTMAX_DISC_KEY: False,
-        FLASH_DISC_PIPE_KEY: 1,
-        FLASH_SPLIT_P_ARRIVE_KEY: False,
-        FLASH_P_STORE_REP_KEY: 32,
-        FLASH_S_LOAD_REP_KEY: 32,
-        FLASH_PRECOMPUTE_QK_DESC_KEY: True,
-        FLASH_FIRST_LOAD_ORDER_KEY: 1,
-        FLASH_KV_ORDER_KEY: "descending",
-        FLASH_SOFTMAX_REGS_KEY: 200,
-        FLASH_CORR_REGS_KEY: 80,
-        FLASH_OTHER_REGS_KEY: 32,
-        FLASH_EPI_TMA_KEY: epi_tma,
-        FLASH_EPI_STG_KEY: _flash_dense_hd64_seed_epi_stg(num_kv) and not epi_tma,
-        FLASH_EPI_STG_STORE_KEY: "slice",
-        FLASH_EPI_STG_GMEM_KEY: "stage",
-        FLASH_CORR_TILE_SIZE_KEY: _flash_dense_hd64_seed_corr_tile_size(num_kv),
-        FLASH_RESCALE_THRESHOLD_KEY: rescale_threshold,
-        FLASH_SKIP_RESCALE_STATS_KEY: _flash_dense_hd64_seed_skip_rescale_stats(num_kv),
-        FLASH_RESCALE_CHUNK_COLS_KEY: rescale_chunk_cols,
-        FLASH_PACKED_REDUCE_KEY: packed_reduce,
-        FLASH_CLC_PDL_KEY: False,
-        FLASH_CLC_STAGES_KEY: 1,
-    }
-    if not _flash_seed_set_all(seed, fragments, family_values):
-        return None
-    return Config.from_dict(seed)
-
-
-def _flash_causal_lpt_seed_config(
-    head_dim: int,
-    num_kv: int,
-    *,
-    dtype: torch.dtype,
-    is_causal: bool,
-    has_kv_tile_pruning: bool,
-    requires_ws_overlap: bool,
-    small_biased_candidate: bool,
-    block_size_targets: Sequence[int],
-) -> Config | None:
-    if (
-        not is_causal
-        or head_dim != 64
-        or requires_ws_overlap
-        or not _flash_causal_hd64_seed_num_kv_supported(num_kv)
-    ):
-        return None
-    block_sizes = _flash_seed_block_sizes(block_size_targets)
-    if block_sizes is None:
-        return None
-
-    fragments = _flash_seed_fragments(
-        head_dim,
-        num_kv,
-        dtype=dtype,
-        is_causal=is_causal,
-        has_kv_tile_pruning=has_kv_tile_pruning,
-        requires_ws_overlap=requires_ws_overlap,
-        small_biased_candidate=small_biased_candidate,
-        topology_override="fa4",
-    )
-    e2e_offset, disc_pipe, softmax_regs, lpt_swizzle = _flash_causal_hd64_seed_params(
-        num_kv
-    )
-    offset0 = _flash_causal_hd64_seed_offset0(num_kv)
-    seed: dict[str, object] = {"block_sizes": block_sizes}
-    family_values: dict[str, object] = {
-        FLASH_PIPELINE_FAMILY_KEY: "fa4",
-        FLASH_S_STAGE_KEY: 2,
-        FLASH_KV_STAGE_KEY: 2,
-        FLASH_PERSISTENT_KEY: False,
-        FLASH_E2E_SCHEDULE_KEY: "8/2",
-        FLASH_MASKED_E2E_SCHEDULE_KEY: _flash_causal_hd64_seed_masked_schedule(num_kv),
-        FLASH_E2E_OFFSET_KEY: e2e_offset,
-        FLASH_E2E_OFFSET0_KEY: offset0,
-        FLASH_DISC_PIPE_KEY: disc_pipe,
-        FLASH_EPI_TMA_KEY: _flash_causal_hd64_seed_epi_tma(num_kv),
-        FLASH_RESCALE_CHUNK_COLS_KEY: _flash_causal_hd64_seed_rescale_chunk_cols(
-            num_kv
-        ),
-        FLASH_ROLE_MAP_KEY: _flash_causal_hd64_seed_role_map(num_kv),
-        FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
-        FLASH_RESCALE_THRESHOLD_KEY: 8.0,
-        FLASH_PACKED_REDUCE_KEY: True,
-        FLASH_CAUSAL_LPT_SWIZZLE_KEY: lpt_swizzle,
-        FLASH_CAUSAL_KV_ORDER_KEY: _flash_causal_hd64_seed_kv_order(num_kv),
-        FLASH_SOFTMAX_REGS_KEY: softmax_regs,
-    }
-    if not _flash_seed_set_all(seed, fragments, family_values):
-        return None
-    return Config.from_dict(seed)
-
-
-def _flash_causal_split_seed_config(
-    head_dim: int,
-    num_kv: int,
-    *,
-    dtype: torch.dtype,
-    is_causal: bool,
-    has_kv_tile_pruning: bool,
-    requires_ws_overlap: bool,
-    small_biased_candidate: bool,
-    block_size_targets: Sequence[int],
-) -> Config | None:
-    if (
-        not is_causal
-        or head_dim != 64
-        or requires_ws_overlap
-        or not _flash_causal_hd64_seed_num_kv_supported(num_kv)
-    ):
-        return None
-    block_sizes = _flash_seed_block_sizes(block_size_targets)
-    if block_sizes is None:
-        return None
-
-    fragments = _flash_seed_fragments(
-        head_dim,
-        num_kv,
-        dtype=dtype,
-        is_causal=is_causal,
-        has_kv_tile_pruning=has_kv_tile_pruning,
-        requires_ws_overlap=requires_ws_overlap,
-        small_biased_candidate=small_biased_candidate,
-        topology_override="fa4",
-    )
-    (
-        e2e_offset,
-        _disc_pipe,
-        softmax_regs,
-        lpt_swizzle,
-    ) = _flash_causal_hd64_seed_params(num_kv)
-    use_long_causal_schedule = num_kv >= 512
-    split_masked_schedule = "16/4"
-    split_lpt_swizzle = 8 if num_kv <= 128 else lpt_swizzle
-    split_disc_pipe = 2 if num_kv <= 128 else 4
-    split_role_map = "fa4" if num_kv <= 128 else "helion"
-    split_offset0 = 0 if num_kv <= 128 else _flash_causal_hd64_seed_offset0(num_kv)
-    seed: dict[str, object] = {"block_sizes": block_sizes}
-    family_values: dict[str, object] = {
-        FLASH_PIPELINE_FAMILY_KEY: "fa4",
-        FLASH_S_STAGE_KEY: 2,
-        FLASH_KV_STAGE_KEY: 2,
-        FLASH_PERSISTENT_KEY: False,
-        FLASH_E2E_SCHEDULE_KEY: "8/2",
-        FLASH_MASKED_E2E_SCHEDULE_KEY: split_masked_schedule,
-        FLASH_E2E_OFFSET_KEY: e2e_offset,
-        FLASH_E2E_OFFSET0_KEY: split_offset0,
-        FLASH_DISC_PIPE_KEY: split_disc_pipe,
-        FLASH_EPI_TMA_KEY: _flash_causal_hd64_seed_epi_tma(num_kv),
-        FLASH_RESCALE_CHUNK_COLS_KEY: _flash_causal_hd64_seed_rescale_chunk_cols(
-            num_kv
-        ),
-        FLASH_ROLE_MAP_KEY: split_role_map,
-        FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
-        FLASH_RESCALE_THRESHOLD_KEY: 8.0,
-        FLASH_PACKED_REDUCE_KEY: True,
-        FLASH_CAUSAL_LPT_SWIZZLE_KEY: split_lpt_swizzle,
-        FLASH_CAUSAL_KV_ORDER_KEY: _flash_causal_hd64_seed_kv_order(num_kv),
-        FLASH_SOFTMAX_REGS_KEY: softmax_regs,
-    }
-    if use_long_causal_schedule:
-        family_values.update(
-            {
-                FLASH_E2E_SCHEDULE_KEY: "16/4",
-                FLASH_MASKED_E2E_SCHEDULE_KEY: "8/2",
-                FLASH_E2E_OFFSET_KEY: 0,
-                FLASH_E2E_OFFSET0_KEY: 14,
-                FLASH_DISC_PIPE_KEY: 3,
-                FLASH_EXP2_PACKET_KEY: "4x1",
-                FLASH_WAIT_HINT_KEY: 0,
-                FLASH_EPI_TMA_KEY: False,
-                FLASH_EPI_STG_KEY: True,
-                FLASH_EPI_STG_GMEM_KEY: "pair",
-                FLASH_RESCALE_CHUNK_COLS_KEY: 16,
-                FLASH_ROLE_MAP_KEY: "fa4",
-            }
-        )
-    if not _flash_seed_set_all(seed, fragments, family_values):
-        return None
-    return Config.from_dict(seed)
-
-
-def _flash_causal_degree2_seed_config(
-    head_dim: int,
-    num_kv: int,
-    *,
-    dtype: torch.dtype,
-    is_causal: bool,
-    has_kv_tile_pruning: bool,
-    requires_ws_overlap: bool,
-    small_biased_candidate: bool,
     standard_causal_output: bool,
+    target_device_capability: tuple[int, int] | None,
+    supports_tensor_4d_tma: bool,
     block_size_targets: Sequence[int],
 ) -> Config | None:
-    """Return a validated causal degree-2 seed."""
-    seed_params = _flash_causal_degree2_seed_params(num_kv)
+    target_policy = get_flash_target_policy(target_device_capability)
+    tuning_policy = target_policy.tuning_for_torch(
+        head_dim, str(dtype).removeprefix("torch.")
+    )
     if (
-        not standard_causal_output
-        or not is_causal
-        or dtype is not torch.float16
-        or head_dim != 64
-        or seed_params is None
+        tuning_policy is None
         or has_kv_tile_pruning
         or requires_ws_overlap
         or small_biased_candidate
     ):
         return None
+
+    if is_causal:
+        causal_policy = tuning_policy.causal_policy(num_kv)
+        if not standard_causal_output or causal_policy is None:
+            return None
+        block_sizes = _flash_seed_block_sizes(block_size_targets)
+        if block_sizes is None:
+            return None
+        causal_overrides = _flash_causal_tuning_overrides(causal_policy)
+        pipeline_family = cast("str", causal_overrides[FLASH_PIPELINE_FAMILY_KEY])
+        fragments = flash_autotune_fragments(
+            head_dim,
+            num_kv,
+            num_bh=num_bh,
+            tensor_4d_heads=tensor_4d_heads,
+            dtype=dtype,
+            is_causal=True,
+            has_kv_tile_pruning=False,
+            requires_ws_overlap=False,
+            small_biased_candidate=False,
+            standard_causal_output=True,
+            target_device_capability=target_device_capability,
+            supports_tensor_4d_tma=supports_tensor_4d_tma,
+            pipeline_family_override=pipeline_family,
+        )
+        values = {key: fragment.default() for key, fragment in fragments.items()}
+        if not _flash_seed_set_all(values, fragments, causal_overrides):
+            return None
+        expected = {
+            **causal_overrides,
+            FLASH_Q_TILE_COUNT_KEY: 2,
+        }
+        return _flash_validated_target_seed(
+            head_dim=head_dim,
+            num_kv=num_kv,
+            dtype=dtype,
+            num_bh=num_bh,
+            is_causal=True,
+            standard_dense_output=False,
+            standard_causal_output=True,
+            supports_tensor_4d_tma=supports_tensor_4d_tma,
+            values={"block_sizes": block_sizes, **values, FLASH_Q_TILE_COUNT_KEY: 2},
+            expected=expected,
+        )
+
+    dense_policy = tuning_policy.dense_policy(num_kv)
+    if not standard_dense_output or dense_policy is None:
+        return None
     block_sizes = _flash_seed_block_sizes(block_size_targets)
     if block_sizes is None:
         return None
-
     fragments = flash_autotune_fragments(
         head_dim,
         num_kv,
+        num_bh=num_bh,
+        tensor_4d_heads=tensor_4d_heads,
         dtype=dtype,
-        is_causal=is_causal,
-        has_kv_tile_pruning=has_kv_tile_pruning,
-        requires_ws_overlap=requires_ws_overlap,
-        small_biased_candidate=small_biased_candidate,
-        pipeline_family_override="fa4",
+        is_causal=False,
+        has_kv_tile_pruning=False,
+        requires_ws_overlap=False,
+        small_biased_candidate=False,
+        standard_dense_output=True,
+        target_device_capability=target_device_capability,
+        supports_tensor_4d_tma=supports_tensor_4d_tma,
+        pipeline_family_override=dense_policy.pipeline_family,
     )
     values = {key: fragment.default() for key, fragment in fragments.items()}
-    overrides: dict[str, object] = {
-        FLASH_E2E_SCHEDULE_KEY: "16/6",
-        FLASH_MASKED_E2E_SCHEDULE_KEY: "16/6",
-        FLASH_E2E_OFFSET_KEY: seed_params.e2e_offset,
-        FLASH_E2E_OFFSET0_KEY: seed_params.e2e_offset0,
-        FLASH_EXP2_PACKET_KEY: _FLASH_DEG2_EXP2_PACKET,
-        FLASH_WAIT_HINT_KEY: 0,
-        FLASH_DISC_PIPE_KEY: 3,
-        FLASH_EPI_TMA_KEY: seed_params.epi_tma,
-        FLASH_RESCALE_CHUNK_COLS_KEY: 16,
-        FLASH_CAUSAL_LPT_SWIZZLE_KEY: 0,
-        FLASH_ROLE_MAP_KEY: seed_params.role_map,
-    }
+    overrides = _flash_dense_tuning_overrides(dense_policy)
     if not _flash_seed_set_all(values, fragments, overrides):
         return None
-    return Config.from_dict({"block_sizes": block_sizes, **values})
+    expected = {
+        **overrides,
+        FLASH_Q_TILE_COUNT_KEY: 2,
+    }
+    return _flash_validated_target_seed(
+        head_dim=head_dim,
+        num_kv=num_kv,
+        dtype=dtype,
+        num_bh=num_bh,
+        is_causal=False,
+        standard_dense_output=True,
+        standard_causal_output=False,
+        supports_tensor_4d_tma=supports_tensor_4d_tma,
+        values={"block_sizes": block_sizes, **values, FLASH_Q_TILE_COUNT_KEY: 2},
+        expected=expected,
+    )
 
 
 def flash_attention_seed_config(
     head_dim: int,
     num_kv: int | None,
     *,
+    num_bh: int | None = None,
+    tensor_4d_heads: int | None = None,
     dtype: torch.dtype = torch.float16,
     is_causal: bool = False,
     has_kv_tile_pruning: bool = False,
     requires_ws_overlap: bool = False,
     small_biased_candidate: bool = False,
+    standard_dense_output: bool = False,
+    standard_causal_output: bool = False,
+    target_device_capability: tuple[int, int] | None = None,
+    supports_tensor_4d_tma: bool = True,
     block_size_targets: Sequence[int] = _FLASH_SEED_BLOCK_SIZE_TARGETS,
     seed_kind: str = "default",
 ) -> Config | None:
-    """Return a fragment-valid seed config for the detected flash surface.
+    """Return a legal measured starting point for the flash search.
 
-    The seed policy is shape-family based rather than exact sequence-length
-    based. ``block_size_targets`` comes from the flash detector's search-surface
-    facts; this helper only emits a seed for the fused 1x128x128 envelope.
+    Target-specific seeds may depend on length, but they only guide generation
+    zero. The legality-driven search surface remains independent of a winner
+    table, and every seed is benchmarked like any other candidate.
     """
+
     if num_kv is None:
         return None
     if seed_kind == "default":
-        return _flash_default_seed_config(
+        target_seed = _flash_target_seed_config(
             head_dim,
             num_kv,
             dtype=dtype,
+            num_bh=num_bh,
+            tensor_4d_heads=tensor_4d_heads,
             is_causal=is_causal,
             has_kv_tile_pruning=has_kv_tile_pruning,
             requires_ws_overlap=requires_ws_overlap,
             small_biased_candidate=small_biased_candidate,
+            standard_dense_output=standard_dense_output,
+            standard_causal_output=standard_causal_output,
+            target_device_capability=target_device_capability,
+            supports_tensor_4d_tma=supports_tensor_4d_tma,
             block_size_targets=block_size_targets,
         )
-    if seed_kind == "causal_lpt":
-        return _flash_causal_lpt_seed_config(
-            head_dim,
-            num_kv,
-            dtype=dtype,
-            is_causal=is_causal,
-            has_kv_tile_pruning=has_kv_tile_pruning,
-            requires_ws_overlap=requires_ws_overlap,
-            small_biased_candidate=small_biased_candidate,
-            block_size_targets=block_size_targets,
-        )
-    if seed_kind == "dense_sp":
-        return _flash_dense_sp_seed_config(
-            head_dim,
-            num_kv,
-            dtype=dtype,
-            is_causal=is_causal,
-            has_kv_tile_pruning=has_kv_tile_pruning,
-            requires_ws_overlap=requires_ws_overlap,
-            small_biased_candidate=small_biased_candidate,
-            block_size_targets=block_size_targets,
-        )
-    if seed_kind == "causal_split":
-        return _flash_causal_split_seed_config(
-            head_dim,
-            num_kv,
-            dtype=dtype,
-            is_causal=is_causal,
-            has_kv_tile_pruning=has_kv_tile_pruning,
-            requires_ws_overlap=requires_ws_overlap,
-            small_biased_candidate=small_biased_candidate,
-            block_size_targets=block_size_targets,
-        )
-    raise AssertionError(f"unknown flash attention seed kind: {seed_kind!r}")
-
-
-def _flash_canonical_family_seed_configs(
-    head_dim: int,
-    num_kv: int | None,
-    *,
-    dtype: torch.dtype,
-    is_causal: bool,
-    has_kv_tile_pruning: bool,
-    requires_ws_overlap: bool,
-    small_biased_candidate: bool,
-    standard_dense_output: bool,
-    block_size_targets: Sequence[int],
-) -> tuple[Config, ...]:
-    """Return one dependency-consistent seed per legal pipeline family."""
-    if num_kv is None:
-        return ()
+        if target_seed is not None:
+            return target_seed
     block_sizes = _flash_seed_block_sizes(block_size_targets)
     if block_sizes is None:
-        return ()
-
-    fragments = flash_autotune_fragments(
+        return None
+    values = _flash_seed_values(
         head_dim,
         num_kv,
+        num_bh=num_bh,
+        tensor_4d_heads=tensor_4d_heads,
         dtype=dtype,
         is_causal=is_causal,
         has_kv_tile_pruning=has_kv_tile_pruning,
         requires_ws_overlap=requires_ws_overlap,
         small_biased_candidate=small_biased_candidate,
         standard_dense_output=standard_dense_output,
+        standard_causal_output=standard_causal_output,
+        supports_tensor_4d_tma=supports_tensor_4d_tma,
     )
+    if seed_kind == "default":
+        return _flash_config_with_values(block_sizes, values)
+    if seed_kind == "causal_lpt":
+        if not is_causal or values[FLASH_PIPELINE_FAMILY_KEY] == "ws_overlap":
+            return None
+        values[FLASH_CAUSAL_LPT_SWIZZLE_KEY] = 1
+    if seed_kind == "causal_split":
+        if not is_causal or values[FLASH_PIPELINE_FAMILY_KEY] == "ws_overlap":
+            return None
+        values[FLASH_CAUSAL_KV_ORDER_KEY] = "descending"
+        values[FLASH_CAUSAL_LOOP_SPLIT_KEY] = True
+    if seed_kind == "dense_sp":
+        if (
+            is_causal
+            or head_dim != 64
+            or values[FLASH_PIPELINE_FAMILY_KEY] == "ws_overlap"
+        ):
+            return None
+        values[FLASH_SOFTMAX_DISC_KEY] = False
+        if dtype is torch.float16:
+            values[FLASH_SP_ROW_SUM_KEY] = "whole"
+    elif seed_kind not in ("causal_lpt", "causal_split"):
+        raise AssertionError(f"unknown flash attention seed kind: {seed_kind!r}")
+    return _flash_config_with_values(block_sizes, values)
+
+
+def flash_attention_seed_configs(
+    head_dim: int,
+    num_kv: int | None,
+    *,
+    num_bh: int | None = None,
+    tensor_4d_heads: int | None = None,
+    dtype: torch.dtype = torch.float16,
+    is_causal: bool = False,
+    has_kv_tile_pruning: bool = False,
+    requires_ws_overlap: bool = False,
+    small_biased_candidate: bool = False,
+    standard_dense_output: bool = False,
+    standard_causal_output: bool = False,
+    target_device_capability: tuple[int, int] | None = None,
+    supports_tensor_4d_tma: bool = True,
+    block_size_targets: Sequence[int] = _FLASH_SEED_BLOCK_SIZE_TARGETS,
+) -> tuple[Config, ...]:
+    """Return measured starting points plus generic structural coverage.
+
+    A target policy may contribute the first candidate. The remaining seeds
+    cover every legal family and compound packet from fragment defaults. Every
+    candidate is subsequently measured; none is selected without benchmarking.
+    """
+
+    if num_kv is None:
+        return ()
+    block_sizes = _flash_seed_block_sizes(block_size_targets)
+    if block_sizes is None:
+        return ()
+
+    common = {
+        "num_bh": num_bh,
+        "tensor_4d_heads": tensor_4d_heads,
+        "dtype": dtype,
+        "is_causal": is_causal,
+        "has_kv_tile_pruning": has_kv_tile_pruning,
+        "requires_ws_overlap": requires_ws_overlap,
+        "small_biased_candidate": small_biased_candidate,
+        "standard_dense_output": standard_dense_output,
+        "standard_causal_output": standard_causal_output,
+        "supports_tensor_4d_tma": supports_tensor_4d_tma,
+    }
+    fragments = flash_autotune_fragments(head_dim, num_kv, **common)
+    base_values = {key: fragment.default() for key, fragment in fragments.items()}
+    seeds: list[Config] = []
+    target_seed = flash_attention_seed_config(
+        head_dim,
+        num_kv,
+        target_device_capability=target_device_capability,
+        block_size_targets=block_size_targets,
+        **common,
+    )
+    if target_seed is not None:
+        seeds.append(target_seed)
+    base_seed = _flash_config_with_values(block_sizes, base_values)
+    if base_seed not in seeds:
+        seeds.append(base_seed)
+
     family_fragment = fragments[FLASH_PIPELINE_FAMILY_KEY]
     assert isinstance(family_fragment, EnumFragment)
     families = (
@@ -4015,136 +4064,153 @@ def _flash_canonical_family_seed_configs(
         if family_fragment.search_choices is None
         else family_fragment.search_choices
     )
-    seeds: list[Config] = []
     for family in families:
         assert isinstance(family, str)
-        family_fragments = flash_autotune_fragments(
+        values = _flash_seed_values(
             head_dim,
             num_kv,
-            dtype=dtype,
-            is_causal=is_causal,
-            has_kv_tile_pruning=has_kv_tile_pruning,
-            requires_ws_overlap=requires_ws_overlap,
-            small_biased_candidate=small_biased_candidate,
-            standard_dense_output=standard_dense_output,
             pipeline_family_override=family,
+            **common,
         )
-        values = {key: fragment.default() for key, fragment in family_fragments.items()}
         values[FLASH_PIPELINE_FAMILY_KEY] = family
-        seeds.append(Config.from_dict({"block_sizes": block_sizes, **values}))
-    return tuple(seeds)
+        seeds.append(_flash_config_with_values(block_sizes, values))
 
-
-def flash_attention_seed_configs(
-    head_dim: int,
-    num_kv: int | None,
-    *,
-    dtype: torch.dtype = torch.float16,
-    is_causal: bool = False,
-    has_kv_tile_pruning: bool = False,
-    requires_ws_overlap: bool = False,
-    small_biased_candidate: bool = False,
-    standard_dense_output: bool = False,
-    standard_causal_output: bool = False,
-    block_size_targets: Sequence[int] = _FLASH_SEED_BLOCK_SIZE_TARGETS,
-) -> tuple[Config, ...]:
-    seeds: list[Config] = []
-    default_seed = flash_attention_seed_config(
-        head_dim,
-        num_kv,
-        dtype=dtype,
-        is_causal=is_causal,
-        has_kv_tile_pruning=has_kv_tile_pruning,
-        requires_ws_overlap=requires_ws_overlap,
-        small_biased_candidate=small_biased_candidate,
-        block_size_targets=block_size_targets,
+    packet_fragment = fragments[FLASH_EXP2_PACKET_KEY]
+    assert isinstance(packet_fragment, EnumFragment)
+    packets = (
+        packet_fragment.choices
+        if packet_fragment.search_choices is None
+        else packet_fragment.search_choices
     )
-    if default_seed is not None:
-        seeds.append(default_seed)
-    if num_kv is not None:
-        dense_degree2_seed = _flash_dense_degree2_seed_config(
+    for packet in packets:
+        if packet == base_values[FLASH_EXP2_PACKET_KEY]:
+            continue
+        values = dict(base_values)
+        values[FLASH_EXP2_PACKET_KEY] = packet
+        if packet in _FLASH_MANUAL_EXP2_PACKET_PARAMS:
+            # A compound packet seed owns its required parent family. Normal
+            # search configs keep an explicit family, where a conflicting child
+            # packet instead canonicalizes to the neutral packet.
+            values.pop(FLASH_PIPELINE_FAMILY_KEY, None)
+        values.update(
+            _flash_compound_exp2_packet_overrides(
+                head_dim,
+                num_kv,
+                values,
+                dtype=dtype,
+                is_causal=is_causal,
+                has_kv_tile_pruning=has_kv_tile_pruning,
+                requires_ws_overlap=requires_ws_overlap,
+                small_biased_candidate=small_biased_candidate,
+                standard_dense_output=standard_dense_output,
+                standard_causal_output=standard_causal_output,
+            )
+        )
+        seeds.append(_flash_config_with_values(block_sizes, values))
+
+    # Seed each emitter-level policy once so quick tuning cannot miss a source
+    # variant merely because it is conditionally active with another field.
+    source_variants: tuple[tuple[str, object, Mapping[str, object]], ...] = (
+        (FLASH_PERSISTENT_LOOP_KEY, "counted", {}),
+        (
+            FLASH_SP_ROW_SUM_KEY,
+            "whole",
+            {FLASH_SOFTMAX_DISC_KEY: False},
+        ),
+        (FLASH_SOFTMAX_SETUP_KEY, "stage_local", {}),
+        (
+            FLASH_EPI_TMA_SETUP_KEY,
+            "role_local",
+            {FLASH_EPI_TMA_KEY: True},
+        ),
+    )
+    for key, value, dependencies in source_variants:
+        fragment = fragments[key]
+        assert isinstance(fragment, EnumFragment)
+        active = (
+            fragment.choices
+            if fragment.search_choices is None
+            else fragment.search_choices
+        )
+        if value not in active:
+            continue
+        values = {**base_values, **dependencies, key: value}
+        seeds.append(_flash_config_with_values(block_sizes, values))
+
+    unique: list[Config] = []
+    for seed in seeds:
+        if seed not in unique:
+            unique.append(seed)
+    return tuple(unique)
+
+
+def _flash_legal_autotune_pipeline_families(
+    head_dim: int,
+    num_kv: int,
+    *,
+    num_bh: int | None,
+    dtype: torch.dtype,
+    is_causal: bool,
+    has_kv_tile_pruning: bool,
+    requires_ws_overlap: bool,
+    small_biased_candidate: bool,
+    standard_dense_output: bool,
+    standard_causal_output: bool,
+    output_requires_tma: bool,
+    supports_tensor_4d_tma: bool,
+    requested_family: str | None,
+) -> tuple[str, ...]:
+    """Enumerate families whose requested structure survives normalization."""
+    candidates = (
+        ("ws_overlap",)
+        if requires_ws_overlap
+        else (requested_family,)
+        if requested_family is not None
+        else FLASH_AUTOTUNE_PIPELINE_FAMILIES
+    )
+    result: list[str] = []
+    for family in candidates:
+        if family == "fa4_deep_1cta" and is_causal and requested_family is None:
+            # The separate-ring causal prototype is available for explicit
+            # experiments, but its phase graph has not passed long-sequence
+            # stress or synccheck. Keep it out of unattended searches.
+            continue
+        if (has_kv_tile_pruning or small_biased_candidate) and family not in (
+            "fa4",
+            "ws_overlap",
+        ):
+            continue
+        requested: dict[str, object] = {FLASH_PIPELINE_FAMILY_KEY: family}
+        if output_requires_tma:
+            requested[FLASH_EPI_TMA_KEY] = True
+        effective = resolve_flash_config(
             head_dim,
             num_kv,
+            requested,
             dtype=dtype,
+            num_bh=num_bh,
             is_causal=is_causal,
             has_kv_tile_pruning=has_kv_tile_pruning,
             requires_ws_overlap=requires_ws_overlap,
             small_biased_candidate=small_biased_candidate,
             standard_dense_output=standard_dense_output,
-            block_size_targets=block_size_targets,
-        )
-        if dense_degree2_seed is not None:
-            seeds.extend(
-                (
-                    dense_degree2_seed,
-                    Config.from_dict(
-                        {
-                            **dense_degree2_seed.config,
-                            FLASH_STAT_TRANSPORT_KEY: "ring2",
-                        }
-                    ),
-                )
-            )
-    causal_lpt_seed = flash_attention_seed_config(
-        head_dim,
-        num_kv,
-        dtype=dtype,
-        is_causal=is_causal,
-        has_kv_tile_pruning=has_kv_tile_pruning,
-        requires_ws_overlap=requires_ws_overlap,
-        small_biased_candidate=small_biased_candidate,
-        block_size_targets=block_size_targets,
-        seed_kind="causal_lpt",
-    )
-    if causal_lpt_seed is not None:
-        seeds.append(causal_lpt_seed)
-    causal_split_seed = flash_attention_seed_config(
-        head_dim,
-        num_kv,
-        dtype=dtype,
-        is_causal=is_causal,
-        has_kv_tile_pruning=has_kv_tile_pruning,
-        requires_ws_overlap=requires_ws_overlap,
-        small_biased_candidate=small_biased_candidate,
-        block_size_targets=block_size_targets,
-        seed_kind="causal_split",
-    )
-    if causal_split_seed is not None:
-        seeds.append(causal_split_seed)
-    if num_kv is not None:
-        causal_degree2_seed = _flash_causal_degree2_seed_config(
-            head_dim,
-            num_kv,
-            dtype=dtype,
-            is_causal=is_causal,
-            has_kv_tile_pruning=has_kv_tile_pruning,
-            requires_ws_overlap=requires_ws_overlap,
-            small_biased_candidate=small_biased_candidate,
             standard_causal_output=standard_causal_output,
-            block_size_targets=block_size_targets,
+            supports_tensor_4d_tma=supports_tensor_4d_tma,
         )
-        if causal_degree2_seed is not None:
-            seeds.append(causal_degree2_seed)
-    for family_seed in _flash_canonical_family_seed_configs(
-        head_dim,
-        num_kv,
-        dtype=dtype,
-        is_causal=is_causal,
-        has_kv_tile_pruning=has_kv_tile_pruning,
-        requires_ws_overlap=requires_ws_overlap,
-        small_biased_candidate=small_biased_candidate,
-        standard_dense_output=standard_dense_output,
-        block_size_targets=block_size_targets,
-    ):
-        if family_seed not in seeds:
-            seeds.append(family_seed)
-    return tuple(seeds)
+        if effective.pipeline_family != family:
+            continue
+        if output_requires_tma and not effective.epi_tma:
+            continue
+        result.append(family)
+    return tuple(result)
 
 
 def flash_autotune_fragments(
     head_dim: int,
     num_kv: int,
     *,
+    num_bh: int | None = None,
+    tensor_4d_heads: int | None = None,
     dtype: torch.dtype = torch.float16,
     is_causal: bool = False,
     has_kv_tile_pruning: bool = False,
@@ -4152,100 +4218,36 @@ def flash_autotune_fragments(
     small_biased_candidate: bool = False,
     standard_dense_output: bool = False,
     standard_causal_output: bool = False,
+    target_device_capability: tuple[int, int] | None = None,
+    output_requires_tma: bool = False,
+    supports_tensor_4d_tma: bool = True,
     topology_override: str | None = None,
     pipeline_family_override: str | None = None,
 ) -> dict[str, ConfigSpecFragment]:
-    """Return ``{config_key: ConfigSpecFragment}`` for the flash autotune surface.
+    """Build a legality-driven, length-invariant flash search surface.
 
-    The defaults dataclass (env/shape resolution) supplies the FIRST element of
-    each ``EnumFragment`` so the seed/default config is byte-identical to the
-    current kernel. Only the known-safe, meaningful knobs are exposed:
-
-      * ``s_stage`` — warp-spec double-buffered-S overlap (1 vs 2).
-      * ``kv_stage`` — K/V TMA ring depth. Most flash kernels keep the validated
-        2/3-stage envelope; dense hd64 FA4 additionally accepts sparse deeper
-        manual values while actively searching only the stable
-        2/3-stage subset.
-      * ``persistent`` — static-persistent scheduler on/off.
-      * ``e2e_schedule`` — paired exp2-pipe-split schedule choices. This
-        replaces the old independent exp2/freq/res search, which produced
-        meaningless duplicate configs and heavily regressive pairings. Long
-        dense hd64 FA4 shapes search only the validated ``16/4`` and ``8/2``
-        schedules; the wider schedule set remains available as manual
-        overrides.
-      * ``e2e_offset`` — stage-1 residue phase offset for the split exp2
-        schedule, exposed across the full phase range required by any selectable
-        split schedule so the autotuner can desynchronize the two softmax
-        warpgroups without relying on a sparse hand-picked subset. Long dense
-        hd64 FA4 shapes use a seed-local offset set to avoid repeatedly
-        benchmarking very slow high-phase candidates.
-      * ``e2e_offset0`` — stage-0 residue phase offset. This defaults to 0 to
-        preserve the FA4-aligned program order, but gives the autotuner the same
-        phase freedom for the first softmax warpgroup when a shape benefits from
-        different XU/FMA pipe staggering.
-      * ``pipeline_family`` — one compound device schedule. It replaces the
-        independent topology, cluster, CLC, local-TMA, and tensor-map switches,
-        so the search enumerates legal emitted schedules instead of a Boolean
-        product containing aliases. Legacy fixed configs are normalized into
-        this family before candidate identity is constructed.
-      * ``disc_pipe`` / ``epi_tma`` / ``rescale_threshold`` / ``packed_reduce`` —
-        fa4/ws perf levers for PASS2 software-pipelining, epilogue TMA-store,
-        alpha-pin O-rescale skipping, rescale chunk width, and packed ws row
-        reductions. ``disc_pipe`` offers the small validated depth set
-        {1, 2, 3, 4}; ``epi_tma`` and ``packed_reduce`` remain booleans;
-        ``rescale_threshold`` uses a narrow enum around FA4's 8.0 fp16/bf16
-        constant; ``rescale_chunk_cols`` searches the characterized
-        16/32-column set. Very long dense hd64 FA4 shapes search the measured
-        8.0 and 12.0 thresholds; manual overrides remain available. Larger
-        64-column chunks remain available as manual overrides but are not
-        searched because they can exceed ptxas register-allocation
-        limits on FA4 shapes. ``resolve_flash_config`` gates ``epi_tma`` on
-        topology, so stale values are harmless choices for the ws_overlap
-        default.
-      * ``causal_lpt_swizzle`` — causal-only launch-order/cache-locality swizzle.
-        ``0`` preserves the shape-derived L2 heuristic; positive values force a
-        compact set of batch/head interleave group sizes.
-      * ``causal_kv_order`` — causal-only KV traversal order. The original
-        Helion stream walks left-to-right; upstream FA4 walks diagonal-first and
-        then backward. Both orders remain accepted for fixed
-        configs; causal hd64 actively searches the diagonal-first descending
-        stream so split-loop candidates are meaningful rather than clamped away.
-      * ``small_biased`` — enables the small contiguous biased-attention SIMT
-        emitter for its validated [BH, 128, 64] envelope. Non-candidate shapes
-        carry the key as a fixed default so cached configs round-trip without
-        widening unrelated searches.
-      * ``softmax_regs`` / ``corr_regs`` — FA4 softmax/correction warpgroup
-        register grants. These stay in narrow characterized sets so promoted
-        seeds survive flatten/unflatten without exposing the rest of the
-        register-budget surface.
-
-    The remaining register budgets (``num_regs_producer``/``num_regs_consumer``)
-    and warp-count fields (``num_*_warps``, ``num_softmax_warpgroups``,
-    ``acc_stage``, ``epi_stage``, ``tmem_plan``, ``tmem_s_to_p_offset``) are kept
-    FIXED here: they have no validated multi-value envelope today, so exposing
-    them would let the autotuner pick combinations the emitter cannot legally
-    build. They are sourced from ``resolve_flash_config`` (env/shape) as single
-    values and can be promoted to fragments once characterized.
+    Sequence length participates only in structural proofs such as even-pair or
+    four-tile cluster alignment.  Within one legality class, defaults, active
+    choices, and their ordering are identical for every length.
     """
-    valid_topology_override = (
+
+    valid_topology = (
         topology_override if topology_override in ("fa4", "ws_overlap") else None
     )
-    valid_pipeline_family_override = (
+    valid_family = (
         pipeline_family_override
         if pipeline_family_override in FLASH_PIPELINE_FAMILY_FLAGS
         else None
     )
+    valid_family_flags = _flash_pipeline_family_flags(valid_family)
     if requires_ws_overlap:
         defaults_config: Mapping[str, object] | None = {
             FLASH_PIPELINE_FAMILY_KEY: "ws_overlap"
         }
-    elif valid_pipeline_family_override is not None:
-        defaults_config = {FLASH_PIPELINE_FAMILY_KEY: valid_pipeline_family_override}
-    elif valid_topology_override is not None:
-        # Preserve legacy topology semantics, including shape-derived cluster
-        # and CLC defaults. Re-encoding this as the base family would suppress
-        # those defaults before legacy configs are normalized.
-        defaults_config = {FLASH_TOPOLOGY_KEY: valid_topology_override}
+    elif valid_family is not None:
+        defaults_config = {FLASH_PIPELINE_FAMILY_KEY: valid_family}
+    elif valid_topology is not None:
+        defaults_config = {FLASH_TOPOLOGY_KEY: valid_topology}
     else:
         defaults_config = None
     defaults = resolve_flash_config(
@@ -4253,947 +4255,674 @@ def flash_autotune_fragments(
         num_kv,
         defaults_config,
         dtype=dtype,
+        num_bh=num_bh,
         is_causal=is_causal,
+        has_kv_tile_pruning=has_kv_tile_pruning,
+        requires_ws_overlap=requires_ws_overlap,
+        small_biased_candidate=small_biased_candidate,
         standard_dense_output=standard_dense_output,
+        standard_causal_output=standard_causal_output,
+        supports_tensor_4d_tma=supports_tensor_4d_tma,
         prefer_packed_reduce=has_kv_tile_pruning or requires_ws_overlap,
     )
-    dense_hd64_fa4 = not is_causal and head_dim == 64 and defaults.topology == "fa4"
-    very_long_dense_hd64_fa4 = (
-        dense_hd64_fa4 and num_kv >= _FLASH_DENSE_HD64_VERY_LONG_MIN_KV
+    paired = num_kv >= 2 and num_kv % 2 == 0
+    cluster_aligned = num_kv >= 4 and num_kv % 4 == 0
+    fa4_eligible = paired and not requires_ws_overlap
+    requested_search_topology = (
+        valid_family_flags.topology
+        if valid_family_flags is not None
+        else valid_topology
     )
-    causal_hd64_seeded_fa4 = (
-        is_causal
-        and head_dim == 64
-        and _flash_causal_hd64_seed_num_kv_supported(num_kv)
-        and defaults.topology == "fa4"
-    )
-    long_causal_hd64_seeded_fa4 = (
-        causal_hd64_seeded_fa4 and num_kv >= _FLASH_CAUSAL_HD64_LONG_AUTOTUNE_MIN_KV
-    )
-    (
-        causal_e2e_offset_search,
-        causal_disc_pipe_search,
-        causal_softmax_regs_search,
-        causal_lpt_swizzle_search,
-    ) = _flash_causal_hd64_seed_params(num_kv)
-    if causal_softmax_regs_search == 0:
-        causal_softmax_regs_search = defaults.softmax_regs
-    if causal_lpt_swizzle_search == 0:
-        causal_lpt_swizzle_search = defaults.causal_lpt_swizzle
-    # ``s_stage`` is forced to 1 for num_kv < 2 (single KV tile); do not offer 2
-    # as a choice there (the resolver would override it anyway, but keep the
-    # surface honest). ``persistent`` requires s_stage == 2 for ws_overlap and is
-    # disabled for causal FA4 to match upstream's nonpersistent causal scheduler.
-    # Keep true in the enum as a cache-compatibility value for best-config
-    # transfer from dense runs.
-    if num_kv < 2:
-        s_stage_choices: tuple[int, ...] = (1,)
-        s_stage_search_choices: tuple[int, ...] | None = None
-    elif dense_hd64_fa4 or causal_hd64_seeded_fa4:
-        s_stage_choices = _flash_choices_with_default(defaults.s_stage, (1, 2))
-        s_stage_search_choices = _flash_choices_with_default(defaults.s_stage, (2,))
-    else:
-        # Seed with the resolved default first (byte-identity), then the other.
-        s_stage_choices = (defaults.s_stage, 1 if defaults.s_stage == 2 else 2)
-        s_stage_search_choices = None
-    kv_stage_search_choices: tuple[int, ...] | None
-    if defaults.separate_kv_rings:
-        kv_stage_choices = _flash_choices_with_default(
-            defaults.kv_stage,
-            tuple(range(2, _flash_deep_1cta_kv_stage_cap(head_dim) + 1)),
-        )
-        kv_stage_search_choices = None
-    elif dense_hd64_fa4:
-        kv_stage_choices = _flash_choices_with_default(
-            defaults.kv_stage, (2, 3, 4, 6, 8, 10)
-        )
-        kv_stage_search_choices = (
-            _flash_choices_with_default(defaults.kv_stage, (2, 3))
-            if very_long_dense_hd64_fa4
-            else (
-                2,
-                3,
-                4,
-                6,
-                8,
-            )
-        )
-    elif causal_hd64_seeded_fa4:
-        kv_stage_choices = _flash_choices_with_default(
-            defaults.kv_stage, (2, 3, 4, 6, 8, 10)
-        )
-        kv_stage_search_choices = (
-            (2,)
-            if long_causal_hd64_seeded_fa4
-            else _flash_choices_with_default(defaults.kv_stage, (10, 8, 6, 4, 3, 2))
-        )
-    else:
-        kv_stage_choices = (defaults.kv_stage, 3 if defaults.kv_stage == 2 else 2)
-        kv_stage_search_choices = None
-
-    if dense_hd64_fa4:
-        persistent_choices = _flash_choices_with_default(
-            defaults.persistent, (True, False)
-        )
-        persistent_search_choices: tuple[bool, ...] | None = (
-            _flash_choices_with_default(defaults.persistent, (True, False))
-        )
-        persistent_ctas_per_sm_choices = _flash_choices_with_default(
-            defaults.persistent_ctas_per_sm, (1, 2, 3, 4)
-        )
-        persistent_ctas_per_sm_search_choices: tuple[int, ...] | None = (
-            (defaults.persistent_ctas_per_sm,)
-            if very_long_dense_hd64_fa4
-            else _flash_choices_with_default(
-                _flash_dense_hd64_seed_persistent_ctas_per_sm(num_kv), (1, 2, 3, 4)
-            )
-        )
-        recompute_tile_coords_choices = _flash_choices_with_default(
-            defaults.recompute_tile_coords, (False, True)
-        )
-        recompute_tile_coords_search_choices: tuple[bool, ...] | None = (
-            defaults.recompute_tile_coords,
-        )
-        e2e_schedule_default = _flash_e2e_schedule_default(defaults.topology, head_dim)
-        e2e_schedule_choices = _flash_choices_with_default(
-            defaults.e2e_schedule, ("16/4", "8/2", "16/2", "xu")
-        )
-        e2e_schedule_search_choices: tuple[str, ...] | None = (
-            _flash_choices_with_default(defaults.e2e_schedule, ("8/2", "16/4"))
-            if very_long_dense_hd64_fa4
-            else _flash_choices_with_default(defaults.e2e_schedule, ("16/4", "8/2"))
-        )
-    elif causal_hd64_seeded_fa4:
-        persistent_choices = _flash_choices_with_default(defaults.persistent, (False,))
-        persistent_search_choices = _flash_choices_with_default(
-            defaults.persistent, (False,)
-        )
-        persistent_ctas_per_sm_choices = (defaults.persistent_ctas_per_sm,)
-        persistent_ctas_per_sm_search_choices = None
-        recompute_tile_coords_choices = (defaults.recompute_tile_coords,)
-        recompute_tile_coords_search_choices = None
-        e2e_schedule_default = _flash_e2e_schedule_default(defaults.topology, head_dim)
-        e2e_schedule_choices = _flash_choices_with_default(
-            defaults.e2e_schedule, ("16/4", "8/2", "16/2", "xu")
-        )
-        e2e_schedule_search_choices = (
-            ("8/2",)
-            if long_causal_hd64_seeded_fa4
-            else _flash_choices_with_default(
-                defaults.e2e_schedule, ("xu", "16/4", "8/2")
-            )
-        )
-    else:
-        persistent_choices = (
-            defaults.persistent,
-            not defaults.persistent,
-        )
-        persistent_search_choices = None
-        persistent_ctas_per_sm_choices = (defaults.persistent_ctas_per_sm,)
-        persistent_ctas_per_sm_search_choices = None
-        recompute_tile_coords_choices = (defaults.recompute_tile_coords,)
-        recompute_tile_coords_search_choices = None
-        e2e_schedule_search_set = ("16/4", "8/2", "16/2", "xu")
-        e2e_schedule_default = (
-            defaults.e2e_schedule
-            if defaults.e2e_schedule in e2e_schedule_search_set
-            else e2e_schedule_search_set[0]
-        )
-        e2e_schedule_choices = (
-            e2e_schedule_default,
-            *(
-                schedule
-                for schedule in e2e_schedule_search_set
-                if schedule != e2e_schedule_default
-            ),
-        )
-        e2e_schedule_search_choices = None
-    if is_causal:
-        masked_e2e_schedule_choices = _flash_choices_with_default(
-            defaults.masked_e2e_schedule, ("inherit", "xu", "16/4", "8/2")
-        )
-        masked_e2e_schedule_search_choices: tuple[str, ...] | None = (
-            (_flash_causal_hd64_seed_masked_schedule(num_kv),)
-            if long_causal_hd64_seeded_fa4
-            else _flash_choices_with_default(
-                _flash_causal_hd64_seed_masked_schedule(num_kv),
-                ("inherit", "xu", "16/4", "8/2"),
-            )
-            if causal_hd64_seeded_fa4
-            else None
-        )
-    else:
-        masked_e2e_schedule_choices = ("inherit",)
-        masked_e2e_schedule_search_choices = None
-    # A manual exp2 packet canonicalizes ``e2e_schedule`` to the cadence it
-    # replaces, so those cadences have to be selectable for the projected config
-    # to round-trip through normalization. They stay out of the search choices
-    # and only appear where a manual packet is selectable at all (see
-    # ``exp2_packet_choices`` below).
-    manual_schedule_names = (
-        tuple(
-            dict.fromkeys(
-                f"{freq}/{res}"
-                for freq, res in _FLASH_MANUAL_EXP2_PACKET_SCHEDULES.values()
-            )
-        )
-        if defaults.topology == "fa4" and head_dim == 64
-        else ()
-    )
-    e2e_schedule_choices = _flash_choices_with_default(
-        defaults.e2e_schedule, (*e2e_schedule_choices, *manual_schedule_names)
-    )
-    if is_causal:
-        masked_e2e_schedule_choices = _flash_choices_with_default(
-            defaults.masked_e2e_schedule,
-            (*masked_e2e_schedule_choices, *manual_schedule_names),
-        )
-    manual_exp2_schedule = _FLASH_MANUAL_EXP2_PACKET_SCHEDULES.get(defaults.exp2_packet)
-    if manual_exp2_schedule is not None:
-        schedule_name = f"{manual_exp2_schedule[0]}/{manual_exp2_schedule[1]}"
-        assert defaults.e2e_schedule == schedule_name
-        e2e_schedule_choices = (defaults.e2e_schedule,)
-        e2e_schedule_search_choices = (defaults.e2e_schedule,)
-        if is_causal:
-            assert defaults.masked_e2e_schedule == schedule_name
-            masked_e2e_schedule_choices = (defaults.masked_e2e_schedule,)
-            masked_e2e_schedule_search_choices = (defaults.masked_e2e_schedule,)
-        else:
-            assert defaults.masked_e2e_schedule == "inherit"
-    # FA4 processes a pair of adjacent Q tiles and therefore requires an even
-    # KV-tile count. Family choices are constructed after the cluster/CLC
-    # eligibility checks below.
-    fa4_eligible = num_kv % 2 == 0
-    if dense_hd64_fa4:
-        softmax_disc_choices = _flash_choices_with_default(
-            defaults.softmax_disc, (True, False)
-        )
-        softmax_disc_search_choices: tuple[bool, ...] | None = (
-            (defaults.softmax_disc,)
-            if very_long_dense_hd64_fa4
-            else _flash_choices_with_default(defaults.softmax_disc, (True, False))
-        )
-    else:
-        softmax_disc_choices = (defaults.softmax_disc,)
-        softmax_disc_search_choices = (
-            (defaults.softmax_disc,) if causal_hd64_seeded_fa4 else None
-        )
-    # fa4 disc PASS2 software-pipeline depth lever. The first choice is the
-    # shape-resolved default; the remaining validated depths are accepted for
-    # fixed configurations. They are consumed only by the fa4 emitter.
-    if dense_hd64_fa4 or causal_hd64_seeded_fa4:
-        disc_pipe_choices = _flash_choices_with_default(
-            defaults.disc_pipe_depth,
-            (1, 2, 3, 4),
-        )
-        disc_pipe_search_choices: tuple[int, ...] | None = (
-            (causal_disc_pipe_search,)
-            if long_causal_hd64_seeded_fa4
-            else _flash_choices_with_default(causal_disc_pipe_search, (2, 3, 4))
-            if causal_hd64_seeded_fa4
-            else (defaults.disc_pipe_depth,)
-            if very_long_dense_hd64_fa4
-            else _flash_choices_with_default(defaults.disc_pipe_depth, (2, 3, 4))
-        )
-    else:
-        disc_pipe_choices = (
-            defaults.disc_pipe_depth,
-            *(depth for depth in (1, 2, 3, 4) if depth != defaults.disc_pipe_depth),
-        )
-        disc_pipe_search_choices = None
-    split_p_arrive_choices = _flash_choices_with_default(
-        defaults.split_p_arrive, (False, True)
-    )
-    split_p_arrive_search_choices: tuple[bool, ...] | None = (
-        _flash_choices_with_default(defaults.split_p_arrive, (False, True))
-        if very_long_dense_hd64_fa4 and num_kv >= 2048
-        else (defaults.split_p_arrive,)
-        if very_long_dense_hd64_fa4
-        else _flash_choices_with_default(defaults.split_p_arrive, (False, True))
-        if dense_hd64_fa4
-        else (defaults.split_p_arrive,)
-    )
-    if dense_hd64_fa4:
-        p_store_rep_choices = _flash_choices_with_default(
-            defaults.p_store_repetition, (16, 32)
-        )
-        p_store_rep_search_choices: tuple[int, ...] | None = (
-            (defaults.p_store_repetition,)
-            if very_long_dense_hd64_fa4
-            else _flash_choices_with_default(
-                _flash_dense_hd64_seed_p_store_rep(num_kv), (16, 32)
-            )
-        )
-        s_load_rep_choices = _flash_choices_with_default(
-            defaults.s_load_repetition, (16, 32)
-        )
-        s_load_rep_search_choices: tuple[int, ...] | None = (
-            (defaults.s_load_repetition,)
-            if very_long_dense_hd64_fa4
-            else _flash_choices_with_default(
-                _flash_dense_hd64_seed_s_load_rep(num_kv), (16, 32)
-            )
-        )
-        precompute_qk_desc_choices = _flash_choices_with_default(
-            defaults.precompute_qk_desc, (False, True)
-        )
-        precompute_qk_desc_search_choices: tuple[bool, ...] | None = (
-            (defaults.precompute_qk_desc,)
-            if very_long_dense_hd64_fa4
-            else _flash_choices_with_default(
-                _flash_dense_hd64_seed_precompute_qk_desc(num_kv), (False, True)
-            )
-        )
-        first_load_order_choices = _flash_choices_with_default(
-            defaults.first_load_order, (0, 1, 2, 3, 4)
-        )
-        first_load_order_search_choices: tuple[int, ...] | None = (
-            (defaults.first_load_order,)
-            if very_long_dense_hd64_fa4
-            else _flash_choices_with_default(
-                _flash_dense_hd64_seed_first_load_order(num_kv), (0, 1, 2, 3, 4)
-            )
-        )
-        kv_order_choices = _flash_choices_with_default(
-            defaults.kv_order, ("ascending", "descending")
-        )
-        kv_order_search_choices: tuple[str, ...] | None = (
-            (defaults.kv_order,)
-            if very_long_dense_hd64_fa4
-            else _flash_choices_with_default(
-                _flash_dense_hd64_seed_kv_order(num_kv), ("ascending", "descending")
-            )
-        )
-    else:
-        p_store_rep_choices = (defaults.p_store_repetition,)
-        p_store_rep_search_choices = None
-        s_load_rep_choices = (defaults.s_load_repetition,)
-        s_load_rep_search_choices = None
-        precompute_qk_desc_choices = (defaults.precompute_qk_desc,)
-        precompute_qk_desc_search_choices = None
-        first_load_order_choices = (defaults.first_load_order,)
-        first_load_order_search_choices = None
-        kv_order_choices = (defaults.kv_order,)
-        kv_order_search_choices = None
-    max_e2e_freq = 0
-    for schedule in e2e_schedule_choices:
-        _impl, freq, res = _flash_parse_e2e_schedule(schedule, e2e_schedule_default)
-        if res > 0:
-            max_e2e_freq = max(max_e2e_freq, freq)
-    if max_e2e_freq > 0:
-        offset_search_values: Iterable[int]
-        offset_search_values = range(max_e2e_freq)
-        if dense_hd64_fa4:
-            e2e_offset_default = defaults.e2e_offset
-            e2e_offset_search_choices: tuple[int, ...] | None = (
-                (defaults.e2e_offset,)
-                if very_long_dense_hd64_fa4
-                else _flash_choices_with_default(defaults.e2e_offset, range(16))
-            )
-        elif causal_hd64_seeded_fa4:
-            e2e_offset_default = defaults.e2e_offset
-            e2e_offset_search_choices = (
-                (causal_e2e_offset_search,)
-                if long_causal_hd64_seeded_fa4
-                else _flash_choices_with_default(
-                    causal_e2e_offset_search,
-                    range(16),
-                )
-            )
-        else:
-            e2e_offset_default = defaults.e2e_offset
-            e2e_offset_search_choices = None
-        e2e_offset_choices = (
-            e2e_offset_default,
-            *(
-                offset
-                for offset in offset_search_values
-                if offset != e2e_offset_default
-            ),
-        )
-        offset0_search_values: Iterable[int] = range(max_e2e_freq)
-        if dense_hd64_fa4:
-            e2e_offset0_default = defaults.e2e_offset0
-            e2e_offset0_search_choices: tuple[int, ...] | None = (
-                (defaults.e2e_offset0,)
-                if very_long_dense_hd64_fa4
-                else _flash_choices_with_default(defaults.e2e_offset0, range(16))
-            )
-        elif causal_hd64_seeded_fa4:
-            e2e_offset0_default = defaults.e2e_offset0
-            e2e_offset0_search_choices = (
-                (_flash_causal_hd64_seed_offset0(num_kv),)
-                if long_causal_hd64_seeded_fa4
-                else _flash_choices_with_default(
-                    _flash_causal_hd64_seed_offset0(num_kv), range(16)
-                )
-            )
-        else:
-            e2e_offset0_default = defaults.e2e_offset0
-            e2e_offset0_search_choices = None
-        e2e_offset0_choices = (
-            e2e_offset0_default,
-            *(
-                offset
-                for offset in offset0_search_values
-                if offset != e2e_offset0_default
-            ),
-        )
-    else:
-        e2e_offset_choices = (defaults.e2e_offset,)
-        e2e_offset0_choices = (defaults.e2e_offset0,)
-        e2e_offset_search_choices = None
-        e2e_offset0_search_choices = None
-    safe_rescale_thresholds = _flash_safe_rescale_threshold_values(dtype)
-    if dense_hd64_fa4 or causal_hd64_seeded_fa4:
-        rescale_threshold_choices = _flash_choices_with_default(
-            defaults.rescale_threshold, safe_rescale_thresholds
-        )
-        rescale_threshold_search_defaults = (
-            (32.0, 16.0, 8.0)
-            if very_long_dense_hd64_fa4 and dtype is torch.bfloat16
-            else (8.0, 12.0)
-            if very_long_dense_hd64_fa4
-            else (8.0,)
-        )
-        rescale_threshold_search_choices: tuple[float, ...] | None = (
-            _flash_choices_with_default(
-                defaults.rescale_threshold, rescale_threshold_search_defaults
-            )
-        )
-        rescale_chunk_cols_manual_values = (
-            (8, 16, 32, 64) if very_long_dense_hd64_fa4 else (16, 32, 64)
-        )
-        rescale_chunk_cols_choices = _flash_choices_with_default(
-            defaults.rescale_chunk_cols,
-            (cols for cols in rescale_chunk_cols_manual_values if head_dim % cols == 0),
-        )
-        rescale_chunk_cols_search_choices: tuple[int, ...] | None = (
-            (defaults.rescale_chunk_cols,)
-            if very_long_dense_hd64_fa4 or long_causal_hd64_seeded_fa4
-            else _flash_choices_with_default(
-                _flash_causal_hd64_seed_rescale_chunk_cols(num_kv)
-                if causal_hd64_seeded_fa4
-                else defaults.rescale_chunk_cols,
-                (16, 32),
-            )
-        )
-        skip_rescale_stats_choices = _flash_choices_with_default(
-            defaults.skip_rescale_stats, (False, True)
-        )
-        skip_rescale_stats_search_choices: tuple[bool, ...] | None = (
-            (False,)
-            if very_long_dense_hd64_fa4 or long_causal_hd64_seeded_fa4
-            else _flash_choices_with_default(
-                _flash_dense_hd64_seed_skip_rescale_stats(num_kv)
-                if dense_hd64_fa4
-                else defaults.skip_rescale_stats,
-                (False, True),
-            )
-        )
-    else:
-        rescale_threshold_choices = (
-            defaults.rescale_threshold,
-            *(
-                threshold
-                for threshold in safe_rescale_thresholds
-                if threshold != defaults.rescale_threshold
-            ),
-        )
-        rescale_chunk_cols_choices = _flash_choices_with_default(
-            defaults.rescale_chunk_cols,
-            (cols for cols in (16, 32, 64) if head_dim % cols == 0),
-        )
-        rescale_chunk_cols_search_choices = _flash_choices_with_default(
-            defaults.rescale_chunk_cols,
-            (cols for cols in (16, 32) if head_dim % cols == 0),
-        )
-        rescale_threshold_search_choices = None
-        skip_rescale_stats_choices = (defaults.skip_rescale_stats,)
-        skip_rescale_stats_search_choices = None
-    if dense_hd64_fa4:
-        softmax_regs_choices = _flash_choices_with_default(
-            defaults.softmax_regs, (176, 184, 192, 200)
-        )
-        softmax_regs_search_choices: tuple[int, ...] | None = (
-            _flash_choices_with_default(defaults.softmax_regs, (200, 192))
-            if very_long_dense_hd64_fa4
-            else None
-        )
-    elif causal_hd64_seeded_fa4:
-        softmax_regs_choices = _flash_choices_with_default(
-            defaults.softmax_regs, (176, 184, 192, 200)
-        )
-        softmax_regs_search_choices = (
-            (causal_softmax_regs_search,)
-            if long_causal_hd64_seeded_fa4
-            else _flash_choices_with_default(
-                causal_softmax_regs_search, (184, 192, 200)
-            )
-        )
-    else:
-        softmax_regs_choices = (
-            defaults.softmax_regs,
-            *(regs for regs in (176, 184, 192, 200) if regs != defaults.softmax_regs),
-        )
-        softmax_regs_search_choices = None
-    corr_regs_manual_choices = (64, 72, 80, 88)
-    if dense_hd64_fa4 or causal_hd64_seeded_fa4:
-        corr_regs_choices = _flash_choices_with_default(
-            defaults.corr_regs, corr_regs_manual_choices
-        )
-        corr_regs_search_choices: tuple[int, ...] | None = _flash_choices_with_default(
-            defaults.corr_regs,
-            (defaults.corr_regs,) if very_long_dense_hd64_fa4 else (64,),
-        )
-    else:
-        corr_regs_choices = (
-            defaults.corr_regs,
-            *(regs for regs in corr_regs_manual_choices if regs != defaults.corr_regs),
-        )
-        corr_regs_search_choices = (
-            defaults.corr_regs,
-            *(regs for regs in (64, 88) if regs != defaults.corr_regs),
-        )
-    other_regs_manual_choices = (32, 40, 48, 56, 64, 80)
-    other_regs_choices = _flash_choices_with_default(
-        defaults.other_regs, other_regs_manual_choices
-    )
-    other_regs_search_choices: tuple[int, ...] | None = (
-        (defaults.other_regs,)
-        if very_long_dense_hd64_fa4
-        else _flash_choices_with_default(defaults.other_regs, other_regs_manual_choices)
-        if dense_hd64_fa4
-        else (defaults.other_regs,)
-        if causal_hd64_seeded_fa4
-        else None
-    )
-    corr_tile_candidates = tuple(tile for tile in (8, 16, 32) if head_dim % tile == 0)
-    corr_tile_choices = _flash_choices_with_default(
-        defaults.corr_tile_size, corr_tile_candidates
-    )
-    if dense_hd64_fa4:
-        corr_tile_search_choices: tuple[int, ...] | None = _flash_choices_with_default(
-            defaults.corr_tile_size
-            if very_long_dense_hd64_fa4
-            else _flash_dense_hd64_seed_corr_tile_size(num_kv),
-            (8, 16) if very_long_dense_hd64_fa4 else corr_tile_candidates,
-        )
-    elif causal_hd64_seeded_fa4:
-        corr_tile_search_choices = _flash_choices_with_default(
-            defaults.corr_tile_size, (16, 8, 32)
-        )
-    else:
-        corr_tile_search_choices = None
-    if dense_hd64_fa4 or causal_hd64_seeded_fa4:
-        packed_reduce_choices = _flash_choices_with_default(
-            defaults.packed_reduce, (True, False)
-        )
-        packed_reduce_search_defaults = (
-            (defaults.packed_reduce,)
-            if very_long_dense_hd64_fa4
-            else (True,)
-            if causal_hd64_seeded_fa4 or num_kv >= 64
-            else (False,)
-        )
-        packed_reduce_search_choices: tuple[bool, ...] | None = (
-            _flash_choices_with_default(
-                defaults.packed_reduce, packed_reduce_search_defaults
-            )
-        )
-    else:
-        packed_reduce_choices = (defaults.packed_reduce, not defaults.packed_reduce)
-        packed_reduce_search_choices = None
-    if is_causal:
-        causal_lpt_swizzle_choices = (
-            defaults.causal_lpt_swizzle,
-            *(
-                swizzle
-                for swizzle in (0, 1, 2, 4, 8, 16, 32, 64)
-                if swizzle != defaults.causal_lpt_swizzle
-            ),
-        )
-        causal_lpt_swizzle_search_choices: tuple[int, ...] | None = (
-            (causal_lpt_swizzle_search,)
-            if long_causal_hd64_seeded_fa4
-            else _flash_choices_with_default(
-                causal_lpt_swizzle_search, (0, 1, 2, 4, 8, 16)
-            )
-            if causal_hd64_seeded_fa4
-            else None
-        )
-        causal_kv_order_choices = _flash_choices_with_default(
-            defaults.causal_kv_order, ("ascending", "descending")
-        )
-        causal_kv_order_search_choices: tuple[str, ...] | None = (
-            (_flash_causal_hd64_seed_kv_order(num_kv),)
-            if long_causal_hd64_seeded_fa4
-            else _flash_choices_with_default(
-                _flash_causal_hd64_seed_kv_order(num_kv),
-                ("ascending", "descending"),
-            )
-            if causal_hd64_seeded_fa4
-            else None
-        )
-    else:
-        causal_lpt_swizzle_choices = (0,)
-        causal_lpt_swizzle_search_choices = None
-        causal_kv_order_choices = ("ascending",)
-        causal_kv_order_search_choices = None
-    role_map_choices = _flash_choices_with_default(defaults.role_map, ("helion", "fa4"))
-    role_map_search_choices: tuple[str, ...] | None = (
-        (_flash_causal_hd64_seed_role_map(num_kv),)
-        if long_causal_hd64_seeded_fa4
-        else _flash_choices_with_default(
-            _flash_causal_hd64_seed_role_map(num_kv), ("helion", "fa4")
-        )
-        if causal_hd64_seeded_fa4
-        else _flash_choices_with_default(defaults.role_map, ("helion", "fa4"))
-        if very_long_dense_hd64_fa4
-        else (defaults.role_map,)
-    )
-    dense_hd128_fa4 = (
-        defaults.topology == "fa4"
-        and not is_causal
-        and head_dim == 128
-        and num_kv % 4 == 0
-    )
-    dense_hd64_2cta_fa4 = (
-        defaults.topology == "fa4"
-        and not is_causal
-        and head_dim == 64
-        and _flash_dense_hd64_2cta_num_kv_supported(num_kv)
-        and dtype is torch.float16
+    fa4_search_eligible = fa4_eligible and requested_search_topology != "ws_overlap"
+    d64_fa4 = head_dim == 64 and fa4_search_eligible
+    dense_d64_fa4 = d64_fa4 and not is_causal
+    causal_d64_fa4 = d64_fa4 and is_causal
+    standard_dense_d64 = (
+        dense_d64_fa4
+        and standard_dense_output
         and not has_kv_tile_pruning
-        and not requires_ws_overlap
         and not small_biased_candidate
     )
-    use_2cta_eligible = dense_hd128_fa4 or dense_hd64_2cta_fa4
-    use_clc_eligible = (
-        dense_hd64_fa4
-        and not is_causal
-        and head_dim == 64
-        and num_kv % 2 == 0
-        and defaults.persistent
+    standard_causal_d64 = (
+        causal_d64_fa4
+        and standard_causal_output
+        and not has_kv_tile_pruning
+        and not small_biased_candidate
     )
-    if requires_ws_overlap:
-        pipeline_family_choices = ("ws_overlap",)
-        pipeline_family_search_choices: tuple[str, ...] | None = None
+    bf16_d128_fa4 = head_dim == 128 and dtype is torch.bfloat16 and fa4_search_eligible
+    bf16_d128_compound_packet_eligible = (
+        bf16_d128_fa4 and not has_kv_tile_pruning and not small_biased_candidate
+    )
+
+    def enum(
+        default: _T,
+        choices: Iterable[_T],
+        search_choices: Iterable[_T] | None = None,
+        coverage_choices: Iterable[_T] | None = None,
+    ) -> EnumFragment:
+        all_choices = _flash_choices_with_default(default, choices)
+        active = (
+            None
+            if search_choices is None
+            else _flash_choices_with_default(default, search_choices)
+        )
+        coverage = (
+            None
+            if coverage_choices is None
+            else _flash_choices_with_default(default, coverage_choices)
+        )
+        return EnumFragment(all_choices, active, coverage)
+
+    if num_kv < 2:
+        s_stage = enum(1, (1,), (1,))
+    elif (
+        fa4_search_eligible
+        and valid_family != "ws_overlap"
+        and (valid_family is not None or output_requires_tma)
+    ):
+        s_stage = enum(defaults.s_stage, (1, 2), (2,))
     else:
-        pipeline_family_search: list[str] = ["fa4" if fa4_eligible else "ws_overlap"]
-        if pipeline_family_search[0] != "ws_overlap":
-            pipeline_family_search.append("ws_overlap")
-        if use_2cta_eligible:
-            pipeline_family_search.append("fa4_2cta")
-        if use_clc_eligible and (
-            not very_long_dense_hd64_fa4 or defaults.use_clc_scheduler
+        s_stage = enum(defaults.s_stage, (1, 2))
+
+    ws_only_kv_pipeline = not fa4_search_eligible
+    if num_kv < 2:
+        kv_stage = enum(1, (1,), (1,))
+    elif ws_only_kv_pipeline:
+        cap = _flash_deep_1cta_kv_stage_cap(head_dim)
+        kv_stage_search = tuple(range(2, cap + 1)) if cap >= 2 else (2, 3)
+        kv_stage_values = (
+            (2, 3, 4, 6, 8, 10)
+            if head_dim == 64
+            else tuple(dict.fromkeys((2, 3, *kv_stage_search)))
+        )
+        kv_stage = enum(defaults.kv_stage, kv_stage_values, kv_stage_search)
+    elif defaults.separate_kv_rings:
+        cap = _flash_deep_1cta_kv_stage_cap(head_dim)
+        kv_stage_values = tuple(range(2, cap + 1))
+        kv_stage = enum(defaults.kv_stage, kv_stage_values, kv_stage_values)
+    elif fa4_search_eligible and head_dim in (64, 128):
+        value_cap = _flash_aliased_kv_stage_cap(head_dim, stage_output=False)
+        search_cap = _flash_aliased_kv_stage_cap(
+            head_dim,
+            stage_output=output_requires_tma,
+        )
+        kv_stage_values = tuple(range(2, value_cap + 1))
+        kv_stage_search = tuple(range(2, search_cap + 1))
+        kv_stage = enum(defaults.kv_stage, kv_stage_values, kv_stage_search)
+    else:
+        kv_stage = enum(defaults.kv_stage, (2, 3))
+
+    fixed_family_requires_persistence = valid_family_flags is not None and (
+        valid_family_flags.use_clc_scheduler or valid_family_flags.local_tma_partition
+    )
+    if (
+        valid_family_flags is not None
+        and valid_family_flags.use_clc_scheduler
+        and not requires_ws_overlap
+    ):
+        persistent = enum(True, (True, False), (True,))
+        persistent_ctas = enum(1, (1,), (1,))
+        recompute = enum(False, (False, True), (False,))
+    elif fa4_search_eligible and not is_causal:
+        persistent = enum(defaults.persistent, (True, False), (True, False))
+        persistent_ctas = enum(
+            defaults.persistent_ctas_per_sm, (1, 2, 3, 4), (1, 2, 3, 4)
+        )
+        recompute = enum(defaults.recompute_tile_coords, (False, True), (False, True))
+    elif is_causal or num_kv < 2:
+        persistent = enum(defaults.persistent, (False, True), (False,))
+        persistent_ctas = enum(defaults.persistent_ctas_per_sm, (1,), (1,))
+        recompute = enum(defaults.recompute_tile_coords, (False,), (False,))
+    else:
+        persistent = enum(defaults.persistent, (False, True))
+        persistent_ctas = enum(defaults.persistent_ctas_per_sm, (1,), (1,))
+        recompute = enum(defaults.recompute_tile_coords, (False,), (False,))
+    if fixed_family_requires_persistence:
+        persistent = enum(True, (True, False), (True,))
+    if valid_family_flags is not None and (
+        valid_family_flags.use_clc_scheduler
+        or valid_family_flags.use_2cta_instrs
+        or valid_family_flags.use_cga2_local_cta
+        or valid_family_flags.separate_kv_rings
+    ):
+        recompute = enum(False, (False, True), (False,))
+
+    manual_schedule_names = tuple(
+        dict.fromkeys(
+            f"{freq}/{res}"
+            for freq, res in _FLASH_MANUAL_EXP2_PACKET_SCHEDULES.values()
+        )
+    )
+    schedule_values = ("16/4", "8/2", "16/2", "xu", *manual_schedule_names)
+    schedule_search = (
+        schedule_values if fa4_search_eligible else (defaults.e2e_schedule,)
+    )
+    manual_schedule = _FLASH_MANUAL_EXP2_PACKET_SCHEDULES.get(defaults.exp2_packet)
+    if manual_schedule is not None:
+        manual_name = f"{manual_schedule[0]}/{manual_schedule[1]}"
+        e2e_schedule = enum(manual_name, (manual_name,), (manual_name,))
+    else:
+        e2e_schedule = enum(defaults.e2e_schedule, schedule_values, schedule_search)
+
+    if is_causal:
+        masked_values = (
+            ("inherit", "xu", "16/4", "8/2", *manual_schedule_names)
+            if fa4_search_eligible
+            else ("inherit", "xu", "16/4", "8/2")
+        )
+        if (
+            fa4_search_eligible
+            and manual_schedule is not None
+            and standard_causal_output
         ):
-            pipeline_family_search.append("fa4_clc")
-        manual_default = (
-            defaults.pipeline_family
-            if defaults.pipeline_family in FLASH_MANUAL_ONLY_PIPELINE_FAMILIES
-            else None
-        )
-        pipeline_family_enum = (
-            (*FLASH_AUTOTUNE_PIPELINE_FAMILIES, manual_default)
-            if manual_default is not None
-            else FLASH_AUTOTUNE_PIPELINE_FAMILIES
-        )
-        effective_family_default = (
-            pipeline_family_search[0]
-            if manual_default is not None
-            else defaults.pipeline_family
-        )
-        pipeline_family_choices = _flash_choices_with_default(
-            effective_family_default, pipeline_family_enum
-        )
-        pipeline_family_search_choices = _flash_choices_with_default(
-            effective_family_default, pipeline_family_search
-        )
-    clc_heads_choices = _flash_choices_with_default(
-        defaults.clc_heads_per_batch, (0, 1, 2, 4, 8, 16, 32, 64)
-    )
-    clc_heads_search_choices: tuple[int, ...] | None = (
-        (defaults.clc_heads_per_batch,)
-        if use_clc_eligible and very_long_dense_hd64_fa4
-        else (0, 32, 16, 64)
-        if use_clc_eligible
-        else (0,)
-    )
-    clc_pdl_choices = (
-        _flash_choices_with_default(defaults.clc_use_pdl, (False, True))
-        if use_clc_eligible
-        else (False,)
-    )
-    clc_pdl_search_choices: tuple[bool, ...] | None = (
-        (defaults.clc_use_pdl,)
-        if use_clc_eligible and very_long_dense_hd64_fa4
-        else clc_pdl_choices
-        if use_clc_eligible
-        else (False,)
-    )
-    clc_stages_choices = (
-        _flash_choices_with_default(defaults.clc_stages, (1, 2, 3))
-        if use_clc_eligible
-        else (1,)
-    )
-    clc_stages_search_choices: tuple[int, ...] | None = (
-        (defaults.clc_stages,)
-        if use_clc_eligible and very_long_dense_hd64_fa4
-        else (2, 3)
-        if use_clc_eligible
-        else (1,)
-    )
-    causal_loop_split_choices = (
-        defaults.causal_loop_split,
-        not defaults.causal_loop_split,
-    )
-    causal_loop_split_search_choices: tuple[bool, ...] | None = (
-        (True,)
-        if long_causal_hd64_seeded_fa4
-        else (True, False)
-        if causal_hd64_seeded_fa4
-        else (defaults.causal_loop_split,)
-    )
-    small_biased_choices = _flash_choices_with_default(
-        defaults.small_biased, (True, False)
-    )
-    small_biased_search_choices: tuple[bool, ...] | None = (
-        small_biased_choices if small_biased_candidate else (defaults.small_biased,)
-    )
-    # fa4 epilogue TMA-store lever. Include TMA-O in search for FA4 hd64 shape
-    # families; value priors keep the characterized default favored without
-    # making it fixed.
-    if dense_hd64_fa4 or causal_hd64_seeded_fa4:
-        epi_tma_choices = _flash_choices_with_default(defaults.epi_tma, (False, True))
-        epi_tma_search_defaults = (False, True)
-        epi_tma_search_choices: tuple[bool, ...] | None = (
-            (_flash_causal_hd64_seed_epi_tma(num_kv),)
-            if long_causal_hd64_seeded_fa4
-            else _flash_choices_with_default(
-                defaults.epi_tma
-                if very_long_dense_hd64_fa4
-                else _flash_causal_hd64_seed_epi_tma(num_kv)
-                if causal_hd64_seeded_fa4
-                else defaults.epi_tma,
-                (defaults.epi_tma,)
-                if very_long_dense_hd64_fa4
-                else epi_tma_search_defaults,
-            )
-        )
-        epi_stg_choices = _flash_choices_with_default(defaults.epi_stg, (False, True))
-        epi_stg_search_choices: tuple[bool, ...] | None = _flash_choices_with_default(
-            defaults.epi_stg
-            if very_long_dense_hd64_fa4 or long_causal_hd64_seeded_fa4
-            else _flash_dense_hd64_seed_epi_stg(num_kv)
-            if dense_hd64_fa4
-            else defaults.epi_stg,
-            (defaults.epi_stg,)
-            if very_long_dense_hd64_fa4 or long_causal_hd64_seeded_fa4
-            else epi_tma_search_defaults,
-        )
-        epi_stg_store_choices = _flash_choices_with_default(
-            defaults.epi_stg_store, ("slice", "whole")
-        )
-        epi_stg_store_search_choices: tuple[str, ...] | None = (
-            (defaults.epi_stg_store,)
-            if very_long_dense_hd64_fa4 or long_causal_hd64_seeded_fa4
-            else _flash_choices_with_default(defaults.epi_stg_store, ("slice", "whole"))
-        )
-        epi_stg_gmem_choices = _flash_choices_with_default(
-            defaults.epi_stg_gmem, ("stage", "pair")
-        )
-        epi_stg_gmem_search_choices: tuple[str, ...] | None = (
-            (defaults.epi_stg_gmem,)
-            if very_long_dense_hd64_fa4 or long_causal_hd64_seeded_fa4
-            else _flash_choices_with_default(defaults.epi_stg_gmem, ("stage", "pair"))
-        )
-    else:
-        epi_tma_choices = (defaults.epi_tma, not defaults.epi_tma)
-        epi_tma_search_choices = None
-        epi_stg_choices = (defaults.epi_stg,)
-        epi_stg_search_choices = None
-        epi_stg_store_choices = (defaults.epi_stg_store,)
-        epi_stg_store_search_choices = None
-        epi_stg_gmem_choices = (defaults.epi_stg_gmem,)
-        epi_stg_gmem_search_choices = None
-    if defaults.topology == "fa4":
-        wait_hint_choices = _flash_choices_with_default(
-            defaults.wait_hint, (10_000_000, 0)
-        )
-        wait_hint_search_choices: tuple[int, ...] | None = wait_hint_choices
-        mma_interleave_choices = _flash_choices_with_default(
-            defaults.mma_interleave, (True, False)
-        )
-        mma_interleave_search_choices: tuple[bool, ...] | None = (
-            defaults.mma_interleave,
-        )
-    else:
-        wait_hint_choices = (10_000_000,)
-        wait_hint_search_choices = None
-        mma_interleave_choices = (False,)
-        mma_interleave_search_choices = None
-    if defaults.topology == "fa4" and head_dim == 64:
-        exp2_packet_choices = _flash_choices_with_default(
-            defaults.exp2_packet,
-            (*_FLASH_EXP2_PACKET_PARAMS, *_FLASH_MANUAL_EXP2_PACKET_PARAMS),
-        )
-        if defaults.exp2_packet in _FLASH_MANUAL_EXP2_PACKET_PARAMS:
-            exp2_packet_search_choices: tuple[str, ...] | None = (defaults.exp2_packet,)
+            masked_name = f"{manual_schedule[0]}/{manual_schedule[1]}"
+            masked_schedule = enum(masked_name, (masked_name,), (masked_name,))
         else:
-            ordinary_packet_choices = (
-                ("8x2", "1x1") if defaults.use_2cta_instrs else ("1x1", "4x1")
+            # Legacy fixed configs may name a distinct cadence even when the
+            # resolver canonicalizes it away; keep it valid but out of search.
+            masked_search = (
+                ("inherit", "xu", "16/4", "8/2")
+                if fa4_search_eligible and standard_causal_output
+                else ("inherit",)
             )
-            degree2_search_choices = (
-                (_FLASH_DEG2_EXP2_PACKET,)
-                if dtype is torch.float16
-                and (
-                    (standard_dense_output and dense_hd64_2cta_fa4)
-                    or (
-                        is_causal
-                        and standard_causal_output
-                        and _flash_causal_degree2_seed_params(num_kv) is not None
-                        and not has_kv_tile_pruning
-                        and not requires_ws_overlap
-                        and not small_biased_candidate
-                    )
-                )
-                else ()
-            )
-            exp2_packet_search_choices = _flash_choices_with_default(
-                defaults.exp2_packet,
-                (*ordinary_packet_choices, *degree2_search_choices),
+            masked_schedule = enum(
+                defaults.masked_e2e_schedule,
+                masked_values,
+                masked_search,
             )
     else:
-        exp2_packet_choices = ("1x1",)
-        exp2_packet_search_choices = None
-    if dense_hd64_fa4:
-        stat_transport_variants = (
+        masked_schedule = enum("inherit", ("inherit",), ("inherit",))
+
+    offset_values = tuple(range(16))
+    if fa4_search_eligible:
+        e2e_offset = enum(defaults.e2e_offset, offset_values, offset_values)
+        e2e_offset0 = enum(defaults.e2e_offset0, offset_values, offset_values)
+    else:
+        e2e_offset = enum(defaults.e2e_offset, offset_values, (defaults.e2e_offset,))
+        e2e_offset0 = enum(defaults.e2e_offset0, offset_values, (defaults.e2e_offset0,))
+
+    if fa4_search_eligible:
+        softmax_disc = enum(
+            defaults.softmax_disc,
+            (True, False),
+            (True,) if is_causal else (True, False),
+        )
+    else:
+        softmax_disc = enum(
+            defaults.softmax_disc, (True, False), (defaults.softmax_disc,)
+        )
+
+    if fa4_search_eligible:
+        disc_pipe = enum(defaults.disc_pipe_depth, (1, 2, 3, 4), (1, 2, 3, 4))
+        split_p = enum(defaults.split_p_arrive, (False, True), (False, True))
+        p_store = enum(defaults.p_store_repetition, (16, 32), (16, 32))
+        s_load = enum(defaults.s_load_repetition, (16, 32), (16, 32))
+        precompute = enum(defaults.precompute_qk_desc, (False, True), (False, True))
+        first_load = enum(defaults.first_load_order, (0, 1, 2, 3, 4), (0, 1, 2, 3, 4))
+        kv_order = enum(
+            defaults.kv_order,
+            ("ascending", "descending"),
+            ("ascending",) if is_causal else ("ascending", "descending"),
+        )
+    else:
+        disc_pipe = enum(
+            defaults.disc_pipe_depth,
+            (1, 2, 3, 4),
+            (defaults.disc_pipe_depth,),
+        )
+        split_p = enum(
+            defaults.split_p_arrive, (False, True), (defaults.split_p_arrive,)
+        )
+        p_store = enum(
+            defaults.p_store_repetition, (16, 32), (defaults.p_store_repetition,)
+        )
+        s_load = enum(
+            defaults.s_load_repetition, (16, 32), (defaults.s_load_repetition,)
+        )
+        precompute = enum(
+            defaults.precompute_qk_desc, (False, True), (defaults.precompute_qk_desc,)
+        )
+        first_load = enum(
+            defaults.first_load_order,
+            (0, 1, 2, 3, 4),
+            (defaults.first_load_order,),
+        )
+        kv_order = enum(
+            defaults.kv_order,
+            ("ascending", "descending"),
+            (defaults.kv_order,),
+        )
+
+    threshold_search = _flash_safe_rescale_threshold_values(dtype)
+    rescale_threshold = enum(
+        defaults.rescale_threshold,
+        _FLASH_RESCALE_THRESHOLD_VALUES,
+        threshold_search if fa4_search_eligible else (defaults.rescale_threshold,),
+    )
+    rescale_chunk_search = (8, 16, 32, 64) if head_dim == 64 else (8, 16, 32)
+    if valid_family_flags is not None and valid_family_flags.use_clc_scheduler:
+        rescale_chunk_search = (8, 16, 32)
+    rescale_chunk = enum(
+        defaults.rescale_chunk_cols,
+        (8, 16, 32, 64),
+        rescale_chunk_search if fa4_search_eligible else (defaults.rescale_chunk_cols,),
+    )
+    softmax_regs = enum(
+        defaults.softmax_regs,
+        (176, 184, 192, 200),
+        (176, 184, 192, 200) if fa4_search_eligible else (defaults.softmax_regs,),
+    )
+    corr_regs = enum(
+        defaults.corr_regs,
+        (64, 72, 80, 88),
+        (64, 72, 80, 88) if fa4_search_eligible else (defaults.corr_regs,),
+    )
+    other_regs = enum(
+        defaults.other_regs,
+        (24, 32, 40, 48, 56, 64, 80),
+        (24, 32, 40, 48, 56, 64, 80) if fa4_search_eligible else (defaults.other_regs,),
+    )
+    corr_tile = enum(
+        defaults.corr_tile_size,
+        (8, 16, 32),
+        (8, 16, 32) if fa4_search_eligible else (defaults.corr_tile_size,),
+    )
+    packed_reduce = enum(
+        defaults.packed_reduce,
+        (False, True),
+        (True,)
+        if output_requires_tma or requested_search_topology == "fa4"
+        else (False, True),
+    )
+
+    if is_causal:
+        causal_lpt_search = _flash_causal_lpt_candidates()
+        causal_lpt = enum(
+            defaults.causal_lpt_swizzle,
+            (0, *causal_lpt_search),
+            causal_lpt_search
+            if fa4_search_eligible
+            else (defaults.causal_lpt_swizzle,),
+        )
+        causal_order = enum(
+            defaults.causal_kv_order,
+            ("ascending", "descending"),
+            ("ascending", "descending")
+            if fa4_search_eligible
+            else (defaults.causal_kv_order,),
+        )
+        causal_split = enum(
+            defaults.causal_loop_split,
+            (False, True),
+            (False, True) if fa4_search_eligible else (defaults.causal_loop_split,),
+        )
+    else:
+        causal_lpt = enum(0, (0,), (0,))
+        causal_order = enum("ascending", ("ascending",), ("ascending",))
+        causal_split = enum(False, (False,), (False,))
+    role_map = enum(
+        defaults.role_map,
+        ("helion", "fa4"),
+        ("helion", "fa4") if fa4_search_eligible else (defaults.role_map,),
+    )
+
+    active_families = _flash_legal_autotune_pipeline_families(
+        head_dim,
+        num_kv,
+        num_bh=num_bh,
+        dtype=dtype,
+        is_causal=is_causal,
+        has_kv_tile_pruning=has_kv_tile_pruning,
+        requires_ws_overlap=requires_ws_overlap,
+        small_biased_candidate=small_biased_candidate,
+        standard_dense_output=standard_dense_output,
+        standard_causal_output=standard_causal_output,
+        output_requires_tma=output_requires_tma,
+        supports_tensor_4d_tma=supports_tensor_4d_tma,
+        requested_family=valid_family,
+    )
+    if valid_family is None and valid_topology is not None:
+        active_families = tuple(
+            family
+            for family in active_families
+            if cast(
+                "FlashPipelineFamilyFlags", _flash_pipeline_family_flags(family)
+            ).topology
+            == valid_topology
+        )
+    if not active_families:
+        raise InvalidConfig(
+            f"CuTe flash pipeline family {valid_family!r} is not legal for "
+            f"head_dim={head_dim}, num_kv={num_kv}, causal={is_causal}"
+        )
+    family_default = (
+        defaults.pipeline_family
+        if defaults.pipeline_family in active_families
+        else active_families[0]
+    )
+    pipeline_family = enum(
+        family_default,
+        FLASH_AUTOTUNE_PIPELINE_FAMILIES,
+        active_families,
+    )
+    role_chain_supported = any(
+        flags is not None
+        and flags.topology == "fa4"
+        and not flags.use_cga2_local_cta
+        and not flags.use_clc_scheduler
+        and (not flags.use_2cta_instrs or (head_dim == 64 and not is_causal))
+        for flags in (
+            _flash_pipeline_family_flags(family) for family in active_families
+        )
+    )
+    role_chain = enum(
+        defaults.role_chain,
+        (False, True),
+        (False, True)
+        if role_chain_supported and head_dim == 64 and not is_causal
+        else (defaults.role_chain,),
+    )
+
+    clc_candidates = _flash_clc_heads_per_batch_candidates(num_bh)
+    use_clc = any(
+        cast_flags is not None and cast_flags.use_clc_scheduler
+        for cast_flags in (
+            _flash_pipeline_family_flags(family) for family in active_families
+        )
+    )
+    clc_default = (
+        defaults.clc_heads_per_batch
+        if defaults.clc_heads_per_batch in clc_candidates
+        else clc_candidates[0]
+    )
+    clc_coverage_candidates = _flash_clc_heads_per_batch_coverage_candidates(
+        num_bh,
+        tensor_4d_heads=tensor_4d_heads,
+        effective_default=clc_default if use_clc else None,
+    )
+    clc_heads = enum(
+        clc_default if use_clc else 0,
+        (0, *clc_candidates),
+        clc_candidates if use_clc else (0,),
+        clc_coverage_candidates if use_clc else (0,),
+    )
+    clc_pdl = enum(
+        defaults.clc_use_pdl,
+        (False, True),
+        (False, True) if use_clc else (False,),
+    )
+    clc_stages = enum(
+        defaults.clc_stages,
+        (1, 2, 3),
+        (2, 3) if use_clc else (1,),
+    )
+
+    fixed_family_disables_epilogue = (
+        valid_family_flags is not None and valid_family_flags.separate_kv_rings
+    )
+    fixed_family_disables_paired_epilogue = valid_family_flags is not None and (
+        valid_family_flags.use_2cta_instrs or fixed_family_disables_epilogue
+    )
+    if output_requires_tma:
+        epi_tma = enum(True, (True, False), (True,))
+        epi_stg = enum(False, (False, True), (False,))
+        epi_stg_store = enum("slice", ("slice", "whole"), ("slice",))
+        epi_stg_gmem = enum("stage", ("stage", "pair"), ("stage",))
+    elif fixed_family_disables_epilogue:
+        epi_tma = enum(False, (False, True), (False,))
+        epi_stg = enum(False, (False, True), (False,))
+        epi_stg_store = enum("slice", ("slice", "whole"), ("slice",))
+        epi_stg_gmem = enum("stage", ("stage", "pair"), ("stage",))
+    elif fixed_family_disables_paired_epilogue:
+        epi_tma = enum(defaults.epi_tma, (False, True), (False, True))
+        epi_stg = enum(defaults.epi_stg, (False, True), (False, True))
+        epi_stg_store = enum(
+            defaults.epi_stg_store,
+            ("slice", "whole"),
+            ("slice", "whole"),
+        )
+        epi_stg_gmem = enum("stage", ("stage", "pair"), ("stage",))
+    elif fa4_search_eligible:
+        epi_tma = enum(defaults.epi_tma, (False, True), (False, True))
+        epi_stg = enum(defaults.epi_stg, (False, True), (False, True))
+        epi_stg_store = enum(
+            defaults.epi_stg_store,
+            ("slice", "whole"),
+            ("slice", "whole"),
+        )
+        epi_stg_gmem = enum(
+            defaults.epi_stg_gmem,
+            ("stage", "pair"),
+            ("stage", "pair"),
+        )
+    else:
+        epi_tma = enum(False, (False, True), (False,))
+        epi_stg = enum(defaults.epi_stg, (False, True), (defaults.epi_stg,))
+        epi_stg_store = enum(
+            defaults.epi_stg_store,
+            ("slice", "whole"),
+            (defaults.epi_stg_store,),
+        )
+        epi_stg_gmem = enum(
+            defaults.epi_stg_gmem,
+            ("stage", "pair"),
+            (defaults.epi_stg_gmem,),
+        )
+
+    if defaults.topology == "fa4":
+        wait_hint = enum(defaults.wait_hint, (10_000_000, 0), (10_000_000, 0))
+        mma_interleave = enum(defaults.mma_interleave, (True, False), (True, False))
+    else:
+        wait_hint = enum(10_000_000, (10_000_000,), (10_000_000,))
+        mma_interleave = enum(False, (False,), (False,))
+
+    packet_values: list[str] = ["1x1"]
+    packet_search: list[str] = ["1x1"]
+    if d64_fa4:
+        packet_values = list(_FLASH_EXP2_PACKET_PARAMS)
+        packet_search = list(_FLASH_EXP2_PACKET_PARAMS)
+        if dtype is torch.float16 and standard_dense_d64 and cluster_aligned:
+            packet_values.extend(
+                (
+                    _FLASH_DEG2_EXP2_PACKET,
+                    _FLASH_DEG1_EXP2_PACKET,
+                    _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET,
+                )
+            )
+            packet_search.extend(
+                (
+                    _FLASH_DEG2_EXP2_PACKET,
+                    _FLASH_DEG1_EXP2_PACKET,
+                    _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET,
+                )
+            )
+        elif dtype is torch.float16 and standard_causal_d64:
+            packet_values.append(_FLASH_DEG2_EXP2_PACKET)
+            packet_search.append(_FLASH_DEG2_EXP2_PACKET)
+            packet_values.append(_FLASH_HYBRID_EXP2_PACKET)
+            packet_search.append(_FLASH_HYBRID_EXP2_PACKET)
+        elif dtype is torch.bfloat16 and standard_causal_d64:
+            packet_values.append(_FLASH_HYBRID_EXP2_PACKET)
+            packet_search.append(_FLASH_HYBRID_EXP2_PACKET)
+    elif (
+        bf16_d128_compound_packet_eligible
+        and not is_causal
+        and standard_dense_output
+        and cluster_aligned
+    ):
+        packet_values.append(_FLASH_DEG2_EXP2_PACKET)
+        packet_search.append(_FLASH_DEG2_EXP2_PACKET)
+    elif bf16_d128_compound_packet_eligible and is_causal and standard_causal_output:
+        resident_packet = (
+            _FLASH_CAUSAL_HD128_RESIDENT3_013_PREFETCH2_DEG2_EARLY_ACQUIRE_EXP2_PACKET
+        )
+        packet_values.append(resident_packet)
+        packet_search.append(resident_packet)
+    if valid_family is not None:
+        packet_search = [
+            packet
+            for packet in packet_search
+            if resolve_flash_config(
+                head_dim,
+                num_kv,
+                {
+                    FLASH_PIPELINE_FAMILY_KEY: valid_family,
+                    FLASH_EXP2_PACKET_KEY: packet,
+                },
+                dtype=dtype,
+                num_bh=num_bh,
+                is_causal=is_causal,
+                has_kv_tile_pruning=has_kv_tile_pruning,
+                requires_ws_overlap=requires_ws_overlap,
+                small_biased_candidate=small_biased_candidate,
+                standard_dense_output=standard_dense_output,
+                standard_causal_output=standard_causal_output,
+                supports_tensor_4d_tma=supports_tensor_4d_tma,
+            ).exp2_packet
+            == packet
+        ]
+    if defaults.exp2_packet in _FLASH_MANUAL_EXP2_PACKET_PARAMS:
+        exp2_packet = enum(
+            defaults.exp2_packet,
+            (defaults.exp2_packet,),
+            (defaults.exp2_packet,),
+        )
+    else:
+        exp2_packet = enum(defaults.exp2_packet, packet_values, packet_search)
+
+    if dense_d64_fa4:
+        transports = (
             ("ring2", "single", "single_final")
             if standard_dense_output
             else ("ring2", "single")
         )
-        stat_transport_choices = _flash_choices_with_default(
-            defaults.stat_transport, stat_transport_variants
-        )
-        stat_transport_search_choices: tuple[str, ...] | None = (
-            _flash_choices_with_default(
-                defaults.stat_transport, stat_transport_variants
-            )
+        if fixed_family_requires_persistence:
+            # These families require persistence, while single_final needs a
+            # nonpersistent grid or the two-CTA instruction path.
+            transports = ("ring2", "single")
+        stat_transport = enum(
+            defaults.stat_transport,
+            transports,
+            transports,
         )
     else:
-        stat_transport_choices = ("ring2",)
-        stat_transport_search_choices = None
-    return {
-        FLASH_S_STAGE_KEY: EnumFragment(s_stage_choices, s_stage_search_choices),
-        FLASH_KV_STAGE_KEY: EnumFragment(kv_stage_choices, kv_stage_search_choices),
-        FLASH_PERSISTENT_KEY: EnumFragment(
-            persistent_choices, persistent_search_choices
-        ),
-        FLASH_PERSISTENT_CTAS_PER_SM_KEY: EnumFragment(
-            persistent_ctas_per_sm_choices,
-            persistent_ctas_per_sm_search_choices,
-        ),
-        FLASH_RECOMPUTE_TILE_COORDS_KEY: EnumFragment(
-            recompute_tile_coords_choices,
-            recompute_tile_coords_search_choices,
-        ),
-        FLASH_E2E_SCHEDULE_KEY: EnumFragment(
-            e2e_schedule_choices, e2e_schedule_search_choices
-        ),
-        FLASH_MASKED_E2E_SCHEDULE_KEY: EnumFragment(
-            masked_e2e_schedule_choices, masked_e2e_schedule_search_choices
-        ),
-        FLASH_E2E_OFFSET_KEY: EnumFragment(
-            e2e_offset_choices, e2e_offset_search_choices
-        ),
-        FLASH_E2E_OFFSET0_KEY: EnumFragment(
-            e2e_offset0_choices, e2e_offset0_search_choices
-        ),
-        FLASH_EXP2_PACKET_KEY: EnumFragment(
-            exp2_packet_choices, exp2_packet_search_choices
-        ),
-        FLASH_MMA_INTERLEAVE_KEY: EnumFragment(
-            mma_interleave_choices, mma_interleave_search_choices
-        ),
-        FLASH_WAIT_HINT_KEY: EnumFragment(wait_hint_choices, wait_hint_search_choices),
-        FLASH_STAT_TRANSPORT_KEY: EnumFragment(
-            stat_transport_choices, stat_transport_search_choices
-        ),
-        FLASH_PIPELINE_FAMILY_KEY: EnumFragment(
-            pipeline_family_choices, pipeline_family_search_choices
-        ),
-        FLASH_SOFTMAX_DISC_KEY: EnumFragment(
-            softmax_disc_choices, softmax_disc_search_choices
-        ),
-        FLASH_DISC_PIPE_KEY: EnumFragment(disc_pipe_choices, disc_pipe_search_choices),
-        FLASH_SPLIT_P_ARRIVE_KEY: EnumFragment(
-            split_p_arrive_choices, split_p_arrive_search_choices
-        ),
-        FLASH_P_STORE_REP_KEY: EnumFragment(
-            p_store_rep_choices, p_store_rep_search_choices
-        ),
-        FLASH_S_LOAD_REP_KEY: EnumFragment(
-            s_load_rep_choices, s_load_rep_search_choices
-        ),
-        FLASH_PRECOMPUTE_QK_DESC_KEY: EnumFragment(
-            precompute_qk_desc_choices, precompute_qk_desc_search_choices
-        ),
-        FLASH_FIRST_LOAD_ORDER_KEY: EnumFragment(
-            first_load_order_choices, first_load_order_search_choices
-        ),
-        FLASH_KV_ORDER_KEY: EnumFragment(kv_order_choices, kv_order_search_choices),
-        FLASH_EPI_TMA_KEY: EnumFragment(epi_tma_choices, epi_tma_search_choices),
-        FLASH_EPI_STG_KEY: EnumFragment(epi_stg_choices, epi_stg_search_choices),
-        FLASH_EPI_STG_STORE_KEY: EnumFragment(
-            epi_stg_store_choices, epi_stg_store_search_choices
-        ),
-        FLASH_EPI_STG_GMEM_KEY: EnumFragment(
-            epi_stg_gmem_choices, epi_stg_gmem_search_choices
-        ),
-        FLASH_RESCALE_THRESHOLD_KEY: EnumFragment(
-            rescale_threshold_choices, rescale_threshold_search_choices
-        ),
-        FLASH_SKIP_RESCALE_STATS_KEY: EnumFragment(
-            skip_rescale_stats_choices, skip_rescale_stats_search_choices
-        ),
-        FLASH_RESCALE_CHUNK_COLS_KEY: EnumFragment(
-            rescale_chunk_cols_choices, rescale_chunk_cols_search_choices
-        ),
-        FLASH_SOFTMAX_REGS_KEY: EnumFragment(
-            softmax_regs_choices, softmax_regs_search_choices
-        ),
-        FLASH_CORR_REGS_KEY: EnumFragment(corr_regs_choices, corr_regs_search_choices),
-        FLASH_OTHER_REGS_KEY: EnumFragment(
-            other_regs_choices, other_regs_search_choices
-        ),
-        FLASH_CORR_TILE_SIZE_KEY: EnumFragment(
-            corr_tile_choices, corr_tile_search_choices
-        ),
-        FLASH_PACKED_REDUCE_KEY: EnumFragment(
-            packed_reduce_choices, packed_reduce_search_choices
-        ),
-        FLASH_SMALL_BIASED_KEY: EnumFragment(
-            small_biased_choices, small_biased_search_choices
-        ),
-        FLASH_CAUSAL_LPT_SWIZZLE_KEY: EnumFragment(
-            causal_lpt_swizzle_choices, causal_lpt_swizzle_search_choices
-        ),
-        FLASH_CAUSAL_KV_ORDER_KEY: EnumFragment(
-            causal_kv_order_choices, causal_kv_order_search_choices
-        ),
-        FLASH_ROLE_MAP_KEY: EnumFragment(role_map_choices, role_map_search_choices),
-        FLASH_CLC_HEADS_PER_BATCH_KEY: EnumFragment(
-            clc_heads_choices, clc_heads_search_choices
-        ),
-        FLASH_CLC_PDL_KEY: EnumFragment(clc_pdl_choices, clc_pdl_search_choices),
-        FLASH_CLC_STAGES_KEY: EnumFragment(
-            clc_stages_choices, clc_stages_search_choices
-        ),
-        FLASH_CAUSAL_LOOP_SPLIT_KEY: EnumFragment(
-            causal_loop_split_choices, causal_loop_split_search_choices
-        ),
+        stat_transport = enum("ring2", ("ring2",), ("ring2",))
+
+    small_biased = enum(
+        defaults.small_biased,
+        (True, False),
+        (True, False) if small_biased_candidate else (defaults.small_biased,),
+    )
+    skip_rescale = enum(False, (False, True), (False,))
+
+    persistent_loop_eligible = (
+        fa4_search_eligible and not is_causal and not defaults.use_clc_scheduler
+    )
+    persistent_loop = enum(
+        defaults.persistent_loop,
+        ("while", "counted"),
+        ("while", "counted") if persistent_loop_eligible else ("while",),
+    )
+    sp_row_sum = enum(
+        defaults.sp_row_sum,
+        ("fragment", "whole"),
+        ("fragment", "whole")
+        if dense_d64_fa4 and dtype is torch.float16
+        else ("fragment",),
+    )
+    softmax_setup = enum(
+        defaults.softmax_setup,
+        ("shared", "stage_local"),
+        ("shared", "stage_local")
+        if dense_d64_fa4 and dtype is torch.float16
+        else ("shared",),
+    )
+    epi_tma_setup = enum(
+        defaults.epi_tma_setup,
+        ("shared", "role_local"),
+        ("shared", "role_local")
+        if standard_dense_d64 and not fixed_family_disables_epilogue
+        else ("shared",),
+    )
+
+    fragments: dict[str, ConfigSpecFragment] = {
+        FLASH_S_STAGE_KEY: s_stage,
+        FLASH_KV_STAGE_KEY: kv_stage,
+        FLASH_PERSISTENT_KEY: persistent,
+        FLASH_PERSISTENT_CTAS_PER_SM_KEY: persistent_ctas,
+        FLASH_RECOMPUTE_TILE_COORDS_KEY: recompute,
+        FLASH_E2E_SCHEDULE_KEY: e2e_schedule,
+        FLASH_MASKED_E2E_SCHEDULE_KEY: masked_schedule,
+        FLASH_E2E_OFFSET_KEY: e2e_offset,
+        FLASH_E2E_OFFSET0_KEY: e2e_offset0,
+        FLASH_EXP2_PACKET_KEY: exp2_packet,
+        FLASH_MMA_INTERLEAVE_KEY: mma_interleave,
+        FLASH_WAIT_HINT_KEY: wait_hint,
+        FLASH_STAT_TRANSPORT_KEY: stat_transport,
+        FLASH_PIPELINE_FAMILY_KEY: pipeline_family,
+        FLASH_SOFTMAX_DISC_KEY: softmax_disc,
+        FLASH_DISC_PIPE_KEY: disc_pipe,
+        FLASH_SPLIT_P_ARRIVE_KEY: split_p,
+        FLASH_P_STORE_REP_KEY: p_store,
+        FLASH_S_LOAD_REP_KEY: s_load,
+        FLASH_PRECOMPUTE_QK_DESC_KEY: precompute,
+        FLASH_FIRST_LOAD_ORDER_KEY: first_load,
+        FLASH_KV_ORDER_KEY: kv_order,
+        FLASH_EPI_TMA_KEY: epi_tma,
+        FLASH_EPI_STG_KEY: epi_stg,
+        FLASH_EPI_STG_STORE_KEY: epi_stg_store,
+        FLASH_EPI_STG_GMEM_KEY: epi_stg_gmem,
+        FLASH_RESCALE_THRESHOLD_KEY: rescale_threshold,
+        FLASH_SKIP_RESCALE_STATS_KEY: skip_rescale,
+        FLASH_RESCALE_CHUNK_COLS_KEY: rescale_chunk,
+        FLASH_SOFTMAX_REGS_KEY: softmax_regs,
+        FLASH_CORR_REGS_KEY: corr_regs,
+        FLASH_OTHER_REGS_KEY: other_regs,
+        FLASH_CORR_TILE_SIZE_KEY: corr_tile,
+        FLASH_PACKED_REDUCE_KEY: packed_reduce,
+        FLASH_SMALL_BIASED_KEY: small_biased,
+        FLASH_CAUSAL_LPT_SWIZZLE_KEY: causal_lpt,
+        FLASH_CAUSAL_KV_ORDER_KEY: causal_order,
+        FLASH_ROLE_MAP_KEY: role_map,
+        FLASH_ROLE_CHAIN_KEY: role_chain,
+        FLASH_CLC_HEADS_PER_BATCH_KEY: clc_heads,
+        FLASH_CLC_PDL_KEY: clc_pdl,
+        FLASH_CLC_STAGES_KEY: clc_stages,
+        FLASH_CAUSAL_LOOP_SPLIT_KEY: causal_split,
+        FLASH_PERSISTENT_LOOP_KEY: persistent_loop,
+        FLASH_SP_ROW_SUM_KEY: sp_row_sum,
+        FLASH_SOFTMAX_SETUP_KEY: softmax_setup,
+        FLASH_EPI_TMA_SETUP_KEY: epi_tma_setup,
     }
+    target_tuning_policy = get_flash_target_policy(
+        target_device_capability
+    ).tuning_for_torch(head_dim, str(dtype).removeprefix("torch."))
+    policy_values: dict[str, object] = {}
+    if target_tuning_policy is not None:
+        if not is_causal and standard_dense_output:
+            dense_policy = target_tuning_policy.dense_policy(num_kv)
+            if dense_policy is not None:
+                policy_values = _flash_dense_tuning_overrides(dense_policy)
+        elif is_causal and standard_causal_output:
+            causal_policy = target_tuning_policy.causal_policy(num_kv)
+            if causal_policy is not None:
+                policy_values = _flash_causal_tuning_overrides(causal_policy)
+    for key, value in policy_values.items():
+        if key not in fragments:
+            continue
+        fragment = cast("EnumFragment", fragments[key])
+        if value not in fragment.choices:
+            search_choices = fragment.search_choices
+            if search_choices is None:
+                # Target-only seed values remain legal without entering the
+                # generic search surface.
+                search_choices = fragment.choices
+            fragments[key] = EnumFragment(
+                (*fragment.choices, value),
+                search_choices,
+                fragment.coverage_choices,
+            )
+    return fragments
 
 
 def flash_config_from_config(
@@ -5202,8 +4931,14 @@ def flash_config_from_config(
     num_kv: int,
     dtype: torch.dtype = torch.float16,
     *,
+    num_bh: int | None = None,
     is_causal: bool = False,
+    has_kv_tile_pruning: bool = False,
+    requires_ws_overlap: bool = False,
+    small_biased_candidate: bool = False,
     standard_dense_output: bool = False,
+    standard_causal_output: bool = False,
+    supports_tensor_4d_tma: bool = True,
 ) -> FlashAttentionConfig:
     """Reconstruct ``FlashAttentionConfig`` from a (normalized) config Mapping.
 
@@ -5216,8 +4951,14 @@ def flash_config_from_config(
         num_kv,
         config,
         dtype=dtype,
+        num_bh=num_bh,
         is_causal=is_causal,
+        has_kv_tile_pruning=has_kv_tile_pruning,
+        requires_ws_overlap=requires_ws_overlap,
+        small_biased_candidate=small_biased_candidate,
         standard_dense_output=standard_dense_output,
+        standard_causal_output=standard_causal_output,
+        supports_tensor_4d_tma=supports_tensor_4d_tma,
     )
 
 
@@ -5232,7 +4973,7 @@ if TYPE_CHECKING:
 # ``_flash_runtime`` (a real module compiled WITHOUT ``from __future__ import
 # annotations``); the generated module imports them. The remaining cute / utils
 # / pipeline symbols are imported under flash-local aliases.
-_FLASH_RUNTIME_ABI = 2
+_FLASH_RUNTIME_ABI = 3
 
 # This literal is part of generated source and therefore the CuTe disk-cache
 # key. Bump it whenever an imported flash runtime helper changes semantics.
@@ -5732,9 +5473,122 @@ def _flash_fa4_descending_causal_split_proof(
     )
 
 
-def _flash_runtime_range_header(loop_var: str, loop_bound: str) -> str:
-    """Emit a runtime CuTe loop header; causal splitting must not unroll it."""
-    return f"for {loop_var} in cutlass.range({loop_bound}, unroll=1):"
+def _flash_fa4_causal_split_equal_iteration_proof(
+    *,
+    split_range_proof: CausalRangeProof,
+    query_slots_per_cta: int,
+) -> CausalRangeProof:
+    """Prove that every split causal query slot executes the same KV count."""
+    if not split_range_proof.proven:
+        return CausalRangeProof(False, split_range_proof.reason)
+    if query_slots_per_cta != 2:
+        return CausalRangeProof(False, "FA4 resident path requires two query slots")
+    # Each resident query slot shares ``flash_num_active_kv``.  Its descending
+    # split executes ``flash_num_active_kv - m_tile`` masked iterations followed
+    # by ``m_tile`` unmasked iterations, so both slots execute the same active
+    # KV count while traversing different mask-free suffix lengths.
+    return CausalRangeProof(
+        True, "resident query slots share the same active KV iteration count"
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class _FlashSoftmaxLoopSegment:
+    """Runtime loop domain and phase facts for one online-softmax segment."""
+
+    loop_var: str
+    loop_bound: str
+    kv_expr: str | None = None
+    continues_previous_segment: bool = False
+
+    @property
+    def not_first_condition(self) -> str:
+        """Return the loop-local expression proving this is not the first KV tile."""
+        if self.continues_previous_segment:
+            return f"{self.loop_var} >= cutlass.Int32(0)"
+        return f"{self.loop_var} != 0"
+
+
+_FLASH_ONLINE_STATISTICS_UPDATE = (
+    "            flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum"
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class _FlashOnlineSoftmaxIteration:
+    """Ordered source blocks for one statically specialized softmax iteration.
+
+    The final row-sum publication is deliberately not part of this plan because
+    it occurs after the complete loop (or masked/unmasked loop pair).
+    """
+
+    load_and_reduce: str
+    alpha_pre_probability: str
+    alpha_publish_pre_probability: str
+    probability_update: str
+    pre_max_update: str = ""
+    alpha_post_probability: str = ""
+    alpha_publish_post_probability: str = ""
+    statistics_acquire: str = ""
+    statistics_update: str = _FLASH_ONLINE_STATISTICS_UPDATE
+    post_statistics: str = ""
+
+
+def _flash_causal_split_softmax_segments(
+    kv_loop_bound: str,
+    stage: str,
+    *,
+    split_range_proof: CausalRangeProof,
+) -> tuple[_FlashSoftmaxLoopSegment, _FlashSoftmaxLoopSegment]:
+    """Return the proof-backed masked prefix and unmasked causal suffix."""
+    if not split_range_proof.proven:
+        raise AssertionError(
+            "causal softmax split requires a proven complete masked/unmasked range"
+        )
+    return (
+        _FlashSoftmaxLoopSegment(
+            loop_var="flash_kv_mask_iter",
+            loop_bound=f"{kv_loop_bound} - flash_m_tile{stage}",
+            kv_expr=(f"{kv_loop_bound} - cutlass.Int32(1) - flash_kv_mask_iter"),
+        ),
+        _FlashSoftmaxLoopSegment(
+            loop_var="flash_kv_unmask_iter",
+            loop_bound=f"flash_m_tile{stage}",
+            kv_expr=(f"flash_m_tile{stage} - cutlass.Int32(1) - flash_kv_unmask_iter"),
+            continues_previous_segment=True,
+        ),
+    )
+
+
+def _format_fa4_online_softmax_loop(
+    segment: _FlashSoftmaxLoopSegment,
+    iteration: _FlashOnlineSoftmaxIteration,
+    *,
+    stage: str,
+    wait_hint: int,
+) -> str:
+    """Render the common FA4 wait/max/alpha/P/row-sum iteration order."""
+    kv_assignment = (
+        f"\n            flash_kv = {segment.kv_expr}" if segment.kv_expr else ""
+    )
+    return f"""        for {segment.loop_var} in cutlass.range({segment.loop_bound}, unroll=1):{kv_assignment}
+            _helion_flash_rt.mbar_spin_wait(
+                flash_s_full_ptr + {stage}, flash_s_full_phase, {wait_hint})
+            flash_s_full_phase ^= 1
+{iteration.pre_max_update}
+            flash_old_row_max = flash_row_max
+{iteration.load_and_reduce}
+            flash_row_max_safe = flash_row_max
+            if flash_row_max == -cutlass.Float32.inf:
+                flash_row_max_safe = cutlass.Float32(0.0)
+{iteration.alpha_pre_probability}
+{iteration.alpha_publish_pre_probability}
+{iteration.probability_update}
+{iteration.alpha_post_probability}
+{iteration.alpha_publish_post_probability}
+{iteration.statistics_acquire}
+{iteration.statistics_update}
+{iteration.post_statistics}"""
 
 
 def _flash_kv_iteration(
@@ -6331,6 +6185,7 @@ def _flash_ws_consumer_body(
     *,
     io_dtype: str,
     score_plan: AttentionScorePlan,
+    output_epilogue: str = _FLASH_OUTPUT_EPILOGUE_IDENTITY,
 ) -> str:
     """Consumer warpgroup (warps 4-7) body for the Stage-4 overlap: per-tile
     online softmax on S[k%2], P-over-S write, O alpha-rescale, p_ready signal;
@@ -6351,6 +6206,12 @@ def _flash_ws_consumer_body(
     t2r->exp2->r2t dependency chain (measured +2.9pp hd64 of SDPA). Setting
     ``HELION_CUTE_FLASH_EXP2_IMPL=xu`` selects the original hardware-XU loop.
     """
+    relu_output = _flash_output_relu_enabled(output_epilogue)
+    relu_store = (
+        "\n            _helion_flash_rt.relu_fragment_inplace(flash_reg)"
+        if relu_output
+        else ""
+    )
     if cfg.exp2_impl == "split":
         exp2_block = f"""            _helion_flash_rt.exp2_split_inplace(
                 tLDrS, _flash_scale_log2, flash_minus_max_scale, {cfg.e2e_freq}, {cfg.e2e_res})"""
@@ -6363,10 +6224,8 @@ def _flash_ws_consumer_body(
     # ``tLDrS.load().reduce(MAX/ADD)`` lowers to a SINGLE-accumulator serial
     # FADD/FMNMX chain over the 128-wide row; the packed helpers fold with 4
     # independent packed-f32x2 accumulators (FA4's fadd_reduce/fmax_reduce
-    # arch>=100). This is default-on only for the characterized long/causal FA4
-    # seeds and KV-pruned sparse ws_overlap masks; other shapes keep the serial
-    # reduction unless ``HELION_CUTE_FLASH_PACKED_REDUCE`` or
-    # ``cute_flash_packed_reduce`` opts in.
+    # arch>=100). The choice is represented in the config and measured instead
+    # of being selected from a sequence-length threshold.
     if cfg.packed_reduce:
         row_max_reduce = (
             "flash_row_max = _helion_flash_rt.fmax_reduce_packed(tLDrS, flash_row_max)"
@@ -6505,7 +6364,7 @@ def _flash_ws_consumer_body(
         flash_rego = cute.make_rmem_tensor(tDgO[None, None, 0].shape, {io_dtype})
         for flash_i in cutlass.range(cute.size(tDtO, mode=[2])):
             cute.copy(flash_tiled_o_ld, tDtO[None, None, flash_i], flash_reg)
-            flash_reg.store(flash_reg.load() * flash_inv_sum)
+            flash_reg.store(flash_reg.load() * flash_inv_sum){relu_store}
             flash_rego.store(flash_reg.load().to({io_dtype}))
             cute.autovec_copy(flash_rego, tDgO[None, None, flash_i])
         flash_o_full.release()"""
@@ -6520,6 +6379,7 @@ def emit_flash_ws_device_body(
     has_lse: bool,
     io_dtype: str,
     score_plan: AttentionScorePlan,
+    output_epilogue: str = _FLASH_OUTPUT_EPILOGUE_IDENTITY,
 ) -> list[ast.stmt]:
     """Stage-4 device body: 2-warpgroup producer/consumer split with a
     double-buffered S TMEM accumulator (S0 @ col 0, S1 @ col 128, O @ col 256).
@@ -6736,6 +6596,7 @@ else:
             cfg,
             io_dtype=io_dtype,
             score_plan=score_plan,
+            output_epilogue=output_epilogue,
         )
         + ws_lse_store,
         persistent,
@@ -6860,6 +6721,7 @@ def _flash_fa4_wrap(
     head: str,
     inner: str,
     persistent: bool,
+    persistent_loop: str = "while",
     prelude: str = "full",
     tail: str = "",
     total_tiles: int | None = None,
@@ -6975,18 +6837,11 @@ def _flash_fa4_wrap(
         if num_m_pairs is not None
         else None
     )
-    # The counted loop was slightly faster for the measured 32K dense FA4 seed,
-    # while longer dense seeds regressed or were neutral. Gate on both total work
-    # and num_m_pairs (seq // 256 for 1-CTA FA4) so small batch/head long-sequence
-    # cases do not slip through solely because their collapsed tile count is low.
-    counted_loop_total_tile_limit = 8192
-    counted_loop_m_pair_limit = 512
     use_counted_no_prelude = (
-        prelude == "none"
+        persistent_loop == "counted"
+        and prelude == "none"
         and total_tiles is not None
         and num_m_pairs is not None
-        and total_tiles <= counted_loop_total_tile_limit
-        and num_m_pairs <= counted_loop_m_pair_limit
     )
     if use_counted_no_prelude:
         counted_loop_body = inner
@@ -7100,6 +6955,8 @@ def emit_flash_fa4_device_body(
     score_plan: AttentionScorePlan,
     tensor_4d_batch: int = 0,
     tensor_4d_heads: int = 0,
+    target_device_capability: tuple[int, int] | None = None,
+    output_epilogue: str = _FLASH_OUTPUT_EPILOGUE_IDENTITY,
 ) -> list[ast.stmt]:
     """FA4-topology device body: faithful transcription of the validated 16-warp /
     512-thread spike kernel (sp single-pass softmax body), adapted for Helion's
@@ -7123,6 +6980,13 @@ def emit_flash_fa4_device_body(
     handshakes; s0_corr / s1_corr are raw full/empty two-stage mbarriers.
     """
     hd = head_dim
+    relu_output = _flash_output_relu_enabled(output_epilogue)
+    direct_relu_store = (
+        "\n            _helion_flash_rt.relu_fragment_inplace(flash_reg{stage})"
+        if relu_output
+        else ""
+    )
+    staged_relu_keyword = ", relu_output=True" if relu_output else ""
     kv_stage = cfg.kv_stage
     q_stage = cfg.q_tile_count
     assert q_stage == 2
@@ -7133,6 +6997,19 @@ def emit_flash_fa4_device_body(
     is_causal = score_plan.is_causal
     if is_causal:
         assert not cfg.persistent
+    target_policy = get_flash_target_policy(target_device_capability)
+    hardware_capabilities = target_policy.hardware
+    tuning_policy = target_policy.tuning_for_cute(hd, io_dtype)
+    tmem_row_reduce_min_kv = (
+        tuning_policy.tmem_row_reduce_min_kv if tuning_policy is not None else None
+    )
+    use_tmem_row_reduce = (
+        hardware_capabilities.supports_tmem_row_reduce
+        and tmem_row_reduce_min_kv is not None
+        and num_kv >= tmem_row_reduce_min_kv
+        and cfg.s_load_repetition == 32
+        and score_plan.modifier_kinds in ((DENSE_SCORE_KIND,), (CAUSAL_MASK_KIND,))
+    )
     causal_desc_kv = is_causal and cfg.causal_kv_order == "descending"
     desc_kv = causal_desc_kv or (not is_causal and cfg.kv_order == "descending")
     num_m_pairs = total_tiles // num_bh
@@ -7141,6 +7018,96 @@ def emit_flash_fa4_device_body(
         num_query_tiles=num_m_pairs * (4 if cfg.causal_two_cta else 2),
         num_kv_tiles=num_kv,
         score_plan=score_plan,
+    )
+    causal_split_equal_iteration_proof = _flash_fa4_causal_split_equal_iteration_proof(
+        split_range_proof=causal_split_proof,
+        query_slots_per_cta=q_stage,
+    )
+    dense_tuning = (
+        tuning_policy.dense_policy(num_kv) if tuning_policy is not None else None
+    )
+    probability_log2_shift = (
+        dense_tuning.probability_log2_shift if dense_tuning is not None else 0
+    )
+    dense_seed_matches = _flash_dense_target_seed_matches(cfg, dense_tuning)
+    dense_softmax_lowering = (
+        dense_tuning.softmax_lowering
+        if dense_tuning is not None
+        else FlashSoftmaxLowering.STANDARD
+    )
+    dense_packed_exp2_mode = (
+        dense_tuning.packed_exp2_mode
+        if dense_tuning is not None
+        else FlashPackedExp2Mode.DISABLED
+    )
+    dense_target_lowering_applies = (
+        dense_tuning is not None
+        and dense_seed_matches
+        and not is_causal
+        and not has_lse
+        and cfg.use_2cta_instrs
+        and not cfg.separate_kv_rings
+        and not cfg.softmax_disc
+        and cfg.p_store_repetition == 16
+        and cfg.s_load_repetition == 32
+        and score_plan.modifier_kinds == (DENSE_SCORE_KIND,)
+    )
+    dense_resident_value_graph_candidate = (
+        dense_target_lowering_applies
+        and cfg.split_p_arrive
+        and cfg.rescale_threshold > 0.0
+        and dense_softmax_lowering is FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH
+    )
+    causal_tuning = (
+        tuning_policy.causal_policy(num_kv) if tuning_policy is not None else None
+    )
+    causal_seed_matches = _flash_causal_resident_native_seed_matches(cfg, causal_tuning)
+    use_causal_resident_native = (
+        causal_tuning is not None
+        and causal_seed_matches
+        and use_tmem_row_reduce
+        and is_causal
+        and not has_lse
+        and not cfg.use_2cta_instrs
+        and not cfg.separate_kv_rings
+        and cfg.causal_loop_split
+        and causal_desc_kv
+        and causal_split_proof.proven
+        and causal_split_equal_iteration_proof.proven
+        and cfg.p_store_repetition == 16
+        and cfg.s_load_repetition == 32
+        and cfg.split_p_arrive
+        and cfg.rescale_threshold > 0.0
+        and score_plan.modifier_kinds == (CAUSAL_MASK_KIND,)
+    )
+    use_causal_resident_value_graph = False
+    use_causal_stateful_softmax = False
+    if use_causal_resident_native:
+        assert causal_tuning is not None
+        resident_softmax_family = causal_tuning.softmax_lowering
+        if resident_softmax_family is FlashSoftmaxLowering.STANDARD:
+            pass
+        elif resident_softmax_family is FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH:
+            use_causal_resident_value_graph = True
+        elif resident_softmax_family is FlashSoftmaxLowering.STATEFUL:
+            use_causal_stateful_softmax = True
+        else:
+            raise AssertionError(
+                "unsupported resident softmax lowering family: "
+                f"{resident_softmax_family!r}"
+            )
+    if use_causal_resident_native:
+        # Use the architecture-selected resident softmax lowering only for the
+        # validated rank-0 schedule. Other manual/autotuned configs remain on
+        # their resolved standard lowering.
+        cfg = _flash_resident_softmax_config(cfg)
+    stat_release_mapping = (
+        FlashStatReleaseMapping.SAME_SLOT
+        if use_causal_stateful_softmax
+        else FlashStatReleaseMapping.CROSS_SLOT
+    )
+    use_whole_row_tmem_reduce = (
+        use_tmem_row_reduce and not is_causal and not cfg.softmax_disc
     )
     persistent = cfg.persistent
     use_tensor_4d_tma = (
@@ -7152,20 +7119,38 @@ def emit_flash_fa4_device_body(
     if not use_tensor_4d_tma:
         tensor_4d_heads = 0
     use_2cta_instrs = cfg.use_2cta_instrs
+    use_packed_f16x2_xu = (
+        dense_packed_exp2_mode is FlashPackedExp2Mode.ALL_XU
+        and hardware_capabilities.supports_packed_f16x2_exp2
+        and dense_target_lowering_applies
+        and cfg.exp2_impl == "split"
+        and cfg.exp2_packet in _FLASH_DEG1_EXP2_PACKETS
+    )
+    effective_probability_log2_shift = (
+        probability_log2_shift
+        if use_packed_f16x2_xu or dense_resident_value_graph_candidate
+        else 0
+    )
     use_cga2_local_cta = cfg.use_cga2_local_cta
     use_clc_scheduler = cfg.use_clc_scheduler
     separate_kv_rings = cfg.separate_kv_rings
     fa4_stat_handoff = cfg.stat_transport in ("single", "single_final")
     # Match FA4's one-slot statistics pipeline: the softmax role acquires slot
-    # ownership after publishing P, while correction releases the opposite
-    # stage's slot. Unsupported schedules retain the conservative handoff below.
+    # ownership after publishing P, while correction releases the slot selected
+    # by the architecture policy. Unsupported schedules retain the conservative
+    # handoff below.
     fa4_stat_pipeline = (
         fa4_stat_handoff
-        and not is_causal
-        and cfg.exp2_impl == "split"
+        and (
+            (not is_causal and cfg.exp2_impl == "split")
+            or (use_causal_resident_native and cfg.exp2_impl == "xu")
+        )
         and not cfg.softmax_disc
         and cfg.rescale_threshold > 0.0
-        and cfg.exp2_packet != _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET
+        and (
+            cfg.exp2_packet != _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET
+            or dense_resident_value_graph_candidate
+        )
     )
     # The MMA warp's PV -> next-QK order makes each alpha slot safe to reuse
     # without a per-iteration empty acknowledgement. Keep a single terminal
@@ -7174,6 +7159,10 @@ def emit_flash_fa4_device_body(
         fa4_stat_pipeline and cfg.stat_transport == "single_final"
     )
     acknowledged_stat_pipeline = fa4_stat_pipeline and not final_only_stat_pipeline
+    if dense_resident_value_graph_candidate:
+        assert acknowledged_stat_pipeline
+    if use_causal_stateful_softmax:
+        assert acknowledged_stat_pipeline
     verified_shared_memory_bytes: int | None = None
     if separate_kv_rings:
         assert not use_cga2_local_cta
@@ -7229,6 +7218,28 @@ def emit_flash_fa4_device_body(
         )
         kv_stage = verified_schedule.spec.kv_depth
         verified_shared_memory_bytes = verified_schedule.schedule.shared_memory_bytes
+    elif use_causal_resident_native:
+        assert causal_split_equal_iteration_proof.proven
+        verified_schedule = verify_flash_schedule(
+            build_fa4_schedule(
+                FlashScheduleSpec(
+                    head_dim=head_dim,
+                    kv_depth=kv_stage,
+                    query_slots_per_cta=q_stage,
+                    causal=True,
+                    persistent=False,
+                    stage_output=cfg.epi_tma or cfg.epi_stg,
+                    split_p_arrive=cfg.split_p_arrive,
+                    stat_depth=1,
+                    pipelined_stat_handoff=True,
+                    stat_release_mapping=stat_release_mapping,
+                    query_slots_have_equal_kv_iterations=(
+                        causal_split_equal_iteration_proof.proven
+                    ),
+                )
+            )
+        )
+        verified_shared_memory_bytes = verified_schedule.schedule.shared_memory_bytes
     use_local_tma_partition = (
         cfg.local_tma_partition
         and persistent
@@ -7252,9 +7263,43 @@ def emit_flash_fa4_device_body(
     exp2_codegen = _flash_disc_exp2_codegen_params(
         cfg.exp2_packet, cfg.e2e_freq, cfg.e2e_res
     )
+    if use_packed_f16x2_xu:
+        exp2_codegen = exp2_codegen._replace(e2e_res=0)
     if exp2_codegen.degree2:
-        assert hd == 64
-        assert io_dtype == "cutlass.Float16"
+        hd128_bf16_dense = (
+            hd == 128
+            and io_dtype == "cutlass.BFloat16"
+            and not is_causal
+            and use_2cta_instrs
+        )
+        hd128_bf16_causal_resident = (
+            hd == 128
+            and io_dtype == "cutlass.BFloat16"
+            and is_causal
+            and cfg.exp2_packet in _FLASH_CAUSAL_HD128_RESIDENT_EXP2_PACKETS
+        )
+        hd64_bf16_causal_hybrid = (
+            hd == 64
+            and io_dtype == "cutlass.BFloat16"
+            and is_causal
+            and _flash_causal_hd64_hybrid_num_kv_supported(num_kv)
+            and cfg.exp2_packet == _FLASH_HYBRID_EXP2_PACKET
+            and not has_lse
+            and _standard_causal_score_plan_supported(score_plan)
+            and causal_split_proof.proven
+            and causal_desc_kv
+            and cfg.causal_loop_split
+            and cfg.softmax_disc
+            and cfg.disc_pipe_depth >= 2
+            and cfg.split_p_arrive
+            and not use_2cta_instrs
+        )
+        assert (
+            (hd == 64 and io_dtype == "cutlass.Float16")
+            or hd128_bf16_dense
+            or hd128_bf16_causal_resident
+            or hd64_bf16_causal_hybrid
+        )
         assert cfg.q_tile_count == 2
         assert not use_cga2_local_cta
         assert not separate_kv_rings
@@ -7266,17 +7311,11 @@ def emit_flash_fa4_device_body(
             assert cfg.disc_pipe_depth >= 2
         else:
             assert use_2cta_instrs
-            assert not cfg.softmax_disc
-    sp_whole_row_sum = (
-        _FLASH_DENSE_HD64_VERY_LONG_MIN_KV <= num_kv <= 2048
-        and not is_causal
-        and hd == 64
-        and io_dtype == "cutlass.Float16"
-    )
+            assert not cfg.softmax_disc or hd128_bf16_dense
+    sp_whole_row_sum = use_causal_resident_native or cfg.sp_row_sum == "whole"
     cta_group_size = 2 if use_2cta_instrs else 1
     mma_m = 256 if use_2cta_instrs else 128
     hd64_2cta = use_2cta_instrs and hd == 64
-    dense_hd64_2cta = hd64_2cta and not is_causal
     pfor2_count = 2 * 128 if use_2cta_instrs else 128
     pfor_count = (
         pfor2_count
@@ -7321,18 +7360,7 @@ def emit_flash_fa4_device_body(
     kv_loop_bound = "flash_num_active_kv" if is_causal else "_flash_num_kv_tiles"
     kv_loop_bound_minus_1 = f"{kv_loop_bound} - 1"
     epi_smem = cfg.epi_tma or cfg.epi_stg
-    role_chain_default = (
-        _flash_role_chain_default(
-            hd=hd, num_kv=num_kv, is_causal=is_causal, role_map=cfg.role_map
-        )
-        or dense_hd64_2cta
-    )
-    role_chain = (
-        (not use_2cta_instrs or dense_hd64_2cta)
-        and not use_cga2_local_cta
-        and not use_clc_scheduler
-        and _flash_bool_env("HELION_CUTE_FLASH_ROLE_CHAIN", role_chain_default)
-    )
+    role_chain = cfg.role_chain
     storage_extra_args = f", {epi_smem!s}, {use_clc_scheduler!s}, {cfg.clc_stages}"
     if separate_kv_rings:
         storage_extra_args += ", True"
@@ -7438,11 +7466,6 @@ tOtO1 = tOtO1_full
     if is_causal:
         if cfg.causal_lpt_swizzle > 0:
             lpt_swizzle = cfg.causal_lpt_swizzle
-        else:
-            size_one_bh = num_kv * 128 * (head_dim + head_dim) * 2
-            size_l2 = 50 * 1024 * 1024
-            if size_one_bh <= size_l2:
-                lpt_swizzle = 1 << int(math.log2(size_l2 // size_one_bh))
         lpt_swizzle = max(1, min(lpt_swizzle, num_bh))
     lpt_group_tiles = lpt_swizzle * num_m_pairs
     lpt_quotient = num_bh // lpt_swizzle
@@ -7766,12 +7789,28 @@ flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
     tScoreSTtS0 = flash_thr_score_st0.partition_D(tStS0)
     tScoreSTtS1 = flash_thr_score_st1.partition_D(tStS1)
 """
+    flash_ld_op = "LdRed32x32bOp" if use_whole_row_tmem_reduce else "Ld32x32bOp"
+    disc_ldred_setup = (
+        f"""    flash_ldred_atom = cute.make_copy_atom(
+        cute_tcgen05_flash.LdRed32x32bOp(cute_tcgen05_flash.Repetition({cfg.s_load_repetition})), cutlass.Float32)
+    flash_tiled_ldred0 = cute_tcgen05_flash.make_tmem_copy(flash_ldred_atom, tStS0)
+    flash_tiled_ldred1 = cute_tcgen05_flash.make_tmem_copy(flash_ldred_atom, tStS1)
+    flash_thr_ldred0 = flash_tiled_ldred0.get_slice(flash_local_tidx)
+    flash_thr_ldred1 = flash_tiled_ldred1.get_slice(flash_local_tidx)
+    tLDRedtS0 = flash_thr_ldred0.partition_S(tStS0)
+    tLDRedtS1 = flash_thr_ldred1.partition_S(tStS1)
+"""
+        if use_tmem_row_reduce and (cfg.softmax_disc or use_causal_resident_native)
+        else ""
+    )
     tmem_softmax_setup = (
         tmem_base_setup
         + f"""    cS = cute.make_identity_tensor((128, 128))
     tScS = flash_qkt.partition_C(cS)
     flash_ld_atom = cute.make_copy_atom(
-        cute_tcgen05_flash.Ld32x32bOp(cute_tcgen05_flash.Repetition({cfg.s_load_repetition})), cutlass.Float32)
+        cute_tcgen05_flash.{flash_ld_op}(cute_tcgen05_flash.Repetition({
+            cfg.s_load_repetition
+        })), cutlass.Float32)
     flash_tiled_ld0 = cute_tcgen05_flash.make_tmem_copy(flash_ld_atom, tStS0)
     flash_tiled_ld1 = cute_tcgen05_flash.make_tmem_copy(flash_ld_atom, tStS1)
     flash_thr_ld0 = flash_tiled_ld0.get_slice(flash_local_tidx)
@@ -7779,6 +7818,7 @@ flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
     tLDtS0 = flash_thr_ld0.partition_S(tStS0)
     tLDtS1 = flash_thr_ld1.partition_S(tStS1)
     tLDcS = flash_thr_ld0.partition_D(tScS)
+{disc_ldred_setup.rstrip()}
 {score_store_setup.rstrip()}
 
     # Staged-P store atom repetition is autotuned. Rep16 preserves the original
@@ -7792,7 +7832,9 @@ flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
         tScS.layout, cute.make_layout((128, flash_tilePlikeFP32)))
     tScS_P = cute.make_tensor(tScS.iterator, flash_tScS_P_layout)
     flash_st_atom = cute.make_copy_atom(
-        cute_tcgen05_flash.St32x32bOp(cute_tcgen05_flash.Repetition({p_store_repetition})), cutlass.Float32)
+        cute_tcgen05_flash.St32x32bOp(cute_tcgen05_flash.Repetition({
+            p_store_repetition
+        })), cutlass.Float32)
     flash_tiled_st0 = cute_tcgen05_flash.make_tmem_copy(flash_st_atom, tStS0_P)
     flash_tiled_st1 = cute_tcgen05_flash.make_tmem_copy(flash_st_atom, tStS1_P)
     flash_thr_st0 = flash_tiled_st0.get_slice(flash_local_tidx)
@@ -7814,20 +7856,9 @@ flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
 {textwrap.indent(p_store_mixed_setup.strip(), "    ") if p_store_mixed_setup else ""}
 """
     )
-    default_stage_local_softmax_setup = (
-        hd == 64
-        and num_kv >= 1024
-        and not is_causal
-        and not has_lse
-        and not score_plan.modifiers
-    )
     stage_local_softmax_setup = (
-        _flash_bool_env(
-            "HELION_CUTE_FLASH_STAGE_LOCAL_SOFTMAX_SETUP",
-            default_stage_local_softmax_setup,
-        )
-        and not mixed_p_store
-    )
+        use_causal_stateful_softmax or cfg.softmax_setup == "stage_local"
+    ) and not mixed_p_store
 
     def _tmem_softmax_setup_stage(stage: str) -> str:
         ptr_expr = "flash_tmem_ptr" if stage == "0" else "flash_tmem_ptr + 128"
@@ -7852,6 +7883,17 @@ flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
     tLDcS = flash_thr_ld_coord.partition_D(tScS)
 """
         )
+        stage_ldred_setup = (
+            f"""    flash_ldred_atom = cute.make_copy_atom(
+        cute_tcgen05_flash.LdRed32x32bOp(cute_tcgen05_flash.Repetition({cfg.s_load_repetition})), cutlass.Float32)
+    flash_tiled_ldred{stage} = cute_tcgen05_flash.make_tmem_copy(
+        flash_ldred_atom, tStS{stage})
+    flash_thr_ldred{stage} = flash_tiled_ldred{stage}.get_slice(flash_local_tidx)
+    tLDRedtS{stage} = flash_thr_ldred{stage}.partition_S(tStS{stage})
+"""
+            if use_tmem_row_reduce and (cfg.softmax_disc or use_causal_resident_native)
+            else ""
+        )
         return f"""    _helion_flash_rt.named_barrier_wait_unaligned(
         2, 13 * 32)
     flash_tmem_ptr = flash_tmem.retrieve_ptr(cutlass.Float32)
@@ -7861,12 +7903,15 @@ flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
     cS = cute.make_identity_tensor((128, 128))
     tScS = flash_qkt.partition_C(cS)
     flash_ld_atom = cute.make_copy_atom(
-        cute_tcgen05_flash.Ld32x32bOp(cute_tcgen05_flash.Repetition({cfg.s_load_repetition})), cutlass.Float32)
+        cute_tcgen05_flash.{flash_ld_op}(cute_tcgen05_flash.Repetition({
+            cfg.s_load_repetition
+        })), cutlass.Float32)
     flash_tiled_ld{stage} = cute_tcgen05_flash.make_tmem_copy(
         flash_ld_atom, tStS{stage})
     flash_thr_ld{stage} = flash_tiled_ld{stage}.get_slice(flash_local_tidx)
     tLDtS{stage} = flash_thr_ld{stage}.partition_S(tStS{stage})
 {coord_setup.rstrip()}
+{stage_ldred_setup.rstrip()}
 {stage_score_store_setup.rstrip()}
 
     # Staged-P store atom repetition is autotuned. Rep16 preserves the original
@@ -7879,7 +7924,9 @@ flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
         tScS.layout, cute.make_layout((128, flash_tilePlikeFP32)))
     tScS_P = cute.make_tensor(tScS.iterator, flash_tScS_P_layout)
     flash_st_atom = cute.make_copy_atom(
-        cute_tcgen05_flash.St32x32bOp(cute_tcgen05_flash.Repetition({p_store_repetition})), cutlass.Float32)
+        cute_tcgen05_flash.St32x32bOp(cute_tcgen05_flash.Repetition({
+            p_store_repetition
+        })), cutlass.Float32)
     flash_tiled_st{stage} = cute_tcgen05_flash.make_tmem_copy(
         flash_st_atom, tStS{stage}_P)
     flash_thr_st{stage} = flash_tiled_st{stage}.get_slice(flash_local_tidx)
@@ -7980,18 +8027,7 @@ tOsO_tma, tOgO_tma = cute_cpasync_flash.tma_partition(
         if cfg.epi_tma
         else ""
     )
-    # Moving O-TMA partition setup into the epilogue role helps the measured
-    # output-only dense noncausal hd64 32K/65K shapes, but 131K measured
-    # neutral/slower. Also use it for the 2048+ KV-tile family where measured
-    # TMA-O wins.
-    local_epi_tma_setup = (
-        cfg.epi_tma
-        and not is_causal
-        and hd == 64
-        and not has_lse
-        and not score_plan.modifiers
-        and (num_kv < 1024 or num_kv >= 2048)
-    )
+    local_epi_tma_setup = cfg.epi_tma_setup == "role_local"
     epi_stg_setup = (
         f"""
 flash_o_store_bits = 128
@@ -8057,6 +8093,7 @@ if warp_idx == 15:
             f"    cute.arch.setmaxregister_decrease({cfg.other_regs})",
             "",
             persistent,
+            persistent_loop=cfg.persistent_loop,
             prelude="none",
             total_tiles=total_tiles,
             num_m_pairs=num_m_pairs,
@@ -8174,6 +8211,7 @@ if warp_idx == 15:
         epi_head,
         epi_inner,
         persistent,
+        persistent_loop=cfg.persistent_loop,
         prelude=epi_prelude,
         total_tiles=total_tiles,
         num_m_pairs=num_m_pairs,
@@ -8267,6 +8305,7 @@ if warp_idx == 15:
         load_head,
         load_inner,
         persistent,
+        persistent_loop=cfg.persistent_loop,
         prelude=load_prelude_mode,
         tail=load_tail,
         total_tiles=total_tiles,
@@ -8637,6 +8676,7 @@ if warp_idx == 15:
         mma_head,
         mma_role_inner,
         persistent,
+        persistent_loop=cfg.persistent_loop,
         prelude="none",
         tail=mma_tmem_teardown,
         total_tiles=total_tiles,
@@ -8676,13 +8716,36 @@ if warp_idx == 15:
     else:
         _disc_pass2_name = "fa4_disc_exp_convert_store"
         _disc_pass2_causal_name = "fa4_disc_exp_convert_store_causal"
-    softmax_loop_var = "flash_kv_iter" if desc_kv else "flash_kv"
-    softmax_actual_kv = (
-        f"\n            flash_kv = {kv_loop_bound} - cutlass.Int32(1) - flash_kv_iter"
-        if desc_kv
-        else ""
+    causal_hd128_resident = (
+        cfg.exp2_packet in _FLASH_CAUSAL_HD128_RESIDENT_EXP2_PACKETS
+        and hd == 128
+        and io_dtype == "cutlass.BFloat16"
+        and is_causal
+        and cfg.pipeline_family == "fa4"
+        and causal_desc_kv
+        and cfg.causal_loop_split
+        and causal_split_proof.proven
+        and cfg.softmax_disc
+        and cfg.disc_pipe_depth == 2
+        and cfg.s_load_repetition == 32
+        and cfg.p_store_repetition == 16
+        and split_p_arrive
+        and not mixed_p_store
+        and not use_2cta_instrs
+        and _flash_fa4_runtime_disc_score_plan_supported(score_plan)
     )
-    softmax_not_first = "flash_kv_iter != 0" if desc_kv else "flash_kv != 0"
+    causal_hd128_resident_early_acquire = (
+        causal_hd128_resident
+        and cfg.exp2_packet in _FLASH_CAUSAL_HD128_RESIDENT_EXP2_PACKETS
+    )
+    softmax_segment = _FlashSoftmaxLoopSegment(
+        loop_var="flash_kv_iter" if desc_kv else "flash_kv",
+        loop_bound=kv_loop_bound,
+        kv_expr=(
+            f"{kv_loop_bound} - cutlass.Int32(1) - flash_kv_iter" if desc_kv else None
+        ),
+    )
+    softmax_not_first = softmax_segment.not_first_condition
     defer_causal_minus_scale = (
         is_causal and _flash_fa4_runtime_disc_score_plan_supported(score_plan)
     )
@@ -8742,6 +8805,18 @@ if warp_idx == 15:
     # PRE-exp block (decide alpha + pin the max) so the kept-old max feeds the exp
     # PASS via flash_minus_max_scale, and an empty POST-exp piece (no second alpha
     # compute). threshold==0.0 keeps the prior pre/post split byte-identically.
+    if effective_probability_log2_shift:
+        # Keep P, the running denominator, and the output accumulator in the same
+        # power-of-two scaled domain.  The online-softmax recurrence preserves that
+        # common scale across iterations and the final O / l normalization cancels
+        # it.  Folding the offset into the existing scalar bias extends the packed
+        # f16x2 exp2 tail range without a per-element scale-back instruction.
+        sp_minus_max_scale = (
+            f"(cutlass.Float32({float(effective_probability_log2_shift)!r})"
+            " - flash_row_max_safe * _flash_scale_log2)"
+        )
+    else:
+        sp_minus_max_scale = "(0.0 - flash_row_max_safe) * _flash_scale_log2"
     if cfg.rescale_threshold > 0.0:
         sp_pin_condition = (
             f"({softmax_not_first}) & (flash_acc_log >= -{cfg.rescale_threshold})"
@@ -8752,13 +8827,10 @@ if warp_idx == 15:
                 flash_row_max = flash_old_row_max
                 flash_row_max_safe = flash_old_row_max
                 flash_alpha = cutlass.Float32(1.0)
-            flash_minus_max_scale = (0.0 - flash_row_max_safe) * _flash_scale_log2"""
+            flash_minus_max_scale = {sp_minus_max_scale}"""
         _sp_alpha_post = ""
     else:
-        _sp_alpha_pre = (
-            "            flash_minus_max_scale ="
-            " (0.0 - flash_row_max_safe) * _flash_scale_log2"
-        )
+        _sp_alpha_pre = f"            flash_minus_max_scale = {sp_minus_max_scale}"
         _sp_alpha_post = """            flash_alpha = cute.math.exp2(
                 _flash_scale_log2 * (flash_old_row_max - flash_row_max_safe), fastmath=True)"""
 
@@ -8767,9 +8839,6 @@ if warp_idx == 15:
             "_helion_flash_rt.mbar_spin_wait("
             f"flash_s_full_ptr + {stage}, flash_s_full_phase, {cfg.wait_hint})"
         )
-
-    def _softmax_release_p_ready(stage: str) -> str:
-        return ""
 
     def _softmax_inner(
         stage: str,
@@ -8866,6 +8935,49 @@ if warp_idx == 15:
 
         pass2_call = _format_disc_pass2(_disc_pass2_name, causal=False)
         pass2_causal_call = _format_disc_pass2(_disc_pass2_causal_name, causal=True)
+
+        def _format_disc_resident_pass2() -> str:
+            disc_exp2_codegen = _flash_disc_exp2_codegen_params(
+                cfg.exp2_packet, cfg.e2e_freq, cfg.e2e_res
+            )
+            assert not disc_exp2_codegen.degree1_unmasked
+            e2e_offset = str(cfg.e2e_offset0 if stage == "0" else cfg.e2e_offset)
+            resident_layout = (0, 1, 3)
+            args = [
+                *(f"flash_res_frg{chunk}" for chunk in resident_layout),
+                ld,
+                ldt,
+                "tLDcS",
+                st,
+                stt,
+                "tSTcS",
+                "_flash_scale_log2",
+                "flash_minus_max_scale",
+                str(disc_exp2_codegen.e2e_freq),
+                str(disc_exp2_codegen.e2e_res),
+                e2e_offset,
+                f"flash_pfor_ptr + {stage}",
+                f"flash_pfor2_ptr + {stage}",
+                io_dtype,
+            ]
+            if disc_exp2_codegen.pair_batch != 1:
+                args.extend(
+                    [
+                        f"pair_batch={disc_exp2_codegen.pair_batch}",
+                        f"emu_batch={disc_exp2_codegen.emu_batch}",
+                    ]
+                )
+            if disc_exp2_codegen.degree2:
+                args.append("degree2=True")
+            return (
+                "_helion_flash_rt.fa4_disc_exp_convert_store_resident3_013_prefetch2("
+                + ", ".join(args)
+                + ")"
+            )
+
+        resident_pass2_call = (
+            _format_disc_resident_pass2() if causal_hd128_resident else ""
+        )
         zero_pass2_call = (
             "_helion_flash_rt.fa4_disc_zero_store("
             + ", ".join(
@@ -8907,20 +9019,23 @@ if warp_idx == 15:
             ).strip()
         )
 
-        def _corr_publish_alpha(indent: str) -> str:
-            if cfg.skip_rescale_stats:
-                return ""
-            publish_alpha_store = (
-                f"{indent}{_scale_slot_expr(corr_prod_index, stage)} = flash_alpha\n"
-            )
-            publish_alpha_advance = corr_prod_advance.replace("\n", f"\n{indent}")
-            producer_acquire = (
+        def _corr_acquire_alpha(indent: str) -> str:
+            return (
                 ""
                 if fa4_stat_pipeline
                 else f"""{indent}_helion_flash_rt.mbar_spin_wait(
 {indent}    {corr_empty_ptr} + {corr_prod_index}, flash_s_corr_prod_phase, {cfg.wait_hint})
 """
             )
+
+        def _corr_publish_alpha(indent: str, *, acquire: bool = True) -> str:
+            if cfg.skip_rescale_stats:
+                return ""
+            publish_alpha_store = (
+                f"{indent}{_scale_slot_expr(corr_prod_index, stage)} = flash_alpha\n"
+            )
+            publish_alpha_advance = corr_prod_advance.replace("\n", f"\n{indent}")
+            producer_acquire = _corr_acquire_alpha(indent) if acquire else ""
             return f"""{producer_acquire}{publish_alpha_store.rstrip()}
 {indent}_helion_flash_rt.named_barrier_arrive_unaligned(
 {indent}    {3 + int(stage) * 4} + warp_idx % 4, 64)
@@ -8943,14 +9058,18 @@ if warp_idx == 15:
             rowsum_producer_acquire = f"""        _helion_flash_rt.mbar_spin_wait(
             {corr_empty_ptr} + {corr_prod_index}, flash_s_corr_prod_phase, {cfg.wait_hint})
 """
-        corr_publish_rowsum = f"""{rowsum_producer_acquire}        {_scale_slot_expr(corr_prod_index, stage)} = flash_row_sum
+        softmax_row_sum_expr = (
+            "flash_softmax.row_sum[0]"
+            if use_causal_stateful_softmax
+            else "flash_row_sum"
+        )
+        corr_publish_rowsum = f"""{rowsum_producer_acquire}        {_scale_slot_expr(corr_prod_index, stage)} = {softmax_row_sum_expr}
         _helion_flash_rt.named_barrier_arrive_unaligned(
             {3 + int(stage) * 4} + warp_idx % 4, 64)
 {lse_store}
         {corr_rowsum_advance}"""
         # The correction warp consumes per-KV alpha handoffs during the loop and
         # one final row-sum handoff after the loop.
-        final_corr_publish_rowsum = corr_publish_rowsum
         if cfg.softmax_disc:
             if not _flash_fa4_runtime_disc_score_plan_supported(score_plan):
                 score_transform = _flash_score_transform_block(
@@ -8979,75 +9098,121 @@ if warp_idx == 15:
                     else f"""            if {softmax_not_first}:
 {corr_publish_alpha}"""
                 )
+                iteration = _FlashOnlineSoftmaxIteration(
+                    load_and_reduce=rowmax_block,
+                    alpha_pre_probability=_disc_alpha_block,
+                    alpha_publish_pre_probability=alpha_publish,
+                    probability_update=f"""{_disc_minus_scale_block}
+{pass2_block}""",
+                )
+                loop = _format_fa4_online_softmax_loop(
+                    softmax_segment,
+                    iteration,
+                    stage=stage,
+                    wait_hint=cfg.wait_hint,
+                )
                 return f"""        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
         flash_row_sum = cutlass.Float32(0.0)
-        for {softmax_loop_var} in cutlass.range({kv_loop_bound}, unroll=1):{softmax_actual_kv}
-            _helion_flash_rt.mbar_spin_wait(flash_s_full_ptr + {stage}, flash_s_full_phase, {cfg.wait_hint})
-            flash_s_full_phase ^= 1
-            flash_old_row_max = flash_row_max
-{rowmax_block}
-            flash_row_max_safe = flash_row_max
-            if flash_row_max == -cutlass.Float32.inf:
-                flash_row_max_safe = cutlass.Float32(0.0)
-{_disc_alpha_block}
-{alpha_publish}
-{_disc_minus_scale_block}
-{pass2_block}
-            flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum
-{final_corr_publish_rowsum}"""
+{loop}
+{corr_publish_rowsum}"""
             rowmax_dense_call = (
-                f"_helion_flash_rt.fa4_disc_rowmax_balanced("
+                f"_helion_flash_rt.disc_rowmax_ldred("
+                f"flash_tiled_ldred{stage}, tLDRedtS{stage}, tLDcS, "
+                "flash_row_max, flash_LD_CHUNKS)"
+                if use_tmem_row_reduce
+                else f"_helion_flash_rt.fa4_disc_rowmax_balanced("
                 f"{ld}, {ldt}, tLDcS, flash_row_max, flash_LD_CHUNKS)"
             )
             direct_dense_rowmax = f"            flash_row_max = {rowmax_dense_call}"
             direct_dense_pass2 = f"            flash_p_sum = {pass2_call}"
+            if causal_hd128_resident:
+                resident_layout = (0, 1, 3)
+                rowmax_lines = [
+                    "            flash_res_ld_shape = tLDcS[None, 0, None, None].shape"
+                ]
+                for chunk in range(4):
+                    fragment = (
+                        f"flash_res_frg{chunk}"
+                        if chunk in resident_layout
+                        else "flash_res_rowmax_tmp"
+                    )
+                    rowmax_lines.extend(
+                        [
+                            (
+                                f"            {fragment} = cute.make_rmem_tensor("
+                                "flash_res_ld_shape, cutlass.Float32)"
+                            ),
+                            (
+                                f"            cute.copy({ld}, {ldt}[None, {chunk}, "
+                                f"None, None], {fragment})"
+                            ),
+                            (
+                                "            flash_row_max = "
+                                "_helion_flash_rt._fmax_reduce_chunk_balanced("
+                                f"{fragment}, flash_row_max)"
+                            ),
+                        ]
+                    )
+                rowmax_lines.append(
+                    "            cute.arch.fence_view_async_tmem_load()"
+                )
+                unmasked_dense_rowmax = "\n".join(rowmax_lines)
+                unmasked_dense_pass2 = (
+                    f"            flash_p_sum = {resident_pass2_call}"
+                )
+            else:
+                unmasked_dense_rowmax = direct_dense_rowmax
+                unmasked_dense_pass2 = direct_dense_pass2
 
             def _format_disc_loop(
-                loop_var: str,
-                loop_bound: str,
-                actual_kv: str,
-                not_first: str,
+                segment: _FlashSoftmaxLoopSegment,
                 loop_rowmax_block: str,
                 loop_pass2_block: str,
                 *,
-                publish_rowsum: bool = True,
                 zero_first_tile: bool = False,
-                known_not_first: bool = False,
+                early_alpha_acquire: bool = False,
             ) -> str:
-                rowsum_publish = final_corr_publish_rowsum if publish_rowsum else ""
+                assert segment.continues_previous_segment or not early_alpha_acquire
                 if cfg.skip_rescale_stats:
                     alpha_publish = ""
-                elif known_not_first:
-                    alpha_publish = _corr_publish_alpha("            ")
+                elif segment.continues_previous_segment:
+                    alpha_publish = _corr_publish_alpha(
+                        "            ", acquire=not early_alpha_acquire
+                    )
                 else:
-                    alpha_publish = f"""            if {not_first}:
+                    alpha_publish = f"""            if {segment.not_first_condition}:
 {corr_publish_alpha}"""
+                early_acquire = (
+                    _corr_acquire_alpha("            ")
+                    if early_alpha_acquire and not cfg.skip_rescale_stats
+                    else ""
+                )
                 if zero_first_tile:
-                    loop_rowmax_block = f"""            if {not_first}:
+                    loop_rowmax_block = f"""            if {segment.not_first_condition}:
 {textwrap.indent(loop_rowmax_block, "    ")}"""
-                    loop_pass2_block = f"""            if {not_first}:
+                    loop_pass2_block = f"""            if {segment.not_first_condition}:
 {textwrap.indent(loop_pass2_block, "    ")}
             else:
                 flash_p_sum = {zero_pass2_call}"""
                 alpha_block, minus_scale_block = _disc_alpha_blocks_for(
-                    not_first, known_not_first=known_not_first
+                    segment.not_first_condition,
+                    known_not_first=segment.continues_previous_segment,
                 )
-                loop_header = _flash_runtime_range_header(loop_var, loop_bound)
-                return f"""        {loop_header}{actual_kv}
-            _helion_flash_rt.mbar_spin_wait(flash_s_full_ptr + {stage}, flash_s_full_phase, {cfg.wait_hint})
-            flash_s_full_phase ^= 1
-            flash_old_row_max = flash_row_max
-{loop_rowmax_block}
-            flash_row_max_safe = flash_row_max
-            if flash_row_max == -cutlass.Float32.inf:
-                flash_row_max_safe = cutlass.Float32(0.0)
-{alpha_block}
-{alpha_publish}
-{minus_scale_block}
+                iteration = _FlashOnlineSoftmaxIteration(
+                    load_and_reduce=loop_rowmax_block,
+                    alpha_pre_probability=alpha_block,
+                    alpha_publish_pre_probability=alpha_publish,
+                    probability_update=f"""{minus_scale_block}
             flash_p_sum = cutlass.Float32(0.0)
-{loop_pass2_block}
-            flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum
-{rowsum_publish}"""
+{loop_pass2_block}""",
+                    pre_max_update=early_acquire.rstrip(),
+                )
+                return _format_fa4_online_softmax_loop(
+                    segment,
+                    iteration,
+                    stage=stage,
+                    wait_hint=cfg.wait_hint,
+                )
 
             if is_causal:
                 mask_m_tile = score_m_tile_expr
@@ -9065,37 +9230,32 @@ if warp_idx == 15:
                     and cfg.causal_loop_split
                     and causal_split_proof.proven
                 ):
+                    masked_segment, unmasked_segment = (
+                        _flash_causal_split_softmax_segments(
+                            kv_loop_bound,
+                            stage,
+                            split_range_proof=causal_split_proof,
+                        )
+                    )
                     masked_loop = _format_disc_loop(
-                        "flash_kv_mask_iter",
-                        f"{kv_loop_bound} - flash_m_tile{stage}",
-                        (
-                            f"\n            flash_kv = {kv_loop_bound} - "
-                            "cutlass.Int32(1) - flash_kv_mask_iter"
-                        ),
-                        "flash_kv_mask_iter != 0",
+                        masked_segment,
                         direct_causal_rowmax,
                         direct_causal_pass2,
-                        publish_rowsum=False,
                         zero_first_tile=stage == "0",
                     )
                     # The proven split always executes a nonempty masked prefix
                     # before entering its unmasked suffix.
                     unmasked_loop = _format_disc_loop(
-                        "flash_kv_unmask_iter",
-                        f"flash_m_tile{stage}",
-                        (
-                            f"\n            flash_kv = flash_m_tile{stage} - "
-                            "cutlass.Int32(1) - flash_kv_unmask_iter"
-                        ),
-                        "flash_kv_unmask_iter >= cutlass.Int32(0)",
-                        direct_dense_rowmax,
-                        direct_dense_pass2,
-                        known_not_first=True,
+                        unmasked_segment,
+                        unmasked_dense_rowmax,
+                        unmasked_dense_pass2,
+                        early_alpha_acquire=causal_hd128_resident_early_acquire,
                     )
                     return f"""        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
         flash_row_sum = cutlass.Float32(0.0)
 {masked_loop}
-{unmasked_loop}"""
+{unmasked_loop}
+{corr_publish_rowsum}"""
                 rowmax_block = f"""            if flash_kv >= flash_m_tile{stage}:
                 flash_row_max = {rowmax_causal_call}
             else:
@@ -9115,29 +9275,22 @@ if warp_idx == 15:
             # fold + the staged-P pfor/pfor2 arrives, freeing each chunk before the
             # next. Peak live = ONE 32-elem fragment -> fits the 200-grant zero-spill.
             loop = _format_disc_loop(
-                softmax_loop_var,
-                kv_loop_bound,
-                softmax_actual_kv,
-                softmax_not_first,
+                softmax_segment,
                 rowmax_block,
                 pass2_block,
                 zero_first_tile=is_causal and causal_desc_kv and stage == "0",
             )
             return f"""        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
         flash_row_sum = cutlass.Float32(0.0)
-{loop}"""
-        score_transform_m_tile = (
-            f"flash_q_mma_tile{stage} * cutlass.Int32(2)"
-            if use_2cta_instrs
-            else f"flash_m_tile{stage}"
-        )
+{loop}
+{corr_publish_rowsum}"""
         score_transform = _flash_score_transform_block(
             score_plan,
             indent="            ",
             score_tensor="tLDrS",
             coord_tensor="tLDcS",
             bh_expr="flash_bh",
-            m_tile_expr=score_transform_m_tile,
+            m_tile_expr=score_m_tile_expr,
             kv_tile_expr="flash_kv",
         )
         if split_p_arrive:
@@ -9163,7 +9316,34 @@ if warp_idx == 15:
             cute.arch.fence_view_async_tmem_store()
             _helion_flash_rt.mbarrier_arrive(
                 flash_pfor_ptr + {stage}{pfor_peer_arg})"""
-        if cfg.exp2_impl == "split":
+        use_resident_value_graph = (
+            use_causal_resident_value_graph or dense_resident_value_graph_candidate
+        )
+        sp_corr_publish_alpha = ""
+        if use_resident_value_graph:
+            assert split_p_arrive
+            assert not mixed_p_store
+            resident_pfor_args = (
+                f""",
+                pfor_peer_cta_rank=cutlass.Int32(0),
+                pfor_self_cta_rank={pfor_self_cta_rank}"""
+                if dense_resident_value_graph_candidate
+                else ""
+            )
+            sp_exp_block = f"""            flash_row_sum = _helion_flash_rt.resident_softmax_value_graph(
+                tLDrS, {st}, {stt}, tSTcS, _flash_scale_log2,
+                flash_minus_max_scale, flash_pfor_ptr + {stage},
+                flash_pfor2_ptr + {stage}, flash_P_STORE_SPLIT,
+                {corr_empty_ptr} + 0,
+                flash_s_corr_prod_phase, flash_row_sum * flash_alpha,
+                {cfg.wait_hint}{resident_pfor_args})"""
+            sp_p_store_block = ""
+        elif cfg.exp2_impl == "split" or use_causal_resident_native:
+            sp_e2e_offset = (
+                "0"
+                if exp2_codegen.e2e_res == 0
+                else str(cfg.e2e_offset0 if stage == "0" else cfg.e2e_offset)
+            )
             if mixed_p_store:
                 sp_pass2_name = (
                     "fa4_sp_exp_convert_store_rep32_split_whole_rowsum"
@@ -9180,9 +9360,9 @@ if warp_idx == 15:
                     "tSTcS",
                     "_flash_scale_log2",
                     "flash_minus_max_scale",
-                    str(cfg.e2e_freq),
-                    str(cfg.e2e_res),
-                    str(cfg.e2e_offset0 if stage == "0" else cfg.e2e_offset),
+                    str(exp2_codegen.e2e_freq),
+                    str(exp2_codegen.e2e_res),
+                    sp_e2e_offset,
                     f"flash_pfor_ptr + {stage}",
                     f"flash_pfor2_ptr + {stage}",
                     io_dtype,
@@ -9200,9 +9380,9 @@ if warp_idx == 15:
                     "tSTcS",
                     "_flash_scale_log2",
                     "flash_minus_max_scale",
-                    str(cfg.e2e_freq),
-                    str(cfg.e2e_res),
-                    str(cfg.e2e_offset0 if stage == "0" else cfg.e2e_offset),
+                    str(exp2_codegen.e2e_freq),
+                    str(exp2_codegen.e2e_res),
+                    sp_e2e_offset,
                     f"flash_pfor_ptr + {stage}",
                     f"flash_pfor2_ptr + {stage}" if split_p_arrive else "None",
                     "flash_P_STORE_SPLIT",
@@ -9224,18 +9404,19 @@ if warp_idx == 15:
                 sp_pass2_args.append("degree1=True")
             elif exp2_codegen.degree2:
                 sp_pass2_args.append("degree2=True")
+            if use_packed_f16x2_xu:
+                assert not mixed_p_store
+                sp_pass2_args.append("f16x2_xu=True")
             sp_exp_block = (
                 f"            flash_p_sum = _helion_flash_rt.{sp_pass2_name}("
                 + ", ".join(sp_pass2_args)
                 + ")"
             )
             sp_p_store_block = ""
-            sp_corr_publish_alpha = ""
         else:
             sp_exp_block = softmax_exp_block
             sp_p_store_block = p_store_block
-            sp_corr_publish_alpha = ""
-        if not sp_corr_publish_alpha and not cfg.skip_rescale_stats:
+        if not cfg.skip_rescale_stats:
             if acknowledged_stat_pipeline:
                 sp_corr_publish_alpha = f"""            if {softmax_not_first}:
 {corr_publish_alpha}
@@ -9269,33 +9450,240 @@ if warp_idx == 15:
             if acknowledged_stat_pipeline
             else ""
         )
+        if use_whole_row_tmem_reduce:
+            assert not score_transform
+        sp_score_load = (
+            f"""            tLDrS_red = cute.make_rmem_tensor(
+                ((1, 1), *tLDrS.shape[1:]), cutlass.Float32)
+            cute.copy({ld}, {ldt}, (tLDrS, tLDrS_red))
+            cute.arch.fence_view_async_tmem_load()
+            flash_hw_row_max = cutlass.Float32(-cutlass.Float32.inf)
+            for flash_red_i in cutlass.range_constexpr(cute.size(tLDrS_red.shape)):
+                flash_hw_row_max = cute.arch.fmax(
+                    flash_hw_row_max, tLDrS_red[flash_red_i])"""
+            if use_whole_row_tmem_reduce
+            else f"""            cute.copy({ld}, {ldt}, tLDrS)
+            cute.arch.fence_view_async_tmem_load(){score_transform}"""
+        )
+        sp_rowmax = (
+            "            flash_row_max = cute.arch.fmax("
+            "flash_row_max, flash_hw_row_max)"
+            if use_whole_row_tmem_reduce
+            else "            flash_row_max = "
+            "_helion_flash_rt.fmax_reduce_packed(tLDrS, flash_row_max)"
+        )
+        if use_causal_resident_native:
+            assert acknowledged_stat_pipeline
+            assert cfg.exp2_impl == "xu"
+
+            def _format_resident_causal_loop(
+                segment: _FlashSoftmaxLoopSegment,
+                score_load: str,
+                rowmax_update: str,
+            ) -> str:
+                pin_condition = (
+                    f"flash_acc_log >= -{cfg.rescale_threshold}"
+                    if segment.continues_previous_segment
+                    else f"({segment.not_first_condition}) & "
+                    f"(flash_acc_log >= -{cfg.rescale_threshold})"
+                )
+                alpha_pre = f"""            flash_acc_log = _flash_scale_log2 * (flash_old_row_max - flash_row_max_safe)
+            flash_alpha = cute.math.exp2(flash_acc_log, fastmath=True)
+            if {pin_condition}:
+                flash_row_max = flash_old_row_max
+                flash_row_max_safe = flash_old_row_max
+                flash_alpha = cutlass.Float32(1.0)
+            flash_minus_max_scale = (0.0 - flash_row_max_safe) * _flash_scale_log2"""
+                if cfg.skip_rescale_stats:
+                    alpha_publish = ""
+                elif segment.continues_previous_segment:
+                    alpha_publish = _corr_publish_alpha("            ")
+                else:
+                    alpha_publish = f"""            if {segment.not_first_condition}:
+{_corr_publish_alpha("                ")}
+            else:
+                _helion_flash_rt.named_barrier_arrive_unaligned(
+                    {3 + int(stage) * 4} + warp_idx % 4, 64)"""
+                post_p_stat_acquire = (
+                    ""
+                    if use_causal_resident_value_graph
+                    else fa4_post_p_stat_acquire.rstrip()
+                )
+                statistics_update = (
+                    "            flash_s_corr_prod_phase ^= 1"
+                    if use_causal_resident_value_graph
+                    else _FLASH_ONLINE_STATISTICS_UPDATE
+                )
+                iteration = _FlashOnlineSoftmaxIteration(
+                    load_and_reduce=f"""            tLDrS = cute.make_rmem_tensor(tLDcS.shape, cutlass.Float32)
+{score_load}
+{rowmax_update}""",
+                    alpha_pre_probability=alpha_pre,
+                    alpha_publish_pre_probability=alpha_publish,
+                    probability_update=sp_exp_block,
+                    statistics_acquire=post_p_stat_acquire,
+                    statistics_update=statistics_update,
+                )
+                return _format_fa4_online_softmax_loop(
+                    segment,
+                    iteration,
+                    stage=stage,
+                    wait_hint=cfg.wait_hint,
+                )
+
+            masked_score_load = f"""            cute.copy({ld}, {ldt}, tLDrS)
+            cute.arch.fence_view_async_tmem_load(){score_transform}"""
+            masked_rowmax = (
+                "            flash_row_max = "
+                "_helion_flash_rt.fmax_reduce_packed(tLDrS, flash_row_max)"
+            )
+            unmasked_score_load = f"""            tLDrS_red = cute.make_rmem_tensor(
+                ((1, 1), *tLDrS.shape[1:]), cutlass.Float32)
+            cute.copy(
+                flash_tiled_ldred{stage}, tLDRedtS{stage}, (tLDrS, tLDrS_red))
+            cute.arch.fence_view_async_tmem_load()
+            flash_hw_row_max = cutlass.Float32(-cutlass.Float32.inf)
+            for flash_red_i in cutlass.range_constexpr(cute.size(tLDrS_red.shape)):
+                flash_hw_row_max = cute.arch.fmax(
+                    flash_hw_row_max, tLDrS_red[flash_red_i])"""
+            unmasked_rowmax = (
+                "            flash_row_max = "
+                "cute.arch.fmax(flash_row_max, flash_hw_row_max)"
+            )
+            if use_causal_stateful_softmax:
+                assert not use_causal_resident_value_graph
+
+                def _format_stateful_softmax_step(
+                    score_load: str,
+                    rowmax_call: str,
+                    *,
+                    indent: str,
+                    is_first: bool,
+                ) -> str:
+                    alpha_publish = (
+                        f"""{indent}_helion_flash_rt.named_barrier_arrive_unaligned(
+{indent}    {3 + int(stage) * 4} + warp_idx % 4, 64)"""
+                        if is_first
+                        else _corr_publish_alpha(indent)
+                    )
+                    row_sum_first_arg = ", True" if is_first else ""
+                    score_load_at_indent = textwrap.indent(
+                        textwrap.dedent(score_load), indent
+                    )
+                    return f"""{indent}{_softmax_wait_s_ready(stage)}
+{indent}flash_s_full_phase ^= 1
+{indent}tLDrS = cute.make_rmem_tensor(tLDcS.shape, cutlass.Float32)
+{score_load_at_indent}
+{indent}flash_row_max_safe, flash_alpha = flash_softmax.{rowmax_call}
+{alpha_publish}
+{indent}flash_softmax.scale_subtract_rowmax(tLDrS, flash_row_max_safe)
+{indent}flash_tSrP_f32 = cute.make_rmem_tensor(tSTcS.shape, cutlass.Float32)
+{indent}flash_tSrP = cute.make_tensor(
+{indent}    cute.recast_ptr(flash_tSrP_f32.iterator, dtype={io_dtype}),
+{indent}    tLDrS.layout)
+{indent}flash_softmax.apply_exp2_convert(tLDrS, flash_tSrP)
+{indent}for flash_ci in cutlass.range_constexpr(flash_P_STORE_SPLIT):
+{indent}    cute.copy({st}, flash_tSrP_f32[None, None, flash_ci],
+{indent}              {stt}[None, None, flash_ci])
+{indent}cute.arch.fence_view_async_tmem_store()
+{indent}_helion_flash_rt.mbarrier_arrive(flash_pfor_ptr + {stage})
+{indent}for flash_ci in cutlass.range_constexpr(
+{indent}        flash_P_STORE_SPLIT, flash_P_STORE_CHUNKS):
+{indent}    cute.copy({st}, flash_tSrP_f32[None, None, flash_ci],
+{indent}              {stt}[None, None, flash_ci])
+{indent}cute.arch.fence_view_async_tmem_store()
+{indent}_helion_flash_rt.mbarrier_arrive(flash_pfor2_ptr + {stage})
+{indent}_helion_flash_rt.mbar_spin_wait(
+{indent}    {corr_empty_ptr} + 0, flash_s_corr_prod_phase, {cfg.wait_hint})
+{indent}flash_softmax.update_row_sum(
+{indent}    tLDrS.load(), flash_alpha{row_sum_first_arg})
+{indent}flash_s_corr_prod_phase ^= 1"""
+
+                first_step = _format_stateful_softmax_step(
+                    masked_score_load,
+                    "update_row_max_masked(tLDrS.load(), True)",
+                    indent="        ",
+                    is_first=True,
+                )
+                masked_tail_step = _format_stateful_softmax_step(
+                    masked_score_load,
+                    "update_row_max_masked(tLDrS.load(), False)",
+                    indent="            ",
+                    is_first=False,
+                )
+                unmasked_step = _format_stateful_softmax_step(
+                    unmasked_score_load,
+                    "update_row_max_precomputed(flash_hw_row_max, False)",
+                    indent="            ",
+                    is_first=False,
+                )
+                return f"""{fa4_entry_stat_acquire}        flash_softmax = _helion_flash_rt.ResidentSoftmaxState.create(
+            _flash_scale_log2, rescale_threshold={cfg.rescale_threshold})
+        flash_kv = {kv_loop_bound} - cutlass.Int32(1)
+{first_step}
+        for flash_kv_mask_iter in cutlass.range(
+                {kv_loop_bound} - flash_m_tile{stage} - cutlass.Int32(1), unroll=1):
+            flash_kv = {kv_loop_bound} - cutlass.Int32(2) - flash_kv_mask_iter
+{masked_tail_step}
+        for flash_kv_unmask_iter in cutlass.range(flash_m_tile{stage}, unroll=1):
+            flash_kv = flash_m_tile{stage} - cutlass.Int32(1) - flash_kv_unmask_iter
+{unmasked_step}
+{corr_publish_rowsum}"""
+            masked_segment, unmasked_segment = _flash_causal_split_softmax_segments(
+                kv_loop_bound,
+                stage,
+                split_range_proof=causal_split_proof,
+            )
+            masked_loop = _format_resident_causal_loop(
+                masked_segment,
+                masked_score_load,
+                masked_rowmax,
+            )
+            unmasked_loop = _format_resident_causal_loop(
+                unmasked_segment,
+                unmasked_score_load,
+                unmasked_rowmax,
+            )
+            return f"""{fa4_entry_stat_acquire}        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
+        flash_row_sum = cutlass.Float32(0.0)
+{masked_loop}
+{unmasked_loop}
+{corr_publish_rowsum}"""
+        post_p_stat_acquire = (
+            ""
+            if dense_resident_value_graph_candidate
+            else fa4_post_p_stat_acquire.rstrip()
+        )
+        statistics_update = (
+            "            flash_s_corr_prod_phase ^= 1"
+            if dense_resident_value_graph_candidate
+            else _FLASH_ONLINE_STATISTICS_UPDATE
+        )
+        iteration = _FlashOnlineSoftmaxIteration(
+            load_and_reduce=f"""            tLDrS = cute.make_rmem_tensor(tLDcS.shape, cutlass.Float32)
+{sp_score_load}
+{sp_rowmax}""",
+            alpha_pre_probability=_sp_alpha_pre,
+            alpha_publish_pre_probability=sp_alpha_publish_pre,
+            probability_update=sp_exp_block,
+            alpha_post_probability=_sp_alpha_post,
+            alpha_publish_post_probability=sp_alpha_publish_post,
+            statistics_acquire=post_p_stat_acquire,
+            statistics_update=statistics_update,
+            post_statistics=sp_p_store_block,
+        )
+        loop = _format_fa4_online_softmax_loop(
+            softmax_segment,
+            iteration,
+            stage=stage,
+            wait_hint=cfg.wait_hint,
+        )
         return f"""{
             fa4_entry_stat_acquire
         }        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
         flash_row_sum = cutlass.Float32(0.0)
-        for {softmax_loop_var} in cutlass.range({kv_loop_bound}, unroll=1):{
-            softmax_actual_kv
-        }
-            {_softmax_wait_s_ready(stage)}
-            flash_s_full_phase ^= 1
-            flash_old_row_max = flash_row_max
-            tLDrS = cute.make_rmem_tensor(tLDcS.shape, cutlass.Float32)
-            cute.copy({ld}, {ldt}, tLDrS)
-            cute.arch.fence_view_async_tmem_load(){score_transform}
-            flash_row_max = _helion_flash_rt.fmax_reduce_packed(tLDrS, flash_row_max)
-            flash_row_max_safe = flash_row_max
-            if flash_row_max == -cutlass.Float32.inf:
-                flash_row_max_safe = cutlass.Float32(0.0)
-{_sp_alpha_pre}
-{sp_alpha_publish_pre}
-{sp_exp_block}
-{_softmax_release_p_ready(stage)}
-{_sp_alpha_post}
-{sp_alpha_publish_post}
-{fa4_post_p_stat_acquire.rstrip()}
-            flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum
-{sp_p_store_block}
-{final_corr_publish_rowsum}"""
+{loop}
+{corr_publish_rowsum}"""
 
     softmax0_setup = (
         _tmem_softmax_setup_stage("0")
@@ -9370,6 +9758,7 @@ if warp_idx == 15:
         softmax0_head,
         softmax0_inner,
         persistent,
+        persistent_loop=cfg.persistent_loop,
         prelude=softmax_prelude,
         tail=_softmax_tail("0"),
         total_tiles=total_tiles,
@@ -9386,6 +9775,7 @@ if warp_idx == 15:
         softmax1_head,
         softmax1_inner,
         persistent,
+        persistent_loop=cfg.persistent_loop,
         prelude=softmax_prelude,
         tail=_softmax_tail("1"),
         total_tiles=total_tiles,
@@ -9513,7 +9903,7 @@ if warp_idx == 15:
             flash_rego{stage} = cute.make_rmem_tensor(tDgO{stage}[None, None, 0].shape, {io_dtype})
             cute.copy(flash_tiled_o_ld{stage}, tDtO{stage}[None, None, flash_i], flash_reg{stage})
             _helion_flash_rt._scale_fragment_packed_f32x2(
-                flash_reg{stage}, flash_inv_sum{stage})
+                flash_reg{stage}, flash_inv_sum{stage}){direct_relu_store.format(stage=stage)}
             flash_rego{stage}.store(flash_reg{stage}.load().to({io_dtype}))
             cute.autovec_copy(flash_rego{stage}, tDgO{stage}[None, None, flash_i])"""
         # FAITHFUL FA4 correction_epilogue port. Per corr-chunk: t2r 16 O cols ->
@@ -9531,7 +9921,7 @@ if warp_idx == 15:
         {_corr_wait_epi_empty(stage)}
         _helion_flash_rt.{scoped_corr_epi_fn}(
             flash_pvt, tOtO{stage}, sO[None, None, {stage}], flash_local_tidx,
-            flash_inv_sum{stage}, {hd}, {cfg.corr_tile_size}, {io_dtype})
+            flash_inv_sum{stage}, {hd}, {cfg.corr_tile_size}, {io_dtype}{staged_relu_keyword})
         cute.arch.fence_view_async_shared()
         {_corr_commit_epi_full(stage)}
 """
@@ -9545,7 +9935,7 @@ if warp_idx == 15:
             flash_corr_epi_full_ptr + {stage},
             flash_pvt, tOtO{stage}, sO[None, None, {stage}], flash_local_tidx,
             flash_inv_sum{stage}, {hd}, {cfg.corr_tile_size}, {io_dtype},
-            {cfg.wait_hint})
+            {cfg.wait_hint}{staged_relu_keyword})
 """
         return f"""        _helion_flash_rt.named_barrier_wait_unaligned(
             {3 + int(stage) * 4} + warp_idx % 4, 64)
@@ -9557,7 +9947,7 @@ if warp_idx == 15:
             flash_corr_epi_full_ptr + {stage},
             flash_o_tiled_t2r, flash_o_tiled_r2s,
             tOtO{stage}_corr_t2r, tOsO{stage}_corr_r2s, tOcO_corr_t2r,
-            flash_inv_sum{stage}, flash_o_corr_chunks, {cfg.wait_hint})
+            flash_inv_sum{stage}, flash_o_corr_chunks, {cfg.wait_hint}{staged_relu_keyword})
 """
 
     corr_epi_empty_toggle = (
@@ -9578,23 +9968,25 @@ if warp_idx == 15:
     )
     corr_empty0_late = (
         ""
-        if not is_causal
+        if not is_causal or fa4_stat_pipeline
         else "            cute.arch.mbarrier_arrive("
         "flash_s0_corr_empty_ptr + flash_s_corr_cons_index)"
     )
     corr_empty1_late = (
         ""
-        if not is_causal
+        if not is_causal or fa4_stat_pipeline
         else "            cute.arch.mbarrier_arrive("
         "flash_s1_corr_empty_ptr + flash_s_corr_cons_index)"
     )
     corr_cross_release0 = (
-        "            cute.arch.mbarrier_arrive(flash_s1_corr_empty_ptr + 0)"
+        "            cute.arch.mbarrier_arrive("
+        f"flash_s{'0' if stat_release_mapping is FlashStatReleaseMapping.SAME_SLOT else '1'}_corr_empty_ptr + 0)"
         if acknowledged_stat_pipeline
         else ""
     )
     corr_cross_release1 = (
-        "            cute.arch.mbarrier_arrive(flash_s0_corr_empty_ptr + 0)"
+        "            cute.arch.mbarrier_arrive("
+        f"flash_s{'1' if stat_release_mapping is FlashStatReleaseMapping.SAME_SLOT else '0'}_corr_empty_ptr + 0)"
         if acknowledged_stat_pipeline
         else ""
     )
@@ -9631,14 +10023,22 @@ if warp_idx == 15:
             3 + warp_idx % 4, 64)
         cute.arch.mbarrier_arrive(flash_s0_corr_empty_ptr + 0)
         _helion_flash_rt.named_barrier_wait_unaligned(
-            7 + warp_idx % 4, 64)
-"""
+            7 + warp_idx % 4, 64)"""
+        + (
+            "\n        cute.arch.mbarrier_arrive(flash_s1_corr_empty_ptr + 0)"
+            if stat_release_mapping is FlashStatReleaseMapping.SAME_SLOT
+            else ""
+        )
+        + "\n"
         if acknowledged_stat_pipeline
         else ""
     )
     corr_stat_release_held = (
         "        cute.arch.mbarrier_arrive(flash_s1_corr_empty_ptr + 0)\n"
-        if acknowledged_stat_pipeline
+        if (
+            acknowledged_stat_pipeline
+            and stat_release_mapping is FlashStatReleaseMapping.CROSS_SLOT
+        )
         else ""
     )
     corr_final_stat_release = (
@@ -9654,7 +10054,10 @@ if warp_idx == 15:
     corr_output_m_tile1 = output_m_tile1 if not epi_smem else "flash_m_tile1"
     corr_steady_stages = (
         f"{corr_stage1}\n{corr_stage0}"
-        if cfg.exp2_packet == _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET
+        if (
+            cfg.exp2_packet == _FLASH_DEG1_SHORT_CORR10_EXP2_PACKET
+            and not acknowledged_stat_pipeline
+        )
         else f"{corr_stage0}\n{corr_stage1}"
     )
     if cfg.skip_rescale_stats:
@@ -9688,6 +10091,7 @@ if warp_idx == 15:
         corr_head,
         corr_inner,
         persistent,
+        persistent_loop=cfg.persistent_loop,
         prelude=corr_prelude,
         tail=tmem_dealloc_arrive,
         total_tiles=total_tiles,
@@ -9724,6 +10128,7 @@ def emit_flash_device_body(
     has_lse: bool,
     io_dtype: str,
     score_plan: AttentionScorePlan,
+    output_epilogue: str = _FLASH_OUTPUT_EPILOGUE_IDENTITY,
 ) -> list[ast.stmt]:
     """Build the spike kernel device body, adapted for Helion's 3D tensors.
 
@@ -9745,6 +10150,10 @@ def emit_flash_device_body(
     ``long_scoreboard`` stall.
     """
     hd = head_dim
+    relu_output = _flash_output_relu_enabled(output_epilogue)
+    relu_store = (
+        "\n    _helion_flash_rt.relu_fragment_inplace(flash_reg)" if relu_output else ""
+    )
     kv_stage = cfg.kv_stage
     flash_prologue = min(kv_stage, num_kv)
     # Phase split: PREFETCH iters each issue the K/V load {kv_stage} tiles ahead;
@@ -9952,7 +10361,7 @@ flash_reg = cute.make_rmem_tensor(tDgO[None, None, 0].shape, cutlass.Float32)
 flash_rego = cute.make_rmem_tensor(tDgO[None, None, 0].shape, {io_dtype})
 for flash_i in cutlass.range(cute.size(tDtO, mode=[2])):
     cute.copy(flash_tiled_o_ld, tDtO[None, None, flash_i], flash_reg)
-    flash_reg.store(flash_reg.load() * flash_inv_sum)
+    flash_reg.store(flash_reg.load() * flash_inv_sum){relu_store}
     flash_rego.store(flash_reg.load().to({io_dtype}))
     cute.autovec_copy(flash_rego, tDgO[None, None, flash_i])
 {lse_store}
@@ -10030,6 +10439,7 @@ class FlashTensorPlan(NamedTuple):
     k_arg: TensorArg
     v_arg: TensorArg
     o_arg: TensorArg
+    output_epilogue: str
     lse_arg: TensorArg | None
     lse_log_base: str | None
     bias_args: tuple[TensorArg, ...]
@@ -10041,38 +10451,6 @@ class FlashTensorPlan(NamedTuple):
     dtype: torch.dtype
     tensor_4d_batch: int
     tensor_4d_heads: int
-
-
-def _flash_4d_base_batch_heads(
-    arg: TensorArg,
-    *,
-    batch: int,
-    seq: int,
-    head_dim: int,
-    dtype: torch.dtype,
-) -> tuple[int, int] | None:
-    """Return ``(z, h)`` when a flattened 3D flash view came from ``[z,h,s,d]``."""
-    value = arg.fake_value
-    base = value._base
-    if base is None:
-        return None
-    if (
-        base.ndim != 4
-        or base.dtype != dtype
-        or not base.is_contiguous()
-        or int(base.shape[2]) != seq
-        or int(base.shape[3]) != head_dim
-        or int(value.storage_offset()) != 0
-        or int(base.storage_offset()) != 0
-    ):
-        return None
-    tensor_4d_batch = int(base.shape[0])
-    tensor_4d_heads = int(base.shape[1])
-    if tensor_4d_batch <= 0 or tensor_4d_heads <= 0:
-        return None
-    if tensor_4d_batch * tensor_4d_heads != batch:
-        return None
-    return tensor_4d_batch, tensor_4d_heads
 
 
 def _flash_current_block_ids(
@@ -10216,42 +10594,31 @@ def flash_attention_tensor_plan(df: DeviceFunction) -> FlashTensorPlan | None:
             return None
     tensor_4d_batch = 0
     tensor_4d_heads = 0
-    if (
-        graph_plan.dtype is torch.float16
-        and graph_plan.head_dim == 64
-        and not resolved_bias_args
-        and not resolved_alibi_args
-        and not resolved_document_args
+    if score_plan is not None and _flash_values_support_tensor_4d_tma(
+        q_arg.fake_value,
+        k_arg.fake_value,
+        v_arg.fake_value,
+        score_plan=score_plan,
+        batch=graph_plan.batch,
+        seq=graph_plan.seq,
+        head_dim=graph_plan.head_dim,
+        dtype=graph_plan.dtype,
     ):
-        q_base_shape = _flash_4d_base_batch_heads(
-            q_arg,
+        q_base_shape = _flash_4d_value_base_batch_heads(
+            q_arg.fake_value,
             batch=graph_plan.batch,
             seq=graph_plan.seq,
             head_dim=graph_plan.head_dim,
             dtype=graph_plan.dtype,
         )
-        if q_base_shape is not None:
-            k_base_shape = _flash_4d_base_batch_heads(
-                k_arg,
-                batch=graph_plan.batch,
-                seq=graph_plan.seq,
-                head_dim=graph_plan.head_dim,
-                dtype=graph_plan.dtype,
-            )
-            v_base_shape = _flash_4d_base_batch_heads(
-                v_arg,
-                batch=graph_plan.batch,
-                seq=graph_plan.seq,
-                head_dim=graph_plan.head_dim,
-                dtype=graph_plan.dtype,
-            )
-            if k_base_shape == q_base_shape and v_base_shape == q_base_shape:
-                tensor_4d_batch, tensor_4d_heads = q_base_shape
+        assert q_base_shape is not None
+        tensor_4d_batch, tensor_4d_heads = q_base_shape
     return FlashTensorPlan(
         q_arg,
         k_arg,
         v_arg,
         o_arg,
+        graph_plan.output_epilogue,
         lse_arg,
         graph_plan.lse_log_base,
         tuple(resolved_bias_args),
@@ -10286,6 +10653,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
     if plan is None:
         return False
     q_arg, k_arg, v_arg, o_arg = plan.q_arg, plan.k_arg, plan.v_arg, plan.o_arg
+    output_epilogue = plan.output_epilogue
     lse_arg = plan.lse_arg
     bias_args = plan.bias_args
     alibi_args = plan.alibi_args
@@ -10311,9 +10679,29 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
     document_masks = score_plan.document_masks
     if len(document_masks) != len(document_args):
         return False
+    if lse_arg is not None and batch * seq > 1 << 31:
+        return False
 
     scale_log2 = score_plan.qk_scale_log2
     num_kv = (seq + 127) // 128
+    small_biased_candidate = _small_biased_attention_score_plan_supported(
+        score_plan,
+        seq=seq,
+        head_dim=head_dim,
+        io_dtype=io_dtype,
+        has_lse=lse_arg is not None,
+        bias_arg_count=len(bias_args),
+    )
+    supports_tensor_4d_tma = _flash_values_support_tensor_4d_tma(
+        plan.q_arg.fake_value,
+        plan.k_arg.fake_value,
+        plan.v_arg.fake_value,
+        score_plan=score_plan,
+        batch=batch,
+        seq=seq,
+        head_dim=head_dim,
+        dtype=io_dtype,
+    )
     flash_config: Mapping[str, object] | None = df.config
     if score_plan.requires_ws_overlap:
         flash_config = {**df.config, FLASH_PIPELINE_FAMILY_KEY: "ws_overlap"}
@@ -10322,7 +10710,11 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         num_kv,
         flash_config,
         dtype=io_dtype,
+        num_bh=batch,
         is_causal=is_causal,
+        has_kv_tile_pruning=score_plan.has_kv_tile_pruning,
+        requires_ws_overlap=score_plan.requires_ws_overlap,
+        small_biased_candidate=small_biased_candidate,
         standard_dense_output=(
             not is_causal
             and lse_arg is None
@@ -10331,8 +10723,19 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
             and not document_args
             and _standard_dense_score_plan_supported(score_plan)
         ),
+        standard_causal_output=(
+            is_causal
+            and lse_arg is None
+            and not bias_args
+            and not alibi_args
+            and not document_args
+            and _standard_causal_score_plan_supported(score_plan)
+        ),
+        supports_tensor_4d_tma=supports_tensor_4d_tma,
         prefer_packed_reduce=bool(score_plan.modifiers),
     )
+    if _flash_output_requires_tma(batch, seq, head_dim) and not cfg.epi_tma:
+        return False
     clc_heads_per_batch = cfg.clc_heads_per_batch
     if (
         cfg.use_clc_scheduler
@@ -10502,6 +10905,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
                     has_lse=lse_arg is not None,
                     io_dtype=io_dtype_str,
                     score_plan=score_plan,
+                    output_epilogue=output_epilogue,
                 )
             )
         else:
@@ -10514,9 +10918,12 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
                     has_lse=lse_arg is not None,
                     io_dtype=io_dtype_str,
                     score_plan=score_plan,
+                    output_epilogue=output_epilogue,
                 )
             )
     elif cfg.topology == "fa4":
+        from ..compile_environment import CompileEnvironment
+
         df.cute_state.attention_flash_threads = 512
         df.body = list(
             emit_flash_fa4_device_body(
@@ -10532,6 +10939,10 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
                 score_plan=score_plan,
                 tensor_4d_batch=plan.tensor_4d_batch if use_tensor_4d_tma else 0,
                 tensor_4d_heads=plan.tensor_4d_heads if use_tensor_4d_tma else 0,
+                target_device_capability=(
+                    CompileEnvironment.current().config_spec.target_device_capability
+                ),
+                output_epilogue=output_epilogue,
             )
         )
     else:

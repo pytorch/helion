@@ -10,6 +10,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import inspect
+import json
 import os
 import sys
 import threading
@@ -18,6 +19,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import NamedTuple
+from unittest.mock import Mock
 from unittest.mock import patch
 
 import numpy as np
@@ -30,7 +32,9 @@ import helion.autotuner.aot_cache as aot_cache_module
 from helion.autotuner.aot_cache import AOTAutotuneCache
 from helion.autotuner.aot_cache import ShapeKey
 from helion.autotuner.aot_cache import _deserialize_tuple
+from helion.autotuner.aot_cache import _deserialize_value
 from helion.autotuner.aot_cache import _serialize_tuple
+from helion.autotuner.aot_cache import _serialize_value
 from helion.autotuner.aot_cache import get_aot_mode
 from helion.autotuner.aot_compile import _standalone_call_key
 from helion.autotuner.aot_compile import generate_standalone_file
@@ -74,6 +78,213 @@ class TestShapeKey:
 
         key3 = ShapeKey("k", (1, 2, 4), "hw")
         assert key1.stable_hash() != key3.stable_hash()
+
+    def test_search_policy_is_structural_and_legacy_serialization_is_unchanged(
+        self,
+    ) -> None:
+        legacy = ShapeKey("k", (1, 2, 3), "hw")
+        policy = ShapeKey("k", (1, 2, 3), "hw", search_policy_hash="full-v1")
+
+        assert "search_policy_hash" not in legacy.to_dict()
+        assert legacy.stable_hash() == "7736dd40a5cb84bd"
+        assert policy.to_dict()["search_policy_hash"] == "full-v1"
+        assert legacy.stable_hash() != policy.stable_hash()
+        assert ShapeKey.from_dict(legacy.to_dict()).search_policy_hash == ""
+
+    def test_aot_shape_key_includes_cute_flash_search_policy(self) -> None:
+        cache = object.__new__(AOTAutotuneCache)
+        cache.autotuner = SimpleNamespace()
+        cache.args = ()
+        cache.hardware_id = "hw"
+        specialization_key = Mock(return_value=("shape",))
+        cache.kernel = SimpleNamespace(
+            config_spec=SimpleNamespace(cute_flash_search_enabled=True),
+            kernel=SimpleNamespace(
+                name="kernel",
+                specialization_key=specialization_key,
+            ),
+        )
+
+        with patch(
+            "helion.autotuner.local_cache._cute_flash_search_policy_hash",
+            return_value="full-v1",
+        ) as policy_hash:
+            key = cache._create_shape_key()
+
+        assert key.search_policy_hash == "full-v1"
+        specialization_key.assert_called_once_with(())
+        policy_hash.assert_called_once_with(
+            cache.autotuner,
+            cute_flash_search_enabled=True,
+        )
+
+    def test_aot_shape_key_preserves_uncacheable_instance_identity(self) -> None:
+        cache = object.__new__(AOTAutotuneCache)
+        first_autotuner = SimpleNamespace(_search_policy_cacheable=True)
+        cache.autotuner = first_autotuner
+        cache.args = ()
+        cache.hardware_id = "hw"
+        cache.kernel = SimpleNamespace(
+            config_spec=SimpleNamespace(cute_flash_search_enabled=True),
+            kernel=SimpleNamespace(
+                name="kernel",
+                specialization_key=Mock(return_value=("shape",)),
+            ),
+        )
+        nonces = iter(("random-nonce-1", "random-nonce-2", "random-nonce-3"))
+
+        def uncacheable_policy(autotuner, *, cute_flash_search_enabled):
+            assert cute_flash_search_enabled
+            autotuner._search_policy_cacheable = False
+            return next(nonces)
+
+        with patch(
+            "helion.autotuner.local_cache._cute_flash_search_policy_hash",
+            side_effect=uncacheable_policy,
+        ):
+            first = cache._create_shape_key()
+        cache.autotuner = SimpleNamespace(_search_policy_cacheable=True)
+        with patch(
+            "helion.autotuner.local_cache._cute_flash_search_policy_hash",
+            side_effect=uncacheable_policy,
+        ):
+            second = cache._create_shape_key()
+
+        assert first.search_policy_hash == "random-nonce-1"
+        assert second.search_policy_hash == "random-nonce-2"
+        assert first != second
+
+    def test_uncacheable_policy_still_uses_aot_evaluate_selection(self) -> None:
+        selected = Config(block_sizes=[8])
+        cache = object.__new__(AOTAutotuneCache)
+        cache.mode = "evaluate"
+        cache._verbose = False
+        cache.autotuner = SimpleNamespace(
+            _search_policy_cacheable=False,
+            log=Mock(),
+        )
+        cache.args = ()
+        cache.get = Mock(return_value=selected)  # type: ignore[method-assign]
+        cache._maybe_run_input_fn_workflows = Mock()  # type: ignore[method-assign]
+        cache._run_autotune_trials = Mock()  # type: ignore[method-assign]
+
+        result = cache.autotune()
+
+        assert result == selected
+        cache.get.assert_called_once_with()
+        cache._run_autotune_trials.assert_not_called()
+
+    def test_uncacheable_policy_still_persists_aot_collection(self) -> None:
+        selected = Config(block_sizes=[8])
+        cache = object.__new__(AOTAutotuneCache)
+        cache.mode = "collect"
+        cache.autotuner = SimpleNamespace(
+            _search_policy_cacheable=False,
+            log=Mock(),
+        )
+        cache.args = ()
+        cache.get = Mock()  # type: ignore[method-assign]
+        cache.put = Mock()  # type: ignore[method-assign]
+        cache._maybe_run_input_fn_workflows = Mock()  # type: ignore[method-assign]
+        cache._run_autotune_trials = Mock(  # type: ignore[method-assign]
+            return_value=selected
+        )
+
+        result = cache.autotune()
+
+        assert result == selected
+        cache.get.assert_not_called()
+        cache.put.assert_called_once_with(selected)
+
+
+@onlyBackends(["triton", "cute"])
+class TestCodeSerialization:
+    """Tests for specialization keys containing function code objects (e.g. callable kernel args)."""
+
+    def test_code_round_trips_through_serialize_value(self) -> None:
+        def fn(v):
+            return v * 2
+
+        serialized = _serialize_value(fn.__code__)
+        deserialized = _deserialize_value(serialized)
+        assert deserialized == (
+            fn.__code__.co_code,
+            fn.__code__.co_consts,
+            fn.__code__.co_names,
+        )
+
+    def test_stable_hash_same_for_rename(self) -> None:
+        def double(v):
+            return v * 2
+
+        def double_renamed(v):
+            return v * 2
+
+        h1 = ShapeKey("k", (double.__code__,), "hw").stable_hash()
+        h2 = ShapeKey("k", (double_renamed.__code__,), "hw").stable_hash()
+        assert h1 == h2
+
+    def test_stable_hash_differs_for_behavior_change(self) -> None:
+        def double(v):
+            return v * 2
+
+        def triple(v):
+            return v * 3
+
+        h1 = ShapeKey("k", (double.__code__,), "hw").stable_hash()
+        h2 = ShapeKey("k", (triple.__code__,), "hw").stable_hash()
+        assert h1 != h2
+
+    def test_stable_hash_differs_for_nested_lambda_behavior_change(self) -> None:
+        def with_nested_lambda_2():
+            return lambda v: v * 2
+
+        def with_nested_lambda_3():
+            return lambda v: v * 3
+
+        h1 = ShapeKey("k", (with_nested_lambda_2.__code__,), "hw").stable_hash()
+        h2 = ShapeKey("k", (with_nested_lambda_3.__code__,), "hw").stable_hash()
+        assert h1 != h2
+
+    def test_stable_hash_for_conames(self) -> None:
+        def with_sin(v):
+            return v.sin()
+
+        def with_cos(v):
+            return v.cos()
+
+        h1 = ShapeKey("k", (with_sin.__code__,), "hw").stable_hash()
+        h2 = ShapeKey("k", (with_cos.__code__,), "hw").stable_hash()
+        assert h1 != h2
+
+    def test_code_serializes_complex_and_ellipsis_consts(self) -> None:
+        def with_complex(v):
+            return v * 1j
+
+        def with_ellipsis(v):  # noqa: FURB118
+            return v[...]
+
+        for fn in (with_complex, with_ellipsis):
+            serialized = _serialize_value(fn.__code__)
+            json.dumps(serialized)  # must not raise
+            assert _deserialize_value(serialized) == (
+                fn.__code__.co_code,
+                fn.__code__.co_consts,
+                fn.__code__.co_names,
+            )
+
+    def test_stable_hash_survives_save_load_round_trip(self) -> None:
+        def fn(v):
+            return v * 2
+
+        key = ShapeKey("k", (fn.__code__,), "hw")
+        original_hash = key.stable_hash()
+
+        # Simulate a JSON save/load cycle
+        reloaded = ShapeKey.from_dict(json.loads(json.dumps(key.to_dict())))
+        assert reloaded.stable_hash() == original_hash
+        reloaded_again = ShapeKey.from_dict(json.loads(json.dumps(reloaded.to_dict())))
+        assert reloaded_again.stable_hash() == original_hash
 
 
 @onlyBackends(["triton", "cute"])
@@ -581,7 +792,11 @@ def test_aot_cache_canonicalizes_defaults_for_compile_get(
         normalize_args=normalize_args,
         specialization_key=lambda args: tuple(args),
     )
-    bound_kernel = SimpleNamespace(kernel=kernel_api, is_cacheable=lambda: True)
+    bound_kernel = SimpleNamespace(
+        kernel=kernel_api,
+        config_spec=SimpleNamespace(cute_flash_search_enabled=False),
+        is_cacheable=lambda: True,
+    )
     autotuner = SimpleNamespace(kernel=bound_kernel, args=(tensor,))
     monkeypatch.setenv("HELION_AOT_MODE", "compile")
     monkeypatch.setattr(aot_cache_module, "get_aot_data_dir", lambda: tmp_path)

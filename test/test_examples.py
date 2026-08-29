@@ -1045,6 +1045,29 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1, 64, 32],
         )
 
+    def test_sparse_attn_indexer(self):
+        mod = import_path(EXAMPLES_DIR / "sparse_attn_indexer.py")
+        args = mod.indexer_inputs(num_tokens=128, kv_len=512)
+        check_example(
+            "sparse_attn_indexer",
+            args,
+            mod.ref_mqa_logits(*args),
+            fn_name="mqa_logits",
+            block_sizes=[16, 128],
+        )
+
+    @skipIfPallasInterpret("numerical mismatch in JAX interpret mode")
+    def test_sparse_attn_indexer_decode(self):
+        mod = import_path(EXAMPLES_DIR / "sparse_attn_indexer.py")
+        args = mod.indexer_inputs(num_tokens=1, kv_len=512)
+        check_example(
+            "sparse_attn_indexer",
+            args,
+            mod.ref_mqa_logits(*args),
+            fn_name="mqa_logits_decode",
+            block_sizes=[1, 128],
+        )
+
     def test_xsa(self):
         args = (
             torch.randn(2, 32, 1024, 64, dtype=HALF_DTYPE, device=DEVICE),
@@ -1088,10 +1111,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="concat2d_dim1_simple",
         )
 
-    @xfailIfPallasInterpret(
-        "jax interpret-mode discharge cannot handle non-divisible blocked "
-        "slices (traced sizes)"
-    )
+    @skipIfPallas("indirect access is unsupported by both one-hot and DMA lowering")
     def test_concat(self):
         args = (
             torch.randn(512, 500, device=DEVICE),
@@ -1104,10 +1124,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="concat2d_dim1",
         )
 
-    @xfailIfPallasInterpret(
-        "emit_pipeline ds-pad DMA uses a tracer-size dynamic_slice, unsupported"
-        " in JAX Pallas interpret mode"
-    )
+    @skipIfPallas("indirect access is unsupported by both one-hot and DMA lowering")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_concat_block_ptr(self):
@@ -1693,7 +1710,6 @@ class TestExamples(RefEagerTestBase, TestCase):
                     rtol=rtol,
                 )
 
-    @xfailIfPallasTpu("tensor-derived if-predicates not supported")
     def test_grouped_gemm_jagged(self):
         # Build small jagged grouped GEMM inputs
         torch.manual_seed(0)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -84,14 +85,23 @@ class TestThreadBudget(unittest.TestCase):
         from helion._compiler.cute.thread_budget import check_thread_limit
         from helion.exc import BackendUnsupported
 
-        with self.assertRaises(BackendUnsupported):
-            check_thread_limit(1025)
+        with patch(
+            "helion._compiler.compile_environment.CompileEnvironment.current"
+        ) as current:
+            current.return_value.backend.name = "cute"
+            with self.assertRaises(BackendUnsupported):
+                check_thread_limit(1025)
 
     def test_over_limit_message(self) -> None:
         from helion._compiler.cute.thread_budget import check_thread_limit
+        from helion.exc import BackendUnsupported
 
-        with self.assertRaises(Exception) as ctx:
-            check_thread_limit(2048, context="(64, 64)")
+        with patch(
+            "helion._compiler.compile_environment.CompileEnvironment.current"
+        ) as current:
+            current.return_value.backend.name = "cute"
+            with self.assertRaises(BackendUnsupported) as ctx:
+                check_thread_limit(2048, context="(64, 64)")
         self.assertIn("(64, 64)", str(ctx.exception))
 
 
