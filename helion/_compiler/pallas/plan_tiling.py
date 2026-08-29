@@ -101,6 +101,7 @@ class DimensionTiling:
 
 REMOTE_SRC_INDEXING_PATTERNS = "pallas_remote_src_indexing_patterns"
 REMOTE_DST_INDEXING_PATTERNS = "pallas_remote_dst_indexing_patterns"
+SCALAR_PANEL_HBM_LOAD = "pallas_scalar_panel_hbm_load"
 
 
 def plan_tiling(
@@ -115,6 +116,80 @@ def plan_tiling(
             graph_info, graph_lookup, parent_ids
         )
         _analyze_indexing_expressions(graph_info, config, local_access_keys)
+    _plan_scalar_panel_hbm_loads(graphs)
+
+
+def _plan_scalar_panel_hbm_loads(graphs: list[GraphInfo]) -> None:
+    """Stage aligned read-only panels selected by device scalar indices."""
+    from ...language import memory_ops
+    from ...language.atomic_ops import ATOMIC_OPS
+    from ..device_function import DeviceFunction
+    from ..device_function import PallasMemorySpace
+    from ..host_function import HostFunction
+    from .dma import is_tpu_dma_aligned_shape
+
+    accesses: dict[str | int, list[tuple[torch.Tensor, torch.fx.Node, bool]]] = {}
+    for graph_info in graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function" or node.target not in (
+                ATOMIC_OPS | {memory_ops.load, memory_ops.store}
+            ):
+                continue
+            tensor_node = node.args[0] if node.args else None
+            tensor = (
+                tensor_node.meta.get("val")
+                if isinstance(tensor_node, torch.fx.Node)
+                else None
+            )
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            accesses.setdefault(_tensor_origin_key(tensor), []).append(
+                (tensor, node, node.target is memory_ops.load)
+            )
+
+    device_fn = DeviceFunction.current()
+    host_inputs = HostFunction.current().tensor_to_origin
+    scalar_patterns = (ArbitraryIndexPattern, TileBeginWithOffsetPattern)
+
+    def is_scalar_pattern(pattern: IndexingPattern) -> bool:
+        return isinstance(pattern, scalar_patterns) or (
+            isinstance(pattern, TensorIndexPattern) and pattern.index_ndim == 0
+        )
+
+    for tensor_accesses in accesses.values():
+        if not all(is_load for _tensor, _node, is_load in tensor_accesses):
+            continue
+        candidates: list[tuple[torch.Tensor, torch.fx.Node]] = []
+        for tensor, node, _is_load in tensor_accesses:
+            patterns = node.meta.get("indexing_patterns")
+            value = node.meta.get("val")
+            if (
+                tensor not in host_inputs
+                or not isinstance(patterns, list)
+                or not isinstance(value, torch.Tensor)
+                or not value.shape
+                or not all(isinstance(size, int) for size in value.shape)
+            ):
+                break
+            if not any(is_scalar_pattern(pattern) for pattern in patterns):
+                break
+            if not all(
+                is_scalar_pattern(pattern)
+                or (
+                    isinstance(pattern, ArbitrarySlicePattern)
+                    and pattern.slice == slice(None)
+                )
+                for pattern in patterns
+            ):
+                break
+            shape = cast("tuple[int, ...]", tuple(value.shape))
+            if not is_tpu_dma_aligned_shape(shape, tensor.dtype):
+                break
+            candidates.append((tensor, node))
+        else:
+            for tensor, node in candidates:
+                device_fn.pallas_memory_space[id(tensor)] = PallasMemorySpace.HBM
+                node.meta[SCALAR_PANEL_HBM_LOAD] = True
 
 
 def _tensor_origin_key(tensor: torch.Tensor) -> str | int:
