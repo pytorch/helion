@@ -5051,3 +5051,34 @@ retained power-of-two 8x-SM grid; the exploratory 7x-SM point remains 92.13 us
 versus 103.15 us. Gemma4 A4B measures 48.26 us versus 53.65 us, GPT-OSS
 measures 35.15 us versus 34.64 us in the heuristic ablation run, and the
 known-static-gap DeepSeek-V3 probe measures 174.75 us versus 158.03 us.
+
+### Pretuned megakernel promotion
+
+- [x] Promote the validated Qwen3-8B decode layer as a self-contained,
+  fixed-shape B200 AOT kernel. The checked-in Helion function contains all 15
+  dependency roots directly and lowers to one PTX entry point (252 registers,
+  zero spills, 17,408 bytes shared memory).
+- [x] Promote the validated Gemma 4 26B-A4B batch-one MoE as a self-contained,
+  fixed-shape B200 AOT kernel. Its eight dependency roots likewise lower to one
+  PTX entry point (109 registers, zero spills, 34,816 bytes shared memory).
+- [x] Compare both promoted kernels against vLLM before timing. Qwen instantiates
+  the compiled `Qwen3DecoderLayer` and leaves its linear and attention backends
+  on the production `auto` policy. Its numerical check mirrors DeepGEMM's UE8M0
+  weight conversion, while Helion retains FP32 dynamic activation scales rather
+  than DeepGEMM's UE8M0 activation-scale rounding. Gemma uses vLLM's Gemma router
+  and fused-MoE implementation with its default MoE backend selection.
+- [x] Register both examples with the pretuned runner and add B200-only,
+  vLLM-conditional correctness and performance tests. The shared pretuned
+  benchmark path uses pre-captured CUDA graphs and clears L2 before every
+  observation.
+- [x] Use the checked-in pretuned entries, rather than probe scripts, as the
+  authoritative cold-L2 measurement path. With vLLM's default FlashInfer
+  attention and DeepGEMM FP8 linears, the restored granular Qwen source at 128
+  attention splits was 96.19 us versus 114.59 us (1.191x). The exploratory
+  7x-SM point is 92.13 us, reproducing the pre-promotion result. Gemma4 A4B was
+  51.07 us versus 106.37 us for the locally selected default Triton MoE backend
+  (2.083x); this FlashInfer installation does not provide either fused-MoE
+  implementation. These model comparisons benchmark each captured graph in a
+  complete sequential cold-L2 run rather than interleaving implementations.
+- [x] Remove superseded probe artifacts from the eventual PR while retaining
+  the local files for future experiments.
