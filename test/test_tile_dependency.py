@@ -3,16 +3,13 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import math
+from typing import Literal
 from unittest import mock
 
 import sympy
 import torch
 
 from test._cross_loop_test_kernels import cartesian_affine_chain
-from test._cross_loop_test_utils import _access
-from test._cross_loop_test_utils import _one_dimensional_domains
-from test._cross_loop_test_utils import _root_predecessors
-from test._cross_loop_test_utils import _symbolic_root_relation
 
 from helion._compiler.device_ir import _collect_memory_op_facts
 from helion._compiler.tile_dependency import AllocationRegion
@@ -21,18 +18,160 @@ from helion._compiler.tile_dependency import LogicalDomain
 from helion._compiler.tile_dependency import LogicalRelation
 from helion._compiler.tile_dependency import LogicalTaskAxis
 from helion._compiler.tile_dependency import TaskFamily
+from helion._compiler.tile_dependency import TileAccess
 from helion._compiler.tile_dependency import TileDependency
 from helion._compiler.tile_dependency import TileDependencyKind
 from helion._compiler.tile_dependency import _LogicalRelationPiece
 from helion._compiler.tile_dependency import allocation_regions_may_overlap
 from helion._compiler.tile_dependency import build_tile_dependency_graph
 from helion._compiler.tile_dependency import instantiate_logical_domains
+from helion._compiler.tile_dependency import instantiate_symbolic_dependencies
 from helion._compiler.tile_dependency import logical_axis_symbol
 from helion._compiler.tile_dependency import owner_roots_by_graph_id
 from helion._compiler.tile_dependency import physical_traversal_relation
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import skipIfNotCUDA
+
+
+def _axis_geometry(
+    root_domains: tuple[LogicalDomain, ...],
+) -> dict[int, tuple[int, int]]:
+    return {
+        axis: (domain.axis_counts[axis], domain.block_sizes[axis])
+        for domain in root_domains
+        for axis in domain.axis_order
+    }
+
+
+def _configured_domains(
+    graph,
+    axis_geometry: dict[int, tuple[int, int]],
+) -> tuple[tuple[LogicalDomain, ...], tuple[LogicalDomain | None, ...]]:
+    configured_roots, scope_domains = instantiate_logical_domains(
+        graph,
+        axis_geometry=axis_geometry,
+    )
+    assert all(domain is not None for domain in configured_roots)
+    return (
+        tuple(domain for domain in configured_roots if domain is not None),
+        scope_domains,
+    )
+
+
+def _access(
+    access_id: int,
+    *,
+    root: int,
+    allocation_id: int = 0,
+    kind: Literal["load", "store"],
+    shape: tuple[int, ...] = (128,),
+    strides: tuple[int, ...] = (1,),
+    block_ids: tuple[int | None, ...] = (0,),
+    scales: tuple[int, ...] = (1,),
+    offsets: tuple[int | None, ...] = (0,),
+    scalar: tuple[bool, ...] | None = None,
+    full_slice: tuple[bool, ...] | None = None,
+    static_extents: tuple[int | None, ...] | None = None,
+    masked: bool = False,
+    tensor_name: str = "tmp",
+    storage_offset: int = 0,
+    layout_is_static: bool = True,
+) -> TileAccess:
+    return TileAccess(
+        access_id=access_id,
+        memory_op_index=access_id,
+        graph_id=root,
+        root=root,
+        allocation_id=allocation_id,
+        kind=kind,
+        tensor_name=tensor_name,
+        tensor_shape=shape,
+        tensor_strides=strides,
+        storage_offset=storage_offset,
+        subscript_dims=tuple(range(len(block_ids))),
+        subscript_affine_block_ids=block_ids,
+        subscript_index_scales=scales,
+        subscript_offsets=offsets,
+        subscript_is_scalar=scalar or tuple(False for _ in block_ids),
+        has_explicit_mask=masked,
+        subscript_is_full_slice=full_slice or tuple(False for _ in block_ids),
+        subscript_static_extents=static_extents or (),
+        layout_is_static=layout_is_static,
+    )
+
+
+def _root_predecessors(
+    plan,
+    root_domains: tuple[LogicalDomain, ...],
+    pair: tuple[int, int] = (0, 1),
+) -> tuple[frozenset[int], ...] | None:
+    axis_geometry = _axis_geometry(root_domains)
+    configured_root_domains, scope_domains = _configured_domains(plan, axis_geometry)
+    relations = tuple(
+        dependency.relation
+        for dependency in instantiate_symbolic_dependencies(
+            plan,
+            root_domains=configured_root_domains,
+            scope_domains=scope_domains,
+        )
+        if (dependency.producer_root, dependency.consumer_root) == pair
+        and dependency.producer_scope_id is None
+        and dependency.consumer_scope_id is None
+    )
+    if not relations or any(relation is None for relation in relations):
+        return None
+    concrete = tuple(relation for relation in relations if relation is not None)
+    result = concrete[0]
+    for relation in concrete[1:]:
+        union = result.union(relation)
+        if union is None:
+            return None
+        result = union
+    return result.materialize(
+        source_traversal=root_domains[pair[1]].axis_order,
+        target_traversal=root_domains[pair[0]].axis_order,
+    )
+
+
+def _symbolic_root_relation(
+    plan,
+    axis_geometry: dict[int, tuple[int, int]],
+):
+    root_domains, scope_domains = _configured_domains(plan, axis_geometry)
+    dependencies = instantiate_symbolic_dependencies(
+        plan,
+        root_domains=root_domains,
+        scope_domains=scope_domains,
+    )
+    self_relations = tuple(
+        dependency.relation
+        for dependency in dependencies
+        if dependency.producer_root == 0 and dependency.consumer_root == 1
+    )
+    assert len(self_relations) == 1
+    return self_relations[0]
+
+
+def _one_dimensional_domains(
+    *,
+    producer_count: int = 8,
+    consumer_count: int = 8,
+    producer_block: int = 16,
+    consumer_block: int = 16,
+) -> tuple[LogicalDomain, LogicalDomain]:
+    return (
+        LogicalDomain(
+            (10,),
+            ((10, producer_count),),
+            ((10, producer_block),),
+        ),
+        LogicalDomain(
+            (20,),
+            ((20, consumer_count),),
+            ((20, consumer_block),),
+        ),
+    )
 
 
 def _dependency_kinds(edge: TileDependency) -> frozenset[TileDependencyKind]:
