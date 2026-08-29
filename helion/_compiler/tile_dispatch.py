@@ -428,6 +428,31 @@ class TileStrategyDispatch:
                 axis += strategy.thread_axes_used()
         return None
 
+    def strategies_can_coexecute(
+        self, first: TileStrategy, second: TileStrategy
+    ) -> bool:
+        """Whether two strategies occur in at least one common execution branch."""
+        return any(
+            first in branch and second in branch for branch in self._strategy_branches()
+        )
+
+    def executable_reduction_block_ids(self) -> set[int]:
+        """Reduction block IDs that correspond to executable reduction work."""
+        spec = CompileEnvironment.current().config_spec
+        block_ids = set(spec.reduction_loops.valid_block_ids())
+        if spec.reduction_kernel_fact is not None:
+            block_ids.update(
+                reduction.block_id
+                for reduction in spec.reduction_kernel_fact.reductions
+            )
+        if spec.kernel_matmul_fact is not None:
+            block_ids.update(
+                matmul.fact.k_block_id
+                for matmul in spec.kernel_matmul_fact.matmuls
+                if matmul.fact.k_block_id is not None
+            )
+        return block_ids
+
     def thread_axis_for_block_id(self, target_block_id: int) -> int | None:
         """Return the launch thread axis assigned to a specific logical block id."""
         for strategy in self.strategies:

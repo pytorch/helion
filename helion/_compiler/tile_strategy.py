@@ -2460,7 +2460,33 @@ class BlockSizeTileStrategy(TileStrategy):
         reserved_reduction_axes = max(
             1 if has_reduction_strategy else 0, active_reduction_axes
         )
-        return reserved_reduction_axes + active_non_reduction_axes
+        offset = reserved_reduction_axes + active_non_reduction_axes
+        tile_axes = set(range(offset, offset + self.thread_axes_used()))
+        executable_reductions = self.fn.tile_strategy.executable_reduction_block_ids()
+        for strategy in self.fn.tile_strategy.strategies:
+            if not isinstance(strategy, ReductionStrategy):
+                continue
+            if strategy.block_index not in executable_reductions:
+                continue
+            if not self.fn.tile_strategy.strategies_can_coexecute(self, strategy):
+                continue
+            if not any(size > 1 for size in strategy.thread_block_sizes()):
+                continue
+            reduction_axis = self.fn.tile_strategy.thread_axis_for_strategy(strategy)
+            if reduction_axis is None:
+                continue
+            reduction_axes = set(
+                range(reduction_axis, reduction_axis + strategy.thread_axes_used())
+            )
+            if collision := tile_axes & reduction_axes:
+                axes = ", ".join(map(str, sorted(collision)))
+                raise exc.BackendUnsupported(
+                    env.backend.name,
+                    "thread-axis collision: tile blocks "
+                    f"{self.block_ids} and executable reduction block "
+                    f"{strategy.block_index} both require axis {axes}",
+                )
+        return offset
 
     def select_pid_strategy(self) -> ProgramIDs:
         env = CompileEnvironment.current()
