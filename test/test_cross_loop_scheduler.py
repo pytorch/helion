@@ -41,7 +41,9 @@ from helion._compiler.cross_loop_scheduler import (
 from helion._compiler.cross_loop_scheduler import choose_final_arrival_continuations
 from helion._compiler.cross_loop_scheduler import choose_readiness_counters
 from helion._compiler.cross_loop_scheduler import derive_final_arrival_continuations
-from helion._compiler.cross_loop_scheduler import order_continuation_producers_by_key
+from helion._compiler.cross_loop_scheduler import (
+    order_continuation_producers_by_readiness_key,
+)
 from helion._compiler.cross_loop_scheduler import place_nested_loop_consumers
 from helion._compiler.tile_dependency import CoordinateDomain
 from helion._compiler.tile_dependency import CoordinateRelation
@@ -49,9 +51,9 @@ from helion._compiler.tile_dependency import ExecutionSite
 from helion._compiler.tile_dependency import TileAccess
 from helion._compiler.tile_dependency import _CoordinateRelationPiece
 from helion._compiler.tile_dependency import build_tile_dependency_graph
+from helion._compiler.tile_dependency import coordinate_axis_symbol
 from helion._compiler.tile_dependency import instantiate_coordinate_domains
 from helion._compiler.tile_dependency import instantiate_symbolic_dependencies
-from helion._compiler.tile_dependency import logical_axis_symbol
 from helion._compiler.tile_dependency import pid_task_order
 from helion._testing import DEVICE
 from helion._testing import TestCase
@@ -270,7 +272,7 @@ def _one_dimensional_task_range(
         (
             (
                 ((axis, 0, count, 1),),
-                (logical_axis_symbol(axis) + begin,),
+                (coordinate_axis_symbol(axis) + begin,),
             ),
         ),
     )
@@ -929,7 +931,7 @@ class TestCrossLoopScheduler(TestCase):
         ]
         self.assertEqual(len(unrelated), 1)
         self.assertEqual(unrelated[0].readiness_key_count, 2)
-        self.assertIsNone(unrelated[0].root_barrier_source)
+        self.assertIsNone(unrelated[0].root_barrier_producer_root)
 
     @skipIfNotCUDA()
     def test_device_ir_sites_preserve_nested_producer_and_consumer_axes(
@@ -1133,7 +1135,7 @@ class TestCrossLoopScheduler(TestCase):
         continuations = derive_final_arrival_continuations(configured, baseline)
         self.assertEqual(
             tuple(
-                configured.event(continuation.event_index)
+                configured.event(continuation.event_id)
                 .consumers[continuation.consumer_index]
                 .consumer_root
                 for continuation in continuations
@@ -1171,7 +1173,7 @@ class TestCrossLoopScheduler(TestCase):
                 (
                     (
                         ((axis, begin, end, 1),),
-                        (logical_axis_symbol(axis) - begin,),
+                        (coordinate_axis_symbol(axis) - begin,),
                     ),
                 ),
             )
@@ -1219,7 +1221,7 @@ class TestCrossLoopScheduler(TestCase):
 
         self.assertEqual(
             tuple(
-                readiness_graph.event(continuation.event_index)
+                readiness_graph.event(continuation.event_id)
                 .consumers[continuation.consumer_index]
                 .consumer_root
                 for continuation in continuations
@@ -1264,8 +1266,8 @@ class TestCrossLoopScheduler(TestCase):
                         (
                             (
                                 10,
-                                2 * logical_axis_symbol(0),
-                                2 * logical_axis_symbol(0) + 1,
+                                2 * coordinate_axis_symbol(0),
+                                2 * coordinate_axis_symbol(0) + 1,
                                 1,
                             ),
                         ),
@@ -1290,7 +1292,7 @@ class TestCrossLoopScheduler(TestCase):
                                 (
                                     (
                                         ((20, 0, 2, 1),),
-                                        (logical_axis_symbol(20),),
+                                        (coordinate_axis_symbol(20),),
                                     ),
                                 ),
                             ),
@@ -1357,11 +1359,11 @@ class TestCrossLoopScheduler(TestCase):
         continuations = choose_final_arrival_continuations(readiness_graph, baseline)
 
         self.assertGreater(root_domains[1].size, baseline.worker_count)
-        self.assertEqual(readiness_graph.events[1].root_barrier_source, 1)
+        self.assertEqual(readiness_graph.events[1].root_barrier_producer_root, 1)
         self.assertEqual(len(continuations), 1)
-        readiness_consumer = readiness_graph.event(
-            continuations[0].event_index
-        ).consumers[continuations[0].consumer_index]
+        readiness_consumer = readiness_graph.event(continuations[0].event_id).consumers[
+            continuations[0].consumer_index
+        ]
         self.assertEqual(readiness_consumer.consumer_root, 1)
 
     def test_semantic_readiness_graph_represents_diamond_without_path_matching(
@@ -1413,7 +1415,7 @@ class TestCrossLoopScheduler(TestCase):
         )
         self.assertEqual(
             {
-                configured.event(continuation.event_index)
+                configured.event(continuation.event_id)
                 .consumers[continuation.consumer_index]
                 .consumer_root
                 for continuation in continuations
@@ -1465,9 +1467,9 @@ class TestCrossLoopScheduler(TestCase):
         family_event = next(
             event
             for event in configured.events
-            if event.root_barrier_source is not None
+            if event.root_barrier_producer_root is not None
         )
-        self.assertEqual(family_event.root_barrier_source, 0)
+        self.assertEqual(family_event.root_barrier_producer_root, 0)
         self.assertEqual(
             _expected_arrivals(
                 family_event.readiness_key_domain, family_event.producers
@@ -1540,10 +1542,10 @@ class TestCrossLoopScheduler(TestCase):
         assert events is not None
         self.assertEqual(len(events), 2)
         exact_event = next(
-            event for event in events if event.root_barrier_source is None
+            event for event in events if event.root_barrier_producer_root is None
         )
         family_event = next(
-            event for event in events if event.root_barrier_source is not None
+            event for event in events if event.root_barrier_producer_root is not None
         )
         dependency_id = access_dependency.dependency_id
         self.assertEqual(
@@ -1684,7 +1686,7 @@ class TestCrossLoopScheduler(TestCase):
                 (
                     (
                         ((task_order_axis, 0, 3, 1),),
-                        (10 + 2 * logical_axis_symbol(task_order_axis),),
+                        (10 + 2 * coordinate_axis_symbol(task_order_axis),),
                     ),
                 ),
             ),
@@ -1730,8 +1732,8 @@ class TestCrossLoopScheduler(TestCase):
             kind="event",
             identity=0,
         )
-        producer_axis = logical_axis_symbol(10)
-        consumer_axis = logical_axis_symbol(20)
+        producer_axis = coordinate_axis_symbol(10)
+        consumer_axis = coordinate_axis_symbol(20)
         readiness_graph = ReadinessGraph(
             root_task_orders=_default_root_task_orders(
                 (producer_domain, consumer_domain)
@@ -1779,7 +1781,7 @@ class TestCrossLoopScheduler(TestCase):
         )
         continuations = derive_final_arrival_continuations(readiness_graph, baseline)
 
-        schedule = order_continuation_producers_by_key(
+        schedule = order_continuation_producers_by_readiness_key(
             readiness_graph,
             baseline,
             continuations,
@@ -1896,7 +1898,7 @@ class TestCrossLoopScheduler(TestCase):
                                 (
                                     (
                                         ((10, 0, 2, 1),),
-                                        (logical_axis_symbol(10),),
+                                        (coordinate_axis_symbol(10),),
                                     ),
                                 ),
                             ),
@@ -1912,7 +1914,7 @@ class TestCrossLoopScheduler(TestCase):
                                 (
                                     (
                                         ((10 * (root + 1), 0, 2, 1),),
-                                        (logical_axis_symbol(10 * (root + 1)),),
+                                        (coordinate_axis_symbol(10 * (root + 1)),),
                                     ),
                                 ),
                             ),
@@ -1963,7 +1965,7 @@ class TestCrossLoopScheduler(TestCase):
                                 (
                                     (
                                         ((10, 0, 4, 1),),
-                                        (sympy.floor(logical_axis_symbol(10) / 2),),
+                                        (sympy.floor(coordinate_axis_symbol(10) / 2),),
                                     ),
                                 ),
                             ),
@@ -1979,7 +1981,7 @@ class TestCrossLoopScheduler(TestCase):
                                 (
                                     (
                                         ((20, 0, 2, 1),),
-                                        (logical_axis_symbol(20),),
+                                        (coordinate_axis_symbol(20),),
                                     ),
                                 ),
                             ),
@@ -2028,8 +2030,8 @@ class TestCrossLoopScheduler(TestCase):
         )
 
         (event,) = _configured_readiness_graph(plan, _one_dimensional_domains()).events
-        self.assertIsNotNone(event.root_barrier_source)
-        self.assertEqual(event.root_barrier_source, 0)
+        self.assertIsNotNone(event.root_barrier_producer_root)
+        self.assertEqual(event.root_barrier_producer_root, 0)
 
     def test_fanout_keeps_one_edge_per_consumer(self) -> None:
         plan = build_tile_dependency_graph(
@@ -2061,7 +2063,7 @@ class TestCrossLoopScheduler(TestCase):
                 for readiness_producer in event.producers
             )
         )
-        self.assertIsNone(event.root_barrier_source)
+        self.assertIsNone(event.root_barrier_producer_root)
         self.assertEqual(
             {
                 readiness_consumer.consumer_root
@@ -2100,9 +2102,9 @@ class TestCrossLoopScheduler(TestCase):
         family_event = next(
             event
             for event in configured.events
-            if event.root_barrier_source is not None
+            if event.root_barrier_producer_root is not None
         )
-        self.assertEqual(family_event.root_barrier_source, 0)
+        self.assertEqual(family_event.root_barrier_producer_root, 0)
 
     def test_mixed_exact_and_unknown_accesses_use_root_barrier(self) -> None:
         dependency_graph = build_tile_dependency_graph(
@@ -2451,7 +2453,7 @@ class TestCrossLoopScheduler(TestCase):
                                 (
                                     (
                                         ((10, 0, 4, 1),),
-                                        (logical_axis_symbol(10),),
+                                        (coordinate_axis_symbol(10),),
                                     ),
                                 ),
                             ),
@@ -2467,7 +2469,7 @@ class TestCrossLoopScheduler(TestCase):
                                 (
                                     (
                                         ((20, 0, 1, 1), (21, 0, 4, 1)),
-                                        (logical_axis_symbol(21),),
+                                        (coordinate_axis_symbol(21),),
                                     ),
                                 ),
                             ),
@@ -2532,7 +2534,7 @@ class TestCrossLoopScheduler(TestCase):
         )
         self.assertEqual(plan.consumers[0].consumer_site_id, 7)
 
-    def test_nested_nested_loop_entry_event_survives_without_early_placement(
+    def test_nested_nested_loop_entry_counter_survives_without_early_placement(
         self,
     ) -> None:
         producer_domain = CoordinateDomain(
@@ -2579,8 +2581,8 @@ class TestCrossLoopScheduler(TestCase):
                                             (11, 0, 4, 1),
                                         ),
                                         (
-                                            logical_axis_symbol(10),
-                                            logical_axis_symbol(11),
+                                            coordinate_axis_symbol(10),
+                                            coordinate_axis_symbol(11),
                                         ),
                                     ),
                                 ),
@@ -2601,8 +2603,8 @@ class TestCrossLoopScheduler(TestCase):
                                             (21, 0, 4, 1),
                                         ),
                                         (
-                                            logical_axis_symbol(20),
-                                            logical_axis_symbol(21),
+                                            coordinate_axis_symbol(20),
+                                            coordinate_axis_symbol(21),
                                         ),
                                     ),
                                 ),
@@ -2667,7 +2669,7 @@ class TestCrossLoopScheduler(TestCase):
                                 (
                                     (
                                         ((10, 0, 4, 1),),
-                                        (logical_axis_symbol(10),),
+                                        (coordinate_axis_symbol(10),),
                                     ),
                                 ),
                             ),
@@ -2683,7 +2685,7 @@ class TestCrossLoopScheduler(TestCase):
                                 (
                                     (
                                         ((20, 0, 1, 1), (21, 0, 4, 1)),
-                                        (logical_axis_symbol(21),),
+                                        (coordinate_axis_symbol(21),),
                                     ),
                                 ),
                             ),
@@ -2758,7 +2760,7 @@ class TestCrossLoopScheduler(TestCase):
                             (axis, 0, source_domain.axis_counts[axis], 1)
                             for axis in source_domain.axis_order
                         ),
-                        (logical_axis_symbol(source_axis),),
+                        (coordinate_axis_symbol(source_axis),),
                     ),
                 ),
             )
@@ -2850,7 +2852,7 @@ class TestCrossLoopScheduler(TestCase):
             (
                 (
                     ((10, 0, 5, 1),),
-                    (logical_axis_symbol(10),),
+                    (coordinate_axis_symbol(10),),
                 ),
             ),
         )
@@ -2862,7 +2864,7 @@ class TestCrossLoopScheduler(TestCase):
             (
                 (
                     ((30, 0, 1, 1), (31, 0, 5, 1)),
-                    (logical_axis_symbol(31),),
+                    (coordinate_axis_symbol(31),),
                 ),
             ),
         )
@@ -2968,7 +2970,7 @@ class TestCrossLoopScheduler(TestCase):
                                             ),
                                         ),
                                         (
-                                            logical_axis_symbol(
+                                            coordinate_axis_symbol(
                                                 root_domains[producer_root].axis_order[
                                                     0
                                                 ]
@@ -2989,7 +2991,7 @@ class TestCrossLoopScheduler(TestCase):
                                 (
                                     (
                                         ((30, 0, 1, 1), (nested_axis, 0, 4, 1)),
-                                        (logical_axis_symbol(nested_axis),),
+                                        (coordinate_axis_symbol(nested_axis),),
                                     ),
                                 ),
                             ),

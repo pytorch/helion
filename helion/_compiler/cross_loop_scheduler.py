@@ -12,10 +12,10 @@ from .tile_dependency import CoordinateDomain
 from .tile_dependency import CoordinateRelation
 from .tile_dependency import DependencyObligation
 from .tile_dependency import TileDependencyGraph
+from .tile_dependency import consumer_to_preceding_site_relation
+from .tile_dependency import coordinate_axis_symbol
 from .tile_dependency import instantiate_symbolic_dependencies
-from .tile_dependency import logical_axis_symbol
 from .tile_dependency import nested_logical_axes
-from .tile_dependency import preceding_site_relation
 
 
 @dataclasses.dataclass(frozen=True)
@@ -88,7 +88,7 @@ def _flat_domain_index_expression(domain: CoordinateDomain) -> sympy.Expr:
     result: sympy.Expr = sympy.Integer(0)
     multiplier = 1
     for axis in domain.axis_order:
-        result += logical_axis_symbol(axis) * multiplier  # pyrefly: ignore[unsupported-operation]
+        result += coordinate_axis_symbol(axis) * multiplier  # pyrefly: ignore[unsupported-operation]
         multiplier *= domain.axis_counts[axis]
     return sympy.simplify(result)
 
@@ -436,7 +436,7 @@ def place_ready_families(
     )
     candidate_roots = sorted(
         {
-            readiness_graph.event(continuation.event_index)
+            readiness_graph.event(continuation.event_id)
             .consumers[continuation.consumer_index]
             .consumer_root
             for continuation in remaining_continuations
@@ -449,7 +449,7 @@ def place_ready_families(
         root_continuations = tuple(
             continuation
             for continuation in remaining_continuations
-            if readiness_graph.event(continuation.event_index)
+            if readiness_graph.event(continuation.event_id)
             .consumers[continuation.consumer_index]
             .consumer_root
             == root
@@ -457,7 +457,7 @@ def place_ready_families(
         if len(root_continuations) != 1:
             continue
         continuation = root_continuations[0]
-        continuation_event = readiness_graph.event(continuation.event_index)
+        continuation_event = readiness_graph.event(continuation.event_id)
         continuation_consumer = continuation_event.consumers[
             continuation.consumer_index
         ]
@@ -554,7 +554,7 @@ def build_worker_schedule(
         baseline,
         excluded_roots=nested_wait_roots,
     )
-    ordered = order_continuation_producers_by_key(
+    ordered = order_continuation_producers_by_readiness_key(
         readiness_graph,
         baseline,
         continuations,
@@ -568,7 +568,7 @@ def build_worker_schedule(
         readiness_consumer.consumer_root
         for continuation in continuations
         for readiness_consumer in (
-            readiness_graph.event(continuation.event_index).consumers[
+            readiness_graph.event(continuation.event_id).consumers[
                 continuation.consumer_index
             ],
         )
@@ -601,7 +601,7 @@ def build_worker_schedule(
 class FinalArrivalContinuation:
     """A consumer task executed by whichever producer makes the final arrival."""
 
-    event_index: int
+    event_id: int
     consumer_index: int
 
 
@@ -611,7 +611,7 @@ def _continuations_by_consumer_root(
 ) -> dict[int, FinalArrivalContinuation]:
     """Index final-arrival continuations by their consumer root."""
     return {
-        readiness_graph.event(continuation.event_index)
+        readiness_graph.event(continuation.event_id)
         .consumers[continuation.consumer_index]
         .consumer_root: continuation
         for continuation in continuations
@@ -724,7 +724,7 @@ class ReadinessEvent:
         return self.readiness_key_domain.size
 
     @property
-    def root_barrier_source(self) -> int | None:
+    def root_barrier_producer_root(self) -> int | None:
         if (
             self.readiness_key_count == 1
             and len(self.producers) == 1
@@ -767,7 +767,7 @@ class ReadinessGraph:
         return self.events[event_id]
 
 
-def _readiness_producer_is_lowerable(
+def _supports_readiness_counter_lowering(
     readiness_producer: ReadinessProducer,
 ) -> bool:
     """Keep scheduler eligibility identical to counted-event code generation."""
@@ -793,7 +793,7 @@ def _canonical_readiness_key_domain(domain: CoordinateDomain) -> CoordinateDomai
     )
 
 
-def _add_readiness_event_candidate(
+def _record_readiness_event(
     pending: dict[
         tuple[CoordinateDomain, tuple[ReadinessProducer, ...]],
         ReadinessEvent,
@@ -804,7 +804,7 @@ def _add_readiness_event_candidate(
     consumers: tuple[ReadinessConsumer, ...],
     require_counter_lowering: bool = False,
 ) -> bool:
-    """Canonicalize and group one event candidate by producer partition.
+    """Canonicalize and group one semantic event by producer partition.
 
     Counter-lowering admission runs only after the final event identity is
     assigned, so later scheduling phases reuse the same relation proofs.
@@ -868,7 +868,7 @@ def _add_readiness_event_candidate(
         previous_consumers = previous_event.consumers
 
     if require_counter_lowering and any(
-        not _readiness_producer_is_lowerable(readiness_producer)
+        not _supports_readiness_counter_lowering(readiness_producer)
         for readiness_producer in event_producers
     ):
         return False
@@ -1028,7 +1028,7 @@ def _static_producer_relations(
         return ((root, root_keys),)
     if root in visiting:
         return None
-    continuation_event = readiness_graph.event(continuation.event_index)
+    continuation_event = readiness_graph.event(continuation.event_id)
     continuation_consumer = continuation_event.consumers[continuation.consumer_index]
     converse_consumer = continuation_consumer.keys_by_consumer.converse()
     key_to_target = (
@@ -1279,7 +1279,7 @@ def _segmented_nested_loop_counter(
                 ),
                 (
                     sympy.Integer(stage),
-                    *(logical_axis_symbol(axis) for axis in outer_axes),
+                    *(coordinate_axis_symbol(axis) for axis in outer_axes),
                 ),
             )
             for stage, (segment_begin, segment_end) in enumerate(segments)
@@ -1409,7 +1409,7 @@ def _split_nested_loop_at_readiness(
     )
 
 
-def _nested_loop_entry_event(
+def _nested_loop_entry_counter(
     readiness_graph: ReadinessGraph,
     event: ReadinessEvent,
     readiness_consumer: ReadinessConsumer,
@@ -1489,7 +1489,7 @@ def place_nested_loop_consumers(
             plan
             for event, readiness_consumer in uncovered_consumers
             if (
-                plan := _nested_loop_entry_event(
+                plan := _nested_loop_entry_counter(
                     readiness_graph, event, readiness_consumer
                 )
             )
@@ -1607,7 +1607,7 @@ def choose_final_arrival_continuations(
         )
         if (
             readiness_consumer := readiness_graph.event(
-                continuation.event_index
+                continuation.event_id
             ).consumers[continuation.consumer_index]
         ).consumer_root
         not in excluded_roots
@@ -1631,13 +1631,13 @@ def choose_readiness_counters(
     selection.
     """
     continuation_consumers = {
-        (continuation.event_index, continuation.consumer_index)
+        (continuation.event_id, continuation.consumer_index)
         for continuation in continuations
     }
     selected: list[ReadinessCounterPlan] = []
     for event in readiness_graph.events:
-        if event.root_barrier_source is not None or any(
-            not _readiness_producer_is_lowerable(readiness_producer)
+        if event.root_barrier_producer_root is not None or any(
+            not _supports_readiness_counter_lowering(readiness_producer)
             for readiness_producer in event.producers
         ):
             continue
@@ -1718,8 +1718,8 @@ def build_readiness_events(
     exact_dependencies = tuple(
         dependency
         for dependency in symbolic_dependencies
-        if dependency.relation is not None
-        and dependency.relation.source_axes_affecting_targets() is not None
+        if dependency.producers_by_consumer is not None
+        and dependency.producers_by_consumer.source_axes_affecting_targets() is not None
     )
     all_obligations_by_pair: dict[tuple[int, int], set[DependencyObligation]] = {}
     for edge in dependency_graph.edges:
@@ -1730,43 +1730,46 @@ def build_readiness_events(
             )
 
     implied_obligations: dict[DependencyObligation, set[DependencyObligation]] = {}
-    for source in exact_dependencies:
-        source_site_id = source.consumer_site_id
-        if source_site_id is None or site_by_id[source_site_id].is_root:
+    for preceding_dependency in exact_dependencies:
+        preceding_site_id = preceding_dependency.consumer_site_id
+        if preceding_site_id is None or site_by_id[preceding_site_id].is_root:
             continue
-        source_relation = source.relation
-        assert source_relation is not None
-        source_obligation = (
-            source.dependency_id,
-            source.producer_site_id,
-            source_site_id,
+        preceding_producers = preceding_dependency.producers_by_consumer
+        assert preceding_producers is not None
+        preceding_obligation = (
+            preceding_dependency.dependency_id,
+            preceding_dependency.producer_site_id,
+            preceding_site_id,
         )
-        for later in exact_dependencies:
-            later_site_id = later.consumer_site_id
-            later_relation = later.relation
+        for later_dependency in exact_dependencies:
+            later_site_id = later_dependency.consumer_site_id
+            later_producers = later_dependency.producers_by_consumer
             if (
-                later is source
+                later_dependency is preceding_dependency
                 or later_site_id is None
-                or later_relation is None
-                or source.consumer_root != later.consumer_root
-                or source.producer_root != later.producer_root
-                or source.producer_site_id != later.producer_site_id
-                or source_relation.target_domain != later_relation.target_domain
+                or later_producers is None
+                or preceding_dependency.consumer_root != later_dependency.consumer_root
+                or preceding_dependency.producer_root != later_dependency.producer_root
+                or preceding_dependency.producer_site_id
+                != later_dependency.producer_site_id
+                or preceding_producers.target_domain != later_producers.target_domain
             ):
                 continue
-            preceding = preceding_site_relation(
+            preceding = consumer_to_preceding_site_relation(
                 dependency_graph,
                 site_domains=site_domains,
-                source_site_id=source_site_id,
+                preceding_site_id=preceding_site_id,
                 consumer_site_id=later_site_id,
-                consumer_access_id=later.consumer_access_id,
+                consumer_access_id=later_dependency.consumer_access_id,
             )
-            acquired = None if preceding is None else preceding.then(source_relation)
-            if acquired is not None and acquired.covers(later_relation):
-                implied_obligations.setdefault(source_obligation, set()).add(
+            acquired = (
+                None if preceding is None else preceding.then(preceding_producers)
+            )
+            if acquired is not None and acquired.covers(later_producers):
+                implied_obligations.setdefault(preceding_obligation, set()).add(
                     (
-                        later.dependency_id,
-                        later.producer_site_id,
+                        later_dependency.dependency_id,
+                        later_dependency.producer_site_id,
                         later_site_id,
                     )
                 )
@@ -1795,7 +1798,7 @@ def build_readiness_events(
         )
 
     for dependency in exact_dependencies:
-        relation = dependency.relation
+        relation = dependency.producers_by_consumer
         assert relation is not None
         obligation = (
             dependency.dependency_id,
@@ -1874,14 +1877,14 @@ def build_readiness_events(
     ] = {}
     represented_obligations: set[DependencyObligation] = set()
 
-    def record_event_candidate(
+    def record_readiness_event(
         *,
         readiness_key_domain: CoordinateDomain,
         producers: tuple[ReadinessProducer, ...],
         consumers: tuple[ReadinessConsumer, ...],
         require_counter_lowering: bool = False,
     ) -> bool:
-        if not _add_readiness_event_candidate(
+        if not _record_readiness_event(
             pending_events,
             readiness_key_domain=readiness_key_domain,
             producers=producers,
@@ -1916,7 +1919,7 @@ def build_readiness_events(
             keys_by_consumer = relation.rename_target_axes(readiness_key_domain)
             if keys_by_consumer is None:
                 raise AssertionError("producer-keyed readiness geometry must match")
-            record_event_candidate(
+            record_readiness_event(
                 readiness_key_domain=readiness_key_domain,
                 producers=(
                     ReadinessProducer(
@@ -2062,7 +2065,7 @@ def build_readiness_events(
             )
             covered_obligations.update(relation_points)
         else:
-            if not record_event_candidate(
+            if not record_readiness_event(
                 readiness_key_domain=readiness_key_domain,
                 producers=tuple(event_producers),
                 consumers=(
@@ -2123,7 +2126,7 @@ def build_readiness_events(
                     covered_obligations=frozenset(obligations),
                 )
             )
-        _add_readiness_event_candidate(
+        _record_readiness_event(
             pending_events,
             readiness_key_domain=readiness_key_domain,
             producers=(
@@ -2187,7 +2190,7 @@ def derive_final_arrival_continuations(
     ] = []
     for event in readiness_graph.events:
         if (
-            event.root_barrier_source is not None
+            event.root_barrier_producer_root is not None
             or len(event.consumers) != 1
             or any(
                 readiness_producer.producer_site_id is not None
@@ -2196,7 +2199,7 @@ def derive_final_arrival_continuations(
         ):
             continue
         if any(
-            not _readiness_producer_is_lowerable(readiness_producer)
+            not _supports_readiness_counter_lowering(readiness_producer)
             for readiness_producer in event.producers
         ):
             continue
@@ -2296,27 +2299,27 @@ def derive_final_arrival_continuations(
         possible_workers_by_root[readiness_consumer.consumer_root] = possible_workers
         result.append(
             FinalArrivalContinuation(
-                event_index=event_id,
+                event_id=event_id,
                 consumer_index=consumer_index,
             )
         )
     return tuple(result)
 
 
-def order_continuation_producers_by_key(
+def order_continuation_producers_by_readiness_key(
     readiness_graph: ReadinessGraph,
     worker_schedule: WorkerSchedule,
     continuations: tuple[FinalArrivalContinuation, ...],
 ) -> WorkerSchedule:
     """Order eligible static producers by readiness key.
 
-    Key-major ordering completes one readiness key at a time so final-arrival work
-    becomes ready as early as possible. It is legal only when one producer
-    compactly enumerates a complete static task family; all other families keep
-    their existing task order.
+    Readiness-key-major ordering completes one readiness key at a time so
+    final-arrival work becomes ready as early as possible. It is legal only
+    when one producer compactly enumerates a complete static task family; all
+    other families keep their existing task order.
     """
     continuation_roots = {
-        readiness_graph.event(continuation.event_index)
+        readiness_graph.event(continuation.event_id)
         .consumers[continuation.consumer_index]
         .consumer_root
         for continuation in continuations
@@ -2324,7 +2327,7 @@ def order_continuation_producers_by_key(
     replacement_by_root: dict[int, tuple[WorkerScheduleSegment, ...]] = {}
 
     for continuation in continuations:
-        event = readiness_graph.event(continuation.event_index)
+        event = readiness_graph.event(continuation.event_id)
         if len(event.producers) != 1:
             continue
         readiness_producer = event.producers[0]

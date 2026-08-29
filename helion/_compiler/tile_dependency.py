@@ -180,10 +180,10 @@ class CoordinateDomain:
         return result
 
 
-def logical_axis_symbol(axis: int) -> sympy.Symbol:
+def coordinate_axis_symbol(axis: int) -> sympy.Symbol:
     """Return the canonical integer symbol for one coordinate-domain axis."""
     suffix = str(axis) if axis >= 0 else f"m{-axis}"
-    return sympy.Symbol(f"logical_axis_{suffix}", integer=True, nonnegative=True)
+    return sympy.Symbol(f"coordinate_axis_{suffix}", integer=True, nonnegative=True)
 
 
 def nested_logical_axes(
@@ -267,8 +267,8 @@ class CoordinateRelation:
                     target_ranges=tuple(
                         (
                             axis,
-                            logical_axis_symbol(axis),
-                            logical_axis_symbol(axis) + 1,  # pyrefly: ignore[unsupported-operation]
+                            coordinate_axis_symbol(axis),
+                            coordinate_axis_symbol(axis) + 1,  # pyrefly: ignore[unsupported-operation]
                             1,
                         )
                         for axis in target_domain.axis_order
@@ -369,8 +369,8 @@ class CoordinateRelation:
                     target_ranges=tuple(
                         (
                             axis,
-                            logical_axis_symbol(axis),
-                            logical_axis_symbol(axis) + 1,  # pyrefly: ignore[unsupported-operation]
+                            coordinate_axis_symbol(axis),
+                            coordinate_axis_symbol(axis) + 1,  # pyrefly: ignore[unsupported-operation]
                             1,
                         )
                         for axis in target_domain.axis_order
@@ -413,7 +413,7 @@ class CoordinateRelation:
             return None
         renamed_axes = dict(zip(old_axes, new_axes, strict=True))
         substitutions = {
-            logical_axis_symbol(axis): logical_axis_symbol(renamed_axes[axis])
+            coordinate_axis_symbol(axis): coordinate_axis_symbol(renamed_axes[axis])
             for axis in old_axes
         }
         return CoordinateRelation(
@@ -491,7 +491,7 @@ class CoordinateRelation:
             target_ranges: list[tuple[int, sympy.Expr, sympy.Expr, int]] = []
             for target_axis, begin, end, target_step in piece.target_ranges:
                 symbols: dict[sympy.Basic, int] = {
-                    logical_axis_symbol(axis): axis
+                    coordinate_axis_symbol(axis): axis
                     for axis in self.source_domain.axis_order
                 }
                 expression_axes = {
@@ -620,7 +620,7 @@ class CoordinateRelation:
             if step != 1:
                 return None
             count = self.target_domain.axis_counts[axis]
-            symbol = logical_axis_symbol(axis)
+            symbol = coordinate_axis_symbol(axis)
             if (
                 axis in source_counts
                 and source_counts[axis] == count
@@ -701,7 +701,7 @@ class CoordinateRelation:
             frozenset(self.source_domain.axis_order) - key_axis_by_source_axis.keys()
         )
         substitutions = {
-            logical_axis_symbol(source_axis): logical_axis_symbol(key_axis)
+            coordinate_axis_symbol(source_axis): coordinate_axis_symbol(key_axis)
             for source_axis, key_axis in key_axis_by_source_axis.items()
         }
         pieces: list[_CoordinateRelationPiece] = []
@@ -716,7 +716,7 @@ class CoordinateRelation:
             ):
                 return None
             if any(
-                symbol == logical_axis_symbol(axis)
+                symbol == coordinate_axis_symbol(axis)
                 for _target_axis, begin, end, _step in piece.target_ranges
                 for symbol in begin.free_symbols | end.free_symbols
                 for axis in dropped_axes
@@ -770,7 +770,7 @@ class CoordinateRelation:
     def source_axes_affecting_targets(self) -> tuple[int, ...] | None:
         """Return source axes that can change the related target set."""
         symbols: dict[sympy.Basic, int] = {
-            logical_axis_symbol(axis): axis for axis in self.source_domain.axis_order
+            coordinate_axis_symbol(axis): axis for axis in self.source_domain.axis_order
         }
         used: set[int] = set()
         full_source_bounds = {
@@ -865,7 +865,7 @@ class CoordinateRelation:
                             divisor,
                             output_offset,
                         ) = floor_point
-                        target_coordinate = logical_axis_symbol(target_axis)
+                        target_coordinate = coordinate_axis_symbol(target_axis)
                         source_begin, source_end, source_step = next(
                             (source_begin, source_end, source_step)
                             for (
@@ -926,7 +926,7 @@ class CoordinateRelation:
                     converse_source_bounds[target_axis][1],
                     offset + final_source * stride + width,
                 )
-                target_coordinate = logical_axis_symbol(target_axis)
+                target_coordinate = coordinate_axis_symbol(target_axis)
                 if width == stride:
                     target_begin = cast(
                         "sympy.Expr",
@@ -994,7 +994,7 @@ class CoordinateRelation:
     def _evaluate(expression: sympy.Expr, coordinates: dict[int, int]) -> int:
         value = expression.xreplace(
             {
-                logical_axis_symbol(axis): sympy.Integer(coordinate)
+                coordinate_axis_symbol(axis): sympy.Integer(coordinate)
                 for axis, coordinate in coordinates.items()
             }
         )
@@ -1278,7 +1278,7 @@ class CoordinateRelation:
         return all(
             target_axis == expected_target_axis
             and step == 1
-            and sympy.simplify(begin - logical_axis_symbol(source_axis)) == 0  # pyrefly: ignore[unsupported-operation]
+            and sympy.simplify(begin - coordinate_axis_symbol(source_axis)) == 0  # pyrefly: ignore[unsupported-operation]
             and sympy.simplify(end - begin) == 1  # pyrefly: ignore[unsupported-operation]
             for source_axis, expected_target_axis, (
                 target_axis,
@@ -1561,7 +1561,7 @@ class CoordinateRelation:
             ),
             kind="task_order",
         )
-        target_index = logical_axis_symbol(target_index_axis)
+        target_index = coordinate_axis_symbol(target_index_axis)
         pieces: list[_CoordinateRelationPiece] = []
         for source_bounds, target_boxes in cell_targets:
             target_index_begin = 0
@@ -1678,7 +1678,7 @@ class CoordinateRelation:
             return None
         fixed_coordinates = {} if fixed_coordinates is None else fixed_coordinates
         substitutions = {
-            logical_axis_symbol(axis): sympy.Integer(coordinate)
+            coordinate_axis_symbol(axis): sympy.Integer(coordinate)
             for axis, coordinate in fixed_coordinates.items()
         }
         minima: list[sympy.Expr] = []
@@ -2057,7 +2057,9 @@ def _logical_expression_bounds(
                 domain=domain,
                 source_bounds=source_bounds,
             )
-        axis_by_symbol = {logical_axis_symbol(axis): axis for axis in domain.axis_order}
+        axis_by_symbol = {
+            coordinate_axis_symbol(axis): axis for axis in domain.axis_order
+        }
         axis = axis_by_symbol.get(expression)
         if axis is None:
             return None
@@ -2203,7 +2205,7 @@ def _target_box_expression_extreme(
 ) -> sympy.Expr | None:
     """Substitute a box endpoint into a coordinatewise-monotone expression."""
     ranges = {
-        logical_axis_symbol(axis): (begin, end, step)
+        coordinate_axis_symbol(axis): (begin, end, step)
         for axis, begin, end, step in target_ranges
     }
     if expression.is_number:
@@ -2549,7 +2551,7 @@ def _single_axis_interval(
 ) -> tuple[int, int, int, int] | None:
     """Recognize ``[stride * axis + offset, ... + width)`` exactly."""
     source_symbols: dict[sympy.Basic, int] = {
-        logical_axis_symbol(axis): axis for axis in domain.axis_order
+        coordinate_axis_symbol(axis): axis for axis in domain.axis_order
     }
     used_symbols = begin.free_symbols | end.free_symbols
     if len(used_symbols) != 1:
@@ -2589,7 +2591,7 @@ def _static_affine_coefficients(
     remainder = expanded
     coefficients: dict[int, int] = {}
     for axis in domain.axis_order:
-        symbol = logical_axis_symbol(axis)
+        symbol = coordinate_axis_symbol(axis)
         coefficient = sympy.simplify(expanded.coeff(symbol))
         if coefficient.free_symbols or coefficient.is_integer is not True:
             return None
@@ -2697,7 +2699,7 @@ def _dense_mixed_radix_converse(
     if targets_per_source * relation.source_domain.size != support_end - support_begin:
         return None
 
-    target_coordinate = logical_axis_symbol(target_axis)
+    target_coordinate = coordinate_axis_symbol(target_axis)
     source_expressions: list[sympy.Expr] = []
     for source_axis in relation.source_domain.axis_order:
         count = relation.source_domain.axis_counts[source_axis]
@@ -2766,7 +2768,7 @@ def _single_axis_floor_point(
     if end != begin + 1 and sympy.simplify(end - begin) != 1:  # pyrefly: ignore[unsupported-operation]
         return None
     source_symbols: dict[sympy.Basic, int] = {
-        logical_axis_symbol(axis): axis for axis in domain.axis_order
+        coordinate_axis_symbol(axis): axis for axis in domain.axis_order
     }
     used_symbols = begin.free_symbols
     if len(used_symbols) != 1:
@@ -2921,7 +2923,7 @@ def _compose_point_relations(
             axis: begin for axis, begin, _end, _step in first_piece.target_ranges
         }
         substitutions: dict[sympy.Basic, sympy.Expr] = {
-            logical_axis_symbol(axis): expression
+            coordinate_axis_symbol(axis): expression
             for axis, expression in first_targets.items()
         }
         for following_piece in following.pieces:
@@ -3040,7 +3042,8 @@ def pid_task_order(
                 (
                     tuple((axis, 0, counts[axis], 1) for axis in pid_axis_order),
                     tuple(
-                        logical_axis_symbol(axis) for axis in logical_domain.axis_order
+                        coordinate_axis_symbol(axis)
+                        for axis in logical_domain.axis_order
                     ),
                 ),
             ),
@@ -3061,7 +3064,7 @@ def pid_task_order(
         kind="task_order",
         identity=logical_domain.identity,
     )
-    inner = logical_axis_symbol(inner_axis)
+    inner = coordinate_axis_symbol(inner_axis)
     pieces: list[
         tuple[
             tuple[tuple[int, int, int, int], ...],
@@ -3077,7 +3080,7 @@ def pid_task_order(
             expressions = {
                 first_axis: inner - begin + first_in_group,  # pyrefly: ignore[unsupported-operation]
                 second_axis: sympy.Integer(second),
-                **{axis: logical_axis_symbol(axis) for axis in outer_axes},
+                **{axis: coordinate_axis_symbol(axis) for axis in outer_axes},
             }
             pieces.append(
                 (
@@ -3328,9 +3331,9 @@ class AccessDependency:
 class TileDependencyRelation:
     """One symbolic dependency between execution-site instance domains.
 
-    ``relation`` maps each consumer instance to the producer instances it must
-    observe.  A missing relation means that dependency scheduling must lift to
-    an enclosing site or root barrier.
+    ``producers_by_consumer`` maps each consumer instance to the producer
+    instances it must observe. A missing relation means that dependency
+    scheduling must lift to an enclosing site or root barrier.
     """
 
     kind: TileDependencyKind
@@ -3341,7 +3344,7 @@ class TileDependencyRelation:
     consumer_root: int
     producer_site_id: int | None
     consumer_site_id: int | None
-    relation: CoordinateRelation | None
+    producers_by_consumer: CoordinateRelation | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3580,7 +3583,9 @@ def _access_interval_expression(
     if scale != 1:
         return None
     coordinate: sympy.Expr = (
-        sympy.Integer(0) if domain.axis_counts[axis] == 1 else logical_axis_symbol(axis)
+        sympy.Integer(0)
+        if domain.axis_counts[axis] == 1
+        else coordinate_axis_symbol(axis)
     )
     if access.subscript_is_scalar[position]:
         begin = coordinate + offset  # pyrefly: ignore[unsupported-operation]
@@ -3791,7 +3796,7 @@ def _symbolic_linear_access_relation(
     )
 
 
-def _symbolic_access_predecessors(
+def _symbolic_producers_by_consumer(
     *,
     producer_access: TileAccess,
     producer_domain: CoordinateDomain,
@@ -3950,8 +3955,8 @@ def instantiate_symbolic_dependencies(
 ) -> tuple[TileDependencyRelation, ...]:
     """Instantiate site dependencies without enumerating task instances.
 
-    Unsupported access geometry returns ``relation=None`` so the caller can
-    monotonically retain root barrier.
+    Unsupported access geometry returns ``producers_by_consumer=None`` so the
+    caller can monotonically retain root barrier.
     """
     if len(root_domains) != len(dependency_graph.task_families):
         raise ValueError("root domain count disagrees with the dependency graph")
@@ -4002,7 +4007,7 @@ def instantiate_symbolic_dependencies(
                         consumer_root=edge.consumer_root,
                         producer_site_id=None,
                         consumer_site_id=None,
-                        relation=None,
+                        producers_by_consumer=None,
                     )
                 )
                 continue
@@ -4018,8 +4023,8 @@ def instantiate_symbolic_dependencies(
                             consumer_root=edge.consumer_root,
                             producer_site_id=producer_site_id,
                             consumer_site_id=consumer_site_id,
-                            relation=(
-                                _symbolic_access_predecessors(
+                            producers_by_consumer=(
+                                _symbolic_producers_by_consumer(
                                     producer_access=producer_access,
                                     producer_domain=producer_domain,
                                     consumer_access=consumer_access,
@@ -4033,31 +4038,31 @@ def instantiate_symbolic_dependencies(
     return tuple(result)
 
 
-def preceding_site_relation(
+def consumer_to_preceding_site_relation(
     dependency_graph: TileDependencyGraph,
     *,
     site_domains: tuple[CoordinateDomain | None, ...],
-    source_site_id: int,
+    preceding_site_id: int,
     consumer_site_id: int,
     consumer_access_id: int,
 ) -> CoordinateRelation | None:
     """Map a consumer site to a preceding site in task-local program order.
 
     An ancestor maps to its single enclosing instance.  A lexically earlier
-    sibling subtree maps to every source instance under the shared enclosing
-    instance. Both are ordinary relations; no flattened iteration IDs are
+    sibling subtree maps to every preceding-site instance under the shared
+    enclosing instance. Both are ordinary relations; no flattened iteration IDs are
     constructed.
     """
     sites = dependency_graph.execution_sites
     if len(site_domains) != len(sites):
         raise ValueError("site domain count disagrees with the dependency graph")
-    source_site = sites[source_site_id]
+    preceding_site = sites[preceding_site_id]
     consumer_site = sites[consumer_site_id]
-    source_domain = site_domains[source_site_id]
+    preceding_domain = site_domains[preceding_site_id]
     consumer_domain = site_domains[consumer_site_id]
     if (
-        source_site.root != consumer_site.root
-        or source_domain is None
+        preceding_site.root != consumer_site.root
+        or preceding_domain is None
         or consumer_domain is None
     ):
         return None
@@ -4081,31 +4086,31 @@ def preceding_site_relation(
         result.reverse()
         return tuple(result)
 
-    source_lineage = lineage(source_site_id)
+    preceding_lineage = lineage(preceding_site_id)
     consumer_lineage = lineage(consumer_site_id)
     common_length = 0
-    for source_ancestor, consumer_ancestor in zip(
-        source_lineage, consumer_lineage, strict=False
+    for preceding_ancestor, consumer_ancestor in zip(
+        preceding_lineage, consumer_lineage, strict=False
     ):
-        if source_ancestor != consumer_ancestor:
+        if preceding_ancestor != consumer_ancestor:
             break
         common_length += 1
     if not common_length:
         return None
 
-    if common_length == len(source_lineage):
-        equal_axes = source_domain.axis_order
+    if common_length == len(preceding_lineage):
+        equal_axes = preceding_domain.axis_order
     else:
-        source_child = sites[source_lineage[common_length]]
-        source_node_index = source_child.callsite_path[-1][0]
+        preceding_child = sites[preceding_lineage[common_length]]
+        preceding_node_index = preceding_child.callsite_path[-1][0]
         if common_length == len(consumer_lineage):
             consumer_node_index = consumer_access.graph_node_index
         else:
             consumer_child = sites[consumer_lineage[common_length]]
             consumer_node_index = consumer_child.callsite_path[-1][0]
-        if source_node_index >= consumer_node_index:
+        if preceding_node_index >= consumer_node_index:
             return None
-        common_site_id = source_lineage[common_length - 1]
+        common_site_id = preceding_lineage[common_length - 1]
         common_domain = site_domains[common_site_id]
         if common_domain is None:
             return None
@@ -4116,7 +4121,7 @@ def preceding_site_relation(
     equal_axis_set = frozenset(equal_axes)
     return CoordinateRelation(
         source_domain=consumer_domain,
-        target_domain=source_domain,
+        target_domain=preceding_domain,
         pieces=(
             _CoordinateRelationPiece(
                 source_bounds_items=tuple(
@@ -4126,18 +4131,18 @@ def preceding_site_relation(
                 target_ranges=tuple(
                     (
                         axis,
-                        logical_axis_symbol(axis),
-                        logical_axis_symbol(axis) + 1,  # pyrefly: ignore[unsupported-operation]
+                        coordinate_axis_symbol(axis),
+                        coordinate_axis_symbol(axis) + 1,  # pyrefly: ignore[unsupported-operation]
                         1,
                     )
                     if axis in equal_axis_set
                     else (
                         axis,
                         sympy.Integer(0),
-                        sympy.Integer(source_domain.axis_counts[axis]),
+                        sympy.Integer(preceding_domain.axis_counts[axis]),
                         1,
                     )
-                    for axis in source_domain.axis_order
+                    for axis in preceding_domain.axis_order
                 ),
             ),
         ),

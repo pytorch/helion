@@ -159,9 +159,9 @@ def task_order(schedule: WorkerSchedule, root: int) -> tuple[int, ...]:
 
 def _materialized_producer_tasks_by_key(
     readiness_graph: ReadinessGraph,
-    event_index: int,
+    event_id: int,
 ) -> tuple[frozenset[tuple[int, int]], ...]:
-    event = readiness_graph.event(event_index)
+    event = readiness_graph.event(event_id)
     result: list[set[tuple[int, int]]] = [
         set() for _ in range(event.readiness_key_count)
     ]
@@ -185,11 +185,11 @@ def _continuation_producers(
 ) -> dict[tuple[int, int], frozenset[tuple[int, int]]]:
     result: dict[tuple[int, int], frozenset[tuple[int, int]]] = {}
     for continuation in continuations:
-        event = readiness_graph.event(continuation.event_index)
+        event = readiness_graph.event(continuation.event_id)
         readiness_consumer = event.consumers[continuation.consumer_index]
         producers_by_key = _materialized_producer_tasks_by_key(
             readiness_graph,
-            continuation.event_index,
+            continuation.event_id,
         )
         for consumer_task, required_keys in enumerate(
             readiness_consumer.keys_by_consumer.materialize(

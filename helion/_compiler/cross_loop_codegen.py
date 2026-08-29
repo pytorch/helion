@@ -29,8 +29,8 @@ from .program_id import typed_program_id
 from .tile_dependency import TILE_DEPENDENCY_SITE_ID_ATTR
 from .tile_dependency import CoordinateDomain
 from .tile_dependency import CoordinateRelation
+from .tile_dependency import coordinate_axis_symbol
 from .tile_dependency import instantiate_coordinate_domains
-from .tile_dependency import logical_axis_symbol
 from .tile_dependency import nested_logical_axes
 from .tile_dependency import pid_task_order
 from .tile_dependency import tile_dependency_site_id
@@ -196,7 +196,7 @@ def _clone_opaque_statements_with_loop_segments(
     return cloned
 
 
-def _stage_root_ranges(owner: ForEachProgramID) -> list[tuple[int, int]]:
+def _phase_root_ranges(owner: ForEachProgramID) -> list[tuple[int, int]]:
     result: list[tuple[int, int]] = []
     begin = 0
     for index in range(1, len(owner.case_phases) + 1):
@@ -440,7 +440,7 @@ def _emit_final_arrival_continuation(
     ]
 
 
-def _publication_barrier(device_function: DeviceFunction) -> ast.stmt:
+def _publication_sync(device_function: DeviceFunction) -> ast.stmt:
     if cast("int", device_function.config.get("num_warps", 1)) != 1:
         return statement_from_string("tl.debug_barrier()")
     sync = device_function.new_var("tile_dependency_publication_sync", dce=False)
@@ -746,7 +746,7 @@ def emit_cross_loop_schedule(
     readiness_counter_arg = state_section(readiness_counter_state_offset)
     root_barrier_counter_arg = state_section(root_barrier_state_offset)
 
-    stage_root_ranges = _stage_root_ranges(owner)
+    phase_root_ranges = _phase_root_ranges(owner)
     result: list[ast.stmt] = [
         statement_from_string(f"{epoch_var} = tl.load({epoch_arg} + {worker}) + 1")
     ]
@@ -792,7 +792,7 @@ def emit_cross_loop_schedule(
             return []
         barrier_counter = root_barrier_counter(root)
         arrivals = root_barrier_arrival_count(root)
-        result = [_publication_barrier(device_function)]
+        result = [_publication_sync(device_function)]
         if arrivals == 1:
             result.append(
                 statement_from_string(
@@ -918,7 +918,7 @@ def emit_cross_loop_schedule(
         expression: sympy.Expr,
         coordinates: dict[int, str],
     ) -> str:
-        """Render the restricted logical-relation expression grammar."""
+        """Render the restricted coordinate-relation expression grammar."""
         if isinstance(expression, sympy.Integer):
             return str(int(expression))
         if isinstance(expression, sympy.Symbol):
@@ -926,7 +926,7 @@ def emit_cross_loop_schedule(
                 (
                     axis
                     for axis in coordinates
-                    if logical_axis_symbol(axis) == expression
+                    if coordinate_axis_symbol(axis) == expression
                 ),
                 None,
             )
@@ -1342,7 +1342,7 @@ def emit_cross_loop_schedule(
 
         last_arrival_body = [consumer_call]
         if consumer_publications:
-            last_arrival_body.append(_publication_barrier(device_function))
+            last_arrival_body.append(_publication_sync(device_function))
             last_arrival_body.extend(consumer_publications)
         last_arrival_body.extend(root_barrier_publication(continuation_root))
         expected_arrivals = plan.uniform_arrival_count()
@@ -1472,7 +1472,7 @@ def emit_cross_loop_schedule(
             cloned = cast("ast.For", _clone_ast_value(loop))
             cloned.body.extend(
                 [
-                    _publication_barrier(device_function),
+                    _publication_sync(device_function),
                     *publications,
                 ]
             )
@@ -1676,7 +1676,7 @@ def emit_cross_loop_schedule(
         body.append(opaque_call)
         if producer_counters:
             has_task_scheduling = True
-            body.append(_publication_barrier(device_function))
+            body.append(_publication_sync(device_function))
         for producer_counter_plan, readiness_producer in producer_counters:
             body.extend(
                 emit_readiness_arrivals_from_producer(
@@ -1797,7 +1797,7 @@ def emit_cross_loop_schedule(
             )
         ]
 
-    for root_begin, root_end in stage_root_ranges:
+    for root_begin, root_end in phase_root_ranges:
         for root in range(root_begin, root_end):
             result.extend(static_root_body(root))
     result.append(

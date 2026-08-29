@@ -5147,6 +5147,19 @@ proposed names are added here only after approval.
 | `LogicalRelation` | `CoordinateRelation` | Represent an exact piecewise symbolic relation between two coordinate domains. |
 | `ExecutionScope` | `ExecutionSite` | Identify one stable reachable DeviceIR callsite, including nested loops and control-flow bodies. |
 | relation `source` / `target` | retain | These are conventional relation-algebra terms: a `CoordinateRelation` maps each source coordinate to a set of target coordinates. Domain-specific fields qualify the direction where it matters, such as `producers_by_key` and `keys_by_consumer`. |
+| `TileDependencyRelation.relation` | `producers_by_consumer` | State the authoritative dependency direction explicitly: consumer execution-site instances map to the producer instances they must observe. |
+| `_symbolic_access_predecessors()` | `_symbolic_producers_by_consumer()` | Match the helper name to the relation direction it constructs. |
+| `preceding_site_relation()` | `consumer_to_preceding_site_relation()` | State both endpoints and their direction in task-local program order. |
+| `source_site_id` in the preceding-site relation | `preceding_site_id` | Avoid calling the relation target its source. |
+| `logical_axis_symbol()` | `coordinate_axis_symbol()` | The symbol is shared by task, execution-site, readiness-key, worker, value, allocation, and task-order domains. |
+| `FinalArrivalContinuation.event_index` | `event_id` | Store the same stable identity exposed by `ReadinessEvent.event_id`; retain `consumer_index` because it genuinely indexes the consumer tuple. |
+| `ReadinessEvent.root_barrier_source` | `root_barrier_producer_root` | Identify the returned root and its producer role directly. |
+| `_nested_loop_entry_event()` | `_nested_loop_entry_counter()` | The helper returns a selected `ReadinessCounterPlan`, not a semantic `ReadinessEvent`. |
+| `order_continuation_producers_by_key()` | `order_continuation_producers_by_readiness_key()` | Qualify the ordering key consistently with readiness-event terminology. |
+| `_readiness_producer_is_lowerable()` | `_supports_readiness_counter_lowering()` | Name the specific counter-publication representation being tested rather than implying general lowerability. |
+| `_add_readiness_event_candidate()` | `_record_readiness_event()` | The helper canonicalizes and merges a semantic event; it does not create an autotuning candidate. |
+| `_stage_root_ranges()` | `_phase_root_ranges()` | Match the existing `KernelPhase` and `case_phases` terminology. |
+| `_publication_barrier()` | `_publication_sync()` | Distinguish local warp/CTA memory-ordering synchronization from a cross-root barrier. |
 
 The approved terminology is now implemented across dependency analysis,
 static-pipeline scheduling, code generation, and their focused tests. Historical

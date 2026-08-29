@@ -24,9 +24,9 @@ from helion._compiler.tile_dependency import TileDependencyKind
 from helion._compiler.tile_dependency import _CoordinateRelationPiece
 from helion._compiler.tile_dependency import allocation_regions_may_overlap
 from helion._compiler.tile_dependency import build_tile_dependency_graph
+from helion._compiler.tile_dependency import coordinate_axis_symbol
 from helion._compiler.tile_dependency import instantiate_coordinate_domains
 from helion._compiler.tile_dependency import instantiate_symbolic_dependencies
-from helion._compiler.tile_dependency import logical_axis_symbol
 from helion._compiler.tile_dependency import owner_roots_by_graph_id
 from helion._compiler.tile_dependency import pid_task_order
 from helion._testing import DEVICE
@@ -109,7 +109,7 @@ def _root_producers_by_consumer(
     axis_geometry = _axis_geometry(root_domains)
     configured_root_domains, site_domains = _configured_domains(plan, axis_geometry)
     relations = tuple(
-        dependency.relation
+        dependency.producers_by_consumer
         for dependency in instantiate_symbolic_dependencies(
             plan,
             root_domains=configured_root_domains,
@@ -145,7 +145,7 @@ def _symbolic_root_relation(
         site_domains=site_domains,
     )
     self_relations = tuple(
-        dependency.relation
+        dependency.producers_by_consumer
         for dependency in dependencies
         if dependency.producer_root == 0 and dependency.consumer_root == 1
     )
@@ -201,8 +201,8 @@ class TestTileDependency(TestCase):
     def test_relation_axis_renaming_preserves_positional_coordinates(self) -> None:
         source = CoordinateDomain((10, 20), ((10, 2), (20, 3)))
         target = CoordinateDomain((30, 40), ((30, 2), (40, 3)))
-        source_10 = logical_axis_symbol(10)
-        source_20 = logical_axis_symbol(20)
+        source_10 = coordinate_axis_symbol(10)
+        source_20 = coordinate_axis_symbol(20)
         relation = CoordinateRelation.point_map(
             source,
             target,
@@ -343,8 +343,8 @@ class TestTileDependency(TestCase):
                     kind="event",
                     identity=None,
                 )
-                slot = logical_axis_symbol(20)
-                activation_block = logical_axis_symbol(21)
+                slot = coordinate_axis_symbol(20)
+                activation_block = coordinate_axis_symbol(21)
                 begin = 256 * slot + 16 * activation_block
                 bounds = ((20, 0, slots, 1), (21, 0, 8, 1))
                 dependency = CoordinateRelation(
@@ -402,8 +402,8 @@ class TestTileDependency(TestCase):
             kind="event",
         )
         producer_domain = CoordinateDomain((10,), ((10, slots * 256),), identity=0)
-        slot = logical_axis_symbol(20)
-        activation_block = logical_axis_symbol(21)
+        slot = coordinate_axis_symbol(20)
+        activation_block = coordinate_axis_symbol(21)
         begin = 256 * slot + 16 * activation_block
         producers_by_key = CoordinateRelation(
             readiness_key_domain,
@@ -430,8 +430,8 @@ class TestTileDependency(TestCase):
             kind="site",
         )
         target_domain = CoordinateDomain((10,), ((10, 24),), kind="allocation")
-        inner = logical_axis_symbol(21)
-        outer = logical_axis_symbol(20)
+        inner = coordinate_axis_symbol(21)
+        outer = coordinate_axis_symbol(20)
         begin = 2 * inner + 12 * outer
         bounds = ((21, 0, 3, 1), (20, 0, 2, 1))
         targets_by_source = CoordinateRelation(
@@ -773,7 +773,7 @@ class TestTileDependency(TestCase):
             (
                 (
                     ((producer_axis, 0, 8, 1),),
-                    (sympy.floor((logical_axis_symbol(producer_axis) + 3) / 4),),
+                    (sympy.floor((coordinate_axis_symbol(producer_axis) + 3) / 4),),
                 ),
             ),
         )
@@ -801,7 +801,7 @@ class TestTileDependency(TestCase):
             (
                 (
                     ((10, 0, 6, 1),),
-                    (sympy.floor(logical_axis_symbol(10) / 2),),
+                    (sympy.floor(coordinate_axis_symbol(10) / 2),),
                 ),
             ),
         )
