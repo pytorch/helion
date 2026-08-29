@@ -1056,6 +1056,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 128],
         )
 
+    @skipIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_sparse_attn_indexer_decode(self):
         mod = import_path(EXAMPLES_DIR / "sparse_attn_indexer.py")
         args = mod.indexer_inputs(num_tokens=1, kv_len=512)
