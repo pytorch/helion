@@ -29,6 +29,9 @@ from .._compiler.cute.tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_SUBTIL
 from .._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
 from .._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_AUX_LOAD_PLACEMENT_SUBTILE_PRE_ACC_WAIT,
+)
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP
 from .._compiler.cute.tcgen05_constants import (
@@ -1952,17 +1955,20 @@ def _codegen_cute_store_tcgen05_tile(
         TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
         TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT,
     )
-    if tcgen05_aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT:
+    if tcgen05_aux_load_placement in (
+        TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
+        TCGEN05_AUX_LOAD_PLACEMENT_SUBTILE_PRE_ACC_WAIT,
+    ):
         if not aux_steps_in_chain:
             raise exc.InvalidConfig(
                 f"invalid {TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY}="
-                f"{TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT!r}: the epilogue has "
+                f"{tcgen05_aux_load_placement!r}: the epilogue has "
                 "no per-subtile auxiliary loads to place"
             )
         if tcgen05_value.partial_output_tma_store:
             raise exc.InvalidConfig(
                 f"invalid {TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY}="
-                f"{TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT!r}: per-subtile "
+                f"{tcgen05_aux_load_placement!r}: per-subtile "
                 "auxiliary loads cannot precede the accumulator wait for a "
                 "partial-output TMA-store epilogue"
             )
@@ -3166,11 +3172,22 @@ def _codegen_cute_store_tcgen05_tile(
             if rec.aux_rmem_full is not None:
                 # Pre-wait hoisted rowvec: the whole fragment is already in
                 # registers (loaded before the accumulator consumer_wait by
-                # ``_aux_tile_setup_lines``); slice the active subtile.
+                # ``_aux_tile_setup_lines``). Its grouped whole-fragment
+                # profile is generally nested, while the accumulator carrier
+                # may be flat. Retile each register-resident subtile through
+                # the carrier layout before loading it, just as the direct
+                # GMEM path does. This keeps the prefetch generic in the
+                # subtile count and avoids a TensorSSA profile mismatch.
                 lines.append(
-                    f"{prelude_indent}{rec.aux_loaded} = "
+                    f"{prelude_indent}{rec.ttr_aux_subtile} = "
                     f"{rec.aux_rmem_full}"
-                    f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))].load()\n"
+                    f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+                    f"{prelude_indent}{rec.aux_rmem} = "
+                    f"cute.make_rmem_tensor(cute.make_layout({carrier_name}.shape), "
+                    f"{rec.aux_dtype})\n"
+                    f"{prelude_indent}cute.autovec_copy("
+                    f"{rec.ttr_aux_subtile}, {rec.aux_rmem})\n"
+                    f"{prelude_indent}{rec.aux_loaded} = {rec.aux_rmem}.load()\n"
                 )
                 continue
             # Both remaining cases -- rowvec / leading-broadcast aux
@@ -4726,8 +4743,9 @@ def _codegen_cute_store_tcgen05_tile(
                 f"                {tcgen05_acc_pipeline}.consumer_release({tcgen05_acc_consumer_state})\n"
             )
         )
-        pre_wait_aux = (
-            tcgen05_aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+        pre_wait_aux = tcgen05_aux_load_placement in (
+            TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
+            TCGEN05_AUX_LOAD_PLACEMENT_SUBTILE_PRE_ACC_WAIT,
         )
         return (
             f"{early_aux_prelude if pre_wait_aux else ''}"

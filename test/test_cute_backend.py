@@ -8298,8 +8298,12 @@ class TestCuteBackend(TestCase):
         # ...and emitted before the accumulator consumer_wait.
         acc_wait_pos = code.index(".consumer_wait(tcgen05_acc_consumer_state)")
         self.assertLess(hoist_pos, acc_wait_pos)
-        # The subtile loop reads the register tensor, not per-subtile GMEM.
-        self.assertNotIn("tcgen05_tTR_gAux_subtile_", code)
+        # The subtile loop retiles the register tensor into the carrier
+        # profile; it does not issue another GMEM read.
+        self.assertIn(
+            "tcgen05_tTR_gAux_subtile_0 = tcgen05_aux_rmem_full_0[",
+            code,
+        )
         self.assertNotIn("tcgen05_aux_rowvec_smem_layout_", code)
 
         # bm=256 cannot use the whole-fragment register hoist, so it stages the
@@ -8314,6 +8318,38 @@ class TestCuteBackend(TestCase):
         )
         self.assertNotIn("tcgen05_aux_rmem_full_", code256)
         self.assertIn("tcgen05_aux_rowvec_smem_layout_", code256)
+
+    def test_matmul_mma_tcgen05_fp8_two_aux_prewait_retiles_rowvec(self) -> None:
+        """A hoisted rowvec composes with a colvec in the same epilogue."""
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        m, k, n = 256, 512, 128
+        x = (torch.randn(m, k, device=DEVICE) * 0.2).to(torch.float8_e4m3fn)
+        y = (torch.randn(k, n, device=DEVICE) * 0.2).to(torch.float8_e4m3fn)
+        scale_m = (
+            (torch.arange(m, device=DEVICE, dtype=torch.float32) + 1.0)
+            .reshape(m, 1)
+            .expand(m, n)
+        )
+        scale_n = torch.rand(n, device=DEVICE) + 0.5
+        code, out = code_and_output(
+            cute_matmul_mma_fp8_rowwise_colwise_scale,
+            (x, y, scale_m, scale_n),
+            block_sizes=[128, 64, 128],
+            tcgen05_cluster_m=2,
+            pid_type="persistent_blocked",
+            tcgen05_aux_load_placement="pre_acc_wait",
+        )
+        ref = (x.float() @ y.float()) * scale_m.float() * scale_n.float()
+        torch.testing.assert_close(out.float(), ref, atol=2.0, rtol=5e-2)
+        self.assertIn("tcgen05_aux_rmem_full_1", code)
+        self.assertIn(
+            "tcgen05_tTR_gAux_subtile_1 = tcgen05_aux_rmem_full_1[",
+            code,
+        )
 
     def test_matmul_mma_tcgen05_fp8_rowvec_warp_staging_configs(self) -> None:
         """Warp-private rowvec staging follows the measured profitability rule."""

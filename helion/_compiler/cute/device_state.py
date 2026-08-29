@@ -264,6 +264,10 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
     l2_swizzle_size: int = 1
     tma_store_full_tiles_only: bool = False
     flat_role_launch_warp_count: int | None = None
+    independent_2cta_groups: int = 1
+    static_work_grid_clusters: int = 0
+    static_work_iterations: int = 0
+    launch_warp_count_override: int | None = None
     grouped: CuteTcgen05GroupedPlan | None = None
     # Per-anchor auxiliary descriptors discovered by the forward FX walker. This
     # is store-fusion metadata, not a collective compatibility field:
@@ -301,6 +305,18 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
         from .strategies import Tcgen05PersistenceModel
 
         return self.persistence_model == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+
+    @property
+    def has_exact_static_work_schedule(self) -> bool:
+        return (
+            self.independent_2cta_groups > 1
+            and self.static_work_grid_clusters > 0
+            and self.static_work_iterations > 0
+        )
+
+    @property
+    def physical_cluster_m(self) -> int:
+        return self.cluster_m * self.independent_2cta_groups
 
     @property
     def exec_warp_id(self) -> int:
@@ -393,6 +409,9 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
         # warp occupies the former padding slot and the launch stays at 8.
         # MONOLITHIC keeps its historical 6-warp launch because generated-code
         # golden pins and validated runtime behavior depend on that shape.
+        if self.launch_warp_count_override is not None:
+            assert self.launch_warp_count_override >= self.role_warp_count
+            return self.launch_warp_count_override
         if self.has_scheduler_warp:
             warpgroup = 4
             return (self.role_warp_count + warpgroup - 1) // warpgroup * warpgroup

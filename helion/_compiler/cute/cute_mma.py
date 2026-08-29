@@ -132,12 +132,17 @@ from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
+from .tcgen05_constants import TCGEN05_INDEPENDENT_2CTA_GROUPS_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_INDEPENDENT_2CTA_GROUPS_DEFAULT
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
+from .tcgen05_constants import TCGEN05_LAUNCH_WARPS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_STATIC_WORK_GRID_CLUSTERS_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_STATIC_WORK_ITERATIONS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
@@ -4328,6 +4333,9 @@ class _PerKiterTmaArgs:
     # (cute_plan.md §6.12.7). Default 1 preserves byte-identity for the
     # validated cluster_m=2 cluster_n=1 path.
     cluster_n: int = 1
+    # Physical four-CTA clusters can contain two independent V=2 groups even
+    # when cluster_n remains one.  In that topology V leaders are ranks 0/2.
+    independent_2cta_groups: int = 1
     # Static-full pipelined TMA loops can drop the per-K runtime full-tile
     # branch and scalar fallback. Non-pipelined/asymmetric paths must keep the
     # guarded fallback path.
@@ -4380,6 +4388,7 @@ def _tcgen05_two_cta_owner_predicate(
     is_two_cta: bool,
     gate_exec_warp: bool,
     cluster_n: int = 1,
+    independent_2cta_groups: int = 1,
 ) -> str | None:
     """Owner-of-the-V-pair predicate for AB consumer release / MMA issuance.
 
@@ -4397,7 +4406,7 @@ def _tcgen05_two_cta_owner_predicate(
     if gate_exec_warp:
         predicate_terms.append(exec_active)
     if is_two_cta:
-        if cluster_n > 1:
+        if cluster_n > 1 or independent_2cta_groups > 1:
             predicate_terms.append(_TCGEN05_V_LEADER_PREDICATE)
         else:
             predicate_terms.append(_TCGEN05_CLUSTER_LEADER_PREDICATE)
@@ -4515,6 +4524,7 @@ def _build_kloop_pipeline_consumer_if(
             is_two_cta=args.is_two_cta,
             gate_exec_warp=gate_exec_warp,
             cluster_n=args.cluster_n,
+            independent_2cta_groups=args.independent_2cta_groups,
         ),
         indent="" if args.static_full_tiles else "    ",
     )
@@ -4551,6 +4561,7 @@ def _build_kloop_pipeline_consumer_prefetch_stmts(
         is_two_cta=args.is_two_cta,
         gate_exec_warp=gate_exec_warp,
         cluster_n=args.cluster_n,
+        independent_2cta_groups=args.independent_2cta_groups,
     )
     if owner_predicate is not None:
         predicate = f"{predicate} and {owner_predicate}"
@@ -4590,6 +4601,7 @@ def _build_kloop_pipeline_release_if(
         is_two_cta=args.is_two_cta,
         gate_exec_warp=gate_exec_warp,
         cluster_n=args.cluster_n,
+        independent_2cta_groups=args.independent_2cta_groups,
     )
     advance_src = emit_pipeline_advance(args.tma_consumer_state)
     indent = "" if args.static_full_tiles else "    "
@@ -4613,6 +4625,7 @@ def _build_kloop_pipeline_release_if(
                 is_two_cta=True,
                 gate_exec_warp=False,
                 cluster_n=args.cluster_n,
+                independent_2cta_groups=args.independent_2cta_groups,
             )
             assert owner_gate is not None
             full_tile_src = (
@@ -4635,6 +4648,7 @@ def _build_tcgen05_mma_accumulate_reset_stmt(
     gate_exec_warp: bool = True,
     is_two_cta: bool = False,
     cluster_n: int = 1,
+    independent_2cta_groups: int = 1,
 ) -> ast.stmt:
     reset_src = f"{tiled_mma}.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, False)"
     predicate = _tcgen05_two_cta_owner_predicate(
@@ -4642,6 +4656,7 @@ def _build_tcgen05_mma_accumulate_reset_stmt(
         is_two_cta=is_two_cta,
         gate_exec_warp=gate_exec_warp,
         cluster_n=cluster_n,
+        independent_2cta_groups=independent_2cta_groups,
     )
     if predicate is None:
         return statement_from_string(reset_src)
@@ -4659,14 +4674,24 @@ def _build_tcgen05_mma_issue_stmt(
     gate_exec_warp: bool = True,
     is_two_cta: bool = False,
     cluster_n: int = 1,
+    independent_2cta_groups: int = 1,
 ) -> ast.stmt:
+    frag_a = (
+        f"{tcgen05_frag_a}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}]"
+    )
+    frag_b = (
+        f"{tcgen05_frag_b}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}]"
+    )
+    if independent_2cta_groups == 1:
+        frag_a = f"[{frag_a}]"
+        frag_b = f"[{frag_b}]"
     issue_src = (
         f"for _tcgen05_kblk_idx in range(cute.size({tcgen05_frag_a}, mode=[2])):\n"
         f"    cute.gemm(\n"
         f"        {tiled_mma},\n"
         f"        {acc_frag},\n"
-        f"        [{tcgen05_frag_a}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}]],\n"
-        f"        [{tcgen05_frag_b}[None, None, cutlass.Int32(_tcgen05_kblk_idx), {mma_stage}]],\n"
+        f"        {frag_a},\n"
+        f"        {frag_b},\n"
         f"        {acc_frag},\n"
         "    )\n"
         f"    {tiled_mma}.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, True)"
@@ -4676,6 +4701,7 @@ def _build_tcgen05_mma_issue_stmt(
         is_two_cta=is_two_cta,
         gate_exec_warp=gate_exec_warp,
         cluster_n=cluster_n,
+        independent_2cta_groups=independent_2cta_groups,
     )
     if predicate is not None:
         issue_src = f"if {predicate}:\n{textwrap.indent(issue_src, '    ')}"
@@ -6163,6 +6189,35 @@ def _emit_mma_pipeline(
         tcgen05_mma_bn = tcgen05_source_bn = bn
 
     tcgen05_cluster_m = _tcgen05_cluster_m(df.config)
+    tcgen05_independent_2cta_groups = _tcgen05_config_int(
+        df.config,
+        TCGEN05_INDEPENDENT_2CTA_GROUPS_CONFIG_KEY,
+        TCGEN05_INDEPENDENT_2CTA_GROUPS_DEFAULT,
+    )
+    tcgen05_static_work_grid_clusters = _tcgen05_config_int(
+        df.config,
+        TCGEN05_STATIC_WORK_GRID_CLUSTERS_CONFIG_KEY,
+        0,
+    )
+    tcgen05_static_work_iterations = _tcgen05_config_int(
+        df.config,
+        TCGEN05_STATIC_WORK_ITERATIONS_CONFIG_KEY,
+        0,
+    )
+    tcgen05_launch_warps = _tcgen05_config_int(
+        df.config,
+        TCGEN05_LAUNCH_WARPS_CONFIG_KEY,
+        0,
+    )
+    tcgen05_exact_static_work_requested = any(
+        value != default
+        for value, default in (
+            (tcgen05_independent_2cta_groups, 1),
+            (tcgen05_static_work_grid_clusters, 0),
+            (tcgen05_static_work_iterations, 0),
+            (tcgen05_launch_warps, 0),
+        )
+    )
     tcgen05_large_bn_proof = _tcgen05_large_bn_proof_enabled(df.config)
     if tcgen05_large_bn_proof and (
         not _tcgen05_large_bn_proof_shape(
@@ -7729,6 +7784,7 @@ def _emit_mma_pipeline(
                 is_two_cta=tcgen05_is_two_cta,
                 gate_exec_warp=False,
                 cluster_n=tcgen05_cluster_n,
+                independent_2cta_groups=tcgen05_independent_2cta_groups,
             )
             assert ab_consumer_prefetch_owner_predicate is not None
             _emit_per_tile(
@@ -7768,6 +7824,7 @@ def _emit_mma_pipeline(
             gate_exec_warp=not tcgen05_use_role_local_mma_exec,
             is_two_cta=tcgen05_is_two_cta,
             cluster_n=tcgen05_cluster_n,
+            independent_2cta_groups=tcgen05_independent_2cta_groups,
         )
         prefix.append(reset_accumulate_stmt)
         per_tile_stmts.append(reset_accumulate_stmt)
@@ -7794,7 +7851,11 @@ def _emit_mma_pipeline(
         mma_physical_m_threads = max(mma_physical_m_threads, 32)
         tcgen05_cta_thread_count = max(tcgen05_cta_thread_count, 4 * 32)
     if mma_impl == "tcgen05" and tcgen05_cluster_m * tcgen05_cluster_n > 1:
-        df.cute_state.cluster_shape = (tcgen05_cluster_m, tcgen05_cluster_n, 1)
+        df.cute_state.cluster_shape = (
+            tcgen05_cluster_m * tcgen05_independent_2cta_groups,
+            tcgen05_cluster_n,
+            1,
+        )
     # PipelineTmaUmma empty barriers are released by the leader CTA with the
     # pipeline's multicast mask. Peer CTAs still advance local consumer state,
     # but they must not add a second empty-barrier arrival: doing so lets the
@@ -7872,6 +7933,60 @@ def _emit_mma_pipeline(
         tcgen05_effective_scheduler_warps = (
             1 if nm_scheduler_decode else tcgen05_warp_spec.scheduler_warps
         )
+        if tcgen05_exact_static_work_requested:
+            logical_m_tiles = (m_size + tcgen05_mma_bm - 1) // tcgen05_mma_bm
+            logical_n_tiles = (n_size + tcgen05_mma_bn - 1) // tcgen05_mma_bn
+            logical_output_tiles = logical_m_tiles * logical_n_tiles
+            scheduled_output_tiles = (
+                tcgen05_static_work_grid_clusters
+                * tcgen05_independent_2cta_groups
+                * tcgen05_static_work_iterations
+            )
+            physical_cluster_m = tcgen05_cluster_m * tcgen05_independent_2cta_groups
+            exact_schedule_valid = (
+                tcgen05_independent_2cta_groups == 2
+                and tcgen05_static_work_grid_clusters > 0
+                and tcgen05_static_work_iterations > 0
+                and tcgen05_launch_warps >= tcgen05_warp_spec.total_warps
+                and tcgen05_launch_warps <= 32
+                and tcgen05_cluster_m == 2
+                and tcgen05_cluster_n == 1
+                and tcgen05_is_two_cta
+                and tcgen05_static_full_tiles
+                and k_total_size // bk >= tcgen05_ab_stage_count_value
+                and tcgen05_use_role_local_persistent_body
+                and tcgen05_effective_scheduler_warps == 0
+                and tcgen05_grouped_plan is None
+                and not (analysis is not None and analysis.has_leading_passthrough)
+                and df.config.get("pid_type") == "persistent_interleaved"
+                and all(
+                    grouping == 1
+                    for grouping in cast("list[int]", df.config.get("l2_groupings", []))
+                )
+                and logical_n_tiles == 1
+                and scheduled_output_tiles == logical_output_tiles
+                and physical_cluster_m <= 16
+                and tcgen05_static_work_grid_clusters
+                <= max(1, env.config_spec.num_sm // physical_cluster_m)
+            )
+            if not exact_schedule_valid:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "independent two-CTA exact scheduling requires a static-full "
+                    "role-local persistent_interleaved CtaGroup.TWO kernel with "
+                    "cluster_m=2, cluster_n=1, two independent groups, no "
+                    "scheduler warp/grouped/batch axis, one logical N tile, "
+                    "l2_groupings=1, a launch "
+                    "warp count covering every role, and "
+                    "grid_clusters * groups * iterations exactly equal to the "
+                    f"output tile count; got m_tiles={logical_m_tiles}, "
+                    f"n_tiles={logical_n_tiles}, tiles={logical_output_tiles}, "
+                    f"scheduled={scheduled_output_tiles}, groups="
+                    f"{tcgen05_independent_2cta_groups}, grid_clusters="
+                    f"{tcgen05_static_work_grid_clusters}, iterations="
+                    f"{tcgen05_static_work_iterations}, launch_warps="
+                    f"{tcgen05_launch_warps}",
+                )
         # Validate overrides before CuTe constructs its layout atoms.
         _tcgen05_layout_overrides = layout_overrides_from_config(df.config)
         tcgen05_smem_swizzle_a = _tcgen05_layout_overrides.smem_swizzle_a
@@ -8265,6 +8380,12 @@ def _emit_mma_pipeline(
             flat_role_launch_warp_count=8
             if tcgen05_use_flat_role_coordinates
             else None,
+            independent_2cta_groups=tcgen05_independent_2cta_groups,
+            static_work_grid_clusters=tcgen05_static_work_grid_clusters,
+            static_work_iterations=tcgen05_static_work_iterations,
+            launch_warp_count_override=(
+                tcgen05_launch_warps if tcgen05_launch_warps > 0 else None
+            ),
             grouped=tcgen05_grouped_plan,
         )
         assert tcgen05_plan is not None
@@ -8273,6 +8394,7 @@ def _emit_mma_pipeline(
             is_two_cta=tcgen05_is_two_cta,
             gate_exec_warp=not tcgen05_use_role_local_mma_exec,
             cluster_n=tcgen05_cluster_n,
+            independent_2cta_groups=tcgen05_independent_2cta_groups,
         )
         candidate_block_shape = tcgen05_matmul_plan.block_shape
         df.cute_state.register_tcgen05_matmul_plan(tcgen05_matmul_plan)
@@ -8569,11 +8691,22 @@ def _emit_mma_pipeline(
             )
     if mma_impl == "tcgen05":
         assert tcgen05_plan is not None
-        prefix.append(
-            statement_from_string(
-                f"{tcgen05_cluster_layout_vmnk} = cute.tiled_divide("
+        if tcgen05_independent_2cta_groups > 1:
+            cluster_layout_expr = (
+                "cute.make_layout("
+                f"(2, 1, 1, {tcgen05_independent_2cta_groups}), "
+                f"stride=(1, {tcgen05_cluster_m * tcgen05_independent_2cta_groups}, "
+                f"{tcgen05_cluster_m * tcgen05_independent_2cta_groups}, 2))"
+            )
+        else:
+            cluster_layout_expr = (
+                "cute.tiled_divide("
                 f"cute.make_layout(({tcgen05_cluster_m}, {tcgen05_cluster_n}, 1)), "
                 f"({tiled_mma}.thr_id.shape,))"
+            )
+        prefix.append(
+            statement_from_string(
+                f"{tcgen05_cluster_layout_vmnk} = {cluster_layout_expr}"
             )
         )
         prefix.extend(
@@ -9103,6 +9236,8 @@ def _emit_mma_pipeline(
     tma_next_consumer_tile = df.new_var("tcgen05_tma_next_consumer_tile")
 
     def _tcgen05_tma_output_tile_predicate() -> str | None:
+        if tcgen05_exact_static_work_requested and tcgen05_static_full_tiles:
+            return None
         if tcgen05_grouped_dynamic_ab_tensormaps:
             if tcgen05_grouped_static_full_output_tiles_from_metadata:
                 return None
@@ -9935,9 +10070,16 @@ def _emit_mma_pipeline(
             if tcgen05_is_two_cta:
                 prefix.append(
                     statement_from_string(
-                        f"{tma_a_cta_layout} = cute.make_layout("
-                        f"cute.slice_({tcgen05_cluster_layout_vmnk}, "
-                        "(0, 0, None, 0)).shape)"
+                        f"{tma_a_cta_layout} = "
+                        + (
+                            "cute.make_layout(1)"
+                            if tcgen05_independent_2cta_groups > 1
+                            else (
+                                "cute.make_layout("
+                                f"cute.slice_({tcgen05_cluster_layout_vmnk}, "
+                                "(0, 0, None, 0)).shape)"
+                            )
+                        )
                     )
                 )
                 prefix.append(
@@ -9967,7 +10109,12 @@ def _emit_mma_pipeline(
                 if tcgen05_is_two_cta:
                     prefix.append(
                         statement_from_string(
-                            f"{tma_a_cta_coord} = {tma_block_in_cluster_coord_vmnk}[2]"
+                            f"{tma_a_cta_coord} = "
+                            + (
+                                "cutlass.Int32(0)"
+                                if tcgen05_independent_2cta_groups > 1
+                                else f"{tma_block_in_cluster_coord_vmnk}[2]"
+                            )
                         )
                     )
                     prefix.append(
@@ -10134,9 +10281,13 @@ def _emit_mma_pipeline(
                     )
                     _emit_per_tile(
                         f"{tma_initial_full_tile} = "
-                        + _tcgen05_tma_tile_predicate(
-                            k_tile_start_expr="cutlass.Int32(0)",
-                            full_tile_end_expr=f"cutlass.Int32({bk})",
+                        + (
+                            "True"
+                            if tcgen05_exact_static_work_requested
+                            else _tcgen05_tma_tile_predicate(
+                                k_tile_start_expr="cutlass.Int32(0)",
+                                full_tile_end_expr=f"cutlass.Int32({bk})",
+                            )
                         ),
                         tma_load=tcgen05_use_role_local_tma_producer,
                     )
@@ -10164,9 +10315,13 @@ def _emit_mma_pipeline(
                         # phase 0. See cute_plan.md §6.9.1.
                         _emit_per_tile(
                             f"{tma_initial_next_full_tile} = "
-                            + _tcgen05_tma_tile_predicate(
-                                k_tile_start_expr=f"cutlass.Int32({bk * (tcgen05_ab_stage_count_value - 1)})",
-                                full_tile_end_expr=f"cutlass.Int32({bk * tcgen05_ab_stage_count_value})",
+                            + (
+                                "True"
+                                if tcgen05_exact_static_work_requested
+                                else _tcgen05_tma_tile_predicate(
+                                    k_tile_start_expr=f"cutlass.Int32({bk * (tcgen05_ab_stage_count_value - 1)})",
+                                    full_tile_end_expr=f"cutlass.Int32({bk * tcgen05_ab_stage_count_value})",
+                                )
                             ),
                             tma_load=tcgen05_use_role_local_tma_producer,
                         )
@@ -10182,9 +10337,13 @@ def _emit_mma_pipeline(
                                 )
                                 _emit_per_tile(
                                     f"{stage_gate_var} = "
-                                    + _tcgen05_tma_tile_predicate(
-                                        k_tile_start_expr=f"cutlass.Int32({bk * stage_idx})",
-                                        full_tile_end_expr=f"cutlass.Int32({bk * (stage_idx + 1)})",
+                                    + (
+                                        "True"
+                                        if tcgen05_exact_static_work_requested
+                                        else _tcgen05_tma_tile_predicate(
+                                            k_tile_start_expr=f"cutlass.Int32({bk * stage_idx})",
+                                            full_tile_end_expr=f"cutlass.Int32({bk * (stage_idx + 1)})",
+                                        )
                                     ),
                                     tma_load=tcgen05_use_role_local_tma_producer,
                                 )
@@ -10487,6 +10646,7 @@ def _emit_mma_pipeline(
                 scalar_load_a=scalar_load_a,
                 scalar_load_b=scalar_load_b,
                 cluster_n=tcgen05_cluster_n,
+                independent_2cta_groups=tcgen05_independent_2cta_groups,
                 static_full_tiles=tcgen05_static_full_tma_fast_path,
                 tma_desc_ptr_a=(
                     grouped_tensormap_a_desc_ptr
@@ -10647,6 +10807,9 @@ def _emit_mma_pipeline(
                                 gate_exec_warp=tcgen05_static_full_tma_fast_path,
                                 is_two_cta=tcgen05_is_two_cta,
                                 cluster_n=tcgen05_cluster_n,
+                                independent_2cta_groups=(
+                                    tcgen05_independent_2cta_groups
+                                ),
                             )
                         )
                     exec_loop_body.append(
@@ -10673,9 +10836,15 @@ def _emit_mma_pipeline(
                         # Only the V-leader consumes AB stages and issues UMMA.
                         # Keep the follower out of the cloned K loop entirely;
                         # it still participates in the TMA-load role.
-                        exec_role_stmt = _wrap_stmt_in_if(
-                            exec_loop, _TCGEN05_CLUSTER_LEADER_PREDICATE
+                        owner_predicate = _tcgen05_two_cta_owner_predicate(
+                            tcgen05_plan.exec_active,
+                            is_two_cta=True,
+                            gate_exec_warp=False,
+                            cluster_n=tcgen05_cluster_n,
+                            independent_2cta_groups=(tcgen05_independent_2cta_groups),
                         )
+                        assert owner_predicate is not None
+                        exec_role_stmt = _wrap_stmt_in_if(exec_loop, owner_predicate)
                     exec_stmt: ast.stmt = exec_role_stmt
                     if tcgen05_use_pure_matmul_role_lifecycle:
                         exec_stmt = _wrap_stmt_in_if(
@@ -10825,6 +10994,7 @@ def _emit_mma_pipeline(
                             mma_stage=mma_stage,
                             is_two_cta=tcgen05_is_two_cta,
                             cluster_n=tcgen05_cluster_n,
+                            independent_2cta_groups=(tcgen05_independent_2cta_groups),
                         )
                     )
                 if tcgen05_use_tma:
