@@ -2536,6 +2536,70 @@ class TestPallas(TestCase):
         expected[2] = values
         torch.testing.assert_close(result, expected)
 
+    def test_computed_scalar_tensor_index_store(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def computed_scalar_tensor_index_store(
+            values: torch.Tensor, output_row: torch.Tensor
+        ) -> torch.Tensor:
+            m, n = values.size()
+            out = torch.zeros([4, m, n], dtype=values.dtype, device=values.device)
+            row = (output_row[0] + 1) % 4
+            for tile_m, tile_n in hl.tile(values.size()):
+                out[row, tile_m, tile_n] = values[tile_m, tile_n]
+            return out
+
+        values = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        output_row = torch.tensor([2], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            computed_scalar_tensor_index_store,
+            (values, output_row),
+            block_sizes=[8, 128],
+        )
+
+        expected = torch.zeros(4, 8, 128, device=DEVICE)
+        expected[3] = values
+        torch.testing.assert_close(result, expected)
+
+    def test_computed_scalar_selects_staged_matmul_weight(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def dynamic_weight_matmul(
+            values: torch.Tensor,
+            weights: torch.Tensor,
+            expert_ids: torch.Tensor,
+        ) -> torch.Tensor:
+            blocks, rows, k = values.size()
+            n = weights.size(2)
+            out = torch.empty(
+                [blocks, rows, n], dtype=values.dtype, device=values.device
+            )
+            for block in hl.grid(blocks):
+                expert = expert_ids[block]
+                for tile_m, tile_n in hl.tile([rows, n]):
+                    acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                    for tile_k in hl.tile(k):
+                        acc = torch.addmm(
+                            acc,
+                            values[block, tile_m, tile_k],
+                            weights[expert, tile_k, tile_n],
+                        )
+                    out[block, tile_m, tile_n] = acc
+            return out
+
+        values = torch.randn(3, 8, 256, device=DEVICE, dtype=torch.bfloat16)
+        weights = torch.randn(4, 256, 128, device=DEVICE, dtype=torch.bfloat16)
+        expert_ids = torch.tensor([2, 0, 3], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            dynamic_weight_matmul,
+            (values, weights, expert_ids),
+            block_sizes=[8, 128, 128],
+            pallas_loop_type="fori_loop",
+        )
+
+        expected = torch.stack(
+            [values[0] @ weights[2], values[1] @ weights[0], values[2] @ weights[3]]
+        )
+        torch.testing.assert_close(result, expected)
+
     def test_tensor_index_atomic_add_raises(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def atomic_add_tensor_index(
