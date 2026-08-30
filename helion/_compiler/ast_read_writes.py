@@ -316,12 +316,23 @@ class _PureExpressionVisitor(ast.NodeVisitor):
         self.visit(node.value)
 
     def visit_Call(self, node: ast.Call) -> None:
-        # Math methods are all pure, so allow them
-        if not (
+        # Math methods and compiler-emitted integer shape helpers are pure.
+        is_math = (
             isinstance(node.func, ast.Attribute)
             and isinstance(node.func.value, ast.Name)
             and node.func.value.id == "math"
-        ):
+        )
+        is_triton_shape_helper = (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "triton"
+            and node.func.attr in {"cdiv", "next_power_of_2"}
+        )
+        is_backend_shape_helper = isinstance(node.func, ast.Name) and node.func.id in {
+            "_cdiv",
+            "_next_power_of_2",
+        }
+        if not (is_math or is_triton_shape_helper or is_backend_shape_helper):
             raise _NotPureException
 
         # Recurse into children except for func
