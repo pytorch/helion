@@ -1048,28 +1048,30 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_sparse_attn_indexer(self):
         mod = import_path(EXAMPLES_DIR / "sparse_attn_indexer.py")
         args = mod.indexer_inputs(num_tokens=128, kv_len=512)
+        # The reference einsum runs in bf16, so kernel-vs-reference diffs are
+        # pure schedule noise: one head's O(11) score rounds by ~11*2^-8 and
+        # the 32-head sum random-walks to ~sqrt(32) of that (~0.25 abs).
         check_example(
             "sparse_attn_indexer",
             args,
             mod.ref_mqa_logits(*args),
             fn_name="mqa_logits",
             block_sizes=[16, 128],
+            atol=0.3,
         )
 
     @skipIfPallasInterpret("numerical mismatch in JAX interpret mode")
-    @skipIfCute(
-        "rank-broadcasted matmul followed by a broadcast-axis reduction "
-        "requires owner-aware CuTe lane lowering"
-    )
     def test_sparse_attn_indexer_decode(self):
         mod = import_path(EXAMPLES_DIR / "sparse_attn_indexer.py")
         args = mod.indexer_inputs(num_tokens=1, kv_len=512)
+        # Same schedule-noise bound as test_sparse_attn_indexer above.
         check_example(
             "sparse_attn_indexer",
             args,
             mod.ref_mqa_logits(*args),
             fn_name="mqa_logits_decode",
             block_sizes=[1, 128],
+            atol=0.3,
         )
 
     def test_xsa(self):

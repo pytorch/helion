@@ -982,6 +982,68 @@ class PersistentReductionStrategy(ReductionStrategy):
         )
         return result_var
 
+    def _sibling_axis_group_params(
+        self, state: CodegenState
+    ) -> tuple[int, int, str, int] | None:
+        """Group params for a lane-reduce marker whose live thread axis has
+        unrelated sibling thread axes BELOW it in the launch block.
+
+        A plain ``warp_reduction_*(threads_in_group=N)`` folds N consecutive
+        linear lanes, which is the reduction group only when the reduce axis
+        occupies the lowest strides. With a sibling axis below (e.g. a
+        128-thread matmul contraction on axis 0 under this 4-thread reduce axis
+        on axis 1), the reduce lanes are strided by the sibling extent, so the
+        finalize must use the grouped (pre-strided) reduction instead. Returns
+        ``(pre, group_span, lane_expr, group_count)``, or ``None`` when the
+        plain consecutive fold is already correct (``pre == 1``) or the layout
+        cannot be de-interleaved safely.
+        """
+        env = CompileEnvironment.current()
+        backend = env.backend
+        if backend.name != "cute":
+            return None
+        reduce_extent = self._thread_count
+        if reduce_extent <= 1:
+            return None
+        reduce_axis = self._get_thread_axis()
+        axis_sizes: dict[int, int] = {}
+        codegen = state.codegen
+        seen: set[int] = set()
+        for loops in codegen.active_device_loops.values():
+            for loop_state in loops:
+                key = id(loop_state)
+                if key in seen:
+                    continue
+                seen.add(key)
+                for axis, size in loop_state.thread_axis_sizes.items():
+                    axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
+        current_grid = codegen.current_grid_state
+        if current_grid is not None:
+            for axis, size in current_grid.thread_axis_sizes.items():
+                axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
+        if axis_sizes.get(reduce_axis, reduce_extent) != reduce_extent:
+            # Another block shares the reduce axis with a different extent;
+            # the linear-lane stride math below would not isolate this axis.
+            return None
+        axis_sizes[reduce_axis] = reduce_extent
+        pre = 1
+        for axis in range(reduce_axis):
+            pre *= axis_sizes.get(axis, 1)
+        if pre <= 1:
+            return None
+        group_span = pre * reduce_extent
+        if group_span > 32 and group_span % 32 != 0:
+            return None
+        num_threads = 1
+        for size in axis_sizes.values():
+            num_threads *= size
+        if num_threads % group_span != 0:
+            return None
+        lane_expr = backend.thread_linear_index_expr(axis_sizes)
+        if lane_expr is None:
+            return None
+        return pre, group_span, lane_expr, num_threads // group_span
+
     def codegen_reduction(
         self,
         state: CodegenState,
@@ -1038,6 +1100,18 @@ class PersistentReductionStrategy(ReductionStrategy):
                     group_pre=group_pre,
                     group_span=group_span,
                     group_lane_expr=group_lane_expr,
+                )
+            elif (sibling_params := self._sibling_axis_group_params(state)) is not None:
+                group_pre, group_span, group_lane_expr, group_count = sibling_params
+                expr = _lane_reduce_marker_expr(
+                    input_name,
+                    reduction_type,
+                    identity_expr,
+                    threads,
+                    group_pre=group_pre,
+                    group_span=group_span,
+                    group_lane_expr=group_lane_expr,
+                    group_count=group_count,
                 )
             else:
                 expr = _lane_reduce_marker_expr(
