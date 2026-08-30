@@ -11,6 +11,8 @@ from typing import cast
 
 import sympy
 
+from .. import exc
+
 if TYPE_CHECKING:
     import ast
 
@@ -4391,6 +4393,13 @@ def build_tile_dependency_graph(
     elif len(root_phases) != root_count:
         raise ValueError("root_phases must have one entry per task family")
     grid_block_ids = [list(family.logical_axis_order) for family in task_families]
+    if root_count > 1 and any(
+        0 <= access.root < root_count and access.allocation_id < 0
+        for access in accesses
+    ):
+        raise exc.CrossLoopSchedulingError(
+            "because a memory operation's allocation identity is unavailable"
+        )
     accesses_by_root: list[list[TileAccess]] = [[] for _ in range(root_count)]
     for access in accesses:
         if 0 <= access.root < root_count and access.allocation_id >= 0:
