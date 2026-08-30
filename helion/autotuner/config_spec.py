@@ -8,7 +8,6 @@ import json
 import logging
 import math
 import operator
-import os
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
@@ -54,12 +53,14 @@ from .._compiler.cute.cute_flash import FlashAttentionConfig
 from .._compiler.cute.cute_flash import _flash_compound_exp2_packet_overrides
 from .._compiler.cute.cute_flash import _flash_e2e_offset_period
 from .._compiler.cute.cute_flash import _flash_e2e_schedule_default
+from .._compiler.cute.cute_flash import _flash_env_get
 from .._compiler.cute.cute_flash import _flash_masked_e2e_schedule_params
 from .._compiler.cute.cute_flash import _flash_normalize_e2e_offset
 from .._compiler.cute.cute_flash import _flash_normalize_e2e_params
 from .._compiler.cute.cute_flash import _flash_parse_e2e_schedule
 from .._compiler.cute.cute_flash import _flash_pipeline_family_flags
 from .._compiler.cute.cute_flash import flash_effective_config_values
+from .._compiler.cute.cute_flash import flash_env_fingerprint
 from .._compiler.cute.cute_flash import flash_exp2_packet_is_compound
 from .._compiler.cute.cute_flash import resolve_flash_config
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS
@@ -1080,6 +1081,17 @@ class ConfigSpec:
         self._cute_flash_output_requires_tma: bool = False
         self._cute_flash_supports_tensor_4d_tma: bool = True
         self._cute_flash_block_size_targets: dict[int, int] = {}
+        # Memo for ``flash_autotune_fragments``: every other input is fixed
+        # ConfigSpec state, so (topology_override, pipeline_family_override) is
+        # a complete key once the env fingerprint below matches. The fragments
+        # builder resolves dozens of configs per call and normalization calls
+        # it for every candidate, so this cache dominates coverage-design cost.
+        self._cute_flash_fragments_cache: dict[
+            tuple[str | None, str | None], dict[str, ConfigSpecFragment]
+        ] = {}
+        self._cute_flash_fragments_env_fingerprint: (
+            tuple[tuple[str, str], ...] | None
+        ) = None
         # Some large attention outputs require the FA4-only TMA epilogue, but
         # odd KV-tile counts and some score plans require the incompatible WS
         # flash topology. Keep that narrow fallback explicit so codegen does
@@ -1257,6 +1269,54 @@ class ConfigSpec:
     def cute_tcgen05_matmul_has_non_tcgen05_operand(self, value: bool) -> None:
         self._cute_tcgen05_config.matmul_has_non_tcgen05_operand = value
 
+    def _cute_flash_autotune_fragments(
+        self,
+        topology_override: str | None = None,
+        pipeline_family_override: str | None = None,
+    ) -> dict[str, ConfigSpecFragment]:
+        """Memoized ``flash_autotune_fragments`` for this spec's flash surface.
+
+        The env fingerprint covers every ``HELION_CUTE_FLASH_*`` variable the
+        builder reads transitively, so patched environments (tests, scripts)
+        invalidate the memo instead of seeing stale fragments. The function is
+        resolved through the module attribute on every miss so tests that
+        ``patch.object`` it still intercept the real computation.
+        """
+        # Fragment values are shared: they are immutable dataclasses that all
+        # callers replace rather than mutate. The mapping is copied because
+        # callers merge it into their own field dicts.
+        fingerprint = flash_env_fingerprint()
+        if fingerprint != self._cute_flash_fragments_env_fingerprint:
+            self._cute_flash_fragments_cache.clear()
+            self._cute_flash_fragments_env_fingerprint = fingerprint
+        key = (topology_override, pipeline_family_override)
+        cached = self._cute_flash_fragments_cache.get(key)
+        if cached is None:
+            from .._compiler.cute.cute_flash import flash_autotune_fragments
+
+            assert self._cute_flash_head_dim is not None
+            assert self._cute_flash_num_kv is not None
+            cached = flash_autotune_fragments(
+                self._cute_flash_head_dim,
+                self._cute_flash_num_kv,
+                num_bh=self._cute_flash_num_bh,
+                tensor_4d_heads=self._cute_flash_tensor_4d_heads,
+                dtype=self._cute_flash_dtype,
+                is_causal=self._cute_flash_is_causal,
+                has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
+                requires_ws_overlap=self._cute_flash_requires_ws_overlap,
+                small_biased_candidate=self._cute_flash_small_biased_candidate,
+                standard_dense_output=self._cute_flash_standard_dense_output,
+                standard_causal_output=self._cute_flash_standard_causal_output,
+                target_device_capability=self.target_device_capability,
+                output_requires_tma=self._cute_flash_output_requires_tma,
+                supports_tensor_4d_tma=self._cute_flash_supports_tensor_4d_tma,
+                topology_override=topology_override,
+                pipeline_family_override=pipeline_family_override,
+            )
+            self._cute_flash_fragments_cache[key] = cached
+        return dict(cached)
+
     def _resolve_cute_flash_config(
         self, config: Mapping[str, object]
     ) -> FlashAttentionConfig:
@@ -1342,8 +1402,6 @@ class ConfigSpec:
         causal_lpt = config.get(FLASH_CAUSAL_LPT_SWIZZLE_KEY)
         if self._cute_flash_is_causal and type(causal_lpt) is int:
             config[FLASH_CAUSAL_LPT_SWIZZLE_KEY] = 1
-        from .._compiler.cute.cute_flash import flash_autotune_fragments
-
         block_size_targets = self._cute_flash_block_size_target_list()
         if fix_invalid:
             config["block_sizes"] = list(block_size_targets)
@@ -1428,24 +1486,7 @@ class ConfigSpec:
             topology: str | None,
             family: str | None,
         ) -> dict[str, ConfigSpecFragment]:
-            return flash_autotune_fragments(
-                self._cute_flash_head_dim,
-                self._cute_flash_num_kv,
-                num_bh=self._cute_flash_num_bh,
-                tensor_4d_heads=self._cute_flash_tensor_4d_heads,
-                dtype=self._cute_flash_dtype,
-                is_causal=self._cute_flash_is_causal,
-                has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
-                requires_ws_overlap=self._cute_flash_requires_ws_overlap,
-                small_biased_candidate=self._cute_flash_small_biased_candidate,
-                standard_dense_output=self._cute_flash_standard_dense_output,
-                standard_causal_output=self._cute_flash_standard_causal_output,
-                output_requires_tma=self._cute_flash_output_requires_tma,
-                supports_tensor_4d_tma=self._cute_flash_supports_tensor_4d_tma,
-                target_device_capability=self.target_device_capability,
-                topology_override=topology,
-                pipeline_family_override=family,
-            )
+            return self._cute_flash_autotune_fragments(topology, family)
 
         if (
             fix_invalid
@@ -1583,7 +1624,7 @@ class ConfigSpec:
         else:
             schedule_default_offset = 0
         default_offset = schedule_default_offset
-        env_offset = os.environ.get("HELION_CUTE_FLASH_E2E_OFFSET")
+        env_offset = _flash_env_get("HELION_CUTE_FLASH_E2E_OFFSET")
         if env_offset is not None:
             default_offset = int(env_offset)
             if e2e_offset_period == 0:
@@ -1595,7 +1636,7 @@ class ConfigSpec:
         if not e2e_offset_was_present:
             config[FLASH_E2E_OFFSET_KEY] = default_offset
         default_offset0 = 0
-        env_offset0 = os.environ.get("HELION_CUTE_FLASH_E2E_OFFSET0")
+        env_offset0 = _flash_env_get("HELION_CUTE_FLASH_E2E_OFFSET0")
         if env_offset0 is not None:
             env_offset0_value = int(env_offset0)
             if e2e_offset_period == 0:
@@ -1730,6 +1771,8 @@ class ConfigSpec:
         self.cute_attention_generic_fallback_enabled = False
         self._cute_attention_generic_fallback_block_size_targets = {}
         self.cute_flash_search_enabled = True
+        self._cute_flash_fragments_cache.clear()
+        self._cute_flash_fragments_env_fingerprint = None
         self._cute_flash_head_dim = head_dim
         self._cute_flash_num_kv = num_kv
         self._cute_flash_num_bh = num_bh
@@ -3161,32 +3204,8 @@ class ConfigSpec:
             if self.cute_tcgen05_search_enabled:
                 fields.update(self._cute_tcgen05_config.flat_fields())
             elif self.cute_flash_search_enabled:
-                from .._compiler.cute.cute_flash import flash_autotune_fragments
-
-                assert self._cute_flash_head_dim is not None
-                assert self._cute_flash_num_kv is not None
                 fields.update(
-                    flash_autotune_fragments(
-                        self._cute_flash_head_dim,
-                        self._cute_flash_num_kv,
-                        num_bh=self._cute_flash_num_bh,
-                        tensor_4d_heads=self._cute_flash_tensor_4d_heads,
-                        dtype=self._cute_flash_dtype,
-                        is_causal=self._cute_flash_is_causal,
-                        has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
-                        requires_ws_overlap=self._cute_flash_requires_ws_overlap,
-                        small_biased_candidate=(
-                            self._cute_flash_small_biased_candidate
-                        ),
-                        standard_dense_output=self._cute_flash_standard_dense_output,
-                        standard_causal_output=(
-                            self._cute_flash_standard_causal_output
-                        ),
-                        target_device_capability=self.target_device_capability,
-                        output_requires_tma=self._cute_flash_output_requires_tma,
-                        supports_tensor_4d_tma=(
-                            self._cute_flash_supports_tensor_4d_tma
-                        ),
+                    self._cute_flash_autotune_fragments(
                         pipeline_family_override=_flash_pipeline_family_override,
                     )
                 )

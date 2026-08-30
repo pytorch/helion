@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING
 from typing import NamedTuple
 from typing import TypeVar
 from typing import cast
+from typing import overload
 
 import torch
 
@@ -1138,6 +1139,88 @@ def flash_attention_graph_lse_plan_valid(
     )
 
 
+_FLASH_ENV_PREFIX = "HELION_CUTE_FLASH_"
+
+
+class _FlashEnvScope(NamedTuple):
+    values: dict[str, str]
+    fingerprint: tuple[tuple[str, str], ...]
+
+
+_flash_env_scope_state: _FlashEnvScope | None = None
+
+
+def _flash_env_fingerprint_read() -> tuple[tuple[str, str], ...]:
+    return tuple(
+        sorted(
+            (name, value)
+            for name, value in os.environ.items()
+            if name.startswith(_FLASH_ENV_PREFIX)
+        )
+    )
+
+
+def flash_env_fingerprint() -> tuple[tuple[str, str], ...]:
+    """Canonical value of every ``HELION_CUTE_FLASH_*`` env var.
+
+    ``resolve_flash_config`` (and everything built on it, notably
+    ``flash_autotune_fragments``) reads only env vars with this prefix, so this
+    tuple is a complete environment cache key for their results.
+    """
+    scope = _flash_env_scope_state
+    if scope is not None:
+        return scope.fingerprint
+    return _flash_env_fingerprint_read()
+
+
+class _FlashEnvSnapshotScope:
+    """Reentrant scope that freezes the flash env for one design pass.
+
+    The autotuner's structural-coverage design resolves millions of configs per
+    pass; each resolution reads ~60 env vars. Within a scope every read comes
+    from one snapshot taken at entry, so env patches made *before* an operation
+    (mock.patch.dict / monkeypatch in tests) still take effect while the
+    per-resolve ``os.environ`` traffic disappears. Never process-lifetime: the
+    snapshot dies with the outermost scope.
+    """
+
+    def __init__(self) -> None:
+        self._owner = False
+
+    def __enter__(self) -> None:
+        global _flash_env_scope_state
+        if _flash_env_scope_state is None:
+            fingerprint = _flash_env_fingerprint_read()
+            _flash_env_scope_state = _FlashEnvScope(dict(fingerprint), fingerprint)
+            self._owner = True
+
+    def __exit__(self, *args: object) -> None:
+        global _flash_env_scope_state
+        if self._owner:
+            _flash_env_scope_state = None
+            self._owner = False
+
+
+def flash_env_snapshot_scope() -> _FlashEnvSnapshotScope:
+    return _FlashEnvSnapshotScope()
+
+
+@overload
+def _flash_env_get(name: str) -> str | None: ...
+
+
+@overload
+def _flash_env_get(name: str, default: str | _T) -> str | _T: ...
+
+
+def _flash_env_get(name: str, default: object = None) -> object:
+    scope = _flash_env_scope_state
+    if scope is None:
+        return os.environ.get(name, default)  # pyright: ignore[reportArgumentType]
+    value = scope.values.get(name)
+    return default if value is None else value
+
+
 def _flash_kv_stage(head_dim: int) -> int:
     """Number of K/V TMA ring stages (Stage 3 multi-stage pipelining).
 
@@ -1152,7 +1235,7 @@ def _flash_kv_stage(head_dim: int) -> int:
     resident while V(k) is still in flight. Bumped accordingly when warp spec is
     on (still overridable).
     """
-    override = os.environ.get("HELION_CUTE_FLASH_KV_STAGE")
+    override = _flash_env_get("HELION_CUTE_FLASH_KV_STAGE")
     if override is not None:
         # Clamp to >=1: a 0/negative stage count would build zero-byte SMEM
         # rings and empty pipelines (a confusing compile hang).
@@ -1194,7 +1277,7 @@ def _flash_persistent() -> bool:
     ``HELION_CUTE_FLASH_PERSISTENT=0`` (or "false"/"off") to fall back to the flat
     one-tile-per-CTA grid.
     """
-    override = os.environ.get("HELION_CUTE_FLASH_PERSISTENT")
+    override = _flash_env_get("HELION_CUTE_FLASH_PERSISTENT")
     if override is None:
         return True
     return override.lower() not in ("0", "", "false", "off")
@@ -1211,7 +1294,7 @@ def _flash_s_stage() -> int:
     (default) is the single-warpgroup Stage-3 path. Overridable via
     ``HELION_CUTE_FLASH_S_STAGE``.
     """
-    override = os.environ.get("HELION_CUTE_FLASH_S_STAGE")
+    override = _flash_env_get("HELION_CUTE_FLASH_S_STAGE")
     if override is not None:
         return 2 if int(override) >= 2 else 1
     # Default ON: the warp-spec double-buffered-S overlap (the Stage-4 win).
@@ -1551,7 +1634,7 @@ class FlashAttentionConfig:
 
 def _flash_bool_env(name: str, default: bool) -> bool:
     """Parse a boolean env var; treat '1'/'true'/'on' (case-insensitive) as True."""
-    val = os.environ.get(name)
+    val = _flash_env_get(name)
     if val is None:
         return default
     return val.lower() in ("1", "true", "on")
@@ -2010,7 +2093,7 @@ def resolve_flash_config(
     """
 
     packet_config = config
-    env_exp2_packet = os.environ.get("HELION_CUTE_FLASH_EXP2_PACKET")
+    env_exp2_packet = _flash_env_get("HELION_CUTE_FLASH_EXP2_PACKET")
     if env_exp2_packet is not None and (
         packet_config is None or FLASH_EXP2_PACKET_KEY not in packet_config
     ):
@@ -2068,7 +2151,7 @@ def resolve_flash_config(
         _cfg(key) is not None for key in FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS
     )
     pipeline_family_cfg = _cfg(FLASH_PIPELINE_FAMILY_KEY)
-    pipeline_family_env = os.environ.get("HELION_CUTE_FLASH_PIPELINE_FAMILY")
+    pipeline_family_env = _flash_env_get("HELION_CUTE_FLASH_PIPELINE_FAMILY")
     requested_family_flags = (
         _flash_pipeline_family_flags(pipeline_family_cfg)
         if pipeline_family_cfg is not None
@@ -2079,7 +2162,7 @@ def resolve_flash_config(
     if requested_family_flags is not None:
         topology = requested_family_flags.topology
     else:
-        topology = os.environ.get("HELION_CUTE_FLASH_TOPOLOGY", topology_default)
+        topology = _flash_env_get("HELION_CUTE_FLASH_TOPOLOGY", topology_default)
         # Legacy fixed configs and environment overrides remain accepted. The
         # compound family above takes precedence when explicitly selected.
         topology_cfg = _cfg(FLASH_TOPOLOGY_KEY)
@@ -2104,7 +2187,7 @@ def resolve_flash_config(
         if (
             (is_causal or dense_hd64_fa4)
             and kv_stage_cfg is None
-            and os.environ.get("HELION_CUTE_FLASH_KV_STAGE") is None
+            and _flash_env_get("HELION_CUTE_FLASH_KV_STAGE") is None
         ):
             kv_stage = 3 if dense_hd64_fa4 else 2
         # fa4 is 2-Q-tile (sQ holds q_stage=2 tiles) and uses one aliased K/V
@@ -2124,7 +2207,7 @@ def resolve_flash_config(
             kv_stage = min(max(kv_stage, 2), ws_kv_stage_cap)
     persistent_ctas_per_sm_default = 1
     persistent_ctas_per_sm = int(
-        os.environ.get(
+        _flash_env_get(
             "HELION_CUTE_FLASH_PERSISTENT_CTAS_PER_SM",
             str(persistent_ctas_per_sm_default),
         )
@@ -2145,14 +2228,14 @@ def resolve_flash_config(
     if recompute_tile_coords_cfg is not None:
         recompute_tile_coords = bool(recompute_tile_coords_cfg)
     num_softmax_warpgroups = int(
-        os.environ.get("HELION_CUTE_FLASH_NUM_SOFTMAX_WG", "1")
+        _flash_env_get("HELION_CUTE_FLASH_NUM_SOFTMAX_WG", "1")
     )
     num_correction_warps = int(
-        os.environ.get("HELION_CUTE_FLASH_NUM_CORRECTION_WARPS", "0")
+        _flash_env_get("HELION_CUTE_FLASH_NUM_CORRECTION_WARPS", "0")
     )
-    num_mma_warps = int(os.environ.get("HELION_CUTE_FLASH_NUM_MMA_WARPS", "0"))
-    num_load_warps = int(os.environ.get("HELION_CUTE_FLASH_NUM_LOAD_WARPS", "0"))
-    num_epilogue_warps = int(os.environ.get("HELION_CUTE_FLASH_NUM_EPI_WARPS", "0"))
+    num_mma_warps = int(_flash_env_get("HELION_CUTE_FLASH_NUM_MMA_WARPS", "0"))
+    num_load_warps = int(_flash_env_get("HELION_CUTE_FLASH_NUM_LOAD_WARPS", "0"))
+    num_epilogue_warps = int(_flash_env_get("HELION_CUTE_FLASH_NUM_EPI_WARPS", "0"))
     # The FA4 emitter, TMEM layout, and barrier graph all own exactly two local
     # query slots. Preserve the legacy input but canonicalize it to the selected
     # structural family before it contributes to config identity.
@@ -2165,20 +2248,20 @@ def resolve_flash_config(
         mma_interleave = False
     wait_hint_default = 10_000_000
     wait_hint = int(
-        os.environ.get("HELION_CUTE_FLASH_WAIT_HINT", str(wait_hint_default))
+        _flash_env_get("HELION_CUTE_FLASH_WAIT_HINT", str(wait_hint_default))
     )
     wait_hint_cfg = _cfg(FLASH_WAIT_HINT_KEY)
     if wait_hint_cfg is not None:
         wait_hint = int(wait_hint_cfg)  # type: ignore[arg-type]
     if wait_hint not in (0, wait_hint_default) or topology != "fa4":
         wait_hint = wait_hint_default
-    acc_stage = int(os.environ.get("HELION_CUTE_FLASH_ACC_STAGE", "1"))
-    epi_stage = int(os.environ.get("HELION_CUTE_FLASH_EPI_STAGE", "1"))
+    acc_stage = int(_flash_env_get("HELION_CUTE_FLASH_ACC_STAGE", "1"))
+    epi_stage = int(_flash_env_get("HELION_CUTE_FLASH_EPI_STAGE", "1"))
     # Exp2 pipe-split schedule. The autotuner sees this as one paired schedule
     # knob so it never searches meaningless combinations like exp2_impl="xu"
     # with independent e2e cadence values, or regressive res/freq pairings.
     e2e_schedule_default = _flash_e2e_schedule_default(topology, head_dim)
-    e2e_schedule = os.environ.get(
+    e2e_schedule = _flash_env_get(
         "HELION_CUTE_FLASH_E2E_SCHEDULE", e2e_schedule_default
     )
     exp2_impl, e2e_freq, e2e_res = _flash_parse_e2e_schedule(
@@ -2186,9 +2269,9 @@ def resolve_flash_config(
     )
     # Legacy env overrides remain accepted for scripts. Config overrides are
     # applied afterward so autotuned/fixed config values still win over env.
-    exp2_impl = os.environ.get("HELION_CUTE_FLASH_EXP2_IMPL", exp2_impl)
-    e2e_freq = int(os.environ.get("HELION_CUTE_FLASH_E2E_FREQ", str(e2e_freq)))
-    e2e_res = int(os.environ.get("HELION_CUTE_FLASH_E2E_RES", str(e2e_res)))
+    exp2_impl = _flash_env_get("HELION_CUTE_FLASH_EXP2_IMPL", exp2_impl)
+    e2e_freq = int(_flash_env_get("HELION_CUTE_FLASH_E2E_FREQ", str(e2e_freq)))
+    e2e_res = int(_flash_env_get("HELION_CUTE_FLASH_E2E_RES", str(e2e_res)))
     exp2_impl, e2e_freq, e2e_res, e2e_schedule = _flash_normalize_e2e_params(
         exp2_impl, e2e_freq, e2e_res, e2e_schedule_default
     )
@@ -2210,7 +2293,7 @@ def resolve_flash_config(
         exp2_impl, e2e_freq, e2e_res, e2e_schedule_default
     )
     masked_e2e_schedule_default = "inherit"
-    masked_e2e_schedule = os.environ.get(
+    masked_e2e_schedule = _flash_env_get(
         "HELION_CUTE_FLASH_MASKED_E2E_SCHEDULE", masked_e2e_schedule_default
     )
     masked_e2e_schedule_cfg = _cfg(FLASH_MASKED_E2E_SCHEDULE_KEY)
@@ -2241,7 +2324,7 @@ def resolve_flash_config(
         else 0
     )
     e2e_offset = int(
-        os.environ.get("HELION_CUTE_FLASH_E2E_OFFSET", str(e2e_offset_default))
+        _flash_env_get("HELION_CUTE_FLASH_E2E_OFFSET", str(e2e_offset_default))
     )
     e2e_offset_cfg = _cfg(FLASH_E2E_OFFSET_KEY)
     if e2e_offset_cfg is not None:
@@ -2251,7 +2334,7 @@ def resolve_flash_config(
     )
     e2e_offset0_default = 0
     e2e_offset0 = int(
-        os.environ.get("HELION_CUTE_FLASH_E2E_OFFSET0", str(e2e_offset0_default))
+        _flash_env_get("HELION_CUTE_FLASH_E2E_OFFSET0", str(e2e_offset0_default))
     )
     e2e_offset0_cfg = _cfg(FLASH_E2E_OFFSET0_KEY)
     if e2e_offset0_cfg is not None:
@@ -2259,9 +2342,9 @@ def resolve_flash_config(
     e2e_offset0 = _flash_normalize_e2e_offset(
         e2e_offset0, e2e_offset0_default, e2e_offset_period
     )
-    tmem_plan = os.environ.get("HELION_CUTE_FLASH_TMEM_PLAN", "separate")
+    tmem_plan = _flash_env_get("HELION_CUTE_FLASH_TMEM_PLAN", "separate")
     tmem_s_to_p_offset = int(
-        os.environ.get("HELION_CUTE_FLASH_TMEM_S_TO_P_OFFSET", "0")
+        _flash_env_get("HELION_CUTE_FLASH_TMEM_S_TO_P_OFFSET", "0")
     )
     # fa4 Stage 2b: PTX-path MMA warp (default ON for fa4). HELION_CUTE_FLASH_MMA_PTX=0
     # reverts to the cute.gemm path (the Stage-1/2a body, for A/B comparison).
@@ -2293,7 +2376,7 @@ def resolve_flash_config(
     else:
         disc_pipe_default = 1
     disc_pipe_depth = int(
-        os.environ.get("HELION_CUTE_FLASH_DISC_PIPE", str(disc_pipe_default))
+        _flash_env_get("HELION_CUTE_FLASH_DISC_PIPE", str(disc_pipe_default))
     )
     disc_pipe_depth_cfg = _cfg(FLASH_DISC_PIPE_KEY)
     if disc_pipe_depth_cfg is not None:
@@ -2311,7 +2394,7 @@ def resolve_flash_config(
         split_p_arrive = True
     p_store_repetition_default = 16
     p_store_repetition = int(
-        os.environ.get("HELION_CUTE_FLASH_P_STORE_REP", str(p_store_repetition_default))
+        _flash_env_get("HELION_CUTE_FLASH_P_STORE_REP", str(p_store_repetition_default))
     )
     p_store_repetition_cfg = _cfg(FLASH_P_STORE_REP_KEY)
     if p_store_repetition_cfg is not None:
@@ -2325,7 +2408,7 @@ def resolve_flash_config(
         p_store_repetition = 16
     s_load_repetition_default = 32
     s_load_repetition = int(
-        os.environ.get("HELION_CUTE_FLASH_S_LOAD_REP", str(s_load_repetition_default))
+        _flash_env_get("HELION_CUTE_FLASH_S_LOAD_REP", str(s_load_repetition_default))
     )
     s_load_repetition_cfg = _cfg(FLASH_S_LOAD_REP_KEY)
     if s_load_repetition_cfg is not None:
@@ -2347,7 +2430,7 @@ def resolve_flash_config(
         precompute_qk_desc = False
     first_load_order_default = 0
     first_load_order = int(
-        os.environ.get(
+        _flash_env_get(
             "HELION_CUTE_FLASH_FIRST_LOAD_ORDER", str(first_load_order_default)
         )
     )
@@ -2357,7 +2440,7 @@ def resolve_flash_config(
     if topology != "fa4" or first_load_order not in (0, 1, 2, 3, 4):
         first_load_order = 0
     kv_order_default = "ascending"
-    kv_order = os.environ.get("HELION_CUTE_FLASH_KV_ORDER", kv_order_default)
+    kv_order = _flash_env_get("HELION_CUTE_FLASH_KV_ORDER", kv_order_default)
     kv_order_cfg = _cfg(FLASH_KV_ORDER_KEY)
     if kv_order_cfg is not None:
         kv_order = str(kv_order_cfg)
@@ -2377,13 +2460,13 @@ def resolve_flash_config(
     if epi_stg_cfg is not None:
         epi_stg = bool(epi_stg_cfg)
     epi_stg = epi_stg and topology == "fa4" and not epi_tma
-    epi_stg_store = os.environ.get("HELION_CUTE_FLASH_EPI_STG_STORE", "slice")
+    epi_stg_store = _flash_env_get("HELION_CUTE_FLASH_EPI_STG_STORE", "slice")
     epi_stg_store_cfg = _cfg(FLASH_EPI_STG_STORE_KEY)
     if epi_stg_store_cfg is not None:
         epi_stg_store = str(epi_stg_store_cfg)
     if epi_stg_store not in ("slice", "whole") or not epi_stg:
         epi_stg_store = "slice"
-    epi_stg_gmem = os.environ.get("HELION_CUTE_FLASH_EPI_STG_GMEM", "stage")
+    epi_stg_gmem = _flash_env_get("HELION_CUTE_FLASH_EPI_STG_GMEM", "stage")
     epi_stg_gmem_cfg = _cfg(FLASH_EPI_STG_GMEM_KEY)
     if epi_stg_gmem_cfg is not None:
         epi_stg_gmem = str(epi_stg_gmem_cfg)
@@ -2398,7 +2481,7 @@ def resolve_flash_config(
     )
     rescale_threshold_default = dtype_rescale_threshold_default
     rescale_threshold = float(
-        os.environ.get("HELION_CUTE_FLASH_RESCALE_THRESHOLD", rescale_threshold_default)
+        _flash_env_get("HELION_CUTE_FLASH_RESCALE_THRESHOLD", rescale_threshold_default)
     )
     rescale_threshold_cfg = _cfg(FLASH_RESCALE_THRESHOLD_KEY)
     if rescale_threshold_cfg is not None:
@@ -2429,7 +2512,7 @@ def resolve_flash_config(
     if topology == "fa4":
         rescale_chunk_default = rescale_chunk_cols
         rescale_chunk_cols = int(
-            os.environ.get(
+            _flash_env_get(
                 "HELION_CUTE_FLASH_RESCALE_CHUNK_COLS", rescale_chunk_default
             )
         )
@@ -2440,7 +2523,7 @@ def resolve_flash_config(
         if rescale_chunk_cols not in valid_rescale_chunks:
             rescale_chunk_cols = rescale_chunk_default
         softmax_regs = int(
-            os.environ.get(
+            _flash_env_get(
                 "HELION_CUTE_FLASH_SOFTMAX_REGS",
                 str(softmax_regs),
             )
@@ -2452,7 +2535,7 @@ def resolve_flash_config(
             softmax_regs = 200
         corr_regs_default = corr_regs
         corr_regs = int(
-            os.environ.get("HELION_CUTE_FLASH_CORR_REGS", str(corr_regs_default))
+            _flash_env_get("HELION_CUTE_FLASH_CORR_REGS", str(corr_regs_default))
         )
         corr_regs_cfg = _cfg(FLASH_CORR_REGS_KEY)
         if corr_regs_cfg is not None:
@@ -2461,7 +2544,7 @@ def resolve_flash_config(
             corr_regs = corr_regs_default
         other_regs_default = 48
         other_regs = int(
-            os.environ.get("HELION_CUTE_FLASH_OTHER_REGS", str(other_regs_default))
+            _flash_env_get("HELION_CUTE_FLASH_OTHER_REGS", str(other_regs_default))
         )
         other_regs_cfg = _cfg(FLASH_OTHER_REGS_KEY)
         if other_regs_cfg is not None:
@@ -2470,7 +2553,7 @@ def resolve_flash_config(
             other_regs = other_regs_default
         corr_tile_size_default = 8 if not is_causal and head_dim <= 64 else 16
         corr_tile_size = int(
-            os.environ.get(
+            _flash_env_get(
                 "HELION_CUTE_FLASH_CORR_TILE_SIZE",
                 str(corr_tile_size_default),
             )
@@ -2497,7 +2580,7 @@ def resolve_flash_config(
     if not small_biased_candidate:
         small_biased = True
     causal_lpt_swizzle = int(
-        os.environ.get(
+        _flash_env_get(
             "HELION_CUTE_FLASH_CAUSAL_LPT_SWIZZLE",
             "0",
         )
@@ -2515,7 +2598,7 @@ def resolve_flash_config(
         if num_bh is not None:
             causal_lpt_swizzle = min(causal_lpt_swizzle, max(num_bh, 1))
     causal_kv_order_default = "ascending"
-    causal_kv_order = os.environ.get(
+    causal_kv_order = _flash_env_get(
         "HELION_CUTE_FLASH_CAUSAL_KV_ORDER", causal_kv_order_default
     )
     causal_kv_order_cfg = _cfg(FLASH_CAUSAL_KV_ORDER_KEY)
@@ -2537,7 +2620,7 @@ def resolve_flash_config(
     if not is_causal or topology != "fa4" or causal_kv_order != "descending":
         causal_loop_split = False
     role_map_default = "helion"
-    role_map = os.environ.get("HELION_CUTE_FLASH_ROLE_MAP", role_map_default)
+    role_map = _flash_env_get("HELION_CUTE_FLASH_ROLE_MAP", role_map_default)
     role_map_cfg = _cfg(FLASH_ROLE_MAP_KEY)
     if role_map_cfg is not None:
         role_map = str(role_map_cfg)
@@ -2605,7 +2688,7 @@ def resolve_flash_config(
             "HELION_CUTE_FLASH_CGA2_LOCAL", use_cga2_local_default
         )
         use_cga2_local_overridden = (
-            "HELION_CUTE_FLASH_CGA2_LOCAL" in os.environ
+            _flash_env_get("HELION_CUTE_FLASH_CGA2_LOCAL") is not None
             or use_cga2_local_cfg is not None
         )
         if use_cga2_local_cfg is not None:
@@ -2652,7 +2735,7 @@ def resolve_flash_config(
         rescale_chunk_cols = 32
     clc_heads_per_batch_default = 0
     clc_heads_per_batch = int(
-        os.environ.get("HELION_CUTE_FLASH_CLC_HEADS", str(clc_heads_per_batch_default))
+        _flash_env_get("HELION_CUTE_FLASH_CLC_HEADS", str(clc_heads_per_batch_default))
     )
     clc_heads_per_batch_cfg = _cfg(FLASH_CLC_HEADS_PER_BATCH_KEY)
     if clc_heads_per_batch_cfg is not None:
@@ -2674,7 +2757,7 @@ def resolve_flash_config(
     if not use_clc_scheduler:
         clc_use_pdl = False
     clc_stages = int(
-        os.environ.get(
+        _flash_env_get(
             "HELION_CUTE_FLASH_CLC_STAGES", "2" if use_clc_scheduler else "1"
         )
     )
@@ -2784,7 +2867,7 @@ def resolve_flash_config(
         and _flash_supported_io_dtype(dtype)
         else "1x1"
     )
-    exp2_packet = os.environ.get("HELION_CUTE_FLASH_EXP2_PACKET", exp2_packet_default)
+    exp2_packet = _flash_env_get("HELION_CUTE_FLASH_EXP2_PACKET", exp2_packet_default)
     exp2_packet_cfg = _cfg(FLASH_EXP2_PACKET_KEY)
     if exp2_packet_cfg is not None:
         exp2_packet = str(exp2_packet_cfg)
@@ -2907,7 +2990,7 @@ def resolve_flash_config(
             else causal_e2e_offset_default % e2e_offset_period
         )
         e2e_offset = int(
-            os.environ.get("HELION_CUTE_FLASH_E2E_OFFSET", str(e2e_offset_default))
+            _flash_env_get("HELION_CUTE_FLASH_E2E_OFFSET", str(e2e_offset_default))
         )
         if e2e_offset_cfg is not None:
             e2e_offset = int(e2e_offset_cfg)  # type: ignore[arg-type]
@@ -2918,7 +3001,7 @@ def resolve_flash_config(
             _FLASH_DEG1_EXP2_OFFSET0 if exp2_packet in _FLASH_DEG1_EXP2_PACKETS else 0
         )
         e2e_offset0 = int(
-            os.environ.get("HELION_CUTE_FLASH_E2E_OFFSET0", str(e2e_offset0_default))
+            _flash_env_get("HELION_CUTE_FLASH_E2E_OFFSET0", str(e2e_offset0_default))
         )
         if e2e_offset0_cfg is not None:
             e2e_offset0 = int(e2e_offset0_cfg)  # type: ignore[arg-type]
@@ -2953,7 +3036,7 @@ def resolve_flash_config(
     stat_transport_default = (
         "single" if stat_transport_eligible and legacy_stat_handoff else "ring2"
     )
-    stat_transport = os.environ.get(
+    stat_transport = _flash_env_get(
         "HELION_CUTE_FLASH_STAT_TRANSPORT", stat_transport_default
     )
     stat_transport_cfg = _cfg(FLASH_STAT_TRANSPORT_KEY)
@@ -3039,7 +3122,7 @@ def resolve_flash_config(
     ):
         role_chain = False
 
-    persistent_loop = os.environ.get("HELION_CUTE_FLASH_PERSISTENT_LOOP", "while")
+    persistent_loop = _flash_env_get("HELION_CUTE_FLASH_PERSISTENT_LOOP", "while")
     persistent_loop_cfg = _cfg(FLASH_PERSISTENT_LOOP_KEY)
     if persistent_loop_cfg is not None:
         persistent_loop = str(persistent_loop_cfg)
@@ -3048,7 +3131,7 @@ def resolve_flash_config(
     ):
         persistent_loop = "while"
 
-    sp_row_sum = os.environ.get("HELION_CUTE_FLASH_SP_ROW_SUM", "fragment")
+    sp_row_sum = _flash_env_get("HELION_CUTE_FLASH_SP_ROW_SUM", "fragment")
     sp_row_sum_cfg = _cfg(FLASH_SP_ROW_SUM_KEY)
     if sp_row_sum_cfg is not None:
         sp_row_sum = str(sp_row_sum_cfg)
@@ -3092,7 +3175,7 @@ def resolve_flash_config(
         # descriptor setup.
         softmax_setup = "shared"
 
-    epi_tma_setup = os.environ.get("HELION_CUTE_FLASH_EPI_TMA_SETUP", "shared")
+    epi_tma_setup = _flash_env_get("HELION_CUTE_FLASH_EPI_TMA_SETUP", "shared")
     epi_tma_setup_cfg = _cfg(FLASH_EPI_TMA_SETUP_KEY)
     if epi_tma_setup_cfg is not None:
         epi_tma_setup = str(epi_tma_setup_cfg)
