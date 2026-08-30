@@ -553,8 +553,11 @@ class TestDistributed(TestCase, MultiProcessTestCase):
             unittest.mock.patch(
                 "helion._dist_utils.sync_seed", wraps=sync_seed
             ) as mock_sync_seed,
+            # The autotuner's compile/accuracy/timing gathers live in
+            # BenchmarkProvider (moved from BaseSearch in #2029), and mock.patch
+            # only intercepts the module-level binding, so spy there.
             unittest.mock.patch(
-                "helion.autotuner.base_search.all_gather_object",
+                "helion.autotuner.benchmark_provider.all_gather_object",
                 wraps=all_gather_object,
             ) as mock_all_gather_object,
             unittest.mock.patch(

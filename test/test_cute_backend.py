@@ -11596,7 +11596,11 @@ def _cute_rank_broadcast_reduction_axis_collision(
     d = hl.specialize(d)
     out = torch.empty((m, n), dtype=torch.float32, device=q.device)
     for tile_m, tile_n in hl.tile((m, n)):
-        score = torch.matmul(q[tile_m, :, :], k[tile_n, :].transpose(0, 1))
+        # The transpose must be a standalone statement: the synthetic-lane K
+        # fold only recognizes direct-load operands, and inlining the
+        # transpose into the matmul call hides the load behind the transpose.
+        kt = k[tile_n, :].transpose(0, 1)
+        score = torch.matmul(q[tile_m, :, :], kt)
         acc = (torch.relu(score.float()) * weights[tile_m, :][:, :, None]).sum(dim=1)
         in_window = (tile_n.index[None, :] >= ks[tile_m][:, None]) & (
             tile_n.index[None, :] < ke[tile_m][:, None]
@@ -11633,8 +11637,16 @@ class TestCuteThreadBudgetRejection(TestCase):
                 cute_vector_widths=[1, 4],
             )
 
-    def test_rank_broadcast_reduction_axis_collision_rejected(self) -> None:
-        """Reject a tile/reduction axis collision before emitting a kernel."""
+    def test_rank_broadcast_reduction_axis_collision_avoided(self) -> None:
+        """The rank-broadcast reduction pattern must compile cleanly.
+
+        With ``block_sizes=[1, 128]`` this kernel used to double-book thread
+        axis 1 between tile blocks [0, 1] and reduction block 3 (a silent
+        illegal-memory-access before the collision check, then a
+        ``BackendUnsupported`` rejection). ``_compute_thread_axis_offset`` now
+        reserves one thread axis per multi-thread reduction, so the tile axes
+        land above the reduction axes and the collision cannot occur.
+        """
         q = torch.empty(
             (1, 32, 128),
             dtype=torch.bfloat16,
@@ -11655,12 +11667,9 @@ class TestCuteThreadBudgetRejection(TestCase):
         bound = _cute_rank_broadcast_reduction_axis_collision.bind(
             (q, k, weights, ks, ke)
         )
-        with self.assertRaisesRegex(
-            BackendUnsupported,
-            r"thread-axis collision: tile blocks \[0, 1\] and executable "
-            r"reduction block 3 both require axis 1",
-        ):
-            bound.to_triton_code(helion.Config(block_sizes=[1, 128]))
+        code = bound.to_triton_code(helion.Config(block_sizes=[1, 128]))
+        self.assertNotIn("thread-axis collision", code)
+        self.assertIn("def ", code)
 
     def test_in_budget_multi_row_passes(self) -> None:
         """A multi-row config that DOES fit in 1024 threads must still

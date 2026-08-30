@@ -251,6 +251,7 @@ from helion._compiler.reduction_strategy import BlockReductionStrategy
 from helion._compiler.reduction_strategy import PersistentReductionStrategy
 from helion._compiler.tile_strategy import DeviceGridState
 from helion._compiler.tile_strategy import DeviceLoopState
+from helion._compiler.tile_strategy import _create_lane_loop
 from helion._compiler.tile_strategy import _lane_loop_iter
 from helion._compiler.variable_origin import NameOrigin
 from helion._compiler.variable_origin import TileBeginOrigin
@@ -13688,6 +13689,30 @@ class TestCuteLowerings(unittest.TestCase):
             self.assertEqual(ast.unparse(_lane_loop_iter(9)), "range(9)")
 
     def test_dead_lane_loop_elimination_splices_invariant_loop(self) -> None:
+        # Build the nest directly: ``wrap_body`` already skips a lane loop that
+        # is dead at wrap time, but a loop can also become invariant later
+        # (e.g. after dead-assignment elimination), which is what the late
+        # splice pass exists for.
+        body: list[ast.AST] = [
+            _create_lane_loop(
+                "synthetic_lane_0",
+                4,
+                [
+                    statement_from_string("indices_0 = synthetic_lane_0"),
+                    statement_from_string("out = 1"),
+                ],
+            )
+        ]
+
+        dead_assignment_elimination(body, ["indices_0"])
+        self.assertTrue(dead_lane_loop_elimination(body))
+
+        code = ast.unparse(ast.Module(body=body, type_ignores=[]))
+        self.assertNotIn("for synthetic_lane_0", code)
+        self.assertNotIn("indices_0", code)
+        self.assertIn("out = 1", code)
+
+    def test_wrap_body_skips_unreferenced_lane_loop(self) -> None:
         grid = DeviceGridState(
             strategy=_FakeLoopStrategy([0]),
             block_id_to_info={},
@@ -13697,9 +13722,6 @@ class TestCuteLowerings(unittest.TestCase):
         )
         grid.add_lane_loop(0, "synthetic_lane_0", 4)
         body = grid.wrap_body([statement_from_string("out = 1")])
-
-        dead_assignment_elimination(body, ["indices_0"])
-        self.assertTrue(dead_lane_loop_elimination(body))
 
         code = ast.unparse(ast.Module(body=body, type_ignores=[]))
         self.assertNotIn("for synthetic_lane_0", code)

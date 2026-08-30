@@ -2141,12 +2141,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         result = kernel(src, dst)
         torch.testing.assert_close(result, src[:, :13])
 
-    # NOTE: concat and unaligned_multi use multiple differently-sized
-    # partial slices in one kernel.  CuTe's thread axis assignment
-    # collides when two reduction blocks of different sizes map to the
-    # same axis.  Triton-only until the CuTe thread mapping is fixed.
-
-    @xfailIfCute("CuTe thread axis collision with differently-sized reduction blocks")
     @xfailIfPallas("slice-based stores not yet supported")
     def test_partial_slice_unaligned_multi(self):
         """Test multiple non-power-of-2 slices in one kernel"""
@@ -2171,7 +2165,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(dst_result, expected_dst)
         torch.testing.assert_close(out_result, src[:, :13])
 
-    @xfailIfCute("CuTe thread axis collision with differently-sized reduction blocks")
     @xfailIfPallas("slice-based stores not yet supported")
     def test_partial_slice_concat(self):
         """Test concat via full-slice load + partial-slice store"""
