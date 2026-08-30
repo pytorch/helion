@@ -142,12 +142,18 @@ def _clone_ast_value(value: object) -> object:
     if isinstance(value, tuple):
         return tuple(_clone_ast_value(item) for item in value)
     if isinstance(value, ast.AST):
+        from .tile_dependency import TILE_DEPENDENCY_SITE_ID_ATTR
+
         fields = {
             field: _clone_ast_value(getattr(value, field)) for field in value._fields
         }
         if isinstance(value, ExtendedAST):
-            return value.copy(**fields)
-        return ast.copy_location(type(value)(**fields), value)
+            cloned = value.copy(**fields)
+        else:
+            cloned = ast.copy_location(type(value)(**fields), value)
+        if (site_id := getattr(value, TILE_DEPENDENCY_SITE_ID_ATTR, None)) is not None:
+            setattr(cloned, TILE_DEPENDENCY_SITE_ID_ATTR, site_id)
+        return cloned
     return value
 
 
@@ -483,8 +489,15 @@ class ForEachProgramID(ProgramIDs):
 
         assert isinstance(base_strategy, PersistentProgramIDs)
         assert base_strategy.is_blocked, (
-            "hl.barrier() currently requires persistent_blocked"
+            "multi-phase kernels currently require persistent_blocked"
         )
+
+        if HostFunction.current().device_ir.implicit_dependency_starts:
+            from .cross_loop_codegen import emit_cross_loop_schedule
+
+            return emit_cross_loop_schedule(
+                self, base_strategy, device_function, total_expr
+            )
 
         # Delegate to helper for phase-split persistent loops
         return self._emit_phase_loops(base_strategy, device_function, total_expr)
@@ -572,6 +585,9 @@ class ForEachProgramID(ProgramIDs):
         base_body = self._prepare_persistent_body(
             device_function.body, device_function, strategy.virtual_pid_var
         )
+        # Access markers are compiler-only insertion points. This conservative
+        # phase-barrier path does not consume them, so remove them before emit.
+        base_body = cast("list[ast.stmt]", _clone_ast_value(base_body))
 
         barrier_stmt = None
         if len(boundaries) > 1:

@@ -9,6 +9,7 @@ from typing import cast
 
 import torch
 
+from .. import language as hl
 from ..autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
 from ..autotuner.config_spec import AccumulatorFact
 from ..autotuner.config_spec import DotAxes
@@ -42,6 +43,7 @@ if TYPE_CHECKING:
     from .device_ir import DeviceIR
     from .device_ir import GraphInfo
     from .host_function import HostFunction
+    from .tile_dependency import TileAccess
 
 
 log = logging.getLogger(__name__)
@@ -130,6 +132,121 @@ def _subscript_block_id(env: CompileEnvironment, subscript: object) -> int | Non
     """Return the block axis indexed by a tile-provenance subscript."""
     info = subscript_tile_info(env, subscript)
     return info.block_id if info is not None else None
+
+
+def _subscript_is_scalar_tile_index(subscript: object) -> bool:
+    """Return whether an affine subscript is derived from ``tile.id``."""
+    if isinstance(subscript, int):
+        return True
+    if not isinstance(subscript, torch.fx.Node) or isinstance(
+        subscript.meta.get("val"), torch.Tensor
+    ):
+        return False
+    node = subscript
+    seen: set[torch.fx.Node] = set()
+    while node not in seen:
+        seen.add(node)
+        if node.target is hl.tile_id:
+            return True
+        node_args = [arg for arg in node.args if isinstance(arg, torch.fx.Node)]
+        if len(node_args) != 1:
+            return False
+        node = node_args[0]
+    return False
+
+
+def _subscript_static_offset(
+    env: CompileEnvironment,
+    subscript: object,
+) -> int | None:
+    """Recover a constant offset through affine and shape-only FX nodes."""
+    if isinstance(subscript, int):
+        return subscript
+    if not isinstance(subscript, torch.fx.Node):
+        return None
+    node = subscript
+    scale = 1
+    offset = 0
+    seen: set[torch.fx.Node] = set()
+    while node not in seen:
+        seen.add(node)
+        info = subscript_tile_info(env, node)
+        if info is not None:
+            if isinstance(info.offset, int):
+                return offset + scale * info.offset
+            if env.known_equal(info.offset, 0):
+                return offset
+            return None
+        if node.target is torch.ops.prims.iota.default:
+            start = node.kwargs.get("start", 0)
+            step = node.kwargs.get("step", 1)
+            if isinstance(start, int) and step == 1:
+                return offset + scale * start
+            return None
+        args = node.args
+        if node.target is torch.ops.aten.add.Tensor and len(args) == 2:
+            constant, operand = args[1], args[0]
+            if not isinstance(constant, int):
+                constant, operand = operand, constant
+            if isinstance(constant, int) and isinstance(operand, torch.fx.Node):
+                offset += scale * constant
+                node = operand
+                continue
+            return None
+        if node.target is torch.ops.aten.mul.Tensor and len(args) == 2:
+            factor, operand = args[1], args[0]
+            if not isinstance(factor, int):
+                factor, operand = operand, factor
+            if isinstance(factor, int) and isinstance(operand, torch.fx.Node):
+                scale *= factor
+                node = operand
+                continue
+            return None
+        node_args = [arg for arg in args if isinstance(arg, torch.fx.Node)]
+        if len(node_args) != 1:
+            return None
+        node = node_args[0]
+    return None
+
+
+def _subscript_static_extent(subscript: object) -> int | None:
+    """Return the width of a proved contiguous static index vector."""
+    if isinstance(subscript, int):
+        return 1
+    if not isinstance(subscript, torch.fx.Node):
+        return None
+    node = subscript
+    seen: set[torch.fx.Node] = set()
+    while node not in seen:
+        seen.add(node)
+        if node.target is torch.ops.prims.iota.default:
+            length = node.args[0] if node.args else None
+            start = node.kwargs.get("start", 0)
+            step = node.kwargs.get("step", 1)
+            if (
+                isinstance(length, int)
+                and length >= 0
+                and isinstance(start, int)
+                and step == 1
+            ):
+                return length
+            return None
+        args = node.args
+        if node.target is torch.ops.aten.add.Tensor and len(args) == 2:
+            constant, operand = args[1], args[0]
+            if not isinstance(constant, int):
+                constant, operand = operand, constant
+            if isinstance(constant, int) and isinstance(operand, torch.fx.Node):
+                node = operand
+                continue
+            return None
+        return None
+    return None
+
+
+def _subscript_is_full_slice(subscript: object) -> bool:
+    """Return whether a tensor subscript covers its complete dimension."""
+    return isinstance(subscript, slice) and subscript == slice(None)
 
 
 def _store_axis_key(
@@ -859,6 +976,141 @@ class DeviceIRAnalysis:
         return [
             fact._replace(matmul_operand=operands.get(node)) for node, fact in records
         ]
+
+    def tile_accesses(
+        self,
+        device_ir: DeviceIR,
+        env: CompileEnvironment,
+        host: HostFunction,
+    ) -> tuple[TileAccess, ...]:
+        """Record allocation-coordinate accesses used for cross-root scheduling."""
+        from ..language import memory_ops
+        from ..language.atomic_ops import ATOMIC_OPS
+        from .tile_dependency import TileAccess
+        from .tile_dependency import owner_roots_by_graph_id
+
+        if len(device_ir.root_ids) <= 1:
+            return ()
+
+        graph_owners = owner_roots_by_graph_id(device_ir)
+        allocation_ids: dict[int, int] = {}
+        accesses: list[TileAccess] = []
+        memory_op_index = 0
+
+        for graph_analysis in self.graphs:
+            for graph_node_index, node in enumerate(graph_analysis.nodes):
+                if node.op != "call_function":
+                    continue
+                is_load = node.target is memory_ops.load
+                is_store = node.target is memory_ops.store
+                is_atomic = node.target in ATOMIC_OPS
+                if not (is_load or is_store or is_atomic):
+                    continue
+
+                fake = _accessed_tensor_fake(node)
+                origin = host.tensor_to_origin.get(fake) if fake is not None else None
+                allocation_id = -1
+                tensor_shape: tuple[int, ...] = ()
+                tensor_strides: tuple[int, ...] = ()
+                storage_offset = 0
+                subscript_dims: tuple[int, ...] = ()
+                subscript_affine_block_ids: tuple[int | None, ...] = ()
+                subscript_index_scales: tuple[int, ...] = ()
+                subscript_offsets: tuple[int | None, ...] = ()
+                subscript_is_scalar: tuple[bool, ...] = ()
+                subscript_is_full_slice: tuple[bool, ...] = ()
+                subscript_static_extents: tuple[int | None, ...] = ()
+                layout_is_static = False
+
+                if fake is not None:
+                    storage = fake.untyped_storage()
+                    storage_key = int(getattr(storage, "_cdata", id(storage)))
+                    allocation_id = allocation_ids.setdefault(
+                        storage_key, len(allocation_ids)
+                    )
+                    tensor_shape = tuple(env.size_hint(dim) for dim in fake.shape)
+                    tensor_strides = tuple(
+                        env.size_hint(stride) for stride in fake.stride()
+                    )
+                    storage_offset = env.size_hint(fake.storage_offset())
+                    layout_is_static = env.settings.static_shapes or all(
+                        type(value) is int
+                        for value in (
+                            *fake.shape,
+                            *fake.stride(),
+                            fake.storage_offset(),
+                        )
+                    )
+                    index_list = node.args[1] if len(node.args) >= 2 else None
+                    if isinstance(index_list, (list, tuple)):
+                        subscript_dims = tuple(range(min(len(index_list), fake.ndim)))
+                        affine = tuple(
+                            subscript_index_scale(env, index_list[position])
+                            for position in subscript_dims
+                        )
+                        subscript_affine_block_ids = tuple(
+                            block_id for block_id, _scale in affine
+                        )
+                        subscript_index_scales = tuple(
+                            scale for _block_id, scale in affine
+                        )
+                        subscript_offsets = tuple(
+                            _subscript_static_offset(env, index_list[position])
+                            for position in subscript_dims
+                        )
+                        subscript_is_scalar = tuple(
+                            _subscript_is_scalar_tile_index(index_list[position])
+                            for position in subscript_dims
+                        )
+                        subscript_is_full_slice = tuple(
+                            _subscript_is_full_slice(index_list[position])
+                            for position in subscript_dims
+                        )
+                        subscript_static_extents = tuple(
+                            _subscript_static_extent(index_list[position])
+                            for position in subscript_dims
+                        )
+
+                has_explicit_mask = (
+                    not is_atomic
+                    and len(node.args) > (2 if is_load else 3)
+                    and node.args[2 if is_load else 3] is not None
+                )
+                owner_roots = (
+                    graph_owners[graph_analysis.graph_id]
+                    if graph_analysis.graph_id < len(graph_owners)
+                    else ()
+                )
+                for owner_root in owner_roots:
+                    accesses.append(
+                        TileAccess(
+                            access_id=len(accesses),
+                            memory_op_index=memory_op_index if not is_atomic else -1,
+                            graph_id=graph_analysis.graph_id,
+                            root=owner_root,
+                            allocation_id=allocation_id,
+                            kind="load" if is_load else "store",
+                            tensor_name=origin.root_rw_name() if origin else None,
+                            tensor_shape=tensor_shape,
+                            tensor_strides=tensor_strides,
+                            storage_offset=storage_offset,
+                            subscript_dims=subscript_dims,
+                            subscript_affine_block_ids=subscript_affine_block_ids,
+                            subscript_index_scales=subscript_index_scales,
+                            subscript_offsets=subscript_offsets,
+                            subscript_is_scalar=subscript_is_scalar,
+                            has_explicit_mask=has_explicit_mask,
+                            subscript_is_full_slice=subscript_is_full_slice,
+                            subscript_static_extents=subscript_static_extents,
+                            is_atomic=is_atomic,
+                            layout_is_static=layout_is_static,
+                            graph_node_index=graph_node_index,
+                        )
+                    )
+                if not is_atomic:
+                    memory_op_index += 1
+
+        return tuple(accesses)
 
     def pointwise_fact(
         self,

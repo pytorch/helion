@@ -71,6 +71,23 @@ def inplace_nested_loop_kernel(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+@helion.kernel()
+def inplace_then_independent_reduction(
+    x: torch.Tensor, a: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, k = a.size()
+    _, n = b.size()
+    out = torch.empty([m, n], device=a.device, dtype=a.dtype)
+    for tile in hl.tile(x.size(0)):
+        x[tile] = x[tile] + 1
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
+        out[tile_m, tile_n] = acc
+    return x, out
+
+
 @onlyBackends(["triton", "cute", "pallas"])
 class TestLoops(RefEagerTestBase, TestCase):
     @skipIfRefEager("StaticLoopUnroller unit test does not execute a kernel")
@@ -970,6 +987,16 @@ class TestLoops(RefEagerTestBase, TestCase):
         spec = inplace_nested_loop_kernel.bind(args).config_spec
         self.assertEqual(len(spec.range_num_stages), 0)
 
+    @skipIfRefEager("not supported in ref eager mode")
+    def test_inplace_loop_only_disables_its_own_pipeline(self):
+        args = (
+            torch.randn([16], device=DEVICE),
+            torch.randn([16, 16], device=DEVICE),
+            torch.randn([16, 16], device=DEVICE),
+        )
+        spec = inplace_then_independent_reduction.bind(args).config_spec
+        self.assertGreater(len(spec.range_num_stages), 0)
+
     @skipIfTileIR("tileir backend will ignore `range_multi_buffers` hint")
     @skipIfNotTriton("range loop hints are Triton-specific")
     def test_range_multi_buffers(self):
@@ -1464,6 +1491,20 @@ class TestLoops(RefEagerTestBase, TestCase):
         # Logic for modifying num_stages and loop unrolling factors should
         # change num_stages=1
         self.assertIn("num_stages=1", code)
+
+        one_warp_code, one_warp_result = code_and_output(
+            matmul,
+            (a, b),
+            block_sizes=[64, 16, 16],
+            indexing="block_ptr",
+            loop_orders=[[1, 0]],
+            num_warps=1,
+            pid_type="persistent_blocked",
+            range_num_stages=[4, 2],
+            range_unroll_factors=[4, 4],
+        )
+        torch.testing.assert_close(one_warp_result, expected, atol=1e-2, rtol=1e-2)
+        self.assertIn("num_stages=4", one_warp_code)
 
     def test_loop_with_symbolic_bounds(self):
         @helion.kernel(
