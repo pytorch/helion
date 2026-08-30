@@ -2677,8 +2677,8 @@ def _dense_mixed_radix_converse(
             or end_bounds is None
             or expression_bounds[0].free_symbols
             or end_bounds[1].free_symbols
-            or expression_bounds[0].is_integer is not True
-            or end_bounds[1].is_integer is not True
+            or expression_bounds[0].is_integer is not True  # pyrefly: ignore[missing-attribute]
+            or end_bounds[1].is_integer is not True  # pyrefly: ignore[missing-attribute]
             or expression_bounds[0] < 0  # pyrefly: ignore[unsupported-operation]
             or end_bounds[1] > relation.target_domain.axis_counts[target_axis]  # pyrefly: ignore[unsupported-operation]
         ):
