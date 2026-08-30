@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import contextlib
 from contextlib import ExitStack
 from contextlib import contextmanager
 import dataclasses
+import functools
 import itertools
 import math
 import os
 import random
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Iterator
 from typing import cast
@@ -68,6 +71,7 @@ from helion._compiler.autotuner_heuristics.triton import _h100_matmul_tile
 from helion._compiler.backend import CuteBackend
 from helion._compiler.backend import TritonBackend
 from helion._compiler.compile_environment import _symint_free_symbols
+from helion._compiler.cute import cute_flash
 from helion._compiler.cute.cute_flash import FLASH_AUTOTUNE_CONFIG_KEYS
 from helion._compiler.cute.cute_flash import FLASH_CAUSAL_KV_ORDER_KEY
 from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LOOP_SPLIT_KEY
@@ -269,6 +273,7 @@ from helion.autotuner import IntegerFragment
 from helion.autotuner.base_cache import BoundKernelInMemoryCacheKey
 from helion.autotuner.base_cache import LooseAutotuneCacheKey
 from helion.autotuner.base_cache import StrictAutotuneCacheKey
+from helion.autotuner.config_fragment import ConfigSpecFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
@@ -287,6 +292,9 @@ from helion.runtime.cute.launcher import _Tcgen05GroupedWorklistCompatibilityCla
 from helion.runtime.kernel import _find_device as runtime_find_device
 from helion.runtime.kernel import _input_tensor_metadata
 from helion.runtime.settings import Settings
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 HOPPER_HARDWARE = HardwareInfo(
     device_kind="cuda",
@@ -534,6 +542,63 @@ def _grouped_worklist_bind_patches(
                 )
             )
         yield
+
+
+@contextlib.contextmanager
+def _memoized_flash_fragments() -> Iterator[None]:
+    """Memoize ``flash_autotune_fragments`` for the duration of one test.
+
+    The structural coverage design calls it thousands of times per
+    ``ConfigGeneration`` with only a handful of distinct argument tuples (one
+    per pipeline-family override), and it is deterministic for fixed arguments
+    and environment. The first repeat of each key is re-verified against the
+    real function so a nondeterministic surface would still fail. Do not use
+    under a patched flash target policy or HELION_CUTE_FLASH_* environment.
+    """
+    real = cast(
+        "Callable[..., dict[str, ConfigSpecFragment]]",
+        cute_flash.flash_autotune_fragments,
+    )
+    surfaces: dict[tuple[object, ...], dict[str, ConfigSpecFragment]] = {}
+    verified: set[tuple[object, ...]] = set()
+
+    def wrapper(
+        head_dim: int, num_kv: int, **kwargs: object
+    ) -> dict[str, ConfigSpecFragment]:
+        key = (head_dim, num_kv, tuple(sorted(kwargs.items())))
+        cached = surfaces.get(key)
+        if cached is None:
+            cached = surfaces[key] = real(head_dim, num_kv, **kwargs)
+        elif key not in verified:
+            verified.add(key)
+            assert real(head_dim, num_kv, **kwargs) == cached
+        return dict(cached)
+
+    with patch.object(cute_flash, "flash_autotune_fragments", wrapper):
+        yield
+
+
+@functools.cache
+def _dense_fp16_hd64_bh64_flash_generation() -> ConfigGeneration:
+    """Shared generation for the num_kv=48, num_bh=64 dense fp16 surface.
+
+    The structural coverage design cached on the returned ``ConfigGeneration``
+    is expensive and independent of compiler seeds, so tests exercising the
+    same surface share one instance. Callers must set
+    ``config_spec.compiler_seed_configs`` before using seed-dependent APIs.
+    """
+    spec = ConfigSpec(backend=CuteBackend())
+    for block_id, target in enumerate((1, 128, 128)):
+        spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
+    spec.enable_cute_flash_search(
+        head_dim=64,
+        num_kv=48,
+        num_bh=64,
+        dtype=torch.float16,
+        block_size_targets={0: 1, 1: 128, 2: 128},
+        standard_dense_output=True,
+    )
+    return ConfigGeneration(spec)
 
 
 class TestAutotunerHeuristic(TestCase):
@@ -842,6 +907,7 @@ class TestAutotunerHeuristic(TestCase):
         self.assertGreaterEqual(len(population), 100)
         self.assertLessEqual(set(coverage), set(population))
 
+    @_memoized_flash_fragments()
     def test_cute_flash_heuristic_returns_all_legal_seeds(self) -> None:
         spec = ConfigSpec(backend=CuteBackend())
         for block_id, size_hint in enumerate((1, 128, 128)):
@@ -5442,10 +5508,10 @@ class TestCuteFp8GemmSkinnyMHeuristic(TestCase):
 
 
 class TestCuteTcgen05ClusterM2Heuristic(TestCase):
-    # Enumerating the full flash search space per seeded shape routinely
-    # exceeds the suite's default 60s per-test timeout on slower CI runners,
-    # which kills the xdist worker mid-test. Give these explicit headroom.
-    pytestmark = pytest.mark.timeout(600)
+    # Structural-coverage enumeration keeps a few of these tests above the
+    # suite's default 60s per-test timeout on slower CI runners, which kills
+    # the xdist worker mid-test. Give them modest headroom.
+    pytestmark = pytest.mark.timeout(120)
 
     def _assert_cute_tcgen05_cluster_m2_seeded(
         self,
@@ -5852,20 +5918,12 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     self.assertEqual(canonical, seed)
                     self.assertEqual(config_gen.unflatten(canonical_flat), seed)
 
+    @_memoized_flash_fragments()
     def test_cute_flash_full_population_covers_compound_schedule_dependencies(
         self,
     ) -> None:
-        spec = ConfigSpec(backend=CuteBackend())
-        for block_id, target in enumerate((1, 128, 128)):
-            spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-        spec.enable_cute_flash_search(
-            head_dim=64,
-            num_kv=48,
-            num_bh=64,
-            dtype=torch.float16,
-            block_size_targets={0: 1, 1: 128, 2: 128},
-            standard_dense_output=True,
-        )
+        config_gen = _dense_fp16_hd64_bh64_flash_generation()
+        spec = config_gen.config_spec
         heuristic_seeds = CuteFlashAttentionHeuristic.get_seed_configs(
             MagicMock(config_spec=spec),
             MagicMock(),
@@ -5878,9 +5936,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         profile = get_effort_profile("full").lfbo_pattern_search
         assert profile is not None
         self.assertEqual(profile.initial_population, 100)
-        population = ConfigGeneration(spec).random_population(
-            profile.initial_population
-        )
+        population = config_gen.random_population(profile.initial_population)
         configs = [config.config for config in population]
         fragments = flash_autotune_fragments(
             64,
@@ -5929,24 +5985,15 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             },
         )
         self.assertEqual(
-            ConfigGeneration(spec).flash_structural_coverage_uncovered_interactions(),
+            config_gen.flash_structural_coverage_uncovered_interactions(),
             [],
         )
 
+    @_memoized_flash_fragments()
     def test_cute_flash_full_population_reserves_random_exploration(self) -> None:
-        spec = ConfigSpec(backend=CuteBackend())
-        for block_id, target in enumerate((1, 128, 128)):
-            spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-        spec.enable_cute_flash_search(
-            head_dim=64,
-            num_kv=48,
-            num_bh=64,
-            dtype=torch.float16,
-            block_size_targets={0: 1, 1: 128, 2: 128},
-            standard_dense_output=True,
-        )
+        config_gen = _dense_fp16_hd64_bh64_flash_generation()
+        spec = config_gen.config_spec
         spec.compiler_seed_configs = []
-        config_gen = ConfigGeneration(spec)
         coverage = config_gen.flash_deterministic_population_configs()
 
         random_state = random.getstate()
@@ -6152,6 +6199,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             set(coverage[: search.initial_population]), partial_population
         )
 
+    @_memoized_flash_fragments()
     def test_cute_flash_large_bh_population_covers_structural_axes_and_random(
         self,
     ) -> None:
@@ -6815,6 +6863,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     )
                 )
 
+    @_memoized_flash_fragments()
     def test_cute_flash_compound_families_reachable_without_compiler_seeds(
         self,
     ) -> None:
@@ -6976,6 +7025,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                         "descending",
                     )
 
+    @_memoized_flash_fragments()
     def test_cute_flash_clc_head_search_uses_work_grid_divisors(self) -> None:
         fragments = flash_autotune_fragments(64, 1024, num_bh=6)
         heads = fragments[FLASH_CLC_HEADS_PER_BATCH_KEY]
@@ -7026,6 +7076,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         }
         self.assertEqual(structural_groups, {1, 2, 3, 6})
 
+    @_memoized_flash_fragments()
     def test_cute_flash_clc_head_search_preserves_tensor_head_geometry(
         self,
     ) -> None:
@@ -7167,6 +7218,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             configs.append(anchors[0].config)
         self.assertTrue(all(config == configs[0] for config in configs[1:]))
 
+    @_memoized_flash_fragments()
     def test_cute_flash_bf16_hd64_2cta_seed_transfers_to_2048(self) -> None:
         spec = ConfigSpec(backend=CuteBackend())
         for block_id, target in enumerate((1, 128, 128)):
@@ -7466,9 +7518,11 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     1,
                 )
 
+    @_memoized_flash_fragments()
     def test_cute_flash_dense_degree2_seed_is_in_full_initial_population(
         self,
     ) -> None:
+        checked_surfaces: set[tuple[object, ...]] = set()
         for num_kv in (48, 256, 260, 516, 768, 1536, 2052, 4096):
             with self.subTest(num_kv=num_kv):
                 spec = ConfigSpec(backend=CuteBackend())
@@ -7492,9 +7546,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     )
                 )
                 config_gen = ConfigGeneration(spec)
+                seed_pairs = config_gen.seed_flat_config_pairs()
                 expected = [
                     config
-                    for _flat, config in config_gen.seed_flat_config_pairs()
+                    for _flat, config in seed_pairs
                     if config.config[FLASH_EXP2_PACKET_KEY] == "deg2_16x6"
                 ]
                 self.assertEqual(len(expected), 1)
@@ -7508,6 +7563,19 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 )
                 self.assertEqual(canonical, degree2)
                 self.assertEqual(config_gen.unflatten(canonical_flat), degree2)
+
+                # The flash surface is length-invariant within one legality
+                # class: lengths whose flat fragments and normalized seeds are
+                # identical yield the same deterministic population prefix, so
+                # the expensive population check runs once per distinct
+                # surface instead of once per length.
+                surface_key = (
+                    tuple(repr(fragment) for fragment in config_gen.flat_spec),
+                    tuple(config for _flat, config in seed_pairs),
+                )
+                if surface_key in checked_surfaces:
+                    continue
+                checked_surfaces.add(surface_key)
 
                 profile = get_effort_profile("full").lfbo_pattern_search
                 assert profile is not None
@@ -7701,9 +7769,11 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
         self.assertIn("deg2_16x6", packet.search_choices or ())
 
+    @_memoized_flash_fragments()
     def test_cute_flash_causal_degree2_seed_is_in_full_initial_population(
         self,
     ) -> None:
+        checked_surfaces: set[tuple[object, ...]] = set()
         for num_kv in (48, 768, 4096):
             with self.subTest(num_kv=num_kv):
                 spec = ConfigSpec(backend=CuteBackend())
@@ -7729,15 +7799,26 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     )
                 )
                 config_gen = ConfigGeneration(spec)
+                seed_pairs = config_gen.seed_flat_config_pairs()
                 degree2 = [
                     config
-                    for _flat, config in config_gen.seed_flat_config_pairs()
+                    for _flat, config in seed_pairs
                     if config.config[FLASH_EXP2_PACKET_KEY] == "deg2_16x6"
                 ]
                 self.assertEqual(len(degree2), 1)
                 expected = degree2[0]
                 roundtrip = config_gen.unflatten(config_gen.flatten(expected))
                 self.assertEqual(roundtrip, expected)
+
+                # Same length-invariance dedup as the dense variant above: the
+                # expensive population check runs once per distinct surface.
+                surface_key = (
+                    tuple(repr(fragment) for fragment in config_gen.flat_spec),
+                    tuple(config for _flat, config in seed_pairs),
+                )
+                if surface_key in checked_surfaces:
+                    continue
+                checked_surfaces.add(surface_key)
 
                 profile = get_effort_profile("full").lfbo_pattern_search
                 assert profile is not None

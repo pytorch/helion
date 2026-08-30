@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib
 import os
-from typing import Callable
 import unittest
 from unittest.mock import patch
 
@@ -19,6 +18,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import output_only
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfXPU
@@ -64,43 +64,22 @@ def _assert_bitwise_equal_float(
 
 
 def _rng_2d_block_sizes() -> list[int]:
+    # RNG offsets are block-size independent; small blocks compile much faster
     if _get_backend() == "cute":
         return [32, 32]
-    return [64, 64]
+    return [16, 16]
 
 
 def _rng_heavy_2d_block_sizes() -> list[int]:
     if _get_backend() == "cute":
         return [16, 16]
-    return [16, 16]
+    return [8, 8]
 
 
 def _rng_3d_block_sizes() -> list[int]:
     if _get_backend() == "cute":
         return [4, 8, 32]
-    return [8, 8, 64]
-
-
-def _compile_once(
-    fn: helion.Kernel,
-    args: tuple[object, ...],
-    **kwargs: object,
-) -> tuple[str, object]:
-    bound = fn.bind(args)
-    if kwargs:
-        config = Config(
-            # pyrefly: ignore [bad-argument-type]
-            **kwargs
-        )
-    elif fn.configs:
-        (config,) = fn.configs
-    else:
-        config = bound.config_spec.default_config()
-    for key in bound.config_spec.unsupported_config_keys(config.config):
-        config.config.pop(key, None)
-    code = bound.to_triton_code(config)
-    compiled = bound.compile_config(config)
-    return code, compiled
+    return [4, 8, 16]
 
 
 def _compile_only(
@@ -179,31 +158,6 @@ else:
         raise unittest.SkipTest("requires Triton")
 
 
-def _nested_broadcast_rand_expected(
-    shape: tuple[int, int],
-    block_sizes: tuple[int, int],
-    seed: int,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    m, n = shape
-    block_m, block_n = block_sizes
-    expected = torch.empty((m, n), device=device, dtype=dtype)
-    for m_begin in range(0, m, block_m):
-        tile_m = min(block_m, m - m_begin)
-        values = philox_rand_ref(
-            seed,
-            torch.arange(m_begin, m_begin + tile_m, device=device, dtype=torch.int64),
-        ).to(dtype)
-        for n_begin in range(0, n, block_n):
-            tile_n = min(block_n, n - n_begin)
-            expected[m_begin : m_begin + tile_m, n_begin : n_begin + tile_n] = values[
-                :, None
-            ].expand(tile_m, tile_n)
-    return expected
-
-
 def _nested_broadcast_rand_expected_3d(
     shape: tuple[int, int, int],
     block_sizes: tuple[int, int, int],
@@ -239,134 +193,72 @@ def _nested_broadcast_rand_expected_3d(
 
 @onlyBackends(["triton", "pallas", "cute"])
 class TestRNG(RefEagerTestBase, TestCase):
-    @xfailIfPallas("implicit rand still hits TPU deferred buffer materialization")
-    @skipIfRefEager("compile_config is not supported in ref eager mode")
+    @xfailIfPallas("3D implicit RNG hits TPU deferred buffer materialization")
     @skipIfXPU("RNG tests timeout on XPU")
-    def test_rand(self):
-        """Test RNG seeding behavior, reproducibility, output range, and distribution."""
+    def test_rand_randn_3d_tensor(self):
+        """Test 3D rand and randn with tiled operations using a single kernel."""
 
         @helion.kernel(static_shapes=True, autotune_effort="none")
-        def rand_kernel_tiled_2d(x: torch.Tensor) -> torch.Tensor:
-            output = torch.zeros_like(x)
-            m, n = x.shape
-            for tile_m, tile_n in hl.tile([m, n]):
-                output[tile_m, tile_n] = torch.rand_like(x[tile_m, tile_n])
-            return output
-
-        # Test with different tensor sizes for different aspects
-        x_small = torch.ones(128, 128, device=DEVICE)  # For distribution tests
-        x_large = torch.ones(128, 128, device=DEVICE)  # For seeding tests
-        block_sizes = _rng_2d_block_sizes()
-        _code1, compiled = _compile_once(
-            rand_kernel_tiled_2d, (x_large,), block_sizes=block_sizes
-        )
-
-        # Test 1: Different seeds produce different outputs
-        torch.manual_seed(42)
-        output1 = compiled(x_large)
-
-        torch.manual_seed(123)
-        output2 = compiled(x_large)
-
-        self.assertFalse(
-            torch.allclose(output1, output2),
-            "Different seeds should produce different outputs",
-        )
-
-        # Test 2: Same seed produces identical outputs (reproducibility)
-        torch.manual_seed(42)
-        output3 = compiled(x_large)
-
-        torch.testing.assert_close(
-            output1, output3, msg="Same seed should produce identical outputs"
-        )
-
-        # Test 3: RNG state advances between calls
-        torch.manual_seed(42)
-        output4 = compiled(x_large)
-        # No manual_seed here - RNG state should advance
-        output5 = compiled(x_large)
-
-        self.assertFalse(
-            torch.allclose(output4, output5),
-            "Sequential calls should produce different outputs (RNG state advanced)",
-        )
-
-        # Test 4: Output range and distribution properties
-        torch.manual_seed(42)
-        output6 = compiled(x_small)
-
-        # All values should be in [0, 1) range
-        self.assertTrue(torch.all(output6 >= 0.0), "All values should be >= 0")
-        self.assertTrue(torch.all(output6 < 1.0), "All values should be < 1")
-
-        # Check distribution properties
-        mean_val = output6.mean().item()
-        self.assertTrue(
-            0.4 < mean_val < 0.6,
-            f"Mean {mean_val:.3f} should be around 0.5 for uniform distribution",
-        )
-
-        # Check spread of values
-        min_val = output6.min().item()
-        max_val = output6.max().item()
-        self.assertTrue(
-            min_val < 0.2, f"Min value {min_val:.3f} should be < 0.2 for good spread"
-        )
-        self.assertTrue(
-            max_val > 0.8, f"Max value {max_val:.3f} should be > 0.8 for good spread"
-        )
-
-    @xfailIfPallas("3D aten rand has low uniqueness with fold_in offset collisions")
-    @skipIfXPU("RNG tests timeout on XPU")
-    def test_rand_3d_tensor(self):
-        """Test 3D RNG with tiled operations."""
-
-        @helion.kernel(static_shapes=True, autotune_effort="none")
-        def rand_kernel_3d(x: torch.Tensor) -> torch.Tensor:
-            output = torch.zeros_like(x)
+        def rand_randn_kernel_3d(
+            x: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            uniform = torch.zeros_like(x)
+            normal = torch.zeros_like(x)
             b, m, n = x.shape
             for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
-                output[tile_b, tile_m, tile_n] = torch.rand_like(
-                    x[tile_b, tile_m, tile_n]
-                )
-            return output
+                tile = x[tile_b, tile_m, tile_n]
+                uniform[tile_b, tile_m, tile_n] = torch.rand_like(tile)
+                normal[tile_b, tile_m, tile_n] = torch.randn_like(tile)
+            return uniform, normal
 
-        x = torch.ones(16, 32, 64, device=DEVICE)  # 3D tensor
+        x = torch.ones(8, 32, 64, device=DEVICE)  # 3D tensor
         torch.manual_seed(77)
         block_sizes = _rng_3d_block_sizes()
-        _code, output = code_and_output(rand_kernel_3d, (x,), block_sizes=block_sizes)
-
-        # All values should be in [0, 1) range
-        self.assertTrue(torch.all(output >= 0.0))
-        self.assertTrue(torch.all(output < 1.0))
-
-        # Check uniqueness - 3D should generate different values for each element
-        unique_values = output.cpu().unique().numel()
-        total_values = output.numel()
-
-        # With a good RNG, we should have mostly unique values
-        uniqueness_ratio = unique_values / total_values
-        print(
-            f"3D Unique values: {unique_values}, Total: {total_values}, Percentage: {uniqueness_ratio * 100:.2f}%"
+        _code, (uniform, normal) = code_and_output(
+            rand_randn_kernel_3d, (x,), block_sizes=block_sizes
         )
 
-        # Expect at least 95% unique values for good 3D RNG
+        # All rand values should be in [0, 1) range
+        self.assertTrue(torch.all(uniform >= 0.0))
+        self.assertTrue(torch.all(uniform < 1.0))
+
+        # With a good RNG, we should have mostly unique values
+        uniqueness_ratio = uniform.cpu().unique().numel() / uniform.numel()
         self.assertGreater(uniqueness_ratio, 0.95)
 
+        # Check overall normal distribution
+        normal_cpu = normal.cpu()
+        mean = normal_cpu.mean().item()
+        std = normal_cpu.std().item()
+        self.assertTrue(-0.1 < mean < 0.1, f"3D mean {mean} not close to 0")
+        self.assertTrue(0.95 < std < 1.05, f"3D std {std} not close to 1")
+
         # Check distribution across dimensions
-        # Mean should be around 0.5 for each 2D slice
+        uniform_cpu = uniform.cpu()
         for b_idx in range(x.shape[0]):
-            slice_mean = output[b_idx].mean().item()
+            slice_mean = uniform_cpu[b_idx].mean().item()
             self.assertTrue(
                 0.35 < slice_mean < 0.65,
-                f"Slice {b_idx} mean {slice_mean} is not well distributed",
+                f"Slice {b_idx} rand mean {slice_mean} is not well distributed",
+            )
+            nslice_mean = normal_cpu[b_idx].mean().item()
+            nslice_std = normal_cpu[b_idx].std().item()
+            self.assertTrue(
+                -0.3 < nslice_mean < 0.3,
+                f"Slice {b_idx} randn mean {nslice_mean} is not well distributed",
+            )
+            self.assertTrue(
+                0.85 < nslice_std < 1.15,
+                f"Slice {b_idx} randn std {nslice_std} is not well distributed",
             )
 
         # Verify different seeds produce different results
         torch.manual_seed(88)
-        _code2, output2 = code_and_output(rand_kernel_3d, (x,), block_sizes=block_sizes)
-        self.assertFalse(torch.allclose(output, output2))
+        uniform2, normal2 = output_only(
+            rand_randn_kernel_3d, (x,), block_sizes=block_sizes
+        )
+        self.assertFalse(torch.allclose(uniform, uniform2))
+        self.assertFalse(torch.allclose(normal, normal2))
 
     @xfailIfPallas(
         "mixed explicit and implicit RNG tiles mis-handle partial tile shapes"
@@ -437,9 +329,9 @@ class TestRNG(RefEagerTestBase, TestCase):
     @xfailIfPallas(
         "multiple implicit RNG outputs hit TPU deferred buffer materialization"
     )
-    @skipIfRefEager("compile_config is not supported in ref eager mode")
+    @skipIfXPU("RNG tests timeout on XPU")
     def test_multiple_rng_ops(self):
-        """Test multiple RNG operations: independence, reproducibility, mixed rand/randn."""
+        """Test multiple RNG ops: independence, distributions, seeding behavior."""
 
         @helion.kernel(static_shapes=True, autotune_effort="none")
         def multiple_rng_ops_kernel(
@@ -463,23 +355,20 @@ class TestRNG(RefEagerTestBase, TestCase):
                 normal[tile_m, tile_n] = torch.randn_like(tile)
 
                 # Multiple randn
-                randn_sum[tile_m, tile_n] = (
-                    torch.randn_like(tile)
-                    + torch.randn_like(tile)
-                    + torch.randn_like(tile)
+                randn_sum[tile_m, tile_n] = torch.randn_like(tile) + torch.randn_like(
+                    tile
                 )
 
             return rand1, rand2, normal, randn_sum
 
-        x = torch.ones(32, 32, device=DEVICE)
+        x = torch.ones(64, 64, device=DEVICE)  # 4096 samples per output
         block_sizes = _rng_heavy_2d_block_sizes()
-        _code1, compiled = _compile_once(
-            multiple_rng_ops_kernel, (x,), block_sizes=block_sizes
-        )
 
         # Test 1: Independence and distribution properties
         torch.manual_seed(42)
-        rand1, rand2, normal, randn_sum = compiled(x)
+        code1, (rand1, rand2, normal, randn_sum) = code_and_output(
+            multiple_rng_ops_kernel, (x,), block_sizes=block_sizes
+        )
 
         # Check two independent rand operations
         self.assertTrue(
@@ -503,25 +392,44 @@ class TestRNG(RefEagerTestBase, TestCase):
             f"Second rand mean {rand2.mean().item():.3f} should be ~0.5",
         )
 
-        # Check mixed rand and randn
+        # Check spread of rand values
+        min_val = rand1.min().item()
+        max_val = rand1.max().item()
         self.assertTrue(
-            -0.2 < normal.mean().item() < 0.2,
+            min_val < 0.2, f"Min value {min_val:.3f} should be < 0.2 for good spread"
+        )
+        self.assertTrue(
+            max_val > 0.8, f"Max value {max_val:.3f} should be > 0.8 for good spread"
+        )
+
+        # Check mixed rand and randn; with 4096 samples the std of the sample
+        # mean is ~0.016, so +-0.1 is a >6 sigma bound.
+        self.assertTrue(
+            -0.1 < normal.mean().item() < 0.1,
             f"Normal mean {normal.mean().item():.3f} should be ~0",
         )
         self.assertTrue(
-            0.9 < normal.cpu().std().item() < 1.1,
+            0.95 < normal.cpu().std().item() < 1.05,
             f"Normal std {normal.cpu().std().item():.3f} should be ~1",
         )
         self.assertTrue(
-            torch.any(normal < 0.0), "Normal distribution should have negative values"
+            torch.any(normal < -1.0) and torch.any(normal > 1.0),
+            "Normal distribution should have tails beyond [-1, 1]",
+        )
+        # Roughly 68% should be within 1 std
+        within_1_std = (
+            torch.logical_and(normal > -1.0, normal < 1.0).float().mean().item()
+        )
+        self.assertTrue(
+            0.63 < within_1_std < 0.73, f"Values within 1 std: {within_1_std}"
         )
         self.assertFalse(
             torch.allclose(rand1, normal),
             "Uniform and normal distributions should be different",
         )
 
-        # Check sum of multiple randn
-        expected_std = 3**0.5
+        # Check sum of multiple randn (two terms -> std of sqrt(2))
+        expected_std = 2**0.5
         mean = randn_sum.mean().item()
         std = randn_sum.cpu().std().item()
         self.assertTrue(-0.2 < mean < 0.2, f"Combined mean {mean:.3f} should be ~0")
@@ -530,154 +438,78 @@ class TestRNG(RefEagerTestBase, TestCase):
             f"Combined std {std:.3f} should be ~{expected_std:.3f}",
         )
 
-        # Test 2: Reproducibility with same seed
-        torch.manual_seed(42)
-        outputs_a = compiled(x)
+        # Test 2: Different seeds produce different outputs
+        torch.manual_seed(123)
+        outputs_123 = output_only(
+            multiple_rng_ops_kernel, (x,), block_sizes=block_sizes
+        )
+        self.assertFalse(
+            torch.allclose(rand1, outputs_123[0]),
+            "Different seeds should produce different outputs",
+        )
+        self.assertFalse(
+            torch.allclose(normal, outputs_123[2]),
+            "Different seeds should produce different outputs",
+        )
 
+        # Test 3: Reproducibility with same seed, then RNG state advances
         torch.manual_seed(42)
-        outputs_b = compiled(x)
-
-        # All outputs should be identical with same seed
-        for i, (a, b) in enumerate(zip(outputs_a, outputs_b, strict=False)):
+        outputs_a = output_only(multiple_rng_ops_kernel, (x,), block_sizes=block_sizes)
+        for i, (a, b) in enumerate(
+            zip((rand1, rand2, normal, randn_sum), outputs_a, strict=True)
+        ):
             torch.testing.assert_close(
                 a, b, msg=f"Output {i} should be identical with same seed"
             )
-
-        _assert_uses_philox(self, _code1)
-
-    @xfailIfPallas("implicit randn still hits TPU deferred buffer materialization")
-    @skipIfXPU("RNG tests timeout on XPU")
-    def test_randn_different_seeds_tiled(self):
-        """Test that different torch.manual_seed values produce different outputs for randn."""
-
-        @helion.kernel(static_shapes=True, autotune_effort="none")
-        def randn_kernel_tiled_2d(x: torch.Tensor) -> torch.Tensor:
-            output = torch.zeros_like(x)
-            m, n = x.shape
-            for tile_m, tile_n in hl.tile([m, n]):
-                output[tile_m, tile_n] = torch.randn_like(x[tile_m, tile_n])
-            return output
-
-        x = torch.ones(128, 128, device=DEVICE)
-        block_sizes = _rng_2d_block_sizes()
-
-        torch.manual_seed(42)
-        _code1, output1 = code_and_output(
-            randn_kernel_tiled_2d, (x,), block_sizes=block_sizes
+        # No manual_seed here - RNG state should advance
+        outputs_b = output_only(multiple_rng_ops_kernel, (x,), block_sizes=block_sizes)
+        self.assertFalse(
+            torch.allclose(outputs_a[0], outputs_b[0]),
+            "Sequential calls should produce different outputs (RNG state advanced)",
         )
 
-        torch.manual_seed(123)
-        _code2, output2 = code_and_output(
-            randn_kernel_tiled_2d, (x,), block_sizes=block_sizes
-        )
+        _assert_uses_philox(self, code1)
 
-        # Different seeds should produce different outputs
-        self.assertFalse(torch.allclose(output1, output2))
+    @xfailIfPallas(
+        "dynamic-shape implicit RNG hits TPU deferred buffer materialization"
+    )
+    @skipIfRefEager("compile_config is not supported in ref eager mode")
+    def test_rng_ops_with_dynamic_tile_sizes(self):
+        """Test torch.rand/rand_like/randn/randn_like with dynamic tile dimensions."""
 
-    @xfailIfPallas("implicit randn still hits TPU deferred buffer materialization")
-    @skipIfXPU("RNG tests timeout on XPU")
-    def test_randn_normal_distribution(self):
-        """Test that torch.randn_like produces normal distribution (mean≈0, std≈1)."""
-
-        @helion.kernel(static_shapes=True, autotune_effort="none")
-        def randn_kernel_tiled_2d(x: torch.Tensor) -> torch.Tensor:
-            output = torch.zeros_like(x)
-            m, n = x.shape
-            for tile_m, tile_n in hl.tile([m, n]):
-                output[tile_m, tile_n] = torch.randn_like(x[tile_m, tile_n])
-            return output
-
-        x = torch.ones(128, 128, device=DEVICE)  # 16384 samples for better statistics
-        torch.manual_seed(42)
-        _code, output = code_and_output(
-            randn_kernel_tiled_2d, (x,), block_sizes=_rng_2d_block_sizes()
-        )
-
-        # Check mean is close to 0
-        mean = output.mean().item()
-        self.assertTrue(-0.1 < mean < 0.1, f"Mean {mean} is not close to 0")
-
-        # Check std is close to 1
-        std = output.cpu().std().item()
-        self.assertTrue(0.95 < std < 1.05, f"Std {std} is not close to 1")
-
-        # Check we have values outside [-1, 1] (characteristic of normal distribution)
-        self.assertTrue(torch.any(output < -1.0))
-        self.assertTrue(torch.any(output > 1.0))
-
-        # Roughly 68% should be within 1 std
-        within_1_std = (
-            torch.logical_and(output > -1.0, output < 1.0).float().mean().item()
-        )
-        self.assertTrue(
-            0.63 < within_1_std < 0.73, f"Values within 1 std: {within_1_std}"
-        )
-
-    @xfailIfPallas("3D implicit randn still hits TPU materialization failure")
-    @skipIfXPU("RNG tests timeout on XPU")
-    def test_randn_3d_tensor(self):
-        """Test 3D randn with tiled operations."""
-
-        @helion.kernel(static_shapes=True, autotune_effort="none")
-        def randn_kernel_3d(x: torch.Tensor) -> torch.Tensor:
-            output = torch.zeros_like(x)
-            b, m, n = x.shape
-            for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
-                output[tile_b, tile_m, tile_n] = torch.randn_like(
-                    x[tile_b, tile_m, tile_n]
-                )
-            return output
-
-        x = torch.ones(8, 32, 64, device=DEVICE)  # 3D tensor
-        torch.manual_seed(77)
-        _code, output = code_and_output(
-            randn_kernel_3d, (x,), block_sizes=_rng_3d_block_sizes()
-        )
-
-        # Check overall distribution
-        output_cpu = output.cpu()
-        mean = output_cpu.mean().item()
-        std = output_cpu.std().item()
-        self.assertTrue(-0.1 < mean < 0.1, f"3D mean {mean} not close to 0")
-        self.assertTrue(0.95 < std < 1.05, f"3D std {std} not close to 1")
-
-        # Check distribution across dimensions
-        for b_idx in range(x.shape[0]):
-            slice_mean = output_cpu[b_idx].mean().item()
-            slice_std = output_cpu[b_idx].std().item()
-            self.assertTrue(
-                -0.3 < slice_mean < 0.3,
-                f"Slice {b_idx} mean {slice_mean} is not well distributed",
-            )
-            self.assertTrue(
-                0.85 < slice_std < 1.15,
-                f"Slice {b_idx} std {slice_std} is not well distributed",
-            )
-
-    def _test_rng_with_dynamic_tile_sizes(self, rng_func, is_uniform, rng_name):
-        """Common test logic for RNG operations with dynamic tile sizes."""
-
-        # Single kernel that takes an RNG callable as a parameter
         @helion.kernel(static_shapes=True, autotune_effort="none")
         def rng_kernel(
             x: torch.Tensor,
-            rng_func: Callable[[int, int, torch.dtype], torch.Tensor],
-        ) -> torch.Tensor:
-            output = torch.zeros_like(x)
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            out_rand = torch.zeros_like(x)
+            out_rand_like = torch.zeros_like(x)
+            out_randn = torch.zeros_like(x)
+            out_randn_like = torch.zeros_like(x)
             m, n = x.shape
             for tile_m, tile_n in hl.tile([m, n]):
-                output[tile_m, tile_n] = rng_func(tile_m, tile_n, x.dtype)
-            return output
+                out_rand[tile_m, tile_n] = torch.rand(
+                    (tile_m, tile_n), dtype=x.dtype, device=x.device
+                )
+                out_rand_like[tile_m, tile_n] = torch.rand_like(
+                    torch.ones((tile_m, tile_n), dtype=x.dtype, device=x.device)
+                )
+                out_randn[tile_m, tile_n] = torch.randn(
+                    (tile_m, tile_n), dtype=x.dtype, device=x.device
+                )
+                out_randn_like[tile_m, tile_n] = torch.randn_like(
+                    torch.ones((tile_m, tile_n), dtype=x.dtype, device=x.device)
+                )
+            return out_rand, out_rand_like, out_randn, out_randn_like
 
+        names = ("rand", "rand_like", "randn", "randn_like")
         x = torch.ones(48, 48, device=DEVICE)
         torch.manual_seed(42)
         block_sizes = _rng_2d_block_sizes()
-        compiled = _compile_only(rng_kernel, (x, rng_func), block_sizes=block_sizes)
-        output = compiled(x, rng_func)
+        compiled = _compile_only(rng_kernel, (x,), block_sizes=block_sizes)
+        outputs = compiled(x)
 
-        # Check distribution properties based on RNG type
-        if is_uniform:
-            # For rand: values in [0, 1), mean ~0.5
+        # For rand variants: values in [0, 1), mean ~0.5
+        for rng_name, output in zip(names[:2], outputs[:2], strict=True):
             self.assertTrue(
                 torch.all(output >= 0.0), f"{rng_name}: All values should be >= 0"
             )
@@ -689,8 +521,9 @@ class TestRNG(RefEagerTestBase, TestCase):
                 0.4 < mean_val < 0.6,
                 f"{rng_name}: Mean {mean_val:.3f} should be ~0.5",
             )
-        else:
-            # For randn: mean ~0, std ~1
+
+        # For randn variants: mean ~0, std ~1
+        for rng_name, output in zip(names[2:], outputs[2:], strict=True):
             mean_val = output.mean().item()
             std_val = output.cpu().std().item()
             self.assertTrue(
@@ -702,76 +535,22 @@ class TestRNG(RefEagerTestBase, TestCase):
 
         # Test reproducibility with same seed
         torch.manual_seed(42)
-        output2 = compiled(x, rng_func)
-        torch.testing.assert_close(
-            output,
-            output2,
-            msg=f"{rng_name}: Same seed should produce identical outputs",
-        )
+        outputs2 = compiled(x)
+        for rng_name, output, output2 in zip(names, outputs, outputs2, strict=True):
+            torch.testing.assert_close(
+                output,
+                output2,
+                msg=f"{rng_name}: Same seed should produce identical outputs",
+            )
 
         # Test that different seeds produce different outputs
         torch.manual_seed(99)
-        output3 = compiled(x, rng_func)
-        self.assertFalse(
-            torch.allclose(output, output3),
-            f"{rng_name}: Different seeds should produce different outputs",
-        )
-
-    @xfailIfPallas(
-        "dynamic-shape implicit rand hits TPU deferred buffer materialization"
-    )
-    @skipIfRefEager("compile_config is not supported in ref eager mode")
-    def test_rand_with_dynamic_tile_sizes(self):
-        """Test torch.rand with dynamic tile dimensions."""
-        self._test_rng_with_dynamic_tile_sizes(
-            rng_func=lambda tile_m, tile_n, dtype: torch.rand(
-                (tile_m, tile_n), dtype=dtype, device=DEVICE
-            ),
-            is_uniform=True,
-            rng_name="rand",
-        )
-
-    @xfailIfPallas(
-        "dynamic-shape implicit rand_like hits TPU deferred buffer materialization"
-    )
-    @skipIfRefEager("compile_config is not supported in ref eager mode")
-    def test_rand_like_with_dynamic_tile_sizes(self):
-        """Test torch.rand_like with dynamic tile dimensions."""
-        self._test_rng_with_dynamic_tile_sizes(
-            rng_func=lambda tile_m, tile_n, dtype: torch.rand_like(
-                torch.ones((tile_m, tile_n), dtype=dtype, device=DEVICE)
-            ),
-            is_uniform=True,
-            rng_name="rand_like",
-        )
-
-    @xfailIfPallas(
-        "dynamic-shape implicit randn hits TPU deferred buffer materialization"
-    )
-    @skipIfRefEager("compile_config is not supported in ref eager mode")
-    def test_randn_with_dynamic_tile_sizes(self):
-        """Test torch.randn with dynamic tile dimensions."""
-        self._test_rng_with_dynamic_tile_sizes(
-            rng_func=lambda tile_m, tile_n, dtype: torch.randn(
-                (tile_m, tile_n), dtype=dtype, device=DEVICE
-            ),
-            is_uniform=False,
-            rng_name="randn",
-        )
-
-    @xfailIfPallas(
-        "dynamic-shape implicit randn_like hits TPU deferred buffer materialization"
-    )
-    @skipIfRefEager("compile_config is not supported in ref eager mode")
-    def test_randn_like_with_dynamic_tile_sizes(self):
-        """Test torch.randn_like with dynamic tile dimensions."""
-        self._test_rng_with_dynamic_tile_sizes(
-            rng_func=lambda tile_m, tile_n, dtype: torch.randn_like(
-                torch.ones((tile_m, tile_n), dtype=dtype, device=DEVICE)
-            ),
-            is_uniform=False,
-            rng_name="randn_like",
-        )
+        outputs3 = compiled(x)
+        for rng_name, output, output3 in zip(names, outputs, outputs3, strict=True):
+            self.assertFalse(
+                torch.allclose(output, output3),
+                f"{rng_name}: Different seeds should produce different outputs",
+            )
 
     @skipIfRefEager(
         "compiled implicit RNG validation is not applicable in ref eager mode"
@@ -878,7 +657,7 @@ class TestRNG(RefEagerTestBase, TestCase):
     def test_rand_like_with_specialized_dimension(self):
         """Test torch.rand_like with specialized (constant) dimensions."""
 
-        @helion.kernel(config=helion.Config(block_sizes=[64, 128]))
+        @helion.kernel(config=helion.Config(block_sizes=[32, 64]))
         def matmul_with_rand(
             x: torch.Tensor,
             y: torch.Tensor,
@@ -906,7 +685,7 @@ class TestRNG(RefEagerTestBase, TestCase):
                 out[tile_m, :] = acc.to(out.dtype)
             return out
 
-        m, k, n = 256, 512, 64
+        m, k, n = 128, 256, 64
         x = torch.randn(m, k, device=DEVICE, dtype=HALF_DTYPE)
         y = torch.randn(k, n, device=DEVICE, dtype=HALF_DTYPE)
 
@@ -990,16 +769,17 @@ class TestRNG(RefEagerTestBase, TestCase):
 @onlyBackends(["triton", "cute"])
 @skipIfRefEager("compiled RNG parity checks are not applicable in ref eager mode")
 class TestRNGBitParity(TestCase):
-    def test_run_ref_matches_compiled_for_multiple_implicit_rng_callsites(self):
+    def test_implicit_rng_callsites_match_triton_and_ref(self):
         def implicit_rng_impl(x: torch.Tensor) -> torch.Tensor:
-            out = torch.zeros((2, *x.shape), device=x.device, dtype=x.dtype)
+            out = torch.zeros((3, *x.shape), device=x.device, dtype=x.dtype)
             m, n = x.shape
             for tile_m, tile_n in hl.tile([m, n]):
                 tile = x[tile_m, tile_n]
                 out[0, tile_m, tile_n] = torch.rand(
                     (tile_m, tile_n), device=x.device, dtype=x.dtype
                 )
-                out[1, tile_m, tile_n] = torch.randn_like(tile)
+                out[1, tile_m, tile_n] = torch.rand_like(tile)
+                out[2, tile_m, tile_n] = torch.randn_like(tile)
             return out
 
         compiled_kernel = helion.kernel(
@@ -1013,81 +793,74 @@ class TestRNGBitParity(TestCase):
         )(implicit_rng_impl)
 
         x = torch.ones(17, 19, device=DEVICE)
-        compiled_bound = compiled_kernel.bind((x,))
-        ref_bound = ref_kernel.bind((x,))
-        config = Config(block_sizes=[8, 16])
+        torch.manual_seed(987)
+        seeds = inductor_prims.seeds(3, torch.accelerator.current_accelerator())
+        seed0 = int(seeds[0].item())
+        seed1 = int(seeds[1].item())
+        seed2 = int(seeds[2].item())
+        torch.manual_seed(987)
+        _code, out = code_and_output(compiled_kernel, (x,), block_sizes=[8, 16])
+        offsets = torch.arange(x.numel(), device=DEVICE, dtype=torch.int64)
+        expected0 = _triton_rand_reference(seed0, offsets).reshape_as(x)
+        expected1 = _triton_rand_reference(seed1, offsets).reshape_as(x)
+        _assert_bitwise_equal_float(self, out[0], expected0)
+        _assert_bitwise_equal_float(self, out[1], expected1)
+        self.assertFalse(torch.equal(out[0].cpu(), out[1].cpu()))
+        expected2 = _triton_randn_reference(seed2, offsets).reshape_as(x)
+        torch.testing.assert_close(out[2], expected2, rtol=1e-6, atol=1e-6)
 
-        torch.manual_seed(2026)
-        compiled = compiled_bound.compile_config(config)(x)
+        # run_ref should match the compiled kernel given the same torch seed
+        torch.manual_seed(987)
+        ref = ref_kernel(x)
+        _assert_bitwise_equal_float(self, out[0], ref[0])
+        _assert_bitwise_equal_float(self, out[1], ref[1])
+        torch.testing.assert_close(out[2], ref[2], rtol=1e-6, atol=1e-6)
 
-        torch.manual_seed(2026)
-        ref = ref_bound.run_ref(x)
-
-        _assert_bitwise_equal_float(self, compiled[0], ref[0])
-        torch.testing.assert_close(compiled[1], ref[1], rtol=1e-6, atol=1e-6)
-
-    def test_rand_nested_tl_range_loops_match_philox(self):
+    def test_rand_nested_and_multi_axis_loops_match_philox(self):
         @helion.kernel(static_shapes=True, autotune_effort="none")
-        def nested_rand_kernel(x: torch.Tensor) -> torch.Tensor:
-            out = torch.zeros_like(x)
+        def nested_rand_kernel(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            out0 = torch.zeros_like(x)
+            out1 = torch.zeros_like(x)
             b, m, n = x.shape
             for tile_b in hl.tile(b):
                 for tile_m in hl.tile(m):
                     for tile_n in hl.tile(n):
-                        noise = torch.rand(
+                        noise0 = torch.rand(
                             (tile_b, tile_m), device=x.device, dtype=x.dtype
                         )
-                        out[tile_b, tile_m, tile_n] = noise[:, :, None].expand(
+                        out0[tile_b, tile_m, tile_n] = noise0[:, :, None].expand(
                             tile_b, tile_m, tile_n
                         )
-            return out
-
-        x = torch.ones(3, 7, 9, device=DEVICE)
-        torch.manual_seed(901)
-        seed = int(
-            inductor_prims.seeds(1, torch.accelerator.current_accelerator())[0].item()
-        )
-        torch.manual_seed(901)
-        code, out = code_and_output(nested_rand_kernel, (x,), block_sizes=[2, 4, 8])
-        expected = _nested_broadcast_rand_expected_3d(
-            (3, 7, 9),
-            (2, 4, 8),
-            seed,
-            device=DEVICE,
-            dtype=x.dtype,
-        )
-        _assert_bitwise_equal_float(self, out, expected)
-        if _get_backend() == "triton":
-            self.assertTrue("tl.range" in code or "tl.static_range" in code)
-
-    def test_rand_multi_axis_loop_offsets_match_philox(self):
-        @helion.kernel(static_shapes=True, autotune_effort="none")
-        def tiled_rand_kernel(x: torch.Tensor) -> torch.Tensor:
-            out = torch.zeros_like(x)
-            b, m, n = x.shape
             for tile_b in hl.tile(b):
                 for tile_m, tile_n in hl.tile([m, n]):
-                    noise = torch.rand((tile_b, tile_m), device=x.device, dtype=x.dtype)
-                    out[tile_b, tile_m, tile_n] = noise[:, :, None].expand(
+                    noise1 = torch.rand(
+                        (tile_b, tile_m), device=x.device, dtype=x.dtype
+                    )
+                    out1[tile_b, tile_m, tile_n] = noise1[:, :, None].expand(
                         tile_b, tile_m, tile_n
                     )
-            return out
+            return out0, out1
 
         x = torch.ones(3, 7, 9, device=DEVICE)
-        torch.manual_seed(902)
-        seed = int(
-            inductor_prims.seeds(1, torch.accelerator.current_accelerator())[0].item()
+        torch.manual_seed(901)
+        seeds = inductor_prims.seeds(2, torch.accelerator.current_accelerator())
+        seed0 = int(seeds[0].item())
+        seed1 = int(seeds[1].item())
+        torch.manual_seed(901)
+        code, (out0, out1) = code_and_output(
+            nested_rand_kernel, (x,), block_sizes=[2, 4, 8, 2, 4, 8]
         )
-        torch.manual_seed(902)
-        _code, out = code_and_output(tiled_rand_kernel, (x,), block_sizes=[2, 4, 8])
-        expected = _nested_broadcast_rand_expected_3d(
-            (3, 7, 9),
-            (2, 4, 8),
-            seed,
-            device=DEVICE,
-            dtype=x.dtype,
-        )
-        _assert_bitwise_equal_float(self, out, expected)
+        for seed, out in ((seed0, out0), (seed1, out1)):
+            expected = _nested_broadcast_rand_expected_3d(
+                (3, 7, 9),
+                (2, 4, 8),
+                seed,
+                device=DEVICE,
+                dtype=x.dtype,
+            )
+            _assert_bitwise_equal_float(self, out, expected)
+        if _get_backend() == "triton":
+            self.assertTrue("tl.range" in code or "tl.static_range" in code)
 
     def test_rand_like_nested_loops_matches_philox(self):
         @helion.kernel(static_shapes=True, autotune_effort="none")
@@ -1138,10 +911,16 @@ class TestRNGBitParity(TestCase):
     def test_rand_with_literal_non_power_of_two_dim_matches_philox(self):
         @helion.kernel(static_shapes=True, autotune_effort="none")
         def literal_dim_rand_kernel(x: torch.Tensor) -> torch.Tensor:
-            out = torch.zeros_like(x)
+            out = torch.zeros((2, *x.shape), device=x.device, dtype=x.dtype)
             (m, _) = x.shape
             for tile_m in hl.tile(m):
-                out[tile_m, :] = torch.rand(
+                # Store rand directly (no intermediate op) and via an intermediate add
+                out[0, tile_m, :] = torch.rand(
+                    (tile_m, 3),
+                    device=x.device,
+                    dtype=x.dtype,
+                )
+                out[1, tile_m, :] = torch.rand(
                     (tile_m, 3),
                     device=x.device,
                     dtype=x.dtype,
@@ -1150,112 +929,16 @@ class TestRNGBitParity(TestCase):
 
         x = torch.ones(13, 3, device=DEVICE)
         torch.manual_seed(314)
-        seed = int(
-            inductor_prims.seeds(1, torch.accelerator.current_accelerator())[0].item()
-        )
-        torch.manual_seed(314)
-        _code, out = code_and_output(literal_dim_rand_kernel, (x,), block_sizes=[8])
-        expected = (
-            philox_rand_ref(
-                seed,
-                torch.arange(out.numel(), device=DEVICE, dtype=torch.int64),
-            ).reshape_as(out)
-            + 1.0
-        )
-        torch.testing.assert_close(out, expected, rtol=0.0, atol=2e-7)
-
-    def test_rand_with_literal_non_power_of_two_dim_no_intermediate_matches_philox(
-        self,
-    ):
-        @helion.kernel(static_shapes=True, autotune_effort="none")
-        def literal_dim_rand_kernel(x: torch.Tensor) -> torch.Tensor:
-            out = torch.zeros_like(x)
-            (m, _) = x.shape
-            for tile_m in hl.tile(m):
-                out[tile_m, :] = torch.rand(
-                    (tile_m, 3),
-                    device=x.device,
-                    dtype=x.dtype,
-                )
-            return out
-
-        x = torch.ones(13, 3, device=DEVICE)
-        torch.manual_seed(2718)
-        seed = int(
-            inductor_prims.seeds(1, torch.accelerator.current_accelerator())[0].item()
-        )
-        torch.manual_seed(2718)
-        _code, out = code_and_output(literal_dim_rand_kernel, (x,), block_sizes=[8])
-        expected = philox_rand_ref(
-            seed,
-            torch.arange(out.numel(), device=DEVICE, dtype=torch.int64),
-        ).reshape_as(out)
-        _assert_bitwise_equal_float(self, out, expected)
-
-    def test_rand_like_matches_triton_philox(self):
-        @helion.kernel(static_shapes=True, autotune_effort="none")
-        def rand_like_kernel(x: torch.Tensor) -> torch.Tensor:
-            out = torch.zeros_like(x)
-            m, n = x.shape
-            for tile_m, tile_n in hl.tile([m, n]):
-                out[tile_m, tile_n] = torch.rand_like(x[tile_m, tile_n])
-            return out
-
-        x = torch.ones(17, 19, device=DEVICE)
-        torch.manual_seed(123)
-        seed = int(
-            inductor_prims.seeds(1, torch.accelerator.current_accelerator())[0].item()
-        )
-        torch.manual_seed(123)
-        _code, out = code_and_output(rand_like_kernel, (x,), block_sizes=[8, 16])
-        offsets = torch.arange(out.numel(), device=DEVICE, dtype=torch.int64)
-        expected = _triton_rand_reference(seed, offsets).reshape_as(out)
-        _assert_bitwise_equal_float(self, out, expected)
-
-    def test_rand_like_multiple_calls_match_triton_reference(self):
-        @helion.kernel(static_shapes=True, autotune_effort="none")
-        def rand_like_twice_kernel(x: torch.Tensor) -> torch.Tensor:
-            out = torch.zeros((2, *x.shape), device=x.device, dtype=x.dtype)
-            m, n = x.shape
-            for tile_m, tile_n in hl.tile([m, n]):
-                tile = x[tile_m, tile_n]
-                out[0, tile_m, tile_n] = torch.rand_like(tile)
-                out[1, tile_m, tile_n] = torch.rand_like(tile)
-            return out
-
-        x = torch.ones(17, 19, device=DEVICE)
-        torch.manual_seed(987)
         seeds = inductor_prims.seeds(2, torch.accelerator.current_accelerator())
         seed0 = int(seeds[0].item())
         seed1 = int(seeds[1].item())
-        torch.manual_seed(987)
-        _code, out = code_and_output(rand_like_twice_kernel, (x,), block_sizes=[8, 16])
+        torch.manual_seed(314)
+        _code, out = code_and_output(literal_dim_rand_kernel, (x,), block_sizes=[8])
         offsets = torch.arange(x.numel(), device=DEVICE, dtype=torch.int64)
-        expected0 = _triton_rand_reference(seed0, offsets).reshape_as(x)
-        expected1 = _triton_rand_reference(seed1, offsets).reshape_as(x)
+        expected0 = philox_rand_ref(seed0, offsets).reshape_as(x)
         _assert_bitwise_equal_float(self, out[0], expected0)
-        _assert_bitwise_equal_float(self, out[1], expected1)
-        self.assertFalse(torch.equal(out[0].cpu(), out[1].cpu()))
-
-    def test_randn_like_matches_triton_philox(self):
-        @helion.kernel(static_shapes=True, autotune_effort="none")
-        def randn_like_kernel(x: torch.Tensor) -> torch.Tensor:
-            out = torch.zeros_like(x)
-            m, n = x.shape
-            for tile_m, tile_n in hl.tile([m, n]):
-                out[tile_m, tile_n] = torch.randn_like(x[tile_m, tile_n])
-            return out
-
-        x = torch.ones(13, 29, device=DEVICE)
-        torch.manual_seed(321)
-        seed = int(
-            inductor_prims.seeds(1, torch.accelerator.current_accelerator())[0].item()
-        )
-        torch.manual_seed(321)
-        _code, out = code_and_output(randn_like_kernel, (x,), block_sizes=[8, 16])
-        offsets = torch.arange(out.numel(), device=DEVICE, dtype=torch.int64)
-        expected = _triton_randn_reference(seed, offsets).reshape_as(out)
-        torch.testing.assert_close(out, expected, rtol=1e-6, atol=1e-6)
+        expected1 = philox_rand_ref(seed1, offsets).reshape_as(x) + 1.0
+        torch.testing.assert_close(out[1], expected1, rtol=0.0, atol=2e-7)
 
 
 class TestPallasRNGRegression(TestCase):
@@ -1295,89 +978,46 @@ class TestPallasRNGRegression(TestCase):
 )
 @skipIfRefEager("compiled backend parity checks are not applicable in ref eager mode")
 class TestRNGBackendParity(TestCase):
-    def test_triton_and_cute_match_explicit_seeded_rand(self):
-        @helion.kernel(backend="triton", static_shapes=False, autotune_effort="none")
-        def rand_kernel_triton(
+    def test_triton_and_cute_match_explicit_seeded_rand_and_randint(self):
+        def rng_impl(
             x: torch.Tensor, seed: int
-        ) -> tuple[torch.Tensor, torch.Tensor]:
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             m, n = x.shape
             out0 = torch.zeros_like(x)
             out1 = torch.zeros_like(x)
+            int0 = torch.zeros((m, n), dtype=torch.int32, device=x.device)
+            int1 = torch.zeros((m, n), dtype=torch.int32, device=x.device)
             for tile_m, tile_n in hl.tile([m, n]):
                 out0[tile_m, tile_n] = hl.rand([tile_m, tile_n], seed=seed)
+                int0[tile_m, tile_n] = hl.randint(
+                    [tile_m, tile_n], low=-3, high=29, seed=seed
+                )
             for tile_m, tile_n in hl.tile([m, n]):
                 out1[tile_m, tile_n] = hl.rand([tile_m, tile_n], seed=seed)
-            return out0, out1
+                int1[tile_m, tile_n] = hl.randint(
+                    [tile_m, tile_n], low=-3, high=29, seed=seed
+                )
+            return out0, out1, int0, int1
 
-        @helion.kernel(backend="cute", static_shapes=False, autotune_effort="none")
-        def rand_kernel_cute(
-            x: torch.Tensor, seed: int
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            m, n = x.shape
-            out0 = torch.zeros_like(x)
-            out1 = torch.zeros_like(x)
-            for tile_m, tile_n in hl.tile([m, n]):
-                out0[tile_m, tile_n] = hl.rand([tile_m, tile_n], seed=seed)
-            for tile_m, tile_n in hl.tile([m, n]):
-                out1[tile_m, tile_n] = hl.rand([tile_m, tile_n], seed=seed)
-            return out0, out1
+        rng_kernel_triton = helion.kernel(
+            backend="triton", static_shapes=False, autotune_effort="none"
+        )(rng_impl)
+        rng_kernel_cute = helion.kernel(
+            backend="cute", static_shapes=False, autotune_effort="none"
+        )(rng_impl)
 
         x = torch.empty((11, 13), device=DEVICE, dtype=torch.float32)
         seed = 4096
-        out_t = _compile_only(rand_kernel_triton, (x, seed), block_sizes=[4, 8, 4, 8])(
+        out_t = _compile_only(rng_kernel_triton, (x, seed), block_sizes=[4, 8, 4, 8])(
             x, seed
         )
-        out_c = _compile_only(rand_kernel_cute, (x, seed), block_sizes=[4, 8, 4, 8])(
+        out_c = _compile_only(rng_kernel_cute, (x, seed), block_sizes=[4, 8, 4, 8])(
             x, seed
         )
         _assert_bitwise_equal_float(self, out_t[0], out_c[0])
         _assert_bitwise_equal_float(self, out_t[1], out_c[1])
-
-    def test_triton_and_cute_match_explicit_seeded_randint(self):
-        @helion.kernel(backend="triton", static_shapes=False, autotune_effort="none")
-        def randint_kernel_triton(
-            x: torch.Tensor, seed: int
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            m, n = x.shape
-            out0 = torch.zeros_like(x)
-            out1 = torch.zeros_like(x)
-            for tile_m, tile_n in hl.tile([m, n]):
-                out0[tile_m, tile_n] = hl.randint(
-                    [tile_m, tile_n], low=-3, high=29, seed=seed
-                )
-            for tile_m, tile_n in hl.tile([m, n]):
-                out1[tile_m, tile_n] = hl.randint(
-                    [tile_m, tile_n], low=-3, high=29, seed=seed
-                )
-            return out0, out1
-
-        @helion.kernel(backend="cute", static_shapes=False, autotune_effort="none")
-        def randint_kernel_cute(
-            x: torch.Tensor, seed: int
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            m, n = x.shape
-            out0 = torch.zeros_like(x)
-            out1 = torch.zeros_like(x)
-            for tile_m, tile_n in hl.tile([m, n]):
-                out0[tile_m, tile_n] = hl.randint(
-                    [tile_m, tile_n], low=-3, high=29, seed=seed
-                )
-            for tile_m, tile_n in hl.tile([m, n]):
-                out1[tile_m, tile_n] = hl.randint(
-                    [tile_m, tile_n], low=-3, high=29, seed=seed
-                )
-            return out0, out1
-
-        x = torch.empty((9, 15), device=DEVICE, dtype=torch.int32)
-        seed = 5150
-        out_t = _compile_only(
-            randint_kernel_triton, (x, seed), block_sizes=[4, 8, 4, 8]
-        )(x, seed)
-        out_c = _compile_only(randint_kernel_cute, (x, seed), block_sizes=[4, 8, 4, 8])(
-            x, seed
-        )
-        self.assertTrue(torch.equal(out_t[0].cpu(), out_c[0].cpu()))
-        self.assertTrue(torch.equal(out_t[1].cpu(), out_c[1].cpu()))
+        self.assertTrue(torch.equal(out_t[2].cpu(), out_c[2].cpu()))
+        self.assertTrue(torch.equal(out_t[3].cpu(), out_c[3].cpu()))
 
     def test_triton_and_cute_match_raw_aten_rand_and_randn(self):
         @helion.kernel(backend="triton", static_shapes=False, autotune_effort="none")

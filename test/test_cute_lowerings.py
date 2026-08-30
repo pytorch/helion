@@ -19112,8 +19112,8 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         )
 
     def test_aux_pipeline_multi_tile_runtime_correctness_cluster_m2(self) -> None:
-        """Multi-tile runtime regression: 4096^3 residual with
-        cluster_m=2 + ``c_input_warps=1`` must run to completion
+        """Multi-tile runtime regression: 4096x4096 (K=1024) residual
+        with cluster_m=2 + ``c_input_warps=1`` must run to completion
         and produce bit-correct output.
 
         The prior 1024^3 ``test_residual_c_input_runtime_correctness``
@@ -19122,13 +19122,16 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         wrap-around of the aux pipeline depth would silently
         slip through (the cycle 2b prior-subagent
         ``partition_D(smem).load()`` form deadlocked at 1024^3
-        only with cluster_m=2 with more tiles per CTA). 4096^3
+        only with cluster_m=2 with more tiles per CTA). M=N=4096
         gives 16x16 = 256 tiles → ~ceil(256/2/148) ≈ 1-2 tiles
         per CTA at cluster_m=2; the producer wraps the stage
         count on the third subtile of each tile (so the
         producer goes through ≥3 stage cycles per CTA),
         triggering the deadlock if the per-CTA producer/consumer
-        subtile counts disagree.
+        subtile counts disagree.  The deadlock depends only on the
+        M/N tile schedule and the epilogue subtile count, not on
+        the mainloop depth, so K is kept at 1024 (8 k-iters, still
+        several ab-stage wraps) to bound runtime.
         """
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
@@ -19136,8 +19139,8 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
 
         torch.manual_seed(0)
-        x = torch.randn(4096, 4096, dtype=torch.bfloat16, device=DEVICE)
-        y = torch.randn(4096, 4096, dtype=torch.bfloat16, device=DEVICE)
+        x = torch.randn(4096, 1024, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(1024, 4096, dtype=torch.bfloat16, device=DEVICE)
         residual = torch.randn(4096, 4096, dtype=torch.bfloat16, device=DEVICE)
         kernel = self._residual_kernel()
         config = self._canonical_c_input_config()
@@ -19193,11 +19196,19 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
 
         Pin: ``c_input_warps=1 + cluster_m=2 + ab_stages=2``
         runs correctness-clean across the sweep
-        ``l2_groupings ∈ {1, 2, 4, 8} × cluster_n ∈ {1, 2}``.
-        The non-trivial ``g`` values are the load-bearing
+        ``l2_groupings ∈ {1, 4} × cluster_n ∈ {1, 2}``.
+        The non-trivial ``g`` value is the load-bearing
         regression for the original cycle 2i fix; the
         ``cluster_n=2`` values are the load-bearing
-        regression for the autoreview P1 fix.
+        regression for the autoreview P1 fix.  The shape is
+        2048x2048 (K=1024) with bm=bn=256: the 8x8 tile grid
+        gives 2 L2 groups along M and 8 along N at g=4, so the
+        post-L2 remap is non-identity (the original bug at
+        4096^3 mismatched 60-69% of elements for EVERY g > 1,
+        so a single non-trivial g at a smaller shape still
+        catches the raw-coords regression).  g ∈ {2, 8} were
+        dropped as redundant with g=4 — same bug class, same
+        failure signature.
         """
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
@@ -19205,9 +19216,9 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
 
         torch.manual_seed(0)
-        x = torch.randn(4096, 4096, dtype=torch.bfloat16, device=DEVICE)
-        y = torch.randn(4096, 4096, dtype=torch.bfloat16, device=DEVICE)
-        residual = torch.randn(4096, 4096, dtype=torch.bfloat16, device=DEVICE)
+        x = torch.randn(2048, 1024, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(1024, 2048, dtype=torch.bfloat16, device=DEVICE)
+        residual = torch.randn(2048, 2048, dtype=torch.bfloat16, device=DEVICE)
         expected = (x @ y + residual).to(x.dtype)
         kernel = self._residual_kernel()
         # Bind once — args don't change across the sweep, only
@@ -19227,9 +19238,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         # is included to keep the cycle 2b correctness
         # baseline pinned.
         sweep_configs: list[tuple[int, int]] = [
-            (l2_grouping, cluster_n)
-            for cluster_n in (1, 2)
-            for l2_grouping in (1, 2, 4, 8)
+            (l2_grouping, cluster_n) for cluster_n in (1, 2) for l2_grouping in (1, 4)
         ]
         for l2_grouping, cluster_n in sweep_configs:
             config = helion.Config(

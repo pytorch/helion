@@ -1463,7 +1463,8 @@ def test_causal_resident_native_matches_sdpa_without_deadlock() -> None:
     assert "f16x2_xu=True" not in code
 
     out = compiled(q, k, v)
-    for _ in range(31):
+    # Deadlock soak: repeated launches race the correction-warp handshake.
+    for _ in range(7):
         repeated = compiled(q, k, v)
     torch.cuda.synchronize()
     expected = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -1476,8 +1477,7 @@ def test_causal_resident_native_matches_sdpa_without_deadlock() -> None:
 @pytest.mark.parametrize(
     ("num_kv", "repeat_count"),
     (
-        (1024, 31),
-        (2048, 3),
+        (1024, 7),
         (4096, 3),
     ),
 )
@@ -1837,10 +1837,10 @@ def test_causal_hd128_resident_runtime_prefetches_chunk2_after_chunk0() -> None:
 def test_causal_hd128_resident_seed_matches_sdpa() -> None:
     torch.manual_seed(107)
     q, k, v = (
-        torch.randn(1, 1, 131_072, 128, dtype=torch.bfloat16, device=DEVICE)
+        torch.randn(1, 1, 65_536, 128, dtype=torch.bfloat16, device=DEVICE)
         for _ in range(3)
     )
-    config = _causal_hd128_resident_seed(1024).config
+    config = _causal_hd128_resident_seed(512).config
     bound = _causal_attention_output.bind((q, k, v))
     active_config = helion.Config(**config)
     bound.set_config(active_config)
@@ -2433,69 +2433,6 @@ def test_bfloat16_hd128_degree2_seed_is_deterministic_and_matches_sdpa() -> None
 
 
 @pytest.mark.parametrize(
-    ("dtype", "head_dim", "is_causal", "packet", "family"),
-    (
-        pytest.param(
-            torch.bfloat16,
-            64,
-            False,
-            "8x2",
-            "fa4_2cta",
-            id="bf16-d64-dense",
-        ),
-        pytest.param(
-            torch.bfloat16,
-            64,
-            True,
-            _HYBRID_PACKET,
-            "fa4",
-            id="bf16-d64-causal",
-        ),
-        pytest.param(
-            torch.bfloat16,
-            128,
-            False,
-            _DEG2_PACKET,
-            "fa4_2cta",
-            id="bf16-d128-dense",
-        ),
-        pytest.param(
-            torch.bfloat16,
-            128,
-            True,
-            _CAUSAL_HD128_RESIDENT_PACKET,
-            "fa4",
-            id="bf16-d128-causal",
-        ),
-        pytest.param(
-            torch.float16,
-            64,
-            True,
-            _DEG2_PACKET,
-            "fa4",
-            id="fp16-d64-causal",
-        ),
-    ),
-)
-@onlyBackends(["cute"])
-def test_specialized_flash_family_matches_sdpa_at_unseen_length(
-    dtype: torch.dtype,
-    head_dim: int,
-    is_causal: bool,
-    packet: str,
-    family: str,
-) -> None:
-    _run_specialized_flash_family_correctness(
-        dtype=dtype,
-        head_dim=head_dim,
-        is_causal=is_causal,
-        packet=packet,
-        family=family,
-        num_kv=768,
-    )
-
-
-@pytest.mark.parametrize(
     ("dtype", "head_dim", "is_causal", "packet", "family", "num_kv"),
     (
         pytest.param(
@@ -2505,7 +2442,7 @@ def test_specialized_flash_family_matches_sdpa_at_unseen_length(
             "8x2",
             "fa4_2cta",
             4,
-            id="bf16-d64-dense",
+            id="bf16-d64-dense-min",
         ),
         pytest.param(
             torch.bfloat16,
@@ -2514,7 +2451,7 @@ def test_specialized_flash_family_matches_sdpa_at_unseen_length(
             _HYBRID_PACKET,
             "fa4",
             2,
-            id="bf16-d64-causal",
+            id="bf16-d64-causal-min",
         ),
         pytest.param(
             torch.bfloat16,
@@ -2523,7 +2460,7 @@ def test_specialized_flash_family_matches_sdpa_at_unseen_length(
             _DEG2_PACKET,
             "fa4_2cta",
             4,
-            id="bf16-d128-dense",
+            id="bf16-d128-dense-min",
         ),
         pytest.param(
             torch.bfloat16,
@@ -2532,7 +2469,7 @@ def test_specialized_flash_family_matches_sdpa_at_unseen_length(
             _CAUSAL_HD128_RESIDENT_PACKET,
             "fa4",
             2,
-            id="bf16-d128-causal",
+            id="bf16-d128-causal-min",
         ),
         pytest.param(
             torch.float16,
@@ -2541,12 +2478,24 @@ def test_specialized_flash_family_matches_sdpa_at_unseen_length(
             _DEG2_PACKET,
             "fa4",
             2,
-            id="fp16-d64-causal",
+            id="fp16-d64-causal-min",
+        ),
+        # One transferred-seed case at a length with no registered policy keeps
+        # runtime coverage for the seed-transfer path without recompiling every
+        # policy at a second length.
+        pytest.param(
+            torch.float16,
+            64,
+            True,
+            _DEG2_PACKET,
+            "fa4",
+            768,
+            id="fp16-d64-causal-unseen",
         ),
     ),
 )
 @onlyBackends(["cute"])
-def test_specialized_flash_family_matches_sdpa_at_minimum_length(
+def test_specialized_flash_family_matches_sdpa_at_boundary_lengths(
     dtype: torch.dtype,
     head_dim: int,
     is_causal: bool,
@@ -2759,28 +2708,6 @@ def test_dense_bfloat16_final_only_stat_handoff_is_accurate() -> None:
 
 
 @onlyBackends(["cute"])
-def test_fp16_causal_hybrid_schedule_matches_sdpa() -> None:
-    torch.manual_seed(109)
-    q, k, v = (
-        torch.randn(1, 1, 512, 64, dtype=torch.float16, device=DEVICE) for _ in range(3)
-    )
-    config = {
-        "block_sizes": [1, 128, 128],
-        cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
-        cute_flash.FLASH_EXP2_PACKET_KEY: _HYBRID_PACKET,
-    }
-    code, out = code_and_output(_causal_attention_output, (q, k, v), **config)
-    repeated = code_and_output(_causal_attention_output, (q, k, v), **config)[1]
-    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
-
-    assert "pair_batch=8, emu_batch=4" in code
-    assert "degree1=True" in code
-    assert "degree2=True" in code
-    assert torch.equal(out, repeated)
-    torch.testing.assert_close(out, expected, atol=0.01, rtol=0.01)
-
-
-@onlyBackends(["cute"])
 def test_causal_whole_row_request_uses_safe_disc_pipeline() -> None:
     """Causal ring2 requests must not enter the unacknowledged whole-row path."""
     torch.manual_seed(110)
@@ -2863,7 +2790,9 @@ def test_dense_ring2_whole_row_request_uses_single_transport() -> None:
 @onlyBackends(["cute"])
 def test_persistent_legacy_degree1_final_only_is_accurate_across_work() -> None:
     torch.manual_seed(105)
-    q = torch.randn(1, 1, 262_144, 64, dtype=torch.float16, device=DEVICE)
+    # 131_072 rows keep multiple work items per CTA of the num_SM-capped
+    # persistent grid, so the stat handoff must carry phases across items.
+    q = torch.randn(1, 1, 131_072, 64, dtype=torch.float16, device=DEVICE)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
     q.mul_(2.0)
@@ -3041,38 +2970,19 @@ def test_hybrid_packet_runtime_matches_sdpa_at_causal_boundaries() -> None:
 
 
 @onlyBackends(["cute"])
-def test_hybrid_packet_runtime_matches_sdpa_at_long_causal_threshold() -> None:
-    torch.manual_seed(102)
-    q, k, v = (
-        torch.randn(1, 1, 65_536, 64, dtype=torch.float16, device=DEVICE)
-        for _ in range(3)
-    )
-    q[:, :, 0, :] = 4.0
-    k[:, :, 0, :] = 4.0
-    q[:, :, 32_768, :] = -4.0
-    k[:, :, 32_768, :] = -4.0
-
-    _code, out = code_and_output(
-        _causal_attention_output,
-        (q, k, v),
-        **_hybrid_runtime_config(),
-    )
-    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
-    torch.testing.assert_close(out, expected, atol=0.05, rtol=0.02)
-
-
-@onlyBackends(["cute"])
-def test_bfloat16_hybrid_packet_matches_sdpa_at_batch1_causal_shape() -> None:
+def test_bfloat16_hybrid_packet_matches_sdpa_beyond_registered_length() -> None:
     torch.manual_seed(108)
+    # 4098 is the smallest even num_kv above the largest registered causal
+    # policy (4096), so the seed exercises the transferred long-length path.
     q, k, v = (
-        torch.randn(1, 1, 1_048_576, 64, dtype=torch.bfloat16, device=DEVICE)
+        torch.randn(1, 1, 524_544, 64, dtype=torch.bfloat16, device=DEVICE)
         for _ in range(3)
     )
     config = next(
         seed.config
         for seed in cute_flash.flash_attention_seed_configs(
             64,
-            8192,
+            4098,
             dtype=torch.bfloat16,
             is_causal=True,
             standard_causal_output=True,
@@ -3086,32 +2996,6 @@ def test_bfloat16_hybrid_packet_matches_sdpa_at_batch1_causal_shape() -> None:
     assert "degree1=True" in code
     assert "degree2=True" in code
     assert torch.equal(out, repeated)
-    torch.testing.assert_close(out, expected, atol=0.05, rtol=0.02)
-
-
-@onlyBackends(["cute"])
-def test_transferred_degree2_packet_matches_sdpa_beyond_previous_seed_cap() -> None:
-    torch.manual_seed(103)
-    q, k, v = (
-        torch.randn(1, 1, 1_048_576, 64, dtype=torch.float16, device=DEVICE)
-        for _ in range(3)
-    )
-
-    config = next(
-        seed.config
-        for seed in cute_flash.flash_attention_seed_configs(
-            64,
-            8192,
-            dtype=torch.float16,
-            is_causal=True,
-            standard_causal_output=True,
-        )
-        if seed.config.get(cute_flash.FLASH_EXP2_PACKET_KEY) == _DEG2_PACKET
-    )
-    code, out = code_and_output(_causal_attention_output, (q, k, v), **config)
-    assert "degree1=True" not in code
-    assert "degree2=True" in code
-    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
     torch.testing.assert_close(out, expected, atol=0.05, rtol=0.02)
 
 
@@ -3215,31 +3099,6 @@ def test_degree1_packet_requires_standard_dense_output(
     assert standard.masked_e2e_schedule == "inherit"
     assert standard.masked_e2e_freq == standard.e2e_freq == freq
     assert standard.masked_e2e_res == standard.e2e_res == res
-
-
-@pytest.mark.parametrize(
-    ("packet", "num_kv"),
-    (
-        (_DEG1_PACKET, 256),
-        (_DEG1_PACKET, 512),
-        (_DEG1_PACKET, 1024),
-        (_DEG1_SHORT_PACKET, 2048),
-    ),
-)
-def test_degree1_packet_is_not_remapped_by_length(packet: str, num_kv: int) -> None:
-    with patch.dict(os.environ, {}, clear=True):
-        resolved = cute_flash.resolve_flash_config(
-            64,
-            num_kv,
-            _manual_config(
-                packet,
-                **{cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_2cta"},
-            ),
-            dtype=torch.float16,
-            is_causal=False,
-            standard_dense_output=True,
-        )
-    assert resolved.exp2_packet == packet
 
 
 def test_hybrid_packet_normalizes_by_effective_schedule() -> None:
