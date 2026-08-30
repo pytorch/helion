@@ -266,7 +266,6 @@ def run_sweep(
     *,
     use_cudagraph: bool,
     pre_captured_cudagraph: bool = False,
-    interleave_pre_captured: bool = True,
     make_resets: Callable[[ShapeT], Sequence[Callable[[], object] | None]]
     | None = None,
     shape_header: str,
@@ -280,8 +279,6 @@ def run_sweep(
     ``make_calls(shape)`` returns ``(helion_call, [(baseline_name, baseline_call)],
     shape_cells)`` where the calls are zero-arg closures over freshly built inputs
     and ``shape_cells`` is the preformatted leading column(s) for the table row.
-    Set ``interleave_pre_captured=False`` to finish one cold-L2 graph benchmark
-    before starting the next implementation.
     The metrics dict is always returned; the per-shape table is printed only when
     ``verbose``.
     """
@@ -322,27 +319,15 @@ def run_sweep(
             )
             if len(resets) != len(calls):
                 raise ValueError("make_resets must return one entry per call")
-            if interleave_pre_captured:
-                thermal_warmup(thermal_warmup_ms)
-                if make_resets is None:
-                    timings = bench_pre_captured_cudagraphs(calls, rep=rep)
-                else:
-                    timings = bench_pre_captured_cudagraphs(
-                        calls,
-                        rep=rep,
-                        resets=resets,
-                    )
+            thermal_warmup(thermal_warmup_ms)
+            if make_resets is None:
+                timings = bench_pre_captured_cudagraphs(calls, rep=rep)
             else:
-                timings = []
-                for call, reset in zip(calls, resets, strict=True):
-                    thermal_warmup(thermal_warmup_ms)
-                    timings.extend(
-                        bench_pre_captured_cudagraphs(
-                            [call],
-                            rep=rep,
-                            resets=[reset],
-                        )
-                    )
+                timings = bench_pre_captured_cudagraphs(
+                    calls,
+                    rep=rep,
+                    resets=resets,
+                )
             ms_helion, *baseline_timings = timings
             base_ms = dict(zip(names, baseline_timings, strict=True))
         else:

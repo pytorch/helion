@@ -87,16 +87,18 @@ def _import_pretuned_heuristic(name: str, compute: str = "sm100"):
 def test_megakernel_aot_key_is_fixed_shape(name: str) -> None:
     heuristic = _import_pretuned_heuristic(name)
     signatures = heuristic._TENSOR_SIGNATURES
+    meta_device = torch.device("meta")
     args = [
-        torch.empty(shape, dtype=dtype, device="meta") for shape, dtype in signatures
+        torch.empty(shape, dtype=dtype, device=meta_device)
+        for shape, dtype in signatures
     ] + list(heuristic._STATIC_ARGS)
     key = getattr(heuristic, f"key_{name}")
     assert key(*args) == 0
 
     for index, (shape, dtype) in enumerate(signatures):
         for replacement in (
-            torch.empty((*shape, 1), dtype=dtype, device="meta"),
-            torch.empty(shape, dtype=torch.float64, device="meta"),
+            torch.empty((*shape, 1), dtype=dtype, device=meta_device),
+            torch.empty(shape, dtype=torch.float64, device=meta_device),
         ):
             changed = list(args)
             changed[index] = replacement
@@ -110,7 +112,7 @@ def test_megakernel_aot_key_is_fixed_shape(name: str) -> None:
             key(*changed)
 
 
-def test_pre_captured_graph_sweep_can_measure_sequentially(
+def test_pre_captured_graph_sweep_passes_resets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from pretuned_kernels import _bench
@@ -143,15 +145,14 @@ def test_pre_captured_graph_sweep_can_measure_sequentially(
         ),
         use_cudagraph=False,
         pre_captured_cudagraph=True,
-        interleave_pre_captured=False,
         make_resets=lambda _shape: (helion_reset, baseline_reset),
         shape_header="shape",
         rep=7,
         verbose=False,
     )
 
-    assert batches == [("helion",), ("baseline",)]
-    assert reset_batches == [(helion_reset,), (baseline_reset,)]
+    assert batches == [("helion", "baseline")]
+    assert reset_batches == [(helion_reset, baseline_reset)]
     assert metrics["geomean"] == 2.0
 
 

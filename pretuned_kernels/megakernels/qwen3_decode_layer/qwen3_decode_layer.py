@@ -114,44 +114,43 @@ def qwen3_decode_layer(
     group,
     eps,
 ):
-    __td_pre_result = pre_q
-    __td_pre_input = hidden_states
-    __td_pre_weight = pre_weight
-    __td_pre_scale = pre_scale
-    __td_pre_epsilon = eps
-    __td_pre_scale_ub = None
-    __td_pre_residual = residual
-    __td_pre_group_size = group
-    __td_pre_is_scale_transposed = False
-    assert __td_pre_input.ndim == 2
-    __td_pre_num_tokens, __td_pre_hidden_size = __td_pre_input.shape
-    hl.specialize(__td_pre_hidden_size)
-    hl.specialize(__td_pre_group_size)
-    __td_pre_groups_per_row = __td_pre_scale.shape[1]
-    hl.specialize(__td_pre_groups_per_row)
-    assert __td_pre_group_size == 128
-    assert __td_pre_result.dtype == torch.float8_e4m3fn
-    assert __td_pre_scale.dtype == torch.float32
-    __td_pre_rms_partials = torch.empty(
-        (__td_pre_num_tokens, __td_pre_groups_per_row),
+    pre_result = pre_q
+    pre_input = hidden_states
+    pre_norm_weight = pre_weight
+    pre_scale_output = pre_scale
+    pre_epsilon = eps
+    pre_scale_ub = None
+    pre_residual = residual
+    pre_group_size = group
+    assert pre_input.ndim == 2
+    pre_num_tokens, pre_hidden_size = pre_input.shape
+    hl.specialize(pre_hidden_size)
+    hl.specialize(pre_group_size)
+    pre_groups_per_row = pre_scale_output.shape[1]
+    hl.specialize(pre_groups_per_row)
+    assert pre_group_size == 128
+    assert pre_result.dtype == torch.float8_e4m3fn
+    assert pre_scale_output.dtype == torch.float32
+    pre_rms_partials = torch.empty(
+        (pre_num_tokens, pre_groups_per_row),
         dtype=torch.float32,
-        device=__td_pre_input.device,
+        device=pre_input.device,
     )
-    __td_pre_unrounded_values = torch.empty_like(__td_pre_input, dtype=torch.float32)
-    __td_qkv_mm_activation_q = pre_q
-    __td_qkv_mm_activation_scale = pre_scale
-    __td_qkv_mm_weight_q = qkv_weight_q
-    __td_qkv_mm_weight_scale = qkv_weight_scale
-    __td_qkv_mm_group_size = group
-    __td_qkv_mm_m, __td_qkv_mm_k = __td_qkv_mm_activation_q.size()
-    __td_qkv_mm_n, __td_qkv_mm_weight_k = __td_qkv_mm_weight_q.size()
-    assert __td_qkv_mm_weight_k == __td_qkv_mm_k
-    assert __td_qkv_mm_group_size == 128
-    hl.specialize(__td_qkv_mm_group_size)
+    pre_unrounded_values = torch.empty_like(pre_input, dtype=torch.float32)
+    qkv_mm_activation_q = pre_q
+    qkv_mm_activation_scale = pre_scale
+    qkv_mm_weight_q = qkv_weight_q
+    qkv_mm_weight_scale = qkv_weight_scale
+    qkv_mm_group_size = group
+    qkv_mm_m, qkv_mm_k = qkv_mm_activation_q.size()
+    qkv_mm_n, qkv_mm_weight_k = qkv_mm_weight_q.size()
+    assert qkv_mm_weight_k == qkv_mm_k
+    assert qkv_mm_group_size == 128
+    hl.specialize(qkv_mm_group_size)
     qkv = torch.empty(
-        (__td_qkv_mm_m, __td_qkv_mm_n),
+        (qkv_mm_m, qkv_mm_n),
         dtype=torch.bfloat16,
-        device=__td_qkv_mm_activation_q.device,
+        device=qkv_mm_activation_q.device,
     )
     batch = hidden_states.shape[0]
     query = qkv[:, : q_heads * head_dim].view(batch, q_heads, head_dim)
@@ -162,852 +161,743 @@ def qwen3_decode_layer(
     value = qkv[
         :, key_begin + kv_heads * head_dim : (q_heads + 2 * kv_heads) * head_dim
     ].view(batch, kv_heads, head_dim)
-    __td_qk_qkv = qkv
-    __td_qk_num_heads_q = q_heads
-    __td_qk_num_heads_k = kv_heads
-    __td_qk_num_heads_v = kv_heads
-    __td_qk_head_dim = head_dim
-    __td_qk_eps = eps
-    __td_qk_q_weight = q_weight
-    __td_qk_k_weight = k_weight
-    __td_qk_cos_sin_cache = cos_sin
-    __td_qk_is_neox = True
-    __td_qk_position_ids = position
-    __td_qk_forced_token_heads_per_warp = -1
-    __td_qk_num_tokens = __td_qk_qkv.shape[0]
-    __td_qk_total_heads = (
-        __td_qk_num_heads_q + __td_qk_num_heads_k + __td_qk_num_heads_v
-    )
-    hl.specialize(__td_qk_qkv.shape[1])
-    __td_qk__, __td_qk_rotary_dim = __td_qk_cos_sin_cache.shape
-    hl.specialize(__td_qk_rotary_dim)
-    __td_qk_embed_dim = __td_qk_rotary_dim // 2
-    hl.specialize(__td_qk_num_heads_q)
-    hl.specialize(__td_qk_num_heads_k)
-    hl.specialize(__td_qk_num_heads_v)
-    hl.specialize(__td_qk_head_dim)
-    __td_qk_qk_heads = __td_qk_num_heads_q + __td_qk_num_heads_k
-    __td_qk_qkv = __td_qk_qkv.view(
-        __td_qk_num_tokens, __td_qk_total_heads, __td_qk_head_dim
-    )
-    __td_cache_key = key
-    __td_cache_value = value
-    __td_cache_kv_cache = kv_cache
-    __td_cache_slot_mapping = slot_mapping
-    __td_cache_block_size = cache_block
-    __td_cache_num_tokens, __td_cache_num_kv_heads, __td_cache_head_dim = (
-        __td_cache_key.shape
-    )
-    hl.specialize(__td_cache_num_kv_heads)
-    hl.specialize(__td_cache_head_dim)
-    hl.specialize(__td_cache_block_size)
-    __td_attention_split_query = query
-    __td_attention_split_kv_cache = kv_cache
-    __td_attention_split_block_table = block_table
-    __td_attention_split_context = context
-    __td_attention_split_block_size = cache_block
-    __td_attention_split_q_per_kv = q_heads // kv_heads
-    __td_attention_split_splits = attention_splits
+    qk_qkv = qkv
+    qk_num_heads_q = q_heads
+    qk_num_heads_k = kv_heads
+    qk_num_heads_v = kv_heads
+    qk_head_dim = head_dim
+    qk_eps = eps
+    qk_q_weight = q_weight
+    qk_k_weight = k_weight
+    qk_cos_sin_cache = cos_sin
+    qk_is_neox = True
+    qk_position_ids = position
+    qk_num_tokens = qk_qkv.shape[0]
+    qk_total_heads = qk_num_heads_q + qk_num_heads_k + qk_num_heads_v
+    hl.specialize(qk_qkv.shape[1])
+    qk_rotary_dim = qk_cos_sin_cache.shape[1]
+    hl.specialize(qk_rotary_dim)
+    qk_embed_dim = qk_rotary_dim // 2
+    hl.specialize(qk_num_heads_q)
+    hl.specialize(qk_num_heads_k)
+    hl.specialize(qk_num_heads_v)
+    hl.specialize(qk_head_dim)
+    qk_qk_heads = qk_num_heads_q + qk_num_heads_k
+    qk_qkv = qk_qkv.view(qk_num_tokens, qk_total_heads, qk_head_dim)
+    cache_key = key
+    cache_value = value
+    cache_kv_cache = kv_cache
+    cache_slot_mapping = slot_mapping
+    cache_block_size = cache_block
+    cache_num_tokens, cache_num_kv_heads, cache_head_dim = cache_key.shape
+    hl.specialize(cache_num_kv_heads)
+    hl.specialize(cache_head_dim)
+    hl.specialize(cache_block_size)
+    attention_split_query = query
+    attention_split_kv_cache = kv_cache
+    attention_split_block_table = block_table
+    attention_split_context = context
+    attention_split_block_size = cache_block
+    attention_split_q_per_kv = q_heads // kv_heads
+    attention_split_splits = attention_splits
     (
-        __td_attention_split_num_tokens,
-        __td_attention_split_num_q_heads,
-        __td_attention_split_head_dim,
-    ) = __td_attention_split_query.shape
-    __td_attention_split_num_kv_heads = __td_attention_split_kv_cache.shape[2]
+        attention_split_num_tokens,
+        attention_split_num_q_heads,
+        attention_split_head_dim,
+    ) = attention_split_query.shape
+    attention_split_num_kv_heads = attention_split_kv_cache.shape[2]
     assert (
-        __td_attention_split_num_q_heads
-        == __td_attention_split_num_kv_heads * __td_attention_split_q_per_kv
+        attention_split_num_q_heads
+        == attention_split_num_kv_heads * attention_split_q_per_kv
     )
-    assert __td_attention_split_context % __td_attention_split_splits == 0
-    hl.specialize(__td_attention_split_head_dim)
-    hl.specialize(__td_attention_split_num_kv_heads)
-    hl.specialize(__td_attention_split_q_per_kv)
-    hl.specialize(__td_attention_split_context)
-    hl.specialize(__td_attention_split_block_size)
-    hl.specialize(__td_attention_split_splits)
-    __td_attention_split_split_context = (
-        __td_attention_split_context // __td_attention_split_splits
-    )
-    __td_attention_split_token_kv_heads = (
-        __td_attention_split_num_tokens * __td_attention_split_num_kv_heads
+    assert attention_split_context % attention_split_splits == 0
+    hl.specialize(attention_split_head_dim)
+    hl.specialize(attention_split_num_kv_heads)
+    hl.specialize(attention_split_q_per_kv)
+    hl.specialize(attention_split_context)
+    hl.specialize(attention_split_block_size)
+    hl.specialize(attention_split_splits)
+    attention_split_split_context = attention_split_context // attention_split_splits
+    attention_split_token_kv_heads = (
+        attention_split_num_tokens * attention_split_num_kv_heads
     )
     partial_out = torch.empty(
         (
-            __td_attention_split_splits,
-            __td_attention_split_token_kv_heads,
-            __td_attention_split_q_per_kv,
-            __td_attention_split_head_dim,
+            attention_split_splits,
+            attention_split_token_kv_heads,
+            attention_split_q_per_kv,
+            attention_split_head_dim,
         ),
-        device=__td_attention_split_query.device,
+        device=attention_split_query.device,
         dtype=torch.float32,
     )
     partial_lse = torch.empty(
         (
-            __td_attention_split_splits,
-            __td_attention_split_token_kv_heads,
-            __td_attention_split_q_per_kv,
+            attention_split_splits,
+            attention_split_token_kv_heads,
+            attention_split_q_per_kv,
         ),
-        device=__td_attention_split_query.device,
+        device=attention_split_query.device,
         dtype=torch.float32,
     )
-    __td_attention_split_qk_scale = (
-        1.0 / math.sqrt(__td_attention_split_head_dim) * 1.44269504
-    )
-    __td_attention_merge_partial_out = partial_out
-    __td_attention_merge_partial_lse = partial_lse
+    attention_split_qk_scale = 1.0 / math.sqrt(attention_split_head_dim) * 1.44269504
+    attention_merge_partial_out = partial_out
+    attention_merge_partial_lse = partial_lse
     (
-        __td_attention_merge_splits,
-        __td_attention_merge_num_kv_heads,
-        __td_attention_merge_q_per_kv,
-        __td_attention_merge_head_dim,
-    ) = __td_attention_merge_partial_out.shape
-    hl.specialize(__td_attention_merge_splits)
-    hl.specialize(__td_attention_merge_num_kv_heads)
-    hl.specialize(__td_attention_merge_q_per_kv)
-    hl.specialize(__td_attention_merge_head_dim)
-    __td_attention_merge_query_heads = (
-        __td_attention_merge_num_kv_heads * __td_attention_merge_q_per_kv
+        attention_merge_splits,
+        attention_merge_num_kv_heads,
+        attention_merge_q_per_kv,
+        attention_merge_head_dim,
+    ) = attention_merge_partial_out.shape
+    hl.specialize(attention_merge_splits)
+    hl.specialize(attention_merge_num_kv_heads)
+    hl.specialize(attention_merge_q_per_kv)
+    hl.specialize(attention_merge_head_dim)
+    attention_merge_query_heads = (
+        attention_merge_num_kv_heads * attention_merge_q_per_kv
     )
-    hl.specialize(__td_attention_merge_query_heads)
-    __td_attention_merge_merge_chunks = 16
-    hl.specialize(__td_attention_merge_merge_chunks)
-    assert __td_attention_merge_splits % __td_attention_merge_merge_chunks == 0
-    __td_attention_merge_splits_per_chunk = (
-        __td_attention_merge_splits // __td_attention_merge_merge_chunks
+    hl.specialize(attention_merge_query_heads)
+    attention_merge_merge_chunks = 16
+    hl.specialize(attention_merge_merge_chunks)
+    assert attention_merge_splits % attention_merge_merge_chunks == 0
+    attention_merge_splits_per_chunk = (
+        attention_merge_splits // attention_merge_merge_chunks
     )
-    hl.specialize(__td_attention_merge_splits_per_chunk)
-    __td_attention_merge_partial_out_flat = __td_attention_merge_partial_out.view(
-        __td_attention_merge_splits,
-        __td_attention_merge_query_heads,
-        __td_attention_merge_head_dim,
+    hl.specialize(attention_merge_splits_per_chunk)
+    attention_merge_partial_out_flat = attention_merge_partial_out.view(
+        attention_merge_splits,
+        attention_merge_query_heads,
+        attention_merge_head_dim,
     )
-    __td_attention_merge_partial_lse_flat = __td_attention_merge_partial_lse.view(
-        __td_attention_merge_splits, __td_attention_merge_query_heads
+    attention_merge_partial_lse_flat = attention_merge_partial_lse.view(
+        attention_merge_splits, attention_merge_query_heads
     )
-    __td_attention_merge_partial_out_storage = (
-        __td_attention_merge_partial_out_flat.view(-1)
-    )
-    __td_attention_merge_partial_lse_storage = (
-        __td_attention_merge_partial_lse_flat.view(-1)
-    )
-    __td_attention_merge_chunk_out = torch.empty(
+    attention_merge_partial_out_storage = attention_merge_partial_out_flat.view(-1)
+    attention_merge_partial_lse_storage = attention_merge_partial_lse_flat.view(-1)
+    attention_merge_chunk_out = torch.empty(
         (
-            __td_attention_merge_merge_chunks,
-            __td_attention_merge_query_heads,
-            __td_attention_merge_head_dim,
+            attention_merge_merge_chunks,
+            attention_merge_query_heads,
+            attention_merge_head_dim,
         ),
         dtype=torch.float32,
-        device=__td_attention_merge_partial_out.device,
+        device=attention_merge_partial_out.device,
     )
-    __td_attention_merge_chunk_lse = torch.empty(
-        (__td_attention_merge_merge_chunks, __td_attention_merge_query_heads),
+    attention_merge_chunk_lse = torch.empty(
+        (attention_merge_merge_chunks, attention_merge_query_heads),
         dtype=torch.float32,
-        device=__td_attention_merge_partial_out.device,
+        device=attention_merge_partial_out.device,
     )
-    __td_attention_merge_chunk_out_storage = __td_attention_merge_chunk_out.view(-1)
-    __td_attention_merge_chunk_lse_storage = __td_attention_merge_chunk_lse.view(-1)
+    attention_merge_chunk_out_storage = attention_merge_chunk_out.view(-1)
+    attention_merge_chunk_lse_storage = attention_merge_chunk_lse.view(-1)
     attention = torch.empty(
-        (__td_attention_merge_query_heads, __td_attention_merge_head_dim),
+        (attention_merge_query_heads, attention_merge_head_dim),
         dtype=torch.bfloat16,
-        device=__td_attention_merge_partial_out.device,
+        device=attention_merge_partial_out.device,
     )
     attention_flat = attention.view(batch, hidden)
-    __td_attention_quant_input = attention_flat
-    __td_attention_quant_output_q = attention_q
-    __td_attention_quant_output_s = attention_scale
-    __td_attention_quant_group_size = group
-    __td_attention_quant_eps = 1e-10
-    __td_attention_quant_fp8_min = FP8_MIN
-    __td_attention_quant_fp8_max = FP8_MAX
-    __td_attention_quant_scale_ue8m0 = False
-    __td_attention_quant_dummy_is_scale_transposed = False
-    __td_attention_quant_dummy_is_tma_aligned = False
-    __td_attention_quant_num_tokens, __td_attention_quant_hidden_size = (
-        __td_attention_quant_input.shape
+    attention_quant_input = attention_flat
+    attention_quant_output_q = attention_q
+    attention_quant_output_s = attention_scale
+    attention_quant_group_size = group
+    attention_quant_eps = 1e-10
+    attention_quant_fp8_min = FP8_MIN
+    attention_quant_fp8_max = FP8_MAX
+    attention_quant_scale_ue8m0 = False
+    attention_quant_num_tokens, attention_quant_hidden_size = (
+        attention_quant_input.shape
     )
-    hl.specialize(__td_attention_quant_hidden_size)
-    hl.specialize(__td_attention_quant_group_size)
-    __td_attention_quant_groups_per_row = __td_attention_quant_output_s.shape[1]
-    hl.specialize(__td_attention_quant_groups_per_row)
-    __td_attention_quant_input = __td_attention_quant_input.view(
-        __td_attention_quant_num_tokens,
-        __td_attention_quant_groups_per_row,
-        __td_attention_quant_group_size,
+    hl.specialize(attention_quant_hidden_size)
+    hl.specialize(attention_quant_group_size)
+    attention_quant_groups_per_row = attention_quant_output_s.shape[1]
+    hl.specialize(attention_quant_groups_per_row)
+    attention_quant_input = attention_quant_input.view(
+        attention_quant_num_tokens,
+        attention_quant_groups_per_row,
+        attention_quant_group_size,
     )
-    __td_attention_quant_output_q = __td_attention_quant_output_q.view(
-        __td_attention_quant_num_tokens,
-        __td_attention_quant_groups_per_row,
-        __td_attention_quant_group_size,
+    attention_quant_output_q = attention_quant_output_q.view(
+        attention_quant_num_tokens,
+        attention_quant_groups_per_row,
+        attention_quant_group_size,
     )
-    __td_o_mm_activation_q = attention_q
-    __td_o_mm_activation_scale = attention_scale
-    __td_o_mm_weight_q = o_weight_q
-    __td_o_mm_weight_scale = o_weight_scale
-    __td_o_mm_group_size = group
-    __td_o_mm_m, __td_o_mm_k = __td_o_mm_activation_q.size()
-    __td_o_mm_n, __td_o_mm_weight_k = __td_o_mm_weight_q.size()
-    assert __td_o_mm_weight_k == __td_o_mm_k
-    assert __td_o_mm_group_size == 128
-    hl.specialize(__td_o_mm_group_size)
+    o_mm_activation_q = attention_q
+    o_mm_activation_scale = attention_scale
+    o_mm_weight_q = o_weight_q
+    o_mm_weight_scale = o_weight_scale
+    o_mm_group_size = group
+    o_mm_m, o_mm_k = o_mm_activation_q.size()
+    o_mm_n, o_mm_weight_k = o_mm_weight_q.size()
+    assert o_mm_weight_k == o_mm_k
+    assert o_mm_group_size == 128
+    hl.specialize(o_mm_group_size)
     attention_out = torch.empty(
-        (__td_o_mm_m, __td_o_mm_n),
+        (o_mm_m, o_mm_n),
         dtype=torch.bfloat16,
-        device=__td_o_mm_activation_q.device,
+        device=o_mm_activation_q.device,
     )
-    __td_post_result = ffn_q
-    __td_post_input = attention_out
-    __td_post_weight = post_weight
-    __td_post_scale = ffn_scale
-    __td_post_epsilon = eps
-    __td_post_scale_ub = None
-    __td_post_residual = residual
-    __td_post_group_size = group
-    __td_post_is_scale_transposed = False
-    assert __td_post_input.ndim == 2
-    __td_post_num_tokens, __td_post_hidden_size = __td_post_input.shape
-    hl.specialize(__td_post_hidden_size)
-    hl.specialize(__td_post_group_size)
-    __td_post_groups_per_row = __td_post_scale.shape[1]
-    hl.specialize(__td_post_groups_per_row)
-    assert __td_post_group_size == 128
-    assert __td_post_result.dtype == torch.float8_e4m3fn
-    assert __td_post_scale.dtype == torch.float32
-    __td_post_rms_partials = torch.empty(
-        (__td_post_num_tokens, __td_post_groups_per_row),
+    post_result = ffn_q
+    post_input = attention_out
+    post_norm_weight = post_weight
+    post_scale = ffn_scale
+    post_epsilon = eps
+    post_scale_ub = None
+    post_residual = residual
+    post_group_size = group
+    assert post_input.ndim == 2
+    post_num_tokens, post_hidden_size = post_input.shape
+    hl.specialize(post_hidden_size)
+    hl.specialize(post_group_size)
+    post_groups_per_row = post_scale.shape[1]
+    hl.specialize(post_groups_per_row)
+    assert post_group_size == 128
+    assert post_result.dtype == torch.float8_e4m3fn
+    assert post_scale.dtype == torch.float32
+    post_rms_partials = torch.empty(
+        (post_num_tokens, post_groups_per_row),
         dtype=torch.float32,
-        device=__td_post_input.device,
+        device=post_input.device,
     )
-    __td_post_unrounded_values = torch.empty_like(__td_post_input, dtype=torch.float32)
-    __td_w13_activation_q = ffn_q
-    __td_w13_activation_scale = ffn_scale
-    __td_w13_weight_q = w13_q
-    __td_w13_weight_scale = w13_scale
-    __td_w13_group_size = group
-    __td_w13_m, __td_w13_k = __td_w13_activation_q.size()
-    __td_w13_n, __td_w13_weight_k = __td_w13_weight_q.size()
-    assert __td_w13_weight_k == __td_w13_k
-    assert __td_w13_group_size == 128
-    hl.specialize(__td_w13_group_size)
+    post_unrounded_values = torch.empty_like(post_input, dtype=torch.float32)
+    w13_activation_q = ffn_q
+    w13_activation_scale = ffn_scale
+    w13_weight_q = w13_q
+    w13_weight_scale = w13_scale
+    w13_group_size = group
+    w13_m, w13_k = w13_activation_q.size()
+    w13_n, w13_weight_k = w13_weight_q.size()
+    assert w13_weight_k == w13_k
+    assert w13_group_size == 128
+    hl.specialize(w13_group_size)
     gate_up = torch.empty(
-        (__td_w13_m, __td_w13_n),
+        (w13_m, w13_n),
         dtype=torch.bfloat16,
-        device=__td_w13_activation_q.device,
+        device=w13_activation_q.device,
     )
-    __td_activation_gate_up = gate_up
-    __td_activation_group_size = group
-    __td_activation_m, __td_activation_twice_intermediate = (
-        __td_activation_gate_up.size()
-    )
-    __td_activation_intermediate = __td_activation_twice_intermediate // 2
-    hl.specialize(__td_activation_group_size)
-    __td_activation_groups = __td_activation_intermediate // __td_activation_group_size
+    activation_gate_up = gate_up
+    activation_group_size = group
+    activation_m, activation_twice_intermediate = activation_gate_up.size()
+    activation_intermediate = activation_twice_intermediate // 2
+    hl.specialize(activation_group_size)
+    activation_groups = activation_intermediate // activation_group_size
     activation_q = torch.empty(
-        (__td_activation_m, __td_activation_intermediate),
+        (activation_m, activation_intermediate),
         dtype=torch.float8_e4m3fn,
-        device=__td_activation_gate_up.device,
+        device=activation_gate_up.device,
     )
     activation_scale = torch.empty(
-        (__td_activation_m, __td_activation_groups),
+        (activation_m, activation_groups),
         dtype=torch.float32,
-        device=__td_activation_gate_up.device,
+        device=activation_gate_up.device,
     )
-    __td_w2_activation_q = activation_q
-    __td_w2_activation_scale = activation_scale
-    __td_w2_weight_q = w2_q
-    __td_w2_weight_scale = w2_scale
-    __td_w2_group_size = group
-    __td_w2_m, __td_w2_k = __td_w2_activation_q.size()
-    __td_w2_n, __td_w2_weight_k = __td_w2_weight_q.size()
-    assert __td_w2_weight_k == __td_w2_k
-    assert __td_w2_group_size == 128
-    hl.specialize(__td_w2_group_size)
+    w2_activation_q = activation_q
+    w2_activation_scale = activation_scale
+    w2_weight_q = w2_q
+    w2_weight_scale = w2_scale
+    w2_group_size = group
+    w2_m, w2_k = w2_activation_q.size()
+    w2_n, w2_weight_k = w2_weight_q.size()
+    assert w2_weight_k == w2_k
+    assert w2_group_size == 128
+    hl.specialize(w2_group_size)
     output = torch.empty(
-        (__td_w2_m, __td_w2_n), dtype=torch.bfloat16, device=__td_w2_activation_q.device
+        (w2_m, w2_n), dtype=torch.bfloat16, device=w2_activation_q.device
     )
-    for __td_pre_partial_m, __td_pre_partial_n in hl.tile(
-        [__td_pre_num_tokens, __td_pre_hidden_size], block_size=[1, __td_pre_group_size]
+    for pre_partial_m, pre_partial_n in hl.tile(
+        [pre_num_tokens, pre_hidden_size], block_size=[1, pre_group_size]
     ):
-        __td_pre_partial_values = __td_pre_input[
-            __td_pre_partial_m, __td_pre_partial_n
-        ].to(torch.float32)
-        if __td_pre_residual is not None:
-            __td_pre_partial_values = (
-                __td_pre_partial_values
-                + __td_pre_residual[__td_pre_partial_m, __td_pre_partial_n]
+        pre_partial_values = pre_input[pre_partial_m, pre_partial_n].to(torch.float32)
+        if pre_residual is not None:
+            pre_partial_values = (
+                pre_partial_values + pre_residual[pre_partial_m, pre_partial_n]
             )
-            __td_pre_residual[__td_pre_partial_m, __td_pre_partial_n] = (
-                __td_pre_partial_values.to(__td_pre_residual.dtype)
+            pre_residual[pre_partial_m, pre_partial_n] = pre_partial_values.to(
+                pre_residual.dtype
             )
-        __td_pre_unrounded_values[__td_pre_partial_m, __td_pre_partial_n] = (
-            __td_pre_partial_values
+        pre_unrounded_values[pre_partial_m, pre_partial_n] = pre_partial_values
+        pre_rms_partials[pre_partial_m, pre_partial_n.id] = torch.sum(
+            pre_partial_values * pre_partial_values, dim=-1
         )
-        __td_pre_rms_partials[__td_pre_partial_m, __td_pre_partial_n.id] = torch.sum(
-            __td_pre_partial_values * __td_pre_partial_values, dim=-1
-        )
-    for __td_pre_quant_m, __td_pre_quant_g, __td_pre_quant_n in hl.tile(
-        [__td_pre_num_tokens, __td_pre_groups_per_row, __td_pre_group_size],
-        block_size=[1, 1, __td_pre_group_size],
+    for pre_quant_m, pre_quant_g, pre_quant_n in hl.tile(
+        [pre_num_tokens, pre_groups_per_row, pre_group_size],
+        block_size=[1, 1, pre_group_size],
     ):
-        __td_pre_quant_m_idx = __td_pre_quant_m.begin + hl.arange(
-            __td_pre_quant_m.block_size
+        pre_quant_m_idx = pre_quant_m.begin + hl.arange(pre_quant_m.block_size)
+        pre_quant_group_idx = pre_quant_g.index
+        pre_quant_n_idx = (
+            pre_quant_group_idx[:, None] * pre_group_size + pre_quant_n.index[None, :]
         )
-        __td_pre_quant_group_idx = __td_pre_quant_g.index
-        __td_pre_quant_n_idx = (
-            __td_pre_quant_group_idx[:, None] * __td_pre_group_size
-            + __td_pre_quant_n.index[None, :]
-        )
-        __td_pre_quant_m_blk = __td_pre_quant_m_idx[:, None, None]
-        __td_pre_quant_n_blk = __td_pre_quant_n_idx[None, :, :]
-        __td_pre_square_sum = hl.zeros([__td_pre_quant_m], dtype=torch.float32)
-        for __td_pre_reduce_g in hl.tile(__td_pre_groups_per_row, block_size=1):
-            __td_pre_square_sum = __td_pre_square_sum + torch.sum(
-                __td_pre_rms_partials[__td_pre_quant_m, __td_pre_reduce_g], dim=-1
+        pre_quant_m_blk = pre_quant_m_idx[:, None, None]
+        pre_quant_n_blk = pre_quant_n_idx[None, :, :]
+        pre_square_sum = hl.zeros([pre_quant_m], dtype=torch.float32)
+        for pre_reduce_g in hl.tile(pre_groups_per_row, block_size=1):
+            pre_square_sum = pre_square_sum + torch.sum(
+                pre_rms_partials[pre_quant_m, pre_reduce_g], dim=-1
             )
-        __td_pre_inv_rms = torch.rsqrt(
-            __td_pre_square_sum * (1.0 / __td_pre_hidden_size) + __td_pre_epsilon
+        pre_inv_rms = torch.rsqrt(
+            pre_square_sum * (1.0 / pre_hidden_size) + pre_epsilon
         )
-        __td_pre_quant_values = __td_pre_unrounded_values[
-            __td_pre_quant_m_blk, __td_pre_quant_n_blk
-        ]
-        __td_pre_normalized = (
-            __td_pre_quant_values * __td_pre_inv_rms[:, None, None]
-        ).to(torch.bfloat16) * __td_pre_weight[__td_pre_quant_n_blk]
-        __td_pre_quant_scale = torch.amax(torch.abs(__td_pre_normalized), dim=-1).to(
+        pre_quant_values = pre_unrounded_values[pre_quant_m_blk, pre_quant_n_blk]
+        pre_normalized = (pre_quant_values * pre_inv_rms[:, None, None]).to(
+            torch.bfloat16
+        ) * pre_norm_weight[pre_quant_n_blk]
+        pre_quant_scale = torch.amax(torch.abs(pre_normalized), dim=-1).to(
             torch.float32
         )
-        if __td_pre_scale_ub is not None:
-            __td_pre_quant_scale = __td_pre_quant_scale.clamp(
-                max=hl.load(__td_pre_scale_ub, [])
-            )
-        __td_pre_quant_scale = (__td_pre_quant_scale / FP8_MAX).clamp(min=FP8_MIN_SCALE)
-        __td_pre_scale[__td_pre_quant_m, __td_pre_quant_g] = __td_pre_quant_scale
-        __td_pre_result[__td_pre_quant_m_blk, __td_pre_quant_n_blk] = (
-            (__td_pre_normalized / __td_pre_quant_scale[:, :, None])
+        if pre_scale_ub is not None:
+            pre_quant_scale = pre_quant_scale.clamp(max=hl.load(pre_scale_ub, []))
+        pre_quant_scale = (pre_quant_scale / FP8_MAX).clamp(min=FP8_MIN_SCALE)
+        pre_scale_output[pre_quant_m, pre_quant_g] = pre_quant_scale
+        pre_result[pre_quant_m_blk, pre_quant_n_blk] = (
+            (pre_normalized / pre_quant_scale[:, :, None])
             .clamp(FP8_MIN, FP8_MAX)
-            .to(__td_pre_result.dtype)
+            .to(pre_result.dtype)
         )
-    for __td_qkv_mm_tile_m, __td_qkv_mm_tile_n in hl.tile(
-        [__td_qkv_mm_m, __td_qkv_mm_n], block_size=[1, None]
+    for qkv_mm_tile_m, qkv_mm_tile_n in hl.tile(
+        [qkv_mm_m, qkv_mm_n], block_size=[1, None]
     ):
-        __td_qkv_mm_acc = hl.zeros(
-            [__td_qkv_mm_tile_m, __td_qkv_mm_tile_n], dtype=torch.float32
-        )
-        for __td_qkv_mm_tile_k in hl.tile(
-            __td_qkv_mm_k, block_size=__td_qkv_mm_group_size
-        ):
-            __td_qkv_mm_partial = hl.dot(
-                __td_qkv_mm_activation_q[__td_qkv_mm_tile_m, __td_qkv_mm_tile_k],
-                __td_qkv_mm_weight_q[__td_qkv_mm_tile_n, __td_qkv_mm_tile_k].T,
+        qkv_mm_acc = hl.zeros([qkv_mm_tile_m, qkv_mm_tile_n], dtype=torch.float32)
+        for qkv_mm_tile_k in hl.tile(qkv_mm_k, block_size=qkv_mm_group_size):
+            qkv_mm_partial = hl.dot(
+                qkv_mm_activation_q[qkv_mm_tile_m, qkv_mm_tile_k],
+                qkv_mm_weight_q[qkv_mm_tile_n, qkv_mm_tile_k].T,
             ).to(torch.float32)
-            __td_qkv_mm_a_scale = __td_qkv_mm_activation_scale[
-                __td_qkv_mm_tile_m, __td_qkv_mm_tile_k.id
+            qkv_mm_a_scale = qkv_mm_activation_scale[
+                qkv_mm_tile_m, qkv_mm_tile_k.id
             ].to(torch.float32)
-            __td_qkv_mm_w_scale = __td_qkv_mm_weight_scale[
-                __td_qkv_mm_tile_n.index // __td_qkv_mm_group_size,
-                __td_qkv_mm_tile_k.id,
+            qkv_mm_w_scale = qkv_mm_weight_scale[
+                qkv_mm_tile_n.index // qkv_mm_group_size,
+                qkv_mm_tile_k.id,
             ].to(torch.float32)
-            __td_qkv_mm_acc = (
-                __td_qkv_mm_acc
-                + __td_qkv_mm_partial
-                * __td_qkv_mm_a_scale[:, None]
-                * __td_qkv_mm_w_scale[None, :]
+            qkv_mm_acc = (
+                qkv_mm_acc
+                + qkv_mm_partial * qkv_mm_a_scale[:, None] * qkv_mm_w_scale[None, :]
             )
-        qkv[__td_qkv_mm_tile_m, __td_qkv_mm_tile_n] = __td_qkv_mm_acc.to(qkv.dtype)
-    for __td_qk_tile_m, __td_qk_tile_gn, __td_qk_tile_n in hl.tile(
-        [__td_qk_num_tokens, __td_qk_qk_heads, __td_qk_head_dim],
-        block_size=[1, None, __td_qk_head_dim],
+        qkv[qkv_mm_tile_m, qkv_mm_tile_n] = qkv_mm_acc.to(qkv.dtype)
+    for qk_tile_m, qk_tile_gn, qk_tile_n in hl.tile(
+        [qk_num_tokens, qk_qk_heads, qk_head_dim],
+        block_size=[1, None, qk_head_dim],
     ):
-        __td_qk_x = __td_qk_qkv[__td_qk_tile_m, __td_qk_tile_gn, __td_qk_tile_n].to(
-            torch.float32
+        qk_x = qk_qkv[qk_tile_m, qk_tile_gn, qk_tile_n].to(torch.float32)
+        qk_rms = torch.rsqrt(qk_x.pow(2).sum(-1) * (1.0 / qk_head_dim) + qk_eps)
+        qk_use_q = (qk_tile_gn.index < qk_num_heads_q)[None, :, None]
+        qk_w = torch.where(
+            qk_use_q,
+            qk_q_weight[None, None, qk_tile_n],
+            qk_k_weight[None, None, qk_tile_n],
         )
-        __td_qk_rms = torch.rsqrt(
-            __td_qk_x.pow(2).sum(-1) * (1.0 / __td_qk_head_dim) + __td_qk_eps
-        )
-        __td_qk_use_q = (__td_qk_tile_gn.index < __td_qk_num_heads_q)[None, :, None]
-        __td_qk_w = torch.where(
-            __td_qk_use_q,
-            __td_qk_q_weight[None, None, __td_qk_tile_n],
-            __td_qk_k_weight[None, None, __td_qk_tile_n],
-        )
-        __td_qk_x = (__td_qk_x * __td_qk_rms[:, :, None]).to(
-            __td_qk_qkv.dtype
-        ) * __td_qk_w
-        __td_qk_qkv[__td_qk_tile_m, __td_qk_tile_gn, __td_qk_tile_n] = __td_qk_x
-        __td_qk_pos = __td_qk_position_ids[__td_qk_tile_m]
-        __td_qk_cos = __td_qk_cos_sin_cache[__td_qk_pos, hl.arange(__td_qk_embed_dim)]
-        __td_qk_sin = __td_qk_cos_sin_cache[
-            __td_qk_pos, hl.arange(__td_qk_embed_dim) + __td_qk_embed_dim
-        ]
-        if __td_qk_is_neox:
-            __td_qk_x1_offset = hl.arange(__td_qk_embed_dim)
-            __td_qk_x2_offset = __td_qk_x1_offset + __td_qk_embed_dim
+        qk_x = (qk_x * qk_rms[:, :, None]).to(qk_qkv.dtype) * qk_w
+        qk_qkv[qk_tile_m, qk_tile_gn, qk_tile_n] = qk_x
+        qk_pos = qk_position_ids[qk_tile_m]
+        qk_cos = qk_cos_sin_cache[qk_pos, hl.arange(qk_embed_dim)]
+        qk_sin = qk_cos_sin_cache[qk_pos, hl.arange(qk_embed_dim) + qk_embed_dim]
+        if qk_is_neox:
+            qk_x1_offset = hl.arange(qk_embed_dim)
+            qk_x2_offset = qk_x1_offset + qk_embed_dim
         else:
-            __td_qk_x1_offset = hl.arange(__td_qk_embed_dim) * 2
-            __td_qk_x2_offset = __td_qk_x1_offset + 1
-        __td_qk_x1 = __td_qk_qkv[__td_qk_tile_m, __td_qk_tile_gn, __td_qk_x1_offset]
-        __td_qk_x2 = __td_qk_qkv[__td_qk_tile_m, __td_qk_tile_gn, __td_qk_x2_offset]
-        __td_qk_qkv[__td_qk_tile_m, __td_qk_tile_gn, __td_qk_x1_offset] = (
-            __td_qk_x1 * __td_qk_cos[:, None, :] - __td_qk_x2 * __td_qk_sin[:, None, :]
+            qk_x1_offset = hl.arange(qk_embed_dim) * 2
+            qk_x2_offset = qk_x1_offset + 1
+        qk_x1 = qk_qkv[qk_tile_m, qk_tile_gn, qk_x1_offset]
+        qk_x2 = qk_qkv[qk_tile_m, qk_tile_gn, qk_x2_offset]
+        qk_qkv[qk_tile_m, qk_tile_gn, qk_x1_offset] = (
+            qk_x1 * qk_cos[:, None, :] - qk_x2 * qk_sin[:, None, :]
         )
-        __td_qk_qkv[__td_qk_tile_m, __td_qk_tile_gn, __td_qk_x2_offset] = (
-            __td_qk_x2 * __td_qk_cos[:, None, :] + __td_qk_x1 * __td_qk_sin[:, None, :]
+        qk_qkv[qk_tile_m, qk_tile_gn, qk_x2_offset] = (
+            qk_x2 * qk_cos[:, None, :] + qk_x1 * qk_sin[:, None, :]
         )
-    for __td_cache_tile_t, __td_cache_tile_h, __td_cache_tile_d in hl.tile(
-        [__td_cache_num_tokens, __td_cache_num_kv_heads, __td_cache_head_dim],
-        block_size=[1, 1, __td_cache_head_dim],
+    for cache_tile_t, cache_tile_h, cache_tile_d in hl.tile(
+        [cache_num_tokens, cache_num_kv_heads, cache_head_dim],
+        block_size=[1, 1, cache_head_dim],
     ):
-        __td_cache_token = __td_cache_tile_t.index
-        __td_cache_cache_head = __td_cache_tile_h.index
-        __td_cache_dimension = __td_cache_tile_d.index
-        __td_cache_key_value = __td_cache_key[
-            __td_cache_tile_t, __td_cache_tile_h, __td_cache_tile_d
-        ]
-        __td_cache_value_value = __td_cache_value[
-            __td_cache_tile_t, __td_cache_tile_h, __td_cache_tile_d
-        ]
-        __td_cache_slot = __td_cache_slot_mapping[__td_cache_token]
-        __td_cache_block = (__td_cache_slot // __td_cache_block_size)[:, None, None]
-        __td_cache_offset = (__td_cache_slot % __td_cache_block_size)[:, None, None]
+        cache_token = cache_tile_t.index
+        cache_cache_head = cache_tile_h.index
+        cache_dimension = cache_tile_d.index
+        cache_key_value = cache_key[cache_tile_t, cache_tile_h, cache_tile_d]
+        cache_value_value = cache_value[cache_tile_t, cache_tile_h, cache_tile_d]
+        cache_slot = cache_slot_mapping[cache_token]
+        cache_block_index = (cache_slot // cache_block_size)[:, None, None]
+        cache_offset = (cache_slot % cache_block_size)[:, None, None]
         hl.store(
-            __td_cache_kv_cache,
+            cache_kv_cache,
             [
-                __td_cache_block,
-                __td_cache_offset,
-                __td_cache_cache_head[None, :, None],
-                __td_cache_dimension[None, None, :],
+                cache_block_index,
+                cache_offset,
+                cache_cache_head[None, :, None],
+                cache_dimension[None, None, :],
             ],
-            __td_cache_key_value,
+            cache_key_value,
         )
         hl.store(
-            __td_cache_kv_cache,
+            cache_kv_cache,
             [
-                __td_cache_block,
-                __td_cache_offset,
-                __td_cache_cache_head[None, :, None],
-                (__td_cache_dimension + __td_cache_head_dim)[None, None, :],
+                cache_block_index,
+                cache_offset,
+                cache_cache_head[None, :, None],
+                (cache_dimension + cache_head_dim)[None, None, :],
             ],
-            __td_cache_value_value,
+            cache_value_value,
         )
     for (
-        __td_attention_split_tile_split,
-        __td_attention_split_tile_bg,
-        __td_attention_split_tile_q,
+        attention_split_tile_split,
+        attention_split_tile_bg,
+        attention_split_tile_q,
     ) in hl.tile(
         [
-            __td_attention_split_splits,
-            __td_attention_split_token_kv_heads,
-            __td_attention_split_q_per_kv,
+            attention_split_splits,
+            attention_split_token_kv_heads,
+            attention_split_q_per_kv,
         ],
         block_size=[1, 1, None],
     ):
-        __td_attention_split_m_i = hl.full(
-            [__td_attention_split_tile_bg, __td_attention_split_tile_q],
+        attention_split_m_i = hl.full(
+            [attention_split_tile_bg, attention_split_tile_q],
             float("-inf"),
             dtype=torch.float32,
         )
-        __td_attention_split_l_i = hl.full(
-            [__td_attention_split_tile_bg, __td_attention_split_tile_q],
+        attention_split_l_i = hl.full(
+            [attention_split_tile_bg, attention_split_tile_q],
             1.0,
             dtype=torch.float32,
         )
-        __td_attention_split_acc = hl.zeros(
+        attention_split_acc = hl.zeros(
             [
-                __td_attention_split_tile_bg,
-                __td_attention_split_tile_q,
-                __td_attention_split_head_dim,
+                attention_split_tile_bg,
+                attention_split_tile_q,
+                attention_split_head_dim,
             ],
             dtype=torch.float32,
         )
-        __td_attention_split_split_idx = __td_attention_split_tile_split.begin
-        __td_attention_split_token = (
-            __td_attention_split_tile_bg.index // __td_attention_split_num_kv_heads
+        attention_split_split_idx = attention_split_tile_split.begin
+        attention_split_token = (
+            attention_split_tile_bg.index // attention_split_num_kv_heads
         )
-        __td_attention_split_kv_head = (
-            __td_attention_split_tile_bg.index % __td_attention_split_num_kv_heads
+        attention_split_kv_head = (
+            attention_split_tile_bg.index % attention_split_num_kv_heads
         )
-        __td_attention_split_query_head = (
-            __td_attention_split_kv_head[:, None] * __td_attention_split_q_per_kv
-            + __td_attention_split_tile_q.index[None, :]
+        attention_split_query_head = (
+            attention_split_kv_head[:, None] * attention_split_q_per_kv
+            + attention_split_tile_q.index[None, :]
         )
-        __td_attention_split_q_blk = __td_attention_split_query[
-            __td_attention_split_token[:, None],
-            __td_attention_split_query_head,
+        attention_split_q_blk = attention_split_query[
+            attention_split_token[:, None],
+            attention_split_query_head,
             :,
         ]
-        __td_attention_split_q_blk = (
-            __td_attention_split_q_blk * __td_attention_split_qk_scale
-        ).to(__td_attention_split_query.dtype)
-        for __td_attention_split_tile_local_n in hl.tile(
-            __td_attention_split_split_context
-        ):
-            __td_attention_split_n = (
-                __td_attention_split_split_idx * __td_attention_split_split_context
-                + __td_attention_split_tile_local_n.index
+        attention_split_q_blk = (attention_split_q_blk * attention_split_qk_scale).to(
+            attention_split_query.dtype
+        )
+        for attention_split_tile_local_n in hl.tile(attention_split_split_context):
+            attention_split_n = (
+                attention_split_split_idx * attention_split_split_context
+                + attention_split_tile_local_n.index
             )
-            __td_attention_split_physical_block = __td_attention_split_block_table[
-                __td_attention_split_token[:, None],
-                (__td_attention_split_n // __td_attention_split_block_size)[None, :],
+            attention_split_physical_block = attention_split_block_table[
+                attention_split_token[:, None],
+                (attention_split_n // attention_split_block_size)[None, :],
             ]
-            __td_attention_split_block_offset = (
-                __td_attention_split_n % __td_attention_split_block_size
+            attention_split_block_offset = (
+                attention_split_n % attention_split_block_size
             )
-            __td_attention_split_d = hl.arange(__td_attention_split_head_dim)
-            __td_attention_split_k = hl.load(
-                __td_attention_split_kv_cache,
+            attention_split_d = hl.arange(attention_split_head_dim)
+            attention_split_k = hl.load(
+                attention_split_kv_cache,
                 [
-                    __td_attention_split_physical_block[:, :, None],
-                    __td_attention_split_block_offset[None, :, None],
-                    __td_attention_split_kv_head[:, None, None],
-                    __td_attention_split_d[None, None, :],
+                    attention_split_physical_block[:, :, None],
+                    attention_split_block_offset[None, :, None],
+                    attention_split_kv_head[:, None, None],
+                    attention_split_d[None, None, :],
                 ],
             )
-            __td_attention_split_scores = torch.bmm(
-                __td_attention_split_q_blk,
-                __td_attention_split_k.transpose(1, 2),
+            attention_split_scores = torch.bmm(
+                attention_split_q_blk,
+                attention_split_k.transpose(1, 2),
                 torch.float32,
             )
-            __td_attention_split_m_ij = torch.maximum(
-                __td_attention_split_m_i, torch.amax(__td_attention_split_scores, -1)
+            attention_split_m_ij = torch.maximum(
+                attention_split_m_i, torch.amax(attention_split_scores, -1)
             )
-            __td_attention_split_p = torch.exp2(
-                __td_attention_split_scores - __td_attention_split_m_ij[:, :, None]
+            attention_split_p = torch.exp2(
+                attention_split_scores - attention_split_m_ij[:, :, None]
             )
-            __td_attention_split_alpha = torch.exp2(
-                __td_attention_split_m_i - __td_attention_split_m_ij
+            attention_split_alpha = torch.exp2(
+                attention_split_m_i - attention_split_m_ij
             )
-            __td_attention_split_l_i = (
-                __td_attention_split_l_i * __td_attention_split_alpha
-                + torch.sum(__td_attention_split_p, -1)
+            attention_split_l_i = (
+                attention_split_l_i * attention_split_alpha
+                + torch.sum(attention_split_p, -1)
             )
-            __td_attention_split_acc = (
-                __td_attention_split_acc * __td_attention_split_alpha[:, :, None]
+            attention_split_acc = (
+                attention_split_acc * attention_split_alpha[:, :, None]
             )
-            __td_attention_split_v = hl.load(
-                __td_attention_split_kv_cache,
+            attention_split_v = hl.load(
+                attention_split_kv_cache,
                 [
-                    __td_attention_split_physical_block[:, :, None],
-                    __td_attention_split_block_offset[None, :, None],
-                    __td_attention_split_kv_head[:, None, None],
-                    (__td_attention_split_d + __td_attention_split_head_dim)[
-                        None, None, :
-                    ],
+                    attention_split_physical_block[:, :, None],
+                    attention_split_block_offset[None, :, None],
+                    attention_split_kv_head[:, None, None],
+                    (attention_split_d + attention_split_head_dim)[None, None, :],
                 ],
             )
-            __td_attention_split_acc = torch.baddbmm(
-                __td_attention_split_acc,
-                __td_attention_split_p.to(__td_attention_split_v.dtype),
-                __td_attention_split_v,
+            attention_split_acc = torch.baddbmm(
+                attention_split_acc,
+                attention_split_p.to(attention_split_v.dtype),
+                attention_split_v,
             )
-            __td_attention_split_m_i = __td_attention_split_m_ij
+            attention_split_m_i = attention_split_m_ij
         partial_out[
-            __td_attention_split_tile_split,
-            __td_attention_split_tile_bg,
-            __td_attention_split_tile_q,
+            attention_split_tile_split,
+            attention_split_tile_bg,
+            attention_split_tile_q,
             :,
-        ] = (__td_attention_split_acc / __td_attention_split_l_i[:, :, None])[
-            None, :, :, :
-        ]
+        ] = (attention_split_acc / attention_split_l_i[:, :, None])[None, :, :, :]
         partial_lse[
-            __td_attention_split_tile_split,
-            __td_attention_split_tile_bg,
-            __td_attention_split_tile_q,
-        ] = (__td_attention_split_m_i + torch.log2(__td_attention_split_l_i))[
-            None, :, :
-        ]
-    for __td_attention_merge_tile_chunk, __td_attention_merge_chunk_head in hl.tile(
-        [__td_attention_merge_merge_chunks, __td_attention_merge_query_heads],
+            attention_split_tile_split,
+            attention_split_tile_bg,
+            attention_split_tile_q,
+        ] = (attention_split_m_i + torch.log2(attention_split_l_i))[None, :, :]
+    for attention_merge_tile_chunk, attention_merge_chunk_head in hl.tile(
+        [attention_merge_merge_chunks, attention_merge_query_heads],
         block_size=[1, 1],
     ):
-        __td_attention_merge_chunk_split_idx = (
-            __td_attention_merge_tile_chunk.index[:, None]
-            * __td_attention_merge_splits_per_chunk
-            + hl.arange(__td_attention_merge_splits_per_chunk)[None, :]
+        attention_merge_chunk_split_idx = (
+            attention_merge_tile_chunk.index[:, None] * attention_merge_splits_per_chunk
+            + hl.arange(attention_merge_splits_per_chunk)[None, :]
         )
-        __td_attention_merge_chunk_lse_offsets = (
-            __td_attention_merge_chunk_split_idx[:, :, None]
-            * __td_attention_merge_query_heads
-            + __td_attention_merge_chunk_head.index[None, None, :]
+        attention_merge_chunk_lse_offsets = (
+            attention_merge_chunk_split_idx[:, :, None] * attention_merge_query_heads
+            + attention_merge_chunk_head.index[None, None, :]
         )
-        __td_attention_merge_chunk_lse_values = (
-            __td_attention_merge_partial_lse_storage[
-                __td_attention_merge_chunk_lse_offsets
-            ]
-        )
-        __td_attention_merge_chunk_max_lse = torch.amax(
-            __td_attention_merge_chunk_lse_values, dim=1
-        )
-        __td_attention_merge_chunk_weights = torch.exp2(
-            __td_attention_merge_chunk_lse_values
-            - __td_attention_merge_chunk_max_lse[:, None, :]
-        )
-        __td_attention_merge_chunk_value_offsets = (
-            __td_attention_merge_chunk_lse_offsets[:, :, :, None]
-            * __td_attention_merge_head_dim
-            + hl.arange(__td_attention_merge_head_dim)[None, None, None, :]
-        )
-        __td_attention_merge_chunk_values = __td_attention_merge_partial_out_storage[
-            __td_attention_merge_chunk_value_offsets
+        attention_merge_chunk_lse_values = attention_merge_partial_lse_storage[
+            attention_merge_chunk_lse_offsets
         ]
-        __td_attention_merge_chunk_denominator = torch.sum(
-            __td_attention_merge_chunk_weights, dim=1
+        attention_merge_chunk_max_lse = torch.amax(
+            attention_merge_chunk_lse_values, dim=1
         )
-        __td_attention_merge_chunk_merged = torch.sum(
-            __td_attention_merge_chunk_values
-            * __td_attention_merge_chunk_weights[:, :, :, None],
+        attention_merge_chunk_weights = torch.exp2(
+            attention_merge_chunk_lse_values - attention_merge_chunk_max_lse[:, None, :]
+        )
+        attention_merge_chunk_value_offsets = (
+            attention_merge_chunk_lse_offsets[:, :, :, None] * attention_merge_head_dim
+            + hl.arange(attention_merge_head_dim)[None, None, None, :]
+        )
+        attention_merge_chunk_values = attention_merge_partial_out_storage[
+            attention_merge_chunk_value_offsets
+        ]
+        attention_merge_chunk_denominator = torch.sum(
+            attention_merge_chunk_weights, dim=1
+        )
+        attention_merge_chunk_merged = torch.sum(
+            attention_merge_chunk_values * attention_merge_chunk_weights[:, :, :, None],
             dim=1,
         )
-        __td_attention_merge_chunk_merged = (
-            __td_attention_merge_chunk_merged
-            / __td_attention_merge_chunk_denominator[:, :, None]
+        attention_merge_chunk_merged = (
+            attention_merge_chunk_merged / attention_merge_chunk_denominator[:, :, None]
         )
-        __td_attention_merge_chunk_out[
-            __td_attention_merge_tile_chunk, __td_attention_merge_chunk_head, :
-        ] = __td_attention_merge_chunk_merged
-        __td_attention_merge_chunk_lse[
-            __td_attention_merge_tile_chunk, __td_attention_merge_chunk_head
-        ] = __td_attention_merge_chunk_max_lse + torch.log2(
-            __td_attention_merge_chunk_denominator
+        attention_merge_chunk_out[
+            attention_merge_tile_chunk, attention_merge_chunk_head, :
+        ] = attention_merge_chunk_merged
+        attention_merge_chunk_lse[
+            attention_merge_tile_chunk, attention_merge_chunk_head
+        ] = attention_merge_chunk_max_lse + torch.log2(
+            attention_merge_chunk_denominator
         )
-    for __td_attention_merge_final_head in hl.tile(
-        __td_attention_merge_query_heads, block_size=1
+    for attention_merge_final_head in hl.tile(
+        attention_merge_query_heads, block_size=1
     ):
-        __td_attention_merge_final_chunk_idx = hl.arange(
-            __td_attention_merge_merge_chunks
+        attention_merge_final_chunk_idx = hl.arange(attention_merge_merge_chunks)
+        attention_merge_final_lse_offsets = (
+            attention_merge_final_chunk_idx[:, None] * attention_merge_query_heads
+            + attention_merge_final_head.index[None, :]
         )
-        __td_attention_merge_final_lse_offsets = (
-            __td_attention_merge_final_chunk_idx[:, None]
-            * __td_attention_merge_query_heads
-            + __td_attention_merge_final_head.index[None, :]
-        )
-        __td_attention_merge_final_lse_values = __td_attention_merge_chunk_lse_storage[
-            __td_attention_merge_final_lse_offsets
+        attention_merge_final_lse_values = attention_merge_chunk_lse_storage[
+            attention_merge_final_lse_offsets
         ]
-        __td_attention_merge_final_max_lse = torch.amax(
-            __td_attention_merge_final_lse_values, dim=0
+        attention_merge_final_max_lse = torch.amax(
+            attention_merge_final_lse_values, dim=0
         )
-        __td_attention_merge_final_weights = torch.exp2(
-            __td_attention_merge_final_lse_values
-            - __td_attention_merge_final_max_lse[None, :]
+        attention_merge_final_weights = torch.exp2(
+            attention_merge_final_lse_values - attention_merge_final_max_lse[None, :]
         )
-        __td_attention_merge_final_value_offsets = (
-            __td_attention_merge_final_lse_offsets[:, :, None]
-            * __td_attention_merge_head_dim
-            + hl.arange(__td_attention_merge_head_dim)[None, None, :]
+        attention_merge_final_value_offsets = (
+            attention_merge_final_lse_offsets[:, :, None] * attention_merge_head_dim
+            + hl.arange(attention_merge_head_dim)[None, None, :]
         )
-        __td_attention_merge_final_values = __td_attention_merge_chunk_out_storage[
-            __td_attention_merge_final_value_offsets
+        attention_merge_final_values = attention_merge_chunk_out_storage[
+            attention_merge_final_value_offsets
         ]
-        __td_attention_merge_final_denominator = torch.sum(
-            __td_attention_merge_final_weights, dim=0
+        attention_merge_final_denominator = torch.sum(
+            attention_merge_final_weights, dim=0
         )
-        __td_attention_merge_final_merged = torch.sum(
-            __td_attention_merge_final_values
-            * __td_attention_merge_final_weights[:, :, None],
+        attention_merge_final_merged = torch.sum(
+            attention_merge_final_values * attention_merge_final_weights[:, :, None],
             dim=0,
         )
-        attention[__td_attention_merge_final_head, :] = (
-            __td_attention_merge_final_merged
-            / __td_attention_merge_final_denominator[:, None]
+        attention[attention_merge_final_head, :] = (
+            attention_merge_final_merged / attention_merge_final_denominator[:, None]
         ).to(attention.dtype)
     for (
-        __td_attention_quant_tile_m,
-        __td_attention_quant_tile_gn,
-        __td_attention_quant_tile_n,
+        attention_quant_tile_m,
+        attention_quant_tile_gn,
+        attention_quant_tile_n,
     ) in hl.tile(
         [
-            __td_attention_quant_num_tokens,
-            __td_attention_quant_groups_per_row,
-            __td_attention_quant_group_size,
+            attention_quant_num_tokens,
+            attention_quant_groups_per_row,
+            attention_quant_group_size,
         ],
-        block_size=[1, None, __td_attention_quant_group_size],
+        block_size=[1, None, attention_quant_group_size],
     ):
-        __td_attention_quant_x = __td_attention_quant_input[
-            __td_attention_quant_tile_m,
-            __td_attention_quant_tile_gn,
-            __td_attention_quant_tile_n,
+        attention_quant_x = attention_quant_input[
+            attention_quant_tile_m,
+            attention_quant_tile_gn,
+            attention_quant_tile_n,
         ]
-        __td_attention_quant_s = (
-            torch.amax(torch.abs(__td_attention_quant_x), dim=-1).clamp(
-                min=__td_attention_quant_eps
+        attention_quant_s = (
+            torch.amax(torch.abs(attention_quant_x), dim=-1).clamp(
+                min=attention_quant_eps
             )
-            / __td_attention_quant_fp8_max
+            / attention_quant_fp8_max
         )
-        if __td_attention_quant_scale_ue8m0:
-            __td_attention_quant_s = torch.exp2(
-                torch.ceil(torch.log2(__td_attention_quant_s))
-            )
-        __td_attention_quant_output_s[
-            __td_attention_quant_tile_m, __td_attention_quant_tile_gn
-        ] = __td_attention_quant_s
-        __td_attention_quant_output_q[
-            __td_attention_quant_tile_m,
-            __td_attention_quant_tile_gn,
-            __td_attention_quant_tile_n,
+        if attention_quant_scale_ue8m0:
+            attention_quant_s = torch.exp2(torch.ceil(torch.log2(attention_quant_s)))
+        attention_quant_output_s[attention_quant_tile_m, attention_quant_tile_gn] = (
+            attention_quant_s
+        )
+        attention_quant_output_q[
+            attention_quant_tile_m,
+            attention_quant_tile_gn,
+            attention_quant_tile_n,
         ] = (
-            (__td_attention_quant_x / __td_attention_quant_s[:, :, None])
-            .clamp(__td_attention_quant_fp8_min, __td_attention_quant_fp8_max)
-            .to(__td_attention_quant_output_q.dtype)
+            (attention_quant_x / attention_quant_s[:, :, None])
+            .clamp(attention_quant_fp8_min, attention_quant_fp8_max)
+            .to(attention_quant_output_q.dtype)
         )
-    for __td_o_mm_tile_m, __td_o_mm_tile_n in hl.tile(
-        [__td_o_mm_m, __td_o_mm_n], block_size=[1, None]
-    ):
-        __td_o_mm_acc = hl.zeros(
-            [__td_o_mm_tile_m, __td_o_mm_tile_n], dtype=torch.float32
-        )
-        for __td_o_mm_tile_k in hl.tile(__td_o_mm_k, block_size=__td_o_mm_group_size):
-            __td_o_mm_partial = hl.dot(
-                __td_o_mm_activation_q[__td_o_mm_tile_m, __td_o_mm_tile_k],
-                __td_o_mm_weight_q[__td_o_mm_tile_n, __td_o_mm_tile_k].T,
+    for o_mm_tile_m, o_mm_tile_n in hl.tile([o_mm_m, o_mm_n], block_size=[1, None]):
+        o_mm_acc = hl.zeros([o_mm_tile_m, o_mm_tile_n], dtype=torch.float32)
+        for o_mm_tile_k in hl.tile(o_mm_k, block_size=o_mm_group_size):
+            o_mm_partial = hl.dot(
+                o_mm_activation_q[o_mm_tile_m, o_mm_tile_k],
+                o_mm_weight_q[o_mm_tile_n, o_mm_tile_k].T,
             ).to(torch.float32)
-            __td_o_mm_a_scale = __td_o_mm_activation_scale[
-                __td_o_mm_tile_m, __td_o_mm_tile_k.id
+            o_mm_a_scale = o_mm_activation_scale[o_mm_tile_m, o_mm_tile_k.id].to(
+                torch.float32
+            )
+            o_mm_w_scale = o_mm_weight_scale[
+                o_mm_tile_n.index // o_mm_group_size, o_mm_tile_k.id
             ].to(torch.float32)
-            __td_o_mm_w_scale = __td_o_mm_weight_scale[
-                __td_o_mm_tile_n.index // __td_o_mm_group_size, __td_o_mm_tile_k.id
-            ].to(torch.float32)
-            __td_o_mm_acc = (
-                __td_o_mm_acc
-                + __td_o_mm_partial
-                * __td_o_mm_a_scale[:, None]
-                * __td_o_mm_w_scale[None, :]
+            o_mm_acc = (
+                o_mm_acc + o_mm_partial * o_mm_a_scale[:, None] * o_mm_w_scale[None, :]
             )
-        attention_out[__td_o_mm_tile_m, __td_o_mm_tile_n] = __td_o_mm_acc.to(
-            attention_out.dtype
-        )
-    for __td_post_partial_m, __td_post_partial_n in hl.tile(
-        [__td_post_num_tokens, __td_post_hidden_size],
-        block_size=[1, __td_post_group_size],
+        attention_out[o_mm_tile_m, o_mm_tile_n] = o_mm_acc.to(attention_out.dtype)
+    for post_partial_m, post_partial_n in hl.tile(
+        [post_num_tokens, post_hidden_size],
+        block_size=[1, post_group_size],
     ):
-        __td_post_partial_values = __td_post_input[
-            __td_post_partial_m, __td_post_partial_n
-        ].to(torch.float32)
-        if __td_post_residual is not None:
-            __td_post_partial_values = (
-                __td_post_partial_values
-                + __td_post_residual[__td_post_partial_m, __td_post_partial_n]
-            )
-            __td_post_residual[__td_post_partial_m, __td_post_partial_n] = (
-                __td_post_partial_values.to(__td_post_residual.dtype)
-            )
-        __td_post_unrounded_values[__td_post_partial_m, __td_post_partial_n] = (
-            __td_post_partial_values
-        )
-        __td_post_rms_partials[__td_post_partial_m, __td_post_partial_n.id] = torch.sum(
-            __td_post_partial_values * __td_post_partial_values, dim=-1
-        )
-    for __td_post_quant_m, __td_post_quant_g, __td_post_quant_n in hl.tile(
-        [__td_post_num_tokens, __td_post_groups_per_row, __td_post_group_size],
-        block_size=[1, 1, __td_post_group_size],
-    ):
-        __td_post_quant_m_idx = __td_post_quant_m.begin + hl.arange(
-            __td_post_quant_m.block_size
-        )
-        __td_post_quant_group_idx = __td_post_quant_g.index
-        __td_post_quant_n_idx = (
-            __td_post_quant_group_idx[:, None] * __td_post_group_size
-            + __td_post_quant_n.index[None, :]
-        )
-        __td_post_quant_m_blk = __td_post_quant_m_idx[:, None, None]
-        __td_post_quant_n_blk = __td_post_quant_n_idx[None, :, :]
-        __td_post_square_sum = hl.zeros([__td_post_quant_m], dtype=torch.float32)
-        for __td_post_reduce_g in hl.tile(__td_post_groups_per_row, block_size=1):
-            __td_post_square_sum = __td_post_square_sum + torch.sum(
-                __td_post_rms_partials[__td_post_quant_m, __td_post_reduce_g], dim=-1
-            )
-        __td_post_inv_rms = torch.rsqrt(
-            __td_post_square_sum * (1.0 / __td_post_hidden_size) + __td_post_epsilon
-        )
-        __td_post_quant_values = __td_post_unrounded_values[
-            __td_post_quant_m_blk, __td_post_quant_n_blk
-        ]
-        __td_post_normalized = (
-            __td_post_quant_values * __td_post_inv_rms[:, None, None]
-        ).to(torch.bfloat16) * __td_post_weight[__td_post_quant_n_blk]
-        __td_post_quant_scale = torch.amax(torch.abs(__td_post_normalized), dim=-1).to(
+        post_partial_values = post_input[post_partial_m, post_partial_n].to(
             torch.float32
         )
-        if __td_post_scale_ub is not None:
-            __td_post_quant_scale = __td_post_quant_scale.clamp(
-                max=hl.load(__td_post_scale_ub, [])
+        if post_residual is not None:
+            post_partial_values = (
+                post_partial_values + post_residual[post_partial_m, post_partial_n]
             )
-        __td_post_quant_scale = (__td_post_quant_scale / FP8_MAX).clamp(
-            min=FP8_MIN_SCALE
+            post_residual[post_partial_m, post_partial_n] = post_partial_values.to(
+                post_residual.dtype
+            )
+        post_unrounded_values[post_partial_m, post_partial_n] = post_partial_values
+        post_rms_partials[post_partial_m, post_partial_n.id] = torch.sum(
+            post_partial_values * post_partial_values, dim=-1
         )
-        __td_post_scale[__td_post_quant_m, __td_post_quant_g] = __td_post_quant_scale
-        __td_post_result[__td_post_quant_m_blk, __td_post_quant_n_blk] = (
-            (__td_post_normalized / __td_post_quant_scale[:, :, None])
+    for post_quant_m, post_quant_g, post_quant_n in hl.tile(
+        [post_num_tokens, post_groups_per_row, post_group_size],
+        block_size=[1, 1, post_group_size],
+    ):
+        post_quant_m_idx = post_quant_m.begin + hl.arange(post_quant_m.block_size)
+        post_quant_group_idx = post_quant_g.index
+        post_quant_n_idx = (
+            post_quant_group_idx[:, None] * post_group_size
+            + post_quant_n.index[None, :]
+        )
+        post_quant_m_blk = post_quant_m_idx[:, None, None]
+        post_quant_n_blk = post_quant_n_idx[None, :, :]
+        post_square_sum = hl.zeros([post_quant_m], dtype=torch.float32)
+        for post_reduce_g in hl.tile(post_groups_per_row, block_size=1):
+            post_square_sum = post_square_sum + torch.sum(
+                post_rms_partials[post_quant_m, post_reduce_g], dim=-1
+            )
+        post_inv_rms = torch.rsqrt(
+            post_square_sum * (1.0 / post_hidden_size) + post_epsilon
+        )
+        post_quant_values = post_unrounded_values[post_quant_m_blk, post_quant_n_blk]
+        post_normalized = (post_quant_values * post_inv_rms[:, None, None]).to(
+            torch.bfloat16
+        ) * post_norm_weight[post_quant_n_blk]
+        post_quant_scale = torch.amax(torch.abs(post_normalized), dim=-1).to(
+            torch.float32
+        )
+        if post_scale_ub is not None:
+            post_quant_scale = post_quant_scale.clamp(max=hl.load(post_scale_ub, []))
+        post_quant_scale = (post_quant_scale / FP8_MAX).clamp(min=FP8_MIN_SCALE)
+        post_scale[post_quant_m, post_quant_g] = post_quant_scale
+        post_result[post_quant_m_blk, post_quant_n_blk] = (
+            (post_normalized / post_quant_scale[:, :, None])
             .clamp(FP8_MIN, FP8_MAX)
-            .to(__td_post_result.dtype)
+            .to(post_result.dtype)
         )
-    for __td_w13_tile_m, __td_w13_tile_n in hl.tile(
-        [__td_w13_m, __td_w13_n], block_size=[1, None]
-    ):
-        __td_w13_acc = hl.zeros([__td_w13_tile_m, __td_w13_tile_n], dtype=torch.float32)
-        for __td_w13_tile_k in hl.tile(__td_w13_k, block_size=__td_w13_group_size):
-            __td_w13_partial = hl.dot(
-                __td_w13_activation_q[__td_w13_tile_m, __td_w13_tile_k],
-                __td_w13_weight_q[__td_w13_tile_n, __td_w13_tile_k].T,
+    for w13_tile_m, w13_tile_n in hl.tile([w13_m, w13_n], block_size=[1, None]):
+        w13_acc = hl.zeros([w13_tile_m, w13_tile_n], dtype=torch.float32)
+        for w13_tile_k in hl.tile(w13_k, block_size=w13_group_size):
+            w13_partial = hl.dot(
+                w13_activation_q[w13_tile_m, w13_tile_k],
+                w13_weight_q[w13_tile_n, w13_tile_k].T,
             ).to(torch.float32)
-            __td_w13_a_scale = __td_w13_activation_scale[
-                __td_w13_tile_m, __td_w13_tile_k.id
-            ].to(torch.float32)
-            __td_w13_w_scale = __td_w13_weight_scale[
-                __td_w13_tile_n.index // __td_w13_group_size, __td_w13_tile_k.id
-            ].to(torch.float32)
-            __td_w13_acc = (
-                __td_w13_acc
-                + __td_w13_partial
-                * __td_w13_a_scale[:, None]
-                * __td_w13_w_scale[None, :]
+            w13_a_scale = w13_activation_scale[w13_tile_m, w13_tile_k.id].to(
+                torch.float32
             )
-        gate_up[__td_w13_tile_m, __td_w13_tile_n] = __td_w13_acc.to(gate_up.dtype)
-    for __td_activation_tile_m, __td_activation_tile_i in hl.tile(
-        [__td_activation_m, __td_activation_intermediate],
-        block_size=[1, __td_activation_group_size],
+            w13_w_scale = w13_weight_scale[
+                w13_tile_n.index // w13_group_size, w13_tile_k.id
+            ].to(torch.float32)
+            w13_acc = (
+                w13_acc + w13_partial * w13_a_scale[:, None] * w13_w_scale[None, :]
+            )
+        gate_up[w13_tile_m, w13_tile_n] = w13_acc.to(gate_up.dtype)
+    for activation_tile_m, activation_tile_i in hl.tile(
+        [activation_m, activation_intermediate],
+        block_size=[1, activation_group_size],
     ):
-        __td_activation_gate = __td_activation_gate_up[
-            __td_activation_tile_m, __td_activation_tile_i
-        ].to(torch.float32)
-        __td_activation_up = __td_activation_gate_up[
-            __td_activation_tile_m,
-            __td_activation_tile_i + __td_activation_intermediate,
-        ].to(torch.float32)
-        __td_activation_activated = (
-            __td_activation_gate
-            * torch.sigmoid(__td_activation_gate)
-            * __td_activation_up
+        activation_gate = activation_gate_up[activation_tile_m, activation_tile_i].to(
+            torch.float32
         )
-        __td_activation_scale = (
-            torch.amax(torch.abs(__td_activation_activated), dim=-1) / FP8_MAX
+        activation_up = activation_gate_up[
+            activation_tile_m,
+            activation_tile_i + activation_intermediate,
+        ].to(torch.float32)
+        activation_activated = (
+            activation_gate * torch.sigmoid(activation_gate) * activation_up
+        )
+        activation_tile_scale = (
+            torch.amax(torch.abs(activation_activated), dim=-1) / FP8_MAX
         ).clamp(min=FP8_MIN_SCALE)
-        activation_scale[__td_activation_tile_m, __td_activation_tile_i.id] = (
-            __td_activation_scale
+        activation_scale[activation_tile_m, activation_tile_i.id] = (
+            activation_tile_scale
         )
-        activation_q[__td_activation_tile_m, __td_activation_tile_i] = (
-            (__td_activation_activated / __td_activation_scale[:, None])
+        activation_q[activation_tile_m, activation_tile_i] = (
+            (activation_activated / activation_tile_scale[:, None])
             .clamp(FP8_MIN, FP8_MAX)
             .to(activation_q.dtype)
         )
-    for __td_w2_tile_m, __td_w2_tile_n in hl.tile(
-        [__td_w2_m, __td_w2_n], block_size=[1, None]
-    ):
-        __td_w2_acc = hl.zeros([__td_w2_tile_m, __td_w2_tile_n], dtype=torch.float32)
-        for __td_w2_tile_k in hl.tile(__td_w2_k, block_size=__td_w2_group_size):
-            __td_w2_partial = hl.dot(
-                __td_w2_activation_q[__td_w2_tile_m, __td_w2_tile_k],
-                __td_w2_weight_q[__td_w2_tile_n, __td_w2_tile_k].T,
+    for w2_tile_m, w2_tile_n in hl.tile([w2_m, w2_n], block_size=[1, None]):
+        w2_acc = hl.zeros([w2_tile_m, w2_tile_n], dtype=torch.float32)
+        for w2_tile_k in hl.tile(w2_k, block_size=w2_group_size):
+            w2_partial = hl.dot(
+                w2_activation_q[w2_tile_m, w2_tile_k],
+                w2_weight_q[w2_tile_n, w2_tile_k].T,
             ).to(torch.float32)
-            __td_w2_a_scale = __td_w2_activation_scale[
-                __td_w2_tile_m, __td_w2_tile_k.id
+            w2_a_scale = w2_activation_scale[w2_tile_m, w2_tile_k.id].to(torch.float32)
+            w2_w_scale = w2_weight_scale[
+                w2_tile_n.index // w2_group_size, w2_tile_k.id
             ].to(torch.float32)
-            __td_w2_w_scale = __td_w2_weight_scale[
-                __td_w2_tile_n.index // __td_w2_group_size, __td_w2_tile_k.id
-            ].to(torch.float32)
-            __td_w2_acc = (
-                __td_w2_acc
-                + __td_w2_partial * __td_w2_a_scale[:, None] * __td_w2_w_scale[None, :]
-            )
-        output[__td_w2_tile_m, __td_w2_tile_n] = __td_w2_acc.to(output.dtype)
+            w2_acc = w2_acc + w2_partial * w2_a_scale[:, None] * w2_w_scale[None, :]
+        output[w2_tile_m, w2_tile_n] = w2_acc.to(output.dtype)
     return (
         output,
         pre_q,
@@ -1646,7 +1536,6 @@ def main(verbose: bool = True) -> dict:
             make_calls,
             use_cudagraph=False,
             pre_captured_cudagraph=True,
-            interleave_pre_captured=False,
             make_resets=lambda _shape: (helion_reset, vllm_reset),
             thermal_warmup_ms=10_000,
             verbose=verbose,
