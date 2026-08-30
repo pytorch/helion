@@ -892,6 +892,93 @@ def _cute_unroll_vec_extract(hoist_var: str, idx: str, dtype: torch.dtype) -> st
     return f"cutlass.Uint16({hoist_var}[{idx}]).bitcast({elem_dtype})"
 
 
+def _cute_lane_vloop_insert_pos(
+    strategy: object, block_id: int, lane_body: list
+) -> int:
+    """Insertion position for statements that must run just BEFORE the
+    constexpr V-loop in ``lane_body``.
+
+    Uses the strategy's recorded V-loop node when available (the V-loop is
+    no longer guaranteed to be the last entry once vec-store flushes are
+    appended after it); falls back to ``len(lane_body) - 1``.
+    """
+    vloop_by_block = getattr(strategy, "_cute_lane_vloop_by_block", None)
+    vloop = None
+    if isinstance(vloop_by_block, dict):
+        vloop = vloop_by_block.get(block_id)
+    if vloop is not None:
+        for i, stmt in enumerate(lane_body):
+            if stmt is vloop:
+                return i
+    return len(lane_body) - 1
+
+
+def _cute_register_tile_unroll_vec_store(
+    state: CodegenState,
+    strategy: object,  # BlockSizeTileStrategy (PerThreadNDTileStrategy)
+    block_id: int,
+    tensor_name: str,
+    index_exprs: list[str],
+    value_expr: str,
+    mask_expr: str | None,
+) -> ast.stmt | None:
+    """Vector-store counterpart of ``_cute_register_tile_unroll_vec_hoist``.
+
+    Replaces the per-lane scalar ``(ptr).store(value)`` inside the constexpr
+    V-loop with an append onto a compile-time Python list, and splices ONE
+    ``_cute_store_u16_vec(base_ptr, vals)`` flush AFTER the V-loop, emitting
+    an ST.64/ST.128 instead of V scalar 2-byte stores.
+
+    Caller must guarantee the per-element mask is uniform across the V
+    lanes (``numel % V == 0``, no extra_mask); the flush reuses the scalar
+    mask expression, whose per-element vars hold the last unrolled lane's
+    (uniform) value after the V-loop.
+
+    Returns the per-lane append statement, or None when the lane context
+    isn't available.
+    """
+    base_var_by_block = getattr(strategy, "_cute_lane_base_index_var_by_block", {})
+    lane_body_by_block = getattr(strategy, "_cute_lane_body_by_block", {})
+    base_index_var = base_var_by_block.get(block_id)
+    lane_body = lane_body_by_block.get(block_id)
+    if not isinstance(base_index_var, str) or not isinstance(lane_body, list):
+        return None
+    vloop_by_block = getattr(strategy, "_cute_lane_vloop_by_block", None)
+    if not isinstance(vloop_by_block, dict) or vloop_by_block.get(block_id) is None:
+        return None
+    lane_pos = _cute_lane_axis_pos(strategy, block_id, index_exprs)
+    base_exprs = list(index_exprs)
+    base_exprs[lane_pos] = base_index_var
+    base_ptr_expr = _cute_scalar_pointer_expr(tensor_name, base_exprs)
+    sites_by_block = getattr(strategy, "_cute_lane_vec_stores_by_block", None)
+    if sites_by_block is None:
+        sites_by_block = {}
+        # pyrefly: ignore [missing-attribute]
+        strategy._cute_lane_vec_stores_by_block = sites_by_block
+    sites = sites_by_block.setdefault(block_id, [])
+    site_index = len(sites)
+    list_var = state.device_function.new_var(
+        f"_tile_store_vals_{block_id}_{site_index}", dce=False
+    )
+    sites.append(list_var)
+    vloop_pos = _cute_lane_vloop_insert_pos(strategy, block_id, lane_body)
+    lane_body.insert(vloop_pos, statement_from_string(f"{list_var} = []"))
+    flush_expr = f"_cute_store_u16_vec({base_ptr_expr}, {list_var})"
+    if mask_expr is not None:
+        flush_stmt = statement_from_string(f"if {mask_expr}:\n    {flush_expr}")
+    else:
+        flush_stmt = statement_from_string(flush_expr)
+    # Insert after the V-loop AND after any earlier sites' flushes so the
+    # emitted store order matches the source order.
+    lane_body.insert(
+        _cute_lane_vloop_insert_pos(strategy, block_id, lane_body) + 1 + site_index,
+        flush_stmt,
+    )
+    return statement_from_string(
+        f"{list_var}.append(({value_expr}).bitcast(cutlass.Uint16))"
+    )
+
+
 def _cute_register_tile_unroll_vec_hoist(
     state: CodegenState,
     strategy: object,  # BlockSizeTileStrategy (PerThreadNDTileStrategy)
@@ -952,143 +1039,54 @@ def _cute_register_tile_unroll_vec_hoist(
         env_local = CompileEnvironment.current()
         numel = env_local.block_sizes[block_id].numel
         numel_expr = state.sympy_expr(numel)
-        # Build the "anchor" pointer: same index_exprs but with the
-        # inner reduction-axis index forced to 0.  This is the
-        # ``tile_offset == 0, lane_var == 0, vec_lane_var == 0`` base
-        # for the very first outer-tile iter, which is always in-bounds
-        # for any grid block.
-        anchor_exprs = list(index_exprs)
-        anchor_exprs[lane_pos] = "0"
-        anchor_ptr_expr = _cute_scalar_pointer_expr(tensor_name, anchor_exprs)
-        guarded_ptr = (
-            f"({base_ptr_expr} if {base_index_var} < {numel_expr} "
-            f"else {anchor_ptr_expr})"
+        mask_vars = getattr(strategy, "mask_vars", None)
+        block_pos = strategy.block_ids.index(block_id)  # pyrefly: ignore
+        static_bs = strategy._configured_block_size_int(  # pyrefly: ignore
+            strategy.block_size[block_pos]  # pyrefly: ignore
         )
+        try:
+            numel_int = int(numel)
+        except (TypeError, ValueError):
+            numel_int = None
+        if (
+            isinstance(mask_vars, dict)
+            and block_id in mask_vars
+            and (mask_vars[block_id] is None)
+            and isinstance(static_bs, int)
+            and numel_int is not None
+            and static_bs >= numel_int
+        ):
+            # Single-trip tile loop whose block provably covers the extent
+            # (the strategy elided the bounds mask): every per-thread vec
+            # base is in-bounds and there is no next-iteration prefetch to
+            # clamp (the software-pipelining pass, which prefetches one
+            # tile PAST the loop end, needs the guard on multi-trip
+            # loops).  Dropping the pointer select saves ~14 registers per
+            # thread on the resident-row softmax family.
+            guarded_ptr = base_ptr_expr
+        else:
+            # Build the "anchor" pointer: same index_exprs but with the
+            # inner reduction-axis index forced to 0.  This is the
+            # ``tile_offset == 0, lane_var == 0, vec_lane_var == 0`` base
+            # for the very first outer-tile iter, which is always
+            # in-bounds for any grid block.
+            anchor_exprs = list(index_exprs)
+            anchor_exprs[lane_pos] = "0"
+            anchor_ptr_expr = _cute_scalar_pointer_expr(tensor_name, anchor_exprs)
+            guarded_ptr = (
+                f"({base_ptr_expr} if {base_index_var} < {numel_expr} "
+                f"else {anchor_ptr_expr})"
+            )
         hoist_stmt = statement_from_string(
             f"{hoist_var} = {_cute_unroll_vec_load_expr(guarded_ptr, tensor.dtype, vec_width)}"
         )
-        # Insert the hoist just BEFORE the constexpr V-loop (the last
-        # entry in lane_body).
-        lane_body.insert(len(lane_body) - 1, hoist_stmt)
+        # Insert the hoist just BEFORE the constexpr V-loop.
+        lane_body.insert(
+            _cute_lane_vloop_insert_pos(strategy, block_id, lane_body), hoist_stmt
+        )
     else:
         hoist_var, _ = cache[cache_key]
     return _cute_unroll_vec_extract(hoist_var, vec_lane_var, tensor.dtype)
-
-
-def _cute_register_tile_unroll_vec_hoist_split2(
-    state: CodegenState,
-    strategy: object,  # BlockSizeTileStrategy (PerThreadNDTileStrategy)
-    block_id: int,
-    tensor: torch.Tensor,
-    tensor_name: str,
-    index_exprs: list[str],
-    vec_width: int,
-) -> str:
-    """Split-2 variant of ``_cute_register_tile_unroll_vec_hoist`` for V=8
-    on fp16/bf16.
-
-    The CuTe DSL's ``nvvm.load.ext`` ICEs at V=8 for these dtypes, so the
-    full 16-byte LDG.128 is decomposed into TWO back-to-back V=4 loads
-    (lanes 0-3 and 4-7).  The SASS scheduler is free to overlap the two
-    LDGs, so the per-thread bytes-per-load grows from 8 (V=4) to the
-    full 16 (effective V=8) without invoking the DSL bug.
-
-    Returns a per-vec-lane expression of the form::
-
-        (
-            cutlass.Uint16(_tile_unroll_vec_ < n > _ < m > _a[vi]).bitcast(dtype)
-            if vi < 4
-            else cutlass.Uint16(_tile_unroll_vec_ < n > _ < m > _b[vi - 4]).bitcast(
-                dtype
-            )
-        )
-
-    Because ``vec_lane_var`` is the target of a ``cutlass.range_constexpr(8)``
-    loop, it is a Python-int constant at each unrolled iter, so the
-    ``if vi < 4`` branch folds away at trace time and the emitted SASS
-    contains only the active load's extract.
-    """
-    assert vec_width == 8, (
-        "tile_unroll_split2 expects V=8 (4+4); other widths use tile_unroll"
-    )
-    half = vec_width // 2
-    vec_elem_type = _cute_unroll_vec_elem_type(tensor.dtype)
-    base_var_by_block = getattr(strategy, "_cute_lane_base_index_var_by_block", {})
-    lane_body_by_block = getattr(strategy, "_cute_lane_body_by_block", {})
-    vec_lane_var_by_block = getattr(strategy, "_cute_vec_lane_var_by_block", {})
-    base_index_var = base_var_by_block.get(block_id)
-    lane_body = lane_body_by_block.get(block_id)
-    vec_lane_var = vec_lane_var_by_block.get(block_id)
-    assert isinstance(base_index_var, str)
-    assert isinstance(lane_body, list)
-    assert isinstance(vec_lane_var, str)
-    lane_pos = _cute_lane_axis_pos(strategy, block_id, index_exprs)
-    base_exprs = list(index_exprs)
-    base_exprs[lane_pos] = base_index_var
-    base_ptr_expr_a = _cute_scalar_pointer_expr(tensor_name, base_exprs)
-    # The second-half pointer points 4 elements past the first.  Build
-    # it by substituting ``base_index_var + half`` for the inner index.
-    base_exprs_b = list(index_exprs)
-    base_exprs_b[lane_pos] = f"({base_index_var} + {half})"
-    base_ptr_expr_b = _cute_scalar_pointer_expr(tensor_name, base_exprs_b)
-    cache_key = (tensor_name, base_ptr_expr_a, "split2")
-    cache_by_block = getattr(strategy, "_cute_lane_vec_loads_by_block", None)
-    if cache_by_block is None:
-        cache_by_block = {}
-        # pyrefly: ignore [missing-attribute]
-        strategy._cute_lane_vec_loads_by_block = cache_by_block
-    cache = cache_by_block.setdefault(block_id, {})
-    if cache_key not in cache:
-        slot = len(cache)
-        hoist_var_a = state.device_function.new_var(
-            f"_tile_unroll_vec_{block_id}_{slot}_a", dce=False
-        )
-        hoist_var_b = state.device_function.new_var(
-            f"_tile_unroll_vec_{block_id}_{slot}_b", dce=False
-        )
-        # Stash both names plus the split marker so this entry doesn't
-        # collide with the V=4 cache_key shape.  Downstream readers
-        # don't introspect this tuple — it's just a sentinel.
-        cache[cache_key] = ((hoist_var_a, hoist_var_b), tensor.dtype)
-        env_local = CompileEnvironment.current()
-        numel = env_local.block_sizes[block_id].numel
-        numel_expr = state.sympy_expr(numel)
-        anchor_exprs = list(index_exprs)
-        anchor_exprs[lane_pos] = "0"
-        anchor_ptr_expr = _cute_scalar_pointer_expr(tensor_name, anchor_exprs)
-        # The first-half OOB guard checks the same V-aligned base used by
-        # the V=4 path; the second-half pointer is ``base + 4`` and only
-        # needs guarding when ``base + 4 < numel``.  Reuse the same
-        # anchor pointer for both halves' fallbacks (the per-element
-        # mask gate downstream drops any anchor-fetched bytes anyway).
-        guarded_ptr_a = (
-            f"({base_ptr_expr_a} if {base_index_var} < {numel_expr} "
-            f"else {anchor_ptr_expr})"
-        )
-        guarded_ptr_b = (
-            f"({base_ptr_expr_b} if ({base_index_var} + {half}) < {numel_expr} "
-            f"else {anchor_ptr_expr})"
-        )
-        hoist_stmt_a = statement_from_string(
-            f"{hoist_var_a} = cute.arch.load({guarded_ptr_a}, "
-            f"ir.VectorType.get([{half}], {vec_elem_type}.mlir_type))"
-        )
-        hoist_stmt_b = statement_from_string(
-            f"{hoist_var_b} = cute.arch.load({guarded_ptr_b}, "
-            f"ir.VectorType.get([{half}], {vec_elem_type}.mlir_type))"
-        )
-        # Insert both hoists just BEFORE the constexpr V-loop (the last
-        # entry in lane_body).  Emit them back-to-back so the SASS
-        # scheduler can issue the two LDGs together.
-        lane_body.insert(len(lane_body) - 1, hoist_stmt_a)
-        lane_body.insert(len(lane_body) - 1, hoist_stmt_b)
-    else:
-        (hoist_var_a, hoist_var_b), _ = cache[cache_key]
-    extract_a = _cute_unroll_vec_extract(hoist_var_a, vec_lane_var, tensor.dtype)
-    extract_b = _cute_unroll_vec_extract(
-        hoist_var_b, f"{vec_lane_var} - {half}", tensor.dtype
-    )
-    return f"({extract_a} if {vec_lane_var} < {half} else {extract_b})"
 
 
 def _cute_combined_mask(

@@ -118,6 +118,7 @@ def _lane_reduce_marker_expr(
     group_span: int = 0,
     group_lane_expr: str = "",
     group_count: int = 1,
+    group_cluster_n: int = 1,
 ) -> str:
     # ``group_*`` (optional) carry the parameters of a strided grouped
     # reduction. They are required when the reduction's live thread axis is
@@ -134,7 +135,7 @@ def _lane_reduce_marker_expr(
     return (
         f"{_HELION_LANE_REDUCE_MARKER}({input_name}, {reduction_type!r}, "
         f"{identity_expr}, {threads_in_group}, {group_pre}, {group_span}, "
-        f"{group_lane_expr!r}, {group_count})"
+        f"{group_lane_expr!r}, {group_count}, {group_cluster_n})"
     )
 
 
@@ -160,6 +161,9 @@ class _LaneReduceMarker:
     group_span: int = 0
     group_lane_expr: str = ""
     group_count: int = 1
+    # > 1 when the reduction group is additionally split across the CTAs of
+    # a thread-block cluster; the finalize then uses the DSM cluster reduce.
+    group_cluster_n: int = 1
 
     def finalize_expr(self, reduced: str) -> str:
         return self.wrap_template.replace("__HELION_FINALIZED__", f"({reduced})")
@@ -204,7 +208,7 @@ def _is_lane_reduce_marker_assign(stmt: ast.AST) -> _LaneReduceMarker | None:
     if not isinstance(target, ast.Name):
         return None
     call = _find_lane_reduce_call(stmt.value)
-    if call is None or len(call.args) != 8:
+    if call is None or len(call.args) not in (8, 9):
         return None
     (
         input_node,
@@ -215,7 +219,9 @@ def _is_lane_reduce_marker_assign(stmt: ast.AST) -> _LaneReduceMarker | None:
         group_span_node,
         group_lane_node,
         group_count_node,
+        *rest,
     ) = call.args
+    group_cluster_n = int(ast.literal_eval(rest[0])) if rest else 1
     input_name = ast.unparse(input_node)
     reduction_type = ast.literal_eval(type_node)
     identity_expr = ast.unparse(identity_node)
@@ -239,6 +245,7 @@ def _is_lane_reduce_marker_assign(stmt: ast.AST) -> _LaneReduceMarker | None:
         group_span=group_span,
         group_lane_expr=group_lane_expr,
         group_count=group_count,
+        group_cluster_n=group_cluster_n,
     )
 
 
@@ -346,6 +353,20 @@ def _finalize_lane_reduce_marker(m: _LaneReduceMarker, acc_var: str) -> list[ast
     * a plain consecutive-lane warp reduction otherwise;
     * the accumulator unchanged when there is no live thread axis to combine.
     """
+    if m.group_cluster_n > 1:
+        # The two-pass marker finalize has no access to the preamble
+        # buffer/mbarrier plumbing the DSM cluster reduce needs (only the
+        # strided-thread-reduction path emits that), so a cluster-split
+        # reduce landing here cannot be combined across the cluster —
+        # reject the config loudly.
+        from .. import exc
+
+        raise exc.BackendUnsupported(
+            "cute",
+            "cute_cluster_n > 1 is not supported for the two-pass lane "
+            "reduction finalize; only the strided cross-warp reduce path "
+            "can perform the cluster combine",
+        )
     if m.group_span > 32 and m.group_span % 32 == 0 and m.group_lane_expr:
         # Cross-warp: the reduce group is spread across warps, so fold the
         # per-lane accumulator with the two-stage shared-memory reduction.
@@ -2580,15 +2601,18 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         assert isinstance(block_size, (int, torch.SymInt))
         super().__init__(fn, block_ids, block_size, loop_order)
         env = CompileEnvironment.current()
-        if not env.backend.force_tile_mask() and env.known_multiple(
+        self._mask_elidable = not env.backend.force_tile_mask() and env.known_multiple(
             functools.reduce(  # pyrefly: ignore[incompatible-overload-residual]
                 operator.mul, [env.block_sizes[i].numel for i in block_ids]
             ),
             block_size,
-        ):
-            self._mask_var = None
-        else:
-            self._mask_var: str | None = self.new_var("mask", dce=True)
+        )
+        # Elision also requires that no sibling section launches this
+        # strategy's thread axis wider than the tile, which is unknowable
+        # until every strategy is registered in the dispatch — ``mask_var``
+        # decides lazily on first use during codegen.
+        self._mask_elision_decided = False
+        self._mask_var: str | None = self.new_var("mask", dce=True)
         self._offsets_var = self.new_var("offsets", dce=True)
 
         key = (*self.block_ids,)
@@ -2606,6 +2630,13 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         raise NotImplementedError("offset_var not used in FlattenedTileStrategy")
 
     def mask_var(self, block_idx: int) -> str | None:
+        if not self._mask_elision_decided:
+            self._mask_elision_decided = True
+            if self._mask_elidable and not (
+                CompileEnvironment.current().backend.launches_surplus_tile_threads()
+                and self.fn.tile_strategy.has_surplus_threads_for_strategy(self)
+            ):
+                self._mask_var = None
         return self._mask_var
 
     def block_size_var(self, block_idx: int) -> str:
@@ -3621,6 +3652,10 @@ class NDTileStrategy(_BaseNDTileStrategy):
             not env.backend.force_tile_mask()
             and env.block_sizes[block_idx].known_multiple(block_size)
             and not env.is_jagged_tile(block_idx)
+            and not (
+                env.backend.launches_surplus_tile_threads()
+                and self.fn.tile_strategy.has_surplus_threads_for_block_id(block_idx)
+            )
         ):
             self.mask_vars[block_idx] = None
             return None
@@ -3734,6 +3769,26 @@ class PerThreadNDTileStrategy(NDTileStrategy):
         # ``insert(len(lane_body)-1, hoist_stmt)`` to splice the vec
         # load just before the inner V-loop.
         self._cute_lane_body_by_block: dict[int, list] = {}
+        # Per-block constexpr V-loop AST node.  memory_ops locates it in
+        # ``lane_body`` to splice vec-load hoists BEFORE it and vec-store
+        # flushes AFTER it (position-independent, so both can coexist).
+        self._cute_lane_vloop_by_block: dict[int, ast.For] = {}
+        # Per-block cache of vec-store flush sites:
+        # (tensor_name, base_ptr_expr) -> list_var_name.
+        self._cute_lane_vec_stores_by_block: dict[int, dict] = {}
+        # Per-block lane layout ("blocked" | "strided") from the
+        # ``cute_lane_layouts`` config knob.  Only differs from blocked
+        # when the lane loop has more than one iteration.
+        self._cute_lane_layout_by_block: dict[int, str] = {}
+        # Lazy one-shot guard for ``_maybe_apply_cute_cluster``.
+        self._cute_cluster_checked: bool = False
+        # Per-block thread-block-cluster split (from ``cute_cluster_n``):
+        # the axis's elements are divided across ``cl`` cluster CTAs in
+        # addition to the CTA's own threads.  Applied only to a single
+        # lane-looped axis when the tile covers the full extent (single
+        # trip, so cluster reduces run exactly once per call site) and all
+        # sibling axes have thread extent 1.
+        self._cute_cluster_by_block: dict[int, int] = {}
         # Shared per-block hoist cache: (tensor_name, base_ptr_expr) ->
         # (hoist_var, dtype).  Same shape as
         # ``LoopedReductionStrategy._cute_lane_vec_loads``.
@@ -3743,6 +3798,10 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             cute_vec_widths_cfg = cast(
                 "list[int]",
                 fn.config.config.get("cute_vector_widths", []) or [],
+            )
+            cute_lane_layouts_cfg = cast(
+                "list[str]",
+                fn.config.config.get("cute_lane_layouts", []) or [],
             )
             for block_id, nt, bs in zip(
                 block_ids, num_threads, block_size, strict=True
@@ -3759,6 +3818,15 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                     self._lane_var_by_block[block_id] = self.fn.new_var(
                         f"lane_{block_id}"
                     )
+                    if (
+                        block_id
+                        in env_local.config_spec.cute_lane_layouts.valid_block_ids()
+                    ):
+                        layout = env_local.config_spec.cute_lane_layouts.config_get(
+                            cute_lane_layouts_cfg, block_id, "blocked"
+                        )
+                        if isinstance(layout, str):
+                            self._cute_lane_layout_by_block[block_id] = layout
                     elements_per_thread = static_bs // nt
                     # Vec slot is registered eagerly in device-IR analysis; read
                     # the tuned V.  Never append here — growing the spec during
@@ -3806,8 +3874,74 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             return None
         return int(block_size_expr)
 
+    def _maybe_apply_cute_cluster(
+        self, env: CompileEnvironment, state: CodegenState
+    ) -> None:
+        """Decide whether the ``cute_cluster_n`` knob applies to this loop
+        (invoked lazily on the first ``codegen_device_loop`` call so the
+        active grid state is visible).
+
+        See ``_cute_cluster_by_block``.  When applied, the owning
+        ``DeviceFunction``'s ``cute_state.simt_cluster_n`` is set so the
+        host-side call emits the extra grid dim + cluster launch shape.
+        """
+        if self._cute_cluster_checked:
+            return
+        self._cute_cluster_checked = True
+        if env.backend_name != "cute" or self.mma_mode:
+            return
+        cl = self.fn.config.config.get("cute_cluster_n", 1)
+        if not isinstance(cl, int) or cl <= 1:
+            return
+        if getattr(self.fn.cute_state, "simt_cluster_n", 1) > 1:
+            # Another device loop's strategy already claimed the cluster
+            # rank; splitting a second axis on the same rank would leave
+            # only the diagonal rank x rank blocks covered.
+            return
+        if len(self._lane_var_by_block) != 1:
+            return
+        # The cluster reduce combines across the WHOLE CTA, so the grid
+        # strategy must not put sibling axes on thread dims (e.g. a
+        # multi-row grid tile with block_m > 1) — those rows would be
+        # folded together.
+        grid_axis_sizes = getattr(
+            state.codegen.current_grid_state, "thread_axis_sizes", None
+        )
+        if isinstance(grid_axis_sizes, dict) and any(
+            size > 1 for size in grid_axis_sizes.values()
+        ):
+            return
+        [block_id] = self._lane_var_by_block.keys()
+        vec = self._cute_lane_vec_width_by_block.get(block_id, 1)
+        idx = self.block_ids.index(block_id)
+        nt = self.num_threads[idx]
+        static_bs = self._configured_block_size_int(self.block_size[idx])
+        if static_bs is None or nt <= 0 or nt % 32 != 0:
+            return
+        numel = env.block_sizes[block_id].numel
+        try:
+            numel_int = int(numel)
+        except (TypeError, ValueError):
+            return
+        # Single trip (the whole extent in one tile) so each cluster reduce
+        # call site executes exactly once (fixed mbarrier phase), and the
+        # per-CTA slice must keep a whole vec chunk per thread.
+        if static_bs < numel_int or static_bs % (nt * cl * vec) != 0:
+            return
+        # All sibling axes must not use a thread axis (the cluster reduce
+        # combines across the whole CTA).
+        for other_id, other_bs in zip(self.block_ids, self.block_size, strict=True):
+            if other_id == block_id:
+                continue
+            extent = self._static_thread_extent_for_block(other_id, other_bs)
+            if extent is not None and extent != 1:
+                return
+        self._cute_cluster_by_block[block_id] = cl
+        self.fn.cute_state.simt_cluster_n = cl
+
     def _elements_per_thread_for_block(self, block_id: int) -> int:
-        """Elements per thread for *block_id* (derived from num_threads)."""
+        """Elements per thread for *block_id* (derived from num_threads and
+        the cluster split)."""
         if block_id in self.inactive_block_ids:
             return 1
         idx = self.block_ids.index(block_id)
@@ -3816,7 +3950,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             return 1
         bs = self._configured_block_size_int(self.block_size[idx])
         assert isinstance(bs, int)  # validated by _thread_extent_for_axis
-        return bs // nt
+        return bs // nt // self._cute_cluster_by_block.get(block_id, 1)
 
     def _thread_extent_for_axis(
         self, block_id: int, block_size: SymIntLike
@@ -4093,6 +4227,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
 
         block_ids = self.block_ids
         env = CompileEnvironment.current()
+        self._maybe_apply_cute_cluster(env, state)
         dtype = env.index_type()
         block_sizes = self.block_size
         user_body: list[ast.AST] = []
@@ -4136,6 +4271,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                 # the same protocol ``LoopedReductionStrategy`` uses.
                 lane_body: list[ast.AST] = [inner_for]
                 self._cute_lane_body_by_block[block_id] = lane_body
+                self._cute_lane_vloop_by_block[block_id] = inner_for
                 outer_extent = extent // vec_width
                 # Always emit the outer lane loop even when ``outer_extent
                 # == 1`` (i.e. EPT == V): the lane-base index expression
@@ -4240,6 +4376,35 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                 idx_expr = offset_var
             block_vec_width = self._cute_lane_vec_width_by_block.get(block_idx, 1)
             vec_lane_var = self._cute_vec_lane_var_by_block.get(block_idx)
+            # Strided lane layout: thread ``t`` owns V-wide chunks strided by
+            # the thread count instead of one contiguous EPT-element span, so
+            # each warp instruction touches consecutive chunks (coalesced).
+            lane_strided = (
+                self._cute_lane_layout_by_block.get(block_idx, "blocked") == "strided"
+                and uses_thread_axis
+                and isinstance(static_extent, int)
+            )
+            # Cluster split: each of the ``cluster_n`` CTAs in the cluster
+            # owns a contiguous ``block/cluster_n`` slice of the tile (the
+            # launch adds a grid dim of ``cluster_n`` CTAs per outer index).
+            # The slice offset folds into the tile offset; the per-CTA lane
+            # layout applies within the slice unchanged
+            # (``_elements_per_thread_for_block`` already divides by the
+            # cluster width).
+            lane_cluster_n = self._cute_cluster_by_block.get(block_idx, 1)
+            if lane_cluster_n > 1:
+                assert uses_thread_axis and isinstance(static_extent, int)
+                cluster_block = self._configured_block_size_int(block_size)
+                assert isinstance(cluster_block, int)
+                slice_len = cluster_block // lane_cluster_n
+                offset_var = (
+                    f"({offset_var} + "
+                    f"{env.backend.program_id_expr(1, index_dtype=dtype)}"
+                    f" * {slice_len})"
+                )
+                idx_expr = env.backend.lane_index_expr(
+                    offset_var, elements_per_thread, axis=axis
+                )
             if lane_var := self._lane_var_by_block.get(block_idx):
                 if block_vec_width > 1 and vec_lane_var is not None:
                     # Composite per-element lane index = outer*V + inner.
@@ -4261,10 +4426,21 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                     # at the same level by memory_ops.
                     lane_body_list = self._cute_lane_body_by_block.get(block_idx)
                     if lane_body_list is not None:
-                        base_expr = (
-                            f"{idx_expr} + {env.backend.lane_offset_expr(lane_var)} "
-                            f"* {block_vec_width}"
-                        )
+                        if lane_strided:
+                            # ``base = offset + (outer*NT + tid) * V``
+                            base_expr = (
+                                f"{offset_var} + "
+                                f"({env.backend.lane_offset_expr(lane_var)} "
+                                f"* {static_extent} + "
+                                f"{env.backend.thread_index_expr(axis=axis)}) "
+                                f"* {block_vec_width}"
+                            )
+                        else:
+                            base_expr = (
+                                f"{idx_expr} + "
+                                f"{env.backend.lane_offset_expr(lane_var)} "
+                                f"* {block_vec_width}"
+                            )
                         lane_body_list.insert(
                             0,
                             statement_from_string(f"{base_index_var} = {base_expr}"),
@@ -4274,6 +4450,13 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                     # pipeline (mask + cast + reduce-or-store) keeps
                     # working unchanged.
                     idx_expr = f"{base_index_var} + cutlass.Int32({vec_lane_var})"
+                elif lane_strided:
+                    # ``idx = offset + tid + lane * NT``
+                    idx_expr = (
+                        f"{offset_var} + {env.backend.thread_index_expr(axis=axis)}"
+                        f" + {env.backend.lane_offset_expr(lane_var)}"
+                        f" * {static_extent}"
+                    )
                 else:
                     idx_expr = f"{idx_expr} + {env.backend.lane_offset_expr(lane_var)}"
             index_setup.append(statement_from_string(f"{index_var} = {idx_expr}"))

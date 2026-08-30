@@ -301,6 +301,24 @@ class ReductionStrategy(TileStrategy):
                     return True
         return False
 
+    def _lane_reduce_cluster_n(self) -> int:
+        """Thread-block-cluster width of the lane-looped strategy that
+        distributes this reduction block, or 1 when not cluster-split."""
+        codegen = getattr(self, "_codegen", None)
+        if codegen is None:
+            return 1
+        for loops in codegen.active_device_loops.values():
+            for loop_state in loops:
+                if (
+                    isinstance(loop_state, DeviceLoopState)
+                    and self.block_index in loop_state.lane_loop_blocks
+                ):
+                    strategy = loop_state.strategy
+                    cluster_by_block = getattr(strategy, "_cute_cluster_by_block", None)
+                    if isinstance(cluster_by_block, dict):
+                        return cluster_by_block.get(self.block_index, 1)
+        return 1
+
     def _lane_reduce_threads_in_group(self) -> int | None:
         """Return ``threads_in_group`` for a two-pass lane reduction over this
         block, or ``None`` when this reduction is not over a lane-distributed
@@ -2250,6 +2268,16 @@ class BlockReductionStrategy(ReductionStrategy):
                     > smem_budget_bytes
                 ):
                     return None
+                if self._lane_reduce_cluster_n() > 1 and (pre != 1 or group_count != 1):
+                    # The cluster split covers the whole CTA; an
+                    # interleaved / multi-group reduce cannot combine
+                    # across the cluster and would silently drop the
+                    # peer CTAs' contributions.
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        "cute_cluster_n > 1 requires a whole-CTA reduce "
+                        "group (pre == 1 and group_count == 1)",
+                    )
                 return self._strided_thread_reduction_expr_shared_two_stage(
                     state=state,
                     input_name=input_name,
@@ -2270,6 +2298,12 @@ class BlockReductionStrategy(ReductionStrategy):
                 > smem_budget_bytes
             ):
                 return None
+            if self._lane_reduce_cluster_n() > 1:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "cute_cluster_n > 1 is not supported with the "
+                    "shared-tree reduction layout",
+                )
             return self._strided_thread_reduction_expr_shared_tree(
                 state=state,
                 input_name=input_name,
@@ -2285,6 +2319,12 @@ class BlockReductionStrategy(ReductionStrategy):
                 group_count=group_count,
             )
 
+        if self._lane_reduce_cluster_n() > 1:
+            raise exc.BackendUnsupported(
+                "cute",
+                "cute_cluster_n > 1 requires a cross-warp reduce group; "
+                "this config reduces within single warps",
+            )
         return (
             "_cute_grouped_reduce_warp("
             f"{input_name}, {reduction_type!r}, {identity_expr}, {lane_expr}, "
@@ -2307,6 +2347,43 @@ class BlockReductionStrategy(ReductionStrategy):
         group_count: int,
     ) -> str:
         result_var = self.fn.new_var("strided_reduce_result", dce=True)
+        cluster_n = self._lane_reduce_cluster_n()
+        if cluster_n > 1 and pre == 1 and group_count == 1:
+            # The reduced axis is additionally split across the CTAs of a
+            # thread-block cluster (``cute_cluster_n``): combine within-CTA
+            # warps and across the cluster with one DSM exchange.  The SMEM
+            # receive buffer and mbarrier are allocated + initialized in the
+            # kernel preamble; ``codegen_function_def`` emits ONE
+            # ``mbarrier_init_fence`` + cluster arrive/wait covering every
+            # site (a per-site cluster barrier costs ~10% of kernel time at
+            # cluster_n=16).
+            slots = (group_span // 32) * cluster_n
+            buf_var = self.fn.new_var("_cluster_red_buf", dce=False)
+            mbar_var = self.fn.new_var("_cluster_red_mbar", dce=False)
+            self.fn.preamble.append(
+                statement_from_string(
+                    f"{buf_var} = cute.arch.alloc_smem(cutlass.Float32, {slots})"
+                )
+            )
+            self.fn.preamble.append(
+                statement_from_string(
+                    f"{mbar_var} = cute.arch.alloc_smem(cutlass.Int64, 1)"
+                )
+            )
+            self.fn.preamble.append(
+                statement_from_string(
+                    "if cutlass.Int32(cute.arch.thread_idx()[0]) == 0:"
+                    f"\n    cute.arch.mbarrier_init({mbar_var}, 1)"
+                )
+            )
+            self.fn.cute_state.simt_cluster_reduce_sites += 1
+            state.add_statement(
+                f"{result_var} = _cute_grouped_reduce_cluster("
+                f"{input_name}, {reduction_type!r}, {identity_expr}, "
+                f"{lane_var}, {buf_var}, {mbar_var}, "
+                f"group_span={group_span}, cluster_n={cluster_n})"
+            )
+            return result_var
         state.add_statement(
             f"{result_var} = _cute_grouped_reduce_shared_two_stage("
             f"{input_name}, {reduction_type!r}, {identity_expr}, "
@@ -2401,6 +2478,13 @@ class BlockReductionStrategy(ReductionStrategy):
                     constant_repr(default), _dtype_str(acc_dtype)
                 )
                 group_params = self._lane_loop_cross_warp_group_params()
+                cluster_n = self._lane_reduce_cluster_n()
+                if cluster_n > 1 and group_params is None:
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        "cute_cluster_n > 1 requires the cross-warp "
+                        "grouped reduce path",
+                    )
                 if group_params is not None:
                     # The reduce group is spread across warps (the reduced tile
                     # dim sits ABOVE a sibling tile axis on the linear thread
@@ -2418,6 +2502,7 @@ class BlockReductionStrategy(ReductionStrategy):
                         group_span=group_span,
                         group_lane_expr=group_lane_expr,
                         group_count=group_count,
+                        group_cluster_n=cluster_n,
                     )
                 else:
                     expr = _lane_reduce_marker_expr(

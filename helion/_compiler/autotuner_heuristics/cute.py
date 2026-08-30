@@ -157,21 +157,15 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
 def _cute_tile_seed_vec_width_for_dtype(dtype: torch.dtype | None) -> int:
     """V seed for ``PerThreadNDTileStrategy`` lane-loop vec on a given dtype.
 
-    Returns 4 for fp32 (LDG.128 = 16 bytes), 4 for fp16/bf16 (LDG.64,
-    8 bytes per thread per outer iter).  Note: V=8 for fp16/bf16 IS now
-    supported via a 2x V=4 split (see
-    ``_cute_register_tile_unroll_vec_hoist_split2``), but the autotuner
-    seed stays at 4 because the split emits two LDG.64s rather than a
-    single LDG.128 — empirically the per-element bookkeeping in the 8-
-    iter constexpr V-loop and the doubled fuser cache offset the
-    extra bytes-per-load.  The split path stays available as a
-    reachable point in the autotuner's V search space for shapes where
-    it does win.
+    Seeds a full 16-byte LDG.128 per thread per outer iter: V=4 for fp32,
+    V=8 for fp16/bf16 (a single ``cute.arch.load(..., V=8)``; the old 4+4
+    split workaround for the ``nvvm.load.ext`` ICE is gone as of cutlass
+    4.7).
     """
     if dtype is torch.float32:
         return 4
     if dtype in (torch.float16, torch.bfloat16):
-        return 4
+        return 8
     return 1
 
 
@@ -359,6 +353,173 @@ class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
             "block_sizes": [1, block_n],
             "num_threads": [0, 32],
             "cute_vector_widths": [1, vec],
+        }
+        try:
+            return Config(**seed)
+        except Exception:
+            return None
+
+
+class CuteResidentRowHeuristic(AutotunerHeuristic):
+    """Register-resident whole-row seed for softmax-shaped tile kernels.
+
+    Seeds ``block_sizes=[1, N]`` (the whole reduction axis as one tile) with
+    a multi-warp thread block, V=8 vec loads/stores, and the strided
+    (coalesced) lane layout.  With the single-trip tile loop the cross-sweep
+    load fuser caches the row in a register fragment (one gmem read for the
+    whole kernel), the lane-reduce collapse runs ONE grouped reduction per
+    sweep, and the vec-store flush writes 128-bit stores.  Measured ~2x over
+    the warp-reduce family on (32768, 4096..16384) bf16 rows on B200.
+    """
+
+    name = "cute_resident_row"
+    backend = "cute"
+
+    @classmethod
+    def _plan(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, int, int] | None:
+        """Return ``(row_extent, num_threads, vec, cluster_n)`` or None."""
+        spec = env.config_spec
+        if spec.matmul_facts:
+            return None
+        if len(spec.block_sizes) != 2 or spec.reduction_loops:
+            return None
+        inner = cast("Any", spec.block_sizes[1])
+        inner_block_id = inner.block_ids[0] if hasattr(inner, "block_ids") else None
+        if inner_block_id is None:
+            return None
+        if inner_block_id not in spec.cute_vector_widths.valid_block_ids():
+            return None
+        if inner_block_id not in spec.cute_lane_layouts.valid_block_ids():
+            return None
+        dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
+        vec = _cute_tile_seed_vec_width_for_dtype(dtype)
+        if vec <= 1:
+            return None
+        try:
+            n = int(env.block_sizes[inner_block_id].numel)
+        except (TypeError, ValueError):
+            return None
+        # The whole-row block must be a reachable block size (power of 2)
+        # and fit the per-thread register budget at some thread count.
+        if n & (n - 1) or n <= 0:
+            return None
+        bn_fragment = inner._fragment(spec)
+        bn_high = getattr(bn_fragment, "high", None)
+        if not isinstance(bn_high, int) or bn_high < n:
+            return None
+        # Prefer <=64 elements per thread (no spills) at 256 threads, using
+        # the smallest cluster that fits — a 256-thread CTA with a wider
+        # cluster measures well ahead of a 512-thread CTA at the same
+        # per-thread footprint (5090 vs 3374 GB/s on 32768x32768 bf16).
+        # Each cluster CTA owns a contiguous register-resident slice; one
+        # DSM cluster reduce per sweep.
+        for threads in (256, 512, 128):
+            for cluster_n in (1, 2, 4, 8, 16):
+                per_cta = n // cluster_n
+                if per_cta % (threads * vec) == 0 and per_cta // threads <= 64:
+                    return n, threads, vec, cluster_n
+        return None
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._plan(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return None
+        n, threads, vec, cluster_n = plan
+        seed: dict[str, Any] = {
+            "block_sizes": [1, n],
+            "num_threads": [0, threads],
+            "cute_vector_widths": [1, vec],
+            "cute_lane_layouts": ["blocked", "strided"],
+        }
+        if cluster_n > 1:
+            seed["cute_cluster_n"] = cluster_n
+        if cluster_n >= 4:
+            # Wide clusters need occupancy over registers (measured +9-27%
+            # at cluster 4-16 on B200).
+            seed["cute_min_blocks_per_mp"] = 3
+        try:
+            return Config(**seed)
+        except Exception:
+            return None
+
+
+class CuteResidentMultiRowHeuristic(AutotunerHeuristic):
+    """Multi-row variant of ``CuteResidentRowHeuristic`` for short rows.
+
+    A short reduction axis (N <= 2048) leaves a whole-row CTA with too few
+    threads/CTAs doing too little work each; packing several rows per CTA
+    with one warp per row keeps the reduction a pure warp shuffle (no
+    shared memory) while restoring the CTA size.
+    """
+
+    name = "cute_resident_multi_row"
+    backend = "cute"
+
+    _ROWS_PER_CTA = 4
+    _THREADS_PER_ROW = 32
+    _MAX_ROW_EXTENT = 2048
+
+    @classmethod
+    def _plan(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int] | None:
+        spec = env.config_spec
+        if spec.matmul_facts:
+            return None
+        if len(spec.block_sizes) != 2 or spec.reduction_loops:
+            return None
+        inner = cast("Any", spec.block_sizes[1])
+        inner_block_id = inner.block_ids[0] if hasattr(inner, "block_ids") else None
+        if inner_block_id is None:
+            return None
+        if inner_block_id not in spec.cute_vector_widths.valid_block_ids():
+            return None
+        if inner_block_id not in spec.cute_lane_layouts.valid_block_ids():
+            return None
+        dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
+        vec = _cute_tile_seed_vec_width_for_dtype(dtype)
+        if vec <= 1:
+            return None
+        try:
+            n = int(env.block_sizes[inner_block_id].numel)
+        except (TypeError, ValueError):
+            return None
+        if n & (n - 1) or n <= 0 or n > cls._MAX_ROW_EXTENT:
+            return None
+        if n % (cls._THREADS_PER_ROW * vec) != 0:
+            return None
+        bn_fragment = inner._fragment(spec)
+        bn_high = getattr(bn_fragment, "high", None)
+        if not isinstance(bn_high, int) or bn_high < n:
+            return None
+        return n, vec
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._plan(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return None
+        n, vec = plan
+        seed: dict[str, Any] = {
+            "block_sizes": [cls._ROWS_PER_CTA, n],
+            "num_threads": [cls._ROWS_PER_CTA, cls._THREADS_PER_ROW],
+            "cute_vector_widths": [1, vec],
+            "cute_lane_layouts": ["blocked", "strided"],
         }
         try:
             return Config(**seed)

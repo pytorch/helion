@@ -496,6 +496,15 @@ class CuteDeviceFunctionState:
     """CuTe-owned state for one DeviceFunction codegen instance."""
 
     def __init__(self) -> None:
+        # SIMT reduction-kernel thread-block cluster width (from the
+        # ``cute_cluster_n`` config knob, applied by
+        # ``PerThreadNDTileStrategy`` when a lane-looped axis is split
+        # across cluster CTAs).  1 = no cluster.
+        self.simt_cluster_n: int = 1
+        # Number of DSM cluster-reduce call sites emitted; > 0 makes the
+        # device function emit one mbarrier fence + cluster arrive/wait
+        # after the preamble (covering every site's mbarrier init).
+        self.simt_cluster_reduce_sites: int = 0
         self._tcgen05_store_values: dict[str, CuteTcgen05StoreValue] = {}
         self._tcgen05_grouped_tail_proofs: dict[
             torch.fx.Node, Tcgen05GroupedTailEpilogueMatch

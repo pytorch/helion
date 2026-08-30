@@ -709,6 +709,11 @@ class Backend(abc.ABC):
         """Cast a lane variable for addition to an index expression."""
         raise exc.BackendUnsupported(self.name, "lane offset")
 
+    def thread_index_expr(self, *, axis: int) -> str:
+        """Bare thread index expression (no elements-per-thread stride),
+        used by the strided lane layout."""
+        raise exc.BackendUnsupported(self.name, "thread index")
+
     def reduction_combine_expr(
         self,
         reduction_type: str,

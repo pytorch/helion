@@ -34,6 +34,7 @@ from .. import language as hl
 from ..autotuner.config_spec import FULL_EXTENT_CATEGORIES
 from ..autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
 from ..autotuner.config_spec import CoResidencyGroup
+from ..autotuner.config_spec import CuteLaneLayoutSpec
 from ..autotuner.config_spec import CuteVectorWidthSpec
 from ..autotuner.config_spec import MatmulWithReductionEpilogueFact
 from ..autotuner.config_spec import ReductionCategory
@@ -1022,6 +1023,9 @@ class DeviceIR:
                             size_hint=rdim.size_hint(),
                         )
                     )
+                    env.config_spec.cute_lane_layouts.append(
+                        CuteLaneLayoutSpec(block_id=rdim.block_id)
+                    )
             graphs_with_rolled_rdim |= used_graphs
 
         # Track which rdims appear as the reduction axis of an indexed
@@ -1089,6 +1093,9 @@ class DeviceIR:
                     block_id=tile_bs.block_id,
                     size_hint=size_hint_val,
                 )
+            )
+            env.config_spec.cute_lane_layouts.append(
+                CuteLaneLayoutSpec(block_id=tile_bs.block_id)
             )
 
     def _categorize_reduction(
@@ -2836,22 +2843,26 @@ def _register_cute_lane_vector_width_specs(config_spec: ConfigSpec) -> None:
     lane-looped simply keep ``V=1`` (the slot's default), which the tile
     strategy ignores.
     """
+    from ..autotuner.config_spec import CuteLaneLayoutSpec
     from ..autotuner.config_spec import CuteVectorWidthSpec
 
     num_thread_block_ids = set(config_spec.num_threads.valid_block_ids())
     existing = set(config_spec.cute_vector_widths.valid_block_ids())
+    existing_layouts = set(config_spec.cute_lane_layouts.valid_block_ids())
     for spec in config_spec.block_sizes:
         block_id = spec.block_id
-        if block_id not in num_thread_block_ids or block_id in existing:
-            continue
         # ``max_size`` bounds the largest block_size the autotuner may pick;
         # only blocks that can exceed a single thread can ever be lane-looped.
-        if spec.max_size <= 1:
+        if block_id not in num_thread_block_ids or spec.max_size <= 1:
             continue
-        config_spec.cute_vector_widths.append(
-            CuteVectorWidthSpec(block_id=block_id, size_hint=spec.size_hint)
-        )
-        existing.add(block_id)
+        if block_id not in existing:
+            config_spec.cute_vector_widths.append(
+                CuteVectorWidthSpec(block_id=block_id, size_hint=spec.size_hint)
+            )
+            existing.add(block_id)
+        if block_id not in existing_layouts:
+            config_spec.cute_lane_layouts.append(CuteLaneLayoutSpec(block_id=block_id))
+            existing_layouts.add(block_id)
 
 
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:
