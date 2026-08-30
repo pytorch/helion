@@ -2119,13 +2119,18 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 from .._compiler.cute.aux_tensor import (
                     host_function_matmul_has_non_tcgen05_operand,
                 )
-                from .._compiler.cute.cute_mma import tcgen05_fragment_epilogue_present
+                from .._compiler.cute.cute_mma import (
+                    tcgen05_fragment_epilogue_has_host_loads,
+                )
 
-                aux_kernel_detected = host_function_has_tcgen05_aux_kernel_pattern(
-                    self.host_function
+                direct_aux_kernel_detected = (
+                    host_function_has_tcgen05_aux_kernel_pattern(self.host_function)
+                )
+                fragment_aux_kernel_detected = tcgen05_fragment_epilogue_has_host_loads(
+                    self.host_function.device_ir.graphs
                 )
                 self.env.config_spec.cute_tcgen05_aux_kernel_detected = (
-                    aux_kernel_detected
+                    direct_aux_kernel_detected or fragment_aux_kernel_detected
                 )
                 self.env.config_spec.cute_tcgen05_exact_shape_aux_kernel_detected = (
                     host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
@@ -2133,10 +2138,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     )
                 )
                 self.env.config_spec.cute_tcgen05_fragment_aux_kernel_detected = (
-                    aux_kernel_detected
-                    and tcgen05_fragment_epilogue_present(
-                        self.host_function.device_ir.graphs
-                    )
+                    fragment_aux_kernel_detected
                 )
                 self.env.config_spec.cute_tcgen05_matmul_has_non_tcgen05_operand = (
                     host_function_matmul_has_non_tcgen05_operand(self.host_function)

@@ -27,8 +27,8 @@ from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
 from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER
 from .cute.tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
-from .cute.tcgen05_constants import Tcgen05GroupedRuntimeTileField
 from .cute.tcgen05_constants import Tcgen05AuxStagingScope
+from .cute.tcgen05_constants import Tcgen05GroupedRuntimeTileField
 from .device_function import DeviceFunction
 from .device_function import TensorArg
 from .host_function import HostFunction

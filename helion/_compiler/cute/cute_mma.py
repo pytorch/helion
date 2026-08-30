@@ -68,6 +68,7 @@ from .fragment_epilogue import _tcgen05_fragment_source_layout_reachable
 from .fragment_epilogue import _tcgen05_fragment_source_layout_supported
 from .fragment_epilogue import analyze_tcgen05_fragment_epilogue_candidate
 from .fragment_epilogue import analyze_tcgen05_fragment_epilogue_plan
+from .fragment_epilogue import tcgen05_fragment_epilogue_candidate_has_host_loads
 from .layout import MatmulExecutionKind
 from .layout import MatmulExecutionPlan
 from .matmul_utils import analyze_direct_grouped_n_loads
@@ -150,12 +151,11 @@ from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
-from .tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
-from .tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from .tcgen05_constants import Tcgen05AuxStagingScope
+from .tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
-from .tcgen05_constants import tcgen05_c_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_default_epilogue_tile_size
+from .tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from .tcgen05_constants import tcgen05_staged_smem_bytes_per_cta
 from .tcgen05_lifecycle import Tcgen05LifecycleContext
 from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
@@ -2718,6 +2718,7 @@ class _MmaOutputStoreAnalysis:
     explicit_epi_tile_compatible: bool
     output_column_major: bool
     requires_fragment_epilogue: bool = False
+    fragment_epilogue_has_host_loads: bool = False
 
 
 def _mma_tiles_are_static_full(
@@ -3447,6 +3448,19 @@ def tcgen05_fragment_epilogue_present(graphs: list[GraphInfo]) -> bool:
             _MmaOutputStoreAnalysis,
         )
         and output_analysis.requires_fragment_epilogue
+        for graph_info in graphs
+        for node in graph_info.graph.nodes
+    )
+
+
+def tcgen05_fragment_epilogue_has_host_loads(graphs: list[GraphInfo]) -> bool:
+    """Whether a thread-local epilogue reads tensors outside the MMA carrier."""
+    return any(
+        isinstance(
+            output_analysis := node.meta.get(_MMA_OUTPUT_STORE_ANALYSIS_META_KEY),
+            _MmaOutputStoreAnalysis,
+        )
+        and output_analysis.fragment_epilogue_has_host_loads
         for graph_info in graphs
         for node in graph_info.graph.nodes
     )
@@ -5807,15 +5821,26 @@ def _analyze_mma_output_stores(
 
     analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
     if analyzed_stores is None:
-        if analyze_tcgen05_fragment_epilogue_candidate(
-            graphs,
-            mma_node,
-            expected_output_block_ids=analysis.output_block_ids,
+        fragment_epilogue_has_host_loads = (
+            tcgen05_fragment_epilogue_candidate_has_host_loads(
+                graphs,
+                mma_node,
+                expected_output_block_ids=analysis.output_block_ids,
+            )
+        )
+        if (
+            fragment_epilogue_has_host_loads
+            or analyze_tcgen05_fragment_epilogue_candidate(
+                graphs,
+                mma_node,
+                expected_output_block_ids=analysis.output_block_ids,
+            )
         ):
             return _MmaOutputStoreAnalysis(
                 explicit_epi_tile_compatible=False,
                 output_column_major=False,
                 requires_fragment_epilogue=True,
+                fragment_epilogue_has_host_loads=fragment_epilogue_has_host_loads,
             )
         return None
     env = CompileEnvironment.current()

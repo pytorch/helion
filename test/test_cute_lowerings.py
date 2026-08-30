@@ -16438,6 +16438,7 @@ class TestCuteLowerings(unittest.TestCase):
                     torch.empty([128, 128], device=DEVICE, dtype=dtype),
                     torch.empty([1, 128], device=DEVICE, dtype=dtype),
                 ),
+                True,
             ),
             (
                 cute_projection_interleaved_swiglu_bf16,
@@ -16445,12 +16446,17 @@ class TestCuteLowerings(unittest.TestCase):
                     torch.empty([128, 128], device=DEVICE, dtype=dtype),
                     torch.empty([1, 128, 128], device=DEVICE, dtype=dtype),
                 ),
+                False,
             ),
         )
-        for kernel, args in kernels_and_args:
+        for kernel, args, has_fragment_aux in kernels_and_args:
             with self.subTest(kernel=kernel.__name__), patch_cute_mma_support():
                 bound = kernel.bind(args)
                 spec = bound.config_spec
+                self.assertEqual(
+                    spec.cute_tcgen05_fragment_aux_kernel_detected,
+                    has_fragment_aux,
+                )
                 self.assertIn(
                     CuteTcgen05ThreadLocalEpilogueHeuristic.name,
                     spec.autotuner_heuristics,

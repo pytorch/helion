@@ -180,15 +180,7 @@ class Tcgen05FragmentEpiloguePlan:
     @property
     def has_host_loads(self) -> bool:
         """Whether the fragment reads tensors other than the MMA carrier."""
-        for node in self.owned_nodes:
-            source = node.args[0] if node.args else None
-            if (
-                node.target is memory_ops.load
-                and isinstance(source, Node)
-                and _is_host_tensor(source)
-            ):
-                return True
-        return False
+        return _nodes_have_host_loads(self.owned_nodes)
 
     @property
     def streaming_program(self) -> _SourceSubtileProgram | None:
@@ -481,6 +473,16 @@ def _is_split_getitem(node: Node) -> bool:
 
 def _is_host_tensor(node: Node) -> bool:
     return node.op == "call_function" and node.target is _tracing_ops._host_tensor
+
+
+def _nodes_have_host_loads(nodes: frozenset[Node]) -> bool:
+    return any(
+        node.target is memory_ops.load
+        and bool(node.args)
+        and isinstance(node.args[0], Node)
+        and _is_host_tensor(node.args[0])
+        for node in nodes
+    )
 
 
 def _shape_only_subscript(node: Node) -> bool:
@@ -896,6 +898,20 @@ def analyze_tcgen05_fragment_epilogue_candidate(
     except _UnsupportedFragment:
         return False
     return True
+
+
+def tcgen05_fragment_epilogue_candidate_has_host_loads(
+    graphs: Sequence[GraphInfo],
+    anchor: Node,
+    *,
+    expected_output_block_ids: tuple[int, ...],
+) -> bool:
+    """Whether a structurally valid fragment candidate reads host tensors."""
+    try:
+        region = _extract_region(graphs, anchor, expected_output_block_ids)
+    except _UnsupportedFragment:
+        return False
+    return _nodes_have_host_loads(region.owned)
 
 
 def _interpret_index(
