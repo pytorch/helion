@@ -406,6 +406,147 @@ def test_bench_steady_scores_every_timer_on_median(monkeypatch) -> None:
     assert backend_stats["runs_ms"] == [1.0, 1.0]
 
 
+def test_wait_for_gpu_cooldown_reasons(monkeypatch) -> None:
+    clock = {"now": 0.0}
+    monkeypatch.setattr(
+        compare_attention_backends.time,
+        "sleep",
+        lambda s: clock.__setitem__("now", clock["now"] + s),
+    )
+    monkeypatch.setattr(
+        compare_attention_backends.time, "perf_counter", lambda: clock["now"]
+    )
+
+    def temps(sequence):
+        it = iter(sequence)
+        return lambda: next(it)
+
+    monkeypatch.setattr(compare_attention_backends, "_gpu_temperature_c", temps([45.0]))
+    result = compare_attention_backends._wait_for_gpu_cooldown(55.0)
+    assert result["reason"] == "already_cool"
+    assert result["waited_s"] == 0.0
+    assert result["start_temp_c"] == 45.0
+
+    monkeypatch.setattr(
+        compare_attention_backends, "_gpu_temperature_c", temps([70.0, 60.0, 54.0])
+    )
+    result = compare_attention_backends._wait_for_gpu_cooldown(55.0)
+    assert result["reason"] == "reached"
+    assert result["end_temp_c"] == 54.0
+
+    # Temperature stuck just above the threshold plateaus out instead of
+    # spinning until the timeout (ambient may make the threshold unreachable).
+    monkeypatch.setattr(
+        compare_attention_backends,
+        "_gpu_temperature_c",
+        temps([70.0] + [69.9] * 100),
+    )
+    result = compare_attention_backends._wait_for_gpu_cooldown(55.0)
+    assert result["reason"] == "plateau"
+    assert result["end_temp_c"] == 69.9
+
+    monkeypatch.setattr(
+        compare_attention_backends,
+        "_gpu_temperature_c",
+        temps([90.0, 85.0, 80.0, 75.0]),
+    )
+    result = compare_attention_backends._wait_for_gpu_cooldown(55.0, timeout_s=10.0)
+    assert result["reason"] == "timeout"
+
+    # Hard cap: a temperature that rises forever (never reaches the target,
+    # never plateaus) must still terminate at the default timeout.
+    state = {"temp": 60.0}
+
+    def rising():
+        state["temp"] += 1.0
+        return state["temp"]
+
+    monkeypatch.setattr(compare_attention_backends, "_gpu_temperature_c", rising)
+    result = compare_attention_backends._wait_for_gpu_cooldown(55.0)
+    assert result["reason"] == "timeout"
+    assert result["waited_s"] <= compare_attention_backends._COOLDOWN_MAX_WAIT_S + 5.0
+
+    monkeypatch.setattr(compare_attention_backends, "_gpu_temperature_c", temps([None]))
+    assert compare_attention_backends._wait_for_gpu_cooldown(55.0) is None
+
+
+def test_bench_steady_reports_cooldown_provenance(monkeypatch) -> None:
+    marker = {"reason": "reached", "waited_s": 42.0}
+    calls = []
+
+    def fake_cooldown(max_temp_c):
+        calls.append(max_temp_c)
+        return dict(marker)
+
+    def fake_bench(fn, *, warmup, rep, return_mode):
+        return 1.0
+
+    triton_testing = pytest.importorskip(
+        "triton.testing", reason="default do_bench path requires triton"
+    )
+    monkeypatch.setattr(compare_attention_backends, "_gpu_warmup", lambda ms: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(triton_testing, "do_bench", fake_bench)
+    monkeypatch.setattr(
+        compare_attention_backends, "_wait_for_gpu_cooldown", fake_cooldown
+    )
+
+    stats = compare_attention_backends._bench_steady(
+        lambda: None,
+        num_runs=1,
+        warmup_ms=1,
+        rep_ms=1,
+        cache_warmup_calls=1,
+        thermal_warmup_ms=0,
+        cooldown_max_temp_c=55.0,
+    )
+    assert calls == [55.0]
+    assert stats["thermal_cooldown"] == marker
+
+    stats = compare_attention_backends._bench_steady(
+        lambda: None,
+        num_runs=1,
+        warmup_ms=1,
+        rep_ms=1,
+        cache_warmup_calls=1,
+        thermal_warmup_ms=0,
+    )
+    assert calls == [55.0]
+    assert "thermal_cooldown" not in stats
+
+
+def test_cooldown_target_is_startup_reference_plus_margin(monkeypatch) -> None:
+    args = SimpleNamespace(measure_cooldown_margin_c=3.0)
+
+    # No startup reference captured (or unreadable) -> cooldown disabled.
+    monkeypatch.setattr(compare_attention_backends, "_STARTUP_GPU_TEMP_C", None)
+    assert compare_attention_backends._cooldown_target_temp_c(args) is None
+
+    monkeypatch.setattr(compare_attention_backends, "_STARTUP_GPU_TEMP_C", 41.0)
+    assert compare_attention_backends._cooldown_target_temp_c(args) == pytest.approx(
+        44.0
+    )
+    # Negative margin disables; a missing attribute (bare namespace) disables.
+    assert (
+        compare_attention_backends._cooldown_target_temp_c(
+            SimpleNamespace(measure_cooldown_margin_c=-1.0)
+        )
+        is None
+    )
+    assert compare_attention_backends._cooldown_target_temp_c(SimpleNamespace()) is None
+
+
+def test_capture_startup_gpu_temperature(monkeypatch) -> None:
+    monkeypatch.setattr(compare_attention_backends, "_STARTUP_GPU_TEMP_C", None)
+    monkeypatch.setattr(compare_attention_backends, "_gpu_temperature_c", lambda: 39.0)
+    compare_attention_backends._capture_startup_gpu_temperature()
+    assert compare_attention_backends._STARTUP_GPU_TEMP_C == 39.0
+
+    monkeypatch.setattr(compare_attention_backends, "_gpu_temperature_c", lambda: None)
+    compare_attention_backends._capture_startup_gpu_temperature()
+    assert compare_attention_backends._STARTUP_GPU_TEMP_C is None
+
+
 def test_attention_epilogue_shape_metadata_preserves_identity_schema():
     args = _attention_subprocess_args(biased=0)
 
@@ -611,6 +752,8 @@ def test_attention_subprocess_forwards_helion_cute_timer(monkeypatch):
 
     flag_index = cmd.index("--helion-cute-benchmark-timer")
     assert cmd[flag_index + 1] == "event"
+    cooldown_index = cmd.index("--measure-cooldown-margin-c")
+    assert cmd[cooldown_index + 1] == "3.0"
     power_index = cmd.index("--power-cap-w")
     assert cmd[power_index + 1] == "750"
     seed_index = cmd.index("--helion-seed-config")
@@ -621,17 +764,21 @@ def test_attention_subprocess_forwards_helion_cute_timer(monkeypatch):
     assert cmd[truth_index + 1] == "0"
 
 
-def test_attention_strict_cute_benchmark_requires_wall_timer():
-    args = _attention_subprocess_args(
-        helion_cute_benchmark_timer="event",
-        helion_require_full_autotune=1,
+def test_attention_helion_cute_timer_defaults_to_event(monkeypatch):
+    # Event timing is the default so helion-cute samples use the exact same
+    # CUDA-event do_bench path as the SDPA/FlexAttention/FA4 baselines; the
+    # wall timer stays available for cross-checks only.
+    monkeypatch.setattr(
+        compare_attention_backends.sys,
+        "argv",
+        ["compare_attention_backends.py", "--impl", "helion-cute"],
     )
-
-    with pytest.raises(SystemExit, match="requires.*timer=wall"):
-        compare_attention_backends._validate_strict_helion_benchmark_timer(args, "cute")
-
-    args.helion_cute_benchmark_timer = "wall"
-    compare_attention_backends._validate_strict_helion_benchmark_timer(args, "cute")
+    parser_args = compare_attention_backends.parse_args()
+    assert parser_args.helion_cute_benchmark_timer == "event"
+    assert (
+        compare_attention_backends._helion_benchmark_timer(parser_args, "cute")
+        == "event"
+    )
 
 
 def test_attention_subprocess_limits_strict_autotune_to_helion_cute(monkeypatch):
@@ -8491,33 +8638,18 @@ def test_attention_selected_source_code_preserves_repro_setting(print_output_cod
 
 
 def test_attention_helion_cute_timer_selects_bench_fn():
-    calls = []
-
-    def wall_timer(*args, **kwargs):
-        return 1.0
-
-    backend = SimpleNamespace(
-        get_do_bench=lambda: calls.append("get_do_bench") or wall_timer
-    )
-    bound = SimpleNamespace(env=SimpleNamespace(backend=backend))
+    from helion.autotuner.benchmarking import do_bench_generic
 
     wall_args = SimpleNamespace(helion_cute_benchmark_timer="wall")
     assert (
-        compare_attention_backends._helion_do_bench_fn(bound, wall_args, "cute")
-        is wall_timer
+        compare_attention_backends._helion_do_bench_fn(wall_args, "cute")
+        is do_bench_generic
     )
-    assert calls == ["get_do_bench"]
 
     event_args = SimpleNamespace(helion_cute_benchmark_timer="event")
-    assert (
-        compare_attention_backends._helion_do_bench_fn(bound, event_args, "cute")
-        is None
-    )
-    assert (
-        compare_attention_backends._helion_do_bench_fn(bound, wall_args, "triton")
-        is None
-    )
-    assert calls == ["get_do_bench"]
+    assert compare_attention_backends._helion_do_bench_fn(event_args, "cute") is None
+    # Non-cute backends always use the default CUDA-event do_bench.
+    assert compare_attention_backends._helion_do_bench_fn(wall_args, "triton") is None
 
 
 @pytest.mark.parametrize(
@@ -9768,6 +9900,7 @@ def test_attention_power_cap_is_verified(monkeypatch):
         "check": True,
         "capture_output": True,
         "text": True,
+        "timeout": 30,
     }
 
 

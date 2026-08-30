@@ -954,6 +954,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self.budget_exceeded_fn = _never_exceeded
 
     def _subprocess_benchmark_uses_wall_clock(self) -> bool:
+        # Always False for the stock cute backend since it inherits the
+        # default (event-timed) get_do_bench; this hook remains for a backend
+        # that opts into wall-clock timing while still supporting the simple
+        # subprocess benchmark job shape.
         backend = getattr(self.config_spec, "backend", None)
         if backend is None:
             return False
@@ -961,10 +965,11 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         return backend.name == "cute" and custom_bench is do_bench_generic
 
     def _probe_long_cute_flash_kernel(self) -> bool:
-        return bool(
-            self.config_spec.cute_flash_search_enabled
-            and self._subprocess_benchmark_uses_wall_clock()
-        )
+        # Flash attention candidates can run for multiple seconds per launch;
+        # probing from a single call (instead of the 5-call estimate loop)
+        # keeps those benchmarks to ~3 launches on both the event-timed and
+        # wall-clock paths.
+        return bool(self.config_spec.cute_flash_search_enabled)
 
     def _effective_source_dedup_enabled(self) -> bool:
         """Whether this provider may collapse source-identical candidates.
@@ -1597,11 +1602,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 benchmark_runner = (
                     _backend.get_do_bench() if _backend is not None else None
                 ) or do_bench
-                if (
-                    benchmark_runner is do_bench_generic
-                    and self._probe_long_cute_flash_kernel()
-                ):
-                    res = do_bench_generic(
+                # Only the cute backend enables flash search, and it uses the
+                # default do_bench, which accepts probe_long_kernel.
+                if self._probe_long_cute_flash_kernel():
+                    res = benchmark_runner(
                         functools.partial(benchmark_function, *working_args),
                         return_mode="median",
                         warmup=1,  # we are already warmed up above
