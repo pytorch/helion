@@ -8,6 +8,7 @@ from unittest import mock
 
 import sympy
 
+from helion import exc
 from helion._compiler.tile_dependency import AllocationRegion
 from helion._compiler.tile_dependency import CoordinateDomain
 from helion._compiler.tile_dependency import CoordinateRelation
@@ -172,6 +173,16 @@ def _dependency_kinds(edge: TileDependency) -> frozenset[TileDependencyKind]:
 
 
 class TestTileDependency(TestCase):
+    def test_unresolved_allocation_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            exc.CrossLoopSchedulingError,
+            "allocation identity is unavailable",
+        ):
+            build_tile_dependency_graph(
+                (_access(0, root=0, allocation_id=-1, kind="store"),),
+                [[0], [1]],
+            )
+
     def test_coordinate_domain_separates_geometry_from_linearization_order(
         self,
     ) -> None:

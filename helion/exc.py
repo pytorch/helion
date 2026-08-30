@@ -103,6 +103,10 @@ class LoopDependencyError(BaseError):
     )
 
 
+class CrossLoopSchedulingError(BaseError):
+    message = "Cross-loop scheduling cannot safely lower dependency {0}."
+
+
 class TopLevelStatementBetweenLoops(BaseError):
     message = "Statements cannot appear between top level loops."
 
