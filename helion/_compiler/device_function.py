@@ -1043,11 +1043,20 @@ class DeviceFunction:
                 )
             except Exception:
                 thread_block_dims = (1, 1, 1)
-            tensor_dtypes = {
-                arg.name: backend.dtype_str(arg.fake_value.dtype)
-                for arg in self.arguments
-                if isinstance(arg, TensorArg)
-            }
+            # Best-effort map for the fuser's cache-dtype resolution;
+            # ``dtype_str`` raises for dtypes the cute backend has no
+            # canonical spelling for (e.g. uint32 barrier flags, which
+            # SIMT loads treat as raw bytes) — such tensors simply don't
+            # participate in load fusion.
+            tensor_dtypes = {}
+            for arg in self.arguments:
+                if isinstance(arg, TensorArg):
+                    try:
+                        tensor_dtypes[arg.name] = backend.dtype_str(
+                            arg.fake_value.dtype
+                        )
+                    except ValueError:
+                        continue
             kernel_body = fuse_two_pass_loads(
                 kernel_body,
                 constexpr_values,
@@ -1120,6 +1129,28 @@ class DeviceFunction:
             kernel_body = pipeline_inner_loads(
                 kernel_body, constexpr_values, rename_groups=rename_groups
             )
+            # Fuse an online-softmax (max, sum) pair of cluster reduces into
+            # ONE packed DSM exchange: the max reduce relocalizes to a
+            # CTA-local block reduce, the sum site exchanges the
+            # ``(local_max, local_sum)`` pair once and folds with the
+            # online-softmax rescale, and the write sweep reuses the sum
+            # sweep's cached exp values.  Saves a full cluster round-trip
+            # per row (+5..9% at cluster_n 2..16 on B200 softmax).
+            from .cute.cluster_online_pair import fuse_cluster_online_pair
+
+            kernel_body = fuse_cluster_online_pair(
+                kernel_body,
+                constexpr_values,
+                rename_groups=rename_groups,
+                fast_math=CompileEnvironment.current().settings.fast_math,
+            )
+            # ``ex2.approx.ftz`` is a numerics change (denormal exp outputs
+            # flush to zero), so it is gated on the fast_math SETTING —
+            # tuned configs must never change numerics.
+            if CompileEnvironment.current().settings.fast_math:
+                from .cute.exp2_fastmath import apply_exp2_fastmath
+
+                kernel_body = apply_exp2_fastmath(kernel_body)
             # The DSM cluster reduce uses a single-phase mbarrier, so each
             # call site must execute exactly ONCE per kernel.  The
             # lane-reduce collapse normally hoists it out of the (staged,
