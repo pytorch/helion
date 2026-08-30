@@ -1057,6 +1057,10 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfPallasInterpret("numerical mismatch in JAX interpret mode")
+    @skipIfCute(
+        "rank-broadcasted matmul followed by a broadcast-axis reduction "
+        "requires owner-aware CuTe lane lowering"
+    )
     def test_sparse_attn_indexer_decode(self):
         mod = import_path(EXAMPLES_DIR / "sparse_attn_indexer.py")
         args = mod.indexer_inputs(num_tokens=1, kv_len=512)

@@ -11307,6 +11307,29 @@ def _cute_fp8_gemm_skinny_m(
     return out
 
 
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_rank_broadcast_reduction_axis_collision(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+) -> torch.Tensor:
+    m, h, d = q.size()
+    n = k.size(0)
+    h = hl.specialize(h)
+    d = hl.specialize(d)
+    out = torch.empty((m, n), dtype=torch.float32, device=q.device)
+    for tile_m, tile_n in hl.tile((m, n)):
+        score = torch.matmul(q[tile_m, :, :], k[tile_n, :].transpose(0, 1))
+        acc = (torch.relu(score.float()) * weights[tile_m, :][:, :, None]).sum(dim=1)
+        in_window = (tile_n.index[None, :] >= ks[tile_m][:, None]) & (
+            tile_n.index[None, :] < ke[tile_m][:, None]
+        )
+        out[tile_m, tile_n] = torch.where(in_window, acc, float("-inf"))
+    return out
+
+
 @onlyBackends(["cute"])
 class TestCuteThreadBudgetRejection(TestCase):
     """The CuTe launcher raises ``BackendUnsupported`` when a config
@@ -11334,6 +11357,35 @@ class TestCuteThreadBudgetRejection(TestCase):
                 num_threads=[0, 256],
                 cute_vector_widths=[1, 4],
             )
+
+    def test_rank_broadcast_reduction_axis_collision_rejected(self) -> None:
+        """Reject a tile/reduction axis collision before emitting a kernel."""
+        q = torch.empty(
+            (1, 32, 128),
+            dtype=torch.bfloat16,
+            device="meta",  # @ignore-device-lint
+        )
+        k = torch.empty(
+            (512, 128),
+            dtype=torch.bfloat16,
+            device="meta",  # @ignore-device-lint
+        )
+        weights = torch.empty(
+            (1, 32),
+            dtype=torch.float32,
+            device="meta",  # @ignore-device-lint
+        )
+        ks = torch.empty((1,), dtype=torch.int32, device="meta")  # @ignore-device-lint
+        ke = torch.empty((1,), dtype=torch.int32, device="meta")  # @ignore-device-lint
+        bound = _cute_rank_broadcast_reduction_axis_collision.bind(
+            (q, k, weights, ks, ke)
+        )
+        with self.assertRaisesRegex(
+            BackendUnsupported,
+            r"thread-axis collision: tile blocks \[0, 1\] and executable "
+            r"reduction block 3 both require axis 1",
+        ):
+            bound.to_triton_code(helion.Config(block_sizes=[1, 128]))
 
     def test_in_budget_multi_row_passes(self) -> None:
         """A multi-row config that DOES fit in 1024 threads must still
