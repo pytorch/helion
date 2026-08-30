@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 from typing import Any
-from typing import Literal
 from typing import cast
 
 import torch
@@ -10,6 +9,10 @@ import torch
 from ...runtime.config import Config
 from ..cute.cutedsl_compat import tcgen05_runtime_n_ptx_compatible
 from ..cute.cutedsl_compat import warn_tcgen05_runtime_n_ptx_fallback
+from ..cute.grouped_worklist_policy import GroupedBMajor
+from ..cute.grouped_worklist_policy import GroupedWorklistHardwareIdentity
+from ..cute.grouped_worklist_policy import get_grouped_worklist_target_policy
+from ..cute.grouped_worklist_policy import grouped_worklist_target_identities
 from ..cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from ..cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
 from ..cute.strategies import TCGEN05_STRATEGY_CONFIG_KEY
@@ -54,6 +57,7 @@ if TYPE_CHECKING:
     from ...autotuner.config_spec import ReductionLoopSpec
     from ..compile_environment import CompileEnvironment
     from ..cute.cute_mma import Tcgen05GroupedWorklistAnalysis
+    from ..cute.grouped_worklist_policy import GroupedWorklistTargetPolicy
     from ..device_ir import DeviceIR
     from .registry import CompilerHeuristicSpecializationFact
 
@@ -711,8 +715,9 @@ def _tcgen05_grouped_seed_config(bk: int) -> Config:
     return config
 
 
-GroupedBMajor = Literal["k", "n"]
-
+# These B200 values shape generic reservation seeds only. Their SM reservations
+# scale proportionally on other devices; exact measured policy overrides remain
+# restricted to the product and SM count recorded in their workload envelope.
 _TCGEN05_GROUPED_B200_REFERENCE_NUM_SMS = 148
 _TCGEN05_GROUPED_B200_LOW_RESERVED_SMS = 32
 _TCGEN05_GROUPED_B200_HIGH_RESERVED_SMS = 52
@@ -720,38 +725,16 @@ _TCGEN05_GROUPED_B200_PANEL_RESERVED_SMS = 20
 # Grouped tcgen05 lowering is supported on both Blackwell compute capabilities;
 # target-specific seed ranking remains separate from this architecture gate.
 _TCGEN05_GROUPED_SUPPORTED_CAPABILITIES = frozenset({"sm100", "sm103"})
-# These measurements rank the initial seed population only. Other SM counts are
-# scaled proportionally, and live autotuning remains authoritative.
-
-# Exhaustive schema for the side-effect-free grouped-worklist config builder.
-_TCGEN05_GROUPED_WORKLIST_CONFIG_KEYS = frozenset(
-    {
-        "block_sizes",
-        "l2_groupings",
-        "loop_orders",
-        "num_stages",
-        "num_warps",
-        "pid_type",
-        "tcgen05_cluster_m",
-        "tcgen05_cluster_n",
-        "tcgen05_ab_stages",
-        "tcgen05_acc_stages",
-        "tcgen05_c_stages",
-        "tcgen05_num_epi_warps",
-        TCGEN05_CONSUMER_REGS_CONFIG_KEY,
-        TCGEN05_GROUPED_MODE_CONFIG_KEY,
-        TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
-        TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY,
-        TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY,
-        TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
-        TCGEN05_STRATEGY_CONFIG_KEY,
-        TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY,
-        TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY,
-    }
-)
+# The bound-kernel key already carries device kind and capability. Registering
+# every policy identity as a named promotion target adds the exact product name,
+# so two products on the same architecture cannot reuse different ranked seeds.
+_TCGEN05_GROUPED_TARGET_IDENTITIES = grouped_worklist_target_identities()
+assert {
+    capability for _kind, _name, capability in _TCGEN05_GROUPED_TARGET_IDENTITIES
+} <= _TCGEN05_GROUPED_SUPPORTED_CAPABILITIES
 
 
-def tcgen05_grouped_worklist_config_values(
+def _tcgen05_grouped_worklist_config(
     source_m_tile: int,
     block_k: int,
     ab_stages: int,
@@ -761,12 +744,7 @@ def tcgen05_grouped_worklist_config_values(
     l2_swizzle_size: int | None = None,
     reserved_sms: int | None = None,
     clc: bool = False,
-) -> dict[str, object]:
-    """Return the exact values used by the grouped-worklist seed builder.
-
-    This side-effect-free seam exposes compiler seed values without depending on
-    the compiler's private builder.
-    """
+) -> Config:
     if clc and not runtime_direct:
         raise ValueError("grouped worklist CLC requires runtime_direct=True")
     cluster_m = (
@@ -807,42 +785,43 @@ def tcgen05_grouped_worklist_config_values(
                 ),
             }
         )
-    if missing_schema_keys := values.keys() - _TCGEN05_GROUPED_WORKLIST_CONFIG_KEYS:
-        raise RuntimeError(
-            "grouped-worklist config builder emitted keys missing from its schema: "
-            f"{sorted(missing_schema_keys)!r}"
-        )
-    return values
+    return Config.from_dict(values)
 
 
-def _tcgen05_grouped_worklist_config(
-    source_m_tile: int,
-    block_k: int,
-    ab_stages: int,
-    consumer_regs: int,
+def _tcgen05_grouped_worklist_target_seed(
     *,
-    runtime_direct: bool = True,
-    l2_swizzle_size: int | None = None,
-    reserved_sms: int | None = None,
-    clc: bool = False,
-) -> Config:
-    return Config.from_dict(
-        tcgen05_grouped_worklist_config_values(
-            source_m_tile,
-            block_k,
-            ab_stages,
-            consumer_regs,
-            runtime_direct=runtime_direct,
-            l2_swizzle_size=l2_swizzle_size,
-            reserved_sms=reserved_sms,
-            clc=clc,
-        )
+    groups: int,
+    n: int,
+    k: int,
+    b_major: GroupedBMajor,
+    source_m_tile: int,
+    source_tiles: int,
+    num_sm: int,
+    target_policy: GroupedWorklistTargetPolicy,
+    worklist_rows: tuple[tuple[int, int, int, int], ...] | None,
+) -> Config | None:
+    tuning = target_policy.tuning_for(
+        groups=groups,
+        n=n,
+        k=k,
+        b_major=b_major,
+        source_m_tile=source_m_tile,
+        source_tiles=source_tiles,
+        num_sm=num_sm,
+        worklist_rows=worklist_rows,
     )
-
-
-def tcgen05_grouped_worklist_config_keys() -> frozenset[str]:
-    """Return the exhaustive grouped-worklist compiler-seed schema."""
-    return _TCGEN05_GROUPED_WORKLIST_CONFIG_KEYS
+    if tuning is None:
+        return None
+    return _tcgen05_grouped_worklist_config(
+        source_m_tile,
+        tuning.block_k,
+        tuning.ab_stages,
+        tuning.consumer_regs,
+        runtime_direct=tuning.runtime_direct,
+        l2_swizzle_size=tuning.l2_swizzle_size,
+        reserved_sms=tuning.reserved_sms,
+        clc=tuning.clc,
+    )
 
 
 def _tcgen05_grouped_scaled_reserved_sms(
@@ -886,7 +865,7 @@ def _tcgen05_grouped_small_m_reserved_sms(
     return (high, low) if high_first else (low, high)
 
 
-def tcgen05_grouped_worklist_seed_configs(
+def _tcgen05_grouped_worklist_seed_family(
     *,
     groups: int,
     packed_m: int,
@@ -895,8 +874,10 @@ def tcgen05_grouped_worklist_seed_configs(
     b_major: GroupedBMajor,
     source_m_tile: int,
     num_sm: int,
-) -> list[Config]:
-    """Build ranked, tile-compatible grouped-worklist compiler seeds."""
+    target_policy: GroupedWorklistTargetPolicy,
+    worklist_rows: tuple[tuple[int, int, int, int], ...] | None = None,
+) -> tuple[list[Config], Config | None]:
+    """Build one ranked family and return its exact target seed, if any."""
     if any(
         type(value) is not int or value <= 0
         for value in (groups, packed_m, n, k, num_sm)
@@ -909,11 +890,26 @@ def tcgen05_grouped_worklist_seed_configs(
     if packed_m % source_m_tile != 0:
         raise ValueError("packed M extent must be divisible by source_m_tile")
 
+    source_tiles = packed_m // source_m_tile
+    logical_n_per_cluster = (
+        128 if source_m_tile == TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE else 256
+    )
+    work_clusters = source_tiles * (
+        (n + logical_n_per_cluster - 1) // logical_n_per_cluster
+    )
+    target_seed = _tcgen05_grouped_worklist_target_seed(
+        groups=groups,
+        n=n,
+        k=k,
+        b_major=b_major,
+        source_m_tile=source_m_tile,
+        source_tiles=source_tiles,
+        num_sm=num_sm,
+        target_policy=target_policy,
+        worklist_rows=worklist_rows,
+    )
+
     if source_m_tile == TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE:
-        logical_n_per_cluster = 128
-        work_clusters = (packed_m // source_m_tile) * (
-            (n + logical_n_per_cluster - 1) // logical_n_per_cluster
-        )
         preferred_reservation, alternate_reservation = (
             _tcgen05_grouped_small_m_reserved_sms(
                 groups=groups,
@@ -973,24 +969,29 @@ def tcgen05_grouped_worklist_seed_configs(
         }
         if groups >= 16:
             if n > k:
-                primary = bk64["panel8"]
+                generic_primary = bk64["panel8"]
             elif n < k:
-                primary = bk64["panel4"]
+                generic_primary = bk64["panel4"]
             else:
-                primary = bk64["direct"]
+                generic_primary = bk64["direct"]
         elif n >= 9 * k // 4:
-            primary = bk128["alternate_reserved"]
+            generic_primary = bk128["alternate_reserved"]
         elif n >= 2 * k:
-            primary = bk64["high_reserved"]
+            generic_primary = bk64["high_reserved"]
         elif k > n:
-            primary = bk64["direct"]
+            generic_primary = bk64["direct"]
         else:
-            primary = bk128["preferred_reserved"]
-        return dedupe_configs([primary, *bk128.values(), *bk64.values()])
+            generic_primary = bk128["preferred_reserved"]
+        primary = generic_primary if target_seed is None else target_seed
+        return (
+            dedupe_configs([primary, generic_primary, *bk128.values(), *bk64.values()]),
+            target_seed,
+        )
 
     if source_m_tile == TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT:
-        # Source-224 keeps the reviewed panel-8 direct config as its deterministic
-        # primary; the remaining mailbox/BK128 variants are fallback seeds.
+        # Source-224 normally keeps the reviewed panel-8 direct config as its
+        # deterministic primary; target policy may replace it only for an
+        # exact measured workload.
         panel8_direct = _tcgen05_grouped_worklist_config(
             source_m_tile,
             64,
@@ -1005,14 +1006,19 @@ def tcgen05_grouped_worklist_seed_configs(
             for ab_stages in range(7, 3, -1)
         }
         bk128_direct = _tcgen05_grouped_worklist_config(source_m_tile, 128, 3, 240)
-        return dedupe_configs(
-            [panel8_direct, *mailbox_by_ab_stages.values(), bk128_direct]
+        primary = panel8_direct if target_seed is None else target_seed
+        return (
+            dedupe_configs(
+                [
+                    primary,
+                    panel8_direct,
+                    *mailbox_by_ab_stages.values(),
+                    bk128_direct,
+                ]
+            ),
+            target_seed,
         )
 
-    logical_n_per_cluster = 256
-    work_clusters = (packed_m // source_m_tile) * (
-        (n + logical_n_per_cluster - 1) // logical_n_per_cluster
-    )
     bk128 = {
         "mailbox": _tcgen05_grouped_worklist_config(
             source_m_tile, 128, 3, 240, runtime_direct=False
@@ -1063,70 +1069,83 @@ def tcgen05_grouped_worklist_seed_configs(
     # Ranking-only splits fitted from the reviewed B200 source-256 cases:
     # 16 groups marks high fan-out, N/K=2 and 9/4 are aspect buckets, and
     # 8/24 tiles per group separate short, medium, and long expert waves.
-    tiles_per_group = packed_m // source_m_tile // groups
+    tiles_per_group = source_tiles // groups
     clc_ready = bool(clc_configs) and work_clusters >= num_sm
     if groups >= 16:
         if k > n or n >= 9 * k // 4:
-            primary = bk128["mailbox"]
+            generic_primary = bk128["mailbox"]
         elif n >= 2 * k:
-            primary = bk64["direct_regs240"]
+            generic_primary = bk64["direct_regs240"]
         else:
-            primary = bk64["mailbox_regs224"]
+            generic_primary = bk64["mailbox_regs224"]
     elif tiles_per_group >= 8:
         if k > n and clc_ready:
             preferred_clc_consumer_regs = 256 if groups <= 4 else 240
-            primary = clc_by_consumer_regs[preferred_clc_consumer_regs]
+            generic_primary = clc_by_consumer_regs[preferred_clc_consumer_regs]
         elif n >= 9 * k // 4:
-            primary = bk64["panel16_regs224"] if b_major == "n" else bk128["panel8"]
+            generic_primary = (
+                bk64["panel16_regs224"] if b_major == "n" else bk128["panel8"]
+            )
         elif n >= 2 * k:
-            primary = (
+            generic_primary = (
                 clc_by_consumer_regs[240]
                 if b_major == "n" and clc_ready
                 else bk64["direct_regs240"]
             )
         elif n == k:
-            primary = (
+            generic_primary = (
                 bk128["direct"]
                 if tiles_per_group >= 24
                 else bk64["panel8_stage5_regs224"]
             )
         else:
-            primary = bk64["mailbox_regs240"]
+            generic_primary = bk64["mailbox_regs240"]
     elif b_major == "n" and n >= 2 * k:
-        primary = bk64["direct_regs240"]
+        generic_primary = bk64["direct_regs240"]
     else:
-        primary = bk64["mailbox_regs240"]
-    return dedupe_configs([primary, *clc_configs, *bk64.values(), *bk128.values()])
+        generic_primary = bk64["mailbox_regs240"]
+    primary = generic_primary if target_seed is None else target_seed
+    return (
+        dedupe_configs(
+            [primary, generic_primary, *clc_configs, *bk64.values(), *bk128.values()]
+        ),
+        target_seed,
+    )
 
 
-def _tcgen05_grouped_worklist_source_m_tiles(
+def _tcgen05_grouped_worklist_source_analysis(
     env: CompileEnvironment,
     analysis: Tcgen05GroupedWorklistAnalysis,
-) -> tuple[int, ...]:
-    """Return legal source-M schedule families for one recognized input layout."""
+) -> tuple[
+    tuple[int, ...],
+    tuple[tuple[int, int, int, int], ...] | None,
+]:
+    """Return legal source-M families and any exact reviewed row signature."""
     if analysis.input_kind == "device_split_sizes":
         # Compact A has no physical source-tile constraint. Source-32 currently
         # requires the one-CTA path, which is not valid for device split sizes.
         return (
-            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
-            TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+            (
+                TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+                TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+            ),
+            None,
         )
 
     facts = analysis.seed_facts
     from ..cute.grouped_worklist import (
         has_tcgen05_grouped_worklist_runtime_specialization,
     )
+    from ..cute.grouped_worklist import tcgen05_grouped_worklist_rows
 
+    reviewed_rows = _tcgen05_grouped_worklist_reviewed_rows(env)
     if not has_tcgen05_grouped_worklist_runtime_specialization(
         env, analysis.metadata_tensor
     ):
-        return ()
+        return (), None
     worklist = env.runtime_value_for_tensor(analysis.metadata_tensor)
     if not isinstance(worklist, torch.Tensor):
-        return ()
-    from torch._subclasses import FakeTensor
-    from torch._subclasses.fake_tensor import unset_fake_temporarily
-
+        return (), None
     from ..cute.grouped_worklist import (
         tcgen05_grouped_worklist_compatible_source_m_tiles,
     )
@@ -1134,22 +1153,18 @@ def _tcgen05_grouped_worklist_source_m_tiles(
         tcgen05_grouped_worklist_source_m_tiles_by_preference,
     )
 
-    if isinstance(worklist, FakeTensor):
-        if not isinstance(worklist.constant, torch.Tensor):
-            return ()
-        worklist = worklist.constant
-    with unset_fake_temporarily():
-        rows = (
-            cast("list[list[int]]", worklist.detach().cpu().tolist())
-            if worklist.ndim == 2 and worklist.shape[1] == 4
-            else []
-        )
+    rows = tcgen05_grouped_worklist_rows(worklist)
+    if rows is None:
+        return (), None
     compatible = tcgen05_grouped_worklist_compatible_source_m_tiles(
         rows,
         group_count=facts.groups_hint,
         packed_m=facts.packed_m_hint,
     )
-    return tcgen05_grouped_worklist_source_m_tiles_by_preference(compatible)
+    return (
+        tcgen05_grouped_worklist_source_m_tiles_by_preference(compatible),
+        rows if rows in reviewed_rows else None,
+    )
 
 
 _TCGEN05_GROUPED_WORKLIST_AUTOMATIC_SEED_LIMIT = 8
@@ -1157,27 +1172,76 @@ _TCGEN05_GROUPED_WORKLIST_AUTOMATIC_SEED_LIMIT = 8
 
 def _bounded_grouped_worklist_seed_families(
     families: Sequence[Sequence[Config]],
+    *,
+    preferred_config: Config | None = None,
 ) -> list[Config]:
     """Keep every legal family represented without expanding tuning startup."""
     nonempty = [family for family in families if family]
+    if preferred_config is not None and not any(
+        preferred_config in family for family in nonempty
+    ):
+        raise ValueError("preferred_config must belong to a nonempty seed family")
     if not nonempty:
         return []
-    ranked = [
+    ranked = [] if preferred_config is None else [preferred_config]
+    ranked.extend(
         family[index]
         for index in range(max(map(len, nonempty)))
         for family in nonempty
         if index < len(family)
-    ]
+    )
     return dedupe_configs(ranked)[:_TCGEN05_GROUPED_WORKLIST_AUTOMATIC_SEED_LIMIT]
 
 
+def _tcgen05_grouped_worklist_hardware_identity(
+    env: CompileEnvironment,
+) -> GroupedWorklistHardwareIdentity | None:
+    """Resolve the exact policy identity, failing closed on inconsistent data."""
+    from ..._argument_device import _canonicalize_argument_device
+    from ..._hardware import get_hardware_info
+
+    try:
+        hardware = get_hardware_info(_canonicalize_argument_device(env.device))
+    except RuntimeError:
+        return None
+    capability = env.config_spec.target_device_capability
+    if (
+        capability is None
+        or hardware.compute_capability != f"sm{capability[0]}{capability[1]}"
+    ):
+        return None
+    return (
+        hardware.device_kind,
+        hardware.hardware_name,
+        hardware.compute_capability,
+    )
+
+
+def _tcgen05_grouped_worklist_reviewed_rows(
+    env: CompileEnvironment,
+) -> frozenset[tuple[tuple[int, int, int, int], ...]]:
+    """Return exact worklist signatures eligible for a target-specific override."""
+    if env.settings.disable_autotuner_heuristics:
+        return frozenset()
+    policy = get_grouped_worklist_target_policy(
+        _tcgen05_grouped_worklist_hardware_identity(env)
+    )
+    return policy.reviewed_worklist_rows()
+
+
 class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
-    """Rank general grouped-worklist configs while preserving live tuning."""
+    """Rank grouped-worklist configs for validated Blackwell products.
+
+    B200 uses the generic structural ranking. GB300 prepends a target-specific
+    primary only for an exact measured worklist; other rows retain the generic
+    rank-0 while live autotuning receives the complete legal seed set.
+    """
 
     name = "cute_tcgen05_grouped_worklist"
     backend = "cute"
     promote_seed_to_default = True
     PROMOTE_TARGETS = (("cuda", "sm100"), ("cuda", "sm103"))
+    CACHE_NAMED_TARGETS = _TCGEN05_GROUPED_TARGET_IDENTITIES
     CACHE_SPECIALIZATION_FACTS = frozenset({"config_num_sm", "input_tensor_metadata"})
 
     @classmethod
@@ -1215,6 +1279,7 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
                 analysis.metadata_tensor,
                 grouped_tensor=analysis.grouped_tensor,
                 packed_tensor=analysis.packed_tensor,
+                reviewed_rows=_tcgen05_grouped_worklist_reviewed_rows(env),
             )
         if seed_facts.groups_hint > 0:
             spec.register_cute_tcgen05_grouped_worklist_smem_facts(
@@ -1279,10 +1344,18 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
         _fact, analysis = eligible
         spec = env.config_spec
         seed_facts = analysis.seed_facts
-        source_m_tiles = _tcgen05_grouped_worklist_source_m_tiles(env, analysis)
+        source_m_tiles, reviewed_rows = _tcgen05_grouped_worklist_source_analysis(
+            env, analysis
+        )
         if not source_m_tiles:
             return []
         families: list[list[Config]] = []
+        target_policy = get_grouped_worklist_target_policy(
+            None
+            if seed_facts.device_split_sizes
+            else _tcgen05_grouped_worklist_hardware_identity(env)
+        )
+        preferred_target_seed: Config | None = None
         for source_m_tile in source_m_tiles:
             # ``packed_m_hint`` remains the exact compiler fact. Seed selection
             # only needs a tile-wave estimate, so round this local ranking input
@@ -1295,7 +1368,7 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
             ranking_packed_m = (
                 (seed_facts.packed_m_hint + ranking_quantum - 1) // ranking_quantum
             ) * ranking_quantum
-            family = tcgen05_grouped_worklist_seed_configs(
+            family, family_target_seed = _tcgen05_grouped_worklist_seed_family(
                 groups=seed_facts.groups_hint,
                 packed_m=ranking_packed_m,
                 n=seed_facts.n_hint,
@@ -1303,6 +1376,8 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
                 b_major=seed_facts.b_major,
                 source_m_tile=source_m_tile,
                 num_sm=spec.num_sm,
+                target_policy=target_policy,
+                worklist_rows=reviewed_rows,
             )
             if seed_facts.device_split_sizes:
                 # Device split-size kernels derive group rows on device and are
@@ -1333,8 +1408,17 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
                 == 0
             ]
             family = _filter_reachable_block_size_configs(spec, family)
+            if (
+                preferred_target_seed is None
+                and family_target_seed is not None
+                and family_target_seed in family
+            ):
+                preferred_target_seed = family_target_seed
             families.append(family)
-        return _bounded_grouped_worklist_seed_families(families)
+        return _bounded_grouped_worklist_seed_families(
+            families,
+            preferred_config=preferred_target_seed,
+        )
 
     @classmethod
     def should_promote(cls, env: CompileEnvironment) -> bool:

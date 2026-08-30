@@ -684,6 +684,41 @@ def _require_runtime_cuda13_sm100_or_newer() -> None:
         pytest.skip("tcgen05 F16/BF16 MMA is not supported on this machine")
 
 
+def test_grouped_worklist_nm_unmatched_gb300_uses_generic_default() -> None:
+    _require_runtime_cuda13_sm100_or_newer()
+    if torch.cuda.get_device_name(DEVICE) != "NVIDIA GB300":
+        pytest.skip("the unmatched-product promotion gate is specific to GB300")
+
+    args = _make_args(
+        (1901, 1913, 1925, 1937, 1949, 1961, 1973, 1985),
+        n=512,
+        k=256,
+        dirty_padding=True,
+        source_m_tile=TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+    )
+    kernel = helion.kernel(
+        _selected_kernel.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
+        bound = kernel.bind(args)
+        grouped_seeds = [
+            config
+            for config in bound.config_spec.compiler_seed_configs
+            if config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+            == TCGEN05_GROUPED_MODE_WORKLIST_NM
+        ]
+        assert grouped_seeds
+        assert bound.config_spec.compiler_default_config == grouped_seeds[0]
+
+        out = bound(*args)
+        torch.cuda.synchronize()
+
+    _assert_output(out, args)
+
+
 def test_grouped_worklist_nm_codegen_and_wrapper_plan() -> None:
     _require_codegen_cuda()
 
