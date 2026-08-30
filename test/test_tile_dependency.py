@@ -32,6 +32,7 @@ from helion._compiler.tile_dependency import pid_task_order
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import skipIfNotCUDA
+from helion._testing import skipIfRefEager
 import helion.language as hl
 
 
@@ -971,6 +972,7 @@ class TestTileDependency(TestCase):
             self.assertEqual(relation.targets(consumer_task), expected)
 
     @skipIfNotCUDA()
+    @skipIfRefEager("compiled DeviceIR is unavailable in ref eager mode")
     def test_shared_device_graph_preserves_every_root_owner(self) -> None:
         x = torch.empty((2, 64), device=DEVICE, dtype=torch.float32)
         bound = cartesian_affine_chain.bind((x,))

@@ -18,7 +18,10 @@ class _ReadWriteVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         super().__init__()
         self.rw = ReadWrites(
-            collections.Counter(), collections.Counter(), collections.Counter()
+            collections.Counter(),
+            collections.Counter(),
+            collections.Counter(),
+            set(),
         )
 
     def _update(self, name: str, ctx: ast.expr_context) -> None:
@@ -57,8 +60,10 @@ class _ReadWriteVisitor(ast.NodeVisitor):
         target = node.target
         if isinstance(target, ast.Name):
             self.rw.reads[target.id] += 1
+            self.rw.augassign_reads.add(target.id)
         elif isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
             self.rw.reads[target.value.id] += 1
+            self.rw.augassign_reads.add(target.value.id)
         self.generic_visit(node)
 
     def visit_For(self, node: ast.For) -> None:
@@ -78,6 +83,10 @@ class ReadWrites(typing.NamedTuple):
     # methods inside kernels (e.g. x.copy_(), x.fill_()), the visitor should
     # be updated to detect those as well.
     inplace_writes: dict[str, int]
+    # AugAssign targets are reads semantically, but branch argument ordering
+    # historically placed them with writes. Keep that ordering stable while
+    # exposing the read to analyses that consume ``reads`` directly.
+    augassign_reads: set[str]
 
     def __iter__(self) -> typing.Iterator[str]:
         return iter({**self.reads, **self.writes})
@@ -307,23 +316,12 @@ class _PureExpressionVisitor(ast.NodeVisitor):
         self.visit(node.value)
 
     def visit_Call(self, node: ast.Call) -> None:
-        # Math methods and compiler-emitted integer shape helpers are pure.
-        is_math = (
+        # Math methods are all pure, so allow them
+        if not (
             isinstance(node.func, ast.Attribute)
             and isinstance(node.func.value, ast.Name)
             and node.func.value.id == "math"
-        )
-        is_triton_shape_helper = (
-            isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "triton"
-            and node.func.attr in {"cdiv", "next_power_of_2"}
-        )
-        is_backend_shape_helper = isinstance(node.func, ast.Name) and node.func.id in {
-            "_cdiv",
-            "_next_power_of_2",
-        }
-        if not (is_math or is_triton_shape_helper or is_backend_shape_helper):
+        ):
             raise _NotPureException
 
         # Recurse into children except for func

@@ -1669,7 +1669,12 @@ class WalkDeviceAST(NodeVisitor):
 
     @staticmethod
     def _rw_names(rw: ReadWrites) -> tuple[str, ...]:
-        ordered = dict.fromkeys([*rw.reads.keys(), *rw.writes.keys()])
+        ordered = dict.fromkeys(
+            [
+                *(name for name in rw.reads if name not in rw.augassign_reads),
+                *rw.writes.keys(),
+            ]
+        )
         return tuple(ordered)
 
     def _trace_graph(
@@ -2734,7 +2739,14 @@ class WalkHostAST(NodeVisitor):
                     axes=tuple(
                         TaskAxis(
                             block_id=block_id,
-                            extent=env.block_sizes[block_id].numel,
+                            extent=(
+                                env.block_sizes[block_id].numel
+                                if isinstance(
+                                    env.block_sizes[block_id].size,
+                                    (int, torch.SymInt),
+                                )
+                                else None
+                            ),
                             canonical_origin=canonical_origin,
                         )
                         for block_id in block_ids
@@ -3284,10 +3296,8 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 source_phase_starts,
             )
             if device_ir.implicit_dependency_starts:
-                if (
-                    CompileEnvironment.current().backend_name != "triton"
-                    or CompileEnvironment.current().device.type != "cuda"
-                    or torch.version.hip is not None
+                if env.device.type != "cuda" or not config_spec.supports_config_key(
+                    "cross_loop_schedule"
                 ):
                     edge = next(
                         edge
@@ -3302,7 +3312,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     "tile dependencies require a persistent blocked kernel for "
                     "tile-dependency scheduling"
                 )
-                CompileEnvironment.current().require_persistent_blocked(reason)
+                env.require_persistent_blocked(reason)
                 config_spec.enable_cross_loop_schedule()
         if config_spec.supports_config_key("pallas_load_buffer_count"):
             config_spec.pallas_load_buffer_count.length = len(

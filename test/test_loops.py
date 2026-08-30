@@ -987,6 +987,8 @@ class TestLoops(RefEagerTestBase, TestCase):
         spec = inplace_nested_loop_kernel.bind(args).config_spec
         self.assertEqual(len(spec.range_num_stages), 0)
 
+    @xfailIfPallas("range_num_stages is Triton-specific")
+    @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
     @skipIfRefEager("not supported in ref eager mode")
     def test_inplace_loop_only_disables_its_own_pipeline(self):
         args = (

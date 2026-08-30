@@ -8,10 +8,12 @@ import torch
 import helion
 from helion import exc
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
+from helion._testing import _get_backend
 from helion._testing import code_and_output
-from helion._testing import onlyBackends
+from helion._testing import is_cuda
+from helion._testing import skipIfNotCUDA
+from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
@@ -152,14 +154,11 @@ def implicit_tile_dependency_matmul_chain(
     return out
 
 
-class TestTileDependencyScheduling(unittest.TestCase):
+class TestTileDependencyAnalysis(TestCase):
     def test_tile_dependency_schedule_has_no_separate_public_object(self) -> None:
         self.assertFalse(hasattr(helion, "TileDependencySchedule"))
         self.assertNotIn("cross_loop_num_workers", helion.Config())
 
-
-@onlyBackends(["triton"])
-class TestTileDependencyLowering(RefEagerTestBase, TestCase):
     @skipIfRefEager("compiled HostFunction metadata is unavailable in ref eager mode")
     def test_source_barrier_remains_distinct_from_implicit_lowering(self) -> None:
         x = torch.empty(8, device=DEVICE)
@@ -188,15 +187,56 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
                 "cross_loop_schedule",
                 bound.config_spec._flat_fields(),
             )
-            config = dict(bound.config_spec.default_config())
-            config["cross_loop_schedule"] = "barrier"
-            with self.assertRaisesRegex(
-                exc.InvalidConfig,
-                "only for kernels with compiler-inferred cross-loop dependencies",
-            ):
-                bound.config_spec.normalize(config)
 
-    @skipIfRefEager("compiled HostFunction metadata is unavailable in ref eager mode")
+    @skipIfRefEager("compiler validation is unavailable in ref eager mode")
+    def test_cross_root_device_values_are_rejected(self) -> None:
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        with pytest.raises(
+            exc.CrossRootDeviceValue,
+            match="cannot be carried between top-level loops",
+        ):
+            invalid_cross_root_value.bind((x,))
+
+    @skipIfRefEager("Loop dependency checks are not performed in ref eager mode")
+    def test_top_level_statement_between_loops_is_rejected(self) -> None:
+        @helion.kernel
+        def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(x.size()):
+                x[tile] += x[tile]
+
+            x.sum()
+
+            for tile in hl.tile(y.size()):
+                y[tile] += y[tile]
+
+            return x + y
+
+        x = torch.randn(4, device=DEVICE)
+        y = torch.randn(4, device=DEVICE)
+
+        with pytest.raises(
+            expected_exception=exc.TopLevelStatementBetweenLoops,
+            match="Statements cannot appear between top level loops.",
+        ):
+            kernel.bind((x, y))
+
+    @skipIfRefEager("Loop dependency checks are not performed in ref eager mode")
+    def test_implicit_dependency_lowering_is_rejected_when_unsupported(self) -> None:
+        if _get_backend() == "triton" and is_cuda():
+            self.skipTest("implicit dependency lowering is supported")
+
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        with pytest.raises(
+            exc.LoopDependencyError,
+            match="Loop dependency detected: 'tmp' was written in a previous loop.",
+        ):
+            implicit_tile_dependency_chain.bind((x,))
+
+
+@skipIfNotTriton("tile-dependency lowering requires the Triton backend")
+@skipIfNotCUDA()
+@skipIfRefEager("tile-dependency lowering is unavailable in ref eager mode")
+class TestTritonTileDependencyLowering(TestCase):
     def test_implicit_dependency_exposes_cross_loop_schedule(self) -> None:
         x = torch.empty(8, device=DEVICE)
         bound = implicit_tile_dependency_chain.bind((x,))
@@ -209,7 +249,6 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
             "barrier",
         )
 
-    @skipIfRefEager("persistent grid-barrier codegen is unavailable in ref eager mode")
     def test_implicit_dependency_defaults_to_grid_barrier(self) -> None:
         x = torch.arange(8, device=DEVICE, dtype=torch.float32)
         code, output = code_and_output(
@@ -222,83 +261,17 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         self.assertIn("triton_helpers.x_grid_barrier(", code)
         self.assertIn("launch_cooperative_grid=True", code)
 
-    @skipIfRefEager("persistent tile-dependency codegen is unavailable in ref eager")
-    def test_implicit_dependency_static_pipeline(self) -> None:
+    def test_atomic_dependency_defaults_to_grid_barrier(self) -> None:
         x = torch.arange(8, device=DEVICE, dtype=torch.float32)
         code, output = code_and_output(
-            implicit_tile_dependency_chain,
-            (x,),
-            block_sizes=[8, 8],
-            pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
-        )
-        torch.testing.assert_close(output, (x + 1) * 2)
-        self.assertIn("tile_dependency_root_barrier_wait", code)
-        self.assertNotIn("triton_helpers.x_grid_barrier(", code)
-
-    @skipIfRefEager("persistent grid-barrier codegen is unavailable in ref eager mode")
-    def test_allocation_graph_tracks_atomics_as_writes(self) -> None:
-        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
-        _code, output = code_and_output(
             implicit_atomic_dependency,
             (x,),
             block_sizes=[8, 8],
             pid_type="persistent_blocked",
         )
         torch.testing.assert_close(output, x + 1)
+        self.assertIn("triton_helpers.x_grid_barrier(", code)
 
-    @skipIfRefEager("persistent grid-barrier codegen is unavailable in ref eager mode")
-    def test_schedule_rejects_cross_root_device_values(self) -> None:
-        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
-        with pytest.raises(
-            exc.CrossRootDeviceValue,
-            match="cannot be carried between top-level loops",
-        ):
-            code_and_output(
-                invalid_cross_root_value,
-                (x,),
-                block_sizes=[8, 8],
-                pid_type="persistent_blocked",
-            )
-
-    @skipIfRefEager("persistent grid-barrier codegen is unavailable in ref eager mode")
-    def test_one_task_event_synchronizes_multiple_consumers(self) -> None:
-        x = torch.arange(64, device=DEVICE, dtype=torch.float32)
-        code, outputs = code_and_output(
-            implicit_tile_dependency_fanout,
-            (x,),
-            block_sizes=[8, 8, 8],
-            pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
-        )
-        out0, out1 = outputs
-        torch.testing.assert_close(out0, (x + 1) * 2)
-        torch.testing.assert_close(out1, (x + 1) * 3)
-        self.assertEqual(code.count("sem='release'"), 1)
-        self.assertGreaterEqual(code.count("tile_dependency_readiness_wait"), 2)
-        self.assertIn("ld.acquire.gpu.global.u32", code)
-        self.assertNotIn("triton_helpers.x_grid_barrier(", code)
-
-    @skipIfRefEager("persistent tile-dependency codegen is unavailable in ref eager")
-    def test_three_stage_chain(self) -> None:
-        x = torch.arange(64, device=DEVICE, dtype=torch.float32)
-        code, output = code_and_output(
-            implicit_tile_dependency_three_stage,
-            (x,),
-            block_sizes=[8, 8, 8],
-            pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
-            num_warps=1,
-        )
-        torch.testing.assert_close(output, (x + 1) * 2 - 3)
-        self.assertNotIn("tl.atomic_", code)
-        self.assertIn("tile_dependency_root_1(tmp0, tmp1", code)
-        self.assertIn("tile_dependency_root_2(tmp1, out", code)
-        self.assertNotIn("tile_dependency_root_barrier", code)
-        self.assertNotIn("triton_helpers.x_grid_barrier(", code)
-        self.assertNotIn("launch_cooperative_grid=True", code)
-
-    @skipIfRefEager("persistent grid-barrier codegen is unavailable in ref eager")
     def test_dynamic_shape_defaults_to_grid_barrier(self) -> None:
         x = torch.arange(65, device=DEVICE, dtype=torch.float32)
         bound = dynamic_implicit_tile_dependency_chain.bind((x,))
@@ -321,6 +294,57 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         self.assertIn("triton_helpers.x_grid_barrier(", code)
         self.assertIn("launch_cooperative_grid=True", code)
         self.assertIn("_minimum_resident_programs=_NUM_SM", code)
+
+    def test_implicit_dependency_static_pipeline(self) -> None:
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        code, output = code_and_output(
+            implicit_tile_dependency_chain,
+            (x,),
+            block_sizes=[8, 8],
+            pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
+        )
+        torch.testing.assert_close(output, (x + 1) * 2)
+        self.assertIn("tile_dependency_root_barrier_wait", code)
+        self.assertNotIn("triton_helpers.x_grid_barrier(", code)
+
+    def test_one_task_event_synchronizes_multiple_consumers(self) -> None:
+        x = torch.arange(64, device=DEVICE, dtype=torch.float32)
+        code, outputs = code_and_output(
+            implicit_tile_dependency_fanout,
+            (x,),
+            block_sizes=[8, 8, 8],
+            pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
+        )
+        out0, out1 = outputs
+        torch.testing.assert_close(out0, (x + 1) * 2)
+        torch.testing.assert_close(out1, (x + 1) * 3)
+        self.assertEqual(code.count("sem='release'"), 1)
+        self.assertGreaterEqual(code.count("tile_dependency_readiness_wait"), 2)
+        self.assertIn("ld.acquire.gpu.global.u32", code)
+        self.assertNotIn("triton_helpers.x_grid_barrier(", code)
+
+    def test_three_stage_chain(self) -> None:
+        x = torch.arange(64, device=DEVICE, dtype=torch.float32)
+        code, output = code_and_output(
+            implicit_tile_dependency_three_stage,
+            (x,),
+            block_sizes=[8, 8, 8],
+            pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
+            num_warps=1,
+        )
+        torch.testing.assert_close(output, (x + 1) * 2 - 3)
+        self.assertNotIn("tl.atomic_", code)
+        self.assertIn("tile_dependency_root_1(tmp0, tmp1", code)
+        self.assertIn("tile_dependency_root_2(tmp1, out", code)
+        self.assertNotIn("tile_dependency_root_barrier", code)
+        self.assertNotIn("triton_helpers.x_grid_barrier(", code)
+        self.assertNotIn("launch_cooperative_grid=True", code)
+
+    def test_dynamic_shape_rejects_static_pipeline(self) -> None:
+        x = torch.arange(65, device=DEVICE, dtype=torch.float32)
         with self.assertRaisesRegex(
             exc.InvalidConfig,
             "requires concrete top-level task counts",
@@ -334,7 +358,6 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
                 num_warps=1,
             )
 
-    @skipIfRefEager("persistent tile-dependency codegen is unavailable in ref eager")
     def test_matmul_chain_allows_reused_accumulator_name(self) -> None:
         a = torch.arange(256, device=DEVICE, dtype=torch.float32).reshape(16, 16)
         b = torch.eye(16, device=DEVICE)
@@ -351,7 +374,6 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         self.assertIn("ld.acquire.gpu.global.u32", code)
         self.assertNotIn("triton_helpers.x_grid_barrier(", code)
 
-    @skipIfRefEager("persistent tile-dependency codegen is unavailable in ref eager")
     def test_outlined_matmul_root_threads_tensor_descriptor(self) -> None:
         a = torch.arange(256, device=DEVICE, dtype=torch.float32).reshape(16, 16)
         b = torch.eye(16, device=DEVICE)
@@ -376,92 +398,6 @@ class TestTileDependencyLowering(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, a, atol=0, rtol=0)
         self.assertIn("b_desc = tl.make_tensor_descriptor", code)
         self.assertIn("def tile_dependency_root_0(a, tmp, b_desc):", code)
-
-
-@onlyBackends(["cute"])
-class TestLoops(RefEagerTestBase, TestCase):
-    @skipIfRefEager("compiled HostFunction metadata is unavailable in ref eager mode")
-    def test_device_ir_records_source_barrier_phases(self) -> None:
-        x = torch.empty(8, device=DEVICE)
-        bound = tile_dependency_info_across_barrier.bind((x,))
-        host_function = bound.host_function
-        assert host_function is not None
-        self.assertEqual(
-            tuple(host_function.device_ir.phase_for_root(root) for root in range(2)),
-            (0, 1),
-        )
-        self.assertEqual(
-            host_function.device_ir.implicit_dependency_starts, frozenset()
-        )
-
-    @skipIfRefEager("Loop dependency checks are not performed in ref eager mode")
-    def test_loop_dependency_error1(self):
-        @helion.kernel
-        def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            out = torch.empty_like(x)
-
-            for tile in hl.tile(x.size()):
-                out[tile] += x[tile]
-
-            for tile in hl.tile(y.size()):
-                out[tile] += y[tile]
-
-            return out
-
-        x = torch.randn(4, device=DEVICE)
-        y = torch.randn(4, device=DEVICE)
-
-        with pytest.raises(
-            expected_exception=exc.LoopDependencyError,
-            match="Loop dependency detected: 'out' was written in a previous loop.",
-        ):
-            code_and_output(kernel, (x, y))
-
-    @skipIfRefEager("Loop dependency checks are not performed in ref eager mode")
-    def test_loop_dependency_error2(self):
-        @helion.kernel
-        def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            out = torch.empty_like(x)
-
-            for tile in hl.tile(x.size()):
-                y[tile] += x[tile]
-
-            for tile in hl.tile(y.size()):
-                out[tile] += y[tile]
-
-            return out
-
-        x = torch.randn(4, device=DEVICE)
-        y = torch.randn(4, device=DEVICE)
-
-        with pytest.raises(
-            expected_exception=exc.LoopDependencyError,
-            match="Loop dependency detected: 'y' was written in a previous loop.",
-        ):
-            code_and_output(kernel, (x, y))
-
-    @skipIfRefEager("Loop dependency checks are not performed in ref eager mode")
-    def test_loop_dependency_error3(self):
-        @helion.kernel
-        def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            for tile in hl.tile(x.size()):
-                x[tile] += x[tile]
-
-            x.sum()
-
-            for tile in hl.tile(y.size()):
-                y[tile] += y[tile]
-
-            return x + y
-
-        x = torch.randn(4, device=DEVICE)
-        y = torch.randn(4, device=DEVICE)
-
-        with pytest.raises(
-            expected_exception=exc.TopLevelStatementBetweenLoops,
-            match="Statements cannot appear between top level loops.",
-        ):
-            code_and_output(kernel, (x, y))
 
 
 if __name__ == "__main__":

@@ -52,6 +52,7 @@ from helion._compiler.tile_dependency import pid_task_order
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import skipIfNotCUDA
+from helion._testing import skipIfRefEager
 import helion.language as hl
 
 
@@ -1124,6 +1125,7 @@ class TestCrossLoopScheduler(TestCase):
         self.assertIsNone(unrelated[0].root_barrier_producer_root)
 
     @skipIfNotCUDA()
+    @skipIfRefEager("compiled DeviceIR is unavailable in ref eager mode")
     def test_device_ir_sites_preserve_nested_producer_and_consumer_axes(
         self,
     ) -> None:
