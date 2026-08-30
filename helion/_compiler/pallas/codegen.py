@@ -26,11 +26,28 @@ if TYPE_CHECKING:
     from helion._compiler.tile_strategy import ForiLoopState
 
 
+def _host_tensor_arg_name(state: CodegenState, tensor: torch.Tensor) -> str | None:
+    """Return the Pallas argument name for a host-backed tensor."""
+    from helion._compiler.host_function import HostFunction
+
+    if tensor not in HostFunction.current().tensor_to_origin:
+        return None
+    return state.device_function.tensor_arg(tensor).name
+
+
 def _load_route(
     state: CodegenState, tensor: torch.Tensor
 ) -> tuple[str, str, list[object]]:
-    arg_name = state.device_function.pallas_tensor_ref_name(tensor)
-    active_name = vmem_name(state, arg_name)
+    arg_name = state.device_function.pallas_internal_scratch_name(tensor)
+    if arg_name is None:
+        arg_name = _host_tensor_arg_name(state, tensor)
+    if arg_name is None:
+        # Tensors computed by an enclosing device region are passed to an
+        # inner loop as ordinary closure arguments, not host tensor arguments.
+        arg_name = ast.unparse(state.ast_arg(0))
+        active_name = arg_name
+    else:
+        active_name = vmem_name(state, arg_name)
     state.device_function.device_load_index += 1
     state.device_function.device_memory_op_index += 1
     assert state.fx_node is not None
@@ -45,7 +62,7 @@ def load_expr(
 ) -> ast.AST:
     """Emit a normal Pallas load or a selected TensorCore gather."""
     from helion import exc
-    from helion._compiler.pallas.dma import emit_grid_indirect_transfer
+    from helion._compiler.pallas.dma import emit_immediate_indirect_transfer
     from helion._compiler.pallas.gather import emit_gather
     from helion._compiler.pallas.tensorcore_plan import TENSORCORE_PLAN_META
     from helion._compiler.pallas.tensorcore_plan import DmaGatherPlan
@@ -61,7 +78,7 @@ def load_expr(
             raise exc.InvalidConfig(
                 "indirect DMA load was not admitted by the active scheduler"
             )
-        emit_grid_indirect_transfer(state, plan, arg_name)
+        emit_immediate_indirect_transfer(state, plan, arg_name)
         return expr_from_string(f"{dma_ref}[...]")
     if isinstance(plan, OneHotGatherPlan):
         return emit_gather(state, plan.plan, active_name)
@@ -81,7 +98,13 @@ def load_expr(
     ):
         return _hbm_load_expr(state, subscript, tensor, arg_name)
 
-    parts, none_dims = index_parts(state, subscript, tensor)
+    parts, none_dims = index_parts(
+        state,
+        subscript,
+        tensor,
+        indexing_patterns=patterns,
+        tensor_name=arg_name,
+    )
     scalar_load = classify_vmem_scalar_load(state, tensor, parts, patterns)
     if scalar_load is None:
         result = expr_from_string(f"{active_name}[{', '.join(parts)}]")
@@ -179,7 +202,7 @@ def resident_ref_load_expr(
     """Keep a proven direct VMEM load as a Pallas Ref."""
     from helion import exc
     from helion._compiler.device_function import PallasMemorySpace
-    from helion._compiler.pallas.dma import emit_grid_indirect_transfer
+    from helion._compiler.pallas.dma import emit_immediate_indirect_transfer
     from helion._compiler.pallas.tensorcore_plan import TENSORCORE_PLAN_META
     from helion._compiler.pallas.tensorcore_plan import DmaGatherPlan
     from helion._compiler.pallas.tensorcore_plan import OneHotGatherPlan
@@ -195,7 +218,7 @@ def resident_ref_load_expr(
             raise exc.InvalidConfig(
                 "resident Ref indirect gather was not admitted by a DMA scheduler"
             )
-        emit_grid_indirect_transfer(state, plan, arg_name)
+        emit_immediate_indirect_transfer(state, plan, arg_name)
         return expr_from_string(dma_ref)
     if isinstance(plan, OneHotGatherPlan):
         raise exc.InvalidConfig(
@@ -380,7 +403,9 @@ def _tensor_routed_to_fori_scratch(state: CodegenState, tensor: torch.Tensor) ->
     """True if ``tensor``'s store destination ref is a fori_loop DMA scratch."""
     from helion._compiler.tile_strategy import ForiLoopState
 
-    name = state.codegen.device_function.tensor_arg(tensor).name
+    name = _host_tensor_arg_name(state, tensor)
+    if name is None:
+        return False
     loop, _ref = _find_dma_scratch_loop(state, name)
     return isinstance(loop, ForiLoopState)
 
@@ -501,7 +526,11 @@ def _padded_value_for_load(
     block-sized, not clamped) and size-1 dims (they broadcast; zero-padding
     would break that).
     """
-    name = state.codegen.device_function.tensor_arg(tensor).name
+    name = _host_tensor_arg_name(state, tensor)
+    if name is None:
+        # A tensor produced by an enclosing device region is already a local
+        # VMEM value. It has no host BlockSpec whose extent could be clamped.
+        return value
     if _find_dma_scratch_loop(state, name)[0] is not None:
         return value
 
@@ -552,6 +581,8 @@ def _can_tile_dimension(state: CodegenState, tensor_dim: int) -> bool:
     assert isinstance(tensor_val, torch.Tensor)
 
     dim_tilings = state.device_function.pallas_tensor_dim_tilings.get(id(tensor_val))
+    if dim_tilings is None:
+        return False
     assert isinstance(dim_tilings, list)
     assert tensor_dim < len(dim_tilings)
     from helion._compiler.pallas.plan_tiling import DimensionTiling
@@ -579,6 +610,7 @@ def index_parts(
     pipeline_scalar_indices_local: bool = True,
     tensor_indices_are_scalars: bool = False,
     raw_hbm_ref: bool = False,
+    tensor_name: str | None = None,
 ) -> tuple[list[str], list[int]]:
     """Build a JAX/Pallas index string from a Helion subscript list.
 
@@ -602,7 +634,8 @@ def index_parts(
     # only tensors present in the loop's _tensor_to_dma_scratch mapping were
     # routed through the inner DMA / Buffered BlockSpec.  Others stay on
     # their outer BlockSpec and fall through to pl.ds().
-    tensor_name = state.codegen.device_function.tensor_arg(tensor).name
+    if tensor_name is None:
+        tensor_name = state.codegen.device_function.tensor_arg(tensor).name
     in_pipeline = False
     pipeline_block_ids: set[int] = set()
     for loop, _ref in _iter_dma_scratch_loops(state, tensor_name):
@@ -1178,6 +1211,17 @@ def memory_op_dma_scratch(state: CodegenState) -> str | None:
         return resources.scratch_ref(stage)
     resources = grid_memory_op_dma_binding(state)
     return resources.scratch if resources is not None else None
+
+
+def fori_memory_op_dma_binding(state: CodegenState) -> DmaResources | None:
+    """Return a fori-owned single-stage DMA binding for immediate use."""
+    found = _memory_op_fori_binding(state)
+    if found is None:
+        return None
+    _loop, resources = found
+    if resources.buffer_count != 1:
+        return None
+    return resources
 
 
 def grid_memory_op_dma_binding(state: CodegenState) -> DmaResources | None:

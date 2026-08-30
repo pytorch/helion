@@ -647,6 +647,10 @@ def _scalar_address_expr(
     *,
     state: CodegenState,
     captured_exprs: dict[torch.fx.Node, str],
+    block_ids: list[int] | None = None,
+    begin_exprs: list[str] | None = None,
+    iter_step_exprs: list[str] | None = None,
+    iteration_indices: list[str] | None = None,
 ) -> str | None:
     """Render a scalar HBM address captured by an inner device loop."""
     if isinstance(value, int):
@@ -661,10 +665,33 @@ def _scalar_address_expr(
         return None
     if value.target is _new_var and value.args:
         return _scalar_address_expr(
-            value.args[0], state=state, captured_exprs=captured_exprs
+            value.args[0],
+            state=state,
+            captured_exprs=captured_exprs,
+            block_ids=block_ids,
+            begin_exprs=begin_exprs,
+            iter_step_exprs=iter_step_exprs,
+            iteration_indices=iteration_indices,
         )
 
     from ...language import memory_ops
+    from ...language.tile_ops import tile_begin
+
+    if (
+        value.target is tile_begin
+        and block_ids is not None
+        and begin_exprs is not None
+        and iter_step_exprs is not None
+        and iteration_indices is not None
+    ):
+        return _contiguous_range_base_expr(
+            value,
+            state=state,
+            block_ids=block_ids,
+            begin_exprs=begin_exprs,
+            iter_step_exprs=iter_step_exprs,
+            iteration_indices=iteration_indices,
+        )
 
     if value.target is memory_ops.load:
         tensor_node, subscript = value.args[:2]
@@ -676,11 +703,40 @@ def _scalar_address_expr(
         if not isinstance(subscript, (list, tuple)) or len(subscript) != 1:
             return None
         index = _scalar_address_expr(
-            subscript[0], state=state, captured_exprs=captured_exprs
+            subscript[0],
+            state=state,
+            captured_exprs=captured_exprs,
+            block_ids=block_ids,
+            begin_exprs=begin_exprs,
+            iter_step_exprs=iter_step_exprs,
+            iteration_indices=iteration_indices,
         )
         if index is None:
             return None
-        name = state.device_function.tensor_arg(tensor).name
+        captured_tensor_node = tensor_node
+        while (
+            captured_tensor_node.op == "call_function"
+            and captured_tensor_node.target is _new_var
+            and captured_tensor_node.args
+            and isinstance(captured_tensor_node.args[0], torch.fx.Node)
+        ):
+            captured_tensor_node = captured_tensor_node.args[0]
+        name = captured_exprs.get(captured_tensor_node)
+        if name is None:
+            name = state.device_function.tensor_arg(tensor).name
+        from .vmem_scalar_load import classify_vmem_scalar_load
+        from .vmem_scalar_load import emit_vmem_scalar_load
+
+        scalar_load = classify_vmem_scalar_load(
+            state,
+            tensor,
+            [index],
+            list(value.meta.get("indexing_patterns") or ()),
+        )
+        if scalar_load is not None:
+            return ast.unparse(
+                emit_vmem_scalar_load(tensor, name, [index], scalar_load)
+            )
         return f"{name}[{index}]"
 
     binary_operators = {
@@ -710,10 +766,22 @@ def _scalar_address_expr(
     ):
         return None
     lhs = _scalar_address_expr(
-        value.args[0], state=state, captured_exprs=captured_exprs
+        value.args[0],
+        state=state,
+        captured_exprs=captured_exprs,
+        block_ids=block_ids,
+        begin_exprs=begin_exprs,
+        iter_step_exprs=iter_step_exprs,
+        iteration_indices=iteration_indices,
     )
     rhs = _scalar_address_expr(
-        value.args[1], state=state, captured_exprs=captured_exprs
+        value.args[1],
+        state=state,
+        captured_exprs=captured_exprs,
+        block_ids=block_ids,
+        begin_exprs=begin_exprs,
+        iter_step_exprs=iter_step_exprs,
+        iteration_indices=iteration_indices,
     )
     if lhs is None or rhs is None:
         return None
@@ -768,6 +836,22 @@ def _collect_indirect_accesses(
             assert plan is not None
             node = spec.node
             tensor = plan.access.tensor
+            if plan.spec.index_access is None:
+                if plan.spec.index_node.graph is not graph_info.graph:
+                    raise InvalidConfig(
+                        "computed indirect DMA indices must be produced in the "
+                        "same device region as their gather"
+                    )
+                admitted.append(
+                    IndirectDmaTransfer(
+                        tensor=tensor,
+                        subscript=tuple(_extract_subscript_vals(node.args[1])),
+                        direction="load",
+                        plan=plan,
+                    )
+                )
+                continue
+            assert plan.spec.index_block_id is not None
             extent = block_extents.get(plan.spec.index_block_id)
             if plan.spec.index_block_id not in block_ids or extent is None:
                 raise InvalidConfig(
@@ -852,9 +936,12 @@ def _collect_fori_indirect_accesses(
         return [], set()
     begin, end = _get_loop_begin_and_end(state, 0)
     try:
-        extent = int(end) - int(begin)
+        block_extents = {block_ids[0]: int(end) - int(begin)}
     except (TypeError, ValueError):
-        return [], set()
+        # Locally computed DMA indices do not depend on a static loop trip
+        # count. Memory-backed metadata still requires an entry here and is
+        # rejected by _collect_indirect_accesses when the bound is dynamic.
+        block_extents = {}
 
     active_block_ids = {
         block_id
@@ -865,7 +952,7 @@ def _collect_fori_indirect_accesses(
         list(state.codegen.codegen_graphs),
         graph_info,
         block_ids,
-        {block_ids[0]: extent},
+        block_extents,
         active_block_ids,
     )
     from ..device_function import DeviceFunction
@@ -3852,6 +3939,10 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
     for transfer, vmem_shape in dma_transfers:
         fake = transfer.tensor
         storage_id = id(fake.untyped_storage())
+        computed_indirect_index = (
+            isinstance(transfer, IndirectDmaTransfer)
+            and transfer.plan.spec.index_access is None
+        )
         input_slots = input_slots_by_id.get(
             id(fake), input_slots_by_storage.get(storage_id)
         )
@@ -3859,6 +3950,7 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
             state.config.pallas_load_buffer_count[input_slots[0]]
             if load_buffer_counts_active
             and transfer.direction == "load"
+            and not computed_indirect_index
             and storage_id not in stored_tensor_storages
             and storage_id not in indirect_store_storages
             and input_slots is not None
@@ -3933,7 +4025,7 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
             dma_stores.append(scheduled)
         elif uses_load_prefetch:
             prefetched_loads.append(scheduled)
-        elif isinstance(transfer, IndirectDmaTransfer):
+        elif isinstance(transfer, IndirectDmaTransfer) and not computed_indirect_index:
             immediate_loads.append(scheduled)
 
     # ``all_tensor_info`` represents a read-modify-write tensor only by its
@@ -4190,6 +4282,10 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
                                 index_node,
                                 state=state,
                                 captured_exprs=placeholder_exprs,
+                                block_ids=block_ids,
+                                begin_exprs=begin_exprs,
+                                iter_step_exprs=iter_step_exprs,
+                                iteration_indices=iteration_indices,
                             )
                     if offset_expr is None:
                         offset_expr = state.device_function.literal_expr(idx_meta)
@@ -4275,6 +4371,8 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
 
         plan = transfer.plan
         index_access = plan.spec.index_access
+        if index_access is None:
+            raise AssertionError("computed-index DMA is emitted at the gather site")
         metadata_fake = index_access.tensor
         metadata_patterns = list(index_access.patterns)
         hbm_name = state.device_function.tensor_arg(transfer.tensor).name

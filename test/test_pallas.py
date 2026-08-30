@@ -2689,6 +2689,29 @@ class TestPallas(TestCase):
         expected[3] = values
         torch.testing.assert_close(result, expected)
 
+    def test_scalar_tensor_index_loads_metadata(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def load_metadata(values: torch.Tensor, starts: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                [starts.size(0), 8], dtype=values.dtype, device=values.device
+            )
+            for block in hl.grid(starts.size(0)):
+                start = starts[block]
+                for lane in hl.static_range(8):
+                    out[block, lane] = values[start + lane]
+            return out
+
+        values = torch.arange(64, device=DEVICE, dtype=torch.int32)
+        starts = torch.tensor([0, 8, 24, 48], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            load_metadata,
+            (values, starts),
+            pallas_loop_type="fori_loop",
+        )
+
+        expected = torch.stack([values[start : start + 8] for start in starts.tolist()])
+        torch.testing.assert_close(result, expected)
+
     def test_computed_scalar_selects_staged_matmul_weight(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def dynamic_weight_matmul(
@@ -7037,6 +7060,43 @@ class TestPallasIndirectGather(TestCase):
             result,
             table.cpu()[indices.long().cpu()].to(device=DEVICE),
         )
+
+    @skipIfPallasInterpret("computed grouped HBM DMA requires TPU lowering")
+    def test_computed_fori_indirect_gather_tpu_correctness(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def gather_state(table: torch.Tensor) -> torch.Tensor:
+            rows = 32
+            out = torch.empty(
+                [rows, *table.shape[1:]],
+                dtype=table.dtype,
+                device=table.device,
+            )
+            for _ in hl.grid(1):
+                for tile_b in hl.tile(rows, block_size=8):
+                    selected = ((tile_b.index * 3 + 5) % table.size(0)).to(torch.int32)
+                    out[tile_b, :, :, :] = hl.load(
+                        table,
+                        [selected, slice(None), slice(None), slice(None)],
+                    )
+            return out
+
+        table = torch.randn(
+            512,
+            3,
+            4,
+            128,
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        )
+        _, result = code_and_output(
+            gather_state,
+            (table,),
+            pallas_loop_type="fori_loop",
+            pallas_load_buffer_count=[1],
+            pallas_indirect_access_mode="dma",
+        )
+        indices = (torch.arange(32) * 3 + 5) % table.size(0)
+        torch.testing.assert_close(result.cpu(), table.cpu()[indices])
 
     @skipIfPallasInterpret("grouped HBM DMA requires TPU lowering")
     def test_indirect_roundtrip_uses_shared_state_scratch(self) -> None:
