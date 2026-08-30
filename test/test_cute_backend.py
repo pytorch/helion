@@ -6,8 +6,10 @@ import dataclasses
 from dataclasses import dataclass
 import gc
 import importlib
+import logging
 import math
 import os
+from pathlib import Path
 import threading
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -6613,7 +6615,7 @@ class TestCuteBackend(TestCase):
         expected = torch.sigmoid(torch.sin(torch.relu(x * y)))
         torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
 
-    def test_pointwise_minimum_maximum_cutlass_45_fallback(self) -> None:
+    def test_pointwise_minimum_maximum_uses_native_math(self) -> None:
         cases = (
             (
                 torch.tensor(
@@ -6625,31 +6627,35 @@ class TestCuteBackend(TestCase):
             ),
             (
                 torch.tensor(
-                    [[2**25 + 1, -(2**25 + 1)]], device=DEVICE, dtype=torch.int32
+                    [
+                        [
+                            2**25 - 1,
+                            2**25 + 1,
+                            -(2**25 - 1),
+                            -(2**25 + 1),
+                        ]
+                    ],
+                    device=DEVICE,
+                    dtype=torch.int32,
                 ),
-                torch.tensor([[2**25, -(2**25)]], device=DEVICE, dtype=torch.int32),
+                torch.tensor(
+                    [[2**25, 2**25, -(2**25), -(2**25)]],
+                    device=DEVICE,
+                    dtype=torch.int32,
+                ),
             ),
         )
         for args in cases:
             with self.subTest(dtype=str(args[0].dtype)):
-                with patch(
-                    "helion._compiler.inductor_lowering.cute_math_min_max_available",
-                    return_value=False,
-                ):
-                    code, out = code_and_output(cute_minimum_maximum, args)
-                x, y = args
-                torch.testing.assert_close(
-                    out, torch.minimum(torch.maximum(x, y), x), equal_nan=True
-                )
-                if x.is_floating_point():
+                code, out = code_and_output(cute_minimum_maximum, args)
+                expected = torch.minimum(torch.maximum(args[0], args[1]), args[0])
+                torch.testing.assert_close(out, expected, equal_nan=True)
+                if args[0].is_floating_point():
                     torch.testing.assert_close(
-                        torch.signbit(out),
-                        torch.signbit(torch.minimum(torch.maximum(x, y), x)),
+                        torch.signbit(out), torch.signbit(expected)
                     )
-                self.assertNotIn("cute.arch.fmax", code)
-                self.assertNotIn("cute.arch.fmin", code)
-                self.assertNotIn("cute.math.max", code)
-                self.assertNotIn("cute.math.min", code)
+                self.assertIn("cute.math.max", code)
+                self.assertIn("cute.math.min", code)
 
     def test_rms_norm_uses_native_rsqrt(self) -> None:
         x = torch.randn(8, 32, device=DEVICE, dtype=torch.float32)
@@ -9818,8 +9824,15 @@ class TestCuteBackend(TestCase):
             "group_count": 8,
             "m_size": 2048,
             "n_size": 512,
+            "bm": 256,
         }
 
+        self.assertEqual(
+            launcher._tcgen05_grouped_device_split_total_clusters(
+                {**common_plan, "source_m_tile": 32}
+            ),
+            1024,
+        )
         self.assertEqual(
             launcher._tcgen05_grouped_device_split_total_clusters(
                 {**common_plan, "source_m_tile": 224}
@@ -11619,7 +11632,7 @@ class TestCuteConfigValuePriors(TestCase):
 
 
 class TestCuteBackendRequirements(TestCase):
-    """The cute backend hard-requires CuTe DSL >= 4.5.1, apache-tvm-ffi, and
+    """The cute backend hard-requires CuTe DSL >= 4.7.0, apache-tvm-ffi, and
     CUDA >= 13, enforced up front via ``CuteBackend.validate_environment``.
     This module is ``importorskip``-gated on cutlass, so the environment under
     test already satisfies the requirements (the gate must pass here).
@@ -11629,6 +11642,28 @@ class TestCuteBackendRequirements(TestCase):
         from helion._compiler.cute.cutedsl_compat import _cute_backend_requirement_error
 
         self.assertIsNone(_cute_backend_requirement_error())
+
+    def test_validated_version_matches_checked_in_cutlass_pin(self) -> None:
+        from helion._compiler.cute.cutedsl_compat import (
+            CUTE_TCGEN05_RUNTIME_N_PTX_VALIDATED_VERSION,
+        )
+        from helion._compiler.cute.cutedsl_compat import CUTE_VALIDATED_VERSION
+
+        pin = (
+            (
+                Path(__file__).parents[1]
+                / ".github"
+                / "ci_commit_pins"
+                / "nvidia_cutlass_dsl.txt"
+            )
+            .read_text(encoding="utf-8")
+            .strip()
+        )
+        self.assertEqual(str(CUTE_VALIDATED_VERSION), pin)
+        self.assertEqual(
+            CUTE_TCGEN05_RUNTIME_N_PTX_VALIDATED_VERSION,
+            CUTE_VALIDATED_VERSION,
+        )
 
     def test_check_does_not_raise_when_satisfied(self) -> None:
         from helion._compiler.cute.cutedsl_compat import check_cute_backend_requirements
@@ -11640,26 +11675,22 @@ class TestCuteBackendRequirements(TestCase):
 
         CuteBackend().validate_environment()  # must not raise in this environment
 
-    def test_math_min_max_version_guard(self) -> None:
+    def test_pre_47_dsl_is_rejected_before_codegen(self) -> None:
         from helion._compiler.cute import cutedsl_compat
 
-        self.addCleanup(cutedsl_compat.cute_math_min_max_available.cache_clear)
-        for version, expected in (
-            ("4.5.1", False),
-            ("4.6.0", True),
-            ("4.6.1", True),
-            ("4.7.0", True),
+        self.addCleanup(cutedsl_compat._cute_backend_requirement_error.cache_clear)
+        self.addCleanup(cutedsl_compat._installed_cute_dsl_version.cache_clear)
+        cutedsl_compat._cute_backend_requirement_error.cache_clear()
+        cutedsl_compat._installed_cute_dsl_version.cache_clear()
+        with patch.object(
+            cutedsl_compat.importlib.metadata,
+            "version",
+            return_value="4.6.1",
         ):
-            with self.subTest(version=version):
-                cutedsl_compat.cute_math_min_max_available.cache_clear()
-                with patch.object(
-                    cutedsl_compat.importlib.metadata,
-                    "version",
-                    return_value=version,
-                ):
-                    self.assertEqual(
-                        cutedsl_compat.cute_math_min_max_available(), expected
-                    )
+            self.assertEqual(
+                cutedsl_compat._cute_backend_requirement_error(),
+                "the installed CuTe DSL is too old (need >= 4.7.0, found 4.6.1)",
+            )
 
     def test_unmet_requirement_raises_with_actionable_message(self) -> None:
         from helion._compiler.cute import cutedsl_compat
@@ -11676,5 +11707,77 @@ class TestCuteBackendRequirements(TestCase):
         message = str(ctx.exception)
         self.assertIn("apache-tvm-ffi package is required (simulated)", message)
         # The fixed tail names all three requirements so the user knows the set.
-        self.assertIn("nvidia-cutlass-dsl >= 4.5.1", message)
+        self.assertIn("nvidia-cutlass-dsl >= 4.7.0", message)
         self.assertIn("CUDA >= 13", message)
+
+
+def test_newer_cute_dsl_warns_once_only_for_grouped_runtime_n_fallback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from helion._compiler.cute import cutedsl_compat
+
+    cutedsl_compat._installed_cute_dsl_version.cache_clear()
+    cutedsl_compat.warn_tcgen05_runtime_n_ptx_fallback.cache_clear()
+    try:
+        with (
+            patch.object(
+                cutedsl_compat.importlib.metadata,
+                "version",
+                return_value="4.7.1",
+            ) as version_probe,
+            caplog.at_level(logging.WARNING, logger=cutedsl_compat.__name__),
+        ):
+            assert not cutedsl_compat.tcgen05_runtime_n_ptx_compatible()
+            assert not cutedsl_compat.tcgen05_runtime_n_ptx_compatible()
+            assert not caplog.records
+            cutedsl_compat.warn_tcgen05_runtime_n_ptx_fallback()
+            cutedsl_compat.warn_tcgen05_runtime_n_ptx_fallback()
+            assert version_probe.call_count == 1
+    finally:
+        cutedsl_compat._installed_cute_dsl_version.cache_clear()
+        cutedsl_compat.warn_tcgen05_runtime_n_ptx_fallback.cache_clear()
+
+    matching = [
+        record
+        for record in caplog.records
+        if "Grouped runtime-N compiler seeds and promoted defaults are disabled"
+        in record.getMessage()
+    ]
+    assert len(matching) == 1
+    assert "4.7.1" in matching[0].getMessage()
+    assert "4.7.0" in matching[0].getMessage()
+    assert "fall back to typed static-width MMA" in matching[0].getMessage()
+
+
+@pytest.mark.parametrize("failure", ("missing", "invalid"))
+def test_failed_cute_dsl_version_probe_is_shared_and_cached(failure: str) -> None:
+    from helion._compiler.cute import cutedsl_compat
+
+    if failure == "missing":
+        error: Exception = cutedsl_compat.importlib.metadata.PackageNotFoundError(
+            "nvidia-cutlass-dsl"
+        )
+        expected = "the CuTe DSL is not installed"
+    else:
+        error = cutedsl_compat.InvalidVersion("not-a-version")
+        expected = "the installed CuTe DSL version is invalid"
+
+    cutedsl_compat._installed_cute_dsl_version.cache_clear()
+    cutedsl_compat._cute_backend_requirement_error.cache_clear()
+    cutedsl_compat.warn_tcgen05_runtime_n_ptx_fallback.cache_clear()
+    try:
+        with patch.object(
+            cutedsl_compat.importlib.metadata,
+            "version",
+            side_effect=error,
+        ) as version_probe:
+            assert not cutedsl_compat.tcgen05_runtime_n_ptx_compatible()
+            assert not cutedsl_compat.tcgen05_runtime_n_ptx_compatible()
+            cutedsl_compat.warn_tcgen05_runtime_n_ptx_fallback()
+            cutedsl_compat.warn_tcgen05_runtime_n_ptx_fallback()
+            assert expected in str(cutedsl_compat._cute_backend_requirement_error())
+            assert version_probe.call_count == 1
+    finally:
+        cutedsl_compat._installed_cute_dsl_version.cache_clear()
+        cutedsl_compat._cute_backend_requirement_error.cache_clear()
+        cutedsl_compat.warn_tcgen05_runtime_n_ptx_fallback.cache_clear()

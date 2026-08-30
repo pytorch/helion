@@ -105,8 +105,11 @@ from .tcgen05_constants import TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_K
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_SEARCH_CHOICES
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
@@ -141,10 +144,12 @@ from .tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
+from .tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_shape
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_c_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_default_epilogue_tile_size
 from .tcgen05_constants import tcgen05_direct_entry_stage_tuple_allowed
+from .tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from .tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
 
 if TYPE_CHECKING:
@@ -862,18 +867,40 @@ class CuteTcgen05Config:
     def _fix_cluster_m2_search_config(self, config: dict[str, object]) -> None:
         if not (self.search_enabled and config.get("tcgen05_cluster_m") == 2):
             return
+        config_view = self._matmul_config_view(config)
+        if config_view is None:
+            config["tcgen05_cluster_m"] = 1
+            return
+        block_sizes, m_index, n_index, k_index = config_view
+
+        def is_grouped_worklist_two_cta() -> bool:
+            return (
+                config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+                == TCGEN05_GROUPED_MODE_WORKLIST_NM
+                and config.get("tcgen05_cluster_n", 1) == 1
+                and block_sizes[m_index] == TCGEN05_TWO_CTA_BLOCK_M
+                and block_sizes[n_index] == 128
+                and block_sizes[k_index] in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+                and config.get(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY)
+                in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+            )
+
         constraints = self.cluster_m2_search_constraints
+        if is_grouped_worklist_two_cta():
+            # The selected worklist source-M family owns the validated physical
+            # 256x32/224/256 MMA profile and its K envelope independently of
+            # the generic cluster-M2 policy. Compiler seeds widen the
+            # otherwise-narrow pid fragment, so keep this exact family even
+            # when generic constraints reject it or are absent.
+            config["pid_type"] = TCGEN05_TWO_CTA_SEED_PID_TYPE
+            config.pop("epilogue_subtile", None)
+            return
         if constraints is None:
             config["tcgen05_cluster_m"] = 1
             return
         if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
             config["tcgen05_cluster_m"] = 1
             return
-        config_view = self._matmul_config_view(config)
-        if config_view is None:
-            config["tcgen05_cluster_m"] = 1
-            return
-        block_sizes, m_index, n_index, k_index = config_view
         edge_k_tail_family = constraints.allow_edge_k_tail_family
         is_narrow_clc_aux_tma = self._is_clc_aux_tma_narrow_n_request(config)
         if edge_k_tail_family:
@@ -947,6 +974,17 @@ class CuteTcgen05Config:
     def prepare_normalization(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
+        grouped_mode = config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+        if (
+            grouped_mode in TCGEN05_GROUPED_MODES
+            and config.get("num_sm_multiplier", 1) != 1
+        ):
+            if fix_invalid:
+                config.pop("num_sm_multiplier", None)
+            else:
+                raise InvalidConfig(
+                    "tcgen05 grouped kernels require num_sm_multiplier=1"
+                )
         source_m_tile_key = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
         source_m_tile = config.get(source_m_tile_key)
         if source_m_tile_key in config and (
@@ -1219,34 +1257,80 @@ class CuteTcgen05Config:
             and all(config.get(key) is None for key in TCGEN05_LAYOUT_OVERRIDES_KEYS)
         )
 
-    def _grouped_worklist_nm_deep_ab_config_matches(
+    def _grouped_worklist_nm_ab_config_matches(
         self, config: dict[str, object], ab_stages: object
     ) -> bool:
-        block_sizes = config.get("block_sizes")
+        config_view = self._matmul_config_view(config)
+        if config_view is None:
+            block_sizes = config.get("block_sizes")
+            if (
+                self.matmul_block_ids is not None
+                or not isinstance(block_sizes, list)
+                or len(block_sizes) != 3
+            ):
+                return False
+            # Reviewed/AOT configs can be normalized by a standalone ConfigSpec
+            # before compiler MMA analysis registers semantic block IDs.  That
+            # schema is exactly the canonical [M, N, K] triple.  Real kernels
+            # always use the registered semantic indices above, including when
+            # their block-size order is permuted.
+            config_view = (block_sizes, 0, 1, 2)
+        block_sizes, m_index, n_index, k_index = config_view
+        cluster_m = config.get("tcgen05_cluster_m")
+        source_m_tile = config.get(
+            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
+            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+        )
+        block_k = block_sizes[k_index]
+        physical_shape = resolve_tcgen05_grouped_worklist_mma_shape(
+            cluster_m=cluster_m,
+            block_k=block_k,
+            source_m_tile=source_m_tile,
+        )
         if not (
             type(ab_stages) is int
             and 4 <= ab_stages <= 7
-            and config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
-            == TCGEN05_GROUPED_MODE_WORKLIST_NM
-            and config.get("tcgen05_cluster_m") == 2
+            and physical_shape is not None
             and config.get("tcgen05_cluster_n", 1) == 1
             and config.get("tcgen05_acc_stages", 2) == 2
             and config.get("tcgen05_c_stages", 2) == 2
-            and isinstance(block_sizes, list)
-            and block_sizes[:3] == [TCGEN05_TWO_CTA_BLOCK_M, 128, 64]
+            and block_sizes[m_index] == TCGEN05_TWO_CTA_BLOCK_M
+            and block_sizes[n_index] == 128
         ):
             return False
-        if self.ab_stages_three_search_constraints is None:
+        constraints = self.ab_stages_three_search_constraints
+        if constraints is None:
             # Fixed configs can be normalized before their input device is known.
             # CuTe MMA selection applies the real target's SMEM limit at codegen.
             return True
-        return self.ab_stages_three_fits(
-            bm=block_sizes[0],
-            bn=block_sizes[1],
-            bk=block_sizes[2],
-            cluster_m=2,
-            ab_stages=ab_stages,
+        target_capacity_bytes = (
+            constraints.per_cta_smem_budget_bytes
+            + TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES
         )
+        sched_stage_count = config.get(TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY, 1)
+        if type(sched_stage_count) is not int or sched_stage_count <= 0:
+            return False
+        physical_bm, physical_bn = physical_shape
+        # The generic AB search budget reserves 28 KiB, which is deliberately
+        # conservative for general matmuls but would reject the valid
+        # BK64/source-224/AB7 worklist at B200's exact 227-KiB cap. Reconstruct
+        # the raw target cap and account for this path's full ordered allocation.
+        # Use the same conservative ordered allocation as codegen. Current
+        # scheduler modes all round to the same final 1024-byte C-ring boundary.
+        required_bytes = tcgen05_grouped_worklist_smem_bytes(
+            group_count=1,
+            device_split_sizes=False,
+            sched_stage_count=sched_stage_count,
+            bm=physical_bm,
+            bn=physical_bn,
+            bk=cast("int", block_k),
+            dtype_bytes=constraints.dtype_bytes,
+            ab_stages=ab_stages,
+            acc_stages=2,
+            c_stages=2,
+            cluster_m=cast("int", cluster_m),
+        )
+        return required_bytes <= target_capacity_bytes
 
     def grouped_dynamic_stages_fit_for_target(
         self,
@@ -1733,11 +1817,11 @@ class CuteTcgen05Config:
             return
         if self._grouped_dynamic_deep_config_matches(config):
             return
-        if self._grouped_worklist_nm_deep_ab_config_matches(config, ab_stages):
+        if self._grouped_worklist_nm_ab_config_matches(config, ab_stages):
             return
-        # ab>3 is only valid on the TVM-FFI direct-entry path, and only for the
-        # (bk, ab, c) stage tuples the direct-entry codegen accepts (bk=64
-        # admits (ab=6, c=4)). Everything else clamps (or rejects) to ab=3.
+        # After the grouped dynamic/worklist exceptions above, ab>3 is only valid
+        # on the TVM-FFI direct-entry path and for its accepted (bk, ab, c) tuples
+        # (bk=64 admits (ab=6, c=4)). Everything else clamps or rejects to ab=3.
         block_sizes = config.get("block_sizes")
         k_block_index = self._direct_entry_k_block_index()
         bk = (
@@ -2137,7 +2221,20 @@ class CuteTcgen05Config:
         config_view = self._matmul_config_view(config)
         if config_view is None:
             return
-        block_sizes, m_index, _, _ = config_view
+        block_sizes, m_index, n_index, k_index = config_view
+        if (
+            config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+            == TCGEN05_GROUPED_MODE_WORKLIST_NM
+            and config.get("tcgen05_cluster_n", 1) == 1
+            and block_sizes[m_index] == TCGEN05_TWO_CTA_BLOCK_M
+            and block_sizes[n_index] == 128
+            and block_sizes[k_index] in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+            and config.get(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY)
+            == TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
+        ):
+            # The logical DSL tile remains 256x128 while the N,M-oriented
+            # collective resolves to a physical 128x32 CtaGroup.ONE MMA.
+            return
         constraints = self.cluster_m2_search_constraints
         if constraints is not None and constraints.allow_edge_k_tail_family:
             # persistent_interleaved stays in the flat enum so cluster_m=2
@@ -2659,7 +2756,7 @@ class CuteTcgen05Config:
                 if key in config:
                     if key == "tcgen05_ab_stages" and (
                         self._grouped_dynamic_deep_config_matches(config)
-                        or self._grouped_worklist_nm_deep_ab_config_matches(
+                        or self._grouped_worklist_nm_ab_config_matches(
                             config,
                             config[key],
                         )

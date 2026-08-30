@@ -14716,6 +14716,42 @@ class TestCuteLowerings(unittest.TestCase):
             block_sizes=[128, 128, 256],
             tcgen05_ab_stages=2,
         )
+        worklist_config = helion.Config(
+            block_sizes=[256, 128, 64],
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=7,
+        )
+        worklist_config.config.update(
+            {
+                "tcgen05_grouped_mode": "worklist_nm",
+                "tcgen05_grouped_worklist_source_m_tile": 224,
+            }
+        )
+        cases = (
+            (torch.float16, 128, 128, 256, config, 200 * 1024, False, "universal"),
+            (torch.float16, 128, 128, 128, config, 200 * 1024, False, "tcgen05"),
+            (torch.float16, 128, 128, 128, config, 100 * 1024, False, "universal"),
+            (
+                torch.bfloat16,
+                256,
+                224,
+                64,
+                worklist_config,
+                200 * 1024,
+                False,
+                "universal",
+            ),
+            (
+                torch.bfloat16,
+                256,
+                224,
+                64,
+                worklist_config,
+                200 * 1024,
+                True,
+                "tcgen05",
+            ),
+        )
         with (
             patch(
                 "helion._compiler.cute.cute_mma.get_cute_mma_support",
@@ -14728,40 +14764,26 @@ class TestCuteLowerings(unittest.TestCase):
             ) as smem_budget,
             patch.dict("os.environ", {"HELION_CUTE_MMA_IMPL": "auto"}, clear=False),
         ):
-            self.assertEqual(
-                _choose_mma_impl(
-                    torch.float16,
-                    bm=128,
-                    bn=128,
-                    bk=256,
-                    config=config,
-                    input_device=torch.device("cuda"),
-                ),
-                "universal",
-            )
-            self.assertEqual(
-                _choose_mma_impl(
-                    torch.float16,
-                    bm=128,
-                    bn=128,
-                    bk=128,
-                    config=config,
-                    input_device=torch.device("cuda"),
-                ),
-                "tcgen05",
-            )
-            smem_budget.return_value = 100 * 1024
-            self.assertEqual(
-                _choose_mma_impl(
-                    torch.float16,
-                    bm=128,
-                    bn=128,
-                    bk=128,
-                    config=config,
-                    input_device=torch.device("cuda"),
-                ),
-                "universal",
-            )
+            for dtype, bm, bn, bk, case_config, budget, defer, expected in cases:
+                with self.subTest(
+                    dtype=str(dtype),
+                    block_sizes=(bm, bn, bk),
+                    budget=budget,
+                    defer=defer,
+                ):
+                    smem_budget.return_value = budget
+                    self.assertEqual(
+                        _choose_mma_impl(
+                            dtype,
+                            bm=bm,
+                            bn=bn,
+                            bk=bk,
+                            config=case_config,
+                            input_device=torch.device("cuda"),
+                            defer_grouped_worklist_smem_check=defer,
+                        ),
+                        expected,
+                    )
 
     def test_tcgen05_thread_counts_match_participants_and_cta(self) -> None:
         # ``_tcgen05_epi_warp_count`` takes a ``Tcgen05WarpSpec`` (G2-B);
@@ -20218,7 +20240,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
 
 @onlyBackends(["cute"])
 class TestCuteDslCompat(unittest.TestCase):
-    """The cute backend hard-requires the 4.5.1 CuTe DSL API (enforced up front
+    """The cute backend hard-requires the 4.7 CuTe DSL API (enforced up front
     by ``CuteBackend.validate_environment``), so the pipeline emitters render
     the native CuTe calls directly with no per-build workarounds."""
 
@@ -21961,6 +21983,8 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             tcgen05_frag_a="tCrA",
             tcgen05_frag_b="tCrB",
             mma_stage="mma_stage",
+            input_dtype_str="cutlass.BFloat16",
+            acc_dtype_str="cutlass.Float32",
             is_two_cta=True,
         )
         self.assertIsInstance(node, ast.If)
@@ -21977,11 +22001,56 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             body_src,
         )
 
+    def test_tcgen05_runtime_mma_issue_requires_bf16_fp32(self) -> None:
+        def build(input_dtype_str: str) -> ast.stmt:
+            return _build_tcgen05_mma_issue_stmt(
+                exec_active="exec_active",
+                tiled_mma="tiled_mma",
+                acc_frag="acc_frag",
+                tcgen05_frag_a="tCrA",
+                tcgen05_frag_b="tCrB",
+                mma_stage="mma_stage",
+                input_dtype_str=input_dtype_str,
+                acc_dtype_str="cutlass.Float32",
+                runtime_mma_n="runtime_mma_n",
+                runtime_instr_desc="runtime_instr_desc",
+                static_mma_n=224,
+                is_two_cta=True,
+            )
+
+        node = build("cutlass.BFloat16")
+        self.assertIn(
+            "tcgen05.mma.cta_group::2.kind::f16",
+            ast.unparse(node),
+        )
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported,
+            "validated only for BF16/FP32",
+        ):
+            build("cutlass.Float16")
+        with (
+            patch(
+                "helion._compiler.cute.cute_mma.tcgen05_runtime_n_ptx_compatible",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "requires exactly nvidia-cutlass-dsl==4.7.0",
+            ),
+        ):
+            build("cutlass.BFloat16")
+
     def test_tcgen05_mma_accumulate_reset_two_cta_gates_to_leader(self) -> None:
-        node = _build_tcgen05_mma_accumulate_reset_stmt(
-            "exec_active", tiled_mma="tiled_mma", is_two_cta=True
+        stmts = _build_tcgen05_mma_accumulate_reset_stmt(
+            "exec_active",
+            tiled_mma="tiled_mma",
+            input_dtype_str="cutlass.BFloat16",
+            acc_dtype_str="cutlass.Float32",
+            is_two_cta=True,
         )
 
+        self.assertEqual(len(stmts), 1)
+        node = stmts[0]
         self.assertIsInstance(node, ast.If)
         self.assertEqual(
             ast.unparse(node.test),

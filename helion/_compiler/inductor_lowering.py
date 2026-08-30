@@ -53,7 +53,6 @@ from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import _symint_expr
 from .compile_environment import _symint_sympy_expr
-from .cute.cutedsl_compat import cute_math_min_max_available
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
 from .node_masking import inductor_masked_value
@@ -1236,15 +1235,6 @@ class GenerateASTFromInductor(DefaultHandler):
         if dtype is not None:
             a = self._create_cast_expr(a, dtype)
             b = self._create_cast_expr(b, dtype)
-        if not cute_math_min_max_available():
-            return self._lift(
-                expr_from_string(
-                    "{a} if {a} != {a} else "
-                    "({b} if {b} != {b} else ({a} if {a} >= {b} else {b}))",
-                    a=self._to_ast(a),
-                    b=self._to_ast(b),
-                )
-            )
         return self._lift(
             expr_from_string(
                 "cute.math.max({a}, {b}, propagate_nan=True)",
@@ -1260,15 +1250,6 @@ class GenerateASTFromInductor(DefaultHandler):
         if dtype is not None:
             a = self._create_cast_expr(a, dtype)
             b = self._create_cast_expr(b, dtype)
-        if not cute_math_min_max_available():
-            return self._lift(
-                expr_from_string(
-                    "{a} if {a} != {a} else "
-                    "({b} if {b} != {b} else ({a} if {a} <= {b} else {b}))",
-                    a=self._to_ast(a),
-                    b=self._to_ast(b),
-                )
-            )
         return self._lift(
             expr_from_string(
                 "cute.math.min({a}, {b}, propagate_nan=True)",

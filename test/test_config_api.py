@@ -19,6 +19,12 @@ from helion._compiler.backend import PallasBackend
 from helion._compiler.backend import TritonBackend
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.tcgen05_config import Tcgen05AbStagesThreeSearchConstraints
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_STAGES_THREE_MIN_DEVICE_SMEM_OPTIN,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES,
+)
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_DIRECT
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_DYNAMIC
@@ -34,7 +40,19 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX,
 )
 from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES,
+)
+from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
 )
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
@@ -43,6 +61,10 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER,
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
+from helion._compiler.cute.tcgen05_constants import (
+    resolve_tcgen05_grouped_worklist_mma_shape,
+)
+from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
@@ -1003,6 +1025,28 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
             )
         return spec
 
+    @staticmethod
+    def _make_permuted_cute_tcgen05_spec():
+        from helion._compiler.backend import CuteBackend
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import ConfigSpec
+
+        spec = ConfigSpec(backend=CuteBackend())
+        spec.cute_tcgen05_search_enabled = True
+        for block_id, max_size in enumerate((256, 128, 256)):
+            spec.block_sizes.append(
+                BlockSizeSpec(block_id=block_id, size_hint=4096, max_size=max_size)
+            )
+        spec.register_cute_tcgen05_mma_analysis(
+            m_block_id=2,
+            n_block_id=0,
+            k_block_id=1,
+            input_dtype=torch.bfloat16,
+            has_leading_passthrough=False,
+            explicit_epi_tile_compatible=True,
+        )
+        return spec
+
     def test_grouped_static_seed_representation(self) -> None:
         from helion.autotuner.config_generation import ConfigGeneration
 
@@ -1035,17 +1079,23 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
 
     def test_grouped_worklist_source_tile_normalization(self) -> None:
         spec = self._make_cute_tcgen05_spec()
-        config = helion.Config(
-            block_sizes=[256, 128, 128],
-            pid_type="persistent_interleaved",
-            tcgen05_grouped_mode=TCGEN05_GROUPED_MODE_WORKLIST_NM,
-            tcgen05_grouped_worklist_source_m_tile=256,
-        )
-        spec.normalize(config)
         self.assertEqual(
-            config.config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY],
-            256,
+            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES[0],
+            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
         )
+        for source_m_tile in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES:
+            with self.subTest(source_m_tile=source_m_tile):
+                config = helion.Config(
+                    block_sizes=[256, 128, 128],
+                    pid_type="persistent_interleaved",
+                    tcgen05_grouped_mode=TCGEN05_GROUPED_MODE_WORKLIST_NM,
+                    tcgen05_grouped_worklist_source_m_tile=source_m_tile,
+                )
+                spec.normalize(config)
+                self.assertEqual(
+                    config.config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY],
+                    source_m_tile,
+                )
 
         for invalid_value in (256.0, True, 225):
             wrong_type_config = helion.Config(
@@ -1081,7 +1131,9 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
             block_sizes=[256, 128, 128],
             pid_type="persistent_interleaved",
             tcgen05_grouped_mode=TCGEN05_GROUPED_MODE_WORKLIST_NM,
-            tcgen05_grouped_worklist_source_m_tile=256,
+            tcgen05_grouped_worklist_source_m_tile=(
+                TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
+            ),
         )
         spec.compiler_seed_configs = [seed]
 
@@ -1089,14 +1141,109 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
         [(flat, normalized)] = generation.seed_flat_config_pairs()
         self.assertEqual(
             normalized.config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY],
-            256,
+            TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
         )
         generation.encode_config(flat)
         round_trip = generation.unflatten(flat)
         self.assertEqual(
             round_trip.config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY],
-            256,
+            TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
         )
+
+    def test_grouped_worklist_one_cta_accepts_bk128_ab5(self) -> None:
+        spec = self._make_cute_tcgen05_spec()
+        config = helion.Config(
+            block_sizes=[256, 128, 128],
+            num_stages=7,
+            num_warps=8,
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=5,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_consumer_regs=256,
+            tcgen05_grouped_mode=TCGEN05_GROUPED_MODE_WORKLIST_NM,
+            tcgen05_grouped_worklist_source_m_tile=(
+                TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
+            ),
+        )
+
+        spec.normalize(config)
+
+        self.assertEqual(config.block_sizes[:3], [256, 128, 128])
+        self.assertEqual(config.config["tcgen05_ab_stages"], 5)
+        self.assertEqual(config.config["tcgen05_consumer_regs"], 256)
+
+    def test_grouped_worklist_two_cta_fix_preserves_logical_tile(self) -> None:
+        spec = self._make_cute_tcgen05_spec()
+        spec.register_cute_tcgen05_mma_analysis(
+            m_block_id=0,
+            n_block_id=1,
+            k_block_id=2,
+            input_dtype=torch.bfloat16,
+            has_leading_passthrough=False,
+            explicit_epi_tile_compatible=True,
+        )
+        spec.allow_tcgen05_cluster_m2_search(static_k=128)
+        for source_m_tile in (
+            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+            TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+        ):
+            for block_k in (64, 128):
+                config = helion.Config(
+                    block_sizes=[256, 128, block_k],
+                    pid_type="persistent_interleaved",
+                    tcgen05_cluster_m=2,
+                    tcgen05_cluster_n=1,
+                    tcgen05_grouped_mode=TCGEN05_GROUPED_MODE_WORKLIST_NM,
+                    tcgen05_grouped_worklist_source_m_tile=source_m_tile,
+                )
+                spec.normalize(config, _fix_invalid=True)
+                self.assertEqual(config.block_sizes[:3], [256, 128, block_k])
+                self.assertEqual(config.config["tcgen05_cluster_m"], 2)
+                self.assertEqual(config.config["pid_type"], "persistent_interleaved")
+
+    def test_grouped_worklist_cluster_m1_fix_uses_semantic_axes(self) -> None:
+        spec = self._make_permuted_cute_tcgen05_spec()
+        config = helion.Config(
+            block_sizes=[128, 64, 256],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_grouped_mode=TCGEN05_GROUPED_MODE_WORKLIST_NM,
+            tcgen05_grouped_worklist_source_m_tile=32,
+        )
+        spec._cute_tcgen05_config.fix_search_config(config.config)
+        self.assertEqual(config.block_sizes, [128, 64, 256])
+        self.assertEqual(config.config["tcgen05_cluster_m"], 1)
+
+    def test_grouped_worklist_deep_ab_uses_semantic_axes(self) -> None:
+        spec = self._make_permuted_cute_tcgen05_spec()
+        config = helion.Config(
+            block_sizes=[128, 128, 256],
+            num_stages=7,
+            num_warps=8,
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=5,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_consumer_regs=256,
+            tcgen05_grouped_mode=TCGEN05_GROUPED_MODE_WORKLIST_NM,
+            tcgen05_grouped_worklist_source_m_tile=32,
+        )
+        spec.normalize(config)
+        self.assertEqual(config.block_sizes, [128, 128, 256])
+        self.assertEqual(config.config["tcgen05_ab_stages"], 5)
+
+        positional_decoy = helion.Config.from_dict(config.config)
+        positional_decoy.config["block_sizes"] = [256, 128, 64]
+        with self.assertRaisesRegex(exc.InvalidConfig, "tcgen05_ab_stages"):
+            spec.normalize(positional_decoy)
 
     def test_tcgen05_search_fields_do_not_leak_to_other_backends(self) -> None:
         from helion._compiler.backend import MetalBackend
@@ -1256,6 +1403,24 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
                 repaired.config,
             )
 
+    def test_grouped_rejects_num_sm_multiplier(self) -> None:
+        spec = self._make_cute_tcgen05_spec()
+
+        def make_config() -> helion.Config:
+            return helion.Config(
+                block_sizes=[256, 128, 64],
+                num_sm_multiplier=2,
+                pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
+                tcgen05_grouped_mode=TCGEN05_GROUPED_MODE_WORKLIST_NM,
+            )
+
+        with self.assertRaisesRegex(exc.InvalidConfig, "num_sm_multiplier=1"):
+            spec.normalize(make_config())
+
+        repaired = make_config()
+        spec.normalize(repaired, _fix_invalid=True)
+        self.assertNotIn("num_sm_multiplier", repaired.config)
+
     def test_grouped_static_problem_signature_envelope(self) -> None:
         spec = self._make_cute_tcgen05_spec()
         key = TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY
@@ -1391,6 +1556,71 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
         )
         with self.assertRaisesRegex(exc.InvalidConfig, "tcgen05_ab_stages"):
             constrained_spec.normalize(selected_config())
+
+    def test_grouped_worklist_two_cta_deep_ab_uses_conservative_smem_capacity(
+        self,
+    ) -> None:
+        def selected_config(source_m_tile: int, ab_stages: int) -> helion.Config:
+            return helion.Config(
+                block_sizes=[256, 128, 64],
+                pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=ab_stages,
+                tcgen05_grouped_mode=TCGEN05_GROUPED_MODE_WORKLIST_NM,
+                tcgen05_grouped_worklist_source_m_tile=source_m_tile,
+            )
+
+        b200_capacity_bytes = TCGEN05_AB_STAGES_THREE_MIN_DEVICE_SMEM_OPTIN
+        constrained_budget_bytes = (
+            b200_capacity_bytes - TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES
+        )
+        cases = (
+            (TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT, 7, True, 232_448),
+            (TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE, 6, True, 214_016),
+            (TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE, 7, False, 246_784),
+        )
+        for source_m_tile, ab_stages, should_fit, required_bytes in cases:
+            with self.subTest(
+                source_m_tile=source_m_tile,
+                ab_stages=ab_stages,
+                should_fit=should_fit,
+            ):
+                physical_shape = resolve_tcgen05_grouped_worklist_mma_shape(
+                    cluster_m=2,
+                    block_k=64,
+                    source_m_tile=source_m_tile,
+                )
+                self.assertEqual(physical_shape, (256, source_m_tile))
+                assert physical_shape is not None
+                self.assertEqual(
+                    tcgen05_grouped_worklist_smem_bytes(
+                        group_count=1,
+                        device_split_sizes=False,
+                        sched_stage_count=1,
+                        bm=physical_shape[0],
+                        bn=physical_shape[1],
+                        bk=64,
+                        dtype_bytes=2,
+                        ab_stages=ab_stages,
+                        acc_stages=2,
+                        c_stages=2,
+                        cluster_m=2,
+                    ),
+                    required_bytes,
+                )
+
+                spec = self._make_cute_tcgen05_spec()
+                spec._cute_tcgen05_config.ab_stages_three_search_constraints = (
+                    Tcgen05AbStagesThreeSearchConstraints(
+                        dtype_bytes=2,
+                        per_cta_smem_budget_bytes=constrained_budget_bytes,
+                    )
+                )
+                if should_fit:
+                    spec.normalize(selected_config(source_m_tile, ab_stages))
+                else:
+                    with self.assertRaisesRegex(exc.InvalidConfig, "tcgen05_ab_stages"):
+                        spec.normalize(selected_config(source_m_tile, ab_stages))
 
     def test_grouped_dynamic_deep_stage_smem_accounts_for_output_dtype(self) -> None:
         from helion._compiler.backend import CuteBackend

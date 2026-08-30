@@ -15,10 +15,10 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
 )
 from helion._compiler.cute.tcgen05_constants import (
-    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE,
+    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
 )
 from helion._compiler.cute.tcgen05_constants import (
-    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
+    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
 )
 from helion._testing import DEVICE
 from helion._testing import matchesBackends
@@ -61,7 +61,7 @@ def _selected_config(
             if source_m_tile is not None
             else TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE
             if block_k == 128
-            else TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE
+            else TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
         )
     return config
 
@@ -417,14 +417,16 @@ def _grouped_plan(code: str) -> dict[str, object]:
 
 
 def _bk64_device_split_smem_bytes(group_count: int) -> int:
-    from helion._compiler.cute.cute_mma import _tcgen05_grouped_worklist_smem_bytes
+    from helion._compiler.cute.tcgen05_constants import (
+        tcgen05_grouped_worklist_smem_bytes,
+    )
 
-    return _tcgen05_grouped_worklist_smem_bytes(
+    return tcgen05_grouped_worklist_smem_bytes(
         group_count=group_count,
         device_split_sizes=True,
         sched_stage_count=1,
         bm=256,
-        bn=TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE,
+        bn=TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
         bk=64,
         dtype_bytes=2,
         ab_stages=7,
@@ -444,9 +446,9 @@ def test_grouped_device_split_smem_accounting_includes_fixed_allocations() -> No
 @pytest.mark.parametrize(
     ("block_k", "source_m_tile"),
     (
-        (64, TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE),
+        (64, TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT),
         (128, TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE),
-        (128, TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE),
+        (128, TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT),
     ),
 )
 def test_grouped_device_split_sizes_codegen_and_wrapper_plan(
