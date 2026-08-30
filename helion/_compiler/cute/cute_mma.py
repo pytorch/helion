@@ -28,6 +28,8 @@ import os
 import textwrap
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Literal
+from typing import NamedTuple
 from typing import cast
 
 import torch
@@ -136,7 +138,6 @@ from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MMA_N_CHOICES
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
-from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
@@ -148,7 +149,7 @@ from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
-from .tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_shape
+from .tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from .tcgen05_lifecycle import Tcgen05LifecycleContext
@@ -449,9 +450,14 @@ class _Rank3RhsPackedGroupInfo:
 
 @dataclass(frozen=True)
 class _Rank3RhsPackedSplitInfo:
-    """Proof that compact A rows are partitioned by device split sizes."""
+    """Proof that compact A rows are partitioned by a device segment layout.
 
-    split_sizes_tensor: torch.Tensor
+    Both ``split_sizes[G]`` and ``offsets[G + 1]`` are normalized to the same
+    kernel-local scheduler table before the persistent loop starts.
+    """
+
+    layout_tensor: torch.Tensor
+    layout_kind: Literal["split_sizes", "offsets"]
 
 
 @dataclass(frozen=True)
@@ -506,6 +512,64 @@ class _Rank3RhsGroupedProof:
     @property
     def is_worklist(self) -> bool:
         return self.worklist_lhs is not None
+
+    @property
+    def requires_explicit_grouped_mode(self) -> bool:
+        """Whether lowering must explicitly enable grouped semantics."""
+        return self.k_mask is not None or self.tail_epilogue is not None
+
+    @property
+    def requires_worklist_nm_schedule(self) -> bool:
+        """Whether lowering needs the N,M-oriented worklist schedule."""
+        return (
+            self.rhs.matrix_major == "row"
+            or self.packed_split is not None
+            or (
+                self.worklist_store is not None
+                and self.worklist_store.uses_scheduler_store_extent
+            )
+        )
+
+
+class Tcgen05GroupedWorklistSeedFacts(NamedTuple):
+    """Structural proof plus first-binding hints for worklist seed ranking.
+
+    The integer fields are deliberately named ``*_hint``: they are not static
+    compiler facts and must not escape the grouped-worklist heuristic.
+    """
+
+    groups_hint: int
+    packed_m_hint: int
+    n_hint: int
+    k_hint: int
+    b_major: Literal["k", "n"]
+    device_split_sizes: bool
+
+
+@dataclass(frozen=True)
+class Tcgen05GroupedWorklistAnalysis:
+    """Schedule-independent compiler facts for a grouped worklist input.
+
+    ``metadata_tensor`` is the traced fake tensor for either a compact device
+    segment layout or the external ``[segments, 4]`` worklist described by
+    ``input_kind``. ``packed_tensor`` and ``grouped_tensor`` provide replayable
+    runtime sources for the dimensions that define that layout.
+    """
+
+    seed_facts: Tcgen05GroupedWorklistSeedFacts
+    metadata_tensor: torch.Tensor
+    packed_tensor: torch.Tensor
+    grouped_tensor: torch.Tensor
+    device_layout_kind: Literal["split_sizes", "offsets"] | None = None
+
+    @property
+    def input_kind(self) -> Literal["device_split_sizes", "external_worklist"]:
+        """Return the semantic form of the traced scheduling input."""
+        return (
+            "device_split_sizes"
+            if self.seed_facts.device_split_sizes
+            else "external_worklist"
+        )
 
 
 @dataclass(frozen=True)
@@ -1150,7 +1214,7 @@ def _rank3_rhs_segment_metadata_load(
         not isinstance(metadata, torch.Tensor)
         or metadata.ndim != 2
         or metadata.dtype not in (torch.int32, torch.int64)
-        or metadata.shape[1] < 4
+        or metadata.shape[1] != 4
         or (expected_tensor is not None and metadata is not expected_tensor)
         or not isinstance(loaded, torch.Tensor)
         or loaded.ndim != 0
@@ -1363,6 +1427,139 @@ def _rank3_rhs_lhs_scaffold(
     )
 
 
+def _rank3_rhs_is_group_plus_one(
+    cg: GenerateAST,
+    node: Node,
+    *,
+    group_index: Node,
+) -> bool:
+    import operator
+
+    root = _trace_to_outer_graph_arg(cg, node)
+    if (
+        root.op != "call_function"
+        or root.target not in (operator.add, torch.ops.aten.add.Tensor)
+        or len(root.args) != 2
+        or root.kwargs
+    ):
+        return False
+    lhs, rhs = root.args
+    return (
+        isinstance(lhs, Node)
+        and _trace_to_outer_graph_arg(cg, lhs) is group_index
+        and type(rhs) is int
+        and rhs == 1
+    ) or (
+        isinstance(rhs, Node)
+        and _trace_to_outer_graph_arg(cg, rhs) is group_index
+        and type(lhs) is int
+        and lhs == 1
+    )
+
+
+def _rank3_rhs_packed_offsets_lhs_info(
+    cg: GenerateAST,
+    lhs_scaffold: _Rank3RhsLhsScaffold,
+    *,
+    group_index: Node,
+    group_count: int,
+) -> tuple[_Rank3RhsWorklistLhsInfo, _Rank3RhsPackedSplitInfo] | None:
+    """Match ``offsets[g] + local_m`` with extent ``offsets[g+1]-offsets[g]``."""
+    import operator
+
+    start_loaded = _rank3_rhs_packed_split_load(
+        cg,
+        lhs_scaffold.row_offset,
+        expected_index=group_index,
+    )
+    if start_loaded is None:
+        return None
+    offsets, start_load = start_loaded
+    if offsets.shape[0] != group_count + 1:
+        return None
+
+    extent = lhs_scaffold.valid_extent
+    if (
+        extent.op != "call_function"
+        or extent.target not in (operator.sub, torch.ops.aten.sub.Tensor)
+        or len(extent.args) != 2
+        or extent.kwargs
+        or not all(isinstance(arg, Node) for arg in extent.args)
+    ):
+        return None
+    end_value, start_value = cast("tuple[Node, Node]", extent.args)
+    if (
+        _trace_to_outer_graph_arg(cg, start_value) is not start_load
+        and _rank3_rhs_packed_split_load(
+            cg,
+            start_value,
+            expected_tensor=offsets,
+            expected_index=group_index,
+        )
+        is None
+    ):
+        return None
+    end_loaded = _rank3_rhs_packed_split_load(
+        cg,
+        end_value,
+        expected_tensor=offsets,
+    )
+    if end_loaded is None:
+        return None
+    _offsets, end_load = end_loaded
+    end_indices = end_load.args[1] if len(end_load.args) >= 2 else None
+    if (
+        not isinstance(end_indices, list | tuple)
+        or len(end_indices) != 1
+        or not isinstance(end_indices[0], Node)
+        or not _rank3_rhs_is_group_plus_one(
+            cg,
+            end_indices[0],
+            group_index=group_index,
+        )
+    ):
+        return None
+
+    dependency_nodes = tuple(
+        dict.fromkeys(
+            (
+                group_index,
+                *(
+                    dependency
+                    for dependency in _collect_node_dependencies(lhs_scaffold.row_index)
+                    if dependency.op == "call_function"
+                    and isinstance(dependency.meta.get("val"), torch.Tensor)
+                    and cast("torch.Tensor", dependency.meta["val"]).ndim == 0
+                ),
+                *(
+                    dependency
+                    for dependency in _collect_node_dependencies(lhs_scaffold.valid_m)
+                    if dependency.op == "call_function"
+                    and isinstance(dependency.meta.get("val"), torch.Tensor)
+                    and cast("torch.Tensor", dependency.meta["val"]).ndim == 0
+                ),
+                lhs_scaffold.row_offset,
+                extent,
+                lhs_scaffold.row_index,
+                lhs_scaffold.valid_m,
+            )
+        )
+    )
+    return (
+        _Rank3RhsWorklistLhsInfo(
+            row_start=start_load,
+            group_m=extent,
+            row_index=lhs_scaffold.row_index,
+            valid_m=lhs_scaffold.valid_m,
+            dependency_nodes=dependency_nodes,
+        ),
+        _Rank3RhsPackedSplitInfo(
+            layout_tensor=offsets,
+            layout_kind="offsets",
+        ),
+    )
+
+
 def _rank3_rhs_packed_split_lhs_info(
     cg: GenerateAST,
     lhs_info: _MmaOperandInfo,
@@ -1421,6 +1618,14 @@ def _rank3_rhs_packed_split_lhs_info(
     )
     if lhs_scaffold is None:
         return None
+    offsets_lhs = _rank3_rhs_packed_offsets_lhs_info(
+        cg,
+        lhs_scaffold,
+        group_index=packed_group.group_index,
+        group_count=group_count,
+    )
+    if offsets_lhs is not None:
+        return offsets_lhs
     group_m_loaded = _rank3_rhs_packed_split_load(
         cg,
         lhs_scaffold.valid_extent,
@@ -1502,7 +1707,8 @@ def _rank3_rhs_packed_split_lhs_info(
             dependency_nodes=dependency_nodes,
         ),
         _Rank3RhsPackedSplitInfo(
-            split_sizes_tensor=split_sizes,
+            layout_tensor=split_sizes,
+            layout_kind="split_sizes",
         ),
     )
 
@@ -2608,6 +2814,11 @@ def tcgen05_fragment_epilogue_source_tiles_reachable(
     """
     if not candidate.requires_fragment_epilogue:
         return True
+    static_m = plan.static_m
+    static_n = plan.static_n
+    static_k = plan.static_k
+    if static_m is None or static_n is None or static_k is None:
+        return False
 
     def reachable_values(block_id: int, low: int, high: int) -> tuple[int, ...]:
         if block_id not in config_spec.block_sizes.valid_block_ids():
@@ -2645,9 +2856,9 @@ def tcgen05_fragment_epilogue_source_tiles_reachable(
             bn=bn,
             input_dtype=analysis.lhs.source_fake.dtype,
         )
-        and plan.static_m % bm == 0
-        and plan.static_n % bn == 0
-        and plan.static_k % bk == 0
+        and static_m % bm == 0
+        and static_n % bn == 0
+        and static_k % bk == 0
         for bm in block_values[0]
         for bn in block_values[1]
         for bk in block_values[2]
@@ -2847,7 +3058,7 @@ def _analyze_rank3_rhs_grouped_search_operands(
         role="rhs",
         allow_rank3_rhs_nt=True,
         # This early DeviceIR pass only recovers axes. Complete grouped
-        # semantics are proven by ``_prove_rank3_rhs_grouped_mma``.
+        # semantics are proven by ``_analyze_rank3_rhs_grouped_mma``.
         allow_rank3_rhs_mn_major=True,
         cg=graph_view,
         allow_grouped_k_mask=True,
@@ -2864,6 +3075,16 @@ def _analyze_rank3_rhs_grouped_search_operands(
     canonical_block_id = env.canonical_block_id
     n_block_id = canonical_block_id(rhs.rhs_n_block_id)
     k_block_id = canonical_block_id(rhs.rhs_k_block_id)
+    lhs_indices = lhs.load.args[1] if len(lhs.load.args) > 1 else None
+    lhs_k_block_id = (
+        _rank3_rhs_exact_index_block_id(lhs_indices[-1], reduction=None)
+        if isinstance(lhs_indices, list | tuple)
+        and lhs_indices
+        and isinstance(lhs_indices[-1], Node)
+        else None
+    )
+    if lhs_k_block_id is None or canonical_block_id(lhs_k_block_id) != k_block_id:
+        return None
     if len(device_ir.grid_block_ids) != 1:
         return None
     root_grid_ids = device_ir.grid_block_ids[0]
@@ -2923,9 +3144,67 @@ def _analyze_rank3_rhs_grouped_search_operands(
     )
     if lhs.source_fake.dtype != rhs.source_fake.dtype:
         return None
-    if not env.known_equal(lhs.source_fake.size(-1), rhs.source_fake.size(-1)):
-        return None
+    # Dynamic inputs can carry distinct K symbols. Admission relies on the
+    # proven shared reduction block-id above, never coincidentally equal size
+    # hints; the host K-equality guard and full grouped proof stay authoritative.
     return _MmaOperandAnalysis(lhs=lhs, rhs=rhs)
+
+
+def _rank3_grouped_root_axes(
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    *,
+    m_block_id: int,
+    n_block_id: int,
+    k_block_id: int,
+) -> _GroupedMmaAxes | None:
+    """Resolve grouped matrix axes by identity, independent of root order.
+
+    The persistent grouped scheduler replaces the original three-dimensional
+    root traversal, so source order is not semantic.  It still requires one
+    unique M axis, one unique N axis, and (for a three-axis root) one remaining
+    work/group axis; aliases and a root-carried K axis fail closed.
+    """
+    if len(device_ir.grid_block_ids) != 1:
+        return None
+    root_block_ids = device_ir.grid_block_ids[0]
+    if len(root_block_ids) not in (2, 3):
+        return None
+    canonical_block_id = env.canonical_block_id
+    canonical_m = canonical_block_id(m_block_id)
+    canonical_n = canonical_block_id(n_block_id)
+    canonical_root = tuple(map(canonical_block_id, root_block_ids))
+    if (
+        canonical_m == canonical_n
+        or canonical_block_id(k_block_id) in canonical_root
+        or len(set(canonical_root)) != len(canonical_root)
+    ):
+        return None
+    m_root_ids = [
+        block_id
+        for block_id in root_block_ids
+        if canonical_block_id(block_id) == canonical_m
+    ]
+    n_root_ids = [
+        block_id
+        for block_id in root_block_ids
+        if canonical_block_id(block_id) == canonical_n
+    ]
+    if len(m_root_ids) != 1 or len(n_root_ids) != 1:
+        return None
+    remaining = [
+        block_id
+        for block_id in root_block_ids
+        if block_id not in (m_root_ids[0], n_root_ids[0])
+    ]
+    if len(remaining) != len(root_block_ids) - 2:
+        return None
+    return _GroupedMmaAxes(
+        m_block_id=m_root_ids[0],
+        n_block_id=n_root_ids[0],
+        k_block_id=k_block_id,
+        segment_block_id=remaining[0] if remaining else None,
+    )
 
 
 def is_mma_compatible_aten(
@@ -3272,6 +3551,35 @@ def analyze_cute_mma_node(
                             worklist_store,
                             graphs=device_ir.graphs,
                         )
+            elif (segment_group := operands.rhs.rhs_segment_group) is not None:
+                graph_view = cast(
+                    "GenerateAST",
+                    _MmaSearchGraphView(device_ir.graphs),
+                )
+                segment_lhs = _rank3_rhs_segment_lhs_info(
+                    graph_view,
+                    operands.lhs,
+                    operands.rhs,
+                    segment_block_id=segment_group.segment_block_id,
+                    m_block_id=operands.m_block_id,
+                    k_block_id=operands.k_block_id,
+                )
+                if segment_lhs is not None:
+                    worklist_store = _rank3_rhs_worklist_store_info(
+                        graph_view,
+                        node,
+                        segment_lhs,
+                        segment_group,
+                        n_block_id=operands.n_block_id,
+                        allow_store_extent_metadata=True,
+                    )
+                    if worklist_store is not None:
+                        output_store_analysis = _analyze_packed_split_mma_output_store(
+                            node,
+                            operands,
+                            worklist_store,
+                            graphs=device_ir.graphs,
+                        )
             else:
                 output_store_analysis = _analyze_mma_output_stores(
                     node,
@@ -3330,47 +3638,47 @@ def analyze_cute_mma_node(
     )
 
 
-def _prove_rank3_rhs_grouped_mma(
+def _node_has_static_empty_tensor_result(node: Node) -> bool:
+    value = node.meta.get("val")
+    return isinstance(value, torch.Tensor) and any(
+        type(size) is int and size == 0 for size in value.shape
+    )
+
+
+def _analyze_rank3_rhs_grouped_mma(
     cg: GenerateAST,
     node: Node,
     *,
-    config: _ConfigLike,
     axes: _GroupedMmaAxes,
+    allow_missing_empty_store: bool = False,
 ) -> _Rank3RhsGroupedProof | None:
-    """Prove the graph semantics required by rank-3 RHS grouped lowering."""
+    """Analyze rank-3 RHS grouped semantics independently of a schedule."""
     from ..compile_environment import CompileEnvironment
 
-    # The grouped lowering is proven only for the rank-2 addmm form emitted by
-    # Helion's tiled reduction. Other Aten MMA forms remain supported by the
-    # ordinary collective path, but must not enter this grouped proof through
-    # only a subset of the compiler phases.
+    # Grouped semantics are recognized only for the rank-2 addmm form emitted
+    # by Helion's tiled reduction. Other Aten MMA forms remain supported by the
+    # ordinary collective path, but must not enter this analysis through only a
+    # subset of the compiler phases.
     if node.target is not torch.ops.aten.addmm.default:
         return None
-    with_acc = True
-    grouped_mode = _tcgen05_grouped_mode(config)
-    allow_grouped_k_mask = grouped_mode is not None
-    allow_rank3_rhs_mn_major = grouped_mode == TCGEN05_GROUPED_MODE_WORKLIST_NM
     if not can_codegen_cute_mma_aten(
         node,
-        with_acc,
+        True,
         allow_rank3_rhs_nt=True,
         cg=cg,
         rank3_rhs_m_block_id=axes.m_block_id,
-        allow_grouped_k_mask=allow_grouped_k_mask,
-        allow_rank3_rhs_mn_major=allow_rank3_rhs_mn_major,
+        allow_grouped_k_mask=True,
+        allow_rank3_rhs_mn_major=True,
     ):
         return None
-    lhs_node = node.args[1] if with_acc else node.args[0]
-    rhs_node = node.args[2] if with_acc else node.args[1]
+    lhs_node = node.args[1]
+    rhs_node = node.args[2]
     assert isinstance(lhs_node, Node) and isinstance(rhs_node, Node)
-    allow_segment_store_extent_metadata = (
-        grouped_mode == TCGEN05_GROUPED_MODE_WORKLIST_NM
-    )
     lhs_info = _trace_to_mma_operand(
         lhs_node,
         role="lhs",
         cg=cg,
-        allow_grouped_k_mask=allow_grouped_k_mask,
+        allow_grouped_k_mask=True,
     )
     rhs_info = _trace_to_mma_operand(
         rhs_node,
@@ -3378,8 +3686,8 @@ def _prove_rank3_rhs_grouped_mma(
         allow_rank3_rhs_nt=True,
         cg=cg,
         rank3_rhs_m_block_id=axes.m_block_id,
-        allow_grouped_k_mask=allow_grouped_k_mask,
-        allow_rank3_rhs_mn_major=allow_rank3_rhs_mn_major,
+        allow_grouped_k_mask=True,
+        allow_rank3_rhs_mn_major=True,
     )
     if lhs_info is None or rhs_info is None or not rhs_info.rhs_rank3_grouped_nt:
         return None
@@ -3393,25 +3701,20 @@ def _prove_rank3_rhs_grouped_mma(
         lhs_info.grouped_k_mask is not None or rhs_info.grouped_k_mask is not None
     ) and k_mask is None:
         return None
+    rhs_major = _tcgen05_tma_matrix_major(rhs_fake)
     if not (
         lhs_fake.dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         and _tcgen05_tma_matrix_major(lhs_fake) == "row"
-        and _tcgen05_tma_matrix_major(rhs_fake) in ("row", "col")
+        and rhs_major in ("row", "col")
         and rhs_info.rhs_n_block_id == canonical_block_id(axes.n_block_id)
         and rhs_info.rhs_k_block_id == canonical_block_id(axes.k_block_id)
-        and (
-            not with_acc
-            or (isinstance(node.args[0], Node) and _is_zero_init_acc_node(node.args[0]))
-        )
+        and isinstance(node.args[0], Node)
+        and _is_zero_init_acc_node(node.args[0])
     ):
         return None
 
     tail_epilogue = None
-    if (
-        allow_grouped_k_mask
-        and rhs_info.rhs_group_index is not None
-        and rhs_info.rhs_safe_group is not None
-    ):
+    if rhs_info.rhs_group_index is not None and rhs_info.rhs_safe_group is not None:
         tail_epilogue = find_tcgen05_grouped_tail_epilogue_for_mma(
             node,
             cg.codegen_graphs,
@@ -3437,8 +3740,6 @@ def _prove_rank3_rhs_grouped_mma(
     worklist_store = None
     packed_split = None
     if rhs_info.rhs_packed_group is not None:
-        if grouped_mode != TCGEN05_GROUPED_MODE_WORKLIST_NM:
-            return None
         packed_group = rhs_info.rhs_packed_group
         if axes.segment_block_id is None or canonical_block_id(
             packed_group.group_block_id
@@ -3478,7 +3779,7 @@ def _prove_rank3_rhs_grouped_mma(
             worklist_store,
             uses_scheduler_store_extent=True,
         )
-        layout_tensor = packed_split.split_sizes_tensor
+        layout_tensor = packed_split.layout_tensor
     elif segment_group is not None:
         if axes.segment_block_id is None:
             return None
@@ -3498,9 +3799,11 @@ def _prove_rank3_rhs_grouped_mma(
             worklist_lhs,
             segment_group,
             n_block_id=axes.n_block_id,
-            allow_store_extent_metadata=allow_segment_store_extent_metadata,
+            allow_store_extent_metadata=True,
         )
-        if worklist_store is None:
+        if worklist_store is None and not (
+            allow_missing_empty_store and _node_has_static_empty_tensor_result(node)
+        ):
             return None
         layout_tensor = segment_group.metadata_tensor
     else:
@@ -3534,6 +3837,160 @@ def _prove_rank3_rhs_grouped_mma(
     )
 
 
+def _rank3_rhs_grouped_schedule_is_legal(
+    proof: _Rank3RhsGroupedProof,
+    *,
+    grouped_mode: str | None,
+) -> bool:
+    """Return whether a requested grouped schedule can lower a semantic proof."""
+    if grouped_mode is None and proof.requires_explicit_grouped_mode:
+        return False
+    return not (
+        grouped_mode != TCGEN05_GROUPED_MODE_WORKLIST_NM
+        and proof.requires_worklist_nm_schedule
+    )
+
+
+def _prove_rank3_rhs_grouped_mma(
+    cg: GenerateAST,
+    node: Node,
+    *,
+    config: _ConfigLike,
+    axes: _GroupedMmaAxes,
+) -> _Rank3RhsGroupedProof | None:
+    """Compatibility wrapper for config-specific grouped MMA admission."""
+    proof = _analyze_rank3_rhs_grouped_mma(cg, node, axes=axes)
+    if proof is None or not _rank3_rhs_grouped_schedule_is_legal(
+        proof,
+        grouped_mode=_tcgen05_grouped_mode(config),
+    ):
+        return None
+    return proof
+
+
+def analyze_tcgen05_grouped_worklist(
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    fact: MatmulFact,
+) -> Tcgen05GroupedWorklistAnalysis | None:
+    """Analyze a grouped worklist without assuming a compiler config."""
+    from ..compile_environment import CompileEnvironment
+
+    host_function = device_ir.host_function
+    if (
+        host_function is None
+        or fact.m_block_id is None
+        or fact.k_block_id is None
+        or len(device_ir.root_ids) != 1
+        or len(device_ir.grid_block_ids) != 1
+        or len(device_ir.grid_block_ids[0]) != 3
+    ):
+        return None
+    if fact.n_block_id is None and fact.static_n != 0:
+        return None
+    graph_view = _MmaSearchGraphView(device_ir.graphs)
+    if CompileEnvironment.has_current():
+        assert CompileEnvironment.current() is env, (
+            "grouped worklist analysis must use the provided compile environment"
+        )
+        env_context = contextlib.nullcontext()
+    else:
+        env_context = env
+    with env_context, host_function:
+        for graph_info in device_ir.graphs:
+            for node in graph_info.graph.nodes:
+                if (
+                    node.op != "call_function"
+                    or node.target is not torch.ops.aten.addmm.default
+                ):
+                    continue
+                lhs_node = node.args[1] if len(node.args) > 1 else None
+                rhs_node = node.args[2] if len(node.args) > 2 else None
+                if not isinstance(lhs_node, Node) or not isinstance(rhs_node, Node):
+                    continue
+                operands = _analyze_rank3_rhs_grouped_search_operands(
+                    lhs_node,
+                    rhs_node,
+                    env,
+                    device_ir,
+                )
+                if operands is None:
+                    continue
+                axes = _rank3_grouped_root_axes(
+                    env,
+                    device_ir,
+                    m_block_id=operands.m_block_id,
+                    n_block_id=operands.n_block_id,
+                    k_block_id=operands.k_block_id,
+                )
+                segment_block_id = operands.leading_passthrough_block_id
+                if (
+                    axes is None
+                    or axes.segment_block_id is None
+                    or segment_block_id is None
+                    or env.canonical_block_id(axes.segment_block_id)
+                    != env.canonical_block_id(segment_block_id)
+                ):
+                    continue
+                canonical_block_id = env.canonical_block_id
+                if (
+                    canonical_block_id(operands.m_block_id)
+                    != canonical_block_id(fact.m_block_id)
+                    or canonical_block_id(operands.k_block_id)
+                    != canonical_block_id(fact.k_block_id)
+                    or (
+                        fact.n_block_id is not None
+                        and canonical_block_id(operands.n_block_id)
+                        != canonical_block_id(fact.n_block_id)
+                    )
+                ):
+                    continue
+                proof = _analyze_rank3_rhs_grouped_mma(
+                    cast("GenerateAST", graph_view),
+                    node,
+                    axes=axes,
+                    allow_missing_empty_store=True,
+                )
+                if proof is None or not proof.is_worklist:
+                    continue
+                rhs_major = proof.rhs.matrix_major
+                if rhs_major == "col":
+                    b_major: Literal["k", "n"] = "k"
+                elif rhs_major == "row":
+                    b_major = "n"
+                else:
+                    continue
+                groups = env.size_hint(proof.rhs.source_fake.shape[0])
+                packed_m = env.size_hint(proof.lhs.source_fake.shape[0])
+                n = env.size_hint(proof.rhs.source_fake.shape[1])
+                k = env.size_hint(proof.rhs.source_fake.shape[2])
+                device_split_sizes = proof.packed_split is not None
+                # Resolve and cache the input path while HostFunction is active.
+                # Seed ranking later replays this path against real bind values.
+                env.tensor_input_source(proof.layout_tensor)
+                env.tensor_input_source(proof.lhs.source_fake)
+                env.tensor_input_source(proof.rhs.source_fake)
+                return Tcgen05GroupedWorklistAnalysis(
+                    seed_facts=Tcgen05GroupedWorklistSeedFacts(
+                        groups,
+                        packed_m,
+                        n,
+                        k,
+                        b_major,
+                        device_split_sizes,
+                    ),
+                    metadata_tensor=proof.layout_tensor,
+                    packed_tensor=proof.lhs.source_fake,
+                    grouped_tensor=proof.rhs.source_fake,
+                    device_layout_kind=(
+                        proof.packed_split.layout_kind
+                        if proof.packed_split is not None
+                        else None
+                    ),
+                )
+    return None
+
+
 def _tcgen05_grouped_static_seed_has_proof(
     env: CompileEnvironment,
     device_ir: DeviceIR,
@@ -3557,17 +4014,9 @@ def _tcgen05_grouped_static_seed_has_proof(
         k_block_id=fact.k_block_id,
     )
 
-    probe_config = {
-        "block_sizes": [128, 64, 64 if require_exact_k else 16],
-        "pid_type": "persistent_interleaved",
-        "tcgen05_cluster_m": 1,
-        "tcgen05_cluster_n": 1,
-        TCGEN05_GROUPED_MODE_CONFIG_KEY: (
-            TCGEN05_GROUPED_MODE_DYNAMIC
-            if require_exact_k
-            else TCGEN05_GROUPED_MODE_STATIC
-        ),
-    }
+    grouped_mode = (
+        TCGEN05_GROUPED_MODE_DYNAMIC if require_exact_k else TCGEN05_GROUPED_MODE_STATIC
+    )
     graph_view = _MmaSearchGraphView(device_ir.graphs)
     env_context = contextlib.nullcontext() if CompileEnvironment.has_current() else env
     with env_context, host_function:
@@ -3577,13 +4026,15 @@ def _tcgen05_grouped_static_seed_has_proof(
                     continue
                 if node.target is not torch.ops.aten.addmm.default:
                     continue
-                proof = _prove_rank3_rhs_grouped_mma(
+                proof = _analyze_rank3_rhs_grouped_mma(
                     cast("GenerateAST", graph_view),
                     node,
-                    config=probe_config,
                     axes=axes,
                 )
-                if proof is None:
+                if proof is None or not _rank3_rhs_grouped_schedule_is_legal(
+                    proof,
+                    grouped_mode=grouped_mode,
+                ):
                     continue
                 proof_matches = (
                     proof.k_mask is not None
@@ -4248,10 +4699,9 @@ def prepare_cute_collective_lane_loop_suppression(
                     or cg.device_function.resolved_block_size(segment_block_id) != 1
                 ):
                     continue
-            proof = _prove_rank3_rhs_grouped_mma(
+            proof = _analyze_rank3_rhs_grouped_mma(
                 cg,
                 node,
-                config=cg.device_function.config,
                 axes=_GroupedMmaAxes(
                     m_block_id=m_block_id,
                     n_block_id=n_block_id,
@@ -4259,7 +4709,10 @@ def prepare_cute_collective_lane_loop_suppression(
                     segment_block_id=segment_block_id,
                 ),
             )
-            if proof is None:
+            if proof is None or not _rank3_rhs_grouped_schedule_is_legal(
+                proof,
+                grouped_mode=grouped_mode,
+            ):
                 continue
             if (
                 not proof.is_worklist
@@ -4288,33 +4741,22 @@ def prepare_cute_collective_lane_loop_suppression(
                     is None
                 ):
                     continue
-        collective_bm = bm
-        collective_bn = bn
-        worklist_shape = None
-        if (
+        worklist_lowering = (
             rhs_rank3_worklist_lhs_info is not None
-            and _requested_tcgen05_grouped_schedule(
-                cast(
-                    "str | None",
-                    cast("_ConfigLike", cg.device_function.config).get(
-                        TCGEN05_GROUPED_MODE_CONFIG_KEY
-                    ),
-                )
-            )
-            is Tcgen05Orientation.NM
-        ):
-            worklist_shape = resolve_tcgen05_grouped_worklist_mma_shape(
-                cluster_m=_tcgen05_cluster_m(cg.device_function.config),
+            and grouped_mode == TCGEN05_GROUPED_MODE_WORKLIST_NM
+        )
+        worklist_profile = (
+            resolve_tcgen05_grouped_worklist_mma_profile(
+                cg.device_function.config,
                 block_k=bk,
-                source_m_tile=_tcgen05_config_int(
-                    cg.device_function.config,
-                    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
-                    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
-                ),
             )
-            if worklist_shape is None:
-                continue
-            collective_bm, collective_bn = worklist_shape
+            if worklist_lowering
+            else None
+        )
+        if worklist_lowering and worklist_profile is None:
+            continue
+        collective_bm = worklist_profile.mma_m if worklist_profile is not None else bm
+        collective_bn = worklist_profile.mma_n if worklist_profile is not None else bn
         if (
             _choose_mma_impl(
                 lhs_fake.dtype,
@@ -4323,10 +4765,7 @@ def prepare_cute_collective_lane_loop_suppression(
                 bk=bk,
                 config=cg.device_function.config,
                 input_device=lhs_fake.device,
-                defer_grouped_worklist_smem_check=(
-                    rhs_rank3_worklist_lhs_info is not None
-                    and worklist_shape is not None
-                ),
+                defer_grouped_worklist_smem_check=worklist_profile is not None,
             )
             != "tcgen05"
         ):
@@ -5585,25 +6024,36 @@ def _requested_tcgen05_grouped_schedule(
     return Tcgen05Orientation.NM
 
 
-def _emit_tcgen05_device_split_sizes_setup(
+def _emit_tcgen05_device_segments_setup(
     prefix: list[ast.AST],
     df: DeviceFunction,
     grouped: CuteTcgen05GroupedPlan,
     *,
     n_size: int,
     k_size: int,
-    split_dtype: torch.dtype,
+    layout_dtype: torch.dtype,
 ) -> None:
-    """Materialize clipped source intervals from device split sizes in SMEM."""
+    """Materialize clipped source intervals from a compact device layout."""
     assert grouped.device_split_sizes
     assert grouped.m_size is not None
-    assert split_dtype in (torch.int32, torch.int64)
-    split_int_type = "cutlass.Int64" if split_dtype is torch.int64 else "cutlass.Int32"
+    assert grouped.device_layout_kind in ("split_sizes", "offsets")
+    assert layout_dtype in (torch.int32, torch.int64)
+    layout_int_type = (
+        "cutlass.Int64" if layout_dtype is torch.int64 else "cutlass.Int32"
+    )
     group_count = int(grouped.count)
     problem_sizes_ptr = df.new_var("tcgen05_grouped_problem_sizes_smem_ptr")
     starts_ptr = df.new_var("tcgen05_grouped_starts_smem_ptr")
-    running_start = df.new_var("tcgen05_grouped_running_start")
-    raw_split_value = df.new_var("tcgen05_grouped_raw_split_value")
+    if grouped.device_layout_kind == "offsets":
+        running_start = None
+        raw_split_value = None
+        raw_start = df.new_var("tcgen05_grouped_raw_start")
+        raw_extent = df.new_var("tcgen05_grouped_raw_extent")
+    else:
+        running_start = df.new_var("tcgen05_grouped_running_start")
+        raw_split_value = df.new_var("tcgen05_grouped_raw_split_value")
+        raw_start = None
+        raw_extent = None
     raw_end = df.new_var("tcgen05_grouped_raw_end")
     source_end = df.new_var("tcgen05_grouped_source_end")
     visible_start = df.new_var("tcgen05_grouped_visible_start")
@@ -5631,36 +6081,91 @@ def _emit_tcgen05_device_split_sizes_setup(
         ]
     )
     setup_lines = [
-        "if cute.arch.thread_idx()[0] == 0:",
-        f"    {running_start} = {split_int_type}(0)",
+        (
+            "if (cute.arch.thread_idx()[0] == 0) and "
+            "(cute.arch.thread_idx()[1] == 0) and "
+            "(cute.arch.thread_idx()[2] == 0):"
+        )
     ]
+    if grouped.device_layout_kind == "split_sizes":
+        assert running_start is not None
+        setup_lines.append(f"    {running_start} = {layout_int_type}(0)")
     for group_idx in range(group_count):
-        split_load = (
+        layout_load = (
             f"({grouped.layout}.iterator + cutlass.Int64({group_idx}) * "
             f"cutlass.Int64({grouped.layout}.layout.stride[0])).load()"
         )
+        if grouped.device_layout_kind == "offsets":
+            assert raw_start is not None and raw_extent is not None
+            next_layout_load = (
+                f"({grouped.layout}.iterator + cutlass.Int64({group_idx + 1}) * "
+                f"cutlass.Int64({grouped.layout}.layout.stride[0])).load()"
+            )
+            setup_lines.extend(
+                [
+                    f"    {raw_start} = {layout_int_type}({layout_load})",
+                    f"    {raw_end} = {layout_int_type}({next_layout_load})",
+                    (
+                        f"    {raw_extent} = max({raw_end} - {raw_start}, "
+                        f"{layout_int_type}(0))"
+                    ),
+                    (
+                        f"    {source_end} = {raw_start} + min({raw_extent}, "
+                        f"{layout_int_type}({grouped.m_size}))"
+                    ),
+                ]
+            )
+            setup_lines.extend(
+                [
+                    (
+                        f"    {visible_start} = min(max({raw_start}, "
+                        f"{layout_int_type}(0)), "
+                        f"{layout_int_type}({grouped.m_size}))"
+                    ),
+                    (
+                        f"    {visible_end} = min(max({source_end}, "
+                        f"{layout_int_type}(0)), "
+                        f"{layout_int_type}({grouped.m_size}))"
+                    ),
+                    (
+                        f"    {visible_extent} = max({visible_end} - "
+                        f"{visible_start}, {layout_int_type}(0)) if "
+                        f"{raw_extent} > {layout_int_type}(0) else "
+                        f"{layout_int_type}(0)"
+                    ),
+                ]
+            )
+        else:
+            assert running_start is not None and raw_split_value is not None
+            setup_lines.extend(
+                [
+                    f"    {raw_split_value} = {layout_int_type}({layout_load})",
+                    f"    {raw_end} = {running_start} + {raw_split_value}",
+                    (
+                        f"    {source_end} = {running_start} + min(max("
+                        f"{raw_split_value}, {layout_int_type}(0)), "
+                        f"{layout_int_type}({grouped.m_size}))"
+                    ),
+                    (
+                        f"    {visible_start} = min(max({running_start}, "
+                        f"{layout_int_type}(0)), "
+                        f"{layout_int_type}({grouped.m_size}))"
+                    ),
+                    (
+                        f"    {visible_end} = min(max({source_end}, "
+                        f"{layout_int_type}(0)), "
+                        f"{layout_int_type}({grouped.m_size}))"
+                    ),
+                    (
+                        f"    {visible_extent} = max({visible_end} - "
+                        f"{visible_start}, {layout_int_type}(0)) if "
+                        f"{raw_split_value} > {layout_int_type}(0) else "
+                        f"{layout_int_type}(0)"
+                    ),
+                ]
+            )
         setup_lines.extend(
             [
-                f"    {raw_split_value} = {split_int_type}({split_load})",
-                f"    {raw_end} = {running_start} + {raw_split_value}",
-                (
-                    f"    {source_end} = {running_start} + min(max("
-                    f"{raw_split_value}, {split_int_type}(0)), "
-                    f"{split_int_type}({grouped.m_size}))"
-                ),
-                (
-                    f"    {visible_start} = min(max({running_start}, "
-                    f"{split_int_type}(0)), {split_int_type}({grouped.m_size}))"
-                ),
-                (
-                    f"    {visible_end} = min(max({source_end}, {split_int_type}(0)), "
-                    f"{split_int_type}({grouped.m_size}))"
-                ),
-                (
-                    f"    {visible_extent} = max({visible_end} - {visible_start}, "
-                    f"{split_int_type}(0)) if {raw_split_value} > "
-                    f"{split_int_type}(0) else {split_int_type}(0)"
-                ),
                 (
                     f"    {grouped.starts}[cutlass.Int32({group_idx})] = "
                     f"cutlass.Int32({visible_start})"
@@ -5681,9 +6186,11 @@ def _emit_tcgen05_device_split_sizes_setup(
                     f"    {grouped.problem_sizes}[cutlass.Int32({group_idx}), "
                     "cutlass.Int32(3)] = cutlass.Int32(1)"
                 ),
-                f"    {running_start} = {raw_end}",
             ]
         )
+        if grouped.device_layout_kind == "split_sizes":
+            assert running_start is not None
+            setup_lines.append(f"    {running_start} = {raw_end}")
     prefix.extend(
         [
             statement_from_string("\n".join(setup_lines)),
@@ -6229,10 +6736,9 @@ def _emit_mma_pipeline(
                 return _unsupported_schedule(
                     "segment metadata work axis block size was not 1"
                 )
-        rhs_rank3_grouped_proof = _prove_rank3_rhs_grouped_mma(
+        rhs_rank3_grouped_proof = _analyze_rank3_rhs_grouped_mma(
             cg,
             fx_node,
-            config=df.config,
             axes=_GroupedMmaAxes(
                 m_block_id=m_block_id,
                 n_block_id=n_block_id,
@@ -6241,6 +6747,11 @@ def _emit_mma_pipeline(
             ),
         )
         if rhs_rank3_grouped_proof is None:
+            return _unsupported_schedule("rank3 grouped semantic proof failed")
+        if not _rank3_rhs_grouped_schedule_is_legal(
+            rhs_rank3_grouped_proof,
+            grouped_mode=grouped_mode,
+        ):
             return _unsupported_schedule("rank3 grouped semantic proof failed")
         lhs_info = rhs_rank3_grouped_proof.lhs
         rhs_info = rhs_rank3_grouped_proof.rhs
@@ -6323,37 +6834,25 @@ def _emit_mma_pipeline(
     # B becomes physical operand A, while packed A becomes physical operand B.
     tcgen05_mma_a_k_major = not tcgen05_nm_orientation or tcgen05_b_k_major
     tcgen05_mma_b_k_major = True if tcgen05_nm_orientation else tcgen05_b_k_major
+    worklist_profile = None
     tcgen05_worklist_source_m_tile: int | None = None
     tcgen05_one_cta_worklist_shape = False
-    worklist_shape = None
     if tcgen05_nm_orientation:
-        if bk not in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES:
-            return _unsupported_schedule("block_k must be 64 or 128")
-        tcgen05_worklist_source_m_tile = _tcgen05_config_int(
+        worklist_profile = resolve_tcgen05_grouped_worklist_mma_profile(
             df.config,
-            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
-            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
-        )
-        if (
-            tcgen05_worklist_source_m_tile
-            not in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
-        ):
-            return _unsupported_schedule(
-                f"{TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY} must be "
-                f"one of {TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES}"
-            )
-        worklist_shape = resolve_tcgen05_grouped_worklist_mma_shape(
-            cluster_m=tcgen05_cluster_m,
             block_k=bk,
-            source_m_tile=tcgen05_worklist_source_m_tile,
         )
-        if worklist_shape is None:
+        if worklist_profile is None:
             return _unsupported_schedule(
-                "worklist N,M requires cluster_m=2, or cluster_m=1 with "
+                "worklist N,M requires block_k in (64, 128), cluster_m=2, "
+                "or cluster_m=1 with "
                 f"{TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY}="
                 f"{TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE}"
             )
-        tcgen05_mma_bm, tcgen05_mma_bn = worklist_shape
+        tcgen05_cluster_m = worklist_profile.cluster_m
+        tcgen05_worklist_source_m_tile = worklist_profile.source_m_tile
+        tcgen05_mma_bm = worklist_profile.mma_m
+        tcgen05_mma_bn = worklist_profile.mma_n
         tcgen05_one_cta_worklist_shape = tcgen05_cluster_m == 1
         tcgen05_source_bm = tcgen05_worklist_source_m_tile
         tcgen05_source_bn = tcgen05_mma_bm
@@ -6394,7 +6893,7 @@ def _emit_mma_pipeline(
         bk=bk,
         config=df.config,
         input_device=lhs_fake.device,
-        defer_grouped_worklist_smem_check=(worklist_shape is not None),
+        defer_grouped_worklist_smem_check=worklist_profile is not None,
     )
     if (
         mma_impl == "tcgen05"
@@ -6481,7 +6980,7 @@ def _emit_mma_pipeline(
                 bn=bn,
                 bk=bk,
                 config=df.config,
-                defer_grouped_worklist_smem_check=(worklist_shape is not None),
+                defer_grouped_worklist_smem_check=worklist_profile is not None,
             )
         )
     ):
@@ -7024,6 +7523,7 @@ def _emit_mma_pipeline(
     tcgen05_grouped_worklist_persistent = False
     grouped_worklist_supported = False
     tcgen05_grouped_device_split_sizes = False
+    tcgen05_grouped_device_layout_kind: Literal["split_sizes", "offsets"] | None = None
     tcgen05_grouped_layout_arg_name: str | None = None
     tcgen05_grouped_n_sizes_arg_name: str | None = None
     tcgen05_grouped_k_sizes_arg_name: str | None = None
@@ -7150,6 +7650,11 @@ def _emit_mma_pipeline(
         tcgen05_grouped_device_split_sizes = (
             rhs_rank3_grouped_proof.packed_split is not None
         )
+        tcgen05_grouped_device_layout_kind = (
+            rhs_rank3_grouped_proof.packed_split.layout_kind
+            if rhs_rank3_grouped_proof.packed_split is not None
+            else None
+        )
         tcgen05_grouped_worklist_persistent = (
             rhs_rank3_grouped_proof.is_worklist
             and tcgen05_grouped_dynamic_ab_tensormaps_requested
@@ -7157,6 +7662,7 @@ def _emit_mma_pipeline(
         if (
             tcgen05_grouped_worklist_persistent
             and not tcgen05_grouped_device_split_sizes
+            and not tcgen05_grouped_runtime_nm_direct
         ):
             if grouped_layout_tensor.ndim != 2 or grouped_layout_tensor.shape[1] != 4:
                 raise exc.BackendUnsupported(
@@ -7706,12 +8212,14 @@ def _emit_mma_pipeline(
                 tcgen05_worklist_source_m_tile if tcgen05_nm_orientation else None
             ),
             m_size=m_size if tcgen05_grouped_device_split_sizes else None,
+            device_layout_kind=tcgen05_grouped_device_layout_kind,
         )
     if requested_schedule is not None and (
         tcgen05_grouped_plan is None
         or (
             tcgen05_grouped_plan.real_groups is None
             and not tcgen05_grouped_plan.device_split_sizes
+            and not tcgen05_grouped_plan.uses_runtime_tile_table
         )
         or tcgen05_grouped_plan.orientation is not requested_schedule
     ):
@@ -7769,7 +8277,6 @@ def _emit_mma_pipeline(
         # MMA-M tile and K to be a whole BK tile. Every A/B TMA transaction is
         # therefore full even when the logical valid-row mask zeros D padding.
         tcgen05_static_full_tma_fast_path = True
-    nm_worklist = tcgen05_nm_orientation
     rhs_rank3_tma_group_expr = rhs_rank3_group_expr
     rhs_rank3_tma_group_setup: list[str] = []
     if (
@@ -7868,7 +8375,7 @@ def _emit_mma_pipeline(
                     and rhs_rank3_grouped_proof.packed_split is not None
                 )
                 if (
-                    rhs_rank3_grouped_proof.packed_split.split_sizes_tensor.dtype
+                    rhs_rank3_grouped_proof.packed_split.layout_tensor.dtype
                     is torch.int64
                 ):
                     # Int64 split sizes lower these exact proof nodes to an
@@ -7972,10 +8479,11 @@ def _emit_mma_pipeline(
     )
     if tcgen05_runtime_n_specialization:
         assert tcgen05_worklist_source_m_tile is not None
-        # Runtime UMMA-N specialization is a correctness path for ragged
-        # source-M tails, not a tunable choice. The exact BF16/FP32 shape
-        # envelope below fails closed; the pinned CuTe/CUTLASS environment is
-        # validation provenance, and upgrades require revalidating raw PTX.
+        # Runtime UMMA-N narrows ragged runtime-direct source-M tails.  Mailbox
+        # scheduling and the newer-DSL fallback retain public typed static-width
+        # MMA. The exact BF16/FP32 shape envelope below fails closed; the pinned
+        # CuTe/CUTLASS environment is validation provenance, and upgrades require
+        # revalidating raw PTX.
         runtime_n_shape_supported = (
             input_dtype == torch.bfloat16
             and input_dtype_str == "cutlass.BFloat16"
@@ -8025,13 +8533,13 @@ def _emit_mma_pipeline(
             rhs_rank3_grouped_proof is not None
             and rhs_rank3_grouped_proof.packed_split is not None
         )
-        _emit_tcgen05_device_split_sizes_setup(
+        _emit_tcgen05_device_segments_setup(
             prefix,
             df,
             tcgen05_grouped_plan,
             n_size=n_size,
             k_size=k_total_size,
-            split_dtype=rhs_rank3_grouped_proof.packed_split.split_sizes_tensor.dtype,
+            layout_dtype=rhs_rank3_grouped_proof.packed_split.layout_tensor.dtype,
         )
     # This call corresponds to one MMA FX-node lowering. The later
     # register_tcgen05_kloop_owned_stmts slice starts here, so pre-existing
@@ -8311,8 +8819,7 @@ def _emit_mma_pipeline(
         tcgen05_warp_spec = warp_spec_from_config(df.config)
         # The public NM profile reserves its scheduler warp internally.
         nm_scheduler_decode = (
-            nm_worklist
-            and tcgen05_nm_orientation
+            tcgen05_nm_orientation
             and tcgen05_grouped_static_persistent
             and tcgen05_grouped_worklist_persistent
             and (
@@ -8579,7 +9086,7 @@ def _emit_mma_pipeline(
             )
             and explicit_epi_aux_supported
         )
-        if nm_worklist:
+        if tcgen05_nm_orientation:
             nm_worklist_metadata_checks = {
                 "supported_physical_store": nm_explicit_store_wave,
                 "dynamic_rank2_ab_tensormaps": (
@@ -9987,6 +10494,7 @@ def _emit_mma_pipeline(
                         **(
                             {
                                 "device_split_sizes": True,
+                                "device_layout_kind": grouped_plan.device_layout_kind,
                                 "m_size": cast("int", grouped_plan.m_size),
                             }
                             if grouped_plan.device_split_sizes
@@ -10027,7 +10535,7 @@ def _emit_mma_pipeline(
                             if grouped_plan.static_group_quota_args
                             else {}
                         ),
-                        **({"orientation": "nm"} if nm_worklist else {}),
+                        **({"orientation": "nm"} if tcgen05_nm_orientation else {}),
                         **(
                             {"worklist_metadata": True}
                             if tcgen05_grouped_worklist_persistent
@@ -10114,7 +10622,7 @@ def _emit_mma_pipeline(
                 "k_total_size": k_total_size,
                 "kernel_args": [tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b],
             }
-            if nm_worklist:
+            if tcgen05_nm_orientation:
                 ab_tma_plan["orientation"] = "nm"
             if tcgen05_grouped_fixed_tensormaps:
                 ab_tma_plan["fixed_ab_tensormaps"] = True
@@ -10491,7 +10999,8 @@ def _emit_mma_pipeline(
                 )
                 _emit_per_tile(
                     f"if {tcgen05_grouped_valid_m} <= "
-                    f"cutlass.Int32({tcgen05_mma_bn - 16}):\n"
+                    f"cutlass.Int32("
+                    f"{tcgen05_mma_bn - _TCGEN05_RUNTIME_MMA_N_GRANULARITY}):\n"
                     f"    {tma_runtime_mma_n} = "
                     f"{_tcgen05_runtime_mma_n_expr(tcgen05_grouped_valid_m, tcgen05_mma_bn)}\n"
                     f"    {tma_b_peer_delta} = {mma_slice_linear} * "
@@ -11054,7 +11563,7 @@ def _emit_mma_pipeline(
                 )
                 and tcgen05_static_full_tiles
                 and tcgen05_is_two_cta
-                and (bk == 64 or nm_worklist)
+                and (bk == 64 or tcgen05_nm_orientation)
             )
             tma_kloop_args = _PerKiterTmaArgs(
                 tma_pipeline=tma_pipeline,
@@ -11607,7 +12116,7 @@ def _emit_mma_pipeline(
             segment_store_actual_m = (
                 tcgen05_grouped_store_m
                 if (
-                    nm_worklist
+                    tcgen05_nm_orientation
                     and tcgen05_grouped_store_m
                     and rhs_rank3_worklist_store_info.uses_scheduler_store_extent
                 )
@@ -11615,21 +12124,30 @@ def _emit_mma_pipeline(
             )
             segment_store_valid_m_bound = (
                 tcgen05_grouped_valid_m
-                if nm_worklist and tcgen05_grouped_valid_m
+                if tcgen05_nm_orientation and tcgen05_grouped_valid_m
                 else rhs_rank3_worklist_lhs_info.group_m.name
             )
             segment_store_node = rhs_rank3_worklist_store_info.store_node
             segment_store_row_index = rhs_rank3_worklist_store_info.row_index
             segment_store_valid_m = rhs_rank3_worklist_store_info.valid_m
+        if analysis is not None:
+            output_block_ids = analysis.output_block_ids
+        elif rhs_rank3_grouped_proof is not None:
+            grouped_output_segment = (
+                rhs_rank3_grouped_proof.rhs.rhs_grouped_leading_block_id
+            )
+            output_block_ids = (
+                *(() if grouped_output_segment is None else (grouped_output_segment,)),
+                m_block_id,
+                n_block_id,
+            )
+        else:
+            output_block_ids = tuple(grid_state.block_ids)
         df.cute_state.register_tcgen05_store_value(
             result_var,
             CuteTcgen05StoreValue(
                 lifecycle_context=tcgen05_lifecycle_context,
-                output_block_ids=(
-                    analysis.output_block_ids
-                    if analysis is not None
-                    else tuple(grid_state.block_ids)
-                ),
+                output_block_ids=output_block_ids,
                 pure_matmul_object=tcgen05_pure_matmul_object,
                 bm=tcgen05_mma_bm,
                 bn=tcgen05_mma_bn,
@@ -11936,20 +12454,17 @@ def _tcgen05_candidate_exceeds_smem(
     """Whether tcgen05 A/B staging exceeds the device's per-CTA budget."""
     if input_device is None or config is None:
         return False
-    worklist_shape = (
-        resolve_tcgen05_grouped_worklist_mma_shape(
-            cluster_m=_tcgen05_cluster_m(config),
-            block_k=bk,
-            source_m_tile=_tcgen05_config_int(
-                config,
-                TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
-                TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
-            ),
+    worklist_profile = (
+        resolve_tcgen05_grouped_worklist_mma_profile(
+            cast("_ConfigLike", config), block_k=bk
         )
         if defer_grouped_worklist_smem_check
         else None
     )
-    if worklist_shape is not None and (bm, bn) == worklist_shape:
+    if worklist_profile is not None and (bm, bn) == (
+        worklist_profile.mma_m,
+        worklist_profile.mma_n,
+    ):
         # The grouped worklist owns scheduler mailboxes, TensorMap storage, and
         # an explicit C ring. Its conservative allocation upper bound is checked
         # by ``tcgen05_grouped_worklist_smem_bytes`` in the resolved worklist
@@ -12776,8 +13291,8 @@ def _validate_tcgen05_smem_swizzle_override(
     """Reject illegal ``smem_swizzle_a/b`` overrides at codegen time.
 
     CuTe's ``make_smem_layout_atom`` requires the major-mode bytes-per-row
-    to be a multiple of the swizzle pattern's contiguous bytes. For
-    The resolved operand major mode determines the contiguous extent: K-major
+    to be a multiple of the swizzle pattern's contiguous bytes. The resolved
+    operand major mode determines the contiguous extent: K-major
     operands use ``bk``; MN-major A uses ``bm`` and MN-major B uses ``bn``.
 
     This helper computes the active bytes-per-row from the live tile

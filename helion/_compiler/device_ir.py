@@ -83,6 +83,7 @@ from .type_info import _eval_unary
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Collection
     from collections.abc import Iterable
     from collections.abc import Mapping
     from collections.abc import Sequence
@@ -90,6 +91,7 @@ if TYPE_CHECKING:
     from ..autotuner.config_spec import AccumulatorFact
     from ..autotuner.config_spec import ConfigSpec
     from ..autotuner.config_spec import MemoryOpFact
+    from ..language.matmul_ops import _CuteTcgen05SearchPlanningResult
     from .cute.layout import CuTeGridExecutionPlan
     from .device_ir_analysis import DeviceIRAnalysis
 
@@ -100,6 +102,23 @@ if TYPE_CHECKING:
 tls: _TLS = cast("_TLS", threading.local())
 
 log = logging.getLogger(__name__)
+
+
+def _finalize_cute_tcgen05_search_planning(
+    env: CompileEnvironment,
+    planning_results: Sequence[_CuteTcgen05SearchPlanningResult],
+    analysis_keys: Collection[object],
+) -> bool:
+    """Publish every guard and report whether one cache-safe analysis remains."""
+    env.specialized_vars.update(
+        symbol
+        for result in planning_results
+        for symbol in result.required_specialized_vars
+    )
+    return (
+        all(result.guards_complete for result in planning_results)
+        and len(analysis_keys) == 1
+    )
 
 
 def _lerp_scalar_decomp(
@@ -2922,8 +2941,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     supports_tensor_4d_tma=flash_shape.supports_tensor_4d_tma,
                 )
             else:
+                from ..language.matmul_ops import _plan_cute_tcgen05_search_candidate
                 from ..language.matmul_ops import enable_cute_tcgen05_search
-                from ..language.matmul_ops import plan_cute_tcgen05_search
+                from .cute.cute_mma import _rank3_grouped_root_axes
                 from .cute.cute_mma import analyze_cute_mma_node
                 from .cute.cute_mma import (
                     tcgen05_fragment_epilogue_source_tiles_reachable,
@@ -2939,13 +2959,33 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 for graph_info in device_ir.graphs:
                     for node in graph_info.graph.nodes:
                         candidate = analyze_cute_mma_node(node, device_ir=device_ir)
+                        if candidate is None or candidate.requires_accumulator_seed:
+                            continue
                         if (
-                            candidate is None
-                            or candidate.requires_accumulator_seed
-                            or candidate.operands.output_block_ids
+                            candidate.operands.output_block_ids
                             not in root_grid_block_ids
                         ):
-                            continue
+                            if not candidate.operands.rhs.rhs_rank3_grouped_nt:
+                                continue
+                            env = CompileEnvironment.current()
+                            grouped_axes = _rank3_grouped_root_axes(
+                                env,
+                                device_ir,
+                                m_block_id=candidate.operands.m_block_id,
+                                n_block_id=candidate.operands.n_block_id,
+                                k_block_id=candidate.operands.k_block_id,
+                            )
+                            leading_block_id = (
+                                candidate.operands.leading_passthrough_block_id
+                            )
+                            if (
+                                grouped_axes is None
+                                or grouped_axes.segment_block_id is None
+                                or leading_block_id is None
+                                or env.canonical_block_id(grouped_axes.segment_block_id)
+                                != env.canonical_block_id(leading_block_id)
+                            ):
+                                continue
                         lhs = candidate.lhs.meta.get("val")
                         rhs = candidate.rhs.meta.get("val")
                         if not (
@@ -2963,8 +3003,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     for candidate, _lhs, _rhs, _node in mma_candidates
                 )
                 search_candidates = []
+                planning_results = []
                 for candidate, lhs, rhs, _node in mma_candidates:
-                    search_plan = plan_cute_tcgen05_search(
+                    planning_result = _plan_cute_tcgen05_search_candidate(
                         lhs,
                         rhs,
                         has_leading_passthrough=(
@@ -2976,7 +3017,12 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         supports_small_n_scalar_fallback=(
                             supports_small_n_scalar_fallback
                         ),
+                        allow_dynamic_hints=(
+                            candidate.operands.rhs.rhs_segment_group is not None
+                        ),
                     )
+                    planning_results.append(planning_result)
+                    search_plan = planning_result.plan
                     if (
                         search_plan is None
                         or not candidate.supports_tcgen05_search_plan(search_plan)
@@ -2995,7 +3041,15 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     )
                     for candidate, _lhs, _plan in search_candidates
                 }
-                if len(analysis_keys) == 1:
+                # Every dynamic candidate can change the accepted analysis-key
+                # set on a later binding. Publish all source-backed guards only
+                # after every candidate has observed the same compile state.
+                env = CompileEnvironment.current()
+                if _finalize_cute_tcgen05_search_planning(
+                    env,
+                    planning_results,
+                    analysis_keys,
+                ):
                     candidate, lhs, search_plan = search_candidates[0]
                     enable_cute_tcgen05_search(
                         lhs,

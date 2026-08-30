@@ -2,19 +2,37 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Literal
 from typing import cast
 
 import torch
 
 from ...runtime.config import Config
+from ..cute.cutedsl_compat import tcgen05_runtime_n_ptx_compatible
+from ..cute.cutedsl_compat import warn_tcgen05_runtime_n_ptx_fallback
+from ..cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from ..cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
+from ..cute.strategies import TCGEN05_STRATEGY_CONFIG_KEY
+from ..cute.strategies import TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY
 from ..cute.strategies import Tcgen05PersistenceModel
+from ..cute.strategies import Tcgen05Strategy
 from ..cute.tcgen05_config import TCGEN05_GROUPED_DYNAMIC_AB4_STAGE
+from ..cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_MODE_DYNAMIC
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_MODE_STATIC
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_RUNTIME_DIRECT_CLC_MAX_CLUSTERS
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_COMMON_K_BLOCK_PAIRS
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
@@ -23,16 +41,21 @@ from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from ..cute.tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
+from .common import dedupe_configs
 from .common import is_canonical_row_reduction
 from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from ...autotuner.config_fragment import BlockSizeFragment
     from ...autotuner.config_spec import ConfigSpec
     from ...autotuner.config_spec import MatmulFact
     from ...autotuner.config_spec import ReductionLoopSpec
     from ..compile_environment import CompileEnvironment
+    from ..cute.cute_mma import Tcgen05GroupedWorklistAnalysis
     from ..device_ir import DeviceIR
+    from .registry import CompilerHeuristicSpecializationFact
 
 
 def _cute_seed_vec_width(
@@ -237,13 +260,8 @@ class CuteTileVecHeuristic(AutotunerHeuristic):
         # SM100 warp + L2 hit cadence) when reachable, else cap at the
         # inner tile's fragment.high.  ``num_threads`` is sized so the
         # lane_extent equals V (one vec load per thread per outer iter).
-        bn_fragment = cast("Any", spec.block_sizes[1])._fragment(spec)
-        bn_high = getattr(bn_fragment, "high", None)
-        block_n: int
-        if isinstance(bn_high, int):
-            block_n = 1024 if bn_high >= 1024 else max(bn_high, vec)
-        else:
-            block_n = 1024
+        bn_high = spec.block_sizes[1]._fragment(spec).high
+        block_n = 1024 if bn_high >= 1024 else max(bn_high, vec)
         # Threads = block_n // V so each thread owns V contiguous elts.
         nt_n = max(1, block_n // vec)
         seed: dict[str, Any] = {
@@ -307,9 +325,8 @@ class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
         # against the launch cost (and an autotuner-picked warp lattice
         # can hold the row).  We use the inner block fragment's high
         # bound as a proxy for the reduction extent.
-        bn_fragment = cast("Any", spec.block_sizes[1])._fragment(spec)
-        bn_high = getattr(bn_fragment, "high", None)
-        return isinstance(bn_high, int) and bn_high >= vec * 32
+        bn_high = spec.block_sizes[1]._fragment(spec).high
+        return bn_high >= vec * 32
 
     @classmethod
     def get_seed_config(
@@ -330,10 +347,9 @@ class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
         # Each thread owns V contiguous elements; one warp = 32 threads
         # = 32 * V elements per outer-tile iter. Cap by the fragment's
         # high bound so the seed is reachable for short reduction axes.
-        bn_fragment = cast("Any", spec.block_sizes[1])._fragment(spec)
-        bn_high = getattr(bn_fragment, "high", None)
+        bn_high = spec.block_sizes[1]._fragment(spec).high
         block_n = vec * 32
-        if isinstance(bn_high, int) and bn_high < block_n:
+        if bn_high < block_n:
             return None
         seed: dict[str, Any] = {
             "block_sizes": [1, block_n],
@@ -397,18 +413,13 @@ class CuteTileVecWarpPerRowHeuristic(AutotunerHeuristic):
         vec = _cute_tile_seed_vec_width_for_dtype(dtype)
         if vec <= 1:
             return False
-        bn_fragment = cast("Any", spec.block_sizes[1])._fragment(spec)
-        bn_high = getattr(bn_fragment, "high", None)
-        if not isinstance(bn_high, int) or bn_high < vec * 32:
+        bn_high = spec.block_sizes[1]._fragment(spec).high
+        if bn_high < vec * 32:
             return False
         # Outer (M) fragment must admit M=2 (warp-per-row launches 2
         # warps per CTA so each row is one warp).
-        bm_fragment = cast("Any", spec.block_sizes[0])._fragment(spec)
-        bm_low = getattr(bm_fragment, "low", 1)
-        bm_high = getattr(bm_fragment, "high", None)
-        if not isinstance(bm_high, int):
-            return False
-        return bm_low <= 2 <= bm_high
+        bm_fragment = spec.block_sizes[0]._fragment(spec)
+        return bm_fragment.low <= 2 <= bm_fragment.high
 
     @classmethod
     def get_seed_config(
@@ -426,10 +437,9 @@ class CuteTileVecWarpPerRowHeuristic(AutotunerHeuristic):
         vec = _cute_tile_seed_vec_width_for_dtype(dtype)
         if vec <= 1:
             return None
-        bn_fragment = cast("Any", spec.block_sizes[1])._fragment(spec)
-        bn_high = getattr(bn_fragment, "high", None)
+        bn_high = spec.block_sizes[1]._fragment(spec).high
         block_n = vec * 32
-        if isinstance(bn_high, int) and bn_high < block_n:
+        if bn_high < block_n:
             return None
         seed: dict[str, Any] = {
             "block_sizes": [2, block_n],
@@ -500,10 +510,28 @@ def _block_size_value_reachable(
 ) -> bool:
     if block_index < 0 or block_index >= len(spec.block_sizes):
         return False
-    fragment = cast("Any", spec.block_sizes[block_index])._fragment(spec)
-    low = getattr(fragment, "low", None)
-    high = getattr(fragment, "high", None)
-    return isinstance(low, int) and isinstance(high, int) and low <= value <= high
+    fragment = spec.block_sizes[block_index]._fragment(spec)
+    return fragment.low <= value <= fragment.high
+
+
+def _filter_reachable_block_size_configs(
+    spec: ConfigSpec,
+    configs: Sequence[Config],
+) -> list[Config]:
+    """Keep seeds whose block sizes are reachable in the live config spec."""
+    result: list[Config] = []
+    for config in configs:
+        block_sizes = config.config.get("block_sizes")
+        if not isinstance(block_sizes, list) or len(block_sizes) != len(
+            spec.block_sizes
+        ):
+            continue
+        if all(
+            type(value) is int and _block_size_value_reachable(spec, index, value)
+            for index, value in enumerate(block_sizes)
+        ):
+            result.append(config)
+    return result
 
 
 def _tcgen05_grouped_fact(env: CompileEnvironment) -> MatmulFact | None:
@@ -514,7 +542,7 @@ def _tcgen05_grouped_fact(env: CompileEnvironment) -> MatmulFact | None:
         or len(spec.block_sizes) != 3
     ):
         return None
-    fact = spec.matmul_facts[0]
+    fact = _tcgen05_fact_with_static_provenance(spec, spec.matmul_facts[0])
     if fact.lhs_dtype is not fact.rhs_dtype or fact.lhs_dtype not in (
         torch.float16,
         torch.bfloat16,
@@ -542,6 +570,65 @@ def _tcgen05_grouped_fact(env: CompileEnvironment) -> MatmulFact | None:
     if fact.static_m % 128 != 0 or fact.static_n % 64 != 0:
         return None
     return fact
+
+
+def _tcgen05_fact_with_static_provenance(
+    spec: ConfigSpec,
+    fact: MatmulFact,
+) -> MatmulFact:
+    static_extents = spec._tcgen05_matmul_compile_time_static_extents()
+    if static_extents is None:
+        return fact
+    return fact._replace(
+        static_m=static_extents[0],
+        static_n=static_extents[1],
+        static_k=static_extents[2],
+    )
+
+
+def _tcgen05_grouped_worklist_structural_fact(
+    env: CompileEnvironment,
+) -> MatmulFact | None:
+    """Return structural grouped facts before dynamic shape hints are frozen."""
+    spec = env.config_spec
+    if len(spec.matmul_facts) != 1 or len(spec.block_sizes) != 3:
+        return None
+    fact = _tcgen05_fact_with_static_provenance(spec, spec.matmul_facts[0])
+    if fact.lhs_dtype is not torch.bfloat16 or fact.rhs_dtype is not torch.bfloat16:
+        return None
+    if (
+        fact.m_block_id is None
+        or (fact.k_block_id is None and fact.static_k != 0)
+        or (fact.n_block_id is None and fact.static_n != 0)
+    ):
+        return None
+    if fact.k_block_id is None:
+        # A statically empty reduction erases the K block association from the
+        # matmul fact, but the registered third block axis remains its source.
+        # Recover it so the full grouped-worklist proof below can decide whether
+        # this kernel needs input-metadata specialization.
+        fact = fact._replace(k_block_id=spec.block_sizes[2].block_id)
+    try:
+        assert fact.m_block_id is not None
+        assert fact.k_block_id is not None
+        m_index = spec.block_sizes.block_id_to_index(fact.m_block_id)
+        k_index = spec.block_sizes.block_id_to_index(fact.k_block_id)
+        n_index = (
+            None
+            if fact.n_block_id is None
+            else spec.block_sizes.block_id_to_index(fact.n_block_id)
+        )
+    except KeyError:
+        return None
+    return fact if (m_index, n_index, k_index) in ((0, 1, 2), (0, None, 2)) else None
+
+
+def _tcgen05_grouped_worklist_fact(
+    env: CompileEnvironment,
+) -> MatmulFact | None:
+    if not env.config_spec.cute_tcgen05_search_enabled:
+        return None
+    return _tcgen05_grouped_worklist_structural_fact(env)
 
 
 def _tcgen05_grouped_dynamic_bk64_fact(env: CompileEnvironment) -> MatmulFact | None:
@@ -622,6 +709,659 @@ def _tcgen05_grouped_seed_config(bk: int) -> Config:
         Tcgen05PersistenceModel.STATIC_PERSISTENT.value
     )
     return config
+
+
+GroupedBMajor = Literal["k", "n"]
+
+_TCGEN05_GROUPED_B200_REFERENCE_NUM_SMS = 148
+_TCGEN05_GROUPED_B200_LOW_RESERVED_SMS = 32
+_TCGEN05_GROUPED_B200_HIGH_RESERVED_SMS = 52
+_TCGEN05_GROUPED_B200_PANEL_RESERVED_SMS = 20
+# Grouped tcgen05 lowering is supported on both Blackwell compute capabilities;
+# target-specific seed ranking remains separate from this architecture gate.
+_TCGEN05_GROUPED_SUPPORTED_CAPABILITIES = frozenset({"sm100", "sm103"})
+# These measurements rank the initial seed population only. Other SM counts are
+# scaled proportionally, and live autotuning remains authoritative.
+
+# Exhaustive schema for the side-effect-free grouped-worklist config builder.
+_TCGEN05_GROUPED_WORKLIST_CONFIG_KEYS = frozenset(
+    {
+        "block_sizes",
+        "l2_groupings",
+        "loop_orders",
+        "num_stages",
+        "num_warps",
+        "pid_type",
+        "tcgen05_cluster_m",
+        "tcgen05_cluster_n",
+        "tcgen05_ab_stages",
+        "tcgen05_acc_stages",
+        "tcgen05_c_stages",
+        "tcgen05_num_epi_warps",
+        TCGEN05_CONSUMER_REGS_CONFIG_KEY,
+        TCGEN05_GROUPED_MODE_CONFIG_KEY,
+        TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
+        TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY,
+        TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY,
+        TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
+        TCGEN05_STRATEGY_CONFIG_KEY,
+        TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY,
+        TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY,
+    }
+)
+
+
+def tcgen05_grouped_worklist_config_values(
+    source_m_tile: int,
+    block_k: int,
+    ab_stages: int,
+    consumer_regs: int,
+    *,
+    runtime_direct: bool = True,
+    l2_swizzle_size: int | None = None,
+    reserved_sms: int | None = None,
+    clc: bool = False,
+) -> dict[str, object]:
+    """Return the exact values used by the grouped-worklist seed builder.
+
+    This side-effect-free seam exposes compiler seed values without depending on
+    the compiler's private builder.
+    """
+    if clc and not runtime_direct:
+        raise ValueError("grouped worklist CLC requires runtime_direct=True")
+    cluster_m = (
+        1 if source_m_tile == TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE else 2
+    )
+    values: dict[str, object] = {
+        "block_sizes": [256, 128, block_k],
+        "l2_groupings": [1],
+        "loop_orders": [[0, 1, 2]],
+        "num_stages": 7,
+        "num_warps": 8,
+        "pid_type": "persistent_interleaved",
+        "tcgen05_cluster_m": cluster_m,
+        "tcgen05_cluster_n": 1,
+        "tcgen05_ab_stages": ab_stages,
+        "tcgen05_acc_stages": 2,
+        "tcgen05_c_stages": 2,
+        "tcgen05_num_epi_warps": 4,
+        TCGEN05_CONSUMER_REGS_CONFIG_KEY: consumer_regs,
+        TCGEN05_GROUPED_MODE_CONFIG_KEY: TCGEN05_GROUPED_MODE_WORKLIST_NM,
+        TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY: source_m_tile,
+    }
+    if runtime_direct:
+        values[TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY] = True
+    if l2_swizzle_size is not None:
+        values[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = l2_swizzle_size
+    if reserved_sms is not None:
+        values[TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY] = reserved_sms
+    if clc:
+        values.update(
+            {
+                TCGEN05_STRATEGY_CONFIG_KEY: (
+                    Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+                ),
+                TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: 1,
+                TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
+                    Tcgen05PersistenceModel.CLC_PERSISTENT.value
+                ),
+            }
+        )
+    if missing_schema_keys := values.keys() - _TCGEN05_GROUPED_WORKLIST_CONFIG_KEYS:
+        raise RuntimeError(
+            "grouped-worklist config builder emitted keys missing from its schema: "
+            f"{sorted(missing_schema_keys)!r}"
+        )
+    return values
+
+
+def _tcgen05_grouped_worklist_config(
+    source_m_tile: int,
+    block_k: int,
+    ab_stages: int,
+    consumer_regs: int,
+    *,
+    runtime_direct: bool = True,
+    l2_swizzle_size: int | None = None,
+    reserved_sms: int | None = None,
+    clc: bool = False,
+) -> Config:
+    return Config.from_dict(
+        tcgen05_grouped_worklist_config_values(
+            source_m_tile,
+            block_k,
+            ab_stages,
+            consumer_regs,
+            runtime_direct=runtime_direct,
+            l2_swizzle_size=l2_swizzle_size,
+            reserved_sms=reserved_sms,
+            clc=clc,
+        )
+    )
+
+
+def tcgen05_grouped_worklist_config_keys() -> frozenset[str]:
+    """Return the exhaustive grouped-worklist compiler-seed schema."""
+    return _TCGEN05_GROUPED_WORKLIST_CONFIG_KEYS
+
+
+def _tcgen05_grouped_scaled_reserved_sms(
+    num_sm: int,
+    b200_reserved_sms: int,
+) -> int:
+    value = round(num_sm * b200_reserved_sms / _TCGEN05_GROUPED_B200_REFERENCE_NUM_SMS)
+    # The reviewed B200 occupancy splits were selected on a two-SM reservation
+    # lattice.  Preserve that lattice after proportional scaling; an odd rounded
+    # value moves up so the seed never reserves less than the scaled reference.
+    value += value % 2
+    return min(
+        max(value, 0),
+        max(num_sm - 2, 0),
+        TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX,
+    )
+
+
+def _tcgen05_grouped_small_m_reserved_sms(
+    *,
+    groups: int,
+    work_clusters: int,
+    num_sm: int,
+) -> tuple[int, int]:
+    """Rank low/high reserved-SM seeds scaled from B200 occupancy splits."""
+    low = _tcgen05_grouped_scaled_reserved_sms(
+        num_sm,
+        _TCGEN05_GROUPED_B200_LOW_RESERVED_SMS,
+    )
+    high = _tcgen05_grouped_scaled_reserved_sms(
+        num_sm,
+        _TCGEN05_GROUPED_B200_HIGH_RESERVED_SMS,
+    )
+    active_high = num_sm - high
+    high_first = (
+        groups <= 8
+        and work_clusters > num_sm
+        and active_high > 0
+        and work_clusters % active_high == 0
+    )
+    return (high, low) if high_first else (low, high)
+
+
+def tcgen05_grouped_worklist_seed_configs(
+    *,
+    groups: int,
+    packed_m: int,
+    n: int,
+    k: int,
+    b_major: GroupedBMajor,
+    source_m_tile: int,
+    num_sm: int,
+) -> list[Config]:
+    """Build ranked, tile-compatible grouped-worklist compiler seeds."""
+    if any(
+        type(value) is not int or value <= 0
+        for value in (groups, packed_m, n, k, num_sm)
+    ):
+        raise ValueError("grouped seed dimensions and num_sm must be positive integers")
+    if b_major not in ("k", "n"):
+        raise ValueError(f"unsupported grouped B major {b_major!r}")
+    if source_m_tile not in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES:
+        raise ValueError(f"unsupported grouped source M tile {source_m_tile!r}")
+    if packed_m % source_m_tile != 0:
+        raise ValueError("packed M extent must be divisible by source_m_tile")
+
+    if source_m_tile == TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE:
+        logical_n_per_cluster = 128
+        work_clusters = (packed_m // source_m_tile) * (
+            (n + logical_n_per_cluster - 1) // logical_n_per_cluster
+        )
+        preferred_reservation, alternate_reservation = (
+            _tcgen05_grouped_small_m_reserved_sms(
+                groups=groups,
+                work_clusters=work_clusters,
+                num_sm=num_sm,
+            )
+        )
+        high_reservation = _tcgen05_grouped_scaled_reserved_sms(
+            num_sm,
+            _TCGEN05_GROUPED_B200_HIGH_RESERVED_SMS,
+        )
+        panel_reservation = _tcgen05_grouped_scaled_reserved_sms(
+            num_sm,
+            _TCGEN05_GROUPED_B200_PANEL_RESERVED_SMS,
+        )
+        bk128 = {
+            "preferred_reserved": _tcgen05_grouped_worklist_config(
+                source_m_tile,
+                128,
+                5,
+                256,
+                reserved_sms=preferred_reservation,
+            ),
+            "alternate_reserved": _tcgen05_grouped_worklist_config(
+                source_m_tile,
+                128,
+                5,
+                256,
+                reserved_sms=alternate_reservation,
+            ),
+            "unreserved": _tcgen05_grouped_worklist_config(source_m_tile, 128, 5, 256),
+        }
+        bk64 = {
+            "high_reserved": _tcgen05_grouped_worklist_config(
+                source_m_tile, 64, 7, 240, reserved_sms=high_reservation
+            ),
+            "direct": _tcgen05_grouped_worklist_config(source_m_tile, 64, 7, 240),
+            "panel4": _tcgen05_grouped_worklist_config(
+                source_m_tile,
+                64,
+                7,
+                240,
+                l2_swizzle_size=4,
+                reserved_sms=panel_reservation,
+            ),
+            "panel8": _tcgen05_grouped_worklist_config(
+                source_m_tile,
+                64,
+                7,
+                240,
+                l2_swizzle_size=8,
+                reserved_sms=panel_reservation,
+            ),
+            "mailbox": _tcgen05_grouped_worklist_config(
+                source_m_tile, 64, 7, 240, runtime_direct=False
+            ),
+        }
+        if groups >= 16:
+            if n > k:
+                primary = bk64["panel8"]
+            elif n < k:
+                primary = bk64["panel4"]
+            else:
+                primary = bk64["direct"]
+        elif n >= 9 * k // 4:
+            primary = bk128["alternate_reserved"]
+        elif n >= 2 * k:
+            primary = bk64["high_reserved"]
+        elif k > n:
+            primary = bk64["direct"]
+        else:
+            primary = bk128["preferred_reserved"]
+        return dedupe_configs([primary, *bk128.values(), *bk64.values()])
+
+    if source_m_tile == TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT:
+        # Source-224 keeps the reviewed panel-8 direct config as its deterministic
+        # primary; the remaining mailbox/BK128 variants are fallback seeds.
+        panel8_direct = _tcgen05_grouped_worklist_config(
+            source_m_tile,
+            64,
+            7,
+            256,
+            l2_swizzle_size=8,
+        )
+        mailbox_by_ab_stages = {
+            ab_stages: _tcgen05_grouped_worklist_config(
+                source_m_tile, 64, ab_stages, 240, runtime_direct=False
+            )
+            for ab_stages in range(7, 3, -1)
+        }
+        bk128_direct = _tcgen05_grouped_worklist_config(source_m_tile, 128, 3, 240)
+        return dedupe_configs(
+            [panel8_direct, *mailbox_by_ab_stages.values(), bk128_direct]
+        )
+
+    logical_n_per_cluster = 256
+    work_clusters = (packed_m // source_m_tile) * (
+        (n + logical_n_per_cluster - 1) // logical_n_per_cluster
+    )
+    bk128 = {
+        "mailbox": _tcgen05_grouped_worklist_config(
+            source_m_tile, 128, 3, 240, runtime_direct=False
+        ),
+        "direct": _tcgen05_grouped_worklist_config(source_m_tile, 128, 3, 240),
+        "panel8": _tcgen05_grouped_worklist_config(
+            source_m_tile, 128, 3, 240, l2_swizzle_size=8
+        ),
+    }
+    bk64 = {
+        "mailbox_regs224": _tcgen05_grouped_worklist_config(
+            source_m_tile, 64, 6, 224, runtime_direct=False
+        ),
+        "mailbox_regs240": _tcgen05_grouped_worklist_config(
+            source_m_tile, 64, 6, 240, runtime_direct=False
+        ),
+        "direct_regs240": _tcgen05_grouped_worklist_config(source_m_tile, 64, 6, 240),
+        "panel16_regs224": _tcgen05_grouped_worklist_config(
+            source_m_tile, 64, 6, 224, l2_swizzle_size=16
+        ),
+        "panel8_stage5_regs224": _tcgen05_grouped_worklist_config(
+            source_m_tile, 64, 5, 224, l2_swizzle_size=8
+        ),
+    }
+    # Runtime CLC uses fixed full-allocation TensorMaps.  In N,M orientation,
+    # logical N is the physical MMA-M dimension, so the immutable descriptor
+    # path requires a whole 256-row physical tile.  Keep tail-N shapes on the
+    # dynamic-TensorMap runtime-direct or mailbox families.
+    clc_by_consumer_regs = (
+        {
+            consumer_regs: _tcgen05_grouped_worklist_config(
+                source_m_tile,
+                64,
+                6,
+                consumer_regs,
+                l2_swizzle_size=8,
+                clc=True,
+            )
+            for consumer_regs in (240, 256)
+        }
+        if (
+            n % logical_n_per_cluster == 0
+            and work_clusters <= TCGEN05_GROUPED_RUNTIME_DIRECT_CLC_MAX_CLUSTERS
+        )
+        else {}
+    )
+    clc_configs = list(clc_by_consumer_regs.values())
+    # Ranking-only splits fitted from the reviewed B200 source-256 cases:
+    # 16 groups marks high fan-out, N/K=2 and 9/4 are aspect buckets, and
+    # 8/24 tiles per group separate short, medium, and long expert waves.
+    tiles_per_group = packed_m // source_m_tile // groups
+    clc_ready = bool(clc_configs) and work_clusters >= num_sm
+    if groups >= 16:
+        if k > n or n >= 9 * k // 4:
+            primary = bk128["mailbox"]
+        elif n >= 2 * k:
+            primary = bk64["direct_regs240"]
+        else:
+            primary = bk64["mailbox_regs224"]
+    elif tiles_per_group >= 8:
+        if k > n and clc_ready:
+            preferred_clc_consumer_regs = 256 if groups <= 4 else 240
+            primary = clc_by_consumer_regs[preferred_clc_consumer_regs]
+        elif n >= 9 * k // 4:
+            primary = bk64["panel16_regs224"] if b_major == "n" else bk128["panel8"]
+        elif n >= 2 * k:
+            primary = (
+                clc_by_consumer_regs[240]
+                if b_major == "n" and clc_ready
+                else bk64["direct_regs240"]
+            )
+        elif n == k:
+            primary = (
+                bk128["direct"]
+                if tiles_per_group >= 24
+                else bk64["panel8_stage5_regs224"]
+            )
+        else:
+            primary = bk64["mailbox_regs240"]
+    elif b_major == "n" and n >= 2 * k:
+        primary = bk64["direct_regs240"]
+    else:
+        primary = bk64["mailbox_regs240"]
+    return dedupe_configs([primary, *clc_configs, *bk64.values(), *bk128.values()])
+
+
+def _tcgen05_grouped_worklist_source_m_tiles(
+    env: CompileEnvironment,
+    analysis: Tcgen05GroupedWorklistAnalysis,
+) -> tuple[int, ...]:
+    """Return legal source-M schedule families for one recognized input layout."""
+    if analysis.input_kind == "device_split_sizes":
+        # Compact A has no physical source-tile constraint. Source-32 currently
+        # requires the one-CTA path, which is not valid for device split sizes.
+        return (
+            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+            TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+        )
+
+    facts = analysis.seed_facts
+    from ..cute.grouped_worklist import (
+        has_tcgen05_grouped_worklist_runtime_specialization,
+    )
+
+    if not has_tcgen05_grouped_worklist_runtime_specialization(
+        env, analysis.metadata_tensor
+    ):
+        return ()
+    worklist = env.runtime_value_for_tensor(analysis.metadata_tensor)
+    if not isinstance(worklist, torch.Tensor):
+        return ()
+    from torch._subclasses import FakeTensor
+    from torch._subclasses.fake_tensor import unset_fake_temporarily
+
+    from ..cute.grouped_worklist import (
+        tcgen05_grouped_worklist_compatible_source_m_tiles,
+    )
+    from ..cute.grouped_worklist import (
+        tcgen05_grouped_worklist_source_m_tiles_by_preference,
+    )
+
+    if isinstance(worklist, FakeTensor):
+        if not isinstance(worklist.constant, torch.Tensor):
+            return ()
+        worklist = worklist.constant
+    with unset_fake_temporarily():
+        rows = (
+            cast("list[list[int]]", worklist.detach().cpu().tolist())
+            if worklist.ndim == 2 and worklist.shape[1] == 4
+            else []
+        )
+    compatible = tcgen05_grouped_worklist_compatible_source_m_tiles(
+        rows,
+        group_count=facts.groups_hint,
+        packed_m=facts.packed_m_hint,
+    )
+    return tcgen05_grouped_worklist_source_m_tiles_by_preference(compatible)
+
+
+_TCGEN05_GROUPED_WORKLIST_AUTOMATIC_SEED_LIMIT = 8
+
+
+def _bounded_grouped_worklist_seed_families(
+    families: Sequence[Sequence[Config]],
+) -> list[Config]:
+    """Keep every legal family represented without expanding tuning startup."""
+    nonempty = [family for family in families if family]
+    if not nonempty:
+        return []
+    ranked = [
+        family[index]
+        for index in range(max(map(len, nonempty)))
+        for family in nonempty
+        if index < len(family)
+    ]
+    return dedupe_configs(ranked)[:_TCGEN05_GROUPED_WORKLIST_AUTOMATIC_SEED_LIMIT]
+
+
+class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
+    """Rank general grouped-worklist configs while preserving live tuning."""
+
+    name = "cute_tcgen05_grouped_worklist"
+    backend = "cute"
+    promote_seed_to_default = True
+    PROMOTE_TARGETS = (("cuda", "sm100"), ("cuda", "sm103"))
+    CACHE_SPECIALIZATION_FACTS = frozenset({"config_num_sm", "input_tensor_metadata"})
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        """Record grouped SMEM facts independently of seed generation.
+
+        Grouped semantics are discovered from DeviceIR rather than a user
+        annotation. Publish seed specialization even when an empty first
+        binding cannot emit seeds, and input specialization when heuristics are
+        disabled but correctness facts still depend on runtime metadata.
+        """
+        spec = env.config_spec
+        fact = _tcgen05_grouped_worklist_structural_fact(env)
+        if fact is None:
+            return frozenset()
+        from ..cute.cute_mma import analyze_tcgen05_grouped_worklist
+
+        analysis = analyze_tcgen05_grouped_worklist(
+            env,
+            device_ir,
+            fact,
+        )
+        if analysis is None:
+            return frozenset()
+        seed_facts = analysis.seed_facts
+        if analysis.input_kind == "external_worklist":
+            from ..cute.grouped_worklist import (
+                register_tcgen05_grouped_worklist_runtime_specialization,
+            )
+
+            register_tcgen05_grouped_worklist_runtime_specialization(
+                env,
+                analysis.metadata_tensor,
+                grouped_tensor=analysis.grouped_tensor,
+                packed_tensor=analysis.packed_tensor,
+            )
+        if seed_facts.groups_hint > 0:
+            spec.register_cute_tcgen05_grouped_worklist_smem_facts(
+                group_count=seed_facts.groups_hint,
+                device_split_sizes=seed_facts.device_split_sizes,
+            )
+        if env.settings.disable_autotuner_heuristics:
+            return frozenset({"input_tensor_metadata"})
+        return cls.CACHE_SPECIALIZATION_FACTS
+
+    @classmethod
+    def _eligible_inputs(
+        cls,
+        env: CompileEnvironment,
+        device_ir: DeviceIR,
+    ) -> tuple[MatmulFact, Tcgen05GroupedWorklistAnalysis] | None:
+        spec = env.config_spec
+        fact = _tcgen05_grouped_worklist_fact(env)
+        if (
+            fact is None
+            or (fact.static_n is not None and fact.static_n % 32 != 0)
+            or spec.target_device_capability is None
+            or f"sm{spec.target_device_capability[0]}{spec.target_device_capability[1]}"
+            not in _TCGEN05_GROUPED_SUPPORTED_CAPABILITIES
+            or not _block_size_value_reachable(spec, 0, 256)
+            or not _block_size_value_reachable(spec, 1, 128)
+            or not any(
+                _block_size_value_reachable(spec, 2, block_k)
+                for block_k in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+            )
+        ):
+            return None
+        from ..cute.cute_mma import analyze_tcgen05_grouped_worklist
+
+        analysis = analyze_tcgen05_grouped_worklist(env, device_ir, fact)
+        if (
+            analysis is None
+            or min(
+                analysis.seed_facts.groups_hint,
+                analysis.seed_facts.packed_m_hint,
+                analysis.seed_facts.n_hint,
+                analysis.seed_facts.k_hint,
+            )
+            <= 0
+            or analysis.seed_facts.n_hint % 32 != 0
+        ):
+            return None
+        if not tcgen05_runtime_n_ptx_compatible():
+            warn_tcgen05_runtime_n_ptx_fallback()
+            return None
+        return fact, analysis
+
+    @classmethod
+    def _seed_configs(
+        cls,
+        env: CompileEnvironment,
+        device_ir: DeviceIR,
+    ) -> list[Config]:
+        eligible = cls._eligible_inputs(env, device_ir)
+        if eligible is None:
+            return []
+        _fact, analysis = eligible
+        spec = env.config_spec
+        seed_facts = analysis.seed_facts
+        source_m_tiles = _tcgen05_grouped_worklist_source_m_tiles(env, analysis)
+        if not source_m_tiles:
+            return []
+        families: list[list[Config]] = []
+        for source_m_tile in source_m_tiles:
+            # ``packed_m_hint`` remains the exact compiler fact. Seed selection
+            # only needs a tile-wave estimate, so round this local ranking input
+            # upward. Runtime/codegen validation never consumes the rounded value.
+            ranking_quantum = (
+                seed_facts.groups_hint * source_m_tile
+                if seed_facts.device_split_sizes
+                else source_m_tile
+            )
+            ranking_packed_m = (
+                (seed_facts.packed_m_hint + ranking_quantum - 1) // ranking_quantum
+            ) * ranking_quantum
+            family = tcgen05_grouped_worklist_seed_configs(
+                groups=seed_facts.groups_hint,
+                packed_m=ranking_packed_m,
+                n=seed_facts.n_hint,
+                k=seed_facts.k_hint,
+                b_major=seed_facts.b_major,
+                source_m_tile=source_m_tile,
+                num_sm=spec.num_sm,
+            )
+            if seed_facts.device_split_sizes:
+                # Device split-size kernels derive group rows on device and are
+                # supported only by the scheduler-mailbox family. Convert direct
+                # seeds rather than dropping useful BK/reservation variants;
+                # panel swizzles and CLC have no mailbox equivalent.
+                mailbox_family: list[Config] = []
+                for config in family:
+                    values = dict(config.config)
+                    l2_swizzle_size = values.get(
+                        TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY,
+                        1,
+                    )
+                    if values.get(
+                        TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
+                    ) == Tcgen05PersistenceModel.CLC_PERSISTENT.value or (
+                        type(l2_swizzle_size) is int and l2_swizzle_size > 1
+                    ):
+                        continue
+                    values.pop(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY, None)
+                    mailbox_family.append(Config.from_dict(values))
+                family = dedupe_configs(mailbox_family)
+            family = [
+                config
+                for config in family
+                if seed_facts.k_hint
+                % cast("list[int]", config.config["block_sizes"])[2]
+                == 0
+            ]
+            family = _filter_reachable_block_size_configs(spec, family)
+            families.append(family)
+        return _bounded_grouped_worklist_seed_families(families)
+
+    @classmethod
+    def should_promote(cls, env: CompileEnvironment) -> bool:
+        fact = _tcgen05_grouped_worklist_fact(env)
+        return (
+            tcgen05_runtime_n_ptx_compatible()
+            and fact is not None
+            and fact.static_k is not None
+            and super().should_promote(env)
+        )
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._eligible_inputs(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        configs = cls._seed_configs(env, device_ir)
+        return configs[0] if configs else None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        return cls._seed_configs(env, device_ir)
 
 
 class CuteTcgen05GroupedStaticCommonKHeuristic(AutotunerHeuristic):
@@ -850,6 +1590,7 @@ class CuteTcgen05ThreadLocalEpilogueHeuristic(AutotunerHeuristic):
 class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
     name = "cute_tcgen05_cluster_m2"
     backend = "cute"
+    CACHE_SPECIALIZATION_FACTS = frozenset({"device_num_sm"})
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:

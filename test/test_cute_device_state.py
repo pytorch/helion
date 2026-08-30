@@ -15,6 +15,7 @@ from torch.fx import Graph
 from helion import exc
 from helion._compiler.ast_extension import statement_from_string
 from helion._compiler.cute.cute_mma import _collective_load_dependency_nodes
+from helion._compiler.cute.cute_mma import _emit_tcgen05_device_segments_setup
 from helion._compiler.cute.cutedsl_compat import emit_pipeline_advance
 from helion._compiler.cute.device_state import CuteDeviceFunctionState
 from helion._compiler.cute.device_state import CuteTcgen05GroupedPlan
@@ -78,6 +79,20 @@ def _grouped_plan(**overrides: object) -> CuteTcgen05GroupedPlan:
     }
     kwargs.update(overrides)
     return CuteTcgen05GroupedPlan(**kwargs)
+
+
+def _runtime_direct_grouped_plan() -> CuteTcgen05GroupedPlan:
+    return _grouped_plan(
+        orientation=Tcgen05Orientation.NM,
+        scheduler_mode=Tcgen05GroupedSchedulerMode.RUNTIME_DIRECT,
+        runtime_tile_records="runtime_tile_records",
+        runtime_total_clusters="runtime_total_clusters",
+        valid_m="valid_m",
+        store_m="store_m",
+        source_m_tile=32,
+        d_mode=Tcgen05GroupedDMode.ALL_TILES,
+        d_tensormap="d_tensormap",
+    )
 
 
 def _lifecycle(**overrides: object) -> Tcgen05LifecycleContext:
@@ -179,36 +194,37 @@ class TestCuteDeviceFunctionState(unittest.TestCase):
         device_search = _grouped_plan()
         self.assertFalse(device_search.uses_runtime_tile_table)
 
-        runtime_direct = _grouped_plan(
-            orientation=Tcgen05Orientation.NM,
-            scheduler_mode=Tcgen05GroupedSchedulerMode.RUNTIME_DIRECT,
-            runtime_tile_records="runtime_tile_records",
-            runtime_total_clusters="runtime_total_clusters",
-            real_groups="real_groups",
-            valid_m="valid_m",
-            store_m="store_m",
-            source_m_tile=32,
-            d_mode=Tcgen05GroupedDMode.ALL_TILES,
-            d_tensormap="d_tensormap",
-        )
+        runtime_direct = _runtime_direct_grouped_plan()
         self.assertTrue(runtime_direct.uses_runtime_tile_table)
 
-        with self.assertRaises(AssertionError):
-            dataclasses.replace(
+        invalid_replacements = (
+            lambda: dataclasses.replace(
                 runtime_direct,
                 scheduler_mode=Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH,
-            )
-        with self.assertRaises(AssertionError):
-            _grouped_plan(
+            ),
+            lambda: _grouped_plan(
                 scheduler_mode=Tcgen05GroupedSchedulerMode.RUNTIME_DIRECT,
-            )
-        with self.assertRaises(AssertionError):
-            _grouped_plan(fixed_tensormaps=True)
-        with self.assertRaises(AssertionError):
-            dataclasses.replace(
+            ),
+            lambda: _grouped_plan(fixed_tensormaps=True),
+            lambda: _grouped_plan(
+                orientation=Tcgen05Orientation.NM,
+                valid_m="valid_m",
+                store_m="store_m",
+                source_m_tile=32,
+                m_size=128,
+                real_groups="real_groups",
+                d_mode=Tcgen05GroupedDMode.ALL_TILES,
+                d_tensormap="d_tensormap",
+            ),
+            lambda: _grouped_plan(device_layout_kind="split_sizes"),
+            lambda: dataclasses.replace(
                 runtime_direct,
                 scheduler_mode=Tcgen05GroupedSchedulerMode.RUNTIME_CLC,
-            )
+            ),
+        )
+        for make_invalid in invalid_replacements:
+            with self.assertRaises(AssertionError):
+                make_invalid()
 
         runtime_clc = dataclasses.replace(
             runtime_direct,
@@ -219,19 +235,39 @@ class TestCuteDeviceFunctionState(unittest.TestCase):
         )
         self.assertTrue(runtime_clc.uses_runtime_tile_table)
 
-    def test_grouped_runtime_mode_matches_parent_warp_topology(self) -> None:
-        runtime_direct = _grouped_plan(
+    def test_grouped_device_metadata_setup_uses_one_physical_thread(self) -> None:
+        grouped = _grouped_plan(
             orientation=Tcgen05Orientation.NM,
-            scheduler_mode=Tcgen05GroupedSchedulerMode.RUNTIME_DIRECT,
-            runtime_tile_records="runtime_tile_records",
-            runtime_total_clusters="runtime_total_clusters",
-            real_groups="real_groups",
             valid_m="valid_m",
             store_m="store_m",
             source_m_tile=32,
+            m_size=33,
+            device_layout_kind="split_sizes",
             d_mode=Tcgen05GroupedDMode.ALL_TILES,
             d_tensormap="d_tensormap",
         )
+        prefix: list[ast.AST] = []
+        device_function = SimpleNamespace(new_var=lambda name: name)
+
+        _emit_tcgen05_device_segments_setup(
+            prefix,
+            cast("Any", device_function),
+            grouped,
+            n_size=64,
+            k_size=64,
+            layout_dtype=torch.int32,
+        )
+
+        source = ast.unparse(ast.Module(body=prefix, type_ignores=[]))
+        self.assertIn(
+            "if cute.arch.thread_idx()[0] == 0 and cute.arch.thread_idx()[1] == 0 "
+            "and (cute.arch.thread_idx()[2] == 0):",
+            source,
+        )
+        self.assertNotIn("if cute.arch.thread_idx()[0] == 0:\n", source)
+
+    def test_grouped_runtime_mode_matches_parent_warp_topology(self) -> None:
+        runtime_direct = _runtime_direct_grouped_plan()
         _plan(grouped=runtime_direct)
         with self.assertRaises(AssertionError):
             _plan(grouped=runtime_direct, scheduler_warp_count=1)
@@ -241,6 +277,7 @@ class TestCuteDeviceFunctionState(unittest.TestCase):
             scheduler_mode=Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH,
             runtime_tile_records=None,
             runtime_total_clusters=None,
+            real_groups="real_groups",
         )
         _plan(grouped=device_search_nm, scheduler_warp_count=1)
         with self.assertRaises(AssertionError):

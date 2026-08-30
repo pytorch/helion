@@ -36,6 +36,7 @@ from helion._compiler.backend import CuteBackend
 from helion._compiler.backend import PallasBackend
 from helion._compiler.backend import TritonBackend
 from helion._compiler.backend import _loop_contains_matmul
+from helion._compiler.compile_environment import AutoSize
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.argreduce import codegen_cute_tile_argreduce
 from helion._compiler.cute.aten_lowering import codegen_baddbmm_cute
@@ -1160,6 +1161,20 @@ class TestCuteLowerings(unittest.TestCase):
                     supports_small_n_scalar_fallback=True,
                 )
             )
+
+    def test_static_problem_extent_rejects_unresolved_registered_blocks(self) -> None:
+        from helion.language.matmul_ops import _static_problem_extent
+
+        for unresolved_size in (AutoSize(), None):
+            with self.subTest(size=type(unresolved_size).__name__):
+                env = SimpleNamespace(
+                    get_block_id=lambda _size: 0,
+                    block_sizes=[SimpleNamespace(size=unresolved_size)],
+                )
+                self.assertIsNone(_static_problem_extent(env, 64))
+
+        unregistered_env = SimpleNamespace(get_block_id=lambda _size: None)
+        self.assertEqual(_static_problem_extent(unregistered_env, 64), 64)
 
     def test_tcgen05_swapped_matmul_small_n_runtime(self) -> None:
         """Swapped operands use tcgen05 with a column-major small-N output."""
@@ -16018,8 +16033,37 @@ class TestCuteLowerings(unittest.TestCase):
                         config=config,
                     )
                 )
-
         self.assertEqual(analyze.call_count, 2)
+
+    def test_tcgen05_fragment_source_tiles_reject_dynamic_problem_shape(
+        self,
+    ) -> None:
+        from helion._compiler.cute import cute_mma as cute_mma_module
+
+        candidate = cast("Any", SimpleNamespace(requires_fragment_epilogue=True))
+        static_extents = {"static_m": 128, "static_n": 128, "static_k": 64}
+        for dynamic_extent in static_extents:
+            with (
+                self.subTest(dynamic_extent=dynamic_extent),
+                patch.object(
+                    cute_mma_module,
+                    "_tcgen05_fragment_epilogue_operands_supported",
+                ) as operands_supported,
+            ):
+                plan = SimpleNamespace(
+                    **{
+                        **static_extents,
+                        dynamic_extent: None,
+                    }
+                )
+                self.assertFalse(
+                    cute_mma_module.tcgen05_fragment_epilogue_source_tiles_reachable(
+                        candidate,
+                        cast("Any", plan),
+                        cast("Any", SimpleNamespace()),
+                    )
+                )
+                operands_supported.assert_not_called()
 
     def test_tcgen05_fragment_projection_rotary_codegen(self) -> None:
         dtype = torch.bfloat16
@@ -17017,7 +17061,35 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
 
         return cute_matmul_residual_c_input
 
-    def _canonical_c_input_config(self) -> helion.Config:
+    def _fanout_kernel(self):  # type: ignore[no-untyped-def]
+        @helion.kernel(backend="cute")
+        def cute_matmul_residual_fanout(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            residual_a: torch.Tensor,
+            residual_b: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, k = x.size()
+            _, n = y.size()
+            out_a = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            out_b = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out_a[tile_m, tile_n] = (acc + residual_a[tile_m, tile_n]).to(x.dtype)
+                out_b[tile_m, tile_n] = (acc + residual_b[tile_m, tile_n]).to(x.dtype)
+            return out_a, out_b
+
+        return cute_matmul_residual_fanout
+
+    def _square_args(self, count: int) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16)
+            for _ in range(count)
+        )
+
+    def _canonical_c_input_config(self, *, ab_stages: int = 2) -> helion.Config:
         return helion.Config(
             block_sizes=[256, 256, 128],
             l2_groupings=[1],
@@ -17025,7 +17097,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             num_sm_multiplier=1,
             pid_type="persistent_interleaved",
             tcgen05_cluster_m=2,
-            tcgen05_ab_stages=2,
+            tcgen05_ab_stages=ab_stages,
             tcgen05_acc_stages=2,
             tcgen05_c_stages=2,
             tcgen05_num_epi_warps=4,
@@ -17849,35 +17921,12 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
     def test_aux_tma_load_rejects_multi_store_fanout(self) -> None:
         """Explicit aux TMA rejects multi-store fan-out instead of falling back."""
 
-        @helion.kernel(backend="cute")
-        def cute_matmul_residual_fanout(
-            x: torch.Tensor,
-            y: torch.Tensor,
-            residual_a: torch.Tensor,
-            residual_b: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            m, k = x.size()
-            _, n = y.size()
-            out_a = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            out_b = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out_a[tile_m, tile_n] = (acc + residual_a[tile_m, tile_n]).to(x.dtype)
-                out_b[tile_m, tile_n] = (acc + residual_b[tile_m, tile_n]).to(x.dtype)
-            return out_a, out_b
-
-        args = (
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-        )
+        kernel = self._fanout_kernel()
+        args = self._square_args(4)
         config = self._canonical_c_input_config()
         config.config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_TMA
         with patch_cute_mma_support():
-            bound = cute_matmul_residual_fanout.bind(args)
+            bound = kernel.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             with self.assertRaises(exc.BackendUnsupported) as cm:
                 bound.to_triton_code(config)
@@ -19327,34 +19376,11 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         directly.
         """
 
-        @helion.kernel(backend="cute")
-        def cute_matmul_residual_fanout(
-            x: torch.Tensor,
-            y: torch.Tensor,
-            residual_a: torch.Tensor,
-            residual_b: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            m, k = x.size()
-            _, n = y.size()
-            out_a = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            out_b = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out_a[tile_m, tile_n] = (acc + residual_a[tile_m, tile_n]).to(x.dtype)
-                out_b[tile_m, tile_n] = (acc + residual_b[tile_m, tile_n]).to(x.dtype)
-            return out_a, out_b
-
-        args = (
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-        )
+        kernel = self._fanout_kernel()
+        args = self._square_args(4)
         config = self._canonical_c_input_config()
         with patch_cute_mma_support():
-            bound = cute_matmul_residual_fanout.bind(args)
+            bound = kernel.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             code = bound.to_triton_code(config)
 
@@ -19423,31 +19449,8 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         explicit rejection assertion.
         """
         kernel = self._residual_kernel()
-        args = (
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-        )
-        config = helion.Config(
-            block_sizes=[256, 256, 128],
-            l2_groupings=[1],
-            num_warps=4,
-            num_sm_multiplier=1,
-            pid_type="persistent_interleaved",
-            tcgen05_cluster_m=2,
-            tcgen05_ab_stages=3,
-            tcgen05_acc_stages=2,
-            tcgen05_c_stages=2,
-            tcgen05_num_epi_warps=4,
-            tcgen05_strategy="role_local_with_scheduler",
-            tcgen05_warp_spec_scheduler_warps=1,
-            tcgen05_warp_spec_c_input_warps=1,
-            indexing=[
-                "tensor_descriptor",
-                "tensor_descriptor",
-                "tensor_descriptor",
-            ],
-        )
+        args = self._square_args(3)
+        config = self._canonical_c_input_config(ab_stages=3)
         with patch_cute_mma_support():
             bound = kernel.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
@@ -19479,11 +19482,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         and silently disable the cycle 2b productive body.
         """
         kernel = self._residual_kernel()
-        args = (
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-        )
+        args = self._square_args(3)
         # The canonical cycle 2b config from
         # ``_canonical_c_input_config`` already uses
         # ``ab_stages=2`` + ``c_input_warps=1``.
@@ -19543,58 +19542,16 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         rejection cannot have fired on this path).
         """
 
-        @helion.kernel(backend="cute")
-        def cute_matmul_residual_fanout(
-            x: torch.Tensor,
-            y: torch.Tensor,
-            residual_a: torch.Tensor,
-            residual_b: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            m, k = x.size()
-            _, n = y.size()
-            out_a = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            out_b = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out_a[tile_m, tile_n] = (acc + residual_a[tile_m, tile_n]).to(x.dtype)
-                out_b[tile_m, tile_n] = (acc + residual_b[tile_m, tile_n]).to(x.dtype)
-            return out_a, out_b
-
-        args = (
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-        )
+        kernel = self._fanout_kernel()
+        args = self._square_args(4)
         # Same canonical config as
         # ``test_aux_pipeline_ab_stages_3_with_c_input_rejected``
         # — only difference is the fan-out kernel shape, which
         # should close the productive-body gate and prevent
         # the rejection from firing.
-        config = helion.Config(
-            block_sizes=[256, 256, 128],
-            l2_groupings=[1],
-            num_warps=4,
-            num_sm_multiplier=1,
-            pid_type="persistent_interleaved",
-            tcgen05_cluster_m=2,
-            tcgen05_ab_stages=3,
-            tcgen05_acc_stages=2,
-            tcgen05_c_stages=2,
-            tcgen05_num_epi_warps=4,
-            tcgen05_strategy="role_local_with_scheduler",
-            tcgen05_warp_spec_scheduler_warps=1,
-            tcgen05_warp_spec_c_input_warps=1,
-            indexing=[
-                "tensor_descriptor",
-                "tensor_descriptor",
-                "tensor_descriptor",
-            ],
-        )
+        config = self._canonical_c_input_config(ab_stages=3)
         with patch_cute_mma_support():
-            bound = cute_matmul_residual_fanout.bind(args)
+            bound = kernel.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             # Must not raise BackendUnsupported on the fan-out
             # path despite carrying ``ab_stages=3`` +
@@ -19617,10 +19574,9 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
 
         The productive C-input warp is reachable from the
         normal Helion autotune path when the bound kernel's
-        FX graphs contain a tcgen05 matmul AND at least one
-        ``memory_ops.load`` whose target isn't one of the
-        matmul operands (the residual / bias / chained
-        residual_relu pattern). Pin:
+        FX graphs contain an accepted matmul-to-store chain with at least one
+        per-subtile auxiliary load (the residual / bias / chained
+        residual-relu pattern). Pin:
           - ``cute_tcgen05_aux_kernel_detected`` is True after
             bind.
           - ``tcgen05_strategy`` autotune fragment widens to
@@ -19633,11 +19589,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         from helion._compiler.cute.strategies import Tcgen05Strategy
 
         kernel = self._residual_kernel()
-        args = (
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-        )
+        args = self._square_args(3)
         with patch_cute_mma_support():
             bound = kernel.bind(args)
         self.assertTrue(bound.env.config_spec.cute_tcgen05_aux_kernel_detected)
@@ -19725,37 +19677,13 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         codegen already prevents the over-budget compile.
         """
 
-        @helion.kernel(backend="cute")
-        def cute_matmul_residual_fanout(
-            x: torch.Tensor,
-            y: torch.Tensor,
-            residual_a: torch.Tensor,
-            residual_b: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            m, k = x.size()
-            _, n = y.size()
-            out_a = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            out_b = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out_a[tile_m, tile_n] = (acc + residual_a[tile_m, tile_n]).to(x.dtype)
-                out_b[tile_m, tile_n] = (acc + residual_b[tile_m, tile_n]).to(x.dtype)
-            return out_a, out_b
-
-        args = (
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-        )
+        kernel = self._fanout_kernel()
+        args = self._square_args(4)
         with patch_cute_mma_support():
-            bound = cute_matmul_residual_fanout.bind(args)
-        # Detector is intentionally coarse and DOES flag
-        # fan-out as aux (it has aux loads). The
-        # productive-body safety gate at codegen suppresses
-        # the productive body for fan-out specifically.
+            bound = kernel.bind(args)
+        # Both stores have accepted aux-fused chains, so the detector flags the
+        # kernel even though the productive-body safety gate suppresses the
+        # dedicated C-input pipeline for multi-store fan-out specifically.
         self.assertTrue(bound.env.config_spec.cute_tcgen05_aux_kernel_detected)
 
     def test_aux_autotune_fixup_demotes_ab3_c_input1(self) -> None:
@@ -19778,11 +19706,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         from helion._compiler.cute.strategies import Tcgen05Strategy
 
         kernel = self._residual_kernel()
-        args = (
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-        )
+        args = self._square_args(3)
         with patch_cute_mma_support():
             bound = kernel.bind(args)
         # Manually craft the over-budget combo.
@@ -20063,25 +19987,11 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
     def test_aux_autotune_surface_stays_narrow_for_wrapped_cast_pure_matmul(
         self,
     ) -> None:
-        """Operand-cast wrappers (``lhs.to(dtype) @ rhs.to(dtype)``)
-        are traced through to the underlying ``memory_ops.load``
-        nodes so the detector classifies them as MMA-operand
-        loads, not aux loads.
+        """Operand-cast wrappers do not create an aux-fused store chain.
 
-        Without operand-trace, the detector's "every
-        ``memory_ops.load`` that isn't the exact node arg of
-        the MMA call is aux" rule misclassifies the underlying
-        load behind a ``convert_element_type`` wrapper as aux
-        and the autotune surface widens on a kernel where no
-        true aux load exists — autotune then samples the
-        strictly-worse inert C-input warp on pure matmul.
-
-        Pin: a pure matmul with explicit operand casts (fp32
-        operand tensors cast to bf16 before the dot) keeps
-        the detector flag False — the cast wrapper is walked
-        through to the underlying load via
-        ``_trace_to_load_through_casts`` and the load is
-        classified as an MMA operand, not an aux load.
+        Pin: a pure matmul with explicit fp32-to-bf16 operand casts keeps the
+        detector flag False because its accepted store chain is still an
+        identity epilogue with no auxiliary steps.
         """
         from helion._compiler.cute.strategies import Tcgen05Strategy
 

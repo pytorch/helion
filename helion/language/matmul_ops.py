@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import dataclasses
 from itertools import zip_longest
+from typing import TYPE_CHECKING
 
 import torch
 
 from .. import exc
 from .._compat import min_dot_size
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.compile_environment import _symint_free_symbols
 from .._compiler.compile_environment import _to_sympy
 from .._compiler.compile_environment import format_shape
 from .._compiler.compile_environment import shape_env_var_hints
@@ -24,6 +26,9 @@ from . import _decorators
 
 MATMUL_FACT_ID_META = "helion_matmul_fact_id"
 MATMUL_DIM_BLOCK_IDS_META = "helion_matmul_dim_block_ids"
+
+if TYPE_CHECKING:
+    import sympy
 
 
 def _static_dim_value(env: CompileEnvironment, size: int | torch.SymInt) -> int | None:
@@ -234,15 +239,29 @@ def _dot_dimensions(
     return m, n, k
 
 
-def _static_problem_extent(
+def _problem_extent(
     env: CompileEnvironment, size: int | torch.SymInt
-) -> int | None:
+) -> int | torch.SymInt | None:
+    """Return the resolved problem extent represented by one tile dimension.
+
+    ``AutoSize`` and ``None`` block sizes are deliberately unresolved: treating
+    the tile symbol's current hint as a problem extent would record a false
+    static ``MatmulFact``.
+    """
     block_idx = env.get_block_id(size)
     if block_idx is not None:
         block_size = env.block_sizes[block_idx].size
         if isinstance(block_size, (int, torch.SymInt)):
-            return _static_dim_value(env, block_size)
-    return _static_dim_value(env, size)
+            return block_size
+        return None
+    return size
+
+
+def _static_problem_extent(
+    env: CompileEnvironment, size: int | torch.SymInt
+) -> int | None:
+    problem_extent = _problem_extent(env, size)
+    return None if problem_extent is None else _static_dim_value(env, problem_extent)
 
 
 def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> int:
@@ -335,14 +354,19 @@ _decorators.post_create_proxy(dot)(_associate_latest_matmul_fact)
 
 @dataclasses.dataclass(frozen=True)
 class CuteTcgen05SearchPlan:
-    """Side-effect-free tcgen05 search limits for one MMA candidate."""
+    """Immutable tcgen05 search limits for one MMA candidate.
+
+    Planning does not mutate shared compile state. ``static_*`` are proven
+    compile-time extents; dynamic cache requirements live in the surrounding
+    planning result so rejected candidates retain them too.
+    """
 
     m: int | torch.SymInt
     n: int | torch.SymInt
     k: int | torch.SymInt
-    static_m: int
-    static_n: int
-    static_k: int
+    static_m: int | None
+    static_n: int | None
+    static_k: int | None
     leading_work_multiplier: int
     is_fp8: bool
     is_small_n: bool
@@ -361,20 +385,78 @@ class CuteTcgen05SearchPlan:
     min_search_n: int
 
 
-def plan_cute_tcgen05_search(
+@dataclasses.dataclass(frozen=True)
+class _CuteTcgen05SearchPlanningResult:
+    """One side-effect-free candidate decision and its cache requirements.
+
+    ``guards_complete`` is false when a dynamic extent cannot be traced back to
+    runtime inputs. Such a candidate makes the whole tcgen05 search unsafe to
+    cache, even when this particular binding rejects the candidate.
+    """
+
+    plan: CuteTcgen05SearchPlan | None
+    required_specialized_vars: frozenset[sympy.Symbol]
+    guards_complete: bool
+
+
+def _plan_cute_tcgen05_search_candidate(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
     *,
     has_leading_passthrough: bool,
     supports_small_n_role_local_tma: bool = False,
     supports_small_n_scalar_fallback: bool = False,
-) -> CuteTcgen05SearchPlan | None:
-    """Return search limits without mutating the shared ``ConfigSpec``."""
+    allow_dynamic_hints: bool = False,
+) -> _CuteTcgen05SearchPlanningResult:
+    """Plan one candidate and retain guards even when the candidate is rejected."""
     m, n, k = _dot_dimensions(lhs, rhs)
     env = CompileEnvironment.current()
-    static_m = _static_problem_extent(env, m)
-    static_n = _static_problem_extent(env, n)
-    static_k = _static_problem_extent(env, k)
+
+    problem_extents = tuple(_problem_extent(env, size) for size in (m, n, k))
+    static_m, static_n, static_k = (
+        None if problem_extent is None else _static_dim_value(env, problem_extent)
+        for problem_extent in problem_extents
+    )
+    required_specialized_vars: set[sympy.Symbol] = set()
+    guards_complete = True
+    if allow_dynamic_hints:
+        for problem_extent, static_size in zip(
+            problem_extents,
+            (static_m, static_n, static_k),
+            strict=True,
+        ):
+            if static_size is not None:
+                continue
+            if not isinstance(problem_extent, torch.SymInt):
+                guards_complete = False
+                continue
+            dynamic_symbols = _symint_free_symbols(problem_extent)
+            if not dynamic_symbols:
+                guards_complete = False
+                continue
+            for symbol in dynamic_symbols:
+                if env.shape_env.var_to_sources.get(symbol):
+                    required_specialized_vars.add(symbol)
+                else:
+                    guards_complete = False
+    frozen_required_specialized_vars = frozenset(required_specialized_vars)
+
+    def reject() -> _CuteTcgen05SearchPlanningResult:
+        return _CuteTcgen05SearchPlanningResult(
+            plan=None,
+            required_specialized_vars=frozen_required_specialized_vars,
+            guards_complete=guards_complete,
+        )
+
+    if not guards_complete:
+        return reject()
+    if not allow_dynamic_hints and (
+        static_m is None or static_n is None or static_k is None
+    ):
+        return reject()
+    m_hint = static_m if static_m is not None else env.size_hint(m)
+    n_hint = static_n if static_n is not None else env.size_hint(n)
+    k_hint = static_k if static_k is not None else env.size_hint(k)
     is_fp8 = lhs.dtype == torch.float8_e4m3fn
     mma_k = 32 if is_fp8 else 16
     min_tcgen05_n = 16 if is_fp8 else 8
@@ -383,22 +465,20 @@ def plan_cute_tcgen05_search(
         env.backend_name != "cute"
         or lhs.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         or rhs.dtype != lhs.dtype
-        or static_m is None
-        or static_n is None
-        or static_k is None
-        or static_m < 64
+        or m_hint < 64
         # Size-one tile axes are fixed to block size one before this analysis,
         # so they cannot carry the minimum tcgen05 instruction tile.
-        or static_n < 2
+        or (static_n is not None and static_n < 2)
+        or (static_n is None and n_hint < min_tcgen05_n)
         or (
             is_small_n
             and not (
                 supports_small_n_role_local_tma or supports_small_n_scalar_fallback
             )
         )
-        or static_k < mma_k
+        or k_hint < mma_k
     ):
-        return None
+        return reject()
     small_n_requires_role_local_tma = (
         is_small_n and not supports_small_n_scalar_fallback
     )
@@ -407,18 +487,35 @@ def plan_cute_tcgen05_search(
 
     support = get_cute_mma_support()
     if not (support.tcgen05_f8 if is_fp8 else support.tcgen05_f16bf16):
-        return None
+        return reject()
 
     def pow2_floor_at_least(value: int, minimum: int) -> int:
         return 1 << (max(minimum, value).bit_length() - 1)
 
-    max_tcgen05_n = min(256, pow2_floor_at_least(static_n, min_tcgen05_n))
-    max_tcgen05_m = 256 if max_tcgen05_n >= 128 and static_m >= 256 else 128
-    max_search_m = min(max_tcgen05_m, pow2_floor_at_least(static_m, 64))
+    max_tcgen05_n = (
+        256
+        if static_n is None
+        else min(256, pow2_floor_at_least(static_n, min_tcgen05_n))
+    )
+    max_tcgen05_m = (
+        256 if max_tcgen05_n >= 128 and (static_m is None or static_m >= 256) else 128
+    )
+    max_search_m = (
+        max_tcgen05_m
+        if static_m is None
+        else min(max_tcgen05_m, pow2_floor_at_least(static_m, 64))
+    )
     max_search_n = max_tcgen05_n
-    max_search_k = min(128, pow2_floor_at_least(static_k, mma_k))
+    max_search_k = (
+        128 if static_k is None else min(128, pow2_floor_at_least(static_k, mma_k))
+    )
     min_search_m = 128 if max_tcgen05_m >= 256 else 64
-    if is_small_n and supports_small_n_scalar_fallback and not is_fp8:
+    if (
+        static_n is not None
+        and is_small_n
+        and supports_small_n_scalar_fallback
+        and not is_fp8
+    ):
         min_search_n = 1 << (static_n - 1).bit_length()
     else:
         min_search_n = min_tcgen05_n
@@ -428,44 +525,77 @@ def plan_cute_tcgen05_search(
         static_leading = _static_problem_extent(env, leading_operand.shape[0])
         if static_leading is not None:
             leading_work_multiplier = max(static_leading, 1)
-        if static_m % min_search_m != 0:
-            min_search_m = 64
-        max_search_m = min(max_search_m, static_m & -static_m)
-        max_search_n = min(max_search_n, static_n & -static_n)
-        max_search_k = min(max_search_k, static_k & -static_k)
-        if (
-            max_search_m < min_search_m
-            or max_search_n < min_search_n
-            or max_search_k < mma_k
-        ):
-            return None
-    if static_m % max_search_m != 0 and static_n % max_search_n != 0:
+        if static_m is not None and static_n is not None and static_k is not None:
+            if static_m % min_search_m != 0:
+                min_search_m = 64
+            max_search_m = min(max_search_m, static_m & -static_m)
+            max_search_n = min(max_search_n, static_n & -static_n)
+            max_search_k = min(max_search_k, static_k & -static_k)
+            if (
+                max_search_m < min_search_m
+                or max_search_n < min_search_n
+                or max_search_k < mma_k
+            ):
+                return reject()
+    if (
+        static_m is not None
+        and static_n is not None
+        and static_m % max_search_m != 0
+        and static_n % max_search_n != 0
+    ):
         max_search_m = min(max_search_m, 128)
     if small_n_requires_role_local_tma and (
-        static_m % max_search_m != 0 or static_k % max_search_k != 0
+        static_m is None
+        or static_k is None
+        or static_m % max_search_m != 0
+        or static_k % max_search_k != 0
     ):
-        return None
-    return CuteTcgen05SearchPlan(
-        m=m,
-        n=n,
-        k=k,
-        static_m=static_m,
-        static_n=static_n,
-        static_k=static_k,
-        leading_work_multiplier=leading_work_multiplier,
-        is_fp8=is_fp8,
-        is_small_n=is_small_n,
-        small_n_supports_role_local_tma=supports_small_n_role_local_tma,
-        small_n_requires_role_local_tma=small_n_requires_role_local_tma,
-        mma_k=mma_k,
-        max_tcgen05_m=max_tcgen05_m,
-        max_tcgen05_n=max_tcgen05_n,
-        max_search_m=max_search_m,
-        max_search_n=max_search_n,
-        max_search_k=max_search_k,
-        min_search_m=min_search_m,
-        min_search_n=min_search_n,
+        return reject()
+    return _CuteTcgen05SearchPlanningResult(
+        plan=CuteTcgen05SearchPlan(
+            m=m,
+            n=n,
+            k=k,
+            static_m=static_m,
+            static_n=static_n,
+            static_k=static_k,
+            leading_work_multiplier=leading_work_multiplier,
+            is_fp8=is_fp8,
+            is_small_n=is_small_n,
+            small_n_supports_role_local_tma=supports_small_n_role_local_tma,
+            small_n_requires_role_local_tma=small_n_requires_role_local_tma,
+            mma_k=mma_k,
+            max_tcgen05_m=max_tcgen05_m,
+            max_tcgen05_n=max_tcgen05_n,
+            max_search_m=max_search_m,
+            max_search_n=max_search_n,
+            max_search_k=max_search_k,
+            min_search_m=min_search_m,
+            min_search_n=min_search_n,
+        ),
+        required_specialized_vars=frozen_required_specialized_vars,
+        guards_complete=True,
     )
+
+
+def plan_cute_tcgen05_search(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    *,
+    has_leading_passthrough: bool,
+    supports_small_n_role_local_tma: bool = False,
+    supports_small_n_scalar_fallback: bool = False,
+    allow_dynamic_hints: bool = False,
+) -> CuteTcgen05SearchPlan | None:
+    """Return search limits without mutating shared compilation state."""
+    return _plan_cute_tcgen05_search_candidate(
+        lhs,
+        rhs,
+        has_leading_passthrough=has_leading_passthrough,
+        supports_small_n_role_local_tma=supports_small_n_role_local_tma,
+        supports_small_n_scalar_fallback=supports_small_n_scalar_fallback,
+        allow_dynamic_hints=allow_dynamic_hints,
+    ).plan
 
 
 def enable_cute_tcgen05_search(
@@ -486,6 +616,7 @@ def enable_cute_tcgen05_search(
         m_block_id=m_block_id,
         n_block_id=n_block_id,
         k_block_id=k_block_id,
+        compile_time_static_extents=(plan.static_m, plan.static_n, plan.static_k),
         input_dtype=input_dtype,
         has_leading_passthrough=has_leading_passthrough,
         explicit_epi_tile_compatible=explicit_epi_tile_compatible,
@@ -497,52 +628,60 @@ def enable_cute_tcgen05_search(
     max_search_n = plan.max_search_n
     max_search_k = plan.max_search_k
     spec.cute_tcgen05_search_enabled = True
-    allow_full_tile_persistent_pid_types = (
-        static_m % max_search_m == 0
-        and static_n % max_search_n == 0
-        and static_k % max_search_k == 0
-    )
-    allow_small_n_persistent_pid_types = (
-        plan.is_small_n
-        and plan.small_n_supports_role_local_tma
-        and 0 < static_n < max_search_n
-        and static_m % max_search_m == 0
-        and static_k % max_search_k == 0
-    )
     max_cluster_m2_search_k = TCGEN05_TWO_CTA_MAX_K_TILES * max_search_k
-    allow_full_tile_cluster_m2_search = (
-        allow_full_tile_persistent_pid_types
-        and max_search_m >= TCGEN05_TWO_CTA_BLOCK_M
-        and max_search_n >= TCGEN05_TWO_CTA_BLOCK_N
-        and static_k <= max_cluster_m2_search_k
-    )
-    allow_edge_cluster_m2_search = (
-        not has_leading_passthrough
-        and not allow_full_tile_persistent_pid_types
-        and plan.max_tcgen05_m >= TCGEN05_TWO_CTA_BLOCK_M
-        and plan.max_tcgen05_n >= TCGEN05_TWO_CTA_BLOCK_N
-        and static_m >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
-        and static_n >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
-        and static_k >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
-        and static_k <= max_cluster_m2_search_k
-        and static_m % TCGEN05_TWO_CTA_BLOCK_M != 0
-        and static_n % TCGEN05_TWO_CTA_BLOCK_N != 0
-        and static_k % max_search_k != 0
-    )
-    allow_fp8_small_grid_cluster_m2_search = (
-        not has_leading_passthrough
-        and plan.is_fp8
-        and allow_full_tile_persistent_pid_types
-        and max_search_m >= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
-        and max_search_n >= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
-        and static_k <= max_cluster_m2_search_k
-    )
+    if static_m is None or static_n is None or static_k is None:
+        allow_full_tile_persistent_pid_types = False
+        allow_small_n_persistent_pid_types = False
+        allow_full_tile_cluster_m2_search = False
+        allow_edge_cluster_m2_search = False
+        allow_fp8_small_grid_cluster_m2_search = False
+    else:
+        allow_full_tile_persistent_pid_types = (
+            static_m % max_search_m == 0
+            and static_n % max_search_n == 0
+            and static_k % max_search_k == 0
+        )
+        allow_small_n_persistent_pid_types = (
+            plan.is_small_n
+            and plan.small_n_supports_role_local_tma
+            and 0 < static_n < max_search_n
+            and static_m % max_search_m == 0
+            and static_k % max_search_k == 0
+        )
+        allow_full_tile_cluster_m2_search = (
+            allow_full_tile_persistent_pid_types
+            and max_search_m >= TCGEN05_TWO_CTA_BLOCK_M
+            and max_search_n >= TCGEN05_TWO_CTA_BLOCK_N
+            and static_k <= max_cluster_m2_search_k
+        )
+        allow_edge_cluster_m2_search = (
+            not has_leading_passthrough
+            and not allow_full_tile_persistent_pid_types
+            and plan.max_tcgen05_m >= TCGEN05_TWO_CTA_BLOCK_M
+            and plan.max_tcgen05_n >= TCGEN05_TWO_CTA_BLOCK_N
+            and static_m >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
+            and static_n >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
+            and static_k >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
+            and static_k <= max_cluster_m2_search_k
+            and static_m % TCGEN05_TWO_CTA_BLOCK_M != 0
+            and static_n % TCGEN05_TWO_CTA_BLOCK_N != 0
+            and static_k % max_search_k != 0
+        )
+        allow_fp8_small_grid_cluster_m2_search = (
+            not has_leading_passthrough
+            and plan.is_fp8
+            and allow_full_tile_persistent_pid_types
+            and max_search_m >= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
+            and max_search_n >= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
+            and static_k <= max_cluster_m2_search_k
+        )
     allow_cluster_m2_search = (
         allow_full_tile_cluster_m2_search
         or allow_edge_cluster_m2_search
         or allow_fp8_small_grid_cluster_m2_search
     )
     if allow_cluster_m2_search:
+        assert static_m is not None and static_n is not None and static_k is not None
         num_sms = _cuda_num_sms_or_zero(lhs.device)
         if num_sms > 0:
             if allow_fp8_small_grid_cluster_m2_search:

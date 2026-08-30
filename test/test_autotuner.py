@@ -366,6 +366,41 @@ class TestAutotuneIgnoreErrors(TestCase):
             search._prepare()
         return search
 
+    def _make_compile_failure_search(self) -> BaseSearch:
+        search = self._make_search(
+            Settings(
+                autotune_precompile=None,
+                autotune_log_level=logging.CRITICAL,
+            )
+        )
+        search.kernel.env = SimpleNamespace(process_group_name=None)
+        search.kernel.compile_config = None
+        return search
+
+    def _run_late_compile_failures(
+        self,
+        late_configs: Sequence[str],
+        error_for: Callable[[str], Exception],
+    ) -> tuple[list[object], list[object]]:
+        search = self._make_compile_failure_search()
+
+        def compile_config(config: str, **_kwargs: object) -> Callable[..., None]:
+            if config == "valid":
+                return lambda *args, **kwargs: None
+            raise error_for(config)
+
+        with (
+            patch.object(search.kernel, "compile_config", side_effect=compile_config),
+            patch.object(
+                search.benchmark_provider,
+                "_benchmark_function",
+                return_value=1.0,
+            ),
+        ):
+            initial = search.benchmark_batch(["valid"], desc="initial")
+            late = search.benchmark_batch(list(late_configs), desc="late")
+        return initial, late
+
     def test_settings_flag_from_env(self):
         with patch.dict(
             os.environ, {"HELION_AUTOTUNE_IGNORE_ERRORS": "1"}, clear=False
@@ -665,6 +700,57 @@ class TestAutotuneIgnoreErrors(TestCase):
         self.assertEqual(results[1].status, "error")
         self.assertEqual(results[2].perf, 1.0)
         self.assertEqual(search._autotune_metrics.num_compile_failures, 1)
+
+    def test_initial_compile_failures_raise(self) -> None:
+        cases: tuple[tuple[str, type[Exception], str, Exception], ...] = (
+            (
+                "invalid",
+                exc.InvalidConfig,
+                "invalid initial config",
+                exc.InvalidConfig("invalid initial config"),
+            ),
+            (
+                "runtime",
+                RuntimeError,
+                "initial compiler failure",
+                RuntimeError("initial compiler failure"),
+            ),
+        )
+        for config, error_type, message, error in cases:
+            with self.subTest(config=config):
+                search = self._make_compile_failure_search()
+                with (
+                    patch.object(
+                        search.kernel,
+                        "compile_config",
+                        side_effect=error,
+                    ),
+                    self.assertRaisesRegex(error_type, message),
+                ):
+                    search.benchmark_batch([config], desc="initial")
+
+    def test_late_compile_failures_are_skipped(self) -> None:
+        cases = (
+            (
+                "invalid",
+                lambda config: exc.InvalidConfig(f"invalid late neighbor: {config}"),
+            ),
+            ("runtime", lambda config: RuntimeError("late compiler failure")),
+            (
+                "unsupported",
+                lambda config: exc.BackendUnsupported(
+                    "cute", f"unsupported late neighbor {config}"
+                ),
+            ),
+        )
+        for prefix, error_for in cases:
+            with self.subTest(prefix=prefix):
+                initial, late = self._run_late_compile_failures(
+                    (f"{prefix}_a", f"{prefix}_b"), error_for
+                )
+                self.assertEqual(initial[0].perf, 1.0)
+                self.assertEqual([result.perf for result in late], [float("inf")] * 2)
+                self.assertEqual([result.status for result in late], ["error"] * 2)
 
     def test_autotune_log_sink_writes_csv_and_log(self):
         tmpdir = tempfile.TemporaryDirectory()
@@ -12779,6 +12865,37 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
             best_of_k=5,
         )
         self.assertNotEqual(k1_aliased.stable_hash(), k5.stable_hash())
+
+    def test_strict_cache_key_tracks_nondefault_best_of_k(self) -> None:
+        from helion.autotuner.base_cache import StrictAutotuneCacheKey
+
+        common_kwargs = {
+            "specialization_key": (),
+            "extra_results": (),
+            "kernel_source_hash": "abc",
+            "hardware": "B200",
+            "runtime_name": "12.6",
+            "backend": "triton",
+            "config_spec_hash": "h1",
+            "extra_cache_key": "",
+            "helion_key": "helion",
+            "torch_key": "torch",
+            "triton_key": "triton",
+        }
+        k1 = StrictAutotuneCacheKey(**common_kwargs, best_of_k=1)
+        k5 = StrictAutotuneCacheKey(**common_kwargs, best_of_k=5)
+        expected_k1_repr = (
+            "StrictAutotuneCacheKey("
+            "specialization_key=(), extra_results=(), "
+            "kernel_source_hash='abc', hardware='B200', "
+            "runtime_name='12.6', backend='triton', "
+            "config_spec_hash='h1', extra_cache_key='', "
+            "helion_key='helion', torch_key='torch', triton_key='triton')"
+        )
+
+        self.assertEqual(repr(k1), expected_k1_repr)
+        self.assertIn("best_of_k=5", repr(k5))
+        self.assertNotEqual(k1.stable_hash(), k5.stable_hash())
 
     def test_best_of_k_gt_1_without_factory_raises(self) -> None:
         """The bare ``Cache(autotuner)`` constructor must reject K>1 at

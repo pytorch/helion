@@ -156,6 +156,17 @@ def _record_restriction(
 _TARGET_DEVICE_CAPABILITY_UNSET = object()
 
 
+def _copy_config_structure(value: object) -> object:
+    """Copy built-in config containers while preserving opaque leaf objects."""
+    if type(value) is dict:
+        return {key: _copy_config_structure(item) for key, item in value.items()}
+    if type(value) is list:
+        return [_copy_config_structure(item) for item in value]
+    if type(value) is tuple:
+        return tuple(_copy_config_structure(item) for item in value)
+    return value
+
+
 class TensorNumelConstraint(NamedTuple):
     """Tensor element count must stay within Triton's max numel limit."""
 
@@ -165,7 +176,12 @@ class TensorNumelConstraint(NamedTuple):
 
 
 class MatmulFact(NamedTuple):
-    """Shape facts recorded when matmul requirements are applied."""
+    """Shape facts recorded when matmul requirements are applied.
+
+    ``static_m``, ``static_n``, and ``static_k`` initially contain proven
+    compile-time extents. DeviceIR analysis may later fill missing values with
+    representative runtime hints for whole-kernel matmul sizing.
+    """
 
     lhs_ndim: int
     rhs_ndim: int
@@ -1892,6 +1908,7 @@ class ConfigSpec:
         m_block_id: int,
         n_block_id: int,
         k_block_id: int,
+        compile_time_static_extents: tuple[int | None, int | None, int | None],
         input_dtype: torch.dtype,
         has_leading_passthrough: bool,
         explicit_epi_tile_compatible: bool,
@@ -1900,6 +1917,7 @@ class ConfigSpec:
             m_block_id=m_block_id,
             n_block_id=n_block_id,
             k_block_id=k_block_id,
+            compile_time_static_extents=compile_time_static_extents,
             input_dtype=input_dtype,
             has_leading_passthrough=has_leading_passthrough,
             explicit_epi_tile_compatible=explicit_epi_tile_compatible,
@@ -1909,6 +1927,14 @@ class ConfigSpec:
         self,
     ) -> tuple[BlockSizeFragment, BlockSizeFragment, BlockSizeFragment] | None:
         return self._cute_tcgen05_config._matmul_block_fragments()
+
+    def _tcgen05_matmul_block_ids(self) -> tuple[int, int, int] | None:
+        return self._cute_tcgen05_config.matmul_block_ids
+
+    def _tcgen05_matmul_compile_time_static_extents(
+        self,
+    ) -> tuple[int | None, int | None, int | None] | None:
+        return self._cute_tcgen05_config.matmul_compile_time_static_extents
 
     def _tcgen05_matmul_seed_block_sizes(
         self, *, bm: int, bn: int, bk: int
@@ -1984,6 +2010,14 @@ class ConfigSpec:
         self._cute_tcgen05_config.allow_ab_stages_three_search(
             dtype_bytes=dtype_bytes,
             device=device,
+        )
+
+    def register_cute_tcgen05_grouped_worklist_smem_facts(
+        self, *, group_count: int, device_split_sizes: bool
+    ) -> None:
+        self._cute_tcgen05_config.register_grouped_worklist_smem_facts(
+            group_count=group_count,
+            device_split_sizes=device_split_sizes,
         )
 
     @staticmethod
@@ -2153,6 +2187,21 @@ class ConfigSpec:
 
     def is_supported_config(self, config: Mapping[str, object]) -> bool:
         return not self.unsupported_config_keys(config)
+
+    def normalized_config(
+        self,
+        config: helion.Config | Mapping[str, object],
+    ) -> helion.Config:
+        """Return a normalized copy without mutating the requested config."""
+        values = config.config if isinstance(config, helion.Config) else config
+        copied_values = {
+            key: _copy_config_structure(value) for key, value in values.items()
+        }
+        normalized = helion.Config(
+            **copied_values  # pyrefly: ignore[bad-argument-type]
+        )
+        self.normalize(normalized)
+        return normalized
 
     def normalize(
         self, config: helion.Config | dict[str, object], *, _fix_invalid: bool = False
