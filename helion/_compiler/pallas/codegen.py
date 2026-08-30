@@ -866,6 +866,8 @@ def _tile_begin_with_offset_pattern_code(
 ) -> str:
     from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
     from helion._compiler.tile_strategy import DeviceLoopState
+    from helion._compiler.tile_strategy import EmitPipelineLoopState
+    from helion._compiler.tile_strategy import ForiLoopState
 
     assert isinstance(pattern, TileBeginWithOffsetPattern)
 
@@ -889,7 +891,10 @@ def _tile_begin_with_offset_pattern_code(
     assert isinstance(pattern.offset, int)
 
     loops = state.codegen.active_device_loops.get(block_id)
-    if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
+    if loops and any(
+        isinstance(loop, (DeviceLoopState, EmitPipelineLoopState, ForiLoopState))
+        for loop in loops
+    ):
         offset = state.codegen.offset_var(block_id)
         if pattern.offset != 0:
             offset = f"{offset} + {pattern.offset}"

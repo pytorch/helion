@@ -2071,6 +2071,26 @@ class TestPallas(TestCase):
         self.assertIn("[pl.ds(1, 2), :, :]", code)
         torch.testing.assert_close(out, torch.full_like(out, 8.0))
 
+    def test_resident_fori_loop_scalar_index_uses_current_iteration(self) -> None:
+        """A scalar row index into a resident tensor advances with the loop."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def select_rows(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for _request in hl.grid(1):
+                for row in hl.tile(x.size(1), block_size=1):
+                    hl.store(out, [0, row.begin, slice(None)], x[0, row.begin, :] + 1)
+            return out
+
+        x = torch.arange(4 * 128, device=DEVICE, dtype=torch.float32).reshape(1, 4, 128)
+        _, actual = code_and_output(
+            select_rows,
+            (x,),
+            pallas_loop_type="fori_loop",
+            pallas_load_buffer_count=[1],
+        )
+        torch.testing.assert_close(actual, x + 1)
+
     def test_resident_subview_of_untiled_dimension(self) -> None:
         """A direct run may address any aligned dimension of the resident Ref."""
 

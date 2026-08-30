@@ -298,6 +298,49 @@ def _pipeline_remote_copy(
 
 @helion.kernel(
     static_shapes=True,
+    config=helion.Config(
+        block_sizes=[],
+        pallas_loop_type="fori_loop",
+        pallas_load_buffer_count=[2, 1, 1, 1],
+    ),
+)
+def _nested_computed_row_remote_copy(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    peers: torch.Tensor,
+    valid_counts: torch.Tensor,
+) -> torch.Tensor:
+    """Send each row of a computed VMEM tile from a nested device loop."""
+    num_steps = hl.specialize(src.size(1))
+    num_rows = hl.specialize(src.size(2))
+    width = hl.specialize(src.size(3))
+    stage = torch.empty(
+        (num_rows, 1, width),
+        dtype=src.dtype,
+        device=src.device,
+    )
+    for _program in hl.grid(1):
+        hl.remote_barrier(peers[0, 0])
+        for step in hl.tile(num_steps, block_size=1):
+            valid_count = hl.load(valid_counts, [step.begin])
+            stage[:, 0, :] = hl.zeros([num_rows, width], dtype=stage.dtype)
+            if valid_count > 0:
+                stage[:, 0, :] = src[0, step.begin, :, :] + 1
+            for row in hl.tile(num_rows, block_size=1):
+                copy = hl.make_async_remote_copy(
+                    stage,
+                    [row.begin],
+                    peers[0, 0],
+                    dst=dst,
+                    dst_index=[0, step.begin, row.begin],
+                )
+                copy.start()
+                copy.wait()
+    return dst
+
+
+@helion.kernel(
+    static_shapes=True,
     config=helion.Config(block_sizes=[]),
 )
 def _computed_fp8_remote_copy(
@@ -1715,6 +1758,32 @@ def _remote_copy_torch_tpu_worker(rank: int, world_size: int, master_port: int) 
         result = gather_op(local_values, gathered, peers, slots)
         expected = torch.from_numpy(_expected_all_gather(world_size)).unsqueeze(1)
         assert result.shape == (world_size, 1, _GATHER_ROWS, _WIDTH)
+        torch.testing.assert_close(result.cpu(), expected)
+
+        rank_value = torch.tensor(rank * 1000, dtype=torch.float32, device=device)
+        steps = torch.arange(
+            _PIPELINE_STEPS, dtype=torch.float32, device=device
+        ).reshape(1, _PIPELINE_STEPS, 1, 1)
+        rows = torch.arange(_GATHER_ROWS, dtype=torch.float32, device=device).reshape(
+            1, 1, _GATHER_ROWS, 1
+        )
+        columns = torch.arange(_WIDTH, dtype=torch.float32, device=device).reshape(
+            1, 1, 1, _WIDTH
+        )
+        src = rank_value + steps * 100 + rows * 10 + columns
+        dst = torch.full(
+            (1, _PIPELINE_STEPS, _GATHER_ROWS, 1, _WIDTH),
+            -7,
+            dtype=torch.float32,
+            device=device,
+        )
+        peers = torch.tensor(
+            [[(rank + 1) % world_size]], dtype=torch.int32, device=device
+        )
+        valid_counts = torch.ones(_PIPELINE_STEPS, dtype=torch.int32, device=device)
+        result = _nested_computed_row_remote_copy(src, dst, peers, valid_counts)
+        previous_rank = (rank - 1) % world_size
+        expected = (src.cpu() - rank * 1000 + previous_rank * 1000 + 1).unsqueeze(-2)
         torch.testing.assert_close(result.cpu(), expected)
 
     run_checks()
