@@ -3453,9 +3453,13 @@ class TestCuteBackend(TestCase):
         expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
-    def test_flash_attention_fa4_dense_128k_clc_seed_matches_sdpa(self) -> None:
+    def test_flash_attention_fa4_dense_16k_clc_seed_matches_sdpa(self) -> None:
+        # 16k seq x 32 heads x 2 batches gives a (64, 32, 2) tile space
+        # (4096 work items >> the 148-CTA grid), which exercises the CLC
+        # dynamic scheduler the same way the original 128k shape did at
+        # 1/64th the FLOPs — no scheduler threshold sits between them.
         q, k, v = (
-            torch.randn(2, 32, 131072, 64, dtype=torch.float16, device=DEVICE)
+            torch.randn(2, 32, 16384, 64, dtype=torch.float16, device=DEVICE)
             for _ in range(3)
         )
         code, out = code_and_output(
@@ -3473,20 +3477,22 @@ class TestCuteBackend(TestCase):
             "barrier_storage=storage.clc_mbar_ptr.data_ptr(), num_stages=2,",
             code,
         )
-        self.assertIn("problem_shape_ntile_mnl=(512, 32, 2)", code)
+        self.assertIn("problem_shape_ntile_mnl=(64, 32, 2)", code)
         self.assertIn(
-            "flash_m_pair = cutlass.Int32(512 - 1) - "
+            "flash_m_pair = cutlass.Int32(64 - 1) - "
             "cutlass.Int32(flash_clc_work.tile_idx[0])",
             code,
         )
         expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
-    def test_flash_attention_fa4_dense_64k_role_chain_seed_matches_sdpa(
+    def test_flash_attention_fa4_dense_role_chain_seed_matches_sdpa(
         self,
     ) -> None:
+        # The role-chain pins are seq-independent codegen properties; 8k
+        # (64 kv tiles, many pipeline wraps) replaces the original 64k.
         q, k, v = (
-            torch.randn(1, 1, 65536, 64, dtype=torch.float16, device=DEVICE)
+            torch.randn(1, 1, 8192, 64, dtype=torch.float16, device=DEVICE)
             for _ in range(3)
         )
         code, out = code_and_output(
@@ -3561,7 +3567,10 @@ class TestCuteBackend(TestCase):
         self.assertEqual(cfg.epi_stg_gmem, "stage")
 
     def test_flash_attention_fa4_dense_hd64_two_cta_matches_sdpa(self) -> None:
-        for seq_len in (32768, 65536, 131072):
+        # 32768 (128 m-pairs) and 65536 (256 m-pairs) cover both sides of
+        # the 148-SM persistent-grid wrap; 131072 was dropped — it only
+        # added more waves of the already-wrapping schedule.
+        for seq_len in (32768, 65536):
             with self.subTest(seq_len=seq_len):
                 q, k, v = (
                     torch.randn(1, 1, seq_len, 64, dtype=torch.float16, device=DEVICE)
@@ -3651,8 +3660,12 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(out, expected_out, atol=2e-2, rtol=2e-2)
         torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
 
-    def test_flash_attention_bf16_large_2cta_seed_matches_sdpa(self) -> None:
-        seq_len = 524_288
+    def test_flash_attention_bf16_2cta_seed_matches_sdpa(self) -> None:
+        # The fa4_2cta seed (and its 8x2 packet resolution) is selected
+        # identically for every num_kv >= 256, so the original 524288 seq
+        # guarded no threshold; 32768 still wraps the persistent grid
+        # (128 m-pairs x 2 CTAs > 148 SMs) at 1/256th the FLOPs.
+        seq_len = 32_768
         seeds = _cute_flash.flash_attention_seed_configs(
             64,
             seq_len // 128,
@@ -3693,8 +3706,11 @@ class TestCuteBackend(TestCase):
         expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
-    def test_flash_attention_bf16_dense_2048kv_seed_matches_sdpa(self) -> None:
-        seq_len = 262_144
+    def test_flash_attention_bf16_dense_256kv_seed_matches_sdpa(self) -> None:
+        # An epi_tma seed exists for every num_kv >= 256 (exact-match
+        # policy tables aside, the structural seeds are num_kv-invariant),
+        # so the original 262144/2048kv seq guarded no threshold.
+        seq_len = 32_768
         seeds = _cute_flash.flash_attention_seed_configs(
             64,
             seq_len // 128,
@@ -8210,8 +8226,8 @@ class TestCuteBackend(TestCase):
             self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
 
         torch.manual_seed(0)
-        x = (torch.randn(512, 2048, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
-        y = (torch.randn(2048, 2048, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        x = (torch.randn(512, 1024, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (torch.randn(1024, 1024, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
 
         # Use block_m=256 to enable is_two_cta (required for cluster_m=2 role-local)
         code, out = code_and_output(

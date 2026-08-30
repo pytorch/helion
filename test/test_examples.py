@@ -725,8 +725,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfPallasInterpret(
-        "65536x1024x1280 GEMM is too slow under CPU interpret -- it exceeds the "
-        "300s per-test timeout and (thread timeout method) kills the whole job"
+        "GEMM pair is too slow under CPU interpret -- at the original 65536-row "
+        "shape it exceeded the 300s per-test timeout"
     )
     @skipIfTileIR("precision differences with bf16xint16 operations on tileir")
     @skipIfRocm("precision differences with bf16xint16 operations on rocm")
@@ -734,7 +734,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_bf16xint16(self):
         from examples.bf16xint16_gemm import reference_bf16xint16_pytorch
 
-        m, k, n = 65536, 1024, 1280
+        m, k, n = 2048, 1024, 1280
 
         # The CuTe scalar matmul fallback accumulates each bf16xbf16 product in
         # full fp32 (it never rounds the per-element products back to bf16), so
@@ -909,7 +909,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfTileIR("PassManager::run failed")
     def test_epilogue_subtiling_residual_gelu(self):
-        m, k, n = 8192, 8192, 8192
+        m, k, n = 1024, 1024, 1024
         x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
         w = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
         bias = torch.randn([n], device=DEVICE, dtype=HALF_DTYPE)
@@ -929,7 +929,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfTileIR("PassManager::run failed")
     def test_epilogue_subtiling_gelu_aux(self):
-        m, k, n = 8192, 8192, 8192
+        m, k, n = 1024, 1024, 1024
         x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
         w = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
         bias = torch.randn([n], device=DEVICE, dtype=HALF_DTYPE)

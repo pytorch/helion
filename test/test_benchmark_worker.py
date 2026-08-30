@@ -2052,9 +2052,12 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         bound_kernel.settings.autotune_benchmark_subprocess = True
         bound_kernel.settings.autotune_benchmark_timeout = 60
         bound_kernel.settings.autotune_precompile = None
+        # The autotuner reseeds `random` from this setting, so pinning it (not
+        # random.seed) is what makes the config sequence reproducible.
+        bound_kernel.settings.autotune_random_seed = 123
 
         random.seed(123)
-        RandomSearch(bound_kernel, args, 20).autotune()
+        RandomSearch(bound_kernel, args, 10).autotune()
 
     @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
     def test_autotune_continues_when_subprocess_reports_inf(self) -> None:
@@ -2091,6 +2094,9 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         bound_kernel.settings.autotune_benchmark_subprocess = True
         bound_kernel.settings.autotune_benchmark_timeout = 60
         bound_kernel.settings.autotune_precompile = None
+        # The autotuner reseeds `random` from this setting, so pinning it (not
+        # random.seed) is what makes the config sequence reproducible.
+        bound_kernel.settings.autotune_random_seed = 123
 
         random.seed(123)
         with patch.object(
@@ -2098,7 +2104,7 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
             "_benchmark_function_subprocess",
             maybe_fail,
         ):
-            search = RandomSearch(bound_kernel, args, 20)
+            search = RandomSearch(bound_kernel, args, 10)
             search.autotune()
 
         self.assertGreaterEqual(call_count[0], 6)
@@ -2108,9 +2114,9 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
     @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
     def test_autotune_continues_when_accuracy_check_crashes(self) -> None:
         # A config can pass the timed run and then crash in the accuracy
-        # check. Patches the accuracy job to raise a sticky CUDA error for a
-        # fraction of configs; the worker dies and respawns, and autotune must
-        # still pick a best config from the rest instead of aborting.
+        # check. Patches the accuracy job to raise a sticky CUDA error for one
+        # config; the worker dies and respawns, and autotune must still pick a
+        # best config from the rest instead of aborting.
         if not torch.cuda.is_available():
             self.skipTest("requires CUDA")
 
@@ -2122,7 +2128,10 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
             fn: CompiledConfig,
         ) -> AccuracyCheckResult | None:
             call_count[0] += 1
-            if call_count[0] % 3 == 0:
+            # Crash exactly once, early: every induced crash costs a ~5s worker
+            # kill/respawn cycle, and one cycle already proves autotune survives
+            # an accuracy-check crash and keeps searching.
+            if call_count[0] == 2:
                 call_count[1] += 1
                 if self._benchmark_worker is None:
                     self._benchmark_worker = BenchmarkWorker(device=None)
@@ -2146,6 +2155,9 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         bound_kernel.settings.autotune_benchmark_subprocess = True
         bound_kernel.settings.autotune_benchmark_timeout = 60
         bound_kernel.settings.autotune_precompile = None
+        # The autotuner reseeds `random` from this setting, so pinning it (not
+        # random.seed) is what makes the config sequence reproducible.
+        bound_kernel.settings.autotune_random_seed = 123
 
         random.seed(123)
         with patch.object(
@@ -2153,11 +2165,13 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
             "_run_subprocess_accuracy_check_job",
             maybe_crash,
         ):
-            best = RandomSearch(bound_kernel, args, 20).autotune()
+            best = RandomSearch(bound_kernel, args, 8).autotune()
 
         self.assertIsNotNone(best)
-        self.assertGreaterEqual(call_count[0], 6)
-        self.assertGreaterEqual(call_count[1], 2)
+        # Random configs that fail to compile never reach the accuracy check
+        # (hardware-dependent even with a pinned seed), so leave slack here.
+        self.assertGreaterEqual(call_count[0], 4)
+        self.assertEqual(call_count[1], 1)
 
 
 if __name__ == "__main__":

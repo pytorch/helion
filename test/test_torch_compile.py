@@ -541,13 +541,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         expected_num_compilations: list[int] | None = None,
         kernels_ref: list | None = None,
         expected_num_kernels_ref: int | None = None,
+        ref_on_fusion_leg: bool = False,
     ):
         """Run torch.compile test comparing eager vs compiled execution."""
+        # The upgrade-error path for fusion on unsupported builds is covered
+        # once by test_fusion_unsupported_raises_upgrade_error; skip the many
+        # parametrized fusion legs that would otherwise all re-check it.
         if allow_torch_compile_fusion and not supports_torch_compile_fusion():
-            expected_error = (
-                RuntimeError,
-                "torch_compile_fusion=True requires PyTorch nightly build",
-            )
+            self.skipTest("torch.compile fusion not supported by this PyTorch build")
 
         # Reset specific kernels and configure fusion setting
         for kernel in kernels:
@@ -616,8 +617,14 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 f"Expected {expected_num_kernels} triton kernel(s), got {kernel_count}",
             )
 
-        # Ref baseline kernel count check
-        if expected_num_kernels_ref is not None:
+        # Ref baseline kernel count check. The *_ref baselines are pure torch
+        # (no helion kernels), so this compile is identical on both fusion
+        # legs; check it on only one leg to avoid duplicate compiles. Tests
+        # that skip their fusion=False leg opt in via ref_on_fusion_leg.
+        if (
+            expected_num_kernels_ref is not None
+            and allow_torch_compile_fusion == ref_on_fusion_leg
+        ):
             assert kernels_ref is not None, (
                 "kernels_ref must be provided when expected_num_kernels_ref is set"
             )
@@ -644,6 +651,34 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                     f"Expected {expected} helion compilation(s) for {kernel}, "
                     f"got {len(kernel._bound_kernels)}",
                 )
+
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_fusion_unsupported_raises_upgrade_error(self):
+        """Fusion requested on a build without fusion support: eager still
+        works, but torch.compile raises the upgrade error at trace time."""
+        if supports_torch_compile_fusion():
+            self.skipTest("this PyTorch build supports torch.compile fusion")
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            return k_add(x, y)
+
+        self.addCleanup(
+            setattr,
+            k_add.settings,
+            "torch_compile_fusion",
+            k_add.settings.torch_compile_fusion,
+        )
+        k_add.settings.torch_compile_fusion = True
+        k_add.reset()
+        torch._dynamo.reset()
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        torch.testing.assert_close(f(x, y), x + y)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "torch_compile_fusion=True requires PyTorch nightly build",
+        ):
+            torch.compile(f, fullgraph=True, backend="inductor")(x, y)
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
@@ -4606,6 +4641,8 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             compare_fn=compare,
             kernels_ref=[k_returns_string_ref],
             expected_num_kernels_ref=1,
+            # This test skips its fusion=False leg, so check the ref here.
+            ref_on_fusion_leg=True,
         )
 
     @requires_fusion_support
