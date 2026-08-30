@@ -1,13 +1,9 @@
 from __future__ import annotations
 
-import itertools
+import ast
 from typing import TYPE_CHECKING
 
-from .. import exc
-from .ast_read_writes import ReadWrites
-
 if TYPE_CHECKING:
-    import ast
     from collections.abc import Callable
 
     from .device_ir import GraphInfo
@@ -15,6 +11,142 @@ if TYPE_CHECKING:
 
 # fx node meta key marking a load that must be preceded by ``tl.debug_barrier()``.
 INTRA_LOOP_RAW_BARRIER_META = "_needs_debug_barrier_before"
+
+
+def collect_host_tensor_aliases(body: list[ast.stmt]) -> dict[str, str]:
+    """Collect conservative base-storage aliases from host-wrapper statements."""
+    aliases: dict[str, str] = {}
+    for stmt in body:
+        if not isinstance(stmt, ast.For):
+            _update_host_aliases(stmt, aliases)
+    return aliases
+
+
+def canonical_host_tensor_name(name: str, aliases: dict[str, str]) -> str:
+    """Resolve ``name`` through aliases collected by collect_host_tensor_aliases."""
+    return _canonical_alias(name, aliases)
+
+
+_ALIAS_PRESERVING_METHODS = frozenset(
+    {
+        "as_strided",
+        "detach",
+        "expand",
+        "flatten",
+        "movedim",
+        "narrow",
+        "permute",
+        "reshape",
+        "select",
+        "squeeze",
+        "swapaxes",
+        "swapdims",
+        "transpose",
+        "unbind",
+        "unflatten",
+        "unsqueeze",
+        "view",
+    }
+)
+
+
+def _canonical_alias(name: str, aliases: dict[str, str]) -> str:
+    """Resolve a host name to the base storage name tracked by the analysis."""
+    path: list[str] = []
+    while (base := aliases.get(name)) is not None and base != name:
+        path.append(name)
+        name = base
+    for alias in path:
+        aliases[alias] = name
+    return name
+
+
+def _alias_base_name(expr: ast.expr, aliases: dict[str, str]) -> str | None:
+    """Return the conservative base name for a host-side tensor alias expression.
+
+    Basic slicing and the standard view-like tensor methods preserve storage.
+    Treating an advanced-indexing subscript as an alias is conservative: it can
+    add a dependency but cannot remove one.
+    """
+    if isinstance(expr, ast.Name):
+        return _canonical_alias(expr.id, aliases)
+    if isinstance(expr, ast.Subscript):
+        return _alias_base_name(expr.value, aliases)
+    if isinstance(expr, ast.Attribute) and expr.attr in {"T", "mT", "data"}:
+        return _alias_base_name(expr.value, aliases)
+    if isinstance(expr, ast.Call):
+        if (
+            isinstance(expr.func, ast.Attribute)
+            and isinstance(expr.func.value, ast.Name)
+            and expr.func.value.id == "torch"
+            and expr.func.attr in _ALIAS_PRESERVING_METHODS
+            and expr.args
+        ):
+            return _alias_base_name(expr.args[0], aliases)
+        if (
+            isinstance(expr.func, ast.Attribute)
+            and expr.func.attr in _ALIAS_PRESERVING_METHODS
+        ):
+            return _alias_base_name(expr.func.value, aliases)
+    return None
+
+
+def _target_names(target: ast.expr) -> tuple[str, ...]:
+    if isinstance(target, ast.Name):
+        return (target.id,)
+    if isinstance(target, (ast.List, ast.Tuple)):
+        return tuple(name for element in target.elts for name in _target_names(element))
+    return ()
+
+
+def _update_alias_target(
+    target: ast.expr,
+    value: ast.expr,
+    aliases: dict[str, str],
+) -> None:
+    """Apply one host assignment to the conservative storage-alias map."""
+    if isinstance(target, ast.Name):
+        base = _alias_base_name(value, aliases)
+        if base is None:
+            aliases.pop(target.id, None)
+        else:
+            aliases[target.id] = base
+        return
+
+    if not isinstance(target, (ast.List, ast.Tuple)):
+        return
+
+    # Pairwise tuple/list assignment preserves the more precise base for each
+    # element.  Calls such as ``q, k, v = qkv.unbind(0)`` return multiple views
+    # of one storage, so every unpacked name conservatively aliases the call's
+    # receiver even though the RHS is not an AST tuple.
+    if isinstance(value, (ast.List, ast.Tuple)) and len(target.elts) == len(value.elts):
+        for target_element, value_element in zip(target.elts, value.elts, strict=True):
+            _update_alias_target(target_element, value_element, aliases)
+        return
+
+    base = _alias_base_name(value, aliases)
+    for name in _target_names(target):
+        if base is None:
+            aliases.pop(name, None)
+        else:
+            aliases[name] = base
+
+
+def _update_host_aliases(stmt: ast.stmt, aliases: dict[str, str]) -> None:
+    """Update base-storage aliases from a host-wrapper assignment."""
+    value: ast.expr | None = None
+    targets: tuple[ast.expr, ...] = ()
+    if isinstance(stmt, ast.Assign):
+        targets = tuple(stmt.targets)
+        value = stmt.value
+    elif isinstance(stmt, ast.AnnAssign):
+        targets = (stmt.target,)
+        value = stmt.value
+    if value is None:
+        return
+    for target in targets:
+        _update_alias_target(target, value, aliases)
 
 
 def mark_intra_loop_raw_barriers(
@@ -160,51 +292,3 @@ def needs_inter_loop_debug_barrier_for_global_raw(
     """
     cur_global_reads = global_barrier_tensor_names(host_loop_reads)
     return bool(prev_global_writes & cur_global_reads)
-
-
-class LoopDependencyChecker:
-    """
-    A class to check dependencies between top-level for loops in a Helion kernel.
-
-    This class tracks memory accesses (reads and writes) for each top-level for loop
-    and raises an error if a later loop reads or writes to anything written in a
-    previous loop.
-    """
-
-    def __init__(self) -> None:
-        self.reads: set[str] = set()
-        self.writes: set[str] = set()
-        self._barrier_after_root: set[int] = set()
-        self._root_counter: int = 0
-        self.disabled: bool = False
-
-    def insert_barrier_after_root(self, root_id: int) -> None:
-        """Record that a barrier separates root_id and root_id+1."""
-        self._barrier_after_root.add(root_id)
-
-    def register_loop(self, loop_node: ast.For, root_id: int | None = None) -> None:
-        if self.disabled:
-            return
-        current_root = root_id if root_id is not None else self._root_counter
-        if (current_root - 1) in self._barrier_after_root:
-            self.reads.clear()
-            self.writes.clear()
-            self._barrier_after_root.discard(current_root - 1)
-        rw = ReadWrites.from_list(loop_node.body)
-
-        self._check_dependencies(rw)
-
-        self.reads |= set(rw.reads)
-        self.writes |= set(rw.writes)
-        self._root_counter = current_root + 1
-
-    def _check_dependencies(self, rw: ReadWrites) -> None:
-        """
-        Check for dependencies between the current loop and previous loops.
-
-        Raises:
-            exc.LoopDependencyError: If a dependency is detected
-        """
-        for name in sorted(itertools.chain(rw.reads, rw.writes)):
-            if name in self.writes:
-                raise exc.LoopDependencyError(name)

@@ -4351,7 +4351,7 @@ def build_tile_dependency_graph(
     device_ir: DeviceIR | None = None,
     task_families: tuple[TaskFamily, ...] | None = None,
     root_phases: tuple[int, ...] | None = None,
-    noncanonical_task_origin_block_ids: frozenset[int] = frozenset(),
+    noncanonical_task_origin_block_ids: frozenset[int] | None = None,
 ) -> TileDependencyGraph:
     """Build the minimal source-ordered allocation hazard graph.
 
@@ -4360,8 +4360,15 @@ def build_tile_dependency_graph(
     task readiness for the strict affine subset. Anything else remains a
     root-barrier dependency.
     """
-    if task_families is None and device_ir is not None:
-        task_families = tuple(device_ir.task_families)
+    if device_ir is not None:
+        if task_families is None:
+            task_families = tuple(device_ir.task_families)
+        if noncanonical_task_origin_block_ids is None:
+            noncanonical_task_origin_block_ids = frozenset(
+                device_ir.noncanonical_task_origin_block_ids
+            )
+    if noncanonical_task_origin_block_ids is None:
+        noncanonical_task_origin_block_ids = frozenset()
     if task_families is None:
         if grid_block_ids is None:
             raise TypeError(

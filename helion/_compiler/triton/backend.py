@@ -78,6 +78,10 @@ class TritonBackend(Backend):
         return host_str
 
     def supports_config_key(self, key: str) -> bool:
+        if key == "cross_loop_schedule":
+            from ..._compat import is_hip
+
+            return self.name == "triton" and not is_hip()
         if key in ("load_cache_modifiers", "store_cache_modifiers"):
             return True
         if key == "waves_per_eu":
@@ -563,6 +567,17 @@ class TritonBackend(Backend):
                 for tensor, numel in device_fn.triton_remote_copy_scratch_specs
             )
             out.append(f"_remote_copy_scratch_specs=({specs},)")
+        if device_fn.triton_persistent_state_specs:
+            specs = ", ".join(
+                f"({tensor}, {numel}, {dtype})"
+                for tensor, numel, dtype in device_fn.triton_persistent_state_specs
+            )
+            out.append(f"_persistent_state_specs=({specs},)")
+        if device_fn.triton_minimum_resident_programs is not None:
+            out.append(
+                "_minimum_resident_programs="
+                f"{device_fn.triton_minimum_resident_programs}"
+            )
         out.extend(self.launcher_keyword_args(config, has_barrier=has_barrier))
         return out
 

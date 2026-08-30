@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import collections
 import contextlib
 import contextvars
@@ -427,6 +428,11 @@ class CompileEnvironment:
         for pid_type in ("flat", "xyz"):
             self.config_spec.disallow_pid_type(pid_type, reason=reason)
 
+    def require_persistent_blocked(self, reason: str) -> None:
+        """Restrict program-ID selection to blocked persistent execution."""
+        for pid_type in ("flat", "xyz", "persistent_interleaved"):
+            self.config_spec.disallow_pid_type(pid_type, reason=reason)
+
     def restrict_pid_types_for_persistent(self, args: Sequence[object]) -> None:
         """Restrict to persistent kernels when the kernel needs cross-rank sync.
 
@@ -823,7 +829,7 @@ class CompileEnvironment:
 
     def _disable_range_num_stages_for_aliasing(self) -> None:
         """
-        Disable range_num_stages choices if any kernel argument name is both read and written.
+        Disable pipelining only on loops that read and write the same argument.
 
         Workaround for https://github.com/triton-lang/triton/issues/8259
         """
@@ -831,17 +837,49 @@ class CompileEnvironment:
         if not self.config_spec.range_num_stages:
             return
 
+        from .ast_extension import ExtendedAST
         from .ast_read_writes import ReadWrites
         from .host_function import HostFunction
+        from .loop_dependency_checker import canonical_host_tensor_name
+        from .loop_dependency_checker import collect_host_tensor_aliases
+        from .type_info import IterType
+        from .type_info import SequenceType
+        from .type_info import TileIndexType
 
         host_fn = HostFunction.current()
-        rw = ReadWrites.from_list(host_fn.body)
-        if not (rw.reads and rw.writes):
-            return
-
         arg_names = set(host_fn.params.arguments.keys())
-        if set(rw.reads) & set(rw.writes) & arg_names:
-            self.config_spec.range_num_stages.clear()
+        aliases = collect_host_tensor_aliases(host_fn.body)
+        unsafe_block_ids: set[int] = set()
+        for node in ast.walk(ast.Module(body=host_fn.body, type_ignores=[])):
+            if not isinstance(node, ast.For) or not isinstance(node, ExtendedAST):
+                continue
+            rw = ReadWrites.from_list(node.body)
+            reads = {
+                canonical_host_tensor_name(name, aliases)
+                for name, count in rw.reads.items()
+                if count > rw.inplace_writes.get(name, 0)
+            }
+            writes = {canonical_host_tensor_name(name, aliases) for name in rw.writes}
+            if not (reads & writes & arg_names):
+                continue
+            iter_node = node.iter
+            if not isinstance(iter_node, ExtendedAST):
+                continue
+            iter_type = iter_node._type_info
+            if not isinstance(iter_type, IterType):
+                continue
+            inner = iter_type.inner
+            if isinstance(inner, SequenceType):
+                unsafe_block_ids.update(
+                    item.block_id
+                    for item in inner.unpack()
+                    if isinstance(item, TileIndexType)
+                )
+            elif isinstance(inner, TileIndexType):
+                unsafe_block_ids.add(inner.block_id)
+        for block_id in unsafe_block_ids:
+            if block_id in self.config_spec.range_num_stages.valid_block_ids():
+                self.config_spec.range_num_stages.disable_block_id(block_id)
 
     def allocate_block_size(
         self,

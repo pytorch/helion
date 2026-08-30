@@ -38,12 +38,12 @@ class _ReadWriteVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
-        # Detect atomic operations (hl.atomic_*) as writes to their first argument.
-        # e.g. hl.atomic_add(x, [i], value) means x is mutated in-place.
+        # Detect explicit memory/atomic operations as writes to their first
+        # argument.  e.g. hl.store(x, [i], value) and hl.atomic_add(x, ...).
         func = node.func
         if (
             isinstance(func, ast.Attribute)
-            and func.attr.startswith("atomic_")
+            and (func.attr == "store" or func.attr.startswith("atomic_"))
             and isinstance(func.value, ast.Name)
             and node.args
         ):
@@ -51,6 +51,14 @@ class _ReadWriteVisitor(ast.NodeVisitor):
             if isinstance(first_arg, ast.Name):
                 self.rw.writes[first_arg.id] += 1
                 self.rw.inplace_writes[first_arg.id] += 1
+        self.generic_visit(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        target = node.target
+        if isinstance(target, ast.Name):
+            self.rw.reads[target.id] += 1
+        elif isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+            self.rw.reads[target.value.id] += 1
         self.generic_visit(node)
 
     def visit_For(self, node: ast.For) -> None:
@@ -299,12 +307,23 @@ class _PureExpressionVisitor(ast.NodeVisitor):
         self.visit(node.value)
 
     def visit_Call(self, node: ast.Call) -> None:
-        # Math methods are all pure, so allow them
-        if not (
+        # Math methods and compiler-emitted integer shape helpers are pure.
+        is_math = (
             isinstance(node.func, ast.Attribute)
             and isinstance(node.func.value, ast.Name)
             and node.func.value.id == "math"
-        ):
+        )
+        is_triton_shape_helper = (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "triton"
+            and node.func.attr in {"cdiv", "next_power_of_2"}
+        )
+        is_backend_shape_helper = isinstance(node.func, ast.Name) and node.func.id in {
+            "_cdiv",
+            "_next_power_of_2",
+        }
+        if not (is_math or is_triton_shape_helper or is_backend_shape_helper):
             raise _NotPureException
 
         # Recurse into children except for func

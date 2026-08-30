@@ -2033,16 +2033,27 @@ class TileStrategy:
             and env.block_sizes[block_idx].size
             and env.block_sizes[block_idx].numel.is_number
         ):
-            # Unrolling can cause CUDA IMA with pipelining
-            # We want to ensure new step size + pipeline is within bounds
             loop_numel = int(env.block_sizes[block_idx].numel)
             block_size = int(env.block_sizes[block_idx].from_config_assert(config))
-            step = range_unroll_factor * block_size
-            last_offset = ((loop_numel - 1) // block_size) * block_size
-            remainder = loop_numel - last_offset
-            range_num_stages = min(
-                max(1, int(math.ceil(remainder / step))), range_num_stages
-            )
+            if config.num_warps == 1:
+                # One-warp kernels have no cross-warp layout hazard. Keep the
+                # pipeline within the number of complete unrolled iterations;
+                # using only the final tile's remainder would collapse every
+                # exactly divisible reduction to one stage.
+                loop_iterations = int(math.ceil(loop_numel / block_size))
+                unrolled_iterations = int(
+                    math.ceil(loop_iterations / range_unroll_factor)
+                )
+                range_num_stages = min(max(1, unrolled_iterations), range_num_stages)
+            else:
+                # Multi-warp unrolling plus pipelining can cause CUDA IMA. Keep
+                # the conservative legacy bound for those kernels.
+                step = range_unroll_factor * block_size
+                last_offset = ((loop_numel - 1) // block_size) * block_size
+                remainder = loop_numel - last_offset
+                range_num_stages = min(
+                    max(1, int(math.ceil(remainder / step))), range_num_stages
+                )
 
         if range_unroll_factor > 0:
             kwargs.append(f"loop_unroll_factor={range_unroll_factor}")
