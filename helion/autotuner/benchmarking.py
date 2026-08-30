@@ -62,12 +62,12 @@ def _mirrored_bench_call_layout(desired_calls: int) -> tuple[int, int, int]:
 def _make_l2_cache_clearer() -> Callable[[], None]:
     """Return a callable that flushes the GPU L2 cache, or a no-op.
 
-    The generic (wall-clock) bench used by the CuTe backend otherwise times
-    kernels with the operands resident in L2 (warm), biasing the autotuner
-    toward shallow-prefetch configs that starve the pipeline in the cold-L2 /
-    streamed-once regime that deployment and tritonbench (which clears L2 by
-    default) actually measure. Flushing L2 between timed calls makes the
-    autotune regime match the deployment regime.
+    The generic (wall-clock) bench for backends without event timing
+    otherwise times kernels with the operands resident in L2 (warm), biasing
+    the autotuner toward shallow-prefetch configs that starve the pipeline in
+    the cold-L2 / streamed-once regime that deployment and tritonbench (which
+    clears L2 by default) actually measure. Flushing L2 between timed calls
+    makes the autotune regime match the deployment regime.
 
     Uses Triton's CUDA-only cache-clear primitive. Returns a no-op when not on
     CUDA (e.g. TPU/Pallas backends that also use the generic bench).
@@ -632,6 +632,7 @@ def do_bench(
     *,
     default_cudagraph: bool = False,
     fixed_repetitions: int | None = None,
+    probe_long_kernel: bool = False,
 ) -> float | tuple[float, ...]:
     """
     Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
@@ -651,6 +652,10 @@ def do_bench(
     :type return_mode: str
     :param fixed_repetitions: Skip adaptive estimation and time exactly this many
         calls after the initial setup call.
+    :param probe_long_kernel: Estimate from a single call first and skip the
+        four remaining estimate calls when that call already exceeds both
+        timing windows; CuTe flash enables it for multi-second attention
+        candidates.
     """
     from triton import runtime
     from triton.testing import _summarize_statistics
@@ -671,7 +676,27 @@ def do_bench(
 
     cache = runtime.driver.active.get_empty_cache_for_benchmark()  # pyrefly: ignore
 
-    if fixed_repetitions is None:
+    if fixed_repetitions is None and probe_long_kernel:
+
+        def run_estimate_batch(count: int) -> float:
+            batch_start = di.Event(enable_timing=True)
+            batch_end = di.Event(enable_timing=True)
+            batch_start.record()
+            for _ in range(count):
+                runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
+                benchmark_function()
+            batch_end.record()
+            di.synchronize()
+            return float(batch_start.elapsed_time(batch_end))
+
+        estimate_ms, n_warmup = _estimate_runtime_and_warmup(
+            run_estimate_batch,
+            warmup=warmup,
+            rep=rep,
+            process_group_name=process_group_name,
+        )
+        n_repeat = max(1, int(rep / estimate_ms))
+    elif fixed_repetitions is None:
         # Estimate the runtime of the function
         start_event = di.Event(enable_timing=True)
         end_event = di.Event(enable_timing=True)

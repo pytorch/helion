@@ -297,11 +297,10 @@ class RecordingRandomSearch(RandomSearch):
 
     def _autotune(self) -> helion.Config:
         self.samples.append(random.random())
-        if torch.version.hip is not None:
-            # This test covers seed propagation, not benchmark behavior. Avoid
-            # competing GPU benchmarks across ROCm xdist workers.
-            return self.config_spec.default_config()
-        return super()._autotune()
+        # The seed tests only assert on the sample recorded above, which is
+        # drawn from the RNG seeded in _prepare(); skip the real search to
+        # avoid compiling/benchmarking configs the assertions never look at.
+        return self.config_spec.default_config()
 
 
 class TestMismatchTolerance(TestCase):
@@ -365,6 +364,41 @@ class TestAutotuneIgnoreErrors(TestCase):
         ):
             search._prepare()
         return search
+
+    def _make_compile_failure_search(self) -> BaseSearch:
+        search = self._make_search(
+            Settings(
+                autotune_precompile=None,
+                autotune_log_level=logging.CRITICAL,
+            )
+        )
+        search.kernel.env = SimpleNamespace(process_group_name=None)
+        search.kernel.compile_config = None
+        return search
+
+    def _run_late_compile_failures(
+        self,
+        late_configs: Sequence[str],
+        error_for: Callable[[str], Exception],
+    ) -> tuple[list[object], list[object]]:
+        search = self._make_compile_failure_search()
+
+        def compile_config(config: str, **_kwargs: object) -> Callable[..., None]:
+            if config == "valid":
+                return lambda *args, **kwargs: None
+            raise error_for(config)
+
+        with (
+            patch.object(search.kernel, "compile_config", side_effect=compile_config),
+            patch.object(
+                search.benchmark_provider,
+                "_benchmark_function",
+                return_value=1.0,
+            ),
+        ):
+            initial = search.benchmark_batch(["valid"], desc="initial")
+            late = search.benchmark_batch(list(late_configs), desc="late")
+        return initial, late
 
     def test_settings_flag_from_env(self):
         with patch.dict(
@@ -665,6 +699,57 @@ class TestAutotuneIgnoreErrors(TestCase):
         self.assertEqual(results[1].status, "error")
         self.assertEqual(results[2].perf, 1.0)
         self.assertEqual(search._autotune_metrics.num_compile_failures, 1)
+
+    def test_initial_compile_failures_raise(self) -> None:
+        cases: tuple[tuple[str, type[Exception], str, Exception], ...] = (
+            (
+                "invalid",
+                exc.InvalidConfig,
+                "invalid initial config",
+                exc.InvalidConfig("invalid initial config"),
+            ),
+            (
+                "runtime",
+                RuntimeError,
+                "initial compiler failure",
+                RuntimeError("initial compiler failure"),
+            ),
+        )
+        for config, error_type, message, error in cases:
+            with self.subTest(config=config):
+                search = self._make_compile_failure_search()
+                with (
+                    patch.object(
+                        search.kernel,
+                        "compile_config",
+                        side_effect=error,
+                    ),
+                    self.assertRaisesRegex(error_type, message),
+                ):
+                    search.benchmark_batch([config], desc="initial")
+
+    def test_late_compile_failures_are_skipped(self) -> None:
+        cases = (
+            (
+                "invalid",
+                lambda config: exc.InvalidConfig(f"invalid late neighbor: {config}"),
+            ),
+            ("runtime", lambda config: RuntimeError("late compiler failure")),
+            (
+                "unsupported",
+                lambda config: exc.BackendUnsupported(
+                    "cute", f"unsupported late neighbor {config}"
+                ),
+            ),
+        )
+        for prefix, error_for in cases:
+            with self.subTest(prefix=prefix):
+                initial, late = self._run_late_compile_failures(
+                    (f"{prefix}_a", f"{prefix}_b"), error_for
+                )
+                self.assertEqual(initial[0].perf, 1.0)
+                self.assertEqual([result.perf for result in late], [float("inf")] * 2)
+                self.assertEqual([result.status for result in late], ["error"] * 2)
 
     def test_autotune_log_sink_writes_csv_and_log(self):
         tmpdir = tempfile.TemporaryDirectory()
@@ -986,8 +1071,10 @@ class TestAutotuneIgnoreErrors(TestCase):
                 "HELION_AUTOTUNE_LOG_LEVEL": "0",
             },
         ):
-
-            @helion.kernel()
+            # started/completed entries are recorded in the parent's benchmark
+            # loop either way; skip the benchmark worker subprocess (several
+            # seconds of interpreter+CUDA startup per search).
+            @helion.kernel(autotune_benchmark_subprocess=False)
             def add(a, b):
                 out = torch.empty_like(a)
                 for tile in hl.tile(out.size()):
@@ -1028,17 +1115,22 @@ class TestAutotuneIgnoreErrors(TestCase):
                 "FiniteSearch",
                 lambda kernel, args: FiniteSearch(kernel, args, configs=configs),
             ),
-            ("RandomSearch", lambda kernel, args: RandomSearch(kernel, args, count=3)),
+            ("RandomSearch", lambda kernel, args: RandomSearch(kernel, args, count=2)),
             (
                 "PatternSearch",
                 lambda kernel, args: PatternSearch(
-                    kernel, args, initial_population=3, max_generations=1, copies=1
+                    kernel,
+                    args,
+                    initial_population=2,
+                    max_generations=1,
+                    copies=1,
+                    num_neighbors_cap=2,
                 ),
             ),
             (
                 "DifferentialEvolutionSearch",
                 lambda kernel, args: DifferentialEvolutionSearch(
-                    kernel, args, population_size=3, max_generations=1
+                    kernel, args, population_size=2, max_generations=1
                 ),
             ),
         ]
@@ -1070,8 +1162,9 @@ class TestAutotuneIgnoreErrors(TestCase):
                 "HELION_AUTOTUNE_LOG_LEVEL": "0",
             },
         ):
-
-            @helion.kernel(configs=configs)
+            # The CSV/sidecar gating under test is parent-side logging; skip
+            # the benchmark worker subprocess (seconds of startup overhead).
+            @helion.kernel(configs=configs, autotune_benchmark_subprocess=False)
             def add(a, b):
                 out = torch.empty_like(a)
                 for tile in hl.tile(out.size()):
@@ -1438,6 +1531,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 helion.Config(block_sizes=[1, 1, 512], num_warps=8),
             ],
             autotune_log_level=0,
+            # Config selection is the behavior under test; skip the benchmark
+            # worker subprocess (seconds of startup overhead). The worker path
+            # keeps coverage via test_autotune_noncontiguous_arg/broadcast_arg.
+            autotune_benchmark_subprocess=False,
         )
         def add(a, b):
             out = torch.empty_like(a)
@@ -1460,6 +1557,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         disrupt processing of subsequent valid configs.
         """
 
+        # The compile-failure skip logic under test runs at the compile stage;
+        # skip the benchmark worker subprocess (seconds of startup overhead).
         @helion.kernel(
             configs=[
                 # Good config
@@ -1470,6 +1569,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 helion.Config(block_sizes=[1, 1, 512], num_warps=8),
             ],
             autotune_log_level=0,
+            autotune_benchmark_subprocess=False,
         )
         def add(a, b):
             out = torch.empty_like(a)
@@ -1494,8 +1594,11 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
         bound_kernel = _get_examples_matmul().bind(args)
         bound_kernel.settings.autotune_precompile = None
+        # Smoke test of the RandomSearch loop itself; skip the benchmark
+        # worker subprocess (seconds of startup overhead).
+        bound_kernel.settings.autotune_benchmark_subprocess = False
         random.seed(123)
-        best = RandomSearch(bound_kernel, args, 20).autotune()
+        best = RandomSearch(bound_kernel, args, 5).autotune()
         fn = bound_kernel.compile_config(best)
         torch.testing.assert_close(fn(*args), args[0] @ args[1], rtol=1e-2, atol=1e-1)
 
@@ -8821,29 +8924,34 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         fn = bound_kernel.compile_config(best)
         torch.testing.assert_close(fn(*args), sum(args), rtol=1e-2, atol=1e-1)
 
-    def test_accuracy_check_filters_bad_config_wrong_output(self) -> None:
-        bad_config = helion.Config(block_sizes=[1], num_warps=8)
-        good_config = helion.Config(block_sizes=[1], num_warps=4)
-
-        @helion.kernel(configs=[bad_config, good_config], autotune_log_level=0)
-        def add_inplace(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-            for tile in hl.tile(b.size()):
-                b[tile] = a[tile] + b[tile]
-            return b
+    def _check_accuracy_filters_bad_config(
+        self,
+        kernel: helion.Kernel,
+        bad_config: helion.Config,
+        good_config: helion.Config,
+        wrap_bad_fn: Callable[[Callable[..., object]], Callable[..., object]],
+        *,
+        exact_final_failure_count: bool,
+        check_spawn: bool = True,
+    ) -> None:
+        """Shared body for the accuracy-check filtering tests: benchmark a
+        known-bad and a known-good config (the bad one's compiled fn is
+        wrapped by ``wrap_bad_fn`` to corrupt its behavior) and assert the
+        accuracy check rejects only the bad one in fork mode. In spawn mode
+        the patched compile result cannot be serialized, so autotuning must
+        fail with an error pointing at fork mode."""
 
         def run_mode(mode: str, *, expect_error: bool) -> None:
             a = torch.randn([32], device=DEVICE)
             b = torch.randn([32], device=DEVICE)
-            bound_kernel = add_inplace.bind((a, b))
+            bound_kernel = kernel.bind((a, b))
             original_compile = bound_kernel.compile_config
             bound_kernel.settings.autotune_precompile = mode
 
-            def make_bad_config_produce_wrong_output(
-                config: helion.Config, *, allow_print: bool = True
-            ):
+            def wrapping_compile(config: helion.Config, *, allow_print: bool = True):
                 fn = original_compile(config, allow_print=allow_print)
                 if config == bad_config:
-                    return lambda *fn_args, **fn_kwargs: fn(*fn_args, **fn_kwargs) + 1
+                    return wrap_bad_fn(fn)
                 return fn
 
             import helion.autotuner.base_search as base_search_module
@@ -8851,7 +8959,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             with patch.object(
                 bound_kernel,
                 "compile_config",
-                side_effect=make_bad_config_produce_wrong_output,
+                side_effect=wrapping_compile,
             ):
                 search = FiniteSearch(
                     bound_kernel, (a, b), configs=[bad_config, good_config]
@@ -8893,10 +9001,36 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
                     best = search.autotune()
                     self.assertEqual(best, good_config)
-                    self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
+                    if exact_final_failure_count:
+                        self.assertEqual(
+                            search._autotune_metrics.num_accuracy_failures, 1
+                        )
+                    else:
+                        self.assertGreaterEqual(
+                            search._autotune_metrics.num_accuracy_failures, 1
+                        )
 
         run_mode("fork", expect_error=False)
-        run_mode("spawn", expect_error=True)
+        if check_spawn:
+            run_mode("spawn", expect_error=True)
+
+    def test_accuracy_check_filters_bad_config_wrong_output(self) -> None:
+        bad_config = helion.Config(block_sizes=[1], num_warps=8)
+        good_config = helion.Config(block_sizes=[1], num_warps=4)
+
+        @helion.kernel(configs=[bad_config, good_config], autotune_log_level=0)
+        def add_inplace(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(b.size()):
+                b[tile] = a[tile] + b[tile]
+            return b
+
+        self._check_accuracy_filters_bad_config(
+            add_inplace,
+            bad_config,
+            good_config,
+            lambda fn: lambda *fn_args, **fn_kwargs: fn(*fn_args, **fn_kwargs) + 1,
+            exact_final_failure_count=True,
+        )
 
     def test_autotune_noncontiguous_arg(self) -> None:
         """Autotuning a kernel bound on a non-contiguous arg must succeed.
@@ -8932,7 +9066,11 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         best = search.autotune()
         self.assertIn(best, (config_a, config_b))
 
-        torch.testing.assert_close(double(x), x * 2.0)
+        # Compile the winning config directly; calling double(x) would rerun
+        # the whole FiniteSearch since the manual search above is not attached
+        # to the bound kernel.
+        fn = bound_kernel.compile_config(best)
+        torch.testing.assert_close(fn(x), x * 2.0)
 
     def test_autotune_broadcast_arg(self) -> None:
         """Autotuning a kernel bound on a broadcast/expanded arg must succeed.
@@ -8967,7 +9105,11 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         best = search.autotune()
         self.assertIn(best, (config_a, config_b))
 
-        torch.testing.assert_close(add_bias(x, b), x + b)
+        # Compile the winning config directly; calling add_bias(x, b) would
+        # rerun the whole FiniteSearch since the manual search above is not
+        # attached to the bound kernel.
+        fn = bound_kernel.compile_config(best)
+        torch.testing.assert_close(fn(x, b), x + b)
 
     def test_accuracy_check_filters_bad_config_wrong_arg_mutation(self) -> None:
         bad_config = helion.Config(block_sizes=[1], num_warps=8)
@@ -8979,81 +9121,22 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 b[tile] = a[tile] + b[tile]
             return b
 
-        def run_mode(mode: str, *, expect_error: bool) -> None:
-            a = torch.randn([32], device=DEVICE)
-            b = torch.randn([32], device=DEVICE)
-            bound_kernel = add_inplace.bind((a, b))
-            original_compile = bound_kernel.compile_config
-            bound_kernel.settings.autotune_precompile = mode
+        def wrap_bad_fn(fn):
+            def wrong_fn(*fn_args, **fn_kwargs):
+                result = fn(*fn_args, **fn_kwargs)
+                # Introduce an extra mutation so inputs differ from baseline
+                fn_args[1].add_(1)
+                return result
 
-            def make_bad_config_produce_wrong_input_arg_mutation(
-                config: helion.Config, *, allow_print: bool = True
-            ):
-                fn = original_compile(config, allow_print=allow_print)
-                if config == bad_config:
+            return wrong_fn
 
-                    def wrong_fn(*fn_args, **fn_kwargs):
-                        result = fn(*fn_args, **fn_kwargs)
-                        # Introduce an extra mutation so inputs differ from baseline
-                        fn_args[1].add_(1)
-                        return result
-
-                    return wrong_fn
-                return fn
-
-            import helion.autotuner.base_search as base_search_module
-
-            with patch.object(
-                bound_kernel,
-                "compile_config",
-                side_effect=make_bad_config_produce_wrong_input_arg_mutation,
-            ):
-                search = FiniteSearch(
-                    bound_kernel, (a, b), configs=[bad_config, good_config]
-                )
-                search._prepare()
-                if mode == "fork":
-                    start_cm = patch.object(
-                        search.benchmark_provider,
-                        "_create_precompile_future",
-                        side_effect=lambda config, fn: (
-                            base_search_module.PrecompileFuture.skip(
-                                search.benchmark_provider._precompile_context(),
-                                config,
-                                True,
-                            )
-                        ),
-                    )
-                else:
-                    start_cm = nullcontext()
-
-                with start_cm:
-                    if expect_error:
-                        with self.assertRaisesRegex(
-                            helion.exc.AutotuneError,
-                            'Set HELION_AUTOTUNE_PRECOMPILE="fork"',
-                        ):
-                            search.autotune()
-                        return
-
-                    bad_time = search.benchmark(bad_config).perf
-                    assert math.isinf(bad_time)
-                    self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
-                    search._autotune_metrics.num_accuracy_failures = 0
-
-                    good_time = search.benchmark(good_config).perf
-                    assert not math.isinf(good_time)
-                    self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
-                    search._autotune_metrics.num_accuracy_failures = 0
-
-                    best = search.autotune()
-                    self.assertEqual(best, good_config)
-                    self.assertGreaterEqual(
-                        search._autotune_metrics.num_accuracy_failures, 1
-                    )
-
-        run_mode("fork", expect_error=False)
-        run_mode("spawn", expect_error=True)
+        self._check_accuracy_filters_bad_config(
+            add_inplace,
+            bad_config,
+            good_config,
+            wrap_bad_fn,
+            exact_final_failure_count=False,
+        )
 
     def test_autotune_baseline_fn(self) -> None:
         """Test that custom baseline function is used for accuracy checking."""
@@ -9068,10 +9151,13 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             # Return the expected result using PyTorch operations
             return a + b
 
+        # The custom baseline fn is invoked on the parent-side baseline path;
+        # skip the benchmark worker subprocess (seconds of startup overhead).
         @helion.kernel(
             configs=[config1, config2],
             autotune_baseline_fn=custom_baseline,
             autotune_log_level=0,
+            autotune_benchmark_subprocess=False,
         )
         def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(a)
@@ -9104,10 +9190,13 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             # Return the correct expected result
             return a + b
 
+        # The custom baseline fn is invoked on the parent-side baseline path;
+        # skip the benchmark worker subprocess (seconds of startup overhead).
         @helion.kernel(
             configs=[bad_config, good_config],
             autotune_baseline_fn=custom_baseline,
             autotune_log_level=0,
+            autotune_benchmark_subprocess=False,
         )
         def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(a)
@@ -9115,53 +9204,14 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 out[tile] = a[tile] + b[tile]
             return out
 
-        a = torch.randn([32], device=DEVICE)
-        b = torch.randn([32], device=DEVICE)
-        bound_kernel = add.bind((a, b))
-        original_compile = bound_kernel.compile_config
-        bound_kernel.settings.autotune_precompile = "fork"
-
-        # Make bad_config produce wrong output
-        def make_bad_config_produce_wrong_output(
-            config: helion.Config, *, allow_print: bool = True
-        ):
-            fn = original_compile(config, allow_print=allow_print)
-            if config == bad_config:
-                return lambda *fn_args, **fn_kwargs: fn(*fn_args, **fn_kwargs) + 1
-            return fn
-
-        import helion.autotuner.base_search as base_search_module
-
-        with patch.object(
-            bound_kernel,
-            "compile_config",
-            side_effect=make_bad_config_produce_wrong_output,
-        ):
-            search = FiniteSearch(
-                bound_kernel, (a, b), configs=[bad_config, good_config]
-            )
-            search._prepare()
-            with patch.object(
-                search.benchmark_provider,
-                "_create_precompile_future",
-                side_effect=lambda config, fn: base_search_module.PrecompileFuture.skip(
-                    search.benchmark_provider._precompile_context(), config, True
-                ),
-            ):
-                # Bad config should be filtered out by accuracy check
-                bad_time = search.benchmark(bad_config).perf
-                self.assertTrue(math.isinf(bad_time))
-                self.assertEqual(search._autotune_metrics.num_accuracy_failures, 1)
-
-                # Good config should pass accuracy check
-                search._autotune_metrics.num_accuracy_failures = 0
-                good_time = search.benchmark(good_config).perf
-                self.assertFalse(math.isinf(good_time))
-                self.assertEqual(search._autotune_metrics.num_accuracy_failures, 0)
-
-                # Autotuning should select the good config
-                best = search.autotune()
-                self.assertEqual(best, good_config)
+        self._check_accuracy_filters_bad_config(
+            add,
+            bad_config,
+            good_config,
+            lambda fn: lambda *fn_args, **fn_kwargs: fn(*fn_args, **fn_kwargs) + 1,
+            exact_final_failure_count=True,
+            check_spawn=False,
+        )
 
     def test_autotune_baseline_fn_raises_on_failure(self) -> None:
         """Test that AutotuneError is raised when custom baseline function fails."""
@@ -9205,12 +9255,15 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
         # Test both strict (1e-5) and lenient (1e-3) tolerances
         for tol, expect_reject in [(1e-5, True), (1e-3, False)]:
-
+            # The tolerance plumbing under test is shared with the in-process
+            # accuracy path; skip the benchmark worker subprocess (seconds of
+            # startup overhead per kernel).
             @helion.kernel(
                 configs=[cfg1, cfg2],
                 autotune_baseline_fn=incorrect_baseline,
                 autotune_baseline_atol=tol,
                 autotune_baseline_rtol=tol,
+                autotune_benchmark_subprocess=False,
             )
             def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
                 o = torch.empty_like(a)
@@ -9240,8 +9293,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         cfg1 = helion.Config(block_sizes=[16], num_warps=4)
         cfg2 = helion.Config(block_sizes=[32], num_warps=8)
 
-        # Test with float8_e4m3fn as a representative fp8 dtype
-        @helion.kernel(configs=[cfg1, cfg2])
+        # Test with float8_e4m3fn as a representative fp8 dtype. The automatic
+        # tolerance selection under test is parent-side; skip the benchmark
+        # worker subprocess (seconds of startup overhead).
+        @helion.kernel(configs=[cfg1, cfg2], autotune_benchmark_subprocess=False)
         def cast_to_fp8(x: torch.Tensor) -> torch.Tensor:
             out = torch.empty(x.size(), dtype=torch.float8_e4m3fn, device=x.device)
             for t in hl.tile(x.size()):
@@ -9303,7 +9358,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         cfg1 = helion.Config(block_sizes=[16], num_warps=4)
         cfg2 = helion.Config(block_sizes=[32], num_warps=8)
 
-        @helion.kernel(configs=[cfg1, cfg2])
+        # The fp8 handling under test lives in the shared accuracy.assert_close;
+        # skip the benchmark worker subprocess (seconds of startup overhead).
+        @helion.kernel(configs=[cfg1, cfg2], autotune_benchmark_subprocess=False)
         def mixed_output(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             fp8_out = torch.empty(x.size(), dtype=torch.float8_e4m3fn, device=x.device)
             fp32_out = torch.empty(x.size(), dtype=torch.float32, device=x.device)
@@ -10948,7 +11005,11 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         """Test that autotuning accuracy checks use chunked comparison for large tensors."""
         import helion.autotuner.accuracy as _accuracy
 
-        numel = 2**26  # 64M float32 elements (~256 MB each)
+        numel = 2**22  # 4M float32 elements (~16 MB each)
+        # The default chunk_size (2**22) would not chunk a tensor this small,
+        # so pass a smaller one through the patched helper below; 4 chunks is
+        # enough to exercise the chunked path and its memory bound.
+        chunk_size = 2**20
 
         config1 = helion.Config(block_sizes=[128], num_warps=4)
         config2 = helion.Config(block_sizes=[256], num_warps=4)
@@ -10987,7 +11048,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         def measuring_chunked_assert_close(*args, **kwargs):
             torch.cuda.reset_peak_memory_stats()
             before = torch.cuda.memory_allocated()
-            real_chunked_assert_close(*args, **kwargs)
+            real_chunked_assert_close(*args, chunk_size=chunk_size, **kwargs)
             peak = torch.cuda.max_memory_allocated() - before
             peaks.append(peak)
 
@@ -11121,10 +11182,13 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             # Always reject
             raise AssertionError("strict check: always fails")
 
+        # Custom accuracy-check fns always run in-process; skip the benchmark
+        # worker subprocess (seconds of startup overhead).
         @helion.kernel(
             configs=[cfg1, cfg2],
             autotune_log_level=0,
             autotune_baseline_accuracy_check_fn=strict_check,
+            autotune_benchmark_subprocess=False,
         )
         def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             o = torch.empty_like(a)
@@ -11974,7 +12038,7 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
         search_capture: dict[str, RecordingRandomSearch] = {}
 
         def autotuner_factory(bound_kernel, args, **kwargs):
-            search = RecordingRandomSearch(bound_kernel, args, count=4, **kwargs)
+            search = RecordingRandomSearch(bound_kernel, args, count=2, **kwargs)
             search_capture["search"] = search
             return search
 
@@ -12780,6 +12844,37 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
         )
         self.assertNotEqual(k1_aliased.stable_hash(), k5.stable_hash())
 
+    def test_strict_cache_key_tracks_nondefault_best_of_k(self) -> None:
+        from helion.autotuner.base_cache import StrictAutotuneCacheKey
+
+        common_kwargs = {
+            "specialization_key": (),
+            "extra_results": (),
+            "kernel_source_hash": "abc",
+            "hardware": "B200",
+            "runtime_name": "12.6",
+            "backend": "triton",
+            "config_spec_hash": "h1",
+            "extra_cache_key": "",
+            "helion_key": "helion",
+            "torch_key": "torch",
+            "triton_key": "triton",
+        }
+        k1 = StrictAutotuneCacheKey(**common_kwargs, best_of_k=1)
+        k5 = StrictAutotuneCacheKey(**common_kwargs, best_of_k=5)
+        expected_k1_repr = (
+            "StrictAutotuneCacheKey("
+            "specialization_key=(), extra_results=(), "
+            "kernel_source_hash='abc', hardware='B200', "
+            "runtime_name='12.6', backend='triton', "
+            "config_spec_hash='h1', extra_cache_key='', "
+            "helion_key='helion', torch_key='torch', triton_key='triton')"
+        )
+
+        self.assertEqual(repr(k1), expected_k1_repr)
+        self.assertIn("best_of_k=5", repr(k5))
+        self.assertNotEqual(k1.stable_hash(), k5.stable_hash())
+
     def test_best_of_k_gt_1_without_factory_raises(self) -> None:
         """The bare ``Cache(autotuner)`` constructor must reject K>1 at
         run time rather than silently fall back to single-trial."""
@@ -13468,7 +13563,10 @@ class TestConfigFilter(TestCase):
             return config if (config.get("block_sizes") or [0])[0] >= 64 else None
 
         add, args = self._make_kernel_and_args(
-            autotune_config_filter=reject_small_blocks
+            autotune_config_filter=reject_small_blocks,
+            # Filtering happens before compile/benchmark; skip the benchmark
+            # worker subprocess (seconds of startup overhead).
+            autotune_benchmark_subprocess=False,
         )
         bound = add.bind(args)
         search = FiniteSearch(bound, args, configs=[cfg_fast, cfg_slow])
@@ -15183,15 +15281,23 @@ class TestAutotuneBudget(TestCase):
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         self.assertFalse(provider.budget_exceeded_fn())
 
-    def test_cute_wall_clock_benchmark_uses_subprocess_worker(self) -> None:
+    def test_cute_benchmark_uses_event_timed_subprocess_worker(self) -> None:
+        # CuTe inherits the default (None) do_bench hooks: compiled launchers
+        # run on the Torch current stream, so CUDA-event timing is accurate
+        # and subprocess benchmark jobs must NOT switch to the wall-clock
+        # path that charges per-launch host overhead to the kernel.
         from helion._compiler.backend import CuteBackend
+
+        backend = CuteBackend()
+        self.assertIsNone(backend.get_do_bench())
+        self.assertIsNone(backend.get_interleaved_bench())
 
         provider = self._make_stub_provider()
         provider.kernel.supports_subprocess_benchmark = lambda: True
-        provider.config_spec = SimpleNamespace(backend=CuteBackend())
+        provider.config_spec = SimpleNamespace(backend=backend)
 
         self.assertTrue(provider._subprocess_benchmark_enabled())
-        self.assertTrue(provider._subprocess_benchmark_uses_wall_clock())
+        self.assertFalse(provider._subprocess_benchmark_uses_wall_clock())
 
     def test_non_cute_custom_benchmark_stays_in_process(self) -> None:
         from helion.autotuner.benchmarking import do_bench_generic

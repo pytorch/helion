@@ -4,7 +4,10 @@ import importlib
 import inspect
 import os
 import pickle
+from typing import TYPE_CHECKING
 from typing import Any
+from typing import Callable
+from typing import cast
 import unittest
 from unittest.mock import patch
 
@@ -15,15 +18,29 @@ import torch
 
 import helion
 from helion import exc
+from helion._compiler.autotuner_heuristics.cute import (
+    _tcgen05_grouped_worklist_seed_family,
+)
 from helion._compiler.backend import PallasBackend
 from helion._compiler.backend import TritonBackend
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute.grouped_worklist_policy import GroupedWorklistTargetPolicy
+from helion._compiler.cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from helion._compiler.cute.tcgen05_config import Tcgen05AbStagesThreeSearchConstraints
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_STAGES_THREE_MIN_DEVICE_SMEM_OPTIN,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES,
+)
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_DIRECT
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_DYNAMIC
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_STATIC
 from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY,
+)
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY,
 )
@@ -34,7 +51,19 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX,
 )
 from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES,
+)
+from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
 )
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
@@ -43,12 +72,22 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER,
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
+from helion._compiler.cute.tcgen05_constants import (
+    resolve_tcgen05_grouped_worklist_mma_profile,
+)
+from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
+from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_spec import ConfigSpec
+from helion.autotuner.config_spec import LoopOrderSpec
+from helion.autotuner.config_spec import MatmulFact
 import helion.language as hl
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 
 def _json_safe_values() -> st.SearchStrategy[Any]:
@@ -276,18 +315,48 @@ class TestConfigAPI(TestCase):
         # latter is memoized behind _target_device_capability, mirroring the
         # is_hip / _is_hip pattern where tests mock the public wrapper, not
         # the cached inner query.
-        with patch(
-            "helion.runtime.kernel.target_device_capability", return_value=(9, 0)
+        with (
+            patch(
+                "helion.runtime.kernel.target_device_capability", return_value=(9, 0)
+            ),
+            patch(
+                "helion.runtime.kernel.compiler_promotion_specialization_key",
+                return_value=(),
+            ),
         ):
             sm90_key = device_key_kernel._base_specialization_key((device,))
-        with patch(
-            "helion.runtime.kernel.target_device_capability", return_value=(10, 0)
+        with (
+            patch(
+                "helion.runtime.kernel.target_device_capability",
+                return_value=(10, 0),
+            ),
+            patch(
+                "helion.runtime.kernel.compiler_promotion_specialization_key",
+                return_value=(),
+            ),
         ):
             sm100_key = device_key_kernel._base_specialization_key((device,))
 
         self.assertEqual(sm90_key[-3:], ("cuda", (9, 0), False))
         self.assertEqual(sm100_key[-3:], ("cuda", (10, 0), False))
         self.assertNotEqual(sm90_key, sm100_key)
+
+        promotion = (("synthetic", "NVIDIA B200"),)
+        with (
+            patch(
+                "helion.runtime.kernel.target_device_capability",
+                return_value=(10, 0),
+            ),
+            patch(
+                "helion.runtime.kernel.compiler_promotion_specialization_key",
+                return_value=promotion,
+            ),
+        ):
+            promoted_key = device_key_kernel._base_specialization_key((device,))
+        self.assertEqual(
+            promoted_key[-4:],
+            ("cuda", (10, 0), promotion, False),
+        )
 
     def test_config_constructor_signature_contains_expected_kwargs(self) -> None:
         # Keep this list in sync with public kwargs; removal/rename should fail tests
@@ -984,6 +1053,46 @@ class TestHardwareConfigSpecRanges(TestCase):
         self.assertEqual(nvidia_spec.store_cache_modifiers.inner.choices, ("",))
 
 
+class TestConfigSpecNormalizedCopy(TestCase):
+    def test_nested_containers_are_copied_without_copying_opaque_leaves(self) -> None:
+        class NonCopyable:
+            def __deepcopy__(self, memo: object) -> None:
+                raise AssertionError("opaque config leaves must not be deep-copied")
+
+        spec = ConfigSpec(
+            backend=TritonBackend(),
+            user_defined_tunables={"metadata": EnumFragment((None,))},
+        )
+        spec.loop_orders.append(LoopOrderSpec([0, 1]))
+        opaque = NonCopyable()
+        tensor = torch.empty(0)
+        requested = helion.Config(
+            loop_orders=[[0, 1]],
+            metadata={"nested": ([opaque, tensor],)},
+        )
+        requested_values = dict(requested.config)
+
+        normalized = spec.normalized_config(requested)
+
+        self.assertIsNot(normalized, requested)
+        self.assertEqual(requested.config, requested_values)
+        self.assertEqual(normalized.config["num_warps"], 4)
+        self.assertEqual(normalized.config["num_stages"], 1)
+        self.assertEqual(normalized.config["pid_type"], "flat")
+        normalized.loop_orders[0][0] = 1
+        normalized_metadata = cast("dict[str, object]", normalized["metadata"])
+        normalized_tuple = cast("tuple[object, ...]", normalized_metadata["nested"])
+        normalized_nested = cast("list[object]", normalized_tuple[0])
+        normalized_nested.append("normalized-only")
+        requested_metadata = cast("dict[str, object]", requested["metadata"])
+        requested_tuple = cast("tuple[object, ...]", requested_metadata["nested"])
+        requested_nested = cast("list[object]", requested_tuple[0])
+        self.assertEqual(requested.loop_orders, [[0, 1]])
+        self.assertEqual(len(requested_nested), 2)
+        self.assertIs(normalized_nested[0], opaque)
+        self.assertIs(normalized_nested[1], tensor)
+
+
 class TestCuteTcgen05ConfigSpecSplit(TestCase):
     @staticmethod
     def _make_cute_tcgen05_spec():
@@ -1002,6 +1111,137 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
                 )
             )
         return spec
+
+    @staticmethod
+    def _make_permuted_cute_tcgen05_spec():
+        from helion._compiler.backend import CuteBackend
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import ConfigSpec
+
+        # Config order is [N, K, M], while semantic MMA axes are M=2, N=0, K=1.
+        spec = ConfigSpec(backend=CuteBackend())
+        spec.cute_tcgen05_search_enabled = True
+        for block_id, max_size in enumerate((256, 128, 256)):
+            spec.block_sizes.append(
+                BlockSizeSpec(
+                    block_id=block_id,
+                    size_hint=4096,
+                    max_size=max_size,
+                )
+            )
+        spec.register_cute_tcgen05_mma_analysis(
+            m_block_id=2,
+            n_block_id=0,
+            k_block_id=1,
+            compile_time_static_extents=(4096, 4096, 4096),
+            input_dtype=torch.bfloat16,
+            has_leading_passthrough=False,
+            explicit_epi_tile_compatible=True,
+        )
+        return spec
+
+    @staticmethod
+    def _register_default_cute_tcgen05_mma_analysis(spec):
+        spec.register_cute_tcgen05_mma_analysis(
+            m_block_id=0,
+            n_block_id=1,
+            k_block_id=2,
+            compile_time_static_extents=(4096, 4096, 4096),
+            input_dtype=torch.bfloat16,
+            has_leading_passthrough=False,
+            explicit_epi_tile_compatible=True,
+        )
+        return spec
+
+    @staticmethod
+    def _add_cute_tcgen05_matmul_fact(
+        spec,
+        *,
+        static_k: int,
+        k_block_id: int = 2,
+    ) -> None:
+        spec.matmul_facts.append(
+            MatmulFact(
+                lhs_ndim=2,
+                rhs_ndim=3,
+                m_block_id=0,
+                n_block_id=1,
+                k_block_id=k_block_id,
+                static_m=256,
+                static_n=None,
+                static_k=static_k,
+                lhs_dtype=torch.bfloat16,
+                rhs_dtype=torch.bfloat16,
+            )
+        )
+
+    @staticmethod
+    def _grouped_worklist_config(
+        *,
+        block_sizes: tuple[int, int, int] | list[int] = (256, 128, 64),
+        source_m_tile: int = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+        cluster_m: int = 2,
+        **overrides: Any,
+    ) -> helion.Config:
+        values: dict[str, Any] = {
+            "block_sizes": list(block_sizes),
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": cluster_m,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_grouped_mode": TCGEN05_GROUPED_MODE_WORKLIST_NM,
+            "tcgen05_grouped_worklist_source_m_tile": source_m_tile,
+        }
+        values.update(overrides)
+        return helion.Config(**values)
+
+    def _grouped_worklist_generation(
+        self,
+        spec: Any,
+        *,
+        source_m_tile: int,
+        cluster_m: int = 2,
+    ) -> tuple[Any, list[Any], int, int, int]:
+        from helion.autotuner.config_generation import ConfigGeneration
+
+        spec.compiler_seed_configs = [
+            self._grouped_worklist_config(
+                source_m_tile=source_m_tile,
+                cluster_m=cluster_m,
+            )
+        ]
+        generation = ConfigGeneration(spec)
+        [(flat, _normalized)] = generation.seed_flat_config_pairs()
+        _m_flat, n_flat, k_flat = generation.block_size_indices[:3]
+        [cluster_flat], _ = generation._key_to_flat_indices["tcgen05_cluster_m"]
+        return generation, flat, n_flat, k_flat, cluster_flat
+
+    def _constrained_grouped_worklist_spec(self, smem_budget: int) -> Any:
+        spec = self._register_default_cute_tcgen05_mma_analysis(
+            self._make_cute_tcgen05_spec()
+        )
+        spec._cute_tcgen05_config.ab_stages_three_search_constraints = (
+            Tcgen05AbStagesThreeSearchConstraints(
+                dtype_bytes=2,
+                per_cta_smem_budget_bytes=smem_budget,
+            )
+        )
+        return spec
+
+    @staticmethod
+    def _enum_fragment(fragment: object) -> EnumFragment:
+        assert isinstance(fragment, EnumFragment)
+        return fragment
+
+    def test_normalized_config_drops_none_core_values(self) -> None:
+        spec = self._make_cute_tcgen05_spec()
+        requested = helion.Config.from_dict(
+            {"block_sizes": [256, 128, 128], "xcd_remap": None}
+        )
+
+        normalized = spec.normalized_config(requested)
+
+        self.assertNotIn("xcd_remap", normalized.config)
+        self.assertIsNone(requested.config["xcd_remap"])
 
     def test_grouped_static_seed_representation(self) -> None:
         from helion.autotuner.config_generation import ConfigGeneration
@@ -1035,17 +1275,29 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
 
     def test_grouped_worklist_source_tile_normalization(self) -> None:
         spec = self._make_cute_tcgen05_spec()
-        config = helion.Config(
-            block_sizes=[256, 128, 128],
-            pid_type="persistent_interleaved",
-            tcgen05_grouped_mode=TCGEN05_GROUPED_MODE_WORKLIST_NM,
-            tcgen05_grouped_worklist_source_m_tile=256,
-        )
-        spec.normalize(config)
         self.assertEqual(
-            config.config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY],
-            256,
+            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES,
+            tuple(sorted(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES)),
         )
+        self.assertEqual(
+            spec._tcgen05_optional_fragments()[
+                TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
+            ].default(),
+            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+        )
+        for source_m_tile in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES:
+            with self.subTest(source_m_tile=source_m_tile):
+                config = helion.Config(
+                    block_sizes=[256, 128, 128],
+                    pid_type="persistent_interleaved",
+                    tcgen05_grouped_mode=TCGEN05_GROUPED_MODE_WORKLIST_NM,
+                    tcgen05_grouped_worklist_source_m_tile=source_m_tile,
+                )
+                spec.normalize(config)
+                self.assertEqual(
+                    config.config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY],
+                    source_m_tile,
+                )
 
         for invalid_value in (256.0, True, 225):
             wrong_type_config = helion.Config(
@@ -1057,7 +1309,10 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
             wrong_type_config.config[
                 TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
             ] = invalid_value
-            with self.assertRaisesRegex(exc.InvalidConfig, "source_m_tile"):
+            with self.assertRaisesRegex(
+                exc.InvalidConfig,
+                r"source_m_tile.*\(32, 224, 256\)",
+            ):
                 spec.normalize(wrong_type_config)
 
         invalid = helion.Config(
@@ -1073,30 +1328,503 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
             invalid.config,
         )
 
-    def test_grouped_worklist_source_tile_seed_round_trip(self) -> None:
+    def test_grouped_runtime_direct_normalization(self) -> None:
+        spec = self._make_cute_tcgen05_spec()
+        spec.target_device_capability = (10, 0)
+
+        def grouped_config(
+            *,
+            block_k: int = 64,
+            grouped_mode: str = TCGEN05_GROUPED_MODE_WORKLIST_NM,
+            runtime_direct: bool = True,
+            clc: bool = False,
+            static_signature: bool = False,
+        ) -> helion.Config:
+            config = helion.Config(
+                block_sizes=[256, 128, block_k],
+                pid_type="persistent_interleaved",
+                tcgen05_grouped_mode=grouped_mode,
+                tcgen05_grouped_runtime_direct=runtime_direct,
+                **(
+                    {
+                        "tcgen05_strategy": "role_local_with_scheduler",
+                        "tcgen05_warp_spec_scheduler_warps": 1,
+                        "tcgen05_persistence_model": "clc_persistent",
+                    }
+                    if clc
+                    else {}
+                ),
+            )
+            if static_signature:
+                config.config[TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY] = [
+                    1,
+                    256,
+                    128,
+                    64,
+                ]
+            return config
+
+        def rejected_and_repaired(
+            factory: Callable[[], helion.Config], message: str
+        ) -> helion.Config:
+            with self.assertRaisesRegex(exc.InvalidConfig, message):
+                spec.normalize(factory())
+            repaired = factory()
+            spec.normalize(repaired, _fix_invalid=True)
+            return repaired
+
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                config = grouped_config(block_k=128, runtime_direct=enabled)
+                spec.normalize(config)
+                self.assertIs(
+                    config.config[TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY],
+                    enabled,
+                )
+
+        invalid = grouped_config(block_k=128)
+        invalid.config[TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY] = 1
+        with self.assertRaisesRegex(exc.InvalidConfig, "must be a boolean"):
+            spec.normalize(invalid)
+
+        unsupported_cases = (
+            {"grouped_mode": TCGEN05_GROUPED_MODE_DYNAMIC},
+            {"static_signature": True},
+        )
+        for case in unsupported_cases:
+            with self.subTest(unsupported=case):
+                repaired = rejected_and_repaired(
+                    lambda case=case: grouped_config(**case),
+                    "must not silently fall back",
+                )
+            self.assertNotIn(
+                TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY,
+                repaired.config,
+            )
+
+        for fix_invalid in (False, True):
+            valid_clc = grouped_config(clc=True)
+            spec.normalize(valid_clc, _fix_invalid=fix_invalid)
+            self.assertEqual(
+                valid_clc.config["tcgen05_persistence_model"], "clc_persistent"
+            )
+            self.assertEqual(valid_clc.config["tcgen05_warp_spec_scheduler_warps"], 1)
+
+        invalid_clc_cases = (
+            {"runtime_direct": False},
+            {"grouped_mode": TCGEN05_GROUPED_MODE_DYNAMIC},
+            {"static_signature": True},
+        )
+        for case in invalid_clc_cases:
+            with self.subTest(invalid_clc=case):
+                repaired_clc = rejected_and_repaired(
+                    lambda case=case: grouped_config(clc=True, **case),
+                    "exact one-record-per-cluster tile table",
+                )
+            self.assertNotEqual(
+                repaired_clc.config.get("tcgen05_persistence_model"),
+                "clc_persistent",
+            )
+
+        repaired_with_reservation = grouped_config(clc=True, runtime_direct=False)
+        repaired_with_reservation.config[
+            TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY
+        ] = 52
+        spec.normalize(repaired_with_reservation, _fix_invalid=True)
+        self.assertNotEqual(
+            repaired_with_reservation.config.get("tcgen05_persistence_model"),
+            "clc_persistent",
+        )
+        self.assertEqual(
+            repaired_with_reservation.config[
+                TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY
+            ],
+            52,
+        )
+
+    def test_grouped_worklist_panel_requires_runtime_direct(self) -> None:
+        spec = self._make_cute_tcgen05_spec()
+
+        def panel_config(*, runtime_direct: bool | None = None) -> helion.Config:
+            config = helion.Config(
+                block_sizes=[256, 128, 64],
+                pid_type="persistent_interleaved",
+                tcgen05_grouped_mode=TCGEN05_GROUPED_MODE_WORKLIST_NM,
+                tcgen05_l2_swizzle_size=8,
+            )
+            if runtime_direct is not None:
+                config.config[TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY] = (
+                    runtime_direct
+                )
+            return config
+
+        for runtime_direct in (None, False):
+            with (
+                self.subTest(runtime_direct=runtime_direct),
+                self.assertRaisesRegex(
+                    exc.InvalidConfig,
+                    "requires tcgen05_grouped_runtime_direct=True",
+                ),
+            ):
+                spec.normalize(panel_config(runtime_direct=runtime_direct))
+
+            repaired = panel_config(runtime_direct=runtime_direct)
+            spec.normalize(repaired, _fix_invalid=True)
+            self.assertEqual(
+                repaired.config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY],
+                1,
+            )
+
+        runtime_direct = panel_config(runtime_direct=True)
+        spec.normalize(runtime_direct)
+        self.assertEqual(
+            runtime_direct.config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY],
+            8,
+        )
+
+    def test_grouped_worklist_seed_fields_round_trip(self) -> None:
         from helion.autotuner.config_generation import ConfigGeneration
 
-        spec = self._make_cute_tcgen05_spec()
-        seed = helion.Config(
-            block_sizes=[256, 128, 128],
-            pid_type="persistent_interleaved",
-            tcgen05_grouped_mode=TCGEN05_GROUPED_MODE_WORKLIST_NM,
-            tcgen05_grouped_worklist_source_m_tile=256,
+        cases = (
+            (
+                "source_m_tile",
+                128,
+                TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
+                TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
+            ),
+            (
+                "runtime_direct",
+                64,
+                TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY,
+                True,
+            ),
         )
-        spec.compiler_seed_configs = [seed]
+        for name, block_k, key, expected in cases:
+            with self.subTest(name=name):
+                spec = self._make_cute_tcgen05_spec()
+                seed = helion.Config(
+                    block_sizes=[256, 128, block_k],
+                    pid_type="persistent_interleaved",
+                    tcgen05_grouped_mode=TCGEN05_GROUPED_MODE_WORKLIST_NM,
+                )
+                seed.config[key] = expected
+                spec.compiler_seed_configs = [seed]
+                generation = ConfigGeneration(spec)
+                [(flat, normalized)] = generation.seed_flat_config_pairs()
+                self.assertEqual(normalized.config[key], expected)
+                generation.encode_config(flat)
+                self.assertEqual(generation.unflatten(flat).config[key], expected)
 
-        generation = ConfigGeneration(spec)
-        [(flat, normalized)] = generation.seed_flat_config_pairs()
-        self.assertEqual(
-            normalized.config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY],
-            256,
+    def test_grouped_worklist_one_cta_accepts_bk128_ab5(self) -> None:
+        spec = self._register_default_cute_tcgen05_mma_analysis(
+            self._make_cute_tcgen05_spec()
         )
-        generation.encode_config(flat)
-        round_trip = generation.unflatten(flat)
-        self.assertEqual(
-            round_trip.config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY],
-            256,
+        config = self._grouped_worklist_config(
+            block_sizes=[256, 128, 128],
+            source_m_tile=TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
+            cluster_m=1,
+            num_stages=7,
+            num_warps=8,
+            tcgen05_ab_stages=5,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            tcgen05_consumer_regs=256,
         )
+
+        spec.normalize(config)
+
+        self.assertEqual(config.block_sizes[:3], [256, 128, 128])
+        self.assertEqual(config.config["tcgen05_ab_stages"], 5)
+        self.assertEqual(config.config["tcgen05_consumer_regs"], 256)
+
+    def test_grouped_worklist_two_cta_fix_preserves_logical_tile(self) -> None:
+        spec = self._make_cute_tcgen05_spec()
+        spec.register_cute_tcgen05_mma_analysis(
+            m_block_id=0,
+            n_block_id=1,
+            k_block_id=2,
+            compile_time_static_extents=(4096, 4096, 4096),
+            input_dtype=torch.bfloat16,
+            has_leading_passthrough=False,
+            explicit_epi_tile_compatible=True,
+        )
+        spec.allow_tcgen05_cluster_m2_search(static_k=128)
+
+        for source_m_tile in (
+            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+            TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+        ):
+            for block_k in (64, 128):
+                with self.subTest(
+                    source_m_tile=source_m_tile,
+                    block_k=block_k,
+                ):
+                    config = self._grouped_worklist_config(
+                        block_sizes=[256, 128, block_k],
+                        source_m_tile=source_m_tile,
+                    )
+
+                    spec.normalize(config, _fix_invalid=True)
+
+                    self.assertEqual(config.block_sizes[:3], [256, 128, block_k])
+                    self.assertEqual(config.config["tcgen05_cluster_m"], 2)
+                    self.assertEqual(
+                        config.config["pid_type"],
+                        "persistent_interleaved",
+                    )
+
+    def test_grouped_worklist_search_fix_projects_semantic_tile(self) -> None:
+        spec = self._register_default_cute_tcgen05_mma_analysis(
+            self._make_cute_tcgen05_spec()
+        )
+        cases = (
+            (32, 1, [128, 256, 32], [256, 128, 64], 1),
+            (32, 2, [128, 256, 256], [256, 128, 128], 2),
+            # BK=96 is equidistant; the deterministic tie breaks toward 64.
+            (224, 1, [128, 256, 96], [256, 128, 64], 2),
+            # Exact canary family: a BN neighbor must return to logical BN=128.
+            (224, 2, [256, 256, 128], [256, 128, 128], 2),
+            (256, 1, [64, 64, 256], [256, 128, 128], 2),
+        )
+        for source_m_tile, cluster_m, block_sizes, expected, expected_cluster in cases:
+            with self.subTest(
+                source_m_tile=source_m_tile,
+                cluster_m=cluster_m,
+                block_sizes=block_sizes,
+            ):
+                config = self._grouped_worklist_config(
+                    block_sizes=[*block_sizes],
+                    source_m_tile=source_m_tile,
+                    cluster_m=cluster_m,
+                )
+
+                spec._cute_tcgen05_config.fix_search_config(config.config)
+
+                self.assertEqual(config.block_sizes[:3], expected)
+                self.assertEqual(config.config["tcgen05_cluster_m"], expected_cluster)
+
+    def test_grouped_worklist_search_fix_rejects_no_divisible_block_k(self) -> None:
+        spec = self._register_default_cute_tcgen05_mma_analysis(
+            self._make_cute_tcgen05_spec()
+        )
+        spec.allow_tcgen05_cluster_m2_search(static_k=96)
+        config = self._grouped_worklist_config(
+            block_sizes=[256, 256, 128],
+            source_m_tile=224,
+        )
+
+        with self.assertRaisesRegex(exc.InvalidConfig, "no supported block_k"):
+            spec.normalize(config, _fix_invalid=True)
+
+    def test_grouped_worklist_config_generation_canonicalizes_neighbors(
+        self,
+    ) -> None:
+        cases = (
+            (32, 1, 256, 32, 1, 64),
+            (32, 2, 256, 256, 2, 128),
+            (224, 1, 256, 32, 2, 64),
+            (224, 2, 256, 128, 2, 128),
+            (256, 1, 64, 256, 2, 128),
+        )
+        for (
+            source_m_tile,
+            sampled_cluster,
+            sampled_bn,
+            sampled_bk,
+            expected_cluster,
+            expected_bk,
+        ) in cases:
+            with self.subTest(
+                source_m_tile=source_m_tile,
+                sampled_cluster=sampled_cluster,
+                sampled_bk=sampled_bk,
+            ):
+                spec = self._register_default_cute_tcgen05_mma_analysis(
+                    self._make_cute_tcgen05_spec()
+                )
+                generation, flat, n_flat, k_flat, cluster_flat = (
+                    self._grouped_worklist_generation(
+                        spec,
+                        source_m_tile=source_m_tile,
+                    )
+                )
+                neighbor = [*flat]
+                neighbor[n_flat] = sampled_bn
+                neighbor[k_flat] = sampled_bk
+                neighbor[cluster_flat] = sampled_cluster
+
+                canonical_flat, normalized = generation.canonicalize_flat(neighbor)
+
+                self.assertEqual(normalized.block_sizes[:3], [256, 128, expected_bk])
+                self.assertEqual(
+                    normalized.config["tcgen05_cluster_m"], expected_cluster
+                )
+                self.assertEqual(canonical_flat[n_flat], 128)
+                self.assertEqual(canonical_flat[k_flat], expected_bk)
+                self.assertEqual(canonical_flat[cluster_flat], expected_cluster)
+
+    def test_grouped_worklist_config_generation_uses_fact_static_k(self) -> None:
+        spec = self._register_default_cute_tcgen05_mma_analysis(
+            self._make_cute_tcgen05_spec()
+        )
+        self._add_cute_tcgen05_matmul_fact(spec, static_k=192)
+        # A fact for another semantic K block must not constrain this MMA.
+        self._add_cute_tcgen05_matmul_fact(
+            spec,
+            static_k=96,
+            k_block_id=1,
+        )
+        self.assertIsNone(spec._cute_tcgen05_config.cluster_m2_search_constraints)
+        generation, flat, _n_flat, k_flat, _cluster_flat = (
+            self._grouped_worklist_generation(
+                spec,
+                source_m_tile=224,
+            )
+        )
+        neighbor = [*flat]
+        neighbor[k_flat] = 128
+
+        canonical_flat, normalized = generation.canonicalize_flat(neighbor)
+
+        self.assertEqual(normalized.block_sizes[:3], [256, 128, 64])
+        self.assertEqual(canonical_flat[k_flat], 64)
+
+    def test_grouped_worklist_config_generation_uses_aliased_fact_static_k(
+        self,
+    ) -> None:
+        spec = self._register_default_cute_tcgen05_mma_analysis(
+            self._make_cute_tcgen05_spec()
+        )
+        k_spec = spec.block_sizes[2]
+        k_spec.block_ids.append(7)
+        spec.block_sizes[2] = k_spec
+        self._add_cute_tcgen05_matmul_fact(spec, static_k=192, k_block_id=7)
+        generation, flat, _n_flat, k_flat, _cluster_flat = (
+            self._grouped_worklist_generation(
+                spec,
+                source_m_tile=224,
+            )
+        )
+        neighbor = [*flat]
+        neighbor[k_flat] = 128
+
+        canonical_flat, normalized = generation.canonicalize_flat(neighbor)
+
+        self.assertEqual(normalized.block_sizes[:3], [256, 128, 64])
+        self.assertEqual(canonical_flat[k_flat], 64)
+
+    def test_grouped_worklist_fact_static_k_rejects_without_constraints(
+        self,
+    ) -> None:
+        spec = self._register_default_cute_tcgen05_mma_analysis(
+            self._make_cute_tcgen05_spec()
+        )
+        self._add_cute_tcgen05_matmul_fact(spec, static_k=96)
+        self.assertIsNone(spec._cute_tcgen05_config.cluster_m2_search_constraints)
+        config = self._grouped_worklist_config(source_m_tile=224)
+
+        with self.assertRaisesRegex(exc.InvalidConfig, "no supported block_k"):
+            spec.normalize(config, _fix_invalid=True)
+
+    def test_grouped_worklist_config_generation_respects_k_constraints(
+        self,
+    ) -> None:
+        cases = (
+            # BK128 does not divide K192, so choose the exact BK64 profile.
+            (192, None, False, 224, 2, 1, 128, 2, 64),
+            # Generic max-K-tile limits must not rewrite a valid one-CTA BK64.
+            (32768, None, False, 32, 1, 1, 64, 1, 64),
+            # Generic edge-tail policy must not select a non-dividing worklist BK.
+            (192, None, True, 224, 2, 2, 128, 2, 64),
+            # The source-32 two-CTA profile owns the same exact-divisibility rule.
+            (192, None, True, 32, 2, 2, 128, 2, 64),
+            # Generic constraints and matching semantic facts are intersected.
+            (256, 192, False, 224, 2, 2, 128, 2, 64),
+        )
+        for (
+            static_k,
+            fact_static_k,
+            allow_edge_k_tail_family,
+            source_m_tile,
+            seed_cluster,
+            sampled_cluster,
+            sampled_bk,
+            expected_cluster,
+            expected_bk,
+        ) in cases:
+            with self.subTest(
+                static_k=static_k,
+                allow_edge_k_tail_family=allow_edge_k_tail_family,
+                source_m_tile=source_m_tile,
+                sampled_cluster=sampled_cluster,
+            ):
+                spec = self._register_default_cute_tcgen05_mma_analysis(
+                    self._make_cute_tcgen05_spec()
+                )
+                if fact_static_k is not None:
+                    self._add_cute_tcgen05_matmul_fact(
+                        spec,
+                        static_k=fact_static_k,
+                    )
+                spec.allow_tcgen05_cluster_m2_search(
+                    static_k=static_k,
+                    allow_edge_k_tail_family=allow_edge_k_tail_family,
+                )
+                generation, flat, n_flat, k_flat, cluster_flat = (
+                    self._grouped_worklist_generation(
+                        spec,
+                        source_m_tile=source_m_tile,
+                        cluster_m=seed_cluster,
+                    )
+                )
+                neighbor = [*flat]
+                neighbor[n_flat] = 256
+                neighbor[k_flat] = sampled_bk
+                neighbor[cluster_flat] = sampled_cluster
+
+                canonical_flat, normalized = generation.canonicalize_flat(neighbor)
+
+                self.assertEqual(normalized.block_sizes[:3], [256, 128, expected_bk])
+                self.assertEqual(
+                    normalized.config["tcgen05_cluster_m"], expected_cluster
+                )
+                self.assertEqual(canonical_flat[n_flat], 128)
+                self.assertEqual(canonical_flat[k_flat], expected_bk)
+                self.assertEqual(canonical_flat[cluster_flat], expected_cluster)
+
+    def test_grouped_worklist_two_cta_seed_survives_without_generic_constraints(
+        self,
+    ) -> None:
+        spec = self._register_default_cute_tcgen05_mma_analysis(
+            self._make_cute_tcgen05_spec()
+        )
+        self.assertIsNone(spec._cute_tcgen05_config.cluster_m2_search_constraints)
+
+        for source_m_tile in (
+            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+            TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+        ):
+            with self.subTest(source_m_tile=source_m_tile):
+                generation, flat, _n_flat, _k_flat, _cluster_flat = (
+                    self._grouped_worklist_generation(
+                        spec,
+                        source_m_tile=source_m_tile,
+                    )
+                )
+                [seed] = spec.compiler_seed_configs
+                spec.compiler_default_config = seed
+
+                effective = spec.default_config()
+                self.assertEqual(effective.config["tcgen05_cluster_m"], 2)
+                self.assertEqual(effective.config["block_sizes"][:3], [256, 128, 64])
+
+                [(seed_flat, normalized)] = generation.seed_flat_config_pairs()
+                self.assertEqual(seed_flat, flat)
+                self.assertEqual(normalized.config["tcgen05_cluster_m"], 2)
+                unflattened = generation.unflatten([*flat])
+                self.assertEqual(unflattened.config["tcgen05_cluster_m"], 2)
+                self.assertEqual(unflattened.config["block_sizes"][:3], [256, 128, 64])
 
     def test_tcgen05_search_fields_do_not_leak_to_other_backends(self) -> None:
         from helion._compiler.backend import MetalBackend
@@ -1256,6 +1984,65 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
                 repaired.config,
             )
 
+    def test_grouped_rejects_num_sm_multiplier(self) -> None:
+        spec = self._make_cute_tcgen05_spec()
+
+        def make_config(grouped_mode: str) -> helion.Config:
+            return helion.Config(
+                block_sizes=[256, 128, 64],
+                num_sm_multiplier=2,
+                pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
+                tcgen05_grouped_mode=grouped_mode,
+            )
+
+        for grouped_mode in (
+            TCGEN05_GROUPED_MODE_STATIC,
+            TCGEN05_GROUPED_MODE_DYNAMIC,
+            TCGEN05_GROUPED_MODE_DIRECT,
+            TCGEN05_GROUPED_MODE_WORKLIST_NM,
+        ):
+            with self.subTest(grouped_mode=grouped_mode):
+                with self.assertRaisesRegex(exc.InvalidConfig, "num_sm_multiplier=1"):
+                    spec.normalize(make_config(grouped_mode))
+
+                repaired = make_config(grouped_mode)
+                spec.normalize(repaired, _fix_invalid=True)
+                self.assertNotIn("num_sm_multiplier", repaired.config)
+
+    def test_grouped_clc_rejects_ignored_occupancy_limits(self) -> None:
+        from helion._compiler.cute.strategies import (
+            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY,
+        )
+        from helion._compiler.cute.strategies import Tcgen05PersistenceModel
+
+        spec = self._make_cute_tcgen05_spec()
+
+        def make_config() -> helion.Config:
+            return helion.Config(
+                block_sizes=[256, 128, 64],
+                pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
+                tcgen05_strategy="role_local_with_scheduler",
+                tcgen05_warp_spec_scheduler_warps=1,
+                **{
+                    TCGEN05_GROUPED_MODE_CONFIG_KEY: (TCGEN05_GROUPED_MODE_WORKLIST_NM),
+                    TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY: True,
+                    TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY: 4,
+                    TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
+                        Tcgen05PersistenceModel.CLC_PERSISTENT.value
+                    ),
+                },
+            )
+
+        with self.assertRaisesRegex(exc.InvalidConfig, "exact full tile-record grid"):
+            spec.normalize(make_config())
+
+        repaired = make_config()
+        spec.normalize(repaired, _fix_invalid=True)
+        self.assertNotIn(
+            TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
+            repaired.config,
+        )
+
     def test_grouped_static_problem_signature_envelope(self) -> None:
         spec = self._make_cute_tcgen05_spec()
         key = TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY
@@ -1303,10 +2090,7 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
                 spec.normalize(fixed, _fix_invalid=True)
                 self.assertNotIn(key, fixed.config)
 
-        for mode in (
-            None,
-            TCGEN05_GROUPED_MODE_WORKLIST_NM,
-        ):
+        for mode in (None, TCGEN05_GROUPED_MODE_WORKLIST_NM):
             with self.subTest(mode=mode):
                 invalid = make_config(signature, mode)
                 with self.assertRaisesRegex(exc.InvalidConfig, key):
@@ -1317,39 +2101,40 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
 
     def test_deep_ab_stage_mode_envelopes_and_stage7_roundtrip(self) -> None:
         def selected_config() -> helion.Config:
-            return helion.Config(
-                block_sizes=[256, 128, 64],
+            return self._grouped_worklist_config(
                 pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
-                tcgen05_cluster_m=2,
+                num_stages=7,
+                num_warps=8,
                 tcgen05_ab_stages=7,
-                **{
-                    TCGEN05_GROUPED_MODE_CONFIG_KEY: (TCGEN05_GROUPED_MODE_WORKLIST_NM),
-                },
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+                tcgen05_num_epi_warps=4,
+                tcgen05_consumer_regs=240,
             )
 
-        spec = self._make_cute_tcgen05_spec()
-        grouped_ab4 = helion.Config(
-            block_sizes=[128, 64, 64],
-            pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
-            tcgen05_ab_stages=4,
-            **{
-                TCGEN05_GROUPED_MODE_CONFIG_KEY: TCGEN05_GROUPED_MODE_DYNAMIC,
-            },
+        def dynamic_config(
+            ab_stages: int, c_stages: int | None = None
+        ) -> helion.Config:
+            config = helion.Config(
+                block_sizes=[128, 64, 64],
+                pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
+                tcgen05_ab_stages=ab_stages,
+                tcgen05_grouped_mode=TCGEN05_GROUPED_MODE_DYNAMIC,
+            )
+            if c_stages is not None:
+                config.config["tcgen05_c_stages"] = c_stages
+            return config
+
+        spec = self._register_default_cute_tcgen05_mma_analysis(
+            self._make_cute_tcgen05_spec()
         )
+        grouped_ab4 = dynamic_config(4)
         spec.normalize(grouped_ab4)
         grouped_ab4.config["tcgen05_ab_stages"] = 4.0
         with self.assertRaisesRegex(exc.InvalidConfig, "tcgen05_ab_stages"):
             spec.normalize(grouped_ab4)
 
-        grouped_ab8 = helion.Config(
-            block_sizes=[128, 64, 64],
-            pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
-            tcgen05_ab_stages=8,
-            tcgen05_c_stages=4,
-            **{
-                TCGEN05_GROUPED_MODE_CONFIG_KEY: TCGEN05_GROUPED_MODE_DYNAMIC,
-            },
-        )
+        grouped_ab8 = dynamic_config(8, 4)
         spec.normalize(grouped_ab8)
         self.assertEqual(grouped_ab8.config["tcgen05_ab_stages"], 8)
         minimized_ab8 = grouped_ab8.minimize(spec)
@@ -1358,15 +2143,7 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
         self.assertEqual(minimized_ab8.config["tcgen05_c_stages"], 4)
 
         for ab_stages, c_stages in ((8, 2), (4, 4)):
-            mismatched = helion.Config(
-                block_sizes=[128, 64, 64],
-                pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
-                tcgen05_ab_stages=ab_stages,
-                tcgen05_c_stages=c_stages,
-            )
-            mismatched.config[TCGEN05_GROUPED_MODE_CONFIG_KEY] = (
-                TCGEN05_GROUPED_MODE_DYNAMIC
-            )
+            mismatched = dynamic_config(ab_stages, c_stages)
             with (
                 self.subTest(ab_stages=ab_stages, c_stages=c_stages),
                 self.assertRaisesRegex(exc.InvalidConfig, "tcgen05_ab_stages"),
@@ -1375,6 +2152,8 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
 
         config = selected_config()
         spec.normalize(config)
+        self.assertEqual(config.block_sizes, [256, 128, 64])
+        self.assertEqual(config.config["tcgen05_ab_stages"], 7)
         minimized = config.minimize(spec)
         self.assertNotIn("tcgen05_cluster_n", minimized.config)
         self.assertNotIn("tcgen05_acc_stages", minimized.config)
@@ -1382,15 +2161,150 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
         spec.normalize(minimized)
         self.assertEqual(minimized.config["tcgen05_ab_stages"], 7)
 
-        constrained_spec = self._make_cute_tcgen05_spec()
-        constrained_spec._cute_tcgen05_config.ab_stages_three_search_constraints = (
-            Tcgen05AbStagesThreeSearchConstraints(
-                dtype_bytes=2,
-                per_cta_smem_budget_bytes=1,
-            )
-        )
+        constrained_spec = self._constrained_grouped_worklist_spec(1)
         with self.assertRaisesRegex(exc.InvalidConfig, "tcgen05_ab_stages"):
             constrained_spec.normalize(selected_config())
+
+    def test_grouped_worklist_two_cta_deep_ab_uses_conservative_smem_capacity(
+        self,
+    ) -> None:
+        def selected_config(source_m_tile: int, ab_stages: int) -> helion.Config:
+            return self._grouped_worklist_config(
+                source_m_tile=source_m_tile,
+                pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
+                tcgen05_ab_stages=ab_stages,
+            )
+
+        for invalid_cluster_m in (True, 4):
+            with self.subTest(invalid_cluster_m=invalid_cluster_m):
+                invalid = selected_config(
+                    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+                    7,
+                )
+                invalid.config["tcgen05_cluster_m"] = invalid_cluster_m
+                self.assertIsNone(
+                    resolve_tcgen05_grouped_worklist_mma_profile(
+                        invalid,
+                        block_k=64,
+                    )
+                )
+
+        b200_capacity_bytes = TCGEN05_AB_STAGES_THREE_MIN_DEVICE_SMEM_OPTIN
+        constrained_budget_bytes = (
+            b200_capacity_bytes - TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES
+        )
+        cases = (
+            (TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT, 7, True, 232_448),
+            (TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE, 6, True, 214_016),
+            (TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE, 7, False, 246_784),
+        )
+        for source_m_tile, ab_stages, should_fit, required_bytes in cases:
+            with self.subTest(
+                source_m_tile=source_m_tile,
+                ab_stages=ab_stages,
+                should_fit=should_fit,
+            ):
+                config = selected_config(source_m_tile, ab_stages)
+                profile = resolve_tcgen05_grouped_worklist_mma_profile(
+                    config,
+                    block_k=64,
+                )
+                assert profile is not None
+                self.assertEqual((profile.mma_m, profile.mma_n), (256, source_m_tile))
+                self.assertEqual(
+                    tcgen05_grouped_worklist_smem_bytes(
+                        group_count=1,
+                        device_split_sizes=False,
+                        sched_stage_count=1,
+                        bm=profile.mma_m,
+                        bn=profile.mma_n,
+                        bk=64,
+                        dtype_bytes=2,
+                        ab_stages=ab_stages,
+                        acc_stages=2,
+                        c_stages=2,
+                        cluster_m=2,
+                    ),
+                    required_bytes,
+                )
+
+                spec = self._constrained_grouped_worklist_spec(constrained_budget_bytes)
+                spec.register_cute_tcgen05_grouped_worklist_smem_facts(
+                    group_count=1,
+                    device_split_sizes=False,
+                )
+                if should_fit:
+                    spec.normalize(config)
+                else:
+                    with self.assertRaisesRegex(exc.InvalidConfig, "tcgen05_ab_stages"):
+                        spec.normalize(config)
+
+    def test_grouped_worklist_deep_ab_normalization_uses_device_split_facts(
+        self,
+    ) -> None:
+        config = self._grouped_worklist_config(
+            pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            tcgen05_ab_stages=7,
+        )
+        constrained_budget_bytes = (
+            TCGEN05_AB_STAGES_THREE_MIN_DEVICE_SMEM_OPTIN
+            - TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES
+        )
+        for group_count, should_fit in ((20, True), (21, False)):
+            with self.subTest(group_count=group_count, should_fit=should_fit):
+                spec = self._constrained_grouped_worklist_spec(constrained_budget_bytes)
+                spec.register_cute_tcgen05_grouped_worklist_smem_facts(
+                    group_count=group_count,
+                    device_split_sizes=True,
+                )
+                if should_fit:
+                    spec.normalize(helion.Config.from_dict(config.config))
+                else:
+                    with self.assertRaisesRegex(exc.InvalidConfig, "tcgen05_ab_stages"):
+                        spec.normalize(helion.Config.from_dict(config.config))
+
+    def test_reviewed_grouped_worklist_seeds_fit_conservative_b200_smem(self) -> None:
+        seed_inputs = (
+            (6, 6 * 32, 4096, 4096, "k", 32),
+            (6, 6 * 224, 7168, 3072, "k", 224),
+            (8, 8 * 4096, 4096, 2048, "k", 256),
+            (8, 8 * 4096, 4096, 2048, "n", 256),
+        )
+        reviewed_configs = [
+            config
+            for groups, packed_m, n, k, b_major, source_m_tile in seed_inputs
+            for config in _tcgen05_grouped_worklist_seed_family(
+                groups=groups,
+                packed_m=packed_m,
+                n=n,
+                k=k,
+                b_major=b_major,
+                source_m_tile=source_m_tile,
+                num_sm=148,
+                target_policy=GroupedWorklistTargetPolicy(),
+            )[0]
+        ]
+        spec = self._constrained_grouped_worklist_spec(
+            TCGEN05_AB_STAGES_THREE_MIN_DEVICE_SMEM_OPTIN
+            - TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES
+        )
+        spec.register_cute_tcgen05_grouped_worklist_smem_facts(
+            group_count=8,
+            device_split_sizes=False,
+        )
+
+        for config in reviewed_configs:
+            with self.subTest(config=config.config):
+                ab_stages = config.config["tcgen05_ab_stages"]
+                assert isinstance(ab_stages, int)
+                # AB1-3 use the ordinary admission path; deeper reviewed seeds
+                # must pass the conservative all-scheduler SMEM upper bound.
+                self.assertTrue(
+                    ab_stages < 4
+                    or spec._cute_tcgen05_config._grouped_worklist_nm_ab_config_matches(
+                        config.config, ab_stages
+                    )
+                )
 
     def test_grouped_dynamic_deep_stage_smem_accounts_for_output_dtype(self) -> None:
         from helion._compiler.backend import CuteBackend
@@ -1478,17 +2392,193 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
         spec = self._make_cute_tcgen05_spec()
         tcgen05_config = spec._cute_tcgen05_config
 
+        def choices(fragments: Mapping[str, object], key: str) -> tuple[object, ...]:
+            return self._enum_fragment(fragments[key]).choices
+
         narrow = tcgen05_config.strategy_autotune_fragments()
-        self.assertEqual(narrow["tcgen05_strategy"].choices, ("role_local_monolithic",))
-        self.assertEqual(narrow["tcgen05_warp_spec_c_input_warps"].choices, (0,))
+        self.assertEqual(
+            choices(narrow, "tcgen05_strategy"), ("role_local_monolithic",)
+        )
+        self.assertEqual(choices(narrow, "tcgen05_warp_spec_c_input_warps"), (0,))
 
         tcgen05_config.aux_kernel_detected = True
         widened = tcgen05_config.strategy_autotune_fragments()
         self.assertEqual(
-            widened["tcgen05_strategy"].choices,
+            choices(widened, "tcgen05_strategy"),
             ("role_local_monolithic", "role_local_with_scheduler"),
         )
-        self.assertEqual(widened["tcgen05_warp_spec_c_input_warps"].choices, (0, 1))
+        self.assertEqual(
+            choices(widened, "tcgen05_warp_spec_c_input_warps"),
+            (0, 1),
+        )
+
+    def test_compiler_seed_fragments_preserve_base_search_choices(self) -> None:
+        spec = self._make_cute_tcgen05_spec()
+        spec.compiler_seed_configs = [
+            helion.Config(
+                pid_type="flat",
+                tcgen05_consumer_regs=240,
+                tcgen05_strategy="role_local_with_scheduler",
+                tcgen05_warp_spec_scheduler_warps=1,
+                tcgen05_persistence_model="non_persistent",
+            ),
+            helion.Config(
+                pid_type="persistent_interleaved",
+                tcgen05_persistence_model="clc_persistent",
+            ),
+            helion.Config.from_dict(
+                {
+                    "tcgen05_consumer_regs": True,
+                    "tcgen05_strategy": "invalid",
+                    "tcgen05_warp_spec_scheduler_warps": True,
+                    "tcgen05_persistence_model": "invalid",
+                }
+            ),
+        ]
+        tcgen05_config = spec._cute_tcgen05_config
+
+        consumer = self._enum_fragment(
+            tcgen05_config.consumer_regs_autotune_fragments()["tcgen05_consumer_regs"]
+        )
+        strategy = tcgen05_config.strategy_autotune_fragments()
+        persistence = self._enum_fragment(
+            tcgen05_config.persistence_model_autotune_fragments()[
+                "tcgen05_persistence_model"
+            ]
+        )
+        strategy_fragment = self._enum_fragment(strategy["tcgen05_strategy"])
+        scheduler_fragment = self._enum_fragment(
+            strategy["tcgen05_warp_spec_scheduler_warps"]
+        )
+
+        self.assertEqual(consumer.choices, (256, 240))
+        self.assertEqual(consumer.search_choices, (256,))
+        self.assertEqual(
+            strategy_fragment.choices,
+            ("role_local_monolithic", "role_local_with_scheduler"),
+        )
+        self.assertEqual(strategy_fragment.search_choices, ("role_local_monolithic",))
+        self.assertEqual(scheduler_fragment.choices, (0, 1))
+        self.assertEqual(scheduler_fragment.search_choices, (0,))
+        self.assertEqual(
+            persistence.choices,
+            ("non_persistent", "static_persistent", "clc_persistent"),
+        )
+        self.assertEqual(
+            persistence.search_choices,
+            ("non_persistent", "static_persistent"),
+        )
+
+    def test_default_seed_values_do_not_add_degenerate_fragments(self) -> None:
+        baseline = self._make_cute_tcgen05_spec()
+        baseline_hash = baseline.structural_fingerprint_hash()
+
+        spec = self._make_cute_tcgen05_spec()
+        spec.compiler_seed_configs = [
+            helion.Config(
+                pid_type="flat",
+                tcgen05_consumer_regs=256,
+                tcgen05_persistence_model="non_persistent",
+            )
+        ]
+        fields = spec._cute_tcgen05_config.flat_fields()
+
+        self.assertNotIn("tcgen05_consumer_regs", fields)
+        self.assertNotIn("tcgen05_persistence_model", fields)
+        self.assertEqual(spec.structural_fingerprint_hash(), baseline_hash)
+
+        spec.compiler_seed_configs = [
+            helion.Config(
+                pid_type="flat",
+                tcgen05_persistence_model="static_persistent",
+            )
+        ]
+        persistence = self._enum_fragment(
+            spec._cute_tcgen05_config.flat_fields()["tcgen05_persistence_model"]
+        )
+        self.assertEqual(
+            persistence.choices,
+            ("non_persistent", "static_persistent"),
+        )
+        self.assertIsNone(persistence.search_choices)
+        self.assertNotEqual(spec.structural_fingerprint_hash(), baseline_hash)
+        self.assertIn(
+            (
+                "tcgen05_persistence_model",
+                "enum",
+                repr("non_persistent"),
+                repr("static_persistent"),
+            ),
+            spec.structural_fingerprint(),
+        )
+
+    def test_mixed_grouped_persistence_seed_search_domain(self) -> None:
+        from helion.autotuner.config_generation import ConfigGeneration
+
+        spec = self._make_cute_tcgen05_spec()
+        spec.target_device_capability = (10, 0)
+        spec.allowed_pid_types = ("flat",)
+        spec.compiler_seed_configs = [
+            helion.Config(
+                pid_type="persistent_interleaved",
+                tcgen05_grouped_mode=TCGEN05_GROUPED_MODE_WORKLIST_NM,
+                tcgen05_grouped_runtime_direct=True,
+            ),
+            helion.Config(
+                pid_type="persistent_interleaved",
+                tcgen05_grouped_mode=TCGEN05_GROUPED_MODE_WORKLIST_NM,
+                tcgen05_grouped_runtime_direct=True,
+                tcgen05_persistence_model="clc_persistent",
+                tcgen05_strategy="role_local_with_scheduler",
+                tcgen05_warp_spec_scheduler_warps=1,
+            ),
+        ]
+
+        generation = ConfigGeneration(spec)
+        [persistence_index], _ = generation._key_to_flat_indices[
+            "tcgen05_persistence_model"
+        ]
+        persistence = self._enum_fragment(generation.flat_spec[persistence_index])
+        self.assertEqual(
+            persistence.choices,
+            ("non_persistent", "static_persistent", "clc_persistent"),
+        )
+        self.assertEqual(
+            persistence.search_choices,
+            ("non_persistent",),
+        )
+        self.assertEqual(
+            persistence.search_values(),
+            ["non_persistent"],
+        )
+        self.assertIn(
+            (
+                "tcgen05_persistence_model",
+                "enum",
+                repr("non_persistent"),
+                repr("static_persistent"),
+                repr("clc_persistent"),
+                "search",
+                repr("non_persistent"),
+            ),
+            spec.structural_fingerprint(),
+        )
+
+        pairs = generation.seed_flat_config_pairs()
+        self.assertEqual(len(pairs), 2)
+        by_model = {
+            normalized.config["tcgen05_persistence_model"]: flat
+            for flat, normalized in pairs
+        }
+        self.assertEqual(set(by_model), {"static_persistent", "clc_persistent"})
+        feature_dim = sum(fragment.dim() for fragment in generation.flat_spec)
+        for flat in by_model.values():
+            self.assertEqual(len(generation.encode_config(flat)), feature_dim)
+        for model in ("static_persistent", "clc_persistent"):
+            self.assertEqual(
+                persistence.pattern_neighbors(by_model[model][persistence_index]),
+                ["non_persistent"],
+            )
 
 
 if __name__ == "__main__":

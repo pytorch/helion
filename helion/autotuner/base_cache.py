@@ -118,10 +118,29 @@ class BoundKernelInMemoryCacheKey(CacheKeyBase):
     specialization_key: Information about all kernel inputs.
                         For tensors this means their device, shape, size etc.
     extra_results: Information regarding `hl.specialize` decisions
+    compiler_seed_results: Device facts consumed by compiler seed heuristics
+                           that fired for this bound kernel.
     """
 
     specialization_key: tuple[Hashable, ...]
     extra_results: tuple[Hashable, ...]
+    compiler_seed_results: tuple[Hashable, ...] = dataclasses.field(
+        default=(),
+        repr=False,
+        kw_only=True,
+    )
+
+    def _repr_body(self) -> str:
+        auto_fields = [field for field in dataclasses.fields(self) if field.repr]
+        body = ", ".join(
+            f"{field.name}={getattr(self, field.name)!r}" for field in auto_fields
+        )
+        if self.compiler_seed_results:
+            body = f"{body}, compiler_seed_results={self.compiler_seed_results!r}"
+        return body
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self._repr_body()})"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -160,19 +179,15 @@ class LooseAutotuneCacheKey(BoundKernelInMemoryCacheKey):
     search_policy_hash: str = dataclasses.field(default="", repr=False)
 
     def __repr__(self) -> str:
-        # Reproduce the dataclass-generated repr for all auto-repr fields, then
-        # append ``best_of_k`` only when it is non-default. This preserves the
-        # byte-identical hash for K=1 entries written before the field existed.
-        auto_fields = [f for f in dataclasses.fields(self) if f.repr]
-        body = ", ".join(f"{f.name}={getattr(self, f.name)!r}" for f in auto_fields)
+        # Append ``best_of_k`` only when it is non-default. ``_repr_body`` does
+        # the same for compiler seed results, preserving historical hashes when
+        # both extensions have their defaults.
+        body = self._repr_body()
         if self.best_of_k != 1:
             body = f"{body}, best_of_k={self.best_of_k!r}"
         if self.search_policy_hash:
             body = f"{body}, search_policy_hash={self.search_policy_hash!r}"
         return f"{type(self).__name__}({body})"
-
-    def stable_hash(self) -> str:
-        return hashlib.sha256(repr(self).encode("utf-8")).hexdigest()
 
 
 @dataclasses.dataclass(frozen=True, repr=False)

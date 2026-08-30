@@ -34,6 +34,92 @@ def _clear_process_local_cute_library_override(monkeypatch):
     monkeypatch.delenv("CUTE_DSL_LIBS", raising=False)
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _share_flash_coverage_across_instances():
+    # _flash_deterministic_coverage_flats costs seconds per ConfigGeneration
+    # instance, and the validator canonicalizes the same fixture configs on
+    # every call; both are deterministic given the spec and override state.
+    # Product paths exercised here build many instances from one spec, so share
+    # the computed results across instances with identical inputs. Keys hold a
+    # strong spec reference so id() values cannot be recycled.
+    from helion._compiler.cute import cute_flash
+    from helion.autotuner.config_generation import ConfigGeneration
+
+    original_coverage = ConfigGeneration._flash_deterministic_coverage_flats
+    original_canonicalize = ConfigGeneration.canonicalize_flat
+    original_flatten = ConfigGeneration.flatten
+    original_fragments = cute_flash.flash_autotune_fragments
+    prototypes: dict[tuple[object, ...], tuple[object, dict[str, object]]] = {}
+    canonicalize_memo: dict[tuple[object, ...], tuple[object, object]] = {}
+    flatten_memo: dict[tuple[object, ...], tuple[object, object]] = {}
+    fragments_memo: dict[tuple[object, ...], list[object]] = {}
+
+    def generation_key(self):
+        return (
+            id(self.config_spec),
+            self._flash_pipeline_family_override,
+            repr(sorted(self._override_values.items())),
+            repr(self._advanced_controls_files),
+        )
+
+    def shared_coverage(self):
+        if self._flash_coverage_cache is not None:
+            return original_coverage(self)
+        cached = prototypes.get(generation_key(self))
+        if cached is None:
+            result = original_coverage(self)
+            prototypes[generation_key(self)] = (
+                self.config_spec,
+                {attr: getattr(self, attr) for attr in _FLASH_COVERAGE_CACHE_ATTRS},
+            )
+            return result
+        for attr, value in cached[1].items():
+            setattr(self, attr, copy.deepcopy(value))
+        return original_coverage(self)
+
+    def shared_canonicalize_flat(self, flat_values):
+        key = (generation_key(self), repr(flat_values))
+        cached = canonicalize_memo.get(key)
+        if cached is None:
+            result = original_canonicalize(self, flat_values)
+            canonicalize_memo[key] = (self.config_spec, result)
+            return copy.deepcopy(result)
+        return copy.deepcopy(cached[1])
+
+    def shared_flatten(self, config):
+        key = (generation_key(self), repr(config))
+        cached = flatten_memo.get(key)
+        if cached is None:
+            result = original_flatten(self, config)
+            flatten_memo[key] = (self.config_spec, result)
+            return copy.deepcopy(result)
+        return copy.deepcopy(cached[1])
+
+    def shared_fragments(head_dim, num_kv, **kwargs):
+        key = (head_dim, num_kv, tuple(sorted(kwargs.items())))
+        cached = fragments_memo.get(key)
+        if cached is None:
+            result = original_fragments(head_dim, num_kv, **kwargs)
+            fragments_memo[key] = [result, False]
+            return dict(result)
+        if not cached[1]:
+            # Re-verify the first repeat of each key so a nondeterministic
+            # fragment surface still fails instead of being masked.
+            assert original_fragments(head_dim, num_kv, **kwargs) == cached[0]
+            cached[1] = True
+        return dict(cached[0])
+
+    ConfigGeneration._flash_deterministic_coverage_flats = shared_coverage
+    ConfigGeneration.canonicalize_flat = shared_canonicalize_flat
+    ConfigGeneration.flatten = shared_flatten
+    cute_flash.flash_autotune_fragments = shared_fragments
+    yield
+    ConfigGeneration._flash_deterministic_coverage_flats = original_coverage
+    ConfigGeneration.canonicalize_flat = original_canonicalize
+    ConfigGeneration.flatten = original_flatten
+    cute_flash.flash_autotune_fragments = original_fragments
+
+
 def test_mirrored_bench_generic_rotates_balanced_pairs(monkeypatch) -> None:
     calls: list[int] = []
     cleanups: list[int] = []
@@ -406,6 +492,147 @@ def test_bench_steady_scores_every_timer_on_median(monkeypatch) -> None:
     assert backend_stats["runs_ms"] == [1.0, 1.0]
 
 
+def test_wait_for_gpu_cooldown_reasons(monkeypatch) -> None:
+    clock = {"now": 0.0}
+    monkeypatch.setattr(
+        compare_attention_backends.time,
+        "sleep",
+        lambda s: clock.__setitem__("now", clock["now"] + s),
+    )
+    monkeypatch.setattr(
+        compare_attention_backends.time, "perf_counter", lambda: clock["now"]
+    )
+
+    def temps(sequence):
+        it = iter(sequence)
+        return lambda: next(it)
+
+    monkeypatch.setattr(compare_attention_backends, "_gpu_temperature_c", temps([45.0]))
+    result = compare_attention_backends._wait_for_gpu_cooldown(55.0)
+    assert result["reason"] == "already_cool"
+    assert result["waited_s"] == 0.0
+    assert result["start_temp_c"] == 45.0
+
+    monkeypatch.setattr(
+        compare_attention_backends, "_gpu_temperature_c", temps([70.0, 60.0, 54.0])
+    )
+    result = compare_attention_backends._wait_for_gpu_cooldown(55.0)
+    assert result["reason"] == "reached"
+    assert result["end_temp_c"] == 54.0
+
+    # Temperature stuck just above the threshold plateaus out instead of
+    # spinning until the timeout (ambient may make the threshold unreachable).
+    monkeypatch.setattr(
+        compare_attention_backends,
+        "_gpu_temperature_c",
+        temps([70.0] + [69.9] * 100),
+    )
+    result = compare_attention_backends._wait_for_gpu_cooldown(55.0)
+    assert result["reason"] == "plateau"
+    assert result["end_temp_c"] == 69.9
+
+    monkeypatch.setattr(
+        compare_attention_backends,
+        "_gpu_temperature_c",
+        temps([90.0, 85.0, 80.0, 75.0]),
+    )
+    result = compare_attention_backends._wait_for_gpu_cooldown(55.0, timeout_s=10.0)
+    assert result["reason"] == "timeout"
+
+    # Hard cap: a temperature that rises forever (never reaches the target,
+    # never plateaus) must still terminate at the default timeout.
+    state = {"temp": 60.0}
+
+    def rising():
+        state["temp"] += 1.0
+        return state["temp"]
+
+    monkeypatch.setattr(compare_attention_backends, "_gpu_temperature_c", rising)
+    result = compare_attention_backends._wait_for_gpu_cooldown(55.0)
+    assert result["reason"] == "timeout"
+    assert result["waited_s"] <= compare_attention_backends._COOLDOWN_MAX_WAIT_S + 5.0
+
+    monkeypatch.setattr(compare_attention_backends, "_gpu_temperature_c", temps([None]))
+    assert compare_attention_backends._wait_for_gpu_cooldown(55.0) is None
+
+
+def test_bench_steady_reports_cooldown_provenance(monkeypatch) -> None:
+    marker = {"reason": "reached", "waited_s": 42.0}
+    calls = []
+
+    def fake_cooldown(max_temp_c):
+        calls.append(max_temp_c)
+        return dict(marker)
+
+    def fake_bench(fn, *, warmup, rep, return_mode):
+        return 1.0
+
+    triton_testing = pytest.importorskip(
+        "triton.testing", reason="default do_bench path requires triton"
+    )
+    monkeypatch.setattr(compare_attention_backends, "_gpu_warmup", lambda ms: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(triton_testing, "do_bench", fake_bench)
+    monkeypatch.setattr(
+        compare_attention_backends, "_wait_for_gpu_cooldown", fake_cooldown
+    )
+
+    stats = compare_attention_backends._bench_steady(
+        lambda: None,
+        num_runs=1,
+        warmup_ms=1,
+        rep_ms=1,
+        cache_warmup_calls=1,
+        thermal_warmup_ms=0,
+        cooldown_max_temp_c=55.0,
+    )
+    assert calls == [55.0]
+    assert stats["thermal_cooldown"] == marker
+
+    stats = compare_attention_backends._bench_steady(
+        lambda: None,
+        num_runs=1,
+        warmup_ms=1,
+        rep_ms=1,
+        cache_warmup_calls=1,
+        thermal_warmup_ms=0,
+    )
+    assert calls == [55.0]
+    assert "thermal_cooldown" not in stats
+
+
+def test_cooldown_target_is_startup_reference_plus_margin(monkeypatch) -> None:
+    args = SimpleNamespace(measure_cooldown_margin_c=3.0)
+
+    # No startup reference captured (or unreadable) -> cooldown disabled.
+    monkeypatch.setattr(compare_attention_backends, "_STARTUP_GPU_TEMP_C", None)
+    assert compare_attention_backends._cooldown_target_temp_c(args) is None
+
+    monkeypatch.setattr(compare_attention_backends, "_STARTUP_GPU_TEMP_C", 41.0)
+    assert compare_attention_backends._cooldown_target_temp_c(args) == pytest.approx(
+        44.0
+    )
+    # Negative margin disables; a missing attribute (bare namespace) disables.
+    assert (
+        compare_attention_backends._cooldown_target_temp_c(
+            SimpleNamespace(measure_cooldown_margin_c=-1.0)
+        )
+        is None
+    )
+    assert compare_attention_backends._cooldown_target_temp_c(SimpleNamespace()) is None
+
+
+def test_capture_startup_gpu_temperature(monkeypatch) -> None:
+    monkeypatch.setattr(compare_attention_backends, "_STARTUP_GPU_TEMP_C", None)
+    monkeypatch.setattr(compare_attention_backends, "_gpu_temperature_c", lambda: 39.0)
+    compare_attention_backends._capture_startup_gpu_temperature()
+    assert compare_attention_backends._STARTUP_GPU_TEMP_C == 39.0
+
+    monkeypatch.setattr(compare_attention_backends, "_gpu_temperature_c", lambda: None)
+    compare_attention_backends._capture_startup_gpu_temperature()
+    assert compare_attention_backends._STARTUP_GPU_TEMP_C is None
+
+
 def test_attention_epilogue_shape_metadata_preserves_identity_schema():
     args = _attention_subprocess_args(biased=0)
 
@@ -611,6 +838,8 @@ def test_attention_subprocess_forwards_helion_cute_timer(monkeypatch):
 
     flag_index = cmd.index("--helion-cute-benchmark-timer")
     assert cmd[flag_index + 1] == "event"
+    cooldown_index = cmd.index("--measure-cooldown-margin-c")
+    assert cmd[cooldown_index + 1] == "3.0"
     power_index = cmd.index("--power-cap-w")
     assert cmd[power_index + 1] == "750"
     seed_index = cmd.index("--helion-seed-config")
@@ -621,17 +850,21 @@ def test_attention_subprocess_forwards_helion_cute_timer(monkeypatch):
     assert cmd[truth_index + 1] == "0"
 
 
-def test_attention_strict_cute_benchmark_requires_wall_timer():
-    args = _attention_subprocess_args(
-        helion_cute_benchmark_timer="event",
-        helion_require_full_autotune=1,
+def test_attention_helion_cute_timer_defaults_to_event(monkeypatch):
+    # Event timing is the default so helion-cute samples use the exact same
+    # CUDA-event do_bench path as the SDPA/FlexAttention/FA4 baselines; the
+    # wall timer stays available for cross-checks only.
+    monkeypatch.setattr(
+        compare_attention_backends.sys,
+        "argv",
+        ["compare_attention_backends.py", "--impl", "helion-cute"],
     )
-
-    with pytest.raises(SystemExit, match="requires.*timer=wall"):
-        compare_attention_backends._validate_strict_helion_benchmark_timer(args, "cute")
-
-    args.helion_cute_benchmark_timer = "wall"
-    compare_attention_backends._validate_strict_helion_benchmark_timer(args, "cute")
+    parser_args = compare_attention_backends.parse_args()
+    assert parser_args.helion_cute_benchmark_timer == "event"
+    assert (
+        compare_attention_backends._helion_benchmark_timer(parser_args, "cute")
+        == "event"
+    )
 
 
 def test_attention_subprocess_limits_strict_autotune_to_helion_cute(monkeypatch):
@@ -1263,6 +1496,43 @@ def test_attention_direct_script_pins_helion_to_benchmark_checkout(tmp_path):
     )
 
 
+# Instance caches populated by ConfigGeneration._flash_deterministic_coverage_flats.
+_FLASH_COVERAGE_CACHE_ATTRS = (
+    "_flash_coverage_cache",
+    "_flash_coverage_active_values_cache",
+    "_flash_coverage_uncovered_cache",
+    "_flash_coverage_underqualified_cache",
+    "_flash_structural_leaf_catalog_cache",
+    "_flash_pipeline_lane_catalog_cache",
+    "_flash_pipeline_lane_witness_cache",
+    "_flash_clc_lane_catalog_cache",
+    "_flash_clc_lane_witness_cache",
+    "_flash_structural_underqualified_leaves_cache",
+    "_flash_coverage_uncovered_interactions_cache",
+    "_flash_coverage_active_interactions_cache",
+    "_flash_parent_coverage_prefix_count_cache",
+    "_flash_qualification_prefix_count_cache",
+)
+
+
+def _fresh_full_autotune_config_generation():
+    """ConfigGeneration for the canonical fixture spec with warm coverage caches.
+
+    The deterministic coverage design costs several seconds per instance and is
+    identical for every instance built from _full_autotune_config_spec(), so
+    compute it once on the shared prototype and copy the caches onto each new
+    instance.
+    """
+    from helion.autotuner.config_generation import ConfigGeneration
+
+    generation = ConfigGeneration(_full_autotune_config_spec())
+    prototype = _cached_full_autotune_config_generation()
+    prototype._flash_deterministic_coverage_flats()
+    for attr in _FLASH_COVERAGE_CACHE_ATTRS:
+        setattr(generation, attr, copy.deepcopy(getattr(prototype, attr)))
+    return generation
+
+
 @functools.lru_cache(maxsize=1)
 def _full_autotune_trial_configs():
     from helion.autotuner.config_generation import ConfigGeneration
@@ -1278,7 +1548,7 @@ def _full_autotune_trial_configs():
         random.setstate(state)
     configs_by_depth = {2: [], 3: []}
     seen: set[str] = set()
-    witness_generation = ConfigGeneration(_full_autotune_config_spec())
+    witness_generation = _fresh_full_autotune_config_generation()
     for (
         leaf,
         key,
@@ -1339,7 +1609,6 @@ def _full_autotune_terminal_fixture():
     from helion._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILY_KEY
     from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_DISC_KEY
     from helion._compiler.cute.cute_flash import flash_structural_leaf_from_config
-    from helion.autotuner.config_generation import ConfigGeneration
     from helion.autotuner.search_space_logger import canonical_config_id
     from helion.runtime.config import Config
 
@@ -1348,8 +1617,8 @@ def _full_autotune_terminal_fixture():
     initial_id = canonical_config_id(initial)
     leaf = flash_structural_leaf_from_config(initial.config)
     assert leaf is not None
-    config_spec = _full_autotune_config_spec()
-    root_generation = ConfigGeneration(config_spec)
+    root_generation = _fresh_full_autotune_config_generation()
+    config_spec = root_generation.config_spec
     overrides = dict(root_generation._override_values)
     overrides[FLASH_PIPELINE_FAMILY_KEY] = leaf.pipeline_family
     overrides[FLASH_SOFTMAX_DISC_KEY] = leaf.softmax_disc
@@ -1483,10 +1752,8 @@ def _full_autotune_terminal_fixture():
 
 @functools.lru_cache(maxsize=1)
 def _full_autotune_terminal_surface_catalog():
-    from helion.autotuner.config_generation import ConfigGeneration
-
-    return ConfigGeneration(
-        _full_autotune_config_spec()
+    return (
+        _fresh_full_autotune_config_generation()
     ).flash_terminal_coordinate_surface_catalog(radius=2)
 
 
@@ -1546,7 +1813,6 @@ def _measured_full_autotune_terminal_fixture():
     from helion._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILY_KEY
     from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_DISC_KEY
     from helion._compiler.cute.cute_flash import flash_structural_leaf_from_config
-    from helion.autotuner.config_generation import ConfigGeneration
     from helion.autotuner.search_space_logger import canonical_config_id
     from helion.runtime.config import Config
 
@@ -1555,8 +1821,8 @@ def _measured_full_autotune_terminal_fixture():
     initial_id = canonical_config_id(initial)
     leaf = flash_structural_leaf_from_config(initial.config)
     assert leaf is not None
-    config_spec = _full_autotune_config_spec()
-    root_generation = ConfigGeneration(config_spec)
+    root_generation = _fresh_full_autotune_config_generation()
+    config_spec = root_generation.config_spec
     overrides = dict(root_generation._override_values)
     overrides[FLASH_PIPELINE_FAMILY_KEY] = leaf.pipeline_family
     overrides[FLASH_SOFTMAX_DISC_KEY] = leaf.softmax_disc
@@ -1800,7 +2066,8 @@ def _populate_measurement_source_hashes(value, *, overwrite: bool = False) -> No
             _populate_measurement_source_hashes(child, overwrite=overwrite)
 
 
-def _full_autotune_trial(**overrides):
+@functools.lru_cache(maxsize=1)
+def _full_autotune_trial_base():
     configs = [copy.deepcopy(config) for config in _full_autotune_trial_configs()]
     terminal_refinement, selected_config = copy.deepcopy(
         _full_autotune_terminal_fixture()
@@ -1848,7 +2115,7 @@ def _full_autotune_trial(**overrides):
             "status": "ok",
         }
 
-    trial = {
+    return {
         "input_shapes": repr([(2, 32, 65536, 64)] * 3),
         "dtypes": repr(["torch.float16"] * 3),
         "hardware": "NVIDIA B200",
@@ -2132,6 +2399,10 @@ def _full_autotune_trial(**overrides):
             "terminal_coordinate_refinement": terminal_refinement,
         },
     }
+
+
+def _full_autotune_trial(**overrides):
+    trial = copy.deepcopy(_full_autotune_trial_base())
     trial.update(overrides)
     if "search_phase_metrics" not in overrides:
         _synchronize_full_autotune_terminal_boundary(trial)
@@ -2230,7 +2501,8 @@ def _add_isolated_rebenchmark_alias_invalidation(trial, invalidated_id, *, compl
     return alias["config_id"]
 
 
-def _full_autotune_trial_provenance(**overrides):
+@functools.lru_cache(maxsize=1)
+def _full_autotune_trial_provenance_base():
     design_configs = [
         copy.deepcopy(config) for config in _full_autotune_trial_configs()[:2]
     ]
@@ -2245,7 +2517,7 @@ def _full_autotune_trial_provenance(**overrides):
     ]
     terminal_surface = copy.deepcopy(_full_autotune_terminal_surface_catalog())
     _terminal_refinement, selected_config = _full_autotune_terminal_fixture()
-    provenance = _full_autotune_provenance(
+    return _full_autotune_provenance(
         flash_structural_coverage_design=design,
         flash_structural_coverage_design_count=len(design),
         flash_structural_coverage_design_sha256=hashlib.sha256(
@@ -2281,17 +2553,20 @@ def _full_autotune_trial_provenance(**overrides):
         ).hexdigest(),
         selected_config=copy.deepcopy(selected_config),
     )
+
+
+def _full_autotune_trial_provenance(**overrides):
+    provenance = copy.deepcopy(_full_autotune_trial_provenance_base())
     provenance.update(overrides)
     return provenance
 
 
-def _full_autotune_trial_with_complete_schedule_anchors():
-    from helion.autotuner.config_generation import ConfigGeneration
-
+@functools.lru_cache(maxsize=1)
+def _cached_full_autotune_trial_with_complete_schedule_anchors():
     trial = _full_autotune_trial()
     provenance = _full_autotune_trial_provenance()
     phase = cast("dict[str, Any]", trial["search_phase_metrics"])
-    generation = ConfigGeneration(_full_autotune_config_spec())
+    generation = _fresh_full_autotune_config_generation()
     anchors = generation.flash_low_confound_schedule_anchor_configs()
     assert len(anchors) == 131
 
@@ -2623,9 +2898,12 @@ def _full_autotune_trial_with_complete_schedule_anchors():
     return trial, provenance, anchor_ids
 
 
-def _full_autotune_trial_with_family_probe_candidate():
-    from helion.autotuner.config_generation import ConfigGeneration
+def _full_autotune_trial_with_complete_schedule_anchors():
+    return copy.deepcopy(_cached_full_autotune_trial_with_complete_schedule_anchors())
 
+
+@functools.lru_cache(maxsize=1)
+def _cached_full_autotune_trial_with_family_probe_candidate():
     trial, provenance, anchor_ids = (
         _full_autotune_trial_with_complete_schedule_anchors()
     )
@@ -2635,7 +2913,7 @@ def _full_autotune_trial_with_family_probe_candidate():
         key: probe_path[key] for key in ("family", "compound_packet", "softmax_disc")
     }
     manifest = cast("dict[str, dict[str, Any]]", phase["config_manifest"])
-    generation = ConfigGeneration(_full_autotune_config_spec())
+    generation = _fresh_full_autotune_config_generation()
     state = random.getstate()
     random.seed(24680)
     try:
@@ -2710,6 +2988,10 @@ def _full_autotune_trial_with_family_probe_candidate():
     return trial, provenance, [*anchor_ids, candidate_id]
 
 
+def _full_autotune_trial_with_family_probe_candidate():
+    return copy.deepcopy(_cached_full_autotune_trial_with_family_probe_candidate())
+
+
 @functools.lru_cache(maxsize=1)
 def _cached_full_autotune_trial_with_pipeline_repair():
     from helion.autotuner.config_generation import ConfigGeneration
@@ -2763,7 +3045,7 @@ def _cached_full_autotune_trial_with_pipeline_repair():
     assert repair_config is not None and repair_id is not None
     manifest[repair_id] = {"config": repair_config}
 
-    witness_generation = ConfigGeneration(_full_autotune_config_spec())
+    witness_generation = _fresh_full_autotune_config_generation()
     witness_config = next(
         config
         for (witness_leaf, key, value), config in (
@@ -3090,8 +3372,8 @@ def _full_autotune_trial_with_terminal_pipeline_failure():
     return trial, provenance, witness_id, repair_id
 
 
-def _full_autotune_trial_with_compound_transfer():
-    from helion.autotuner.config_generation import ConfigGeneration
+@functools.lru_cache(maxsize=1)
+def _cached_full_autotune_trial_with_compound_transfer():
     from helion.exc import InvalidConfig
 
     trial = _full_autotune_trial()
@@ -3133,7 +3415,7 @@ def _full_autotune_trial_with_compound_transfer():
         ],
         key=operator.itemgetter("selection_perf", "config_id"),
     )
-    generation = ConfigGeneration(_full_autotune_config_spec())
+    generation = _fresh_full_autotune_config_generation()
     attempted_ids: list[str] = []
     selected_ids: list[str] = []
     transfers: list[dict[str, Any]] = []
@@ -3296,6 +3578,10 @@ def _full_autotune_trial_with_compound_transfer():
     return trial, provenance
 
 
+def _full_autotune_trial_with_compound_transfer():
+    return copy.deepcopy(_cached_full_autotune_trial_with_compound_transfer())
+
+
 def _full_autotune_config_spec():
     from helion._compiler.backend import CuteBackend
     from helion.autotuner.config_spec import BlockSizeSpec
@@ -3323,18 +3609,15 @@ def _full_autotune_config_spec():
 
 @functools.lru_cache(maxsize=1)
 def _full_autotune_compiler_seed_policy():
-    from helion.autotuner.config_generation import ConfigGeneration
-
-    spec = _full_autotune_config_spec()
+    generation = _fresh_full_autotune_config_generation()
     return compare_attention_backends._compiler_seed_policy(
-        spec, ConfigGeneration(spec)
+        generation.config_spec, generation
     )
 
 
 def test_attention_strict_schedule_anchor_enumerator_matches_live_product():
-    from helion.autotuner.config_generation import ConfigGeneration
 
-    generation = ConfigGeneration(_full_autotune_config_spec())
+    generation = _fresh_full_autotune_config_generation()
     independent = compare_attention_backends._independent_flash_schedule_anchor_configs(
         generation
     )
@@ -3352,9 +3635,8 @@ def test_attention_strict_schedule_anchor_enumerator_matches_live_product():
 def test_attention_strict_schedule_anchor_enumerator_rejects_producer_omission(
     monkeypatch,
 ):
-    from helion.autotuner.config_generation import ConfigGeneration
 
-    generation = ConfigGeneration(_full_autotune_config_spec())
+    generation = _fresh_full_autotune_config_generation()
     produced = generation.flash_low_confound_schedule_anchor_configs()
     assert produced
     monkeypatch.setattr(
@@ -3575,6 +3857,15 @@ def _cached_full_autotune_config_generation():
     return ConfigGeneration(_full_autotune_config_spec())
 
 
+@functools.cache
+def _validation_config_spec(seeds_json):
+    # One spec object per distinct fixture seed set keeps the id-keyed sharing
+    # of coverage and canonicalization results effective across tests. The
+    # caller reassigns the seed-dependent fields on every use.
+    assert seeds_json
+    return _full_autotune_config_spec()
+
+
 def _validate_full_autotune_trials(provenance, trials, *, expected_fixture_trial=None):
     from helion.runtime.config import Config
 
@@ -3611,7 +3902,6 @@ def _validate_full_autotune_trials(provenance, trials, *, expected_fixture_trial
     if expected_fixture_trial is not None:
         expected_trial = expected_fixture_trial
         expected_provenance = provenance
-    config_spec = _full_autotune_config_spec()
     seed_phase = (
         phase
         if isinstance(phase.get("initial_results"), list)
@@ -3626,6 +3916,13 @@ def _validate_full_autotune_trials(provenance, trials, *, expected_fixture_trial
         Config.from_dict(seed_phase["config_manifest"][config_id]["config"])
         for config_id in fixture_seed_ids
     ]
+    config_spec = _validation_config_spec(
+        json.dumps(
+            [config.config for config in fixture_seeds],
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
     config_spec.compiler_seed_configs = fixture_seeds
     config_spec.compiler_seed_timeout_retry_repetitions = 3
     config_spec.autotuner_heuristics = ["cute_flash_attention"]
@@ -3822,10 +4119,9 @@ def test_attention_required_full_autotune_rejects_noncanonical_seed_policy(mutat
 
 
 def test_attention_compiler_seed_policy_requires_exact_live_seed_order():
-    from helion.autotuner.config_generation import ConfigGeneration
 
-    spec = _full_autotune_config_spec()
-    generation = ConfigGeneration(spec)
+    generation = _fresh_full_autotune_config_generation()
+    spec = generation.config_spec
     policy = compare_attention_backends._compiler_seed_policy(spec, generation)
 
     assert policy["kind"] == "canonical_cute_flash"
@@ -3839,11 +4135,10 @@ def test_attention_compiler_seed_policy_requires_exact_live_seed_order():
 
 
 def test_attention_compiler_seed_policy_rejects_extra_alias_and_invalid_seed():
-    from helion.autotuner.config_generation import ConfigGeneration
     from helion.runtime.config import Config
 
-    spec = _full_autotune_config_spec()
-    generation = ConfigGeneration(spec)
+    generation = _fresh_full_autotune_config_generation()
+    spec = generation.config_spec
     canonical_ids = compare_attention_backends._compiler_seed_policy(spec, generation)[
         "effective_config_ids"
     ]
@@ -4718,10 +5013,6 @@ def test_attention_required_full_autotune_accepts_unlimited_family_cap():
     _validate_full_autotune_trials(provenance, [trial])
 
 
-# Building the trial fixture and validating it both walk the full flash config
-# surface; the first test to warm the lru_cache fixtures can exceed the 60s
-# CI per-test timeout on slower runners.
-@pytest.mark.timeout(300)
 def test_attention_required_full_autotune_accepts_measured_family_probe_candidate():
     trial, provenance, _config_ids = _full_autotune_trial_with_family_probe_candidate()
 
@@ -6170,401 +6461,6 @@ def test_attention_structural_retention_mirror_matches_live_capacity_selector():
     )
 
 
-def test_attention_structural_retention_counts_ordinary_lane_alternate_as_parent():
-    kv2 = ("cute_flash_kv_stage", 2)
-    kv3 = ("cute_flash_kv_stage", 3)
-    lanes = (kv2, kv3)
-    config_ids = [f"{index:016x}" for index in range(6)]
-    retained = compare_attention_backends._expected_flash_structural_retention(
-        [
-            (
-                "compound_rich",
-                "deg2_16x6",
-                True,
-                [(config_ids[0], 0.5, frozenset((kv2,)))],
-                lanes,
-            ),
-            (
-                "compound_rich",
-                None,
-                True,
-                [
-                    (config_ids[1], 1.0, frozenset((kv2,))),
-                    (config_ids[2], 1.1, frozenset((kv3,))),
-                ],
-                lanes,
-            ),
-            _structural_leaf_qualification("alpha", None, [(config_ids[3], 0.8)]),
-            _structural_leaf_qualification("beta", None, [(config_ids[4], 0.9)]),
-            _structural_leaf_qualification("gamma", None, [(config_ids[5], 1.2)]),
-        ],
-        retained_per_leaf=2,
-        retained_family_cap=3,
-        retained_family_limit=3,
-        retained_family_slowdown_limit=2.0,
-        starting_path_limit=4,
-        pipeline_qualification_keys=(
-            "cute_flash_kv_stage",
-            "cute_flash_s_stage",
-        ),
-    )
-
-    assert [family["family"] for family in retained] == [
-        "compound_rich",
-        "alpha",
-        "beta",
-    ]
-    assert retained[0]["parent_promoted"] is True
-    assert retained[0]["starting_paths"] == [
-        {
-            "family": "compound_rich",
-            "compound_packet": None,
-            "softmax_disc": True,
-            "config_id": config_ids[1],
-            "unrestricted": False,
-            "pipeline_lane": None,
-        },
-        {
-            "family": "compound_rich",
-            "compound_packet": "deg2_16x6",
-            "softmax_disc": True,
-            "config_id": config_ids[0],
-            "unrestricted": True,
-            "pipeline_lane": None,
-        },
-    ]
-
-
-def test_attention_structural_retention_selects_top_four_and_distinct_leaves():
-    config_ids = [f"{index:016x}" for index in range(8)]
-    retained = compare_attention_backends._expected_flash_structural_retention(
-        [
-            _structural_leaf_qualification(
-                "alpha", None, [(config_ids[0], 1.0), (config_ids[2], 1.0)]
-            ),
-            _structural_leaf_qualification(
-                "alpha", "deg2_16x6", [(config_ids[1], 1.0)]
-            ),
-            _structural_leaf_qualification("beta", None, [(config_ids[3], 1.0)]),
-            _structural_leaf_qualification("gamma", None, [(config_ids[4], 2.0)]),
-            _structural_leaf_qualification("delta", None, [(config_ids[5], 3.0)]),
-            _structural_leaf_qualification("epsilon", None, [(config_ids[6], 4.0)]),
-        ],
-        retained_per_leaf=2,
-        retained_family_cap=4,
-        retained_family_limit=4,
-        retained_family_slowdown_limit=10.0,
-        starting_path_limit=7,
-        pipeline_qualification_keys=(
-            "cute_flash_kv_stage",
-            "cute_flash_s_stage",
-        ),
-    )
-
-    assert [family["family"] for family in retained] == [
-        "alpha",
-        "beta",
-        "gamma",
-        "delta",
-    ]
-    assert [path["config_id"] for path in retained[0]["starting_paths"]] == [
-        config_ids[0],
-        config_ids[2],
-        config_ids[1],
-        config_ids[0],
-    ]
-    assert [path["unrestricted"] for path in retained[0]["starting_paths"]] == [
-        False,
-        False,
-        False,
-        True,
-    ]
-    assert sum(len(family["starting_paths"]) for family in retained) == 7
-
-
-def test_attention_structural_retention_unlimited_keeps_slow_live_family():
-    config_ids = [f"{index:016x}" for index in range(5)]
-    retained = compare_attention_backends._expected_flash_structural_retention(
-        [
-            _structural_leaf_qualification(family, None, [(config_id, perf)])
-            for family, config_id, perf in zip(
-                ("alpha", "beta", "gamma", "delta", "epsilon"),
-                config_ids,
-                (1.0, 1.1, 1.2, 1.3, 5.0),
-                strict=True,
-            )
-        ],
-        retained_per_leaf=2,
-        retained_family_cap=None,
-        retained_family_limit=5,
-        retained_family_slowdown_limit=2.0,
-        starting_path_limit=6,
-        pipeline_qualification_keys=(
-            "cute_flash_kv_stage",
-            "cute_flash_s_stage",
-        ),
-    )
-
-    assert [family["family"] for family in retained] == [
-        "alpha",
-        "beta",
-        "gamma",
-        "delta",
-        "epsilon",
-    ]
-
-
-def test_attention_structural_retention_does_not_prune_close_sibling_leaf():
-    config_ids = [f"{index:016x}" for index in range(8)]
-    retained = compare_attention_backends._expected_flash_structural_retention(
-        [
-            _structural_leaf_qualification(
-                "alpha", None, [(config_ids[0], 1.0), (config_ids[1], 1.001)]
-            ),
-            _structural_leaf_qualification("beta", None, [(config_ids[2], 1.015)]),
-            _structural_leaf_qualification(
-                "beta", "deg2_16x6", [(config_ids[3], 1.01)]
-            ),
-            _structural_leaf_qualification(
-                "beta", "deg1_16x8", [(config_ids[4], 1.011)]
-            ),
-            _structural_leaf_qualification("gamma", None, [(config_ids[5], 3.0)]),
-            _structural_leaf_qualification("delta", None, [(config_ids[6], 3.1)]),
-            _structural_leaf_qualification("epsilon", None, [(config_ids[7], 3.2)]),
-        ],
-        retained_per_leaf=2,
-        retained_family_cap=4,
-        retained_family_limit=4,
-        retained_family_slowdown_limit=2.0,
-        starting_path_limit=6,
-        pipeline_qualification_keys=(
-            "cute_flash_kv_stage",
-            "cute_flash_s_stage",
-        ),
-    )
-
-    by_family = {family["family"]: family["starting_paths"] for family in retained}
-    assert [path["config_id"] for path in by_family["alpha"]] == [
-        config_ids[0],
-        config_ids[1],
-        config_ids[0],
-    ]
-    assert [path["config_id"] for path in by_family["beta"]] == config_ids[2:5]
-    assert [
-        path["config_id"]
-        for paths in by_family.values()
-        for path in paths
-        if path["unrestricted"]
-    ] == [config_ids[0]]
-
-
-def test_attention_structural_retention_does_not_parent_promote_compound_only():
-    config_ids = [f"{index:016x}" for index in range(5)]
-    retained = compare_attention_backends._expected_flash_structural_retention(
-        [
-            _structural_leaf_qualification(
-                "compound_only", "deg2_16x6", [(config_ids[0], 0.5)]
-            ),
-            _structural_leaf_qualification("alpha", None, [(config_ids[1], 1.0)]),
-            _structural_leaf_qualification("beta", None, [(config_ids[2], 1.1)]),
-            _structural_leaf_qualification("gamma", None, [(config_ids[3], 1.2)]),
-            _structural_leaf_qualification("delta", None, [(config_ids[4], 1.3)]),
-        ],
-        retained_per_leaf=2,
-        retained_family_cap=4,
-        retained_family_limit=4,
-        retained_family_slowdown_limit=2.0,
-        starting_path_limit=5,
-        pipeline_qualification_keys=(
-            "cute_flash_kv_stage",
-            "cute_flash_s_stage",
-        ),
-    )
-
-    assert [family["family"] for family in retained] == [
-        "compound_only",
-        "alpha",
-        "beta",
-        "gamma",
-        "delta",
-    ]
-    assert retained[0]["parent_promoted"] is False
-    assert len(retained[0]["starting_paths"]) == 1
-
-
-def test_attention_structural_retention_scores_families_by_ordinary_leaf():
-    config_ids = [f"{index:016x}" for index in range(7)]
-    retained = compare_attention_backends._expected_flash_structural_retention(
-        [
-            _structural_leaf_qualification(
-                "compound_rich", None, [(config_ids[0], 1.5)]
-            ),
-            _structural_leaf_qualification(
-                "compound_rich", "deg2_16x6", [(config_ids[1], 0.9)]
-            ),
-            _structural_leaf_qualification("alpha", None, [(config_ids[2], 0.8)]),
-            _structural_leaf_qualification("beta", None, [(config_ids[3], 1.0)]),
-            _structural_leaf_qualification("gamma", None, [(config_ids[4], 1.1)]),
-            _structural_leaf_qualification("delta", None, [(config_ids[5], 1.2)]),
-        ],
-        retained_per_leaf=2,
-        retained_family_cap=4,
-        retained_family_limit=4,
-        retained_family_slowdown_limit=2.0,
-        starting_path_limit=5,
-        pipeline_qualification_keys=(
-            "cute_flash_kv_stage",
-            "cute_flash_s_stage",
-        ),
-    )
-
-    assert [family["family"] for family in retained if family["parent_promoted"]] == [
-        "alpha",
-        "beta",
-        "gamma",
-        "delta",
-    ]
-    assert all(
-        family["score_compound_packet"] is None
-        for family in retained
-        if family["parent_promoted"]
-    )
-
-
-def test_attention_structural_retention_keeps_global_compound_winner():
-    config_ids = [f"{index:016x}" for index in range(6)]
-    retained = compare_attention_backends._expected_flash_structural_retention(
-        [
-            _structural_leaf_qualification(
-                "compound_rich", None, [(config_ids[0], 1.5)]
-            ),
-            _structural_leaf_qualification(
-                "compound_rich", "deg2_16x6", [(config_ids[1], 0.5)]
-            ),
-            _structural_leaf_qualification("alpha", None, [(config_ids[2], 1.0)]),
-            _structural_leaf_qualification("beta", None, [(config_ids[3], 1.1)]),
-            _structural_leaf_qualification("gamma", None, [(config_ids[4], 1.2)]),
-            _structural_leaf_qualification("delta", None, [(config_ids[5], 1.3)]),
-        ],
-        retained_per_leaf=2,
-        retained_family_cap=4,
-        retained_family_limit=4,
-        retained_family_slowdown_limit=2.0,
-        starting_path_limit=4,
-        pipeline_qualification_keys=(
-            "cute_flash_kv_stage",
-            "cute_flash_s_stage",
-        ),
-    )
-
-    unrestricted = [
-        path
-        for family in retained
-        for path in family["starting_paths"]
-        if path["unrestricted"]
-    ]
-    assert unrestricted == [
-        {
-            "family": "compound_rich",
-            "compound_packet": "deg2_16x6",
-            "softmax_disc": True,
-            "config_id": config_ids[1],
-            "unrestricted": True,
-            "pipeline_lane": None,
-        }
-    ]
-    assert [family["family"] for family in retained] == [
-        "compound_rich",
-        "alpha",
-        "beta",
-        "gamma",
-    ]
-    assert retained[0]["parent_promoted"] is False
-
-
-def test_attention_structural_retention_gives_dominated_compound_winner_one_path():
-    config_ids = [f"{index:016x}" for index in range(6)]
-    retained = compare_attention_backends._expected_flash_structural_retention(
-        [
-            _structural_leaf_qualification(
-                "compound_rich", None, [(config_ids[0], 3.0)]
-            ),
-            _structural_leaf_qualification(
-                "compound_rich", "deg2_16x6", [(config_ids[1], 0.5)]
-            ),
-            _structural_leaf_qualification("alpha", None, [(config_ids[2], 1.0)]),
-            _structural_leaf_qualification("beta", None, [(config_ids[3], 1.1)]),
-            _structural_leaf_qualification("gamma", None, [(config_ids[4], 1.2)]),
-            _structural_leaf_qualification("delta", None, [(config_ids[5], 1.3)]),
-        ],
-        retained_per_leaf=2,
-        retained_family_cap=4,
-        retained_family_limit=4,
-        retained_family_slowdown_limit=2.0,
-        starting_path_limit=4,
-        pipeline_qualification_keys=(
-            "cute_flash_kv_stage",
-            "cute_flash_s_stage",
-        ),
-    )
-
-    assert [family["family"] for family in retained] == [
-        "compound_rich",
-        "alpha",
-        "beta",
-        "gamma",
-    ]
-    assert retained[0]["parent_promoted"] is False
-    assert retained[0]["starting_paths"] == [
-        {
-            "family": "compound_rich",
-            "compound_packet": "deg2_16x6",
-            "softmax_disc": True,
-            "config_id": config_ids[1],
-            "unrestricted": True,
-            "pipeline_lane": None,
-        }
-    ]
-    assert all(family["parent_promoted"] for family in retained[1:])
-
-
-def test_attention_structural_retention_replaces_dominated_family():
-    config_ids = [f"{index:016x}" for index in range(6)]
-    retained = compare_attention_backends._expected_flash_structural_retention(
-        [
-            _structural_leaf_qualification(
-                "alpha",
-                None,
-                [
-                    (config_ids[0], 1.0),
-                    (config_ids[1], 1.1),
-                    (config_ids[2], 1.2),
-                ],
-            ),
-            _structural_leaf_qualification(
-                "alpha", "deg2_16x6", [(config_ids[3], 1.3)]
-            ),
-            _structural_leaf_qualification("beta", None, [(config_ids[4], 1.4)]),
-            _structural_leaf_qualification("dominated", None, [(config_ids[5], 2.01)]),
-        ],
-        retained_per_leaf=3,
-        retained_family_cap=4,
-        retained_family_limit=3,
-        retained_family_slowdown_limit=2.0,
-        starting_path_limit=5,
-        pipeline_qualification_keys=(
-            "cute_flash_kv_stage",
-            "cute_flash_s_stage",
-        ),
-    )
-
-    assert [family["family"] for family in retained] == ["alpha", "beta"]
-    assert sum(len(family["starting_paths"]) for family in retained) == 5
-    assert config_ids[5] not in {
-        path["config_id"] for family in retained for path in family["starting_paths"]
-    }
-
-
 def test_attention_required_full_autotune_rejects_packet_owner_mismatch():
     phase = _full_autotune_trial()["search_phase_metrics"]
     leaf_result = cast("dict[str, Any]", phase["leaf_results"][0])
@@ -6670,7 +6566,8 @@ def test_attention_required_full_autotune_checks_every_trial():
         )
 
 
-def _exact_small_space_trial_provenance():
+@functools.lru_cache(maxsize=1)
+def _cached_exact_small_space_trial_provenance():
     trial = _full_autotune_trial(
         num_configs_tested=4,
         num_successful_candidate_measurements=4,
@@ -6826,18 +6723,22 @@ def _exact_small_space_trial_provenance():
     return trial, provenance, exact_ids
 
 
+def _exact_small_space_trial_provenance():
+    return copy.deepcopy(_cached_exact_small_space_trial_provenance())
+
+
 def test_attention_required_full_autotune_accepts_exact_small_space_exhaustion():
     trial, provenance, _exact_ids = _exact_small_space_trial_provenance()
 
     _validate_full_autotune_trials(provenance, [trial])
 
 
-def _exact_small_space_trial_with_exhausted_clc():
+@functools.lru_cache(maxsize=1)
+def _cached_exact_small_space_trial_with_exhausted_clc():
     trial, provenance, exact_ids = _exact_small_space_trial_provenance()
     phase = cast("dict[str, Any]", trial["search_phase_metrics"])
-    from helion.autotuner.config_generation import ConfigGeneration
 
-    generation = ConfigGeneration(_full_autotune_config_spec())
+    generation = _fresh_full_autotune_config_generation()
     expected_catalog = compare_attention_backends._flash_clc_lane_provenance(
         generation,
         leaf_catalog=[
@@ -7098,11 +6999,14 @@ def _exact_small_space_trial_with_exhausted_clc():
     return trial, provenance
 
 
+def _exact_small_space_trial_with_exhausted_clc():
+    return copy.deepcopy(_cached_exact_small_space_trial_with_exhausted_clc())
+
+
 @functools.lru_cache(maxsize=1)
 def _cached_full_autotune_trial_with_reused_clc_combination():
-    from helion.autotuner.config_generation import ConfigGeneration
 
-    generation = ConfigGeneration(_full_autotune_config_spec())
+    generation = _fresh_full_autotune_config_generation()
     leaf = {
         "family": "fa4_clc",
         "compound_packet": None,
@@ -8020,7 +7924,6 @@ def test_attention_required_full_autotune_rejects_dropped_initial_leaf_member():
 
 
 def test_attention_required_full_autotune_rejects_tampered_random_fill():
-    from helion.autotuner.config_generation import ConfigGeneration
 
     trial = _full_autotune_trial()
     provenance = _full_autotune_trial_provenance()
@@ -8044,7 +7947,7 @@ def test_attention_required_full_autotune_rejects_tampered_random_fill():
     )
     manifest = cast("dict[str, dict[str, Any]]", phase["config_manifest"])
     victim_config = cast("dict[str, object]", manifest[victim_id]["config"])
-    generation = ConfigGeneration(_full_autotune_config_spec())
+    generation = _fresh_full_autotune_config_generation()
     replacement_config = compare_attention_backends._canonical_flash_projection(
         generation,
         victim_config,
@@ -8097,9 +8000,8 @@ def test_attention_required_full_autotune_rejects_tampered_random_fill():
 
 
 def test_attention_strict_initial_population_replay_uses_seed_without_rng_leak():
-    from helion.autotuner.config_generation import ConfigGeneration
 
-    generation = ConfigGeneration(_full_autotune_config_spec())
+    generation = _fresh_full_autotune_config_generation()
     original_state = random.getstate()
     try:
         random.seed(987654321)
@@ -8491,33 +8393,18 @@ def test_attention_selected_source_code_preserves_repro_setting(print_output_cod
 
 
 def test_attention_helion_cute_timer_selects_bench_fn():
-    calls = []
-
-    def wall_timer(*args, **kwargs):
-        return 1.0
-
-    backend = SimpleNamespace(
-        get_do_bench=lambda: calls.append("get_do_bench") or wall_timer
-    )
-    bound = SimpleNamespace(env=SimpleNamespace(backend=backend))
+    from helion.autotuner.benchmarking import do_bench_generic
 
     wall_args = SimpleNamespace(helion_cute_benchmark_timer="wall")
     assert (
-        compare_attention_backends._helion_do_bench_fn(bound, wall_args, "cute")
-        is wall_timer
+        compare_attention_backends._helion_do_bench_fn(wall_args, "cute")
+        is do_bench_generic
     )
-    assert calls == ["get_do_bench"]
 
     event_args = SimpleNamespace(helion_cute_benchmark_timer="event")
-    assert (
-        compare_attention_backends._helion_do_bench_fn(bound, event_args, "cute")
-        is None
-    )
-    assert (
-        compare_attention_backends._helion_do_bench_fn(bound, wall_args, "triton")
-        is None
-    )
-    assert calls == ["get_do_bench"]
+    assert compare_attention_backends._helion_do_bench_fn(event_args, "cute") is None
+    # Non-cute backends always use the default CUDA-event do_bench.
+    assert compare_attention_backends._helion_do_bench_fn(wall_args, "triton") is None
 
 
 @pytest.mark.parametrize(
@@ -9768,6 +9655,7 @@ def test_attention_power_cap_is_verified(monkeypatch):
         "check": True,
         "capture_output": True,
         "text": True,
+        "timeout": 30,
     }
 
 

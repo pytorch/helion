@@ -26,6 +26,7 @@ from ..language.tile_proxy import _CheckForIndexCalls
 from .ast_extension import ExtendedAST
 from .compile_environment import AutoSize
 from .compile_environment import CompileEnvironment
+from .compile_environment import ConfigValueExpression
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import LoopSpecBlockSizeSource
 from .compile_environment import _symint_expr
@@ -814,7 +815,33 @@ class CallableType(LiteralType):
             for x in proxy_args
         ):
             if self.value in self._new_symint_on_host_fns() and origin.is_host():
-                return SymIntType.new_unbacked(origin)
+                result = SymIntType.new_unbacked(origin)
+                operation = self._config_value_operation()
+                derived_args: list[int | str | ConfigValueExpression] = []
+                for arg in proxy_args:
+                    if isinstance(arg, int):
+                        derived_args.append(arg)
+                    elif isinstance(arg, torch.SymInt):
+                        expr = _symint_expr(arg)
+                        if expr is None:
+                            break
+                        expression = env.config_value_expressions.get(expr)
+                        if expression is None:
+                            break
+                        derived_args.append(expression)
+                    else:
+                        break
+                else:
+                    result_expr = _symint_expr(result.value)
+                    if (
+                        operation is not None
+                        and not proxy_kwargs
+                        and result_expr is not None
+                    ):
+                        env.config_value_expressions[result_expr] = (
+                            ConfigValueExpression(operation, tuple(derived_args))
+                        )
+                return result
             if isinstance(self.value, type) and issubclass(
                 self.value, ConfigFragmentType
             ):
@@ -876,6 +903,23 @@ class CallableType(LiteralType):
         except ImportError:
             pass
         return cast("dict[object, None]", dict.fromkeys(fns))
+
+    def _config_value_operation(self) -> str | None:
+        from .._utils import cdiv
+        from .._utils import next_power_of_2
+
+        if self.value in (cdiv, next_power_of_2):
+            return self.value.__name__
+        try:
+            import triton as _triton
+
+            if self.value is _triton.cdiv:
+                return "cdiv"
+            if self.value is _triton.next_power_of_2:
+                return "next_power_of_2"
+        except ImportError:
+            pass
+        return None
 
 
 def _raise_shape_specializing(*args: object) -> None:
@@ -1157,14 +1201,27 @@ class TileIndexType(TypeInfo):
             if isinstance(numel, torch.SymInt):
                 maybe_bounded_by = _detect_outer_block_bound(numel, env)
                 if maybe_bounded_by is not None:
+                    bounded_by = maybe_bounded_by
                     try:
                         outer_spec = env.config_spec.block_sizes.block_id_lookup(
                             maybe_bounded_by
                         )
                     except KeyError:
-                        pass
+                        # A fixed outer tile has no autotuner BlockSizeSpec, but it
+                        # still bounds this inner loop. Retain the relationship and
+                        # use the fixed source's value as the search ceiling.
+                        if 0 <= maybe_bounded_by < len(env.block_sizes):
+                            outer_info = env.block_sizes[maybe_bounded_by]
+                            source = outer_info.block_size_source
+                            if isinstance(source, FixedBlockSizeSource):
+                                try:
+                                    outer_max = max(
+                                        1,
+                                        int(env.size_hint(source.value)),
+                                    )
+                                except Exception:
+                                    outer_max = None
                     else:
-                        bounded_by = maybe_bounded_by
                         outer_max = outer_spec.max_size
             env.config_spec.block_sizes.append(
                 BlockSizeSpec(

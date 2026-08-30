@@ -14,7 +14,6 @@ import re
 import tempfile
 from typing import TYPE_CHECKING
 from typing import Any
-from typing import Callable
 from typing import Sequence
 
 import sympy
@@ -193,6 +192,7 @@ def _detect_grouped_rank3_specialized_mma_loop(
 ) -> bool:
     from ..compile_environment import CompileEnvironment
     from ..host_function import HostFunction
+    from .cute_mma import _rank3_grouped_root_axes
 
     device_ir = HostFunction.current().device_ir
     if len(device_ir.grid_block_ids) != 1 or len(block_ids) != 1:
@@ -200,7 +200,25 @@ def _detect_grouped_rank3_specialized_mma_loop(
     root_grid_ids = device_ir.grid_block_ids[0]
     if any(block_id in root_grid_ids for block_id in block_ids):
         return False
-    if len(root_grid_ids) == 2:
+    env = CompileEnvironment.current()
+    semantic_block_ids = env.config_spec._tcgen05_matmul_block_ids()
+    axes = None
+    if semantic_block_ids is not None:
+        m_block_id, n_block_id, k_block_id = semantic_block_ids
+        if env.canonical_block_id(k_block_id) == env.canonical_block_id(block_ids[0]):
+            axes = _rank3_grouped_root_axes(
+                env,
+                device_ir,
+                m_block_id=m_block_id,
+                n_block_id=n_block_id,
+                k_block_id=block_ids[0],
+            )
+    if semantic_block_ids is not None and axes is None:
+        return False
+    if axes is not None:
+        segment_root_grid_id = axes.segment_block_id
+        mn_root_grid_ids = [axes.m_block_id, axes.n_block_id]
+    elif len(root_grid_ids) == 2:
         segment_root_grid_id = None
         mn_root_grid_ids = root_grid_ids
     elif len(root_grid_ids) == 3:
@@ -208,8 +226,6 @@ def _detect_grouped_rank3_specialized_mma_loop(
         mn_root_grid_ids = root_grid_ids[1:]
     else:
         return False
-
-    env = CompileEnvironment.current()
     if segment_root_grid_id is not None:
         segment_block = env.block_sizes[segment_root_grid_id].from_config(config)
         segment_threads = env.config_spec.num_threads.config_get(
@@ -1054,23 +1070,15 @@ class CuteBackend(Backend):
             return "warn"
         return None
 
-    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
-        # The default Triton do_bench uses CUDA events that mis-time the CuTe
-        # path on Blackwell - launches show up as ~5ms when the kernel is
-        # actually 250ms+. Use synchronized wall-clock timing instead so
-        # autotune scores reflect real performance.
-        from ...autotuner.benchmarking import do_bench_generic
-
-        return do_bench_generic
-
-    def get_interleaved_bench(self) -> Callable[..., list[float]]:
-        # Same rationale as get_do_bench: the default interleaved bench uses
-        # CUDA events that mis-time the CuTe path. Use the synchronized
-        # wall-clock fallback so the autotuner's interleaved compare path
-        # produces real timings.
-        from ...autotuner.benchmarking import interleaved_bench_generic
-
-        return interleaved_bench_generic
+    # Note: this backend intentionally does NOT override get_do_bench /
+    # get_interleaved_bench. CUDA-event timing once mis-read CuTe launches
+    # (~5ms reported for 250ms kernels) because the pre-compiled-launcher
+    # per-call ``@cute.jit`` dispatch path spent ~200ms on the host per
+    # launch; with ``_CompiledCuteLauncher`` kernels launch on the Torch
+    # current stream and event timing matches synchronized wall-clock timing
+    # to <0.1ms on B200 across flash families (including CLC+PDL and
+    # multi-second launches). Event timing avoids charging per-launch host
+    # overhead to the kernel, which the wall path does.
 
     def autotune(
         self,

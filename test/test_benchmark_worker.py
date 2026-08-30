@@ -339,8 +339,8 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         load_args.assert_called_once_with("/tmp/args.pt")
         event_bench.assert_not_called()
         wall_clock_bench.assert_called_once()
-        self.assertNotIn("fixed_repetitions", wall_clock_bench.call_args.kwargs)
-        self.assertNotIn("probe_long_kernel", wall_clock_bench.call_args.kwargs)
+        self.assertIsNone(wall_clock_bench.call_args.kwargs["fixed_repetitions"])
+        self.assertIs(wall_clock_bench.call_args.kwargs["probe_long_kernel"], False)
 
     def test_wall_clock_fixed_repetitions_run_setup_and_measurements(self) -> None:
         invocation_count = 0
@@ -392,6 +392,58 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             )()
 
         self.assertIs(wall_clock_bench.call_args.kwargs["probe_long_kernel"], True)
+
+    def test_benchmark_job_forwards_long_kernel_probe_on_event_path(self) -> None:
+        fn = _ReturnValue(torch.empty(()))
+
+        with (
+            patch(
+                "helion.autotuner.benchmark_job._load_compiled_fn",
+                return_value=fn,
+            ),
+            patch(
+                "helion.autotuner.benchmark_job.load_trusted_kernel_args",
+                return_value=(),
+            ),
+            patch(
+                "helion.autotuner.benchmark_job.do_bench",
+                return_value=1.25,
+            ) as event_bench,
+            patch("helion.autotuner.benchmark_job.do_bench_generic") as wall_bench,
+        ):
+            BenchmarkJob(
+                fn_spec=cast("SerializedCompiledFunction", object()),
+                args_path="/tmp/args.pt",
+                use_wall_clock=False,
+                probe_long_kernel=True,
+            )()
+
+        wall_bench.assert_not_called()
+        self.assertIs(event_bench.call_args.kwargs["probe_long_kernel"], True)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_event_timed_long_kernel_skips_redundant_estimates(self) -> None:
+        # A kernel longer than both timing windows must be measured with
+        # setup + single-call estimate + one timed repeat (3 launches), not
+        # the 5-call estimate loop.
+        invocation_count = 0
+        sleep_cycles = int(50e6)  # tens of ms at ~GHz clocks
+
+        def fn() -> None:
+            nonlocal invocation_count
+            invocation_count += 1
+            torch.cuda._sleep(sleep_cycles)
+
+        result = do_bench(
+            fn,
+            warmup=1,
+            rep=1,
+            return_mode="median",
+            probe_long_kernel=True,
+        )
+
+        self.assertEqual(invocation_count, 3)
+        self.assertGreater(cast("float", result), 1.0)
 
     def test_wall_clock_long_kernel_skips_redundant_estimates(self) -> None:
         invocation_count = 0
@@ -1040,8 +1092,10 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         self.assertEqual(provider._benchmark_worker.run.call_args.kwargs["timeout"], 17)
 
     def test_long_kernel_probe_is_cute_flash_gated(self) -> None:
+        # The probe applies to flash searches on both timer paths: the
+        # event-timed do_bench now short-circuits its estimate loop the same
+        # way do_bench_generic does for multi-second candidates.
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
-        provider._subprocess_benchmark_uses_wall_clock = lambda: True
         provider.config_spec = SimpleNamespace(cute_flash_search_enabled=False)
         self.assertFalse(provider._probe_long_cute_flash_kernel())
 
@@ -1998,9 +2052,12 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         bound_kernel.settings.autotune_benchmark_subprocess = True
         bound_kernel.settings.autotune_benchmark_timeout = 60
         bound_kernel.settings.autotune_precompile = None
+        # The autotuner reseeds `random` from this setting, so pinning it (not
+        # random.seed) is what makes the config sequence reproducible.
+        bound_kernel.settings.autotune_random_seed = 123
 
         random.seed(123)
-        RandomSearch(bound_kernel, args, 20).autotune()
+        RandomSearch(bound_kernel, args, 10).autotune()
 
     @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
     def test_autotune_continues_when_subprocess_reports_inf(self) -> None:
@@ -2037,6 +2094,9 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         bound_kernel.settings.autotune_benchmark_subprocess = True
         bound_kernel.settings.autotune_benchmark_timeout = 60
         bound_kernel.settings.autotune_precompile = None
+        # The autotuner reseeds `random` from this setting, so pinning it (not
+        # random.seed) is what makes the config sequence reproducible.
+        bound_kernel.settings.autotune_random_seed = 123
 
         random.seed(123)
         with patch.object(
@@ -2044,7 +2104,7 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
             "_benchmark_function_subprocess",
             maybe_fail,
         ):
-            search = RandomSearch(bound_kernel, args, 20)
+            search = RandomSearch(bound_kernel, args, 10)
             search.autotune()
 
         self.assertGreaterEqual(call_count[0], 6)
@@ -2054,9 +2114,9 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
     @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
     def test_autotune_continues_when_accuracy_check_crashes(self) -> None:
         # A config can pass the timed run and then crash in the accuracy
-        # check. Patches the accuracy job to raise a sticky CUDA error for a
-        # fraction of configs; the worker dies and respawns, and autotune must
-        # still pick a best config from the rest instead of aborting.
+        # check. Patches the accuracy job to raise a sticky CUDA error for one
+        # config; the worker dies and respawns, and autotune must still pick a
+        # best config from the rest instead of aborting.
         if not torch.cuda.is_available():
             self.skipTest("requires CUDA")
 
@@ -2068,7 +2128,10 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
             fn: CompiledConfig,
         ) -> AccuracyCheckResult | None:
             call_count[0] += 1
-            if call_count[0] % 3 == 0:
+            # Crash exactly once, early: every induced crash costs a ~5s worker
+            # kill/respawn cycle, and one cycle already proves autotune survives
+            # an accuracy-check crash and keeps searching.
+            if call_count[0] == 2:
                 call_count[1] += 1
                 if self._benchmark_worker is None:
                     self._benchmark_worker = BenchmarkWorker(device=None)
@@ -2092,6 +2155,9 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         bound_kernel.settings.autotune_benchmark_subprocess = True
         bound_kernel.settings.autotune_benchmark_timeout = 60
         bound_kernel.settings.autotune_precompile = None
+        # The autotuner reseeds `random` from this setting, so pinning it (not
+        # random.seed) is what makes the config sequence reproducible.
+        bound_kernel.settings.autotune_random_seed = 123
 
         random.seed(123)
         with patch.object(
@@ -2099,11 +2165,13 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
             "_run_subprocess_accuracy_check_job",
             maybe_crash,
         ):
-            best = RandomSearch(bound_kernel, args, 20).autotune()
+            best = RandomSearch(bound_kernel, args, 8).autotune()
 
         self.assertIsNotNone(best)
-        self.assertGreaterEqual(call_count[0], 6)
-        self.assertGreaterEqual(call_count[1], 2)
+        # Random configs that fail to compile never reach the accuracy check
+        # (hardware-dependent even with a pinned seed), so leave slack here.
+        self.assertGreaterEqual(call_count[0], 4)
+        self.assertEqual(call_count[1], 1)
 
 
 if __name__ == "__main__":

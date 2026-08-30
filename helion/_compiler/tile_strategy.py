@@ -1905,8 +1905,29 @@ class DeviceGridState(DeviceLoopOrGridState):
         self.lane_loop_blocks.add(block_id)
 
     def wrap_body(self, body: list[ast.AST]) -> list[ast.AST]:
-        wrapped: list[ast.AST] = [*self.lane_setup_statements, *body]
+        from .ast_read_writes import ReadWrites
+
+        # Drop setup statements (per-lane index/mask defs) whose results the
+        # body never reads, then skip any lane loop whose variable is left
+        # unreferenced. An unused rdim block (e.g. one allocated for a
+        # ``tile.index`` that codegen serves from the tile's own block) would
+        # otherwise wrap the whole body in a dead innermost loop, and the
+        # lane-reduce split pass would then try to split reductions on that
+        # loop's lane var instead of the loop that actually distributes them.
+        needed: set[str] = set()
+        for stmt in body:
+            needed |= set(ReadWrites.from_ast(stmt).reads)
+        kept_setup: list[ast.AST] = []
+        for stmt in reversed(self.lane_setup_statements):
+            rw = ReadWrites.from_ast(stmt)
+            if not rw.writes or set(rw.writes) & needed:
+                kept_setup.append(stmt)
+                needed |= set(rw.reads)
+        kept_setup.reverse()
+        wrapped: list[ast.AST] = [*kept_setup, *body]
         for lane_var, extent in reversed(self.lane_loops):
+            if lane_var not in needed:
+                continue
             wrapped = [_create_lane_loop(lane_var, extent, wrapped)]
         return wrapped
 
@@ -2448,19 +2469,63 @@ class BlockSizeTileStrategy(TileStrategy):
         if not env.backend.reduction_axis_first():
             return active_non_reduction_axes + active_reduction_axes
 
-        has_reduction_strategy = any(
-            isinstance(strategy, ReductionStrategy) and strategy.thread_axes_used() > 0
+        # Reduction strategies claim axes 0..n-1 in creation order
+        # (``_get_thread_axis``), so reserving only one axis when two
+        # multi-thread reductions are live would place this strategy on the
+        # same axis as the second reduction. That collision double-books the
+        # axis (e.g. a tile axis planned for 2 threads sharing thread_idx[1]
+        # with a 4-thread reduction), making the generated tile indices span
+        # more elements than the tile holds. Reserve one axis per reduction
+        # that actually spreads across threads; single-thread reductions
+        # (thread_idx is constant 0 on their axis) may share an axis safely.
+        reduction_strategies = [
+            strategy
             for strategy in self.fn.tile_strategy.strategies
+            if isinstance(strategy, ReductionStrategy)
+        ]
+        planned_reduction_axes = max(
+            sum(
+                1
+                for strategy in reduction_strategies
+                if strategy._reduction_thread_count() > 1
+            ),
+            1
+            if any(strategy.thread_axes_used() > 0 for strategy in reduction_strategies)
+            else 0,
         )
         if plan is not None and any(
             plan.disables_reduction_axis_reservation(block_id)
             for block_id in self.block_ids
         ):
             return active_non_reduction_axes + active_reduction_axes
-        reserved_reduction_axes = max(
-            1 if has_reduction_strategy else 0, active_reduction_axes
-        )
-        return reserved_reduction_axes + active_non_reduction_axes
+        reserved_reduction_axes = max(planned_reduction_axes, active_reduction_axes)
+        offset = reserved_reduction_axes + active_non_reduction_axes
+        tile_axes = set(range(offset, offset + self.thread_axes_used()))
+        executable_reductions = self.fn.tile_strategy.executable_reduction_block_ids()
+        for strategy in self.fn.tile_strategy.strategies:
+            if not isinstance(strategy, ReductionStrategy):
+                continue
+            if strategy.block_index not in executable_reductions:
+                continue
+            if not self.fn.tile_strategy.strategies_can_coexecute(self, strategy):
+                continue
+            if not any(size > 1 for size in strategy.thread_block_sizes()):
+                continue
+            reduction_axis = self.fn.tile_strategy.thread_axis_for_strategy(strategy)
+            if reduction_axis is None:
+                continue
+            reduction_axes = set(
+                range(reduction_axis, reduction_axis + strategy.thread_axes_used())
+            )
+            if collision := tile_axes & reduction_axes:
+                axes = ", ".join(map(str, sorted(collision)))
+                raise exc.BackendUnsupported(
+                    env.backend.name,
+                    "thread-axis collision: tile blocks "
+                    f"{self.block_ids} and executable reduction block "
+                    f"{strategy.block_index} both require axis {axes}",
+                )
+        return offset
 
     def select_pid_strategy(self) -> ProgramIDs:
         env = CompileEnvironment.current()

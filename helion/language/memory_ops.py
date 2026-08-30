@@ -1779,6 +1779,15 @@ def _codegen_cute_store_tcgen05_tile(
         if segment_store
         else ""
     )
+    matmul_plan = df.cute_state.matmul_plan
+    segment_grouped = (
+        matmul_plan.grouped if segment_store and matmul_plan is not None else None
+    )
+    grouped_fixed_d_tensormap = (
+        segment_store
+        and segment_grouped is not None
+        and segment_grouped.fixed_tensormaps
+    )
     tcgen05_source_bm = tcgen05_value.source_tile_m
     tcgen05_source_bn = tcgen05_value.source_tile_n
     tile_coord_m = (
@@ -3328,11 +3337,9 @@ def _codegen_cute_store_tcgen05_tile(
             f"({final_expr}).to({target_dtype})",
         )
 
-    grouped_tma_plan = (
-        df.cute_state.matmul_plan if (grouped_tail_epilogue or segment_store) else None
-    )
+    grouped_tma_plan = matmul_plan if grouped_tail_epilogue or segment_store else None
     grouped_tma = grouped_tma_plan.grouped if grouped_tma_plan is not None else None
-    d_tma_uses_rank3_mnl_tensor = (
+    d_tma_uses_rank3_mnl_tensor = grouped_fixed_d_tensormap or (
         grouped_tma is not None
         and grouped_tma.d_mode is not Tcgen05GroupedDMode.NONE
         and grouped_tma.d_tensormap is not None
@@ -3389,6 +3396,7 @@ def _codegen_cute_store_tcgen05_tile(
                 tcgen05_value.tma_store_tensor,
             ],
             **({"orientation": "nm"} if tcgen05_nm_store else {}),
+            **({"fixed_tensormap": True} if grouped_fixed_d_tensormap else {}),
             **({"rank3_mnl_tensor": True} if d_tma_uses_rank3_mnl_tensor else {}),
             **(
                 {
@@ -3459,10 +3467,7 @@ def _codegen_cute_store_tcgen05_tile(
         if segment_store
         else f"({m_index}) + cutlass.Int32({tcgen05_source_bm}) <= {m_size} "
     ) + f"and ({n_index}) + cutlass.Int32({tcgen05_source_bn}) <= {n_size}"
-    grouped_tail_plan = (
-        df.cute_state.matmul_plan if (grouped_tail_epilogue or segment_store) else None
-    )
-    grouped_tail = grouped_tail_plan.grouped if grouped_tail_plan is not None else None
+    grouped_tail = grouped_tma
     grouped_tail_store = (
         grouped_tail is not None
         and bool(grouped_tail.global_m_start)
@@ -3648,16 +3653,24 @@ def _codegen_cute_store_tcgen05_tile(
             in (tcgen05_aux_tma_store_tensor, tcgen05_aux_tail_tma_store_tensor)
             and rank3_mnl_tensor
         ):
-            source_coord_m = (
-                grouped_tail_cta_tile_idx_m
-                if dynamic_d_tensormap
-                else static_tile_coord_m
-            )
-            source_coord_n = (
-                grouped_tail_cta_tile_idx_n
-                if dynamic_d_tensormap
-                else static_tile_coord_n
-            )
+            if grouped_fixed_d_tensormap:
+                source_coord_m = (
+                    f"{grouped_tail_global_m_start} // "
+                    f"cutlass.Int32({tcgen05_source_bm}) + "
+                    f"{grouped_tail_cta_tile_idx_m}"
+                )
+                source_coord_n = grouped_tail_cta_tile_idx_n
+            else:
+                source_coord_m = (
+                    grouped_tail_cta_tile_idx_m
+                    if dynamic_d_tensormap
+                    else static_tile_coord_m
+                )
+                source_coord_n = (
+                    grouped_tail_cta_tile_idx_n
+                    if dynamic_d_tensormap
+                    else static_tile_coord_n
+                )
             if tcgen05_nm_store:
                 coord_m = source_coord_n
                 coord_n = source_coord_m
@@ -4706,9 +4719,13 @@ def _codegen_cute_store_tcgen05_tile(
         )
         carrier = trs_racc
         store_target = trs_rd
+        worklist_nm_identity_store = bool(
+            worklist_nm_segment_valid_m_bound
+            and (epilogue_chain is None or not epilogue_chain.steps)
+        )
         early_aux_prelude, late_prelude, rhs = _splice_acc_vec(
             carrier,
-            "        ",
+            "            " if worklist_nm_identity_store else "        ",
             safe_direct_aux_with_full_tile=partial_tma_needs_full_tile_guard,
             coord_layout="trs",
         )
@@ -4729,16 +4746,49 @@ def _codegen_cute_store_tcgen05_tile(
         pre_wait_aux = (
             tcgen05_aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
         )
+        if worklist_nm_identity_store:
+            # Identity-store means the epilogue chain is empty, so
+            # ``_splice_acc_vec`` returns no auxiliary-load prelude by
+            # construction.
+            if early_aux_prelude:
+                raise RuntimeError(
+                    "worklist identity store unexpectedly produced an aux prelude"
+                )
+            # The generated worklist clamps valid_m to source_tile_m.  Almost
+            # every scheduled tile therefore needs no padding fixup at all.
+            # Keep the existing coordinate-derived predicate only in the
+            # uniform tail branch; this removes identity-tensor partitioning,
+            # predicate construction, and cute.where from full output tiles.
+            full_acc_vec = df.new_var("tcgen05_full_acc_vec")
+            tail_acc_vec = df.new_var("tcgen05_tail_acc_vec")
+            branch_acc_release = textwrap.indent(acc_release, "    ")
+            store_source = (
+                f"        if {worklist_nm_segment_valid_m_bound} == "
+                f"cutlass.Int32({tcgen05_source_bm}):\n"
+                f"            {full_acc_vec} = "
+                f"({carrier}.load()).to({target_dtype})\n"
+                f"{branch_acc_release}"
+                f"            {store_target}.store({full_acc_vec})\n"
+                f"        else:\n"
+                f"{late_prelude}"
+                f"            {tail_acc_vec} = {rhs}\n"
+                f"{branch_acc_release}"
+                f"            {store_target}.store({tail_acc_vec})\n"
+            )
+        else:
+            store_source = (
+                f"{'' if pre_wait_aux else early_aux_prelude}"
+                f"{late_prelude}"
+                f"        {acc_vec} = {rhs}\n"
+                f"{acc_release}"
+                f"        {store_target}.store({acc_vec})\n"
+            )
         return (
             f"{early_aux_prelude if pre_wait_aux else ''}"
             f"{acc_wait}"
             f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
             f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
-            f"{'' if pre_wait_aux else early_aux_prelude}"
-            f"{late_prelude}"
-            f"        {acc_vec} = {rhs}\n"
-            f"{acc_release}"
-            f"        {store_target}.store({acc_vec})\n"
+            f"{store_source}"
         )
 
     def tma_store_tail_params(
