@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import operator
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
     from helion._compiler.aten_lowering import LoweringContext
     from helion._compiler.inductor_lowering import CodegenState
     from helion._compiler.pallas.dma import DmaResources
+    from helion._compiler.tile_strategy import DeviceGridState
     from helion._compiler.tile_strategy import DeviceLoopOrGridState
     from helion._compiler.tile_strategy import ForiLoopState
 
@@ -108,6 +110,8 @@ def _hbm_load_expr(
     subscript: list[object],
     tensor: torch.Tensor,
     name: str,
+    *,
+    return_ref: bool = False,
 ) -> ast.AST:
     """Stage one directly accessed HBM region into VMEM.
 
@@ -182,6 +186,31 @@ def _hbm_load_expr(
                 resources
             )
     source = f"{name}.at[{', '.join(parts)}]"
+    hoist_target: DeviceGridState | ForiLoopState | None = None
+    hoisted_source = source
+    if return_ref:
+        contiguous_dims = [
+            (dim, pattern)
+            for dim, pattern in enumerate(patterns)
+            if isinstance(pattern, ContiguousRangeIndexPattern)
+        ]
+        if len(contiguous_dims) == 1:
+            dim, pattern = contiguous_dims[0]
+            base = _hoistable_scalar_expr(state, pattern.base)
+            if base is not None:
+                from helion._compiler.tile_strategy import DeviceGridState
+
+                grid_state = state.codegen.current_grid_state
+                if isinstance(grid_state, DeviceGridState):
+                    hoist_target = grid_state
+                    hoisted_parts = [*parts]
+                    hoisted_parts[dim] = (
+                        f"pl.ds(pl.multiple_of({base}, {pattern.alignment}), "
+                        f"{pattern.length})"
+                    )
+                    hoisted_source = f"{name}.at[{', '.join(hoisted_parts)}]"
+    if hoist_target is None and return_ref:
+        hoist_target = _single_iteration_fori_loop(state)
     if device_fn.is_pallas_direct_hbm_load(tensor):
         from helion._compiler.tile_strategy import DeviceGridState
 
@@ -214,6 +243,21 @@ def _hbm_load_expr(
                 f"{name}_load_copy",
             ):
                 state.codegen.add_statement(statement)
+    elif hoist_target is not None:
+        start_statements = async_copy_statements(
+            state,
+            hoisted_source,
+            resources.scratch,
+            resources.semaphore,
+            ("start",),
+            f"{name}_load_copy",
+        )
+        copy_assignment = start_statements[0]
+        assert isinstance(copy_assignment, ast.Assign)
+        copy_target = copy_assignment.targets[0]
+        assert isinstance(copy_target, ast.Name)
+        hoist_target.outer_prefix.extend(start_statements)
+        state.codegen.add_statement(statement_from_string(f"{copy_target.id}.wait()"))
     else:
         for statement in async_copy_statements(
             state,
@@ -225,8 +269,15 @@ def _hbm_load_expr(
         ):
             state.codegen.add_statement(statement)
 
-    result = expr_from_string(f"{resources.scratch}[...]")
     mask_expr = _load_mask_expr(state, subscript, tensor)
+    if return_ref:
+        if none_dims or mask_expr is not None:
+            raise NotImplementedError(
+                "resident HBM windows do not support inserted dimensions or masks"
+            )
+        return expr_from_string(resources.scratch)
+
+    result = expr_from_string(f"{resources.scratch}[...]")
     if mask_expr is not None:
         result = expr_from_string(
             "{result} * ({mask})", result=result, mask=expr_from_string(mask_expr)
@@ -236,6 +287,102 @@ def _hbm_load_expr(
             f"jnp.expand_dims({{result}}, axis={dim})", result=result
         )
     return result
+
+
+def _single_iteration_fori_loop(state: CodegenState) -> ForiLoopState | None:
+    """Return the active Pallas loop when every tiled axis has one iteration."""
+    from helion._compiler.tile_strategy import ForiLoopState
+
+    loop = next(
+        (
+            candidate
+            for loops in state.codegen.active_device_loops.values()
+            for candidate in loops
+            if isinstance(candidate, ForiLoopState)
+        ),
+        None,
+    )
+    if loop is None:
+        return None
+    for block_id in loop.block_ids:
+        info = loop.block_id_to_info[block_id]
+        block_size = state.device_function.resolved_block_size(block_id)
+        if (
+            not isinstance(block_size, int)
+            or info.begin_expr != 0
+            or not info.is_end_matching(block_size)
+        ):
+            return None
+    return loop
+
+
+def _hoistable_scalar_expr(state: CodegenState, value: object) -> str | None:
+    """Render loop-invariant integer arithmetic over scalar input loads."""
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, torch.SymInt):
+        return state.device_function.literal_expr(value)
+    if not isinstance(value, torch.fx.Node) or value.op != "call_function":
+        return None
+
+    from helion.language import memory_ops
+    from helion.language._tracing_ops import _new_var
+
+    if value.target is _new_var and value.args:
+        return _hoistable_scalar_expr(state, value.args[0])
+
+    binary_operators = {
+        operator.add: "+",
+        operator.floordiv: "//",
+        operator.mul: "*",
+        operator.sub: "-",
+        torch.ops.aten.add.Scalar: "+",
+        torch.ops.aten.add.Tensor: "+",
+        torch.ops.aten.div.Tensor_mode: "//",
+        torch.ops.aten.mul.Scalar: "*",
+        torch.ops.aten.mul.Tensor: "*",
+        torch.ops.aten.sub.Scalar: "-",
+        torch.ops.aten.sub.Tensor: "-",
+    }
+    if value.target in binary_operators and len(value.args) >= 2:
+        if (
+            value.target is torch.ops.aten.div.Tensor_mode
+            and value.kwargs.get("rounding_mode") != "floor"
+        ):
+            return None
+        if (
+            value.target
+            in (
+                torch.ops.aten.add.Scalar,
+                torch.ops.aten.add.Tensor,
+                torch.ops.aten.sub.Scalar,
+                torch.ops.aten.sub.Tensor,
+            )
+            and value.kwargs.get("alpha", 1) != 1
+        ):
+            return None
+        lhs = _hoistable_scalar_expr(state, value.args[0])
+        rhs = _hoistable_scalar_expr(state, value.args[1])
+        if lhs is None or rhs is None:
+            return None
+        return f"({lhs}) {binary_operators[value.target]} ({rhs})"
+
+    if value.target is memory_ops.load:
+        tensor_node, subscript = value.args[:2]
+        if not isinstance(tensor_node, torch.fx.Node):
+            return None
+        tensor = tensor_node.meta.get("val")
+        if not isinstance(tensor, torch.Tensor):
+            return None
+        if not isinstance(subscript, (list, tuple)) or len(subscript) != 1:
+            return None
+        index = _hoistable_scalar_expr(state, subscript[0])
+        if index is None:
+            return None
+        name = state.device_function.tensor_arg(tensor).name
+        return f"{name}[{index}]"
+
+    return None
 
 
 def resident_ref_load_expr(
@@ -251,10 +398,27 @@ def resident_ref_load_expr(
     from helion._compiler.pallas.tensorcore_plan import DmaGatherPlan
     from helion._compiler.pallas.tensorcore_plan import OneHotGatherPlan
 
-    arg_name, name, _patterns = _load_route(state, tensor)
+    arg_name, name, patterns = _load_route(state, tensor)
     device_fn = state.device_function
 
     assert state.fx_node is not None
+    from helion._compiler.pallas.plan_tiling import ContiguousRangeIndexPattern
+
+    if (
+        name == arg_name
+        and device_fn.pallas_memory_space.get(id(tensor)) is PallasMemorySpace.HBM
+        and any(
+            isinstance(pattern, ContiguousRangeIndexPattern) for pattern in patterns
+        )
+    ):
+        return _hbm_load_expr(
+            state,
+            subscript,
+            tensor,
+            arg_name,
+            return_ref=True,
+        )
+
     plan = state.fx_node.meta.get(TENSORCORE_PLAN_META)
     if isinstance(plan, DmaGatherPlan):
         dma_ref = memory_op_dma_scratch(state)
