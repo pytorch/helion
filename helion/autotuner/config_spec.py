@@ -3231,6 +3231,15 @@ class ConfigSpec:
                 )
             elif self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
+                # Rolled-reduction loop chunks are tunable on the SIMT path
+                # (LoopedReductionStrategy lane lattices).  Without this
+                # entry the chunk silently pins to its default and neither
+                # the seeds nor the search can change it.
+                if (
+                    self.supports_config_key("reduction_loops")
+                    and len(self.reduction_loops) > 0
+                ):
+                    fields["reduction_loops"] = self.reduction_loops
                 # Universal pid emission honors ``loop_orders`` and the
                 # better order is shape-dependent. tcgen05 exposes the same
                 # field from CuteTcgen05Config.flat_fields().
