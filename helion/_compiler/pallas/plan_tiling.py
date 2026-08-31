@@ -115,6 +115,134 @@ def plan_tiling(
             graph_info, graph_lookup, parent_ids
         )
         _analyze_indexing_expressions(graph_info, config, local_access_keys)
+    _plan_overlapped_direct_hbm_loads(graphs, config)
+
+
+def _plan_overlapped_direct_hbm_loads(
+    graphs: list[GraphInfo],
+    config: Config,
+) -> None:
+    """Stage aligned read-only inputs inside distributed projection kernels.
+
+    Launcher-managed VMEM BlockSpecs complete before the kernel body starts.
+    When a kernel also streams dynamic HBM windows and performs remote copies,
+    keeping independent inputs in HBM lets their local DMAs overlap those
+    streams instead of serializing the input prologue.
+    """
+    from ...language import distributed_ops
+    from ...language import memory_ops
+    from ...language.atomic_ops import ATOMIC_OPS
+    from ..compile_environment import CompileEnvironment
+    from ..device_function import DeviceFunction
+    from ..device_function import PallasMemorySpace
+    from ..host_function import HostFunction
+    from .dma import is_tpu_dma_aligned_shape
+
+    nodes = [node for graph in graphs for node in graph.graph.nodes]
+    if not any(
+        node.op == "call_function"
+        and node.target is distributed_ops.make_async_remote_copy
+        for node in nodes
+    ):
+        return
+    if not any(
+        node.op == "call_function"
+        and node.target is memory_ops.load
+        and any(
+            isinstance(pattern, ContiguousRangeIndexPattern)
+            for pattern in node.meta.get("indexing_patterns", ())
+        )
+        for node in nodes
+    ):
+        return
+
+    written_keys: set[str | int] = set()
+    loads_by_key: dict[str | int, list[tuple[torch.Tensor, torch.fx.Node]]] = {}
+    for node in nodes:
+        if node.op != "call_function":
+            continue
+        tensor_arg = node.args[0] if node.args else None
+        tensor = (
+            tensor_arg.meta.get("val")
+            if isinstance(tensor_arg, torch.fx.Node)
+            else None
+        )
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        key = _tensor_origin_key(tensor)
+        if node.target is memory_ops.load:
+            loads_by_key.setdefault(key, []).append((tensor, node))
+        elif node.target is memory_ops.store or node.target in ATOMIC_OPS:
+            written_keys.add(key)
+
+    env = CompileEnvironment.current()
+    device_fn = DeviceFunction.current()
+    host_inputs = HostFunction.current().tensor_to_origin
+
+    def load_shape(node: torch.fx.Node) -> tuple[int, ...] | None:
+        value = node.meta.get("val")
+        if not isinstance(value, torch.Tensor):
+            return None
+        patterns = node.meta.get("indexing_patterns", ())
+        shape = list(value.shape)
+        for dimension in reversed(
+            [
+                index
+                for index, pattern in enumerate(patterns)
+                if isinstance(pattern, NonePattern)
+            ]
+        ):
+            shape.pop(dimension)
+        resolved: list[int] = []
+        for size in shape:
+            block_id = env.resolve_block_id(size)
+            concrete = (
+                env.block_sizes[block_id].from_config(config)
+                if block_id is not None
+                else size
+            )
+            if not isinstance(concrete, int):
+                return None
+            resolved.append(concrete)
+        return tuple(resolved)
+
+    for key, loads in loads_by_key.items():
+        if key in written_keys:
+            continue
+        if any(
+            any(
+                isinstance(pattern, ContiguousRangeIndexPattern)
+                for pattern in node.meta.get("indexing_patterns", ())
+            )
+            for _tensor, node in loads
+        ):
+            # Dynamic windows already have a loop-aware DMA pipeline.  This
+            # pass only overlaps independent full-input loads with that stream.
+            continue
+        tensor = loads[0][0]
+        if tensor not in host_inputs:
+            continue
+        if any(
+            not isinstance(value := node.meta.get("val"), torch.Tensor)
+            or not all(isinstance(size, int) for size in value.shape)
+            for _loaded_tensor, node in loads
+        ):
+            continue
+        shapes = [load_shape(node) for _tensor, node in loads]
+        if not shapes or any(
+            shape is None
+            or not shape
+            or not is_tpu_dma_aligned_shape(shape, tensor.dtype)
+            for shape in shapes
+        ):
+            continue
+        # Hoisting is only safe for one source-level load. Repeated windows from
+        # the same input intentionally reuse one immediate DMA scratch buffer.
+        if len(loads) != 1:
+            continue
+        for loaded_tensor, _node in loads:
+            device_fn.pallas_direct_hbm_load_tensor_ids.add(id(loaded_tensor))
+            device_fn.pallas_memory_space[id(loaded_tensor)] = PallasMemorySpace.HBM
 
 
 def _tensor_origin_key(tensor: torch.Tensor) -> str | int:

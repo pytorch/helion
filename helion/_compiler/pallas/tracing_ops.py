@@ -1507,9 +1507,9 @@ def _hoist_initial_dma_before_pure_outer_compute(
     A buffered inner loop normally starts its first load immediately before
     entering the loop. If the address depends only on kernel arguments and
     constants, starting it before preceding elementwise root computation
-    exposes useful DMA/compute overlap. Stay conservative: cross only plain
-    assignments and compiler-owned scratch initialization, never user-visible
-    stores, structured control flow, or a producer of a value read by the DMA.
+    exposes useful DMA/compute overlap. The intervening work may itself contain
+    communication or stores; moving a read-only DMA across it is safe as long
+    as none of that work produces a value or mutates a ref read by the DMA.
     """
     from ..ast_read_writes import ReadWrites
 
@@ -1521,14 +1521,18 @@ def _hoist_initial_dma_before_pure_outer_compute(
     # ``outer`` produces it. Keep the prime inside that loop body in this case.
     if dma_reads.intersection(loop_local_names):
         return False
-    scratch_names = {scratch.name for scratch in state.device_function._scratch_args}
     for statement in outer:
-        if not isinstance(statement, ast.Assign):
-            return False
         rw = ReadWrites.from_ast(statement)
-        if set(rw.writes) & dma_reads or set(rw.inplace_writes) - scratch_names:
+        if (set(rw.writes) | set(rw.inplace_writes)) & dma_reads:
             return False
-    outer[:0] = statements
+    grid_state = state.codegen.current_grid_state
+    if (
+        state.device_function.pallas_hoisted_direct_dma_copy_names
+        and grid_state is not None
+    ):
+        grid_state.outer_prefix.extend(statements)
+    else:
+        outer[:0] = statements
     return True
 
 
