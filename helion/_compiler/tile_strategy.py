@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 
     from ..runtime.config import Config
     from .inductor_lowering import CodegenState
+    from .pallas.dma import DmaResources
 
     _T = TypeVar("_T")
     SymIntLike = torch.SymInt | int
@@ -1892,6 +1893,9 @@ class ForiLoopState(DeviceLoopOrGridState):
     _tensor_to_dma_scratch: dict[str, str] = dataclasses.field(default_factory=dict)
     _tensor_to_sem: dict[str, str] = dataclasses.field(default_factory=dict)
     _prefetched_load_tensors: set[str] = dataclasses.field(default_factory=set)
+    _memory_op_to_dma_scratch: dict[torch.fx.Node, DmaResources] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 @dataclasses.dataclass
@@ -1910,8 +1914,29 @@ class DeviceGridState(DeviceLoopOrGridState):
         self.lane_loop_blocks.add(block_id)
 
     def wrap_body(self, body: list[ast.AST]) -> list[ast.AST]:
-        wrapped: list[ast.AST] = [*self.lane_setup_statements, *body]
+        from .ast_read_writes import ReadWrites
+
+        # Drop setup statements (per-lane index/mask defs) whose results the
+        # body never reads, then skip any lane loop whose variable is left
+        # unreferenced. An unused rdim block (e.g. one allocated for a
+        # ``tile.index`` that codegen serves from the tile's own block) would
+        # otherwise wrap the whole body in a dead innermost loop, and the
+        # lane-reduce split pass would then try to split reductions on that
+        # loop's lane var instead of the loop that actually distributes them.
+        needed: set[str] = set()
+        for stmt in body:
+            needed |= set(ReadWrites.from_ast(stmt).reads)
+        kept_setup: list[ast.AST] = []
+        for stmt in reversed(self.lane_setup_statements):
+            rw = ReadWrites.from_ast(stmt)
+            if not rw.writes or set(rw.writes) & needed:
+                kept_setup.append(stmt)
+                needed |= set(rw.reads)
+        kept_setup.reverse()
+        wrapped: list[ast.AST] = [*kept_setup, *body]
         for lane_var, extent in reversed(self.lane_loops):
+            if lane_var not in needed:
+                continue
             wrapped = [_create_lane_loop(lane_var, extent, wrapped)]
         return wrapped
 
@@ -2453,19 +2478,63 @@ class BlockSizeTileStrategy(TileStrategy):
         if not env.backend.reduction_axis_first():
             return active_non_reduction_axes + active_reduction_axes
 
-        has_reduction_strategy = any(
-            isinstance(strategy, ReductionStrategy) and strategy.thread_axes_used() > 0
+        # Reduction strategies claim axes 0..n-1 in creation order
+        # (``_get_thread_axis``), so reserving only one axis when two
+        # multi-thread reductions are live would place this strategy on the
+        # same axis as the second reduction. That collision double-books the
+        # axis (e.g. a tile axis planned for 2 threads sharing thread_idx[1]
+        # with a 4-thread reduction), making the generated tile indices span
+        # more elements than the tile holds. Reserve one axis per reduction
+        # that actually spreads across threads; single-thread reductions
+        # (thread_idx is constant 0 on their axis) may share an axis safely.
+        reduction_strategies = [
+            strategy
             for strategy in self.fn.tile_strategy.strategies
+            if isinstance(strategy, ReductionStrategy)
+        ]
+        planned_reduction_axes = max(
+            sum(
+                1
+                for strategy in reduction_strategies
+                if strategy._reduction_thread_count() > 1
+            ),
+            1
+            if any(strategy.thread_axes_used() > 0 for strategy in reduction_strategies)
+            else 0,
         )
         if plan is not None and any(
             plan.disables_reduction_axis_reservation(block_id)
             for block_id in self.block_ids
         ):
             return active_non_reduction_axes + active_reduction_axes
-        reserved_reduction_axes = max(
-            1 if has_reduction_strategy else 0, active_reduction_axes
-        )
-        return reserved_reduction_axes + active_non_reduction_axes
+        reserved_reduction_axes = max(planned_reduction_axes, active_reduction_axes)
+        offset = reserved_reduction_axes + active_non_reduction_axes
+        tile_axes = set(range(offset, offset + self.thread_axes_used()))
+        executable_reductions = self.fn.tile_strategy.executable_reduction_block_ids()
+        for strategy in self.fn.tile_strategy.strategies:
+            if not isinstance(strategy, ReductionStrategy):
+                continue
+            if strategy.block_index not in executable_reductions:
+                continue
+            if not self.fn.tile_strategy.strategies_can_coexecute(self, strategy):
+                continue
+            if not any(size > 1 for size in strategy.thread_block_sizes()):
+                continue
+            reduction_axis = self.fn.tile_strategy.thread_axis_for_strategy(strategy)
+            if reduction_axis is None:
+                continue
+            reduction_axes = set(
+                range(reduction_axis, reduction_axis + strategy.thread_axes_used())
+            )
+            if collision := tile_axes & reduction_axes:
+                axes = ", ".join(map(str, sorted(collision)))
+                raise exc.BackendUnsupported(
+                    env.backend.name,
+                    "thread-axis collision: tile blocks "
+                    f"{self.block_ids} and executable reduction block "
+                    f"{strategy.block_index} both require axis {axes}",
+                )
+        return offset
 
     def select_pid_strategy(self) -> ProgramIDs:
         env = CompileEnvironment.current()
@@ -3122,7 +3191,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         """Hook: does ``block_id`` claim a CUDA thread axis under this strategy?
 
         Defaults to ``_uses_thread_axis(block_size)``. Subclasses that
-        track per-block-id state (e.g. ``CuteNDTileStrategy``'s
+        track per-block-id state (e.g. ``PerThreadNDTileStrategy``'s
         ``inactive_block_ids``) override this to return False for
         block_ids that don't claim an axis so the grid / device-loop
         codegen does not emit ``thread_idx[axis]`` for them.
@@ -3623,8 +3692,13 @@ class NDTileStrategy(_BaseNDTileStrategy):
         return super().select_pid_strategy()
 
 
-class CuteNDTileStrategy(NDTileStrategy):
-    """CuTe N-D tile strategy using the standard tile pipeline."""
+class PerThreadNDTileStrategy(NDTileStrategy):
+    """N-D tiling for backends that give each thread one element of the tile.
+
+    Adds, on top of :class:`NDTileStrategy`, the per-axis ``num_threads`` split
+    and the lane loop it implies: an axis served by fewer threads than its
+    block size has each thread walk ``block_size // num_threads`` elements.
+    """
 
     def __init__(
         self,
@@ -3763,20 +3837,22 @@ class CuteNDTileStrategy(NDTileStrategy):
         nt = self.num_threads[idx]
         if nt == 0:
             return block_size
+        backend_name = CompileEnvironment.current().backend.name
         resolved_block_size = block_size
         if not isinstance(resolved_block_size, int):
             static_block_size = self._configured_block_size_int(resolved_block_size)
             if static_block_size is None:
                 raise exc.BackendUnsupported(
-                    "cute",
-                    "num_threads requires static ND block sizes for cute",
+                    backend_name,
+                    f"num_threads requires static ND block sizes for {backend_name}",
                 )
             resolved_block_size = static_block_size
         if resolved_block_size % nt != 0:
             raise exc.BackendUnsupported(
-                "cute",
+                backend_name,
                 (
-                    "block size must be divisible by num_threads for cute axis "
+                    f"block size must be divisible by num_threads for "
+                    f"{backend_name} axis "
                     f"{block_id}: {resolved_block_size} is not divisible by {nt}"
                 ),
             )
@@ -4242,8 +4318,13 @@ class CuteNDTileStrategy(NDTileStrategy):
         return False
 
 
-class CuteFlattenedTileStrategy(FlattenedTileStrategy):
-    """Flattened CuTe strategy: scalar index per thread over a flattened tile."""
+class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
+    """Flattened tiling with one scalar index per thread.
+
+    The flattened counterpart of :class:`PerThreadNDTileStrategy`: a single
+    ``num_threads`` splits the flattened tile, and a lane loop covers the rest
+    when it is narrower than the block size.
+    """
 
     def __init__(
         self,
@@ -4270,16 +4351,18 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
     def _thread_extent(self) -> SymIntLike:
         if self._num_threads == 0:
             return self.block_size
+        backend_name = CompileEnvironment.current().backend.name
         if not isinstance(self.block_size, int):
             raise exc.BackendUnsupported(
-                "cute",
-                "num_threads requires static flattened block sizes for cute",
+                backend_name,
+                f"num_threads requires static flattened block sizes for {backend_name}",
             )
         if self.block_size % self._num_threads != 0:
             raise exc.BackendUnsupported(
-                "cute",
+                backend_name,
                 (
-                    "block size must be divisible by num_threads for cute: "
+                    f"block size must be divisible by num_threads for "
+                    f"{backend_name}: "
                     f"{self.block_size} is not divisible by {self._num_threads}"
                 ),
             )

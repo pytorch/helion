@@ -50,12 +50,59 @@ log = logging.getLogger(__name__)
 TensorDescriptorLayoutSignature = tuple[int | None, tuple[bool, ...]]
 
 
+@dataclasses.dataclass(frozen=True)
+class ConfigValueExpression:
+    """Small integer expression whose leaves are emitted config values."""
+
+    operation: str
+    arguments: tuple[int | str | ConfigValueExpression, ...]
+
+    def evaluate(self, config: Config) -> int:
+        def value(arg: int | str | ConfigValueExpression) -> int:
+            if isinstance(arg, ConfigValueExpression):
+                return arg.evaluate(config)
+            if isinstance(arg, str):
+                result = config[arg]
+                if not isinstance(result, int):
+                    raise TypeError(f"config value {arg!r} is not an integer")
+                return result
+            return arg
+
+        args = tuple(value(arg) for arg in self.arguments)
+        if self.operation == "config":
+            assert len(self.arguments) == 1 and isinstance(self.arguments[0], str)
+            return value(self.arguments[0])
+        if self.operation == "cdiv":
+            assert len(args) == 2
+            return (args[0] + args[1] - 1) // args[1]
+        if self.operation == "next_power_of_2":
+            assert len(args) == 1
+            return next_power_of_2(args[0])
+        raise ValueError(f"unknown config expression operation {self.operation!r}")
+
+
 @dataclasses.dataclass
 class TensorDescriptorLayoutGuard:
     ndim: int
     element_size: int
     memory_op_indices: set[int] = dataclasses.field(default_factory=set)
     atomic_op_indices: set[int] = dataclasses.field(default_factory=set)
+
+
+@dataclasses.dataclass(frozen=True)
+class RuntimeInputSpecialization:
+    """Internal runtime-input projection used to extend a kernel cache key.
+
+    ``classifier_identity`` distinguishes classifier semantics when compiler
+    discovery registers the same named projection more than once. Runtime cache
+    state is deliberately excluded from descriptor equality.
+    """
+
+    sources: tuple[Source, ...]
+    classifier_identity: typing.Hashable
+    classifier: typing.Callable[[typing.Sequence[object]], typing.Hashable] = (
+        dataclasses.field(compare=False, repr=False)
+    )
 
 
 def _is_supported_tensor_input_source(source: Source) -> bool:
@@ -201,6 +248,7 @@ if TYPE_CHECKING:
 
     from .. import Config
     from ..runtime.settings import Settings
+    from .autotuner_heuristics.registry import CompilerHeuristicSpecializationFact
     from .backend import Backend
     from .pallas.compact_worklist import CompactWorklistPlan
     from .pallas.compact_worklist import ResidentCacheDecision
@@ -296,6 +344,7 @@ class CompileEnvironment:
         # TODO(jansel): check for guards in the shapeenv
         self.fake_mode = FakeTensorMode(shape_env=self.shape_env)
         self.input_sources: dict[torch.Tensor, Source] = {}
+        self._ambiguous_tensor_input_source_ids: set[int] = set()
         self._runtime_arg_values_by_name: contextvars.ContextVar[
             dict[str, object] | None
         ] = contextvars.ContextVar(
@@ -303,6 +352,11 @@ class CompileEnvironment:
             default=None,
         )
         self.cute_resolved_wrapper_plans: list[dict[str, object]] = []
+        # Host integer helpers such as cdiv/next_power_of_2 deliberately return
+        # unbacked SymInts during tracing. Preserve the config expression beside
+        # that symbol so a fixed block size derived from a user tunable can still
+        # be resolved for each candidate configuration.
+        self.config_value_expressions: dict[sympy.Expr, ConfigValueExpression] = {}
         self.block_sizes: list[BlockSizeInfo] = []
         self.debug_shape_renames: dict[sympy.Basic, sympy.Basic] = {}
         self._debug_shape_rename_override: contextvars.ContextVar[
@@ -324,6 +378,13 @@ class CompileEnvironment:
             num_sm=_num_sm,
             log_restrictions_verbose=settings.autotune_log_search_space_verbose,
         )
+        # Correctness facts registered by compiler heuristics can depend on
+        # dynamic runtime inputs even when seed generation is disabled or later
+        # found ineligible. Bound-kernel caching consumes this set separately
+        # from specialization requirements of heuristics that emitted seeds.
+        self.compiler_fact_specialization_facts: frozenset[
+            CompilerHeuristicSpecializationFact
+        ] = frozenset()
         # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
             collections.Counter()
@@ -332,9 +393,12 @@ class CompileEnvironment:
         self.kernel_min_element_bits: int = 32  # smallest dtype bits across all tensors
         self.specialized_vars: set[sympy.Symbol] = set()
         self.specialized_strides: set[TensorPropertySource] = set()
+        # Config-backed values created by hl.register_tunable().
+        self.tunable_symbols: set[sympy.Symbol] = set()
         self.tensor_descriptor_layout_guards: dict[
             Source, TensorDescriptorLayoutGuard
         ] = {}
+        self.runtime_input_specializations: dict[str, RuntimeInputSpecialization] = {}
         self._tensor_input_source_cache: dict[int, Source | None] = {}
         self.jagged_tile_parent_ids: dict[int, list[int]] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
@@ -550,6 +614,9 @@ class CompileEnvironment:
         cache_key = id(fake_tensor)
         if cache_key in self._tensor_input_source_cache:
             return self._tensor_input_source_cache[cache_key]
+        if cache_key in self._ambiguous_tensor_input_source_ids:
+            self._tensor_input_source_cache[cache_key] = None
+            return None
 
         source = self.input_sources.get(fake_tensor)
         from .host_function import HostFunction
@@ -575,6 +642,23 @@ class CompileEnvironment:
 
         self._tensor_input_source_cache[cache_key] = result
         return result
+
+    def runtime_value_for_tensor(self, fake_tensor: torch.Tensor) -> object | None:
+        """Replay a traced tensor's input source against the current real arguments."""
+        source = self.tensor_input_source(fake_tensor)
+        if source is None:
+            return None
+        return _replay_tensor_input_source(source, self.runtime_arg_values_by_name)
+
+    def register_runtime_input_specialization(
+        self,
+        key: str,
+        specialization: RuntimeInputSpecialization,
+    ) -> None:
+        """Register an internal projection from runtime inputs to a cache-key fact."""
+        previous = self.runtime_input_specializations.setdefault(key, specialization)
+        if previous != specialization:
+            raise RuntimeError(f"conflicting runtime input specializations for {key!r}")
 
     def tensor_descriptor_layout_signature(
         self, fake_tensor: torch.Tensor
@@ -1243,7 +1327,12 @@ class CompileEnvironment:
             result = self.fake_mode.fake_tensor_converter.from_real_tensor(
                 self.fake_mode, tensor, shape_env=self.shape_env, source=source
             )
-        self.input_sources[result] = source
+        previous_source = self.input_sources.get(result)
+        if previous_source is not None and previous_source != source:
+            self._ambiguous_tensor_input_source_ids.add(id(result))
+            self._tensor_input_source_cache.pop(id(result), None)
+        else:
+            self.input_sources[result] = source
         if isinstance(source, LocalSource):
             for i, s in enumerate(result.size()):
                 if isinstance(s, torch.SymInt) and isinstance(

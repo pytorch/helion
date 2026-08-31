@@ -35,13 +35,17 @@ pretuned_kernels/
 ├── grouped_gemm_deepgemm/            # B200 grouped BF16 vs DeepGEMM + cuBLAS
 ├── nvfp4_gemv/                       # B200 Triton NVFP4 (W4A4 / W4A16) decode GEMV
 ├── nvfp4_gemv_cute/                  # B200 Helion CuTe NVFP4 decode GEMV
+├── projection_rotary/                # B200 CuTe projection + rotary fragment epilogue
+├── interleaved_swiglu/               # B200 CuTe projection + compact SwiGLU epilogue
 ├── silu_mul_fp8/                     # ported from vLLM (vllm/kernels/helion/ops)
 ├── dynamic_per_token_scaled_fp8_quant/
 ├── per_token_group_fp8_quant/
 ├── rms_norm_dynamic_per_token_quant/
 ├── rms_norm_per_block_quant/
 ├── silu_and_mul_per_block_quant/
-└── fused_qk_norm_rope/
+├── fused_qk_norm_rope/
+├── causal_conv1d/                    # TPU/Pallas fixed-config decode kernel
+└── gdn_decode/                       # TPU/Pallas fixed-config recurrent decode
 ```
 
 Each kernel ships with one heuristic file per supported compute capability.
@@ -61,6 +65,8 @@ At runtime Helion picks the file matching the current GPU.
 | `grouped_gemm_deepgemm` | Eight official DeepGEMM BF16 grouped-NT shapes with deterministic heterogeneous per-group M (B200 CuTe only) | pinned DeepGEMM `m_grouped_bf16_gemm_nt_contiguous` + CUDA's `cublasGemmGroupedBatchedEx` |
 | `nvfp4_gemv` | Decode (M=1) NVFP4 GEMV `(N, K)` weight shapes (Llama-3 / Qwen projections), W4A4 + W4A16 (B200 Triton backend) | NVFP4 dequant reference + vLLM CUTLASS `cutlass_scaled_fp4_mm` |
 | `nvfp4_gemv_cute` | Decode (M=1) NVFP4 GEMV `(N, K)` weight shapes, W4A4 + W4A16, using Helion kernels compiled with the CuTe backend on B200 | NVFP4 dequant reference + vLLM CUTLASS `cutlass_scaled_fp4_mm` |
+| `projection_rotary` | BF16 `(M=1024, K=4096, heads=32, D=128)` projection with fused bias and adjacent-pair rotary mixing (B200 CuTe only) | eager BF16 projection + rotary composition |
+| `interleaved_swiglu` | BF16 `(M=1024, K=4096, heads=1, packed D=11008)` projection with interleaved gate/value columns (B200 CuTe only) | eager BF16 projection + SwiGLU composition |
 | `silu_mul_fp8` | vLLM `(num_tokens, intermediate)` decode shapes | torch-native silu-and-mul + fp8 quant |
 | `dynamic_per_token_scaled_fp8_quant` | vLLM `(num_tokens, hidden)` shapes | torch-native per-token fp8 quant |
 | `per_token_group_fp8_quant` | vLLM `(num_tokens, hidden, group)` shapes | torch-native per-group fp8 quant |
@@ -68,6 +74,8 @@ At runtime Helion picks the file matching the current GPU.
 | `rms_norm_per_block_quant` | vLLM `(num_tokens, hidden, group)` shapes | torch-native RMSNorm + per-block fp8 quant |
 | `silu_and_mul_per_block_quant` | vLLM `(num_tokens, intermediate, group)` shapes | torch-native silu-and-mul + per-block fp8 quant |
 | `fused_qk_norm_rope` | vLLM `(num_tokens, q_heads, kv_heads)` shapes | torch-native fused QK-RMSNorm + RoPE |
+| `causal_conv1d` | TPU decode `N=512, H=4, D=128, W=4` | tpu-inference `ragged_causal_conv1d` |
+| `gdn_decode` | TPU decode `N=512, H=2, K=V=128` | tpu-inference `fused_decoding_gdn` |
 
 Most kernels additionally benchmark against `torch.compile` of the listed
 PyTorch baseline (a speedup-comparison baseline only -- correctness is checked
@@ -93,6 +101,14 @@ The kernels ported from vLLM (`vllm/kernels/helion/ops`) benchmark each fused
 Helion kernel under CUDA graphs against a torch-native (unfused, eager)
 reference; `silu_mul_fp8` ships an `sm90` heuristic only, the rest ship both
 `sm90` and `sm100`.
+
+`causal_conv1d` and `gdn_decode` are Pallas kernels with checked-in fixed
+configurations rather than CUDA AOT heuristic files. Their module-level
+`main()` functions run real-TPU JAX-export correctness checks. They are not
+registered in the CUDA-only aggregate runner. The implementations and
+baselines follow the Apache-licensed `vllm-project/tpu-inference` state-cache
+contracts; `gdn_decode` currently targets `H=2` because larger recurrent-state
+tiles exceed Helion's current aligned indirect-DMA VMEM plan.
 
 ## Scope
 

@@ -40,10 +40,17 @@ from ..compile_environment import CompileEnvironment
 from ..compile_environment import _symint_sympy_expr
 from ..device_function import find_block_size_symbols
 from ..host_function import HostFunction
+from .dma import DmaResources
 from .dma import DmaTransfer
+from .dma import IndirectDmaTransfer
 from .dma import ScheduledDmaTransfer
 from .dma import allocate_dma_resources
+from .dma import allocate_indirect_dma_resources
 from .dma import async_copy_statements
+from .dma import indirect_group_statements
+from .dma import is_tpu_dma_aligned_shape
+from .tensorcore_plan import DmaAccessPlan
+from .tensorcore_plan import build_dma_access_candidates
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +60,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ...runtime.config import Config
+    from ..device_ir import GraphInfo
     from ..generate_ast import ResidentPrepLowering
     from ..inductor_lowering import CodegenState
     from ..tile_strategy import LoopDimInfo
@@ -613,12 +621,221 @@ def _classify_loop_tensors(
     return loaded_tensors, stored_tensors
 
 
-def _tensor_dim_subscripts(subscript_meta: list[object]) -> list[object]:
+def _dma_plan_for_node(node: torch.fx.Node) -> DmaAccessPlan | None:
+    from .tensorcore_plan import TENSORCORE_PLAN_META
+
+    plan = node.meta.get(TENSORCORE_PLAN_META)
+    return plan if isinstance(plan, DmaAccessPlan) else None
+
+
+def _collect_indirect_accesses(
+    graphs: list[GraphInfo],
+    graph_info: GraphInfo,
+    block_ids: list[int],
+    block_extents: dict[int, int],
+    active_block_ids: set[int],
+) -> tuple[list[IndirectDmaTransfer], set[int]]:
+    """Return indirect gathers and paired writebacks owned by one scheduler."""
+    from ..device_function import DeviceFunction
+    from .memory_access import MemoryAccessKind
+    from .plan_tiling import ArbitraryIndexPattern
+    from .plan_tiling import TileBeginWithOffsetPattern
+    from .plan_tiling import TilePattern
+
+    admitted: list[IndirectDmaTransfer] = []
+    metadata_ids: set[int] = set()
+
+    optional_dma = (
+        DeviceFunction.current().config.get("pallas_indirect_access_mode", "one_hot")
+        == "dma"
+    )
+    if not optional_dma:
+        return [], set()
+    for candidate in build_dma_access_candidates(graphs):
+        if candidate.graph_id != graph_info.graph_id:
+            continue
+        specs = [candidate.load]
+        if candidate.store is not None:
+            specs.append(candidate.store)
+        plans = [_dma_plan_for_node(spec.node) for spec in specs]
+        if not any(plan is not None for plan in plans):
+            continue
+        if any(plan is None for plan in plans):
+            raise InvalidConfig(
+                "indirect DMA requires the paired state load and store to use "
+                "the same DMA schedule"
+            )
+        for spec, plan in zip(specs, plans, strict=True):
+            assert plan is not None
+            node = spec.node
+            tensor = plan.access.tensor
+            extent = block_extents.get(plan.spec.index_block_id)
+            if plan.spec.index_block_id not in block_ids or extent is None:
+                raise InvalidConfig(
+                    "indirect DMA address metadata is not owned by the active scheduler"
+                )
+            if extent % plan.group_count != 0:
+                raise InvalidConfig(
+                    f"indirect DMA block size {plan.group_count} does not divide "
+                    f"scheduler extent {extent}"
+                )
+
+            index_access = plan.spec.index_access
+            patterns = index_access.patterns
+            sub_meta = _extract_subscript_vals(index_access.subscript)
+            if len(patterns) != len(sub_meta) or any(
+                not (
+                    isinstance(pattern, TilePattern)
+                    or (
+                        isinstance(pattern, TileBeginWithOffsetPattern)
+                        and pattern.block_id in active_block_ids
+                    )
+                    or (
+                        isinstance(pattern, ArbitraryIndexPattern)
+                        and isinstance(index, (int, torch.SymInt))
+                    )
+                )
+                for pattern, index in zip(patterns, sub_meta, strict=True)
+            ):
+                raise InvalidConfig(
+                    "indirect DMA address metadata cannot be sliced by the active "
+                    "scheduler"
+                )
+
+            admitted.append(
+                IndirectDmaTransfer(
+                    tensor=tensor,
+                    subscript=tuple(_extract_subscript_vals(node.args[1])),
+                    direction=(
+                        "load" if plan.access.kind is MemoryAccessKind.LOAD else "store"
+                    ),
+                    plan=plan,
+                )
+            )
+        metadata_ids.update(candidate.metadata_tensor_ids)
+
+    return admitted, metadata_ids
+
+
+def _collect_fori_indirect_accesses(
+    graph_info: object,
+    block_ids: list[int],
+    state: CodegenState,
+) -> tuple[list[IndirectDmaTransfer], set[int]]:
+    """Admit static indirect accesses owned by one fori scheduler."""
+    from ..device_ir import ForLoopGraphInfo
+    from ..tile_strategy import DeviceLoopState
+    from ..tile_strategy import EmitPipelineLoopState
+    from ..tile_strategy import ForiLoopState
+
+    env = CompileEnvironment.current()
+    if state.config.get("pallas_indirect_access_mode", "one_hot") != "dma":
+        return [], set()
+    nested_scheduler = any(
+        isinstance(loop, (DeviceLoopState, EmitPipelineLoopState, ForiLoopState))
+        for loops in state.codegen.active_device_loops.values()
+        for loop in loops
+    )
+    if (
+        not isinstance(graph_info, ForLoopGraphInfo)
+        or len(block_ids) != 1
+        or env.compact_worklist_plan is not None
+        or nested_scheduler
+    ):
+        return [], set()
+
+    steps = state.proxy_arg(4) if len(state.proxy_args) > 4 else None
+    step = steps[0] if isinstance(steps, (list, tuple)) else steps
+    if step is not None and sympy.sympify(step) not in (
+        sympy.Integer(0),
+        sympy.Integer(1),
+    ):
+        return [], set()
+    begin, end = _get_loop_begin_and_end(state, 0)
+    try:
+        extent = int(end) - int(begin)
+    except (TypeError, ValueError):
+        return [], set()
+
+    active_block_ids = {
+        block_id
+        for block_id, loops in state.codegen.active_device_loops.items()
+        if loops
+    } | set(block_ids)
+    accesses, metadata_ids = _collect_indirect_accesses(
+        list(state.codegen.codegen_graphs),
+        graph_info,
+        block_ids,
+        {block_ids[0]: extent},
+        active_block_ids,
+    )
+    from ..device_function import DeviceFunction
+    from ..device_function import PallasMemorySpace
+
+    device_fn = DeviceFunction.current()
+    for access in accesses:
+        device_fn.pallas_memory_space[id(access.tensor)] = PallasMemorySpace.HBM
+    return accesses, metadata_ids
+
+
+def plan_grid_indirect_accesses(graphs: list[GraphInfo]) -> None:
+    """Bind root-grid indirect accesses to immediate-wait DMA scratch."""
+    from ..device_function import DeviceFunction
+    from ..device_function import PallasMemorySpace
+    from ..device_ir import RootGraphInfo
+
+    env = CompileEnvironment.current()
+    device_fn = DeviceFunction.current()
+    if env.compact_worklist_plan is not None or env.settings.pallas_interpret:
+        return
+    device_ir = HostFunction.current().device_ir
+    graph_by_id = {graph.graph_id: graph for graph in graphs}
+    for root_id, block_ids in zip(
+        device_ir.root_ids, device_ir.grid_block_ids, strict=True
+    ):
+        graph_info = graph_by_id.get(root_id)
+        if not isinstance(graph_info, RootGraphInfo):
+            continue
+        block_extents: dict[int, int] = {}
+        for block_id in block_ids:
+            size = env.block_sizes[block_id].size
+            if not isinstance(size, (int, torch.SymInt)):
+                break
+            extent = env.try_concretize_symint(size)
+            if not isinstance(extent, int) or extent <= 0:
+                break
+            block_extents[block_id] = extent
+        if len(block_extents) != len(block_ids):
+            continue
+        accesses, _ = _collect_indirect_accesses(
+            graphs,
+            graph_info,
+            block_ids,
+            block_extents,
+            set(block_ids),
+        )
+        load_resources_by_storage: dict[int, DmaResources] = {}
+        for access in accesses:
+            node = access.plan.access.node
+            storage_id = id(access.tensor.untyped_storage())
+            resources = allocate_indirect_dma_resources(
+                device_fn,
+                access,
+                buffer_count=1,
+                load_resources=load_resources_by_storage.get(storage_id),
+            )
+            if access.direction == "load":
+                load_resources_by_storage[storage_id] = resources
+            device_fn.pallas_grid_dma_bindings[node] = resources
+            device_fn.pallas_memory_space[id(access.tensor)] = PallasMemorySpace.HBM
+
+
+def _tensor_dim_subscripts(subscript_meta: Sequence[object]) -> list[object]:
     """Drop rank-expanding ``None`` entries from a tensor subscript."""
     return [index for index in subscript_meta if index is not None]
 
 
-def _subscript_at_dim(subscripts: list[object], dim: int) -> object:
+def _subscript_at_dim(subscripts: Sequence[object], dim: int) -> object:
     return subscripts[dim] if dim < len(subscripts) else slice(None)
 
 
@@ -1473,11 +1690,66 @@ def _pipeline_begin_alignment(
     return None
 
 
+def _fixed_loop_extent(state: CodegenState, loop_dim_index: int) -> int | None:
+    """Return a direct ``end = begin + constant`` loop extent, if present.
+
+    Device-loop bounds that come from scalar tensor arithmetic are no longer
+    symbolic integers by codegen time. Their generated names therefore do not
+    retain enough information for SymPy simplification, but the enclosing
+    ``_for_loop`` FX node still records the original relationship. Keep this
+    matcher deliberately narrow: it proves only a direct, positive constant
+    addition (or the equivalent subtraction on the begin).
+    """
+    node = state.fx_node
+    if node is None or len(node.args) < 3:
+        return None
+    raw_begins, raw_ends = node.args[1:3]
+    begins = list(raw_begins) if isinstance(raw_begins, (list, tuple)) else [raw_begins]
+    ends = list(raw_ends) if isinstance(raw_ends, (list, tuple)) else [raw_ends]
+    if loop_dim_index >= len(begins) or loop_dim_index >= len(ends):
+        return None
+    begin = begins[loop_dim_index]
+    end = ends[loop_dim_index]
+
+    def _positive_int(value: object) -> int | None:
+        if isinstance(value, (int, sympy.Integer)) and int(value) > 0:
+            return int(value)
+        return None
+
+    if isinstance(begin, (int, sympy.Integer)) and isinstance(
+        end, (int, sympy.Integer)
+    ):
+        return _positive_int(int(end) - int(begin))
+
+    if isinstance(end, torch.fx.Node) and end.op == "call_function":
+        if (
+            end.target
+            in (operator.add, torch.ops.aten.add.Tensor, torch.ops.aten.add.Scalar)
+            and len(end.args) >= 2
+            and end.kwargs.get("alpha", 1) == 1
+        ):
+            if end.args[0] is begin:
+                return _positive_int(end.args[1])
+            if end.args[1] is begin:
+                return _positive_int(end.args[0])
+    if isinstance(begin, torch.fx.Node) and begin.op == "call_function":
+        if (
+            begin.target
+            in (operator.sub, torch.ops.aten.sub.Tensor, torch.ops.aten.sub.Scalar)
+            and len(begin.args) >= 2
+            and begin.kwargs.get("alpha", 1) == 1
+        ):
+            if begin.args[0] is end:
+                return _positive_int(begin.args[1])
+    return None
+
+
 def _compute_pipeline_or_dma_extra_pad(
     begin_expr: str,
     bid: int,
     env: CompileEnvironment,
     state: CodegenState,
+    loop_dim_index: int | None = None,
 ) -> int:
     """Return extra host-side padding for a pipeline/DMA dim with a non-zero begin.
 
@@ -1493,6 +1765,10 @@ def _compute_pipeline_or_dma_extra_pad(
     bs_val = state.device_function.resolved_block_size(bid)
     if not isinstance(bs_val, int):
         return 0
+    if loop_dim_index is not None:
+        extent = _fixed_loop_extent(state, loop_dim_index)
+        if extent is not None and extent % bs_val == 0:
+            return 0
     alignment = _pipeline_begin_alignment(begin_expr, state)
     if alignment is not None and alignment % bs_val == 0:
         return 0
@@ -2708,7 +2984,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 from ...language.memory_ops import _record_pad_info
 
                 extra_pad = _compute_pipeline_or_dma_extra_pad(
-                    begin_expr, bid, env, state
+                    begin_expr, bid, env, state, bid_idx
                 )
                 begin_is_zero = begin_expr == "0"
                 end_expr = end_exprs[bid_idx]
@@ -3187,26 +3463,6 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     return None
 
 
-def _check_dma_alignment(vmem_shape: tuple[int, ...]) -> bool:
-    """Check if a VMEM buffer shape satisfies TPU DMA alignment.
-
-    DMA requires last dim % 128 == 0 and second-to-last dim % 8 == 0
-    for 2D+ tensors. Note that these rules are currently optimized for
-    bf16 sublanes; they are overly conservative for f32 (no constraint)
-    and too lenient for 1D (which should be % 1024).
-
-    These rules differ from outer BlockSpec constraints where 1D is
-    dtype-dependent: 128 * (32 / bitwidth(dtype)). Unlike outer BlockSpecs,
-    emit_pipeline/fori_loop inner DMA does NOT have a ``block == tensor_dim``
-    exception.
-    """
-    if len(vmem_shape) >= 2:
-        return vmem_shape[-1] % 128 == 0 and vmem_shape[-2] % 8 == 0
-    if len(vmem_shape) == 1:
-        return vmem_shape[0] % 128 == 0
-    return True
-
-
 def _is_supported_contiguous_row_slab_dma(
     fake: torch.Tensor,
     sub_meta: list[object],
@@ -3283,7 +3539,7 @@ def _can_stream_inner_tile(
     state: CodegenState,
 ) -> bool:
     """Return whether a loop-local tensor should use the inner streaming path."""
-    if _check_dma_alignment(vmem_shape):
+    if is_tpu_dma_aligned_shape(vmem_shape, fake.dtype):
         return True
     if direction != "load":
         return False
@@ -3635,6 +3891,9 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
         state, block_ids, block_size_vars
     )
+    indirect_accesses, dma_metadata_ids = _collect_fori_indirect_accesses(
+        graph_info, block_ids, state
+    )
 
     # --- Handle loop-carried state as scratch VMEM buffers ---
     scratch_names: list[str] = []
@@ -3667,6 +3926,12 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     all_tensor_info, vmem_shapes, pipelined_tensor_ids = _classify_pipelined_tensors(
         loaded_tensors, stored_tensors, block_ids, slice_size_exprs, env, state
     )
+    # Indirect addresses must be available before the graph body so the
+    # scheduler can form the next iteration's HBM Refs. Keep their producer
+    # tensors on the enclosing BlockSpec instead of streaming them here.
+    pipelined_tensor_ids -= dma_metadata_ids | {
+        id(access.tensor) for access in indirect_accesses
+    }
 
     # Compact worklist: the compact-tile aligned_load and exact_store tensors use
     # max-sized window BlockSpecs, which Pallas double-buffers across the
@@ -3720,6 +3985,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     immediate_loads: list[ScheduledDmaTransfer] = []
     dma_stores: list[ScheduledDmaTransfer] = []
     scheduled_by_hbm_name: dict[str, ScheduledDmaTransfer] = {}
+    memory_op_to_dma_scratch: dict[torch.fx.Node, DmaResources] = {}
     # compact_worklist shares this lowering but keeps its compact/resident routes;
     # only an actual fori_loop config enables depth-two staging.
     load_buffer_counts_active = state.config.get("pallas_loop_type") == "fori_loop"
@@ -3738,8 +4004,9 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     stored_tensor_storages = {
         id(fake.untyped_storage()) for fake, _node, _sub_meta in stored_tensors.values()
     }
-
-    dma_transfers: list[tuple[DmaTransfer, tuple[int, ...]]] = []
+    dma_transfers: list[tuple[DmaTransfer, tuple[int, ...]]] = [
+        (transfer, transfer.plan.transfer_shape) for transfer in indirect_accesses
+    ]
     for (fake, sub_meta, direction), vmem_shape in zip(
         all_tensor_info, vmem_shapes, strict=True
     ):
@@ -3756,6 +4023,12 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             )
         )
 
+    indirect_load_resources_by_storage: dict[int, DmaResources] = {}
+    indirect_store_storages = {
+        id(transfer.tensor.untyped_storage())
+        for transfer in indirect_accesses
+        if transfer.direction == "store"
+    }
     for transfer, vmem_shape in dma_transfers:
         fake = transfer.tensor
         storage_id = id(fake.untyped_storage())
@@ -3767,6 +4040,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             if load_buffer_counts_active
             and transfer.direction == "load"
             and storage_id not in stored_tensor_storages
+            and storage_id not in indirect_store_storages
             and input_slots is not None
             and len(input_slots) == 1
             else 1
@@ -3784,14 +4058,24 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         )
         resource_cache = (
             state.codegen.grouped_fori_dma_resource_cache
-            if state.codegen.grouped_compact_common_statements is not None
+            if not isinstance(transfer, IndirectDmaTransfer)
+            and state.codegen.grouped_compact_common_statements is not None
             and _is_compact_ordered_inner_loop(state)
             else None
         )
         cached_resource = (
             resource_cache.get(resource_key) if resource_cache is not None else None
         )
-        if cached_resource is None:
+        if isinstance(transfer, IndirectDmaTransfer):
+            resources = allocate_indirect_dma_resources(
+                state.device_function,
+                transfer,
+                buffer_count=load_buffer_count,
+                load_resources=indirect_load_resources_by_storage.get(storage_id),
+            )
+        elif cached_resource is None:
+            scratch_hint = hbm_name.replace("_hbm", "") + "_buf"
+            sem_hint = hbm_name.replace("_hbm", "") + "_sem"
             shape_sources = (
                 _runtime_vmem_shape_sources(
                     fake, list(transfer.subscript), block_ids, env
@@ -3804,29 +4088,38 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 transfer,
                 vmem_shape=vmem_shape,
                 buffer_count=load_buffer_count,
-                scratch_hint=hbm_name.replace("_hbm", "") + "_buf",
-                semaphore_hint=hbm_name.replace("_hbm", "") + "_sem",
+                scratch_hint=scratch_hint,
+                semaphore_hint=sem_hint,
                 shape_sources=shape_sources,
             )
             if resource_cache is not None:
                 resource_cache[resource_key] = resources
         else:
             resources = cached_resource
+        if isinstance(transfer, IndirectDmaTransfer) and transfer.direction == "load":
+            indirect_load_resources_by_storage[storage_id] = resources
         scheduled = ScheduledDmaTransfer(transfer, resources)
-        tensor_to_dma_scratch[hbm_name] = resources.scratch
-        tensor_to_sem[hbm_name] = resources.semaphore
-        scheduled_by_hbm_name[hbm_name] = scheduled
+
+        if not isinstance(transfer, IndirectDmaTransfer):
+            tensor_to_dma_scratch[hbm_name] = resources.scratch
+            tensor_to_sem[hbm_name] = resources.semaphore
+            scheduled_by_hbm_name[hbm_name] = scheduled
+            if uses_load_prefetch:
+                prefetched_load_tensors.add(hbm_name)
+        else:
+            memory_op_to_dma_scratch[transfer.plan.access.node] = resources
 
         if transfer.direction == "store":
             dma_stores.append(scheduled)
         elif uses_load_prefetch:
-            prefetched_load_tensors.add(hbm_name)
             prefetched_loads.append(scheduled)
+        elif isinstance(transfer, IndirectDmaTransfer):
+            immediate_loads.append(scheduled)
 
     # ``all_tensor_info`` represents a read-modify-write tensor only by its
-    # store record so that its load and store share one VMEM buffer. Rebuild
-    # the immediate load from its original load site to preserve ordering
-    # before nested updates while reusing the store record's resources.
+    # store record so that its load and store share one VMEM buffer. Build
+    # contiguous immediate loads from the original load sites while indirect
+    # loads continue to use their access-specific plans above.
     for fake, _tensor_node, sub_meta in loaded_tensors.values():
         hbm_name = state.device_function.tensor_arg(fake).name
         scheduled = scheduled_by_hbm_name.get(hbm_name)
@@ -3898,6 +4191,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         _tensor_to_dma_scratch=tensor_to_dma_scratch,
         _tensor_to_sem=tensor_to_sem,
         _prefetched_load_tensors=prefetched_load_tensors,
+        _memory_op_to_dma_scratch=memory_op_to_dma_scratch,
     )
     resident_prep_lowerings = _prepare_resident_prep_lowerings(
         state, block_ids, all_tensor_info
@@ -3915,6 +4209,9 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         clamp: bool,
         iteration_indices: list[str],
         stage_expr: str | None = None,
+        hbm_part_overrides: dict[int, str] | None = None,
+        resident_source: bool = False,
+        indexing_patterns: Sequence[object] | None = None,
     ) -> tuple[str, str]:
         """Build (vmem_ref, hbm_ref) ref slices for a DMA copy with loop variable.
 
@@ -3936,6 +4233,11 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         hbm_needs_slice = False
         vmem_needs_slice = False
         for dim_idx in range(len(shape)):
+            if hbm_part_overrides and dim_idx in hbm_part_overrides:
+                hbm_parts.append(hbm_part_overrides[dim_idx])
+                hbm_needs_slice = True
+                vmem_parts.append(":")
+                continue
             bid = dim_to_bid.get(dim_idx)
             if bid is not None and bid in block_ids:
                 bid_idx = block_ids.index(bid)
@@ -3969,13 +4271,48 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 from ...language.memory_ops import _record_pad_info
 
                 extra_pad = _compute_pipeline_or_dma_extra_pad(
-                    begin_expr, bid, env, state
+                    begin_expr, bid, env, state, bid_idx
                 )
                 _record_pad_info(state, fake, dim_idx, bid, extra_pad)
             elif bid is not None and bid not in block_ids:
                 # Outer grid dim: use grid offset
                 grid_loops = state.codegen.active_device_loops.get(bid)
                 if grid_loops:
+                    if resident_source:
+                        idx_meta = _subscript_at_dim(tensor_subscripts, dim_idx)
+                        pattern = _subscript_at_dim(indexing_patterns or [], dim_idx)
+                        from .plan_tiling import ArbitraryIndexPattern
+                        from .plan_tiling import TileBeginWithOffsetPattern
+
+                        if isinstance(pattern, ArbitraryIndexPattern):
+                            hbm_parts.append(
+                                state.device_function.literal_expr(idx_meta)
+                            )
+                        elif isinstance(pattern, TileBeginWithOffsetPattern):
+                            dim_tilings = (
+                                state.device_function.pallas_tensor_dim_tilings[
+                                    id(fake)
+                                ]
+                            )
+                            if dim_tilings[dim_idx].can_tile:
+                                hbm_parts.append(
+                                    state.device_function.literal_expr(pattern.offset)
+                                )
+                            else:
+                                offset = state.codegen.offset_var(bid)
+                                if pattern.offset != 0:
+                                    offset += (
+                                        " + "
+                                        + state.device_function.literal_expr(
+                                            pattern.offset
+                                        )
+                                    )
+                                hbm_parts.append(offset)
+                        else:
+                            hbm_parts.append(":")
+                        hbm_needs_slice = True
+                        vmem_parts.append(":")
+                        continue
                     offset = state.codegen.offset_var(bid)
                     bs_var = state.device_function.block_size_var(bid)
                     if bs_var:
@@ -3998,7 +4335,18 @@ def _codegen_fori_loop(state: CodegenState) -> object:
 
                 if is_scalar_index(idx_meta):
                     offset_expr = state.device_function.literal_expr(idx_meta)
-                    hbm_parts.append(f"pl.ds({offset_expr}, 1)")
+                    hbm_parts.append(
+                        offset_expr if resident_source else f"pl.ds({offset_expr}, 1)"
+                    )
+                    hbm_needs_slice = True
+                elif isinstance(idx_meta, slice) and idx_meta != slice(None):
+                    start = 0 if idx_meta.start is None else idx_meta.start
+                    stop = shape[dim_idx] if idx_meta.stop is None else idx_meta.stop
+                    if not isinstance(start, int) or not isinstance(stop, int):
+                        raise NotImplementedError(
+                            "Pallas DMA requires concrete bounded slice extents"
+                        )
+                    hbm_parts.append(f"pl.ds({start}, {stop - start})")
                     hbm_needs_slice = True
                 else:
                     hbm_parts.append(":")
@@ -4018,13 +4366,12 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         return vmem, hbm
 
     def _dma_copy_statements(
-        scheduled: ScheduledDmaTransfer,
+        transfer: DmaTransfer,
+        resources: DmaResources,
         iteration_indices: list[str],
         stage_expr: str | None,
         methods: tuple[str, ...],
     ) -> list[ast.stmt]:
-        transfer = scheduled.transfer
-        resources = scheduled.resources
         fake = transfer.tensor
         hbm_name = state.device_function.tensor_arg(fake).name
         vmem_ref, hbm_ref = _build_dma_slices(
@@ -4050,6 +4397,83 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             "_copy_out" if transfer.direction == "store" else "_copy",
         )
 
+    def _dma_transfer_statements(
+        scheduled: ScheduledDmaTransfer,
+        iteration_indices: list[str],
+        stage_expr: str | None,
+        methods: tuple[str, ...],
+    ) -> list[ast.stmt]:
+        """Emit one transfer through the common fori scheduling policy."""
+        transfer = scheduled.transfer
+        resources = scheduled.resources
+        if not isinstance(transfer, IndirectDmaTransfer):
+            return _dma_copy_statements(
+                transfer,
+                resources,
+                iteration_indices,
+                stage_expr,
+                methods,
+            )
+
+        plan = transfer.plan
+        index_access = plan.spec.index_access
+        metadata_fake = index_access.tensor
+        metadata_patterns = list(index_access.patterns)
+        hbm_name = state.device_function.tensor_arg(transfer.tensor).name
+        metadata_name = state.device_function.tensor_arg(metadata_fake).name
+        result: list[ast.stmt] = []
+        if "start" in methods:
+            index_name = state.device_function.new_var("_dma_indices")
+            _, metadata_ref = _build_dma_slices(
+                metadata_fake,
+                "_unused_metadata_scratch",
+                metadata_name,
+                _extract_subscript_vals(index_access.subscript),
+                clamp=False,
+                iteration_indices=iteration_indices,
+                resident_source=True,
+                indexing_patterns=metadata_patterns,
+            )
+            result.append(statement_from_string(f"{index_name} = {metadata_ref}[...]"))
+            _, member_hbm = _build_dma_slices(
+                transfer.tensor,
+                "_unused_group_scratch",
+                hbm_name,
+                list(transfer.subscript),
+                clamp=False,
+                iteration_indices=iteration_indices,
+                hbm_part_overrides={0: "{index}"},
+            )
+        else:
+            index_name = ""
+            member_hbm = ""
+        if "wait" in methods:
+            _, aggregate_hbm = _build_dma_slices(
+                transfer.tensor,
+                "_unused_group_scratch",
+                hbm_name,
+                list(transfer.subscript),
+                clamp=False,
+                iteration_indices=iteration_indices,
+                hbm_part_overrides={0: f"pl.ds(0, {plan.group_count})"},
+            )
+        else:
+            aggregate_hbm = ""
+        result.extend(
+            indirect_group_statements(
+                state,
+                group_count=plan.group_count,
+                index_name=index_name,
+                member_hbm=member_hbm,
+                aggregate_hbm=aggregate_hbm,
+                scratch_ref=resources.scratch_ref(stage_expr),
+                semaphore_ref=resources.semaphore_ref(stage_expr),
+                direction=transfer.direction,
+                methods=methods,
+            )
+        )
+        return result
+
     def _guarded_statements(
         condition: str, name_hint: str, statements: list[ast.stmt]
     ) -> ast.FunctionDef:
@@ -4064,13 +4488,12 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             statement_from_string(f"{num_iterations} = {grid_parts[-1]}")
         )
         grid_parts[-1] = num_iterations
-
         prime_indices = [*loop_vars]
         prime_indices[-1] = "0"
         prime_starts: list[ast.stmt] = []
         for transfer in prefetched_loads:
             prime_starts.extend(
-                _dma_copy_statements(transfer, prime_indices, "0", ("start",))
+                _dma_transfer_statements(transfer, prime_indices, "0", ("start",))
             )
         prime_statements.append(
             _guarded_statements(
@@ -4086,7 +4509,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         next_starts: list[ast.stmt] = []
         for transfer in prefetched_loads:
             next_starts.extend(
-                _dma_copy_statements(transfer, next_indices, next_stage, ("start",))
+                _dma_transfer_statements(transfer, next_indices, next_stage, ("start",))
             )
         body_prefetch = _guarded_statements(
             f"{next_iteration} < {num_iterations}",
@@ -4097,7 +4520,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         current_stage = f"{stage_loop_var} % 2"
         for transfer in prefetched_loads:
             body_current_stage_waits.extend(
-                _dma_copy_statements(transfer, loop_vars, current_stage, ("wait",))
+                _dma_transfer_statements(transfer, loop_vars, current_stage, ("wait",))
             )
 
     # For loop-carried state, remap args to scratch reads inside the body
@@ -4126,11 +4549,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             state.codegen.add_statement(body_prefetch)
 
         for transfer in immediate_loads:
-            for statement in _dma_copy_statements(
-                transfer,
-                loop_vars,
-                None,
-                ("start", "wait"),
+            for statement in _dma_transfer_statements(
+                transfer, loop_vars, None, ("start", "wait")
             ):
                 state.codegen.add_statement(statement)
 
@@ -4146,11 +4566,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             _write_back_loop_carried(state, scratch_names, carried, graph_results)
 
         for transfer in dma_stores:
-            for statement in _dma_copy_statements(
-                transfer,
-                loop_vars,
-                None,
-                ("start", "wait"),
+            for statement in _dma_transfer_statements(
+                transfer, loop_vars, None, ("start", "wait")
             ):
                 state.codegen.add_statement(statement)
 

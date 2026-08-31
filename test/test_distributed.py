@@ -44,6 +44,23 @@ import helion.language as hl
 
 autotuner_names = ["fixed", *search_algorithms]
 
+# The full kernel x autotuner cross product is too slow for CI. Only the
+# cheapest kernel (test_allreduce) runs every algorithm; the other kernels keep
+# one fast representative each, since the search algorithms themselves are
+# covered in test_autotuner.py and distributed coordination is orthogonal to
+# the choice of algorithm.
+representative_autotuner_names = ["FiniteSearch"]
+
+# LLM-guided autotuners call a real LLM endpoint and abort on every rank when
+# no API key is configured, so skip them instead of failing in key-less envs.
+_LLM_AUTOTUNER_NAMES = frozenset(
+    name for name in search_algorithms if name.startswith("LLM")
+)
+_HAS_LLM_API_KEY = any(
+    os.environ.get(name)
+    for name in ("HELION_LLM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
+)
+
 # torch.distributed._symmetric_memory.is_symm_mem_tensor exists only on newer
 # PyTorch. The symm-mem-based gating degrades to conservative behavior without it,
 # so the tests that assert the fine-grained gating require the API.
@@ -132,6 +149,13 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         super().tearDownClass()
 
     def setUp(self) -> None:
+        # The per-test skip_if_lt_x_gpu(4) guards only fire inside the spawned
+        # worker processes, so without this pre-check every skip on a <4-GPU
+        # machine still pays ~6s of process spawning. Same check, parent-side.
+        if not (
+            torch.accelerator.is_available() and torch.accelerator.device_count() >= 4
+        ):
+            self.skipTest("Need at least 4 accelerator devices")
         super().setUp()
         self._spawn_processes()
 
@@ -209,6 +233,8 @@ class TestDistributed(TestCase, MultiProcessTestCase):
     @skip_if_lt_x_gpu(4)
     @parametrize("autotuner", autotuner_names)
     def test_allreduce(self, autotuner):
+        if autotuner in _LLM_AUTOTUNER_NAMES and not _HAS_LLM_API_KEY:
+            self.skipTest("LLM autotuners require an LLM API key")
         self._init_process()
         if autotuner == "fixed":
             fixed_num_warps = 16 if torch.version.hip is not None else 32
@@ -277,7 +303,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
             "two_shot_allreduce_bias_rmsnorm_kernel",
         ),
     )
-    @parametrize("autotuner", autotuner_names)
+    @parametrize("autotuner", representative_autotuner_names)
     def test_allreduce_bias_rmsnorm(self, kernel_name, autotuner):
         """
         There is a similar test in test/test_examples_dist.py.
@@ -349,7 +375,9 @@ class TestDistributed(TestCase, MultiProcessTestCase):
 
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
-    @parametrize("autotuner", autotuner_names)
+    # "fixed" stays alongside the representative: its deliberately small block
+    # config is the only coverage for large launch grids on this kernel.
+    @parametrize("autotuner", ["fixed", *representative_autotuner_names])
     def test_matmul_reduce_scatter(self, autotuner):
         self._init_process()
 
@@ -553,8 +581,11 @@ class TestDistributed(TestCase, MultiProcessTestCase):
             unittest.mock.patch(
                 "helion._dist_utils.sync_seed", wraps=sync_seed
             ) as mock_sync_seed,
+            # The autotuner's compile/accuracy/timing gathers live in
+            # BenchmarkProvider (moved from BaseSearch in #2029), and mock.patch
+            # only intercepts the module-level binding, so spy there.
             unittest.mock.patch(
-                "helion.autotuner.base_search.all_gather_object",
+                "helion.autotuner.benchmark_provider.all_gather_object",
                 wraps=all_gather_object,
             ) as mock_all_gather_object,
             unittest.mock.patch(

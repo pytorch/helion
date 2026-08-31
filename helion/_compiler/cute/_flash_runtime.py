@@ -6,6 +6,7 @@
 # generated Helion module DOES carry ``from __future__ import annotations`` at
 # its top, so the struct + the inline-traced rescale helper must live here, in a
 # real module compiled without that flag, and be imported by the generated code.
+from dataclasses import dataclass
 import functools
 from functools import partial
 from itertools import starmap
@@ -24,6 +25,7 @@ from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.utils.blackwell_helpers as sm100_utils_flash
 
 from ._mlir_compat import ir
+from .epilogue_helpers import rcp_approx_ftz as rcp_approx_ftz
 
 
 @functools.cache
@@ -306,18 +308,45 @@ def named_barrier_wait_unaligned(
 
 
 @dsl_user_op
-def rcp_approx_ftz(x: object, *, loc: object = None, ip: object = None) -> Float32:
-    """FA4-style approximate reciprocal that lowers to ``rcp.approx.ftz.f32``."""
-    return cutlass.Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(x).ir_value(loc=loc, ip=ip)],  # pyrefly: ignore[bad-argument-type]
-            "rcp.approx.ftz.f32 $0, $1;",
-            "=f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
+def exp2_approx_f16x2_to_f32(
+    x: object,
+    y: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> tuple[Float32, Float32]:
+    """Evaluate two approximate exp2 values through one packed-f16x2 XU op."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal(  # pyrefly: ignore[missing-attribute]
+            [Float32.mlir_type, Float32.mlir_type]
+        ),
+        [
+            Float32(x).ir_value(loc=loc, ip=ip),  # pyrefly: ignore[bad-argument-type]
+            Float32(y).ir_value(loc=loc, ip=ip),  # pyrefly: ignore[bad-argument-type]
+        ],
+        """
+        {
+          .reg .b16 lo, hi;
+          .reg .b32 packed;
+          cvt.rn.f16.f32 lo, $2;
+          cvt.rn.f16.f32 hi, $3;
+          mov.b32 packed, {lo, hi};
+          ex2.approx.f16x2 packed, packed;
+          mov.b32 {lo, hi}, packed;
+          cvt.f32.f16 $0, lo;
+          cvt.f32.f16 $1, hi;
+        }
+        """,
+        "=f,=f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float32(llvm.extractvalue(Float32.mlir_type, result, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(Float32.mlir_type, result, [1], loc=loc, ip=ip)),
     )
 
 
@@ -992,6 +1021,31 @@ def fa4_disc_rowmax_balanced(
     return row_max
 
 
+def disc_rowmax_ldred(
+    tiled_ld: object,
+    tLDtS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    row_max: Float32,
+    ld_chunks: int,
+) -> Float32:
+    """Chunked row-max using ``tcgen05.ld.red``.
+
+    ``LdRed32x32bOp`` returns the loaded score fragment plus one hardware
+    maximum for each 32-column TMEM tile.  Folding only those reduction
+    registers removes the software FMNMX tree while preserving the disc
+    path's one-chunk register footprint.
+    """
+    ld_shape = tLDcS[None, 0, None, None].shape  # pyrefly: ignore[missing-attribute]
+    for ci in range(ld_chunks):
+        frg = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
+        red = cute.make_rmem_tensor(((1, 1), *frg.shape[1:]), cutlass.Float32)
+        cute.copy(tiled_ld, tLDtS[None, ci, None, None], (frg, red))
+        for i in range(cute.size(red.shape)):
+            row_max = cute.arch.fmax(row_max, red[i])
+    cute.arch.fence_view_async_tmem_load()
+    return row_max
+
+
 def fa4_disc_rowmax_causal_balanced(
     tiled_ld: object,
     tLDtS: cute.Tensor,
@@ -1159,6 +1213,143 @@ def fa4_disc_exp_convert_store_causal(
     return p_sum
 
 
+def _disc_resident_exp_store_rowsum(
+    frg: cute.Tensor,
+    tiled_st: object,
+    tSTtS: cute.Tensor,
+    tSTcS: cute.Tensor,
+    ci: int,
+    scale: Float32,
+    minus_max_scale: Float32,
+    e2e_freq: int,
+    e2e_res: int,
+    e2e_offset: int,
+    last_frag: bool,
+    io_dtype: object,
+    pair_batch: int,
+    emu_batch: int,
+    degree2: bool,
+) -> Float32:
+    """Consume one resident score chunk without changing chunk order."""
+    _disc_chunk_exp(
+        frg,
+        scale,
+        minus_max_scale,
+        e2e_freq,
+        e2e_res,
+        e2e_offset,
+        last_frag,
+        pair_batch,
+        emu_batch,
+        degree2,
+    )
+    _disc_chunk_convert_store(frg, tiled_st, tSTtS, tSTcS, ci, io_dtype)
+    return _disc_chunk_rowsum(frg)
+
+
+def fa4_disc_exp_convert_store_resident3_013_prefetch2(
+    frg0: cute.Tensor,
+    frg1: cute.Tensor,
+    frg3: cute.Tensor,
+    tiled_ld: object,
+    tLDtS: cute.Tensor,
+    tLDcS: cute.Tensor,
+    tiled_st: object,
+    tSTtS: cute.Tensor,
+    tSTcS: cute.Tensor,
+    scale: Float32,
+    minus_max_scale: Float32,
+    e2e_freq: int,
+    e2e_res: int,
+    e2e_offset: int,
+    pfor_ptr_stage: object,
+    pfor2_ptr_stage: object,
+    io_dtype: object = cutlass.BFloat16,
+    pair_batch: int = 1,
+    emu_batch: int = 1,
+    degree2: bool = False,
+) -> Float32:
+    """Prefetch reloaded chunk 2 while consuming resident chunk 1."""
+    p_sum = _disc_resident_exp_store_rowsum(
+        frg0,
+        tiled_st,
+        tSTtS,
+        tSTcS,
+        0,
+        scale,
+        minus_max_scale,
+        e2e_freq,
+        e2e_res,
+        e2e_offset,
+        False,
+        io_dtype,
+        pair_batch,
+        emu_batch,
+        degree2,
+    )
+    ld_shape = tLDcS[None, 0, None, None].shape  # pyrefly: ignore[missing-attribute]
+    frg2 = cute.make_rmem_tensor(ld_shape, cutlass.Float32)
+    cute.copy(tiled_ld, tLDtS[None, 2, None, None], frg2)
+    _disc_pin_frag(frg2)
+    p_sum = p_sum + _disc_resident_exp_store_rowsum(
+        frg1,
+        tiled_st,
+        tSTtS,
+        tSTcS,
+        1,
+        scale,
+        minus_max_scale,
+        e2e_freq,
+        e2e_res,
+        e2e_offset,
+        False,
+        io_dtype,
+        pair_batch,
+        emu_batch,
+        degree2,
+    )
+    cute.arch.fence_view_async_tmem_load()
+    p_sum = p_sum + _disc_resident_exp_store_rowsum(
+        frg2,
+        tiled_st,
+        tSTtS,
+        tSTcS,
+        2,
+        scale,
+        minus_max_scale,
+        e2e_freq,
+        e2e_res,
+        e2e_offset,
+        False,
+        io_dtype,
+        pair_batch,
+        emu_batch,
+        degree2,
+    )
+    cute.arch.fence_view_async_tmem_store()
+    mbarrier_arrive(pfor_ptr_stage)
+    p_sum = p_sum + _disc_resident_exp_store_rowsum(
+        frg3,
+        tiled_st,
+        tSTtS,
+        tSTcS,
+        3,
+        scale,
+        minus_max_scale,
+        e2e_freq,
+        e2e_res,
+        e2e_offset,
+        True,
+        io_dtype,
+        pair_batch,
+        emu_batch,
+        degree2,
+    )
+    cute.arch.fence_view_async_tmem_store()
+    mbarrier_arrive(pfor2_ptr_stage)
+    return p_sum
+
+
 def _disc_chunk_exp(
     frg: cute.Tensor,
     scale: Float32,
@@ -1171,6 +1362,7 @@ def _disc_chunk_exp(
     emu_batch: int = 1,
     degree2: bool = False,
     degree1: bool = False,
+    f16x2_xu: bool = False,
 ) -> None:
     """In-place packed scale-subtract then exp2(pipe-split) over ONE 32-elem chunk.
 
@@ -1192,8 +1384,11 @@ def _disc_chunk_exp(
             )
             use_xu = ((i + e2e_offset) % e2e_freq) < (e2e_freq - e2e_res) or last_frag
             if use_xu:
-                frg[i] = cute.arch.exp2(r0)
-                frg[i + 1] = cute.arch.exp2(r1)
+                if f16x2_xu:
+                    frg[i], frg[i + 1] = exp2_approx_f16x2_to_f32(r0, r1)
+                else:
+                    frg[i] = cute.arch.exp2(r0)
+                    frg[i + 1] = cute.arch.exp2(r1)
             elif degree1:
                 frg[i], frg[i + 1] = ex2_emulation_deg1_2(r0, r1)  # pyrefly: ignore[bad-argument-type]
             elif degree2:
@@ -1218,8 +1413,11 @@ def _disc_chunk_exp(
         pending_values = []
         for i, r0, r1, use_xu in scaled:
             if use_xu:
-                frg[i] = cute.arch.exp2(r0)
-                frg[i + 1] = cute.arch.exp2(r1)
+                if f16x2_xu:
+                    frg[i], frg[i + 1] = exp2_approx_f16x2_to_f32(r0, r1)
+                else:
+                    frg[i] = cute.arch.exp2(r0)
+                    frg[i + 1] = cute.arch.exp2(r1)
             elif emu_batch == 1:
                 if degree1:
                     frg[i], frg[i + 1] = ex2_emulation_deg1_2(r0, r1)  # pyrefly: ignore[bad-argument-type]
@@ -2139,6 +2337,20 @@ def fa4_store_o_smem_to_gmem_whole(
         )
 
 
+def relu_fragment_inplace(frg: cute.Tensor) -> None:
+    """Apply torch.relu semantics to an FP32 register fragment."""
+    value = frg.load()
+    # Preserve NaNs; every non-positive value maps to the +0 produced by CUDA
+    # torch.relu, including negative zero.
+    frg.store(
+        cute.where(
+            value != value,
+            value,
+            cute.where(value > 0.0, value, 0.0),
+        )
+    )
+
+
 def fa4_correction_epilogue_to_smem(
     tiled_t2r: object,
     tiled_r2s: object,
@@ -2147,6 +2359,7 @@ def fa4_correction_epilogue_to_smem(
     tOcO_corr_t2r: cute.Tensor,
     inv_sum: object,
     chunks: int,
+    relu_output: bool = False,
 ) -> None:
     """FA4 correction epilogue: rescale O in TMEM and stage fp16 output in SMEM."""
     for i in range(chunks):
@@ -2154,6 +2367,8 @@ def fa4_correction_epilogue_to_smem(
         reg = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
         cute.copy(tiled_t2r, tOtO_corr_t2r[None, 0, 0, i], reg)
         reg.store(reg.load() * inv_sum)
+        if cutlass.const_expr(relu_output):
+            relu_fragment_inplace(reg)
         cvt_copy(tiled_r2s, reg, tOsO_corr_r2s[None, 0, 0, i])
 
 
@@ -2171,6 +2386,7 @@ def fa4_correction_epilogue_handoff_to_smem(
     inv_sum: object,
     chunks: int,
     wait_hint: int = 10_000_000,
+    relu_output: bool = False,
 ) -> None:
     """Wait for O/epilogue handoff, stage final O in SMEM, then publish it."""
     mbar_spin_wait(o_full_ptr_stage, o_full_phase, wait_hint)
@@ -2183,6 +2399,7 @@ def fa4_correction_epilogue_handoff_to_smem(
         tOcO_corr_t2r,
         inv_sum,
         chunks,
+        relu_output=relu_output,
     )
     cute.arch.fence_view_async_shared()
     cute.arch.mbarrier_arrive(corr_epi_full_ptr_stage)
@@ -2198,6 +2415,7 @@ def fa4_correction_epilogue_to_smem_scoped(
     head_dim: int,
     corr_tile_size: int,
     o_dtype: object,
+    relu_output: bool = False,
     *,
     loc: object = None,
     ip: object = None,
@@ -2237,6 +2455,8 @@ def fa4_correction_epilogue_to_smem_scoped(
         reg = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
         cute.copy(tiled_t2r, tOtO_t2r[None, 0, 0, i], reg)
         reg.store(reg.load() * inv_sum)
+        if cutlass.const_expr(relu_output):
+            relu_fragment_inplace(reg)
         cvt_copy(tiled_r2s, reg, tOsO_r2s[None, 0, 0, i])
 
 
@@ -2250,6 +2470,7 @@ def fa4_correction_epilogue_to_smem_scoped_2cta(
     head_dim: int,
     corr_tile_size: int,
     o_dtype: object,
+    relu_output: bool = False,
     *,
     loc: object = None,
     ip: object = None,
@@ -2288,6 +2509,8 @@ def fa4_correction_epilogue_to_smem_scoped_2cta(
         reg = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
         cute.copy(tiled_t2r, tOtO_t2r[None, 0, 0, i], reg)
         reg.store(reg.load() * inv_sum)
+        if cutlass.const_expr(relu_output):
+            relu_fragment_inplace(reg)
         cvt_copy(tiled_r2s, reg, tOsO_r2s[None, 0, 0, i])
 
 
@@ -2306,6 +2529,7 @@ def fa4_correction_epilogue_handoff_to_smem_scoped(
     corr_tile_size: int,
     o_dtype: object,
     wait_hint: int = 10_000_000,
+    relu_output: bool = False,
 ) -> None:
     """Wait for O/epilogue handoff, scope copy views, then publish staged O."""
     mbar_spin_wait(o_full_ptr_stage, o_full_phase, wait_hint)
@@ -2319,6 +2543,7 @@ def fa4_correction_epilogue_handoff_to_smem_scoped(
         head_dim,
         corr_tile_size,
         o_dtype,
+        relu_output=relu_output,
     )
     cute.arch.fence_view_async_shared()
     cute.arch.mbarrier_arrive(corr_epi_full_ptr_stage)
@@ -2339,6 +2564,7 @@ def fa4_correction_epilogue_handoff_to_smem_scoped_2cta(
     corr_tile_size: int,
     o_dtype: object,
     wait_hint: int = 10_000_000,
+    relu_output: bool = False,
 ) -> None:
     """Wait for handoff and stage a two-CTA output in CTA-local shared memory."""
     mbar_spin_wait(o_full_ptr_stage, o_full_phase, wait_hint)
@@ -2352,9 +2578,77 @@ def fa4_correction_epilogue_handoff_to_smem_scoped_2cta(
         head_dim,
         corr_tile_size,
         o_dtype,
+        relu_output=relu_output,
     )
     cute.arch.fence_view_async_shared()
     cute.arch.mbarrier_arrive(corr_epi_full_ptr_stage)
+
+
+@dsl_user_op
+def resident_softmax_value_graph(
+    tLDrS: cute.Tensor,
+    tiled_st: object,
+    tSTtS: cute.Tensor,
+    tSTcS: cute.Tensor,
+    scale: Float32,
+    minus_max_scale: Float32,
+    pfor_ptr_stage: object,
+    pfor2_ptr_stage: object,
+    p_store_split: int,
+    stats_empty_ptr_stage: object,
+    stats_empty_phase: object,
+    row_sum_init: object,
+    wait_hint: int = 10_000_000,
+    *,
+    pfor_peer_cta_rank: object = None,
+    pfor_self_cta_rank: object = None,
+    loc: object = None,
+    ip: object = None,
+) -> Float32:
+    """Resident softmax lowering with a full-row value graph.
+
+    Keep scale, exp2/conversion, split-P publication, statistics acquire, and
+    row-sum reduction in one lowering unit.  The exp2 results remain fp32 in
+    ``tLDrS`` for the reducer while a distinct register tensor holds fp16 P.
+    """
+    assert tLDrS.element_type is cutlass.Float32
+    assert cute.size(tLDrS) % 32 == 0
+    frag_count = cute.size(tLDrS) // 32
+    assert cute.size(tSTtS, mode=[2]) == frag_count
+    assert 0 < p_store_split < frag_count
+
+    for i in range(0, cute.size(tLDrS), 2):
+        tLDrS[i], tLDrS[i + 1] = cute.arch.fma_packed_f32x2(
+            (tLDrS[i], tLDrS[i + 1]),
+            (scale, scale),
+            (minus_max_scale, minus_max_scale),
+        )
+
+    tSTrS = cute.make_rmem_tensor(tSTcS.shape, cutlass.Float32)
+    tSTrS_e = cute.make_tensor(
+        cute.recast_ptr(tSTrS.iterator, dtype=cutlass.Float16), tLDrS.layout
+    )
+    src = cute.logical_divide(tLDrS, cute.make_layout(32))
+    dst = cute.logical_divide(tSTrS_e, cute.make_layout(32))
+    for ci in range(frag_count):
+        for i in range(0, 32, 2):
+            exp0 = cute.math.exp2(src[i, ci], fastmath=True)
+            exp1 = cute.math.exp2(src[i + 1, ci], fastmath=True)
+            src[i, ci] = exp0
+            src[i + 1, ci] = exp1
+        cast("cute.Tensor", dst[None, ci]).store(
+            cast("cute.Tensor", src[None, ci]).load().to(cutlass.Float16)
+        )
+
+    for ci in range(frag_count):
+        cute.copy(tiled_st, tSTrS[None, None, ci], tSTtS[None, None, ci])
+        if ci == p_store_split - 1:
+            cute.arch.fence_view_async_tmem_store()
+            mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    cute.arch.fence_view_async_tmem_store()
+    mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+    mbar_spin_wait(stats_empty_ptr_stage, stats_empty_phase, wait_hint)
+    return fadd_reduce_packed(tLDrS, row_sum_init)
 
 
 def _fa4_sp_exp_convert_store_impl(
@@ -2380,6 +2674,7 @@ def _fa4_sp_exp_convert_store_impl(
     emu_batch: int = 1,
     degree2: bool = False,
     degree1: bool = False,
+    f16x2_xu: bool = False,
     *,
     loc: object = None,
     ip: object = None,
@@ -2406,6 +2701,7 @@ def _fa4_sp_exp_convert_store_impl(
                 emu_batch,
                 degree2,
                 degree1,
+                f16x2_xu,
             )
             cast("cute.Tensor", dst[None, ci]).store(frg.load().to(io_dtype))
         for ci in range(p_store_split):
@@ -2426,6 +2722,7 @@ def _fa4_sp_exp_convert_store_impl(
                 emu_batch,
                 degree2,
                 degree1,
+                f16x2_xu,
             )
             cast("cute.Tensor", dst[None, ci]).store(frg.load().to(io_dtype))
         for ci in range(p_store_split, p_store_chunks):
@@ -2447,6 +2744,7 @@ def _fa4_sp_exp_convert_store_impl(
                 emu_batch,
                 degree2,
                 degree1,
+                f16x2_xu,
             )
             cast("cute.Tensor", dst[None, ci]).store(frg.load().to(io_dtype))
         for ci in range(p_store_chunks):
@@ -2493,6 +2791,7 @@ def fa4_sp_exp_convert_store(
     emu_batch: int = 1,
     degree2: bool = False,
     degree1: bool = False,
+    f16x2_xu: bool = False,
     *,
     loc: object = None,
     ip: object = None,
@@ -2521,6 +2820,7 @@ def fa4_sp_exp_convert_store(
         emu_batch,
         degree2,
         degree1,
+        f16x2_xu,
     )
 
 
@@ -2547,6 +2847,7 @@ def fa4_sp_exp_convert_store_whole_rowsum(
     emu_batch: int = 1,
     degree2: bool = False,
     degree1: bool = False,
+    f16x2_xu: bool = False,
     *,
     loc: object = None,
     ip: object = None,
@@ -2575,6 +2876,7 @@ def fa4_sp_exp_convert_store_whole_rowsum(
         emu_batch,
         degree2,
         degree1,
+        f16x2_xu,
     )
 
 
@@ -2823,6 +3125,7 @@ def fa4_disc_exp_convert_store_pipe(
     emu_batch: int = 1,
     degree2: bool = False,
     degree1: bool = False,
+    f16x2_xu: bool = False,
 ) -> Float32:
     """SOFTWARE-PIPELINED chunked-t2r PASS 2 (the L1 lever). Same numerics + staged-P
     handshake + zero-spill peak (ONE chunk + a bounded pipeline window) as the serial
@@ -2887,6 +3190,7 @@ def fa4_disc_exp_convert_store_pipe(
             emu_batch,
             degree2,
             degree1,
+            f16x2_xu,
         )
         _disc_chunk_convert_store(cur, tiled_st, tSTtS, tSTcS, ci, io_dtype)
         p_sum = p_sum + _disc_chunk_rowsum(cur)
@@ -2928,6 +3232,7 @@ def fa4_disc_exp_convert_store_pipe_causal(
     emu_batch: int = 1,
     degree2: bool = False,
     degree1: bool = False,
+    f16x2_xu: bool = False,
 ) -> Float32:
     """Causal variant of ``fa4_disc_exp_convert_store_pipe``."""
     p_sum = cutlass.Float32(0.0)
@@ -2968,6 +3273,7 @@ def fa4_disc_exp_convert_store_pipe_causal(
             emu_batch,
             degree2,
             degree1,
+            f16x2_xu,
         )
         _disc_chunk_convert_store(cur, tiled_st, tSTtS, tSTcS, ci, io_dtype)
         p_sum = p_sum + _disc_chunk_rowsum(cur)
@@ -3138,6 +3444,190 @@ def fmax_reduce_packed(frg: cute.Tensor, init_val: object = None) -> Float32:
         local_max[3] = _fmax3(local_max[3], frg[i + 6], frg[i + 7])
     local_max[0] = _fmax3(local_max[0], local_max[1])
     return _fmax3(local_max[0], local_max[2], local_max[3])
+
+
+@cute.jit
+def _fmax_reduce_packed_ssa(
+    values: cute.TensorSSA,
+    init_val: object = None,
+) -> Float32:
+    values_rmem = cute.make_rmem_tensor(values.shape, Float32)
+    values_rmem.store(values)
+    return fmax_reduce_packed(values_rmem, init_val)
+
+
+@cute.jit
+def _fadd_reduce_packed_ssa(
+    values: cute.TensorSSA,
+) -> Float32:
+    values_rmem = cute.make_rmem_tensor(values.shape, Float32)
+    values_rmem.store(values)
+    return fadd_reduce_packed(values_rmem)
+
+
+@cute.jit
+def _fadd_reduce_packed_ssa_scaled(
+    values: cute.TensorSSA,
+    row_sum: Float32,
+    acc_scale: Float32,
+) -> Float32:
+    values_rmem = cute.make_rmem_tensor(values.shape, Float32)
+    values_rmem.store(values)
+    n = cute.size(values_rmem)
+    assert n % 8 == 0
+    local_sum = [
+        cute.arch.fma_packed_f32x2(
+            (row_sum, 0.0),
+            (acc_scale, 0.0),
+            (values_rmem[0], values_rmem[1]),
+        ),
+        (values_rmem[2], values_rmem[3]),
+        (values_rmem[4], values_rmem[5]),
+        (values_rmem[6], values_rmem[7]),
+    ]
+    for i in cutlass.range_constexpr(8, n, 8):
+        local_sum[0] = _add_packed_f32x2(
+            local_sum[0], (values_rmem[i], values_rmem[i + 1])
+        )
+        local_sum[1] = _add_packed_f32x2(
+            local_sum[1], (values_rmem[i + 2], values_rmem[i + 3])
+        )
+        local_sum[2] = _add_packed_f32x2(
+            local_sum[2], (values_rmem[i + 4], values_rmem[i + 5])
+        )
+        local_sum[3] = _add_packed_f32x2(
+            local_sum[3], (values_rmem[i + 6], values_rmem[i + 7])
+        )
+    local_sum[0] = _add_packed_f32x2(local_sum[0], local_sum[1])
+    local_sum[2] = _add_packed_f32x2(local_sum[2], local_sum[3])
+    local_sum[0] = _add_packed_f32x2(local_sum[0], local_sum[2])
+    sum_lo, sum_hi = local_sum[0]
+    return Float32(sum_lo) + Float32(sum_hi)
+
+
+@dataclass
+class ResidentSoftmaxState:
+    """Register-backed online-softmax state for a causal resident lowering."""
+
+    scale_log2: Float32
+    row_max: cute.Tensor
+    row_sum: cute.Tensor
+    rescale_threshold: cutlass.Constexpr[float] = 0.0
+
+    @staticmethod
+    def create(
+        scale_log2: Float32,
+        rescale_threshold: cutlass.Constexpr[float] = 0.0,
+    ) -> "ResidentSoftmaxState":
+        row_max = cute.make_rmem_tensor(1, Float32)
+        row_sum = cute.make_rmem_tensor(1, Float32)
+        row_max.fill(Float32(-Float32.inf))
+        row_sum.fill(Float32(0.0))
+        return ResidentSoftmaxState(
+            scale_log2,
+            row_max,
+            row_sum,
+            rescale_threshold,
+        )
+
+    @cute.jit
+    def _update_row_max_from_local(
+        self,
+        row_max_new: Float32,
+        is_first: cutlass.Constexpr[bool],
+    ) -> tuple[Float32, Float32]:
+        acc_scale: Float32
+        if cutlass.const_expr(is_first):
+            row_max_safe = row_max_new if row_max_new != -Float32.inf else Float32(0.0)
+            acc_scale = Float32(0.0)
+        else:
+            row_max_old = self.row_max[0]
+            assert isinstance(row_max_old, Float32)
+            row_max_safe = row_max_new if row_max_new != -Float32.inf else Float32(0.0)
+            acc_scale_log2 = (row_max_old - row_max_safe) * self.scale_log2
+            acc_scale = cute.math.exp2(acc_scale_log2, fastmath=True)
+            if cutlass.const_expr(self.rescale_threshold > 0.0):
+                if acc_scale_log2 >= -self.rescale_threshold:
+                    row_max_new = row_max_old
+                    row_max_safe = row_max_old
+                    acc_scale = Float32(1.0)
+        self.row_max[0] = row_max_new
+        return row_max_safe, acc_scale
+
+    @cute.jit
+    def update_row_max_precomputed(
+        self,
+        hw_row_max: Float32,
+        is_first: cutlass.Constexpr[bool],
+    ) -> tuple[Float32, Float32]:
+        row_max_new = (
+            hw_row_max
+            if cutlass.const_expr(is_first)
+            else cute.arch.fmax(hw_row_max, self.row_max[0])
+        )
+        return self._update_row_max_from_local(row_max_new, is_first)
+
+    @cute.jit
+    def update_row_max_masked(
+        self,
+        scores: cute.TensorSSA,
+        is_first: cutlass.Constexpr[bool],
+    ) -> tuple[Float32, Float32]:
+        row_max_new = _fmax_reduce_packed_ssa(
+            scores,
+            None if cutlass.const_expr(is_first) else self.row_max[0],
+        )
+        return self._update_row_max_from_local(row_max_new, is_first)
+
+    @cute.jit
+    def scale_subtract_rowmax(
+        self,
+        scores: cute.Tensor,
+        row_max: Float32,
+    ) -> None:
+        assert cute.size(scores) % 2 == 0
+        bias = Float32(0.0) - row_max * self.scale_log2
+        for i in cutlass.range(0, cute.size(scores), 2, unroll_full=True):
+            scores[i], scores[i + 1] = cute.arch.fma_packed_f32x2(
+                (scores[i], scores[i + 1]),
+                (self.scale_log2, self.scale_log2),
+                (bias, bias),
+            )
+
+    @cute.jit
+    def apply_exp2_convert(
+        self,
+        scores: cute.Tensor,
+        converted: cute.Tensor,
+    ) -> None:
+        assert cute.size(scores) % 32 == 0
+        score_fragments = cute.logical_divide(scores, cute.make_layout(32))
+        converted_fragments = cute.logical_divide(converted, cute.make_layout(32))
+        for fragment in cutlass.range_constexpr(cute.size(score_fragments, mode=[1])):
+            for i in cutlass.range_constexpr(0, 32, 2):
+                score_fragments[i, fragment] = cute.math.exp2(
+                    score_fragments[i, fragment], fastmath=True
+                )
+                score_fragments[i + 1, fragment] = cute.math.exp2(
+                    score_fragments[i + 1, fragment], fastmath=True
+                )
+            converted_fragments[None, fragment].store(
+                score_fragments[None, fragment].load().to(converted.element_type)
+            )
+
+    @cute.jit
+    def update_row_sum(
+        self,
+        scores_exp: cute.TensorSSA,
+        acc_scale: Float32,
+        is_first: cutlass.Constexpr[bool] = False,
+    ) -> None:
+        if cutlass.const_expr(is_first):
+            self.row_sum[0] = _fadd_reduce_packed_ssa(scores_exp)
+        else:
+            self.row_sum[0] = _fadd_reduce_packed_ssa_scaled(
+                scores_exp, self.row_sum[0], acc_scale
+            )
 
 
 # ===========================================================================

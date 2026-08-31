@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     from .generate_ast import GenerateAST
     from .indexing_strategy import IndexingStrategy
     from .program_id import ProgramIDs
+    from helion._compiler.pallas.dma import DmaResources
     from helion._compiler.pallas.ordered_carry import CarryBoundaryTile
     from helion._compiler.pallas.ordered_carry import CarryScratchKey
     from helion._compiler.pallas.plan_tiling import DimensionTiling
@@ -263,14 +264,12 @@ class DeviceFunction:
         self._tensor_descriptor_args: dict[
             tuple[torch.Tensor, str], TensorDescriptorArg
         ] = {}
-        self._expr_args: dict[sympy.Expr, SymbolArgument] = {}
+        self._expr_args: dict[sympy.Expr, NumericArgument] = {}
         self._constexpr_args: dict[str, ConstExprArg] = {}
         self._constexpr_host_defs: set[str] = set()
         self._scratch_args: list[ScratchArg] = []
         self.wrapper_only_params: list[str] = []
-        self._tensor_properties: dict[
-            tuple[type[TensorPropertyArg], torch.Tensor, int], TensorPropertyArg
-        ] = {}
+        self._tensor_properties: dict[tuple[object, ...], TensorPropertyArg] = {}
         self._unique_counter: dict[str, itertools.count[int]] = defaultdict(
             itertools.count
         )
@@ -369,6 +368,9 @@ class DeviceFunction:
         # dict would then need to support multiple entries per tensor
         # or the tensor would get distinct arg IDs per memory space.
         self.pallas_memory_space: dict[int, PallasMemorySpace] = {}
+        # Root-grid memory operations routed through explicit DMA resources.
+        # Inner-loop schedulers keep iteration-specific bindings on loop state.
+        self.pallas_grid_dma_bindings: dict[torch.fx.Node, DmaResources] = {}
         # Pallas: id(fake_tensor) → {dim: (block_id, extra_pad)} for dims
         # using pl.ds() that may need host-side padding.
         self.pallas_pad_info: dict[int, dict[int, tuple[int, int]]] = {}
@@ -777,9 +779,16 @@ class DeviceFunction:
             self._tensor_descriptor_args[key] = arg
         return self._tensor_descriptor_args[key]
 
-    def expr_arg(self, sym: sympy.Expr, origin: Origin) -> SymbolArgument:
+    def expr_arg(self, sym: sympy.Expr, origin: Origin) -> NumericArgument:
         if sym not in self._expr_args:
-            arg = SymbolArgument(
+            tunable_symbols = CompileEnvironment.current().tunable_symbols
+            # A tunable-only expression is constant for each compiled config.
+            arg_type = (
+                ConstExprArg
+                if sym.free_symbols and sym.free_symbols.issubset(tunable_symbols)
+                else SymbolArgument
+            )
+            arg = arg_type(
                 name=self.new_var(origin.suggest_var_name()),
                 _host_str=origin.host_str(),
             )
@@ -829,8 +838,14 @@ class DeviceFunction:
         dim: int,
         prefix: str,
     ) -> _P:
-        # TODO(jansel): dedupe based on sympy expressions
-        key = (prop_cls, fake_value, dim)
+        key: tuple[object, ...] = (prop_cls, fake_value, dim)
+        if prop_cls is TensorSizeArg:
+            size = fake_value.size(dim)
+            assert isinstance(size, torch.SymInt)
+            key = (
+                prop_cls,
+                CompileEnvironment.current().shape_env.replace(size._sympy_()),
+            )
         if key not in self._tensor_properties:
             arg = self.tensor_arg(fake_value)
             prop = prop_cls(f"{arg.name}_{prefix}_{dim}", arg, dim)

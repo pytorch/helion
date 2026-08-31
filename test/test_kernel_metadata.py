@@ -246,7 +246,7 @@ class TestAutotuneDatasetE2E(TestCase):
             bound_kernel = add.bind(args)
             random.seed(123)
             search = FiniteSearch(bound_kernel, args, configs=configs)
-            search.autotune()
+            search.autotune(skip_cache=True)
 
         csv_path = base_path.with_suffix(".csv")
         meta_path = base_path.with_suffix(".meta.jsonl")
@@ -262,6 +262,8 @@ class TestAutotuneDatasetE2E(TestCase):
         for line in meta_lines:
             record = json.loads(line)
             self.assertIn("kernel_source", record)
+            self.assertFalse(record["settings"]["force_autotune"])
+            self.assertTrue(record["settings"]["effective_cache_read_bypass"])
             configs_by_id.update(record["configs"])
             run_ids.add(record["run_id"])
             if _HAS_NETWORKX:

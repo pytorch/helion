@@ -1460,35 +1460,36 @@ def _try_splice_tcgen05_unary_epilogue(
     return ast.Constant(value=None)
 
 
-def _try_codegen_tcgen05_pair_epilogue(
+def _try_codegen_tcgen05_fragment_epilogue(
     state: CodegenState,
     tensor: object,
     subscript: list[object] | tuple[object, ...],
     ast_subscript: list[object] | tuple[object, ...],
     extra_mask: ast.AST | None,
 ) -> ast.AST | None:
-    plan = state.device_function.cute_state.tcgen05_pair_epilogue_plan_for_store(
+    plan = state.device_function.cute_state.tcgen05_fragment_epilogue_plan_for_store(
         state.fx_node
     )
     if plan is None:
         return None
     if not isinstance(tensor, torch.Tensor):
         raise exc.BackendUnsupported("cute", "planned tcgen05 store is not a tensor")
-    from ..inductor_lowering import is_deferred_tcgen05_pair_epilogue
+    from ..inductor_lowering import is_deferred_tcgen05_fragment_epilogue
 
     value_node = state.fx_node.args[2] if state.fx_node is not None else None
-    if value_node is not plan.value_node or not is_deferred_tcgen05_pair_epilogue(
+    if value_node is not plan.value_node or not is_deferred_tcgen05_fragment_epilogue(
         state.ast_args[2]
     ):
         raise exc.BackendUnsupported(
-            "cute", "committed tcgen05 pair epilogue received the wrong store value"
+            "cute",
+            "committed tcgen05 thread-local epilogue received the wrong store value",
         )
     result_var = state.device_function.cute_state.matmul_fx_node_result_vars.get(
         plan.anchor
     )
     if result_var is None:
         raise exc.BackendUnsupported(
-            "cute", "tcgen05 pair epilogue store ran before its MMA anchor"
+            "cute", "tcgen05 thread-local epilogue store ran before its MMA anchor"
         )
     rewritten = _codegen_cute_store_tcgen05_tile(
         state,
@@ -1497,11 +1498,11 @@ def _try_codegen_tcgen05_pair_epilogue(
         ast_subscript,
         extra_mask,
         result_var,
-        pair_epilogue=plan,
+        fragment_epilogue=plan,
     )
     if rewritten is None:
         raise exc.BackendUnsupported(
-            "cute", "committed tcgen05 pair epilogue could not render its store"
+            "cute", "committed tcgen05 thread-local epilogue could not render its store"
         )
     for statement in rewritten if isinstance(rewritten, list) else [rewritten]:
         state.add_statement(statement)
@@ -1559,7 +1560,7 @@ def _(state: CodegenState) -> ast.AST:
     extra_mask = state.ast_args[3]
     assert isinstance(extra_mask, (type(None), ast.AST))
     if (
-        planned := _try_codegen_tcgen05_pair_epilogue(
+        planned := _try_codegen_tcgen05_fragment_epilogue(
             state, tensor, subscript, ast_subscript, extra_mask
         )
     ) is not None:
@@ -2068,7 +2069,7 @@ def _cute_vector_load_ctx(
             return vec_width, inner_block_id, "unroll"
         return None
     # CuTe N-D tile strategy with lane loops: vec is set up per-block in
-    # ``CuteNDTileStrategy.__init__`` when the autotuner picks
+    # ``PerThreadNDTileStrategy.__init__`` when the autotuner picks
     # ``cute_vector_widths[block_id]`` > 1 and EPT is divisible by V.  Mode
     # is forced to ``"unroll"`` (per-element bitcast) for fp16/bf16 since
     # subscripting a bf16/fp16 vector in the CuTe DSL is unsafe; fp32
@@ -2292,7 +2293,7 @@ def _(state: CodegenState) -> object:
             )
         elif vec_mode == "tile_unroll":
             # Same hoist protocol as ``LoopedReductionStrategy``'s
-            # ``unroll`` mode but for ``CuteNDTileStrategy`` lane loops.
+            # ``unroll`` mode but for ``PerThreadNDTileStrategy`` lane loops.
             from ..tile_strategy import BlockSizeTileStrategy
 
             assert isinstance(strategy, BlockSizeTileStrategy)

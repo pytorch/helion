@@ -4,6 +4,7 @@ import ast
 import dataclasses
 import enum
 from typing import TYPE_CHECKING
+from typing import Literal
 from typing import Protocol
 from typing import cast
 
@@ -22,7 +23,7 @@ if TYPE_CHECKING:
     from .cute_epilogue import Tcgen05GroupedTailEpilogueMatch
     from .cute_mma import _Tcgen05AuxPipelinePlan
     from .cute_mma import _Tcgen05SchedPipelinePlan
-    from .fragment_epilogue import Tcgen05PairEpiloguePlan
+    from .fragment_epilogue import Tcgen05FragmentEpiloguePlan
     from .tcgen05_lifecycle import Tcgen05LifecycleContext
     from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
@@ -36,6 +37,14 @@ class Tcgen05GroupedDMode(enum.Enum):
     NONE = enum.auto()
     ALL_TILES = enum.auto()
     EDGE_ONLY = enum.auto()
+
+
+class Tcgen05GroupedSchedulerMode(enum.Enum):
+    """How a grouped persistent kernel selects its next logical tile."""
+
+    DEVICE_GROUP_SEARCH = "device_group_search"
+    RUNTIME_DIRECT = "runtime_direct"
+    RUNTIME_CLC = "runtime_clc"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -54,6 +63,17 @@ class CuteTcgen05GroupedPlan:
     problem_n: str
     problem_k: str
     global_m_start: str
+    scheduler_mode: Tcgen05GroupedSchedulerMode = (
+        Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH
+    )
+    # Host-expanded per-logical-tile records for the runtime N,M worklist
+    # direct scheduler.  Unlike ``static_problem_shapes``, this table is built
+    # from the current worklist values by the launcher and is therefore reusable
+    # by one compiled kernel across routing vectors.  ``total_clusters`` is a
+    # runtime scalar because the table row count is launch metadata, not an AOT
+    # problem signature.
+    runtime_tile_records: str | None = None
+    runtime_total_clusters: str | None = None
     static_problem_shapes: tuple[tuple[int, int, int], ...] | None = None
     static_group_quota_args: tuple[str, ...] = ()
     real_groups: str | None = None
@@ -63,14 +83,17 @@ class CuteTcgen05GroupedPlan:
     direct_strides: str | None = None
     d_mode: Tcgen05GroupedDMode = Tcgen05GroupedDMode.NONE
     d_tensormap: str | None = None
+    fixed_tensormaps: bool = False
     # N,M worklists carry their source-row tile explicitly so runtime metadata
     # validation and launch bounds consume the exact schedule selected by the
-    # compiler.  For the device-split variant, ``layout`` names the device
-    # ``split_sizes[G]`` tensor while ``problem_sizes`` and ``starts`` are
-    # kernel-local SMEM tensors.  ``m_size`` lets the launcher derive a safe
-    # static cluster bound without reading split values on the host.
+    # compiler.  For compact device layouts, ``layout`` names either the
+    # ``split_sizes[G]`` or ``offsets[G + 1]`` tensor while ``problem_sizes``
+    # and ``starts`` are kernel-local SMEM tensors.  ``m_size`` lets the
+    # launcher derive a safe static cluster bound without reading layout
+    # values on the host.
     source_m_tile: int | None = None
     m_size: int | None = None
+    device_layout_kind: Literal["split_sizes", "offsets"] | None = None
 
     def __post_init__(self) -> None:
         assert (self.valid_m is None) == (self.store_m is None)
@@ -81,6 +104,40 @@ class CuteTcgen05GroupedPlan:
         assert (self.direct_pointers is None) == (self.direct_strides is None)
         assert (self.d_mode is Tcgen05GroupedDMode.NONE) == (self.d_tensormap is None)
         assert not self.device_split_sizes or self.orientation is Tcgen05Orientation.NM
+        assert self.device_layout_kind in (None, "split_sizes", "offsets")
+        assert (self.device_layout_kind is not None) == self.device_split_sizes
+        assert (self.runtime_tile_records is None) == (
+            self.runtime_total_clusters is None
+        )
+        if self.scheduler_mode is Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH:
+            assert self.runtime_tile_records is None
+            assert self.runtime_total_clusters is None
+        elif self.scheduler_mode in (
+            Tcgen05GroupedSchedulerMode.RUNTIME_DIRECT,
+            Tcgen05GroupedSchedulerMode.RUNTIME_CLC,
+        ):
+            assert self.runtime_tile_records is not None
+            assert self.runtime_total_clusters is not None
+            assert self.orientation is Tcgen05Orientation.NM
+            assert not self.device_split_sizes
+            assert self.static_problem_shapes is None
+            if self.scheduler_mode is Tcgen05GroupedSchedulerMode.RUNTIME_CLC:
+                assert self.fixed_tensormaps
+        else:
+            raise AssertionError(
+                f"unhandled grouped scheduler mode: {self.scheduler_mode!r}"
+            )
+        if self.orientation is Tcgen05Orientation.NM:
+            assert (
+                self.uses_runtime_tile_table
+                or self.real_groups is not None
+                or self.device_split_sizes
+            )
+            assert self.fixed_tensormaps == (self.d_mode is Tcgen05GroupedDMode.NONE)
+        if self.fixed_tensormaps:
+            assert self.orientation is Tcgen05Orientation.NM
+            assert not self.device_split_sizes
+            assert self.direct_pointers is None
         if self.static_problem_shapes is not None:
             assert self.orientation is Tcgen05Orientation.MN
             assert self.real_groups is None
@@ -91,6 +148,13 @@ class CuteTcgen05GroupedPlan:
     @property
     def device_split_sizes(self) -> bool:
         return self.m_size is not None
+
+    @property
+    def uses_runtime_tile_table(self) -> bool:
+        return self.scheduler_mode in (
+            Tcgen05GroupedSchedulerMode.RUNTIME_DIRECT,
+            Tcgen05GroupedSchedulerMode.RUNTIME_CLC,
+        )
 
 
 class _CuteTcgen05Orientation(Protocol):
@@ -275,6 +339,28 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
         default=(), compare=False
     )
 
+    def __post_init__(self) -> None:
+        if self.grouped is None:
+            return
+        scheduler_mode = self.grouped.scheduler_mode
+        if scheduler_mode is Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH:
+            if self.grouped.orientation is Tcgen05Orientation.NM:
+                assert self.uses_role_local_persistent_body
+                assert self.has_scheduler_warp
+                assert not self.is_clc_persistent
+            return
+        if scheduler_mode is Tcgen05GroupedSchedulerMode.RUNTIME_DIRECT:
+            assert self.uses_role_local_persistent_body
+            assert not self.has_scheduler_warp
+            assert not self.is_clc_persistent
+            return
+        if scheduler_mode is Tcgen05GroupedSchedulerMode.RUNTIME_CLC:
+            assert self.uses_role_local_persistent_body
+            assert self.has_scheduler_warp
+            assert self.is_clc_persistent
+            return
+        raise AssertionError(f"unhandled grouped scheduler mode: {scheduler_mode!r}")
+
     @property
     def orientation(self) -> Tcgen05Orientation:
         return self.grouped.orientation if self.grouped else Tcgen05Orientation.MN
@@ -438,13 +524,13 @@ class CuteDeviceFunctionState:
         # registered under this result var, even when user-visible names were
         # renamed through casts or epilogue nodes.
         self.matmul_fx_node_result_vars: dict[torch.fx.Node, str] = {}
-        self._pair_epilogue_plan: Tcgen05PairEpiloguePlan | None = None
+        self._fragment_epilogue_plan: Tcgen05FragmentEpiloguePlan | None = None
         # Rejected proofs are stable for this per-config codegen state. Keep
         # the tile shape in the key so callers cannot accidentally reuse a
         # verdict if this helper is ever exercised with multiple shapes.
-        self._rejected_pair_epilogue_plans: set[tuple[torch.fx.Node, int, int, int]] = (
-            set()
-        )
+        self._rejected_fragment_epilogue_plans: set[
+            tuple[torch.fx.Node, int, int, int]
+        ] = set()
         self._collective_lane_loop_suppression_vetoed = False
         self.matmul_plan: CuteTcgen05MatmulPlan | None = None
         # Variable-name containers allocated in cute_mma and consumed by
@@ -499,45 +585,45 @@ class CuteDeviceFunctionState:
         # Stage-3) or 256 (Stage-4 warp-spec, double-buffered-S overlap).
         self.attention_flash_threads: int = 128
 
-    def register_tcgen05_pair_epilogue_plan(
-        self, plan: Tcgen05PairEpiloguePlan
+    def register_tcgen05_fragment_epilogue_plan(
+        self, plan: Tcgen05FragmentEpiloguePlan
     ) -> None:
         """Atomically commit one fully validated live-FX fragment plan."""
-        if self._pair_epilogue_plan is not None:
+        if self._fragment_epilogue_plan is not None:
             raise exc.BackendUnsupported(
-                "cute", "tcgen05 pair epilogue plan must be unique"
+                "cute", "tcgen05 fragment epilogue plan must be unique"
             )
-        self._pair_epilogue_plan = plan
+        self._fragment_epilogue_plan = plan
 
-    def reject_tcgen05_pair_epilogue_plan(
+    def reject_tcgen05_fragment_epilogue_plan(
         self, anchor: Node, *, bm: int, bn: int, bk: int
     ) -> None:
-        """Memoize a failed pair-locality proof for this config."""
-        self._rejected_pair_epilogue_plans.add((anchor, bm, bn, bk))
+        """Memoize a failed thread-locality proof for this config."""
+        self._rejected_fragment_epilogue_plans.add((anchor, bm, bn, bk))
 
-    def tcgen05_pair_epilogue_plan_was_rejected(
+    def tcgen05_fragment_epilogue_plan_was_rejected(
         self, anchor: Node, *, bm: int, bn: int, bk: int
     ) -> bool:
-        return (anchor, bm, bn, bk) in self._rejected_pair_epilogue_plans
+        return (anchor, bm, bn, bk) in self._rejected_fragment_epilogue_plans
 
     @property
-    def has_tcgen05_pair_epilogue_plan(self) -> bool:
-        return self._pair_epilogue_plan is not None
+    def has_tcgen05_fragment_epilogue_plan(self) -> bool:
+        return self._fragment_epilogue_plan is not None
 
-    def tcgen05_pair_epilogue_plan_for_anchor(
+    def tcgen05_fragment_epilogue_plan_for_anchor(
         self, anchor: Node
-    ) -> Tcgen05PairEpiloguePlan | None:
-        plan = self._pair_epilogue_plan
+    ) -> Tcgen05FragmentEpiloguePlan | None:
+        plan = self._fragment_epilogue_plan
         return plan if plan is not None and plan.anchor is anchor else None
 
-    def tcgen05_pair_epilogue_plan_for_store(
+    def tcgen05_fragment_epilogue_plan_for_store(
         self, store: Node | None
-    ) -> Tcgen05PairEpiloguePlan | None:
-        plan = self._pair_epilogue_plan
+    ) -> Tcgen05FragmentEpiloguePlan | None:
+        plan = self._fragment_epilogue_plan
         return plan if plan is not None and plan.store_node is store else None
 
-    def is_deferred_tcgen05_pair_epilogue_node(self, node: Node) -> bool:
-        plan = self._pair_epilogue_plan
+    def is_deferred_tcgen05_fragment_epilogue_node(self, node: Node) -> bool:
+        plan = self._fragment_epilogue_plan
         return plan is not None and node in plan.owned_nodes
 
     def veto_collective_lane_loop_suppression(self) -> None:

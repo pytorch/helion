@@ -53,7 +53,6 @@ from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import _symint_expr
 from .compile_environment import _symint_sympy_expr
-from .cute.cutedsl_compat import cute_math_min_max_available
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
 from .node_masking import inductor_masked_value
@@ -124,6 +123,11 @@ def prepare_node_lowering(
     if is_api_func(api := node.target):
         APIFuncLowering.normalize_args_kwargs(api, node)
         node.meta["lowering"] = APIFuncLowering(api)
+        return
+
+    backend_lowering = CompileEnvironment.current().backend.pre_inductor_lowering(node)
+    if backend_lowering is not None:
+        node.meta["lowering"] = backend_lowering
         return
 
     if node.target in aten_lowering_dispatch:
@@ -1231,15 +1235,6 @@ class GenerateASTFromInductor(DefaultHandler):
         if dtype is not None:
             a = self._create_cast_expr(a, dtype)
             b = self._create_cast_expr(b, dtype)
-        if not cute_math_min_max_available():
-            return self._lift(
-                expr_from_string(
-                    "{a} if {a} != {a} else "
-                    "({b} if {b} != {b} else ({a} if {a} >= {b} else {b}))",
-                    a=self._to_ast(a),
-                    b=self._to_ast(b),
-                )
-            )
         return self._lift(
             expr_from_string(
                 "cute.math.max({a}, {b}, propagate_nan=True)",
@@ -1255,15 +1250,6 @@ class GenerateASTFromInductor(DefaultHandler):
         if dtype is not None:
             a = self._create_cast_expr(a, dtype)
             b = self._create_cast_expr(b, dtype)
-        if not cute_math_min_max_available():
-            return self._lift(
-                expr_from_string(
-                    "{a} if {a} != {a} else "
-                    "({b} if {b} != {b} else ({a} if {a} <= {b} else {b}))",
-                    a=self._to_ast(a),
-                    b=self._to_ast(b),
-                )
-            )
         return self._lift(
             expr_from_string(
                 "cute.math.min({a}, {b}, propagate_nan=True)",
@@ -1497,22 +1483,22 @@ class GraphInterpreter(LoweringContext, Interpreter):
             ):
                 try:
                     cute_state = self.cg.device_function.cute_state
-                    if cute_state.has_tcgen05_pair_epilogue_plan:
-                        if cute_state.is_deferred_tcgen05_pair_epilogue_node(n):
-                            n.meta["codegen"] = _DEFERRED_TCGEN05_PAIR_EPILOGUE
-                            return _DEFERRED_TCGEN05_PAIR_EPILOGUE
+                    if cute_state.has_tcgen05_fragment_epilogue_plan:
+                        if cute_state.is_deferred_tcgen05_fragment_epilogue_node(n):
+                            n.meta["codegen"] = _DEFERRED_TCGEN05_FRAGMENT_EPILOGUE
+                            return _DEFERRED_TCGEN05_FRAGMENT_EPILOGUE
                         if (
                             any(
                                 self.env.get(input_node)
-                                is _DEFERRED_TCGEN05_PAIR_EPILOGUE
+                                is _DEFERRED_TCGEN05_FRAGMENT_EPILOGUE
                                 for input_node in n.all_input_nodes
                             )
-                            and cute_state.tcgen05_pair_epilogue_plan_for_store(n)
+                            and cute_state.tcgen05_fragment_epilogue_plan_for_store(n)
                             is None
                         ):
                             raise exc.BackendUnsupported(
                                 "cute",
-                                "deferred tcgen05 pair epilogue escaped its "
+                                "deferred tcgen05 fragment epilogue escaped its "
                                 "committed store",
                             )
                     lowering: Lowering = n.meta["lowering"]
@@ -1571,11 +1557,11 @@ class GraphInterpreter(LoweringContext, Interpreter):
         return super().run_node(n)
 
 
-_DEFERRED_TCGEN05_PAIR_EPILOGUE = object()
+_DEFERRED_TCGEN05_FRAGMENT_EPILOGUE = object()
 
 
-def is_deferred_tcgen05_pair_epilogue(value: object) -> bool:
-    return value is _DEFERRED_TCGEN05_PAIR_EPILOGUE
+def is_deferred_tcgen05_fragment_epilogue(value: object) -> bool:
+    return value is _DEFERRED_TCGEN05_FRAGMENT_EPILOGUE
 
 
 def codegen_call_with_graph(

@@ -644,6 +644,7 @@ def _pallas_jnp_dtype_map() -> dict[str, object]:
         "jnp.int8": jnp.int8,
         "jnp.uint8": jnp.uint8,
         "jnp.bool_": jnp.bool_,
+        "jnp.float8_e4m3fn": jnp.float8_e4m3fn,
     }
 
 
@@ -1647,10 +1648,14 @@ def _pallas_pl_kernel_jit_fn(
             )(*pipe_any)
 
         kernel_kwargs: dict[str, object] = {scratch_kw: scratch_shapes}
+        compiler_params: dict[str, object] = {
+            "vmem_limit_bytes": _get_vmem_limit_bytes(pltpu, interpret)
+        }
         if collective_id is not None:
-            kernel_kwargs["compiler_params"] = pltpu.CompilerParams(  # type: ignore[union-attr]
-                collective_id=collective_id
-            )
+            compiler_params["collective_id"] = collective_id
+        kernel_kwargs["compiler_params"] = pltpu.CompilerParams(  # type: ignore[union-attr]
+            **compiler_params
+        )
         return pl.kernel(  # type: ignore[union-attr]
             kernel_body,
             kernel_out_shape,

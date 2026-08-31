@@ -29,10 +29,14 @@ from helion._compiler.ast_read_writes import dead_lane_loop_elimination
 from helion._compiler.aten_lowering import _pallas_argreduce
 from helion._compiler.aten_lowering import _should_use_cute_argreduce_lowering
 from helion._compiler.aten_lowering import _triton_argreduce
+from helion._compiler.autotuner_heuristics.cute import (
+    CuteTcgen05ThreadLocalEpilogueHeuristic,
+)
 from helion._compiler.backend import CuteBackend
 from helion._compiler.backend import PallasBackend
 from helion._compiler.backend import TritonBackend
 from helion._compiler.backend import _loop_contains_matmul
+from helion._compiler.compile_environment import AutoSize
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.argreduce import codegen_cute_tile_argreduce
 from helion._compiler.cute.aten_lowering import codegen_baddbmm_cute
@@ -80,6 +84,7 @@ from helion._compiler.cute.cute_mma import _tcgen05_root_m_threads
 from helion._compiler.cute.cute_mma import _tcgen05_tmem_barrier_thread_count
 from helion._compiler.cute.cute_mma import _trace_mma_to_store_dtype
 from helion._compiler.cute.cute_mma import _unwrap_mma_operand_permute
+from helion._compiler.cute.cute_reshape import CUTE_DIM_LOCAL_COORD_META
 from helion._compiler.cute.cute_reshape import _get_dim_local_coord
 from helion._compiler.cute.cute_reshape import codegen_cute_permute
 from helion._compiler.cute.cute_reshape import codegen_cute_reshape
@@ -89,6 +94,7 @@ from helion._compiler.cute.fragment_epilogue import _floordiv
 from helion._compiler.cute.fragment_epilogue import _Index
 from helion._compiler.cute.fragment_epilogue import _mod
 from helion._compiler.cute.fragment_epilogue import _mul
+from helion._compiler.cute.fragment_epilogue import _query_tcgen05_fragment_ownership
 from helion._compiler.cute.indexing import CutePackedAffineLoad
 from helion._compiler.cute.indexing import CutePackedTerms
 from helion._compiler.cute.indexing import CuteShapeChainView
@@ -107,6 +113,7 @@ from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
 from helion._compiler.cute.strategies import TCGEN05_STRATEGY_CONFIG_KEY
+from helion._compiler.cute.strategies import TCGEN05_WARP_SPEC_DEFAULTS_BY_KEY
 from helion._compiler.cute.strategies import Tcgen05LayoutStrategy
 from helion._compiler.cute.strategies import Tcgen05Strategy
 from helion._compiler.cute.strategies import Tcgen05WarpSpec
@@ -233,6 +240,7 @@ from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreBodyCorePar
 from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStorePipelineParams
 from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreSubtileLoopParams
 from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreTailParams
+from helion._compiler.cute.view_subtile import _split_minor_coord_meta
 from helion._compiler.device_ir import DeviceIR
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import GraphInfo
@@ -243,6 +251,7 @@ from helion._compiler.reduction_strategy import BlockReductionStrategy
 from helion._compiler.reduction_strategy import PersistentReductionStrategy
 from helion._compiler.tile_strategy import DeviceGridState
 from helion._compiler.tile_strategy import DeviceLoopState
+from helion._compiler.tile_strategy import _create_lane_loop
 from helion._compiler.tile_strategy import _lane_loop_iter
 from helion._compiler.variable_origin import NameOrigin
 from helion._compiler.variable_origin import TileBeginOrigin
@@ -443,6 +452,10 @@ def cute_projection_rotary_bf16(
     table: torch.Tensor,
     bias: torch.Tensor,
 ) -> torch.Tensor:
+    """Fuse projection, bias, and adjacent-pair rotation.
+
+    Each table row is half-packed as ``[left..., right...]``.
+    """
     m, k = x.size()
     h, _, d = weight.size()
     out = torch.empty([h, m, d], dtype=x.dtype, device=x.device)
@@ -456,11 +469,12 @@ def cute_projection_rotary_bf16(
             )
         bias_tile = bias[tile_h.index[:, None], tile_d.index[None, :]]
         acc = acc + bias_tile[:, None, :]
-        table_tile = table[tile_m, tile_d]
-        table_pairs = table_tile.view(
-            tile_m.block_size, 2, tile_d.block_size // 2
-        ).permute(0, 2, 1)
-        left, right = hl.split(table_pairs)
+        # Derive table addresses from global D coordinates so every D tile
+        # observes the same half-packed layout.
+        pair_index = hl.split(tile_d.index.view(tile_d.block_size // 2, 2))[0]
+        pair_index = pair_index // 2
+        left = table[tile_m.index[:, None], pair_index[None, :]]
+        right = table[tile_m.index[:, None], d // 2 + pair_index[None, :]]
         pairs = acc.view(
             tile_h.block_size,
             tile_m.block_size,
@@ -475,6 +489,77 @@ def cute_projection_rotary_bf16(
         out[tile_h, tile_m, tile_d] = result.view(
             tile_h.block_size, tile_m.block_size, tile_d.block_size
         ).to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", fast_math=True)
+def cute_projection_interleaved_swiglu_bf16(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    """Fuse a projection whose gate/value columns are interleaved."""
+    m, k = x.size()
+    h, _, packed_d = weight.size()
+    out = torch.empty([h, m, packed_d // 2], dtype=x.dtype, device=x.device)
+    for tile_h, tile_m, tile_packed_d in hl.tile([h, m, packed_d]):
+        acc = hl.zeros([tile_h, tile_m, tile_packed_d], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(
+                x[tile_m, tile_k],
+                weight[tile_h, tile_k, tile_packed_d],
+                acc=acc,
+            )
+        pairs = acc.view(
+            tile_h.block_size,
+            tile_m.block_size,
+            tile_packed_d.block_size // 2,
+            2,
+        )
+        gate, value = hl.split(pairs)
+        output_d = (
+            hl.split(tile_packed_d.index.view(tile_packed_d.block_size // 2, 2))[0] // 2
+        )
+        out[
+            tile_h.index[:, None, None],
+            tile_m.index[None, :, None],
+            output_d[None, None, :],
+        ] = (gate * torch.sigmoid(gate) * value).to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_projection_wrapped_swiglu_bf16(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    """An invalid compact store that aliases only after several packed-D tiles."""
+    m, k = x.size()
+    h, _, packed_d = weight.size()
+    out = torch.empty([h, m, packed_d // 2], dtype=x.dtype, device=x.device)
+    for tile_h, tile_m, tile_packed_d in hl.tile([h, m, packed_d]):
+        acc = hl.zeros([tile_h, tile_m, tile_packed_d], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(
+                x[tile_m, tile_k],
+                weight[tile_h, tile_k, tile_packed_d],
+                acc=acc,
+            )
+        pairs = acc.view(
+            tile_h.block_size,
+            tile_m.block_size,
+            tile_packed_d.block_size // 2,
+            2,
+        )
+        gate, value = hl.split(pairs)
+        output_d = (
+            hl.split(tile_packed_d.index.view(tile_packed_d.block_size // 2, 2))[0] // 2
+        )
+        output_d = output_d % 256
+        out[
+            tile_h.index[:, None, None],
+            tile_m.index[None, :, None],
+            output_d[None, None, :],
+        ] = (gate * torch.sigmoid(gate) * value).to(x.dtype)
     return out
 
 
@@ -504,6 +589,122 @@ def cute_pair_butterfly_bf16(x: torch.Tensor, weight: torch.Tensor) -> torch.Ten
 
 
 @helion.kernel(backend="cute")
+def cute_group4_fragment_bf16(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """A four-register transform that exercises the generic ownership proof."""
+    m, k = x.size()
+    h, _, d = weight.size()
+    out = torch.empty([h, m, d], dtype=x.dtype, device=x.device)
+    for tile_h, tile_m, tile_d in hl.tile([h, m, d]):
+        acc = hl.zeros([tile_h, tile_m, tile_d], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_h, tile_k, tile_d], acc=acc)
+        groups = acc.view(
+            tile_h.block_size,
+            tile_m.block_size,
+            tile_d.block_size // 4,
+            2,
+            2,
+        )
+        left, right = hl.split(groups)
+        x0, x1 = hl.split(left)
+        x2, x3 = hl.split(right)
+        total = x0 + x1 + x2 + x3
+        mixed_left = hl.join(total + x0, total + x1)
+        mixed_right = hl.join(total + x2, total + x3)
+        out[tile_h, tile_m, tile_d] = (
+            hl.join(mixed_left, mixed_right)
+            .view(tile_h.block_size, tile_m.block_size, tile_d.block_size)
+            .to(x.dtype)
+        )
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_compact_group4_fragment_bf16(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    """Compact four adjacent projection columns into one weighted output."""
+    m, k = x.size()
+    h, _, d = weight.size()
+    out = torch.empty([h, m, d // 4], dtype=x.dtype, device=x.device)
+    for tile_h, tile_m, tile_d in hl.tile([h, m, d]):
+        acc = hl.zeros([tile_h, tile_m, tile_d], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_h, tile_k, tile_d], acc=acc)
+        groups = acc.view(
+            tile_h.block_size,
+            tile_m.block_size,
+            tile_d.block_size // 4,
+            2,
+            2,
+        )
+        left, right = hl.split(groups)
+        x0, x2 = hl.split(left)
+        x1, x3 = hl.split(right)
+        index_groups = tile_d.index.view(tile_d.block_size // 4, 2, 2)
+        index_left, index_right = hl.split(index_groups)
+        output_d, output_d_other = hl.split(index_left)
+        out[
+            tile_h.index[:, None, None],
+            tile_m.index[None, :, None],
+            (output_d // 4)[None, None, :],
+        ] = (x0 + 2.0 * x1 - 3.0 * x2 + 4.0 * x3).to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_fragment_sigmoid_bf16(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Exercise strict sigmoid through the generic fragment renderer."""
+    m, k = x.size()
+    h, _, d = weight.size()
+    out = torch.empty([h, m, d], dtype=x.dtype, device=x.device)
+    for tile_h, tile_m, tile_d in hl.tile([h, m, d]):
+        acc = hl.zeros([tile_h, tile_m, tile_d], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_h, tile_k, tile_d], acc=acc)
+        pairs = acc.view(
+            tile_h.block_size,
+            tile_m.block_size,
+            tile_d.block_size // 2,
+            2,
+        )
+        left, right = hl.split(pairs)
+        out[tile_h, tile_m, tile_d] = (
+            hl.join(torch.sigmoid(left), right)
+            .view(tile_h.block_size, tile_m.block_size, tile_d.block_size)
+            .to(x.dtype)
+        )
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_fragment_wrong_output_extent_bf16(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    """A locally shape-preserving transform stored into too small an output."""
+    m, k = x.size()
+    h, _, d = weight.size()
+    out = torch.empty([h, m, d // 2], dtype=x.dtype, device=x.device)
+    for tile_h, tile_m, tile_d in hl.tile([h, m, d]):
+        acc = hl.zeros([tile_h, tile_m, tile_d], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_h, tile_k, tile_d], acc=acc)
+        pairs = acc.view(
+            tile_h.block_size,
+            tile_m.block_size,
+            tile_d.block_size // 2,
+            2,
+        )
+        left, right = hl.split(pairs)
+        out[tile_h, tile_m, tile_d] = (
+            hl.join(left, right)
+            .view(tile_h.block_size, tile_m.block_size, tile_d.block_size)
+            .to(x.dtype)
+        )
+    return out
+
+
+@helion.kernel(backend="cute")
 def cute_cross_pair_swap_bf16(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """A reshape transform that is deliberately not register-pair-local."""
     m, k = x.size()
@@ -523,6 +724,34 @@ def cute_cross_pair_swap_bf16(x: torch.Tensor, weight: torch.Tensor) -> torch.Te
         out[tile_h, tile_m, tile_d] = (
             hl.join(high, low)
             .view(tile_h.block_size, tile_m.block_size, tile_d.block_size)
+            .to(x.dtype)
+        )
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_cross_thread_row_swap_bf16(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    """A transform whose source row belongs to a different output thread."""
+    m, k = x.size()
+    h, _, d = weight.size()
+    out = torch.empty([h, m, d], dtype=x.dtype, device=x.device)
+    for tile_h, tile_m, tile_d in hl.tile([h, m, d]):
+        acc = hl.zeros([tile_h, tile_m, tile_d], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], weight[tile_h, tile_k, tile_d], acc=acc)
+        row_pairs = acc.view(
+            tile_h.block_size,
+            tile_m.block_size // 2,
+            2,
+            tile_d.block_size,
+        ).permute(0, 1, 3, 2)
+        even, odd = hl.split(row_pairs)
+        out[tile_h, tile_m, tile_d] = (
+            hl.join(odd, even)
+            .permute(0, 1, 3, 2)
+            .reshape(tile_h.block_size, tile_m.block_size, tile_d.block_size)
             .to(x.dtype)
         )
     return out
@@ -598,44 +827,6 @@ def cute_mixed_pair_plain_bf16(
             )
         plain_out[tile_h, tile_m, tile_d] = plain_acc.to(x1.dtype)
     return pair_out, plain_out
-
-
-@helion.kernel(backend="cute")
-def cute_pair_plus_f32_mma(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """A pair candidate plus a decoded MMA outside tcgen05 search."""
-    m, k = x.size()
-    h, _, d = weight.size()
-    m2, k2 = a.size()
-    _, n2 = b.size()
-    pair_out = torch.empty([h, m, d], dtype=x.dtype, device=x.device)
-    f32_out = torch.empty([m2, n2], dtype=a.dtype, device=a.device)
-    for tile_h, tile_m, tile_d in hl.tile([h, m, d]):
-        acc = hl.zeros([tile_h, tile_m, tile_d], dtype=torch.float32)
-        for tile_k in hl.tile(k):
-            acc = hl.dot(x[tile_m, tile_k], weight[tile_h, tile_k, tile_d], acc=acc)
-        pairs = acc.view(
-            tile_h.block_size,
-            tile_m.block_size,
-            tile_d.block_size // 2,
-            2,
-        )
-        low, high = hl.split(pairs)
-        pair_out[tile_h, tile_m, tile_d] = (
-            hl.join(low + high, low - high)
-            .view(tile_h.block_size, tile_m.block_size, tile_d.block_size)
-            .to(x.dtype)
-        )
-    for tile_m2, tile_n2 in hl.tile([m2, n2]):
-        f32_acc = hl.zeros([tile_m2, tile_n2], dtype=torch.float32)
-        for tile_k2 in hl.tile(k2):
-            f32_acc = hl.dot(a[tile_m2, tile_k2], b[tile_k2, tile_n2], acc=f32_acc)
-        f32_out[tile_m2, tile_n2] = f32_acc
-    return pair_out, f32_out
 
 
 class _FakeBlockSize:
@@ -972,6 +1163,20 @@ class TestCuteLowerings(unittest.TestCase):
                 )
             )
 
+    def test_static_problem_extent_rejects_unresolved_registered_blocks(self) -> None:
+        from helion.language.matmul_ops import _static_problem_extent
+
+        for unresolved_size in (AutoSize(), None):
+            with self.subTest(size=type(unresolved_size).__name__):
+                env = SimpleNamespace(
+                    get_block_id=lambda _size: 0,
+                    block_sizes=[SimpleNamespace(size=unresolved_size)],
+                )
+                self.assertIsNone(_static_problem_extent(env, 64))
+
+        unregistered_env = SimpleNamespace(get_block_id=lambda _size: None)
+        self.assertEqual(_static_problem_extent(unregistered_env, 64), 64)
+
     def test_tcgen05_swapped_matmul_small_n_runtime(self) -> None:
         """Swapped operands use tcgen05 with a column-major small-N output."""
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -1071,9 +1276,27 @@ class TestCuteLowerings(unittest.TestCase):
         )
         self.assertIn("'lhs_tma_order': (1, 0)", code)
         self.assertIn("'rhs_tma_order': (0, 1)", code)
-        self.assertIn("while tcgen05_role_local", code)
         self.assertIn("cute.gemm(", direct_code)
-        self.assertIn("while tcgen05_role_local", direct_code)
+        for name, persistent_code in (
+            ("swapped", code),
+            ("direct", direct_code),
+        ):
+            with self.subTest(schedule=name):
+                self.assertIn(
+                    "tcgen05_role_local_0_tile_sched = "
+                    "cutlass.utils.StaticPersistentTileScheduler.create(",
+                    persistent_code,
+                )
+                self.assertIn(
+                    "tcgen05_role_local_0_work_tile = "
+                    "tcgen05_role_local_0_tile_sched.initial_work_tile_info()",
+                    persistent_code,
+                )
+                self.assertNotIn("while tcgen05_role_local", persistent_code)
+                self.assertNotIn(
+                    "tcgen05_role_local_0_tile_sched.advance_to_next_work()",
+                    persistent_code,
+                )
         self.assertIn("cute.gemm(", direct_row_code)
         self.assertNotIn("while tcgen05_role_local", direct_row_code)
         torch.testing.assert_close(direct_actual, expected.T, rtol=0, atol=0)
@@ -9089,6 +9312,8 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("cute.math.exp2", code)
         self.assertIn("1.4426950408889634", code)
         self.assertIn("tcgen05_chain_step", code)
+        self.assertIn("1.0 /", code)
+        self.assertNotIn("_cute_sigmoid_approx_ftz_f32", code)
         out = bound(x, y)
         expected = torch.sigmoid((x @ y).float()).to(x.dtype)
         torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
@@ -12604,6 +12829,7 @@ class TestCuteLowerings(unittest.TestCase):
             env={},
         )
         env = SimpleNamespace(resolve_block_id=lambda size: None)
+        codegen = hl.dot._codegen["cute"]
 
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
@@ -12620,7 +12846,7 @@ class TestCuteLowerings(unittest.TestCase):
                 return_value=ast.Name(id="dot_result", ctx=ast.Load()),
             ) as emit,
         ):
-            result = hl.dot._codegen["cute"](state)
+            result = codegen(state)
 
         self.assertEqual(ast.unparse(result), "dot_result")
         self.assertEqual(emit.call_args.kwargs["out_dtype"], torch.float32)
@@ -12665,6 +12891,7 @@ class TestCuteLowerings(unittest.TestCase):
             env={},
         )
         env = SimpleNamespace(resolve_block_id=lambda size: None)
+        codegen = hl.dot._codegen["cute"]
 
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
@@ -12682,7 +12909,7 @@ class TestCuteLowerings(unittest.TestCase):
             ) as emit,
             self.assertRaisesRegex(exc.BackendUnsupported, "hl.dot"),
         ):
-            hl.dot._codegen["cute"](state)
+            codegen(state)
 
         emit.assert_not_called()
 
@@ -12722,6 +12949,7 @@ class TestCuteLowerings(unittest.TestCase):
             env={},
         )
         env = SimpleNamespace(resolve_block_id=lambda size: None)
+        codegen = hl.dot._codegen["cute"]
 
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
@@ -12742,7 +12970,7 @@ class TestCuteLowerings(unittest.TestCase):
                 TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
             ),
         ):
-            hl.dot._codegen["cute"](state)
+            codegen(state)
 
         emit.assert_not_called()
 
@@ -12784,6 +13012,7 @@ class TestCuteLowerings(unittest.TestCase):
             env={},
         )
         env = SimpleNamespace(resolve_block_id=lambda size: None)
+        codegen = hl.dot._codegen["cute"]
 
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
@@ -12800,7 +13029,7 @@ class TestCuteLowerings(unittest.TestCase):
                 return_value=ast.Name(id="dot_result", ctx=ast.Load()),
             ) as emit,
         ):
-            hl.dot._codegen["cute"](state)
+            codegen(state)
 
         self.assertEqual(emit.call_args.kwargs["out_dtype"], torch.float32)
 
@@ -12852,6 +13081,7 @@ class TestCuteLowerings(unittest.TestCase):
         env = SimpleNamespace(
             resolve_block_id=lambda size: 11 if int(size) == 8 else None
         )
+        codegen = hl.dot._codegen["cute"]
 
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
@@ -12868,7 +13098,7 @@ class TestCuteLowerings(unittest.TestCase):
                 return_value=ast.Name(id="dot_result", ctx=ast.Load()),
             ) as emit,
         ):
-            result = hl.dot._codegen["cute"](state)
+            result = codegen(state)
 
         self.assertEqual(ast.unparse(result), "dot_result")
         self.assertIsNone(emit.call_args.kwargs["k_block_id"])
@@ -12926,6 +13156,7 @@ class TestCuteLowerings(unittest.TestCase):
         env = SimpleNamespace(
             resolve_block_id=lambda size: 11 if int(size) == 8 else None
         )
+        codegen = hl.dot._codegen["cute"]
 
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
@@ -12938,7 +13169,7 @@ class TestCuteLowerings(unittest.TestCase):
                 return_value=ast.Name(id="dot_result", ctx=ast.Load()),
             ) as emit,
         ):
-            result = hl.dot._codegen["cute"](state)
+            result = codegen(state)
 
         self.assertEqual(ast.unparse(result), "dot_result")
         self.assertEqual(emit.call_args.kwargs["k_block_id"], 11)
@@ -13458,6 +13689,30 @@ class TestCuteLowerings(unittest.TestCase):
             self.assertEqual(ast.unparse(_lane_loop_iter(9)), "range(9)")
 
     def test_dead_lane_loop_elimination_splices_invariant_loop(self) -> None:
+        # Build the nest directly: ``wrap_body`` already skips a lane loop that
+        # is dead at wrap time, but a loop can also become invariant later
+        # (e.g. after dead-assignment elimination), which is what the late
+        # splice pass exists for.
+        body: list[ast.AST] = [
+            _create_lane_loop(
+                "synthetic_lane_0",
+                4,
+                [
+                    statement_from_string("indices_0 = synthetic_lane_0"),
+                    statement_from_string("out = 1"),
+                ],
+            )
+        ]
+
+        dead_assignment_elimination(body, ["indices_0"])
+        self.assertTrue(dead_lane_loop_elimination(body))
+
+        code = ast.unparse(ast.Module(body=body, type_ignores=[]))
+        self.assertNotIn("for synthetic_lane_0", code)
+        self.assertNotIn("indices_0", code)
+        self.assertIn("out = 1", code)
+
+    def test_wrap_body_skips_unreferenced_lane_loop(self) -> None:
         grid = DeviceGridState(
             strategy=_FakeLoopStrategy([0]),
             block_id_to_info={},
@@ -13467,9 +13722,6 @@ class TestCuteLowerings(unittest.TestCase):
         )
         grid.add_lane_loop(0, "synthetic_lane_0", 4)
         body = grid.wrap_body([statement_from_string("out = 1")])
-
-        dead_assignment_elimination(body, ["indices_0"])
-        self.assertTrue(dead_lane_loop_elimination(body))
 
         code = ast.unparse(ast.Module(body=body, type_ignores=[]))
         self.assertNotIn("for synthetic_lane_0", code)
@@ -13524,6 +13776,7 @@ class TestCuteLowerings(unittest.TestCase):
                 _FakeBlockSize(16, block_id=2, reduction=True),
             ],
             config_spec=SimpleNamespace(
+                cute_attention_generic_fallback_enabled=False,
                 num_threads=SimpleNamespace(config_get=lambda *args: 0),
                 loop_orders=SimpleNamespace(config_get=lambda *args: None),
                 l2_groupings=SimpleNamespace(config_get=lambda *args: 1),
@@ -14500,6 +14753,42 @@ class TestCuteLowerings(unittest.TestCase):
             block_sizes=[128, 128, 256],
             tcgen05_ab_stages=2,
         )
+        worklist_config = helion.Config(
+            block_sizes=[256, 128, 64],
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=7,
+        )
+        worklist_config.config.update(
+            {
+                "tcgen05_grouped_mode": "worklist_nm",
+                "tcgen05_grouped_worklist_source_m_tile": 224,
+            }
+        )
+        cases = (
+            (torch.float16, 128, 128, 256, config, 200 * 1024, False, "universal"),
+            (torch.float16, 128, 128, 128, config, 200 * 1024, False, "tcgen05"),
+            (torch.float16, 128, 128, 128, config, 100 * 1024, False, "universal"),
+            (
+                torch.bfloat16,
+                256,
+                224,
+                64,
+                worklist_config,
+                200 * 1024,
+                False,
+                "universal",
+            ),
+            (
+                torch.bfloat16,
+                256,
+                224,
+                64,
+                worklist_config,
+                200 * 1024,
+                True,
+                "tcgen05",
+            ),
+        )
         with (
             patch(
                 "helion._compiler.cute.cute_mma.get_cute_mma_support",
@@ -14512,40 +14801,26 @@ class TestCuteLowerings(unittest.TestCase):
             ) as smem_budget,
             patch.dict("os.environ", {"HELION_CUTE_MMA_IMPL": "auto"}, clear=False),
         ):
-            self.assertEqual(
-                _choose_mma_impl(
-                    torch.float16,
-                    bm=128,
-                    bn=128,
-                    bk=256,
-                    config=config,
-                    input_device=torch.device("cuda"),
-                ),
-                "universal",
-            )
-            self.assertEqual(
-                _choose_mma_impl(
-                    torch.float16,
-                    bm=128,
-                    bn=128,
-                    bk=128,
-                    config=config,
-                    input_device=torch.device("cuda"),
-                ),
-                "tcgen05",
-            )
-            smem_budget.return_value = 100 * 1024
-            self.assertEqual(
-                _choose_mma_impl(
-                    torch.float16,
-                    bm=128,
-                    bn=128,
-                    bk=128,
-                    config=config,
-                    input_device=torch.device("cuda"),
-                ),
-                "universal",
-            )
+            for dtype, bm, bn, bk, case_config, budget, defer, expected in cases:
+                with self.subTest(
+                    dtype=str(dtype),
+                    block_sizes=(bm, bn, bk),
+                    budget=budget,
+                    defer=defer,
+                ):
+                    smem_budget.return_value = budget
+                    self.assertEqual(
+                        _choose_mma_impl(
+                            dtype,
+                            bm=bm,
+                            bn=bn,
+                            bk=bk,
+                            config=case_config,
+                            input_device=torch.device("cuda"),
+                            defer_grouped_worklist_smem_check=defer,
+                        ),
+                        expected,
+                    )
 
     def test_tcgen05_thread_counts_match_participants_and_cta(self) -> None:
         # ``_tcgen05_epi_warp_count`` takes a ``Tcgen05WarpSpec`` (G2-B);
@@ -15626,7 +15901,22 @@ class TestCuteLowerings(unittest.TestCase):
                 "(mask_1)",
             )
 
-    def test_tcgen05_pair_index_compiler_matches_sympy(self) -> None:
+    def test_split_minor_coord_does_not_cross_non_pointwise_node(self) -> None:
+        graph = Graph()
+        source = graph.placeholder("source")
+        source.meta["val"] = torch.empty([8, 2])
+        coordinate = {"block_id": 2, "divisor": 1, "modulus": 2}
+        source.meta[CUTE_DIM_LOCAL_COORD_META] = [None, coordinate]
+        split = graph.call_function(hl.split, (source,))
+        projected = graph.call_function(operator.getitem, (split, 0))
+        projected.meta["val"] = torch.empty([8])
+        opaque = graph.call_function(torch.ops.aten.clone.default, (projected,))
+        opaque.meta["val"] = torch.empty([8])
+
+        self.assertEqual(_split_minor_coord_meta(projected), coordinate)
+        self.assertIsNone(_split_minor_coord_meta(opaque))
+
+    def test_tcgen05_fragment_index_compiler_matches_sympy(self) -> None:
         row = _Index.variable("row", 3)
         pair = _Index.variable("pair", 4)
         numerator = _add(_add(_mul(row, -3), _mul(pair, 5)), -1)
@@ -15648,7 +15938,58 @@ class TestCuteLowerings(unittest.TestCase):
                 )
                 self.assertEqual(evaluate(variables), expected)
 
-    def test_tcgen05_pair_plan_rejection_is_memoized_per_tile_shape(self) -> None:
+    def test_tcgen05_thread_local_ownership_oracle_is_complete_and_cached(
+        self,
+    ) -> None:
+        _query_tcgen05_fragment_ownership.cache_clear()
+        for source_bn, destination_bn in (
+            (64, 64),
+            (64, 32),
+            (128, 128),
+            (128, 64),
+        ):
+            with self.subTest(source_bn=source_bn, destination_bn=destination_bn):
+                ownership = _query_tcgen05_fragment_ownership(
+                    bm=128,
+                    bn=source_bn,
+                    bk=32,
+                    destination_bm=128,
+                    destination_bn=destination_bn,
+                    input_dtype=torch.bfloat16,
+                    output_dtype=torch.bfloat16,
+                )
+                self.assertEqual(ownership.source_shape, (128, source_bn))
+                self.assertEqual(ownership.destination_shape, (128, destination_bn))
+                for slots, shape in (
+                    (ownership.source_slots, ownership.source_shape),
+                    (ownership.destination_slots, ownership.destination_shape),
+                ):
+                    self.assertEqual(len(slots), shape[0] * shape[1])
+                    self.assertEqual(
+                        len(
+                            {
+                                (slot.thread, slot.subtile, slot.register)
+                                for slot in slots
+                            }
+                        ),
+                        len(slots),
+                    )
+                self.assertIs(
+                    _query_tcgen05_fragment_ownership(
+                        bm=128,
+                        bn=source_bn,
+                        bk=32,
+                        destination_bm=128,
+                        destination_bn=destination_bn,
+                        input_dtype=torch.bfloat16,
+                        output_dtype=torch.bfloat16,
+                    ),
+                    ownership,
+                )
+
+    def test_tcgen05_fragment_plan_rejection_is_memoized_per_tile_shape(
+        self,
+    ) -> None:
         from helion._compiler.cute import cute_mma as cute_mma_module
 
         graph = Graph()
@@ -15663,11 +16004,21 @@ class TestCuteLowerings(unittest.TestCase):
         candidate = cast(
             "Any",
             SimpleNamespace(
-                requires_pair_epilogue=True,
-                operands=SimpleNamespace(output_block_ids=()),
+                requires_fragment_epilogue=True,
+                operands=SimpleNamespace(
+                    output_block_ids=(),
+                    lhs=SimpleNamespace(
+                        source_fake=torch.empty([], dtype=torch.bfloat16),
+                        is_leading_passthrough=False,
+                        matrix_rows=128,
+                    ),
+                    rhs=SimpleNamespace(
+                        logical_fake=torch.empty([1, 128, 128]), matrix_cols=128
+                    ),
+                ),
             ),
         )
-        config = cast("Any", {})
+        config = _make_tcgen05_persistent_config(**TCGEN05_WARP_SPEC_DEFAULTS_BY_KEY)
 
         with (
             patch.object(
@@ -15675,7 +16026,7 @@ class TestCuteLowerings(unittest.TestCase):
             ),
             patch.object(
                 cute_mma_module,
-                "_tcgen05_pair_epilogue_operands_supported",
+                "_tcgen05_fragment_epilogue_operands_supported",
                 return_value=True,
             ),
             patch.object(
@@ -15683,13 +16034,18 @@ class TestCuteLowerings(unittest.TestCase):
             ),
             patch.object(
                 cute_mma_module,
-                "analyze_tcgen05_pair_epilogue_plan",
+                "warp_spec_from_config",
+                return_value=SimpleNamespace(store_warps=0),
+            ),
+            patch.object(
+                cute_mma_module,
+                "analyze_tcgen05_fragment_epilogue_plan",
                 return_value=None,
             ) as analyze,
         ):
             for bn in (64, 64, 128):
                 self.assertFalse(
-                    cute_mma_module.ensure_tcgen05_pair_epilogue_plan(
+                    cute_mma_module.ensure_tcgen05_fragment_epilogue_plan(
                         fn,
                         anchor,
                         candidate,
@@ -15699,10 +16055,39 @@ class TestCuteLowerings(unittest.TestCase):
                         config=config,
                     )
                 )
-
         self.assertEqual(analyze.call_count, 2)
 
-    def test_tcgen05_pair_fragment_projection_rotary_codegen(self) -> None:
+    def test_tcgen05_fragment_source_tiles_reject_dynamic_problem_shape(
+        self,
+    ) -> None:
+        from helion._compiler.cute import cute_mma as cute_mma_module
+
+        candidate = cast("Any", SimpleNamespace(requires_fragment_epilogue=True))
+        static_extents = {"static_m": 128, "static_n": 128, "static_k": 64}
+        for dynamic_extent in static_extents:
+            with (
+                self.subTest(dynamic_extent=dynamic_extent),
+                patch.object(
+                    cute_mma_module,
+                    "_tcgen05_fragment_epilogue_operands_supported",
+                ) as operands_supported,
+            ):
+                plan = SimpleNamespace(
+                    **{
+                        **static_extents,
+                        dynamic_extent: None,
+                    }
+                )
+                self.assertFalse(
+                    cute_mma_module.tcgen05_fragment_epilogue_source_tiles_reachable(
+                        candidate,
+                        cast("Any", plan),
+                        cast("Any", SimpleNamespace()),
+                    )
+                )
+                operands_supported.assert_not_called()
+
+    def test_tcgen05_fragment_projection_rotary_codegen(self) -> None:
         dtype = torch.bfloat16
         x = torch.empty([128, 128], device=DEVICE, dtype=dtype)
         for head_dim in (64, 128):
@@ -15722,21 +16107,69 @@ class TestCuteLowerings(unittest.TestCase):
                 self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
                 bound.set_config(config)
                 code = bound.to_triton_code(config)
-                self.assertEqual(code.count("for tcgen05_epi_pair"), 1)
-                self.assertEqual(
-                    len(
-                        re.findall(
-                            r"^\s*tcgen05_epi_load_\d+ = ",
-                            code,
-                            flags=re.MULTILINE,
-                        )
-                    ),
-                    4,
-                )
+                self.assertIn("for tcgen05_epi_position", code)
+                self.assertIn("table.iterator", code)
+                self.assertIn("bias.iterator", code)
                 self.assertNotIn("split_smem", code)
                 self.assertNotIn("permute_smem", code)
 
-    def test_tcgen05_pair_fragment_projection_rotary_runtime(self) -> None:
+    def test_tcgen05_thread_local_heuristic_promotes_seed(self) -> None:
+        dtype = torch.bfloat16
+        kernels_and_args = (
+            (
+                cute_projection_rotary_bf16,
+                (
+                    torch.empty([128, 128], device=DEVICE, dtype=dtype),
+                    torch.empty([1, 128, 128], device=DEVICE, dtype=dtype),
+                    torch.empty([128, 128], device=DEVICE, dtype=dtype),
+                    torch.empty([1, 128], device=DEVICE, dtype=dtype),
+                ),
+            ),
+            (
+                cute_projection_interleaved_swiglu_bf16,
+                (
+                    torch.empty([128, 128], device=DEVICE, dtype=dtype),
+                    torch.empty([1, 128, 128], device=DEVICE, dtype=dtype),
+                ),
+            ),
+        )
+        for kernel, args in kernels_and_args:
+            with self.subTest(kernel=kernel.__name__), patch_cute_mma_support():
+                bound = kernel.bind(args)
+                spec = bound.config_spec
+                self.assertIn(
+                    CuteTcgen05ThreadLocalEpilogueHeuristic.name,
+                    spec.autotuner_heuristics,
+                )
+                default_config = spec.default_config()
+                self.assertEqual(
+                    default_config.config["block_sizes"],
+                    [1, 128, 128, 128],
+                )
+                self.assertIn(
+                    "for tcgen05_epi_position",
+                    bound.to_triton_code(default_config),
+                )
+                seed = spec.compiler_default_config
+                assert seed is not None
+                self.assertEqual(seed.config["block_sizes"], [1, 128, 128, 128])
+                self.assertIn(seed, spec.compiler_seed_configs)
+
+    def test_tcgen05_thread_local_heuristic_ignores_regular_epilogue(self) -> None:
+        dtype = torch.bfloat16
+        args = (
+            torch.empty([128, 128], device=DEVICE, dtype=dtype),
+            torch.empty([128, 128], device=DEVICE, dtype=dtype),
+        )
+        with patch_cute_mma_support():
+            spec = cute_matmul_role_local_monolithic_relu_bf16.bind(args).config_spec
+        self.assertNotIn(
+            CuteTcgen05ThreadLocalEpilogueHeuristic.name,
+            spec.autotuner_heuristics,
+        )
+        self.assertIsNone(spec.compiler_default_config)
+
+    def test_tcgen05_fragment_projection_rotary_runtime(self) -> None:
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
         if not get_cute_mma_support().tcgen05_f16bf16:
@@ -15751,16 +16184,7 @@ class TestCuteLowerings(unittest.TestCase):
                 table = torch.randn([m, head_dim], device=DEVICE, dtype=dtype)
                 bias = torch.randn([heads, head_dim], device=DEVICE, dtype=dtype)
                 args = (x, weight, table, bias)
-                config = _make_tcgen05_persistent_config(
-                    block_sizes=[1, 128, head_dim, 32],
-                    loop_orders=[[0, 1, 2]],
-                    pid_type="persistent_interleaved",
-                )
                 bound = cute_projection_rotary_bf16.bind(args)
-                bound.env.config_spec.cute_tcgen05_search_enabled = True
-                bound.set_config(config)
-                actual = bound(*args)
-
                 acc = torch.einsum("mk,hkd->hmd", x.float(), weight.float())
                 pairs = (acc + bias.float()[:, None, :]).view(
                     heads, m, head_dim // 2, 2
@@ -15775,11 +16199,167 @@ class TestCuteLowerings(unittest.TestCase):
                     ),
                     dim=-1,
                 ).view(heads, m, head_dim)
+                config = _make_tcgen05_persistent_config(
+                    block_sizes=[1, 128, head_dim, 32],
+                    loop_orders=[[0, 1, 2]],
+                    pid_type="persistent_interleaved",
+                )
+                bound.set_config(config)
                 torch.testing.assert_close(
-                    actual, expected.to(dtype), atol=0.1, rtol=1e-2
+                    bound(*args), expected.to(dtype), atol=0.1, rtol=1e-2
                 )
 
-    def test_tcgen05_pair_fragment_is_generic_and_locality_checked(self) -> None:
+    def test_tcgen05_thread_local_store_coverage_is_proven(self) -> None:
+        dtype = torch.bfloat16
+        cases = (
+            (cute_projection_wrapped_swiglu_bf16, 1024, 128),
+            (cute_fragment_wrong_output_extent_bf16, 128, 64),
+        )
+        for kernel, output_size, block_n in cases:
+            with self.subTest(kernel=kernel.__name__), patch_cute_mma_support():
+                args = (
+                    torch.empty([128, 64], device=DEVICE, dtype=dtype),
+                    torch.empty([1, 64, output_size], device=DEVICE, dtype=dtype),
+                )
+                bound = kernel.bind(args)
+                self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+                config = _make_tcgen05_persistent_config(
+                    block_sizes=[1, 128, block_n, 32],
+                    loop_orders=[[0, 1, 2]],
+                    pid_type="persistent_interleaved",
+                )
+                with self.assertRaisesRegex(
+                    exc.BackendUnsupported,
+                    "thread-local epilogue ownership proof rejected",
+                ):
+                    bound.to_triton_code(config)
+
+    def test_tcgen05_thread_local_interleaved_swiglu_runtime(self) -> None:
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+        torch.manual_seed(7)
+        dtype = torch.bfloat16
+        heads, m = 2, 256
+        x = torch.randn([m, 128], device=DEVICE, dtype=dtype)
+        weight = torch.randn([heads, 128, 128], device=DEVICE, dtype=dtype)
+        projected = torch.einsum("mk,hkd->hmd", x.float(), weight.float()).view(
+            heads, m, 64, 2
+        )
+        gate, value = projected.unbind(-1)
+        expected = (torch.nn.functional.silu(gate) * value).to(dtype)
+        swapped = (torch.nn.functional.silu(value) * gate).to(dtype)
+        with patch_cute_mma_support():
+            bound = cute_projection_interleaved_swiglu_bf16.bind((x, weight))
+            for source_bn in (64, 128):
+                with self.subTest(source_bn=source_bn):
+                    config = _make_tcgen05_persistent_config(
+                        block_sizes=[1, 128, source_bn, 32],
+                        loop_orders=[[0, 1, 2]],
+                        pid_type="persistent_interleaved",
+                    )
+                    code = bound.to_triton_code(config)
+                    self.assertIn("for tcgen05_epi_position", code)
+                    self.assertIn("tcgen05_compact_gD_epi", code)
+                    self.assertIn("_cute_sigmoid_approx_ftz_f32(", code)
+                    self.assertIn(
+                        f"'kind': 'tcgen05_d_tma', 'bm': 128, 'bn': {source_bn // 2}",
+                        code,
+                    )
+                    bound.set_config(config)
+                    actual = bound(x, weight)
+                    torch.testing.assert_close(actual, expected, atol=0.1, rtol=2e-2)
+                    self.assertFalse(torch.allclose(actual, torch.zeros_like(actual)))
+                    self.assertFalse(
+                        torch.allclose(actual, swapped, atol=0.1, rtol=2e-2)
+                    )
+
+    def test_tcgen05_fragment_sigmoid_respects_strict_math(self) -> None:
+        torch.manual_seed(13)
+        dtype = torch.bfloat16
+        args = (
+            torch.randn([128, 64], device=DEVICE, dtype=dtype),
+            torch.randn([1, 64, 64], device=DEVICE, dtype=dtype),
+        )
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[1, 128, 64, 32],
+            loop_orders=[[0, 1, 2]],
+            pid_type="persistent_interleaved",
+        )
+        with patch_cute_mma_support():
+            bound = cute_fragment_sigmoid_bf16.bind(args)
+            self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+            code = bound.to_triton_code(config)
+            bound.set_config(config)
+            actual = bound(*args)
+        self.assertIn("for tcgen05_epi_position", code)
+        self.assertIn("1.0 /", code)
+        self.assertNotIn("_cute_sigmoid_approx_ftz_f32", code)
+        acc = torch.einsum("mk,hkd->hmd", args[0].float(), args[1].float())
+        pairs = acc.view(1, 128, 32, 2)
+        expected = torch.stack(
+            (torch.sigmoid(pairs[..., 0]), pairs[..., 1]), dim=-1
+        ).view(1, 128, 64)
+        torch.testing.assert_close(actual, expected.to(dtype), atol=0.1, rtol=2e-2)
+
+    def test_tcgen05_fragment_rejects_dedicated_store_warp(self) -> None:
+        dtype = torch.bfloat16
+        args = (
+            torch.empty([128, 128], device=DEVICE, dtype=dtype),
+            torch.empty([1, 128, 128], device=DEVICE, dtype=dtype),
+        )
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[1, 128, 128, 32],
+            loop_orders=[[0, 1, 2]],
+            pid_type="persistent_interleaved",
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_warp_spec_store_warps=1,
+        )
+        with patch_cute_mma_support():
+            bound = cute_projection_interleaved_swiglu_bf16.bind(args)
+            self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "thread-local epilogue ownership proof rejected",
+            ):
+                bound.to_triton_code(config)
+
+    def test_projection_rotary_scalar_fallback_runtime(self) -> None:
+        torch.manual_seed(1)
+        dtype = torch.bfloat16
+        heads, m, k, head_dim = 1, 96, 48, 40
+        x = torch.randn([m, k], device=DEVICE, dtype=dtype)
+        weight = torch.randn([heads, k, head_dim], device=DEVICE, dtype=dtype)
+        table = torch.randn([m, head_dim], device=DEVICE, dtype=dtype)
+        bias = torch.randn([heads, head_dim], device=DEVICE, dtype=dtype)
+        args = (x, weight, table, bias)
+        with patch_cute_mma_support():
+            bound = cute_projection_rotary_bf16.bind(args)
+            self.assertFalse(bound.config_spec.cute_tcgen05_search_enabled)
+            config = bound.config_spec.default_config()
+            bound.set_config(config)
+            self.assertNotIn("for tcgen05_epi_position", bound.to_triton_code(config))
+            actual = bound(*args)
+
+        acc = torch.einsum("mk,hkd->hmd", x.float(), weight.float())
+        pairs = (acc + bias.float()[:, None, :]).view(heads, m, head_dim // 2, 2)
+        left, right = (table.float().view(m, 2, head_dim // 2).permute(0, 2, 1)).unbind(
+            -1
+        )
+        expected = torch.stack(
+            (
+                pairs[..., 0] * right - pairs[..., 1] * left,
+                pairs[..., 1] * right + pairs[..., 0] * left,
+            ),
+            dim=-1,
+        ).view(heads, m, head_dim)
+        torch.testing.assert_close(actual, expected.to(dtype), atol=0.1, rtol=1e-2)
+
+    def test_tcgen05_fragment_is_generic_and_locality_checked(
+        self,
+    ) -> None:
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
         if not get_cute_mma_support().tcgen05_f16bf16:
@@ -15797,16 +16377,24 @@ class TestCuteLowerings(unittest.TestCase):
             bound = cute_pair_butterfly_bf16.bind((x, weight))
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             bound.set_config(config)
-            self.assertIn("for tcgen05_epi_pair", bound.to_triton_code(config))
+            self.assertIn("for tcgen05_epi_position", bound.to_triton_code(config))
             actual = bound(x, weight)
 
             rejected = cute_cross_pair_swap_bf16.bind((x, weight))
-            self.assertFalse(rejected.config_spec.cute_tcgen05_search_enabled)
-            rejected.env.config_spec.cute_tcgen05_search_enabled = True
+            self.assertTrue(rejected.config_spec.cute_tcgen05_search_enabled)
             with self.assertRaisesRegex(
-                exc.BackendUnsupported, "pair epilogue locality proof rejected"
+                exc.BackendUnsupported,
+                "thread-local epilogue ownership proof rejected",
             ):
                 rejected.to_triton_code(config)
+
+            cross_thread = cute_cross_thread_row_swap_bf16.bind((x, weight))
+            self.assertTrue(cross_thread.config_spec.cute_tcgen05_search_enabled)
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "thread-local epilogue ownership proof rejected",
+            ):
+                cross_thread.to_triton_code(config)
         pairs = torch.einsum("mk,hkd->hmd", x.float(), weight.float()).view(
             1, 128, 32, 2
         )
@@ -15815,7 +16403,74 @@ class TestCuteLowerings(unittest.TestCase):
         ).view(1, 128, 64)
         torch.testing.assert_close(actual, expected.to(dtype), atol=0.5, rtol=2e-2)
 
-    def test_tcgen05_pair_fragment_mixed_mma_is_rejected_atomically(self) -> None:
+    def test_tcgen05_thread_local_fragment_reads_four_registers_runtime(self) -> None:
+        torch.manual_seed(11)
+        dtype = torch.bfloat16
+        args = (
+            torch.randn([128, 64], device=DEVICE, dtype=dtype),
+            torch.randn([1, 64, 64], device=DEVICE, dtype=dtype),
+        )
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[1, 128, 64, 32],
+            loop_orders=[[0, 1, 2]],
+            pid_type="persistent_interleaved",
+        )
+        with patch_cute_mma_support():
+            bound = cute_group4_fragment_bf16.bind(args)
+            self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+            code = bound.to_triton_code(config)
+            bound.set_config(config)
+            actual = bound(*args)
+        self.assertIn("for tcgen05_epi_position", code)
+        acc = torch.einsum("mk,hkd->hmd", args[0].float(), args[1].float())
+        groups = acc.view(1, 128, 16, 2, 2)
+        left, right = groups.unbind(-1)
+        x0, x1 = left.unbind(-1)
+        x2, x3 = right.unbind(-1)
+        total = x0 + x1 + x2 + x3
+        expected = torch.stack(
+            (
+                torch.stack((total + x0, total + x1), dim=-1),
+                torch.stack((total + x2, total + x3), dim=-1),
+            ),
+            dim=-1,
+        ).view(1, 128, 64)
+        torch.testing.assert_close(actual, expected.to(dtype), atol=0.1, rtol=2e-2)
+
+    def test_tcgen05_compact_fragment_reads_four_registers_runtime(self) -> None:
+        torch.manual_seed(17)
+        dtype = torch.bfloat16
+        args = (
+            torch.randn([128, 64], device=DEVICE, dtype=dtype),
+            torch.randn([1, 64, 128], device=DEVICE, dtype=dtype),
+        )
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[1, 128, 128, 32],
+            loop_orders=[[0, 1, 2]],
+            pid_type="persistent_interleaved",
+        )
+        with patch_cute_mma_support():
+            bound = cute_compact_group4_fragment_bf16.bind(args)
+            self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+            code = bound.to_triton_code(config)
+            bound.set_config(config)
+            actual = bound(*args)
+        self.assertIn("for tcgen05_epi_position", code)
+        self.assertIn("'kind': 'tcgen05_d_tma', 'bm': 128, 'bn': 32", code)
+        self.assertNotIn("_cute_sigmoid_approx_ftz_f32", code)
+        acc = torch.einsum("mk,hkd->hmd", args[0].float(), args[1].float())
+        groups = acc.view(1, 128, 32, 4)
+        expected = (
+            groups[..., 0]
+            + 2.0 * groups[..., 1]
+            - 3.0 * groups[..., 2]
+            + 4.0 * groups[..., 3]
+        )
+        torch.testing.assert_close(actual, expected.to(dtype), atol=0.2, rtol=2e-2)
+
+    def test_tcgen05_fragment_mixed_mma_is_rejected_atomically(
+        self,
+    ) -> None:
         dtype = torch.bfloat16
         args = (
             torch.empty([128, 64], device=DEVICE, dtype=dtype),
@@ -15837,23 +16492,14 @@ class TestCuteLowerings(unittest.TestCase):
                     self.subTest(pid_type=pid_type),
                     self.assertRaisesRegex(
                         exc.BackendUnsupported,
-                        "pair epilogue requires a unique MMA",
+                        "thread-local epilogue requires a unique MMA",
                     ),
                 ):
                     bound.to_triton_code(config)
 
-    def test_tcgen05_pair_fragment_mixed_ineligible_mma_disables_search(self) -> None:
-        args = (
-            torch.empty([128, 64], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([1, 64, 64], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([128, 64], device=DEVICE, dtype=torch.float32),
-            torch.empty([64, 64], device=DEVICE, dtype=torch.float32),
-        )
-        with patch_cute_mma_support():
-            bound = cute_pair_plus_f32_mma.bind(args)
-        self.assertFalse(bound.config_spec.cute_tcgen05_search_enabled)
-
-    def test_tcgen05_pair_fragment_rejects_unplanned_search_tiles(self) -> None:
+    def test_tcgen05_fragment_rejects_unplanned_search_tiles(
+        self,
+    ) -> None:
         args = (
             torch.empty([128, 64], device=DEVICE, dtype=torch.bfloat16),
             torch.empty([1, 64, 64], device=DEVICE, dtype=torch.bfloat16),
@@ -15876,21 +16522,35 @@ class TestCuteLowerings(unittest.TestCase):
                     self.subTest(block_sizes=block_sizes),
                     self.assertRaisesRegex(
                         exc.BackendUnsupported,
-                        "pair epilogue locality proof rejected",
+                        "thread-local epilogue ownership proof rejected",
                     ),
                 ):
                     bound.to_triton_code(config)
 
-    def test_tcgen05_pair_fragment_column_major_output_disables_search(self) -> None:
+    def test_tcgen05_thread_local_fragment_column_major_output_is_rejected(
+        self,
+    ) -> None:
         args = (
             torch.empty([128, 64], device=DEVICE, dtype=torch.bfloat16),
             torch.empty([1, 64, 64], device=DEVICE, dtype=torch.bfloat16),
         )
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[1, 128, 64, 32],
+            loop_orders=[[0, 1, 2]],
+            pid_type="persistent_interleaved",
+        )
         with patch_cute_mma_support():
             bound = cute_pair_column_major_output_bf16.bind(args)
-        self.assertFalse(bound.config_spec.cute_tcgen05_search_enabled)
+            self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "thread-local epilogue ownership proof rejected",
+            ):
+                bound.to_triton_code(config)
 
-    def test_tcgen05_pair_fragment_rejects_explicit_epilogue_layout(self) -> None:
+    def test_tcgen05_fragment_rejects_explicit_epilogue_layout(
+        self,
+    ) -> None:
         dtype = torch.bfloat16
         args = (
             torch.empty([128, 128], device=DEVICE, dtype=dtype),
@@ -15915,7 +16575,8 @@ class TestCuteLowerings(unittest.TestCase):
             bound = cute_projection_rotary_bf16.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             with self.assertRaisesRegex(
-                exc.BackendUnsupported, "pair epilogue locality proof rejected"
+                exc.BackendUnsupported,
+                "thread-local epilogue ownership proof rejected",
             ):
                 bound.to_triton_code(config)
 
@@ -16422,7 +17083,35 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
 
         return cute_matmul_residual_c_input
 
-    def _canonical_c_input_config(self) -> helion.Config:
+    def _fanout_kernel(self):  # type: ignore[no-untyped-def]
+        @helion.kernel(backend="cute")
+        def cute_matmul_residual_fanout(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            residual_a: torch.Tensor,
+            residual_b: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, k = x.size()
+            _, n = y.size()
+            out_a = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            out_b = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out_a[tile_m, tile_n] = (acc + residual_a[tile_m, tile_n]).to(x.dtype)
+                out_b[tile_m, tile_n] = (acc + residual_b[tile_m, tile_n]).to(x.dtype)
+            return out_a, out_b
+
+        return cute_matmul_residual_fanout
+
+    def _square_args(self, count: int) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16)
+            for _ in range(count)
+        )
+
+    def _canonical_c_input_config(self, *, ab_stages: int = 2) -> helion.Config:
         return helion.Config(
             block_sizes=[256, 256, 128],
             l2_groupings=[1],
@@ -16430,7 +17119,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             num_sm_multiplier=1,
             pid_type="persistent_interleaved",
             tcgen05_cluster_m=2,
-            tcgen05_ab_stages=2,
+            tcgen05_ab_stages=ab_stages,
             tcgen05_acc_stages=2,
             tcgen05_c_stages=2,
             tcgen05_num_epi_warps=4,
@@ -17254,35 +17943,12 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
     def test_aux_tma_load_rejects_multi_store_fanout(self) -> None:
         """Explicit aux TMA rejects multi-store fan-out instead of falling back."""
 
-        @helion.kernel(backend="cute")
-        def cute_matmul_residual_fanout(
-            x: torch.Tensor,
-            y: torch.Tensor,
-            residual_a: torch.Tensor,
-            residual_b: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            m, k = x.size()
-            _, n = y.size()
-            out_a = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            out_b = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out_a[tile_m, tile_n] = (acc + residual_a[tile_m, tile_n]).to(x.dtype)
-                out_b[tile_m, tile_n] = (acc + residual_b[tile_m, tile_n]).to(x.dtype)
-            return out_a, out_b
-
-        args = (
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-        )
+        kernel = self._fanout_kernel()
+        args = self._square_args(4)
         config = self._canonical_c_input_config()
         config.config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_TMA
         with patch_cute_mma_support():
-            bound = cute_matmul_residual_fanout.bind(args)
+            bound = kernel.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             with self.assertRaises(exc.BackendUnsupported) as cm:
                 bound.to_triton_code(config)
@@ -18446,8 +19112,8 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         )
 
     def test_aux_pipeline_multi_tile_runtime_correctness_cluster_m2(self) -> None:
-        """Multi-tile runtime regression: 4096^3 residual with
-        cluster_m=2 + ``c_input_warps=1`` must run to completion
+        """Multi-tile runtime regression: 4096x4096 (K=1024) residual
+        with cluster_m=2 + ``c_input_warps=1`` must run to completion
         and produce bit-correct output.
 
         The prior 1024^3 ``test_residual_c_input_runtime_correctness``
@@ -18456,13 +19122,16 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         wrap-around of the aux pipeline depth would silently
         slip through (the cycle 2b prior-subagent
         ``partition_D(smem).load()`` form deadlocked at 1024^3
-        only with cluster_m=2 with more tiles per CTA). 4096^3
+        only with cluster_m=2 with more tiles per CTA). M=N=4096
         gives 16x16 = 256 tiles → ~ceil(256/2/148) ≈ 1-2 tiles
         per CTA at cluster_m=2; the producer wraps the stage
         count on the third subtile of each tile (so the
         producer goes through ≥3 stage cycles per CTA),
         triggering the deadlock if the per-CTA producer/consumer
-        subtile counts disagree.
+        subtile counts disagree.  The deadlock depends only on the
+        M/N tile schedule and the epilogue subtile count, not on
+        the mainloop depth, so K is kept at 1024 (8 k-iters, still
+        several ab-stage wraps) to bound runtime.
         """
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
@@ -18470,8 +19139,8 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
 
         torch.manual_seed(0)
-        x = torch.randn(4096, 4096, dtype=torch.bfloat16, device=DEVICE)
-        y = torch.randn(4096, 4096, dtype=torch.bfloat16, device=DEVICE)
+        x = torch.randn(4096, 1024, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(1024, 4096, dtype=torch.bfloat16, device=DEVICE)
         residual = torch.randn(4096, 4096, dtype=torch.bfloat16, device=DEVICE)
         kernel = self._residual_kernel()
         config = self._canonical_c_input_config()
@@ -18527,11 +19196,19 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
 
         Pin: ``c_input_warps=1 + cluster_m=2 + ab_stages=2``
         runs correctness-clean across the sweep
-        ``l2_groupings ∈ {1, 2, 4, 8} × cluster_n ∈ {1, 2}``.
-        The non-trivial ``g`` values are the load-bearing
+        ``l2_groupings ∈ {1, 4} × cluster_n ∈ {1, 2}``.
+        The non-trivial ``g`` value is the load-bearing
         regression for the original cycle 2i fix; the
         ``cluster_n=2`` values are the load-bearing
-        regression for the autoreview P1 fix.
+        regression for the autoreview P1 fix.  The shape is
+        2048x2048 (K=1024) with bm=bn=256: the 8x8 tile grid
+        gives 2 L2 groups along M and 8 along N at g=4, so the
+        post-L2 remap is non-identity (the original bug at
+        4096^3 mismatched 60-69% of elements for EVERY g > 1,
+        so a single non-trivial g at a smaller shape still
+        catches the raw-coords regression).  g ∈ {2, 8} were
+        dropped as redundant with g=4 — same bug class, same
+        failure signature.
         """
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
@@ -18539,9 +19216,9 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
 
         torch.manual_seed(0)
-        x = torch.randn(4096, 4096, dtype=torch.bfloat16, device=DEVICE)
-        y = torch.randn(4096, 4096, dtype=torch.bfloat16, device=DEVICE)
-        residual = torch.randn(4096, 4096, dtype=torch.bfloat16, device=DEVICE)
+        x = torch.randn(2048, 1024, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(1024, 2048, dtype=torch.bfloat16, device=DEVICE)
+        residual = torch.randn(2048, 2048, dtype=torch.bfloat16, device=DEVICE)
         expected = (x @ y + residual).to(x.dtype)
         kernel = self._residual_kernel()
         # Bind once — args don't change across the sweep, only
@@ -18561,9 +19238,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         # is included to keep the cycle 2b correctness
         # baseline pinned.
         sweep_configs: list[tuple[int, int]] = [
-            (l2_grouping, cluster_n)
-            for cluster_n in (1, 2)
-            for l2_grouping in (1, 2, 4, 8)
+            (l2_grouping, cluster_n) for cluster_n in (1, 2) for l2_grouping in (1, 4)
         ]
         for l2_grouping, cluster_n in sweep_configs:
             config = helion.Config(
@@ -18732,34 +19407,11 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         directly.
         """
 
-        @helion.kernel(backend="cute")
-        def cute_matmul_residual_fanout(
-            x: torch.Tensor,
-            y: torch.Tensor,
-            residual_a: torch.Tensor,
-            residual_b: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            m, k = x.size()
-            _, n = y.size()
-            out_a = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            out_b = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out_a[tile_m, tile_n] = (acc + residual_a[tile_m, tile_n]).to(x.dtype)
-                out_b[tile_m, tile_n] = (acc + residual_b[tile_m, tile_n]).to(x.dtype)
-            return out_a, out_b
-
-        args = (
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-        )
+        kernel = self._fanout_kernel()
+        args = self._square_args(4)
         config = self._canonical_c_input_config()
         with patch_cute_mma_support():
-            bound = cute_matmul_residual_fanout.bind(args)
+            bound = kernel.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             code = bound.to_triton_code(config)
 
@@ -18828,31 +19480,8 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         explicit rejection assertion.
         """
         kernel = self._residual_kernel()
-        args = (
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-        )
-        config = helion.Config(
-            block_sizes=[256, 256, 128],
-            l2_groupings=[1],
-            num_warps=4,
-            num_sm_multiplier=1,
-            pid_type="persistent_interleaved",
-            tcgen05_cluster_m=2,
-            tcgen05_ab_stages=3,
-            tcgen05_acc_stages=2,
-            tcgen05_c_stages=2,
-            tcgen05_num_epi_warps=4,
-            tcgen05_strategy="role_local_with_scheduler",
-            tcgen05_warp_spec_scheduler_warps=1,
-            tcgen05_warp_spec_c_input_warps=1,
-            indexing=[
-                "tensor_descriptor",
-                "tensor_descriptor",
-                "tensor_descriptor",
-            ],
-        )
+        args = self._square_args(3)
+        config = self._canonical_c_input_config(ab_stages=3)
         with patch_cute_mma_support():
             bound = kernel.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
@@ -18884,11 +19513,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         and silently disable the cycle 2b productive body.
         """
         kernel = self._residual_kernel()
-        args = (
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-        )
+        args = self._square_args(3)
         # The canonical cycle 2b config from
         # ``_canonical_c_input_config`` already uses
         # ``ab_stages=2`` + ``c_input_warps=1``.
@@ -18948,58 +19573,16 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         rejection cannot have fired on this path).
         """
 
-        @helion.kernel(backend="cute")
-        def cute_matmul_residual_fanout(
-            x: torch.Tensor,
-            y: torch.Tensor,
-            residual_a: torch.Tensor,
-            residual_b: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            m, k = x.size()
-            _, n = y.size()
-            out_a = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            out_b = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out_a[tile_m, tile_n] = (acc + residual_a[tile_m, tile_n]).to(x.dtype)
-                out_b[tile_m, tile_n] = (acc + residual_b[tile_m, tile_n]).to(x.dtype)
-            return out_a, out_b
-
-        args = (
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-        )
+        kernel = self._fanout_kernel()
+        args = self._square_args(4)
         # Same canonical config as
         # ``test_aux_pipeline_ab_stages_3_with_c_input_rejected``
         # — only difference is the fan-out kernel shape, which
         # should close the productive-body gate and prevent
         # the rejection from firing.
-        config = helion.Config(
-            block_sizes=[256, 256, 128],
-            l2_groupings=[1],
-            num_warps=4,
-            num_sm_multiplier=1,
-            pid_type="persistent_interleaved",
-            tcgen05_cluster_m=2,
-            tcgen05_ab_stages=3,
-            tcgen05_acc_stages=2,
-            tcgen05_c_stages=2,
-            tcgen05_num_epi_warps=4,
-            tcgen05_strategy="role_local_with_scheduler",
-            tcgen05_warp_spec_scheduler_warps=1,
-            tcgen05_warp_spec_c_input_warps=1,
-            indexing=[
-                "tensor_descriptor",
-                "tensor_descriptor",
-                "tensor_descriptor",
-            ],
-        )
+        config = self._canonical_c_input_config(ab_stages=3)
         with patch_cute_mma_support():
-            bound = cute_matmul_residual_fanout.bind(args)
+            bound = kernel.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             # Must not raise BackendUnsupported on the fan-out
             # path despite carrying ``ab_stages=3`` +
@@ -19022,10 +19605,9 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
 
         The productive C-input warp is reachable from the
         normal Helion autotune path when the bound kernel's
-        FX graphs contain a tcgen05 matmul AND at least one
-        ``memory_ops.load`` whose target isn't one of the
-        matmul operands (the residual / bias / chained
-        residual_relu pattern). Pin:
+        FX graphs contain an accepted matmul-to-store chain with at least one
+        per-subtile auxiliary load (the residual / bias / chained
+        residual-relu pattern). Pin:
           - ``cute_tcgen05_aux_kernel_detected`` is True after
             bind.
           - ``tcgen05_strategy`` autotune fragment widens to
@@ -19038,11 +19620,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         from helion._compiler.cute.strategies import Tcgen05Strategy
 
         kernel = self._residual_kernel()
-        args = (
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-        )
+        args = self._square_args(3)
         with patch_cute_mma_support():
             bound = kernel.bind(args)
         self.assertTrue(bound.env.config_spec.cute_tcgen05_aux_kernel_detected)
@@ -19130,37 +19708,13 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         codegen already prevents the over-budget compile.
         """
 
-        @helion.kernel(backend="cute")
-        def cute_matmul_residual_fanout(
-            x: torch.Tensor,
-            y: torch.Tensor,
-            residual_a: torch.Tensor,
-            residual_b: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            m, k = x.size()
-            _, n = y.size()
-            out_a = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            out_b = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out_a[tile_m, tile_n] = (acc + residual_a[tile_m, tile_n]).to(x.dtype)
-                out_b[tile_m, tile_n] = (acc + residual_b[tile_m, tile_n]).to(x.dtype)
-            return out_a, out_b
-
-        args = (
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-        )
+        kernel = self._fanout_kernel()
+        args = self._square_args(4)
         with patch_cute_mma_support():
-            bound = cute_matmul_residual_fanout.bind(args)
-        # Detector is intentionally coarse and DOES flag
-        # fan-out as aux (it has aux loads). The
-        # productive-body safety gate at codegen suppresses
-        # the productive body for fan-out specifically.
+            bound = kernel.bind(args)
+        # Both stores have accepted aux-fused chains, so the detector flags the
+        # kernel even though the productive-body safety gate suppresses the
+        # dedicated C-input pipeline for multi-store fan-out specifically.
         self.assertTrue(bound.env.config_spec.cute_tcgen05_aux_kernel_detected)
 
     def test_aux_autotune_fixup_demotes_ab3_c_input1(self) -> None:
@@ -19183,11 +19737,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         from helion._compiler.cute.strategies import Tcgen05Strategy
 
         kernel = self._residual_kernel()
-        args = (
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-        )
+        args = self._square_args(3)
         with patch_cute_mma_support():
             bound = kernel.bind(args)
         # Manually craft the over-budget combo.
@@ -19468,25 +20018,11 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
     def test_aux_autotune_surface_stays_narrow_for_wrapped_cast_pure_matmul(
         self,
     ) -> None:
-        """Operand-cast wrappers (``lhs.to(dtype) @ rhs.to(dtype)``)
-        are traced through to the underlying ``memory_ops.load``
-        nodes so the detector classifies them as MMA-operand
-        loads, not aux loads.
+        """Operand-cast wrappers do not create an aux-fused store chain.
 
-        Without operand-trace, the detector's "every
-        ``memory_ops.load`` that isn't the exact node arg of
-        the MMA call is aux" rule misclassifies the underlying
-        load behind a ``convert_element_type`` wrapper as aux
-        and the autotune surface widens on a kernel where no
-        true aux load exists — autotune then samples the
-        strictly-worse inert C-input warp on pure matmul.
-
-        Pin: a pure matmul with explicit operand casts (fp32
-        operand tensors cast to bf16 before the dot) keeps
-        the detector flag False — the cast wrapper is walked
-        through to the underlying load via
-        ``_trace_to_load_through_casts`` and the load is
-        classified as an MMA operand, not an aux load.
+        Pin: a pure matmul with explicit fp32-to-bf16 operand casts keeps the
+        detector flag False because its accepted store chain is still an
+        identity epilogue with no auxiliary steps.
         """
         from helion._compiler.cute.strategies import Tcgen05Strategy
 
@@ -19645,7 +20181,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
 
 @onlyBackends(["cute"])
 class TestCuteDslCompat(unittest.TestCase):
-    """The cute backend hard-requires the 4.5.1 CuTe DSL API (enforced up front
+    """The cute backend hard-requires the 4.7 CuTe DSL API (enforced up front
     by ``CuteBackend.validate_environment``), so the pipeline emitters render
     the native CuTe calls directly with no per-build workarounds."""
 
@@ -19749,6 +20285,63 @@ class TestPersistentLoopSplitter(unittest.TestCase):
 
         self.assertEqual(reads, {"value", "increment"})
         self.assertEqual(writes, {"value"})
+
+    def test_prune_dead_generated_assignments_tracks_transitive_reads(self) -> None:
+        from helion._compiler.program_id import (
+            _prune_dead_side_effect_free_generated_assignments,
+        )
+
+        statements = [
+            self._stmt("tile_start = cta_m * 128"),
+            self._stmt("valid_m = min(128, problem_m - tile_start)"),
+            self._stmt("store_m = min(128, problem_m - tile_start)"),
+            self._stmt("pid_0 = cta_m"),
+            self._stmt("pid_1 = cta_n"),
+        ]
+
+        kept, live_in = _prune_dead_side_effect_free_generated_assignments(
+            statements, {"valid_m", "pid_1"}
+        )
+
+        self.assertEqual(
+            [ast.unparse(stmt) for stmt in kept],
+            [
+                "tile_start = cta_m * 128",
+                "valid_m = min(128, problem_m - tile_start)",
+                "pid_1 = cta_n",
+            ],
+        )
+        self.assertEqual(live_in, {"cta_m", "cta_n", "min", "problem_m"})
+
+    def test_literal_mailbox_access_fields_handles_staged_accesses(self) -> None:
+        from helion._compiler.program_id import _literal_mailbox_access_fields
+
+        tree = ast.parse(
+            """
+first = mailbox[cutlass.Int32(3)]
+second = mailbox[cutlass.Int32(7), consumer_state.index]
+mailbox[cutlass.Int32(3), producer_state.index] = first
+"""
+        )
+
+        reads, writes = _literal_mailbox_access_fields(tree, "mailbox")
+
+        self.assertEqual(reads, {3, 7})
+        self.assertEqual(writes, {3})
+        with self.assertRaisesRegex(AssertionError, "literal Int32 field"):
+            _literal_mailbox_access_fields(
+                ast.parse("value = mailbox[field]"), "mailbox"
+            )
+        for source in (
+            "consume(mailbox)",
+            "alias = mailbox",
+            "value = mailbox.iterator",
+        ):
+            with (
+                self.subTest(source=source),
+                self.assertRaisesRegex(AssertionError, "direct literal field access"),
+            ):
+                _literal_mailbox_access_fields(ast.parse(source), "mailbox")
 
     def test_omit_shared_loop_rejects_post_loop_dependency(self) -> None:
         from helion._compiler.program_id import Tcgen05PersistentProgramIDs
@@ -19910,6 +20503,25 @@ class TestPersistentLoopSplitter(unittest.TestCase):
             work_tile_consume_stmts=[],
             work_tile_release_stmts=[],
         )
+
+    def test_clustered_pid_mailbox_rendezvous_precedes_first_acquire(self) -> None:
+        """Peer mailbox mbarriers must be initialized cluster-wide first."""
+        _stub_df, splitter = self._make_role_local_stubs(num_pid_dims=2)
+        splitter._tcgen05_l2_swizzle_size = lambda: 1  # type: ignore[attr-defined]
+        layout = self._make_minimal_layout(cluster_m=2)
+        layout.work_tile_publish_stmts = [self._stmt("sp.producer_acquire(ps)")]
+
+        emitted = splitter._build_tcgen05_persistent_prelude(layout)
+        source = "\n".join(ast.unparse(stmt) for stmt in emitted)
+        create = source.index("sp = cutlass.pipeline.PipelineAsync.create(")
+        arrive = source.index("cutlass.pipeline.pipeline_init_arrive(")
+        wait = source.index("cutlass.pipeline.pipeline_init_wait(")
+        acquire = source.index("sp.producer_acquire(ps)")
+
+        self.assertLess(create, arrive)
+        self.assertLess(arrive, wait)
+        self.assertLess(wait, acquire)
+        self.assertIn("cute.make_layout((2, 1, 1))", source)
 
     def test_tcgen05_persistent_foreach_multi_root_keeps_host_guard(self) -> None:
         """Multi-root tcgen05 role-local codegen is guarded as unvalidated.
@@ -21388,6 +22000,8 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             tcgen05_frag_a="tCrA",
             tcgen05_frag_b="tCrB",
             mma_stage="mma_stage",
+            input_dtype_str="cutlass.BFloat16",
+            acc_dtype_str="cutlass.Float32",
             is_two_cta=True,
         )
         self.assertIsInstance(node, ast.If)
@@ -21404,11 +22018,56 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             body_src,
         )
 
+    def test_tcgen05_runtime_mma_issue_requires_bf16_fp32(self) -> None:
+        def build(input_dtype_str: str) -> ast.stmt:
+            return _build_tcgen05_mma_issue_stmt(
+                exec_active="exec_active",
+                tiled_mma="tiled_mma",
+                acc_frag="acc_frag",
+                tcgen05_frag_a="tCrA",
+                tcgen05_frag_b="tCrB",
+                mma_stage="mma_stage",
+                input_dtype_str=input_dtype_str,
+                acc_dtype_str="cutlass.Float32",
+                runtime_mma_n="runtime_mma_n",
+                runtime_instr_desc="runtime_instr_desc",
+                static_mma_n=224,
+                is_two_cta=True,
+            )
+
+        node = build("cutlass.BFloat16")
+        self.assertIn(
+            "tcgen05.mma.cta_group::2.kind::f16",
+            ast.unparse(node),
+        )
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported,
+            "validated only for BF16/FP32",
+        ):
+            build("cutlass.Float16")
+        with (
+            patch(
+                "helion._compiler.cute.cute_mma.tcgen05_runtime_n_ptx_compatible",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "requires exactly nvidia-cutlass-dsl==4.7.0",
+            ),
+        ):
+            build("cutlass.BFloat16")
+
     def test_tcgen05_mma_accumulate_reset_two_cta_gates_to_leader(self) -> None:
-        node = _build_tcgen05_mma_accumulate_reset_stmt(
-            "exec_active", tiled_mma="tiled_mma", is_two_cta=True
+        stmts = _build_tcgen05_mma_accumulate_reset_stmt(
+            "exec_active",
+            tiled_mma="tiled_mma",
+            input_dtype_str="cutlass.BFloat16",
+            acc_dtype_str="cutlass.Float32",
+            is_two_cta=True,
         )
 
+        self.assertEqual(len(stmts), 1)
+        node = stmts[0]
         self.assertIsInstance(node, ast.If)
         self.assertEqual(
             ast.unparse(node.test),

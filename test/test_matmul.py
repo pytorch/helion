@@ -539,6 +539,49 @@ class TestMatmul(RefEagerTestBase, TestCase):
         expected = (x.float() @ weight.T).to(x.dtype)
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
 
+    def test_matmul_3d_2d_broadcast(self):
+        """torch.matmul broadcasts a 2-D rhs across a 3-D lhs's batch."""
+
+        @helion.kernel(static_shapes=True)
+        def bmm_3d_2d(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            bsz, m, _ = a.size()
+            n = b.size(1)
+            out = torch.empty([bsz, m, n], dtype=torch.float32, device=a.device)
+            for tile_b, tile_m, tile_n in hl.tile([bsz, m, n]):
+                out[tile_b, tile_m, tile_n] = torch.matmul(
+                    a[tile_b, tile_m, :], b[:, tile_n]
+                ).to(torch.float32)
+            return out
+
+        a = torch.randn(4, 64, 32, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(32, 48, device=DEVICE, dtype=torch.bfloat16)
+        # batch tile of 2: the 2-D operand is broadcast across a tile, not a row.
+        _code, result = code_and_output(bmm_3d_2d, (a, b), block_sizes=[2, 32, 16])
+        torch.testing.assert_close(
+            result, torch.matmul(a.float(), b.float()), rtol=1e-2, atol=1e-2
+        )
+
+    def test_matmul_2d_3d_broadcast(self):
+        """torch.matmul broadcasts a 2-D lhs across a 3-D rhs's batch."""
+
+        @helion.kernel(static_shapes=True)
+        def bmm_2d_3d(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            m, _ = a.size()
+            bsz, _, n = b.size()
+            out = torch.empty([bsz, m, n], dtype=torch.float32, device=a.device)
+            for tile_b, tile_m, tile_n in hl.tile([bsz, m, n]):
+                out[tile_b, tile_m, tile_n] = torch.matmul(
+                    a[tile_m, :], b[tile_b, :, tile_n]
+                ).to(torch.float32)
+            return out
+
+        a = torch.randn(64, 32, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(4, 32, 48, device=DEVICE, dtype=torch.bfloat16)
+        _code, result = code_and_output(bmm_2d_3d, (a, b), block_sizes=[2, 32, 16])
+        torch.testing.assert_close(
+            result, torch.matmul(a.float(), b.float()), rtol=1e-2, atol=1e-2
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

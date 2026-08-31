@@ -3,7 +3,7 @@
 These tests exercise the codegen paths that lifted Helion CuTe softmax
 performance from ~0.45x ATen to ~0.66x ATen on (4096, *) shapes:
 
-- P1: tile-loop vec hoist (CuteNDTileStrategy emits ``cute.arch.load``
+- P1: tile-loop vec hoist (PerThreadNDTileStrategy emits ``cute.arch.load``
   with ``ir.VectorType`` so masked reductions can vectorize).
 - P2/P5: ``fuse_two_pass_loads`` extended alias map to canonicalize
   per-sweep ``mask_<N>``, ``lane_base_<N>``, ``vec_lane_<N>``, and
@@ -30,6 +30,7 @@ performance from ~0.45x ATen to ~0.66x ATen on (4096, *) shapes:
 from __future__ import annotations
 
 import os
+import re
 
 import pytest
 import torch
@@ -76,6 +77,43 @@ def softmax_two_pass_kernel(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+# Cache of compiled softmax artifacts shared across tests.  Many tests in
+# this file pin different codegen properties of the byte-identical kernel
+# (same shape, config, and env — the autouse fixture below pins
+# ``HELION_DISABLE_ONLINE_TO_3PASS=1`` for every class that uses this
+# cache), so paying the full CuTe compile once per distinct artifact
+# instead of once per test keeps the assertions while cutting most of the
+# file's wall time.  Keyed by (N, block_n, vector_width); M is fixed at
+# 4096 (it is never the property under test).
+_ARTIFACT_CACHE: dict[tuple[int, int, int], tuple[str, torch.Tensor, torch.Tensor]] = {}
+
+
+def _pipe_shadow_var_count(code: str, kind: str) -> int:
+    """Count ``_pipe_<kind>_N = `` occurrences (prologue + per-iter
+    prefetch assignments, so 2 per pipelined load site)."""
+    return len(re.findall(rf"_pipe_{kind}_\d+ = ", code))
+
+
+def _softmax_artifact(
+    n: int, *, block_n: int = 128, vec_width: int = 4
+) -> tuple[str, torch.Tensor, torch.Tensor]:
+    """Compile ``softmax_two_pass_kernel`` on (4096, n) fp16 once and
+    return ``(code, out, ref)`` for shared assertions."""
+    key = (n, block_n, vec_width)
+    if key not in _ARTIFACT_CACHE:
+        x = torch.randn(4096, n, device=DEVICE, dtype=HALF_DTYPE)
+        code, out = code_and_output(
+            softmax_two_pass_kernel,
+            (x,),
+            block_sizes=[1, block_n],
+            num_threads=[0, 32],
+            cute_vector_widths=[1, vec_width],
+        )
+        ref = torch.nn.functional.softmax(x, dim=1)
+        _ARTIFACT_CACHE[key] = (code, out, ref)
+    return _ARTIFACT_CACHE[key]
+
+
 @pytest.fixture(autouse=True)
 def _disable_online_to_3pass(request):
     """The 2-loop softmax perf tests in this file pin codegen details of
@@ -112,15 +150,7 @@ class TestCuteSoftmaxVecHoist(TestCase):
         — the new tile-loop vec hoist path that replaces 4 scalar fp16
         loads with one 8-byte vec load per thread per iter.
         """
-        x = torch.randn(4096, 6400, device=DEVICE, dtype=HALF_DTYPE)
-        code, out = code_and_output(
-            softmax_two_pass_kernel,
-            (x,),
-            block_sizes=[1, 128],
-            num_threads=[0, 32],
-            cute_vector_widths=[1, 4],
-        )
-        ref = torch.nn.functional.softmax(x, dim=1)
+        code, out, ref = _softmax_artifact(6400)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
         # The vec hoist target var name is _tile_unroll_vec_*.
         self.assertIn("_tile_unroll_vec_", code)
@@ -195,17 +225,11 @@ class TestCuteSoftmaxVecHoist(TestCase):
 
     def test_scalar_load_when_vec_width_is_one(self) -> None:
         """When V=1 the vec hoist must NOT fire — the codegen falls back to
-        the scalar load path so the change is opt-in.
+        the scalar load path so the change is opt-in.  (N is not the
+        property here; shares the V=1 artifact with the P11/P14 no-op
+        gate tests.)
         """
-        x = torch.randn(4096, 6400, device=DEVICE, dtype=HALF_DTYPE)
-        code, out = code_and_output(
-            softmax_two_pass_kernel,
-            (x,),
-            block_sizes=[1, 128],
-            num_threads=[0, 32],
-            cute_vector_widths=[1, 1],
-        )
-        ref = torch.nn.functional.softmax(x, dim=1)
+        code, out, ref = _softmax_artifact(4096, vec_width=1)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
         self.assertNotIn("_tile_unroll_vec_", code)
 
@@ -259,43 +283,8 @@ class TestCuteFuseTwoPassAlias(TestCase):
             "consume sweep must read from _fuse_cache_, not gmem",
         )
 
-    def test_fuser_skips_when_cache_size_too_large(self) -> None:
-        """Auto-policy keeps the original cache_size>64 cap to avoid the
-        register-pressure regression measured in P8. So for trip > 64 we
-        expect the consume sweep to still load from gmem.
-
-        For (4096, 12672) with block_size 128, trip = 99, V = 4, so the
-        cache_size would be 99 — fuser must bail.
-        """
-        x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
-        code, out = code_and_output(
-            softmax_two_pass_kernel,
-            (x,),
-            block_sizes=[1, 128],
-            num_threads=[0, 32],
-            cute_vector_widths=[1, 4],
-        )
-        ref = torch.nn.functional.softmax(x, dim=1)
-        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-        # Both sweeps load from gmem (cache fragment NOT allocated since
-        # the fuser bails on cache_size > 64).
-        self.assertNotIn("_fuse_cache_", code)
-        # When the P18 load-pipeline pass is OFF the kernel has exactly
-        # 2 ``cute.arch.load`` calls (one per sweep).  With pipelining
-        # ON each load site is hoisted into a prologue and a per-iter
-        # prefetch, so the total is 4 (2 prologue + 2 inner-loop
-        # prefetch).  Both forms are correct; assert at least 2.
-        self.assertGreaterEqual(code.count("cute.arch.load("), 2)
-        # Each sweep must contain at least one gmem load (either
-        # inline or as a per-iter prefetch).
-        first_sweep_marker = "for tile_offset_2 in range"
-        first_sweep_start = code.find(first_sweep_marker)
-        second_sweep_start = code.find(first_sweep_marker, first_sweep_start + 1)
-        self.assertGreater(second_sweep_start, first_sweep_start)
-        first_sweep = code[first_sweep_start:second_sweep_start]
-        second_sweep = code[second_sweep_start:]
-        self.assertIn("cute.arch.load(", first_sweep)
-        self.assertIn("cute.arch.load(", second_sweep)
+    # The trip>64 fuser-bail case on (4096, 12672) is pinned in
+    # ``TestCuteCanonicalSoftmaxArtifact`` (shared compile).
 
 
 @onlyBackends(["cute"])
@@ -312,15 +301,7 @@ class TestCuteHoistWarpReduce(TestCase):
         zero warp reduces — they live OUTSIDE the loop with a per-thread
         local fold first.
         """
-        x = torch.randn(4096, 6400, device=DEVICE, dtype=HALF_DTYPE)
-        code, out = code_and_output(
-            softmax_two_pass_kernel,
-            (x,),
-            block_sizes=[1, 128],
-            num_threads=[0, 32],
-            cute_vector_widths=[1, 4],
-        )
-        ref = torch.nn.functional.softmax(x, dim=1)
+        code, out, ref = _softmax_artifact(6400)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
         # Both reduces still get emitted (correctness), just outside the V-loop.
         self.assertIn("warp_reduction_max", code)
@@ -336,15 +317,7 @@ class TestCuteHoistWarpReduce(TestCase):
         """When V=1 there's no constexpr V-loop, so the hoist pass must be
         a no-op — the reduce stays where the strategy emitted it.
         """
-        x = torch.randn(4096, 4096, device=DEVICE, dtype=HALF_DTYPE)
-        code, out = code_and_output(
-            softmax_two_pass_kernel,
-            (x,),
-            block_sizes=[1, 128],
-            num_threads=[0, 32],
-            cute_vector_widths=[1, 1],
-        )
-        ref = torch.nn.functional.softmax(x, dim=1)
+        code, out, ref = _softmax_artifact(4096, vec_width=1)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
         # No hoist accumulator names (no V-loop to hoist out of).
         self.assertNotIn("_helion_vfold_acc_", code)
@@ -364,75 +337,14 @@ class TestCuteMergeSiblingVLoops(TestCase):
     downstream code immediately re-promotes to fp32.
     """
 
-    def test_merge_fires_on_softmax_two_pass(self) -> None:
-        """The pass must fire on the canonical softmax shape and emit
-        a ``_helion_vmerge_cache_*`` fragment populated in V-loop 1
-        and read in V-loop 2.
-        """
-        x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
-        code, out = code_and_output(
-            softmax_two_pass_kernel,
-            (x,),
-            block_sizes=[1, 128],
-            num_threads=[0, 32],
-            cute_vector_widths=[1, 4],
-        )
-        ref = torch.nn.functional.softmax(x, dim=1)
-        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-        # Cache fragment allocated.
-        self.assertIn("_helion_vmerge_cache_", code)
-        # Cache write in V-loop 1 (writes Float32(values) at the
-        # vec_lane index).
-        self.assertIn("_helion_vmerge_cache_0[vec_lane_1]", code)
-        # The cache is allocated as Float32 (promotes from fp16 so V-loop
-        # 2 doesn't need the redundant Float32 cast).
-        self.assertIn(
-            "_helion_vmerge_cache_0 = cute.make_rmem_tensor(4, cutlass.Float32)",
-            code,
-        )
-
-    def test_cast_elision_on_warp_reduction(self) -> None:
-        """The double-cast peephole (part of ``merge_sibling_v_loops``)
-        must collapse ``A = Float16(warp_reduction(...)); B = Float32(A)``
-        into ``A = warp_reduction(...); B = A``.  The inner Float16
-        wrap on the max-reduce becomes dead and gets removed.
-        """
-        x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
-        code, out = code_and_output(
-            softmax_two_pass_kernel,
-            (x,),
-            block_sizes=[1, 128],
-            num_threads=[0, 32],
-            cute_vector_widths=[1, 4],
-        )
-        ref = torch.nn.functional.softmax(x, dim=1)
-        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-        # The original pattern ``local_amax = Float16(warp_reduction_max(...))``
-        # must have been elided to just ``local_amax = warp_reduction_max(...)``.
-        # (The hoist pass already promoted the V-fold acc to fp32, so the
-        # warp_reduction returns fp32 — the Float16 wrap was a no-op cycle.)
-        self.assertNotIn(
-            "local_amax = cutlass.Float16(cute.arch.warp_reduction_max",
-            code,
-        )
-        self.assertIn(
-            "local_amax = cute.arch.warp_reduction_max",
-            code,
-        )
+    # The merge-fires and cast-elision pins on (4096, 12672) live in
+    # ``TestCuteCanonicalSoftmaxArtifact`` (shared compile).
 
     def test_no_merge_when_v_loop_absent(self) -> None:
         """When V=1 there's no constexpr V-loop, so the merge pass must
         be a no-op — no cache fragment should be emitted.
         """
-        x = torch.randn(4096, 4096, device=DEVICE, dtype=HALF_DTYPE)
-        code, out = code_and_output(
-            softmax_two_pass_kernel,
-            (x,),
-            block_sizes=[1, 128],
-            num_threads=[0, 32],
-            cute_vector_widths=[1, 1],
-        )
-        ref = torch.nn.functional.softmax(x, dim=1)
+        code, out, ref = _softmax_artifact(4096, vec_width=1)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
         self.assertNotIn("_helion_vmerge_cache_", code)
 
@@ -456,33 +368,8 @@ class TestCuteHoistLoopInvariantRecip(TestCase):
     outside the loop.
     """
 
-    def test_recip_hoist_fires_on_softmax_two_pass(self) -> None:
-        """For ``softmax_two_pass``, the consume sweep's per-element
-        divide by ``di`` (a per-row scalar) must be rewritten to a
-        single hoisted ``_helion_inv_div_*`` reciprocal + multiply.
-        """
-        x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
-        code, out = code_and_output(
-            softmax_two_pass_kernel,
-            (x,),
-            block_sizes=[1, 128],
-            num_threads=[0, 32],
-            cute_vector_widths=[1, 4],
-        )
-        ref = torch.nn.functional.softmax(x, dim=1)
-        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-        # The hoisted reciprocal declaration must reference the
-        # loop-external root name ``di``, not the inside-loop alias
-        # ``di_copy_*`` (which wouldn't be visible above the loop).
-        self.assertIn("_helion_inv_div_", code)
-        self.assertIn("= 1.0 / di", code)
-        # The inner divide must have been rewritten to a multiply against
-        # the hoisted reciprocal name.
-        self.assertIn("* _helion_inv_div_", code)
-        # The original per-element divide pattern is no longer present.
-        # (The two-pass kernel had ``v_12 = v_11 / di_copy_1_0`` — that
-        # specific text must be gone after the rewrite.)
-        self.assertNotIn("/ di_copy_1_0", code)
+    # The recip-hoist-fires pin on (4096, 12672) lives in
+    # ``TestCuteCanonicalSoftmaxArtifact`` (shared compile).
 
     def test_recip_hoist_does_not_fire_on_loop_dependent_divisor(self) -> None:
         """When the divisor changes per-iteration (e.g. ``local_sum``
@@ -546,184 +433,147 @@ class TestCuteHoistLoopInvariantRecip(TestCase):
 
 
 @onlyBackends(["cute"])
-class TestCuteHoistLoopInvariantP17(TestCase):
-    """P17: extended ``hoist_loop_invariant_recips`` pass.
+class TestCuteCanonicalSoftmaxArtifact(TestCase):
+    """All codegen pins on the canonical (4096, 12672) fp16 artifact
+    (``block_sizes=[1, 128]``, ``num_threads=[0, 32]``,
+    ``cute_vector_widths=[1, 4]``), compiled ONCE via
+    ``_softmax_artifact`` and shared across the tests below.
 
-    Adds three sub-passes on top of the original P16 reciprocal hoist:
+    Previously each of these pins was its own test that recompiled the
+    byte-identical kernel (11 full CuTe compiles).  The properties are
+    unchanged — grouped here by pass:
 
-      1. **Alias DCE**: pure SSA-style ``NAME = ANOTHER_NAME`` chains
-         (``mi_copy_1 = mi``, ``mi_copy_1_0 = mi_copy_1``, ...) collapse
-         to direct ``mi`` reads with the alias assignments removed.
-      2. **Outer-in walk for the reciprocal hoist** so the reciprocal
-         lands at the OUTERMOST legal scope — eliminating the cascade
-         ``_helion_inv_div_N = 1.0 * _helion_inv_div_{N+1}`` aliases
-         that the original inner-first walk produced.
-      3. **FMA-friendly scale hoist**: ``(A - INV) * CONST`` patterns
-         where ``INV`` is loop-invariant emit a single hoisted
-         ``_helion_scaled_K = INV * CONST`` outside the loop and
-         rewrite the inner expression to ``A * CONST - _helion_scaled_K``.
-
-    Plus a final DCE pass to remove dead Sub assigns left over by the
-    FMA hoist (``v_10 = v_9 - mi`` becomes dead when the Mult that used
-    it was rewritten).
+    * P2/P5 fuser bail: trip = 99 > cache cap 64, so both sweeps load
+      from gmem (guards the P8 register-pressure regression).
+    * P14 ``merge_sibling_v_loops``: vmerge cache + double-cast elision.
+    * P16 reciprocal hoist: ``1.0 / di`` hoisted, inner divide becomes
+      a multiply.
+    * P17 extended hoists: alias DCE (``*_copy`` chains inlined),
+      outer-in reciprocal walk (no ``1.0 * _helion_inv_div_`` cascade),
+      FMA-friendly scale hoists in both the consume loop and the reduce
+      V-loop, dead-Sub DCE, and the post-rename invariance
+      canonicalization that keeps ``mi`` loop-VARIANT in the reduce
+      loop (silent-miscompile guard).
+    * P18 load pipeline: both sweeps pipelined (prologue snapshot +
+      per-iter prefetch).
     """
 
-    def test_useless_cascade_alias_removed(self) -> None:
-        """The original inner-first hoist produced a cascade of useless
-        ``_helion_inv_div_N = 1.0 * _helion_inv_div_{N+1}`` aliases when
-        the consume loop was 3 levels deep.  The outer-in walk emits a
-        single hoist at the outermost legal scope instead.
+    def test_numerics_and_fuser_bails_above_cache_cap(self) -> None:
+        """End-to-end correctness of the canonical artifact, plus the
+        P2/P5 fuser gate: for (4096, 12672) with block_size 128 the
+        trip count is 99 > the 64-entry cache cap, so the fuser must
+        bail and BOTH sweeps must load from gmem.
         """
-        x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
-        code, out = code_and_output(
-            softmax_two_pass_kernel,
-            (x,),
-            block_sizes=[1, 128],
-            num_threads=[0, 32],
-            cute_vector_widths=[1, 4],
-        )
-        ref = torch.nn.functional.softmax(x, dim=1)
+        code, out, ref = _softmax_artifact(12672)
+        # Tight tolerance — this also guards the P17 invariance
+        # canonicalization silent-miscompile (the bench would still
+        # "look fast" with wrong outputs if we regressed there).
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-        # The useless cascade text MUST be gone.  Original bad output had
-        # ``_helion_inv_div_0 = 1.0 * _helion_inv_div_1`` (and similar
-        # for the next level).  The new pass must not emit such aliases.
+        # Cache fragment NOT allocated (fuser bails on cache_size > 64).
+        self.assertNotIn("_fuse_cache_", code)
+        # When the P18 load-pipeline pass is OFF the kernel has exactly
+        # 2 ``cute.arch.load`` calls (one per sweep).  With pipelining
+        # ON each load site is hoisted into a prologue and a per-iter
+        # prefetch, so the total is 4 (2 prologue + 2 inner-loop
+        # prefetch).  Both forms are correct; assert at least 2.
+        self.assertGreaterEqual(code.count("cute.arch.load("), 2)
+        # Each sweep must contain at least one gmem load (either
+        # inline or as a per-iter prefetch).
+        first_sweep_marker = "for tile_offset_2 in range"
+        first_sweep_start = code.find(first_sweep_marker)
+        second_sweep_start = code.find(first_sweep_marker, first_sweep_start + 1)
+        self.assertGreater(second_sweep_start, first_sweep_start)
+        first_sweep = code[first_sweep_start:second_sweep_start]
+        second_sweep = code[second_sweep_start:]
+        self.assertIn("cute.arch.load(", first_sweep)
+        self.assertIn("cute.arch.load(", second_sweep)
+
+    def test_vmerge_recip_and_fma_hoists(self) -> None:
+        """P14 + P16 + P17 codegen pins on the shared artifact."""
+        code, _, _ = _softmax_artifact(12672)
+        # P14: vmerge cache fragment allocated, written in V-loop 1 at
+        # the vec_lane index, and allocated as Float32 (promotes from
+        # fp16 so V-loop 2 doesn't need the redundant Float32 cast).
+        self.assertIn("_helion_vmerge_cache_", code)
+        self.assertIn("_helion_vmerge_cache_0[vec_lane_1]", code)
+        self.assertIn(
+            "_helion_vmerge_cache_0 = cute.make_rmem_tensor(4, cutlass.Float32)",
+            code,
+        )
+        # P14 double-cast peephole: ``local_amax =
+        # Float16(warp_reduction_max(...))`` must have been elided to
+        # just ``local_amax = warp_reduction_max(...)`` (the hoist pass
+        # already promoted the V-fold acc to fp32, so the Float16 wrap
+        # was a no-op cycle).
+        self.assertNotIn(
+            "local_amax = cutlass.Float16(cute.arch.warp_reduction_max",
+            code,
+        )
+        self.assertIn(
+            "local_amax = cute.arch.warp_reduction_max",
+            code,
+        )
+        # P16: the hoisted reciprocal references the loop-external root
+        # name ``di`` (not an inside-loop ``di_copy_*`` alias) and the
+        # inner divide is rewritten to a multiply.
+        self.assertIn("_helion_inv_div_", code)
+        self.assertIn("= 1.0 / di", code)
+        self.assertIn("* _helion_inv_div_", code)
+        self.assertNotIn("/ di_copy_1_0", code)
+        # P17 outer-in walk: no ``_helion_inv_div_N = 1.0 *
+        # _helion_inv_div_{N+1}`` cascade, exactly ONE reciprocal hoist
+        # for the consume sweep's ``1.0/di``.
         self.assertEqual(code.count("1.0 * _helion_inv_div_"), 0)
-        # Exactly ONE reciprocal hoist for the consume sweep's ``1.0/di``.
         self.assertEqual(code.count("= 1.0 / di"), 1)
-
-    def test_ssa_alias_chain_inlined(self) -> None:
-        """The per-iter ``mi_copy_*`` and ``di_copy_*`` alias chains
-        Helion's SSA maintenance inserts MUST be inlined so the deepest
-        use reads the root name directly.  Eliminates the per-iter copy
-        instruction the SSA maintenance otherwise leaves behind.
-        """
-        x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
-        code, out = code_and_output(
-            softmax_two_pass_kernel,
-            (x,),
-            block_sizes=[1, 128],
-            num_threads=[0, 32],
-            cute_vector_widths=[1, 4],
-        )
-        ref = torch.nn.functional.softmax(x, dim=1)
-        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-        # Neither ``mi_copy`` nor ``di_copy`` should appear in the
-        # generated code — both were SSA snapshots whose only purpose
-        # was to capture the value at a specific point; with the
-        # snapshot removed the inner use reads the root directly.
+        # P17 alias DCE: neither ``mi_copy`` nor ``di_copy`` appears —
+        # both were SSA snapshots; with the snapshot removed the inner
+        # use reads the root directly.
         self.assertEqual(code.count("_copy"), 0)
-
-    def test_fma_scale_hoist_above_consume(self) -> None:
-        """For ``softmax_two_pass``, the consume loop's
-        ``exp2((v_9 - mi) * 1.4427)`` pattern with ``mi`` loop-invariant
-        MUST get a hoisted ``_helion_scaled_K = mi * 1.4426950408889634``
-        placed BEFORE the consume loop, and the inner expression must
-        be rewritten to ``v_9 * 1.4427 - _helion_scaled_K`` (the outer
-        redundant ``cutlass.Float32(v_9)`` cast is stripped because
-        ``v_9 = cutlass.Float32(values_1)`` is already fp32).
-        """
-        x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
-        code, out = code_and_output(
-            softmax_two_pass_kernel,
-            (x,),
-            block_sizes=[1, 128],
-            num_threads=[0, 32],
-            cute_vector_widths=[1, 4],
-        )
-        ref = torch.nn.functional.softmax(x, dim=1)
-        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-        # A scaled hoist for ``mi * 1.4426950408889634`` must be emitted.
+        # P17 FMA scale hoist above the consume loop: ``mi * log2(e)``
+        # hoisted, inner expression rewritten to the FMA-friendly form
+        # (the outer redundant ``cutlass.Float32(v_9)`` cast is
+        # stripped because ``v_9`` is already fp32).
         self.assertIn("_helion_scaled_", code)
         self.assertIn("= mi * 1.4426950408889634", code)
-        # The inner consume body must use the FMA-friendly form.
-        # ``v_11 = cute.math.exp2(v_9 * 1.4427 - _helion_scaled_*)``
         self.assertIn("cute.math.exp2(v_9 * 1.4426950408889634 - _helion_scaled_", code)
-
-    def test_fma_scale_hoist_in_reduce_v_loop(self) -> None:
-        """In the reduce loop's INNER ``for vec_lane_1`` V-loop, the
-        ``(v_5 - v_1) * 1.4427`` pattern has ``v_1`` loop-invariant
-        w.r.t. the V-loop (v_1 is the new-max from the warp_reduce
-        that runs before the V-loop), so the scale hoist must also
-        fire here and emit a ``_helion_scaled_* = v_1 * 1.4427``
-        just before the V-loop.
-        """
-        x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
-        code, out = code_and_output(
-            softmax_two_pass_kernel,
-            (x,),
-            block_sizes=[1, 128],
-            num_threads=[0, 32],
-            cute_vector_widths=[1, 4],
-        )
-        ref = torch.nn.functional.softmax(x, dim=1)
-        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-        # The reduce-loop scale hoist for ``v_1 * 1.4427``.
+        # P17 FMA scale hoist in the reduce V-loop: ``v_1`` (the
+        # new-max from the warp_reduce before the V-loop) is
+        # V-loop-invariant, so the hoist fires there too.
         self.assertIn("= v_1 * 1.4426950408889634", code)
-        # The V-loop body must use the FMA-friendly form via v_5
-        # (the outer cast is stripped because ``v_5 = cutlass.Float32(values)``
-        # is already fp32).
         self.assertIn("cute.math.exp2(v_5 * 1.4426950408889634 - _helion_scaled_", code)
-
-    def test_dce_removes_dead_sub_after_fma_hoist(self) -> None:
-        """After the FMA hoist rewrites ``cast(v_X) * CONST`` to read
-        the underlying ``A`` directly (where ``v_X = A - INV`` was the
-        Sub statement), the ``v_X = A - INV`` becomes dead and the
-        final DCE pass must remove it.
-        """
-        x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
-        code, out = code_and_output(
-            softmax_two_pass_kernel,
-            (x,),
-            block_sizes=[1, 128],
-            num_threads=[0, 32],
-            cute_vector_widths=[1, 4],
-        )
-        ref = torch.nn.functional.softmax(x, dim=1)
-        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-        # The consume-loop ``v_10 = v_9 - mi`` MUST be DCE'd: nothing
-        # reads ``v_10`` after the FMA hoist rewrote ``v_11`` to
-        # reference ``v_9`` directly.
+        # P17 DCE: the consume-loop ``v_10 = v_9 - mi`` and the reduce
+        # V-loop ``v_6 = v_5 - v_1`` are dead after the FMA hoists and
+        # must be removed; statements that ARE read (``v_4`` feeds
+        # ``di``) must survive.
         self.assertNotIn("v_10 = v_9 - mi", code)
-        # Same for the inner reduce V-loop ``v_6 = v_5 - v_1`` — dead
-        # after the V-loop's FMA hoist.
         self.assertNotIn("v_6 = v_5 - v_1", code)
-        # But statements that ARE read (e.g. ``v_4 = di * v_3`` reads
-        # ``di``, and ``v_4`` is read by ``di = v_4 + sum_1``) MUST
-        # NOT be DCE'd.
         self.assertIn("di = v_4 + sum_1", code)
-
-    def test_invariance_canonicalization_does_not_break_consume(self) -> None:
-        """The pass must use the post-rename canonical name map for
-        invariance analysis on hoist-OUT passes, so that ``mi`` in the
-        REDUCE loop body is correctly classified as loop-VARIANT
-        (because ``v_1_0 = v_1`` will be renamed to ``mi = v_1``).
-        Without this, the FMA hoist would lift ``_helion_scaled_K =
-        mi * 1.4427`` ABOVE the reduce loop and capture the stale
-        initial ``-inf`` value of ``mi`` — silently producing wildly
-        wrong softmax outputs.
-        """
-        x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
-        code, out = code_and_output(
-            softmax_two_pass_kernel,
-            (x,),
-            block_sizes=[1, 128],
-            num_threads=[0, 32],
-            cute_vector_widths=[1, 4],
-        )
-        # Tight tolerance — this test specifically guards a silent
-        # mis-compile (the bench would still "look fast" with wrong
-        # outputs if we regressed here).
-        ref = torch.nn.functional.softmax(x, dim=1)
-        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-        # The ``mi`` scale hoist for the consume sweep lives BETWEEN
-        # the two outer for-loops (after the reduce loop finishes
-        # mutating ``mi`` via the rename ``v_1_0 -> mi``), not before
-        # the reduce loop.  Verify the hoist is positioned AFTER the
-        # ``mi = v_1`` post-rename assignment in the reduce loop.
+        # P17 invariance canonicalization: the ``mi`` scale hoist for
+        # the consume sweep lives BETWEEN the two outer for-loops
+        # (after the reduce loop finishes mutating ``mi`` via the
+        # rename ``v_1_0 -> mi``), not before the reduce loop — else
+        # it would capture the stale initial ``-inf`` value of ``mi``.
         reduce_end = code.find("mi = v_1\n")
         self.assertGreaterEqual(reduce_end, 0)
         scaled_consume = code.find("= mi * 1.4426950408889634")
         self.assertGreater(scaled_consume, reduce_end)
+
+    def test_load_pipeline_fires_on_both_sweeps(self) -> None:
+        """P18: both the reduce and consume sweeps match the (single
+        inner-lane loop, single load) shape so the pass rewrites both.
+        Each rewrite emits a prologue snapshot and a per-iter prefetch
+        — 2 ``_pipe_lane_base_*`` assigns and 2 ``_pipe_load_*``
+        assigns per pipelined site, for 4 total of each.
+        """
+        code, _, _ = _softmax_artifact(12672)
+        self.assertEqual(_pipe_shadow_var_count(code, "lane_base"), 4)
+        self.assertEqual(_pipe_shadow_var_count(code, "load"), 4)
+        # The snapshot ``lane_base_<N> = _pipe_lane_base_<M>`` form must
+        # appear inside the loop body — that's the substitution that
+        # gives the SASS scheduler one full iter of slack to issue the
+        # next load.
+        self.assertRegex(code, r"lane_base_\d+ = _pipe_lane_base_\d+")
+        self.assertRegex(code, r"_tile_unroll_vec_\d+_\d+ = _pipe_load_\d+")
 
 
 @onlyBackends(["cute"])
@@ -740,41 +590,8 @@ class TestCuteLoadPipelineP18(TestCase):
     GB/s gain on most softmax shapes.
     """
 
-    def _shadow_var_count(self, code: str, kind: str) -> int:
-        """Count ``_pipe_<kind>_N = `` occurrences (prologue + per-iter
-        prefetch assignments, so 2 per pipelined load site)."""
-        import re
-
-        return len(re.findall(rf"_pipe_{kind}_\d+ = ", code))
-
-    def test_pipeline_fires_on_softmax_two_pass(self) -> None:
-        """Both the reduce and consume sweeps of softmax_two_pass match
-        the (single inner-lane loop, single load) shape so the pass
-        rewrites both sweeps.  Each rewrite emits a prologue snapshot
-        and a per-iter prefetch — 2 ``_pipe_lane_base_*`` assigns and
-        2 ``_pipe_load_*`` assigns per pipelined site, for 4 total of
-        each across the two sweeps.
-        """
-        x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
-        code, out = code_and_output(
-            softmax_two_pass_kernel,
-            (x,),
-            block_sizes=[1, 128],
-            num_threads=[0, 32],
-            cute_vector_widths=[1, 4],
-        )
-        ref = torch.nn.functional.softmax(x, dim=1)
-        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-        # 2 sweeps * 2 assigns each = 4 _pipe_lane_base_* writes and
-        # 4 _pipe_load_* writes.
-        self.assertEqual(self._shadow_var_count(code, "lane_base"), 4)
-        self.assertEqual(self._shadow_var_count(code, "load"), 4)
-        # The snapshot ``lane_base_<N> = _pipe_lane_base_<M>`` form must
-        # appear inside the loop body — that's the substitution that
-        # gives the SASS scheduler one full iter of slack to issue the
-        # next load.
-        self.assertRegex(code, r"lane_base_\d+ = _pipe_lane_base_\d+")
-        self.assertRegex(code, r"_tile_unroll_vec_\d+_\d+ = _pipe_load_\d+")
+    # The pipeline-fires pin on (4096, 12672) lives in
+    # ``TestCuteCanonicalSoftmaxArtifact`` (shared compile).
 
     def test_pipeline_skips_when_lane_reps_greater_than_one(self) -> None:
         """V=4 with block_size=256 forces the inner lane loop to
@@ -869,10 +686,18 @@ class TestCuteLoadPipelineCarriedOnlyP19(TestCase):
         else:
             os.environ[name] = value
 
-    def test_carried_only_pipelines_reduce_sweep(self) -> None:
+    def test_carried_only_pipelines_reduce_sweep_but_not_consume(self) -> None:
         """With the gate enabled, the reduce sweep (which writes ``mi``
         and ``di`` — both defined in the outer function-body scope
-        before the loop) MUST still be pipelined.
+        before the loop) MUST still be pipelined, while the consume
+        sweep (which only stores into ``out[k]`` and never writes a
+        scalar accumulator in the outer scope) MUST NOT be.
+
+        The reduce-sweep pipeline writes ``_pipe_lane_base_0`` and
+        ``_pipe_load_0``; the consume sweep would have written
+        ``_pipe_lane_base_1`` and ``_pipe_load_1`` under the default
+        behavior.  Under the gate, only the ``_0`` indices appear.
+        (Was two tests compiling the identical artifact twice.)
         """
         self._set_env("HELION_LOAD_PIPELINE_CARRIED_ONLY", "1")
         x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
@@ -887,36 +712,15 @@ class TestCuteLoadPipelineCarriedOnlyP19(TestCase):
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
         # The reduce sweep MUST still be pipelined — there's a
         # loop-carried scalar write to ``mi`` (pre-rename: ``v_1_0
-        # = v_1``) so the gate fires positive.
+        # = v_1``) so the gate fires positive.  ONLY the reduce-sweep
+        # pipe (index 0) — no index 1.
         self.assertIn("_pipe_lane_base_", code)
-        self.assertIn("_pipe_load_", code)
-        # And the per-iter snapshot ``lane_base_<N> = _pipe_lane_base_<M>``
-        # form appears inside the reduce loop body.
-        self.assertRegex(code, r"lane_base_\d+ = _pipe_lane_base_\d+")
-
-    def test_carried_only_skips_consume_sweep(self) -> None:
-        """With the gate enabled, the consume sweep (which only
-        stores into ``out[k]`` and never writes a scalar accumulator
-        in the outer scope) MUST NOT be pipelined.
-
-        The reduce-sweep pipeline writes ``_pipe_lane_base_0`` and
-        ``_pipe_load_0``; the consume sweep would have written
-        ``_pipe_lane_base_1`` and ``_pipe_load_1`` under the default
-        behavior.  Under the gate, only the ``_0`` indices appear.
-        """
-        self._set_env("HELION_LOAD_PIPELINE_CARRIED_ONLY", "1")
-        x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
-        code, _ = code_and_output(
-            softmax_two_pass_kernel,
-            (x,),
-            block_sizes=[1, 128],
-            num_threads=[0, 32],
-            cute_vector_widths=[1, 4],
-        )
-        # ONLY the reduce-sweep pipe (index 0) — no index 1.
         self.assertIn("_pipe_load_0", code)
         self.assertNotIn("_pipe_load_1", code)
         self.assertNotIn("_pipe_lane_base_1", code)
+        # The per-iter snapshot ``lane_base_<N> = _pipe_lane_base_<M>``
+        # form appears inside the reduce loop body.
+        self.assertRegex(code, r"lane_base_\d+ = _pipe_lane_base_\d+")
         # And the consume sweep retains its original inline
         # ``cute.arch.load`` (no snapshot/prefetch rewrite).  The
         # consume sweep's load assigns to ``_tile_unroll_vec_1_1``.
@@ -996,15 +800,7 @@ class TestCuteWarpReduceHeuristic(TestCase):
         uses ``cute.arch.warp_reduction_*`` and not the shared-memory
         two-stage reduce.
         """
-        x = torch.randn(4096, 6400, device=DEVICE, dtype=HALF_DTYPE)
-        code, out = code_and_output(
-            softmax_two_pass_kernel,
-            (x,),
-            block_sizes=[1, 128],
-            num_threads=[0, 32],
-            cute_vector_widths=[1, 4],
-        )
-        ref = torch.nn.functional.softmax(x, dim=1)
+        code, out, ref = _softmax_artifact(6400)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
         self.assertIn("cute.arch.warp_reduction_max", code)
         self.assertIn("cute.arch.warp_reduction_sum", code)
@@ -1051,37 +847,14 @@ class TestCuteSoftmaxCorrectness(TestCase):
         )
 
     def test_softmax_4096x6400(self) -> None:
-        self._check_softmax(
-            (4096, 6400),
-            {
-                "block_sizes": [1, 128],
-                "num_threads": [0, 32],
-                "cute_vector_widths": [1, 4],
-            },
-        )
+        _, out, ref = _softmax_artifact(6400)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
-    def test_softmax_4096x12672(self) -> None:
-        self._check_softmax(
-            (4096, 12672),
-            {
-                "block_sizes": [1, 128],
-                "num_threads": [0, 32],
-                "cute_vector_widths": [1, 4],
-            },
-        )
-
-    def test_softmax_4096x8192(self) -> None:
-        """Power-of-two N — the divisible case."""
-        # V=8 falls back to scalar internally (see V=8 cap test) but the
-        # outer warp-reduce + hoist path still must be correct.
-        self._check_softmax(
-            (4096, 8192),
-            {
-                "block_sizes": [1, 256],
-                "num_threads": [0, 32],
-                "cute_vector_widths": [1, 4],
-            },
-        )
+    # (4096, 12672) numerics are pinned by
+    # ``TestCuteCanonicalSoftmaxArtifact`` and (4096, 8192) with
+    # ``block_sizes=[1, 256]`` (the power-of-two divisible case) by
+    # ``TestCuteLoadPipelineP18.test_pipeline_skips_when_lane_reps_greater_than_one``
+    # — both on the identical artifact these entries used to recompile.
 
 
 @onlyBackends(["cute"])
@@ -1112,7 +885,7 @@ class TestCuteMultiRowInvestigation(TestCase):
     ``thread_idx[0]`` = lane in row, ``thread_idx[1]`` = row index)
     would require structurally swapping the thread-axis assignment
     between the M-grid loop and the inner N-tile loop in
-    ``CuteNDTileStrategy``.  Even if implemented, the wall-clock gain
+    ``PerThreadNDTileStrategy``.  Even if implemented, the wall-clock gain
     is bounded by the launcher overhead.
 
     Future work to close the (4096, 256) gap should target either:
@@ -1423,8 +1196,12 @@ class TestCuteOnlineTo3PassRewrite(TestCase):
         the rewrite (the 3-pass and online forms have different
         rounding paths in fp16 — the diff must stay inside softmax's
         existing tolerance).
+
+        One power-of-two and one non-power-of-two N; each N is a full
+        recompile.  (4096, 12672) is already numerics-checked by
+        ``test_rewrite_fires_on_canonical_pattern`` above.
         """
-        for N in (4096, 6400, 12672, 16384):
+        for N in (4096, 6400):
             x = torch.randn(4096, N, device=DEVICE, dtype=HALF_DTYPE)
             _, out = code_and_output(
                 softmax_two_pass_kernel_for_3pass,

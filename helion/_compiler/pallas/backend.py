@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
     from ...runtime.settings import DotPrecision
+    from ..aten_lowering import Lowering
     from ..device_function import Argument
     from ..device_ir import GraphInfo
     from ..host_function import HostFunction
@@ -294,6 +295,7 @@ class PallasBackend(Backend):
             "pallas_worklist_grouping",
             "pallas_loop_type",
             "pallas_load_buffer_count",
+            "pallas_indirect_access_mode",
             "pallas_pre_broadcast",
         }
     )
@@ -1481,6 +1483,13 @@ class PallasBackend(Backend):
             return self.default_launcher_name
         return self.build_launcher_name(device_fn.config)
 
+    def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
+        from .aten_lowering import cat_lowering_pallas
+
+        if node.target is torch.ops.aten.cat.default:
+            return cat_lowering_pallas
+        return None
+
     def pre_codegen(
         self,
         graphs: list[GraphInfo],
@@ -1523,6 +1532,10 @@ class PallasBackend(Backend):
 
         if grouping in (1, 2):
             self._setup_compact_worklist(graphs, config)
+
+        from .tracing_ops import plan_grid_indirect_accesses
+
+        plan_grid_indirect_accesses(graphs)
 
         from .view_ops import plan_resident_ref_views
 

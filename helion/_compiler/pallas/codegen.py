@@ -21,7 +21,9 @@ if TYPE_CHECKING:
 
     from helion._compiler.aten_lowering import LoweringContext
     from helion._compiler.inductor_lowering import CodegenState
+    from helion._compiler.pallas.dma import DmaResources
     from helion._compiler.tile_strategy import DeviceLoopOrGridState
+    from helion._compiler.tile_strategy import ForiLoopState
 
 
 def _load_route(
@@ -42,25 +44,42 @@ def load_expr(
     tensor: torch.Tensor,
 ) -> ast.AST:
     """Emit a normal Pallas load or a selected TensorCore gather."""
+    from helion import exc
+    from helion._compiler.pallas.dma import emit_grid_indirect_transfer
     from helion._compiler.pallas.gather import emit_gather
     from helion._compiler.pallas.tensorcore_plan import TENSORCORE_PLAN_META
+    from helion._compiler.pallas.tensorcore_plan import DmaGatherPlan
     from helion._compiler.pallas.tensorcore_plan import OneHotGatherPlan
 
     arg_name, active_name, patterns = _load_route(state, tensor)
     device_fn = state.device_function
     assert state.fx_node is not None
     plan = state.fx_node.meta.get(TENSORCORE_PLAN_META)
+    if isinstance(plan, DmaGatherPlan):
+        dma_ref = memory_op_dma_scratch(state)
+        if dma_ref is None:
+            raise exc.InvalidConfig(
+                "indirect DMA load was not admitted by the active scheduler"
+            )
+        emit_grid_indirect_transfer(state, plan, arg_name)
+        return expr_from_string(f"{dma_ref}[...]")
     if isinstance(plan, OneHotGatherPlan):
         return emit_gather(state, plan.plan, active_name)
 
     from helion._compiler.device_function import PallasMemorySpace
+    from helion._compiler.pallas.plan_tiling import ContiguousRangeIndexPattern
 
     if (
         active_name == arg_name
         and device_fn.pallas_memory_space.get(id(tensor)) == PallasMemorySpace.HBM
-        and device_fn.is_pallas_remote_copy_operand(tensor)
+        and (
+            device_fn.is_pallas_remote_copy_operand(tensor)
+            or any(
+                isinstance(pattern, ContiguousRangeIndexPattern) for pattern in patterns
+            )
+        )
     ):
-        return _remote_hbm_load_expr(state, subscript, tensor, arg_name)
+        return _hbm_load_expr(state, subscript, tensor, arg_name)
 
     parts, none_dims = index_parts(state, subscript, tensor)
     scalar_load = classify_vmem_scalar_load(state, tensor, parts, patterns)
@@ -81,19 +100,19 @@ def load_expr(
     return result
 
 
-def _remote_hbm_load_expr(
+def _hbm_load_expr(
     state: CodegenState,
     subscript: list[object],
     tensor: torch.Tensor,
     name: str,
 ) -> ast.AST:
-    """Stage one directly accessed remote-DMA HBM region into VMEM.
+    """Stage one directly accessed HBM region into VMEM.
 
-    Remote-copy destinations can intentionally remain in HBM so their address is
-    stable across program iterations. Mosaic cannot load an HBM Ref directly, so
-    materialize the selected region at the exact source-level load. Emitting the
-    DMA here preserves ordering with nearby remote-copy waits and avoids changing
-    the placement of unrelated tensor arguments.
+    Remote-copy destinations and dynamic contiguous windows can intentionally
+    remain in HBM. Mosaic cannot load an HBM Ref directly, so materialize the
+    selected region at the exact source-level load. Emitting the DMA here
+    preserves ordering with nearby remote-copy waits and avoids changing the
+    placement of unrelated tensor arguments.
     """
     assert state.fx_node is not None
     value = state.fx_node.meta.get("val")
@@ -160,7 +179,9 @@ def resident_ref_load_expr(
     """Keep a proven direct VMEM load as a Pallas Ref."""
     from helion import exc
     from helion._compiler.device_function import PallasMemorySpace
+    from helion._compiler.pallas.dma import emit_grid_indirect_transfer
     from helion._compiler.pallas.tensorcore_plan import TENSORCORE_PLAN_META
+    from helion._compiler.pallas.tensorcore_plan import DmaGatherPlan
     from helion._compiler.pallas.tensorcore_plan import OneHotGatherPlan
 
     arg_name, name, _patterns = _load_route(state, tensor)
@@ -168,8 +189,18 @@ def resident_ref_load_expr(
 
     assert state.fx_node is not None
     plan = state.fx_node.meta.get(TENSORCORE_PLAN_META)
+    if isinstance(plan, DmaGatherPlan):
+        dma_ref = memory_op_dma_scratch(state)
+        if dma_ref is None:
+            raise exc.InvalidConfig(
+                "resident Ref indirect gather was not admitted by a DMA scheduler"
+            )
+        emit_grid_indirect_transfer(state, plan, arg_name)
+        return expr_from_string(dma_ref)
     if isinstance(plan, OneHotGatherPlan):
-        raise exc.InvalidConfig("resident Ref cannot follow an indirect gather")
+        raise exc.InvalidConfig(
+            "resident Ref indirect gather requires the indirect DMA access mode"
+        )
     parts, none_dims = index_parts(state, subscript, tensor)
     if none_dims or len(parts) != tensor.ndim:
         raise exc.InvalidConfig("resident Ref producer must preserve rank")
@@ -660,6 +691,7 @@ def _generated_index_code(
     """Generate index code based on the indexing pattern."""
     from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
     from helion._compiler.pallas.plan_tiling import ArbitrarySlicePattern
+    from helion._compiler.pallas.plan_tiling import ContiguousRangeIndexPattern
     from helion._compiler.pallas.plan_tiling import TensorIndexPattern
     from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
@@ -706,6 +738,18 @@ def _generated_index_code(
             in_pipeline,
             ast_subscripts,
             pipeline_scalar_indices_local,
+        )
+
+    if isinstance(pattern, ContiguousRangeIndexPattern):
+        if in_pipeline:
+            return ":"
+        if not raw_hbm_ref:
+            raise RuntimeError(
+                "a contiguous dynamic range must address its raw HBM source"
+            )
+        index = _index_expr_from_ast(state, subscript_index, ast_subscripts)
+        return (
+            f"pl.ds(pl.multiple_of({index}[0], {pattern.alignment}), {pattern.length})"
         )
 
     if isinstance(pattern, TensorIndexPattern):
@@ -1081,3 +1125,46 @@ def vmem_name(state: CodegenState, name: str) -> str:
     if isinstance(loop, ForiLoopState) and name in loop._prefetched_load_tensors:
         return f"{ref}.at[{loop.loop_var_name} % 2]"
     return ref
+
+
+def _memory_op_fori_binding(
+    state: CodegenState,
+) -> tuple[ForiLoopState, DmaResources] | None:
+    from helion._compiler.tile_strategy import ForiLoopState
+
+    node = state.fx_node
+    if node is None:
+        return None
+    seen: set[int] = set()
+    for loops in state.codegen.active_device_loops.values():
+        for loop in reversed(loops):
+            if id(loop) in seen or not isinstance(loop, ForiLoopState):
+                continue
+            seen.add(id(loop))
+            binding = loop._memory_op_to_dma_scratch.get(node)
+            if binding is not None:
+                return loop, binding
+    return None
+
+
+def memory_op_dma_scratch(state: CodegenState) -> str | None:
+    """Return this memory operation's scheduler-owned VMEM stage, if any."""
+    found = _memory_op_fori_binding(state)
+    if found is not None:
+        loop, resources = found
+        stage = (
+            None
+            if resources.buffer_count == 1
+            else f"{loop.loop_var_name} % {resources.buffer_count}"
+        )
+        return resources.scratch_ref(stage)
+    resources = grid_memory_op_dma_binding(state)
+    return resources.scratch if resources is not None else None
+
+
+def grid_memory_op_dma_binding(state: CodegenState) -> DmaResources | None:
+    """Return this root-grid memory operation's DMA resources."""
+    node = state.fx_node
+    if node is None:
+        return None
+    return state.device_function.pallas_grid_dma_bindings.get(node)

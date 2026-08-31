@@ -14,7 +14,6 @@ import re
 import tempfile
 from typing import TYPE_CHECKING
 from typing import Any
-from typing import Callable
 from typing import Sequence
 
 import sympy
@@ -193,6 +192,7 @@ def _detect_grouped_rank3_specialized_mma_loop(
 ) -> bool:
     from ..compile_environment import CompileEnvironment
     from ..host_function import HostFunction
+    from .cute_mma import _rank3_grouped_root_axes
 
     device_ir = HostFunction.current().device_ir
     if len(device_ir.grid_block_ids) != 1 or len(block_ids) != 1:
@@ -200,7 +200,25 @@ def _detect_grouped_rank3_specialized_mma_loop(
     root_grid_ids = device_ir.grid_block_ids[0]
     if any(block_id in root_grid_ids for block_id in block_ids):
         return False
-    if len(root_grid_ids) == 2:
+    env = CompileEnvironment.current()
+    semantic_block_ids = env.config_spec._tcgen05_matmul_block_ids()
+    axes = None
+    if semantic_block_ids is not None:
+        m_block_id, n_block_id, k_block_id = semantic_block_ids
+        if env.canonical_block_id(k_block_id) == env.canonical_block_id(block_ids[0]):
+            axes = _rank3_grouped_root_axes(
+                env,
+                device_ir,
+                m_block_id=m_block_id,
+                n_block_id=n_block_id,
+                k_block_id=block_ids[0],
+            )
+    if semantic_block_ids is not None and axes is None:
+        return False
+    if axes is not None:
+        segment_root_grid_id = axes.segment_block_id
+        mn_root_grid_ids = [axes.m_block_id, axes.n_block_id]
+    elif len(root_grid_ids) == 2:
         segment_root_grid_id = None
         mn_root_grid_ids = root_grid_ids
     elif len(root_grid_ids) == 3:
@@ -208,8 +226,6 @@ def _detect_grouped_rank3_specialized_mma_loop(
         mn_root_grid_ids = root_grid_ids[1:]
     else:
         return False
-
-    env = CompileEnvironment.current()
     if segment_root_grid_id is not None:
         segment_block = env.block_sizes[segment_root_grid_id].from_config(config)
         segment_threads = env.config_spec.num_threads.config_get(
@@ -263,7 +279,7 @@ def _detect_specialized_mma_loop(
     from .cute_mma import _choose_mma_impl
     from .cute_mma import _mma_tiles_are_static_full
     from .cute_mma import analyze_cute_mma_node
-    from .cute_mma import ensure_tcgen05_pair_epilogue_plan
+    from .cute_mma import ensure_tcgen05_fragment_epilogue_plan
 
     if _detect_grouped_rank3_specialized_mma_loop(
         fn,
@@ -341,7 +357,7 @@ def _detect_specialized_mma_loop(
             root_m_threads=root_m_threads,
             root_n_threads=root_n_threads,
         ):
-            if mma_impl == "tcgen05" and not ensure_tcgen05_pair_epilogue_plan(
+            if mma_impl == "tcgen05" and not ensure_tcgen05_fragment_epilogue_plan(
                 fn,
                 node,
                 candidate,
@@ -477,6 +493,10 @@ def _detect_attention_mma_loop(
     default scalar-fallback path is unchanged while the path is incomplete.
     """
     if not _attention_flash_gate_enabled() or not _attention_flash_supported():
+        return False
+    from ..compile_environment import CompileEnvironment
+
+    if CompileEnvironment.current().config_spec.cute_attention_generic_fallback_enabled:
         return False
     shape = _attention_loop_shape(fn, block_ids, config=config)
     if shape is None:
@@ -780,6 +800,9 @@ _CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS = 600
 class CuteBackend(Backend):
     """CuTe DSL (CUTLASS Python DSL) code generation backend."""
 
+    # Bump when config_value_priors() changes its candidate distribution.
+    config_value_priors_version = 1
+
     @property
     def name(self) -> str:
         return "cute"
@@ -849,28 +872,7 @@ class CuteBackend(Backend):
             ),
             TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: weighted_choice({True: 3.0, False: 1.0}),
         }
-        if config_spec is not None and config_spec.cute_flash_search_enabled:
-            priors.update(self._cute_flash_config_value_priors(config_spec))
         return priors
-
-    @staticmethod
-    def _cute_flash_config_value_priors(
-        config_spec: ConfigSpec,
-    ) -> dict[str, ValuePrior]:
-        from ...autotuner.config_priors import weighted_choice
-        from .cute_flash import flash_attention_value_prior_weights
-
-        return {
-            key: weighted_choice(weights)
-            for key, weights in flash_attention_value_prior_weights(
-                config_spec._cute_flash_head_dim or 0,
-                config_spec._cute_flash_num_kv,
-                dtype=config_spec._cute_flash_dtype,
-                is_causal=config_spec._cute_flash_is_causal,
-                has_kv_tile_pruning=config_spec._cute_flash_has_kv_tile_pruning,
-                requires_ws_overlap=config_spec._cute_flash_requires_ws_overlap,
-            ).items()
-        }
 
     def customize_ast(self, hf: HostFunction) -> None:
         """CuTe-specific AST rewrites that rewrite high-level patterns into
@@ -1068,23 +1070,15 @@ class CuteBackend(Backend):
             return "warn"
         return None
 
-    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
-        # The default Triton do_bench uses CUDA events that mis-time the CuTe
-        # path on Blackwell - launches show up as ~5ms when the kernel is
-        # actually 250ms+. Use synchronized wall-clock timing instead so
-        # autotune scores reflect real performance.
-        from ...autotuner.benchmarking import do_bench_generic
-
-        return do_bench_generic
-
-    def get_interleaved_bench(self) -> Callable[..., list[float]]:
-        # Same rationale as get_do_bench: the default interleaved bench uses
-        # CUDA events that mis-time the CuTe path. Use the synchronized
-        # wall-clock fallback so the autotuner's interleaved compare path
-        # produces real timings.
-        from ...autotuner.benchmarking import interleaved_bench_generic
-
-        return interleaved_bench_generic
+    # Note: this backend intentionally does NOT override get_do_bench /
+    # get_interleaved_bench. CUDA-event timing once mis-read CuTe launches
+    # (~5ms reported for 250ms kernels) because the pre-compiled-launcher
+    # per-call ``@cute.jit`` dispatch path spent ~200ms on the host per
+    # launch; with ``_CompiledCuteLauncher`` kernels launch on the Torch
+    # current stream and event timing matches synchronized wall-clock timing
+    # to <0.1ms on B200 across flash families (including CLC+PDL and
+    # multi-second launches). Event timing avoids charging per-launch host
+    # overhead to the kernel, which the wall path does.
 
     def autotune(
         self,
@@ -1147,6 +1141,10 @@ class CuteBackend(Backend):
             "_cute_gelu_erf_exact_f32x2": (
                 "from helion._compiler.cute.epilogue_helpers import "
                 "gelu_erf_exact_f32x2 as _cute_gelu_erf_exact_f32x2"
+            ),
+            "_cute_sigmoid_approx_ftz_f32": (
+                "from helion._compiler.cute.epilogue_helpers import "
+                "sigmoid_approx_ftz_f32 as _cute_sigmoid_approx_ftz_f32"
             ),
             "_cute_grouped_reduce_shared_tree": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_tree",
             "_cute_grouped_reduce_shared_two_stage": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage",
@@ -2028,8 +2026,8 @@ class CuteBackend(Backend):
         from ..device_ir import ForLoopGraphInfo
         from ..device_ir import ReductionLoopGraphInfo
         from ..host_function import HostFunction
-        from ..tile_strategy import CuteFlattenedTileStrategy
-        from ..tile_strategy import CuteNDTileStrategy
+        from ..tile_strategy import PerThreadFlattenedTileStrategy
+        from ..tile_strategy import PerThreadNDTileStrategy
 
         env = CompileEnvironment.current()
         device_ir = HostFunction.current().device_ir
@@ -2288,9 +2286,13 @@ class CuteBackend(Backend):
             from .thread_budget import check_thread_limit
 
             # Detect MMA-compatible K-loops: device loops containing
-            # addmm/mm with float16/bfloat16 operands.
+            # addmm/mm with float16/bfloat16 operands.  Metal borrows this
+            # planner but has its own matmul lowering (MPP), and everything
+            # ``mma_mode`` selects -- tcgen05, warpgroups, cute_state -- is
+            # CuTe's, so only run the detectors for CuTe.
             mma_mode = False
-            if is_device_loop:
+            detect_mma = self.name == "cute"
+            if is_device_loop and detect_mma:
                 if _detect_attention_mma_loop(
                     fn,
                     block_ids,
@@ -2310,7 +2312,8 @@ class CuteBackend(Backend):
                         config=config,
                     )
             elif (
-                len(device_ir.grid_block_ids) == 1
+                detect_mma
+                and len(device_ir.grid_block_ids) == 1
                 and block_ids == device_ir.grid_block_ids[0]
             ):
                 specialized_mma_plan = _kernel_specialized_mma_plan(fn, config=config)
@@ -2357,7 +2360,7 @@ class CuteBackend(Backend):
                     )
 
             check_thread_limit(static_threads, context=str(tuple(nd_block_size)))
-            return CuteNDTileStrategy(
+            return PerThreadNDTileStrategy(
                 fn,
                 block_ids,
                 block_size=nd_block_size,
@@ -2391,7 +2394,7 @@ class CuteBackend(Backend):
             from .thread_budget import check_thread_limit
 
             check_thread_limit(flat_num_threads, context=str(block_size))
-        return CuteFlattenedTileStrategy(
+        return PerThreadFlattenedTileStrategy(
             fn,
             block_ids,
             block_size=block_size,

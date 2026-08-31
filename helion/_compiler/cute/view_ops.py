@@ -112,7 +112,7 @@ def _(state: CodegenState) -> list[ast.AST]:
 @_decorators.codegen(join, "cute")
 def _(state: CodegenState) -> ast.AST:
     from ..generate_ast import GenerateAST
-    from .cute_reshape import _get_dim_local_coord
+    from .cute_reshape import _get_node_dim_local_coord
 
     fx_node = state.fx_node
     assert fx_node is not None
@@ -121,7 +121,7 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(state.codegen, GenerateAST)
 
     new_dim = output_val.ndim - 1
-    selector = _get_dim_local_coord(state.codegen, output_val, new_dim)
+    selector = _get_node_dim_local_coord(state.codegen, fx_node, output_val, new_dim)
 
     return expr_from_string(
         f"(({{a}}) if ({selector}) == cutlass.Int32(0) else ({{b}}))",

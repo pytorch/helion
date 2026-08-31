@@ -51,6 +51,15 @@ class MemoryAccess:
     value_node: torch.fx.Node | None
 
 
+@dataclass(frozen=True)
+class IndirectAccess:
+    """The single tensor-indexed dimension of a memory access."""
+
+    access: MemoryAccess
+    position: int
+    index_node: torch.fx.Node
+
+
 def build_memory_access(
     node: torch.fx.Node,
     tensor: torch.Tensor,
@@ -83,4 +92,45 @@ def build_memory_access(
         subscript=tuple(subscript),
         patterns=tuple(patterns),
         value_node=value_node if isinstance(value_node, torch.fx.Node) else None,
+    )
+
+
+def memory_access_value(access: MemoryAccess) -> torch.Tensor | None:
+    """Return the tensor loaded or stored by ``access`` when available."""
+    value = (
+        access.node.meta.get("val")
+        if access.kind is MemoryAccessKind.LOAD
+        else access.value_node.meta.get("val")
+        if access.value_node is not None
+        else None
+    )
+    return value if isinstance(value, torch.Tensor) else None
+
+
+def memory_access_mask(access: MemoryAccess) -> object | None:
+    """Return an explicit mask, excluding automatic tile-bound masks."""
+    position = 2 if access.kind is MemoryAccessKind.LOAD else 3
+    return access.node.args[position] if len(access.node.args) > position else None
+
+
+def indirect_access(access: MemoryAccess) -> IndirectAccess | None:
+    """Return the unique tensor-indexed dimension, if there is one."""
+    positions = tensor_index_positions(access)
+    if len(positions) != 1:
+        return None
+    position = positions[0]
+    index = access.subscript[position]
+    if not isinstance(index, torch.fx.Node):
+        return None
+    return IndirectAccess(access, position, index)
+
+
+def tensor_index_positions(access: MemoryAccess) -> tuple[int, ...]:
+    """Return all tensor-indexed subscript positions."""
+    from .plan_tiling import TensorIndexPattern
+
+    return tuple(
+        position
+        for position, pattern in enumerate(access.patterns)
+        if isinstance(pattern, TensorIndexPattern)
     )

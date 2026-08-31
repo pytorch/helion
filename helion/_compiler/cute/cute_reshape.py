@@ -126,7 +126,7 @@ def _resolve_dim_block_id(
 def _strategy_aliases_index_and_offset(strategy: object, block_id: int) -> bool:
     """Return True when ``strategy`` produces an index var aliased to its offset.
 
-    ``CuteFlattenedTileStrategy`` (and ``FlattenedTileStrategy``) emit
+    ``PerThreadFlattenedTileStrategy`` (and ``FlattenedTileStrategy``) emit
     ``indices_X = offsets_X`` when collapsing a single block id, so the
     difference ``indices_X - offsets_X`` is always zero. We must derive the
     per-thread coordinate from ``thread_idx`` instead.
@@ -295,6 +295,18 @@ _LAYOUT_PRESERVING_POINTWISE_TARGETS = frozenset(
     }
 )
 
+# Shape ops whose per-thread scalar equals their input's: adding a unit dim or
+# broadcasting one leaves each thread's element in place, so a transpose feeding
+# them (e.g. the rank-broadcast matmul's ``permute -> unsqueeze -> expand ->
+# bmm`` chain) is judged by the ultimate consumer, exactly like the pointwise
+# set above.
+_LAYOUT_PRESERVING_SHAPE_TARGETS = frozenset(
+    {
+        torch.ops.aten.unsqueeze.default,
+        torch.ops.aten.expand.default,
+    }
+)
+
 
 def _shape_op_needs_materialization(node: Node) -> bool:
     """Return True when non-store consumers need values, not just metadata."""
@@ -325,10 +337,13 @@ def _shape_op_needs_materialization(node: Node) -> bool:
         target_name = str(user.target)
         if any(name in target_name for name in reduction_names):
             return False
-        # Layout-preserving per-thread pointwise/cast ops keep each thread's
-        # element in place, so recurse to find the ultimate consumer instead of
-        # forcing a shared-memory shuffle for the intervening op.
-        if user.target in _LAYOUT_PRESERVING_POINTWISE_TARGETS:
+        # Layout-preserving per-thread pointwise/cast/shape ops keep each
+        # thread's element in place, so recurse to find the ultimate consumer
+        # instead of forcing a shared-memory shuffle for the intervening op.
+        if (
+            user.target in _LAYOUT_PRESERVING_POINTWISE_TARGETS
+            or user.target in _LAYOUT_PRESERVING_SHAPE_TARGETS
+        ):
             if user in visited:
                 return False
             visited.add(user)

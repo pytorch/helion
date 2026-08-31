@@ -1,22 +1,21 @@
 """Tests for ``Kernel._fast_dispatch_key``, the cheap dispatch key that backs
 the ``Kernel.__call__`` fast-path cache (``_dispatch_cache``).
 
-The correctness argument for the cache is that the fast key is *strictly finer*
-than the full specialization key: any two argument lists that produce different
-full keys also produce different fast keys, so a fast-key hit can never dispatch
-to a BoundKernel that a full ``bind()`` would not have resolved for those
-arguments. "Strictly" finer because the converse fails -- the fast key
-distinguishes argument lists (e.g. scalar values, or dynamic-shape sizes that
-bucket together) that the full key deliberately collapses.
+The correctness argument for the cache is that the fast key refines the full
+specialization key: any two argument lists that produce different full keys also
+produce different fast keys, so a fast-key hit can never dispatch to a
+BoundKernel that a full ``bind()`` would not have resolved for those arguments.
+The fast key remains strictly finer for exact tensor metadata that the dynamic
+specialization key deliberately buckets together.
 
 These tests pin down:
 1. Refinement: across a matrix of dtype/shape/stride variants, distinct full
    keys always imply distinct fast keys.
-2. Strictness under two witnesses that share a full key but not a fast key:
-   scalar value (full key records only ``type``) and dynamic-shape bucketing.
-3. The documented ``None`` returns: unhandled argument types and the
+2. Runtime scalar values share a key, while constexpr values remain distinct.
+3. Strictness under dynamic-shape bucketing.
+4. The documented ``None`` returns: unhandled argument types and the
    no-tensor-to-pin-the-device case.
-4. ``key=`` functions feed into the fast key.
+5. ``key=`` functions feed into the fast key.
 
 The key is pure argument-metadata bookkeeping, so it needs no compilation and
 runs on CPU-only bots.
@@ -30,6 +29,7 @@ import torch
 
 import helion
 import helion.language as hl
+from helion.runtime.kernel import _make_prepared_arg_guard
 
 
 @helion.kernel(static_shapes=True)
@@ -53,6 +53,22 @@ def _dynamic_add_scalar(x: torch.Tensor, s: int) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(x.size(0)):
         out[tile] = x[tile] + s
+    return out
+
+
+@helion.kernel(static_shapes=False)
+def _dynamic_add_constexpr(x: torch.Tensor, s: hl.constexpr) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + s
+    return out
+
+
+@helion.kernel(static_shapes=False)
+def _dynamic_add_scalar_list(x: torch.Tensor, values: list[int]) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + values[0]
     return out
 
 
@@ -90,11 +106,7 @@ class TestFastDispatchKey(unittest.TestCase):
                     )
         self.assertTrue(saw_distinct_full)
 
-    def test_strictly_finer_via_scalar_value(self) -> None:
-        """Witness that the fast key is *strictly* finer: two calls whose only
-        difference is a scalar's value share a full key (which records only the
-        scalar's ``type``) but get distinct fast keys (which record its value).
-        """
+    def test_runtime_scalar_values_share_fast_key(self) -> None:
         x = torch.empty(64, dtype=torch.float32)
         a = (x, 1)
         b = (x, 2)
@@ -102,9 +114,70 @@ class TestFastDispatchKey(unittest.TestCase):
             _dynamic_add_scalar.specialization_key(a),
             _dynamic_add_scalar.specialization_key(b),
         )
-        self.assertNotEqual(
+        self.assertEqual(
             _dynamic_add_scalar._fast_dispatch_key(a),
             _dynamic_add_scalar._fast_dispatch_key(b),
+        )
+        self.assertEqual(
+            len(
+                {
+                    _dynamic_add_scalar._fast_dispatch_key((x, value))
+                    for value in (True, 1, 1.0)
+                }
+            ),
+            3,
+        )
+
+    def test_constexpr_scalar_values_have_distinct_fast_keys(self) -> None:
+        x = torch.empty(64, dtype=torch.float32)
+        self.assertNotEqual(
+            _dynamic_add_constexpr._fast_dispatch_key((x, 1)),
+            _dynamic_add_constexpr._fast_dispatch_key((x, 2)),
+        )
+        self.assertNotEqual(
+            _dynamic_add_scalar._fast_dispatch_key((x, hl.constexpr(1))),
+            _dynamic_add_scalar._fast_dispatch_key((x, hl.constexpr(2))),
+        )
+
+    def test_nested_runtime_scalar_values_share_fast_key(self) -> None:
+        x = torch.empty(64, dtype=torch.float32)
+        self.assertEqual(
+            _dynamic_add_scalar_list._fast_dispatch_key((x, [1, 2])),
+            _dynamic_add_scalar_list._fast_dispatch_key((x, [3, 4])),
+        )
+
+    def test_prepared_guard_preserves_nested_constexpr_values(self) -> None:
+        x = torch.empty(64, dtype=torch.float32)
+        guard = _make_prepared_arg_guard(_dynamic_add_constexpr, (x, (1, 2)))
+
+        self.assertTrue(guard((x, (1, 2))))
+        self.assertFalse(guard((x, (3, 4))))
+
+    def test_prepared_guard_supports_constexpr_wrapped_values(self) -> None:
+        x = torch.empty(64, dtype=torch.float32)
+        guard = _make_prepared_arg_guard(_dynamic_add_scalar, (x, hl.constexpr(2)))
+
+        self.assertTrue(guard((x, hl.constexpr(2))))
+        self.assertFalse(guard((x, hl.constexpr(3))))
+        self.assertFalse(guard((x, 2)))
+
+        fguard = _make_prepared_arg_guard(_dynamic_add_scalar, (x, hl.constexpr(0.0)))
+        self.assertTrue(fguard((x, hl.constexpr(0.0))))
+        self.assertFalse(fguard((x, hl.constexpr(-0.0))))
+        with self.assertRaises(TypeError):
+            _make_prepared_arg_guard(
+                _dynamic_add_scalar, (x, hl.constexpr(float("nan")))
+            )
+
+    def test_constexpr_container_with_tensor_returns_none(self) -> None:
+        """A constexpr-annotated container specializes on the raw argument, so
+        tensor identity drives the full key; a metadata fast key would conflate
+        keys the full key distinguishes, so there must be no fast key."""
+        x = torch.empty(64, dtype=torch.float32)
+        t = torch.empty(8, dtype=torch.float32)
+        self.assertIsNone(_dynamic_add_constexpr._fast_dispatch_key((x, (t, 1))))
+        self.assertIsNone(
+            _dynamic_add_constexpr._fast_dispatch_key((x, {"weights": t}))
         )
 
     def test_strictly_finer_via_dynamic_shape_bucketing(self) -> None:
@@ -137,11 +210,54 @@ class TestFastDispatchKey(unittest.TestCase):
         self.assertIs(type(entry[1]), torch.Size)
 
     def test_returns_none_for_unhandled_arg_type(self) -> None:
-        """A container / unsupported argument type forces the slow ``bind()``
-        path by returning ``None``."""
+        """An unsupported nested argument forces the slow ``bind()`` path."""
         x = torch.empty(64, dtype=torch.float32)
-        self.assertIsNone(_static_add1._fast_dispatch_key((x, [1, 2, 3])))
+        self.assertIsNone(_static_add1._fast_dispatch_key((x, [object()])))
         self.assertIsNone(_static_add1._fast_dispatch_key((x, object())))
+
+    def test_nested_containers_record_structure_and_tensor_metadata(self) -> None:
+        x = torch.empty(64, dtype=torch.float32)
+        y = torch.empty(128, dtype=torch.float32)
+
+        tuple_key = _static_add1._fast_dispatch_key(((x, y),))
+        list_key = _static_add1._fast_dispatch_key(([x, y],))
+        dict_key = _static_add1._fast_dispatch_key(({"x": x, "y": y},))
+        reordered_dict_key = _static_add1._fast_dispatch_key(({"y": y, "x": x},))
+        nested_key = _static_add1._fast_dispatch_key(({"pair": [x, y]},))
+
+        self.assertIsNotNone(tuple_key)
+        self.assertIsNotNone(list_key)
+        self.assertIsNotNone(nested_key)
+        self.assertNotEqual(tuple_key, list_key)
+        self.assertEqual(dict_key, reordered_dict_key)
+        self.assertNotEqual(
+            tuple_key,
+            _static_add1._fast_dispatch_key(((x, torch.empty_like(x)),)),
+        )
+
+    def test_nested_container_without_tensor_returns_none(self) -> None:
+        self.assertIsNone(_dynamic_add_scalar._fast_dispatch_key((([1, 2],),)))
+
+    def test_prepared_guard_recurses_through_nested_containers(self) -> None:
+        x = torch.empty(64, dtype=torch.float32)
+        y = torch.empty(128, dtype=torch.float32)
+        args = ({"pair": [x, y], "scale": 2},)
+        guard = _make_prepared_arg_guard(_static_add1, args)
+
+        self.assertTrue(
+            guard(
+                (
+                    {
+                        "scale": 3,
+                        "pair": [torch.empty_like(x), torch.empty_like(y)],
+                    },
+                )
+            )
+        )
+        self.assertFalse(guard(({"pair": (x, y), "scale": 2},)))
+        self.assertFalse(guard(({"pair": [x], "scale": 2},)))
+        self.assertFalse(guard(({"pair": [x, y], "other": 2},)))
+        self.assertFalse(guard(({"pair": [x, torch.empty_like(x)], "scale": 2},)))
 
     def test_returns_none_without_tensor_to_pin_device(self) -> None:
         """With no tensor argument there is nothing to pin the device, so the
@@ -150,12 +266,11 @@ class TestFastDispatchKey(unittest.TestCase):
         self.assertIsNone(_dynamic_add_scalar._fast_dispatch_key(()))
 
     def test_scalar_and_none_entries(self) -> None:
-        """Handled non-tensor arguments contribute (type, value) for scalars
-        and a bare ``None`` for ``None``, provided a tensor pins the device."""
+        """Runtime scalars contribute their type and ``None`` stays bare."""
         x = torch.empty(64, dtype=torch.float32)
         key = _dynamic_add_scalar._fast_dispatch_key((x, 7))
         assert isinstance(key, tuple)
-        self.assertEqual(key[1], (int, 7))
+        self.assertIs(key[1], int)
 
         none_key = _static_add1._fast_dispatch_key((x, None))
         assert isinstance(none_key, tuple)

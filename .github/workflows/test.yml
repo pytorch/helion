@@ -99,23 +99,14 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
+          restore-cache: true
+          # Pull requests can consume caches published by main/release pushes,
+          # but should not occupy accelerator runners uploading new archives.
+          save-cache: ${{ github.event_name == 'push' }}
 
       - name: Create virtual environment
         run: |
           uv venv --python ${{ matrix.python-version }}
-
-      - name: Get current month
-        id: date
-        run: echo "month=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
-
-      - name: Cache dependencies
-        id: cache
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cache/uv
-            ~/.venv
-          key: ${{ matrix.python-version }}-${{ matrix.runtime-version }}-${{ matrix.pytorch-version }}-${{ matrix.backend }}-${{ hashFiles('.github/workflows/test.yml') }}-${{ steps.date.outputs.month }}
 
       # TPU installs its (pinned) torch via the install-pytorch-for-torchtpu composite
       # action below; every other runtime installs torch here.
@@ -200,7 +191,7 @@ jobs:
         if: matrix.alias == 'pallas-interpret'
         run: |
           source .venv/bin/activate
-          uv pip install 'jax==0.11.0' 'jaxlib==0.11.0' 'absl-py'
+          uv pip install 'jax==0.11.1' 'jaxlib==0.11.1' 'absl-py'
 
       - name: Install CUTLASS CuTe DSL
         if: matrix.backend == 'cute'
@@ -274,7 +265,7 @@ jobs:
 
       - name: Run Tests
         run: |
-          set -o pipefail
+          set -e -o pipefail
           source .venv/bin/activate
           uv pip install pytest-xdist
           uv pip install pytest-rerunfailures
@@ -342,7 +333,7 @@ jobs:
           fi
 
   test-notebooks:
-    name: test-notebooks-cu130-py3.12-pytorch-2.9-a10g
+    name: test-notebooks-cu130-py3.12-pytorch-2.13-a10g
 
     container:
       image: nvidia/cuda:13.1.0-devel-ubuntu24.04
@@ -368,6 +359,8 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
+          restore-cache: true
+          save-cache: ${{ github.event_name == 'push' }}
 
       - name: Create virtual environment
         run: |
@@ -377,19 +370,6 @@ jobs:
         run: |
           source .venv/bin/activate
           uv pip install pip
-
-      - name: Get current month
-        id: date
-        run: echo "month=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
-
-      - name: Cache dependencies
-        id: cache
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cache/uv
-            ~/.venv
-          key: notebooks-3.12-cu130-${{ hashFiles('.github/workflows/test.yml') }}-${{ steps.date.outputs.month }}
 
       - name: Install notebook execution tools
         run: |

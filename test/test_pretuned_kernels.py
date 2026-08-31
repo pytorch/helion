@@ -27,6 +27,7 @@ from helion._testing import is_cuda
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfSharedMemoryLessThan
 
 
 def _under_xdist() -> bool:
@@ -392,6 +393,10 @@ class TestPretunedKernelsCorrectness(TestCase):
     def test_rope_bwd(self):
         self._run_correctness("rope_bwd")
 
+    @skipIfSharedMemoryLessThan(
+        147456,
+        reason="pretuned sm90 scaled_mm config exceeds device shared memory limit",
+    )
     def test_scaled_mm(self):
         if not is_cuda():
             self.skipTest("Pretuned kernels require CUDA / ROCm.")
@@ -451,6 +456,29 @@ class TestPretunedKernelsCorrectness(TestCase):
 @onlyBackends(["cute"])
 @skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
 class TestPretunedCuteCodegen(TestCase):
+    def _run_tcgen05_fragment_epilogue_correctness(self, name: str) -> None:
+        if not is_cuda() or torch.cuda.get_device_capability() < (10, 0):
+            self.skipTest(f"{name} requires tcgen05 support (SM100+).")
+        module = _import_pretuned_kernel_module(name)
+        module.correctness_check()
+
+    def test_projection_rotary(self) -> None:
+        self._run_tcgen05_fragment_epilogue_correctness("projection_rotary")
+
+    def test_interleaved_swiglu(self) -> None:
+        self._run_tcgen05_fragment_epilogue_correctness("interleaved_swiglu")
+
+    def test_tcgen05_fragment_epilogues_are_registered_for_b200(self) -> None:
+        path = PRETUNED_KERNELS_DIR / "run.py"
+        spec = importlib.util.spec_from_file_location("_pretuned_runner", path)
+        assert spec is not None and spec.loader is not None
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        for name in ("projection_rotary", "interleaved_swiglu"):
+            with self.subTest(name=name):
+                self.assertIn(name, runner.KERNELS)
+                self.assertEqual(runner._supported_hardware(name), {"b200"})
+
     def test_scale_mm_pretuned_explicit_epilogue_configs(self) -> None:
         path = (
             PRETUNED_KERNELS_DIR
