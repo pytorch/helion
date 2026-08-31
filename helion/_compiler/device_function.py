@@ -1070,7 +1070,6 @@ class DeviceFunction:
                 block_id: env.config_spec.cute_reduction_reloads.config_get(
                     reload_cfg, block_id, "auto"
                 )
-                or "auto"
                 for block_id in env.config_spec.cute_reduction_reloads.valid_block_ids()
             }
             kernel_body = fuse_two_pass_loads(

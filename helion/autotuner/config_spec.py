@@ -2477,8 +2477,16 @@ class ConfigSpec:
         ):
             nt_list = cast("list[int]", config.get("num_threads", []) or [])
             bs_list = cast("list[int]", config.get("block_sizes", []) or [])
+            # ``num_threads`` also carries per-rolled-rdim slots (the
+            # reduction's own thread count); only NON-reduction tile axes
+            # consume the budget the reduction competes for.  Tile slots
+            # are registered in ``block_sizes`` order, so pairing the i-th
+            # num_threads slot with block_sizes[i] stays valid for them.
+            reduction_block_ids = {spec.block_id for spec in self.reduction_loops}
             other_threads = 1
-            for i, _ in enumerate(self.num_threads):
+            for i, nt_spec in enumerate(self.num_threads):
+                if nt_spec.block_id in reduction_block_ids:
+                    continue
                 nt = nt_list[i] if i < len(nt_list) else 0
                 if not isinstance(nt, int) or nt <= 0:
                     bs = bs_list[i] if i < len(bs_list) else 1
