@@ -40,15 +40,12 @@ import helion.language as hl
     static_shapes=True,
     autotune_effort="none",
 )
-def cartesian_affine_chain(x: torch.Tensor) -> torch.Tensor:
+def cartesian_affine_stage(x: torch.Tensor) -> torch.Tensor:
     batch, width = x.size()
-    tmp = torch.empty_like(x)
     out = torch.empty_like(x)
 
     for tile_batch, tile_width in hl.tile([batch, width]):
-        tmp[tile_batch, tile_width] = x[tile_batch, tile_width] + 1
-    for tile_batch, tile_width in hl.tile([batch, width]):
-        out[tile_batch, tile_width] = tmp[tile_batch, tile_width] * 2
+        out[tile_batch, tile_width] = x[tile_batch, tile_width] + 1
     return out
 
 
@@ -975,16 +972,19 @@ class TestTileDependency(TestCase):
     @skipIfRefEager("compiled DeviceIR is unavailable in ref eager mode")
     def test_shared_device_graph_preserves_every_root_owner(self) -> None:
         x = torch.empty((2, 64), device=DEVICE, dtype=torch.float32)
-        bound = cartesian_affine_chain.bind((x,))
+        bound = cartesian_affine_stage.bind((x,))
         assert bound.host_function is not None
         device_ir = bound.host_function.device_ir
         shared_graph_id = device_ir.root_ids[0]
         shared_family = device_ir.task_families[0]
+        shared_grid_block_ids = device_ir.grid_block_ids[0]
         original_root_ids = device_ir.root_ids
         original_task_families = device_ir.task_families
+        original_grid_block_ids = device_ir.grid_block_ids
         try:
             device_ir.root_ids = [shared_graph_id, shared_graph_id]
             device_ir.task_families = [shared_family, shared_family]
+            device_ir.grid_block_ids = [shared_grid_block_ids, shared_grid_block_ids]
             owners = owner_roots_by_graph_id(device_ir)
             self.assertEqual(owners[shared_graph_id], (0, 1))
             with bound.env, bound.host_function:
@@ -1013,6 +1013,7 @@ class TestTileDependency(TestCase):
         finally:
             device_ir.root_ids = original_root_ids
             device_ir.task_families = original_task_families
+            device_ir.grid_block_ids = original_grid_block_ids
 
     def test_noninjective_regions_are_not_coordinate_disjoint(self) -> None:
         for layout, left_interval, right_interval, second_dimension in (
