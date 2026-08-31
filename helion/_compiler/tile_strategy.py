@@ -1865,6 +1865,17 @@ class EmitPipelineLoopState(DeviceLoopOrGridState):
 
 
 @dataclasses.dataclass
+class RemoteRecvDrain:
+    """Deferred receive completions for one looped destination payload."""
+
+    semaphore: str
+    reference: ast.AST
+    starts_per_iteration: int = 0
+    dynamic_start_counter: str | None = None
+    waits_deferred: bool = False
+
+
+@dataclasses.dataclass
 class ForiLoopState(DeviceLoopOrGridState):
     """State for fori_loop-based loops on TPU (Pallas backend).
 
@@ -1887,6 +1898,9 @@ class ForiLoopState(DeviceLoopOrGridState):
     _prefetched_load_tensors: set[str] = dataclasses.field(default_factory=set)
     _memory_op_to_dma_scratch: dict[torch.fx.Node, DmaResources] = dataclasses.field(
         default_factory=dict
+    )
+    _remote_recv_drains: dict[tuple[str, tuple[int, ...]], RemoteRecvDrain] = (
+        dataclasses.field(default_factory=dict)
     )
 
 

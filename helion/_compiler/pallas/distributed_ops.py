@@ -28,6 +28,8 @@ from .plan_tiling import REMOTE_SRC_INDEXING_PATTERNS
 
 if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
+    from ..tile_strategy import ForiLoopState
+    from ..tile_strategy import RemoteRecvDrain
 
 
 _PALLAS_SRC_MATERIALIZATION_META = "_helion_pallas_remote_copy_src_materialization"
@@ -53,6 +55,7 @@ def _automatic_collective_id(fn: Callable[..., object]) -> int:
 class _PallasRemoteCopyInfo:
     op_name: str
     source_materialization: tuple[ast.AST, ast.AST] | None
+    deferred_recv: RemoteRecvDrain | None = None
 
 
 @_decorators.codegen(remote_barrier, "pallas")
@@ -162,6 +165,48 @@ def _direct_value_expr(tensor: ast.AST, ast_index: list[object]) -> ast.AST:
         placeholders[key] = value
         parts.append(f"{{{key}}}")
     return expr_from_string(f"{{tensor}}[{', '.join(parts)}]", **placeholders)
+
+
+def _canonical_recv_ref(dst_ref: ast.AST, indexed_dims: int) -> ast.AST | None:
+    """Return a fixed same-shaped destination region for a receive drain."""
+    if not isinstance(dst_ref, ast.Subscript):
+        return None
+    raw_parts = (
+        dst_ref.slice.elts if isinstance(dst_ref.slice, ast.Tuple) else [dst_ref.slice]
+    )
+    if len(raw_parts) < indexed_dims:
+        return None
+    placeholders: dict[str, ast.AST] = {"base": dst_ref.value}
+    rendered: list[str] = []
+    for index, part in enumerate(raw_parts):
+        key = f"part_{index}"
+        if index < indexed_dims:
+            if (
+                isinstance(part, ast.Call)
+                and isinstance(part.func, ast.Attribute)
+                and part.func.attr == "ds"
+                and len(part.args) >= 2
+            ):
+                part = expr_from_string("pl.ds(0, {size})", size=part.args[1])
+            else:
+                part = expr_from_string("0")
+        placeholders[key] = part
+        rendered.append(f"{{{key}}}")
+    return expr_from_string(f"{{base}}[{', '.join(rendered)}]", **placeholders)
+
+
+def _active_fori_loop(state: CodegenState) -> ForiLoopState | None:
+    from ..tile_strategy import ForiLoopState
+
+    return next(
+        (
+            loop
+            for loops in state.codegen.active_device_loops.values()
+            for loop in loops
+            if isinstance(loop, ForiLoopState)
+        ),
+        None,
+    )
 
 
 def _materialized_source_value(
@@ -398,7 +443,26 @@ def _make_remote_copy(state: CodegenState) -> ast.AST:
         if send_slot_shape
         else expr_from_string(send_sem_name)
     )
-    recv_sem = device_fn.register_dma_semaphore(name_hint="remote_recv_sem")
+    try:
+        payload_shape = tuple(int(size) for size in src.shape[len(proxy_src_index) :])
+    except (TypeError, ValueError):
+        payload_shape = ()
+    fori_loop = _active_fori_loop(state)
+    dst_name: str | None = None
+    drain_key: tuple[str, tuple[int, ...]] | None = None
+    deferred_recv: RemoteRecvDrain | None = None
+    if fori_loop is not None and payload_shape:
+        dst_name = _tensor_argument_name(state, dst)
+        if dst_name is not None:
+            read_names, _ = device_fn.get_tensor_read_write_names()
+            if dst_name not in read_names:
+                drain_key = (dst_name, payload_shape)
+                deferred_recv = fori_loop._remote_recv_drains.get(drain_key)
+    recv_sem = (
+        deferred_recv.semaphore
+        if deferred_recv is not None
+        else device_fn.register_dma_semaphore(name_hint="remote_recv_sem")
+    )
     src_ref = _remote_ref_expr(
         state,
         src,
@@ -420,6 +484,15 @@ def _make_remote_copy(state: CodegenState) -> ast.AST:
         state.ast_args[4],
         REMOTE_DST_INDEXING_PATTERNS,
     )
+    if fori_loop is not None and drain_key is not None and deferred_recv is None:
+        ast_dst_index = state.ast_args[4]
+        assert isinstance(ast_dst_index, list)
+        canonical_ref = _canonical_recv_ref(dst_ref, len(ast_dst_index))
+        if canonical_ref is not None:
+            from ..tile_strategy import RemoteRecvDrain
+
+            deferred_recv = RemoteRecvDrain(recv_sem, canonical_ref)
+            fori_loop._remote_recv_drains[drain_key] = deferred_recv
     device_id = state.ast_args[2]
     if isinstance(device_id, int):
         device_id = expr_from_string(repr(device_id))
@@ -442,6 +515,7 @@ def _make_remote_copy(state: CodegenState) -> ast.AST:
     device_fn.remote_copy_descriptors[descriptor_id] = _PallasRemoteCopyInfo(
         op_name=op_name,
         source_materialization=materialization,
+        deferred_recv=deferred_recv,
     )
     return expr_from_string(op_name)
 
@@ -492,7 +566,34 @@ def _emit_wait(state: CodegenState, method: str) -> ast.AST:
     info = _paired_copy_info(state)
     if method == "start":
         _emit_source_materialization(state, info)
-    state.codegen.add_statement(statement_from_string(f"{info.op_name}.{method}()"))
+        if info.deferred_recv is not None:
+            fori_loop = _active_fori_loop(state)
+            if fori_loop is None:
+                info.deferred_recv = None
+            elif state.codegen.statements_stack[-1] is fori_loop.inner_statements:
+                info.deferred_recv.starts_per_iteration += 1
+            else:
+                counter = info.deferred_recv.dynamic_start_counter
+                if counter is None:
+                    counter = state.device_function.register_scratch(
+                        (128,), torch.int32, name_hint="remote_recv_count"
+                    )
+                    info.deferred_recv.dynamic_start_counter = counter
+                    fori_loop.outer_prefix.append(
+                        statement_from_string(
+                            f"{counter}[...] = jnp.zeros_like({counter}[...])"
+                        )
+                    )
+                state.codegen.add_statement(
+                    statement_from_string(
+                        f"{counter}[...] = {counter}[...] + "
+                        f"jnp.ones_like({counter}[...])"
+                    )
+                )
+    if method == "wait_recv" and info.deferred_recv is not None:
+        info.deferred_recv.waits_deferred = True
+    else:
+        state.codegen.add_statement(statement_from_string(f"{info.op_name}.{method}()"))
     return expr_from_string("None")
 
 
