@@ -213,6 +213,7 @@ def gemma4_a4b_moe(
     moe_post_norm_m, moe_post_norm_n = moe_post_norm_x.size()
     hl.specialize(moe_post_norm_n)
     moe_branch = torch.empty_like(moe_post_norm_x)
+    # vLLM: Gemma4Router.forward (norm, scaling, and proj).
     for router_project_tile_m, router_project_tile_expert in hl.tile(
         [router_project_m, router_project_num_experts],
         block_size=[1, None],
@@ -242,6 +243,7 @@ def gemma4_a4b_moe(
         router_logits[router_project_token, router_project_tile_expert] = (
             router_project_acc
         )
+    # vLLM: gemma4_fused_routing_kernel_triton (group top-k candidates).
     for (
         route_candidates_tile_m,
         route_candidates_tile_group,
@@ -268,6 +270,7 @@ def gemma4_a4b_moe(
             route_candidates_ids.to(torch.int32)
             + route_candidates_group * route_candidates_group_size
         )
+    # vLLM: gemma4_fused_routing_kernel_triton (global top-k and weights).
     for route_merge_tile_m in hl.tile(route_merge_m, block_size=1):
         route_merge_token = route_merge_tile_m.begin
         route_merge_values, route_merge_positions = torch.topk(
@@ -289,6 +292,7 @@ def gemma4_a4b_moe(
             * route_merge_per_expert_scale[route_merge_ids].to(torch.float32)
         )
         topk_ids[route_merge_token, :] = route_merge_ids
+    # vLLM: pre_feedforward_layernorm_2 and Gemma4MoE.experts gate/up projection.
     for (
         expert_gate_up_tile_m,
         expert_gate_up_tile_slot,
@@ -361,6 +365,7 @@ def gemma4_a4b_moe(
             selected_weights[expert_gate_up_token, expert_gate_up_slot] = (
                 expert_gate_up_topk_weights[expert_gate_up_token, expert_gate_up_slot]
             )
+    # vLLM: Gemma4MoE.experts gelu_tanh activation.
     for expert_geglu_tile_m, expert_geglu_tile_i in hl.tile(
         [expert_geglu_m, expert_geglu_intermediate],
         block_size=[1, None],
@@ -389,6 +394,7 @@ def gemma4_a4b_moe(
                 )
             )
         ).to(expert_geglu_up.dtype) * expert_geglu_up
+    # vLLM: Gemma4MoE.experts down projection and routing-weight application.
     for (
         expert_down_tile_m,
         expert_down_tile_slot,
@@ -431,6 +437,7 @@ def gemma4_a4b_moe(
             expert_down_slot,
             expert_down_tile_n,
         ] = (expert_down_acc * expert_down_routing_weight).to(expert_outputs.dtype)
+    # vLLM: Gemma4MoE.experts weighted expert reduction.
     for expert_reduce_tile_m, expert_reduce_tile_n in hl.tile(
         [expert_reduce_m, expert_reduce_hidden_size],
         block_size=[1, None],
@@ -441,6 +448,7 @@ def gemma4_a4b_moe(
         moe_down[expert_reduce_tile_m, expert_reduce_tile_n] = torch.sum(
             expert_reduce_values, dim=1
         ).to(moe_down.dtype)
+    # vLLM: Gemma4DecoderLayer.post_feedforward_layernorm_2.
     for moe_post_norm_tile_m in hl.tile(moe_post_norm_m, block_size=1):
         moe_post_norm_values = moe_post_norm_x[moe_post_norm_tile_m, :].to(
             torch.float32

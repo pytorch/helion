@@ -403,6 +403,7 @@ def qwen3_decode_layer(
     output = torch.empty(
         (w2_m, w2_n), dtype=torch.bfloat16, device=w2_activation_q.device
     )
+    # vLLM: Qwen3DecoderLayer.input_layernorm (residual add and RMS partials).
     for pre_partial_m, pre_partial_n in hl.tile(
         [pre_num_tokens, pre_hidden_size], block_size=[1, pre_group_size]
     ):
@@ -418,6 +419,7 @@ def qwen3_decode_layer(
         pre_rms_partials[pre_partial_m, pre_partial_n.id] = torch.sum(
             pre_partial_values * pre_partial_values, dim=-1
         )
+    # vLLM: input_layernorm output and qkv_proj input FP8 quantization.
     for pre_quant_m, pre_quant_g, pre_quant_n in hl.tile(
         [pre_num_tokens, pre_groups_per_row, pre_group_size],
         block_size=[1, 1, pre_group_size],
@@ -453,6 +455,7 @@ def qwen3_decode_layer(
             .clamp(FP8_MIN, FP8_MAX)
             .to(pre_result.dtype)
         )
+    # vLLM: Qwen3DecoderLayer.self_attn.qkv_proj.
     for qkv_mm_tile_m, qkv_mm_tile_n in hl.tile(
         [qkv_mm_m, qkv_mm_n], block_size=[1, None]
     ):
@@ -474,6 +477,7 @@ def qwen3_decode_layer(
                 + qkv_mm_partial * qkv_mm_a_scale[:, None] * qkv_mm_w_scale[None, :]
             )
         qkv[qkv_mm_tile_m, qkv_mm_tile_n] = qkv_mm_acc.to(qkv.dtype)
+    # vLLM: self_attn.q_norm, k_norm, and rotary_emb.
     for qk_tile_m, qk_tile_gn, qk_tile_n in hl.tile(
         [qk_num_tokens, qk_qk_heads, qk_head_dim],
         block_size=[1, None, qk_head_dim],
@@ -505,6 +509,7 @@ def qwen3_decode_layer(
         qk_qkv[qk_tile_m, qk_tile_gn, qk_x2_offset] = (
             qk_x2 * qk_cos[:, None, :] + qk_x1 * qk_sin[:, None, :]
         )
+    # vLLM: Qwen3DecoderLayer.self_attn.attn KV-cache update.
     for cache_tile_t, cache_tile_h, cache_tile_d in hl.tile(
         [cache_num_tokens, cache_num_kv_heads, cache_head_dim],
         block_size=[1, 1, cache_head_dim],
@@ -537,6 +542,7 @@ def qwen3_decode_layer(
             ],
             cache_value_value,
         )
+    # vLLM: self_attn.attn split paged-attention accumulation.
     for (
         attention_split_tile_split,
         attention_split_tile_bg,
@@ -655,6 +661,7 @@ def qwen3_decode_layer(
             attention_split_tile_bg,
             attention_split_tile_q,
         ] = (attention_split_m_i + torch.log2(attention_split_l_i))[None, :, :]
+    # vLLM: self_attn.attn split-output merge (chunk stage).
     for attention_merge_tile_chunk, attention_merge_chunk_head in hl.tile(
         [attention_merge_merge_chunks, attention_merge_query_heads],
         block_size=[1, 1],
@@ -701,6 +708,7 @@ def qwen3_decode_layer(
         ] = attention_merge_chunk_max_lse + torch.log2(
             attention_merge_chunk_denominator
         )
+    # vLLM: self_attn.attn split-output merge (final stage).
     for attention_merge_final_head in hl.tile(
         attention_merge_query_heads, block_size=1
     ):
@@ -735,6 +743,7 @@ def qwen3_decode_layer(
         attention[attention_merge_final_head, :] = (
             attention_merge_final_merged / attention_merge_final_denominator[:, None]
         ).to(attention.dtype)
+    # vLLM: self_attn.o_proj input FP8 quantization.
     for (
         attention_quant_tile_m,
         attention_quant_tile_gn,
@@ -772,6 +781,7 @@ def qwen3_decode_layer(
             .clamp(attention_quant_fp8_min, attention_quant_fp8_max)
             .to(attention_quant_output_q.dtype)
         )
+    # vLLM: Qwen3DecoderLayer.self_attn.o_proj.
     for o_mm_tile_m, o_mm_tile_n in hl.tile([o_mm_m, o_mm_n], block_size=[1, None]):
         o_mm_acc = hl.zeros([o_mm_tile_m, o_mm_tile_n], dtype=torch.float32)
         for o_mm_tile_k in hl.tile(o_mm_k, block_size=o_mm_group_size):
@@ -789,6 +799,7 @@ def qwen3_decode_layer(
                 o_mm_acc + o_mm_partial * o_mm_a_scale[:, None] * o_mm_w_scale[None, :]
             )
         attention_out[o_mm_tile_m, o_mm_tile_n] = o_mm_acc.to(attention_out.dtype)
+    # vLLM: post_attention_layernorm (residual add and RMS partials).
     for post_partial_m, post_partial_n in hl.tile(
         [post_num_tokens, post_hidden_size],
         block_size=[1, post_group_size],
@@ -807,6 +818,7 @@ def qwen3_decode_layer(
         post_rms_partials[post_partial_m, post_partial_n.id] = torch.sum(
             post_partial_values * post_partial_values, dim=-1
         )
+    # vLLM: post_attention_layernorm output and gate_up_proj input FP8 quantization.
     for post_quant_m, post_quant_g, post_quant_n in hl.tile(
         [post_num_tokens, post_groups_per_row, post_group_size],
         block_size=[1, 1, post_group_size],
@@ -843,6 +855,7 @@ def qwen3_decode_layer(
             .clamp(FP8_MIN, FP8_MAX)
             .to(post_result.dtype)
         )
+    # vLLM: Qwen3DecoderLayer.mlp.gate_up_proj.
     for w13_tile_m, w13_tile_n in hl.tile([w13_m, w13_n], block_size=[1, None]):
         w13_acc = hl.zeros([w13_tile_m, w13_tile_n], dtype=torch.float32)
         for w13_tile_k in hl.tile(w13_k, block_size=w13_group_size):
@@ -860,6 +873,7 @@ def qwen3_decode_layer(
                 w13_acc + w13_partial * w13_a_scale[:, None] * w13_w_scale[None, :]
             )
         gate_up[w13_tile_m, w13_tile_n] = w13_acc.to(gate_up.dtype)
+    # vLLM: Qwen3DecoderLayer.mlp.act_fn and down_proj input FP8 quantization.
     for activation_tile_m, activation_tile_i in hl.tile(
         [activation_m, activation_intermediate],
         block_size=[1, activation_group_size],
@@ -885,6 +899,7 @@ def qwen3_decode_layer(
             .clamp(FP8_MIN, FP8_MAX)
             .to(activation_q.dtype)
         )
+    # vLLM: Qwen3DecoderLayer.mlp.down_proj.
     for w2_tile_m, w2_tile_n in hl.tile([w2_m, w2_n], block_size=[1, None]):
         w2_acc = hl.zeros([w2_tile_m, w2_tile_n], dtype=torch.float32)
         for w2_tile_k in hl.tile(w2_k, block_size=w2_group_size):
