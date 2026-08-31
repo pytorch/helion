@@ -393,7 +393,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
     def _initialize_prompt_state(self) -> None:
         """Reset prompt state for a fresh guided-search run."""
         # Start each run from the fixed system prompt and the initial request.
-        self._default_config_dict = dict(self.config_spec.default_config())
+        self._default_config_dict = dict(self.config_spec.autotune_reference_config())
         self._messages = [
             {"role": "system", "content": self._build_system_prompt()},
             {"role": "user", "content": self._build_initial_prompt()},
@@ -402,7 +402,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
     def _build_seed_configs(self) -> list[Config]:
         """Build the initial benchmark set: default plus a few random seeds."""
         # Start from default and add only distinct random configs that unflatten cleanly.
-        seed_configs: list[Config] = [self.config_spec.default_config()]
+        seed_configs: list[Config] = [self.config_spec.autotune_reference_config()]
         seen_config_keys = {self._config_key(seed_configs[0])}
         for flat in self.config_gen.random_population_flat(
             self.initial_random_configs + 1

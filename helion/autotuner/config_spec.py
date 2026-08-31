@@ -3152,13 +3152,19 @@ class ConfigSpec:
         self._shrink_for_numel_constraints(config)
         return config
 
+    def autotune_reference_config(self) -> helion.Config:
+        """Return the conservative fragment config used as the autotuning
+        reference."""
+        return self._base_default_config()
+
     def default_config(self) -> helion.Config:
+        """Return the config used for execution when autotuning is disabled."""
         if self.compiler_default_config is None:
-            return self._base_default_config()
+            return self.autotune_reference_config()
         # A promoted seed only specifies the knobs it cares about (e.g. block_sizes); layer it over
         # the full base defaults so every other key — including user register_tunable defaults — is
         # preserved rather than dropped.
-        merged = dict(self._base_default_config().config)
+        merged = dict(self.autotune_reference_config().config)
         merged.update(self.compiler_default_config.config)
         config = helion.Config.from_dict(merged)
         # Then normalize, so a promoted compiler default has the same canonical field set as the

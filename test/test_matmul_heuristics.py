@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from itertools import starmap
-import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -10,19 +9,15 @@ import sympy
 import torch
 
 import helion
-from helion._compiler.autotuner_heuristics.triton import _B200_MATMUL_HEURISTICS_PATH
 from helion._compiler.autotuner_heuristics.triton import (
     TritonB200FormulaMatmulHeuristic,
 )
-from helion._compiler.autotuner_heuristics.triton import TritonB200MatmulHeuristic
 from helion._compiler.autotuner_heuristics.triton import (
     TritonB200MultiMatmulHeuristic as _MULTI,
 )
 from helion._compiler.autotuner_heuristics.triton import TritonH100MatmulHeuristic
 from helion._compiler.autotuner_heuristics.triton import _batched_static_matmul_fact
 from helion._compiler.autotuner_heuristics.triton import _generalized_static_matmul_fact
-from helion._compiler.autotuner_heuristics.triton import _seed_config_for_bucket
-from helion._compiler.autotuner_heuristics.triton import _seed_config_for_config_spec
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import IntegerFragment
 from helion.autotuner.config_fragment import ListOf
@@ -36,16 +31,6 @@ from helion.autotuner.config_spec import MatmulFact
 from helion.autotuner.config_spec import PipelinedRegion
 from helion.autotuner.config_spec import RootGridFact
 from helion.autotuner.config_spec import SymbolicLoopBound
-
-_SHAPE_BUCKET_KEYS = {
-    "dtype",
-    "k_bucket",
-    "m_bucket",
-    "n_bucket",
-    "k_value",
-    "m_value",
-    "n_value",
-}
 
 
 def _matmul_fact(
@@ -97,121 +82,17 @@ def _matmul_config_spec(
     )
 
 
-def _bucket(m: int, n: int, k: int) -> dict[str, object]:
-    return {
-        "dtype": "fp16_bf16",
-        "m_value": m,
-        "n_value": n,
-        "k_value": k,
-    }
-
-
-def test_matmul_heuristic_rules_have_unique_shape_buckets() -> None:
-    data = json.loads(_B200_MATMUL_HEURISTICS_PATH.read_text())
-    keys = [json.dumps(rule["shape_bucket"], sort_keys=True) for rule in data["rules"]]
-
-    assert set(data) == {"rules"}
-    assert len(keys) == len(set(keys))
-    for rule in data["rules"]:
-        assert set(rule) == {"shape_bucket", "templates"}
-        assert set(rule["shape_bucket"]).issubset(_SHAPE_BUCKET_KEYS)
-        for key in ("k_bucket", "m_bucket", "n_bucket"):
-            value = rule["shape_bucket"].get(key)
-            if value is not None:
-                values = value if isinstance(value, list) else [value]
-                assert all(isinstance(item, str) for item in values)
-                assert all(item.startswith("(") for item in values)
-                assert all(item.endswith(("]", ")")) for item in values)
-        for key in ("k_value", "m_value", "n_value"):
-            value = rule["shape_bucket"].get(key)
-            if value is not None:
-                values = value if isinstance(value, list) else [value]
-                assert all(isinstance(item, int) for item in values)
-        assert rule["templates"]
-        assert all("template" not in template for template in rule["templates"])
-
-
-def test_matmul_bucket_matching_generates_seed_config() -> None:
-    seed = _seed_config_for_bucket(
-        _bucket(1024, 1024, 1024),
-        config_spec=_matmul_config_spec(),
-    )
-
-    assert seed is not None
-    assert dict(seed)["block_sizes"] == [128, 64, 64]
-    assert dict(seed)["l2_groupings"] == [2]
-
-    assert (
-        _seed_config_for_bucket(
-            _bucket(128, 128, 128),
-            config_spec=_matmul_config_spec(),
-        )
-        is None
-    )
-
-
-def test_matmul_fact_generates_compiler_seed_config() -> None:
-    config_spec = _matmul_config_spec(matmul_facts=[_matmul_fact()])
-
-    seed = _seed_config_for_config_spec(config_spec)
-
-    assert seed is not None
-    assert dict(seed)["block_sizes"] == [128, 64, 64]
-
-    config_spec = _matmul_config_spec(
-        matmul_facts=[_matmul_fact(), _matmul_fact()],
-    )
-
-    assert _seed_config_for_config_spec(config_spec) is None
-
-
-def test_triton_b200_matmul_heuristic_gates_on_hardware() -> None:
-    env = SimpleNamespace(device=None, config_spec=_matmul_config_spec())
-    env.config_spec.matmul_facts.append(_matmul_fact())
-    b200 = SimpleNamespace(
-        device_kind="cuda",
-        hardware_name="NVIDIA B200",
-        compute_capability="sm100",
-    )
-    h100 = SimpleNamespace(
-        device_kind="cuda",
-        hardware_name="NVIDIA H100",
-        compute_capability="sm90",
-    )
-
-    with patch(
-        "helion._hardware.get_hardware_info",
-        return_value=b200,
-    ) as get_hardware_info:
-        assert TritonB200MatmulHeuristic.is_eligible(env, SimpleNamespace())
-        seed = TritonB200MatmulHeuristic.get_seed_config(env, SimpleNamespace())
-        get_hardware_info.assert_called_once_with(None)
-
-    assert seed is not None
-    assert dict(seed)["block_sizes"] == [128, 64, 64]
-
-    with patch(
-        "helion._hardware.get_hardware_info",
-        return_value=h100,
-    ) as get_hardware_info:
-        assert not TritonB200MatmulHeuristic.is_eligible(env, SimpleNamespace())
-        get_hardware_info.assert_called_once_with(None)
-
-
-def test_b200_formula_subsumes_table_promotion_wiring() -> None:
-    # The sm100 FORMULA owns the compiler default; the TABLE is demoted to a search seed.
+def test_b200_formula_front_ends_supply_execution_defaults() -> None:
     assert TritonB200FormulaMatmulHeuristic.promote_seed_to_default is True
-    assert TritonB200MatmulHeuristic.promote_seed_to_default is False
-    assert _MULTI.promote_seed_to_default is False
+    assert _MULTI.promote_seed_to_default is True
     assert TritonB200FormulaMatmulHeuristic.HARDWARE_TARGETS == (("cuda", "sm100"),)
-    # The formula is a subclass of the H100 budget formula (inherits _matmul_tile).
     assert issubclass(TritonB200FormulaMatmulHeuristic, TritonH100MatmulHeuristic)
-    # Registered AFTER the table so it wins the last-promote-wins default loop.
     from helion._compiler.autotuner_heuristics import get_heuristics
 
     order = [h.__name__ for h in get_heuristics("triton")]
-    assert order.index("TritonB200FormulaMatmulHeuristic") > order.index(
-        "TritonB200MatmulHeuristic"
+    assert "TritonB200MatmulHeuristic" not in order
+    assert order.index("TritonB200FormulaMatmulHeuristic") < order.index(
+        "TritonB200MultiMatmulHeuristic"
     )
 
 

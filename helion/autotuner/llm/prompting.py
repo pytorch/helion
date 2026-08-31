@@ -288,7 +288,7 @@ def build_initial_prompt(
     compile_timeout_s: int | None,
 ) -> str:
     """Build the full initial user prompt sent to the LLM."""
-    default_config = config_spec.default_config()
+    default_config = config_spec.autotune_reference_config()
     workload_hints = compute_workload_hints(
         args,
         workload_traits=detect_workload_traits(kernel, config_spec=config_spec),
