@@ -272,6 +272,9 @@ class LiveTile(NamedTuple):
     - ``stageable`` — for a loop-body load, whether its index is proven to
       vary with the enclosing loop. ``None`` means uncertain and is charged
       conservatively as stageable.
+    - ``promoted_lhs`` — this live value is the non-load LHS operand of a dot
+      and may require Triton's power-of-two TMEM promotion scratch. This is
+      independent of ``kind`` because a prior ``dot_out`` can also be an LHS.
     """
 
     dim_block_ids: tuple[int | None, ...]
@@ -279,6 +282,7 @@ class LiveTile(NamedTuple):
     itemsize: int
     kind: str
     stageable: bool | None = None
+    promoted_lhs: bool = False
 
 
 class SymbolicLoopBound(NamedTuple):
@@ -445,6 +449,11 @@ class KernelMatmulFact(NamedTuple):
       sequential (non-grid) loops. For a chunked recurrence this is the number of
       chunks, so ``sequential_loop_trips * fixed_k`` recovers the logical contraction
       length even though each dot only sees one chunk.
+    - ``live_dot_outputs`` — the live set at the step holding the most simultaneously
+      live dot-output tiles, including ancestor loop graphs.
+    - ``live_promoted_lhs`` — the peak transformed-LHS set after adding ancestor
+      loop graphs. Direct loads are excluded; values retain their original
+      ``kind`` so a dot output reused as another dot's LHS is counted in both roles.
     - ``live_tile_steps`` — the live tile set at EVERY step of the kernel's graphs, deduped.
       A register estimate resolves each step under the candidate block sizes and selects
       the peak by bytes.
@@ -464,6 +473,8 @@ class KernelMatmulFact(NamedTuple):
     matmuls: tuple[ResolvedMatmulFact, ...]
     knob_users: tuple[tuple[int, tuple[tuple[int, str], ...]], ...]
     sequential_loop_trips: int
+    live_dot_outputs: tuple[LiveTile, ...]
+    live_promoted_lhs: tuple[LiveTile, ...]
     live_tile_steps: tuple[tuple[LiveTile, ...], ...]
     pipelined_regions: tuple[PipelinedRegion, ...]
     resident_regions: tuple[ResidentRegion, ...]

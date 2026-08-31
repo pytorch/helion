@@ -33,6 +33,8 @@ from .indexing_strategy import subscript_index_scale
 from .indexing_strategy import subscript_tile_info
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Container
     from collections.abc import Iterable
 
     import sympy
@@ -308,6 +310,24 @@ def _index_depends_on_loop(
     return False
 
 
+def _live_node_steps(
+    nodes: tuple[torch.fx.Node, ...],
+    tracked_nodes: Container[torch.fx.Node],
+    last_use: dict[torch.fx.Node, int],
+    *,
+    last_use_default: int = -1,
+) -> Iterable[set[torch.fx.Node]]:
+    """Yield the tracked nodes live after each graph node is introduced."""
+    live: set[torch.fx.Node] = set()
+    for index, node in enumerate(nodes):
+        if node in tracked_nodes:
+            live.add(node)
+        yield live
+        live = {
+            value for value in live if last_use.get(value, last_use_default) > index
+        }
+
+
 @dataclasses.dataclass
 class GraphAnalysis:
     """Shared structural and liveness observations for one DeviceIR graph."""
@@ -319,6 +339,8 @@ class GraphAnalysis:
     block_id_order: tuple[int, ...]
     live_tile_steps: tuple[tuple[LiveTile, ...], ...]
     peak_live_tiles: tuple[LiveTile, ...]
+    peak_dot_output_tiles: tuple[LiveTile, ...]
+    peak_promoted_lhs_tiles: tuple[LiveTile, ...]
     dot_nodes: tuple[torch.fx.Node, ...]
     reduction_occurrences: tuple[int, ...]
     reduction_axis_by_node_id: dict[int, int]
@@ -339,6 +361,7 @@ class GraphAnalysis:
         *,
         is_reduction_loop: bool,
         dot_targets: frozenset[object],
+        resolve_placeholder: Callable[[torch.fx.Node], torch.fx.Node],
     ) -> GraphAnalysis:
         from ..language import memory_ops
         from .inductor_lowering import ReductionLowering
@@ -347,12 +370,30 @@ class GraphAnalysis:
         nodes = tuple(graph.nodes)
         last_use: dict[torch.fx.Node, int] = {}
         tile_details: dict[torch.fx.Node, LiveTile] = {}
+        dot_details: dict[torch.fx.Node, LiveTile] = {}
+        promoted_lhs_details: dict[torch.fx.Node, LiveTile] = {}
         dot_nodes: list[torch.fx.Node] = []
         reduction_occurrences: list[int] = []
         seen_reductions: set[int] = set()
         reduction_axis_by_node_id: dict[int, int] = {}
         reduction_input_itemsizes: list[tuple[int, int]] = []
         memory_tiles: list[tuple[torch.fx.Node, LiveTile]] = []
+        operand_positions = matmul_operand_positions()
+        promoted_lhs_nodes: set[torch.fx.Node] = set()
+        for node in nodes:
+            positions = operand_positions.get(node.target)
+            if (
+                node.op != "call_function"
+                or positions is None
+                or positions[0] >= len(node.args)
+            ):
+                continue
+            lhs = node.args[positions[0]]
+            if (
+                isinstance(lhs, torch.fx.Node)
+                and resolve_placeholder(lhs).target is not memory_ops.load
+            ):
+                promoted_lhs_nodes.add(lhs)
 
         for index, node in enumerate(nodes):
             for input_node in node.all_input_nodes:
@@ -360,6 +401,11 @@ class GraphAnalysis:
 
             kind = _live_tile_kind(node, dot_targets)
             tile = _tile_from_tensor(node.meta.get("val"), env, kind=kind)
+            if tile is not None and kind == "dot_out":
+                dot_details[node] = tile
+            if tile is not None and node in promoted_lhs_nodes:
+                tile = tile._replace(promoted_lhs=True)
+                promoted_lhs_details[node] = tile
             if tile is not None and any(
                 block_id is not None for block_id in tile.dim_block_ids
             ):
@@ -413,10 +459,7 @@ class GraphAnalysis:
         )
         best_key: tuple[int, ...] = ()
         peak_live_tiles: tuple[LiveTile, ...] = ()
-        live: set[torch.fx.Node] = set()
-        for index, node in enumerate(nodes):
-            if node in tile_details:
-                live.add(node)
+        for live in _live_node_steps(nodes, tile_details, last_use):
             if live:
                 step_key = frozenset(id(value) for value in live)
                 step = tuple(tile_details[value] for value in live)
@@ -430,7 +473,35 @@ class GraphAnalysis:
                 if key > best_key:
                     best_key = key
                     peak_live_tiles = step
-            live = {value for value in live if last_use.get(value, -1) > index}
+
+        def peak_role_tiles(
+            details: dict[torch.fx.Node, LiveTile],
+            *,
+            last_use_default: int = -1,
+        ) -> tuple[LiveTile, ...]:
+            best: tuple[LiveTile, ...] = ()
+            best_key = (-1, -1)
+            for live in _live_node_steps(
+                nodes,
+                details,
+                last_use,
+                last_use_default=last_use_default,
+            ):
+                tiles = tuple(details[value] for value in live)
+                key = (
+                    sum(tile_rank(tile.dim_block_ids) for tile in tiles),
+                    len(tiles),
+                )
+                if key > best_key:
+                    best_key = key
+                    best = tiles
+            return best
+
+        peak_dot_output_tiles = peak_role_tiles(
+            dot_details,
+            last_use_default=len(nodes),
+        )
+        peak_promoted_lhs_tiles = peak_role_tiles(promoted_lhs_details)
 
         return cls(
             graph_id=graph_info.graph_id,
@@ -440,6 +511,8 @@ class GraphAnalysis:
             block_id_order=tuple(getattr(graph_info, "block_ids", ()) or ()),
             live_tile_steps=tuple(live_tile_steps),
             peak_live_tiles=peak_live_tiles,
+            peak_dot_output_tiles=peak_dot_output_tiles,
+            peak_promoted_lhs_tiles=peak_promoted_lhs_tiles,
             dot_nodes=tuple(dot_nodes),
             reduction_occurrences=tuple(reduction_occurrences),
             reduction_axis_by_node_id=reduction_axis_by_node_id,
@@ -509,9 +582,27 @@ class DeviceIRAnalysis:
         env: CompileEnvironment,
     ) -> DeviceIRAnalysis:
         from .device_ir import ForLoopGraphInfo
+        from .device_ir import NodeArgsGraphInfo
         from .device_ir import ReductionLoopGraphInfo
 
         dot_targets = frozenset(matmul_operand_positions())
+        graph_info_by_graph = {
+            graph_info.graph: graph_info for graph_info in device_ir.graphs
+        }
+
+        def resolve_placeholder(node: torch.fx.Node) -> torch.fx.Node:
+            seen: set[torch.fx.Node] = set()
+            while node.op == "placeholder" and node not in seen:
+                seen.add(node)
+                graph_info = graph_info_by_graph.get(node.graph)
+                if not isinstance(graph_info, NodeArgsGraphInfo):
+                    break
+                try:
+                    node = graph_info.placeholder_to_outer_arg(node)
+                except KeyError:
+                    break
+            return node
+
         graphs = tuple(
             GraphAnalysis.build(
                 graph_info,
@@ -521,6 +612,7 @@ class DeviceIRAnalysis:
                     ReductionLoopGraphInfo,
                 ),
                 dot_targets=dot_targets,
+                resolve_placeholder=resolve_placeholder,
             )
             for graph_info in device_ir.graphs
         )
@@ -629,6 +721,39 @@ class DeviceIRAnalysis:
             for graph in self.non_reduction_graphs
             for step in graph.live_tile_steps
         )
+
+    def _kernel_peak_role_tiles(self, field: str) -> tuple[LiveTile, ...]:
+        """Peak role-specific tile set after adding ancestor loop graphs."""
+        tiles_of = {
+            graph.graph_id: cast("tuple[LiveTile, ...]", getattr(graph, field))
+            for graph in self.non_reduction_graphs
+        }
+        best: tuple[LiveTile, ...] = ()
+        best_key = (-1, -1)
+        for graph_id, own in tiles_of.items():
+            chain = list(own)
+            current = self.parent_of.get(graph_id, -1)
+            seen = {graph_id}
+            while current in tiles_of and current not in seen:
+                seen.add(current)
+                chain.extend(tiles_of[current])
+                current = self.parent_of.get(current, -1)
+            key = (
+                sum(tile_rank(tile.dim_block_ids) for tile in chain),
+                len(chain),
+            )
+            if key > best_key:
+                best_key = key
+                best = tuple(chain)
+        return best
+
+    def kernel_peak_dot_outputs(self) -> tuple[LiveTile, ...]:
+        """Peak dot-output set after adding accumulator ancestor chains."""
+        return self._kernel_peak_role_tiles("peak_dot_output_tiles")
+
+    def kernel_peak_promoted_lhs(self) -> tuple[LiveTile, ...]:
+        """Peak transformed-LHS set after adding ancestor loop graphs."""
+        return self._kernel_peak_role_tiles("peak_promoted_lhs_tiles")
 
     def group_live_tiles(
         self,
@@ -1559,6 +1684,8 @@ class DeviceIRAnalysis:
                 for block_id in sorted(knob_users)
             ),
             sequential_loop_trips=sequential_loop_trips,
+            live_dot_outputs=tuple(self.kernel_peak_dot_outputs()),
+            live_promoted_lhs=tuple(self.kernel_peak_promoted_lhs()),
             live_tile_steps=tuple(self.kernel_live_tile_steps()),
             pipelined_regions=tuple(pipelined_regions),
             resident_regions=tuple(resident_regions),
