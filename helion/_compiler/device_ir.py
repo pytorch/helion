@@ -363,21 +363,23 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         args = state.ast_args[3]
         assert isinstance(args, list)
         assert all(isinstance(x, ast.AST) for x in args)
-        device_loop = state.device_function.tile_strategy.codegen_device_loop(
-            state, self.block_ids
-        )
-        if state.fx_node is not None:
-            from .tile_dependency import TILE_DEPENDENCY_SITE_ID_ATTR
-            from .tile_dependency import TILE_DEPENDENCY_SITE_IDS_META
-
-            site_ids = dict(state.fx_node.meta.get(TILE_DEPENDENCY_SITE_IDS_META, ()))
-            if (site_id := site_ids.get(0)) is not None:
-                setattr(device_loop.for_node, TILE_DEPENDENCY_SITE_ID_ATTR, site_id)
         # Make the active graph reachable by the strategy so it can pick
         # different lane-loop shapes for the reduce vs consume sweeps.
         # pyrefly: ignore [missing-attribute]
         state.codegen._cute_active_graph_info = self
         try:
+            device_loop = state.device_function.tile_strategy.codegen_device_loop(
+                state, self.block_ids
+            )
+            if state.fx_node is not None:
+                from .tile_dependency import TILE_DEPENDENCY_SITE_ID_ATTR
+                from .tile_dependency import TILE_DEPENDENCY_SITE_IDS_META
+
+                site_ids = dict(
+                    state.fx_node.meta.get(TILE_DEPENDENCY_SITE_IDS_META, ())
+                )
+                if (site_id := site_ids.get(0)) is not None:
+                    setattr(device_loop.for_node, TILE_DEPENDENCY_SITE_ID_ATTR, site_id)
             with state.codegen.add_device_loop(
                 device_loop,
                 needs_barrier_before=self.needs_barrier_before,
