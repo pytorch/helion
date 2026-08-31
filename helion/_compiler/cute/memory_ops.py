@@ -32,6 +32,7 @@ from ...language.memory_ops import _cute_index_exprs
 from ...language.memory_ops import _cute_index_tuple
 from ...language.memory_ops import _cute_is_byte_packed
 from ...language.memory_ops import _cute_is_unroll_dtype
+from ...language.memory_ops import _cute_register_reduction_unroll_vec_store
 from ...language.memory_ops import _cute_register_tile_unroll_vec_hoist
 from ...language.memory_ops import _cute_register_tile_unroll_vec_store
 from ...language.memory_ops import _cute_scalar_load_expr
@@ -239,6 +240,12 @@ def _cute_register_unroll_vec_hoist(
         cache = {}
         # pyrefly: ignore [missing-attribute]
         strategy._cute_lane_vec_loads = cache
+    # Locate the constexpr V-loop: prefer the node recorded by
+    # codegen_device_loop (vec-store flushes may sit after it, so it is not
+    # guaranteed to be the last lane_body entry).
+    constexpr_loop = getattr(strategy, "_cute_lane_vloop", None)
+    if constexpr_loop is None or constexpr_loop not in lane_body:
+        constexpr_loop = lane_body[-1]
     if cache_key not in cache:
         hoist_var = state.device_function.new_var(
             f"_unroll_vec_{len(cache)}", dce=False
@@ -248,13 +255,10 @@ def _cute_register_unroll_vec_hoist(
             f"{hoist_var} = cute.arch.load({base_ptr_expr}, "
             f"ir.VectorType.get([{vec_width}], cutlass.Uint16.mlir_type))"
         )
-        # Insert the hoist just BEFORE the constexpr V-loop (the last entry
-        # in lane_body).  ``lane_body[-1]`` is the constexpr loop.
-        lane_body.insert(len(lane_body) - 1, hoist_stmt)
+        # Insert the hoist just BEFORE the constexpr V-loop.
+        lane_body.insert(lane_body.index(constexpr_loop), hoist_stmt)
     else:
         hoist_var, _ = cache[cache_key]
-    # The constexpr V-loop's target var is the last element's loop var.
-    constexpr_loop = lane_body[-1]
     assert isinstance(constexpr_loop, ast.For)
     assert isinstance(constexpr_loop.target, ast.Name)
     vec_lane_var = constexpr_loop.target.id
@@ -1855,6 +1859,25 @@ def _(state: CodegenState) -> ast.AST:
             if append_stmt is not None:
                 state.add_statement(append_stmt)
                 return ast.Constant(value=None)
+        elif vec_ctx is not None and vec_ctx[2] == "unroll":
+            from ..reduction_strategy import LoopedReductionStrategy
+
+            _vec_width, vec_block_id, _mode = vec_ctx
+            loops = state.codegen.active_device_loops.get(vec_block_id)
+            assert loops
+            red_strategy = loops[-1].strategy
+            if isinstance(red_strategy, LoopedReductionStrategy):
+                append_stmt = _cute_register_reduction_unroll_vec_store(
+                    state,
+                    red_strategy,
+                    tensor_name,
+                    index_exprs,
+                    ast.unparse(value),
+                    mask_expr,
+                )
+                if append_stmt is not None:
+                    state.add_statement(append_stmt)
+                    return ast.Constant(value=None)
 
     store_expr = _cute_scalar_store_expr(tensor_name, index_exprs, "{value}")
     assign_expr = expr_from_string(store_expr, value=value)
@@ -2026,6 +2049,7 @@ def _cute_vector_load_ctx(
         elif isinstance(idx, slice) and idx == slice(None):
             if tensor_dim < tensor.ndim:
                 dim_size = tensor.shape[tensor_dim]
+                matches: list[int] = []
                 for cand_bid, bs in enumerate(env.block_sizes):
                     if not isinstance(bs.size, (int, torch.SymInt)):
                         continue
@@ -2057,10 +2081,20 @@ def _cute_vector_load_ctx(
                     if env.known_equal(
                         bs_int, dim_int
                     ) and state.codegen.active_device_loops.get(cand_bid):
-                        if tensor_dim == stride1_tensor_dim or inner_block_id is None:
-                            inner_block_id = cand_bid
-                            lane_axis_pos = expr_pos
-                        break
+                        matches.append(cand_bid)
+                if matches:
+                    # Matching by extent alone is ambiguous when a
+                    # non-reduction tile dim happens to have the same
+                    # extent (e.g. a square MxN input): a full-slice
+                    # subscript is a reduction axis whenever a reduction
+                    # block of that extent exists, so prefer it.
+                    cand = next(
+                        (bid for bid in matches if env.block_sizes[bid].reduction),
+                        matches[0],
+                    )
+                    if tensor_dim == stride1_tensor_dim or inner_block_id is None:
+                        inner_block_id = cand
+                        lane_axis_pos = expr_pos
         tensor_dim += 1
     if inner_block_id is None or lane_axis_pos is None:
         return None

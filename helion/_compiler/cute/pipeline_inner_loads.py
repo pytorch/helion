@@ -491,9 +491,24 @@ def _try_pipeline_one_outer_loop(
 
     snapshot_lane_base = statement_from_string(f"{lane_base_name} = {pipe_lane_base}")
     snapshot_load = statement_from_string(f"{load_var_name} = {pipe_load}")
-    prefetch_lane_base = statement_from_string(
-        f"{pipe_lane_base} = {ast.unparse(next_lane_base_rhs)}"
-    )
+    # The last iteration's speculative prefetch would read one STEP past
+    # the end of the swept region.  Masked loads (an ``IfExp`` inside the
+    # load expression) already fall through to a safe in-bounds address;
+    # for UNMASKED loads (extent known to divide the chunk, so codegen
+    # elides the mask) clamp the prefetch base back to the current
+    # (in-bounds) lane base — the prefetched value is never consumed on
+    # the final iteration, it just must not fault.
+    load_has_guard = any(isinstance(sub, ast.IfExp) for sub in ast.walk(load_rhs))
+    if load_has_guard:
+        prefetch_lane_base = statement_from_string(
+            f"{pipe_lane_base} = {ast.unparse(next_lane_base_rhs)}"
+        )
+    else:
+        prefetch_lane_base = statement_from_string(
+            f"{pipe_lane_base} = ({ast.unparse(next_lane_base_rhs)}) "
+            f"if ({tile_var} + ({ast.unparse(step_expr)})) < ({ast.unparse(end_expr)}) "
+            f"else {lane_base_name}"
+        )
     prefetch_load = statement_from_string(f"{pipe_load} = {ast.unparse(next_load_rhs)}")
 
     new_inner_body: list[ast.stmt] = [

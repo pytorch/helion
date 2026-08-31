@@ -35,8 +35,10 @@ from ..autotuner.config_spec import FULL_EXTENT_CATEGORIES
 from ..autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
 from ..autotuner.config_spec import CoResidencyGroup
 from ..autotuner.config_spec import CuteLaneLayoutSpec
+from ..autotuner.config_spec import CuteReductionReloadSpec
 from ..autotuner.config_spec import CuteVectorWidthSpec
 from ..autotuner.config_spec import MatmulWithReductionEpilogueFact
+from ..autotuner.config_spec import NumThreadsSpec
 from ..autotuner.config_spec import ReductionCategory
 from ..autotuner.config_spec import ReductionDescriptor
 from ..autotuner.config_spec import ReductionKernelFact
@@ -1025,6 +1027,19 @@ class DeviceIR:
                     )
                     env.config_spec.cute_lane_layouts.append(
                         CuteLaneLayoutSpec(block_id=rdim.block_id)
+                    )
+                    env.config_spec.cute_reduction_reloads.append(
+                        CuteReductionReloadSpec(block_id=rdim.block_id)
+                    )
+                    # Rolled reduction dims get a thread-count knob: fewer
+                    # threads per row (with more elements per thread) is
+                    # often faster for memory-bound row reductions. 0 = auto
+                    # (derive from the loop chunk, the legacy behavior).
+                    env.config_spec.num_threads.append(
+                        NumThreadsSpec(
+                            block_id=rdim.block_id,
+                            size_hint=rdim.size_hint(),
+                        )
                     )
             graphs_with_rolled_rdim |= used_graphs
 
