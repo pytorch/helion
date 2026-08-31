@@ -52,7 +52,7 @@ def _automatic_collective_id(fn: Callable[..., object]) -> int:
 @dataclass
 class _PallasRemoteCopyInfo:
     op_name: str
-    source_materialization: tuple[str, ast.AST] | None
+    source_materialization: tuple[ast.AST, ast.AST] | None
 
 
 @_decorators.codegen(remote_barrier, "pallas")
@@ -148,6 +148,136 @@ def _direct_ref_expr(tensor: ast.AST, ast_index: list[object]) -> ast.AST:
     return expr_from_string(f"{{tensor}}.at[{', '.join(parts)}]", **placeholders)
 
 
+def _direct_value_expr(tensor: ast.AST, ast_index: list[object]) -> ast.AST:
+    """Index an ordinary JAX value with the same leading indices as a Ref."""
+    if not ast_index:
+        return tensor
+    placeholders: dict[str, ast.AST] = {"tensor": tensor}
+    parts = []
+    for index, value in enumerate(ast_index):
+        if isinstance(value, int):
+            value = expr_from_string(repr(value))
+        assert isinstance(value, ast.AST)
+        key = f"index_{index}"
+        placeholders[key] = value
+        parts.append(f"{{{key}}}")
+    return expr_from_string(f"{{tensor}}[{', '.join(parts)}]", **placeholders)
+
+
+def _materialized_source_value(
+    state: CodegenState,
+    tensor_ast: ast.AST,
+    ast_index: list[object],
+) -> ast.AST:
+    """Select a computed source region without dynamic value slicing.
+
+    A send-ring is commonly spelled by expanding one computed tile across a
+    leading slot dimension and indexing that dimension with the current slot.
+    The selected value is independent of the slot, so materialize the original
+    pre-broadcast tile directly. Pallas otherwise sees a dynamic slice of an
+    ordinary JAX value, which TPU lowering does not support.
+    """
+    if not ast_index or state.fx_node is None:
+        return _direct_value_expr(tensor_ast, ast_index)
+    src_node = state.fx_node.args[0]
+    if (
+        not isinstance(src_node, torch.fx.Node)
+        or src_node.op != "call_function"
+        or src_node.target is not torch.ops.aten.expand.default
+        or not src_node.args
+        or not isinstance(src_node.args[0], torch.fx.Node)
+    ):
+        return _direct_value_expr(tensor_ast, ast_index)
+
+    expanded_input = src_node.args[0]
+    expanded = src_node.meta.get("val")
+    unexpanded = expanded_input.meta.get("val")
+    if not isinstance(expanded, torch.Tensor) or not isinstance(
+        unexpanded, torch.Tensor
+    ):
+        return _direct_value_expr(tensor_ast, ast_index)
+    indexed_dims = len(ast_index)
+    if expanded.ndim != unexpanded.ndim or indexed_dims > expanded.ndim:
+        return _direct_value_expr(tensor_ast, ast_index)
+
+    from ..compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    if not all(
+        env.known_equal(unexpanded.shape[dim], 1)
+        and (env.known_equal(expanded.shape[dim], 1) or expanded.stride(dim) == 0)
+        for dim in range(indexed_dims)
+    ):
+        return _direct_value_expr(tensor_ast, ast_index)
+    if not all(
+        env.known_equal(unexpanded.shape[dim], expanded.shape[dim])
+        for dim in range(indexed_dims, expanded.ndim)
+    ):
+        return _direct_value_expr(tensor_ast, ast_index)
+
+    from ...language import view_ops
+
+    if (
+        expanded_input.op == "call_function"
+        and expanded_input.target is view_ops.subscript
+        and len(expanded_input.args) >= 2
+        and isinstance(expanded_input.args[0], torch.fx.Node)
+        and isinstance(expanded_input.args[1], (list, tuple))
+    ):
+        base_node = expanded_input.args[0]
+        indices = expanded_input.args[1]
+        if (
+            len(indices) == expanded.ndim
+            and all(index is None for index in indices[:indexed_dims])
+            and all(
+                isinstance(index, slice)
+                and index.start is None
+                and index.stop is None
+                and index.step is None
+                for index in indices[indexed_dims:]
+            )
+        ):
+            base_ast = state.env.get(base_node)
+            if isinstance(base_ast, ast.AST):
+                return base_ast
+
+    unexpanded_ast = state.env.get(expanded_input)
+    if isinstance(unexpanded_ast, ast.AST):
+        return _direct_value_expr(unexpanded_ast, [0] * indexed_dims)
+    return _direct_value_expr(tensor_ast, ast_index)
+
+
+def _physical_tile_shape(
+    state: CodegenState, tensor: torch.Tensor
+) -> tuple[int | torch.SymInt, ...]:
+    """Resolve block-symbol dimensions to this config's physical tile sizes."""
+    from ..compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    shape: list[int | torch.SymInt] = []
+    for size in tensor.shape:
+        block_id = env.resolve_block_id(size)
+        resolved = (
+            state.device_function.resolved_block_size(block_id)
+            if block_id is not None
+            else None
+        )
+        shape.append(resolved if resolved is not None else size)
+    return tuple(shape)
+
+
+def _tensor_argument_name(state: CodegenState, tensor: torch.Tensor) -> str | None:
+    """Return a kernel argument name, or ``None`` for a computed device value."""
+    from ..host_function import HostFunction
+
+    scratch = state.device_function.pallas_internal_scratch_name(tensor)
+    if scratch is not None:
+        return scratch
+    if tensor not in HostFunction.current().tensor_to_origin:
+        return None
+    return state.device_function.tensor_arg(tensor).name
+
+
 def _remote_ref_expr(
     state: CodegenState,
     tensor: torch.Tensor,
@@ -161,23 +291,29 @@ def _remote_ref_expr(
     """Resolve a logical remote-copy region against the active VMEM block."""
     assert isinstance(proxy_index, (list, tuple))
     assert isinstance(ast_index, list)
-    try:
-        name = state.device_function.pallas_tensor_ref_name(tensor)
-    except KeyError:
+    name = _tensor_argument_name(state, tensor)
+    if name is None:
         if not materialize_device_value:
             raise exc.TypeInferenceError(
                 "Pallas remote-copy destinations must be kernel tensor arguments"
-            ) from None
+            )
         # A computed tile is a JAX value, while TPU DMA requires a Ref. Allocate
         # one reusable VMEM slot now, but defer populating it until descriptor
         # start so a preceding wait can safely release the previous transfer.
         assert isinstance(tensor_ast, ast.AST)
         name = state.device_function.register_scratch(
-            tuple(tensor.shape), tensor.dtype, name_hint="remote_src"
+            _physical_tile_shape(state, tensor),
+            tensor.dtype,
+            name_hint="remote_src",
         )
+        scratch_ref = _direct_ref_expr(expr_from_string(name), ast_index)
+        source_value = _materialized_source_value(state, tensor_ast, ast_index)
         assert state.fx_node is not None
-        state.fx_node.meta[_PALLAS_SRC_MATERIALIZATION_META] = (name, tensor_ast)
-        return _direct_ref_expr(expr_from_string(name), ast_index)
+        state.fx_node.meta[_PALLAS_SRC_MATERIALIZATION_META] = (
+            scratch_ref,
+            source_value,
+        )
+        return scratch_ref
 
     from ..device_function import PallasMemorySpace
 
@@ -234,24 +370,48 @@ def _make_remote_copy(state: CodegenState) -> ast.AST:
 
     device_fn = state.device_function
     device_fn.requires_remote_copy = True
-    send_sem = device_fn.register_dma_semaphore(name_hint="remote_send_sem")
-    recv_sem = device_fn.register_dma_semaphore(name_hint="remote_recv_sem")
-    op_name = device_fn.new_var("remote_copy", dce=False)
+    proxy_src_index = state.proxy_arg(1)
+    ast_src_index = state.ast_args[1]
+    assert isinstance(proxy_src_index, (list, tuple))
+    assert isinstance(ast_src_index, list)
 
     assert state.fx_node is not None
     descriptor_id = state.fx_node.meta.get(_REMOTE_COPY_DESCRIPTOR_ID_META)
     if not isinstance(descriptor_id, int):
         raise exc.InternalError(RuntimeError("remote-copy descriptor has no ID"))
 
+    computed_source = _tensor_argument_name(state, src) is None
+    send_slot_shape: tuple[int, ...] = ()
+    if computed_source and ast_src_index:
+        try:
+            indexed_shape = tuple(int(size) for size in src.shape[: len(ast_src_index)])
+        except (TypeError, ValueError):
+            indexed_shape = ()
+        if indexed_shape and all(size > 0 for size in indexed_shape):
+            send_slot_shape = indexed_shape
+    send_sem_name = device_fn.register_dma_semaphore(
+        name_hint="remote_send_sem",
+        shape=send_slot_shape,
+    )
+    send_sem = (
+        _direct_ref_expr(expr_from_string(send_sem_name), ast_src_index)
+        if send_slot_shape
+        else expr_from_string(send_sem_name)
+    )
+    recv_sem = device_fn.register_dma_semaphore(name_hint="remote_recv_sem")
     src_ref = _remote_ref_expr(
         state,
         src,
         state.ast_args[0],
-        state.proxy_arg(1),
-        state.ast_args[1],
+        proxy_src_index,
+        ast_src_index,
         REMOTE_SRC_INDEXING_PATTERNS,
         materialize_device_value=True,
     )
+    materialization = state.fx_node.meta.get(_PALLAS_SRC_MATERIALIZATION_META)
+    if materialization is not None:
+        assert isinstance(materialization, tuple)
+    op_name = device_fn.new_var("remote_copy", dce=False)
     dst_ref = _remote_ref_expr(
         state,
         dst,
@@ -269,17 +429,16 @@ def _make_remote_copy(state: CodegenState) -> ast.AST:
         statement_from_string(
             f"{op_name} = pltpu.make_async_remote_copy("
             "{src_ref}, {dst_ref}, "
-            f"{send_sem}, {recv_sem}, "
+            "{send_sem}, "
+            f"{recv_sem}, "
             "device_id={device_id}, "
             "device_id_type=pl.DeviceIdType.LOGICAL)",
             src_ref=src_ref,
             dst_ref=dst_ref,
+            send_sem=send_sem,
             device_id=device_id,
         )
     )
-    materialization = state.fx_node.meta.get(_PALLAS_SRC_MATERIALIZATION_META)
-    if materialization is not None:
-        assert isinstance(materialization, tuple)
     device_fn.remote_copy_descriptors[descriptor_id] = _PallasRemoteCopyInfo(
         op_name=op_name,
         source_materialization=materialization,
@@ -314,14 +473,15 @@ def _emit_source_materialization(
     materialization = info.source_materialization
     if materialization is None:
         return False
-    scratch, value = materialization
-    assert isinstance(scratch, str)
+    target, value = materialization
+    assert isinstance(target, ast.AST)
     assert isinstance(value, ast.AST)
     state.codegen.add_statement(
         statement_from_string(
-            f"{scratch}[...] = jnp.pad("
+            "{target}[...] = jnp.pad("
             "{value}, tuple((0, dst - src) for src, dst in "
-            f"zip({{value}}.shape, {scratch}.shape, strict=True)))",
+            "zip({value}.shape, {target}.shape, strict=True)))",
+            target=target,
             value=value,
         )
     )
