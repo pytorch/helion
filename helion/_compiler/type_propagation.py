@@ -763,7 +763,7 @@ class TypePropagation(ast.NodeVisitor):
                 + ", ".join(map(str, unhandled))
             )
         if isinstance(func, NestedFunctionType):
-            return self._call_nested_function(func, args, kwargs)
+            return self._call_nested_function(func, args, kwargs)  # pyrefly: ignore [bad-argument-type]
 
         # pyrefly: ignore [bad-argument-type, bad-return]
         return func.propagate_call(tuple(args), kwargs, self.origin())
@@ -1268,6 +1268,14 @@ class TypePropagation(ast.NodeVisitor):
             raise exc.StatementNotSupported(
                 f"**kwargs not supported in nested function '{node.name}'"
             )
+        if args.posonlyargs:
+            raise exc.StatementNotSupported(
+                f"Positional-only arguments not supported in nested function '{node.name}'"
+            )
+        if args.kwonlyargs:
+            raise exc.StatementNotSupported(
+                f"Keyword-only arguments not supported in nested function '{node.name}'"
+            )
         if args.defaults or args.kw_defaults:
             raise exc.StatementNotSupported(
                 f"Default arguments not supported in nested function '{node.name}'"
@@ -1278,6 +1286,7 @@ class TypePropagation(ast.NodeVisitor):
                     f"'global'/'nonlocal' not supported in nested function "
                     f"'{node.name}'"
                 )
+        # direct recursion only; mutual recursion is not detected
         for descendant in ast.walk(node):
             if (
                 isinstance(descendant, ast.Call)

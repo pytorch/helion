@@ -668,6 +668,34 @@ class TestErrors(RefEagerTestDisabled, TestCase):
         with self.assertRaises(helion.exc.StatementNotSupported):
             code_and_output(fn, (torch.randn(8, device=DEVICE),))
 
+    def test_nested_function_posonly_arg(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            def foo(a, /, b):
+                return a + b
+
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = foo(x[tile], x[tile])
+            return out
+
+        with self.assertRaises(helion.exc.StatementNotSupported):
+            code_and_output(fn, (torch.randn(8, device=DEVICE),))
+
+    def test_nested_function_kwonly_arg(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            def foo(a, *, b):
+                return a + b
+
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = foo(x[tile], b=x[tile])
+            return out
+
+        with self.assertRaises(helion.exc.StatementNotSupported):
+            code_and_output(fn, (torch.randn(8, device=DEVICE),))
+
     def test_nested_function_return_in_control_flow(self):
         @helion.kernel()
         def fn(x: torch.Tensor) -> torch.Tensor:
