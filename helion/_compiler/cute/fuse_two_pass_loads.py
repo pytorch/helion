@@ -292,10 +292,15 @@ class _CuteFuseTwoPassLoads:
         constexpr_values: dict[str, int] | None = None,
         thread_block_dims: tuple[int, int, int] = (1, 1, 1),
         tensor_dtypes: dict[str, str] | None = None,
+        reload_modes: dict[int, str] | None = None,
     ) -> None:
         super().__init__()
         self._counter = 0
         self._constexpr_values = constexpr_values or {}
+        # Autotuner-selected reload mode per rolled-reduction block id
+        # ("auto" / "register" / "gmem").  Sweep loops are matched back to
+        # their block id via the ``roffset_<id>`` loop offset variable.
+        self._reload_modes = reload_modes or {}
         # Kernel tensor-arg name -> backend dtype string (e.g.
         # "cutlass.Float32"); resolves the cache dtype for unmasked
         # scalar loads.
@@ -588,19 +593,47 @@ class _CuteFuseTwoPassLoads:
             #     plumbed correctly from the dispatch layer.
             import os
 
-            _fuser_mode = os.environ.get("HELION_FUSER_MODE", "auto")
+            # Effective per-thread cache footprint in ELEMENTS: for vec
+            # loads each cache slot fans out into V scalar lanes, so the
+            # raw slot count understates the register cost by V.
+            _vec_m = re.search(r"VectorType\.get\(\[(\d+)\]", ast.unparse(first_loop))
+            cache_elems = cache_size * (int(_vec_m.group(1)) if _vec_m else 1)
+            # Rolled-reduction sweeps use ``roffset_<block_id>`` offset
+            # vars; tile-loop sweeps use ``tile_offset_<n>``.  Only the
+            # former have a reload-mode knob.
+            _bid_m = (
+                re.match(r"roffset_(\d+)", first_loop.target.id)
+                if isinstance(first_loop.target, ast.Name)
+                else None
+            )
+            is_reduction_sweep = _bid_m is not None
+            _fuser_mode = os.environ.get("HELION_FUSER_MODE")
+            if _fuser_mode is None:
+                _fuser_mode = (
+                    self._reload_modes.get(int(_bid_m.group(1)), "auto")
+                    if _bid_m is not None
+                    else "auto"
+                )
+                # The config knob spells "never fuse" as ``"gmem"``
+                # (re-load later sweeps from gmem/L2).
+                if _fuser_mode == "gmem":
+                    _fuser_mode = "disabled"
             if _fuser_mode == "disabled":
                 continue
             if _fuser_mode == "register":
                 use_smem = False
-                if cache_size > 1024:
+                if cache_elems > 1024:
                     continue
             elif _fuser_mode == "smem":
                 use_smem = True
-                if cache_size > 1024:
+                if cache_elems > 1024:
                     continue
             else:  # auto
-                if cache_size > 64:
+                # Reduction sweeps cap on the true element footprint (the
+                # vec path multiplies slots by V); tile-loop sweeps keep
+                # the historical slot-count cap their tunings were
+                # calibrated against.
+                if (cache_elems if is_reduction_sweep else cache_size) > 64:
                     continue
                 use_smem = False
             cache_index = first_cache_index
@@ -900,6 +933,7 @@ def fuse_two_pass_loads(
     *,
     thread_block_dims: tuple[int, int, int] = (1, 1, 1),
     tensor_dtypes: dict[str, str] | None = None,
+    reload_modes: dict[int, str] | None = None,
 ) -> list[ast.stmt]:
     """Apply two-pass load fusion to a list of statements (the device kernel
     body). Returns the (possibly modified) body.
@@ -922,6 +956,7 @@ def fuse_two_pass_loads(
         constexpr_values=constexpr_values,
         thread_block_dims=thread_block_dims,
         tensor_dtypes=tensor_dtypes,
+        reload_modes=reload_modes,
     )
     new_body = transformer._try_fuse(body)
     if new_body is None:

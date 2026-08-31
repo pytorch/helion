@@ -1057,11 +1057,28 @@ class DeviceFunction:
                         )
                     except ValueError:
                         continue
+            # Autotuner-selected reload mode per rolled reduction dim
+            # ("auto" / "register" / "gmem"); the fuser keys the sweep
+            # loops back to their block id via the ``roffset_<id>`` /
+            # ``tile_offset_<id>`` loop offset variable.
+            env = CompileEnvironment.current()
+            reload_cfg = cast(
+                "list[str]",
+                self.config.config.get("cute_reduction_reloads", []) or [],
+            )
+            reload_modes = {
+                block_id: env.config_spec.cute_reduction_reloads.config_get(
+                    reload_cfg, block_id, "auto"
+                )
+                or "auto"
+                for block_id in env.config_spec.cute_reduction_reloads.valid_block_ids()
+            }
             kernel_body = fuse_two_pass_loads(
                 kernel_body,
                 constexpr_values,
                 thread_block_dims=thread_block_dims,
                 tensor_dtypes=tensor_dtypes,
+                reload_modes=reload_modes,
             )
             # Hoist warp reductions out of constexpr V-loops to collapse
             # 4 per-V-lane warp reductions into 1 V-fold + 1 warp reduce.

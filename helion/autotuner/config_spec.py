@@ -817,6 +817,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "num_threads",
         "cute_vector_widths",
         "cute_lane_layouts",
+        "cute_reduction_reloads",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
         "load_cache_modifiers",
@@ -858,6 +859,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "pallas_pre_broadcast",
         "cute_vector_widths",
         "cute_lane_layouts",
+        "cute_reduction_reloads",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
         *BACKEND_TUNABLE_KEYS,
@@ -1010,6 +1012,9 @@ class ConfigSpec:
             BlockIdSequence()
         )
         self.cute_lane_layouts: BlockIdSequence[CuteLaneLayoutSpec] = BlockIdSequence()
+        self.cute_reduction_reloads: BlockIdSequence[CuteReductionReloadSpec] = (
+            BlockIdSequence()
+        )
         self.range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = (
             BlockIdSequence()
         )
@@ -2331,6 +2336,7 @@ class ConfigSpec:
             ("reduction_loops", self.reduction_loops, True),
             ("cute_vector_widths", self.cute_vector_widths, True),
             ("cute_lane_layouts", self.cute_lane_layouts, True),
+            ("cute_reduction_reloads", self.cute_reduction_reloads, True),
             ("range_unroll_factors", self.range_unroll_factors, True),
             ("range_warp_specializes", self.range_warp_specialize, True),
             ("range_num_stages", self.range_num_stages, True),
@@ -2537,6 +2543,7 @@ class ConfigSpec:
             "reduction_loops",
             "cute_vector_widths",
             "cute_lane_layouts",
+            "cute_reduction_reloads",
             "range_unroll_factors",
             "range_warp_specializes",
             "range_num_stages",
@@ -3251,6 +3258,14 @@ class ConfigSpec:
                     and len(self.cute_lane_layouts) > 0
                 ):
                     fields["cute_lane_layouts"] = self.cute_lane_layouts
+                # Where multi-sweep rolled reductions keep re-read values
+                # (register fragment vs gmem/L2 reload); see
+                # ``CuteReductionReloadSpec``.
+                if (
+                    self.supports_config_key("cute_reduction_reloads")
+                    and len(self.cute_reduction_reloads) > 0
+                ):
+                    fields["cute_reduction_reloads"] = self.cute_reduction_reloads
                 # Thread-block cluster width for SIMT reduction kernels:
                 # splits a whole-extent lane-looped axis across cluster
                 # CTAs (register-resident slices) with a DSM cluster
@@ -3871,6 +3886,36 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
 
 _CUTE_VECTOR_WIDTH_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
 _CUTE_LANE_LAYOUT_CHOICES: tuple[str, ...] = ("blocked", "strided")
+_CUTE_REDUCTION_RELOAD_CHOICES: tuple[str, ...] = ("auto", "register", "gmem")
+
+
+class CuteReductionReloadSpec(_BlockIdItem):
+    """Where a multi-sweep rolled reduction keeps the values it re-reads.
+
+    LayerNorm/RMSNorm-style kernels sweep the same input several times
+    (reduce, then consume).  ``"register"`` caches the first sweep's loads
+    in a per-thread register fragment (fastest when the per-thread slice
+    is small; spills to local memory when it is not).  ``"gmem"`` re-loads
+    from global memory on later sweeps (the row is usually still resident
+    in L2, and no registers are burned).  ``"auto"`` (default) keeps the
+    legacy size heuristic in ``fuse_two_pass_loads``.
+    """
+
+    def __init__(self, *, block_id: int) -> None:
+        super().__init__([block_id])
+
+    def _fragment(self, base: ConfigSpec) -> EnumFragment:
+        return EnumFragment(choices=_CUTE_REDUCTION_RELOAD_CHOICES)
+
+    def _normalize(self, name: str, value: object) -> str:
+        if value not in _CUTE_REDUCTION_RELOAD_CHOICES:
+            raise InvalidConfig(
+                f"{name} must be one of {_CUTE_REDUCTION_RELOAD_CHOICES}, got {value!r}"
+            )
+        return str(value)
+
+    def _fill_missing(self) -> str:
+        return "auto"
 
 
 class CuteLaneLayoutSpec(_BlockIdItem):
