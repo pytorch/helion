@@ -1518,6 +1518,9 @@ class PallasBackend(Backend):
 
         env = CompileEnvironment.current()
 
+        from .internal_scratch import plan_internal_remote_scratch
+
+        plan_internal_remote_scratch()
         plan_tiling(graphs, config, tile_strategy)
         build_tensorcore_plans(graphs, config)
 

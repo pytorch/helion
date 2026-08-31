@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 def _load_route(
     state: CodegenState, tensor: torch.Tensor
 ) -> tuple[str, str, list[object]]:
-    arg_name = state.device_function.tensor_arg(tensor).name
+    arg_name = state.device_function.pallas_tensor_ref_name(tensor)
     active_name = vmem_name(state, arg_name)
     state.device_function.device_load_index += 1
     state.device_function.device_memory_op_index += 1
