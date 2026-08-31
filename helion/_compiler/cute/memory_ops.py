@@ -178,17 +178,27 @@ def _cute_unroll_vec_load_dtype_arg(dtype: torch.dtype, vec_width: int) -> str:
     return f"ir.VectorType.get([{vec_width}], cutlass.Uint16.mlir_type)"
 
 
+_CUTE_EVICTION_POLICY_MAP = {
+    "": "",
+    "first": "evict_first",
+    "last": "evict_last",
+}
+
+
 def _cute_vector_load_expr(
     tensor_name: str,
     index_exprs: list[str],
     dtype: torch.dtype,
     *,
     vec_width: int,
+    eviction_suffix: str = "",
 ) -> str:
     elem_str, _ = _CUTE_VECTOR_DTYPES[dtype]
     ptr = _cute_scalar_pointer_expr(tensor_name, index_exprs)
     return (
-        f"cute.arch.load({ptr}, ir.VectorType.get([{vec_width}], {elem_str}.mlir_type))"
+        f"cute.arch.load({ptr}, "
+        f"ir.VectorType.get([{vec_width}], {elem_str}.mlir_type)"
+        f"{eviction_suffix})"
     )
 
 
@@ -215,6 +225,7 @@ def _cute_register_unroll_vec_hoist(
     tensor_name: str,
     index_exprs: list[str],
     vec_width: int,
+    eviction_suffix: str = "",
 ) -> str:
     """Register a Uint16 vec load to be hoisted above the constexpr V-loop
     in the active lane body and return the per-element extract expression.
@@ -253,7 +264,8 @@ def _cute_register_unroll_vec_hoist(
         cache[cache_key] = (hoist_var, tensor.dtype)
         hoist_stmt = statement_from_string(
             f"{hoist_var} = cute.arch.load({base_ptr_expr}, "
-            f"ir.VectorType.get([{vec_width}], cutlass.Uint16.mlir_type))"
+            f"ir.VectorType.get([{vec_width}], cutlass.Uint16.mlir_type)"
+            f"{eviction_suffix})"
         )
         # Insert the hoist just BEFORE the constexpr V-loop.
         lane_body.insert(lane_body.index(constexpr_loop), hoist_stmt)
@@ -2318,6 +2330,19 @@ def _(state: CodegenState) -> object:
         tensor=tensor,
         include_tensor_index_masks=False,
     )
+    # Autotunable per-load-site L1 eviction hint, applied to the vectorized
+    # load forms (``cute.arch.load``); scalar ``(ptr).load()`` sites ignore
+    # it.  Same site-order indexing scheme as the Triton backend.
+    eviction_suffix = ""
+    if state.codegen.on_device:
+        device_fn = state.device_function
+        load_idx = device_fn.device_load_index
+        device_fn.device_load_index += 1
+        policies = state.config.load_eviction_policies
+        if load_idx < len(policies):
+            mapped = _CUTE_EVICTION_POLICY_MAP.get(policies[load_idx], "")
+            if mapped:
+                eviction_suffix = f", level1_eviction_priority={mapped!r}"
     vec_ctx = _cute_vector_load_ctx(state, tensor, subscript, index_exprs, extra_mask)
     if vec_ctx is not None:
         vec_width, vec_block_id, vec_mode = vec_ctx
@@ -2327,7 +2352,11 @@ def _(state: CodegenState) -> object:
         strategy = loops[-1].strategy if loops else None
         if vec_mode == "vec":
             load_expr = _cute_vector_load_expr(
-                tensor_name, index_exprs, tensor.dtype, vec_width=vec_width
+                tensor_name,
+                index_exprs,
+                tensor.dtype,
+                vec_width=vec_width,
+                eviction_suffix=eviction_suffix,
             )
             # The mask is deferred to the post-fold scalar in
             # codegen_reduction.  The vec load itself is unconditional; the
@@ -2351,6 +2380,7 @@ def _(state: CodegenState) -> object:
                 tensor_name,
                 index_exprs,
                 vec_width,
+                eviction_suffix=eviction_suffix,
             )
         else:
             assert vec_mode == "tile_unroll"
@@ -2367,6 +2397,7 @@ def _(state: CodegenState) -> object:
                 tensor_name,
                 index_exprs,
                 vec_width,
+                eviction_suffix=eviction_suffix,
             )
     else:
         load_expr = _cute_scalar_load_expr(tensor_name, index_exprs, tensor.dtype)

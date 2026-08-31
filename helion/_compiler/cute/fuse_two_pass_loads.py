@@ -202,8 +202,14 @@ def _trip_count_for(
 
 
 def _node_text(node: ast.AST) -> str:
-    """Stable text key for matching AST nodes."""
-    return ast.unparse(node)
+    """Stable text key for matching AST nodes.
+
+    Per-load-site L1 eviction hints are stripped from the key: the same
+    logical load in different sweeps carries a different (independently
+    tunable) hint, and the hint must not defeat cross-sweep fusion — the
+    surviving first-sweep load keeps its own hint.
+    """
+    return re.sub(r",\s*level1_eviction_priority='[a-z_]+'", "", ast.unparse(node))
 
 
 def _unmasked_load_tensor_dtype(
@@ -276,7 +282,9 @@ def _canonical_load_text(node: ast.AST, lane_var_alias: dict[str, str]) -> str:
     textual form modulo the rename — otherwise identical loads compare
     unequal and fusion bails.
     """
-    text = ast.unparse(node)
+    # Per-load-site eviction hints differ between sweeps and must not
+    # defeat matching (see _node_text).
+    text = re.sub(r",\s*level1_eviction_priority='[a-z_]+'", "", ast.unparse(node))
     for old, new in lane_var_alias.items():
         # Word-boundary replacement so suffixed vars don't pick up matches
         # for shorter prefixes.
