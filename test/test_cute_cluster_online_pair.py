@@ -167,6 +167,24 @@ class TestCuteClusterOnlinePair(TestCase):
         torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-3)
         self.assertNotIn("fastmath=True", code)
 
+    def test_serial_block_reduce_routing(self) -> None:
+        """Pin the serial-vs-two-stage dispatch contract: the cheap serial
+        cross-warp combine only serves single whole-CTA groups of 2..8
+        warps; everything else must keep the two-stage form."""
+        from helion._compiler.cute.reduce_helpers import _use_serial_block_reduce
+
+        self.assertTrue(_use_serial_block_reduce(1, 128, 1))
+        self.assertTrue(_use_serial_block_reduce(1, 256, 1))
+        # 16 warps: serial chain outgrows the two-stage shuffle cost.
+        self.assertFalse(_use_serial_block_reduce(1, 512, 1))
+        # single warp: the warp path handles it without shared memory.
+        self.assertFalse(_use_serial_block_reduce(1, 32, 1))
+        # pre-grouped or multi-group reductions keep the two-stage form.
+        self.assertFalse(_use_serial_block_reduce(2, 128, 1))
+        self.assertFalse(_use_serial_block_reduce(1, 128, 4))
+        # non-warp-multiple spans keep the two-stage form.
+        self.assertFalse(_use_serial_block_reduce(1, 48, 1))
+
     def test_single_site_keeps_two_exchange_form(self) -> None:
         """A cluster kernel without the (max, sum-of-exp) pair keeps the
         plain per-site cluster exchange."""
