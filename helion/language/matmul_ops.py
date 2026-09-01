@@ -517,6 +517,21 @@ def _plan_cute_tcgen05_search_candidate(
         if static_m is None
         else min(max_tcgen05_m, pow2_floor_at_least(static_m, 64))
     )
+    # block_m=512 (tcgen05 M-paired tiles): two 256-row CtaGroup.TWO UMMA
+    # subtiles share each K stage's B buffer, halving B's SMEM/L2/DRAM
+    # traffic (fp16 16384^3: 0.92 -> 1.01 vs cuBLAS). Only searchable on the
+    # 16-bit full-tile plain family the codegen validates; the tcgen05
+    # config projections demote ineligible 512 samples back to 256.
+    if (
+        max_tcgen05_m == 256
+        and not is_fp8
+        and not is_tf32
+        and static_m is not None
+        and static_m % 512 == 0
+        and static_n is not None
+        and max_tcgen05_n >= 128
+    ):
+        max_search_m = 512
     max_search_n = max_tcgen05_n
     max_search_k = (
         128 if static_k is None else min(128, pow2_floor_at_least(static_k, mma_k))

@@ -5554,24 +5554,48 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         ]
         # FFI-eligible shapes have both DEFAULT-layout and direct-entry seeds.
         # Callers decide whether both are expected in the supplied population;
-        # every cluster_m=2 seed must still match the common tile envelope.
+        # every cluster_m=2 seed must still match one of the validated tile
+        # envelopes: the canonical 256x256 tile, the M-paired block_m=512 tile
+        # (two 256-row subtiles sharing B; baseline ab=2 only), or the
+        # deep-staged short-K variant (bk=64 with the ab=6 pipeline). At least
+        # one canonical-envelope seed must be present.
         self.assertGreaterEqual(len(seeded), 1)
+        canonical: list[dict[str, object]] = []
         for seed in seeded:
-            self.assertEqual(
-                seed["block_sizes"][:3],
-                [
-                    TCGEN05_TWO_CTA_BLOCK_M,
-                    TCGEN05_TWO_CTA_BLOCK_N,
-                    expected_block_k,
-                ],
-            )
+            block_sizes = seed["block_sizes"][:3]
+            if block_sizes[0] == 2 * TCGEN05_TWO_CTA_BLOCK_M:
+                self.assertEqual(
+                    block_sizes,
+                    [
+                        2 * TCGEN05_TWO_CTA_BLOCK_M,
+                        TCGEN05_TWO_CTA_BLOCK_N,
+                        expected_block_k,
+                    ],
+                )
+                self.assertEqual(seed["tcgen05_ab_stages"], 2)
+            elif seed.get("tcgen05_ab_stages") == 6:
+                self.assertEqual(
+                    block_sizes,
+                    [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 64],
+                )
+            else:
+                self.assertEqual(
+                    block_sizes,
+                    [
+                        TCGEN05_TWO_CTA_BLOCK_M,
+                        TCGEN05_TWO_CTA_BLOCK_N,
+                        expected_block_k,
+                    ],
+                )
+                canonical.append(seed)
             self.assertEqual(
                 seed["indexing"],
                 ["tensor_descriptor"] * expected_indexing_length,
             )
             self.assertEqual(seed["pid_type"], "persistent_interleaved")
             self.assertEqual(seed["tcgen05_num_epi_warps"], 4)
-        return seeded[0]
+        self.assertGreaterEqual(len(canonical), 1)
+        return canonical[0]
 
     def _assert_cute_tcgen05_edge_k_tail_seed_overrides(
         self,

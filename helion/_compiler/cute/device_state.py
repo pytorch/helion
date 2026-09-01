@@ -327,6 +327,10 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
     cluster_n: int = 1
     l2_swizzle_size: int = 1
     tma_store_full_tiles_only: bool = False
+    # M-paired tiles: number of 256-row UMMA subtiles per work tile along M
+    # (block_m // mma tile M). 2 stages B once per K stage and shares it
+    # across both subtiles, with one TMEM accumulator stage per subtile.
+    m_subtile_count: int = 1
     flat_role_launch_warp_count: int | None = None
     grouped: CuteTcgen05GroupedPlan | None = None
     # Per-anchor auxiliary descriptors discovered by the forward FX walker. This

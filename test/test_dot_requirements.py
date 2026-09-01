@@ -349,8 +349,10 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         spec = bound.config_spec
         self.assertEqual([x.min_size for x in spec.block_sizes], [128, 8, 16])
         # tile_k upper bound is now 128 (the static_k=8192 case; capped at 128
-        # to keep AB SMEM staging budget sane).
-        self.assertEqual([x.max_size for x in spec.block_sizes], [256, 256, 128])
+        # to keep AB SMEM staging budget sane). block_m's upper bound is 512:
+        # this fp16 full-tile shape (8192 % 512 == 0) admits the M-paired
+        # tiles envelope (two 256-row CtaGroup.TWO subtiles sharing B).
+        self.assertEqual([x.max_size for x in spec.block_sizes], [512, 256, 128])
         default_block_sizes = spec.default_config().config["block_sizes"]
         self.assertGreaterEqual(default_block_sizes[2], 16)
         self.assertLessEqual(default_block_sizes[2], 128)
@@ -1012,15 +1014,19 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # round-trip even on a device the gate is off for.
         validation_fragments = spec._tcgen05_optional_fragments(for_search=False)
         self.assertEqual(validation_fragments["tcgen05_ab_stages"].high, 3)
-        # The full-tile cluster_m=2 family now seeds four configs (the
+        # The full-tile cluster_m=2 family now seeds six configs (the
         # canonical static-persistent seed, the CLC dynamic-persistence
-        # scheduler seed, the 4-CTA cluster_n=2 seed, and the CLC + cluster_n=2
-        # seed) — none of which may carry ab=3 when the gate is off.
+        # scheduler seed, the 4-CTA cluster_n=2 seed, the CLC + cluster_n=2
+        # seed, and the two M-paired block_m=512 seeds) — none of which may
+        # deepen the AB pipeline past the baseline ab=2 when the gate is off.
+        # In particular the deep-staged bk=64/ab=6 CLC variant must NOT be
+        # seeded: its admission goes through ``ab_stages_three_fits``, which
+        # rejects every depth once the budget helper reports 0.
         seeds = spec.compiler_seed_configs
-        self.assertEqual(len(seeds), 4)
+        self.assertEqual(len(seeds), 6)
         self.assertNotIn("tcgen05_ab_stages", seeds[0].config)
         for seed in seeds:
-            self.assertNotEqual(seed.config.get("tcgen05_ab_stages"), 3)
+            self.assertIn(seed.config.get("tcgen05_ab_stages"), (None, 2))
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_ab_stages_three_uses_analyzed_block_indices(
@@ -1072,22 +1078,43 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         spec = bound.config_spec
 
         # 16-bit 4096^3 is FFI-eligible (fp16 == bf16 parity), so the initial
-        # population now carries TWO cluster_m=2 seeds: the DEFAULT-layout
-        # cluster_m=2 ab=3 seed and the generalized TVM-FFI direct-entry seed.
-        # Both must carry the canonical ab=3 fast-config envelope (the point of
-        # this test — that ab=3 is seeded rather than discovered by mutation).
+        # population carries several cluster_m=2 seeds: the DEFAULT-layout
+        # cluster_m=2 ab=3 seed, the generalized TVM-FFI direct-entry seed,
+        # and the CLC / cluster_n=2 variants. Every seed on the canonical
+        # 256x256x128 tile must carry the ab=3 fast-config envelope (the point
+        # of this test — that ab=3 is seeded rather than discovered by
+        # mutation).
         cluster_m2_seeds = [
             config.config
             for config in spec.compiler_seed_configs
             if config.config.get("tcgen05_cluster_m") == 2
         ]
         self.assertGreaterEqual(len(cluster_m2_seeds), 1)
-        for seed in cluster_m2_seeds:
-            self.assertEqual(
-                seed["block_sizes"][:3],
-                [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 128],
-            )
+        canonical_seeds = [
+            seed
+            for seed in cluster_m2_seeds
+            if seed["block_sizes"][:3]
+            == [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 128]
+        ]
+        self.assertGreaterEqual(len(canonical_seeds), 2)
+        for seed in canonical_seeds:
             self.assertEqual(seed["tcgen05_ab_stages"], 3)
+        # The same SMEM gate admits the deep-staged short-K variant, which must
+        # be seeded alongside the canonical family: bk=64 with the ab=6
+        # pipeline (nvjet's 64x6 staging).
+        deep_seeds = [seed for seed in cluster_m2_seeds if seed["block_sizes"][2] == 64]
+        self.assertEqual(len(deep_seeds), 1)
+        self.assertEqual(deep_seeds[0]["tcgen05_ab_stages"], 6)
+        # M-paired block_m=512 seeds keep the baseline ab=2: the doubled A
+        # staging leaves no headroom for a deeper AB pipeline at bk=128.
+        m_pair_seeds = [
+            seed
+            for seed in cluster_m2_seeds
+            if seed["block_sizes"][0] == 2 * TCGEN05_TWO_CTA_BLOCK_M
+        ]
+        self.assertGreaterEqual(len(m_pair_seeds), 1)
+        for seed in m_pair_seeds:
+            self.assertEqual(seed["tcgen05_ab_stages"], 2)
 
     @onlyBackends(["cute"])
     def test_cute_universal_matmul_lane_loop_correctness(self) -> None:

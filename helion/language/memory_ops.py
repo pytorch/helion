@@ -1890,6 +1890,14 @@ def _codegen_cute_store_tcgen05_tile(
     tile_coord_n = f"({n_index}) // cutlass.Int32({tcgen05_destination_bn})"
     static_tile_coord_m = tile_coord_m
     static_tile_coord_n = tile_coord_n
+    # M-paired tiles: the epilogue body is wrapped in a two-iteration
+    # ``_tcgen05_msub`` loop (one per 256-row subtile); each iteration drains
+    # its own acc stage at the subtile's M tile coordinate.
+    tcgen05_m_subtile_count = (
+        matmul_plan.m_subtile_count if matmul_plan is not None else 1
+    )
+    if tcgen05_m_subtile_count > 1:
+        static_tile_coord_m = f"({tile_coord_m} + cutlass.Int32(_tcgen05_msub))"
     full_tile = df.new_var("tcgen05_full_tile")
 
     gmem_tile = df.new_var("tcgen05_gC")
@@ -4004,10 +4012,23 @@ def _codegen_cute_store_tcgen05_tile(
     # fallback edge tiles do not perturb the C-pipeline SMEM stage sequence.
     tma_c_buffer_expr = "cutlass.Int32(_tcgen05_subtile)"
     if tcgen05_value.role_local_tile_counter:
-        tma_c_buffer_expr = (
-            f"{tcgen05_value.role_local_tile_counter} * "
-            f"cutlass.Int32({subtile_count}) + cutlass.Int32(_tcgen05_subtile)"
-        )
+        if tcgen05_m_subtile_count > 1:
+            # The role-local tile counter advances once per WORK tile; fold
+            # the M-subtile index in so the C-ring parity stays continuous
+            # across the two drained subtiles regardless of subtile_count
+            # parity.
+            tma_c_buffer_expr = (
+                f"{tcgen05_value.role_local_tile_counter} * "
+                f"cutlass.Int32({tcgen05_m_subtile_count}) * "
+                f"cutlass.Int32({subtile_count}) + "
+                f"cutlass.Int32(_tcgen05_msub) * cutlass.Int32({subtile_count})"
+                " + cutlass.Int32(_tcgen05_subtile)"
+            )
+        else:
+            tma_c_buffer_expr = (
+                f"{tcgen05_value.role_local_tile_counter} * "
+                f"cutlass.Int32({subtile_count}) + cutlass.Int32(_tcgen05_subtile)"
+            )
     simt_store_edge_coord_preloaded = simt_edge_only and bool(aux_steps_in_chain)
     if simt_edge_only:
         simt_store_copy_source = _simt_edge_logical_divide_copy_source(
@@ -5766,9 +5787,20 @@ def _codegen_cute_store_tcgen05_tile(
         else:
             sync_before_stmt = statement_from_string("cute.arch.sync_threads()")
             sync_after_stmt = statement_from_string("cute.arch.sync_threads()")
-            main_stmt = statement_from_string(
-                "if True:\n" + textwrap.indent("\n".join(store_body_core), "    ")
-            )
+            if tcgen05_m_subtile_count > 1:
+                # M-paired tiles: drain both 256-row subtiles per work tile
+                # (their acc stages committed together after the shared-B K
+                # loop). ``unroll_full`` keeps ``_tcgen05_msub`` a trace-time
+                # Python int so tile coordinates stay static expressions.
+                main_stmt = statement_from_string(
+                    f"for _tcgen05_msub in cutlass.range("
+                    f"{tcgen05_m_subtile_count}, unroll_full=True):\n"
+                    + textwrap.indent("\n".join(store_body_core), "    ")
+                )
+            else:
+                main_stmt = statement_from_string(
+                    "if True:\n" + textwrap.indent("\n".join(store_body_core), "    ")
+                )
             df.cute_state.register_tcgen05_per_tile_stmts(
                 [sync_before_stmt, main_stmt, sync_after_stmt]
             )

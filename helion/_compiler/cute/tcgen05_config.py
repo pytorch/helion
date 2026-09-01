@@ -600,6 +600,30 @@ class CuteTcgen05Config:
             return constraints.static_k // bk <= constraints.max_k_tiles
         return False
 
+    def _m_pair_block_m_is_valid(self) -> bool:
+        """Whether block_m=512 (M-paired tiles) is admissible for this kernel.
+
+        The codegen envelope is the plain 16-bit full-tile static family:
+        M divisible by 512 with the canonical 256-wide N tile (the fix pass
+        projects bn to 256 and validates bk). Aux kernels and edge families
+        keep block_m=256.
+        """
+        if self.aux_kernel_detected or self.matmul_has_leading_passthrough:
+            return False
+        constraints = self.cluster_m2_search_constraints
+        if constraints is None or constraints.allow_edge_k_tail_family:
+            return False
+        for fact in self.config_spec.matmul_facts:
+            if (
+                fact.static_m is not None
+                and fact.static_m % (2 * TCGEN05_TWO_CTA_BLOCK_M) == 0
+                and fact.static_n is not None
+                and fact.static_n % TCGEN05_TWO_CTA_BLOCK_N == 0
+                and fact.lhs_dtype in (torch.float16, torch.bfloat16)
+            ):
+                return True
+        return False
+
     def full_tile_direct_entry_seed_bk(self) -> int | None:
         """Largest valid full-tile direct-entry K tile for the live shape.
 
@@ -877,6 +901,62 @@ class CuteTcgen05Config:
             ),
             TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: 1,
         }
+        if self.config_spec.indexing.length == 3:
+            seed_config["indexing"] = ["tensor_descriptor"] * 3
+        return Config(**seed_config)
+
+    def _plain_m_pair_seed_config(self) -> Config | None:
+        """Autotune seed for block_m=512 M-paired tiles (nvjet's B-reuse).
+
+        Two 256-row CtaGroup.TWO subtiles share each K stage's B buffer,
+        halving B's SMEM/L2/DRAM traffic. Measured fp16 16384^3: 986-990
+        TFLOP/s vs the block_m=256 CLC winner's 908 (co-timed vs cuBLAS's
+        971-981). The doubled A staging fits ab=2 at bk=128 under the B200
+        SMEM cap. Rides the CLC WITH_SCHEDULER shape when enabled, else the
+        static persistent default.
+        """
+        if not self._m_pair_block_m_is_valid():
+            return None
+        constraints = self.cluster_m2_search_constraints
+        if constraints is None:
+            return None
+        if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
+            return None
+        fragments = self._matmul_block_fragments()
+        if fragments is None:
+            return None
+        bm_fragment, bn_fragment, bk_fragment = fragments
+        pair_bm = 2 * TCGEN05_TWO_CTA_BLOCK_M
+        if not (
+            bm_fragment.low <= pair_bm <= bm_fragment.high
+            and bn_fragment.low <= TCGEN05_TWO_CTA_BLOCK_N <= bn_fragment.high
+        ):
+            return None
+        bk = TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+        if not (bk_fragment.low <= bk <= bk_fragment.high):
+            return None
+        if not self.cluster_m2_bk_is_valid(bk, constraints):
+            return None
+        seed_config: dict[str, Any] = {
+            "block_sizes": [pair_bm, TCGEN05_TWO_CTA_BLOCK_N, bk],
+            "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            "l2_groupings": [4],
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_num_epi_warps": 4,
+            "tcgen05_ab_stages": 2,
+            "tcgen05_acc_stages": 2,
+        }
+        if self._plain_clc_persistence_search_enabled() and (
+            self._clc_persistence_search_enabled()
+        ):
+            seed_config[TCGEN05_STRATEGY_CONFIG_KEY] = (
+                Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+            )
+            seed_config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY] = (
+                Tcgen05PersistenceModel.CLC_PERSISTENT.value
+            )
+            seed_config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 1
         if self.config_spec.indexing.length == 3:
             seed_config["indexing"] = ["tensor_descriptor"] * 3
         return Config(**seed_config)
@@ -1205,6 +1285,39 @@ class CuteTcgen05Config:
         plain_edge_seed = self._plain_edge_seed_config()
         if plain_edge_seed is not None:
             seeds.append(plain_edge_seed)
+            # Edge-family 4-CTA multicast variant: with the generalized CLC
+            # broadcast this is quack's winning 5000^3 shape (dynamic
+            # persistence + cluster 2x2), measured 907 vs the cluster_n=1
+            # edge seed's 852 TFLOP/s.
+            edge_n2_seed_config: dict[str, Any] = dict(plain_edge_seed.config)
+            edge_n2_seed_config["tcgen05_cluster_n"] = 2
+            seeds.append(Config(**edge_n2_seed_config))
+        if plain_clc_seed is not None:
+            # Deep-staged bk=64 variant of the plain CLC seed: halving the K
+            # tile and doubling the AB pipeline depth absorbs UMMA latency on
+            # SHORT-K shapes where the per-tile K loop is otherwise too short
+            # to hide the drain (fp16 8192x6144x4096: ratio 1.002 vs cuBLAS
+            # at ab=6/bk=64/c=2, from 0.980 at the ab=3/bk=128 pick). cuBLAS
+            # nvjet uses the same 64x6 staging for this shape class.
+            deep_seed_config: dict[str, Any] = dict(plain_clc_seed.config)
+            deep_block_sizes = list(cast("list[int]", deep_seed_config["block_sizes"]))
+            deep_block_sizes[-1] = 64
+            constraints = self.cluster_m2_search_constraints
+            if (
+                constraints is not None
+                and self.cluster_m2_bk_is_valid(64, constraints)
+                and self.ab_stages_three_fits(
+                    bm=deep_block_sizes[0],
+                    bn=deep_block_sizes[1],
+                    bk=64,
+                    cluster_m=2,
+                    ab_stages=6,
+                )
+            ):
+                deep_seed_config["block_sizes"] = deep_block_sizes
+                deep_seed_config["tcgen05_ab_stages"] = 6
+                deep_seed_config["tcgen05_c_stages"] = 2
+                seeds.append(Config(**deep_seed_config))
         plain_cluster_n2_seed = self._plain_cluster_n2_seed_config()
         if plain_cluster_n2_seed is not None:
             seeds.append(plain_cluster_n2_seed)
@@ -1212,10 +1325,25 @@ class CuteTcgen05Config:
                 # 4-CTA multicast + CLC dynamic persistence (Quack's
                 # dynamic-persistent 2x2 topology): reuse the validated CLC
                 # seed shape (WITH_SCHEDULER + scheduler warp) and add the
-                # cluster-N multicast on top.
+                # cluster-N multicast on top. l2_groupings=[8] keeps the
+                # concurrent wave square in TILES (G rows x ~2G tile-cols of
+                # half-width boxes): measured best across the full-tile
+                # cn2+CLC probes (fp16 6144^3 994 vs 962 at [4]; fp16 deepK
+                # 934 vs 898; fp16 16384^3 899 vs 881).
                 clc_n2_seed_config: dict[str, Any] = dict(plain_clc_seed.config)
                 clc_n2_seed_config["tcgen05_cluster_n"] = 2
+                clc_n2_seed_config["l2_groupings"] = [8]
                 seeds.append(Config(**clc_n2_seed_config))
+        plain_m_pair_seed = self._plain_m_pair_seed_config()
+        if plain_m_pair_seed is not None:
+            seeds.append(plain_m_pair_seed)
+            # 2x2 super-tile: A multicast across the cluster-N pairs on top
+            # of the SMEM-shared B within each M-paired tile. Wins on
+            # K-dominated shapes (fp16 4096x4096x32768: ratio 1.016 vs
+            # cuBLAS, from 0.919 at block_m=256/cluster_n=1).
+            m_pair_cn2_seed_config: dict[str, Any] = dict(plain_m_pair_seed.config)
+            m_pair_cn2_seed_config["tcgen05_cluster_n"] = 2
+            seeds.append(Config(**m_pair_cn2_seed_config))
         c_input_seed = self._c_input_seed_config()
         if c_input_seed is not None:
             seeds.append(c_input_seed)
@@ -1329,7 +1457,18 @@ class CuteTcgen05Config:
             block_sizes[m_index] = TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
             block_sizes[n_index] = TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
             return
-        block_sizes[m_index] = TCGEN05_TWO_CTA_BLOCK_M
+        if (
+            block_sizes[m_index] == 2 * TCGEN05_TWO_CTA_BLOCK_M
+            and not edge_k_tail_family
+            and self._m_pair_block_m_is_valid()
+        ):
+            # Keep the sampled block_m=512 (M-paired tiles) and pin the knob
+            # its codegen envelope requires: both TMEM acc stages repurposed
+            # as the pair's accumulators. cluster_n stays searchable in
+            # {1, 2} (the 2x2 super-tile).
+            config["tcgen05_acc_stages"] = 2
+        else:
+            block_sizes[m_index] = TCGEN05_TWO_CTA_BLOCK_M
         # Only the fully validated narrow-N CLC+aux-TMA seed may keep
         # block_n=128; other candidates use the canonical block_n=256.
         if is_narrow_clc_aux_tma:
@@ -2830,7 +2969,11 @@ class CuteTcgen05Config:
         if config_view is None:
             return False
         block_sizes, m_index, n_index, k_index = config_view
-        if block_sizes[m_index] != TCGEN05_TWO_CTA_BLOCK_M:
+        if block_sizes[m_index] not in (
+            TCGEN05_TWO_CTA_BLOCK_M,
+            # M-paired tiles: two 256-row subtiles per work tile.
+            2 * TCGEN05_TWO_CTA_BLOCK_M,
+        ):
             return False
         if block_sizes[n_index] != TCGEN05_TWO_CTA_BLOCK_N:
             return False
@@ -2967,17 +3110,15 @@ class CuteTcgen05Config:
         else:
             cluster_m_choices = (1, 2)
         # cluster_n=2 (the Quack-canonical 4-CTA cluster: B multicast on top
-        # of the 2-CTA A multicast) is searchable on full-tile shapes — it
-        # wins big on B-heavy problems (fp16 4096x4096x32768: 911 vs 824
-        # TFLOP/s) and cuBLAS's nvjet picks 2x2 clusters for the same shape.
-        # Edge/K-tail shapes keep the (1,) surface: their double-edge SIMT
-        # epilogue and CLC scheduler broadcast are cluster_n=1-only.
-        cluster_n_full_tile_searchable = (
-            self.cluster_m2_search_constraints is not None
-            and not self.cluster_m2_search_constraints.allow_edge_k_tail_family
-        )
+        # of the 2-CTA A multicast) is searchable on every cluster_m=2
+        # family — it wins big on B-heavy problems (fp16 4096x4096x32768:
+        # 911 vs 824 TFLOP/s; cuBLAS's nvjet picks 2x2 clusters for the same
+        # shape) and, with the generalized 4-CTA CLC broadcast, closes the
+        # edge-family gap too (bf16 5000^3: 907 vs 852 TFLOP/s, matching
+        # quack's dynamic-persistent 2x2 within 1%).
+        cluster_n_searchable = self.cluster_m2_search_constraints is not None
         cluster_n_choices: tuple[int, ...] = (
-            (1, 2) if not for_search or cluster_n_full_tile_searchable else (1,)
+            (1, 2) if not for_search or cluster_n_searchable else (1,)
         )
         if for_search and self.num_epi_warps_search_choices is not None:
             num_epi_warps_fragment: ConfigSpecFragment = EnumFragment(
