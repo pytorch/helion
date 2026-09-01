@@ -62,6 +62,19 @@ if TYPE_CHECKING:
     from .registry import CompilerHeuristicSpecializationFact
 
 
+def _seq_config_list(
+    seq: Any,  # noqa: ANN401 - BlockIdSequence of any spec type
+    overrides: dict[int, object],
+) -> list[object]:
+    """Build a full-length config list for a BlockIdSequence, filling
+    non-overridden slots with each spec's default.  Seeds must match the
+    live spec length exactly (``_encode_flat_values`` asserts on it), and
+    slot order varies (e.g. ``num_threads`` registers tile slots first
+    while ``cute_vector_widths`` keeps the rdim slot at index 0), so build
+    by block id instead of by position."""
+    return [overrides.get(item.block_id, item._fill_missing()) for item in seq]
+
+
 def _cute_seed_vec_width(
     env: CompileEnvironment,
     rl_spec: ReductionLoopSpec,
@@ -145,12 +158,14 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
             reduction_loops = [max_threads]
         seed: dict[str, Any] = {
             "block_sizes": [1],
-            "num_threads": [1],
+            "num_threads": _seq_config_list(spec.num_threads, {}),
             "reduction_loops": reduction_loops,
         }
         vec = _cute_seed_vec_width(env, rl_spec, max_threads, size_hint, device_ir)
         if vec > 1:
-            seed["cute_vector_widths"] = [vec]
+            seed["cute_vector_widths"] = _seq_config_list(
+                spec.cute_vector_widths, {rl_spec.block_id: vec}
+            )
         return Config(**seed)
 
 
@@ -734,12 +749,80 @@ class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
             chunk = max_threads
         seed: dict[str, Any] = {
             "block_sizes": [1],
-            "num_threads": [1],
+            "num_threads": _seq_config_list(spec.num_threads, {}),
             "reduction_loops": [chunk],
         }
         vec = _cute_seed_vec_width(env, rl_spec, max_threads, size_hint, device_ir)
         if vec > 1:
-            seed["cute_vector_widths"] = [vec]
+            seed["cute_vector_widths"] = _seq_config_list(
+                spec.cute_vector_widths, {rl_spec.block_id: vec}
+            )
+        return Config(**seed)
+
+
+class CuteRolledRowLadderHeuristic(AutotunerHeuristic):
+    """Quack-style ladder seed for rolled row reductions (layernorm /
+    rmsnorm family): moderate threads-per-row that grow with the row width,
+    128-bit vectorized strided lanes, and a wide loop chunk.
+
+    Measured on B200 bf16 rows (see benchmarks/cute/layernorm_plan.md):
+    threads-per-row 32 @ N<=2k, 128 @ <=8k, 256 @ <=32k, 512 @ <=64k, and
+    the chunk-derived maximum beyond; rows-per-CTA fills the CTA to >=128
+    threads for narrow rows.  The reload choice is left at "auto" (register
+    fragment up to 64 elements/thread, gmem/L2 reload beyond), which
+    matched the hand-tuned best at every measured width.
+    """
+
+    name = "cute_rolled_row_ladder"
+    backend = "cute"
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return is_canonical_row_reduction(env)
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        max_threads = spec.max_reduction_threads or 1024
+        size_hint = rl_spec.size_hint
+        vec = _cute_seed_vec_width(env, rl_spec, max_threads, size_hint, device_ir)
+        if size_hint <= 2048:
+            threads_per_row = 32
+        elif size_hint <= 8192:
+            threads_per_row = 128
+        elif size_hint <= 32768:
+            threads_per_row = 256
+        elif size_hint <= 65536:
+            threads_per_row = 512
+        else:
+            threads_per_row = 0  # auto: chunk-derived (1024)
+        rows_per_cta = max(1, 128 // threads_per_row) if threads_per_row else 1
+        if rows_per_cta > 1 and not _block_size_value_reachable(spec, 0, rows_per_cta):
+            rows_per_cta = 1
+        chunk = min(size_hint // 2, 65536)
+        chunk = max(chunk, max(threads_per_row, 1) * max(vec, 1))
+        if chunk >= size_hint or chunk < 2:
+            return None
+        rdim_id = rl_spec.block_id
+        tile_id = spec.block_sizes[0].block_id
+        nt_overrides: dict[int, object] = {tile_id: rows_per_cta}
+        if threads_per_row:
+            nt_overrides[rdim_id] = threads_per_row
+        seed: dict[str, Any] = {
+            "block_sizes": [rows_per_cta],
+            "num_threads": _seq_config_list(spec.num_threads, nt_overrides),
+            "reduction_loops": [chunk],
+            "cute_lane_layouts": _seq_config_list(
+                spec.cute_lane_layouts, {rdim_id: "strided"}
+            ),
+        }
+        if vec > 1:
+            seed["cute_vector_widths"] = _seq_config_list(
+                spec.cute_vector_widths, {rdim_id: vec}
+            )
         return Config(**seed)
 
 
