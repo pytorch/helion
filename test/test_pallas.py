@@ -854,6 +854,19 @@ def _topk_pallas_kernel(x: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Te
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def _prefix_sum_pallas_kernel(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    forward = torch.empty_like(x)
+    reverse = torch.empty_like(x)
+    for _program in hl.grid(1):
+        values = x[:]
+        forward[:] = torch.cumsum(values, dim=-1)
+        reverse[:] = hl.cumsum(values, dim=-1, reverse=True)
+    return forward, reverse
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def _constant_pad_pallas_kernel(x: torch.Tensor) -> torch.Tensor:
     """F.pad -> aten.constant_pad_nd -> jnp.pad on the pallas backend (pad the
     lane dim, mirroring the spec-decode sampler's in-kernel output padding)."""
@@ -880,6 +893,21 @@ def _constant_pad_neg_inf_pallas_kernel(x: torch.Tensor) -> torch.Tensor:
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    def test_prefix_sum(self) -> None:
+        x = torch.arange(256, device=DEVICE, dtype=torch.int32) % 7
+        _code, (forward, reverse) = code_and_output(
+            _prefix_sum_pallas_kernel,
+            (x,),
+            block_sizes=[],
+        )
+        torch.testing.assert_close(forward, torch.cumsum(x, dim=-1).to(x.dtype))
+        torch.testing.assert_close(
+            reverse,
+            torch.flip(torch.cumsum(torch.flip(x, dims=(-1,)), dim=-1), dims=(-1,)).to(
+                x.dtype
+            ),
+        )
+
     def test_cat_columns(self) -> None:
         x = torch.randn(128, 64, device=DEVICE, dtype=torch.bfloat16)
         y = torch.randn(128, 64, device=DEVICE, dtype=torch.bfloat16)
