@@ -715,7 +715,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
 
         The baseline is computed in one of two ways:
         - If settings.autotune_baseline_fn is provided, use that custom function
-        - Otherwise, run the kernel with the default config
+        - Otherwise, run the kernel with the conservative autotuning reference
         """
         new_args = _clone_args(self.args, self.kernel.env.process_group_name)
 
@@ -730,8 +730,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     f"Baseline function: {self.settings.autotune_baseline_fn}\n"
                 ) from e
         else:
-            # Use default config
-            baseline_config = self.config_spec.default_config()
+            baseline_config = self.config_spec.autotune_reference_config()
             try:
                 baseline_output = self.kernel.compile_config(
                     baseline_config, allow_print=False
@@ -749,8 +748,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 )
                 self.kernel.maybe_log_repro(self.log.error, new_args, baseline_config)
                 raise exc.InvalidConfig(
-                    "Default config failed while computing baseline.\n"
-                    f"Default config: {decorator}\n"
+                    "Autotuning reference config failed while computing baseline.\n"
+                    f"Reference config: {decorator}\n"
                     f"{SUPPRESSED_TRITON_CODE_MSG}\n"
                     "To work around this error, you could set `@helion.kernel(autotune_baseline_fn=...)` "
                     "to provide a custom baseline function (e.g. PyTorch eager implementation of your kernel)."

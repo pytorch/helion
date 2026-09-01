@@ -236,7 +236,7 @@ def _get_examples_matmul():
 
 
 # Pin the compute capability for config-space golden tests. The matmul-seed
-# heuristics are hardware-gated (the H100 formula fires on sm90, the B200 table on
+# heuristics are hardware-gated (the H100 formula fires on sm90, the B200 formula on
 # sm100), so which compiler seed configs get injected into ``random_population``
 # depends on the CI runner's GPU. Force a fixed capability so the golden is stable
 # across every runner (H100/B200/A10G) and does not shift as new sm-gated seed

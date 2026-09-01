@@ -808,14 +808,12 @@ class ConfigGeneration:
 
     def default_flat(self) -> FlatConfig:
         """
-        Retrieve the default flat configuration.
+        Retrieve the conservative autotuning reference configuration.
 
         Returns:
             The default flat configuration values.
         """
-        if self.config_spec.compiler_default_config is None:
-            return self._fragment_default_flat()
-        return self.flatten(self.config_spec.default_config())
+        return self._fragment_default_flat()
 
     @_flash_env_scoped
     def _flash_deterministic_coverage_flats(self) -> list[FlatConfig]:

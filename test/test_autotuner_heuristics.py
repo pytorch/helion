@@ -273,6 +273,7 @@ from helion.autotuner import IntegerFragment
 from helion.autotuner.base_cache import BoundKernelInMemoryCacheKey
 from helion.autotuner.base_cache import LooseAutotuneCacheKey
 from helion.autotuner.base_cache import StrictAutotuneCacheKey
+from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.config_fragment import ConfigSpecFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
@@ -727,6 +728,7 @@ class TestAutotunerHeuristic(TestCase):
         class ValidAutotunerHeuristic(AutotunerHeuristic):
             name = "valid_autotuner_heuristic"
             backend = "triton"
+            promote_seed_to_default = True
 
             @classmethod
             def is_eligible(cls, env: object, device_ir: object) -> bool:
@@ -762,6 +764,7 @@ class TestAutotunerHeuristic(TestCase):
             configs = compiler_seed_configs(env, MagicMock())
 
         self.assertEqual([config.config for config in configs], [{"block_sizes": [64]}])
+        self.assertEqual(env.config_spec.compiler_default_config, configs[0])
         self.assertEqual(
             env.config_spec.autotuner_heuristics,
             [ValidAutotunerHeuristic.name, DuplicateAutotunerHeuristic.name],
@@ -1022,23 +1025,47 @@ class TestAutotunerHeuristic(TestCase):
         self.assertEqual(len(messages), 1)
         self.assertIn("Failed to transfer compiler seed config 1", messages[0])
 
-    def test_default_config_promotes_compiler_seed(self) -> None:
+    def test_execution_default_is_separate_from_autotune_reference(self) -> None:
         spec = ConfigSpec(backend=TritonBackend())
         spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
         spec.compiler_default_config = helion.Config(
             block_sizes=[64], num_warps=8, num_stages=2
         )
 
-        default = spec.default_config()
+        execution_default = spec.default_config()
+        reference = spec.autotune_reference_config()
         config_gen = spec.create_config_generation()
-        flat_default = config_gen.unflatten(config_gen.default_flat())
+        generated_reference = config_gen.unflatten(config_gen.default_flat())
 
-        self.assertEqual(default.config["block_sizes"], [64])
-        self.assertEqual(default.config["num_warps"], 8)
-        self.assertEqual(default.config["num_stages"], 2)
-        self.assertEqual(flat_default.config["block_sizes"], [64])
-        self.assertEqual(flat_default.config["num_warps"], 8)
-        self.assertEqual(flat_default.config["num_stages"], 2)
+        self.assertEqual(execution_default.config["block_sizes"], [64])
+        self.assertEqual(execution_default.config["num_warps"], 8)
+        self.assertEqual(execution_default.config["num_stages"], 2)
+        self.assertNotEqual(execution_default, reference)
+        self.assertEqual(generated_reference, reference)
+
+    def test_accuracy_baseline_uses_autotune_reference(self) -> None:
+        reference = helion.Config(block_sizes=[32])
+        execution_default = helion.Config(block_sizes=[128])
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.args = ()
+        provider.settings = MagicMock(autotune_baseline_fn=None)
+        provider.config_spec = MagicMock()
+        provider.config_spec.autotune_reference_config.return_value = reference
+        provider.config_spec.default_config.return_value = execution_default
+        provider.kernel = MagicMock()
+        provider.kernel.env.process_group_name = None
+        provider.kernel.compile_config.return_value = lambda: "baseline"
+
+        with patch("helion.autotuner.benchmark_provider.synchronize_device"):
+            output, mutated, post_args = provider._compute_baseline()
+
+        self.assertEqual(output, "baseline")
+        self.assertEqual(mutated, [])
+        self.assertEqual(post_args, ())
+        provider.kernel.compile_config.assert_called_once_with(
+            reference, allow_print=False
+        )
+        provider.config_spec.default_config.assert_not_called()
 
     def test_should_promote_gate(self) -> None:
         # should_promote() gates a seed's PROMOTION (becoming the autotune-off

@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import functools
-import json
 import logging
 from operator import itemgetter
-from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
@@ -47,8 +44,6 @@ if TYPE_CHECKING:
 
 
 log = logging.getLogger(__name__)
-
-_B200_MATMUL_HEURISTICS_PATH = Path(__file__).resolve().parent / "matmul_b200.json"
 
 # Stand-in ceiling for an arch with no TMEM (sm90): makes a TMEM fit-check vacuously true.
 _INF = float("inf")
@@ -128,15 +123,6 @@ class TritonSkinnyGemmHeuristic(AutotunerHeuristic):
         return Config(block_sizes=block_sizes)
 
 
-def _dtype_family_from_dtype(dtype: object) -> str:
-    dtype = str(dtype)
-    if "float16" in dtype or "bfloat16" in dtype:
-        return "fp16_bf16"
-    if "float32" in dtype:
-        return "fp32"
-    return "other"
-
-
 def _is_fp8_matmul_fact(fact: MatmulFact) -> bool:
     """True when BOTH dot operands are fp8 (a 1-byte floating dtype). A 1-byte float is fp8
     by construction (int8/uint8/bool are not ``is_floating_point``), so this needs no explicit
@@ -148,24 +134,9 @@ def _is_fp8_matmul_fact(fact: MatmulFact) -> bool:
     )
 
 
-def _single_2d_static_matmul_fact(config_spec: ConfigSpec) -> MatmulFact | None:
-    facts = config_spec.matmul_facts
-    if len(facts) != 1 or len(config_spec.block_sizes) != 3:
-        return None
-    fact = facts[0]
-    if fact.lhs_ndim != 2 or fact.rhs_ndim != 2:
-        return None
-    if fact.static_m is None or fact.static_n is None or fact.static_k is None:
-        return None
-    if (fact.m_block_id, fact.n_block_id, fact.k_block_id) != (0, 1, 2):
-        return None
-    return fact
-
-
 def _batched_static_matmul_fact(config_spec: ConfigSpec) -> MatmulFact | None:
-    """The H100 eligibility precondition — broader than the 2-D-only
-    ``_single_2d_static_matmul_fact``: it admits an arbitrary, possibly **BATCHED** matmul. The
-    requirements:
+    """The H100 eligibility precondition for an arbitrary, possibly **BATCHED**
+    matmul. The requirements:
       - exactly one ``MatmulFact`` with **static** M/N/K (the dot's own dims) and three distinct
         M/N/K block-ids that are real tunable axes;
       - every **other** tunable block axis is a BATCH / OUTER grid axis (present in
@@ -268,74 +239,6 @@ def _generalized_static_matmul_fact(config_spec: ConfigSpec) -> MatmulFact | Non
     return fact
 
 
-def _shape_bucket_from_fact(fact: MatmulFact) -> dict[str, object]:
-    assert fact.static_m is not None
-    assert fact.static_n is not None
-    assert fact.static_k is not None
-    return {
-        "dtype": _dtype_family_from_dtype(fact.lhs_dtype),
-        "m_value": fact.static_m,
-        "n_value": fact.static_n,
-        "k_value": fact.static_k,
-    }
-
-
-@functools.cache
-def _heuristic_rules() -> tuple[dict[str, object], ...]:
-    with _B200_MATMUL_HEURISTICS_PATH.open(encoding="utf-8") as handle:
-        data = cast("dict[str, list[dict[str, object]]]", json.load(handle))
-    return tuple(data["rules"])
-
-
-def _interval_contains(interval: str, value: int) -> bool:
-    lower_text, upper_text = interval[1:-1].split(",", maxsplit=1)
-    lower = float(lower_text)
-    upper = float("inf") if upper_text == "inf" else float(upper_text)
-
-    lower_ok = value >= lower if interval[0] == "[" else value > lower
-    upper_ok = value <= upper if interval[-1] == "]" else value < upper
-    return lower_ok and upper_ok
-
-
-def _shape_bucket_matches(
-    rule_bucket: dict[str, object],
-    query_bucket: dict[str, object],
-) -> bool:
-    for key, value in rule_bucket.items():
-        if key in {"k_bucket", "m_bucket", "n_bucket"}:
-            intervals = value if isinstance(value, list) else [value]
-            dim_value = cast("int", query_bucket[f"{key[0]}_value"])
-            if not any(
-                _interval_contains(cast("str", interval), dim_value)
-                for interval in intervals
-            ):
-                return False
-            continue
-        query_value = query_bucket.get(key)
-        values = value if isinstance(value, list) else [value]
-        if query_value not in values:
-            return False
-    return True
-
-
-def _rules_for_bucket(
-    shape_bucket: dict[str, object],
-) -> list[dict[str, object]]:
-    matches = [
-        rule
-        for rule in _heuristic_rules()
-        if _shape_bucket_matches(
-            cast("dict[str, object]", rule["shape_bucket"]),
-            shape_bucket,
-        )
-    ]
-    matches.sort(
-        key=lambda rule: len(cast("dict[str, object]", rule["shape_bucket"])),
-        reverse=True,
-    )
-    return matches
-
-
 def _materialize_config(
     raw: dict[str, object],
     *,
@@ -360,57 +263,6 @@ def _materialize_config(
     config = Config(**cast("dict[str, Any]", supported))
     config_spec._shrink_for_numel_constraints(config)
     return config
-
-
-def _seed_config_for_bucket(
-    shape_bucket: dict[str, object],
-    *,
-    config_spec: ConfigSpec,
-) -> Config | None:
-    rules = _rules_for_bucket(shape_bucket)
-    if not rules:
-        return None
-
-    for rule in rules:
-        for template in cast("list[dict[str, object]]", rule["templates"]):
-            return _materialize_config(template, config_spec=config_spec)
-    return None
-
-
-def _seed_config_for_config_spec(config_spec: ConfigSpec) -> Config | None:
-    fact = _single_2d_static_matmul_fact(config_spec)
-    if fact is None:
-        return None
-    return _seed_config_for_bucket(
-        _shape_bucket_from_fact(fact),
-        config_spec=config_spec,
-    )
-
-
-class TritonB200MatmulHeuristic(AutotunerHeuristic):
-    # DEMOTED (promote=False): the general TritonB200FormulaMatmulHeuristic subsumes this table
-    # (faster on every shape the table fires on, and covers the shapes it declines). Kept as an
-    # unpromoted search seed.
-    name = "triton_b200_matmul"
-    backend = "triton"
-    promote_seed_to_default = False
-    HARDWARE_TARGETS = (("cuda", "sm100"),)
-
-    @classmethod
-    def is_eligible(
-        cls,
-        env: CompileEnvironment,
-        device_ir: DeviceIR,
-    ) -> bool:
-        return matches_hardware(env, cls.HARDWARE_TARGETS)
-
-    @classmethod
-    def get_seed_config(
-        cls,
-        env: CompileEnvironment,
-        device_ir: DeviceIR,
-    ) -> Config | None:
-        return _seed_config_for_config_spec(env.config_spec)
 
 
 def _h100_build_block_sizes(
@@ -2499,15 +2351,12 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
 
 
 class TritonB200FormulaMatmulHeuristic(TritonH100MatmulHeuristic):
-    """B200 (sm100) seed — the H100 budget formula re-homed on Blackwell, subsuming the incumbent
-    ``TritonB200MatmulHeuristic`` table (which fires only on in-bucket fp16/bf16 2-D matmul and
-    declines fp32/fp8/bmm/mamba + any dim>4096). Overrides only the hardware gate and the B200-tuned
-    constants; the promotion (owning the compiler default) is inherited from the base."""
+    """B200 (sm100) seed and execution default using the H100 budget formula
+    with Blackwell-specific hardware gates and constants."""
 
     name = "triton_b200_formula_matmul"
     HARDWARE_TARGETS = (("cuda", "sm100"),)
-    # promote_seed_to_default=True is inherited from TritonH100MatmulHeuristic. Registered after the
-    # (demoted) table so it wins the last-promote-wins compiler_default_config loop on sm100.
+    # promote_seed_to_default=True is inherited from TritonH100MatmulHeuristic.
 
     # num_sm (148) enters via get_num_sm, so the wave/saturation arithmetic self-adjusts; the rest
     # inherit the H100 formula, re-tuned per move below.
@@ -2742,17 +2591,13 @@ class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
     is a PREFERENCE, not an eligibility rule -- dimensions and execution count break every
     tie, and a kernel with no carried accumulator ranks purely on work.
 
-    Registered after the single-matmul front end for deterministic seed ordering,
-    and it declines whenever front end 1 fires, so exactly one path seeds any given
-    kernel.
+    It declines whenever the single-matmul front end fires, so exactly one path
+    seeds and supplies the execution default for any given kernel.
     """
 
     name = "triton_b200_multi_matmul"
     HARDWARE_TARGETS = (("cuda", "sm100"),)
-    # A promoted config must compile before autotuning can start. Keep the
-    # broader multi-contraction policy as a search seed until its legality has
-    # been validated beyond the current corpora.
-    promote_seed_to_default = False
+    promote_seed_to_default = True
     SINGLE_ROLE_AWARE_KNOBS = False
 
     # --- knob-role tile sizing (see ``_apply_knob_roles``) ----------------------------
