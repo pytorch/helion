@@ -579,6 +579,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._effective_atol, self._effective_rtol = (
             self._compute_effective_tolerances()
         )
+        # Scale the atol floor per tensor only when the user did not pin an
+        # explicit absolute tolerance (see accuracy.assert_close).
+        self._scale_atol = self.settings.autotune_baseline_atol is None
         self._jobs = self._decide_num_jobs()
 
     def _record_accuracy_failure(self, config: Config) -> None:
@@ -1029,6 +1032,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     self._baseline_output,
                     atol=self._effective_atol,
                     rtol=self._effective_rtol,
+                    scale_atol_by_expected_rms=self._scale_atol,
                 )
                 if os.getenv("CHECK_INPUT_ACCURACY", "1") == "1":
                     if len(self.mutated_arg_indices) > 0:
@@ -1041,6 +1045,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                             self._baseline_post_args,
                             atol=self._effective_atol,
                             rtol=self._effective_rtol,
+                            scale_atol_by_expected_rms=self._scale_atol,
                         )
         except AssertionError as e:
             if not self.settings.autotune_ignore_errors:
@@ -1885,6 +1890,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             baseline_path=self._precompile_baseline_path,
             atol=self._effective_atol,
             rtol=self._effective_rtol,
+            scale_atol=self._scale_atol,
         )
         return cast(
             "AccuracyCheckResult",

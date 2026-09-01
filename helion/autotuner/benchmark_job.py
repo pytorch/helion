@@ -76,6 +76,7 @@ class AccuracyCheckJob:
     baseline_path: str
     atol: float
     rtol: float
+    scale_atol: bool = False
 
     def __call__(self) -> AccuracyCheckResult:
         # Keep compile/launch diagnostics out of the autotune progress stream.
@@ -90,7 +91,13 @@ class AccuracyCheckJob:
                 _unload_compiled_fn(fn)
 
         try:
-            assert_close(output, baseline_output, atol=self.atol, rtol=self.rtol)
+            assert_close(
+                output,
+                baseline_output,
+                atol=self.atol,
+                rtol=self.rtol,
+                scale_atol_by_expected_rms=self.scale_atol,
+            )
         except AssertionError as e:
             return AccuracyCheckResult(ok=False, message=str(e))
         return AccuracyCheckResult(ok=True)
