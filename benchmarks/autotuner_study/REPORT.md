@@ -239,3 +239,106 @@ worst-seed 1.065 vs 1.106, evals 621 vs 759. The eval-count-focused knobs
   autotuner test suite passes at every step.
 - Additional campaign roots: `/tmp/autotuner_study/{v2s,cute-base,cute-v2s}`,
   head-to-head sessions `winners3.json` (triton) and `cutewinners.json` (cute).
+
+## 10. Round 2: robustness — consistently closer to 1.0x (2026-08-31/09-01)
+
+Round 1 shipped as four PRs; round 2 rebaselined at that HEAD (062bd4a1) and
+asked where the remaining gap to 1.0x lives. All quality numbers below are
+head-to-head: every run's selected config (plus each run's finalist
+shortlist) re-measured per case in one interleaved batch on the case's
+pinned GPU, two independent passes to establish a per-case noise floor
+(`measure_shortlists.py` + `diagnose.py`). Lower is better; 1.000 = best
+config any run found. Baseline campaign: 8 seeds default + 3 seeds
+PatternSearch x 14 cases; arm campaigns: 4 seeds per single arm, 8 seeds
+per bundle; ~750 autotune runs total in round 2.
+
+### 10.1 Where the round-1 gap lives (baseline diagnosis)
+
+* Exploration, not selection: decomposing each run's gap into selection
+  error (final shootout picked the wrong finalist) vs exploration error
+  (nothing near case-best ever reached the shortlist) shows the gap is
+  dominated by exploration everywhere except the context-sensitive kernels
+  (splitk, crossentropy, welford), where the unpaired steady final shootout
+  also mis-ranks. Different seeds end in disjoint local optima; e.g.
+  matmul-wide's good basin (block [128-256, 256, 32] + persistent_interleaved)
+  was found by 3/3 PatternSearch runs and 0/8 LFBO runs.
+* Early collective stall: most runs stop improving by generation ~3 while
+  searching to 8-17; the worst attention seed (1.371) stalled at
+  generation 5 of 20 with the rest of its budget unused.
+* Accuracy-gate false rejection (the largest single find): the default
+  check compares candidates to the kernel's own default-config output with
+  fixed elementwise atol=rtol=1e-2. Near-zero elements of large reductions
+  legitimately differ across accumulation orders in proportion to the
+  *global* output scale, so on matmul_split_k (K=32768, fp16) ~85% of
+  candidates — including every split_k>1 config — were falsely rejected
+  (all failures at the same ~30/4096 near-zero elements; fp64 ground truth
+  shows the rejected configs are exactly as accurate as the baseline
+  itself). The search was structurally confined to split_k=1 in every
+  campaign ever run on this kernel.
+
+### 10.2 What was tried (single arms, 4 seeds x 14 cases each)
+
+| arm | change | full-14 mean | stable-12 mean | evals |
+|---|---|---|---|---|
+| baseline | round-1 default | 1.194 | 1.072 | 593 |
+| acc | scale accuracy atol floor by max(1, rms(expected)) | 1.109 | 1.059 | 642 |
+| polish | full-neighborhood descent after the main loop stalls | 1.100 | 1.050 | 777 |
+| fsel | paired interleaved timing for the finalist shootout | 1.107 | 1.075 | 621 |
+| hop | basin-hop restarts reinvesting unused generation budget | 1.098 | 1.052 | 771 |
+
+(4-seed single-arm numbers carry ~±0.01-0.02 of seed luck; the bundles
+below are the 8-seed decision data. fsel cannot change the search
+trajectory — it only re-times the final shortlist — and it halves measured
+selection regret, mean 1.035 -> 1.014.)
+
+### 10.3 Bundles (8 seeds x 14 cases each)
+
+| bundle | full-14 mean / worst-seed | stable-12 mean / worst-seed | evals | wall |
+|---|---|---|---|---|
+| baseline | 1.194 / 1.309 | 1.072 / 1.138 | 593 | 295s |
+| pfa = acc+polish+fsel | **1.077 / 1.192** | **1.046 / 1.111** | 781 | 327s |
+| all = pfa+hop | 1.083 / 1.215 | 1.051 / 1.102 | 888 | 379s |
+| PatternSearch (ref) | 1.228 / 1.249 | 1.058 / 1.072 | 1538 | 466s |
+
+pfa improves or ties 12 of 14 cases at 8 seeds (splitk 2.58 -> 1.33,
+matmul-wide 1.24 -> 1.11, welford 1.14 -> 1.06, crossentropy 1.28 -> 1.19,
+matmul-4096 1.055 -> 1.031, layernorm 1.088 -> 1.060); the two regressions
+are within the case noise floor (attention-4k128 +0.7% vs 1.1% floor) or a
+single-seed miss (softmax 1.084 once, mean 1.013). It beats PatternSearch's
+mean at half the evals and 70% of the wall time. hop was evaluated and
+rejected: inside the bundle it costs ~12% more evals without improving the
+mean.
+
+### 10.4 What ships (flag-free, on top of the round-1 stack)
+
+1. Scale-aware accuracy tolerance: when the user has not pinned an explicit
+   `autotune_baseline_atol`, each tensor leaf's absolute-tolerance floor
+   becomes `atol * max(1, rms(expected))` — never tighter than before,
+   correctly looser for large-magnitude accumulations, still rejects
+   corruption at the output's own scale. User-specified tolerances remain
+   exact.
+2. Polish descent (`polish_rounds=10`): after the surrogate-guided main
+   loop stalls, plain pattern-search descent benchmarks the entire
+   deterministic radius-1 neighborhood (no surrogate pruning) and moves to
+   the best neighbor until a round fails to improve.
+3. Paired finalist timing: the final-verification shortlist is timed with
+   the event-based interleaved bench instead of unpaired sequential steady
+   windows (which drifted 1-3% between candidates and mis-ranked near-tied
+   finalists).
+
+lfbo_version bumped to 3. Cute-flash searches are unaffected by polish
+(they run their own terminal refinement) and pick up the scaled tolerance
+and paired finalist timing.
+
+### 10.5 Remaining gaps / future work
+
+* splitk residual variance: even in the unlocked space, seeds split between
+  the split_k=8 family (~0.021ms) and lesser basins (worst 2.05). The
+  initial population never seeds structured split_k variants.
+* attention-2k64 worst seed is still 1.27: early collective stall in a bad
+  basin; hop attacked this but did not pay for itself overall. A smarter
+  restart trigger (only when generations remain AND the incumbent is far
+  from the surrogate's frontier) may do better.
+* crossentropy/gathergemv timing context-sensitivity (up to 60% across
+  process/batch composition) still limits both the search's own signal and
+  any single-number quality claim.

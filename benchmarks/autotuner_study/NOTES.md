@@ -172,3 +172,93 @@ tree. What shipped (see REPORT.md section 8): a flag-free improved default
 population, stagnation stop) were removed after review. The final change
 set is the EnumFragment robustness fixes, uniform-list ListOf neighbors
 (pattern_version 2), and the four LFBO search-loop fixes (lfbo_version 2).
+
+# Round 2 (2026-08-31): robustness — consistently closer to 1.0x
+
+Round 1 shipped as 4 PRs (dev 062bd4a1 = new baseline). Round-2 goal per
+Jason: recompute the baseline at HEAD and make final quality consistently
+closer to 1.0x. All round-2 campaign data lives under
+/tmp/autotuner_study/round2/; prototypes live on branch autotuner-r2.
+
+## Rebaseline
+
+- 154 runs: 8 seeds (201-208) default + 3 seeds PatternSearch per case,
+  14 triton cases, GPUs 1-7 (one case pinned per GPU as before).
+
+## Mechanism findings before the arm campaigns
+
+- Selection vs exploration: joining round-1 winners pools with each run's
+  full evaluated-config set shows runs almost never evaluate-and-reject a
+  config that head-to-head beats their selection — different seeds end in
+  disjoint local optima, so the residual gap is dominated by exploration,
+  not final-pick noise. New tools measure_shortlists.py (times every run's
+  finalist shortlist head-to-head, two A/B passes for a per-case noise
+  floor) and diagnose.py (per-run selected vs shortlist-oracle vs case-best
+  decomposition) make this measurable per run.
+- Metric noise floor: two repeat=200 interleaved passes still disagree by
+  1-2% per config on fast kernels; single-pass regret numbers at repeat=50
+  produced a phantom 3.9% selection regret on rmsnorm whose finalists are
+  actually tied within noise. All regret claims must clear the A/B floor.
+- Timing methodology: the CUDA final shootout (final_rebenchmark_best)
+  times the top-8 shortlist with *unpaired sequential* steady windows;
+  paired interleaved timing and steady timing genuinely disagree on
+  tiering for some kernels (rmsnorm steady shows two tiers 2% apart where
+  interleaved says tied).
+- Early collective stall: most runs stop improving by generation ~3 while
+  searching to 8-17 (confirmatory tail); splitk-32768 collapses at
+  generation 2 with all five copies stalling under patience=1.
+- Accuracy-gate false rejections (the big one): the default accuracy check
+  compares candidates against the kernel's own default-config output with
+  fixed atol=rtol=1e-2. On matmul_split_k (K=32768, fp16) ~85% of
+  candidates — including every split_k>1 config — fail at ~30 of 4096
+  elements, always the same near-zero elements at the same magnitudes:
+  legitimate accumulation-order noise proportional to the global output
+  scale (~N(0,181) here), not element magnitude. fp64 ground-truth check:
+  default config is maxabs 0.24 from truth, split_k=4..32 are 0.4-0.8 —
+  the same numerical class; the gate rejects configs as accurate as its
+  own baseline. The search was structurally confined to split_k=1 in every
+  campaign to date.
+
+## Round-2 prototype arms (env-gated on autotuner-r2)
+
+- HELION_SCALED_ATOL=1 ("acc"): scale the accuracy atol floor by
+  max(1, rms(expected)) per tensor, never tightening. Smoke: splitk search
+  reaches split_k=8 at 0.0215ms vs 0.0380ms baseline-search best (~43%
+  faster), selected config verified against fp64.
+- HELION_AUTOTUNE_POLISH=10 ("polish"): full-neighborhood pattern descent
+  from the incumbent after the main loop (no surrogate pruning), until a
+  round fails to improve. Cheap: most of the neighborhood is already
+  visited (rmsnorm smoke: 26 new evals).
+- HELION_FINAL_INTERLEAVED=1 ("fsel"): paired event-based interleaved
+  timing for the final shortlist shootout instead of unpaired steady
+  windows.
+- HELION_AUTOTUNE_RESTARTS=3 ("hop"): after all copies stall with
+  generation budget left, benchmark 20 radius-2 multi-key kicks of the
+  incumbent and descend from the best kick (basin hopping). Splitk smoke:
+  ran but all kicks failed the (unfixed) accuracy gate — restarts need the
+  acc fix on gate-limited cases.
+- Arm campaign: 5 arms (acc, polish, fsel, hop, all) x 4 seeds x 14 cases,
+  every arm carries the acc fix so non-splitk cases isolate the search
+  changes.
+
+## Round-2 results and ship decision
+
+- Single arms (4 seeds x 14): all four beat baseline on full-14 mean
+  (acc 1.109, polish 1.100, fsel 1.107, hop 1.098 vs baseline 1.194);
+  fsel halves selection regret (1.035 -> 1.014) as predicted by the
+  timing-methodology probe.
+- Bundles (8 seeds x 14): pfa (acc+polish+fsel) 1.077/1.046
+  (full-14/stable-12 means) at 781 evals beats all (=pfa+hop)
+  1.083/1.051 at 888 evals. hop rejected. PatternSearch reference
+  1.228/1.058 at 1538 evals.
+- pfa vs baseline per case (8 seeds): improves or ties 12/14; splitk
+  2.58 -> 1.33, matmul-wide 1.24 -> 1.11, welford 1.14 -> 1.06,
+  crossentropy 1.28 -> 1.19; regressions within noise (attention-4k128
+  +0.7% vs 1.1% floor) or single-seed (softmax one 1.084).
+- Wall time: baseline 295s mean/run, pfa 327s (+11% for +29% evals;
+  parallel compile absorbs most of it), PatternSearch 466s.
+- Ship shape (branch autotuner-r2-ship): scaled atol applies whenever the
+  user didn't pin autotune_baseline_atol (explicit tolerances stay exact),
+  finalist shootout interleaved unless isolated opt-in, polish_rounds=10
+  constructor arg, hop code removed, lfbo_version 3, +2 accuracy unit
+  tests; 343 tests pass.
