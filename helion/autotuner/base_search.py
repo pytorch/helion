@@ -104,6 +104,9 @@ _FINAL_REBENCHMARK_PINNED_TOLERANCE_ENV = (
     "HELION_AUTOTUNE_FINAL_REBENCHMARK_PINNED_TOLERANCE"
 )
 _FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT = 0.0
+# Cute-only: prefer pinned seeds on sub-1% finalist ties (see
+# _final_rebenchmark_pinned_tolerance_default).
+_FINAL_REBENCHMARK_PINNED_TOLERANCE_CUTE = 0.01
 _REBENCHMARK_TARGET_MS_DEFAULT = 200.0
 _REBENCHMARK_INTERLEAVED_REPEAT_MAX = 20_000
 _CUTE_FLASH_CONFIG_GENERATION_POLICY_VERSION = 4
@@ -1887,24 +1890,36 @@ class PopulationBasedSearch(BaseSearch):
             )
             return False
 
+    def _final_rebenchmark_pinned_tolerance_default(self) -> float:
+        backend_name = getattr(getattr(self, "config_spec", None), "backend_name", None)
+        if backend_name == "cute":
+            # Prefer a pinned (seed/default) config when it lands within 1%
+            # of the best generated finalist: seeds are production-measured
+            # configs, and at sub-1% separation the finalist ranking is
+            # within run-to-run measurement noise on a power-capped GPU —
+            # the seed is the lower-variance choice (fp16 6144^3: the seed
+            # replays at 0.991-0.998 vs the returned sibling's 0.976-0.988).
+            return _FINAL_REBENCHMARK_PINNED_TOLERANCE_CUTE
+        return _FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT
+
     def _final_rebenchmark_pinned_tolerance(self) -> float:
         raw = os.getenv(_FINAL_REBENCHMARK_PINNED_TOLERANCE_ENV)
         if raw is None:
-            return _FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT
+            return self._final_rebenchmark_pinned_tolerance_default()
         try:
             tolerance = float(raw)
         except ValueError:
             self.log.warning(
                 f"Ignoring invalid {_FINAL_REBENCHMARK_PINNED_TOLERANCE_ENV}={raw!r}; "
-                f"using {_FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT}."
+                f"using {self._final_rebenchmark_pinned_tolerance_default()}."
             )
-            return _FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT
+            return self._final_rebenchmark_pinned_tolerance_default()
         if not math.isfinite(tolerance) or tolerance < 0:
             self.log.warning(
                 f"Ignoring invalid {_FINAL_REBENCHMARK_PINNED_TOLERANCE_ENV}={raw!r}; "
-                f"using {_FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT}."
+                f"using {self._final_rebenchmark_pinned_tolerance_default()}."
             )
-            return _FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT
+            return self._final_rebenchmark_pinned_tolerance_default()
         return tolerance
 
     @staticmethod
