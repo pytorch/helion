@@ -715,28 +715,3 @@ def tcgen05_grouped_worklist_smem_bytes(
         c_stages=c_stages,
     )
     return _append_aligned_tcgen05_smem(offset, c_smem_bytes, 1024)
-
-
-def tcgen05_l2_grouping_cluster_consistent(
-    *,
-    l2_grouping: int,
-    num_pid_m: int,
-    num_pid_n: int,
-    cluster_n: int,
-) -> bool:
-    """Whether Helion's l2_groupings remap preserves cluster-N peer pairing.
-
-    The CUTLASS persistent scheduler hands the two cluster-N peers the same
-    tile_m and adjacent tile_n, i.e. linear tile ids exactly ``num_pid_m``
-    apart. Helion's grouped decode permutes the flat id space in rows of
-    ``l2_grouping * num_pid_n``; a pair stays consistent (same decoded
-    tile_m) only when every pair sits inside one row —
-    ``cluster_n * num_pid_m`` must divide the row length — and the last
-    group must not shrink (``l2_grouping`` divides ``num_pid_m``).
-    """
-    if cluster_n <= 1 or l2_grouping <= 1:
-        return True
-    effective_group = min(l2_grouping, num_pid_m)
-    if num_pid_m % effective_group != 0:
-        return False
-    return (effective_group * num_pid_n) % (cluster_n * num_pid_m) == 0
