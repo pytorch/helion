@@ -15,6 +15,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from contextlib import suppress
 import contextvars
+import ctypes
 from dataclasses import dataclass
 from dataclasses import field
 import hashlib
@@ -25,6 +26,7 @@ import linecache
 import logging
 import os
 import sys
+import threading
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Literal
@@ -4434,8 +4436,6 @@ class _CuteFastRelaunch:
         last_raw: int,
         keepalive: tuple[object, ...],
     ) -> None:
-        import threading
-
         self.executor = executor
         self.exe_args = exe_args
         self.tensor_guards = tensor_guards
@@ -4538,8 +4538,6 @@ def _cute_build_fast_relaunch(
     launch: _CuteLaunchArgCacheEntry,
     compiled: object,
 ) -> _CuteFastRelaunch | None:
-    import ctypes
-
     if not isinstance(compiled, _CompiledCuteLauncher):
         return None
     dsl_fn = cast("Any", compiled)._compiled
@@ -4620,7 +4618,12 @@ def _cute_build_fast_relaunch(
         stable = [a == b for a, b in zip(n1, n2, strict=True)]
 
         def deref(addr: object) -> int | None:
-            if isinstance(addr, int) and addr > 0xFFFF:
+            # Only dereference values that plausibly ARE host heap
+            # addresses (ctypes cell storage): 8-aligned and above the
+            # low canonical range.  Large by-value integers (e.g. tensor
+            # extents) must never be dereferenced — from_address on a
+            # non-address segfaults uncatchably.
+            if isinstance(addr, int) and addr > (1 << 40) and addr % 8 == 0:
                 return int(ctypes.c_uint64.from_address(addr).value)
             return None
 
@@ -4685,6 +4688,10 @@ def _cute_build_fast_relaunch(
             for i, (a, b) in enumerate(zip(n1, n3, strict=True))
             if stable[i] and a != b
         ]
+        # The wrapper takes ONE stream parameter; its handle can surface in
+        # at most a couple of exe slots (a by-value copy plus a by-ref
+        # cell).  More differing slots means the marshalling isn't the
+        # shape we probe-verified — fall back.
         if not slots or len(slots) > 2:
             return None
         by_ref_writers: list[object] = []
@@ -4697,15 +4704,8 @@ def _cute_build_fast_relaunch(
             # By-reference: the slot holds the address of an 8-byte cell
             # containing the handle.  Verify BOTH probes' cells before
             # trusting the address.
-            if (
-                isinstance(a, int)
-                and isinstance(b, int)
-                and a > 0xFFFF
-                and b > 0xFFFF
-                and ctypes.c_uint64.from_address(a).value == raw0
-                and ctypes.c_uint64.from_address(b).value == alt_raw
-            ):
-                by_ref_writers.append(ctypes.c_uint64.from_address(a))
+            if deref(a) == raw0 and deref(b) == alt_raw:
+                by_ref_writers.append(ctypes.c_uint64.from_address(cast("int", a)))
                 continue
             return None
 
