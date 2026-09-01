@@ -61,6 +61,10 @@ class ArbitrarySlicePattern(IndexingPattern):
     slice: slice
 
 
+def _is_full_slice(idx: slice) -> bool:
+    return idx.start is None and idx.stop is None and idx.step in (None, 1)
+
+
 @dataclass
 class ArbitraryIndexPattern(IndexingPattern):
     index: int | torch.SymInt | object | None
@@ -93,10 +97,12 @@ class DimensionTiling:
 
     can_tile: whether or not we can tile this dimension
     block_ids: which which block_ids we are indexing this dimension (there can be multiple, in which case we mustn't tile)
+    needs_full_slice: whether this dimension is also read as a full slice
     """
 
     can_tile: bool = True
     block_ids: list[int] = field(default_factory=list)
+    needs_full_slice: bool = False
 
 
 REMOTE_SRC_INDEXING_PATTERNS = "pallas_remote_src_indexing_patterns"
@@ -776,6 +782,13 @@ def _update_tiling_decision(
                 # we already need to tile this dim using a different block_id
                 # so fallback to no-tiling so that we can access using both tiles
                 _disallow_tiling()
+        if curr_dim_tiling.needs_full_slice:
+            _disallow_tiling()
+
+    def _record_full_slice() -> None:
+        curr_dim_tiling.needs_full_slice = True
+        if curr_dim_tiling.block_ids:
+            _disallow_tiling()
 
     if isinstance(pattern, TilePattern):
         _try_set_tiling_block_id(pattern.block_id)
@@ -794,8 +807,10 @@ def _update_tiling_decision(
                 _disallow_tiling()
 
     elif isinstance(pattern, ArbitrarySlicePattern):
-        if pattern.slice != slice(None):
-            # bounded slice: fixed subrange of the dim, must stay untiled
+        if _is_full_slice(pattern.slice):
+            _record_full_slice()
+        else:
+            # A bounded slice is a fixed subrange of the dim and stays untiled.
             _disallow_tiling()
 
     elif isinstance(
@@ -813,7 +828,7 @@ def _update_tiling_decision(
             from ..compile_environment import CompileEnvironment
 
             backend = CompileEnvironment.current().backend
-            from helion._compiler.backend import PallasBackend
+            from helion._compiler.pallas.backend import PallasBackend
 
             assert isinstance(backend, PallasBackend)
 
