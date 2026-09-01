@@ -642,6 +642,84 @@ def _classify_loop_tensors(
     return loaded_tensors, stored_tensors
 
 
+def _scalar_address_expr(
+    value: object,
+    *,
+    state: CodegenState,
+    captured_exprs: dict[torch.fx.Node, str],
+) -> str | None:
+    """Render a scalar HBM address captured by an inner device loop."""
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, torch.SymInt):
+        return state.device_function.literal_expr(value)
+    if not isinstance(value, torch.fx.Node):
+        return None
+    if value.op == "placeholder":
+        return captured_exprs.get(value)
+    if value.op != "call_function":
+        return None
+    if value.target is _new_var and value.args:
+        return _scalar_address_expr(
+            value.args[0], state=state, captured_exprs=captured_exprs
+        )
+
+    from ...language import memory_ops
+
+    if value.target is memory_ops.load:
+        tensor_node, subscript = value.args[:2]
+        if not isinstance(tensor_node, torch.fx.Node):
+            return None
+        tensor = tensor_node.meta.get("val")
+        if not isinstance(tensor, torch.Tensor):
+            return None
+        if not isinstance(subscript, (list, tuple)) or len(subscript) != 1:
+            return None
+        index = _scalar_address_expr(
+            subscript[0], state=state, captured_exprs=captured_exprs
+        )
+        if index is None:
+            return None
+        name = state.device_function.tensor_arg(tensor).name
+        return f"{name}[{index}]"
+
+    binary_operators = {
+        operator.add: "+",
+        operator.floordiv: "//",
+        operator.mod: "%",
+        operator.mul: "*",
+        operator.sub: "-",
+        torch.ops.aten.add.Scalar: "+",
+        torch.ops.aten.add.Tensor: "+",
+        torch.ops.aten.mul.Scalar: "*",
+        torch.ops.aten.mul.Tensor: "*",
+        torch.ops.aten.sub.Scalar: "-",
+        torch.ops.aten.sub.Tensor: "-",
+    }
+    if value.target not in binary_operators or len(value.args) < 2:
+        return None
+    if (
+        value.target
+        in (
+            torch.ops.aten.add.Scalar,
+            torch.ops.aten.add.Tensor,
+            torch.ops.aten.sub.Scalar,
+            torch.ops.aten.sub.Tensor,
+        )
+        and value.kwargs.get("alpha", 1) != 1
+    ):
+        return None
+    lhs = _scalar_address_expr(
+        value.args[0], state=state, captured_exprs=captured_exprs
+    )
+    rhs = _scalar_address_expr(
+        value.args[1], state=state, captured_exprs=captured_exprs
+    )
+    if lhs is None or rhs is None:
+        return None
+    return f"({lhs}) {binary_operators[value.target]} ({rhs})"
+
+
 def _dma_plan_for_node(node: torch.fx.Node) -> DmaAccessPlan | None:
     from .tensorcore_plan import TENSORCORE_PLAN_META
 
@@ -3609,6 +3687,22 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
     grid_parts, block_size_vars = _compute_grid_and_block_sizes(state, block_ids, env)
 
     loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
+    placeholders = list(graph_info.graph.find_nodes(op="placeholder"))
+    placeholder_exprs = {
+        placeholder: ast.unparse(arg)
+        for placeholder, arg in zip(placeholders, args, strict=True)
+    }
+    scalar_index_nodes: dict[int, torch.fx.Node] = {}
+    for _fake, load_node, _subscript in loaded_tensors.values():
+        load_indices = load_node.args[1]
+        if not isinstance(load_indices, (list, tuple)):
+            continue
+        for index_node in load_indices:
+            if not isinstance(index_node, torch.fx.Node):
+                continue
+            index_value = index_node.meta.get("val")
+            if isinstance(index_value, torch.Tensor) and index_value.ndim == 0:
+                scalar_index_nodes[id(index_value)] = index_node
     contiguous_ranges = _contiguous_range_patterns(loaded_tensors)
     begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
         state, block_ids, block_size_vars
@@ -4088,7 +4182,17 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
                 from helion._utils import is_scalar_index
 
                 if is_scalar_index(idx_meta):
-                    offset_expr = state.device_function.literal_expr(idx_meta)
+                    offset_expr = None
+                    if isinstance(idx_meta, torch.Tensor):
+                        index_node = scalar_index_nodes.get(id(idx_meta))
+                        if index_node is not None:
+                            offset_expr = _scalar_address_expr(
+                                index_node,
+                                state=state,
+                                captured_exprs=placeholder_exprs,
+                            )
+                    if offset_expr is None:
+                        offset_expr = state.device_function.literal_expr(idx_meta)
                     hbm_parts.append(
                         offset_expr if resident_source else f"pl.ds({offset_expr}, 1)"
                     )

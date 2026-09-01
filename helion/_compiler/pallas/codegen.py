@@ -753,10 +753,19 @@ def _generated_index_code(
         )
 
     if isinstance(pattern, TensorIndexPattern):
+        # A surrounding DMA loop has already selected this scalar-addressed
+        # HBM window. Index the staged VMEM window at its local scalar slot
+        # instead of applying the global scalar address a second time.
+        if in_pipeline and pipeline_scalar_indices_local and pattern.index_ndim == 0:
+            return "0"
         if tensor_indices_are_scalars:
             return _index_expr_from_ast(state, subscript_index, ast_subscripts)
         if pattern.index_ndim == 0:
             assert isinstance(idx, torch.Tensor)
+            from helion._compiler.host_function import HostFunction
+
+            if idx not in HostFunction.current().tensor_to_origin:
+                return _index_expr_from_ast(state, subscript_index, ast_subscripts)
             scalar_arg = state.device_function.tensor_arg(idx)
             return f"{scalar_arg.name}[0]"
         from helion._compiler.pallas.tensorcore_plan import TENSORCORE_PLAN_META

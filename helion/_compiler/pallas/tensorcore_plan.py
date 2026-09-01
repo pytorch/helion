@@ -161,6 +161,16 @@ def build_dma_access_spec(
         not isinstance(index_access, MemoryAccess)
         or index_access.node is not index_node
     ):
+        from ...language import memory_ops
+
+        # Indirect DMA planning requires a vector metadata load. A scalar
+        # computed inside the device program is a direct Ref address instead.
+        if (
+            index_node.op != "call_function"
+            or index_node.target is not memory_ops.load
+            or len(index_node.args) < 2
+        ):
+            return None
         index_access = build_pallas_memory_access(index_node)
     index = memory_access_value(index_access)
     if (
