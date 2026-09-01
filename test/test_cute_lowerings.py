@@ -11038,6 +11038,204 @@ class TestCuteLowerings(unittest.TestCase):
                 expected = args[0] @ args[1]
                 torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
+    def test_tcgen05_m_pair_tiles_runtime_correctness(self) -> None:
+        """block_m=512 M-paired tiles (nvjet's B-reuse design).
+
+        Two 256-row CtaGroup.TWO UMMA subtiles share each K stage's B
+        buffer; the two TMEM acc stages hold the pair's accumulators and
+        the epilogue drains both subtiles per work tile. Covers CLC and
+        static persistence, bf16/fp16, an l2-grouped raster, and the
+        deep-AB bk=64 shape.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_m_pair(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        cases = [
+            # (m, n, k, dtype, l2g, bk, ab, persistence, strategy, sched)
+            (
+                2048,
+                1024,
+                512,
+                torch.float16,
+                2,
+                128,
+                2,
+                "clc_persistent",
+                "role_local_with_scheduler",
+                1,
+            ),
+            (
+                2048,
+                1024,
+                512,
+                torch.bfloat16,
+                1,
+                128,
+                2,
+                "static_persistent",
+                "role_local_monolithic",
+                0,
+            ),
+            (
+                1024,
+                512,
+                256,
+                torch.float16,
+                1,
+                64,
+                4,
+                "clc_persistent",
+                "role_local_with_scheduler",
+                1,
+            ),
+        ]
+        for m, n, k, dtype, l2g, bk, ab, persistence, strategy, sched in cases:
+            with self.subTest(
+                m=m,
+                n=n,
+                k=k,
+                dtype=str(dtype),
+                l2g=l2g,
+                bk=bk,
+                persistence=persistence,
+            ):
+                args = (
+                    torch.randn(m, k, device=DEVICE, dtype=dtype),
+                    torch.randn(k, n, device=DEVICE, dtype=dtype),
+                )
+                with patch_cute_mma_support():
+                    bound = cute_matmul_m_pair.bind(args)
+                    bound.env.config_spec.cute_tcgen05_search_enabled = True
+                    cfg = _make_tcgen05_persistent_config(
+                        block_sizes=[512, 256, bk],
+                        l2_groupings=[l2g],
+                        pid_type="persistent_interleaved",
+                        tcgen05_cluster_m=2,
+                        tcgen05_cluster_n=1,
+                        tcgen05_ab_stages=ab,
+                        tcgen05_acc_stages=2,
+                        tcgen05_c_stages=2,
+                        tcgen05_persistence_model=persistence,
+                        tcgen05_strategy=strategy,
+                        tcgen05_warp_spec_scheduler_warps=sched,
+                    )
+                    bound.set_config(cfg)
+                    out = bound(*args)
+                expected = args[0] @ args[1]
+                torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_m_pair_tiles_codegen_markers(self) -> None:
+        """block_m=512 emits the dual-A / dual-acc / paired-epilogue shape."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_m_pair_markers(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(2048, 512, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(512, 1024, device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_m_pair_markers.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[512, 256, 128],
+                l2_groupings=[1],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_cluster_n=1,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+                tcgen05_persistence_model="clc_persistent",
+                tcgen05_strategy="role_local_with_scheduler",
+                tcgen05_warp_spec_scheduler_warps=1,
+            )
+            code = bound.to_triton_code(cfg)
+        # Dual A staging + fragment, per-K-stage dual copy, dual acc state,
+        # and the two-subtile epilogue loop.
+        self.assertIn("tcgen05_msub_sA", code)
+        self.assertIn("tcgen05_msub_tCrA", code)
+        self.assertIn("tcgen05_msub_acc_producer_state", code)
+        self.assertIn("for _tcgen05_msub in cutlass.range(2, unroll_full=True):", code)
+        self.assertEqual(code.count("cute.copy(tma_atom_a"), 6)
+
+    def test_tcgen05_m_pair_tiles_rejects_ineligible(self) -> None:
+        """block_m=512 outside the plain full-tile static family raises."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_m_pair_reject(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        # M=1280 is not divisible by 512: the pair grid would need a partial
+        # pair, which the M-paired family does not support.
+        args = (
+            torch.randn(1280, 512, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(512, 1024, device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_persistent_config(
+            block_sizes=[512, 256, 128],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_persistence_model="clc_persistent",
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_m_pair_reject.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(exc.BackendUnsupported, "M-paired tiles"):
+                bound.to_triton_code(cfg)
+
     def test_tcgen05_clc_cluster_n2_codegen_broadcast_markers(self) -> None:
         """CLC 4-CTA broadcast codegen pins.
 
