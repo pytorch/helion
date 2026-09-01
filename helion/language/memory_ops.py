@@ -866,15 +866,16 @@ def _cute_lane_axis_pos(strategy: object, block_id: int, index_exprs: list[str])
 
 
 def _cute_unroll_vec_load_expr(
-    ptr_expr: str, dtype: torch.dtype, vec_width: int
+    ptr_expr: str, dtype: torch.dtype, vec_width: int, eviction_suffix: str = ""
 ) -> str:
     """Build the ``cute.arch.load(...)`` RHS for an unroll-mode hoist."""
     if _cute_is_byte_packed(dtype):
         pack = _cute_unroll_vec_elem_type(dtype, vec_width)
-        return f"cute.arch.load({ptr_expr}, {pack})"
+        return f"cute.arch.load({ptr_expr}, {pack}{eviction_suffix})"
     return (
         f"cute.arch.load({ptr_expr}, "
-        f"ir.VectorType.get([{vec_width}], cutlass.Uint16.mlir_type))"
+        f"ir.VectorType.get([{vec_width}], cutlass.Uint16.mlir_type)"
+        f"{eviction_suffix})"
     )
 
 
@@ -1052,6 +1053,7 @@ def _cute_register_tile_unroll_vec_hoist(
     tensor_name: str,
     index_exprs: list[str],
     vec_width: int,
+    eviction_suffix: str = "",
 ) -> str:
     """Tile-loop variant of ``_cute_register_unroll_vec_hoist`` for
     ``PerThreadNDTileStrategy`` lane loops.
@@ -1143,7 +1145,7 @@ def _cute_register_tile_unroll_vec_hoist(
                 f"else {anchor_ptr_expr})"
             )
         hoist_stmt = statement_from_string(
-            f"{hoist_var} = {_cute_unroll_vec_load_expr(guarded_ptr, tensor.dtype, vec_width)}"
+            f"{hoist_var} = {_cute_unroll_vec_load_expr(guarded_ptr, tensor.dtype, vec_width, eviction_suffix)}"
         )
         # Insert the hoist just BEFORE the constexpr V-loop.
         lane_body.insert(

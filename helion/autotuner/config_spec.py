@@ -922,6 +922,12 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
 def get_valid_eviction_policies(backend_name: str) -> tuple[str, ...]:
     if backend_name == "triton" and not supports_amd_cdna_tunables():
         return ("", "first", "last")
+    if backend_name == "cute":
+        # Lowered to ld.global L1 eviction hints
+        # (level1_eviction_priority=evict_first/evict_last) on the
+        # vectorized load sites.  Pays off for reload-from-gmem sweeps
+        # (keep re-read rows resident, evict on the final pass).
+        return ("", "first", "last")
     return ("",)
 
 
@@ -3248,6 +3254,14 @@ class ConfigSpec:
                     and len(self.reduction_loops) > 0
                 ):
                     fields["reduction_loops"] = self.reduction_loops
+                # Per-load-site L1 eviction hints (streamed rows want
+                # evict_first; re-read rows want evict_last until the
+                # final sweep).
+                if (
+                    self.supports_config_key("load_eviction_policies")
+                    and self.load_eviction_policies.length > 0
+                ):
+                    fields["load_eviction_policies"] = self.load_eviction_policies
                 # Universal pid emission honors ``loop_orders`` and the
                 # better order is shape-dependent. tcgen05 exposes the same
                 # field from CuteTcgen05Config.flat_fields().

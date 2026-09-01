@@ -11260,8 +11260,10 @@ class TestCuteAutotuner(TestCase):
         }
         # ``loop_orders`` is exposed for the CuTe non-tcgen05 search
         # surface. ``cute_vector_widths`` is the per-axis vec width slot
-        # registered for non-reduction tile blocks. The set still excludes
-        # Triton-style knobs that the CuTe path does not consume.
+        # registered for non-reduction tile blocks.
+        # ``load_eviction_policies`` carries per-load-site L1 eviction
+        # hints (lowered on the vectorized load forms). The set still
+        # excludes Triton-style knobs that the CuTe path does not consume.
         self.assertEqual(
             flat_keys,
             {
@@ -11272,6 +11274,7 @@ class TestCuteAutotuner(TestCase):
                 "cute_lane_layouts",
                 "cute_cluster_n",
                 "cute_min_blocks_per_mp",
+                "load_eviction_policies",
             },
         )
 
@@ -11294,6 +11297,7 @@ class TestCuteAutotuner(TestCase):
                     "cute_lane_layouts",
                     "cute_cluster_n",
                     "cute_min_blocks_per_mp",
+                    "load_eviction_policies",
                 },
             )
             self.assertNotIn("persistent", config.pid_type)
