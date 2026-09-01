@@ -70,7 +70,9 @@ from .fragment_epilogue import analyze_tcgen05_fragment_epilogue_plan
 from .layout import MatmulExecutionKind
 from .layout import MatmulExecutionPlan
 from .matmul_utils import analyze_direct_grouped_n_loads
+from .mma_support import cute_fp32_dot_uses_tf32
 from .mma_support import get_cute_mma_support
+from .mma_support import tcgen05_supports_input_dtype
 from .strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
 from .strategies import TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES
 from .strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
@@ -152,6 +154,7 @@ from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
 from .tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
+from .tcgen05_constants import tcgen05_l2_grouping_cluster_consistent
 from .tcgen05_lifecycle import Tcgen05LifecycleContext
 from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
@@ -4522,6 +4525,14 @@ def prepare_cute_collective_lane_loop_suppression(
                 != "tcgen05"
             ):
                 continue
+            if lhs_fake.dtype == torch.float32 and _tcgen05_fp32_lowering_blocked(
+                cg,
+                node,
+                lhs_operand=lhs_operand,
+                rhs_operand=rhs_operand,
+                config=cg.device_function.config,
+            ):
+                continue
             if analysis.has_leading_passthrough and not _mma_tiles_are_static_full(
                 analysis, bm=bm, bn=bn, bk=bk
             ):
@@ -4768,6 +4779,14 @@ def prepare_cute_collective_lane_loop_suppression(
                 defer_grouped_worklist_smem_check=worklist_profile is not None,
             )
             != "tcgen05"
+        ):
+            continue
+        if lhs_fake.dtype == torch.float32 and _tcgen05_fp32_lowering_blocked(
+            cg,
+            node,
+            lhs_operand=lhs_info,
+            rhs_operand=rhs_info,
+            config=cg.device_function.config,
         ):
             continue
         if not _operand_infos_exclusive_for_mma(lhs_info, rhs_info, node):
@@ -5858,6 +5877,53 @@ def _analyze_mma_output_stores(
     )
 
 
+def _tcgen05_fp32_lowering_blocked(
+    cg: GenerateAST,
+    node: Node,
+    *,
+    lhs_operand: _MmaOperandInfo,
+    rhs_operand: _MmaOperandInfo,
+    config: object,
+) -> bool:
+    """Whether an fp32 (tf32) matmul must keep the exact universal lowering.
+
+    fp32 reaches tcgen05 only through the TMA AB pipeline (the descriptors
+    recast Float32 -> TFloat32 via ``internal_type``; the SIMT-staged AB path
+    has no such recast), only when every consuming store chain is on the
+    fused-epilogue splice whitelist (the tcgen05 grid does not bind the
+    per-block-id index/mask vars the SIMT store fallback needs, so a rejected
+    chain is otherwise a hard ``BackendUnsupported``), and only when the config
+    does not request ``epilogue_subtile`` (the splice emits exactly one store
+    per output tile). Everything blocked here keeps the exact universal (SIMT)
+    lowering fp32 matmuls used before the tf32 path existed; 16-bit/fp8 keep
+    their historical loud-failure behavior.
+
+    Called by both ``prepare_cute_collective_lane_loop_suppression`` and
+    ``_emit_mma_pipeline`` — the two must agree, otherwise suppression would
+    drop the index/mask definitions the universal fallback needs (see the
+    mirror-bailout comment in the suppression planner).
+    """
+    if not (
+        lhs_operand.matrix_major == "row" and rhs_operand.matrix_major in ("row", "col")
+    ):
+        return True
+    # Batched (leading-passthrough) and grouped/worklist/rank-3 forms are
+    # validated 16-bit/fp8 families only.
+    if (
+        lhs_operand.is_leading_passthrough
+        or rhs_operand.is_leading_passthrough
+        or rhs_operand.rhs_rank3_grouped_nt
+        or rhs_operand.rhs_segment_group is not None
+        or rhs_operand.rhs_packed_group is not None
+        or _tcgen05_grouped_mode(cast("_ConfigLike", config)) is not None
+    ):
+        return True
+    subtile = cast("_ConfigLike", config).get("epilogue_subtile")
+    if subtile is not None and (isinstance(subtile, bool) or subtile != 1):
+        return True
+    return analyze_tcgen05_matmul_store_chains(cg.codegen_graphs, node) is None
+
+
 def _rank3_rhs_worklist_store_info(
     cg: GenerateAST,
     mma_node: Node,
@@ -6564,7 +6630,7 @@ def _emit_mma_pipeline(
         torch.float16,
         torch.bfloat16,
         torch.float8_e4m3fn,
-    )
+    ) or (input_dtype == torch.float32 and cute_fp32_dot_uses_tf32())
     _lhs_major = lhs_operand.matrix_major
     _rhs_major = rhs_operand.matrix_major
     # A must be row-major (M,K) K-contiguous == "row"; the K-major A SMEM
@@ -6895,6 +6961,41 @@ def _emit_mma_pipeline(
         input_device=lhs_fake.device,
         defer_grouped_worklist_smem_check=worklist_profile is not None,
     )
+    if mma_impl == "tcgen05" and input_dtype == torch.float32:
+        # fp32 operands run the tcgen05 MMA as tf32 (permitted by
+        # settings.dot_precision, checked in _mma_impl_matches_problem_shape).
+        # GMEM tensors stay Float32; the TMA descriptors recast to TFloat32 via
+        # internal_type (see the launcher's tcgen05_ab_tma emission), so the
+        # SMEM staging, tiled MMA, and layout plan all use TFloat32. The
+        # SIMT-staged (non-TMA) AB path would load Float32 into TFloat32 SMEM
+        # without that recast, so it stays unsupported for fp32; such kernels
+        # keep the exact universal lowering fp32 used before the tf32 path
+        # (the suppression planner applies the same gate, so no root lane
+        # loops were suppressed for a demoted config).
+        fp32_blocked = (
+            not tcgen05_use_tma_pipeline
+            or fx_node is None
+            or _tcgen05_fp32_lowering_blocked(
+                cg,
+                fx_node,
+                lhs_operand=lhs_operand,
+                rhs_operand=rhs_operand,
+                config=df.config,
+            )
+        )
+        if fp32_blocked:
+            if (
+                os.environ.get("HELION_CUTE_MMA_IMPL", "auto").strip().lower()
+                == "tcgen05"
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "fp32 (tf32) tcgen05 matmul requires TMA-eligible A/B "
+                    "layouts and whitelisted fused-epilogue store chains",
+                )
+            mma_impl = "universal"
+        else:
+            input_dtype_str = "cutlass.TFloat32"
     if (
         mma_impl == "tcgen05"
         and fx_node is not None
@@ -7046,7 +7147,7 @@ def _emit_mma_pipeline(
         and tcgen05_use_tma_pipeline
         and tcgen05_pid_is_persistent
         and tcgen05_cluster_m == 2
-        and tcgen05_cluster_n_requested == 1
+        and tcgen05_cluster_n_requested in (1, 2)
         and tcgen05_requested_two_cta
         and tcgen05_double_edge_output
         and (k_total_size % bk == 0 or tcgen05_has_k_tail)
@@ -7088,7 +7189,7 @@ def _emit_mma_pipeline(
         and tcgen05_use_tma_pipeline
         and tcgen05_pid_is_persistent
         and tcgen05_cluster_m == 2
-        and tcgen05_cluster_n_requested == 1
+        and tcgen05_cluster_n_requested in (1, 2)
         and tcgen05_requested_two_cta
         and tcgen05_k_tail_only
     )
@@ -7097,7 +7198,7 @@ def _emit_mma_pipeline(
         and tcgen05_use_tma_pipeline
         and tcgen05_pid_is_persistent
         and tcgen05_cluster_m == 2
-        and tcgen05_cluster_n_requested == 1
+        and tcgen05_cluster_n_requested in (1, 2)
         and tcgen05_requested_two_cta
         and m_size % bm != 0
         and n_size % bn == 0
@@ -7191,19 +7292,39 @@ def _emit_mma_pipeline(
         tcgen05_cluster_n = 1
     else:
         tcgen05_cluster_n = tcgen05_cluster_n_requested
+    if tcgen05_cluster_n > 1 and not tcgen05_l2_grouping_cluster_consistent(
+        l2_grouping=_l2_grouping_value(df.config),
+        num_pid_m=(m_size + bm - 1) // bm,
+        num_pid_n=(n_size + bn - 1) // bn,
+        cluster_n=tcgen05_cluster_n,
+    ):
+        # Helion's l2_groupings remap permutes the linear tile index per-CTA
+        # without cluster awareness: the two cluster-N peers (vpids exactly
+        # num_pid_m apart) can decode DIFFERENT tile_m, and the A multicast
+        # then fills each peer's SMEM half with the wrong A tile (silent
+        # corruption, max rel err ~1.4). Reject the config unless the remap
+        # provably keeps every N-pair inside one L2 group row.
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05_cluster_n=2 with this l2_grouping/grid combination breaks "
+            "the cluster-N peer pairing that the A multicast requires "
+            "(cluster_n * num_pid_m must divide l2_grouping * num_pid_n, and "
+            "l2_grouping must divide num_pid_m). Use l2_groupings=[1] or "
+            "tcgen05_cluster_n=1 for this shape.",
+        )
     tcgen05_role_local_k_tail_tma = (
         tcgen05_preserve_tma_for_two_cta_k_tail
         and tcgen05_is_two_cta
-        and tcgen05_cluster_n == 1
+        and tcgen05_cluster_n in (1, 2)
     )
     # Mirror the K-tail role-local guard so later cluster demotion or
     # cluster_n enablement cannot silently admit unvalidated edge ownership.
     tcgen05_role_local_m_edge_tma = (
-        tcgen05_m_edge_only and tcgen05_is_two_cta and tcgen05_cluster_n == 1
+        tcgen05_m_edge_only and tcgen05_is_two_cta and tcgen05_cluster_n in (1, 2)
     )
     tcgen05_role_local_n_edge_tma = tcgen05_n_edge_only and tcgen05_cluster_n == 1
     tcgen05_role_local_double_edge_tma = (
-        tcgen05_double_edge_tma and tcgen05_is_two_cta and tcgen05_cluster_n == 1
+        tcgen05_double_edge_tma and tcgen05_is_two_cta and tcgen05_cluster_n in (1, 2)
     )
     tcgen05_role_local_uses_k_tail_tma = tcgen05_role_local_k_tail_tma or (
         tcgen05_role_local_double_edge_tma and tcgen05_has_k_tail
@@ -7293,8 +7414,36 @@ def _emit_mma_pipeline(
         if tcgen05_use_pure_matmul_role_lifecycle
         else "cutlass.pipeline"
     )
+    # The role-local CtaGroup.TWO edge/K-tail families keep every
+    # per-iteration K-loop predicate the slow path would emit constant-true:
+    # the persistent scheduler only publishes in-grid tiles (a tile origin is
+    # always < the problem extent, so the M/N-edge "issue TMA over the partial
+    # stripe" predicates always hold), the K loop runs ceil(K/bk) iterations
+    # so every k_tile start is in range, and partial A/B stripes plus the K
+    # tail are TMA boxes that clamp against the descriptor's true extents and
+    # zero-fill SMEM (zeros accumulate as no-ops through the MMA). Take the
+    # predicate-free fast path (hoisted V-leader gate, unguarded pipeline
+    # waits/releases) instead of paying the per-iteration branch tax on every
+    # tile; the store-side full-tile/fringe split is governed separately by
+    # the TMA-store epilogue flags.
+    # Aux kernels stay on the predicated slow path: their guarded epilogue
+    # aux loads and the aux-TMA hybrid store protocol were validated with the
+    # per-iteration predicates present (removing them deadlocks the aux edge
+    # hybrid TMA-store runtime test), and only plain kernels were measured.
     tcgen05_static_full_tma_fast_path = (
-        tcgen05_static_full_tiles
+        (
+            tcgen05_static_full_tiles
+            or (
+                tcgen05_is_two_cta
+                and not env.config_spec.cute_tcgen05_aux_kernel_detected
+                and (
+                    tcgen05_role_local_k_tail_tma
+                    or tcgen05_role_local_m_edge_tma
+                    or tcgen05_role_local_n_edge_tma
+                    or tcgen05_role_local_double_edge_tma
+                )
+            )
+        )
         and tcgen05_use_tma_pipeline
         and not tcgen05_grouped_static_persistent_requested
     )
@@ -7435,8 +7584,24 @@ def _emit_mma_pipeline(
     tcgen05_acc_stage_count_value = _tcgen05_config_int(
         df.config, "tcgen05_acc_stages", _tcgen05_acc_stage_count(tcgen05_mma_bn)
     )
+    # Budget-driven admission for the output-edge TMA-store epilogue's extra
+    # C ring: the flat <=2 AB-stage cap was calibrated for the residual
+    # (source-C) family's (128, 64) epilogue tile; plain kernels stage a
+    # (128, 32) tile whose ring fits comfortably next to a 3-stage AB
+    # pipeline, and a deeper AB pipeline is worth ~15-25% on edge shapes.
+    # ``c_stages_fits`` fails CLOSED (False without a recorded budget), so
+    # keep the legacy cap as the fallback admission.
     tcgen05_output_edge_tma_store_fits_smem = (
         tcgen05_ab_stage_count_value <= TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
+        or env.config_spec._cute_tcgen05_config.c_stages_fits(
+            bm=tcgen05_source_bm,
+            bn=tcgen05_source_bn,
+            bk=bk,
+            cluster_m=tcgen05_cluster_m,
+            ab_stages=tcgen05_ab_stage_count_value,
+            c_stages=tcgen05_c_stage_count_value,
+            has_source_c=True,
+        )
     )
     # ``tcgen05_is_two_cta`` below gates only the hybrid output-store protocol,
     # not role-local edge-TMA input loading. The mixed full-tile TMA-store plus
@@ -9025,16 +9190,26 @@ def _emit_mma_pipeline(
         )
         # CuTe's TMA descriptor bounds checks correctly suppress partial M/N
         # output stores for the admitted aux-TMA output-edge family, so keep
-        # those edge tiles on the same TMA-store path as full tiles. Kernels
-        # without a productive aux-TMA body keep the original predicated
+        # those edge tiles on the same TMA-store path as full tiles. The same
+        # holds for epilogues with no aux GMEM operands at all (plain store of
+        # the accumulator, possibly through thread-local transforms): with
+        # nothing to read out of bounds, the D descriptor's clamping is the
+        # complete edge story and every tile can take the TMA-store path
+        # instead of draining fringe tiles through the predicated SIMT store.
+        # Kernels with unstaged aux operands keep the original predicated
         # full-tile/edge split.
         tcgen05_partial_output_tma_store = (
             tcgen05_use_tma_store_epilogue
             and tcgen05_use_output_edge_tma_store_for_full_tiles
             and not tcgen05_static_output_tiles
-            and df.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
-            == TCGEN05_AUX_LOAD_MODE_TMA
-            and aux_tma_productive_body_gate_open
+            and (
+                (
+                    df.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                    == TCGEN05_AUX_LOAD_MODE_TMA
+                    and aux_tma_productive_body_gate_open
+                )
+                or not aux_tensor_descriptors_value
+            )
         )
         tcgen05_tma_store_full_tiles_only = tcgen05_tma_store_full_tiles_only_for(
             tcgen05_partial_output_tma_store
@@ -12340,6 +12515,15 @@ def _tcgen05_use_2cta_instrs(
     return bm == 128 and is_fp8
 
 
+def _l2_grouping_value(config: object) -> int:
+    groupings = getattr(config, "config", config)
+    if isinstance(groupings, dict):
+        groupings = groupings.get("l2_groupings")
+    if isinstance(groupings, list) and groupings and isinstance(groupings[0], int):
+        return groupings[0]
+    return 1
+
+
 def _tcgen05_epi_warp_count(
     warp_spec: Tcgen05WarpSpec, *, cta_thread_count: int
 ) -> int:
@@ -12384,10 +12568,18 @@ def _mma_impl_matches_problem_shape(
     if mma_impl == "universal":
         return True
     is_fp8 = input_dtype == torch.float8_e4m3fn
-    min_n = 16 if is_fp8 else 8
+    is_tf32 = input_dtype == torch.float32 and cute_fp32_dot_uses_tf32()
+    # tf32 needs bn >= 32: the (128, 8|16) tf32 epilogue corrupts inside the
+    # CUTLASS tmem/epilogue-tile helpers (bn is power-of-two constrained, so
+    # 32 closes the whole unsafe set); narrower fp32 tiles keep the exact
+    # universal/SIMT lowering.
+    min_n = 16 if is_fp8 else (32 if is_tf32 else 8)
     n_multiple = 16 if is_fp8 else 8
     if (
-        input_dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+        (
+            input_dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+            and not is_tf32
+        )
         or bn < min_n
         or bn % n_multiple != 0
     ):
@@ -12405,19 +12597,20 @@ def _mma_impl_matches_problem_shape(
         return False
     if mma_impl == "warp":
         # Warp MMA atom is fixed-K (16 elements per BF16/FP16 instruction);
-        # fp8 is only wired through tcgen05.
-        if is_fp8:
+        # fp8 and tf32 are only wired through tcgen05.
+        if is_fp8 or is_tf32:
             return False
         return bk == 16 and bm >= 16 and bm % 16 == 0 and bn == 8
     if mma_impl == "tcgen05":
-        # tcgen05 mma instruction K is 16 elements for BF16/FP16 (32 for FP8),
+        # tcgen05 mma instruction K is 16 elements for BF16/FP16 (32 for FP8,
+        # 8 for fp32-as-tf32: 256 bits of K per instruction / operand width),
         # but the tile's K can be any positive multiple of that (the inner
         # cute.gemm loop just runs more instructions per K iteration). Larger
         # tile_k roughly halves the per-K-iter overhead per doubling.
         # Production remains capped at block_n=256 to keep AB SMEM staging
         # budget sane; the explicit G4 proof key admits only the smallest
         # 512-N candidate.
-        mma_k = 32 if is_fp8 else 16
+        mma_k = 32 if is_fp8 else (8 if is_tf32 else 16)
         if bk < mma_k or bk > 256 or bk % mma_k != 0:
             return False
         if bm in (64, 128):
@@ -12486,11 +12679,7 @@ def _tcgen05_candidate_exceeds_smem(
     ):
         return False
     support = get_cute_mma_support()
-    if not (
-        support.tcgen05_f8
-        if input_dtype == torch.float8_e4m3fn
-        else support.tcgen05_f16bf16
-    ):
+    if not tcgen05_supports_input_dtype(support, input_dtype):
         return False
     budget = CuteTcgen05Config.per_cta_smem_budget_bytes(input_device)
     if budget <= 0:
@@ -12567,11 +12756,7 @@ def _choose_mma_impl(
         tcgen05_cluster_m=tcgen05_cluster_m,
         tcgen05_large_bn_proof=tcgen05_large_bn_proof,
     ):
-        tcgen05_ok = (
-            support.tcgen05_f8
-            if input_dtype == torch.float8_e4m3fn
-            else support.tcgen05_f16bf16
-        )
+        tcgen05_ok = tcgen05_supports_input_dtype(support, input_dtype)
         if tcgen05_ok and not _tcgen05_candidate_exceeds_smem(
             input_dtype,
             input_device=input_device,

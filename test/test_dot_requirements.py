@@ -24,6 +24,9 @@ from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
 from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K,
+)
+from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M,
 )
 from helion._compiler.cute.tcgen05_constants import (
@@ -908,13 +911,14 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertEqual(constraints.per_cta_smem_budget_bytes, b200_budget_bytes)
 
         search_fragments = spec._tcgen05_optional_fragments(for_search=True)
-        # Cycle 97: ab=3 is BUDGET-AWARE-SEARCHABLE — the for_search cap is lifted
-        # to 3 wherever the SMEM-budget constraints were recorded (here: the mocked
-        # B200 budget), so the autotuner can SAMPLE ab=3 directly. A sampled ab=3
-        # that does not fit is then demoted by ``_fix_ab_stages_search_config`` (the
-        # over-budget cases below). The validation surface is independently 3 for
-        # explicit configs.
-        self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 3)
+        # Where the SMEM-budget constraints were recorded (here: the mocked B200
+        # budget), the for_search cap is lifted to the dtype's hardware-validated
+        # stage cap (6 for 16-bit) so the autotuner can SAMPLE deep-AB pipelines
+        # (bk=64/ab=5 wins on edge shapes) directly. A sampled depth that does
+        # not fit is then demoted by ``_fix_ab_stages_search_config`` /
+        # budget-clamped by ``_validate_direct_entry_ab_stage_envelope`` (the
+        # over-budget cases below).
+        self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 6)
         validation_fragments = spec._tcgen05_optional_fragments(for_search=False)
         # 16-bit 4096^3 is FFI-eligible (fp16 == bf16 parity), so the validation
         # surface admits the deeper FFI direct-entry stage tuples — up to ab=6
@@ -1008,10 +1012,15 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # round-trip even on a device the gate is off for.
         validation_fragments = spec._tcgen05_optional_fragments(for_search=False)
         self.assertEqual(validation_fragments["tcgen05_ab_stages"].high, 3)
-        # The cluster_m2 seed exists but does *not* carry ab=3.
+        # The full-tile cluster_m=2 family now seeds three configs (the
+        # canonical static-persistent seed, the CLC dynamic-persistence
+        # scheduler seed, and the 4-CTA cluster_n=2 seed) — none of which may
+        # carry ab=3 when the gate is off.
         seeds = spec.compiler_seed_configs
-        self.assertEqual(len(seeds), 1)
+        self.assertEqual(len(seeds), 3)
         self.assertNotIn("tcgen05_ab_stages", seeds[0].config)
+        for seed in seeds:
+            self.assertNotEqual(seed.config.get("tcgen05_ab_stages"), 3)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_ab_stages_three_uses_analyzed_block_indices(
@@ -1035,7 +1044,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 )
             self.assertIsNotNone(spec._tcgen05_ab_stages_three_search_constraints)
             search_fragments = spec._tcgen05_optional_fragments(for_search=True)
-            self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 3)
+            # Constraints recorded -> search cap is the 16-bit hard cap.
+            self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 6)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_ab_stages_three_seeded_in_initial_population(
@@ -1614,7 +1624,15 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 constraints,
             )
         )
-        self.assertFalse(spec._tcgen05_cluster_m2_bk_is_valid(64, constraints))
+        # The deep-AB family admits bk=64 on the edge/K-tail family; other
+        # K tiles stay out of the validated set.
+        self.assertTrue(
+            spec._tcgen05_cluster_m2_bk_is_valid(
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K,
+                constraints,
+            )
+        )
+        self.assertFalse(spec._tcgen05_cluster_m2_bk_is_valid(32, constraints))
 
     def test_tcgen05_edge_tile_detection_skips_unknown_dims(self) -> None:
         config_spec = SimpleNamespace(
@@ -1854,7 +1872,15 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 constraints,
             )
         )
-        self.assertFalse(spec._tcgen05_cluster_m2_bk_is_valid(64, constraints))
+        # The deep-AB family admits bk=64 on the edge/K-tail family; other
+        # K tiles stay out of the validated set.
+        self.assertTrue(
+            spec._tcgen05_cluster_m2_bk_is_valid(
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K,
+                constraints,
+            )
+        )
+        self.assertFalse(spec._tcgen05_cluster_m2_bk_is_valid(32, constraints))
 
     def test_restrict_tcgen05_num_epi_warps_search_helper(self) -> None:
         """Direct unit test for ``restrict_tcgen05_num_epi_warps_search``.

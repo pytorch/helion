@@ -837,6 +837,14 @@ def _append_cute_wrapper_plan(
     cluster_n = plan_int("cluster_n", 1)
     input_dtype = str(plan["input_dtype"])
     acc_dtype = str(plan["acc_dtype"])
+    # fp32 GMEM operands run the MMA as tf32: the A/B cute tensors keep their
+    # torch-derived Float32 element type, and the TMA descriptors recast to
+    # the plan's TFloat32 via ``internal_type`` (both are 4 bytes wide, so the
+    # SMEM layout/byte math is unchanged). Mirrors quack's gemm_sm100 fp32
+    # handling.
+    tma_internal_type_arg = (
+        ", internal_type=cutlass.TFloat32" if input_dtype == "cutlass.TFloat32" else ""
+    )
     ab_stage_count = plan_int("ab_stage_count", 2)
     # Optional ``smem_swizzle_*`` overrides recorded by the device-side
     # codegen when the user opts into a non-default A/B SMEM atom
@@ -1113,6 +1121,7 @@ def _append_cute_wrapper_plan(
                 f"cute.slice_({smem_a_layout}, (None, None, None, 0)), "
                 f"({bm}, {bn}, {bk}), {tiled_mma}"
                 + (f", {cluster_layout_vmnk}.shape" if cluster_n > 1 else "")
+                + tma_internal_type_arg
                 + ")"
             ),
             # See the asymmetry comment above ``make_tiled_tma_atom_A``
@@ -1124,7 +1133,8 @@ def _append_cute_wrapper_plan(
                 f"{cluster_shape}, {tiled_mma}.thr_id), "
                 f"{rhs_tma}, "
                 f"cute.slice_({smem_b_layout}, (None, None, None, 0)), "
-                f"({bm}, {bn}, {bk}), {tiled_mma}, {cluster_layout_vmnk}.shape)"
+                f"({bm}, {bn}, {bk}), {tiled_mma}, {cluster_layout_vmnk}.shape"
+                f"{tma_internal_type_arg})"
             ),
         )
     )
