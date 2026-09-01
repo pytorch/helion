@@ -2600,6 +2600,38 @@ class TestPallas(TestCase):
         )
         torch.testing.assert_close(result, expected)
 
+    @skipIfPallasInterpret("JAX Pallas interpret cannot dynamically slice a VMEM Ref")
+    def test_scalar_tensor_index_with_minor_dimension_selects(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def select_member_and_minor_dimensions(
+            table: torch.Tensor,
+            member_ids: torch.Tensor,
+        ) -> torch.Tensor:
+            blocks = member_ids.size(0)
+            rows = table.size(1)
+            cols = table.size(3)
+            out = torch.empty(
+                [blocks, rows, cols], dtype=table.dtype, device=table.device
+            )
+            for block in hl.grid(blocks):
+                member = member_ids[block]
+                for tile_m, tile_n in hl.tile([rows, cols]):
+                    out[block, tile_m, tile_n] = table[member, tile_m, 0, tile_n, 1]
+            return out
+
+        table = torch.randn(4, 8, 2, 128, 2, device=DEVICE, dtype=torch.bfloat16)
+        member_ids = torch.tensor([2, 0, 3], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            select_member_and_minor_dimensions,
+            (table, member_ids),
+            block_sizes=[8, 128],
+        )
+
+        expected = torch.stack(
+            [table[2, :, 0, :, 1], table[0, :, 0, :, 1], table[3, :, 0, :, 1]]
+        )
+        torch.testing.assert_close(result, expected)
+
     def test_tensor_index_atomic_add_raises(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def atomic_add_tensor_index(
