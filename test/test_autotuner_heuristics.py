@@ -8386,12 +8386,13 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             for_search=True
         )["tcgen05_ab_stages"]
         self.assertIsInstance(search_ab_stages_fragment, IntegerFragment)
-        # Cycle 97: the for_search ab cap is BUDGET-AWARE — lifted to 3 wherever
-        # ab=3 is admissible (the SMEM-budget constraints were recorded at bind
-        # time, i.e. bf16/fp16 on a B200-class optin cap), else 2. Conditioning on
-        # the recorded constraints keeps the assertion deterministic across hosts.
+        # The for_search ab cap is BUDGET-AWARE — lifted to the 16-bit hard cap
+        # (6) wherever deep AB is admissible (the SMEM-budget constraints were
+        # recorded at bind time, i.e. bf16/fp16 on a B200-class optin cap),
+        # else 2. Conditioning on the recorded constraints keeps the assertion
+        # deterministic across hosts.
         expected_search_ab_high = (
-            3
+            6
             if bound.config_spec._cute_tcgen05_config.ab_stages_three_search_constraints
             is not None
             else 2
@@ -10133,11 +10134,12 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertTrue(residual_tcfg.aux_kernel_detected)
         self.assertTrue(residual_tcfg.exact_shape_aux_kernel_detected)
 
-        # The for_search ab fragment is lifted to 3 (the budget was recorded at
-        # bind via the mocked B200 cap) for every family.
+        # The for_search ab fragment is lifted to the 16-bit hard cap (the
+        # budget was recorded at bind via the mocked B200 cap) for every
+        # family; sampled depths are budget-clamped at fix-invalid time.
         for tcfg in (plain_tcfg, bias_tcfg, residual_tcfg):
             ab_fragment = tcfg.optional_fragments(for_search=True)["tcgen05_ab_stages"]
-            self.assertEqual(ab_fragment.high, 3)
+            self.assertEqual(ab_fragment.high, 6)
 
         def _ab3_config(cluster_m: int = 2) -> helion.Config:
             return helion.Config(
