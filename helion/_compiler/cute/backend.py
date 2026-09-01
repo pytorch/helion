@@ -906,6 +906,7 @@ class CuteBackend(Backend):
             key == "num_threads"
             or key == "cute_vector_widths"
             or key == "cute_lane_layouts"
+            or key == "cute_reduction_reloads"
             or key == "cute_cluster_n"
             or key == "cute_min_blocks_per_mp"
             or key.startswith(("tcgen05_", "cute_flash_"))
