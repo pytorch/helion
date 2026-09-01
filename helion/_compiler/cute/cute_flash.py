@@ -2559,7 +2559,10 @@ def resolve_flash_config(
         requested_causal_two_cta
         and is_causal
         and topology == "fa4"
-        and head_dim == 64
+        # hd128 causal had no 2-CTA path at all, though the lowering already
+        # special-cases head_dim==128 under use_2cta_instrs and fa4_2cta is
+        # legal for hd128 dense.
+        and head_dim in (64, 128)
         and dtype is torch.float16
         and num_kv % 4 == 0
     )
@@ -3631,6 +3634,32 @@ def _flash_causal_degree2_template_values(
     }
 
 
+def _flash_causal_resident_template_values(
+    *,
+    e2e_offset: int,
+    e2e_offset0: int,
+    role_map: str,
+    epi_tma: bool,
+) -> dict[str, object]:
+    """Values for the head-dim-agnostic resident causal seed template.
+
+    Mirrors the degree-2 template but omits the FP16/hd64-only compound exp2
+    packet and its 16/6 split schedule: the resident lowering rewrites both to
+    "1x1"/xu in _flash_resident_softmax_config, so pinning them here would be
+    dead weight that also drags in the hd64 restriction.
+    """
+    return {
+        FLASH_PIPELINE_FAMILY_KEY: "fa4",
+        FLASH_E2E_OFFSET_KEY: e2e_offset,
+        FLASH_E2E_OFFSET0_KEY: e2e_offset0,
+        FLASH_WAIT_HINT_KEY: 0,
+        FLASH_EPI_TMA_KEY: epi_tma,
+        FLASH_RESCALE_CHUNK_COLS_KEY: 16,
+        FLASH_CAUSAL_LPT_SWIZZLE_KEY: 1,
+        FLASH_ROLE_MAP_KEY: role_map,
+    }
+
+
 def _flash_dense_tuning_overrides(
     policy: FlashDenseTuningPolicy,
 ) -> dict[str, object]:
@@ -3672,12 +3701,16 @@ def _flash_dense_tuning_overrides(
 def _flash_causal_tuning_overrides(
     policy: FlashCausalTuningPolicy,
 ) -> dict[str, object]:
-    if policy.seed_template is not FlashCausalSeedTemplate.DEGREE2_V1:
+    if policy.seed_template is FlashCausalSeedTemplate.RESIDENT_V1:
+        template_values = _flash_causal_resident_template_values
+    elif policy.seed_template is FlashCausalSeedTemplate.DEGREE2_V1:
+        template_values = _flash_causal_degree2_template_values
+    else:
         raise AssertionError(
             f"unsupported causal seed template: {policy.seed_template!r}"
         )
     overrides = {
-        **_flash_causal_degree2_template_values(
+        **template_values(
             e2e_offset=policy.e2e_offset,
             e2e_offset0=policy.e2e_offset0,
             role_map=policy.role_map,
