@@ -783,13 +783,17 @@ class Settings(_Settings):
         ),
         "autotune_baseline_atol": (
             "Absolute tolerance for baseline output comparison during autotuning accuracy checks. "
-            "Defaults to 1e-2, or 0.0 for fp8 dtypes (automatic bitwise comparison). "
+            "When unset, defaults to 1e-2 scaled per output tensor by max(1, rms(baseline)) "
+            "so large-magnitude reductions tolerate accumulation-order noise, or 0.0 for fp8 "
+            "dtypes (automatic bitwise comparison). Setting an explicit value disables the "
+            "RMS scaling and is applied exactly. "
             "Pass as @helion.kernel(..., autotune_baseline_atol=1e-3)."
         ),
         "autotune_baseline_rtol": (
             "Relative tolerance for baseline output comparison during autotuning accuracy checks. "
             "Defaults to 1e-2, or 0.0 for fp8 dtypes (automatic bitwise comparison). "
-            "Pass as @helion.kernel(..., autotune_baseline_rtol=1e-3)."
+            "Pass as @helion.kernel(..., autotune_baseline_rtol=1e-3). "
+            "See autotune_baseline_atol for how the absolute-tolerance floor scales when unset."
         ),
         "autotune_baseline_accuracy_check_fn": (
             "Custom accuracy check function for comparing autotuning candidate outputs against the baseline. "

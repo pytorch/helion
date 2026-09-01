@@ -329,6 +329,65 @@ class TestMismatchTolerance(TestCase):
                 max_mismatched_abs_diff=5.0,
             )
 
+    def test_accuracy_scaled_atol_tolerates_reduction_noise(self) -> None:
+        from helion.autotuner.accuracy import assert_close
+
+        # A large-K reduction output: elements have scale ~200, and near-zero
+        # elements legitimately differ across accumulation orders by amounts
+        # far above a fixed elementwise atol.
+        torch.manual_seed(0)
+        expected = torch.randn(64, 64, device=DEVICE) * 200.0
+        expected[0, 0] = 0.05  # near-zero element from cancellation
+        actual = expected.clone()
+        actual[0, 0] = -0.05  # reorder-scale wobble on the near-zero element
+
+        # The fixed elementwise default rejects the wobble...
+        with self.assertRaises(AssertionError):
+            assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+        # ...the scaled floor (atol * max(1, rms(expected))) accepts it...
+        assert_close(
+            actual, expected, atol=1e-2, rtol=1e-2, scale_atol_by_expected_rms=True
+        )
+        # ...but a genuinely wrong element at the output's own scale still fails.
+        actual[1, 1] = expected[1, 1] + 100.0
+        with self.assertRaises(AssertionError):
+            assert_close(
+                actual, expected, atol=1e-2, rtol=1e-2, scale_atol_by_expected_rms=True
+            )
+
+    def test_accuracy_scaled_atol_survives_inf_in_baseline(self) -> None:
+        from helion.autotuner.accuracy import assert_close
+
+        # An inf element in the baseline (log-space outputs, masked rows) must
+        # not blow the RMS up to inf and disable the gate for the rest of the
+        # tensor.
+        expected = torch.randn(64, device=DEVICE)
+        expected[0] = float("-inf")
+        actual = expected.clone()
+        actual[1] = expected[1] + 1e6
+        with self.assertRaises(AssertionError):
+            assert_close(
+                actual, expected, atol=1e-2, rtol=1e-2, scale_atol_by_expected_rms=True
+            )
+
+    def test_accuracy_scaled_atol_no_op_for_small_scale_outputs(self) -> None:
+        from helion.autotuner.accuracy import assert_close
+
+        # Outputs with rms <= 1 (e.g. probabilities) keep the exact tolerance:
+        # max(1, rms) == 1, so scaling never loosens well-scaled checks.
+        expected = torch.full((32,), 0.5, device=DEVICE)
+        actual = expected.clone()
+        actual[0] += 0.05
+        for scale in (False, True):
+            with self.assertRaises(AssertionError):
+                assert_close(
+                    actual,
+                    expected,
+                    atol=1e-2,
+                    rtol=1e-2,
+                    scale_atol_by_expected_rms=scale,
+                )
+
 
 @onlyBackends(["triton"])
 class TestAutotuneIgnoreErrors(TestCase):
