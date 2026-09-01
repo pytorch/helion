@@ -1333,18 +1333,41 @@ class _PallasInterpretCallable:
         return tuple(jax_results)
 
 
-def _ensure_cpu_tpu_info() -> None:
-    """Register a synthetic TpuInfo for ``"cpu"`` so that
-    ``emit_pipeline`` / ``fori_loop`` interpret paths don't fail.
+def _ensure_cpu_tpu_info(device_kind: str | None = None) -> None:
+    """Register TPU metadata for Pallas traces that use CPU placeholders.
+
+    Interpret mode uses a TPU7x-compatible default.  The direct TorchTPU
+    launcher passes the physical device kind so hardware-dependent Pallas
+    lowering still targets the attached TPU while JAX remains CPU-only.
     """
     try:
         from jax._src.pallas.mosaic.tpu_info import ChipVersion
+        from jax._src.pallas.mosaic.tpu_info import chip_version_from_device_kind
         from jax._src.pallas.mosaic.tpu_info import get_tpu_info_for_chip
         from jax._src.pallas.mosaic.tpu_info import registry
     except ImportError:
         return
-    if "cpu" not in registry:
-        registry["cpu"] = lambda: get_tpu_info_for_chip(ChipVersion.TPU_7X, 1)
+
+    if device_kind is None:
+        chip_version = ChipVersion.TPU_7X
+    else:
+        # TorchTPU calls the split-core TPU7 device "TPU v7", while JAX calls
+        # the same target "TPU7x".
+        pallas_device_kind = "TPU7x" if device_kind == "TPU v7" else device_kind
+        chip_version = chip_version_from_device_kind(pallas_device_kind)
+        if chip_version is None:
+            raise RuntimeError(f"Unsupported TorchTPU device: {device_kind}")
+    info = get_tpu_info_for_chip(chip_version, 1)
+    registry["cpu"] = lambda: info
+
+
+def _ensure_torch_tpu_cpu_export_info() -> None:
+    """Expose the physical TPU target to a CPU-only JAX export trace."""
+    from torch_tpu._internal.utils.hardware import (  # pyrefly: ignore[missing-import]
+        get_tpu_device_name,
+    )
+
+    _ensure_cpu_tpu_info(get_tpu_device_name())
 
 
 def _pallas_apply_ds_padding(
@@ -2065,6 +2088,8 @@ def _pallas_install_launcher_cache(
     )
     if interpret:
         _ensure_cpu_tpu_info()
+    else:
+        _ensure_torch_tpu_cpu_export_info()
 
     output_indices = _output_indices if _output_indices is not None else []
 
@@ -2705,6 +2730,8 @@ def _pallas_install_compact_launcher_cache(
     )
     if interpret:
         _ensure_cpu_tpu_info()
+    else:
+        _ensure_torch_tpu_cpu_export_info()
     output_indices = _output_indices if _output_indices is not None else []
 
     spec_args = args

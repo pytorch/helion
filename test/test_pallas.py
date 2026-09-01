@@ -88,6 +88,14 @@ def pallas_sigmoid(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_sign(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(out.size()):
+        out[tile] = torch.sign(x[tile])
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_pointwise_chain(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(out.size()):
@@ -1225,6 +1233,11 @@ class TestPallas(TestCase):
         args = (torch.randn(1024, device=DEVICE), torch.randn(1024, device=DEVICE))
         code, result = code_and_output(add_kernel, args, block_size=256)
         torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_sign(self) -> None:
+        x = torch.linspace(-2, 2, 1024, device=DEVICE)
+        _, result = code_and_output(pallas_sign, (x,), block_size=256)
+        torch.testing.assert_close(result.cpu(), torch.sign(x).cpu())
 
     def test_add_large(self) -> None:
         args = (torch.randn(4096, device=DEVICE), torch.randn(4096, device=DEVICE))
