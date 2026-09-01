@@ -9974,7 +9974,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             self.assertEqual(target_ms, 5000.0)
             self.assertFalse(use_isolated)
             self.assertFalse(confirm_suspicious)
-            self.assertFalse(use_interleaved)
+            self.assertTrue(use_interleaved)
             for member in members:
                 member.perfs.append(10.0 if member is stable else 12.0)
 
