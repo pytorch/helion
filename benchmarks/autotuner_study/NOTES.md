@@ -1,0 +1,174 @@
+# Autotuner study working notes
+
+Campaign artifacts live in /tmp/autotuner_study/ (not committed).
+This file accumulates evidence and design decisions as the study progresses.
+
+## Setup
+
+- 14 kernel cases (benchmarks/autotuner_study/kernels.py), B200, triton backend.
+- Audit: per case, default LFBOTreeSearch x4 seeds, PatternSearch x3, DE x2
+  (126 runs), HELION_SKIP_CACHE=1, fixed seeds, per-candidate CSV logging,
+  case pinned to one GPU. Independent post-search measurement of selected and
+  default config via interleaved_bench(repeat=50).
+- Metrics: quality = independently measured selected-config latency;
+  cost = unique configs evaluated (distinct config_id in autotune.csv).
+
+## Mid-campaign observations (default = LFBOTreeSearch, full effort)
+
+1. Seed-to-seed final-quality variance is the dominant quality problem on
+   compute-bound kernels: attention-2k64 selected 0.279 / 0.303 / 0.362 ms
+   across 3 seeds (worst +29%); gathergemv 0.083-0.101 (+21%). The worst
+   attention run also stopped earliest (308 unique evals) - premature
+   convergence into a bad structural basin (pointer indexing +
+   persistent_interleaved), not budget exhaustion.
+2. Memory-bound kernels (layernorm, rmsnorm, bmm, softmax): the default
+   config or a compiler seed is already within a few % of the final answer;
+   400-1300 unique candidates buy 0-7% over the default config. bmm reached
+   within 5% of best-known at candidate #1 in all 4 runs.
+3. Tail waste: 30-76% of unique candidates are evaluated after the run is
+   already within 1% of its own final result.
+4. Initial population composition (attention): default config 2.6 ms,
+   compiler heuristic seed 0.386 ms, best random-of-97 ~0.37-0.53 ms. The
+   ~100 uniform-random configs contribute almost nothing over the compiler
+   seed; the local search phase (0.386 -> 0.279) is where good runs win.
+5. Structural valley: `indexing` etc. are ListOf fragments whose
+   pattern_neighbors change ONE list slot at a time; moving all 5 memory ops
+   from pointer to tensor_descriptor requires stepping through mixed configs.
+   Winning attention config differs from the compiler seed in block_sizes
+   (2 dims), indexing (3+ slots), num_warps, num_stages simultaneously.
+
+## Code-level issues found by reading (to validate with data)
+
+- LFBO `visited` poisoning: in the non-flash path every *generated* neighbor
+  is added to `visited`, even the ~90% never selected/benchmarked
+  (surrogate_pattern_search.py:4801-4804). The surrogate can permanently
+  blacklist candidates it mis-scored early.
+- Copy death by quantization: n_sorted = int(len(candidates) * 0.10) is 0
+  when <10 fresh candidates remain, ending the copy even when improvement
+  was still happening (surrogate_pattern_search.py:4807-4812).
+- `current` can be dropped by _surrogate_select, letting a copy move to a
+  worse `current` (min over selected only).
+- Stale surrogate labels: train_y keeps the first one-shot perf; rebenchmark
+  refinements never propagate back (except inf-repairs).
+- PatternSearch block-size pair cross-product adds ~4*C(B,2) candidates per
+  generation regardless of observed sensitivity.
+- Initial random population has no dedup (non-flash) and randomizes ALL
+  knobs including <1% ones, adding aliasing + noise.
+- DE re-benchmarks duplicate trial vectors (no config-level memoization).
+
+## Prototype directions (to be driven by full audit data)
+
+- P1 better seeding: replace most of the 100 uniform-random initial configs
+  with a small deterministic structural coverage design over high-impact
+  knobs (pid_type x indexing-uniform x canonical block shapes x warps),
+  anchored at default + compiler seeds; dedup by canonical config; keep loow
+  -impact knobs at defaults in seeds.
+- P2 tiered search: classify fragments into impact tiers (data:
+  impact.py matched pairs); main search mutates only high/medium tier
+  coordinates; a final coordinate-descent sweep handles low-tier knobs
+  (cardinality 2-4 each) on the incumbent.
+- P3 tail/stuck fixes: global early-stop on stagnation; min selection >= 1
+  to avoid quantization death; allow re-proposal (no visited-poisoning);
+  uniform-change neighbors for ListOf keys (set all slots at once).
+- P4 surrogate fixes: re-sync train_y before fit; global selection across
+  copies instead of per-copy quotas.
+
+## Plateau-breakout analysis (91 audit runs)
+
+Simulating a hard stagnation stop on per-generation best-so-far curves
+(threshold 0.5%/gen): patience=3 would end 28/91 runs >1% worse than the
+full run (p95 +14%, max +39%); patience=5 still hurts 16/91 (p95 +7%).
+Late breakouts after long plateaus are real (some are 10-40% gains,
+mostly attention/matmul-class). A pure generation-count stop rule trades
+quality for evaluations; escape mechanisms (multi-slot uniform moves,
+diverse seeds/restarts) should come first, with any stop rule kept
+conservative. The v2 ablation tests patience=3 explicitly (v2 vs v2-nostop).
+
+## Full audit results (99 runs, 11 cases; matmul-class rerun pending)
+
+Quality = mean independently measured selected-config latency / case best
+known; evals = mean unique configs. Summary (default LFBOTreeSearch vs
+PatternSearch vs DE):
+
+- default: quality 1.00-1.38 (attention-2k64 1.10, gathergemv 1.38, bmm
+  1.08, crossentropy 1.09, fp8gemm 1.10), evals 400-1200.
+- PatternSearch: usually the best final quality (attention-2k64 1.001,
+  fp8gemm 1.05, welford 1.01) but 2-3x the evals (1200-2100).
+- DE: fixed 1600 evals; excellent on attention (1.001-1.01), catastrophic
+  on fp8gemm (1.56), gathergemv (1.44), welford (1.19).
+- gathergemv: no algorithm reliably finds the best basin (block [32,64],
+  1 warp, 7 stages); 7/9 runs land 30-60% off.
+- Tail waste 70-94% on memory-bound cases for all algorithms.
+
+Conclusion: the surrogate saves evaluations but gives up real quality vs
+plain pattern search; the v2 goal is PatternSearch-level quality at
+LFBO-level (or lower) evaluation counts.
+
+## Complete audit aggregate (126 runs, 14 cases)
+
+Geomean over cases of (mean selected latency / case best-known); evals =
+mean unique configs per run:
+
+| algorithm      | quality | evals | wall(s) |
+|----------------|---------|-------|---------|
+| default (LFBO) | 1.075   | 744   | 352     |
+| PatternSearch  | 1.054   | 1419  | 426     |
+| DE             | 1.113   | 1598  | 640     |
+
+v2 target: quality <= 1.03 at evals <= 600.
+
+## Ablation + validation results (238 + 84 runs; head-to-head re-measured)
+
+Aggregate over the 11 measurement-stable cases (splitk/gathergemv/
+crossentropy excluded for context-sensitive timing; full-14 tables in
+REPORT.md). quality = geomean over cases of mean head-to-head perf ratio
+vs case best; worst = geomean of per-case worst seed.
+
+| variant             | quality | worst | evals |
+|---------------------|---------|-------|-------|
+| default (old)       | 1.057   | 1.106 | 759   |
+| v2 bundle (p3)      | 1.045   | 1.065 | 512   |
+| v2 no stop          | 1.041   | 1.057 | 591   |
+| v2 fixes only       | 1.043   | 1.075 | 663   |
+| v2 no freeze        | 1.043   | 1.055 | 529   |
+| v2 no seed          | 1.053   | 1.090 | 489   |
+| PatternSearch (old) | 1.030   | 1.049 | 1623  |
+| PatternSearch + v2  | 1.046   | 1.067 | 952   |
+
+Attribution: fixes+uniform moves carry most of the quality gain; structured
+population is protective on attention-4k128/matmul-wide; probe+freeze
+rescues crossentropy/welford; patience-3 stop saves ~15% evals at ~0.4%
+mean quality (cost concentrated in occasional stuck attention runs -
+patience 5 does not fix those; restart-on-stagnation is the right future
+work). Session-to-session head-to-head instability on splitk/gathergemv/
+crossentropy (10-40% context-sensitive swings) is itself a finding: the
+autotuner's objective (isolated do_bench with L2 clears) and deployment-like
+interleaved timing can disagree substantially on those kernels.
+
+## Simplified variant + cute validation (follow-up)
+
+- Branch autotuner-v2-simple (merged to dev): probe/freeze/sweep removed
+  (~284 net lines vs ~535). LFBO fixes + uniform ListOf neighbors are now
+  unconditional (pattern_version/lfbo_version bumped); structured population
+  + stagnation stop stay behind HELION_AUTOTUNER_V2=1.
+- Triton re-validation, stable-11, fresh head-to-head session: old default
+  1.056/1.106/759; simplified default (no flag) 1.039/1.065/621; +flag
+  1.048/1.059/517; old PatternSearch 1.029/1.044/1623.
+- Cute: two pre-existing crashes in the OLD autotuner fixed (EnumFragment
+  encode + pattern_neighbors raised on normalization-off-surface values,
+  aborting every cute matmul/bmm autotune). Post-fix: v2 equal-or-better
+  (crossentropy 1.060 vs 1.227; matmul-class surfaces nearly fully pinned,
+  4-8 unique configs; welford is a rare-basin coin flip). Cute
+  attention-2k64 autotuning fails for all algorithms: hung candidates ->
+  unkillable benchmark worker (D-state) -> run aborts; worker-layer
+  robustness bug, filed as future work.
+
+## Final state correction
+
+This file is a chronological log; sections above describe intermediate
+states and cite pre-fix line numbers that no longer correspond to the final
+tree. What shipped (see REPORT.md section 8): a flag-free improved default
+- the HELION_AUTOTUNER_V2 flag and both features behind it (structured
+population, stagnation stop) were removed after review. The final change
+set is the EnumFragment robustness fixes, uniform-list ListOf neighbors
+(pattern_version 2), and the four LFBO search-loop fixes (lfbo_version 2).
