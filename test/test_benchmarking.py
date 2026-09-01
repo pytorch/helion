@@ -185,6 +185,57 @@ def test_mirrored_bench_generic_bounds_fast_kernel_trace(monkeypatch) -> None:
     assert trace.medians_ms == pytest.approx([0.001])
 
 
+def test_interleaved_bench_generic_bounds_wall_clock(monkeypatch) -> None:
+    calls = [0, 0]
+    clock = [0.0]
+
+    def make_fn(index: int):
+        def fn() -> None:
+            calls[index] += 1
+            clock[0] += 0.000_01  # 0.01ms per call
+
+        return fn
+
+    monkeypatch.setattr(benchmarking, "_make_l2_cache_clearer", lambda: lambda: None)
+    monkeypatch.setattr(benchmarking, "synchronize_device", lambda: None)
+    monkeypatch.setattr(benchmarking.time, "perf_counter", lambda: clock[0])
+
+    # One sweep over both fns costs 0.02ms, so a 10ms budget caps the
+    # kernel-perf-sized repeat of 20k at 500 sweeps.
+    times = benchmarking.interleaved_bench_generic(
+        [make_fn(0), make_fn(1)],
+        repeat=20_000,
+        max_total_ms=10.0,
+    )
+
+    assert times == pytest.approx([0.01, 0.01])
+    # warmup + calibration sweep + 500 timed sweeps
+    assert calls == [502, 502]
+
+
+def test_interleaved_bench_generic_repeat_cap_keeps_minimum_samples(
+    monkeypatch,
+) -> None:
+    clock = [0.0]
+
+    def fn() -> None:
+        clock[0] += 1.0  # 1s per call dwarfs any budget
+
+    monkeypatch.setattr(benchmarking, "_make_l2_cache_clearer", lambda: lambda: None)
+    monkeypatch.setattr(benchmarking, "synchronize_device", lambda: None)
+    monkeypatch.setattr(benchmarking.time, "perf_counter", lambda: clock[0])
+
+    times = benchmarking.interleaved_bench_generic(
+        [fn],
+        repeat=100,
+        max_total_ms=1.0,
+    )
+
+    # The budget cannot force fewer than 3 samples per candidate.
+    assert times == pytest.approx([1000.0])
+    assert clock[0] == pytest.approx(5.0)
+
+
 class _FakeStream:
     def wait_stream(self, stream):
         self.waited_stream = stream

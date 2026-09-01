@@ -9939,6 +9939,50 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             ],
         )
 
+    def test_rebenchmark_bounds_interleaved_wall_clock(self) -> None:
+        settings = Settings(
+            autotune_log_level=logging.CRITICAL,
+            autotune_suspicious_rebenchmark_ratio=0,
+        )
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.args = ()
+        search.log = AutotuningLogger(settings)
+        search.best_perf_so_far = 100.0
+        search.benchmark_provider = SimpleNamespace(mutated_arg_indices=[])
+        search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
+        bench_calls: list[dict[str, object]] = []
+
+        def fake_interleaved_bench(
+            fns: list[Callable[[], object]],
+            *,
+            repeat: int,
+            desc: str | None = None,
+            max_total_ms: float | None = None,
+        ) -> list[float]:
+            bench_calls.append({"repeat": repeat, "max_total_ms": max_total_ms})
+            return [100.0] * len(fns)
+
+        search.config_spec = SimpleNamespace(
+            backend=SimpleNamespace(
+                get_interleaved_bench=lambda: fake_interleaved_bench
+            )
+        )
+        member_a = PopulationMember(lambda: None, [100.0], [], helion.Config())
+        member_b = PopulationMember(lambda: None, [101.0], [], helion.Config())
+        search.rebenchmark(
+            [member_a, member_b],
+            target_ms=5000.0,
+            use_isolated=False,
+            confirm_suspicious=False,
+            use_interleaved=True,
+        )
+
+        self.assertEqual(len(bench_calls), 1)
+        # The wall-clock budget preserves the sequential-window budget the
+        # interleaved shootout replaced: target_ms per candidate.
+        self.assertEqual(bench_calls[0]["max_total_ms"], 10000.0)
+
     def test_final_rebenchmark_can_restore_earlier_stable_best(self) -> None:
         settings = Settings(
             autotune_log_level=logging.CRITICAL,
@@ -9974,7 +10018,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             self.assertEqual(target_ms, 5000.0)
             self.assertFalse(use_isolated)
             self.assertFalse(confirm_suspicious)
-            self.assertFalse(use_interleaved)
+            self.assertTrue(use_interleaved)
             for member in members:
                 member.perfs.append(10.0 if member is stable else 12.0)
 
