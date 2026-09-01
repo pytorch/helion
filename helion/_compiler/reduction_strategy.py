@@ -1181,6 +1181,18 @@ class LoopedReductionStrategy(ReductionStrategy):
             ):
                 max_threads = min(max_threads, _CUTE_WARP_REDUCTION_THREADS)
             thread_count = next_power_of_2(min(block_size, max_threads))
+            if env.backend.name == "cute":
+                # Autotunable per-rdim thread count: fewer threads per row
+                # (each covering more elements via the lane loop) is often
+                # faster for memory-bound row reductions. 0 = auto (keep the
+                # chunk-derived count above).
+                requested = env.config_spec.num_threads.config_get(
+                    cast("list[int]", fn.config.config.get("num_threads", []) or []),
+                    block_index,
+                    0,
+                )
+                if isinstance(requested, int) and 0 < requested < thread_count:
+                    thread_count = requested
         else:
             thread_count = 0
         tile_dispatch = getattr(fn, "tile_strategy", None)
@@ -1400,6 +1412,13 @@ class LoopedReductionStrategy(ReductionStrategy):
         # in ``unroll`` mode — the dispatcher uses this to compute the vec
         # pointer offset once.
         self._cute_lane_base_index_var: str | None = None
+        # The constexpr V-loop node of the current lane body (see
+        # codegen_device_loop); used to position vec hoists and vec-store
+        # flushes relative to the V-loop.
+        self._cute_lane_vloop: ast.For | None = None
+        # Vec-store flush sites already spliced into the current lane body
+        # (list of list-var names), in source order.
+        self._cute_lane_vec_stores: list[str] = []
         vec_lane_var: str | None = None
         base_expr: str = ""
         if reduction_lane_var is not None:
@@ -1466,6 +1485,10 @@ class LoopedReductionStrategy(ReductionStrategy):
                         lane_body,
                     )
                 ]
+                # Record the V-loop node so hoists (inserted before it) and
+                # vec-store flushes (appended after it) can locate it even
+                # once it is no longer the last lane_body entry.
+                self._cute_lane_vloop = vec_for
                 # Stash the lane body list so the dispatcher can splice
                 # hoists in (BETWEEN base_stmt and vec_for) as it runs.
                 self._cute_lane_body = lane_body

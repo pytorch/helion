@@ -979,6 +979,71 @@ def _cute_register_tile_unroll_vec_store(
     )
 
 
+def _cute_register_reduction_unroll_vec_store(
+    state: CodegenState,
+    strategy: object,  # LoopedReductionStrategy at runtime
+    tensor_name: str,
+    index_exprs: list[str],
+    value_expr: str,
+    mask_expr: str | None,
+) -> ast.stmt | None:
+    """Reduction-lane variant of ``_cute_register_tile_unroll_vec_store``.
+
+    Consume sweeps of rolled reductions (layernorm / rmsnorm epilogues)
+    store one fp16/bf16 element per constexpr V-loop iter; this collects
+    the V per-lane values into a compile-time list and flushes them with a
+    single ``_cute_store_u16_vec`` after the V-loop (ST.64/ST.128 instead
+    of V scalar 2-byte stores).
+
+    Same mask precondition as the tile variant: the caller only reaches
+    this when ``strategy._mask_var is None`` (uniform, mask-free lanes), so
+    ``mask_expr`` can wrap the flush as a whole.
+    """
+    base_index_var = getattr(strategy, "_cute_lane_base_index_var", None)
+    lane_body = getattr(strategy, "_cute_lane_body", None)
+    vloop = getattr(strategy, "_cute_lane_vloop", None)
+    if (
+        not isinstance(base_index_var, str)
+        or not isinstance(lane_body, list)
+        or vloop is None
+    ):
+        return None
+
+    def _vloop_pos() -> int:
+        for i, stmt in enumerate(lane_body):
+            if stmt is vloop:
+                return i
+        return len(lane_body) - 1
+
+    # The inner reduction-axis index_expr is the last entry (same layout as
+    # ``_cute_register_unroll_vec_hoist``).
+    base_exprs = list(index_exprs)
+    base_exprs[-1] = base_index_var
+    base_ptr_expr = _cute_scalar_pointer_expr(tensor_name, base_exprs)
+    sites = getattr(strategy, "_cute_lane_vec_stores", None)
+    if not isinstance(sites, list):
+        sites = []
+        # pyrefly: ignore [missing-attribute]
+        strategy._cute_lane_vec_stores = sites
+    site_index = len(sites)
+    list_var = state.device_function.new_var(
+        f"_reduction_store_vals_{site_index}", dce=False
+    )
+    sites.append(list_var)
+    lane_body.insert(_vloop_pos(), statement_from_string(f"{list_var} = []"))
+    flush_expr = f"_cute_store_u16_vec({base_ptr_expr}, {list_var})"
+    if mask_expr is not None:
+        flush_stmt = statement_from_string(f"if {mask_expr}:\n    {flush_expr}")
+    else:
+        flush_stmt = statement_from_string(flush_expr)
+    # Insert after the V-loop AND after any earlier sites' flushes so the
+    # emitted store order matches the source order.
+    lane_body.insert(_vloop_pos() + 1 + site_index, flush_stmt)
+    return statement_from_string(
+        f"{list_var}.append(({value_expr}).bitcast(cutlass.Uint16))"
+    )
+
+
 def _cute_register_tile_unroll_vec_hoist(
     state: CodegenState,
     strategy: object,  # BlockSizeTileStrategy (PerThreadNDTileStrategy)
