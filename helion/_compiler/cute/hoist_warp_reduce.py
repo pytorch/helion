@@ -1093,7 +1093,11 @@ def validate_cluster_reduce_placement(
                     if (
                         isinstance(sub, ast.Call)
                         and isinstance(sub.func, ast.Name)
-                        and sub.func.id == "_cute_grouped_reduce_cluster"
+                        and sub.func.id
+                        in (
+                            "_cute_grouped_reduce_cluster",
+                            "_cute_grouped_reduce_cluster_online_pair",
+                        )
                     ):
                         raise exc.BackendUnsupported(
                             "cute",

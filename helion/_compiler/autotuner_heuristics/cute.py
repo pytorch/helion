@@ -452,6 +452,75 @@ class CuteResidentRowHeuristic(AutotunerHeuristic):
             return None
 
 
+class CuteResidentRowWideClusterHeuristic(AutotunerHeuristic):
+    """128-thread wide-cluster variant of ``CuteResidentRowHeuristic``.
+
+    With the cluster online-pair rewrite (one packed DSM exchange per row
+    instead of two) wide clusters of small CTAs win big rows: the measured
+    winners moved from 256-thread CTAs with the narrowest fitting cluster
+    to 128-thread CTAs with cluster_n 8..16 (e.g. 65536: T128/CL8 4761
+    vs T256/CL4 4536 GB/s on B200).  Seed that family too so the search
+    starts in both basins; per-thread footprints up to 128 elements are
+    allowed (the register-capped family) and get ``min_blocks_per_mp=3``.
+    """
+
+    name = "cute_resident_row_wide_cluster"
+    backend = "cute"
+
+    _THREADS = 128
+
+    @classmethod
+    def _plan(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, int, int] | None:
+        base = CuteResidentRowHeuristic._plan(env, device_ir)
+        if base is None:
+            return None
+        n, _threads, vec, _cluster_n = base
+        threads = cls._THREADS
+        for max_per_thread in (64, 128):
+            for cluster_n in (2, 4, 8, 16):
+                per_cta = n // cluster_n
+                if (
+                    per_cta % (threads * vec) == 0
+                    and per_cta // threads <= max_per_thread
+                ):
+                    return n, threads, vec, cluster_n
+        return None
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._plan(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return None
+        n, threads, vec, cluster_n = plan
+        seed: dict[str, Any] = {
+            "block_sizes": [1, n],
+            "num_threads": [0, threads],
+            "cute_vector_widths": [1, vec],
+            "cute_lane_layouts": ["blocked", "strided"],
+            "cute_cluster_n": cluster_n,
+        }
+        if n // cluster_n // threads > 64:
+            # 128 elements/thread: the exp/load caches alone need ~128
+            # registers, so cap the budget for 3 CTAs/SM.
+            seed["cute_min_blocks_per_mp"] = 3
+        else:
+            # 64/thread: launch bounds for >=2 CTAs nudge ptxas off its
+            # 128-register plateau (T128/CL8 65536: 4761 vs 4623 GB/s).
+            seed["cute_min_blocks_per_mp"] = 2
+        try:
+            return Config(**seed)
+        except Exception:
+            return None
+
+
 class CuteResidentMultiRowHeuristic(AutotunerHeuristic):
     """Multi-row variant of ``CuteResidentRowHeuristic`` for short rows.
 
