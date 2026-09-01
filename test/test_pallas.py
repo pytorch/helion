@@ -153,6 +153,28 @@ def pallas_matmul_bf16(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_fp8_fp4_matmul(
+    x: torch.Tensor, weight: torch.Tensor, output_columns: int
+) -> torch.Tensor:
+    """Multiply FP8 activations by a packed E2M1 RHS on TPU."""
+    output_columns = hl.specialize(output_columns)
+    m, k = x.size()
+    n = output_columns
+    out = torch.empty([m, n], device=x.device, dtype=torch.float32)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(
+                x[tile_m, tile_k],
+                weight[tile_k, tile_n],
+                acc=acc,
+                out_dtype=torch.float32,
+            )
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     b, m, k = A.size()
     b, k, n = B.size()
@@ -926,6 +948,52 @@ class TestPallas(TestCase):
         )
         self.assertIn("jnp.concatenate((", code)
         torch.testing.assert_close(result.cpu(), torch.cat((x, y), dim=1).cpu())
+
+    @skipIfPallasInterpret("packed FP4 execution requires a real TPU")
+    def test_fp8_fp4_matmul(self) -> None:
+        generator = torch.Generator().manual_seed(0)
+        m, k, n = 16, 256, 128
+        x_cpu = torch.randn(m, k, generator=generator).to(torch.float8_e4m3fn)
+        packed_cpu = torch.randint(
+            0,
+            256,
+            (k, n // 2),
+            generator=generator,
+            dtype=torch.uint8,
+        )
+        packed = packed_cpu.to(DEVICE)
+        weight = torch.empty_like(packed, dtype=torch.float4_e2m1fn_x2)
+        weight.copy_(packed.view(dtype=torch.float4_e2m1fn_x2))
+
+        _, result = code_and_output(
+            pallas_fp8_fp4_matmul,
+            (x_cpu.to(DEVICE), weight, n),
+            block_sizes=[16, 128, 256],
+        )
+
+        codes = torch.stack(
+            (packed_cpu & 0x0F, (packed_cpu >> 4) & 0x0F), dim=-1
+        ).reshape(k, n)
+        magnitude = codes & 0x07
+        decoded = torch.where(
+            magnitude < 4,
+            magnitude.float() * 0.5,
+            torch.where(
+                magnitude < 6,
+                magnitude.float() - 2,
+                magnitude.float() * 2 - 8,
+            ),
+        )
+        decoded = torch.where((codes & 0x08) == 0, decoded, -decoded)
+        expected = x_cpu.float() @ decoded
+        actual = result.cpu().float()
+        difference = (actual - expected).abs()
+        relative_mean = difference.mean() / expected.abs().mean().clamp_min(1e-6)
+        cosine = torch.nn.functional.cosine_similarity(
+            actual.flatten(), expected.flatten(), dim=0
+        )
+        self.assertLess(relative_mean.item(), 0.01)
+        self.assertGreater(cosine.item(), 0.999)
 
     def test_aligned_dynamic_window_uses_direct_hbm_dma(self) -> None:
         table = torch.randn(8, 512, device=DEVICE, dtype=torch.float32)

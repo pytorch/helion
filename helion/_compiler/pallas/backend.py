@@ -113,6 +113,7 @@ _TORCH_TO_JAX_DTYPE: dict[str, str] = {
     "torch.float8_e5m2": "jnp.float8_e5m2",
     "torch.float8_e5m2fnuz": "jnp.float8_e5m2fnuz",
     "torch.float8_e8m0fnu": "jnp.float8_e8m0fnu",
+    "torch.float4_e2m1fn_x2": "jnp.float4_e2m1fn",
 }
 
 
@@ -194,6 +195,20 @@ class PallasBackend(Backend):
         if key not in _TORCH_TO_JAX_DTYPE:
             raise ValueError(f"Unsupported dtype for Pallas backend: {dtype}")
         return _TORCH_TO_JAX_DTYPE[key]
+
+    def normalize_input_fake_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Trace packed FP4 inputs with their logical JAX shape.
+
+        Torch stores two E2M1 values in each element of
+        ``float4_e2m1fn_x2``, while TorchTPU presents those values to Pallas as
+        two separate elements on the last axis.  Matching that logical shape
+        during Helion tracing keeps indexing, tiling, and matmul dimensions in
+        the same coordinate system as the generated Pallas program.
+        """
+        if tensor.dtype != torch.float4_e2m1fn_x2 or tensor.ndim == 0:
+            return tensor
+        logical_shape = (*tensor.shape[:-1], tensor.shape[-1] * 2)
+        return torch.empty(logical_shape, dtype=tensor.dtype, device=tensor.device)
 
     def acc_type(self, dtype: torch.dtype) -> str:
         # Promote half-precision types to float32 for numerical stability
