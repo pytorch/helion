@@ -3882,6 +3882,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search.make_unbenchmarked = Mock(return_value=anchor)
@@ -4003,6 +4004,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search.train_source_hashes = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
@@ -4085,6 +4087,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: ((stage_key, 2),)
@@ -4171,6 +4174,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: ((stage_key, 2),)
@@ -4251,6 +4255,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: ((stage_key, 2),)
@@ -4322,6 +4327,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._pruned_pattern_search_from = Mock(
@@ -4400,6 +4406,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         generated: list[PopulationMember] = []
@@ -4976,6 +4983,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search.config_gen = SimpleNamespace(
@@ -5141,6 +5149,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         typed_leaves = []
@@ -5278,6 +5287,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search.config_gen = SimpleNamespace(
@@ -5376,6 +5386,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._budgeted_range = lambda *args: range(*args)
@@ -5449,6 +5460,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search.config_gen = SimpleNamespace(
@@ -5622,6 +5634,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: ((stage_key, 2),)
@@ -5761,6 +5774,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: ((stage_key, 2),)
@@ -5896,6 +5910,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             search.train_x = []
             search.train_y = []
             search._train_members = []
+            search.polish_rounds = 0
             search.train_configs = []
             search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
             search._flash_pipeline_lanes = lambda _leaf: ((stage_key, 2),)
@@ -6020,6 +6035,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: (
@@ -6174,6 +6190,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: ((stage_key, 2),)
@@ -6322,6 +6339,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             search.train_x = []
             search.train_y = []
             search._train_members = []
+            search.polish_rounds = 0
             search.train_configs = []
             search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
             search._flash_pipeline_lanes = lambda _leaf: ()
@@ -6487,6 +6505,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: ()
@@ -6715,6 +6734,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: (
@@ -6837,6 +6857,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._budgeted_range = lambda *args: range(*args)
@@ -6955,6 +6976,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = Mock(
@@ -7248,6 +7270,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: ((stage_key, 2),)
@@ -7358,6 +7381,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: ((stage_key, 2),)
@@ -7533,6 +7557,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: (
@@ -7844,6 +7869,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: (
@@ -8058,6 +8084,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = None
         search.train_source_hashes = None
         search._fit_surrogate = Mock()
@@ -8109,6 +8136,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search.train_source_hashes = []
         search._fit_surrogate = Mock()
@@ -8174,6 +8202,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._fit_surrogate = Mock()
         search.config_spec = _cute_flash_test_config_spec()
@@ -8236,6 +8265,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.train_x = []
         search.train_y = []
         search._train_members = []
+        search.polish_rounds = 0
         search.train_configs = []
         search._fit_surrogate = Mock()
         search.config_spec = _cute_flash_test_config_spec()
@@ -12409,6 +12439,7 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         search.quantile = 0.1
         search.patience = 1
         search.similarity_penalty = 1.0
+        search.polish_rounds = 10
         search.compile_timeout_lower_bound = pattern.compile_timeout_lower_bound
         search.compile_timeout_quantile = pattern.compile_timeout_quantile
         search.flash_structural_search = profile.flash_structural_search
@@ -12516,14 +12547,14 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         search.config_spec.cute_flash_search_enabled = False
         search._cute_flash_lane_policy_enabled = False
         non_flash = search._algorithm_cache_policy()
-        self.assertEqual(non_flash["lfbo_version"], 2)
+        self.assertEqual(non_flash["lfbo_version"], 3)
         self.assertNotIn("cute_flash_lane_policy_version", non_flash)
         self.assertIsNone(non_flash["flash_structural_search"])
 
         search.config_spec.cute_flash_search_enabled = True
         search._cute_flash_lane_policy_enabled = True
         cute_flash_policy = search._algorithm_cache_policy()
-        self.assertEqual(cute_flash_policy["lfbo_version"], 2)
+        self.assertEqual(cute_flash_policy["lfbo_version"], 3)
         self.assertEqual(cute_flash_policy["cute_flash_lane_policy_version"], 14)
         self.assertEqual(cute_flash_policy["cute_flash_starting_path_limit"], 17)
         self.assertEqual(cute_flash_policy["cute_flash_family_probe_path_limit"], 18)
@@ -12554,7 +12585,7 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         quick_policy = search._algorithm_cache_policy()
         self.assertNotIn("cute_flash_lane_policy_version", quick_policy)
         self.assertIsNone(quick_policy["flash_structural_search"])
-        self.assertEqual(quick_policy["lfbo_version"], 2)
+        self.assertEqual(quick_policy["lfbo_version"], 3)
 
     def test_unlimited_and_finite_family_retention_have_distinct_cache_keys(
         self,
@@ -15750,6 +15781,91 @@ class TestSelectedSourceMetrics(TestCase):
         self.assertFalse(provider.has_measured_source_hash("failed"))
         self.assertFalse(provider.has_measured_source_hash("nonfinite"))
         self.assertFalse(provider.has_measured_source_hash("missing"))
+
+
+class TestPolishDescent(TestCase):
+    def _make_search(self, polish_rounds: int) -> LFBOTreeSearch:
+        search = object.__new__(LFBOTreeSearch)
+        search.polish_rounds = polish_rounds
+        search.config_spec = SimpleNamespace(cute_flash_search_enabled=False)
+        search.min_improvement_delta = 0.001
+        search.log = Mock()
+        search._budgeted_range = lambda *args: iter(range(*args))
+        search.set_generation = Mock()
+        search._autotune_metrics = SimpleNamespace(num_generations=5)
+        search.format_performance = lambda perf: f"{perf:.4f}"
+        search.rebenchmark_population = Mock()
+        return search
+
+    @staticmethod
+    def _member(perf: float | None, num_warps: int) -> PopulationMember:
+        return PopulationMember(
+            lambda: None,
+            [] if perf is None else [perf],
+            (num_warps,),
+            helion.Config(num_warps=num_warps),
+            status="ok",
+        )
+
+    def test_polish_descends_and_stops_when_no_round_improves(self) -> None:
+        search = self._make_search(polish_rounds=10)
+        start = self._member(10.0, 1)
+        better = self._member(None, 2)
+        visited_member = self._member(None, 3)
+        worse = self._member(None, 4)
+        search.population = [start]
+        visited = {start.config, visited_member.config}
+
+        # Round 1 proposes {better, visited_member}; visited_member must be
+        # skipped. Round 2 (from better) proposes only worse -> stall -> stop.
+        neighbors_by_round = [
+            [better.flat_values, visited_member.flat_values],
+            [worse.flat_values],
+        ]
+        members_by_flat = {
+            better.flat_values: better,
+            visited_member.flat_values: visited_member,
+            worse.flat_values: worse,
+        }
+        perfs = {id(better): 8.0, id(worse): 11.0}
+
+        def fake_benchmark(members, desc="") -> None:
+            for member in members:
+                member.perfs.append(perfs[id(member)])
+
+        search.benchmark_population = fake_benchmark
+        with (
+            patch.object(
+                PatternSearch,
+                "_generate_neighbors",
+                side_effect=lambda self_, base: neighbors_by_round[
+                    0 if base == start.flat_values else 1
+                ],
+            ),
+            patch.object(search, "make_unbenchmarked", side_effect=members_by_flat.get),
+        ):
+            search._polish_descent(visited)
+
+        # Descended to the better neighbor and benchmarked only unvisited ones.
+        self.assertIs(search.best, better)
+        self.assertIn(better, search.population)
+        self.assertIn(worse, search.population)
+        self.assertNotIn(visited_member, search.population)
+        self.assertEqual(len(better.perfs), 1)
+        self.assertEqual(len(visited_member.perfs), 0)
+        # Both proposed configs entered visited.
+        self.assertIn(better.config, visited)
+        self.assertIn(worse.config, visited)
+
+    def test_polish_disabled_or_cute_flash_is_a_no_op(self) -> None:
+        for rounds, cute in ((0, False), (10, True)):
+            search = self._make_search(polish_rounds=rounds)
+            search.config_spec = SimpleNamespace(cute_flash_search_enabled=cute)
+            start = self._member(10.0, 1)
+            search.population = [start]
+            with patch.object(PatternSearch, "_generate_neighbors") as generate:
+                search._polish_descent({start.config})
+            generate.assert_not_called()
 
 
 if __name__ == "__main__":
