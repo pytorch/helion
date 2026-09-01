@@ -4787,13 +4787,37 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             sched_producer_state if staged_work_tile_mailbox else sched_consumer_state
         )
         producer_smem_ptr = self._tcgen05_work_tile_producer_smem_ptr(layout)
+        # Full cluster size for the leader broadcast: with cluster_n > 1 the
+        # CLC leader must feed every CTA in the (cluster_m x cluster_n)
+        # cluster, publishing each peer's own (M, N) tile coordinates.
+        # CUDA cluster ranks are x-fastest, so peer rank r sits at
+        # ``(r % cluster_m, r // cluster_m)`` in the cluster.
+        sched_cluster_size = layout.cluster_m * layout.cluster_n
         if layout.cluster_m > 1:
             sched_barrier_ptr = device_function.new_var("tcgen05_clc_sched_barrier_ptr")
             sched_peer_rank = device_function.new_var("tcgen05_clc_sched_peer_rank")
             sched_peer_m = device_function.new_var("tcgen05_clc_sched_peer_m")
+            if layout.cluster_n > 1:
+                sched_peer_n = device_function.new_var("tcgen05_clc_sched_peer_n")
+                peer_coord_stmts = [
+                    statement_from_string(
+                        f"{sched_peer_m} = "
+                        f"{sched_peer_rank} % cutlass.Int32({layout.cluster_m})"
+                    ),
+                    statement_from_string(
+                        f"{sched_peer_n} = "
+                        f"{sched_peer_rank} // cutlass.Int32({layout.cluster_m})"
+                    ),
+                ]
+                publish_bidy_expr = f"{cluster_bidy_var} + {sched_peer_n}"
+            else:
+                peer_coord_stmts = [
+                    statement_from_string(f"{sched_peer_m} = {sched_peer_rank}")
+                ]
+                publish_bidy_expr = cluster_bidy_var
             # Whole-warp prelude: every lane runs ``producer_acquire``
             # (mbarrier wait) and computes the warp-uniform barrier
-            # pointer + lane id. Lanes ``cluster_m..31`` no-op past
+            # pointer + lane id. Lanes ``cluster_size..31`` no-op past
             # the per-peer broadcast branch.
             per_tile_publish_warp = [
                 statement_from_string(
@@ -4809,10 +4833,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 create(
                     ast.If,
                     test=expr_from_string(
-                        f"{sched_peer_rank} < cutlass.Int32({layout.cluster_m})"
+                        f"{sched_peer_rank} < cutlass.Int32({sched_cluster_size})"
                     ),
                     body=[
-                        statement_from_string(f"{sched_peer_m} = {sched_peer_rank}"),
+                        *peer_coord_stmts,
                         statement_from_string(
                             "cute.arch.mbarrier_arrive_and_expect_tx("
                             f"{sched_barrier_ptr}, 16, {sched_peer_rank})"
@@ -4820,7 +4844,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                         statement_from_string(
                             f"_cute_store_shared_remote_x4("
                             f"{cluster_bidx_var} + {sched_peer_m}, "
-                            f"{cluster_bidy_var}, "
+                            f"{publish_bidy_expr}, "
                             f"{cluster_bidz_var}, "
                             f"{valid_var}, "
                             f"smem_ptr={producer_smem_ptr}, "
@@ -5013,7 +5037,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 create(
                     ast.If,
                     test=expr_from_string(
-                        f"{sched_peer_rank} < cutlass.Int32({layout.cluster_m})"
+                        f"{sched_peer_rank} < cutlass.Int32({sched_cluster_size})"
                     ),
                     body=[
                         statement_from_string(

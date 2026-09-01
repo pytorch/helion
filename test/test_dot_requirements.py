@@ -1012,12 +1012,12 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # round-trip even on a device the gate is off for.
         validation_fragments = spec._tcgen05_optional_fragments(for_search=False)
         self.assertEqual(validation_fragments["tcgen05_ab_stages"].high, 3)
-        # The full-tile cluster_m=2 family now seeds three configs (the
+        # The full-tile cluster_m=2 family now seeds four configs (the
         # canonical static-persistent seed, the CLC dynamic-persistence
-        # scheduler seed, and the 4-CTA cluster_n=2 seed) — none of which may
-        # carry ab=3 when the gate is off.
+        # scheduler seed, the 4-CTA cluster_n=2 seed, and the CLC + cluster_n=2
+        # seed) — none of which may carry ab=3 when the gate is off.
         seeds = spec.compiler_seed_configs
-        self.assertEqual(len(seeds), 3)
+        self.assertEqual(len(seeds), 4)
         self.assertNotIn("tcgen05_ab_stages", seeds[0].config)
         for seed in seeds:
             self.assertNotEqual(seed.config.get("tcgen05_ab_stages"), 3)
@@ -2744,16 +2744,16 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
     def test_cute_tcgen05_strategy_invariants_clc_persistent_cluster_n(
         self,
     ) -> None:
-        """``CLC_PERSISTENT`` + ``cluster_n>1`` is rejected.
+        """``CLC_PERSISTENT`` cluster_n accept set is ``{1, 2}``.
 
-        The CLC scheduler-warp body in
+        The CLC leader's scheduler-warp broadcast in
         ``program_id._build_scheduler_warp_role_local_while_clc``
-        publishes the work tile to peer CTAs by iterating lanes
-        ``< cluster_m``; cluster_n>1 CTAs would never receive the
-        CLC mailbox publish and would hang at ``producer_acquire``.
-        The paired ``(strategy, persistence_model)`` invariant
-        rejects this combination at validate time so the runtime
-        path is unreachable.
+        iterates lanes ``< cluster_m * cluster_n`` and publishes each
+        peer's own (M, N) tile coordinates, so the full 4-CTA cluster
+        (cluster_n=2) is dynamic-persistence capable. Values outside
+        the validated set are still rejected by the paired
+        ``(strategy, persistence_model)`` invariant so an unvalidated
+        cluster shape cannot reach the runtime.
         """
         with_sched = dataclasses.replace(
             ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC, scheduler_warps=1
@@ -2789,9 +2789,9 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         )
         self.assertEqual(errors, [], msg=str(errors))
 
-        # Negative control: CLC + cluster_n=2 rejected. The CLC
-        # broadcast is cluster_m-only; second-N-lane CTAs never
-        # receive the mailbox publish.
+        # Positive control: CLC + cluster_n=2 accepts (the generalized
+        # 4-CTA leader broadcast publishes per-peer tile coordinates to
+        # all cluster_m * cluster_n peers).
         errors = validate_tcgen05_strategy_invariants(
             strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
             persistence_model=Tcgen05PersistenceModel.CLC_PERSISTENT,
@@ -2803,9 +2803,25 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             cluster_n=2,
             arch_major=10,
         )
+        self.assertEqual(errors, [], msg=str(errors))
+
+        # Negative control: CLC + cluster_n=4 rejected — outside the
+        # validated {1, 2} accept set of the paired
+        # (strategy, persistence_model) invariant.
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.CLC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=with_sched,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=2,
+            cluster_n=4,
+            arch_major=10,
+        )
         self.assertTrue(
             any(
-                "clc_persistent" in e and "tcgen05_cluster_n in [1]" in e
+                "clc_persistent" in e and "tcgen05_cluster_n in [1, 2]" in e
                 for e in errors
             ),
             msg=str(errors),

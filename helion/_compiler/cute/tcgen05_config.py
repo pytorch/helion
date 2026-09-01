@@ -982,9 +982,10 @@ class CuteTcgen05Config:
 
         B multicast on top of the 2-CTA A multicast halves B traffic, which
         wins on B-heavy full-tile shapes (fp16 4096x4096x32768: 911 vs 824
-        TFLOP/s); cuBLAS's nvjet picks 2x2 clusters for the same shape. CLC
-        is cluster_n=1-only, so this seeds the static-persistent monolithic
-        family; the search's terminal refinement arbitrates between them.
+        TFLOP/s); cuBLAS's nvjet picks 2x2 clusters for the same shape. This
+        seeds the static-persistent monolithic family; a CLC-persistent
+        variant is layered on in ``autotune_seed_configs`` and the search's
+        terminal refinement arbitrates between them.
         """
         if self.aux_kernel_detected or self.matmul_has_leading_passthrough:
             return None
@@ -1207,6 +1208,14 @@ class CuteTcgen05Config:
         plain_cluster_n2_seed = self._plain_cluster_n2_seed_config()
         if plain_cluster_n2_seed is not None:
             seeds.append(plain_cluster_n2_seed)
+            if plain_clc_seed is not None:
+                # 4-CTA multicast + CLC dynamic persistence (Quack's
+                # dynamic-persistent 2x2 topology): reuse the validated CLC
+                # seed shape (WITH_SCHEDULER + scheduler warp) and add the
+                # cluster-N multicast on top.
+                clc_n2_seed_config: dict[str, Any] = dict(plain_clc_seed.config)
+                clc_n2_seed_config["tcgen05_cluster_n"] = 2
+                seeds.append(Config(**clc_n2_seed_config))
         c_input_seed = self._c_input_seed_config()
         if c_input_seed is not None:
             seeds.append(c_input_seed)
@@ -2477,7 +2486,9 @@ class CuteTcgen05Config:
                 return False
             if config.get("pid_type") != TCGEN05_TWO_CTA_SEED_PID_TYPE:
                 return False
-            if config.get("tcgen05_cluster_n", 1) != 1:
+            # cluster_n=2 rides the generalized 4-CTA CLC leader broadcast
+            # (Quack's dynamic-persistent 2x2 topology).
+            if config.get("tcgen05_cluster_n", 1) not in (1, 2):
                 return False
             if (
                 config.get(TCGEN05_STRATEGY_CONFIG_KEY)
