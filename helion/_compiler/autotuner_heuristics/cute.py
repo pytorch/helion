@@ -453,39 +453,45 @@ class CuteResidentRowHeuristic(AutotunerHeuristic):
 
 
 class CuteResidentRowWideClusterHeuristic(AutotunerHeuristic):
-    """128-thread wide-cluster variant of ``CuteResidentRowHeuristic``.
+    """Wide-cluster occupancy-squeeze variant of ``CuteResidentRowHeuristic``.
 
     With the cluster online-pair rewrite (one packed DSM exchange per row
-    instead of two) wide clusters of small CTAs win big rows: the measured
-    winners moved from 256-thread CTAs with the narrowest fitting cluster
-    to 128-thread CTAs with cluster_n 8..16 (e.g. 65536: T128/CL8 4761
-    vs T256/CL4 4536 GB/s on B200).  Seed that family too so the search
-    starts in both basins; per-thread footprints up to 128 elements are
-    allowed (the register-capped family) and get ``min_blocks_per_mp=3``.
+    instead of two) wide clusters of small CTAs win big rows.  The best
+    measured family keeps 64 elements per thread (the fused u16 x-cache +
+    f32 exp-cache footprint that fits ~80-95 registers) and squeezes
+    ptxas to ~24 warps/SM via ``min_blocks_per_mp = 768 // threads``: on
+    B200 the extra resident CTA outweighs ~10 spilled registers
+    (65536: T128/CL8/mb6 4861 vs mb2 4712 GB/s; 131072: T128/CL16/mb6
+    4821 vs quack 4614; 262144: T256/CL16/mb3 4304 vs quack 4284).
+    Rows that cannot hit 64/thread at any cluster width (e.g. odd-multiple
+    rows whose per-CTA slice divides 128 lanes but not 256) fall back to
+    the 128-elements/thread register-capped family at ``mb=3``; power-of-2
+    rows too big even for that leave the heuristic ineligible.
     """
+
+    # minnctapersm target: ~24 warps/SM measured best for the
+    # 64-element/thread family on B200 (see class docstring).
+    _TARGET_THREADS_PER_SM = 768
 
     name = "cute_resident_row_wide_cluster"
     backend = "cute"
 
-    _THREADS = 128
-
     @classmethod
     def _plan(
         cls, env: CompileEnvironment, device_ir: DeviceIR
-    ) -> tuple[int, int, int, int] | None:
+    ) -> tuple[int, int, int, int, int] | None:
         base = CuteResidentRowHeuristic._plan(env, device_ir)
         if base is None:
             return None
         n, _threads, vec, _cluster_n = base
-        threads = cls._THREADS
-        for max_per_thread in (64, 128):
+        for max_per_thread, threads in ((64, 128), (64, 256), (128, 128)):
             for cluster_n in (2, 4, 8, 16):
                 per_cta = n // cluster_n
                 if (
                     per_cta % (threads * vec) == 0
                     and per_cta // threads <= max_per_thread
                 ):
-                    return n, threads, vec, cluster_n
+                    return n, threads, vec, cluster_n, max_per_thread
         return None
 
     @classmethod
@@ -499,7 +505,7 @@ class CuteResidentRowWideClusterHeuristic(AutotunerHeuristic):
         plan = cls._plan(env, device_ir)
         if plan is None:
             return None
-        n, threads, vec, cluster_n = plan
+        n, threads, vec, cluster_n, max_per_thread = plan
         seed: dict[str, Any] = {
             "block_sizes": [1, n],
             "num_threads": [0, threads],
@@ -507,14 +513,14 @@ class CuteResidentRowWideClusterHeuristic(AutotunerHeuristic):
             "cute_lane_layouts": ["blocked", "strided"],
             "cute_cluster_n": cluster_n,
         }
-        if n // cluster_n // threads > 64:
+        if max_per_thread > 64:
             # 128 elements/thread: the exp/load caches alone need ~128
             # registers, so cap the budget for 3 CTAs/SM.
             seed["cute_min_blocks_per_mp"] = 3
         else:
-            # 64/thread: launch bounds for >=2 CTAs nudge ptxas off its
-            # 128-register plateau (T128/CL8 65536: 4761 vs 4623 GB/s).
-            seed["cute_min_blocks_per_mp"] = 2
+            # 64/thread: squeeze to ~24 warps/SM (85-register cap at 128
+            # threads); a handful of spills costs less than the lost CTA.
+            seed["cute_min_blocks_per_mp"] = cls._TARGET_THREADS_PER_SM // threads
         try:
             return Config(**seed)
         except Exception:

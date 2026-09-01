@@ -3265,14 +3265,17 @@ class ConfigSpec:
                     fields["cute_cluster_n"] = EnumFragment(choices=(1, 2, 4, 8, 16))
                 # Minimum resident CTAs per SM (ptxas ``minnctapersm``):
                 # caps registers per thread so more CTAs fit, trading
-                # spills for occupancy.  0 leaves ptxas free.
+                # spills for occupancy.  0 leaves ptxas free.  6 is a
+                # hard squeeze (at 128 threads it caps registers at 85 ->
+                # 24 warps/SM); measured on B200 softmax rows, one extra
+                # resident CTA beats ~10 spilled registers.
                 if (
                     self.supports_config_key("cute_min_blocks_per_mp")
                     and len(self.cute_lane_layouts) > 0
                     and not self.matmul_facts
                 ):
                     fields["cute_min_blocks_per_mp"] = EnumFragment(
-                        choices=(0, 1, 2, 3, 4)
+                        choices=(0, 1, 2, 3, 4, 6)
                     )
             if (
                 not self.cute_flash_search_enabled

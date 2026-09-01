@@ -350,6 +350,126 @@ _TWO_STAGE_DISPATCH = {
 }
 
 
+# Serial cross-warp combine for whole-CTA groups with few warps: warp
+# reduce, lane 0 of each warp writes its partial to SMEM, one sync, then
+# EVERY thread folds the ``warps`` partials serially.  Compared with the
+# two-stage form this drops the second warp shuffle reduce and its guards
+# (~5 SHFL + WARPSYNC per site) and the result is a fold over SMEM loads,
+# which anchors the scheduler the same way (a shuffle-produced reduction
+# result as the subtrahend of a bulk exp sweep makes LLVM hoist the whole
+# sweep above the reduce and double the live set).  The trailing sync
+# keeps a multi-trip call site from racing the next trip's writes (both
+# passes touch the same slots, unlike the two-stage's disjoint regions).
+
+
+@cute.jit
+def _cute_grouped_reduce_shared_serial_body(
+    input_value: cute.Numeric,
+    warp_op: object,
+    combine: object,
+    identity: cute.Numeric,
+    lane_var: cutlass.Int32,
+    group_span: int,
+) -> cute.Numeric:
+    dtype = type(identity)
+    warps = group_span // 32
+    smem_ptr = cute.arch.alloc_smem(dtype, warps)
+    smem = cute.make_tensor(smem_ptr, (warps,))
+    lane_in_warp = lane_var % 32
+    # Only used for group_count == 1 groups spanning the whole CTA, so
+    # ``lane_var`` is the CTA thread index and ``lane_var // 32`` its warp.
+    warp = lane_var // 32
+    warp_partial = warp_op(input_value, threads_in_group=32)
+    if lane_in_warp == 0:
+        smem[warp] = warp_partial
+    cute.arch.sync_threads()
+    result = smem[0]
+    for w in cutlass.range_constexpr(1, warps):
+        result = combine(result, smem[w])
+    cute.arch.sync_threads()
+    return result
+
+
+def _cute_scalar_combine_max(a: cute.Numeric, b: cute.Numeric) -> cute.Numeric:
+    return cute.arch.fmax(a, b)
+
+
+@cute.jit
+def _cute_scalar_combine_min(a: cute.Numeric, b: cute.Numeric) -> cute.Numeric:
+    return min(b, a)
+
+
+def _cute_scalar_combine_f32_min(a: cute.Numeric, b: cute.Numeric) -> cute.Numeric:
+    return cute.arch.fmin(a, b)
+
+
+@cute.jit
+def _cute_scalar_combine_generic_max(a: cute.Numeric, b: cute.Numeric) -> cute.Numeric:
+    return max(b, a)
+
+
+_SERIAL_DISPATCH = {
+    "sum": (_warp_reduce_sum, operator.add),
+    "prod": (_warp_reduce_prod, operator.mul),
+}
+
+# Above this many warps the serial fold's per-thread chain outgrows the
+# two-stage form's constant shuffle cost.
+_SERIAL_MAX_WARPS = 8
+
+
+def _cute_grouped_reduce_shared_serial(
+    input_value: cute.Numeric,
+    reduction_type: str,
+    identity: cute.Numeric,
+    lane_var: cutlass.Int32,
+    *,
+    group_span: int,
+) -> cute.Numeric:
+    if reduction_type == "max":
+        warp_op = _warp_reduce_max
+        # cute.arch.fmax/fmin are one FMNMX; Python max/min lower to
+        # compare+select.
+        combine = (
+            _cute_scalar_combine_max
+            if type(identity) is cutlass.Float32
+            else _cute_scalar_combine_generic_max
+        )
+    elif reduction_type == "min":
+        warp_op = _warp_reduce_min
+        combine = (
+            _cute_scalar_combine_f32_min
+            if type(identity) is cutlass.Float32
+            else _cute_scalar_combine_min
+        )
+    else:
+        entry = _SERIAL_DISPATCH.get(reduction_type)
+        if entry is None:
+            raise ValueError(f"unsupported CuTe reduction type: {reduction_type!r}")
+        warp_op, combine = entry
+    return _cute_grouped_reduce_shared_serial_body(
+        input_value,
+        warp_op,
+        combine,
+        identity,
+        lane_var,
+        group_span,
+    )
+
+
+def _use_serial_block_reduce(pre: int, group_span: int, group_count: int) -> bool:
+    # group_count == 1 with pre == 1 means ONE group spanning the whole
+    # CTA at every current emitter (they all size group_count as
+    # num_threads // group_span); the serial body's warp indexing relies
+    # on that invariant.
+    return (
+        pre == 1
+        and group_count == 1
+        and group_span % 32 == 0
+        and 2 <= group_span // 32 <= _SERIAL_MAX_WARPS
+    )
+
+
 def _cute_grouped_reduce_shared_two_stage(
     input_value: cute.Numeric,
     reduction_type: str,
@@ -362,6 +482,17 @@ def _cute_grouped_reduce_shared_two_stage(
     group_span: int,
     group_count: int,
 ) -> cute.Numeric:
+    # Despite the name (kept for call-site stability) this dispatcher owns
+    # ALL shared-memory cross-warp combines: small whole-CTA groups route
+    # to the cheaper serial form, everything else to the two-stage form.
+    if _use_serial_block_reduce(pre, group_span, group_count):
+        return _cute_grouped_reduce_shared_serial(
+            input_value,
+            reduction_type,
+            identity,
+            lane_var,
+            group_span=group_span,
+        )
     impl = _TWO_STAGE_DISPATCH.get(reduction_type)
     if impl is None:
         raise ValueError(f"unsupported CuTe reduction type: {reduction_type!r}")
@@ -789,14 +920,6 @@ def _cute_grouped_reduce_cluster_body(
     return result
 
 
-def _cute_scalar_combine_max(a: cute.Numeric, b: cute.Numeric) -> cute.Numeric:
-    return cute.arch.fmax(a, b)
-
-
-def _cute_scalar_combine_min(a: cute.Numeric, b: cute.Numeric) -> cute.Numeric:
-    return min(b, a)
-
-
 _CLUSTER_DISPATCH = {
     "sum": (_warp_reduce_sum, operator.add),
     "max": (_warp_reduce_max, _cute_scalar_combine_max),
@@ -845,11 +968,9 @@ def _cute_grouped_reduce_block(
     combine.  Used by the cluster online-pair rewrite to relocalize the
     first (max) reduction of an online-softmax pair — the cross-CTA
     combine happens later in ``_cute_grouped_reduce_cluster_online_pair``."""
-    impl = _TWO_STAGE_DISPATCH.get(reduction_type)
-    if impl is None:
-        raise ValueError(f"unsupported CuTe reduction type: {reduction_type!r}")
-    return impl(
+    return _cute_grouped_reduce_shared_two_stage(
         input_value,
+        reduction_type,
         identity,
         lane_var,
         lane_var,
@@ -897,8 +1018,9 @@ def _cute_grouped_reduce_cluster_online_pair_body(
     """
     from helion._compiler.cute.cluster_helpers import store_shared_remote_f32x2
 
-    cta_sum = _cute_grouped_reduce_shared_two_stage_sum(
+    cta_sum = _cute_grouped_reduce_shared_two_stage(
         local_sum,
+        "sum",
         cutlass.Float32(0.0),
         lane_var,
         lane_var,
@@ -925,23 +1047,35 @@ def _cute_grouped_reduce_cluster_online_pair_body(
             lane32,
         )
     cute.arch.mbarrier_wait(mbar_ptr, phase=0)
-    # Warp-parallel fold: each lane owns one received pair, two warp
-    # reductions combine them.  A serial constexpr fold would batch
-    # ``cluster_n`` LDS.128 loads into one register burst (32 registers at
-    # cluster_n=16) right where the cached exp values already peak the
-    # live set — this keeps the fold's register profile flat.
-    lane_in_warp = lane32 % 32
-    slot = lane_in_warp % cluster_n
-    pair_max = vals[2 * slot]
-    pair_sum = vals[2 * slot + 1]
-    if lane_in_warp >= cluster_n:
-        pair_max = -cutlass.Float32.inf
-        pair_sum = cutlass.Float32(0.0)
-    group_max = cute.arch.warp_reduction_max(pair_max, threads_in_group=32)
-    rescaled = pair_sum * cute.math.exp2(
-        (pair_max - group_max) * scale, fastmath=fastmath
-    )
-    group_sum = cute.arch.warp_reduction_sum(rescaled, threads_in_group=32)
+    if cutlass.const_expr(cluster_n <= 8):
+        # Serial fold over the received pairs: no shuffles, and the small
+        # LDS burst (<= 8 pairs) stays under the live-set peak.
+        group_max = vals[0]
+        for w in cutlass.range_constexpr(1, cluster_n):
+            group_max = cute.arch.fmax(group_max, vals[2 * w])
+        group_sum = cutlass.Float32(0.0)
+        for w in cutlass.range_constexpr(cluster_n):
+            group_sum = group_sum + vals[2 * w + 1] * cute.math.exp2(
+                (vals[2 * w] - group_max) * scale, fastmath=fastmath
+            )
+    else:
+        # cluster_n = 16: warp-parallel fold — each lane owns one received
+        # pair, two warp reductions combine them.  At this width a serial
+        # constexpr fold batches the 16 pair loads into one register burst
+        # (32 registers) right where the cached exp values already peak
+        # the live set; the warp shuffles keep the register profile flat.
+        lane_in_warp = lane32 % 32
+        slot = lane_in_warp % cluster_n
+        pair_max = vals[2 * slot]
+        pair_sum = vals[2 * slot + 1]
+        if lane_in_warp >= cluster_n:
+            pair_max = -cutlass.Float32.inf
+            pair_sum = cutlass.Float32(0.0)
+        group_max = cute.arch.warp_reduction_max(pair_max, threads_in_group=32)
+        rescaled = pair_sum * cute.math.exp2(
+            (pair_max - group_max) * scale, fastmath=fastmath
+        )
+        group_sum = cute.arch.warp_reduction_sum(rescaled, threads_in_group=32)
     return group_max, group_sum
 
 
