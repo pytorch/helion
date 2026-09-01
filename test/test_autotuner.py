@@ -1749,12 +1749,14 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # ListOf: radius is forwarded to inner fragment
         list_frag = ListOf(inner=IntegerFragment(1, 10, 5), length=2)
         neighbors = list_frag.pattern_neighbors([5, 5], radius=2)
-        # Each position yields 4 neighbors (3,4,6,7), total 8
-        self.assertEqual(len(neighbors), 8)
-        # All neighbors differ from base in exactly one position
-        for neighbor in neighbors:
-            diffs = sum(1 for a, b in zip(neighbor, [5, 5], strict=True) if a != b)
-            self.assertEqual(diffs, 1)
+        # Each position yields 4 neighbors (3,4,6,7) = 8 single-position
+        # changes, plus uniform lists (all elements set to the same value
+        # near the inner default): [3,3], [4,4], [6,6], [7,7].
+        single = [n for n in neighbors if n.count(5) == 1]
+        uniform = [n for n in neighbors if n.count(5) == 0]
+        self.assertEqual(len(single), 8)
+        self.assertEqual(sorted(uniform), [[3, 3], [4, 4], [6, 6], [7, 7]])
+        self.assertEqual(len(neighbors), 12)
 
     def test_lfbo_flash_terminal_coordinate_refinement_runs_two_rounds(self):
         def make_fn(source_id: int):

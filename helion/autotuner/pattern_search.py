@@ -90,7 +90,8 @@ class PatternSearch(PopulationBasedSearch):
 
     def _algorithm_cache_policy(self) -> dict[str, object]:
         return {
-            "pattern_version": 1,
+            # 2: ListOf.pattern_neighbors also proposes uniform lists.
+            "pattern_version": 2,
             "initial_population": self.initial_population,
             "copies": self.copies,
             "max_generations": self.max_generations,
