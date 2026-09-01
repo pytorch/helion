@@ -359,6 +359,14 @@ class DeviceFunction:
         # nested control-flow graphs.
         self.pallas_remote_copy_tensor_ids: set[int] = set()
         self.pallas_remote_copy_storage_ids: set[int] = set()
+        # Read-only inputs selected for explicit local HBM-to-VMEM DMA at
+        # their load sites, rather than launcher-managed VMEM BlockSpecs.
+        self.pallas_direct_hbm_load_tensor_ids: set[int] = set()
+        self.pallas_hoisted_direct_dma_copy_names: set[str] = set()
+        # Body-local ``torch.empty`` tensors that are read and written but do
+        # not escape the kernel return can live entirely in compiler-managed
+        # VMEM scratch instead of becoming hidden HBM in/out arguments.
+        self.pallas_internal_scratch_storage_names: dict[int, str] = {}
         # Pallas: id(fake_tensor) → memory space, determined during
         # tracing (HBM for pipeline) and codegen (SMEM for scalar access).
         # NOTE: Currently each tensor can only have one memory space.
@@ -392,6 +400,18 @@ class DeviceFunction:
             id(tensor) in self.pallas_remote_copy_tensor_ids
             or id(tensor.untyped_storage()) in self.pallas_remote_copy_storage_ids
         )
+
+    def is_pallas_direct_hbm_load(self, tensor: torch.Tensor) -> bool:
+        return id(tensor) in self.pallas_direct_hbm_load_tensor_ids
+
+    def pallas_internal_scratch_name(self, tensor: torch.Tensor) -> str | None:
+        return self.pallas_internal_scratch_storage_names.get(
+            id(tensor.untyped_storage())
+        )
+
+    def pallas_tensor_ref_name(self, tensor: torch.Tensor) -> str:
+        scratch = self.pallas_internal_scratch_name(tensor)
+        return scratch if scratch is not None else self.tensor_arg(tensor).name
 
     def allocate_store_index(self) -> int:
         """Bump store counters and return the indexing strategy slot."""
@@ -878,7 +898,14 @@ class DeviceFunction:
 
     def sorted_args(self) -> list[Argument]:
         self.arguments.sort(key=lambda arg: arg.sort_key())
-        return self.arguments
+        return [
+            arg
+            for arg in self.arguments
+            if not (
+                isinstance(arg, TensorArg)
+                and self.pallas_internal_scratch_name(arg.fake_value) is not None
+            )
+        ]
 
     def codegen_function_def(self) -> list[ast.stmt]:
         prefix = []
@@ -960,11 +987,21 @@ class DeviceFunction:
         )
         if function_decorator:
             decorators.append(expr_from_string(function_decorator))
+        cluster_sync: list[ast.stmt] = []
+        if getattr(self.cute_state, "simt_cluster_reduce_sites", 0) > 0:
+            # One fence + cluster barrier covering every cluster-reduce
+            # site's mbarrier init (emitted into the preamble above).
+            cluster_sync = [
+                statement_from_string("cute.arch.mbarrier_init_fence()"),
+                statement_from_string("cute.arch.cluster_arrive_relaxed()"),
+                statement_from_string("cute.arch.cluster_wait()"),
+            ]
         kernel_body: list[ast.stmt] = cast(
             "list[ast.stmt]",
             [
                 *scalar_preamble,
                 *self.preamble,
+                *cluster_sync,
                 *self.body,
             ],
         )
@@ -1006,10 +1043,25 @@ class DeviceFunction:
                 )
             except Exception:
                 thread_block_dims = (1, 1, 1)
+            # Best-effort map for the fuser's cache-dtype resolution;
+            # ``dtype_str`` raises for dtypes the cute backend has no
+            # canonical spelling for (e.g. uint32 barrier flags, which
+            # SIMT loads treat as raw bytes) — such tensors simply don't
+            # participate in load fusion.
+            tensor_dtypes = {}
+            for arg in self.arguments:
+                if isinstance(arg, TensorArg):
+                    try:
+                        tensor_dtypes[arg.name] = backend.dtype_str(
+                            arg.fake_value.dtype
+                        )
+                    except ValueError:
+                        continue
             kernel_body = fuse_two_pass_loads(
                 kernel_body,
                 constexpr_values,
                 thread_block_dims=thread_block_dims,
+                tensor_dtypes=tensor_dtypes,
             )
             # Hoist warp reductions out of constexpr V-loops to collapse
             # 4 per-V-lane warp reductions into 1 V-fold + 1 warp reduce.
@@ -1017,8 +1069,13 @@ class DeviceFunction:
             # from ~396 to ~99 (4x fewer SHFL trees).
             from .cute.hoist_warp_reduce import hoist_warp_reduce_from_vloop
 
+            # The collapse stage needs the post-rename canonical map to see
+            # through loop-carried alias vars (``v_1`` renaming to ``mi``).
+            rename_groups = {k: v[0] for k, v in self._variable_renames.items()}
             kernel_body = hoist_warp_reduce_from_vloop(
-                kernel_body, running_sum_accumulators=self.cute_matmul_running_sums
+                kernel_body,
+                running_sum_accumulators=self.cute_matmul_running_sums,
+                rename_groups=rename_groups,
             )
             # Merge adjacent constexpr V-loops that share an identical
             # statement prefix.  Caches the last common per-V-lane value
@@ -1072,7 +1129,40 @@ class DeviceFunction:
             kernel_body = pipeline_inner_loads(
                 kernel_body, constexpr_values, rename_groups=rename_groups
             )
-        return [
+            # Fuse an online-softmax (max, sum) pair of cluster reduces into
+            # ONE packed DSM exchange: the max reduce relocalizes to a
+            # CTA-local block reduce, the sum site exchanges the
+            # ``(local_max, local_sum)`` pair once and folds with the
+            # online-softmax rescale, and the write sweep reuses the sum
+            # sweep's cached exp values.  Saves a full cluster round-trip
+            # per row (+5..9% at cluster_n 2..16 on B200 softmax).
+            from .cute.cluster_online_pair import fuse_cluster_online_pair
+
+            kernel_body = fuse_cluster_online_pair(
+                kernel_body,
+                constexpr_values,
+                rename_groups=rename_groups,
+                fast_math=CompileEnvironment.current().settings.fast_math,
+            )
+            # ``ex2.approx.ftz`` is a numerics change (denormal exp outputs
+            # flush to zero), so it is gated on the fast_math SETTING —
+            # tuned configs must never change numerics.
+            if CompileEnvironment.current().settings.fast_math:
+                from .cute.exp2_fastmath import apply_exp2_fastmath
+
+                kernel_body = apply_exp2_fastmath(kernel_body)
+            # The DSM cluster reduce uses a single-phase mbarrier, so each
+            # call site must execute exactly ONCE per kernel.  The
+            # lane-reduce collapse normally hoists it out of the (staged,
+            # multi-trip) lane loop; when the collapse bails for a config,
+            # the call would run once per lane iteration and DEADLOCK in
+            # ``mbarrier_wait`` (an unkillable kernel that wedges the
+            # autotuner's benchmark worker).  Reject such configs loudly so
+            # the autotuner skips them.
+            from .cute.hoist_warp_reduce import validate_cluster_reduce_placement
+
+            validate_cluster_reduce_placement(kernel_body, constexpr_values)
+        result = [
             *prefix,
             ast_rename(
                 create(
@@ -1086,6 +1176,29 @@ class DeviceFunction:
                 {k: v[0] for k, v in self._variable_renames.items()},
             ),
         ]
+        simt_cluster_n = getattr(self.cute_state, "simt_cluster_n", 1)
+        if simt_cluster_n > 1:
+            # The CuTe launcher reads this attribute to launch the kernel
+            # with a (1, cluster_n, 1) thread-block cluster.
+            result.append(
+                statement_from_string(
+                    f"{self.name}._helion_cute_cluster_shape = (1, {simt_cluster_n}, 1)"
+                )
+            )
+        min_blocks = self.config.config.get("cute_min_blocks_per_mp", 0)
+        if (
+            CompileEnvironment.current().backend.name == "cute"
+            and isinstance(min_blocks, int)
+            and min_blocks > 0
+        ):
+            # ptxas ``minnctapersm``: caps registers so ``min_blocks`` CTAs
+            # stay resident per SM (occupancy over spills).
+            result.append(
+                statement_from_string(
+                    f"{self.name}._helion_cute_min_blocks_per_mp = {min_blocks}"
+                )
+            )
+        return result
 
     def codegen_function_call(self) -> ast.AST:
         env = CompileEnvironment.current()
@@ -1112,6 +1225,20 @@ class DeviceFunction:
         assert pid is not None
 
         call_grid_expr = pid.codegen_grid()
+        simt_cluster_n = getattr(self.cute_state, "simt_cluster_n", 1)
+        if simt_cluster_n > 1:
+            # The cluster splits each row across ``cluster_n`` CTAs on a new
+            # trailing grid dim.  Only a 1-D grid can host the cluster dim.
+            if not (
+                isinstance(call_grid_expr, ast.Tuple) and len(call_grid_expr.elts) == 1
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "cute_cluster_n > 1 requires a 1-D launch grid",
+                )
+            call_grid_expr = expr_from_string(
+                f"(*{{grid}}, {simt_cluster_n})", grid=call_grid_expr
+            )
         # Extra params are positional and must come before any keyword args that
         # build_launcher_args appends (e.g. num_warps=, num_stages=).
         args.extend(self.codegen._extra_params)

@@ -704,6 +704,43 @@ def pallas_fixed_dynamic_window(
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_prefetched_aligned_dynamic_window(
+    table: torch.Tensor, starts: torch.Tensor
+) -> torch.Tensor:
+    rows = hl.specialize(table.size(0))
+    out = torch.empty(
+        [starts.size(0), rows, 128], dtype=table.dtype, device=table.device
+    )
+    for _ in hl.grid(1):
+        for tile in hl.tile(starts.size(0), block_size=1):
+            begin = starts[tile.begin] * 128
+            out[tile, :, :] = table[:, begin + hl.arange(128)][None, :, :]
+    return out
+
+
+@helion.kernel(
+    backend="pallas",
+    static_shapes=True,
+    config=helion.Config(pallas_loop_type="fori_loop"),
+)
+def pallas_two_aligned_dynamic_windows(
+    table: torch.Tensor, starts: torch.Tensor
+) -> torch.Tensor:
+    """Read two distinct aligned windows from one HBM tensor per iteration."""
+    rows = hl.specialize(table.size(0))
+    out = torch.empty(
+        [starts.size(0), rows, 128], dtype=table.dtype, device=table.device
+    )
+    for _ in hl.grid(1):
+        for tile in hl.tile(starts.size(0), block_size=1):
+            begin = starts[tile.begin] * 128
+            first = table[:, begin + hl.arange(128)]
+            second = table[:, begin + 128 + hl.arange(128)]
+            out[tile, :, :] = (first + second)[None, :, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_computed_static_slice(x: torch.Tensor) -> torch.Tensor:
     rows = x.size(0)
     out = torch.empty([rows, 128], dtype=x.dtype, device=x.device)
@@ -913,6 +950,37 @@ class TestPallas(TestCase):
                 )
                 expected = x[3 : 3 + extent].sum(dim=0, keepdim=True)
                 torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+    @skipIfPallasInterpret("dynamic HBM DMA offsets require a real TPU")
+    def test_aligned_dynamic_window_prefetch(self) -> None:
+        table = torch.randn(8, 512, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 1, 2, 3], device=DEVICE, dtype=torch.int32)
+        expected = torch.stack(
+            [table[:, begin : begin + 128] for begin in range(0, 512, 128)]
+        )
+
+        for loop_type in ("fori_loop", "unroll"):
+            with self.subTest(pallas_loop_type=loop_type):
+                _, result = code_and_output(
+                    pallas_prefetched_aligned_dynamic_window,
+                    (table, starts),
+                    pallas_load_buffer_count=[2, 1],
+                    pallas_loop_type=loop_type,
+                )
+                torch.testing.assert_close(result.cpu(), expected.cpu())
+
+    @skipIfPallasInterpret("dynamic HBM DMA offsets require a real TPU")
+    def test_two_aligned_dynamic_windows(self) -> None:
+        table = torch.randn(8, 640, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 1, 2, 3], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(pallas_two_aligned_dynamic_windows, (table, starts))
+        expected = torch.stack(
+            [
+                table[:, begin : begin + 128] + table[:, begin + 128 : begin + 256]
+                for begin in range(0, 512, 128)
+            ]
+        )
+        torch.testing.assert_close(result.cpu(), expected.cpu())
 
     def test_computed_static_slice(self) -> None:
         x = torch.randn(128, 256, device=DEVICE, dtype=torch.float32)
@@ -2444,6 +2512,30 @@ class TestPallas(TestCase):
         expected[indices.to(torch.int64)] = values
         torch.testing.assert_close(result, expected)
 
+    def test_scalar_tensor_index_store(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scalar_tensor_index_store(
+            values: torch.Tensor, output_row: torch.Tensor
+        ) -> torch.Tensor:
+            m, n = values.size()
+            out = torch.zeros([4, m, n], dtype=values.dtype, device=values.device)
+            row = output_row[0]
+            for tile_m, tile_n in hl.tile(values.size()):
+                out[row, tile_m, tile_n] = values[tile_m, tile_n]
+            return out
+
+        values = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        output_row = torch.tensor([2], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            scalar_tensor_index_store,
+            (values, output_row),
+            block_sizes=[8, 128],
+        )
+
+        expected = torch.zeros(4, 8, 128, device=DEVICE)
+        expected[2] = values
+        torch.testing.assert_close(result, expected)
+
     def test_tensor_index_atomic_add_raises(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def atomic_add_tensor_index(
@@ -3619,6 +3711,51 @@ class TestPallas(TestCase):
         self.assertLess(prefetch, min(waits))
         self.assertGreaterEqual(sum(i < compute for i in waits), 2)
         torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_static_unroll_tensor_load_buffering(self) -> None:
+        """Static unroll retains the selected depth-two DMA pipeline."""
+        args = (
+            torch.randn(64, 256, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 256, device=DEVICE, dtype=torch.float32),
+        )
+        _, result = code_and_output(
+            pallas_inner_loop_add,
+            args,
+            block_sizes=[8, 128],
+            pallas_loop_type="unroll",
+            pallas_load_buffer_count=[2, 1],
+        )
+
+        torch.testing.assert_close(result.cpu(), (args[0] + args[1]).cpu())
+
+    def test_static_unroll_uses_python_if_for_tile_predicate(self) -> None:
+        """A static tile predicate does not leave a side-effectful lax.cond."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def alternating_add(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                for tile_n in hl.tile(n):
+                    if tile_n.begin == 0:
+                        out[tile_m, tile_n] = x[tile_m, tile_n] + 1
+                    else:
+                        out[tile_m, tile_n] = x[tile_m, tile_n] + 2
+            return out
+
+        x = torch.randn(16, 256, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(
+            alternating_add,
+            (x,),
+            block_sizes=[8, 128],
+            pallas_loop_type="unroll",
+            pallas_load_buffer_count=[2],
+        )
+
+        expected = x.clone()
+        expected[:, :128] += 1
+        expected[:, 128:] += 2
+        torch.testing.assert_close(result.cpu(), expected.cpu())
 
     def test_fori_loop_repeated_loads_share_buffer(self) -> None:
         """Repeated loads of one input reuse its tensor-keyed DMA route."""

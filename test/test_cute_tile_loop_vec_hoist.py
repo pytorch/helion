@@ -6,15 +6,15 @@ reads per-lane scalars via bitcast extracts from the hoist var. This
 replaces V scalar fp16 loads with one V*2-byte vec load per thread per
 outer iter.
 
-The hoist is gated to V<=4 for fp16/bf16 (the CuTe DSL's
-``nvvm.load.ext`` ICEs at V=8); V=8 falls back to a 2x V=4 split with
-``_a`` / ``_b`` suffixed hoist vars covering vec lanes 0-3 and 4-7.
+V=8 emits a single 16-byte load (LDG.128).  Stores through the same
+vec-partitioned lane axis are collected per V-loop and flushed as one
+``_cute_store_u16_vec`` vector store (ST.64/ST.128) after the loop.
 
 Lives in ``helion/_compiler/tile_strategy.py``
 (``PerThreadNDTileStrategy._cute_*_by_block`` hooks) and
-``helion/language/memory_ops.py`` (``_cute_register_tile_unroll_vec_hoist``
-and ``_cute_vector_load_ctx`` ``"tile_unroll"`` / ``"tile_unroll_split2"``
-modes).
+``helion/language/memory_ops.py`` (``_cute_register_tile_unroll_vec_hoist``,
+``_cute_register_tile_unroll_vec_store`` and ``_cute_vector_load_ctx``'s
+``"tile_unroll"`` mode).
 """
 
 from __future__ import annotations
@@ -152,11 +152,11 @@ class TestCuteTileLoopVecHoist(TestCase):
         # And the per-V-lane extract is a bitcast back to Float16.
         self.assertIn("bitcast(cutlass.Float16)", code)
 
-    def test_vec_hoist_v8_uses_4plus4_split(self) -> None:
-        """V=8 fp16/bf16 cannot use a single ``cute.arch.load`` (the CuTe
-        DSL's ``nvvm.load.ext`` ICEs at V=8), so the codegen lowers it as
-        TWO back-to-back ``cute.arch.load(..., V=4)`` calls (covering vec
-        lanes 0-3 and 4-7).
+    def test_vec_hoist_v8_single_load(self) -> None:
+        """V=8 fp16/bf16 emits ONE ``cute.arch.load(..., V=8)`` (LDG.128)
+        per outer-lane iter.  (Older CuTe DSL builds ICE'd on V=8
+        ``nvvm.load.ext`` and needed a 4+4 split; that bug is fixed in
+        cutlass 4.7.)
         """
         x = torch.randn(4096, 8192, device=DEVICE, dtype=HALF_DTYPE)
         code, out = code_and_output(
@@ -168,30 +168,12 @@ class TestCuteTileLoopVecHoist(TestCase):
         )
         ref = torch.nn.functional.softmax(x, dim=1)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-        # The single-V=8 load form is still NOT emitted (would ICE).
-        self.assertNotIn("ir.VectorType.get([8]", code)
-        # The split-2 path emits TWO V=4 vec loads per outer-lane iter
-        # with the ``_a`` / ``_b`` suffix on the hoist var names.  When
-        # the load-pipeline pass fires, the ``_a`` load assignment text
-        # gets rewritten to ``_tile_unroll_vec_1_0_a = _pipe_load_*``
-        # with the actual ``cute.arch.load`` hoisted into the prologue;
-        # the ``_b`` load is left as an inline ``cute.arch.load`` call.
-        self.assertTrue(
-            "_tile_unroll_vec_1_0_a = cute.arch.load(" in code
-            or "_tile_unroll_vec_1_0_a = _pipe_load_" in code,
-            "expected _a hoist var either as inline load or pipeline snapshot",
-        )
-        self.assertIn("_tile_unroll_vec_1_0_b = cute.arch.load(", code)
-        # Both halves use V=4.
-        self.assertGreaterEqual(
-            code.count("ir.VectorType.get([4], cutlass.Uint16.mlir_type)"),
-            2,
-        )
-        # The constexpr V-loop now runs 8 iters (not 4).
+        self.assertIn("ir.VectorType.get([8], cutlass.Uint16.mlir_type)", code)
+        # No 4+4 split vars.
+        self.assertNotIn("_tile_unroll_vec_1_0_a", code)
+        self.assertNotIn("_tile_unroll_vec_1_0_b", code)
+        # The constexpr V-loop runs 8 iters.
         self.assertIn("cutlass.range_constexpr(8)", code)
-        # The per-vec-lane extract uses the if-else split selector so the
-        # constexpr loop unroller picks the right half per iter.
-        self.assertIn("if vec_lane_1 < 4 else", code)
 
     def test_vec_hoist_bf16(self) -> None:
         """The vec hoist must also fire for bf16 (also a uint16-backed type)."""
@@ -358,3 +340,39 @@ class TestCuteTileLoopVecHoist(TestCase):
         ref = torch.nn.functional.softmax(x, dim=1)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
         self.assertNotIn("_tile_unroll_vec_", code)
+
+    def test_vec_store_flush_after_vloop(self) -> None:
+        """Stores through a vec-partitioned lane axis are collected into a
+        compile-time list inside the constexpr V-loop and flushed as ONE
+        ``_cute_store_u16_vec`` vector store after the loop (ST.64/ST.128
+        instead of V scalar 2-byte stores).
+        """
+        x = torch.randn(4096, 6400, device=DEVICE, dtype=HALF_DTYPE)
+        code, out = code_and_output(
+            _reduction_kernel,
+            (x,),
+            block_sizes=[1, 128],
+            num_threads=[0, 32],
+            cute_vector_widths=[1, 4],
+        )
+        ref = torch.nn.functional.softmax(x, dim=1)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+        self.assertIn("_tile_store_vals_1_0 = []", code)
+        self.assertIn("_tile_store_vals_1_0.append(", code)
+        self.assertIn("_cute_store_u16_vec(", code)
+        # No scalar per-element store of the output remains.
+        self.assertNotIn(").store(cutlass.", code)
+
+    def test_scalar_store_when_vec_width_is_one(self) -> None:
+        """When V=1 the vec store must NOT fire — scalar stores remain."""
+        x = torch.randn(4096, 6400, device=DEVICE, dtype=HALF_DTYPE)
+        code, out = code_and_output(
+            _reduction_kernel,
+            (x,),
+            block_sizes=[1, 128],
+            num_threads=[0, 32],
+            cute_vector_widths=[1, 1],
+        )
+        ref = torch.nn.functional.softmax(x, dim=1)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+        self.assertNotIn("_cute_store_u16_vec(", code)

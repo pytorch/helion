@@ -360,9 +360,15 @@ class PallasBackend(Backend):
         tensor_host_args: list[str],
     ) -> str:
         from ..device_function import SymbolArgument
+        from ..device_function import TensorArg
         from ..device_function import TensorSizeArg
         from ..device_function import TensorStrideArg
 
+        if isinstance(arg, TensorArg) and arg.fake_value.ndim == 0:
+            # Mosaic requires every Pallas input to have rank >= 1. Preserve a
+            # host scalar tensor as a one-element input; its device users load
+            # element zero explicitly.
+            return f"{host_str}.reshape(1)"
         if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
             from ..compile_environment import CompileEnvironment
 
@@ -1512,6 +1518,9 @@ class PallasBackend(Backend):
 
         env = CompileEnvironment.current()
 
+        from .internal_scratch import plan_internal_remote_scratch
+
+        plan_internal_remote_scratch()
         plan_tiling(graphs, config, tile_strategy)
         build_tensorcore_plans(graphs, config)
 

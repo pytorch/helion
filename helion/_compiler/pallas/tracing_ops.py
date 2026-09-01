@@ -34,6 +34,7 @@ from ...language._tracing_ops import _phi
 from ...language._tracing_ops import _pre_broadcast_tile
 from ...language._tracing_ops import _while_loop
 from ...language._tracing_ops import is_for_loop_target
+from ..ast_extension import create
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
@@ -54,6 +55,8 @@ from .tensorcore_plan import build_dma_access_candidates
 
 log = logging.getLogger(__name__)
 
+_PALLAS_LOOP_LOAD_COUNT_META = "_helion_pallas_loop_load_count"
+
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
@@ -67,6 +70,7 @@ if TYPE_CHECKING:
     from ..tile_strategy import TileStrategy
     from .compact_worklist import ResidentPrepHoist
     from .dma import DmaDirection
+    from .plan_tiling import ContiguousRangeIndexPattern
 
 
 @_decorators.codegen(_not, "pallas")
@@ -197,6 +201,14 @@ def _raise_unsupported_dynamic_unroll() -> None:
     )
 
 
+def _uses_buffered_static_unroll(state: CodegenState) -> bool:
+    """Whether a static loop requested the existing depth-two load route."""
+    if state.config.get("pallas_loop_type", "unroll") != "unroll":
+        return False
+    counts = state.config.get("pallas_load_buffer_count", ())
+    return isinstance(counts, (list, tuple)) and 2 in counts
+
+
 def _extract_subscript_vals(subscript: object) -> list[object]:
     """Extract meta values from a subscript argument in an FX graph.
 
@@ -245,6 +257,8 @@ def _(state: CodegenState) -> object:
         return _codegen_dynamic_unroll(state)
     if _has_dynamic_unroll_bound(state):
         _raise_unsupported_dynamic_unroll()
+    if _uses_buffered_static_unroll(state):
+        return _codegen_fori_loop(state, static_unroll=True)
     # unroll: fall through to common codegen path
     # pyrefly: ignore[bad-return]
     return state.get_graph(state.proxy_arg(0)).codegen(state)
@@ -283,6 +297,9 @@ def _(state: CodegenState) -> None:
         return None
     if _has_dynamic_unroll_bound(state):
         _raise_unsupported_dynamic_unroll()
+    if _uses_buffered_static_unroll(state):
+        _codegen_fori_loop(state, static_unroll=True)
+        return None
     # pyrefly: ignore[bad-return]
     return state.get_graph(state.proxy_arg(0)).codegen(state)
 
@@ -604,7 +621,13 @@ def _classify_loop_tensors(
                 key = id(fake)
                 if key not in loaded_tensors:
                     sub_vals = _extract_subscript_vals(subscript)
-                    loaded_tensors[key] = (fake, tensor_node, sub_vals)
+                    loaded_tensors[key] = (fake, node, sub_vals)
+                    node.meta[_PALLAS_LOOP_LOAD_COUNT_META] = 1
+                else:
+                    first_load = loaded_tensors[key][1]
+                    first_load.meta[_PALLAS_LOOP_LOAD_COUNT_META] = (
+                        int(first_load.meta[_PALLAS_LOOP_LOAD_COUNT_META]) + 1
+                    )
         elif node.target is _store_op:
             tensor_node = node.args[0]
             subscript = node.args[1]
@@ -855,6 +878,131 @@ def _get_dim_block_ids(
         elif isinstance(idx, slice) and idx == slice(None):
             pass
     return dim_to_bid
+
+
+def _contiguous_range_patterns(
+    loaded_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+) -> dict[int, dict[int, ContiguousRangeIndexPattern]]:
+    """Return direct HBM range patterns keyed by tensor and tensor dimension."""
+    from .plan_tiling import ContiguousRangeIndexPattern
+    from .plan_tiling import NonePattern
+
+    result: dict[int, dict[int, ContiguousRangeIndexPattern]] = {}
+    for fake, load_node, _subscript in loaded_tensors.values():
+        tensor_dim = 0
+        ranges: dict[int, ContiguousRangeIndexPattern] = {}
+        for pattern in load_node.meta.get("indexing_patterns", ()):
+            if isinstance(pattern, NonePattern):
+                continue
+            if isinstance(pattern, ContiguousRangeIndexPattern):
+                ranges[tensor_dim] = pattern
+            tensor_dim += 1
+        if ranges:
+            result[id(fake)] = ranges
+    return result
+
+
+def _contiguous_range_base_expr(
+    value: object,
+    *,
+    state: CodegenState,
+    block_ids: list[int],
+    begin_exprs: list[str],
+    iter_step_exprs: list[str],
+    iteration_indices: list[str],
+) -> str | None:
+    """Render a supported scalar address expression for one loop iteration."""
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, torch.SymInt):
+        return state.device_function.literal_expr(value)
+    if not isinstance(value, torch.fx.Node) or value.op != "call_function":
+        return None
+
+    from ...language import memory_ops
+    from ...language.tile_ops import tile_begin
+
+    if value.target is tile_begin:
+        symbolic_value = value.meta.get("val")
+        if not isinstance(symbolic_value, torch.SymInt):
+            return None
+        block_id = CompileEnvironment.current().get_block_id(symbolic_value)
+        if block_id is None or block_id not in block_ids:
+            return None
+        position = block_ids.index(block_id)
+        return (
+            f"({begin_exprs[position]}) + ({iteration_indices[position]}) * "
+            f"({iter_step_exprs[position]})"
+        )
+
+    binary_operators = {
+        operator.add: "+",
+        operator.floordiv: "//",
+        operator.mod: "%",
+        operator.mul: "*",
+        operator.sub: "-",
+        torch.ops.aten.add.Scalar: "+",
+        torch.ops.aten.add.Tensor: "+",
+        torch.ops.aten.mul.Scalar: "*",
+        torch.ops.aten.mul.Tensor: "*",
+        torch.ops.aten.sub.Scalar: "-",
+        torch.ops.aten.sub.Tensor: "-",
+    }
+    if value.target in binary_operators and len(value.args) >= 2:
+        if (
+            value.target
+            in (
+                torch.ops.aten.add.Scalar,
+                torch.ops.aten.add.Tensor,
+                torch.ops.aten.sub.Scalar,
+                torch.ops.aten.sub.Tensor,
+            )
+            and value.kwargs.get("alpha", 1) != 1
+        ):
+            return None
+        lhs = _contiguous_range_base_expr(
+            value.args[0],
+            state=state,
+            block_ids=block_ids,
+            begin_exprs=begin_exprs,
+            iter_step_exprs=iter_step_exprs,
+            iteration_indices=iteration_indices,
+        )
+        rhs = _contiguous_range_base_expr(
+            value.args[1],
+            state=state,
+            block_ids=block_ids,
+            begin_exprs=begin_exprs,
+            iter_step_exprs=iter_step_exprs,
+            iteration_indices=iteration_indices,
+        )
+        if lhs is None or rhs is None:
+            return None
+        return f"({lhs}) {binary_operators[value.target]} ({rhs})"
+
+    if value.target is memory_ops.load:
+        tensor_node, subscript = value.args[:2]
+        if not isinstance(tensor_node, torch.fx.Node):
+            return None
+        tensor = tensor_node.meta.get("val")
+        if not isinstance(tensor, torch.Tensor):
+            return None
+        if not isinstance(subscript, (list, tuple)) or len(subscript) != 1:
+            return None
+        index = _contiguous_range_base_expr(
+            subscript[0],
+            state=state,
+            block_ids=block_ids,
+            begin_exprs=begin_exprs,
+            iter_step_exprs=iter_step_exprs,
+            iteration_indices=iteration_indices,
+        )
+        if index is None:
+            return None
+        name = state.device_function.tensor_arg(tensor).name
+        return f"{name}[{index}]"
+
+    return None
 
 
 def _find_strategy(
@@ -3554,16 +3702,20 @@ def _compute_vmem_shapes(
     slice_size_exprs: list[str],
     env: CompileEnvironment,
     state: CodegenState,
+    contiguous_ranges: dict[int, dict[int, ContiguousRangeIndexPattern]],
 ) -> list[tuple[int, ...]]:
     """Compute VMEM buffer shapes for each tensor in the fori_loop body."""
     vmem_shapes: list[tuple[int, ...]] = []
     for fake, sub_meta, _direction in all_tensor_info:
         dim_to_bid = _get_dim_block_ids(sub_meta, env)
         tensor_subscripts = _tensor_dim_subscripts(sub_meta)
+        range_dims = contiguous_ranges.get(id(fake), {})
         parts: list[int] = []
         for dim_idx in range(len(fake.shape)):
             bid = dim_to_bid.get(dim_idx)
-            if bid is not None and bid in block_ids:
+            if dim_idx in range_dims:
+                parts.append(range_dims[dim_idx].length)
+            elif bid is not None and bid in block_ids:
                 bid_idx = block_ids.index(bid)
                 block_value_sym = sympy.sympify(slice_size_exprs[bid_idx])
                 if isinstance(block_value_sym, sympy.Integer):
@@ -3655,8 +3807,14 @@ def _classify_pipelined_tensors(
     outer_access_targets = ATOMIC_OPS | {_load_op, _store_op}
 
     all_tensor_info = _resident_loop_tensor_info(loaded_tensors, stored_tensors)
+    contiguous_ranges = _contiguous_range_patterns(loaded_tensors)
     vmem_shapes = _compute_vmem_shapes(
-        all_tensor_info, block_ids, slice_size_exprs, env, state
+        all_tensor_info,
+        block_ids,
+        slice_size_exprs,
+        env,
+        state,
+        contiguous_ranges,
     )
     device_ir = HostFunction.current().device_ir
 
@@ -3695,6 +3853,27 @@ def _classify_pipelined_tensors(
     for (fake, sub_meta, direction), vmem_shape in zip(
         all_tensor_info, vmem_shapes, strict=True
     ):
+        if state.device_function.pallas_internal_scratch_name(fake) is not None:
+            # This tensor already names a VMEM allocation owned by the kernel.
+            # Routing it through the inner-loop HBM DMA path would allocate a
+            # second VMEM buffer and emit pointless copies from an HBM argument
+            # that no longer exists.
+            continue
+        if direction == "load":
+            first_load = loaded_tensors[id(fake)][1]
+            if int(first_load.meta.get(_PALLAS_LOOP_LOAD_COUNT_META, 1)) > 1:
+                # Tensor-level prefetching is keyed by input tensor, not load
+                # site. Dynamic ranges can remain in HBM so each load site
+                # stages its own exact window. Ordinary tiled loads must keep
+                # their outer BlockSpec: raw HBM load-site staging is defined
+                # only for dynamic ranges and remote-copy operands.
+                if id(fake) in contiguous_ranges:
+                    from ..device_function import PallasMemorySpace
+
+                    state.device_function.pallas_memory_space[id(fake)] = (
+                        PallasMemorySpace.HBM
+                    )
+                    continue
         dim_to_bid = _get_dim_block_ids(sub_meta, env)
         if state.device_function.is_pallas_remote_copy_operand(fake) and not set(
             dim_to_bid.values()
@@ -3712,6 +3891,23 @@ def _classify_pipelined_tensors(
             continue
         if id(fake.untyped_storage()) in atomic_storages:
             continue
+        if range_patterns := contiguous_ranges.get(id(fake)):
+            can_render_ranges = all(
+                _contiguous_range_base_expr(
+                    pattern.base,
+                    state=state,
+                    block_ids=block_ids,
+                    begin_exprs=["0"] * len(block_ids),
+                    iter_step_exprs=["1"] * len(block_ids),
+                    iteration_indices=["0"] * len(block_ids),
+                )
+                is not None
+                for pattern in range_patterns.values()
+            )
+            if not can_render_ranges:
+                # The load-site lowering can still stage this window, but the
+                # loop prefetcher cannot safely synthesize its next address.
+                continue
         pipelined_ids.add(id(fake))
     return all_tensor_info, vmem_shapes, pipelined_ids
 
@@ -3857,12 +4053,13 @@ def _codegen_dynamic_unroll(state: CodegenState) -> object:
     return [expr_from_string(f"{result_var}[{i}]") for i in range(len(carried))]
 
 
-def _codegen_fori_loop(state: CodegenState) -> object:
+def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> object:
     """Emit inner device loops using jax.lax.fori_loop.
 
     Tensors admitted by the existing streaming classifier use explicit DMA.
     Selected read-only input tensors use two DMA buffers; all other routes keep
-    their existing single-buffered lowering.
+    their existing single-buffered lowering. ``static_unroll`` retains that DMA
+    schedule while using Python ``range`` so JAX traces a straight-line program.
     """
     from ..device_ir import ForLoopGraphInfo
     from ..device_ir import LiftTensorArgs
@@ -3888,6 +4085,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     grid_parts, block_size_vars = _compute_grid_and_block_sizes(state, block_ids, env)
 
     loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
+    contiguous_ranges = _contiguous_range_patterns(loaded_tensors)
     begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
         state, block_ids, block_size_vars
     )
@@ -3986,9 +4184,13 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     dma_stores: list[ScheduledDmaTransfer] = []
     scheduled_by_hbm_name: dict[str, ScheduledDmaTransfer] = {}
     memory_op_to_dma_scratch: dict[torch.fx.Node, DmaResources] = {}
-    # compact_worklist shares this lowering but keeps its compact/resident routes;
-    # only an actual fori_loop config enables depth-two staging.
-    load_buffer_counts_active = state.config.get("pallas_loop_type") == "fori_loop"
+    # compact_worklist shares this lowering but keeps its compact/resident routes.
+    # Ordinary fori loops and explicitly buffered static unrolls honor the
+    # per-input depth; other callers keep the historical single-buffer route.
+    load_buffer_counts_active = state.config.get("pallas_loop_type") in (
+        "fori_loop",
+        "unroll",
+    )
 
     input_tensors = cast(
         "list[torch.Tensor]",
@@ -4187,6 +4389,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         block_id_to_info=block_id_to_info,
         body_fn_name="_fori_body_0",
         loop_var_name=loop_vars[-1],
+        static_unroll=static_unroll,
         inner_statements=body_stmts,
         _tensor_to_dma_scratch=tensor_to_dma_scratch,
         _tensor_to_sem=tensor_to_sem,
@@ -4239,7 +4442,28 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 vmem_parts.append(":")
                 continue
             bid = dim_to_bid.get(dim_idx)
-            if bid is not None and bid in block_ids:
+            range_pattern = contiguous_ranges.get(id(fake), {}).get(dim_idx)
+            if range_pattern is not None:
+                base_expr = _contiguous_range_base_expr(
+                    range_pattern.base,
+                    state=state,
+                    block_ids=block_ids,
+                    begin_exprs=begin_exprs,
+                    iter_step_exprs=iter_step_exprs,
+                    iteration_indices=iteration_indices,
+                )
+                if base_expr is None:
+                    raise RuntimeError(
+                        "Pallas could not render a planned contiguous HBM range"
+                    )
+                hbm_parts.append(
+                    "pl.ds(pl.multiple_of("
+                    f"{base_expr}, {range_pattern.alignment}), "
+                    f"{range_pattern.length})"
+                )
+                vmem_parts.append(":")
+                hbm_needs_slice = True
+            elif bid is not None and bid in block_ids:
                 bid_idx = block_ids.index(bid)
                 begin_expr = begin_exprs[bid_idx]
                 iter_step_expr = iter_step_exprs[bid_idx]
@@ -4251,7 +4475,13 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 # ragged store on a last-two dim can't clamp and is rejected.
                 if clamp and dim_idx < len(shape) - 2:
                     end_expr = _get_loop_begin_and_end(state, bid_idx)[1]
-                    slice_size_expr = f"jnp.minimum({slice_size_expr}, ({end_expr}) - ({offset_expr}))"
+                    # Static unroll resolves the iteration in Python. Keep the
+                    # DMA extent static too: a traced jnp.minimum here creates
+                    # a dynamic HBM subview that Mosaic cannot place reliably.
+                    minimum = "min" if static_unroll else "jnp.minimum"
+                    slice_size_expr = (
+                        f"{minimum}({slice_size_expr}, ({end_expr}) - ({offset_expr}))"
+                    )
                     vmem_parts.append(f"pl.ds(0, {slice_size_expr})")
                     vmem_needs_slice = True
                 elif clamp and is_dynamic_bound_tile(state, bid):
@@ -4586,7 +4816,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             state.add_statement(stmt)
         return None
 
-    _emit_nonlocal_scratch_declarations(state, body_stmts)
+    if not static_unroll:
+        _emit_nonlocal_scratch_declarations(state, body_stmts)
 
     # Emit nested fori_loop calls — one per dimension.
     # Build inside-out: innermost function wraps body_stmts, each outer
@@ -4597,6 +4828,23 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     # not affect correctness; for loop-carried state the user's source order
     # (block_ids order) is the correct semantic order.
     current_body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
+    if static_unroll:
+        for dim in reversed(range(len(loop_vars))):
+            loop = statement_from_string(
+                f"for {loop_vars[dim]} in range({grid_parts[dim]}):\n    pass"
+            )
+            assert isinstance(loop, ast.For)
+            loop.body = current_body  # pyrefly: ignore[bad-assignment]
+            if dim == len(loop_vars) - 1:
+                current_body = [*prime_statements, loop]
+            else:
+                current_body = [loop]
+        for statement in current_body:
+            state.add_statement(statement)
+        if has_loop_state:
+            return _read_final_loop_state(state, result_vars)
+        return None
+
     for dim in reversed(range(len(loop_vars))):
         fn_name = state.device_function.new_var(f"_fori_body_{dim}")
         fn_def = statement_from_string(f"def {fn_name}({loop_vars[dim]}, _): pass")
@@ -4620,6 +4868,46 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     if has_loop_state:
         return _read_final_loop_state(state, result_vars)
     return None
+
+
+def _is_static_unroll_predicate(state: CodegenState) -> bool:
+    """Whether this predicate is resolved by a surrounding Python tile loop."""
+    test = state.proxy_arg(0)
+    if isinstance(test, (bool, int)):
+        return True
+    if not isinstance(test, torch.SymBool):
+        return False
+
+    from ..tile_strategy import ForiLoopState
+    from ..variable_origin import BlockSizeOrigin
+    from ..variable_origin import GridOrigin
+
+    static_block_ids: set[int] = set()
+    for loops in state.codegen.active_device_loops.values():
+        for loop in loops:
+            if isinstance(loop, ForiLoopState) and loop.static_unroll:
+                static_block_ids.update(loop.block_ids)
+    if not static_block_ids:
+        return False
+
+    expr = test._sympy_()
+    if not isinstance(expr, sympy.Basic):
+        return False
+    origins = HostFunction.current().expr_to_origin
+    for symbol in expr.free_symbols:
+        origin_info = origins.get(symbol)
+        if origin_info is None:
+            return False
+        origin = origin_info.origin
+        base_type = origin.base_type()
+        if issubclass(base_type, BlockSizeOrigin):
+            continue
+        if not issubclass(base_type, GridOrigin):
+            return False
+        block_id = getattr(origin, "block_id", None)
+        if block_id not in static_block_ids:
+            return False
+    return True
 
 
 @_decorators.codegen(_if, "pallas")
@@ -4677,6 +4965,20 @@ def _(state: CodegenState) -> list[object]:
     if_return_names, else_return_names = graph_info.get_branches_return_names(
         state, if_outputs, else_outputs
     )
+
+    if (
+        _is_static_unroll_predicate(state)
+        and not if_return_names
+        and not else_return_names
+    ):
+        if_node = create(
+            ast.If,
+            test=test,
+            body=if_body_stmts or [ast.Pass()],
+            orelse=else_body_stmts or [ast.Pass()],
+        )
+        state.add_statement(if_node)
+        return []
 
     if_arg_ids = {arg.id for arg in if_args}
     union_args = if_args + [a for a in else_args if a.id not in if_arg_ids]
