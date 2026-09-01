@@ -215,7 +215,7 @@ class TestPallasLoadBufferCountConfig(TestCase):
         spec = self._config_spec(2)
         field = spec._flat_fields()["pallas_load_buffer_count"]
         self.assertEqual(field.default(), [1, 1])
-        self.assertEqual(field.pattern_neighbors([1, 1]), [[2, 1], [1, 2]])
+        self.assertEqual(field.pattern_neighbors([1, 1]), [[2, 1], [1, 2], [2, 2]])
         self.assertIn(
             ("pallas_load_buffer_count", *field.fingerprint()),
             spec.structural_fingerprint(),

@@ -530,6 +530,23 @@ class ListOf(ConfigSpecFragment):
                 neighbor = current.copy()
                 neighbor[i] = neighbor_value
                 neighbors.append(neighbor)
+        # Also propose uniform lists (every element set to the same value):
+        # element-at-a-time moves can require crossing worse mixed
+        # configurations (e.g. flipping five memory ops from pointer to
+        # tensor_descriptor one by one), while the uniform move jumps straight
+        # across the valley.
+        if self.length > 1:
+            values: list[object] = []
+            for value in [
+                self.inner.default(),
+                *self.inner.pattern_neighbors(self.inner.default(), radius),
+            ]:
+                if value not in values:
+                    values.append(value)
+            for value in values:
+                uniform = [value] * self.length
+                if uniform != current and uniform not in neighbors:
+                    neighbors.append(uniform)
         return neighbors
 
     def differential_mutation(self, a: object, b: object, c: object) -> list[object]:
