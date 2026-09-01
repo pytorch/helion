@@ -332,8 +332,10 @@ class EnumFragment(ConfigSpecFragment):
         return random.choice(self._active_choices())
 
     def pattern_neighbors(self, current: object, radius: int = 1) -> list[object]:
-        if current not in self.choices:
-            raise ValueError(f"{current!r} not a valid choice")
+        # `current` can be outside `choices` when config normalization rewrote
+        # the knob to a value off the searched surface (e.g. cute tcgen05
+        # knobs on configs that opt out of tcgen05); every searched choice is
+        # then a neighbor so the search can step back onto the surface.
         return [choice for choice in self._active_choices() if choice != current]
 
     def differential_mutation(self, a: object, b: object, c: object) -> object:
@@ -374,14 +376,17 @@ class EnumFragment(ConfigSpecFragment):
         return tuple(result)
 
     def encode(self, value: object) -> list[float]:
-        """Encode enum values as their index."""
+        """Encode enum values as a one-hot vector.
+
+        Values outside ``choices`` encode as all zeros rather than raising:
+        config normalization can legally rewrite a knob to a value outside
+        the searched surface (e.g. cute tcgen05 knobs on configs that opt
+        out of tcgen05), and this encoding only feeds surrogate models.
+        """
         try:
             choice_idx = self.choices.index(value)
         except ValueError:
-            raise ValueError(
-                f"Invalid enum value {value!r} for EnumFragment. "
-                f"Valid choices: {self.choices}"
-            ) from None
+            choice_idx = -1
         return [1.0 if i == choice_idx else 0.0 for i in range(len(self.choices))]
 
 
