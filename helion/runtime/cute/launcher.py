@@ -1359,7 +1359,12 @@ def _create_cute_wrapper(
     # occupancy and enables the reallocation (=1 avoids the smem-carveout path >1 would
     # trigger). NOT applied to ws_overlap (256-thread): forcing 1 CTA/SM there cuts its
     # 2-blocks/SM occupancy and regresses it ~4pp.
-    if any(plan.get("topology") == "fa4" for plan in wrapper_plans):
+    explicit_min_blocks = getattr(
+        cast("Any", cute_kernel), "_helion_cute_min_blocks_per_mp", None
+    )
+    if isinstance(explicit_min_blocks, int) and explicit_min_blocks > 0:
+        launch_suffix += f", min_blocks_per_mp={explicit_min_blocks}"
+    elif any(plan.get("topology") == "fa4" for plan in wrapper_plans):
         launch_suffix += ", min_blocks_per_mp=1"
     body.extend(
         (

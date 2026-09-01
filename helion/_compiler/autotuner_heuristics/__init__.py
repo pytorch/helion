@@ -8,6 +8,8 @@ from .cute import CuteFlashAttentionHeuristic
 from .cute import CuteFp8GemmSkinnyMHeuristic
 from .cute import CuteReductionTileHeuristic
 from .cute import CuteReductionWideChunkHeuristic
+from .cute import CuteResidentMultiRowHeuristic
+from .cute import CuteResidentRowHeuristic
 from .cute import CuteTcgen05ClusterM2FfiHeuristic
 from .cute import CuteTcgen05ClusterM2Heuristic
 from .cute import CuteTcgen05GroupedDynamicBk64Heuristic
@@ -57,6 +59,8 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteTileVecHeuristic,
         CuteTileVecWarpReduceHeuristic,
         CuteTileVecWarpPerRowHeuristic,
+        CuteResidentRowHeuristic,
+        CuteResidentMultiRowHeuristic,
     ),
     "triton": (
         # H100 dense matmul seed FIRST so its budget-formula config is the rank-0

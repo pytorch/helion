@@ -163,13 +163,11 @@ class TestCuteSoftmaxVecHoist(TestCase):
         # And the per-V-lane extract is a bitcast back to Float16.
         self.assertIn("bitcast(cutlass.Float16)", code)
 
-    def test_vec_hoist_v8_uses_4plus4_split(self) -> None:
-        """V=8 fp16/bf16 cannot use a single ``cute.arch.load`` (the CuTe
-        DSL's ``nvvm.load.ext`` ICEs at V=8), so the codegen lowers it as
-        TWO back-to-back ``cute.arch.load(..., V=4)`` calls (covering vec
-        lanes 0-3 and 4-7).  The SASS scheduler is free to overlap the
-        two LDGs, so per-thread bytes-per-load still hit the full
-        LDG.128 (16 bytes) without invoking the DSL bug.
+    def test_vec_hoist_v8_single_load(self) -> None:
+        """V=8 fp16/bf16 emits ONE ``cute.arch.load(..., V=8)`` (LDG.128)
+        per outer-lane iter.  (Older CuTe DSL builds ICE'd on V=8
+        ``nvvm.load.ext`` and needed a 4+4 split; that bug is fixed in
+        cutlass 4.7.)
         """
         x = torch.randn(4096, 8192, device=DEVICE, dtype=HALF_DTYPE)
         code, out = code_and_output(
@@ -181,32 +179,12 @@ class TestCuteSoftmaxVecHoist(TestCase):
         )
         ref = torch.nn.functional.softmax(x, dim=1)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-        # The single-V=8 load form is still NOT emitted (would ICE).
-        self.assertNotIn("ir.VectorType.get([8]", code)
-        # The split-2 path emits TWO V=4 vec loads per outer-lane iter
-        # with the ``_a`` / ``_b`` suffix on the hoist var names.  When
-        # the P18 load-pipeline pass fires, the ``_a`` load assignment
-        # text gets rewritten to ``_tile_unroll_vec_1_0_a = _pipe_load_*``
-        # with the actual ``cute.arch.load`` hoisted into the prologue
-        # and an explicit per-iter prefetch; the ``_b`` load is left as
-        # an inline ``cute.arch.load`` call (it's not the first inner
-        # load).  Accept either form.
-        self.assertTrue(
-            "_tile_unroll_vec_1_0_a = cute.arch.load(" in code
-            or "_tile_unroll_vec_1_0_a = _pipe_load_" in code,
-            "expected _a hoist var either as inline load or pipeline snapshot",
-        )
-        self.assertIn("_tile_unroll_vec_1_0_b = cute.arch.load(", code)
-        # Both halves use V=4.
-        self.assertGreaterEqual(
-            code.count("ir.VectorType.get([4], cutlass.Uint16.mlir_type)"),
-            2,
-        )
-        # The constexpr V-loop now runs 8 iters (not 4).
+        self.assertIn("ir.VectorType.get([8], cutlass.Uint16.mlir_type)", code)
+        # No 4+4 split vars.
+        self.assertNotIn("_tile_unroll_vec_1_0_a", code)
+        self.assertNotIn("_tile_unroll_vec_1_0_b", code)
+        # The constexpr V-loop runs 8 iters.
         self.assertIn("cutlass.range_constexpr(8)", code)
-        # The per-vec-lane extract uses the if-else split selector so the
-        # constexpr loop unroller picks the right half per iter.
-        self.assertIn("if vec_lane_1 < 4 else", code)
 
     def test_vec_hoist_bf16(self) -> None:
         """The vec hoist must also fire for bf16 (also a uint16-backed type)."""
@@ -1022,13 +1000,12 @@ class TestCuteMultiRowInvestigation(TestCase):
         # Warp reduce, no shared-mem reduction.
         self.assertIn("cute.arch.warp_reduction_max", code)
         self.assertNotIn("_cute_grouped_reduce_shared_two_stage", code)
-        # The two-pass fuser must fire here so the consume sweep
-        # reads x from a register cache (only one ``cute.arch.load``).
-        # For (4096, 128) with block_size 128, trip = 1 → fuser bails;
-        # but the larger N=256 path with block_size=128 has trip=2
-        # which fires the fuser.  Document the trip-1 case here so the
-        # fuser path stays explicit.
-        self.assertEqual(code.count("cute.arch.load("), 2)
+        # The two-pass fuser fires (trip=1 is the most profitable case:
+        # the cache index folds to a constant so the fragment stays in
+        # registers) — the consume sweep reads x from the register cache
+        # and only ONE ``cute.arch.load`` of x remains.
+        self.assertEqual(code.count("cute.arch.load("), 1)
+        self.assertIn("cute.make_rmem_tensor", code)
 
 
 # A second, separately-decorated kernel so the P21 tests below can
@@ -1135,12 +1112,13 @@ class TestCuteOnlineTo3PassRewrite(TestCase):
         # 3 inner sweeps now (was 2 in the original online form).
         self.assertEqual(self._generated_loop_count(code), 3)
 
-    def test_shape_gate_skips_small_n(self) -> None:
-        """For (4096, 256) the rewrite MUST be skipped by the
-        reduction-axis-extent gate (256 < default cutoff 2048), so the
-        generated kernel still has TWO inner sweeps (the original
-        online form).
+    def test_shape_gate_env_override_skips_small_n(self) -> None:
+        """With ``HELION_ONLINE_TO_3PASS_MIN_N=2048``, (4096, 256) MUST be
+        skipped by the reduction-axis-extent gate, so the generated kernel
+        still has TWO inner sweeps (the original online form).  (The
+        default cutoff is 0 — always rewrite.)
         """
+        self._set_env("HELION_ONLINE_TO_3PASS_MIN_N", "2048")
         x = torch.randn(4096, 256, device=DEVICE, dtype=HALF_DTYPE)
         code, out = code_and_output(
             softmax_two_pass_kernel_for_3pass,

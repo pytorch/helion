@@ -816,6 +816,9 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     | {
         "num_threads",
         "cute_vector_widths",
+        "cute_lane_layouts",
+        "cute_cluster_n",
+        "cute_min_blocks_per_mp",
         "load_cache_modifiers",
         "store_cache_modifiers",
         "pallas_loop_type",
@@ -854,6 +857,9 @@ VALID_KEYS: frozenset[str] = frozenset(
         "pallas_indirect_access_mode",
         "pallas_pre_broadcast",
         "cute_vector_widths",
+        "cute_lane_layouts",
+        "cute_cluster_n",
+        "cute_min_blocks_per_mp",
         *BACKEND_TUNABLE_KEYS,
         "advanced_controls_file",
         "epilogue_subtile",
@@ -1003,6 +1009,7 @@ class ConfigSpec:
         self.cute_vector_widths: BlockIdSequence[CuteVectorWidthSpec] = (
             BlockIdSequence()
         )
+        self.cute_lane_layouts: BlockIdSequence[CuteLaneLayoutSpec] = BlockIdSequence()
         self.range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = (
             BlockIdSequence()
         )
@@ -1409,6 +1416,9 @@ class ConfigSpec:
             self._normalize_cute_flash_default_sequence(config, "l2_groupings", 1)
             self._normalize_cute_flash_default_sequence(config, "num_threads", 0)
             self._normalize_cute_flash_default_sequence(config, "cute_vector_widths", 1)
+            self._normalize_cute_flash_default_sequence(
+                config, "cute_lane_layouts", "blocked"
+            )
             self._normalize_cute_flash_default_loop_orders(config)
             config.pop("epilogue_subtile", None)
         elif not self._is_cute_flash_config_envelope(config, block_size_targets):
@@ -1871,6 +1881,7 @@ class ConfigSpec:
             ("l2_groupings", 1),
             ("num_threads", 0),
             ("cute_vector_widths", 1),
+            ("cute_lane_layouts", "blocked"),
         ):
             value = config.get(key)
             if value and (
@@ -2319,6 +2330,7 @@ class ConfigSpec:
             ("loop_orders", self.loop_orders, False),
             ("reduction_loops", self.reduction_loops, True),
             ("cute_vector_widths", self.cute_vector_widths, True),
+            ("cute_lane_layouts", self.cute_lane_layouts, True),
             ("range_unroll_factors", self.range_unroll_factors, True),
             ("range_warp_specializes", self.range_warp_specialize, True),
             ("range_num_stages", self.range_num_stages, True),
@@ -2524,6 +2536,7 @@ class ConfigSpec:
             "flatten_loops",
             "reduction_loops",
             "cute_vector_widths",
+            "cute_lane_layouts",
             "range_unroll_factors",
             "range_warp_specializes",
             "range_num_stages",
@@ -3230,6 +3243,37 @@ class ConfigSpec:
                     and len(self.cute_vector_widths) > 0
                 ):
                     fields["cute_vector_widths"] = self.cute_vector_widths
+                # Per-block lane layout (blocked vs strided per-thread
+                # element assignment) for lane loops with more than one
+                # iteration; strided gives fully coalesced warp accesses.
+                if (
+                    self.supports_config_key("cute_lane_layouts")
+                    and len(self.cute_lane_layouts) > 0
+                ):
+                    fields["cute_lane_layouts"] = self.cute_lane_layouts
+                # Thread-block cluster width for SIMT reduction kernels:
+                # splits a whole-extent lane-looped axis across cluster
+                # CTAs (register-resident slices) with a DSM cluster
+                # reduce.  Ignored (cluster 1) when the config shape
+                # doesn't qualify — see
+                # ``PerThreadNDTileStrategy._maybe_apply_cute_cluster``.
+                if (
+                    self.supports_config_key("cute_cluster_n")
+                    and len(self.cute_lane_layouts) > 0
+                    and not self.matmul_facts
+                ):
+                    fields["cute_cluster_n"] = EnumFragment(choices=(1, 2, 4, 8, 16))
+                # Minimum resident CTAs per SM (ptxas ``minnctapersm``):
+                # caps registers per thread so more CTAs fit, trading
+                # spills for occupancy.  0 leaves ptxas free.
+                if (
+                    self.supports_config_key("cute_min_blocks_per_mp")
+                    and len(self.cute_lane_layouts) > 0
+                    and not self.matmul_facts
+                ):
+                    fields["cute_min_blocks_per_mp"] = EnumFragment(
+                        choices=(0, 1, 2, 3, 4)
+                    )
             if (
                 not self.cute_flash_search_enabled
                 and self.epilogue_subtile_autotune_choices is not None
@@ -3823,6 +3867,43 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
 
 
 _CUTE_VECTOR_WIDTH_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
+_CUTE_LANE_LAYOUT_CHOICES: tuple[str, ...] = ("blocked", "strided")
+
+
+class CuteLaneLayoutSpec(_BlockIdItem):
+    """Per-block per-thread element assignment for CuTe lane loops.
+
+    ``"blocked"``: thread ``t`` owns ``EPT`` contiguous elements
+    (``base = offset + t*EPT + lane*V``).  Consecutive threads in a warp
+    touch addresses ``EPT*elem_size`` bytes apart, so a warp's loads/stores
+    of one lane iter span many cache lines (poor per-instruction
+    coalescing; only acceptable when the lane loop has a single iteration,
+    where both layouts coincide).
+
+    ``"strided"``: thread ``t`` owns V-wide chunks strided by the thread
+    count (``base = offset + (lane*NT + t)*V``).  Consecutive threads touch
+    consecutive V-chunks, so each warp instruction is fully coalesced.
+    """
+
+    def __init__(
+        self,
+        *,
+        block_id: int,
+    ) -> None:
+        super().__init__([block_id])
+
+    def _fragment(self, base: ConfigSpec) -> EnumFragment:
+        return EnumFragment(choices=_CUTE_LANE_LAYOUT_CHOICES)
+
+    def _normalize(self, name: str, value: object) -> str:
+        if value not in _CUTE_LANE_LAYOUT_CHOICES:
+            raise InvalidConfig(
+                f"{name} must be one of {_CUTE_LANE_LAYOUT_CHOICES}, got {value!r}"
+            )
+        return str(value)
+
+    def _fill_missing(self) -> str:
+        return "blocked"
 
 
 class CuteVectorWidthSpec(_BlockIdItem):

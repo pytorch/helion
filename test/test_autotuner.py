@@ -11264,7 +11264,15 @@ class TestCuteAutotuner(TestCase):
         # Triton-style knobs that the CuTe path does not consume.
         self.assertEqual(
             flat_keys,
-            {"block_sizes", "num_threads", "loop_orders", "cute_vector_widths"},
+            {
+                "block_sizes",
+                "num_threads",
+                "loop_orders",
+                "cute_vector_widths",
+                "cute_lane_layouts",
+                "cute_cluster_n",
+                "cute_min_blocks_per_mp",
+            },
         )
 
         repaired = gen.unflatten(
@@ -11278,7 +11286,15 @@ class TestCuteAutotuner(TestCase):
         for config in configs:
             self.assertLessEqual(
                 set(config.config),
-                {"block_sizes", "num_threads", "loop_orders", "cute_vector_widths"},
+                {
+                    "block_sizes",
+                    "num_threads",
+                    "loop_orders",
+                    "cute_vector_widths",
+                    "cute_lane_layouts",
+                    "cute_cluster_n",
+                    "cute_min_blocks_per_mp",
+                },
             )
             self.assertNotIn("persistent", config.pid_type)
             explicit_threads = [nt for nt in config.num_threads if nt > 0]
@@ -11948,6 +11964,7 @@ class TestCuteAutotuner(TestCase):
             long_gen.encode_config(flat)
             expected = dict(config.config)
             expected.pop("cute_vector_widths", None)
+            expected.pop("cute_lane_layouts", None)
             self.assertEqual(long_gen.unflatten(flat).config, expected)
 
         random_configs = [long_gen.random_config() for _ in range(24)]

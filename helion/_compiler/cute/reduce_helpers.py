@@ -728,3 +728,105 @@ def _cute_pre_vec_fold(vec: object, reduction_type: str, *, V: int) -> object:
     if reduction_type == "prod":
         return _cute_pre_vec_fold_prod(vec, V=V)
     raise ValueError(f"unsupported CuTe pre-vec-fold type: {reduction_type!r}")
+
+
+@cute.jit
+def _cute_grouped_reduce_cluster_body(
+    input_value: cute.Numeric,
+    warp_op: object,
+    combine: object,
+    identity: cute.Numeric,
+    lane_var: cutlass.Int32,
+    buf_ptr: cute.Pointer,
+    mbar_ptr: cute.Pointer,
+    group_span: int,
+    cluster_n: int,
+) -> cute.Numeric:
+    """Combine ``input_value`` across ``group_span`` CTA threads AND the
+    ``cluster_n`` CTAs of the thread-block cluster that cooperate on one
+    reduction group (e.g. one softmax row split across the cluster).
+
+    Every warp's partial is warp-reduced, then pushed into EVERY peer CTA's
+    SMEM receive buffer with ``st.async`` + an mbarrier transaction count;
+    after the mbarrier wait each CTA folds all ``warps * cluster_n``
+    partials locally.  Each (textual) call site must execute exactly once
+    per kernel — the mbarrier is single-phase.
+
+    ``buf_ptr`` (``warps * cluster_n`` Float32 slots) and ``mbar_ptr`` (one
+    Int64 mbarrier, arrival count 1) must be allocated and initialized in
+    the kernel preamble, followed by ``mbarrier_init_fence`` +
+    ``cluster_arrive_relaxed`` + ``cluster_wait`` so peers' barriers are
+    live before the first remote store (the device-function codegen emits
+    this once for all sites).
+
+    ``identity``'s dtype must be Float32 (the hoist pass rewrites the
+    identity to the fp32 accumulator dtype).
+    """
+    from helion._compiler.cute.cluster_helpers import store_shared_remote_f32
+
+    warps = group_span // 32
+    slots = warps * cluster_n
+    buf = cute.make_tensor(buf_ptr, (slots,))
+    mbar = mbar_ptr
+    warp_partial = warp_op(input_value, threads_in_group=32)
+    rank = cutlass.Int32(cute.arch.block_idx_in_cluster())
+    warp = lane_var // 32
+    lane = lane_var % 32
+    if warp == 0:
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(mbar, slots * 4)
+    if lane < cluster_n:
+        store_shared_remote_f32(
+            cutlass.Float32(warp_partial),
+            buf.iterator + (rank * warps + warp),
+            mbar,
+            lane,
+        )
+    cute.arch.mbarrier_wait(mbar, phase=0)
+    result = identity
+    for i in cutlass.range_constexpr(slots):
+        result = combine(result, buf[i])
+    return result
+
+
+def _cute_scalar_combine_max(a: cute.Numeric, b: cute.Numeric) -> cute.Numeric:
+    return cute.arch.fmax(a, b)
+
+
+def _cute_scalar_combine_min(a: cute.Numeric, b: cute.Numeric) -> cute.Numeric:
+    return min(b, a)
+
+
+_CLUSTER_DISPATCH = {
+    "sum": (_warp_reduce_sum, operator.add),
+    "max": (_warp_reduce_max, _cute_scalar_combine_max),
+    "min": (_warp_reduce_min, _cute_scalar_combine_min),
+}
+
+
+def _cute_grouped_reduce_cluster(
+    input_value: cute.Numeric,
+    reduction_type: str,
+    identity: cute.Numeric,
+    lane_var: cutlass.Int32,
+    buf_ptr: cute.Pointer,
+    mbar_ptr: cute.Pointer,
+    *,
+    group_span: int,
+    cluster_n: int,
+) -> cute.Numeric:
+    impl = _CLUSTER_DISPATCH.get(reduction_type)
+    if impl is None:
+        raise ValueError(f"unsupported CuTe reduction type: {reduction_type!r}")
+    warp_op, combine = impl
+    return _cute_grouped_reduce_cluster_body(
+        input_value,
+        warp_op,
+        combine,
+        identity,
+        lane_var,
+        buf_ptr,
+        mbar_ptr,
+        group_span,
+        cluster_n,
+    )

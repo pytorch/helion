@@ -905,6 +905,9 @@ class CuteBackend(Backend):
         if (
             key == "num_threads"
             or key == "cute_vector_widths"
+            or key == "cute_lane_layouts"
+            or key == "cute_cluster_n"
+            or key == "cute_min_blocks_per_mp"
             or key.startswith(("tcgen05_", "cute_flash_"))
         ):
             return True
@@ -924,6 +927,8 @@ class CuteBackend(Backend):
             # does not support scalar dereference for its 4-bit type yet, so
             # SIMT scalar loads treat the tensor as raw byte storage.
             return "cutlass.Uint8"
+        if dtype is torch.uint32:
+            return "cutlass.Uint32"
         if dtype is torch.uint64:
             return "cutlass.Int64"
 
@@ -1149,6 +1154,7 @@ class CuteBackend(Backend):
             "_cute_grouped_reduce_shared_tree": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_tree",
             "_cute_grouped_reduce_shared_two_stage": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage",
             "_cute_grouped_reduce_warp": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_warp",
+            "_cute_grouped_reduce_cluster": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_cluster",
             "_cute_pre_vec_fold": "from helion._compiler.cute.reduce_helpers import _cute_pre_vec_fold",
             "_cute_store_shared_remote_x4": "from helion._compiler.cute.cluster_helpers import store_shared_remote_x4 as _cute_store_shared_remote_x4",
             "_cute_issue_clc_query_nomulticast": "from helion._compiler.cute.clc_helpers import issue_clc_query_nomulticast as _cute_issue_clc_query_nomulticast",
@@ -1158,6 +1164,7 @@ class CuteBackend(Backend):
             "_cute_float4_e2m1fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x2_to_float32 as _cute_float4_e2m1fn_x2_to_float32",
             "_cute_float4_e2m1fn_x16_to_float16": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x16_to_float16 as _cute_float4_e2m1fn_x16_to_float16",
             "_cute_bfloat16_x16_to_float16": "from helion._compiler.cute.quantized_helpers import bfloat16_x16_to_float16 as _cute_bfloat16_x16_to_float16",
+            "_cute_store_u16_vec": "from helion._compiler.cute.vec_utils import store_u16_vec as _cute_store_u16_vec",
             "_cute_grid_barrier": "from helion._compiler.cute.grid_barrier import grid_barrier as _cute_grid_barrier",
             "_cute_atomic_max_float32": "from helion._compiler.cute.atomic_helpers import atomic_max_float32 as _cute_atomic_max_float32",
             "_cute_atomic_min_float32": "from helion._compiler.cute.atomic_helpers import atomic_min_float32 as _cute_atomic_min_float32",
@@ -1240,6 +1247,12 @@ class CuteBackend(Backend):
 
     def lane_offset_expr(self, lane_var: str) -> str:
         return f"cutlass.Int32({lane_var})"
+
+    def thread_index_expr(self, *, axis: int) -> str:
+        from ..compile_environment import CompileEnvironment
+
+        index_dtype = CompileEnvironment.current().index_type()
+        return f"{index_dtype}(cute.arch.thread_idx()[{axis}])"
 
     def sympy_printer_expr(self, expr: sympy.Expr) -> str:
         from .printer import cute_texpr
@@ -1349,6 +1362,19 @@ class CuteBackend(Backend):
         return f"cutlass.Int32(cute.arch.thread_idx()[{axis}]) < ({block_size_var})"
 
     def force_tile_mask(self) -> bool:
+        # Masks are elided per-axis when the extent is a known multiple of
+        # the block size (same rule as the Triton backend) AND the launch
+        # cannot run the axis wider than the tile (see
+        # ``launches_surplus_tile_threads``).  Every per-element mask costs
+        # a compare + select in the SIMT lane loop, which is significant
+        # for memory-bound reduction kernels.
+        return False
+
+    def launches_surplus_tile_threads(self) -> bool:
+        # Mutually exclusive kernel sections (e.g. persistent stages around
+        # an ``hl.barrier()``) share one launch whose block dims are the
+        # elementwise max across sections, so a section can run with more
+        # threads on an axis than its own tile is wide.
         return True
 
     def full_expr(
