@@ -41,6 +41,19 @@ def _cap_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(
+    backend="pallas", static_shapes=True, config=helion.Config(block_sizes=[16])
+)
+def _cap_add_process_group(
+    x: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = x[tile] + 1
+    return out
+
+
 def _body(src: str) -> list[ast.stmt]:
     return ast.parse(src).body
 
@@ -182,6 +195,12 @@ class TestDecorationSchema:
 
         assert _decoration_schema(_pallas_kernel(k, config=_C16)) == ([None, float], 2)
 
+    def test_process_group_name_uses_string_schema(self) -> None:
+        assert _decoration_schema(_cap_add_process_group) == (
+            [None, hl.ProcessGroupName],
+            1,
+        )
+
     def test_unannotated_return_is_ineligible(self) -> None:
         def k(x: torch.Tensor):  # no return annotation
             return x
@@ -230,3 +249,14 @@ class TestCompileCaptureRoundtrip(unittest.TestCase):
         x = torch.randn(16, 16, device=DEVICE)
         y = torch.randn(16, 16, device=DEVICE)
         torch.testing.assert_close(compiled(x, y), x + y)
+
+    def test_process_group_name_is_capturable(self) -> None:
+        captured = register_decoration_op(_cap_add_process_group)
+        self.assertIsNotNone(captured)
+
+        def invoke(x: torch.Tensor) -> torch.Tensor:
+            return captured((x, "test_process_group"))
+
+        compiled = torch.compile(invoke, backend="eager", fullgraph=True)
+        x = torch.randn(64, device=DEVICE)
+        torch.testing.assert_close(compiled(x), x + 1)

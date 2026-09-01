@@ -28,6 +28,7 @@ import torch
 from ..._compiler._dynamo.variables import _detect_mutated_inputs
 from ..._compiler._dynamo.variables import infer_output_spec
 from ...language import constexpr
+from ...language.constexpr import ProcessGroupName
 
 if TYPE_CHECKING:
     from ..kernel import Kernel
@@ -40,7 +41,12 @@ _op_counter = 0
 _op_cache: dict[Any, Callable[..., Any] | None] = {}
 
 # Python scalar types that map directly to a torch.library schema type.
-_SCHEMA_TYPES: dict[type, str] = {float: "float", int: "int", bool: "bool"}
+_SCHEMA_TYPES: dict[type, str] = {
+    float: "float",
+    int: "int",
+    bool: "bool",
+    ProcessGroupName: "str",
+}
 
 # Sentinel: tells Kernel.__call__ to run its normal dispatch path.
 RUN_NORMAL = object()
@@ -223,7 +229,7 @@ def _build_decoration_op(
         # capture (torch_tpu aborts: "argument not provided").
         folded = []
         for arg, kind in zip(args, kinds, strict=True):
-            if kind is None:
+            if kind is None or kind is ProcessGroupName:
                 folded.append(arg)
             else:
                 folded.append(constexpr(arg))
