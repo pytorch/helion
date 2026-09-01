@@ -7784,6 +7784,28 @@ class TestPallasJaxFn(TestCase):
         result = jax.block_until_ready(f(x))
         self.assertTrue(bool(jnp.all(result == 1.0)))
 
+    def test_jax_fn_rebinds_reshaped_output_to_base(self) -> None:
+        """A launch through an output view must update the returned base."""
+        jax, jnp = self._import_jax()
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[128]),
+        )
+        def write_through_view(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            out_view = out.reshape(x.size(0), 1, x.size(1))
+            x_view = x.reshape(x.size(0), 1, x.size(1))
+            for tile_m in hl.tile(x.size(0)):
+                out_view[tile_m, :, :] = x_view[tile_m, :, :] + 1.0
+            return out
+
+        f = jax.jit(write_through_view.jax_fn)
+        x = jnp.zeros((128, 128), dtype=jnp.float32)
+        result = jax.block_until_ready(f(x))
+        self.assertTrue(bool(jnp.all(result == 1.0)))
+
     def test_jax_standalone_captures_inplace_scratch_and_output_only(self) -> None:
         """Metadata capture mirrors the launcher's output-only return contract."""
         import sys

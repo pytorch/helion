@@ -98,6 +98,7 @@ class _JaxExportTensor(torch.Tensor):
 
     _jax_arr: object
     _declared_device: torch.device
+    _view_parent: _JaxExportTensor | None
 
     @staticmethod
     def from_jax(jax_arr: object, *, device: torch.device) -> _JaxExportTensor:
@@ -110,7 +111,20 @@ class _JaxExportTensor(torch.Tensor):
         out = torch.Tensor._make_subclass(_JaxExportTensor, meta, require_grad=False)
         out._jax_arr = jax_arr
         out._declared_device = device  # pyrefly: ignore[read-only]
+        out._view_parent = None
         return out
+
+    def _replace_jax_array(self, jax_arr: object) -> None:
+        """Replace this view and propagate the update to its source adapter."""
+        self._jax_arr = jax_arr
+        parent = self._view_parent
+        if parent is None:
+            return
+        import jax.numpy as jnp
+
+        parent._replace_jax_array(
+            jnp.reshape(jax_arr, tuple(parent.shape))  # type: ignore[arg-type]
+        )
 
     @property
     def device(self) -> torch.device:  # pyrefly: ignore[bad-override]
@@ -157,7 +171,9 @@ class _JaxExportTensor(torch.Tensor):
             import jax.numpy as jnp
 
             new_jax = jnp.reshape(t._jax_arr, list(new_shape))  # type: ignore[arg-type]
-            return cls.from_jax(new_jax, device=t._declared_device)
+            out = cls.from_jax(new_jax, device=t._declared_device)
+            out._view_parent = t
+            return out
 
         # ``_pallas_apply_ds_padding`` calls ``torch.nn.functional.pad``
         # on adapter inputs to bring tile-misaligned tensors up to a
@@ -389,7 +405,7 @@ def default_pallas_jax_launcher(
             continue
         adapter = wrapper_args[arg_index]
         assert isinstance(adapter, _JaxExportTensor)
-        adapter._jax_arr = output_result
+        adapter._replace_jax_array(output_result)
 
     returned_results = [
         output_result
