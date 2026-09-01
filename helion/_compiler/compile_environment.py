@@ -30,8 +30,6 @@ import torch.distributed as dist
 from torch.fx.experimental.symbolic_shapes import DimDynamic
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
-from torch.utils._sympy.symbol import SymT
-from torch.utils._sympy.symbol import symbol_is_type
 
 from .. import exc
 from .._compat import shape_env_size_hint
@@ -993,19 +991,26 @@ class CompileEnvironment:
                 block_idx = origin_info.origin.block_id
                 existing_block = self.block_sizes[block_idx]
 
-        def _is_unbacked_symint(x: int | torch.SymInt) -> bool:
-            if not isinstance(x, torch.SymInt):
-                return False
-            expr = x._sympy_()
-            if isinstance(expr, sympy.Symbol):
-                return symbol_is_type(expr, SymT.UNBACKED_INT)
-            return False
+        def _has_unbacked(x: int | torch.SymInt) -> bool:
+            return isinstance(x, torch.SymInt) and bool(
+                free_unbacked_symbols(x._sympy_())
+            )
 
-        # Check for existing reduction dimensions with the same size
+        # Check for existing reduction dimensions with the same size. When an
+        # unbacked symbol is involved, the comparison must not guard:
+        # ``rdim.size == size`` on a mixed unbacked-SymInt/int pair forces a
+        # ShapeEnv guard that SPECIALIZES the unbacked block symbol to the
+        # rdim's concrete size (e.g. a tile_m block symbol silently becomes
+        # head_dim==64 when comparing against an existing rdim), corrupting
+        # every downstream shape of that tile. known_equal answers via
+        # _maybe_evaluate_static (no new guards) and returns False when the
+        # equality is undecidable. Backed sizes keep the guarding ``==`` so
+        # distinct input symbols that are equal by hint (e.g. x.size(1) vs
+        # weight.size(0)) still unify into a single rdim.
         for rdim in self.block_sizes:
             if not rdim.reduction or not isinstance(rdim.size, (int, torch.SymInt)):
                 continue
-            if _is_unbacked_symint(rdim.size) and _is_unbacked_symint(size):
+            if _has_unbacked(rdim.size) or _has_unbacked(size):
                 if self.known_equal(rdim.size, size):
                     return rdim
             elif rdim.size == size:
