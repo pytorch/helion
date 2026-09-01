@@ -3822,6 +3822,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.initial_population = 2
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search.make_unbenchmarked = Mock(return_value=anchor)
@@ -3942,6 +3943,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.initial_population = len(generated)
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search.train_source_hashes = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
@@ -4023,6 +4025,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.initial_population = len(search.population)
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: ((stage_key, 2),)
@@ -4108,6 +4111,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.initial_population = len(search.population)
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: ((stage_key, 2),)
@@ -4187,6 +4191,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.initial_population = len(search.population)
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: ((stage_key, 2),)
@@ -4257,6 +4262,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.initial_population = 7
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._pruned_pattern_search_from = Mock(
@@ -4334,6 +4340,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.initial_population = len(exact_space)
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         generated: list[PopulationMember] = []
@@ -4909,6 +4916,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.initial_population = len(search.population)
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search.config_gen = SimpleNamespace(
@@ -5073,6 +5081,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.initial_population = len(search.population)
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         typed_leaves = []
@@ -5105,7 +5114,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             required_leaf=None,
             conditional_surface=False,
             disable_early_stopping=False,
-            selected_only_visited=False,
         ):
             self.assertTrue(disable_early_stopping)
             if selected_limit == 5:
@@ -5117,11 +5125,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 return iter(((current, first), (first, second)))
             self.assertEqual(selected_limit, 20)
             self.assertIsNone(neighbor_limit)
-            if selected_only_visited:
-                self.assertIsNone(required_leaf)
+            if required_leaf is None:
                 self.assertFalse(conditional_surface)
                 return iter(((current, global_probe_child),))
-            assert required_leaf is not None
             self.assertTrue(conditional_surface)
             return iter(
                 ((current, constrained_probe_children[required_leaf.pipeline_family]),)
@@ -5212,6 +5218,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.initial_population = len(search.population)
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search.config_gen = SimpleNamespace(
@@ -5309,6 +5316,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.initial_population = len(search.population)
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._budgeted_range = lambda *args: range(*args)
@@ -5381,6 +5389,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.initial_population = len(search.population)
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search.config_gen = SimpleNamespace(
@@ -5553,6 +5562,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.initial_population = len(search.population)
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: ((stage_key, 2),)
@@ -5691,6 +5701,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.initial_population = len(search.population)
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: ((stage_key, 2),)
@@ -5825,6 +5836,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             search.initial_population = len(search.population)
             search.train_x = []
             search.train_y = []
+            search._train_members = []
             search.train_configs = []
             search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
             search._flash_pipeline_lanes = lambda _leaf: ((stage_key, 2),)
@@ -5948,6 +5960,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.initial_population = len(search.population)
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: (
@@ -6101,6 +6114,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.initial_population = 1
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: ((stage_key, 2),)
@@ -6248,6 +6262,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             search.initial_population = 1
             search.train_x = []
             search.train_y = []
+            search._train_members = []
             search.train_configs = []
             search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
             search._flash_pipeline_lanes = lambda _leaf: ()
@@ -6412,6 +6427,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.initial_population = len(search.population)
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: ()
@@ -6639,6 +6655,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.initial_population = len(search.population)
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: (
@@ -6760,6 +6777,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.initial_population = 1
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._budgeted_range = lambda *args: range(*args)
@@ -6877,6 +6895,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.initial_population = len(search.population)
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = Mock(
@@ -7169,6 +7188,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.initial_population = len(search.population)
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: ((stage_key, 2),)
@@ -7278,6 +7298,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.initial_population = len(search.population)
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: ((stage_key, 2),)
@@ -7452,6 +7473,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.initial_population = len(search.population)
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: (
@@ -7762,6 +7784,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.initial_population = len(search.population)
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search._flash_pipeline_lanes = lambda _leaf: (
@@ -7975,6 +7998,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.config_gen = SimpleNamespace(encode_config=lambda _flat: [0.0])
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = None
         search.train_source_hashes = None
         search._fit_surrogate = Mock()
@@ -8025,6 +8049,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.config_gen = SimpleNamespace(encode_config=lambda flat: flat)
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search.train_source_hashes = []
         search._fit_surrogate = Mock()
@@ -8089,6 +8114,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.config_gen = SimpleNamespace(encode_config=lambda flat: flat)
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._fit_surrogate = Mock()
         search.config_spec = _cute_flash_test_config_spec()
@@ -8113,10 +8139,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(len(calls), 2)
         self.assertIsNone(calls[0].kwargs["required_leaf"])
         self.assertFalse(calls[0].kwargs["conditional_surface"])
-        self.assertTrue(calls[0].kwargs["selected_only_visited"])
         self.assertEqual(calls[1].kwargs["required_leaf"], constrained_leaf)
         self.assertTrue(calls[1].kwargs["conditional_surface"])
-        self.assertFalse(calls[1].kwargs["selected_only_visited"])
 
     def test_lfbo_flash_wall_budget_returns_best_before_required_probe(self):
         config = helion.Config(
@@ -8152,6 +8176,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.config_gen = SimpleNamespace(encode_config=lambda flat: flat)
         search.train_x = []
         search.train_y = []
+        search._train_members = []
         search.train_configs = []
         search._fit_surrogate = Mock()
         search.config_spec = _cute_flash_test_config_spec()
@@ -8588,8 +8613,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertIn(unselected.config, reordered_visited)
         self.assertNotIn(retained.config, reordered_visited)
 
-        # Unconstrained/non-flash paths preserve historical eager visited
-        # bookkeeping, including candidates discarded by the surrogate.
+        # Unconstrained/non-flash paths also record only selected candidates
+        # as visited, so proposals the surrogate discards can be re-proposed
+        # once it has learned more.
         search.frac_selected = 0.5
         search._surrogate_select = lambda candidates, count: candidates[:count]
         search._generate_neighbors = lambda _base: [
@@ -8604,7 +8630,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(next(unconstrained), [current, rejected])
         self.assertEqual(
             unconstrained_visited,
-            {rejected.config, retained.config, unselected.config},
+            {current.config, rejected.config},
         )
 
         # CuTe's unrestricted continuation runs after constrained paths in each
@@ -8618,7 +8644,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             0,
             current,
             selected_only_visited,
-            selected_only_visited=True,
             disable_early_stopping=True,
         )
         self.assertEqual(next(selected_only), [current, rejected])
@@ -12388,14 +12413,14 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         search.config_spec.cute_flash_search_enabled = False
         search._cute_flash_lane_policy_enabled = False
         non_flash = search._algorithm_cache_policy()
-        self.assertEqual(non_flash["lfbo_version"], 1)
+        self.assertEqual(non_flash["lfbo_version"], 2)
         self.assertNotIn("cute_flash_lane_policy_version", non_flash)
         self.assertIsNone(non_flash["flash_structural_search"])
 
         search.config_spec.cute_flash_search_enabled = True
         search._cute_flash_lane_policy_enabled = True
         cute_flash_policy = search._algorithm_cache_policy()
-        self.assertEqual(cute_flash_policy["lfbo_version"], 1)
+        self.assertEqual(cute_flash_policy["lfbo_version"], 2)
         self.assertEqual(cute_flash_policy["cute_flash_lane_policy_version"], 14)
         self.assertEqual(cute_flash_policy["cute_flash_starting_path_limit"], 17)
         self.assertEqual(cute_flash_policy["cute_flash_family_probe_path_limit"], 18)
@@ -12426,7 +12451,7 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         quick_policy = search._algorithm_cache_policy()
         self.assertNotIn("cute_flash_lane_policy_version", quick_policy)
         self.assertIsNone(quick_policy["flash_structural_search"])
-        self.assertEqual(quick_policy["lfbo_version"], 1)
+        self.assertEqual(quick_policy["lfbo_version"], 2)
 
     def test_unlimited_and_finite_family_retention_have_distinct_cache_keys(
         self,
