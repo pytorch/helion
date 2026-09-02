@@ -51,7 +51,10 @@ from helion._compiler.autotuner_heuristics.registry import AutotunerHeuristic
 from helion._compiler.autotuner_heuristics.registry import (
     CompilerHeuristicSpecializationFact,
 )
-from helion._compiler.autotuner_heuristics.triton import TritonH100MatmulHeuristic
+from helion._compiler.autotuner_heuristics.triton import (
+    TritonH100FormulaMatmulHeuristic,
+)
+from helion._compiler.autotuner_heuristics.triton import TritonH100MultiMatmulHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonNarrowReductionHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonPointwiseSeedHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonSkinnyGemmHeuristic
@@ -280,11 +283,16 @@ from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import CoResidencyGroup
+from helion.autotuner.config_spec import DotAxes
+from helion.autotuner.config_spec import DotAxisKind
+from helion.autotuner.config_spec import DotSite
+from helion.autotuner.config_spec import KernelMatmulFact
 from helion.autotuner.config_spec import MatmulFact
 from helion.autotuner.config_spec import ReductionCategory
 from helion.autotuner.config_spec import ReductionDescriptor
 from helion.autotuner.config_spec import ReductionKernelFact
 from helion.autotuner.config_spec import ReductionLoopSpec
+from helion.autotuner.config_spec import ResolvedMatmulFact
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
@@ -1296,7 +1304,8 @@ class TestAutotunerHeuristic(TestCase):
         )
         for heuristic in (
             CuteTcgen05ClusterM2Heuristic,
-            TritonH100MatmulHeuristic,
+            TritonH100FormulaMatmulHeuristic,
+            TritonH100MultiMatmulHeuristic,
             TritonPointwiseSeedHeuristic,
             TritonStandardReductionHeuristicSM90,
             TritonStandardReductionHeuristicSM100,
@@ -4053,6 +4062,44 @@ class TestAutotunerHeuristic(TestCase):
 
 
 class TestMatmulFacts(TestCase):
+    def test_rank_reduction_scaled_accumulator_fact(self) -> None:
+        from operator import eq
+        from types import SimpleNamespace
+
+        from helion._compiler.device_ir_analysis import (
+            _rank_reduction_scaled_baddbmm_batch_block_id,
+        )
+        from helion._compiler.inductor_lowering import ReductionLowering
+
+        graph = torch.fx.Graph()
+
+        def tensor(result: torch.fx.Node, shape: tuple[int, ...]) -> torch.fx.Node:
+            result.meta["val"] = torch.empty(shape)
+            return result
+
+        acc = tensor(graph.placeholder("acc"), (1, 64, 64))
+        scores = tensor(graph.call_function(torch.ops.aten.bmm.default), (1, 64, 32))
+        reduction = tensor(
+            graph.call_function(torch.ops.aten.sum.dim_IntList, (scores, [-1])),
+            (1, 64),
+        )
+        reduction.meta["lowering"] = object.__new__(ReductionLowering)
+        scaled = tensor(
+            graph.call_function(torch.ops.aten.mul.Tensor, (acc, reduction)),
+            (1, 64, 64),
+        )
+        output = tensor(
+            graph.call_function(
+                torch.ops.aten.baddbmm.default, (scaled, scores, scores)
+            ),
+            (1, 64, 64),
+        )
+        env = SimpleNamespace(known_equal=eq, get_block_id=lambda _: 0)
+
+        self.assertEqual(_rank_reduction_scaled_baddbmm_batch_block_id(output, env), 0)
+        reduction.meta["val"] = torch.empty(1, 64, 1)
+        self.assertIsNone(_rank_reduction_scaled_baddbmm_batch_block_id(output, env))
+
     @onlyBackends(["triton"])
     @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
     def test_matmul_facts_record_kernel_structure(self) -> None:
@@ -4399,7 +4446,7 @@ class TestTritonSkinnyGemmHeuristic(TestCase):
     def test_triton_skinny_gemm_seed_eligibility_and_config(
         self,
     ) -> None:
-        # The dense TritonH100MatmulHeuristic ALSO fires on every clean 2-D static matmul on
+        # The dense TritonH100FormulaMatmulHeuristic ALSO fires on every clean 2-D static matmul on
         # sm90 (by design — it is the H100 dense seed). So this test checks the SKINNY
         # heuristic's OWN contribution (its name + [64,64,256] config present-or-absent),
         # robust to the H100 seeds co-existing in the list. expected_skinny = the skinny config
@@ -4612,10 +4659,33 @@ class TestTritonH100MatmulHeuristic(TestCase):
 
     def _attach_matmul(self, env: MagicMock, fact: MatmulFact) -> None:
         env.config_spec.matmul_facts.append(fact)
-        site = MagicMock(graph_id=-1, loop_axes=(), max_loop_trips=None)
-        env.config_spec.kernel_matmul_fact = MagicMock(
-            matmuls=(MagicMock(site=site),),
+        kinds = tuple(
+            (DotAxisKind.TUNABLE_TILED if extent is not None else DotAxisKind.UNKNOWN)
+            for extent in (fact.static_m, fact.static_n, fact.static_k)
+        )
+        axes = DotAxes(
+            kinds[0],
+            kinds[1],
+            kinds[2],
+            fact.static_m,
+            fact.static_n,
+            fact.static_k,
+        )
+        site = DotSite(graph_id=-1, updates_carry=False)
+        env.config_spec.kernel_matmul_fact = KernelMatmulFact(
+            matmuls=(ResolvedMatmulFact(fact, axes, site),),
+            knob_users=(
+                (fact.m_block_id, ((0, "m"),)),
+                (fact.n_block_id, ((0, "n"),)),
+                (fact.k_block_id, ((0, "k"),)),
+            ),
             sequential_loop_trips=1,
+            live_dot_outputs=(),
+            live_promoted_lhs=(),
+            live_tile_steps=(),
+            pipelined_regions=(),
+            resident_regions=(),
+            attribution_complete=True,
         )
 
     def test_budget_formula_is_deterministic_per_regime(self) -> None:
@@ -4666,7 +4736,7 @@ class TestTritonH100MatmulHeuristic(TestCase):
             ),
             # fp8 (both operands 1-byte float) is declined: the budget tile would trigger the
             # Triton fp8-accumulator bug (block_m>=64 -> never-promoted QGMMA accumulator). See
-            # TritonH100MatmulHeuristic.is_eligible. bf16/fp16/fp32 stay eligible above.
+            # TritonH100FormulaMatmulHeuristic.is_eligible. bf16/fp16/fp32 stay eligible above.
             (
                 "fp8_declined",
                 HOPPER_HARDWARE,
@@ -4676,13 +4746,17 @@ class TestTritonH100MatmulHeuristic(TestCase):
         )
         for name, hardware, facts, eligible in cases:
             env = self._make_env()
-            env.config_spec.matmul_facts.extend(facts)
+            if len(facts) == 1:
+                self._attach_matmul(env, facts[0])
+            else:
+                env.config_spec.matmul_facts.extend(facts)
             with (
                 self.subTest(name=name),
                 patch("helion._hardware.get_hardware_info", return_value=hardware),
             ):
                 self.assertEqual(
-                    TritonH100MatmulHeuristic.is_eligible(env, MagicMock()), eligible
+                    TritonH100FormulaMatmulHeuristic.is_eligible(env, MagicMock()),
+                    eligible,
                 )
 
     def test_ranked_multi_seed_and_width_merge(self) -> None:
@@ -4690,10 +4764,10 @@ class TestTritonH100MatmulHeuristic(TestCase):
             # rank-0 (Product A) == get_seed_config; the ranked list has diverse alternates.
             env = self._make_env()
             self._attach_matmul(env, self._matmul_fact())
-            ranked = TritonH100MatmulHeuristic.get_seed_configs(env, MagicMock())
-            primary = TritonH100MatmulHeuristic.get_seed_config(env, MagicMock())
+            ranked = TritonH100FormulaMatmulHeuristic.get_seed_configs(env, MagicMock())
+            primary = TritonH100FormulaMatmulHeuristic.get_seed_config(env, MagicMock())
             assert ranked is not None and primary is not None
-            self.assertGreaterEqual(len(ranked), 1)
+            self.assertGreater(len(ranked), 2)
             self.assertEqual(
                 ranked[0].config["block_sizes"], primary.config["block_sizes"]
             )
@@ -4704,8 +4778,12 @@ class TestTritonH100MatmulHeuristic(TestCase):
             self._attach_matmul(env_bf16, self._matmul_fact(dtype=torch.bfloat16))
             env_fp16 = self._make_env()
             self._attach_matmul(env_fp16, self._matmul_fact(dtype=torch.float16))
-            bf16 = TritonH100MatmulHeuristic.get_seed_config(env_bf16, MagicMock())
-            fp16 = TritonH100MatmulHeuristic.get_seed_config(env_fp16, MagicMock())
+            bf16 = TritonH100FormulaMatmulHeuristic.get_seed_config(
+                env_bf16, MagicMock()
+            )
+            fp16 = TritonH100FormulaMatmulHeuristic.get_seed_config(
+                env_fp16, MagicMock()
+            )
             assert bf16 is not None and fp16 is not None
             self.assertEqual(dict(bf16), dict(fp16))
 
@@ -4730,8 +4808,10 @@ class TestTritonH100MatmulHeuristic(TestCase):
             fact = spec.matmul_facts[0]
             self.assertGreaterEqual(fact.lhs_ndim, 3)  # a 3-D (batched) dot
             self.assertGreater(len(spec.block_sizes), 3)  # batch axis is tunable
-            self.assertIn(TritonH100MatmulHeuristic.name, spec.autotuner_heuristics)
-            seed = TritonH100MatmulHeuristic.get_seed_config(
+            self.assertIn(
+                TritonH100FormulaMatmulHeuristic.name, spec.autotuner_heuristics
+            )
+            seed = TritonH100FormulaMatmulHeuristic.get_seed_config(
                 bound.env, bound.host_function.device_ir
             )
             assert seed is not None

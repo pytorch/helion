@@ -84,6 +84,75 @@ def trace_back_to_load(arg: object, load_op: object) -> torch.fx.Node | None:
     return None
 
 
+def _rank_reduction_scaled_baddbmm_batch_block_id(
+    node: torch.fx.Node,
+    env: CompileEnvironment,
+) -> int | None:
+    """Detect the narrow Triton bug pattern for the H100 matmul heuristic.
+
+    Triton's SM90 layout solver fails above ``num_stages=1`` when a dot-derived
+    row reduction rescales a loop-carried ``baddbmm`` accumulator. Return its
+    batch axis so the heuristic can recognize the singleton-batch WGMMA form
+    and force one stage; this fact is not a general hardware constraint.
+    """
+    if node.target is not torch.ops.aten.baddbmm.default:
+        return None
+    output = node.meta.get("val")
+    if not isinstance(output, torch.Tensor) or output.ndim != 3:
+        return None
+    scaled_acc = node.args[0]
+    if not isinstance(scaled_acc, torch.fx.Node):
+        return None
+    if scaled_acc.target is not torch.ops.aten.mul.Tensor:
+        return None
+
+    def is_carried(value: object) -> bool:
+        if not isinstance(value, torch.fx.Node):
+            return False
+        tensor = value.meta.get("val")
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or tensor.ndim != output.ndim
+            or not all(map(env.known_equal, tensor.shape, output.shape))
+        ):
+            return False
+        return value.op == "placeholder" or (
+            value.target is _tracing_ops._new_var
+            and bool(value.args)
+            and isinstance(value.args[0], torch.fx.Node)
+            and value.args[0].op == "placeholder"
+        )
+
+    accumulator, scale = scaled_acc.args[:2]
+    if not is_carried(accumulator):
+        accumulator, scale = scale, accumulator
+    if not is_carried(accumulator) or not isinstance(scale, torch.fx.Node):
+        return None
+
+    from .inductor_lowering import ReductionLowering
+
+    dot_targets = matmul_operand_positions()
+    pending = [(scale, False)]
+    seen: set[tuple[torch.fx.Node, bool]] = set()
+    while pending:
+        candidate, reduced = pending.pop()
+        value = candidate.meta.get("val")
+        reduced |= (
+            isinstance(candidate.meta.get("lowering"), ReductionLowering)
+            and isinstance(value, torch.Tensor)
+            and len(value.shape) == 2
+            and all(map(env.known_equal, value.shape, output.shape[:-1]))
+        )
+        state = (candidate, reduced)
+        if state in seen:
+            continue
+        seen.add(state)
+        if reduced and candidate.target in dot_targets:
+            return env.get_block_id(output.shape[0])
+        pending.extend((parent, reduced) for parent in candidate.all_input_nodes)
+    return None
+
+
 def _immovable_extent(
     env: CompileEnvironment,
     spec: ConfigSpec,
@@ -1629,6 +1698,14 @@ class DeviceIRAnalysis:
                     self.by_id[graph_id].reaches_output(node)
                     and graph_id in self.loop_block_ids
                 )
+                rank_reduction_scaled_accumulator_batch_block_id = (
+                    _rank_reduction_scaled_baddbmm_batch_block_id(
+                        node,
+                        env,
+                    )
+                    if updates_carry
+                    else None
+                )
                 loop_axes = loop_axes_for(graph_id)
                 exact_loop_trips = (
                     inferred_work_trips.get((graph_id, loop_axes[0].block_id))
@@ -1642,6 +1719,7 @@ class DeviceIRAnalysis:
                         loop_axes,
                         exact_loop_trips,
                         max_trips_for(graph_id),
+                        rank_reduction_scaled_accumulator_batch_block_id,
                     )
                 )
         if not attribution_complete:

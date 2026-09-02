@@ -25,7 +25,9 @@ from .pallas import PallasMatmulF32NoTilingSeedHeuristic
 from .pallas import PallasMatmulNoTilingSeedHeuristic
 from .triton import TritonB200FormulaMatmulHeuristic
 from .triton import TritonB200MultiMatmulHeuristic
-from .triton import TritonH100MatmulHeuristic
+from .triton import TritonH100FormulaMatmulHeuristic
+from .triton import TritonH100MatmulHeuristic as TritonH100MatmulHeuristic
+from .triton import TritonH100MultiMatmulHeuristic
 from .triton import TritonMatmulReductionEpilogueHeuristic
 from .triton import TritonNarrowReductionHeuristic
 from .triton import TritonPointwiseSeedHeuristic
@@ -66,10 +68,10 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteResidentMultiRowHeuristic,
     ),
     "triton": (
-        # H100 dense matmul seed FIRST so its budget-formula config is the rank-0
-        # (Product-A) seed for every clean 2-D static GEMM; the skinny rule below still
-        # plants its config as a later search seed for aspect>=8 shapes.
-        TritonH100MatmulHeuristic,
+        # The two sm90 front ends are disjoint and share the B200 decision flow,
+        # with WGMMA/register-resident resource policy.
+        TritonH100FormulaMatmulHeuristic,
+        TritonH100MultiMatmulHeuristic,
         TritonSkinnyGemmHeuristic,
         # The two sm100 front ends are disjoint and both provide fast
         # autotune-off defaults as well as autotuner seeds.

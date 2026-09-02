@@ -411,6 +411,9 @@ class DotSite(NamedTuple):
     - ``max_loop_trips`` — an optional conservative upper bound used only by
       safety-oriented consumers such as pipeline-depth capping. It must not be used
       as candidate work.
+    - ``rank_reduction_scaled_accumulator_batch_block_id`` — the leading batch
+      block id of a rank-3 ``baddbmm`` whose ``acc=`` input is the loop-carried
+      accumulator rescaled by a row reduction derived from an earlier dot.
     """
 
     graph_id: int
@@ -418,6 +421,7 @@ class DotSite(NamedTuple):
     loop_axes: tuple[LoopAxisFact, ...] = ()
     exact_loop_trips: int | None = None
     max_loop_trips: int | None = None
+    rank_reduction_scaled_accumulator_batch_block_id: int | None = None
 
 
 class ResolvedMatmulFact(NamedTuple):

@@ -17,7 +17,13 @@ from helion._compiler.autotuner_heuristics.triton import (
 from helion._compiler.autotuner_heuristics.triton import (
     TritonB200MultiMatmulHeuristic as _MULTI,
 )
+from helion._compiler.autotuner_heuristics.triton import (
+    TritonH100FormulaMatmulHeuristic,
+)
 from helion._compiler.autotuner_heuristics.triton import TritonH100MatmulHeuristic
+from helion._compiler.autotuner_heuristics.triton import (
+    TritonH100MultiMatmulHeuristic as _H100_MULTI,
+)
 from helion._compiler.autotuner_heuristics.triton import _batched_static_matmul_fact
 from helion._compiler.autotuner_heuristics.triton import _generalized_static_matmul_fact
 from helion.autotuner.config_fragment import EnumFragment
@@ -84,18 +90,18 @@ def _matmul_config_spec(
     )
 
 
-def test_b200_formula_front_ends_supply_execution_defaults() -> None:
-    assert TritonB200FormulaMatmulHeuristic.promote_seed_to_default is True
-    assert _MULTI.promote_seed_to_default is True
-    assert TritonB200FormulaMatmulHeuristic.HARDWARE_TARGETS == (("cuda", "sm100"),)
-    assert issubclass(TritonB200FormulaMatmulHeuristic, TritonH100MatmulHeuristic)
+def test_arch_formula_front_ends_supply_execution_defaults() -> None:
     from helion._compiler.autotuner_heuristics import get_heuristics
 
     order = [h.__name__ for h in get_heuristics("triton")]
-    assert "TritonB200MatmulHeuristic" not in order
-    assert order.index("TritonB200FormulaMatmulHeuristic") < order.index(
-        "TritonB200MultiMatmulHeuristic"
-    )
+    for formula, multi, arch in (
+        (TritonH100FormulaMatmulHeuristic, _H100_MULTI, "sm90"),
+        (TritonB200FormulaMatmulHeuristic, _MULTI, "sm100"),
+    ):
+        assert formula.promote_seed_to_default is True
+        assert multi.promote_seed_to_default is True
+        assert (("cuda", arch),) == formula.HARDWARE_TARGETS
+        assert order.index(formula.__name__) < order.index(multi.__name__)
 
 
 def test_h100_base_tile_is_unchanged_by_tmem_budget() -> None:
@@ -252,6 +258,7 @@ def test_sm90_conservative_accounting_is_inert() -> None:
 
 _FML = TritonB200FormulaMatmulHeuristic
 _H100 = TritonH100MatmulHeuristic
+_H100_FML = TritonH100FormulaMatmulHeuristic
 
 
 def _axes(
@@ -704,7 +711,7 @@ def test_warp_selection_accounts_for_four_to_eight_residency_loss() -> None:
     """Eight warps must earn back any residency lost relative to four."""
     work = SimpleNamespace(
         total=_FML.EIGHT_WARP_DOT_WORK,
-        tcgen05_eligible=_FML.EIGHT_WARP_DOT_WORK,
+        warpgroup_eligible=_FML.EIGHT_WARP_DOT_WORK,
         uncertain=False,
     )
 
@@ -947,6 +954,26 @@ def test_kernel_smem_separates_useful_depth_from_hard_allocation() -> None:
         6,
         hard_allocation=True,
     ) == (per_stage * 6,)
+    assert _H100_FML._smem_region_demands(
+        env,
+        blocks,
+        6,
+        hard_allocation=True,
+    ) == (per_stage * 6,)
+
+    store = _live("store", 0, 1)
+    env = _kernel_smem_env(
+        (fact,),
+        block_ids=[0, 1, 2],
+        pipelined_regions=(PipelinedRegion((LoopAxisFact(2, 32),), (*loads, store)),),
+    )
+    store_bytes = 64 * 32 * 2
+    assert _H100_FML._smem_region_demands(
+        env,
+        blocks,
+        6,
+        hard_allocation=True,
+    ) == (per_stage * 5 + store_bytes,)
 
 
 def test_symbolic_loop_bounds_resolve_candidates_and_preserve_unknowns() -> None:
@@ -1051,15 +1078,8 @@ def test_multi_dot_proposal_preconditions_with_complete_kernel_smem_map() -> Non
     assert all(block_sizes[3] == 1 for block_sizes in seen)
 
 
-def test_sm90_keeps_the_incumbent_gate_and_every_switch_off() -> None:
-    """Every measurement behind the generalized machinery is B200, so sm90 must be a
-    byte-identical freeze: same eligibility precondition, no graded stages, no work-aware
-    warps, no tensor-memory column budget."""
-    cls = TritonH100MatmulHeuristic
-    assert cls.GENERALIZED_AXES is False
-    assert cls.GRADED_STAGES is False
-    assert cls.WORK_AWARE_WARPS is False
-    assert cls.TMEM_COLUMN_BUDGET is None
+def test_sm90_formula_admits_generalized_axes() -> None:
+    cls = _H100_FML
     fixed = MatmulFact(
         lhs_ndim=2,
         rhs_ndim=2,
@@ -1077,10 +1097,39 @@ def test_sm90_keeps_the_incumbent_gate_and_every_switch_off() -> None:
         _axes(k=DotAxisKind.FIXED_FULL_EXTENT, k_extent=64),
         valid_block_ids=[0, 1],
     )
-    # sm90 routes through the incumbent gate, which declines the fixed-axis dot.
-    assert cls._eligible_fact(spec) is None
-    # ...while sm100 admits it.
-    assert _FML._eligible_fact(spec) is fixed
+    assert TritonH100MatmulHeuristic._eligible_fact(spec) is None
+    assert cls._eligible_fact(spec) is fixed
+
+
+def test_sm90_caps_only_reduction_scaled_wgmma_accumulator_bug() -> None:
+    site = SimpleNamespace(
+        rank_reduction_scaled_accumulator_batch_block_id=0,
+    )
+    mm = SimpleNamespace(matmuls=(SimpleNamespace(site=site),))
+    env = SimpleNamespace()
+
+    def cap(*, rows: int = 64, batch: int = 1, warps: int = 4) -> int | None:
+        with (
+            patch.object(_H100_FML, "_full_block_map", return_value={0: batch}),
+            patch.object(
+                _H100_FML,
+                "_all_dot_acc_tiles",
+                return_value=[(rows, 64, 32, 2)],
+            ),
+        ):
+            return _H100_FML._pipeline_stage_cap(
+                env,
+                mm,
+                [batch],
+                num_warps=warps,
+            )
+
+    assert cap() == 1
+    assert cap(rows=32) is None
+    assert cap(warps=2) is None
+    assert cap(batch=2) is None
+    site.rank_reduction_scaled_accumulator_batch_block_id = None
+    assert cap() is None
 
 
 def test_multi_matmul_front_end_declines_whatever_front_end_one_owns() -> None:
@@ -1098,11 +1147,7 @@ def test_multi_matmul_front_end_declines_whatever_front_end_one_owns() -> None:
         return_value=True,
     ):
         assert _MULTI.is_eligible(env, None) is False
-    # Keep single-contraction seeds ahead of the disjoint multi-contraction path.
-    from helion._compiler.autotuner_heuristics import HEURISTICS_BY_BACKEND
-
-    triton_order = HEURISTICS_BY_BACKEND["triton"]
-    assert triton_order.index(_MULTI) > triton_order.index(_FML)
+        assert _H100_MULTI.is_eligible(env, None) is False
 
 
 def _live(kind: str, *block_ids: int | None) -> LiveTile:
@@ -1319,7 +1364,12 @@ def test_reuse_free_output_knob_drops_to_the_allocation_floor() -> None:
     )
     block_sizes = [128]
     _MULTI._apply_knob_roles(env, env.config_spec.kernel_matmul_fact, block_sizes, 148)
-    assert block_sizes == [_MULTI.TMEM_ALLOC_COLUMNS]
+    assert block_sizes == [_MULTI.REUSE_FREE_OUTPUT_N_FLOOR]
+    block_sizes = [128]
+    _H100_MULTI._apply_knob_roles(
+        env, env.config_spec.kernel_matmul_fact, block_sizes, 148
+    )
+    assert block_sizes == [_H100_MULTI.REUSE_FREE_OUTPUT_N_FLOOR]
 
     env, _mm = _knob_spec(
         knob_users=((4, ((0, "n"),)),),
@@ -1694,6 +1744,10 @@ def test_register_estimate_lets_tensor_memory_absorb_wide_accumulators() -> None
     assert _FML._register_live_bytes(_steps_env(wide), [], 1) == 128 * 128 * 4
     assert _FML._register_live_bytes(_steps_env(wide), [], 2) == 128 * 128 * 4
     assert _FML._register_live_bytes(_steps_env(wide), [], 4) == 0
+    # H100 WGMMA issues as a warpgroup too, but its accumulator remains in
+    # registers at four and eight warps.
+    assert _H100_FML._register_live_bytes(_steps_env(wide), [], 4) == 128 * 128 * 4
+    assert _H100_FML._register_live_bytes(_steps_env(wide), [], 8) == 128 * 128 * 4
     narrow = (
         ((32, 128, 4, "dot_out"),),
     )  # below TCGEN05_MIN_BM: never in tensor memory
@@ -1734,20 +1788,20 @@ def test_register_climb_stops_at_a_warpgroup_not_at_max_warps() -> None:
     stopping at a warpgroup scores 0.9591 -- above the hand-tuned key's 0.9363."""
     # A live set far past ANY register file must still stop at a warpgroup, not run to eight.
     huge = tuple([tuple((128, 128, 4, "other") for _ in range(8))])  # 512 KiB
-    assert (
-        _FML._warps_for_live_set(1, _steps_env(huge), [])
-        == _FML.TCGEN05_WARPGROUP_WARPS
-    )
-    assert _FML.TCGEN05_WARPGROUP_WARPS < _FML.MAX_NUM_WARPS
+    assert _FML._warps_for_live_set(1, _steps_env(huge), []) == _FML.WARPGROUP_WARPS
+    assert _FML.WARPGROUP_WARPS < _FML.MAX_NUM_WARPS
     # Eight is still reachable -- it just has to come from the work term, which this rule keeps.
     assert _FML._warps_for_live_set(8, _steps_env(huge), []) == 8
     # The stop is a per-arch class attribute, not an arch test inside the ladder: hardware
     # selection already happened in is_eligible via HARDWARE_TARGETS. Pin that the sm100 carrier
     # ties it to the absorption boundary it is derived from, so the two cannot drift apart...
-    assert _FML.REG_CLIMB_MAX_WARPS == _FML.TCGEN05_WARPGROUP_WARPS
-    # ...and that the sm90 carrier is left where it was, holding that frozen emit still.
-    assert _H100.REG_CLIMB_MAX_WARPS == _H100.MAX_NUM_WARPS
-    assert _H100._warps_for_live_set(1, _steps_env(huge), []) == _H100.MAX_NUM_WARPS
+    assert _FML.REG_CLIMB_MAX_WARPS == _FML.WARPGROUP_WARPS
+    # Register-resident WGMMA keeps climbing when pressure remains unresolved.
+    assert _H100_FML.REG_CLIMB_MAX_WARPS == _H100_FML.MAX_NUM_WARPS
+    assert (
+        _H100_FML._warps_for_live_set(1, _steps_env(huge), [])
+        == _H100_FML.MAX_NUM_WARPS
+    )
 
 
 def test_no_structural_warp_floor_survives() -> None:
