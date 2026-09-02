@@ -772,6 +772,8 @@ def _cute_scalar_load_expr(
     tensor_name: str,
     index_exprs: list[str],
     dtype: torch.dtype,
+    *,
+    eviction_suffix: str = "",
 ) -> str:
     if "None" in index_exprs:
         return f"{tensor_name}[{', '.join(index_exprs)}]"
@@ -779,6 +781,19 @@ def _cute_scalar_load_expr(
         return (
             f"cute.arch.load({_cute_scalar_pointer_expr(tensor_name, index_exprs)}, "
             "cutlass.Uint8)"
+        )
+    if eviction_suffix and dtype.itemsize >= 4 and dtype is not torch.bool:
+        # ``(ptr).load()`` has no cache-hint kwargs; route hinted scalar
+        # sites through ``cute.arch.load`` instead.  Sub-32-bit dtypes stay
+        # on the plain form: their scalar load lowers to ``nvvm.load.ext``,
+        # which rejects cache modifiers ("Unsupported FP type for
+        # ExtLoadOp"); their hints apply on the vectorized forms instead.
+        from .._compiler.compile_environment import CompileEnvironment
+
+        dtype_str = CompileEnvironment.current().backend.dtype_str(dtype)
+        return (
+            f"cute.arch.load({_cute_scalar_pointer_expr(tensor_name, index_exprs)}, "
+            f"{dtype_str}{eviction_suffix})"
         )
     return f"{_cute_scalar_pointer_expr(tensor_name, index_exprs)}.load()"
 
