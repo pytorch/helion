@@ -826,6 +826,90 @@ class CuteRolledRowLadderHeuristic(AutotunerHeuristic):
         return Config(**seed)
 
 
+class CuteRolledClusterLadderHeuristic(AutotunerHeuristic):
+    """Cluster row-split seed for very wide rolled row reductions: split
+    each row across a thread-block cluster so every CTA rolls a ~16k-element
+    slice (one DSM exchange combines the partials; every CTA gets the full
+    result and consumes only its slice).
+
+    Below the cluster the single-CTA rolled form must reload the whole row
+    for the consume sweep from gmem — at multi-hundred-KB rows that second
+    read misses L2 and costs ~1.5x DRAM traffic.  The 16k-element slice
+    target matches both the Quack rmsnorm heuristic (cluster_n =
+    N/16384 capped at 16) and the B200 hand-transplant measurements
+    (see benchmarks/cute/compare_rmsnorm_backends.py): 128 threads/CTA,
+    single roll trip over the slice.
+    """
+
+    name = "cute_rolled_cluster_ladder"
+    backend = "cute"
+
+    _SLICE_TARGET = 16384
+    _MAX_CLUSTER = 16
+    _THREADS_PER_ROW = 128
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        if not is_canonical_row_reduction(env):
+            return False
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        return rl_spec.size_hint >= 4 * cls._SLICE_TARGET
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        size_hint = rl_spec.size_hint
+        vec = _cute_seed_vec_width(
+            env, rl_spec, spec.max_reduction_threads or 1024, size_hint, device_ir
+        )
+        # Power of two only: the cute_cluster_n EnumFragment enumerates
+        # {1,2,4,8,16}, and an off-surface value would one-hot encode as
+        # all zeros in the search surrogate.
+        cluster_n = 1 << (
+            min(cls._MAX_CLUSTER, size_hint // cls._SLICE_TARGET).bit_length() - 1
+        )
+        threads_per_row = cls._THREADS_PER_ROW
+        # The rolled cluster split requires every CTA to roll whole chunks
+        # of its own contiguous slice (see LoopedReductionStrategy).
+        while cluster_n > 1 and size_hint % (cluster_n * threads_per_row * max(vec, 1)):
+            cluster_n //= 2
+        if cluster_n <= 1:
+            return None
+        # A chunk a few trips smaller than the slice schedules better than
+        # one whole-slice trip (measured on B200 at N=262144: 4616 vs
+        # 4350 GB/s) — the shorter unrolled body overlaps its loads across
+        # roll iterations instead of one long dependency chain.
+        slice_len = size_hint // cluster_n
+        chunk = max(threads_per_row * max(vec, 1), min(4096, slice_len))
+        while slice_len % chunk:
+            chunk //= 2
+        rdim_id = rl_spec.block_id
+        tile_id = spec.block_sizes[0].block_id
+        seed: dict[str, Any] = {
+            "block_sizes": [1],
+            "num_threads": _seq_config_list(
+                spec.num_threads, {tile_id: 1, rdim_id: threads_per_row}
+            ),
+            "reduction_loops": [chunk],
+            "cute_cluster_n": cluster_n,
+            "cute_lane_layouts": _seq_config_list(
+                spec.cute_lane_layouts, {rdim_id: "strided"}
+            ),
+        }
+        if vec > 1:
+            seed["cute_vector_widths"] = _seq_config_list(
+                spec.cute_vector_widths, {rdim_id: vec}
+            )
+        try:
+            return Config(**seed)
+        except Exception:
+            return None
+
+
 def _block_size_value_reachable(
     spec: ConfigSpec,
     block_index: int,
