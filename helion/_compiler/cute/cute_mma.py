@@ -70,7 +70,6 @@ from .fragment_epilogue import _tcgen05_fragment_source_layout_reachable
 from .fragment_epilogue import _tcgen05_fragment_source_layout_supported
 from .fragment_epilogue import analyze_tcgen05_fragment_epilogue_candidate
 from .fragment_epilogue import analyze_tcgen05_fragment_epilogue_plan
-from .fragment_epilogue import tcgen05_fragment_epilogue_candidate_has_host_loads
 from .grouped_full_coverage import Tcgen05GroupedFullCoveragePlan
 from .grouped_full_coverage import full_allocation_b_two_cta_profile_supported
 from .grouped_full_coverage import full_allocation_b_two_cta_smem_upper_bound
@@ -6463,21 +6462,12 @@ def _analyze_mma_output_stores(
 
     analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
     if analyzed_stores is None:
-        fragment_epilogue_has_host_loads = (
-            tcgen05_fragment_epilogue_candidate_has_host_loads(
-                graphs,
-                mma_node,
-                expected_output_block_ids=analysis.output_block_ids,
-            )
+        fragment_epilogue_has_host_loads = analyze_tcgen05_fragment_epilogue_candidate(
+            graphs,
+            mma_node,
+            expected_output_block_ids=analysis.output_block_ids,
         )
-        if (
-            fragment_epilogue_has_host_loads
-            or analyze_tcgen05_fragment_epilogue_candidate(
-                graphs,
-                mma_node,
-                expected_output_block_ids=analysis.output_block_ids,
-            )
-        ):
+        if fragment_epilogue_has_host_loads is not None:
             return _MmaOutputStoreAnalysis(
                 explicit_epi_tile_compatible=False,
                 output_column_major=False,
@@ -10552,8 +10542,8 @@ def _emit_mma_pipeline(
                 "cute",
                 f"tcgen05 launch block shape {candidate_block_shape} exceeds 1024 threads",
             )
-        # SMEM-budget rejection: ``tcgen05_ab_stages=3`` +
-        # productive C-input warp
+        # SMEM-budget rejection for epilogue-subtile auxiliary descriptors:
+        # ``tcgen05_ab_stages=3`` + productive C-input warp
         # (``tcgen05_warp_spec_c_input_warps=1`` AND non-empty
         # ``aux_tensor_descriptors`` AND single-store fan-out
         # gate open) is over the 232 KB B200 SMEM cap at every
@@ -10576,7 +10566,10 @@ def _emit_mma_pipeline(
         # C-input warp (SIMT or TMA) OR — under the cycle-94 merge —
         # the store warp (TMA only). The store-warp TMA aux ring has
         # the SAME SMEM cost as the C-input TMA ring, so ab=3 overshoots
-        # the cap identically and must be rejected for it too. When the
+        # the cap identically and must be rejected for it too. Fragment
+        # ``OUTPUT_TILE`` descriptors can stage smaller proportional source
+        # regions, so their exact SMEM footprint is checked below instead of
+        # applying this legacy blanket rejection. When the
         # multi-store fan-out gate closes the productive body, the aux
         # SMEM ring + ``c_pipeline_aux`` are NOT allocated and the
         # kernel falls back to GMEM-aux reads with no extra SMEM cost,
@@ -10595,10 +10588,15 @@ def _emit_mma_pipeline(
         ab_reject_has_aux_producer_warp = tcgen05_matmul_plan.has_c_input_warp or (
             tcgen05_matmul_plan.has_store_warp and ab_reject_aux_tma_requested
         )
+        ab_reject_has_only_epilogue_subtile_descriptors = all(
+            descriptor.staging_scope is Tcgen05AuxStagingScope.EPILOGUE_SUBTILE
+            for descriptor in c_input_aux_tensor_descriptors
+        )
         if (
             ab_reject_has_aux_producer_warp
             and c_input_aux_tensor_descriptors
             and aux_single_store_value
+            and ab_reject_has_only_epilogue_subtile_descriptors
             and tcgen05_matmul_plan.ab_stage_count >= 3
         ):
             raise exc.BackendUnsupported(

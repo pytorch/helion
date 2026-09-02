@@ -2260,10 +2260,14 @@ def _codegen_cute_store_tcgen05_tile(
             and fragment_epilogue.streaming_program is not None
             and fragment_epilogue.has_host_loads
         )
-        if not aux_steps_in_chain and not (
-            fanout_plan is not None
-            and any(chain.auxiliary_tensor_loads for chain in fanout_plan.chains)
-        ) and not fragment_host_prefetch:
+        if (
+            not aux_steps_in_chain
+            and not (
+                fanout_plan is not None
+                and any(chain.auxiliary_tensor_loads for chain in fanout_plan.chains)
+            )
+            and not fragment_host_prefetch
+        ):
             raise exc.InvalidConfig(
                 f"invalid {TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY}="
                 f"{TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT!r}: the epilogue has "
