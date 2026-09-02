@@ -2056,7 +2056,7 @@ class TileStrategy:
         ):
             loop_numel = int(env.block_sizes[block_idx].numel)
             block_size = int(env.block_sizes[block_idx].from_config_assert(config))
-            if config.num_warps == 1:
+            if env.backend.effective_num_warps(config) == 1:
                 # One-warp kernels have no cross-warp layout hazard. Keep the
                 # pipeline within the number of complete unrolled iterations;
                 # using only the final tile's remainder would collapse every

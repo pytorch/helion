@@ -453,6 +453,24 @@ class TestConfigAPI(TestCase):
             ):
                 spec.enable_cross_loop_schedule()
 
+    def test_cross_loop_schedule_is_not_supported_on_xpu(self) -> None:
+        with patch("helion._compat.is_hip", return_value=False):
+            spec = ConfigSpec(
+                backend=TritonBackend(),
+                device=torch.device("xpu"),
+                num_sm=1,
+            )
+            self.assertFalse(spec.supports_config_key("cross_loop_schedule"))
+
+    def test_warp_specialization_uses_effective_launcher_warp_count(self) -> None:
+        backend = TritonBackend()
+        config = helion.Config(
+            num_warps=1,
+            range_warp_specializes=[None, True],
+        )
+
+        self.assertEqual(backend.effective_num_warps(config), 4)
+
     def test_mapping_behavior_len_iter_dict_roundtrip(self) -> None:
         data = {
             "block_sizes": [64, 32],

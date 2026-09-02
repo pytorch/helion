@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+import contextlib
 import dataclasses
 import difflib
 import hashlib
@@ -54,6 +55,7 @@ class CaptureRecord:
 
 class _PytestItem(Protocol):
     nodeid: str
+    path: Path
 
 
 def _run(
@@ -98,7 +100,9 @@ class _CapturePlugin:
         self.collected_tests = len(items)
 
     def pytest_runtest_setup(self, item: _PytestItem) -> None:
-        self.current_nodeid = item.nodeid
+        _path, separator, suffix = item.nodeid.partition("::")
+        stable_path = item.path.name
+        self.current_nodeid = f"{stable_path}::{suffix}" if separator else stable_path
 
     def pytest_runtest_teardown(self) -> None:
         self.current_nodeid = "<session>"
@@ -152,6 +156,8 @@ def _capture_main(argv: Sequence[str]) -> int:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--test-target", action="append", dest="test_targets")
+    parser.add_argument("--require-aot-heuristic", action="store_true")
     args, pytest_args = parser.parse_known_args(argv)
 
     root = args.root.resolve()
@@ -161,6 +167,16 @@ def _capture_main(argv: Sequence[str]) -> int:
     sys.path.insert(0, str(root))
     os.environ["HELION_BACKEND"] = "triton"
     os.environ["HELION_OUTPUT_ORIGIN_LINES"] = "0"
+    if args.require_aot_heuristic:
+        os.environ["HELION_AOT_MODE"] = "evaluate"
+        os.environ["HELION_AUTOTUNE_EFFORT"] = "full"
+        os.environ["HELION_FORCE_AUTOTUNE"] = "0"
+        os.environ["HELION_SKIP_CACHE"] = "0"
+        os.environ["HELION_INTERPRET"] = "0"
+        os.environ["HELION_AOT_DATA_DIR"] = str(artifacts / "aot-data")
+        os.environ.pop("HELION_AUTOTUNE_CONFIG_OVERRIDES", None)
+        os.environ.pop("HELION_HEURISTIC_DIR", None)
+        os.environ.pop("TRITON_INTERPRET", None)
 
     import pytest
 
@@ -187,14 +203,53 @@ def _capture_main(argv: Sequence[str]) -> int:
         plugin.record(bound, config, code)
         return code
 
-    with mock.patch.object(
-        BoundKernel,
-        "to_triton_code",
-        capture_to_triton_code,
-    ):
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            mock.patch.object(
+                BoundKernel,
+                "to_triton_code",
+                capture_to_triton_code,
+            )
+        )
+        if args.require_aot_heuristic:
+            from helion.autotuner.aot_cache import AOTAutotuneCache
+
+            original_get_heuristic_config = AOTAutotuneCache._get_heuristic_config
+
+            def require_heuristic_config(
+                cache: AOTAutotuneCache,
+                heuristic_args: Sequence[object] | None = None,
+            ) -> Config | None:
+                heuristic_file = cache._find_heuristic_file()
+                kernel_source = Path(cache.kernel.kernel.__code__.co_filename).resolve()
+                if (
+                    heuristic_file is None
+                    or heuristic_file.resolve().parent != kernel_source.parent
+                ):
+                    kernel_name = cache.kernel.kernel.name
+                    raise RuntimeError(
+                        f"No adjacent checked-in AOT heuristic found for "
+                        f"{kernel_name!r}"
+                    )
+                config = original_get_heuristic_config(cache, heuristic_args)
+                if config is None:
+                    kernel_name = cache.kernel.kernel.name
+                    raise RuntimeError(
+                        f"No checked-in AOT heuristic selected a config for "
+                        f"{kernel_name!r}"
+                    )
+                return config
+
+            stack.enter_context(
+                mock.patch.object(
+                    AOTAutotuneCache,
+                    "_get_heuristic_config",
+                    require_heuristic_config,
+                )
+            )
         exit_code = int(
             pytest.main(
-                ["test/test_examples.py", "-q", *pytest_args],
+                [*(args.test_targets or ["test/test_examples.py"]), "-q", *pytest_args],
                 plugins=[plugin],
             )
         )
@@ -242,10 +297,17 @@ def _compare_captures(
     *,
     max_diffs: int,
     max_diff_lines: int,
+    suite_name: str,
+    require_same_collection: bool,
+    required_kernels: Sequence[str],
 ) -> bool:
     baseline_metadata, baseline_records = _load_manifest(baseline_manifest)
     candidate_metadata, candidate_records = _load_manifest(candidate_manifest)
-    if baseline_metadata["collected_tests"] != candidate_metadata["collected_tests"]:
+    if (
+        require_same_collection
+        and baseline_metadata["collected_tests"]
+        != candidate_metadata["collected_tests"]
+    ):
         print(
             "Collected test count differs: "
             f"baseline={baseline_metadata['collected_tests']} "
@@ -256,6 +318,22 @@ def _compare_captures(
 
     baseline_by_key = {record.key: record for record in baseline_records}
     candidate_by_key = {record.key: record for record in candidate_records}
+    missing_required_kernels: dict[str, list[str]] = {}
+    required_kernel_set = set(required_kernels)
+    for label, records in (
+        ("baseline", baseline_records),
+        ("candidate", candidate_records),
+    ):
+        missing_kernels = sorted(
+            required_kernel_set - {record.kernel for record in records}
+        )
+        if missing_kernels:
+            missing_required_kernels[label] = missing_kernels
+            print(
+                f"{label.capitalize()} did not capture required kernels: "
+                f"{missing_kernels}",
+                file=sys.stderr,
+            )
     missing = sorted(baseline_by_key.keys() - candidate_by_key.keys())
     added = sorted(candidate_by_key.keys() - baseline_by_key.keys())
     if missing:
@@ -315,8 +393,8 @@ def _compare_captures(
     }
     multi_root = [record for record in candidate_records if record.root_count != 1]
     print(
-        f"Compared {compared} generated Triton programs from "
-        f"{len(source_files)} example source files."
+        f"Compared {compared} generated programs from "
+        f"{len(source_files)} {suite_name} source files."
     )
     if multi_root:
         multi_root_labels = sorted(
@@ -331,11 +409,27 @@ def _compare_captures(
         )
         for label in multi_root_labels:
             print(f"  {label}")
-    return not (missing or added or metadata_mismatches or mismatches)
+    return not (
+        missing_required_kernels
+        or missing
+        or added
+        or metadata_mismatches
+        or mismatches
+    )
 
 
-def _compare_main(argv: Sequence[str]) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+def compare_main(
+    argv: Sequence[str],
+    *,
+    test_target: str | Sequence[str] = "test/test_examples.py",
+    suite_name: str = "example",
+    default_pytest_args: Sequence[str] = (),
+    description: str | None = __doc__,
+    require_same_collection: bool = True,
+    capture_args: Sequence[str] = (),
+    required_kernels: Sequence[str] = (),
+) -> int:
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
         "--baseline-ref",
         help="Git ref to compare against (default: merge-base with origin/main)",
@@ -355,8 +449,10 @@ def _compare_main(argv: Sequence[str]) -> int:
     args, pytest_args = parser.parse_known_args(argv)
     if pytest_args and pytest_args[0] == "--":
         pytest_args = pytest_args[1:]
+    pytest_args = [*default_pytest_args, *pytest_args]
 
     candidate_root = _repo_root()
+    test_targets = (test_target,) if isinstance(test_target, str) else test_target
     baseline_ref = args.baseline_ref or _git_output(
         candidate_root, "merge-base", "HEAD", "origin/main"
     )
@@ -410,7 +506,7 @@ def _compare_main(argv: Sequence[str]) -> int:
             run_environment["PYTHONPATH"] = str(root)
             run_environment["TORCHINDUCTOR_CACHE_DIR"] = str(artifacts / "inductor")
             run_environment["TRITON_CACHE_DIR"] = str(artifacts / "triton")
-            print(f"Running {label} example suite...")
+            print(f"Running {label} {suite_name} suite...")
             _run(
                 (
                     args.python,
@@ -422,6 +518,12 @@ def _compare_main(argv: Sequence[str]) -> int:
                     str(artifacts),
                     "--manifest",
                     str(manifest),
+                    *(
+                        arg
+                        for target in test_targets
+                        for arg in ("--test-target", target)
+                    ),
+                    *capture_args,
                     *pytest_args,
                 ),
                 cwd=root,
@@ -435,11 +537,17 @@ def _compare_main(argv: Sequence[str]) -> int:
             candidate_artifacts,
             max_diffs=args.max_diffs,
             max_diff_lines=args.max_diff_lines,
+            suite_name=suite_name,
+            require_same_collection=require_same_collection,
+            required_kernels=required_kernels,
         )
         if identical:
-            print("All captured example Triton sources are byte-identical.")
+            print(f"All captured {suite_name} generated sources are byte-identical.")
             return 0
-        print("Example Triton source comparison failed.", file=sys.stderr)
+        print(
+            f"{suite_name.capitalize()} generated source comparison failed.",
+            file=sys.stderr,
+        )
         return 1
     finally:
         if worktree_added:
@@ -465,7 +573,7 @@ def _compare_main(argv: Sequence[str]) -> int:
 def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "_capture":
         return _capture_main(sys.argv[2:])
-    return _compare_main(sys.argv[1:])
+    return compare_main(sys.argv[1:])
 
 
 if __name__ == "__main__":

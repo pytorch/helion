@@ -961,6 +961,7 @@ class ConfigSpec:
     ) -> None:
         self.backend = backend
         self.backend_name = backend.name
+        self.device = device
         # When True, search-space restriction decisions are logged live (at
         # INFO) the moment they are applied, in addition to being recorded for
         # the end-of-run summary. Sourced from
@@ -2165,6 +2166,12 @@ class ConfigSpec:
         )
 
     def supports_config_key(self, key: str) -> bool:
+        if (
+            key == "cross_loop_schedule"
+            and self.device is not None
+            and self.device.type != "cuda"
+        ):
+            return False
         return self.backend.supports_config_key(key)
 
     def enable_cross_loop_schedule(self) -> None:

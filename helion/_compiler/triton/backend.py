@@ -479,17 +479,19 @@ class TritonBackend(Backend):
             f"tl.full([{', '.join(shape_dims)}], {value_expr}, {self.dtype_str(dtype)})"
         )
 
-    def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
-        from ..._compat import supports_maxnreg
-
+    def effective_num_warps(self, config: Config) -> int:
         # Workaround for triton bug: warp_specialize requires at least 4 warps
         # See: https://github.com/triton-lang/triton/issues/7354
         num_warps = config.num_warps
         if any(config.range_warp_specializes):
             num_warps = max(4, num_warps)
+        return num_warps
+
+    def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
+        from ..._compat import supports_maxnreg
 
         args = [
-            f"num_warps={num_warps}",
+            f"num_warps={self.effective_num_warps(config)}",
             f"num_stages={config.num_stages}",
             *(["launch_cooperative_grid=True"] if has_barrier else []),
         ] + [

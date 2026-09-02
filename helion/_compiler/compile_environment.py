@@ -905,6 +905,9 @@ class CompileEnvironment:
                 for name, count in rw.reads.items()
                 if count > rw.inplace_writes.get(name, 0)
             }
+            reads.update(
+                canonical_host_tensor_name(name, aliases) for name in rw.atomic_reads
+            )
             writes = {canonical_host_tensor_name(name, aliases) for name in rw.writes}
             if not (reads & writes & arg_names):
                 continue

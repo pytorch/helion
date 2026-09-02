@@ -585,9 +585,6 @@ class ForEachProgramID(ProgramIDs):
         base_body = self._prepare_persistent_body(
             device_function.body, device_function, strategy.virtual_pid_var
         )
-        # Access markers are compiler-only insertion points. This conservative
-        # phase-barrier path does not consume them, so remove them before emit.
-        base_body = cast("list[ast.stmt]", _clone_ast_value(base_body))
 
         barrier_stmt = None
         if len(boundaries) > 1:

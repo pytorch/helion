@@ -22,6 +22,7 @@ class _ReadWriteVisitor(ast.NodeVisitor):
             collections.Counter(),
             collections.Counter(),
             set(),
+            set(),
         )
 
     def _update(self, name: str, ctx: ast.expr_context) -> None:
@@ -54,6 +55,8 @@ class _ReadWriteVisitor(ast.NodeVisitor):
             if isinstance(first_arg, ast.Name):
                 self.rw.writes[first_arg.id] += 1
                 self.rw.inplace_writes[first_arg.id] += 1
+                if func.attr.startswith("atomic_"):
+                    self.rw.atomic_reads.add(first_arg.id)
         self.generic_visit(node)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
@@ -87,6 +90,9 @@ class ReadWrites(typing.NamedTuple):
     # historically placed them with writes. Keep that ordering stable while
     # exposing the read to analyses that consume ``reads`` directly.
     augassign_reads: set[str]
+    # Atomic operations are read-modify-writes even when the generic Name walk
+    # sees only the synthetic first-argument read paired with the in-place write.
+    atomic_reads: set[str]
 
     def __iter__(self) -> typing.Iterator[str]:
         return iter({**self.reads, **self.writes})
@@ -261,6 +267,10 @@ class _PureExpressionVisitor(ast.NodeVisitor):
     AST visitor that determines if an expression is guaranteed to be pure.
     """
 
+    def __init__(self, *, allow_compiler_shape_helpers: bool = False) -> None:
+        super().__init__()
+        self.allow_compiler_shape_helpers = allow_compiler_shape_helpers
+
     def generic_visit(self, node: ast.AST) -> None:
         # Anything without a specific visitor is not pure
         raise _NotPureException
@@ -332,7 +342,10 @@ class _PureExpressionVisitor(ast.NodeVisitor):
             "_cdiv",
             "_next_power_of_2",
         }
-        if not (is_math or is_triton_shape_helper or is_backend_shape_helper):
+        is_compiler_shape_helper = (
+            is_triton_shape_helper or is_backend_shape_helper
+        ) and self.allow_compiler_shape_helpers
+        if not (is_math or is_compiler_shape_helper):
             raise _NotPureException
 
         # Recurse into children except for func
@@ -343,9 +356,15 @@ class _PureExpressionVisitor(ast.NodeVisitor):
             self.visit(keyword.value)
 
 
-def definitely_does_not_have_side_effects(expr: ast.expr) -> bool:
+def definitely_does_not_have_side_effects(
+    expr: ast.expr,
+    *,
+    allow_compiler_shape_helpers: bool = False,
+) -> bool:
     try:
-        _PureExpressionVisitor().visit(expr)
+        _PureExpressionVisitor(
+            allow_compiler_shape_helpers=allow_compiler_shape_helpers
+        ).visit(expr)
         return True
     except _NotPureException:
         return False

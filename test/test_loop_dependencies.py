@@ -260,6 +260,7 @@ class TestTritonTileDependencyLowering(TestCase):
         torch.testing.assert_close(output, (x + 1) * 2)
         self.assertIn("triton_helpers.x_grid_barrier(", code)
         self.assertIn("launch_cooperative_grid=True", code)
+        self.assertNotIn("_minimum_resident_programs=", code)
 
     def test_atomic_dependency_defaults_to_grid_barrier(self) -> None:
         x = torch.arange(8, device=DEVICE, dtype=torch.float32)
@@ -271,6 +272,7 @@ class TestTritonTileDependencyLowering(TestCase):
         )
         torch.testing.assert_close(output, x + 1)
         self.assertIn("triton_helpers.x_grid_barrier(", code)
+        self.assertNotIn("_minimum_resident_programs=", code)
 
     def test_dynamic_shape_defaults_to_grid_barrier(self) -> None:
         x = torch.arange(65, device=DEVICE, dtype=torch.float32)
@@ -293,7 +295,7 @@ class TestTritonTileDependencyLowering(TestCase):
         torch.testing.assert_close(output, (x + 1) * 2)
         self.assertIn("triton_helpers.x_grid_barrier(", code)
         self.assertIn("launch_cooperative_grid=True", code)
-        self.assertIn("_minimum_resident_programs=_NUM_SM", code)
+        self.assertNotIn("_minimum_resident_programs=", code)
 
     def test_implicit_dependency_static_pipeline(self) -> None:
         x = torch.arange(8, device=DEVICE, dtype=torch.float32)
@@ -307,6 +309,31 @@ class TestTritonTileDependencyLowering(TestCase):
         torch.testing.assert_close(output, (x + 1) * 2)
         self.assertIn("tile_dependency_root_barrier_wait", code)
         self.assertNotIn("triton_helpers.x_grid_barrier(", code)
+        self.assertIn("_minimum_resident_programs=", code)
+
+    def test_codegen_schedule_order_does_not_leak_barrier_state(self) -> None:
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        bound = implicit_tile_dependency_chain.bind((x,))
+        common = {
+            "block_sizes": [8, 8],
+            "pid_type": "persistent_blocked",
+        }
+        static_config = helion.Config(
+            **common,
+            cross_loop_schedule="static_pipeline",
+        )
+        barrier_config = helion.Config(
+            **common,
+            cross_loop_schedule="barrier",
+        )
+
+        static_before = bound.to_code(static_config)
+        barrier = bound.to_code(barrier_config)
+        static_after = bound.to_code(static_config)
+
+        self.assertEqual(static_before, static_after)
+        self.assertNotIn("launch_cooperative_grid=True", static_before)
+        self.assertIn("launch_cooperative_grid=True", barrier)
 
     def test_one_task_event_synchronizes_multiple_consumers(self) -> None:
         x = torch.arange(64, device=DEVICE, dtype=torch.float32)

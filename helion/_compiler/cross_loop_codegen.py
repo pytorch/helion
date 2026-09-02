@@ -527,8 +527,7 @@ def emit_cross_loop_schedule(
     """
     schedule = device_function.config.cross_loop_schedule
     if schedule == "barrier":
-        CompileEnvironment.current().has_barrier = True
-        device_function.triton_minimum_resident_programs = strategy.grid_size_expr
+        device_function.has_barrier = True
         return owner._emit_phase_loops(strategy, device_function, total_expr)
     if schedule != "static_pipeline":
         raise exc.InvalidConfig(f"unknown cross_loop_schedule value {schedule!r}")

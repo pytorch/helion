@@ -15,6 +15,44 @@ import helion.language as hl
 
 @onlyBackends(["triton", "cute"])
 class TestStackTensor(RefEagerTestDisabled, TestCase):
+    def test_stack_load_across_explicit_barrier(self):
+        @helion.kernel
+        def stack_load_kernel(
+            dev_ptrs: torch.Tensor,
+            example_tensor: torch.Tensor,
+        ) -> torch.Tensor:
+            m = hl.specialize(dev_ptrs.size(0))
+            n = example_tensor.size(0)
+            tmp = torch.empty(
+                [m, n], dtype=example_tensor.dtype, device=dev_ptrs.device
+            )
+            out = torch.empty_like(tmp)
+
+            for tile in hl.tile(n):
+                tensors = hl.stacktensor_like(example_tensor, dev_ptrs[:])
+                tmp[:, tile] = tensors[tile]
+            hl.barrier()
+            for tile in hl.tile(n):
+                out[:, tile] = tmp[:, tile] + 1
+            return out
+
+        tensor_list = [
+            torch.randn(4, device=DEVICE, dtype=torch.bfloat16) for _ in range(4)
+        ]
+        tensor_ptrs = torch.as_tensor(
+            [tensor.data_ptr() for tensor in tensor_list],
+            device=DEVICE,
+            dtype=torch.uint64,
+        )
+        _code, result = code_and_output(
+            stack_load_kernel,
+            (tensor_ptrs, tensor_list[0]),
+            block_sizes=[4, 4],
+            pid_type="persistent_blocked",
+        )
+
+        torch.testing.assert_close(result, torch.stack(tensor_list) + 1)
+
     def test_stack_load_grid(self):
         @helion.kernel
         def stack_load_kernel(

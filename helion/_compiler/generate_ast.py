@@ -1331,10 +1331,16 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
     def host_dead_code_elimination(self) -> None:
         dce_vars: OrderedSet[str] = OrderedSet()
+        allow_compiler_shape_helpers = (
+            self.device_function.config.cross_loop_schedule == "static_pipeline"
+        )
         for stmt in self.host_statements:
             if (
                 isinstance(stmt, ast.Assign)
-                and definitely_does_not_have_side_effects(stmt.value)
+                and definitely_does_not_have_side_effects(
+                    stmt.value,
+                    allow_compiler_shape_helpers=allow_compiler_shape_helpers,
+                )
                 and all(isinstance(name, ast.Name) for name in stmt.targets)
             ):
                 for name in stmt.targets:

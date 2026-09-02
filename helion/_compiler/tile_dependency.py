@@ -4400,8 +4400,11 @@ def build_tile_dependency_graph(
     elif len(root_phases) != root_count:
         raise ValueError("root_phases must have one entry per task family")
     grid_block_ids = [list(family.logical_axis_order) for family in task_families]
+    roots_per_phase = {phase: root_phases.count(phase) for phase in set(root_phases)}
     if root_count > 1 and any(
-        0 <= access.root < root_count and access.allocation_id < 0
+        0 <= access.root < root_count
+        and access.allocation_id < 0
+        and roots_per_phase[root_phases[access.root]] > 1
         for access in accesses
     ):
         raise exc.CrossLoopSchedulingError(

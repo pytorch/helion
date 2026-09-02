@@ -274,6 +274,7 @@ class DeviceFunction:
         self.name = name
         self.config = config
         self.codegen = codegen
+        self.has_barrier = CompileEnvironment.current().has_barrier
         self.arguments: list[Argument] = []
         self.preamble: list[ast.AST] = []
         self.body: list[ast.AST] = []
@@ -1154,7 +1155,7 @@ class DeviceFunction:
             tensor_host_args=tensor_host_args,
             has_rng_ops=self.has_rng_ops(),
             config=self.config,
-            has_barrier=env.has_barrier,
+            has_barrier=self.has_barrier,
             sorted_args=arg_objects,
         )
         # Check if the backend wants to capture return values for output-only tensors.

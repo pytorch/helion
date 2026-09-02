@@ -204,6 +204,15 @@ class TestTileDependency(TestCase):
                 [[0], [1]],
             )
 
+    def test_unresolved_allocation_is_allowed_across_source_phases(self) -> None:
+        plan = build_tile_dependency_graph(
+            (_access(0, root=0, allocation_id=-1, kind="store"),),
+            [[0], [1]],
+            root_phases=(0, 1),
+        )
+
+        self.assertEqual(plan.edges, ())
+
     def test_coordinate_domain_separates_geometry_from_linearization_order(
         self,
     ) -> None:
