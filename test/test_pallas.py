@@ -5492,6 +5492,25 @@ class TestPallas(TestCase):
         self.assertNotIn("pltpu.make_async_copy", code)
         torch.testing.assert_close(result, x * r)
 
+    def test_dynamic_unroll_rejects_ordered_carry(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def dependent_row_map(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty_like(x)
+            for mb_cta in hl.tile(m, block_size=8):
+                for mb in hl.tile(mb_cta.begin, mb_cta.end):
+                    for nb in hl.tile(n):
+                        out[mb, nb] = x[mb, nb] * 2
+            return out
+
+        x = torch.randn(16, 128, dtype=torch.bfloat16)
+        with self.assertRaisesRegex(
+            helion.exc.InvalidConfig, "does not support ordered carry"
+        ):
+            dependent_row_map.bind((x,)).to_code(
+                helion.Config(block_sizes=[8, 128], pallas_loop_type="unroll")
+            )
+
     def test_dependent_tile_end_composes_with_streaming_loop_types(self) -> None:
         x = torch.randn(192, 192, device=DEVICE, dtype=torch.float32)
         bound = pallas_causal_prefix_sum.bind((x,))
