@@ -317,11 +317,13 @@ def _set_grouped_preference_attributes(
             "average_output_columns",
         ),
     ):
+        # cublasLt.h documents these as uint32_t, but cuBLASLt 13.6 rejects a
+        # four-byte write with CUBLAS_STATUS_INVALID_VALUE and accepts eight.
         _set_attribute(
             library.cublasLtMatmulPreferenceSetAttribute,
             preference,
             attribute,
-            ctypes.c_uint32(values[name]),
+            ctypes.c_uint64(values[name]),
             f"set grouped {name}",
         )
 
