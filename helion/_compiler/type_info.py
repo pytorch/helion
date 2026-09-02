@@ -44,6 +44,7 @@ from .variable_origin import TensorStrideOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterator
     from collections.abc import Sequence
     from typing_extensions import Self
 
@@ -714,6 +715,43 @@ class StringType(TypeInfo):
 
     def __str__(self) -> str:
         return "str"
+
+
+def _iter_body_excluding_nested_defs(node: ast.AST) -> Iterator[ast.AST]:
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        yield child
+        yield from _iter_body_excluding_nested_defs(child)
+
+
+class NestedFunctionType(TypeInfo):
+    func_node: ast.FunctionDef
+
+    def __init__(
+        self,
+        origin: Origin,
+        func_node: ast.FunctionDef,
+    ) -> None:
+        super().__init__(origin)
+        self.func_node = func_node
+
+    def __str__(self) -> str:
+        return f"NestedFunctionType({self.func_node.name})"
+
+    def find_effective_return(self) -> ast.Return | None:
+        func_node = self.func_node
+        for stmt in func_node.body:
+            for desc in _iter_body_excluding_nested_defs(stmt):
+                if isinstance(desc, ast.Return):
+                    raise exc.StatementNotSupported(
+                        f"Early return inside control flow is not supported "
+                        f"in nested function '{func_node.name}'"
+                    )
+        for stmt in func_node.body:
+            if isinstance(stmt, ast.Return):
+                return stmt
+        return None
 
 
 class ConfigFragmentType(LiteralType):
