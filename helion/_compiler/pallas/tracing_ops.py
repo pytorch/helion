@@ -4109,6 +4109,13 @@ def _codegen_dynamic_unroll(state: CodegenState) -> object:
         raise InvalidConfig(
             "dynamic pallas unroll currently supports one inner tile dimension"
         )
+    from helion._compiler.pallas.ordered_carry import needs_ordered_carry
+
+    if any(needs_ordered_carry(state, bid) for bid in block_ids):
+        raise InvalidConfig(
+            "pallas_loop_type='unroll' does not support ordered carry; use a "
+            "different pallas_loop_type"
+        )
 
     args = state.ast_args[-1]
     assert isinstance(args, list)
