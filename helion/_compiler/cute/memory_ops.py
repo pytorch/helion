@@ -22,6 +22,7 @@ from torch.fx.node import map_arg
 from ... import exc
 from ...language import _decorators
 from ...language.memory_ops import _CUTE_VECTOR_DTYPES
+from ...language.memory_ops import _CUTE_VECTOR_UNROLL_CARRIER
 from ...language.memory_ops import _CUTE_VECTOR_UNROLL_DTYPES
 from ...language.memory_ops import _codegen_cute_store_permute_lane_loops
 from ...language.memory_ops import _codegen_cute_store_tcgen05_tile
@@ -30,7 +31,6 @@ from ...language.memory_ops import _cute_active_mask_var
 from ...language.memory_ops import _cute_combined_mask
 from ...language.memory_ops import _cute_index_exprs
 from ...language.memory_ops import _cute_index_tuple
-from ...language.memory_ops import _cute_is_byte_packed
 from ...language.memory_ops import _cute_is_unroll_dtype
 from ...language.memory_ops import _cute_register_reduction_unroll_vec_store
 from ...language.memory_ops import _cute_register_tile_unroll_vec_hoist
@@ -39,7 +39,6 @@ from ...language.memory_ops import _cute_scalar_load_expr
 from ...language.memory_ops import _cute_scalar_pointer_expr
 from ...language.memory_ops import _cute_tensor_dim_size_expr
 from ...language.memory_ops import _cute_unique_graph_block_id
-from ...language.memory_ops import _cute_unroll_vec_elem_type
 from ...language.memory_ops import _matching_block_ids
 from ...language.memory_ops import _maybe_codegen_cute_packed_affine_lhs_load
 from ...language.memory_ops import load
@@ -166,18 +165,6 @@ def _cute_scalar_store_expr(
     return f"{_cute_scalar_pointer_expr(tensor_name, index_exprs)}.store({value})"
 
 
-def _cute_unroll_vec_load_dtype_arg(dtype: torch.dtype, vec_width: int) -> str:
-    """The dtype argument to ``cute.arch.load`` for an unroll-mode hoist.
-
-    fp8 loads ``vec_width`` contiguous bytes as ONE packed scalar integer
-    (no ``VectorType`` — avoids the V=8 ``nvvm.load.ext`` ICE and emits a
-    single LDG).  bf16/fp16 load a ``Uint16`` vector of width ``vec_width``.
-    """
-    if _cute_is_byte_packed(dtype):
-        return _cute_unroll_vec_elem_type(dtype, vec_width) + ".mlir_type"
-    return f"ir.VectorType.get([{vec_width}], cutlass.Uint16.mlir_type)"
-
-
 _CUTE_EVICTION_POLICY_MAP = {
     "": "",
     "first": "evict_first",
@@ -227,7 +214,7 @@ def _cute_register_unroll_vec_hoist(
     vec_width: int,
     eviction_suffix: str = "",
 ) -> str:
-    """Register a Uint16 vec load to be hoisted above the constexpr V-loop
+    """Register an integer-carrier vec load to be hoisted above the constexpr V-loop
     in the active lane body and return the per-element extract expression.
 
     The hoist runs once per outer-lane iter; the constexpr V-loop's body
@@ -235,6 +222,7 @@ def _cute_register_unroll_vec_hoist(
     cast/mul/accumulate pipeline keeps working unchanged.
     """
     elem_dtype = _CUTE_VECTOR_UNROLL_DTYPES[tensor.dtype]
+    carrier = _CUTE_VECTOR_UNROLL_CARRIER[tensor.dtype]
     base_index_var = getattr(strategy, "_cute_lane_base_index_var", None)
     lane_body = getattr(strategy, "_cute_lane_body", None)
     assert isinstance(base_index_var, str)
@@ -264,7 +252,7 @@ def _cute_register_unroll_vec_hoist(
         cache[cache_key] = (hoist_var, tensor.dtype)
         hoist_stmt = statement_from_string(
             f"{hoist_var} = cute.arch.load({base_ptr_expr}, "
-            f"ir.VectorType.get([{vec_width}], cutlass.Uint16.mlir_type)"
+            f"ir.VectorType.get([{vec_width}], {carrier}.mlir_type)"
             f"{eviction_suffix})"
         )
         # Insert the hoist just BEFORE the constexpr V-loop.
@@ -274,7 +262,7 @@ def _cute_register_unroll_vec_hoist(
     assert isinstance(constexpr_loop, ast.For)
     assert isinstance(constexpr_loop.target, ast.Name)
     vec_lane_var = constexpr_loop.target.id
-    return f"cutlass.Uint16({hoist_var}[{vec_lane_var}]).bitcast({elem_dtype})"
+    return f"{carrier}({hoist_var}[{vec_lane_var}]).bitcast({elem_dtype})"
 
 
 def _cute_stack_tensor_offset_expr(
@@ -2122,7 +2110,7 @@ def _cute_vector_load_ctx(
             return None
         if strategy._cute_reduction_lane_extent <= 0:
             return None
-        mode = getattr(strategy, "_cute_reduction_vec_mode", "vec")
+        mode = getattr(strategy, "_cute_reduction_vec_mode", "unroll")
         if mode == "vec":
             if not feeds_reduction:
                 return None
@@ -2131,6 +2119,10 @@ def _cute_vector_load_ctx(
             return vec_width, inner_block_id, "vec"
         if mode == "unroll":
             if tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES:
+                return None
+            # Cap at one LDG.128 per hoist (fp32 V=8 would need 32 bytes);
+            # oversized configs stay on the (correct) scalar fallback.
+            if vec_width * tensor.dtype.itemsize > 16:
                 return None
             # Need a lane base index var + a constexpr V-loop var; both
             # are set up by the strategy's codegen_device_loop.
@@ -2160,9 +2152,9 @@ def _cute_vector_load_ctx(
             return None
         if not _cute_is_unroll_dtype(tensor.dtype):
             return None
-        # Widths above 8 (32 bytes per thread for 16-bit dtypes) exceed
-        # the widest gmem access (LDG.128) and are not supported.
-        if vec_width > 8:
+        # Cap at one LDG.128 per hoist: wider than 16 bytes per thread
+        # exceeds the widest gmem access and is not supported.
+        if vec_width * tensor.dtype.itemsize > 16:
             return None
         base_var_by_block = getattr(
             strategy, "_cute_lane_base_index_var_by_block", None
