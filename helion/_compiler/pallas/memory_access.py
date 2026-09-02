@@ -15,6 +15,21 @@ if TYPE_CHECKING:
 MEMORY_ACCESS_META = "pallas_memory_access"
 
 
+def tensor_origin_key(tensor: torch.Tensor) -> str | int:
+    """Stable key for a tensor's host-side origin expression."""
+    from ..host_function import HostFunction
+
+    origin = HostFunction.current().tensor_to_origin.get(tensor)
+    return origin.host_str() if origin is not None else id(tensor)
+
+
+def tensors_share_origin_or_storage(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
+    """Whether two fake tensors can address the same host allocation."""
+    return tensor_origin_key(lhs) == tensor_origin_key(rhs) or id(
+        lhs.untyped_storage()
+    ) == id(rhs.untyped_storage())
+
+
 class MemoryAccessKind(Enum):
     """Logical effect of one Helion memory operation."""
 
