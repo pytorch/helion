@@ -2122,12 +2122,18 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 from .._compiler.cute.cute_mma import (
                     tcgen05_fragment_epilogue_has_host_loads,
                 )
+                from .._compiler.cute.cute_mma import (
+                    tcgen05_fragment_epilogue_has_unique_anchor,
+                )
 
                 direct_aux_kernel_detected = (
                     host_function_has_tcgen05_aux_kernel_pattern(self.host_function)
                 )
                 fragment_aux_kernel_detected = tcgen05_fragment_epilogue_has_host_loads(
                     self.host_function.device_ir.graphs
+                ) and tcgen05_fragment_epilogue_has_unique_anchor(
+                    self.host_function.device_ir.graphs,
+                    device_ir=self.host_function.device_ir,
                 )
                 self.env.config_spec.cute_tcgen05_aux_kernel_detected = (
                     direct_aux_kernel_detected or fragment_aux_kernel_detected

@@ -2014,7 +2014,10 @@ class CuteTcgen05Config:
         if not self._aux_tma_search_enabled():
             config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_SIMT
             return
-        if self.fragment_aux_kernel_detected:
+        if self.fragment_aux_kernel_detected and not (
+            self._aux_tma_edge_search_enabled()
+            or self._aux_tma_full_tile_search_enabled()
+        ):
             if (
                 not self._is_with_scheduler_c_input_config(config)
                 or config.get("tcgen05_cluster_m") != 1

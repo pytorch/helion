@@ -164,7 +164,6 @@ class Tcgen05FragmentEpiloguePlan:
     value_node: Node
     boundary_nodes: frozenset[Node]
     owned_nodes: frozenset[Node]
-    unmasked_host_loads: frozenset[Node]
     tma_host_tensors: tuple[Tcgen05FragmentTmaHostTensor, ...]
     source_shape: tuple[int, ...]
     destination_shape: tuple[int, ...]
@@ -891,26 +890,12 @@ def analyze_tcgen05_fragment_epilogue_candidate(
     anchor: Node,
     *,
     expected_output_block_ids: tuple[int, ...],
-) -> bool:
-    """Side-effect-free preflight sharing the fragment planner's extraction."""
-    try:
-        _extract_region(graphs, anchor, expected_output_block_ids)
-    except _UnsupportedFragment:
-        return False
-    return True
-
-
-def tcgen05_fragment_epilogue_candidate_has_host_loads(
-    graphs: Sequence[GraphInfo],
-    anchor: Node,
-    *,
-    expected_output_block_ids: tuple[int, ...],
-) -> bool:
-    """Whether a structurally valid fragment candidate reads host tensors."""
+) -> bool | None:
+    """Return host-load presence, or ``None`` when the candidate is invalid."""
     try:
         region = _extract_region(graphs, anchor, expected_output_block_ids)
     except _UnsupportedFragment:
-        return False
+        return None
     return _nodes_have_host_loads(region.owned)
 
 
@@ -1487,86 +1472,6 @@ def _logical_index_value(
         raise _UnsupportedFragment
     memo[key] = result
     return result
-
-
-def _host_load_is_statically_in_bounds(
-    node: Node,
-    flat: _Index,
-    *,
-    config: Config,
-) -> bool:
-    """Prove every arithmetic tensor index stays inside its host tensor."""
-    try:
-        source = node.args[0] if node.args else None
-        indices = node.args[1] if len(node.args) > 1 else None
-        tensor = source.meta.get("val") if isinstance(source, Node) else None
-        if not isinstance(tensor, torch.Tensor) or not isinstance(
-            indices, (list, tuple)
-        ):
-            raise _UnsupportedFragment
-        output_shape = _shape(node, config)
-        env = CompileEnvironment.current()
-        for tensor_dim, index in enumerate(indices):
-            if not (
-                isinstance(index, Node)
-                and isinstance(index.meta.get("val"), torch.Tensor)
-                and _tile_index_uses_arithmetic(index)
-            ):
-                continue
-            tile_origins: dict[int, _Index] = {}
-            tile_extents: dict[int, int] = {}
-            for root in _tile_index_roots(index):
-                size_node = root.args[0] if root.args else None
-                size = (
-                    size_node.meta.get("val")
-                    if isinstance(size_node, Node)
-                    else size_node
-                )
-                block_id = (
-                    env.get_block_id(size)
-                    if isinstance(size, (int, torch.SymInt, sympy.Basic))
-                    else None
-                )
-                root_shape = _shape(root, config)
-                if block_id is None or len(root_shape) != 1:
-                    raise _UnsupportedFragment
-                tile_extent = root_shape[0]
-                canonical = env.canonical_block_id(block_id)
-                global_size = env.block_sizes[canonical].size
-                if not isinstance(global_size, (int, torch.SymInt)):
-                    raise _UnsupportedFragment
-                global_extent = env.size_hint(global_size)
-                if (
-                    global_extent <= 0
-                    or tile_extent <= 0
-                    or global_extent % tile_extent
-                ):
-                    raise _UnsupportedFragment
-                previous = tile_extents.setdefault(canonical, tile_extent)
-                if previous != tile_extent:
-                    raise _UnsupportedFragment
-                tile_count = global_extent // tile_extent
-                tile_origins[canonical] = _mul(
-                    _Index.variable(f"tile_{canonical}", tile_count - 1),
-                    tile_extent,
-                )
-            index_flat = _broadcast_flat(flat, output_shape, _shape(index, config))
-            logical = _logical_index_value(
-                index,
-                index_flat,
-                config=config,
-                tile_origins=tile_origins,
-            )
-            interval = _semantic_interval(
-                logical.semantic,
-                {symbol: (lower, upper) for symbol, lower, upper in logical.bounds},
-            )
-            tensor_extent = env.size_hint(tensor.shape[tensor_dim])
-            if interval is None or interval[0] < 0 or interval[1] >= tensor_extent:
-                return False
-    except (_UnsupportedFragment, IndexError, StopIteration, ValueError):
-        return False
-    return True
 
 
 def _store_indices_are_tile_identity(
@@ -2163,15 +2068,6 @@ def analyze_tcgen05_fragment_epilogue_plan(
             region=region,
             config=config,
         )
-        unmasked_host_loads = frozenset(
-            node
-            for node in {node for node, _ in host_loads}
-            if all(
-                _host_load_is_statically_in_bounds(node, flat, config=config)
-                for current, flat in host_loads
-                if current is node
-            )
-        )
         tma_host_tensors = _fragment_tma_host_tensors(
             host_loads,
             source_shape=source_shape,
@@ -2265,7 +2161,6 @@ def analyze_tcgen05_fragment_epilogue_plan(
             value_node=region.value,
             boundary_nodes=region.boundaries,
             owned_nodes=region.owned,
-            unmasked_host_loads=unmasked_host_loads,
             tma_host_tensors=tma_host_tensors,
             source_shape=source_shape,
             destination_shape=destination_shape,
@@ -2525,7 +2420,7 @@ class _Evaluator:
         self.state.device_function.placeholder_args.add(tensor_name)
         dtype = env.backend.dtype_str(tensor.dtype)
         load_expr = _cute_scalar_load_expr(tensor_name, index_exprs, tensor.dtype)
-        if bounds and node not in self.plan.unmasked_host_loads:
+        if bounds:
             load_expr = f"({load_expr} if {' and '.join(bounds)} else {dtype}(0))"
         result = self._bind("tcgen05_epi_load", expr_from_string(load_expr))
         self.terminals[key] = result

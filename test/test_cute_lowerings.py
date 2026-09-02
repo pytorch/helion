@@ -16250,7 +16250,6 @@ class TestCuteLowerings(unittest.TestCase):
                     line for line in code.splitlines() if "table.iterator" in line
                 ]
                 self.assertTrue(table_loads)
-                self.assertTrue(all(" else " not in line for line in table_loads))
                 self.assertNotIn("split_smem", code)
                 self.assertNotIn("permute_smem", code)
 
@@ -16488,6 +16487,32 @@ class TestCuteLowerings(unittest.TestCase):
             spec.autotuner_heuristics,
         )
         self.assertIsNone(spec.compiler_default_config)
+
+    def test_tcgen05_fragment_aux_detection_requires_unique_mma_anchor(self) -> None:
+        from helion._compiler.cute import cute_mma as cute_mma_module
+
+        dtype = torch.bfloat16
+        args = (
+            torch.empty([128, 128], device=DEVICE, dtype=dtype),
+            torch.empty([1, 128, 128], device=DEVICE, dtype=dtype),
+            torch.empty([128, 128], device=DEVICE, dtype=dtype),
+            torch.empty([1, 128], device=DEVICE, dtype=dtype),
+        )
+        cute_projection_rotary_bf16.reset()
+        try:
+            with (
+                patch_cute_mma_support(),
+                patch.object(
+                    cute_mma_module,
+                    "tcgen05_fragment_epilogue_has_unique_anchor",
+                    return_value=False,
+                ),
+            ):
+                spec = cute_projection_rotary_bf16.bind(args).config_spec
+            self.assertFalse(spec.cute_tcgen05_fragment_aux_kernel_detected)
+            self.assertFalse(spec.cute_tcgen05_aux_kernel_detected)
+        finally:
+            cute_projection_rotary_bf16.reset()
 
     def test_tcgen05_fragment_projection_rotary_runtime(self) -> None:
         from helion._compiler.cute.mma_support import get_cute_mma_support

@@ -9801,6 +9801,17 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # ring to 4 (foundation for the Stage-4 store-warp split). At ab=2 the
         # c=4 ring fits under the 232 KB B200 cap, so the budget gate admits it.
         self.assertEqual(cm2.config["tcgen05_c_stages"], 4)
+        # Fragment-host-load detection is intentionally broad. If a kernel also
+        # has this exact-shape residual path, preserve the already validated
+        # cluster_m=2 aux-TMA projection instead of treating it as fragment-only.
+        spec._cute_tcgen05_config.fragment_aux_kernel_detected = True
+        mixed_cm2 = helion.Config(**cm2.config)
+        spec.normalize(mixed_cm2, _fix_invalid=True)
+        self.assertEqual(
+            mixed_cm2.config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY],
+            TCGEN05_AUX_LOAD_MODE_TMA,
+        )
+        spec._cute_tcgen05_config.fragment_aux_kernel_detected = False
         # A cluster_m=1 candidate is left in its own regime (not forced to TMA),
         # and the deeper C ring is NOT projected onto it.
         cm1 = helion.Config(

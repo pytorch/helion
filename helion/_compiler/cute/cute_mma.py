@@ -68,7 +68,6 @@ from .fragment_epilogue import _tcgen05_fragment_source_layout_reachable
 from .fragment_epilogue import _tcgen05_fragment_source_layout_supported
 from .fragment_epilogue import analyze_tcgen05_fragment_epilogue_candidate
 from .fragment_epilogue import analyze_tcgen05_fragment_epilogue_plan
-from .fragment_epilogue import tcgen05_fragment_epilogue_candidate_has_host_loads
 from .layout import MatmulExecutionKind
 from .layout import MatmulExecutionPlan
 from .matmul_utils import analyze_direct_grouped_n_loads
@@ -5821,21 +5820,12 @@ def _analyze_mma_output_stores(
 
     analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
     if analyzed_stores is None:
-        fragment_epilogue_has_host_loads = (
-            tcgen05_fragment_epilogue_candidate_has_host_loads(
-                graphs,
-                mma_node,
-                expected_output_block_ids=analysis.output_block_ids,
-            )
+        fragment_epilogue_has_host_loads = analyze_tcgen05_fragment_epilogue_candidate(
+            graphs,
+            mma_node,
+            expected_output_block_ids=analysis.output_block_ids,
         )
-        if (
-            fragment_epilogue_has_host_loads
-            or analyze_tcgen05_fragment_epilogue_candidate(
-                graphs,
-                mma_node,
-                expected_output_block_ids=analysis.output_block_ids,
-            )
-        ):
+        if fragment_epilogue_has_host_loads is not None:
             return _MmaOutputStoreAnalysis(
                 explicit_epi_tile_compatible=False,
                 output_column_major=False,
