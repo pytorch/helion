@@ -39,18 +39,15 @@ class DmaAccessSpec:
     """Config-independent structural eligibility for one indirect access."""
 
     access: MemoryAccess
-    index_access: MemoryAccess
-    index_block_id: int
+    index_node: torch.fx.Node
+    index_access: MemoryAccess | None
+    index_block_id: int | None
     selected_starts: tuple[int, ...]
     selected_extents: tuple[int, ...]
 
     @property
     def node(self) -> torch.fx.Node:
         return self.access.node
-
-    @property
-    def index_node(self) -> torch.fx.Node:
-        return self.index_access.node
 
 
 @dataclass(frozen=True)
@@ -163,22 +160,33 @@ def build_dma_access_spec(
     ):
         from ...language import memory_ops
 
-        # Indirect DMA planning requires a vector metadata load. A scalar
-        # computed inside the device program is a direct Ref address instead.
         if (
             index_node.op != "call_function"
             or index_node.target is not memory_ops.load
             or len(index_node.args) < 2
         ):
-            return None
-        index_access = build_pallas_memory_access(index_node)
-    index = memory_access_value(index_access)
-    if (
+            index_access = None
+        else:
+            index_access = build_pallas_memory_access(index_node)
+    index = (
+        memory_access_value(index_access)
+        if index_access is not None
+        else index_node.meta.get("val")
+    )
+    if not isinstance(index, torch.Tensor) or index.ndim != 1:
+        return None
+    if index.dtype != torch.int32:
+        return None
+    if index_access is not None and (
         index_access.kind is not MemoryAccessKind.LOAD
-        or index is None
-        or index.ndim != 1
-        or index.dtype != torch.int32
         or memory_access_mask(index_access) is not None
+    ):
+        return None
+    # A computed index is available only when the gather itself is emitted.
+    # It therefore supports immediate gathers, not paired scatter writeback.
+    if index_access is None and (
+        access.kind is not MemoryAccessKind.LOAD
+        or index_node.graph is not access.node.graph
     ):
         return None
 
@@ -186,8 +194,17 @@ def build_dma_access_spec(
     if not env.settings.static_shapes:
         return None
     block_id = env.resolve_block_id(index.shape[0])
-    if block_id is None or _metadata_dma_block_id(index_access) != block_id:
+    if index_access is not None and (
+        block_id is None or _metadata_dma_block_id(index_access) != block_id
+    ):
         return None
+    if (
+        index_access is None
+        and block_id is None
+        and not isinstance(env.try_concretize_symint(index.shape[0]), int)
+    ):
+        return None
+
     backend = env.backend
     assert isinstance(backend, PallasBackend)
     if len(access.subscript) > access.tensor.ndim:
@@ -202,14 +219,15 @@ def build_dma_access_spec(
             else slice(None)
         )
         value = item.meta.get("val") if isinstance(item, torch.fx.Node) else item
+        dim_size = env.try_concretize_symint(access.tensor.shape[tensor_dim])
+        if not isinstance(dim_size, int):
+            return None
         if not isinstance(value, slice) or value.step not in (None, 1):
             return None
-        dim_size = env.try_concretize_symint(access.tensor.shape[tensor_dim])
         start = 0 if value.start is None else value.start
         stop = dim_size if value.stop is None else value.stop
         if (
-            not isinstance(dim_size, int)
-            or not isinstance(start, int)
+            not isinstance(start, int)
             or not isinstance(stop, int)
             or not 0 <= start <= stop <= dim_size
         ):
@@ -250,6 +268,7 @@ def build_dma_access_spec(
         return None
     return DmaAccessSpec(
         access,
+        index_node,
         index_access,
         block_id,
         tuple(selected_starts),
@@ -355,6 +374,9 @@ def build_dma_access_candidates(
             current = build_dma_access_spec(access)
             if current is None:
                 break
+            if current.index_access is None:
+                specs.append(current)
+                continue
             metadata = current.index_access.tensor
             metadata_layout = _exact_dma_layout(metadata)
             metadata_accesses = accesses_by_storage.get(
@@ -427,8 +449,37 @@ def dma_access_admission(
     """Admit candidates sharing at least one jointly legal block size."""
 
     grouped: dict[int, list[tuple[DmaAccessCandidate, set[int]]]] = {}
+    result: set[torch.fx.Node] = set()
     for candidate in candidates:
         spec = candidate.load
+        if spec.index_access is None:
+            index = spec.index_node.meta.get("val")
+            table_rows = spec.access.tensor.shape[0]
+            if not isinstance(index, torch.Tensor) or not isinstance(table_rows, int):
+                continue
+            if spec.index_block_id is None:
+                group_count = index.shape[0]
+                if isinstance(group_count, int) and 0 < group_count <= table_rows:
+                    result.add(spec.node)
+                continue
+            bounds = block_size_ranges.get(spec.index_block_id)
+            if bounds is None:
+                from ..compile_environment import CompileEnvironment
+
+                group_count = CompileEnvironment.current().size_hint(index.shape[0])
+                if 0 < group_count <= table_rows:
+                    result.add(spec.node)
+                continue
+            block_size, maximum = bounds
+            legal = set()
+            while block_size <= maximum:
+                if block_size <= table_rows:
+                    legal.add(block_size)
+                block_size *= 2
+            if legal:
+                grouped.setdefault(spec.index_block_id, []).append((candidate, legal))
+            continue
+        assert spec.index_block_id is not None
         extent = owner_block_extents.get(candidate.graph_id, {}).get(
             spec.index_block_id
         )
@@ -447,7 +498,6 @@ def dma_access_admission(
         if legal:
             grouped.setdefault(spec.index_block_id, []).append((candidate, legal))
 
-    result: set[torch.fx.Node] = set()
     legal_sizes: dict[int, tuple[int, ...]] = {}
     for block_id, entries in grouped.items():
         common = set.intersection(*(sizes for _candidate, sizes in entries))
@@ -695,7 +745,11 @@ def build_dma_access_plan(
     # Raw HBM refs have no BlockSpec to apply data-member TilePatterns.
     if any(isinstance(pattern, TilePattern) for pattern in access.patterns):
         return None
-    index = memory_access_value(spec.index_access)
+    index = (
+        memory_access_value(spec.index_access)
+        if spec.index_access is not None
+        else spec.index_node.meta.get("val")
+    )
     value = memory_access_value(access)
     if index is None or value is None:
         return None

@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 @_decorators.codegen(store, "pallas")
 def _(state: CodegenState) -> None:
     from ... import exc
-    from .dma import emit_grid_indirect_transfer
+    from .dma import emit_immediate_indirect_transfer
     from .tensorcore_plan import TENSORCORE_PLAN_META
     from .tensorcore_plan import DmaScatterPlan
     from .tensorcore_plan import OneHotScatterPlan
@@ -62,7 +62,7 @@ def _(state: CodegenState) -> None:
         )
         # The fori scheduler emits the writeback after the body. Root grids
         # have no enclosing scheduler, so this call emits it immediately.
-        emit_grid_indirect_transfer(state, plan, arg_name)
+        emit_immediate_indirect_transfer(state, plan, arg_name)
         return
     from .gather import emit_scatter_store
 

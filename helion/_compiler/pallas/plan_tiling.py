@@ -330,6 +330,7 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
 
     is_all_scalar = all(
         isinstance(p, (ArbitraryIndexPattern, TileBeginWithOffsetPattern, NonePattern))
+        or (isinstance(p, TensorIndexPattern) and p.index_ndim == 0)
         for p in indexing_patterns
     )
     has_contiguous_hbm_window = any(
