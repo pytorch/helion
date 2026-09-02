@@ -973,6 +973,14 @@ class DeviceIR:
         for their loads/stores in the indexing config.
         """
         env = CompileEnvironment.current()
+        if env.backend_name == "cute":
+            # Mark provably-FTZ-safe exp sites on the pre-roll graphs so the
+            # roller's node_copy carries the mark into the rolled sweeps
+            # (consumed by the cute op overrides; inert for other backends).
+            from .cute.exp2_fastmath import mark_ftz_safe_exp_nodes
+
+            for graph_info in self.graphs:
+                mark_ftz_safe_exp_nodes(graph_info.graph)
         rdims = [bs for bs in env.block_sizes if bs.reduction]
         # Eager tile-slot registration (see _register_cute_tile_vec_slots).
         # A present reduction must keep its slot at index 0, so reduction
