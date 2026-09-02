@@ -84,7 +84,6 @@ def load_expr(
         return emit_gather(state, plan.plan, active_name)
 
     from helion._compiler.device_function import PallasMemorySpace
-    from helion._compiler.pallas.plan_tiling import SCALAR_PANEL_HBM_LOAD
     from helion._compiler.pallas.plan_tiling import ContiguousRangeIndexPattern
 
     if (
@@ -95,7 +94,6 @@ def load_expr(
             or any(
                 isinstance(pattern, ContiguousRangeIndexPattern) for pattern in patterns
             )
-            or state.fx_node.meta.get(SCALAR_PANEL_HBM_LOAD, False)
         )
     ):
         return _hbm_load_expr(state, subscript, tensor, arg_name)

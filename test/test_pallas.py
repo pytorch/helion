@@ -677,40 +677,6 @@ def pallas_aligned_dynamic_window(
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
-def pallas_scalar_selected_panel(
-    table: torch.Tensor, panel_ids: torch.Tensor
-) -> torch.Tensor:
-    rows = panel_ids.size(0)
-    out = torch.empty([rows, 8, 128], dtype=table.dtype, device=table.device)
-    for row in hl.grid(rows):
-        panel = panel_ids[row]
-        out[row, :, :] = table[panel, :, :] + 1
-    return out
-
-
-@helion.kernel(
-    backend="pallas",
-    static_shapes=True,
-    config=helion.Config(
-        pallas_loop_type="fori_loop",
-        pallas_load_buffer_count=[2, 1],
-    ),
-)
-def pallas_scalar_selected_panel_loop(
-    table: torch.Tensor, panel_ids: torch.Tensor
-) -> torch.Tensor:
-    rows = panel_ids.size(0)
-    out = torch.empty([rows, 8, 128], dtype=table.dtype, device=table.device)
-    resident_ids = torch.empty([rows], dtype=torch.int32, device=panel_ids.device)
-    for _program in hl.grid(1):
-        resident_ids[:] = hl.load(panel_ids, [slice(None)])
-        for row in hl.tile(rows, block_size=1):
-            panel = hl.load(resident_ids, [row.begin])
-            out[row, :, :] = table[panel, :, :][None, :, :] + 1
-    return out
-
-
-@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_aligned_row_window(x: torch.Tensor) -> torch.Tensor:
     rows = hl.specialize(x.size(0))
     out = torch.empty([rows, 128], dtype=x.dtype, device=x.device)
@@ -1041,26 +1007,6 @@ class TestPallas(TestCase):
             [table[:, begin : begin + 128] for begin in range(0, 512, 128)]
         )
         torch.testing.assert_close(result.cpu(), expected.cpu())
-
-    @skipIfPallasInterpret("dynamic HBM panel loads require a real TPU")
-    def test_scalar_selected_panel(self) -> None:
-        table = torch.randn(4, 8, 128, device=DEVICE, dtype=torch.float32)
-        panel_ids = torch.tensor([2, 0, 3], device=DEVICE, dtype=torch.int32)
-        _, result = code_and_output(
-            pallas_scalar_selected_panel,
-            (table, panel_ids),
-        )
-        torch.testing.assert_close(result.cpu(), table[panel_ids.long()].cpu() + 1)
-
-    @skipIfPallasInterpret("dynamic HBM panel loads require a real TPU")
-    def test_scalar_selected_panel_loop(self) -> None:
-        table = torch.randn(4, 8, 128, device=DEVICE, dtype=torch.float32)
-        panel_ids = torch.tensor([2, 0, 3], device=DEVICE, dtype=torch.int32)
-        _, result = code_and_output(
-            pallas_scalar_selected_panel_loop,
-            (table, panel_ids),
-        )
-        torch.testing.assert_close(result.cpu(), table[panel_ids.long()].cpu() + 1)
 
     def test_aligned_row_window_uses_direct_hbm_dma(self) -> None:
         x = torch.randn(16, 256, device=DEVICE, dtype=torch.float32)
