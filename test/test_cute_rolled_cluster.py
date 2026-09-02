@@ -105,6 +105,31 @@ class TestCuteRolledCluster(TestCase):
         self.assertEqual(code.count("cute.arch.block_idx()[1]) * 2048"), 4)
         self.assertIn("_helion_cute_cluster_shape = (1, 4, 1)", code)
 
+    def test_rolled_cluster_fuses_consume_sweep(self) -> None:
+        """The cross-sweep register cache fires under the cluster split: the
+        rank-offset roll bounds (``range(W(rank*S), W(rank*S + S), R)``)
+        still yield a static trip count (S / R), so the consume sweep reads
+        the register fragment instead of re-reading its slice from L2/gmem.
+        Measured +9% on cross-entropy 8192x262144 fp16 at cluster_n=16 on
+        B200 (850 W)."""
+        x = torch.randn(32, 8192, device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.randn(8192, device=DEVICE, dtype=torch.bfloat16)
+        code, (out, inv_rms) = code_and_output(
+            rms_norm_rolled_kernel,
+            (x, weight),
+            block_sizes=[1],
+            num_threads=[1, 128],
+            reduction_loops=[2048],
+            cute_vector_widths=[8, 1],
+            cute_cluster_n=4,
+            cute_reduction_reloads=["register"],
+        )
+        ref_out, ref_inv_rms = _rms_ref(x, weight)
+        torch.testing.assert_close(out, ref_out, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(inv_rms, ref_inv_rms, rtol=1e-3, atol=1e-3)
+        self.assertIn("_fuse_cache_0", code)
+        self.assertIn("_cute_grouped_reduce_cluster(", code)
+
     def test_rolled_cluster_correct_fp32_cl2_multitrip(self) -> None:
         """fp32 (vec mode) with two roll trips per slice."""
         x = torch.randn(16, 8192, device=DEVICE, dtype=torch.float32)

@@ -123,7 +123,28 @@ def _looks_like_vec_load(node: ast.AST) -> ast.Call | None:
     return None
 
 
-def _load_kind(node: ast.AST) -> str | None:
+def _arch_scalar_dtype_mismatch(node: ast.AST, tensor_dtypes: dict[str, str]) -> bool:
+    """True for a scalar ``cute.arch.load(ptr, DTYPE, ...)`` whose explicit
+    DTYPE differs from the base tensor's element dtype.
+
+    fp8/fp4 raw-byte loads (``cutlass.Uint8``) and byte-packed fp8 hoists
+    (``cutlass.Uint32``/``Uint64``) load REINTERPRETED integers; caching
+    them in the base tensor's dtype (what the unmasked path does) would
+    numerically convert the value.  Cache-hinted fp32 loads pass
+    (``cutlass.Float32`` == the tensor's dtype string).
+    """
+    if _looks_like_vec_load(node) is None or _vec_width(node) is not None:
+        return False  # plain ``(ptr).load()``: implicit dtype == tensor dtype
+    assert isinstance(node, ast.Call)
+    if len(node.args) < 2:
+        return True
+    base = _unmasked_load_tensor_dtype(node, tensor_dtypes)
+    return base is None or ast.unparse(node.args[1]) != base
+
+
+def _load_kind(
+    node: ast.AST, tensor_dtypes: dict[str, str] | None = None
+) -> str | None:
     """Classify the load shape into ``"masked"`` / ``"unmasked"`` / ``"vec"``.
 
     Returns None when ``node`` doesn't look like a gmem load we can fuse.
@@ -133,10 +154,15 @@ def _load_kind(node: ast.AST) -> str | None:
     # A cache-hinted SCALAR load also routes through ``cute.arch.load``
     # (``(ptr).load()`` has no hint kwargs), so "vec" additionally requires
     # a VectorType dtype argument; scalar arch loads fall through to
-    # "unmasked".
+    # "unmasked" — but only when their explicit dtype matches the base
+    # tensor's (see _arch_scalar_dtype_mismatch).
     if _looks_like_vec_load(node) is not None and _vec_width(node) is not None:
         return "vec"
     if _looks_like_unmasked_load(node) is not None:
+        if tensor_dtypes is not None and _arch_scalar_dtype_mismatch(
+            node, tensor_dtypes
+        ):
+            return None
         return "unmasked"
     return None
 
@@ -179,6 +205,8 @@ def _trip_count_for(
     end: ast.expr,
     step: ast.expr,
     constexpr_values: dict[str, int],
+    *,
+    allow_dynamic_base: bool = False,
 ) -> int | None:
     """If start/end/step are constants (possibly wrapped in cutlass.Int32 or
     naming a known constexpr), return the static trip count. Otherwise None.
@@ -197,8 +225,42 @@ def _trip_count_for(
                 return constexpr_values[inner.id]
         return None
 
+    def _peel_wrappers(expr: ast.expr) -> tuple[ast.expr, tuple[str, ...]]:
+        # Peel ``cutlass.Int32(...)``-style 1-arg wrapper calls, recording
+        # each callee so both bounds can be required to use the SAME chain
+        # (a value-changing wrapper on one side must not match).
+        callees: list[str] = []
+        while isinstance(expr, ast.Call) and len(expr.args) == 1 and not expr.keywords:
+            callees.append(ast.unparse(expr.func))
+            expr = expr.args[0]
+        return expr, tuple(callees)
+
     s, e, t = _to_int(start), _to_int(end), _to_int(step)
-    if s is None or e is None or t is None or t <= 0:
+    if t is None or t <= 0:
+        return None
+    if s is None or e is None:
+        if not allow_dynamic_base:
+            return None
+        # Rank-offset ranges from the rolled cluster split:
+        # ``range(W(BASE * C), W(BASE * C + SPAN), step)`` — the bounds are
+        # dynamic (BASE is the CTA rank) but the SPAN is a constant shared
+        # offset, so the trip count is still static.  Only the outer roll
+        # loop may use this form: its cache index subtracts the start
+        # expression, so a dynamic base still normalizes to slot 0..trip-1
+        # (a lane loop's index uses the raw loop var and must stay 0-based).
+        start_inner, start_wrappers = _peel_wrappers(start)
+        end_inner, end_wrappers = _peel_wrappers(end)
+        if start_wrappers != end_wrappers:
+            return None
+        if (
+            isinstance(end_inner, ast.BinOp)
+            and isinstance(end_inner.op, ast.Add)
+            and isinstance(end_inner.right, ast.Constant)
+            and isinstance(end_inner.right.value, int)
+            and end_inner.right.value > 0
+            and ast.unparse(end_inner.left) == ast.unparse(start_inner)
+        ):
+            return (end_inner.right.value + t - 1) // t
         return None
     if e <= s:
         return 0
@@ -588,7 +650,9 @@ class _CuteFuseTwoPassLoads:
             if range_args is None:
                 continue
             start, end, step = range_args
-            trip = _trip_count_for(start, end, step, self._constexpr_values)
+            trip = _trip_count_for(
+                start, end, step, self._constexpr_values, allow_dynamic_base=True
+            )
             # Require a static, bounded trip count.  Single-trip loops
             # (whole-row tiles) are the most profitable case: the cache
             # index folds to a constant and the fragment stays in
@@ -706,7 +770,7 @@ class _CuteFuseTwoPassLoads:
                     and len(s.targets) == 1
                     and isinstance(s.targets[0], ast.Name)
                 ):
-                    kind = _load_kind(s.value)
+                    kind = _load_kind(s.value, self._tensor_dtypes)
                     if kind is None:
                         continue
                     dtype = self._dtype_for_load_kind(s.value, kind)
@@ -744,7 +808,7 @@ class _CuteFuseTwoPassLoads:
                         and len(s.targets) == 1
                         and isinstance(s.targets[0], ast.Name)
                     ):
-                        kind = _load_kind(s.value)
+                        kind = _load_kind(s.value, self._tensor_dtypes)
                         if kind is None:
                             continue
                         # Canonicalise this sweep's load text against the
@@ -858,7 +922,7 @@ class _CuteFuseTwoPassLoads:
                     and len(s.targets) == 1
                     and isinstance(s.targets[0], ast.Name)
                 ):
-                    if _load_kind(s.value) is None:
+                    if _load_kind(s.value, self._tensor_dtypes) is None:
                         continue
                     key = _node_text(s.value)
                     entry = cache_names.get(key)
@@ -901,7 +965,7 @@ class _CuteFuseTwoPassLoads:
                         and len(s.targets) == 1
                         and isinstance(s.targets[0], ast.Name)
                     ):
-                        kind = _load_kind(s.value)
+                        kind = _load_kind(s.value, self._tensor_dtypes)
                         if kind is not None:
                             key = _canonical_load_text(s.value, alias_k)
                             entry = cache_names.get(key)
