@@ -93,7 +93,8 @@ def dot(
 
     This operation performs matrix multiplication with inputs of various dtypes including
     float16, bfloat16, float32, int8, and FP8 formats (e4m3fn, e5m2). The computation is
-    performed with appropriate precision based on the input dtypes.
+    performed with appropriate precision based on the input dtypes. On Pallas,
+    a packed E2M1 RHS may use ``torch.float4_e2m1fn_x2``.
 
     Args:
         mat1: First matrix (2D or 3D tensor of torch.float16, torch.bfloat16, torch.float32, torch.int8, torch.float8_e4m3fn, or torch.float8_e5m2)
@@ -146,6 +147,8 @@ def _(
         torch.float8_e4m3fn,
         torch.float8_e5m2,
     )
+    if CompileEnvironment.current().backend_name == "pallas":
+        supported_dtypes += (torch.float4_e2m1fn_x2,)
 
     # Validate input types
     if mat1.dtype not in supported_dtypes:

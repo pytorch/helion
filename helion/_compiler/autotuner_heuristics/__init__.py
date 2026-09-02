@@ -8,6 +8,10 @@ from .cute import CuteFlashAttentionHeuristic
 from .cute import CuteFp8GemmSkinnyMHeuristic
 from .cute import CuteReductionTileHeuristic
 from .cute import CuteReductionWideChunkHeuristic
+from .cute import CuteResidentMultiRowHeuristic
+from .cute import CuteResidentRowHeuristic
+from .cute import CuteResidentRowWideClusterHeuristic
+from .cute import CuteRolledRowLadderHeuristic
 from .cute import CuteTcgen05ClusterM2FfiHeuristic
 from .cute import CuteTcgen05ClusterM2Heuristic
 from .cute import CuteTcgen05GroupedDynamicBk64Heuristic
@@ -20,7 +24,6 @@ from .cute import CuteTileVecWarpReduceHeuristic
 from .pallas import PallasMatmulF32NoTilingSeedHeuristic
 from .pallas import PallasMatmulNoTilingSeedHeuristic
 from .triton import TritonB200FormulaMatmulHeuristic
-from .triton import TritonB200MatmulHeuristic
 from .triton import TritonB200MultiMatmulHeuristic
 from .triton import TritonH100MatmulHeuristic
 from .triton import TritonMatmulReductionEpilogueHeuristic
@@ -54,9 +57,13 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteTcgen05ThreadLocalEpilogueHeuristic,
         CuteReductionTileHeuristic,
         CuteReductionWideChunkHeuristic,
+        CuteRolledRowLadderHeuristic,
         CuteTileVecHeuristic,
         CuteTileVecWarpReduceHeuristic,
         CuteTileVecWarpPerRowHeuristic,
+        CuteResidentRowHeuristic,
+        CuteResidentRowWideClusterHeuristic,
+        CuteResidentMultiRowHeuristic,
     ),
     "triton": (
         # H100 dense matmul seed FIRST so its budget-formula config is the rank-0
@@ -64,12 +71,9 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         # plants its config as a later search seed for aspect>=8 shapes.
         TritonH100MatmulHeuristic,
         TritonSkinnyGemmHeuristic,
-        TritonB200MatmulHeuristic,
-        # The sm100 formula, promoted; registered after the table so it wins the
-        # last-promote-wins compiler_default_config loop.
+        # The two sm100 front ends are disjoint and both provide fast
+        # autotune-off defaults as well as autotuner seeds.
         TritonB200FormulaMatmulHeuristic,
-        # Front end 2: the seed-only multi-contraction path. It declines whenever
-        # front end 1 fires, so the two paths remain structurally disjoint.
         TritonB200MultiMatmulHeuristic,
         TritonMatmulReductionEpilogueHeuristic,
         TritonStandardReductionHeuristicSM90,

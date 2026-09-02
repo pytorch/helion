@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import functools
-import json
+from dataclasses import dataclass
 import logging
 from operator import itemgetter
-from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
+from typing import Literal
 from typing import NamedTuple
 from typing import cast
 
@@ -23,6 +22,7 @@ from ...autotuner.config_spec import KernelMatmulFact
 from ...autotuner.config_spec import LiveTile
 from ...autotuner.config_spec import LoopAxisFact
 from ...autotuner.config_spec import ReductionCategory
+from ...exc import InvalidConfig
 from ...runtime.config import Config
 from ..compile_environment import _symint_sympy_expr
 from .common import clamp_block_size_targets
@@ -33,6 +33,7 @@ from .registry import AutotunerHeuristic
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Collection
+    from collections.abc import Mapping
     from collections.abc import Sequence
 
     from ...autotuner.config_spec import BlockSizeSpec
@@ -48,8 +49,6 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-_B200_MATMUL_HEURISTICS_PATH = Path(__file__).resolve().parent / "matmul_b200.json"
-
 # Stand-in ceiling for an arch with no TMEM (sm90): makes a TMEM fit-check vacuously true.
 _INF = float("inf")
 
@@ -60,6 +59,32 @@ class CandidateDotWork(NamedTuple):
     total: int
     tcgen05_eligible: int
     uncertain: bool = False
+
+
+@dataclass
+class MatmulSeedDraft:
+    block_sizes: list[int]
+    num_warps: int
+    num_stages: int
+    l2_grouping: int = 1
+
+    def copy(self) -> MatmulSeedDraft:
+        return MatmulSeedDraft(
+            list(self.block_sizes),
+            self.num_warps,
+            self.num_stages,
+            self.l2_grouping,
+        )
+
+
+class SeedAxisIds(NamedTuple):
+    m: tuple[int, ...]
+    n: tuple[int, ...]
+    k: tuple[int, ...]
+
+
+MatmulProposal = tuple[int, int, int, int, int, int]
+MatmulResourcePolicy = Literal["strict", "optimistic"]
 
 
 # Heuristic was originally contributed by @umechand-amd
@@ -128,15 +153,6 @@ class TritonSkinnyGemmHeuristic(AutotunerHeuristic):
         return Config(block_sizes=block_sizes)
 
 
-def _dtype_family_from_dtype(dtype: object) -> str:
-    dtype = str(dtype)
-    if "float16" in dtype or "bfloat16" in dtype:
-        return "fp16_bf16"
-    if "float32" in dtype:
-        return "fp32"
-    return "other"
-
-
 def _is_fp8_matmul_fact(fact: MatmulFact) -> bool:
     """True when BOTH dot operands are fp8 (a 1-byte floating dtype). A 1-byte float is fp8
     by construction (int8/uint8/bool are not ``is_floating_point``), so this needs no explicit
@@ -148,24 +164,9 @@ def _is_fp8_matmul_fact(fact: MatmulFact) -> bool:
     )
 
 
-def _single_2d_static_matmul_fact(config_spec: ConfigSpec) -> MatmulFact | None:
-    facts = config_spec.matmul_facts
-    if len(facts) != 1 or len(config_spec.block_sizes) != 3:
-        return None
-    fact = facts[0]
-    if fact.lhs_ndim != 2 or fact.rhs_ndim != 2:
-        return None
-    if fact.static_m is None or fact.static_n is None or fact.static_k is None:
-        return None
-    if (fact.m_block_id, fact.n_block_id, fact.k_block_id) != (0, 1, 2):
-        return None
-    return fact
-
-
 def _batched_static_matmul_fact(config_spec: ConfigSpec) -> MatmulFact | None:
-    """The H100 eligibility precondition — broader than the 2-D-only
-    ``_single_2d_static_matmul_fact``: it admits an arbitrary, possibly **BATCHED** matmul. The
-    requirements:
+    """The H100 eligibility precondition for an arbitrary, possibly **BATCHED**
+    matmul. The requirements:
       - exactly one ``MatmulFact`` with **static** M/N/K (the dot's own dims) and three distinct
         M/N/K block-ids that are real tunable axes;
       - every **other** tunable block axis is a BATCH / OUTER grid axis (present in
@@ -268,74 +269,6 @@ def _generalized_static_matmul_fact(config_spec: ConfigSpec) -> MatmulFact | Non
     return fact
 
 
-def _shape_bucket_from_fact(fact: MatmulFact) -> dict[str, object]:
-    assert fact.static_m is not None
-    assert fact.static_n is not None
-    assert fact.static_k is not None
-    return {
-        "dtype": _dtype_family_from_dtype(fact.lhs_dtype),
-        "m_value": fact.static_m,
-        "n_value": fact.static_n,
-        "k_value": fact.static_k,
-    }
-
-
-@functools.cache
-def _heuristic_rules() -> tuple[dict[str, object], ...]:
-    with _B200_MATMUL_HEURISTICS_PATH.open(encoding="utf-8") as handle:
-        data = cast("dict[str, list[dict[str, object]]]", json.load(handle))
-    return tuple(data["rules"])
-
-
-def _interval_contains(interval: str, value: int) -> bool:
-    lower_text, upper_text = interval[1:-1].split(",", maxsplit=1)
-    lower = float(lower_text)
-    upper = float("inf") if upper_text == "inf" else float(upper_text)
-
-    lower_ok = value >= lower if interval[0] == "[" else value > lower
-    upper_ok = value <= upper if interval[-1] == "]" else value < upper
-    return lower_ok and upper_ok
-
-
-def _shape_bucket_matches(
-    rule_bucket: dict[str, object],
-    query_bucket: dict[str, object],
-) -> bool:
-    for key, value in rule_bucket.items():
-        if key in {"k_bucket", "m_bucket", "n_bucket"}:
-            intervals = value if isinstance(value, list) else [value]
-            dim_value = cast("int", query_bucket[f"{key[0]}_value"])
-            if not any(
-                _interval_contains(cast("str", interval), dim_value)
-                for interval in intervals
-            ):
-                return False
-            continue
-        query_value = query_bucket.get(key)
-        values = value if isinstance(value, list) else [value]
-        if query_value not in values:
-            return False
-    return True
-
-
-def _rules_for_bucket(
-    shape_bucket: dict[str, object],
-) -> list[dict[str, object]]:
-    matches = [
-        rule
-        for rule in _heuristic_rules()
-        if _shape_bucket_matches(
-            cast("dict[str, object]", rule["shape_bucket"]),
-            shape_bucket,
-        )
-    ]
-    matches.sort(
-        key=lambda rule: len(cast("dict[str, object]", rule["shape_bucket"])),
-        reverse=True,
-    )
-    return matches
-
-
 def _materialize_config(
     raw: dict[str, object],
     *,
@@ -360,57 +293,6 @@ def _materialize_config(
     config = Config(**cast("dict[str, Any]", supported))
     config_spec._shrink_for_numel_constraints(config)
     return config
-
-
-def _seed_config_for_bucket(
-    shape_bucket: dict[str, object],
-    *,
-    config_spec: ConfigSpec,
-) -> Config | None:
-    rules = _rules_for_bucket(shape_bucket)
-    if not rules:
-        return None
-
-    for rule in rules:
-        for template in cast("list[dict[str, object]]", rule["templates"]):
-            return _materialize_config(template, config_spec=config_spec)
-    return None
-
-
-def _seed_config_for_config_spec(config_spec: ConfigSpec) -> Config | None:
-    fact = _single_2d_static_matmul_fact(config_spec)
-    if fact is None:
-        return None
-    return _seed_config_for_bucket(
-        _shape_bucket_from_fact(fact),
-        config_spec=config_spec,
-    )
-
-
-class TritonB200MatmulHeuristic(AutotunerHeuristic):
-    # DEMOTED (promote=False): the general TritonB200FormulaMatmulHeuristic subsumes this table
-    # (faster on every shape the table fires on, and covers the shapes it declines). Kept as an
-    # unpromoted search seed.
-    name = "triton_b200_matmul"
-    backend = "triton"
-    promote_seed_to_default = False
-    HARDWARE_TARGETS = (("cuda", "sm100"),)
-
-    @classmethod
-    def is_eligible(
-        cls,
-        env: CompileEnvironment,
-        device_ir: DeviceIR,
-    ) -> bool:
-        return matches_hardware(env, cls.HARDWARE_TARGETS)
-
-    @classmethod
-    def get_seed_config(
-        cls,
-        env: CompileEnvironment,
-        device_ir: DeviceIR,
-    ) -> Config | None:
-        return _seed_config_for_config_spec(env.config_spec)
 
 
 def _h100_build_block_sizes(
@@ -441,32 +323,6 @@ def _h100_build_block_sizes(
         v = min(v, bs_spec.max_size)
         out.append(v)
     return out
-
-
-def _h100_config(
-    spec: ConfigSpec,
-    fact: MatmulFact,
-    bm: int,
-    bn: int,
-    bk: int,
-    num_warps: int,
-    num_stages: int,
-    l2_grouping: int = 1,
-    extra: dict[str, Any] | None = None,
-) -> Config:
-    """Assemble a Config from a tile tuple (emit l2_groupings only when grouping > 1).
-    ``extra`` carries any subclass-emitted fields (e.g. the sm100 Blackwell levers:
-    epilogue_subtile / indexing / range_warp_specializes) merged on top."""
-    cfg: dict[str, Any] = {
-        "block_sizes": _h100_build_block_sizes(spec, fact, bm, bn, bk),
-        "num_warps": num_warps,
-        "num_stages": num_stages,
-    }
-    if l2_grouping > 1:
-        cfg["l2_groupings"] = [l2_grouping]
-    if extra:
-        cfg.update(extra)
-    return Config(**cfg)
 
 
 class TritonH100MatmulHeuristic(AutotunerHeuristic):
@@ -636,6 +492,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
     WORK_AWARE_WARPS = False
     REGIME_AWARE_WARPS = False
     SINGLE_ROLE_AWARE_KNOBS = False
+    EXPANDED_SEED_POOL = False
     # Candidate-work regime boundaries. Inactive unless REGIME_AWARE_WARPS is
     # enabled by a measured architecture subclass.
     SUBSTANTIAL_DOT_WORK = 1 << 20
@@ -745,11 +602,11 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
     @classmethod
     def _tmem_columns(
         cls,
-        tiles: Sequence[tuple[int, int, int] | tuple[int, int, int, int]],
+        accumulator_tiles: Sequence[tuple[int, int]],
         *,
-        include_lhs_scratch: bool = False,
+        lhs_scratch_tiles: Sequence[tuple[int, int, int]] = (),
     ) -> int:
-        """Tensor-memory COLUMNS a set of dots reserves.
+        """Tensor-memory COLUMNS reserved by accumulators and computed LHS tiles.
 
         tcgen05 tensor memory is allocated as ``TMEM_LANES`` (128) lanes x N columns of
         32 bits; a request is denominated in columns, not bytes. Measured on B200 over the
@@ -765,49 +622,33 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         ``OutOfResources: tensor memory, Required: 768, limit 512`` -- exactly
         ``3 x 256`` columns against the 512-column budget.
 
-        ``tiles`` may include K as ``(bm, bn, bk, itemsize)``. With
-        ``include_lhs_scratch``, also reserve each dot's power-of-two LHS promotion
-        allocation. Triton can keep those allocations distinct across dots, just as
-        accumulator allocations can add. The scratch-inclusive value is a hard
-        launchability check; the calibrated residency policy continues to use
-        accumulator columns alone because this all-dot bound is not a reliable
-        peak-residency estimate.
+        ``accumulator_tiles`` contains ``(bm, bn)``. ``lhs_scratch_tiles`` contains
+        ``(bm, bk, itemsize)`` for computed dot LHS values that need Triton's
+        power-of-two promotion allocation; direct loads do not belong in that set.
+        Triton can keep those allocations distinct across dots, just as accumulator
+        allocations can add.
 
-        An accumulator whose ``bm`` is below ``TCGEN05_MIN_BM`` is charged nothing:
-        below that the dot lowers to a non-tcgen05 path that uses no tensor memory at
-        all (measured ``tmem_size == 0``), and its cost lands on the register file
-        instead -- see ``_register_live_bytes``.
+        A tile whose ``bm`` is below ``TCGEN05_MIN_BM`` is charged nothing: below that
+        the dot lowers to a non-tcgen05 path that uses no tensor memory at all
+        (measured ``tmem_size == 0``), and its cost lands on the register file instead
+        -- see ``_register_live_bytes``.
         """
-        if include_lhs_scratch:
-            assert all(len(tile) == 4 for tile in tiles), (
-                "BK is required when include_lhs_scratch=True"
-            )
         if cls.TMEM_COLUMN_BUDGET is None:
             return 0
         total = 0
-        lhs_columns = 0
-        for tile in tiles:
-            if len(tile) == 3:
-                bm, bn, itemsize = tile
-                bk = None
-            else:
-                bm, bn, bk, itemsize = tile
+        for bm, bn in accumulator_tiles:
+            if bm >= cls.TCGEN05_MIN_BM:
+                total += max(1, -(-bm // cls.TMEM_LANES)) * bn
+        for bm, bk, itemsize in lhs_scratch_tiles:
             if bm < cls.TCGEN05_MIN_BM:
                 continue
-            lane_groups = max(1, -(-bm // cls.TMEM_LANES))
-            total += lane_groups * bn
-            if include_lhs_scratch:
-                assert bk is not None
-                raw_columns = max(
-                    1,
-                    -(-(bm * bk * itemsize) // (cls.TMEM_LANES * 4)),
-                )
-                allocated_columns = 1 << (raw_columns - 1).bit_length()
-                lhs_columns += max(
-                    cls.TMEM_ALLOC_COLUMNS,
-                    allocated_columns,
-                )
-        return total + lhs_columns
+            raw_columns = max(
+                1,
+                -(-(bm * bk * itemsize) // (cls.TMEM_LANES * 4)),
+            )
+            allocated_columns = 1 << (raw_columns - 1).bit_length()
+            total += max(cls.TMEM_ALLOC_COLUMNS, allocated_columns)
+        return total
 
     @classmethod
     def _warps_for_live_set(
@@ -914,6 +755,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         grid: int,
         num_sm: int,
         smem_bytes: int,
+        resource_policy: MatmulResourcePolicy = "strict",
     ) -> int:
         """Choose a warp regime from dynamic work and soft register pressure.
 
@@ -940,6 +782,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                 smem_bytes=smem_bytes,
                 grid=grid,
                 num_sm=num_sm,
+                resource_policy=resource_policy,
             )
 
         p1 = pressure(1)
@@ -1074,6 +917,16 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             assert isinstance(value, (int, torch.SymInt))
             out[bid] = max(1, env.size_hint(value))
         return out
+
+    @staticmethod
+    def _reference_block_sizes(spec: ConfigSpec) -> list[int]:
+        """Return a mutable copy of the conservative reference block sizes."""
+        return list(
+            cast(
+                "list[int]",
+                spec.autotune_reference_config().config["block_sizes"],
+            )
+        )
 
     @classmethod
     def _axis_extent(cls, env: CompileEnvironment, block_id: int) -> int | None:
@@ -1230,6 +1083,28 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         return trips
 
     @classmethod
+    def _pipelined_loop_trips(
+        cls,
+        env: CompileEnvironment,
+        block_sizes: list[int],
+        *,
+        max_loop_trips: int,
+    ) -> int:
+        """Longest candidate-resolved pipeline, with an explicit safety fallback."""
+        mm = env.config_spec.kernel_matmul_fact
+        assert mm is not None
+        return max(
+            (
+                trips if trips is not None else max_loop_trips
+                for region in mm.pipelined_regions
+                for trips in (
+                    cls._resolved_loop_trips(env, block_sizes, region.loop_axes),
+                )
+            ),
+            default=max_loop_trips,
+        )
+
+    @classmethod
     def _dot_tile_extents(
         cls,
         fact: MatmulFact,
@@ -1274,6 +1149,76 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             rows, cols, inner = cls._dot_tile_extents(f, resolved.axes, block_of)
             out.append((rows, cols, inner, max(1, f.lhs_dtype.itemsize)))
         return out
+
+    @classmethod
+    def _candidate_tmem_columns(
+        cls,
+        env: CompileEnvironment,
+        block_sizes: list[int],
+        *,
+        include_lhs_scratch: bool,
+        resource_policy: MatmulResourcePolicy,
+    ) -> int:
+        """Candidate TMEM columns under the strict or exploratory policy."""
+        tiles = cls._all_dot_acc_tiles(env, block_sizes)
+        accumulator_tiles = [(bm, bn) for bm, bn, _bk, _itemsize in tiles]
+        if resource_policy == "strict":
+            return cls._tmem_columns(
+                accumulator_tiles,
+                lhs_scratch_tiles=(
+                    [(bm, bk, itemsize) for bm, _bn, bk, itemsize in tiles]
+                    if include_lhs_scratch
+                    else ()
+                ),
+            )
+
+        mm = env.config_spec.kernel_matmul_fact
+        if mm is None:
+            return 0
+        block_of = cls._full_block_map(env, block_sizes)
+
+        def live_accumulator_columns(live: Sequence[LiveTile]) -> int:
+            accumulator_tiles = []
+            for tile in live:
+                shape = cls._single_matrix_shape(tile, block_of)
+                if tile.kind == "dot_out" and shape is not None:
+                    accumulator_tiles.append(shape)
+            return cls._tmem_columns(accumulator_tiles)
+
+        live_sets = tuple(getattr(mm, "live_tile_steps", ()))
+        peak_dot_outputs = tuple(getattr(mm, "live_dot_outputs", ()))
+        accumulator_columns = max(
+            (
+                *(live_accumulator_columns(step) for step in live_sets),
+                live_accumulator_columns(peak_dot_outputs),
+            ),
+            default=0,
+        )
+
+        lhs_columns = 0
+        if include_lhs_scratch:
+
+            def live_lhs_columns(live: Sequence[LiveTile]) -> int:
+                lhs_scratch_tiles = []
+                for tile in live:
+                    shape = cls._single_matrix_shape(tile, block_of)
+                    if tile.promoted_lhs and shape is not None:
+                        rows, columns = shape
+                        lhs_scratch_tiles.append((rows, columns, tile.itemsize))
+                return cls._tmem_columns(
+                    (),
+                    lhs_scratch_tiles=lhs_scratch_tiles,
+                )
+
+            promoted_peak = tuple(getattr(mm, "live_promoted_lhs", ()))
+            lhs_columns = max(
+                (
+                    *(live_lhs_columns(step) for step in live_sets),
+                    live_lhs_columns(promoted_peak),
+                ),
+                default=0,
+            )
+        return accumulator_columns + lhs_columns
 
     @classmethod
     def _candidate_dot_work(
@@ -1372,22 +1317,35 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                 if nbytes > ceiling:
                     continue
                 if tile.kind == "dot_out" and tmem_absorbs:
-                    rows = 1
-                    for block_id, static in zip(
-                        tile.dim_block_ids[:-1],
-                        tile.static_dims[:-1],
-                        strict=False,
-                    ):
-                        rows *= (
-                            block_of[block_id]
-                            if block_id is not None
-                            else max(1, static or 1)
-                        )
-                    if rows >= cls.TCGEN05_MIN_BM:
+                    shape = cls._single_matrix_shape(tile, block_of)
+                    if shape is not None and shape[0] >= cls.TCGEN05_MIN_BM:
                         continue
                 total += nbytes
             peak = max(peak, total)
         return peak
+
+    @classmethod
+    def _single_matrix_shape(
+        cls,
+        tile: object,
+        block_of: dict[int, int],
+    ) -> tuple[int, int] | None:
+        """Resolved trailing matrix shape when no leading batch extent exceeds one."""
+        dims = cls._resolved_tile_dims(tile, block_of)
+        if len(dims) < 2 or any(extent != 1 for extent in dims[:-2]):
+            return None
+        return dims[-2], dims[-1]
+
+    @staticmethod
+    def _resolved_tile_dims(tile: object, block_of: dict[int, int]) -> list[int]:
+        return [
+            max(1, block_of.get(blk, 1)) if blk is not None else max(1, static or 1)
+            for blk, static in zip(
+                tile.dim_block_ids,  # type: ignore[attr-defined]
+                tile.static_dims,  # type: ignore[attr-defined]
+                strict=False,
+            )
+        ]
 
     @classmethod
     def _resolve_tile_bytes(cls, tile: object, block_of: dict[int, int]) -> int:
@@ -1589,6 +1547,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         grid: int,
         num_sm: int,
         include_tmem: bool = True,
+        resource_policy: MatmulResourcePolicy = "strict",
     ) -> int:
         """Resident CTAs jointly achievable under the candidate's resources.
 
@@ -1625,7 +1584,12 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             and cls.TMEM_COLUMNS_PER_SM is not None
             and warps >= cls.TCGEN05_WARPGROUP_WARPS
         ):
-            columns = cls._tmem_columns(cls._all_dot_acc_tiles(env, block_sizes))
+            columns = cls._candidate_tmem_columns(
+                env,
+                block_sizes,
+                include_lhs_scratch=False,
+                resource_policy=resource_policy,
+            )
             if columns > 0:
                 limits.append(max(1, cls.TMEM_COLUMNS_PER_SM // columns))
 
@@ -1641,6 +1605,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         loop_trips: int,
         num_sm: int,
         stage_block_sizes: list[int] | None = None,
+        resource_policy: MatmulResourcePolicy = "strict",
     ) -> int:
         """Run the graded stage model against a complete kernel candidate."""
         stage_blocks = block_sizes if stage_block_sizes is None else stage_block_sizes
@@ -1656,6 +1621,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             smem_bytes=smem_of(1),
             grid=stage_grid,
             num_sm=num_sm,
+            resource_policy=resource_policy,
         )
 
         def candidate_smem_of(stages: int) -> int:
@@ -1686,18 +1652,70 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         num_warps: int,
         num_stages: int,
         num_sm: int,
+        *,
+        min_warps: int | None = None,
+        max_warps: int | None = None,
+        resource_policy: MatmulResourcePolicy = "strict",
     ) -> int:
         """Refresh the warp count from a complete kernel candidate."""
-        if not cls.WORK_AWARE_WARPS:
-            return num_warps
-        return cls._select_num_warps(
-            num_warps,
-            env,
-            block_sizes,
-            grid=cls._launch_grid(env, block_sizes),
-            num_sm=num_sm,
-            smem_bytes=cls._kernel_smem_bytes(env, block_sizes, num_stages),
-        )
+        selected = num_warps
+        if cls.WORK_AWARE_WARPS:
+            selected = cls._select_num_warps(
+                num_warps,
+                env,
+                block_sizes,
+                grid=cls._launch_grid(env, block_sizes),
+                num_sm=num_sm,
+                smem_bytes=cls._kernel_smem_bytes(env, block_sizes, num_stages),
+                resource_policy=resource_policy,
+            )
+        lower = 1 if min_warps is None else max(1, min_warps)
+        upper = cls.MAX_NUM_WARPS if max_warps is None else max(1, max_warps)
+        if lower > upper:
+            raise ValueError(f"invalid warp bounds: {lower} > {upper}")
+        return max(lower, min(upper, selected))
+
+    @classmethod
+    def _candidate_hard_resources(
+        cls,
+        env: CompileEnvironment,
+        block_sizes: list[int],
+        num_warps: int,
+        num_stages: int,
+        *,
+        resource_policy: MatmulResourcePolicy = "strict",
+    ) -> tuple[tuple[int, int], ...]:
+        """Hard SMEM/TMEM demands and their budgets for one complete candidate."""
+        resources: list[tuple[int, int]] = []
+        if cls.ENFORCE_SMEM_BUDGET:
+            resources.extend(
+                (demand, cls.SMEM_BUDGET)
+                for demand in cls._kernel_smem_demands(
+                    env,
+                    block_sizes,
+                    num_stages,
+                    hard_allocation=True,
+                )
+            )
+        if cls.TMEM_COLUMN_BUDGET is not None:
+            # This scratch-inclusive allocation-unit model also dominates
+            # the old per-dot TMEM byte check.
+            resources.append(
+                (
+                    (
+                        cls._candidate_tmem_columns(
+                            env,
+                            block_sizes,
+                            include_lhs_scratch=True,
+                            resource_policy=resource_policy,
+                        )
+                        if num_warps >= cls.TCGEN05_WARPGROUP_WARPS
+                        else 0
+                    ),
+                    cls.TMEM_COLUMN_BUDGET,
+                )
+            )
+        return tuple(resources)
 
     @classmethod
     def _fixup_candidate_resources(
@@ -1710,6 +1728,12 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         num_sm: int,
         shrinkable: list[int],
         largest_first: bool,
+        min_warps: int | None = None,
+        max_warps: int | None = None,
+        refresh_warps: bool = False,
+        min_stages: int | None = None,
+        resource_policy: MatmulResourcePolicy = "strict",
+        solve_final_warps: bool = True,
     ) -> tuple[int, int]:
         """Make a candidate legal under the hard SMEM and TMEM budgets.
 
@@ -1727,39 +1751,30 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             slot_of[bs.block_id] = slot
             floors[bs.block_id] = max(1, bs.min_size, bs.autotuner_min)
 
-        def hard_resources(
+        def solve_warps(
             candidate: list[int],
             warps: int,
             stages: int,
-        ) -> tuple[tuple[int, int], ...]:
-            resources: list[tuple[int, int]] = []
-            if cls.ENFORCE_SMEM_BUDGET:
-                resources.extend(
-                    (demand, cls.SMEM_BUDGET)
-                    for demand in cls._kernel_smem_demands(
-                        env,
-                        candidate,
-                        stages,
-                        hard_allocation=True,
-                    )
+        ) -> int:
+            if min_warps is None and max_warps is None:
+                return cls._solve_candidate_warps(
+                    env,
+                    candidate,
+                    warps,
+                    stages,
+                    num_sm,
+                    resource_policy=resource_policy,
                 )
-            if cls.TMEM_COLUMN_BUDGET is not None:
-                # This scratch-inclusive allocation-unit model also dominates
-                # the old per-dot TMEM byte check.
-                resources.append(
-                    (
-                        (
-                            cls._tmem_columns(
-                                cls._all_dot_acc_tiles(env, candidate),
-                                include_lhs_scratch=True,
-                            )
-                            if warps >= cls.TCGEN05_WARPGROUP_WARPS
-                            else 0
-                        ),
-                        cls.TMEM_COLUMN_BUDGET,
-                    )
-                )
-            return tuple(resources)
+            return cls._solve_candidate_warps(
+                env,
+                candidate,
+                warps,
+                stages,
+                num_sm,
+                min_warps=min_warps,
+                max_warps=max_warps,
+                resource_policy=resource_policy,
+            )
 
         def relief(
             current: tuple[tuple[int, int], ...],
@@ -1781,19 +1796,36 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         mm = env.config_spec.kernel_matmul_fact
         assert mm is not None
         while True:
-            current = hard_resources(block_sizes, num_warps, num_stages)
+            current = cls._candidate_hard_resources(
+                env,
+                block_sizes,
+                num_warps,
+                num_stages,
+                resource_policy=resource_policy,
+            )
             if all(demand <= budget for demand, budget in current):
                 break
 
-            if num_stages > cls.MIN_NUM_STAGES:
+            stage_floor = (
+                cls.MIN_NUM_STAGES if min_stages is None else max(1, min_stages)
+            )
+            if num_stages > stage_floor:
                 trial_stages = num_stages - 1
-                trial_resources = hard_resources(
+                trial_warps = (
+                    solve_warps(block_sizes, num_warps, trial_stages)
+                    if refresh_warps
+                    else num_warps
+                )
+                trial_resources = cls._candidate_hard_resources(
+                    env,
                     block_sizes,
-                    num_warps,
+                    trial_warps,
                     trial_stages,
+                    resource_policy=resource_policy,
                 )
                 if relief(current, trial_resources) is not None:
                     num_stages = trial_stages
+                    num_warps = trial_warps
                     continue
 
             candidates = [
@@ -1816,14 +1848,18 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             for position, bid in enumerate(candidates):
                 trial = list(block_sizes)
                 trial[slot_of[bid]] //= 2
-                trial_warps = cls._solve_candidate_warps(
-                    env,
+                trial_warps = solve_warps(
                     trial,
                     num_warps,
                     num_stages,
-                    num_sm,
                 )
-                trial_resources = hard_resources(trial, trial_warps, num_stages)
+                trial_resources = cls._candidate_hard_resources(
+                    env,
+                    trial,
+                    trial_warps,
+                    num_stages,
+                    resource_policy=resource_policy,
+                )
                 impact = relief(
                     current,
                     trial_resources,
@@ -1868,13 +1904,12 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             _score, winner, num_warps = max(trials, key=itemgetter(0))
             block_sizes[:] = winner
 
-        num_warps = cls._solve_candidate_warps(
-            env,
-            block_sizes,
-            num_warps,
-            num_stages,
-            num_sm,
-        )
+        if solve_final_warps:
+            num_warps = solve_warps(
+                block_sizes,
+                num_warps,
+                num_stages,
+            )
         return num_stages, num_warps
 
     @classmethod
@@ -2109,6 +2144,364 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         return bm, bn, bk, num_warps, num_stages, l2_grouping
 
     @classmethod
+    def _emit_seed_draft(
+        cls,
+        draft: MatmulSeedDraft,
+        extra: dict[str, Any] | None = None,
+        *,
+        l2_groupings: list[int] | None = None,
+    ) -> Config:
+        config: dict[str, Any] = {
+            "block_sizes": list(draft.block_sizes),
+            "num_warps": draft.num_warps,
+            "num_stages": draft.num_stages,
+        }
+        if l2_groupings is not None:
+            config["l2_groupings"] = list(l2_groupings)
+        elif draft.l2_grouping > 1:
+            config["l2_groupings"] = [draft.l2_grouping]
+        if extra:
+            config.update(extra)
+        return Config(**config)
+
+    @staticmethod
+    def _l2_groupings_for_site(
+        env: CompileEnvironment,
+        site: DotSite | None,
+        grouping: int,
+    ) -> list[int] | None:
+        """Apply one dot's L2 choice to its root while preserving other roots."""
+        spec = env.config_spec
+        count = len(spec.l2_groupings)
+        if count == 0:
+            return None
+        base = cast("Config", spec.autotune_reference_config())
+        values = list(
+            cast(
+                "list[int]",
+                base.config.get("l2_groupings", [1] * count),
+            )
+        )
+        if len(values) != count:
+            values = [1] * count
+
+        grid = getattr(spec, "kernel_grid_fact", None)
+        if grid is None or site is None:
+            return values
+        group = grid.group_for_graph(site.graph_id)
+        for block_id in group:
+            try:
+                slot = spec.l2_groupings.block_id_to_index(block_id)
+            except (KeyError, ValueError):
+                continue
+            values[slot] = grouping
+            break
+        return values
+
+    @staticmethod
+    def _seed_axis_ids(roles: Mapping[int, Collection[str]]) -> SeedAxisIds:
+        def ids_for(axis: str) -> tuple[int, ...]:
+            return tuple(
+                block_id
+                for block_id, block_roles in roles.items()
+                if axis in block_roles
+            )
+
+        return SeedAxisIds(ids_for("m"), ids_for("n"), ids_for("k"))
+
+    @classmethod
+    def _set_seed_block(
+        cls,
+        env: CompileEnvironment,
+        block_sizes: list[int],
+        block_id: int,
+        value: int,
+    ) -> bool:
+        """Set one seed block to an absolute value within its live spec bounds."""
+        try:
+            slot = env.config_spec.block_sizes.block_id_to_index(block_id)
+        except (AttributeError, KeyError, ValueError):
+            return False
+        block_spec = cast("BlockSizeSpec", env.config_spec.block_sizes[slot])
+        floor = max(1, block_spec.min_size, block_spec.autotuner_min)
+        value = max(floor, min(block_spec.max_size, value))
+        changed = value != block_sizes[slot]
+        block_sizes[slot] = value
+        return changed
+
+    @classmethod
+    def _scale_seed_axes(
+        cls,
+        env: CompileEnvironment,
+        draft: MatmulSeedDraft,
+        axis_ids: SeedAxisIds,
+        *,
+        log2_deltas: tuple[int, int, int],
+    ) -> tuple[bool, bool, bool]:
+        """Scale the current M/N/K-role blocks by powers of two."""
+        changed: list[bool] = []
+        for ids, log2_delta in zip(axis_ids, log2_deltas, strict=True):
+            axis_changed = False
+            for block_id in ids:
+                try:
+                    slot = env.config_spec.block_sizes.block_id_to_index(block_id)
+                except (AttributeError, KeyError, ValueError):
+                    continue
+                value = draft.block_sizes[slot]
+                if log2_delta >= 0:
+                    value *= 2**log2_delta
+                else:
+                    value //= 2 ** (-log2_delta)
+                axis_changed = (
+                    cls._set_seed_block(env, draft.block_sizes, block_id, value)
+                    or axis_changed
+                )
+            changed.append(axis_changed)
+        return cast("tuple[bool, bool, bool]", tuple(changed))
+
+    @classmethod
+    def _finalize_seed_draft(
+        cls,
+        env: CompileEnvironment,
+        mm: KernelMatmulFact,
+        draft: MatmulSeedDraft,
+        *,
+        num_sm: int,
+        axis_ids: SeedAxisIds,
+        recompute_stages: bool,
+        min_warps: int | None = None,
+        max_warps: int | None = None,
+        keep_tcgen05: bool = False,
+        apply_role_correction: bool = True,
+        protected_block_ids: Collection[int] = (),
+        min_stages: int | None = None,
+        recompute_warps: bool = True,
+        resource_policy: MatmulResourcePolicy = "strict",
+    ) -> MatmulSeedDraft | None:
+        pre_role_blocks = list(draft.block_sizes)
+        if apply_role_correction and getattr(
+            cls,
+            "ROLE_AWARE_KNOBS",
+            cls.SINGLE_ROLE_AWARE_KNOBS,
+        ):
+            cls._apply_knob_roles(env, mm, draft.block_sizes, num_sm)
+
+        m_ids, n_ids, k_ids = axis_ids
+        if keep_tcgen05:
+            for block_id in m_ids:
+                try:
+                    slot = env.config_spec.block_sizes.block_id_to_index(block_id)
+                except (AttributeError, KeyError, ValueError):
+                    continue
+                cls._set_seed_block(
+                    env,
+                    draft.block_sizes,
+                    block_id,
+                    max(draft.block_sizes[slot], cls.TCGEN05_MIN_BM),
+                )
+
+        keep_stage_blocks = recompute_stages and getattr(cls, "ROLE_KEEP_STAGES", False)
+        stage_blocks = pre_role_blocks if keep_stage_blocks else None
+        shrinkable = list(dict.fromkeys((*n_ids, *k_ids, *m_ids)))
+        protected = set(protected_block_ids)
+        shrinkable = [block_id for block_id in shrinkable if block_id not in protected]
+        if keep_tcgen05:
+            shrinkable = [block_id for block_id in shrinkable if block_id not in m_ids]
+
+        seen: set[tuple[tuple[int, ...], int, int]] = set()
+        for _ in range(16):
+            before = (
+                tuple(draft.block_sizes),
+                draft.num_warps,
+                draft.num_stages,
+            )
+            if before in seen:
+                return None
+            seen.add(before)
+            if recompute_warps:
+                draft.num_warps = cls._solve_candidate_warps(
+                    env,
+                    draft.block_sizes,
+                    draft.num_warps,
+                    draft.num_stages,
+                    num_sm,
+                    min_warps=min_warps,
+                    max_warps=max_warps,
+                    resource_policy=resource_policy,
+                )
+            if recompute_stages:
+                stage_candidate = stage_blocks or draft.block_sizes
+                draft.num_stages = cls._solve_candidate_stages(
+                    env,
+                    draft.block_sizes,
+                    num_warps=draft.num_warps,
+                    loop_trips=cls._pipelined_loop_trips(
+                        env,
+                        stage_candidate,
+                        max_loop_trips=max(1, mm.sequential_loop_trips),
+                    ),
+                    num_sm=num_sm,
+                    stage_block_sizes=stage_blocks,
+                    resource_policy=resource_policy,
+                )
+            draft.num_stages, draft.num_warps = cls._fixup_candidate_resources(
+                env,
+                draft.block_sizes,
+                draft.num_stages,
+                draft.num_warps,
+                num_sm=num_sm,
+                shrinkable=shrinkable,
+                largest_first=False,
+                min_warps=min_warps,
+                max_warps=max_warps,
+                refresh_warps=recompute_warps,
+                min_stages=min_stages,
+                resource_policy=resource_policy,
+                solve_final_warps=recompute_warps,
+            )
+            if (
+                tuple(draft.block_sizes),
+                draft.num_warps,
+                draft.num_stages,
+            ) == before:
+                break
+        else:
+            return None
+
+        if keep_tcgen05 and not any(
+            bm >= cls.TCGEN05_MIN_BM
+            for bm, _bn, _bk, _itemsize in cls._all_dot_acc_tiles(
+                env,
+                draft.block_sizes,
+            )
+        ):
+            return None
+        return draft
+
+    @classmethod
+    def _register_mma_seed_drafts(
+        cls,
+        env: CompileEnvironment,
+        mm: KernelMatmulFact,
+        base: MatmulSeedDraft,
+        *,
+        num_sm: int,
+        axis_ids: SeedAxisIds,
+    ) -> list[MatmulSeedDraft]:
+        seeds = []
+        for warps in (1, 2):
+            draft = base.copy()
+            targets = (
+                cls.TCGEN05_MIN_BM,
+                warps * cls.TMEM_ALLOC_COLUMNS,
+                warps * cls.DOT_MIN,
+            )
+            for block_ids, target in zip(axis_ids, targets, strict=True):
+                for block_id in block_ids:
+                    cls._set_seed_block(env, draft.block_sizes, block_id, target)
+            draft.num_warps = warps
+            draft.l2_grouping = 1
+            finalized = cls._finalize_seed_draft(
+                env,
+                mm,
+                draft,
+                num_sm=num_sm,
+                axis_ids=axis_ids,
+                recompute_stages=True,
+                min_warps=warps,
+                max_warps=warps,
+            )
+            # Preserve the partially corrected low-warp candidate if correction
+            # cycles; replacing it with the primary would erase this regime.
+            seeds.append(finalized or draft)
+        return seeds
+
+    @classmethod
+    def _aspect_seed_drafts(
+        cls,
+        env: CompileEnvironment,
+        mm: KernelMatmulFact,
+        base: MatmulSeedDraft,
+        *,
+        num_sm: int,
+        axis_ids: SeedAxisIds,
+    ) -> list[MatmulSeedDraft]:
+        seeds = []
+        for log2_deltas in ((1, -1, 0), (-1, 1, 0)):
+            draft = base.copy()
+            changed = cls._scale_seed_axes(
+                env,
+                draft,
+                axis_ids=axis_ids,
+                log2_deltas=log2_deltas,
+            )
+            if all(changed[:2]):
+                draft = (
+                    cls._finalize_seed_draft(
+                        env,
+                        mm,
+                        draft,
+                        num_sm=num_sm,
+                        axis_ids=axis_ids,
+                        recompute_stages=True,
+                    )
+                    or base.copy()
+                )
+            else:
+                draft = base.copy()
+            seeds.append(draft)
+        return seeds
+
+    @classmethod
+    def _bk_stage_seed_drafts(
+        cls,
+        env: CompileEnvironment,
+        mm: KernelMatmulFact,
+        base: MatmulSeedDraft,
+        *,
+        num_sm: int,
+        axis_ids: SeedAxisIds,
+    ) -> list[MatmulSeedDraft]:
+        def build(
+            log2_deltas: tuple[int, int, int],
+            stage_delta: int,
+            *,
+            keep_tcgen05: bool = False,
+        ) -> MatmulSeedDraft:
+            draft = base.copy()
+            changed = cls._scale_seed_axes(
+                env,
+                draft,
+                axis_ids=axis_ids,
+                log2_deltas=log2_deltas,
+            )
+            if not changed[2]:
+                return base.copy()
+            draft.num_stages = max(
+                cls.MIN_NUM_STAGES,
+                min(cls.HW_MAX_STAGES, draft.num_stages + stage_delta),
+            )
+            return (
+                cls._finalize_seed_draft(
+                    env,
+                    mm,
+                    draft,
+                    num_sm=num_sm,
+                    axis_ids=axis_ids,
+                    recompute_stages=False,
+                    min_warps=(cls.TCGEN05_WARPGROUP_WARPS if keep_tcgen05 else None),
+                    keep_tcgen05=keep_tcgen05,
+                )
+                or base.copy()
+            )
+
+        return [
+            build((0, 0, -1), 1),
+            build((0, 0, 1), -1),
+            build((-1, -1, -1), -1, keep_tcgen05=True),
+        ]
+
+    @classmethod
     def _projected_tile_for_dot(
         cls,
         env: CompileEnvironment,
@@ -2117,6 +2510,8 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         itemsize: int,
         num_sm: int,
         site: DotSite,
+        *,
+        apply_partitioned_k_cap: bool = True,
     ) -> tuple[int, int, int, int, int, int]:
         """Project one dot-local formula proposal onto the axes the kernel exposes."""
         m_extent = fact.static_m if fact.static_m is not None else None
@@ -2147,9 +2542,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                 max(1, block_spec.min_size, block_spec.autotuner_min),
                 block_spec.max_size,
             )
-        base_blocks = list(
-            cast("list[int]", spec._base_default_config().config["block_sizes"])
-        )
+        base_blocks = cls._reference_block_sizes(spec)
         graph_ids = (site.graph_id,)
         grid_group = (
             spec.kernel_grid_fact.group_for_graph(site.graph_id)
@@ -2218,11 +2611,13 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         bk = project("k", bk, fact.k_block_id)
 
         # A partitioned K loop exposes many independent partial-output CTAs.
+        site_loop_axes = getattr(site, "loop_axes", ())
         partitioned_k = any(
-            axis.bounded_by_block_id is not None for axis in site.loop_axes
+            axis.bounded_by_block_id is not None for axis in site_loop_axes
         )
         if (
-            partitioned_k
+            apply_partitioned_k_cap
+            and partitioned_k
             and cls.SAT_PARTITIONED_K_BM is not None
             and cls.SAT_PARTITIONED_K_BN is not None
         ):
@@ -2362,11 +2757,117 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                 num_sm,
             )
 
-        ranked: list[Config] = [
-            _h100_config(
-                spec, fact, bm, bn, bk, nw, ns, l2, _extra(bm, bn, bk, nw, ns, l2)
+        slot_of = {
+            cast("BlockSizeSpec", spec.block_sizes[slot]).block_id: slot
+            for slot in range(len(spec.block_sizes))
+        }
+
+        def emit(
+            draft: MatmulSeedDraft,
+            fallback: tuple[int, int, int],
+            *,
+            compact_single_root_default: bool = False,
+        ) -> Config:
+            tile = tuple(
+                (
+                    draft.block_sizes[slot_of[block_id]]
+                    if block_id is not None and block_id in slot_of
+                    else fallback[index]
+                )
+                for index, block_id in enumerate(
+                    (fact.m_block_id, fact.n_block_id, fact.k_block_id)
+                )
+            )
+            l2_groupings = cls._l2_groupings_for_site(
+                env,
+                site,
+                draft.l2_grouping,
+            )
+            if compact_single_root_default and l2_groupings == [1]:
+                l2_groupings = None
+            return cls._emit_seed_draft(
+                draft,
+                _extra(
+                    tile[0],
+                    tile[1],
+                    tile[2],
+                    draft.num_warps,
+                    draft.num_stages,
+                    draft.l2_grouping,
+                ),
+                l2_groupings=l2_groupings,
+            )
+
+        primary = MatmulSeedDraft(
+            _h100_build_block_sizes(spec, fact, bm, bn, bk),
+            nw,
+            ns,
+            l2,
+        )
+        ranked = [
+            emit(
+                primary,
+                (bm, bn, bk),
+                compact_single_root_default=True,
             )
         ]
+
+        if cls.EXPANDED_SEED_POOL:
+            raw = cls._projected_tile_for_dot(
+                env,
+                fact,
+                axes,
+                itemsize,
+                num_sm,
+                site=site,
+                apply_partitioned_k_cap=False,
+            )
+            raw_draft = MatmulSeedDraft(
+                _h100_build_block_sizes(spec, fact, raw[0], raw[1], raw[2]),
+                raw[3],
+                raw[4],
+                raw[5],
+            )
+            # This is intentionally the untouched formula prior: projection and
+            # ConfigSpec clamping only, with no role/stage/warp/resource correction.
+            ranked.append(emit(raw_draft, raw[:3]))
+
+            axis_ids = cls._seed_axis_ids(
+                {
+                    block_id: (axis,)
+                    for axis, block_id in zip(
+                        ("m", "n", "k"),
+                        (fact.m_block_id, fact.n_block_id, fact.k_block_id),
+                        strict=True,
+                    )
+                    if block_id is not None
+                }
+            )
+            corrected = [
+                *cls._register_mma_seed_drafts(
+                    env,
+                    mm,
+                    primary,
+                    num_sm=num_sm,
+                    axis_ids=axis_ids,
+                ),
+                *cls._aspect_seed_drafts(
+                    env,
+                    mm,
+                    primary,
+                    num_sm=num_sm,
+                    axis_ids=axis_ids,
+                ),
+                *cls._bk_stage_seed_drafts(
+                    env,
+                    mm,
+                    primary,
+                    num_sm=num_sm,
+                    axis_ids=axis_ids,
+                ),
+            ]
+            ranked.extend(emit(draft, (bm, bn, bk)) for draft in corrected)
+            return dedupe_configs(ranked)
 
         def _warps(_bm: int, _bn: int) -> int:
             return 8 if _bm * _bn >= cls.WARPS_HI_ELEMS else 4
@@ -2400,32 +2901,30 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         ):
             nw2 = _warps(bm2, bn2)
             ranked.append(
-                _h100_config(
-                    spec,
-                    fact,
-                    bm2,
-                    bn2,
-                    bk,
-                    nw2,
-                    ns,
-                    1,
-                    _extra(bm2, bn2, bk, nw2, ns, 1),
+                emit(
+                    MatmulSeedDraft(
+                        _h100_build_block_sizes(spec, fact, bm2, bn2, bk),
+                        nw2,
+                        ns,
+                        1,
+                    ),
+                    (bm2, bn2, bk),
+                    compact_single_root_default=True,
                 )
             )
 
         # alt 2 — shallower num_stages neighbor (perturb down only; skipped at the floor ns==2).
         if ns > 2:
             ranked.append(
-                _h100_config(
-                    spec,
-                    fact,
-                    bm,
-                    bn,
-                    bk,
-                    nw,
-                    ns - 1,
-                    l2,
-                    _extra(bm, bn, bk, nw, ns - 1, l2),
+                emit(
+                    MatmulSeedDraft(
+                        _h100_build_block_sizes(spec, fact, bm, bn, bk),
+                        nw,
+                        ns - 1,
+                        l2,
+                    ),
+                    (bm, bn, bk),
+                    compact_single_root_default=True,
                 )
             )
         return ranked
@@ -2499,15 +2998,12 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
 
 
 class TritonB200FormulaMatmulHeuristic(TritonH100MatmulHeuristic):
-    """B200 (sm100) seed — the H100 budget formula re-homed on Blackwell, subsuming the incumbent
-    ``TritonB200MatmulHeuristic`` table (which fires only on in-bucket fp16/bf16 2-D matmul and
-    declines fp32/fp8/bmm/mamba + any dim>4096). Overrides only the hardware gate and the B200-tuned
-    constants; the promotion (owning the compiler default) is inherited from the base."""
+    """B200 (sm100) seed and execution default using the H100 budget formula
+    with Blackwell-specific hardware gates and constants."""
 
     name = "triton_b200_formula_matmul"
     HARDWARE_TARGETS = (("cuda", "sm100"),)
-    # promote_seed_to_default=True is inherited from TritonH100MatmulHeuristic. Registered after the
-    # (demoted) table so it wins the last-promote-wins compiler_default_config loop on sm100.
+    # promote_seed_to_default=True is inherited from TritonH100MatmulHeuristic.
 
     # num_sm (148) enters via get_num_sm, so the wave/saturation arithmetic self-adjusts; the rest
     # inherit the H100 formula, re-tuned per move below.
@@ -2570,6 +3066,7 @@ class TritonB200FormulaMatmulHeuristic(TritonH100MatmulHeuristic):
     # after multi-contraction draft assembly. The multi front end disables the
     # per-dot invocation and applies the shared correction once to its merged draft.
     SINGLE_ROLE_AWARE_KNOBS = True
+    EXPANDED_SEED_POOL = True
     ROLE_FLAT_OUTPUT = True
     ROLE_GRID_FILL = True
     # tcgen05 tensor memory allocates at least 32 columns. Use that as the floor
@@ -2742,18 +3239,17 @@ class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
     is a PREFERENCE, not an eligibility rule -- dimensions and execution count break every
     tie, and a kernel with no carried accumulator ranks purely on work.
 
-    Registered after the single-matmul front end for deterministic seed ordering,
-    and it declines whenever front end 1 fires, so exactly one path seeds any given
-    kernel.
+    It declines whenever the single-matmul front end fires, so exactly one path
+    seeds and supplies the execution default for any given kernel.
     """
 
     name = "triton_b200_multi_matmul"
     HARDWARE_TARGETS = (("cuda", "sm100"),)
-    # A promoted config must compile before autotuning can start. Keep the
-    # broader multi-contraction policy as a search seed until its legality has
-    # been validated beyond the current corpora.
-    promote_seed_to_default = False
+    promote_seed_to_default = True
     SINGLE_ROLE_AWARE_KNOBS = False
+    COMPILER_SEED_CAP = 20
+    OPTIMISTIC_EXPANSION_STEPS = 1
+    LARGE_K_CAP = 512
 
     # --- knob-role tile sizing (see ``_apply_knob_roles``) ----------------------------
     # Master switch, so the correction can be A/B'd against the plain ranked draft; the
@@ -2823,31 +3319,80 @@ class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
         return (carry, work, area)
 
     @classmethod
-    def _draft(
-        cls, env: CompileEnvironment, mm: KernelMatmulFact
-    ) -> dict[str, Any] | None:
-        """Phase 1: assemble a whole-kernel draft from the per-dot proposals."""
-        from ...runtime import get_num_sm
-
-        spec = env.config_spec
-        num_sm = max(1, get_num_sm(env.device))
-        proposals: dict[int, tuple[int, int, int, int, int, int]] = {}
-        for index, resolved in enumerate(mm.matmuls):
-            axes = resolved.axes
-            if any(
-                axes.kind(axis) is DotAxisKind.UNKNOWN or axes.extent(axis) is None
-                for axis in ("m", "n", "k")
-            ):
-                continue
-            fact = resolved.fact
-            proposals[index] = cls._tile_for_dot(
+    def _proposal_for(
+        cls,
+        env: CompileEnvironment,
+        mm: KernelMatmulFact,
+        index: int,
+        num_sm: int,
+        *,
+        precondition: bool = True,
+    ) -> MatmulProposal | None:
+        """One dot's prior, projected and preconditioned against the whole kernel."""
+        resolved = mm.matmuls[index]
+        fact = resolved.fact
+        ax = resolved.axes
+        if any(
+            ax.kind(a) is DotAxisKind.UNKNOWN or ax.extent(a) is None
+            for a in ("m", "n", "k")
+        ):
+            return None
+        itemsize = max(1, fact.lhs_dtype.itemsize)
+        if precondition:
+            return cls._tile_for_dot(
                 env,
                 fact,
-                axes,
-                max(1, fact.lhs_dtype.itemsize),
+                ax,
+                itemsize,
                 num_sm,
                 site=resolved.site,
             )
+        return cls._projected_tile_for_dot(
+            env,
+            fact,
+            ax,
+            itemsize,
+            num_sm,
+            site=resolved.site,
+            apply_partitioned_k_cap=False,
+        )
+
+    @classmethod
+    def _proposals(
+        cls,
+        env: CompileEnvironment,
+        mm: KernelMatmulFact,
+        *,
+        num_sm: int,
+        precondition: bool,
+    ) -> dict[int, MatmulProposal]:
+        return {
+            index: proposal
+            for index in range(len(mm.matmuls))
+            if (
+                proposal := cls._proposal_for(
+                    env,
+                    mm,
+                    index,
+                    num_sm,
+                    precondition=precondition,
+                )
+            )
+            is not None
+        }
+
+    @classmethod
+    def _draft(
+        cls,
+        env: CompileEnvironment,
+        mm: KernelMatmulFact,
+        proposals: dict[int, MatmulProposal],
+        num_sm: int,
+        *,
+        resource_policy: MatmulResourcePolicy = "strict",
+    ) -> MatmulSeedDraft | None:
+        """Phase 1: assemble a whole-kernel draft from cached per-dot proposals."""
+        spec = env.config_spec
         if not proposals:
             return None
 
@@ -2871,8 +3416,7 @@ class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
         # Start from the base default so an axis that is NO dot's M/N/K and no grid axis
         # keeps exactly the size it has today, rather than being pinned by a rule that was
         # never measured on it.
-        base = spec._base_default_config()
-        block_sizes = list(cast("list[int]", base.config["block_sizes"]))
+        block_sizes = cls._reference_block_sizes(spec)
         grid_ids = set(spec.grid_block_ids)
         mn_ids = {resolved.fact.m_block_id for resolved in mm.matmuls} | {
             resolved.fact.n_block_id for resolved in mm.matmuls
@@ -2918,16 +3462,10 @@ class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
 
         if cls.GRADED_STAGES:
             max_loop_trips = max(1, mm.sequential_loop_trips)
-            resolved_trips = (
-                cls._resolved_loop_trips(env, stage_ring, region.loop_axes)
-                for region in mm.pipelined_regions
-            )
-            loop_trips = max(
-                (
-                    trips if trips is not None else max_loop_trips
-                    for trips in resolved_trips
-                ),
-                default=max_loop_trips,
+            loop_trips = cls._pipelined_loop_trips(
+                env,
+                stage_ring,
+                max_loop_trips=max_loop_trips,
             )
             num_stages = cls._solve_candidate_stages(
                 env,
@@ -2936,6 +3474,7 @@ class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
                 loop_trips=loop_trips,
                 num_sm=num_sm,
                 stage_block_sizes=stage_ring,
+                resource_policy=resource_policy,
             )
         num_warps = cls._solve_candidate_warps(
             env,
@@ -2943,45 +3482,434 @@ class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
             num_warps,
             num_stages,
             num_sm,
+            resource_policy=resource_policy,
         )
 
-        return {
-            "block_sizes": block_sizes,
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-            "_num_sm": num_sm,
+        return MatmulSeedDraft(block_sizes, num_warps, num_stages)
+
+    @classmethod
+    def _fixup(
+        cls,
+        env: CompileEnvironment,
+        mm: KernelMatmulFact,
+        draft: MatmulSeedDraft,
+        *,
+        num_sm: int,
+        resource_policy: MatmulResourcePolicy = "strict",
+    ) -> None:
+        """Phase 2: enforce hard budgets on the merged candidate."""
+        draft.num_stages, draft.num_warps = cls._fixup_candidate_resources(
+            env,
+            draft.block_sizes,
+            draft.num_stages,
+            draft.num_warps,
+            num_sm=num_sm,
+            shrinkable=[bid for bid, _users in mm.knob_users],
+            largest_first=True,
+            resource_policy=resource_policy,
+        )
+
+    @classmethod
+    def _optimistic_expanded_seed_drafts(
+        cls,
+        env: CompileEnvironment,
+        mm: KernelMatmulFact,
+        base: MatmulSeedDraft,
+        *,
+        num_sm: int,
+        axis_ids: SeedAxisIds,
+    ) -> list[MatmulSeedDraft]:
+        """M- and N-expanded merged candidates under optimistic TMEM."""
+        result = []
+        for axis in (0, 1):
+            draft = base.copy()
+            log2_deltas = (
+                (cls.OPTIMISTIC_EXPANSION_STEPS, 0, 0)
+                if axis == 0
+                else (0, cls.OPTIMISTIC_EXPANSION_STEPS, 0)
+            )
+            changed = cls._scale_seed_axes(
+                env,
+                draft,
+                axis_ids,
+                log2_deltas=log2_deltas,
+            )
+            if not changed[axis]:
+                continue
+            finalized = cls._finalize_seed_draft(
+                env,
+                mm,
+                draft,
+                num_sm=num_sm,
+                axis_ids=axis_ids,
+                recompute_stages=True,
+                resource_policy="optimistic",
+            )
+            if finalized is not None:
+                result.append(finalized)
+        return result
+
+    @classmethod
+    def _set_capped_large_k(
+        cls,
+        env: CompileEnvironment,
+        draft: MatmulSeedDraft,
+        k_ids: Collection[int],
+    ) -> bool:
+        changed = False
+        for block_id in k_ids:
+            extent = cls._axis_extent(env, block_id)
+            if extent is None:
+                try:
+                    slot = env.config_spec.block_sizes.block_id_to_index(block_id)
+                    extent = cast(
+                        "BlockSizeSpec",
+                        env.config_spec.block_sizes[slot],
+                    ).max_size
+                except (AttributeError, KeyError, ValueError):
+                    continue
+            target = 1 << (max(1, extent) - 1).bit_length()
+            changed = (
+                cls._set_seed_block(
+                    env,
+                    draft.block_sizes,
+                    block_id,
+                    min(target, cls.LARGE_K_CAP),
+                )
+                or changed
+            )
+        return changed
+
+    @classmethod
+    def _optimistic_frontier_seed_drafts(
+        cls,
+        env: CompileEnvironment,
+        mm: KernelMatmulFact,
+        primary: MatmulSeedDraft,
+        register_mma: Sequence[MatmulSeedDraft],
+        *,
+        num_sm: int,
+        axis_ids: SeedAxisIds,
+    ) -> list[MatmulSeedDraft]:
+        """K/stage and high-launch recipes with only their requested fix-ups."""
+        result = []
+        _m_ids, _n_ids, k_ids = axis_ids
+
+        lighter_k = primary.copy()
+        if cls._scale_seed_axes(
+            env,
+            lighter_k,
+            axis_ids,
+            log2_deltas=(0, 0, -1),
+        )[2]:
+            lighter_k.num_stages = min(
+                cls.HW_MAX_STAGES,
+                lighter_k.num_stages + 1,
+            )
+            finalized = cls._finalize_seed_draft(
+                env,
+                mm,
+                lighter_k,
+                num_sm=num_sm,
+                axis_ids=axis_ids,
+                recompute_stages=False,
+                apply_role_correction=False,
+                protected_block_ids=k_ids,
+                min_stages=lighter_k.num_stages,
+                resource_policy="optimistic",
+            )
+            if finalized is not None:
+                result.append(finalized)
+
+        large_k = primary.copy()
+        if cls._set_capped_large_k(env, large_k, k_ids):
+            shallow = large_k.copy()
+            shallow.num_stages = min(2, cls.HW_MAX_STAGES)
+            finalized = cls._finalize_seed_draft(
+                env,
+                mm,
+                shallow,
+                num_sm=num_sm,
+                axis_ids=axis_ids,
+                recompute_stages=False,
+                apply_role_correction=False,
+                protected_block_ids=k_ids,
+                resource_policy="optimistic",
+            )
+            if finalized is not None:
+                result.append(finalized)
+
+            high_launch = large_k.copy()
+            high_launch.num_warps = max(
+                cls.TCGEN05_WARPGROUP_WARPS,
+                high_launch.num_warps,
+            )
+            high_launch.num_stages = min(
+                cls.HW_MAX_STAGES,
+                max(3, high_launch.num_stages + 1),
+            )
+            finalized = cls._finalize_seed_draft(
+                env,
+                mm,
+                high_launch,
+                num_sm=num_sm,
+                axis_ids=axis_ids,
+                recompute_stages=False,
+                min_warps=cls.TCGEN05_WARPGROUP_WARPS,
+                apply_role_correction=False,
+                protected_block_ids=k_ids,
+                min_stages=high_launch.num_stages,
+                resource_policy="optimistic",
+            )
+            if finalized is not None:
+                result.append(finalized)
+
+        if register_mma:
+            small_high_launch = register_mma[0].copy()
+            small_high_launch.num_warps = cls.TCGEN05_WARPGROUP_WARPS
+            small_high_launch.num_stages = min(
+                cls.HW_MAX_STAGES,
+                max(3, small_high_launch.num_stages),
+            )
+            finalized = cls._finalize_seed_draft(
+                env,
+                mm,
+                small_high_launch,
+                num_sm=num_sm,
+                axis_ids=axis_ids,
+                recompute_stages=False,
+                min_warps=cls.TCGEN05_WARPGROUP_WARPS,
+                max_warps=cls.TCGEN05_WARPGROUP_WARPS,
+                apply_role_correction=False,
+                protected_block_ids=tuple(
+                    dict.fromkeys(block_id for ids in axis_ids for block_id in ids)
+                ),
+                min_stages=small_high_launch.num_stages,
+                recompute_warps=False,
+                resource_policy="optimistic",
+            )
+            if finalized is not None:
+                result.append(finalized)
+        return result
+
+    @classmethod
+    def _persistent_seed_config(
+        cls,
+        env: CompileEnvironment,
+        primary: MatmulSeedDraft,
+        *,
+        num_sm: int,
+    ) -> Config | None:
+        spec = env.config_spec
+        if (
+            "persistent_blocked" not in getattr(spec, "allowed_pid_types", ())
+            or cls._launch_grid(env, primary.block_sizes) <= num_sm
+        ):
+            return None
+        config = cls._canonical_seed_config(
+            env,
+            cls._emit_seed_draft(
+                primary,
+                {
+                    "pid_type": "persistent_blocked",
+                    "num_sm_multiplier": 1,
+                },
+            ),
+        )
+        if config is None or config.config.get("pid_type") != "persistent_blocked":
+            return None
+        return config
+
+    @classmethod
+    def _dedupe_seed_pool(
+        cls,
+        env: CompileEnvironment,
+        configs: Sequence[Config],
+    ) -> list[Config]:
+        """Preserve rank zero and deduplicate the tail by live ConfigSpec identity."""
+        if not configs:
+            return []
+        result = [configs[0]]
+        primary = cls._canonical_seed_config(env, configs[0])
+        seen = {primary} if primary is not None else set()
+        for config in configs[1:]:
+            normalized = cls._canonical_seed_config(env, config)
+            if normalized is None or normalized in seen:
+                continue
+            seen.add(normalized)
+            result.append(config)
+        return result
+
+    @classmethod
+    def _canonical_seed_config(
+        cls,
+        env: CompileEnvironment,
+        config: Config,
+    ) -> Config | None:
+        """Fill omitted fields and return the config's live-spec identity."""
+        try:
+            return _materialize_config(
+                config.config,
+                config_spec=env.config_spec,
+            )
+        except (
+            InvalidConfig,
+            ValueError,
+            TypeError,
+            KeyError,
+            AssertionError,
+        ):
+            return None
+
+    @classmethod
+    def _focal_seed_configs(
+        cls,
+        env: CompileEnvironment,
+        mm: KernelMatmulFact,
+        proposals: dict[int, MatmulProposal],
+        *,
+        exclude: Collection[Config] = (),
+    ) -> list[Config]:
+        """Default-filled focal configs in stable dot order, canonically deduplicated."""
+        seen = {
+            normalized
+            for config in exclude
+            if (
+                normalized := cls._canonical_seed_config(
+                    env,
+                    config,
+                )
+            )
+            is not None
         }
+        result = []
+        for index, proposal in proposals.items():
+            blocks = cls._reference_block_sizes(env.config_spec)
+            fact = mm.matmuls[index].fact
+            targets: dict[int, int] = {}
+            for position in (2, 0, 1):  # shared knob priority: K, M, N
+                block_id = (fact.m_block_id, fact.n_block_id, fact.k_block_id)[position]
+                if block_id is not None:
+                    targets.setdefault(block_id, proposal[position])
+            for block_id, target in targets.items():
+                cls._set_seed_block(env, blocks, block_id, target)
+
+            draft = MatmulSeedDraft(blocks, proposal[3], proposal[4], proposal[5])
+            config = cls._canonical_seed_config(
+                env,
+                cls._emit_seed_draft(
+                    draft,
+                    l2_groupings=cls._l2_groupings_for_site(
+                        env,
+                        mm.matmuls[index].site,
+                        proposal[5],
+                    ),
+                ),
+            )
+            if config is None or config in seen:
+                continue
+            seen.add(config)
+            result.append(config)
+        return result
 
     @classmethod
     def _multi_ranked(cls, env: CompileEnvironment) -> list[Config]:
+        from ...runtime import get_num_sm
+
         mm = env.config_spec.kernel_matmul_fact
         if mm is None:
             return []
-        draft = cls._draft(env, mm)
+        num_sm = max(1, get_num_sm(env.device))
+        corrected_proposals = cls._proposals(
+            env,
+            mm,
+            num_sm=num_sm,
+            precondition=True,
+        )
+        raw_proposals = cls._proposals(
+            env,
+            mm,
+            num_sm=num_sm,
+            precondition=False,
+        )
+        draft = cls._draft(env, mm, corrected_proposals, num_sm)
         if draft is None:
             return []
-        draft["num_stages"], draft["num_warps"] = cls._fixup_candidate_resources(
-            env,
-            draft["block_sizes"],
-            draft["num_stages"],
-            draft["num_warps"],
-            num_sm=draft["_num_sm"],
-            shrinkable=[bid for bid, _users in mm.knob_users],
-            largest_first=True,
+        cls._fixup(env, mm, draft, num_sm=num_sm)
+        ranked = [cls._emit_seed_draft(draft)]
+
+        merge_first = cls._draft(env, mm, raw_proposals, num_sm)
+        if merge_first is not None:
+            cls._fixup(env, mm, merge_first, num_sm=num_sm)
+            ranked.append(cls._emit_seed_draft(merge_first))
+
+        axis_ids = cls._seed_axis_ids(
+            {
+                block_id: tuple(axis for _index, axis in users)
+                for block_id, users in mm.knob_users
+            }
         )
-        primary: dict[str, Any] = {
-            "block_sizes": list(draft["block_sizes"]),
-            "num_warps": draft["num_warps"],
-            "num_stages": draft["num_stages"],
-        }
-        ranked = [Config(**primary)]
-        # One shallower-pipeline alternate, the same neighbour front end 1 plants: stage
-        # depth is the knob whose optimum the budget model resolves least sharply.
-        if draft["num_stages"] > 2:
-            alt = dict(primary)
-            alt["num_stages"] = draft["num_stages"] - 1
-            ranked.append(Config(**alt))
-        return dedupe_configs(ranked)
+        register_drafts = cls._register_mma_seed_drafts(
+            env,
+            mm,
+            draft,
+            num_sm=num_sm,
+            axis_ids=axis_ids,
+        )
+        register_mma = [cls._emit_seed_draft(seed) for seed in register_drafts]
+
+        optimistic_expanded: list[Config] = []
+        optimistic_merge = cls._draft(
+            env,
+            mm,
+            corrected_proposals,
+            num_sm,
+            resource_policy="optimistic",
+        )
+        if optimistic_merge is not None:
+            optimistic_expanded = [
+                cls._emit_seed_draft(seed)
+                for seed in cls._optimistic_expanded_seed_drafts(
+                    env,
+                    mm,
+                    optimistic_merge,
+                    num_sm=num_sm,
+                    axis_ids=axis_ids,
+                )
+            ]
+
+        frontier = [
+            cls._emit_seed_draft(seed)
+            for seed in cls._optimistic_frontier_seed_drafts(
+                env,
+                mm,
+                draft,
+                register_drafts,
+                num_sm=num_sm,
+                axis_ids=axis_ids,
+            )
+        ]
+        persistent = cls._persistent_seed_config(
+            env,
+            draft,
+            num_sm=num_sm,
+        )
+        fixed_tail = (
+            register_mma
+            + optimistic_expanded
+            + frontier
+            + ([persistent] if persistent is not None else [])
+        )
+        ranked = cls._dedupe_seed_pool(env, (*ranked, *fixed_tail))
+        ranked.extend(
+            cls._focal_seed_configs(
+                env,
+                mm,
+                raw_proposals,
+                exclude=ranked,
+            )
+        )
+        return ranked[: cls.COMPILER_SEED_CAP]
 
     @classmethod
     def get_seed_config(

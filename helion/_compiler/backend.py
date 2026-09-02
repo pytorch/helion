@@ -440,6 +440,10 @@ class Backend(abc.ABC):
         """Called during `type_propagation` when processing a `load` memory op on fake tensors"""
         return
 
+    def normalize_input_fake_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Return the tensor metadata used while tracing a kernel input."""
+        return tensor
+
     def fake_subscript_shape(
         self,
         tensor: torch.Tensor,
@@ -708,6 +712,11 @@ class Backend(abc.ABC):
     def lane_offset_expr(self, lane_var: str) -> str:
         """Cast a lane variable for addition to an index expression."""
         raise exc.BackendUnsupported(self.name, "lane offset")
+
+    def thread_index_expr(self, *, axis: int) -> str:
+        """Bare thread index expression (no elements-per-thread stride),
+        used by the strided lane layout."""
+        raise exc.BackendUnsupported(self.name, "thread index")
 
     def reduction_combine_expr(
         self,

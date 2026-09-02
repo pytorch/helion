@@ -150,7 +150,10 @@ def _update_host_aliases(stmt: ast.stmt, aliases: dict[str, str]) -> None:
 
 
 def mark_intra_loop_raw_barriers(
-    graphs: list[GraphInfo], root_graph_ids: list[int]
+    graphs: list[GraphInfo],
+    root_graph_ids: list[int],
+    *,
+    mark_in_divergent_control_flow: bool = True,
 ) -> None:
     """Mark loads that read storage written earlier in a device-loop body.
 
@@ -165,20 +168,34 @@ def mark_intra_loop_raw_barriers(
     guarantee to a store->load *within* one loop body.
 
     We mark the load's FX node; the Triton ``load`` codegen emits a
-    ``tl.debug_barrier()`` before it. The barrier flushes every prior write in the
+    ``tl.debug_barrier()`` before it (the CuTe codegen a
+    ``cute.arch.sync_threads()``). The barrier flushes every prior write in the
     block, so once emitted the pending-write set is cleared and later loads need a
     new store to re-arm. Storage identity comes from the fake tensor's underlying
     storage, so distinct FX nodes for aliases and views compare equal. The walk
     follows Helion control-flow subgraphs and merges pending writes at joins.
+
+    ``mark_in_divergent_control_flow=False`` skips marking loads inside ``hl.if``
+    / while bodies: a CuTe SIMT branch condition can vary per thread, and a
+    convergent CTA barrier inside a divergent branch deadlocks.  Loop bodies stay
+    markable — Helion device-loop trip structure is uniform across the CTA.
     """
-    marker = _IntraLoopRawBarrierMarker(graphs)
+    marker = _IntraLoopRawBarrierMarker(
+        graphs, mark_in_divergent_control_flow=mark_in_divergent_control_flow
+    )
     for graph_id in root_graph_ids:
         marker.run_graph(graph_id, set())
 
 
 class _IntraLoopRawBarrierMarker:
-    def __init__(self, graphs: list[GraphInfo]) -> None:
+    def __init__(
+        self,
+        graphs: list[GraphInfo],
+        *,
+        mark_in_divergent_control_flow: bool = True,
+    ) -> None:
         self.graphs = graphs
+        self.mark_in_divergent_control_flow = mark_in_divergent_control_flow
 
     def _storage_ids(self, graph_id: int, obj: object) -> set[int]:
         import torch
@@ -211,7 +228,9 @@ class _IntraLoopRawBarrierMarker:
             result.update(self._storage_ids(graph_id, arg))
         return result
 
-    def run_graph(self, graph_id: int, written: set[int]) -> set[int]:
+    def run_graph(
+        self, graph_id: int, written: set[int], *, divergent: bool = False
+    ) -> set[int]:
         from ..language import memory_ops
         from ..language._tracing_ops import _for_loop
         from ..language._tracing_ops import _for_loop_step
@@ -232,6 +251,10 @@ class _IntraLoopRawBarrierMarker:
                 if node.meta.get(INTRA_LOOP_RAW_BARRIER_META):
                     pending.clear()
                 elif pending & self._storage_ids(graph_id, node.args[0]):
+                    if divergent and not self.mark_in_divergent_control_flow:
+                        # Cannot place a convergent barrier here; leave the
+                        # hazard pending so a later uniform load re-arms it.
+                        continue
                     node.meta[INTRA_LOOP_RAW_BARRIER_META] = True
                     pending.clear()
                 continue
@@ -240,7 +263,7 @@ class _IntraLoopRawBarrierMarker:
                 assert isinstance(if_graph_id, int)
                 if_info = self.graphs[if_graph_id]
                 assert isinstance(if_info, IfGraphInfo)
-                if_pending = self.run_graph(if_graph_id, pending)
+                if_pending = self.run_graph(if_graph_id, pending, divergent=True)
                 if if_info.else_branch is None:
                     pending |= if_pending
                 else:
@@ -249,7 +272,9 @@ class _IntraLoopRawBarrierMarker:
                         if isinstance(if_info.else_branch, int)
                         else if_info.else_branch.graph_id
                     )
-                    else_pending = self.run_graph(else_graph_id, pending)
+                    else_pending = self.run_graph(
+                        else_graph_id, pending, divergent=True
+                    )
                     pending = if_pending | else_pending
                 continue
             if node.target in (_for_loop, _for_loop_step):
@@ -258,7 +283,9 @@ class _IntraLoopRawBarrierMarker:
                 loop_info = self.graphs[loop_graph_id]
                 assert isinstance(loop_info, ForLoopGraphInfo)
                 loop_input = set() if loop_info.needs_barrier_before else pending
-                loop_pending = self.run_graph(loop_graph_id, loop_input)
+                loop_pending = self.run_graph(
+                    loop_graph_id, loop_input, divergent=divergent
+                )
                 # Without a pre-loop barrier, zero iterations preserve the input state.
                 pending = (
                     loop_pending
@@ -271,8 +298,12 @@ class _IntraLoopRawBarrierMarker:
                 assert isinstance(body_graph_id, int)
                 body_info = self.graphs[body_graph_id]
                 assert isinstance(body_info, WhileLoopGraphInfo)
-                condition_pending = self.run_graph(body_info.cond_graph_id, pending)
-                body_pending = self.run_graph(body_graph_id, condition_pending)
+                condition_pending = self.run_graph(
+                    body_info.cond_graph_id, pending, divergent=True
+                )
+                body_pending = self.run_graph(
+                    body_graph_id, condition_pending, divergent=True
+                )
                 # The condition executes at least once; the body may not execute.
                 pending = condition_pending | body_pending
         return pending

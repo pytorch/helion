@@ -1368,6 +1368,7 @@ class CompileEnvironment:
             result = self.fake_mode.fake_tensor_converter.from_real_tensor(
                 self.fake_mode, tensor, shape_env=self.shape_env, source=source
             )
+        result = self.backend.normalize_input_fake_tensor(result)
         previous_source = self.input_sources.get(result)
         if previous_source is not None and previous_source != source:
             self._ambiguous_tensor_input_source_ids.add(id(result))

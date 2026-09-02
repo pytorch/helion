@@ -1273,6 +1273,9 @@ class PopulationBasedSearch(BaseSearch):
     def _final_rebenchmark_cache_policy(self) -> dict[str, object]:
         return {
             "enabled": True,
+            # 2: the non-isolated finalist shootout uses paired interleaved
+            # timing instead of sequential steady windows.
+            "timing_version": 2,
             "top_k": self._final_rebenchmark_top_k(),
             "target_ms": self._final_rebenchmark_target_ms(),
             "isolated": self._final_rebenchmark_use_isolated(),
@@ -2010,11 +2013,13 @@ class PopulationBasedSearch(BaseSearch):
             return min(live_finalists, key=performance, default=fallback)
 
         before = min(finalists, key=performance)
-        # Finalists have already survived the normal benchmark path. Measure the
-        # last shortlist with steady per-candidate timing by default so the
-        # selected config matches standalone benchmark replay. If a user
-        # explicitly opts back into isolated finalist timing, keep suspicious
-        # confirmation enabled for the in-process fallback.
+        # Finalists have already survived the normal benchmark path. Time the
+        # last shortlist with the paired event-based interleaved bench so
+        # clock/thermal drift between per-candidate timing windows cannot
+        # mis-rank near-tied finalists (unpaired sequential steady windows
+        # measured 1-3% apart on identical configs). If a user explicitly
+        # opts into isolated finalist timing, keep suspicious confirmation
+        # enabled for the in-process fallback.
         use_isolated = self._final_rebenchmark_use_isolated()
         self.rebenchmark(
             finalists,
@@ -2022,7 +2027,7 @@ class PopulationBasedSearch(BaseSearch):
             target_ms=self._final_rebenchmark_target_ms(),
             use_isolated=use_isolated,
             confirm_suspicious=use_isolated,
-            use_interleaved=False,
+            use_interleaved=not use_isolated,
         )
         live_finalists = [member for member in finalists if math.isfinite(member.perf)]
         if not live_finalists:
@@ -2175,7 +2180,14 @@ class PopulationBasedSearch(BaseSearch):
                         if _backend is not None
                         else None
                     ) or interleaved_bench
-                    benchmark_function = interleaved_benchmark
+                    # ``repeat`` is sized from candidate kernel time alone; for
+                    # microsecond kernels the fixed per-call overhead dominates
+                    # and the capped repeat count can take minutes of wall
+                    # clock. Keep the whole pass near the sequential-window
+                    # budget it replaced (target_ms per candidate).
+                    benchmark_function = functools.partial(
+                        interleaved_benchmark, max_total_ms=target_ms * len(members)
+                    )
                 if self.settings.autotune_progress_bar:
                     new_timings = benchmark_function(iterator, repeat=repeat, desc=desc)
                 else:

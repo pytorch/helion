@@ -15,6 +15,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from contextlib import suppress
 import contextvars
+import ctypes
 from dataclasses import dataclass
 from dataclasses import field
 import hashlib
@@ -25,6 +26,7 @@ import linecache
 import logging
 import os
 import sys
+import threading
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Literal
@@ -1359,7 +1361,12 @@ def _create_cute_wrapper(
     # occupancy and enables the reallocation (=1 avoids the smem-carveout path >1 would
     # trigger). NOT applied to ws_overlap (256-thread): forcing 1 CTA/SM there cuts its
     # 2-blocks/SM occupancy and regresses it ~4pp.
-    if any(plan.get("topology") == "fa4" for plan in wrapper_plans):
+    explicit_min_blocks = getattr(
+        cast("Any", cute_kernel), "_helion_cute_min_blocks_per_mp", None
+    )
+    if isinstance(explicit_min_blocks, int) and explicit_min_blocks > 0:
+        launch_suffix += f", min_blocks_per_mp={explicit_min_blocks}"
+    elif any(plan.get("topology") == "fa4" for plan in wrapper_plans):
         launch_suffix += ", min_blocks_per_mp=1"
     body.extend(
         (
@@ -4353,6 +4360,405 @@ def _cute_last_launch_arg_guard(
     )
 
 
+_CUTE_FASTPATH_MISS: tuple[bool, None] = (False, None)
+
+
+class _CuteFastRelaunch:
+    """Metadata-guarded, zero-marshalling relaunch of a compiled cute kernel.
+
+    The CuTe DSL's per-call path (schema/arg cache key construction plus
+    ``generate_execution_args`` marshalling: ctypes storage allocation and
+    pointer extraction, ~25-45us of Python) recomputes almost exactly the
+    same values on every call — for a given compiled kernel only the tensor
+    DATA POINTERS and the CUDA stream can change between calls once the
+    tensor metadata (dtype/shape/stride/device), the scalars, the grid, and
+    the block are pinned.  Real workloads allocate fresh output tensors on
+    every call, so pointer-keyed caches miss constantly; for O(30us)
+    memory-bound kernels the marshalling then starves the GPU.
+
+    This caches the marshalled ``exe_args`` once and per call only:
+
+    1. checks the metadata guard (no pointer equality),
+    2. writes each tensor arg's ``data_ptr()`` into its probe-verified
+       ``exe_args`` slot (tensor pointers marshal by value),
+    3. refreshes the CUDA stream slot(s), and
+    4. invokes the executor's ``run_compiled_program``.
+
+    Slot discovery is probe-verified at build time: tensor slots by
+    re-marshalling with per-tensor shifted pointers, stream slots by
+    re-marshalling with a different stream handle (handling both by-value
+    slots and by-reference ctypes cells).  Anything unexpected falls back
+    to the full DSL call path.
+
+    The current stream is sampled fresh on every call via
+    ``torch._C._cuda_getCurrentRawStream`` (same primitive the Triton
+    launcher uses), so CUDA-graph capture streams are honored.
+    """
+
+    __slots__ = (
+        "arg_count",
+        "block",
+        "by_ref_writers",
+        "by_val_slots",
+        "compile_options",
+        "constexpr_flags",
+        "device_index",
+        "exe_args",
+        "executor",
+        "grid",
+        "keepalive",
+        "last_raw",
+        "lock",
+        "scalar_guards",
+        "tensor_guards",
+        "tensor_slots",
+    )
+
+    def __init__(
+        self,
+        *,
+        executor: object,
+        exe_args: list[object],
+        tensor_guards: tuple[
+            tuple[int, str, int | None, torch.dtype, tuple[int, ...], tuple[int, ...]],
+            ...,
+        ],
+        scalar_guards: tuple[_CuteLastScalarArgGuard, ...],
+        constexpr_flags: tuple[bool, ...],
+        tensor_slots: tuple[tuple[int, int | None, object | None], ...],
+        by_ref_writers: list[object],
+        by_val_slots: list[int],
+        arg_count: int,
+        grid: tuple[int, int, int],
+        block: tuple[int, int, int],
+        compile_options: str | None,
+        device_index: int,
+        last_raw: int,
+        keepalive: tuple[object, ...],
+    ) -> None:
+        self.executor = executor
+        self.exe_args = exe_args
+        self.tensor_guards = tensor_guards
+        self.scalar_guards = scalar_guards
+        self.constexpr_flags = constexpr_flags
+        self.tensor_slots = tensor_slots
+        self.by_ref_writers = by_ref_writers
+        self.by_val_slots = by_val_slots
+        self.arg_count = arg_count
+        self.grid = grid
+        self.block = block
+        self.compile_options = compile_options
+        self.device_index = device_index
+        self.last_raw = last_raw
+        self.keepalive = keepalive
+        self.lock = threading.Lock()
+
+    def try_launch(
+        self,
+        args: tuple[object, ...],
+        grid: tuple[int, int, int],
+        block: tuple[int, int, int],
+        compile_options: str | None,
+    ) -> tuple[bool, object]:
+        if (
+            len(args) != self.arg_count
+            or grid != self.grid
+            or block != self.block
+            or compile_options != self.compile_options
+        ):
+            return _CUTE_FASTPATH_MISS
+        for (
+            index,
+            device_type,
+            device_index,
+            dtype,
+            shape,
+            stride,
+        ) in self.tensor_guards:
+            tensor = args[index]
+            if (
+                not isinstance(tensor, torch.Tensor)
+                or tensor.dtype is not dtype
+                or tensor.device.type != device_type
+                or tensor.device.index != device_index
+                or tensor.size() != shape
+                or tensor.stride() != stride
+            ):
+                return _CUTE_FASTPATH_MISS
+        for guard in self.scalar_guards:
+            if not guard.matches(args, self.constexpr_flags):
+                return _CUTE_FASTPATH_MISS
+        raw = torch._C._cuda_getCurrentRawStream(self.device_index)
+        with self.lock:
+            exe_args = self.exe_args
+            # tensor_slots entries: (arg_index, exe_slot_or_None, writer_or_None)
+            for index, slot, writer in self.tensor_slots:
+                ptr = cast("torch.Tensor", args[index]).data_ptr()
+                if writer is not None:
+                    cast("Any", writer).value = ptr
+                else:
+                    exe_args[cast("int", slot)] = ptr
+            if raw != self.last_raw:
+                for stream_writer in self.by_ref_writers:
+                    cast("Any", stream_writer).value = raw
+                for stream_slot in self.by_val_slots:
+                    exe_args[stream_slot] = raw
+                self.last_raw = raw
+            return (True, cast("Any", self.executor).run_compiled_program(exe_args))
+
+
+def _cute_maybe_build_fastpath(
+    cute_kernel: object,
+    args: tuple[object, ...],
+    grid: tuple[int, int, int],
+    block: tuple[int, int, int],
+    compile_options: str | None,
+    launch: _CuteLaunchArgCacheEntry,
+    compiled: object,
+) -> None:
+    """Build (once per kernel) the fast relaunch state after a successful
+    slow-path launch.  ``False`` marks a permanent probe failure so the
+    slow path is not re-probed on every call."""
+    if getattr(cast("Any", cute_kernel), "_helion_cute_fastpath", None) is not None:
+        return
+    state = _cute_build_fast_relaunch(
+        cute_kernel, args, grid, block, compile_options, launch, compiled
+    )
+    cast("Any", cute_kernel)._helion_cute_fastpath = (
+        state if state is not None else False
+    )
+
+
+def _cute_build_fast_relaunch(
+    cute_kernel: object,
+    args: tuple[object, ...],
+    grid: tuple[int, int, int],
+    block: tuple[int, int, int],
+    compile_options: str | None,
+    launch: _CuteLaunchArgCacheEntry,
+    compiled: object,
+) -> _CuteFastRelaunch | None:
+    if not isinstance(compiled, _CompiledCuteLauncher):
+        return None
+    dsl_fn = cast("Any", compiled)._compiled
+    if dsl_fn is None:
+        return None
+    execution_args = getattr(dsl_fn, "execution_args", None)
+    executor = getattr(dsl_fn, "_default_executor", None)
+    if (
+        execution_args is None
+        or not hasattr(execution_args, "generate_execution_args")
+        or executor is None
+        or not hasattr(executor, "run_compiled_program")
+    ):
+        return None
+    # Kernels with grouped-scheduler plans, dynamic tensormaps, or launcher-
+    # owned side tensors have per-call state beyond (pointers, stream);
+    # leave them on the full path.
+    if launch.owned_tensors or launch.grouped_static_metadata:
+        return None
+    if _tcgen05_grouped_static_plans(cute_kernel):
+        return None
+    if _cute_dynamic_tensormap_contexts(cute_kernel, args):
+        return None
+    device_index: int | None = None
+    tensors: list[tuple[int, torch.Tensor]] = []
+    for index, arg in enumerate(args):
+        if isinstance(arg, torch.Tensor):
+            if arg.device.type != "cuda":
+                return None
+            if device_index is None:
+                device_index = arg.device.index
+            tensors.append((index, arg))
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    try:
+        cuda_driver = importlib.import_module("cuda.bindings.driver")
+        gmem_space, make_ptr_obj, _current_stream_obj = _get_cute_launcher_imports()
+        make_ptr = cast("Any", make_ptr_obj)
+        raw0 = int(torch._C._cuda_getCurrentRawStream(device_index))
+        # Clone the pointer entries into fastpath-owned objects: pointer
+        # args marshal by reference into per-object cached ctypes cells,
+        # and the per-call patch pokes those cells — they must not be
+        # shared with the slow path's ``launch.launch_args`` objects.
+        orig_base = tuple(launch.launch_args)
+        base_ptr_positions = [
+            i
+            for i, entry in enumerate(orig_base)
+            if not isinstance(entry, (int, float, bool))
+        ]
+        if len(base_ptr_positions) != len(tensors):
+            return None
+        own_base = list(orig_base)
+        for k, (_arg_index, tensor) in enumerate(tensors):
+            own_base[base_ptr_positions[k]] = make_ptr(
+                cast("Any", _torch_dtype_to_cutlass(tensor.dtype)),
+                int(tensor.data_ptr()),
+                gmem_space,
+                assumed_align=16,
+            )
+        base = tuple(own_base)
+        stream_a = cuda_driver.CUstream(raw0)
+        exe1, adapted1 = execution_args.generate_execution_args((*base, stream_a), {})
+        exe2, _adapted2 = execution_args.generate_execution_args((*base, stream_a), {})
+
+        def norm(value: object) -> object:
+            return value.value if isinstance(value, ctypes.c_void_p) else value
+
+        n1 = [norm(v) for v in exe1]
+        n2 = [norm(v) for v in exe2]
+        if len(n2) != len(n1):
+            return None
+        # Scalar args (eps, grid dims, ...) marshal into FRESH ctypes cells
+        # on every call, so their exe_args entries are unstable addresses
+        # while their contents are fixed (the metadata guard pins every
+        # scalar value).  Restrict slot detection to the slots that are
+        # stable across two identical marshals; unstable slots are reused
+        # from ``exe1`` (their storage stays alive via ``adapted1``).
+        stable = [a == b for a, b in zip(n1, n2, strict=True)]
+
+        def deref(addr: object) -> int | None:
+            # Only dereference values that plausibly ARE host heap
+            # addresses (ctypes cell storage): 8-aligned and above the
+            # low canonical range.  Large by-value integers (e.g. tensor
+            # extents) must never be dereferenced — from_address on a
+            # non-address segfaults uncatchably.
+            if isinstance(addr, int) and addr > (1 << 40) and addr % 8 == 0:
+                return int(ctypes.c_uint64.from_address(addr).value)
+            return None
+
+        # --- Tensor-pointer slots: re-marshal with per-tensor shifted
+        # pointer clones and locate each tensor's slot by its shifted
+        # value.  Handles both marshalling conventions: by value (the slot
+        # holds the device pointer itself) and by reference (the slot holds
+        # the address of a per-object ctypes cell containing it).
+        alt_base = list(base)
+        shifts: list[int] = []
+        for k, (_arg_index, tensor) in enumerate(tensors):
+            shift = 512 * (k + 1)
+            shifts.append(shift)
+            alt_base[base_ptr_positions[k]] = make_ptr(
+                cast("Any", _torch_dtype_to_cutlass(tensor.dtype)),
+                int(tensor.data_ptr()) + shift,
+                gmem_space,
+                assumed_align=16,
+            )
+        exe4, _adapted4 = execution_args.generate_execution_args(
+            (*tuple(alt_base), stream_a), {}
+        )
+        n4 = [norm(v) for v in exe4]
+        if len(n4) != len(n1):
+            return None
+        tensor_slots: list[tuple[int, int | None, object | None]] = []
+        for k, (arg_index, tensor) in enumerate(tensors):
+            ptr = int(tensor.data_ptr())
+            want = ptr + shifts[k]
+            by_val = [
+                i for i, v in enumerate(n4) if stable[i] and v == want and n1[i] == ptr
+            ]
+            if len(by_val) == 1:
+                tensor_slots.append((arg_index, by_val[0], None))
+                continue
+            by_ref = [
+                i
+                for i in range(len(n4))
+                if stable[i] and deref(n1[i]) == ptr and deref(n4[i]) == want
+            ]
+            if len(by_ref) == 1:
+                tensor_slots.append(
+                    (
+                        arg_index,
+                        None,
+                        ctypes.c_uint64.from_address(cast("int", n1[by_ref[0]])),
+                    )
+                )
+                continue
+            return None
+
+        # --- Stream slot(s): re-marshal with a different (never-launched)
+        # handle.
+        alt_raw = raw0 + 0x40
+        stream_b = cuda_driver.CUstream(alt_raw)
+        exe3, _adapted3 = execution_args.generate_execution_args((*base, stream_b), {})
+        n3 = [norm(v) for v in exe3]
+        if len(n3) != len(n1):
+            return None
+        slots = [
+            i
+            for i, (a, b) in enumerate(zip(n1, n3, strict=True))
+            if stable[i] and a != b
+        ]
+        # The wrapper takes ONE stream parameter; its handle can surface in
+        # at most a couple of exe slots (a by-value copy plus a by-ref
+        # cell).  More differing slots means the marshalling isn't the
+        # shape we probe-verified — fall back.
+        if not slots or len(slots) > 2:
+            return None
+        by_ref_writers: list[object] = []
+        by_val_slots: list[int] = []
+        for i in slots:
+            a, b = n1[i], n3[i]
+            if a == raw0 and b == alt_raw:
+                by_val_slots.append(i)
+                continue
+            # By-reference: the slot holds the address of an 8-byte cell
+            # containing the handle.  Verify BOTH probes' cells before
+            # trusting the address.
+            if deref(a) == raw0 and deref(b) == alt_raw:
+                by_ref_writers.append(ctypes.c_uint64.from_address(cast("int", a)))
+                continue
+            return None
+
+        # --- Metadata guards (no pointer equality).
+        constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
+        tensor_guards: list[
+            tuple[int, str, int | None, torch.dtype, tuple[int, ...], tuple[int, ...]]
+        ] = []
+        scalar_guards: list[_CuteLastScalarArgGuard] = []
+        for index, arg in enumerate(args):
+            if isinstance(arg, torch.Tensor):
+                tensor_guards.append(
+                    (
+                        index,
+                        arg.device.type,
+                        arg.device.index,
+                        arg.dtype,
+                        tuple(int(arg.size(d)) for d in range(arg.ndim)),
+                        tuple(int(arg.stride(d)) for d in range(arg.ndim)),
+                    )
+                )
+                continue
+            scalar_kind, scalar_value = _normalize_cute_scalar(arg)
+            scalar_guards.append(
+                _CuteLastScalarArgGuard(
+                    index=index,
+                    is_constexpr=index < len(constexpr_flags)
+                    and constexpr_flags[index],
+                    scalar_kind=scalar_kind,
+                    scalar_value=_cute_scalar_cache_value(scalar_kind, scalar_value),
+                )
+            )
+        return _CuteFastRelaunch(
+            executor=executor,
+            exe_args=list(exe1),
+            tensor_guards=tuple(tensor_guards),
+            scalar_guards=tuple(scalar_guards),
+            constexpr_flags=tuple(constexpr_flags),
+            tensor_slots=tuple(tensor_slots),
+            by_ref_writers=by_ref_writers,
+            by_val_slots=by_val_slots,
+            arg_count=len(args),
+            grid=grid,
+            block=block,
+            compile_options=compile_options,
+            device_index=device_index,
+            last_raw=raw0,
+            keepalive=(base, stream_a, adapted1, exe1),
+        )
+    except Exception:
+        return None
+
+
 def _cute_last_launch_cache_entry(
     cute_kernel: object,
     args: tuple[object, ...],
@@ -4436,6 +4842,17 @@ def default_cute_launcher(
         return None
 
     args_tuple = tuple(args)
+    # Metadata-guarded fast relaunch: skips the pointer-keyed caches AND the
+    # DSL's per-call marshalling entirely (fresh output allocations change
+    # tensor pointers on every call in real workloads, so pointer-keyed
+    # caching alone still pays the full marshalling cost each time).
+    fastpath = getattr(cast("Any", cute_kernel), "_helion_cute_fastpath", None)
+    if isinstance(fastpath, _CuteFastRelaunch):
+        hit, result = fastpath.try_launch(
+            args_tuple, grid_xyz, block_xyz, cute_compile_options
+        )
+        if hit:
+            return result
     last_launch = _cute_last_launch_cache_entry(
         cute_kernel,
         args_tuple,
@@ -4464,6 +4881,18 @@ def default_cute_launcher(
     # be issued there and not on a stale stream baked into the cached args.
     result = cast("Any", compiled)(*launch.launch_args, _cute_current_stream())
     _set_cute_last_launch_cache_entry(
+        cute_kernel,
+        args_tuple,
+        grid_xyz,
+        block_xyz,
+        cute_compile_options,
+        launch,
+        compiled,
+    )
+    # Build the metadata-guarded fast relaunch once the compiled artifact
+    # exists (first successful launch); later calls with fresh output
+    # allocations then skip the marshalling path entirely.
+    _cute_maybe_build_fastpath(
         cute_kernel,
         args_tuple,
         grid_xyz,

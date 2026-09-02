@@ -274,7 +274,7 @@ class TestLLMGuidedSearch(TestCase):
             torch.randn([128, 128], device=DEVICE, dtype=torch.float16),
         )
         bound = _get_examples_matmul().bind(args)
-        default_config = bound.config_spec.default_config()
+        default_config = bound.config_spec.autotune_reference_config()
         search = LLMGuidedSearch(
             bound,
             args,

@@ -16,6 +16,7 @@ import sympy
 import torch
 
 from ... import exc
+from .memory_access import tensor_origin_key
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -75,6 +76,8 @@ class NonePattern(IndexingPattern):
 class TensorIndexPattern(IndexingPattern):
     """Tensor-valued index - no tiling. Resolved for indirect load/store codegen."""
 
+    index_ndim: int = 1
+
 
 @dataclass
 class ContiguousRangeIndexPattern(IndexingPattern):
@@ -115,13 +118,6 @@ def plan_tiling(
         _analyze_indexing_expressions(graph_info, config, local_access_keys)
 
 
-def _tensor_origin_key(tensor: torch.Tensor) -> str | int:
-    from ..host_function import HostFunction
-
-    origin = HostFunction.current().tensor_to_origin.get(tensor)
-    return origin.host_str() if origin is not None else id(tensor)
-
-
 def _collect_local_access_keys(graph: torch.fx.Graph) -> set[str | int]:
     from ...language import memory_ops
     from ...language.atomic_ops import ATOMIC_OPS
@@ -135,7 +131,7 @@ def _collect_local_access_keys(graph: torch.fx.Graph) -> set[str | int]:
         if isinstance(tensor_arg, torch.fx.Node):
             tensor = tensor_arg.meta.get("val")
             if isinstance(tensor, torch.Tensor):
-                local_access_keys.add(_tensor_origin_key(tensor))
+                local_access_keys.add(tensor_origin_key(tensor))
     return local_access_keys
 
 
@@ -252,7 +248,7 @@ def _analyze_remote_operand(
 
     device_fn = DeviceFunction.current()
     tensor_id = id(tensor)
-    tensor_key = _tensor_origin_key(tensor)
+    tensor_key = tensor_origin_key(tensor)
     device_fn.mark_pallas_remote_copy_operand(tensor)
     if tensor_id not in device_fn.pallas_tensor_dim_tilings:
         device_fn.pallas_tensor_dim_tilings[tensor_id] = [
@@ -328,6 +324,7 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
 
     is_all_scalar = all(
         isinstance(p, (ArbitraryIndexPattern, TileBeginWithOffsetPattern, NonePattern))
+        or (isinstance(p, TensorIndexPattern) and p.index_ndim == 0)
         for p in indexing_patterns
     )
     has_contiguous_hbm_window = any(
@@ -735,7 +732,7 @@ def _detect_indexing_pattern(
         # A tensor-valued index that didn't match any arithmetic-of-tile
         # pattern is an indirect gather (e.g. table[idx, :]).
         if isinstance(idx_val, torch.Tensor):
-            return TensorIndexPattern()
+            return TensorIndexPattern(index_ndim=idx_val.ndim)
         # Indices produced by other FX nodes, such as indices[tile] used in
         # tensor-indexed atomics, are legal but cannot participate in Pallas
         # tiling.

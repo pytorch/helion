@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import statistics
+import sys
 import tempfile
 import time
 from typing import TYPE_CHECKING
@@ -234,12 +235,37 @@ def compute_repeat_generic(
     return max(min_repeat, min(max_repeat, max(1, repeat)))
 
 
+def _interleaved_repeat_cap(
+    fns: list[Callable[[], object]],
+    clear_cache: Callable[[], None],
+    max_total_ms: float,
+) -> int:
+    """Bound interleaved repeats by the measured cost of one full sweep.
+
+    Repeat counts are sized from candidate kernel time alone, but for
+    microsecond kernels the fixed per-call cost (L2 flush, launch and wrapper
+    overhead) dominates, so an unbounded repeat can take minutes of wall clock
+    on slow hosts. One timed sweep captures the true per-iteration cost.
+    """
+    synchronize_device()
+    start = time.perf_counter()
+    for fn in fns:
+        clear_cache()
+        fn()
+    synchronize_device()
+    sweep_ms = (time.perf_counter() - start) * 1000
+    if not math.isfinite(sweep_ms) or sweep_ms <= 0:
+        return sys.maxsize
+    return max(3, int(max_total_ms / sweep_ms))
+
+
 def interleaved_bench(
     fns: list[Callable[[], object]],
     *,
     repeat: int,
     desc: str | None = None,
     default_cudagraph: bool = False,
+    max_total_ms: float | None = None,
 ) -> list[float]:
     """
     Benchmark multiple functions at once, interleaving their executions to reduce
@@ -250,6 +276,8 @@ def interleaved_bench(
         fns: List of functions to benchmark
         repeat: Number of times to repeat each benchmark
         desc: Optional description for progress bar
+        max_total_ms: Optional wall-clock budget for the whole timed loop;
+            ``repeat`` is lowered so one measured sweep times ``repeat`` fits
     """
     from triton import runtime
 
@@ -262,6 +290,8 @@ def interleaved_bench(
     )
     clear_cache()
     di = runtime.driver.active.get_device_interface()  # type: ignore[attr-defined]
+    if max_total_ms is not None:
+        repeat = min(repeat, _interleaved_repeat_cap(fns, clear_cache, max_total_ms))
     start_events = [
         [di.Event(enable_timing=True) for _ in range(repeat)] for _ in range(len(fns))
     ]
@@ -307,6 +337,7 @@ def interleaved_bench_generic(
     repeat: int,
     desc: str | None = None,
     default_cudagraph: bool = False,  # accepted for API symmetry; wall-clock timing doesn't use CG
+    max_total_ms: float | None = None,
 ) -> list[float]:
     """
     Benchmark multiple functions using wall-clock timing.
@@ -319,6 +350,8 @@ def interleaved_bench_generic(
     synchronize_device()
 
     clear_l2 = _make_l2_cache_clearer()
+    if max_total_ms is not None:
+        repeat = min(repeat, _interleaved_repeat_cap(fns, clear_l2, max_total_ms))
     all_times: list[list[float]] = [[] for _ in range(len(fns))]
 
     iterator = iter_with_progress(

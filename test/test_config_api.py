@@ -217,7 +217,7 @@ class TestPallasLoadBufferCountConfig(TestCase):
         spec = self._config_spec(2)
         field = spec._flat_fields()["pallas_load_buffer_count"]
         self.assertEqual(field.default(), [1, 1])
-        self.assertEqual(field.pattern_neighbors([1, 1]), [[2, 1], [1, 2]])
+        self.assertEqual(field.pattern_neighbors([1, 1]), [[2, 1], [1, 2], [2, 2]])
         self.assertIn(
             ("pallas_load_buffer_count", *field.fingerprint()),
             spec.structural_fingerprint(),
@@ -233,6 +233,12 @@ class TestPallasLoadBufferCountConfig(TestCase):
         )
         spec.normalize(config)
         self.assertEqual(config.pallas_load_buffer_count, [2, 1])
+
+        unroll_config = helion.Config(
+            pallas_loop_type="unroll", pallas_load_buffer_count=[2, 1]
+        )
+        spec.normalize(unroll_config)
+        self.assertEqual(unroll_config.pallas_load_buffer_count, [2, 1])
 
     def test_inactive_field_is_ignored(self) -> None:
         cases = (

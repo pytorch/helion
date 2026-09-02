@@ -272,6 +272,9 @@ class LiveTile(NamedTuple):
     - ``stageable`` — for a loop-body load, whether its index is proven to
       vary with the enclosing loop. ``None`` means uncertain and is charged
       conservatively as stageable.
+    - ``promoted_lhs`` — this live value is the non-load LHS operand of a dot
+      and may require Triton's power-of-two TMEM promotion scratch. This is
+      independent of ``kind`` because a prior ``dot_out`` can also be an LHS.
     """
 
     dim_block_ids: tuple[int | None, ...]
@@ -279,6 +282,7 @@ class LiveTile(NamedTuple):
     itemsize: int
     kind: str
     stageable: bool | None = None
+    promoted_lhs: bool = False
 
 
 class SymbolicLoopBound(NamedTuple):
@@ -445,6 +449,11 @@ class KernelMatmulFact(NamedTuple):
       sequential (non-grid) loops. For a chunked recurrence this is the number of
       chunks, so ``sequential_loop_trips * fixed_k`` recovers the logical contraction
       length even though each dot only sees one chunk.
+    - ``live_dot_outputs`` — the live set at the step holding the most simultaneously
+      live dot-output tiles, including ancestor loop graphs.
+    - ``live_promoted_lhs`` — the peak transformed-LHS set after adding ancestor
+      loop graphs. Direct loads are excluded; values retain their original
+      ``kind`` so a dot output reused as another dot's LHS is counted in both roles.
     - ``live_tile_steps`` — the live tile set at EVERY step of the kernel's graphs, deduped.
       A register estimate resolves each step under the candidate block sizes and selects
       the peak by bytes.
@@ -464,6 +473,8 @@ class KernelMatmulFact(NamedTuple):
     matmuls: tuple[ResolvedMatmulFact, ...]
     knob_users: tuple[tuple[int, tuple[tuple[int, str], ...]], ...]
     sequential_loop_trips: int
+    live_dot_outputs: tuple[LiveTile, ...]
+    live_promoted_lhs: tuple[LiveTile, ...]
     live_tile_steps: tuple[tuple[LiveTile, ...], ...]
     pipelined_regions: tuple[PipelinedRegion, ...]
     resident_regions: tuple[ResidentRegion, ...]
@@ -818,6 +829,10 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cross_loop_schedule",
         "num_threads",
         "cute_vector_widths",
+        "cute_lane_layouts",
+        "cute_reduction_reloads",
+        "cute_cluster_n",
+        "cute_min_blocks_per_mp",
         "load_cache_modifiers",
         "store_cache_modifiers",
         "pallas_loop_type",
@@ -857,6 +872,10 @@ VALID_KEYS: frozenset[str] = frozenset(
         "pallas_indirect_access_mode",
         "pallas_pre_broadcast",
         "cute_vector_widths",
+        "cute_lane_layouts",
+        "cute_reduction_reloads",
+        "cute_cluster_n",
+        "cute_min_blocks_per_mp",
         *BACKEND_TUNABLE_KEYS,
         "advanced_controls_file",
         "epilogue_subtile",
@@ -916,6 +935,12 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
 # the same worker process.
 def get_valid_eviction_policies(backend_name: str) -> tuple[str, ...]:
     if backend_name == "triton" and not supports_amd_cdna_tunables():
+        return ("", "first", "last")
+    if backend_name == "cute":
+        # Lowered to ld.global L1 eviction hints
+        # (level1_eviction_priority=evict_first/evict_last) on the
+        # vectorized load sites.  Pays off for reload-from-gmem sweeps
+        # (keep re-read rows resident, evict on the final pass).
         return ("", "first", "last")
     return ("",)
 
@@ -1005,6 +1030,10 @@ class ConfigSpec:
         self.flatten_loops: BlockIdSequence[FlattenLoopSpec] = BlockIdSequence()
         self.reduction_loops: BlockIdSequence[ReductionLoopSpec] = BlockIdSequence()
         self.cute_vector_widths: BlockIdSequence[CuteVectorWidthSpec] = (
+            BlockIdSequence()
+        )
+        self.cute_lane_layouts: BlockIdSequence[CuteLaneLayoutSpec] = BlockIdSequence()
+        self.cute_reduction_reloads: BlockIdSequence[CuteReductionReloadSpec] = (
             BlockIdSequence()
         )
         self.range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = (
@@ -1416,6 +1445,9 @@ class ConfigSpec:
             self._normalize_cute_flash_default_sequence(config, "l2_groupings", 1)
             self._normalize_cute_flash_default_sequence(config, "num_threads", 0)
             self._normalize_cute_flash_default_sequence(config, "cute_vector_widths", 1)
+            self._normalize_cute_flash_default_sequence(
+                config, "cute_lane_layouts", "blocked"
+            )
             self._normalize_cute_flash_default_loop_orders(config)
             config.pop("epilogue_subtile", None)
         elif not self._is_cute_flash_config_envelope(config, block_size_targets):
@@ -1878,6 +1910,7 @@ class ConfigSpec:
             ("l2_groupings", 1),
             ("num_threads", 0),
             ("cute_vector_widths", 1),
+            ("cute_lane_layouts", "blocked"),
         ):
             value = config.get(key)
             if value and (
@@ -2353,6 +2386,8 @@ class ConfigSpec:
             ("loop_orders", self.loop_orders, False),
             ("reduction_loops", self.reduction_loops, True),
             ("cute_vector_widths", self.cute_vector_widths, True),
+            ("cute_lane_layouts", self.cute_lane_layouts, True),
+            ("cute_reduction_reloads", self.cute_reduction_reloads, True),
             ("range_unroll_factors", self.range_unroll_factors, True),
             ("range_warp_specializes", self.range_warp_specialize, True),
             ("range_num_stages", self.range_num_stages, True),
@@ -2493,8 +2528,16 @@ class ConfigSpec:
         ):
             nt_list = cast("list[int]", config.get("num_threads", []) or [])
             bs_list = cast("list[int]", config.get("block_sizes", []) or [])
+            # ``num_threads`` also carries per-rolled-rdim slots (the
+            # reduction's own thread count); only NON-reduction tile axes
+            # consume the budget the reduction competes for.  Tile slots
+            # are registered in ``block_sizes`` order, so pairing the i-th
+            # num_threads slot with block_sizes[i] stays valid for them.
+            reduction_block_ids = {spec.block_id for spec in self.reduction_loops}
             other_threads = 1
-            for i, _ in enumerate(self.num_threads):
+            for i, nt_spec in enumerate(self.num_threads):
+                if nt_spec.block_id in reduction_block_ids:
+                    continue
                 nt = nt_list[i] if i < len(nt_list) else 0
                 if not isinstance(nt, int) or nt <= 0:
                     bs = bs_list[i] if i < len(bs_list) else 1
@@ -2558,6 +2601,8 @@ class ConfigSpec:
             "flatten_loops",
             "reduction_loops",
             "cute_vector_widths",
+            "cute_lane_layouts",
+            "cute_reduction_reloads",
             "range_unroll_factors",
             "range_warp_specializes",
             "range_num_stages",
@@ -2682,7 +2727,7 @@ class ConfigSpec:
         if (
             self.supports_config_key("pallas_load_buffer_count")
             and self.has_pallas_inner_loops
-            and config.get("pallas_loop_type") == "fori_loop"
+            and config.get("pallas_loop_type") in ("fori_loop", "unroll")
         ):
             values = config.setdefault(
                 "pallas_load_buffer_count", self.pallas_load_buffer_count.default()
@@ -3169,13 +3214,19 @@ class ConfigSpec:
         self._shrink_for_numel_constraints(config)
         return config
 
+    def autotune_reference_config(self) -> helion.Config:
+        """Return the conservative fragment config used as the autotuning
+        reference."""
+        return self._base_default_config()
+
     def default_config(self) -> helion.Config:
+        """Return the config used for execution when autotuning is disabled."""
         if self.compiler_default_config is None:
-            return self._base_default_config()
+            return self.autotune_reference_config()
         # A promoted seed only specifies the knobs it cares about (e.g. block_sizes); layer it over
         # the full base defaults so every other key — including user register_tunable defaults — is
         # preserved rather than dropped.
-        merged = dict(self._base_default_config().config)
+        merged = dict(self.autotune_reference_config().config)
         merged.update(self.compiler_default_config.config)
         config = helion.Config.from_dict(merged)
         # Then normalize, so a promoted compiler default has the same canonical field set as the
@@ -3262,6 +3313,23 @@ class ConfigSpec:
                 )
             elif self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
+                # Rolled-reduction loop chunks are tunable on the SIMT path
+                # (LoopedReductionStrategy lane lattices).  Without this
+                # entry the chunk silently pins to its default and neither
+                # the seeds nor the search can change it.
+                if (
+                    self.supports_config_key("reduction_loops")
+                    and len(self.reduction_loops) > 0
+                ):
+                    fields["reduction_loops"] = self.reduction_loops
+                # Per-load-site L1 eviction hints (streamed rows want
+                # evict_first; re-read rows want evict_last until the
+                # final sweep).
+                if (
+                    self.supports_config_key("load_eviction_policies")
+                    and self.load_eviction_policies.length > 0
+                ):
+                    fields["load_eviction_policies"] = self.load_eviction_policies
                 # Universal pid emission honors ``loop_orders`` and the
                 # better order is shape-dependent. tcgen05 exposes the same
                 # field from CuteTcgen05Config.flat_fields().
@@ -3281,6 +3349,48 @@ class ConfigSpec:
                     and len(self.cute_vector_widths) > 0
                 ):
                     fields["cute_vector_widths"] = self.cute_vector_widths
+                # Per-block lane layout (blocked vs strided per-thread
+                # element assignment) for lane loops with more than one
+                # iteration; strided gives fully coalesced warp accesses.
+                if (
+                    self.supports_config_key("cute_lane_layouts")
+                    and len(self.cute_lane_layouts) > 0
+                ):
+                    fields["cute_lane_layouts"] = self.cute_lane_layouts
+                # Where multi-sweep rolled reductions keep re-read values
+                # (register fragment vs gmem/L2 reload); see
+                # ``CuteReductionReloadSpec``.
+                if (
+                    self.supports_config_key("cute_reduction_reloads")
+                    and len(self.cute_reduction_reloads) > 0
+                ):
+                    fields["cute_reduction_reloads"] = self.cute_reduction_reloads
+                # Thread-block cluster width for SIMT reduction kernels:
+                # splits a whole-extent lane-looped axis across cluster
+                # CTAs (register-resident slices) with a DSM cluster
+                # reduce.  Ignored (cluster 1) when the config shape
+                # doesn't qualify — see
+                # ``PerThreadNDTileStrategy._maybe_apply_cute_cluster``.
+                if (
+                    self.supports_config_key("cute_cluster_n")
+                    and len(self.cute_lane_layouts) > 0
+                    and not self.matmul_facts
+                ):
+                    fields["cute_cluster_n"] = EnumFragment(choices=(1, 2, 4, 8, 16))
+                # Minimum resident CTAs per SM (ptxas ``minnctapersm``):
+                # caps registers per thread so more CTAs fit, trading
+                # spills for occupancy.  0 leaves ptxas free.  6 is a
+                # hard squeeze (at 128 threads it caps registers at 85 ->
+                # 24 warps/SM); measured on B200 softmax rows, one extra
+                # resident CTA beats ~10 spilled registers.
+                if (
+                    self.supports_config_key("cute_min_blocks_per_mp")
+                    and len(self.cute_lane_layouts) > 0
+                    and not self.matmul_facts
+                ):
+                    fields["cute_min_blocks_per_mp"] = EnumFragment(
+                        choices=(0, 1, 2, 3, 4, 6)
+                    )
             if (
                 not self.cute_flash_search_enabled
                 and self.epilogue_subtile_autotune_choices is not None
@@ -3876,6 +3986,73 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
 
 
 _CUTE_VECTOR_WIDTH_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
+_CUTE_LANE_LAYOUT_CHOICES: tuple[str, ...] = ("blocked", "strided")
+_CUTE_REDUCTION_RELOAD_CHOICES: tuple[str, ...] = ("auto", "register", "gmem")
+
+
+class CuteReductionReloadSpec(_BlockIdItem):
+    """Where a multi-sweep rolled reduction keeps the values it re-reads.
+
+    LayerNorm/RMSNorm-style kernels sweep the same input several times
+    (reduce, then consume).  ``"register"`` caches the first sweep's loads
+    in a per-thread register fragment (fastest when the per-thread slice
+    is small; spills to local memory when it is not).  ``"gmem"`` re-loads
+    from global memory on later sweeps (the row is usually still resident
+    in L2, and no registers are burned).  ``"auto"`` (default) keeps the
+    legacy size heuristic in ``fuse_two_pass_loads``.
+    """
+
+    def __init__(self, *, block_id: int) -> None:
+        super().__init__([block_id])
+
+    def _fragment(self, base: ConfigSpec) -> EnumFragment:
+        return EnumFragment(choices=_CUTE_REDUCTION_RELOAD_CHOICES)
+
+    def _normalize(self, name: str, value: object) -> str:
+        if value not in _CUTE_REDUCTION_RELOAD_CHOICES:
+            raise InvalidConfig(
+                f"{name} must be one of {_CUTE_REDUCTION_RELOAD_CHOICES}, got {value!r}"
+            )
+        return str(value)
+
+    def _fill_missing(self) -> str:
+        return "auto"
+
+
+class CuteLaneLayoutSpec(_BlockIdItem):
+    """Per-block per-thread element assignment for CuTe lane loops.
+
+    ``"blocked"``: thread ``t`` owns ``EPT`` contiguous elements
+    (``base = offset + t*EPT + lane*V``).  Consecutive threads in a warp
+    touch addresses ``EPT*elem_size`` bytes apart, so a warp's loads/stores
+    of one lane iter span many cache lines (poor per-instruction
+    coalescing; only acceptable when the lane loop has a single iteration,
+    where both layouts coincide).
+
+    ``"strided"``: thread ``t`` owns V-wide chunks strided by the thread
+    count (``base = offset + (lane*NT + t)*V``).  Consecutive threads touch
+    consecutive V-chunks, so each warp instruction is fully coalesced.
+    """
+
+    def __init__(
+        self,
+        *,
+        block_id: int,
+    ) -> None:
+        super().__init__([block_id])
+
+    def _fragment(self, base: ConfigSpec) -> EnumFragment:
+        return EnumFragment(choices=_CUTE_LANE_LAYOUT_CHOICES)
+
+    def _normalize(self, name: str, value: object) -> str:
+        if value not in _CUTE_LANE_LAYOUT_CHOICES:
+            raise InvalidConfig(
+                f"{name} must be one of {_CUTE_LANE_LAYOUT_CHOICES}, got {value!r}"
+            )
+        return str(value)
+
+    def _fill_missing(self) -> str:
+        return "blocked"
 
 
 class CuteVectorWidthSpec(_BlockIdItem):

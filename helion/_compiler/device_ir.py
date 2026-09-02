@@ -34,8 +34,11 @@ from .. import language as hl
 from ..autotuner.config_spec import FULL_EXTENT_CATEGORIES
 from ..autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
 from ..autotuner.config_spec import CoResidencyGroup
+from ..autotuner.config_spec import CuteLaneLayoutSpec
+from ..autotuner.config_spec import CuteReductionReloadSpec
 from ..autotuner.config_spec import CuteVectorWidthSpec
 from ..autotuner.config_spec import MatmulWithReductionEpilogueFact
+from ..autotuner.config_spec import NumThreadsSpec
 from ..autotuner.config_spec import ReductionCategory
 from ..autotuner.config_spec import ReductionDescriptor
 from ..autotuner.config_spec import ReductionKernelFact
@@ -70,6 +73,7 @@ from .type_info import GridIndexType
 from .type_info import IterType
 from .type_info import JaggedTileIndexType
 from .type_info import LiteralType
+from .type_info import NestedFunctionType
 from .type_info import NumericType
 from .type_info import SequenceType
 from .type_info import StackTensorType
@@ -1031,6 +1035,22 @@ class DeviceIR:
                             size_hint=rdim.size_hint(),
                         )
                     )
+                    env.config_spec.cute_lane_layouts.append(
+                        CuteLaneLayoutSpec(block_id=rdim.block_id)
+                    )
+                    env.config_spec.cute_reduction_reloads.append(
+                        CuteReductionReloadSpec(block_id=rdim.block_id)
+                    )
+                    # Rolled reduction dims get a thread-count knob: fewer
+                    # threads per row (with more elements per thread) is
+                    # often faster for memory-bound row reductions. 0 = auto
+                    # (derive from the loop chunk, the legacy behavior).
+                    env.config_spec.num_threads.append(
+                        NumThreadsSpec(
+                            block_id=rdim.block_id,
+                            size_hint=rdim.size_hint(),
+                        )
+                    )
             graphs_with_rolled_rdim |= used_graphs
 
         # Track which rdims appear as the reduction axis of an indexed
@@ -1098,6 +1118,9 @@ class DeviceIR:
                     block_id=tile_bs.block_id,
                     size_hint=size_hint_val,
                 )
+            )
+            env.config_spec.cute_lane_layouts.append(
+                CuteLaneLayoutSpec(block_id=tile_bs.block_id)
             )
 
     def _categorize_reduction(
@@ -2571,22 +2594,50 @@ class WalkDeviceAST(NodeVisitor):
             else:
                 kwargs[kwarg.arg] = self.visit(kwarg.value)
 
-        if isinstance(
-            (
-                # pyrefly: ignore [missing-attribute]
-                func_type_info := node.func._type_info
-            ),
-            CallableType,
-        ) and (replacement := get_device_func_replacement(func_type_info.value)):
+        # pyrefly: ignore [missing-attribute]
+        func_type_info = node.func._type_info
+        if isinstance(func_type_info, NestedFunctionType):
+            return self._call_nested_function(func_type_info, args, kwargs)
+        if isinstance(func_type_info, CallableType) and (
+            replacement := get_device_func_replacement(func_type_info.value)
+        ):
             func = replacement
         else:
             func = self.visit(node.func)
-
         # pyrefly: ignore [bad-argument-type]
         return _CheckForIndexCalls.retry_call(func, args, kwargs)
 
     def visit_Attribute(self, node: ast.Attribute) -> object:
         return getattr(self.visit(node.value), node.attr)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.scope[node.name] = None
+
+    def _call_nested_function(
+        self,
+        func: NestedFunctionType,
+        args: list[object],
+        kwargs: dict[str, object],
+    ) -> object:
+        func_node = func.func_node
+        params = func_node.args
+        if kwargs:
+            raise exc.StatementNotSupported(
+                f"Keyword arguments are not supported when calling nested "
+                f"function '{func_node.name}'"
+            )
+        func.find_effective_return()
+        old_scope = self.scope.copy()
+        for param, arg_val in zip(params.args, args, strict=True):
+            self.scope[param.arg] = arg_val
+        try:
+            for stmt in func_node.body:
+                if isinstance(stmt, ast.Return):
+                    return self.visit(stmt.value) if stmt.value is not None else None
+                self.visit(stmt)
+        finally:
+            self.scope = old_scope
+        return None
 
     def visit_Expr(self, node: ast.Expr) -> object:
         return self.visit(node.value)
@@ -2946,22 +2997,26 @@ def _register_cute_lane_vector_width_specs(config_spec: ConfigSpec) -> None:
     lane-looped simply keep ``V=1`` (the slot's default), which the tile
     strategy ignores.
     """
+    from ..autotuner.config_spec import CuteLaneLayoutSpec
     from ..autotuner.config_spec import CuteVectorWidthSpec
 
     num_thread_block_ids = set(config_spec.num_threads.valid_block_ids())
     existing = set(config_spec.cute_vector_widths.valid_block_ids())
+    existing_layouts = set(config_spec.cute_lane_layouts.valid_block_ids())
     for spec in config_spec.block_sizes:
         block_id = spec.block_id
-        if block_id not in num_thread_block_ids or block_id in existing:
-            continue
         # ``max_size`` bounds the largest block_size the autotuner may pick;
         # only blocks that can exceed a single thread can ever be lane-looped.
-        if spec.max_size <= 1:
+        if block_id not in num_thread_block_ids or spec.max_size <= 1:
             continue
-        config_spec.cute_vector_widths.append(
-            CuteVectorWidthSpec(block_id=block_id, size_hint=spec.size_hint)
-        )
-        existing.add(block_id)
+        if block_id not in existing:
+            config_spec.cute_vector_widths.append(
+                CuteVectorWidthSpec(block_id=block_id, size_hint=spec.size_hint)
+            )
+            existing.add(block_id)
+        if block_id not in existing_layouts:
+            config_spec.cute_lane_layouts.append(CuteLaneLayoutSpec(block_id=block_id))
+            existing_layouts.add(block_id)
 
 
 def _root_phases(phases: list[KernelPhase], root_count: int) -> tuple[int, ...]:
