@@ -52,7 +52,7 @@ def _spec(
         (),
         None,
     )
-    return DmaAccessSpec(access, index_access, block_id, (0, 0), (2, 128))
+    return DmaAccessSpec(access, index_node, index_access, block_id, (0, 0), (2, 128))
 
 
 def test_dma_access_candidate_block_admission() -> None:
@@ -68,6 +68,7 @@ def test_dma_access_candidate_block_admission() -> None:
             (),
             None,
         ),
+        load.index_node,
         load.index_access,
         load.index_block_id,
         load.selected_starts,
@@ -119,8 +120,12 @@ def test_dma_access_candidate_requires_exact_store_pair() -> None:
     )
     store_access = build_memory_access(store, table, subscript, patterns)
     store.meta[MEMORY_ACCESS_META] = store_access
-    load_spec = DmaAccessSpec(load_access, index_access, 0, (0, 0), (2, 128))
-    store_spec = DmaAccessSpec(store_access, index_access, 0, (0, 0), (2, 128))
+    load_spec = DmaAccessSpec(
+        load_access, index_load, index_access, 0, (0, 0), (2, 128)
+    )
+    store_spec = DmaAccessSpec(
+        store_access, index_load, index_access, 0, (0, 0), (2, 128)
+    )
     owner = cast("GraphInfo", SimpleNamespace(graph=graph, graph_id=7))
 
     def spec(access: MemoryAccess) -> DmaAccessSpec | None:
@@ -134,7 +139,9 @@ def test_dma_access_candidate_requires_exact_store_pair() -> None:
             DmaAccessCandidate(7, load_spec, store_spec, frozenset({id(indices)})),
         )
 
-        mismatched = DmaAccessSpec(store_access, index_access, 0, (0, 128), (2, 128))
+        mismatched = DmaAccessSpec(
+            store_access, index_load, index_access, 0, (0, 128), (2, 128)
+        )
         with patch(
             "helion._compiler.pallas.tensorcore_plan.build_dma_access_spec",
             side_effect=lambda access: {
@@ -179,8 +186,10 @@ def test_dma_access_candidate_rejects_distinct_input_aliases() -> None:
     store_access = build_memory_access(store, table, list(subscript), [])
     store.meta[MEMORY_ACCESS_META] = store_access
     specs = {
-        load: DmaAccessSpec(load_access, index_access, 0, (0, 0), (2, 128)),
-        store: DmaAccessSpec(store_access, index_access, 0, (0, 0), (2, 128)),
+        load: DmaAccessSpec(load_access, index_load, index_access, 0, (0, 0), (2, 128)),
+        store: DmaAccessSpec(
+            store_access, index_load, index_access, 0, (0, 0), (2, 128)
+        ),
     }
     owner = cast("GraphInfo", SimpleNamespace(graph=graph, graph_id=0))
     with patch(

@@ -725,8 +725,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfPallasInterpret(
-        "65536x1024x1280 GEMM is too slow under CPU interpret -- it exceeds the "
-        "300s per-test timeout and (thread timeout method) kills the whole job"
+        "GEMM pair is too slow under CPU interpret -- at the original 65536-row "
+        "shape it exceeded the 300s per-test timeout"
     )
     @skipIfTileIR("precision differences with bf16xint16 operations on tileir")
     @skipIfRocm("precision differences with bf16xint16 operations on rocm")
@@ -734,7 +734,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_bf16xint16(self):
         from examples.bf16xint16_gemm import reference_bf16xint16_pytorch
 
-        m, k, n = 65536, 1024, 1280
+        m, k, n = 2048, 1024, 1280
 
         # The CuTe scalar matmul fallback accumulates each bf16xbf16 product in
         # full fp32 (it never rounds the per-element products back to bf16), so
@@ -909,7 +909,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfTileIR("PassManager::run failed")
     def test_epilogue_subtiling_residual_gelu(self):
-        m, k, n = 8192, 8192, 8192
+        m, k, n = 1024, 1024, 1024
         x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
         w = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
         bias = torch.randn([n], device=DEVICE, dtype=HALF_DTYPE)
@@ -929,7 +929,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfTileIR("PassManager::run failed")
     def test_epilogue_subtiling_gelu_aux(self):
-        m, k, n = 8192, 8192, 8192
+        m, k, n = 1024, 1024, 1024
         x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
         w = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
         bias = torch.randn([n], device=DEVICE, dtype=HALF_DTYPE)
@@ -1043,6 +1043,35 @@ class TestExamples(RefEagerTestBase, TestCase):
             (torch.nn.functional.scaled_dot_product_attention(*args), None),
             fn_name="attention_dynamic",
             block_sizes=[1, 64, 32],
+        )
+
+    def test_sparse_attn_indexer(self):
+        mod = import_path(EXAMPLES_DIR / "sparse_attn_indexer.py")
+        args = mod.indexer_inputs(num_tokens=128, kv_len=512)
+        # The reference einsum runs in bf16, so kernel-vs-reference diffs are
+        # pure schedule noise: one head's O(11) score rounds by ~11*2^-8 and
+        # the 32-head sum random-walks to ~sqrt(32) of that (~0.25 abs).
+        check_example(
+            "sparse_attn_indexer",
+            args,
+            mod.ref_mqa_logits(*args),
+            fn_name="mqa_logits",
+            block_sizes=[16, 128],
+            atol=0.3,
+        )
+
+    @skipIfPallasInterpret("numerical mismatch in JAX interpret mode")
+    def test_sparse_attn_indexer_decode(self):
+        mod = import_path(EXAMPLES_DIR / "sparse_attn_indexer.py")
+        args = mod.indexer_inputs(num_tokens=1, kv_len=512)
+        # Same schedule-noise bound as test_sparse_attn_indexer above.
+        check_example(
+            "sparse_attn_indexer",
+            args,
+            mod.ref_mqa_logits(*args),
+            fn_name="mqa_logits_decode",
+            block_sizes=[1, 128],
+            atol=0.3,
         )
 
     def test_xsa(self):

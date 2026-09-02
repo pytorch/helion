@@ -8,7 +8,6 @@ import json
 import logging
 import math
 import operator
-import os
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
@@ -54,12 +53,14 @@ from .._compiler.cute.cute_flash import FlashAttentionConfig
 from .._compiler.cute.cute_flash import _flash_compound_exp2_packet_overrides
 from .._compiler.cute.cute_flash import _flash_e2e_offset_period
 from .._compiler.cute.cute_flash import _flash_e2e_schedule_default
+from .._compiler.cute.cute_flash import _flash_env_get
 from .._compiler.cute.cute_flash import _flash_masked_e2e_schedule_params
 from .._compiler.cute.cute_flash import _flash_normalize_e2e_offset
 from .._compiler.cute.cute_flash import _flash_normalize_e2e_params
 from .._compiler.cute.cute_flash import _flash_parse_e2e_schedule
 from .._compiler.cute.cute_flash import _flash_pipeline_family_flags
 from .._compiler.cute.cute_flash import flash_effective_config_values
+from .._compiler.cute.cute_flash import flash_env_fingerprint
 from .._compiler.cute.cute_flash import flash_exp2_packet_is_compound
 from .._compiler.cute.cute_flash import resolve_flash_config
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS
@@ -91,6 +92,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Mapping
     from collections.abc import Sequence
+
+    import sympy
 
     from .._compiler.backend import Backend
     from ..runtime.config import IndexingLiteral
@@ -154,6 +157,17 @@ def _record_restriction(
 _TARGET_DEVICE_CAPABILITY_UNSET = object()
 
 
+def _copy_config_structure(value: object) -> object:
+    """Copy built-in config containers while preserving opaque leaf objects."""
+    if type(value) is dict:
+        return {key: _copy_config_structure(item) for key, item in value.items()}
+    if type(value) is list:
+        return [_copy_config_structure(item) for item in value]
+    if type(value) is tuple:
+        return tuple(_copy_config_structure(item) for item in value)
+    return value
+
+
 class TensorNumelConstraint(NamedTuple):
     """Tensor element count must stay within Triton's max numel limit."""
 
@@ -163,7 +177,12 @@ class TensorNumelConstraint(NamedTuple):
 
 
 class MatmulFact(NamedTuple):
-    """Shape facts recorded when matmul requirements are applied."""
+    """Shape facts recorded when matmul requirements are applied.
+
+    ``static_m``, ``static_n``, and ``static_k`` initially contain proven
+    compile-time extents. DeviceIR analysis may later fill missing values with
+    representative runtime hints for whole-kernel matmul sizing.
+    """
 
     lhs_ndim: int
     rhs_ndim: int
@@ -175,6 +194,297 @@ class MatmulFact(NamedTuple):
     static_k: int | None
     lhs_dtype: torch.dtype
     rhs_dtype: torch.dtype
+
+
+class DotAxisKind(enum.Enum):
+    """How one M/N/K axis of a contraction maps onto the config surface.
+
+    A GEMM has three ``TUNABLE_TILED`` axes, which is what the historical matmul gate
+    assumed. A contraction written inside a chunked kernel very often has one axis the
+    kernel fixes at its full extent: the author ``hl.specialize``\\d it, so the axis has
+    either no block id at all or a block id that is not in ``valid_block_ids()``. That
+    is not a smaller problem, only a smaller set of knobs — the seed must adjust a
+    different axis or a scalar knob instead of declining.
+
+    - ``TUNABLE_TILED`` — a real, tunable ``block_size`` entry the seed may set.
+    - ``FIXED_FULL_EXTENT`` — statically known, not tunable: the tile extent along
+      this axis is the extent itself and cannot be moved.
+    - ``UNKNOWN`` — no static extent (dynamic / jagged); nothing can be sized.
+    """
+
+    TUNABLE_TILED = "tunable_tiled"
+    FIXED_FULL_EXTENT = "fixed_full_extent"
+    UNKNOWN = "unknown"
+
+
+class DotAxes(NamedTuple):
+    """The :class:`DotAxisKind` and the REAL per-program tile extent of one dot's
+    M/N/K axes.
+
+    ``*_extent`` is the extent the hardware sees along that axis for one program:
+    the (not-yet-chosen) block size for a ``TUNABLE_TILED`` axis — recorded here as
+    the axis's full static extent, an upper bound — and the fixed extent for a
+    ``FIXED_FULL_EXTENT`` one. ``*_iters`` is how many times the axis is traversed
+    per program (1 unless the axis is tiled and looped).
+    """
+
+    m_kind: DotAxisKind
+    n_kind: DotAxisKind
+    k_kind: DotAxisKind
+    m_extent: int | None
+    n_extent: int | None
+    k_extent: int | None
+
+    def kind(self, axis: str) -> DotAxisKind:
+        return {"m": self.m_kind, "n": self.n_kind, "k": self.k_kind}[axis]
+
+    def extent(self, axis: str) -> int | None:
+        return {"m": self.m_extent, "n": self.n_extent, "k": self.k_extent}[axis]
+
+    @property
+    def tunable_axes(self) -> tuple[str, ...]:
+        return tuple(
+            a for a in ("m", "n", "k") if self.kind(a) is DotAxisKind.TUNABLE_TILED
+        )
+
+    @property
+    def fixed_axes(self) -> tuple[str, ...]:
+        return tuple(
+            a for a in ("m", "n", "k") if self.kind(a) is DotAxisKind.FIXED_FULL_EXTENT
+        )
+
+
+class LiveTile(NamedTuple):
+    """One simultaneously-live tensor tile at a graph's peak-live step.
+
+    Extends the bare ``dim_block_ids`` liveness view with the two things a resource
+    estimate cannot be written without: how WIDE an element is, and WHO produced
+    the tile. A dot's fp32 output is charged to tensor memory on tcgen05 and to the
+    register file otherwise; a plain load is charged to the operand staging ring;
+    neither substitutes for the other.
+
+    - ``dim_block_ids`` — block id spanned per shape dim (``None`` for a static dim),
+      the same representation as :class:`AccumulatorFact`.
+    - ``static_dims`` — the extent at each ``None`` position, so a footprint can be
+      computed without re-resolving shapes (``None`` where unresolvable).
+    - ``itemsize`` — element width in bytes.
+    - ``kind`` — ``"dot_out"`` | ``"load"`` | ``"carry"`` | ``"other"``.
+    - ``stageable`` — for a loop-body load, whether its index is proven to
+      vary with the enclosing loop. ``None`` means uncertain and is charged
+      conservatively as stageable.
+    - ``promoted_lhs`` — this live value is the non-load LHS operand of a dot
+      and may require Triton's power-of-two TMEM promotion scratch. This is
+      independent of ``kind`` because a prior ``dot_out`` can also be an LHS.
+    """
+
+    dim_block_ids: tuple[int | None, ...]
+    static_dims: tuple[int | None, ...]
+    itemsize: int
+    kind: str
+    stageable: bool | None = None
+    promoted_lhs: bool = False
+
+
+class SymbolicLoopBound(NamedTuple):
+    """A preserved SymPy loop extent and its candidate-dependent symbols.
+
+    The expression remains the one produced by symbolic tracing. Symbol maps
+    identify only leaves a concrete autotuner candidate can resolve; any other
+    free symbol keeps evaluation explicitly unknown.
+    """
+
+    expression: sympy.Expr
+    block_size_symbols: tuple[tuple[sympy.Symbol, int], ...] = ()
+    tile_id_symbols: tuple[tuple[sympy.Symbol, int], ...] = ()
+
+
+class LoopAxisFact(NamedTuple):
+    """One tunable or fixed axis in an enclosing device loop.
+
+    ``extent`` is the full axis length. ``bounded_by_block_id`` records an inner
+    loop over exactly one outer tile (for example split-K's
+    ``tile(outer.begin, outer.end)``); in that case the candidate outer block is
+    the real extent, not the whole underlying axis. ``bounded_extent`` is set
+    only when that outer extent is a literal; a symbolic fixed parent remains
+    explicitly uncertain. ``symbolic_bound`` preserves a candidate-dependent
+    loop bound instead of matching one source expression. Block-size leaves are
+    replaced with the candidate values and tile IDs with the lower-median valid
+    tile before evaluating it. The per-program block is deliberately not
+    recorded here: it is a candidate property and must be resolved from the
+    emitted ``block_sizes`` before the trip count is used.
+    """
+
+    block_id: int
+    extent: int | None
+    bounded_by_block_id: int | None = None
+    bounded_extent: int | None = None
+    symbolic_bound: SymbolicLoopBound | None = None
+
+
+class PipelinedRegion(NamedTuple):
+    """Memory operations belonging to one sequential device-loop body.
+
+    Separate regions are siblings unless their loop descriptors explicitly contain
+    the same ancestor axes.  Loads are conservatively considered stageable for now;
+    the tuple representation keeps that uncertainty local to this fact boundary
+    while allowing useful depth to be capped by the candidate-real loop length.
+    """
+
+    loop_axes: tuple[LoopAxisFact, ...]
+    tiles: tuple[LiveTile, ...]
+
+
+class ResidentRegion(NamedTuple):
+    """Memory operations belonging to one non-loop graph."""
+
+    tiles: tuple[LiveTile, ...]
+
+
+class RootGridFact(NamedTuple):
+    """One top-level device grid before a candidate block size is selected."""
+
+    root_graph_id: int
+    block_ids: tuple[int, ...]
+
+
+class KernelGridFact(NamedTuple):
+    """Root-grid topology shared by every specialized kernel fact.
+
+    ``roots`` preserves the independent top-level grids in source order.
+    ``graph_to_root`` assigns nested device graphs to their owning root. Concrete
+    program counts are intentionally absent: they depend on the candidate block
+    sizes and must be recomputed while a heuristic edits its draft.
+    """
+
+    roots: tuple[RootGridFact, ...]
+    graph_to_root: tuple[tuple[int, int], ...]
+
+    @property
+    def grid_groups(self) -> tuple[tuple[int, ...], ...]:
+        return tuple(root.block_ids for root in self.roots)
+
+    def root_id_for_graph(self, graph_id: int) -> int | None:
+        for candidate, root_id in self.graph_to_root:
+            if candidate == graph_id:
+                return root_id
+        return None
+
+    def group_for_graph(self, graph_id: int) -> tuple[int, ...]:
+        root_id = self.root_id_for_graph(graph_id)
+        for root in self.roots:
+            if root.root_graph_id == root_id:
+                return root.block_ids
+        return ()
+
+    def groups_for_graphs(
+        self, graph_ids: tuple[int, ...]
+    ) -> tuple[tuple[int, ...], ...]:
+        groups: list[tuple[int, ...]] = []
+        for graph_id in graph_ids:
+            group = self.group_for_graph(graph_id)
+            if group and group not in groups:
+                groups.append(group)
+        return tuple(groups)
+
+
+class DotSite(NamedTuple):
+    """Where one contraction sits in the kernel, and how much work it does.
+
+    Attribution of a :class:`MatmulFact` (recorded at trace time, in source order) to
+    a graph node is a COMPUTED pairing validated by a post-condition, never an
+    assumed one: :attr:`KernelMatmulFact.attribution_complete` is False when the
+    pairing could not be proven, and a consumer that needs per-dot placement must
+    check it rather than trusting these fields.
+
+    - ``graph_id`` — the device graph the dot's node lives in.
+      :class:`KernelGridFact` maps that graph to its root grid; the topology is
+      intentionally not copied into each site.
+    - ``updates_carry`` — the dot writes into a value carried by an enclosing loop
+      (``acc=`` into a loop-carried accumulator). Such a dot's accumulator is
+      resident for the whole loop, which is why it gets ranking priority.
+    - ``loop_axes`` — the enclosing loop axes before a candidate block size is
+      selected. This is the canonical execution-count representation; consumers
+      resolve it against the candidate they are evaluating.
+    - ``exact_loop_trips`` — an exact dynamic execution count proven independently
+      of the loop-bound expression. This is used for work estimation only; it does
+      not claim that the same loop is a useful software-pipeline opportunity.
+    - ``max_loop_trips`` — an optional conservative upper bound used only by
+      safety-oriented consumers such as pipeline-depth capping. It must not be used
+      as candidate work.
+    """
+
+    graph_id: int
+    updates_carry: bool
+    loop_axes: tuple[LoopAxisFact, ...] = ()
+    exact_loop_trips: int | None = None
+    max_loop_trips: int | None = None
+
+
+class ResolvedMatmulFact(NamedTuple):
+    """One :class:`MatmulFact` interpreted in its graph and config context.
+
+    ``MatmulFact`` remains the trace-local description of the dot. This fact binds
+    it to the axis roles and execution site that consumers previously recovered
+    through parallel kernel-wide arrays.
+    """
+
+    fact: MatmulFact
+    axes: DotAxes
+    site: DotSite
+
+
+class KernelMatmulFact(NamedTuple):
+    """Every resolved matmul plus the shared facts needed to configure the kernel.
+
+    Built for any kernel with at least one contraction, so the single-matmul and
+    multi-matmul front ends read the same description of the workload and only their
+    POLICY differs. Kernel-name- and role-free by construction: every field is a
+    measured property of the contraction structure. Generic root-grid topology lives
+    in :class:`KernelGridFact` and is not duplicated here.
+
+    - ``matmuls`` — the contextual facts, one per dot.
+    - ``knob_users`` — for each tunable block id, the ``(dot_index, axis)`` pairs
+      whose axis maps onto it, i.e. which dots COMPETE for that knob.
+    - ``sequential_loop_trips`` — product of the trip counts of the kernel's
+      sequential (non-grid) loops. For a chunked recurrence this is the number of
+      chunks, so ``sequential_loop_trips * fixed_k`` recovers the logical contraction
+      length even though each dot only sees one chunk.
+    - ``live_dot_outputs`` — the live set at the step holding the most simultaneously
+      live dot-output tiles, including ancestor loop graphs.
+    - ``live_promoted_lhs`` — the peak transformed-LHS set after adding ancestor
+      loop graphs. Direct loads are excluded; values retain their original
+      ``kind`` so a dot output reused as another dot's LHS is counted in both roles.
+    - ``live_tile_steps`` — the live tile set at EVERY step of the kernel's graphs, deduped.
+      A register estimate resolves each step under the candidate block sizes and selects
+      the peak by bytes.
+    - ``pipelined_regions`` — the loads/stores and enclosing loop axes of each LOOP
+      BODY. The axes let a candidate cap useful pipeline depth by the iterations it
+      actually executes. The SMEM operand ring is charged over every conservatively
+      stageable load, not only the dot's own A and B: a sum within a region times its
+      useful stage count, and a max across regions (separate loops run one after the
+      other).
+    - ``resident_regions`` — the loads/stores of the NON-loop graphs. These are charged
+      ONCE, with no stage multiplier: a load outside a loop is not multi-buffered, and
+      charging it per stage over-states shared memory badly enough to shrink a tile to the
+      dot minimum for a phantom overflow.
+    - ``attribution_complete`` — post-condition flag described above.
+    """
+
+    matmuls: tuple[ResolvedMatmulFact, ...]
+    knob_users: tuple[tuple[int, tuple[tuple[int, str], ...]], ...]
+    sequential_loop_trips: int
+    live_dot_outputs: tuple[LiveTile, ...]
+    live_promoted_lhs: tuple[LiveTile, ...]
+    live_tile_steps: tuple[tuple[LiveTile, ...], ...]
+    pipelined_regions: tuple[PipelinedRegion, ...]
+    resident_regions: tuple[ResidentRegion, ...]
+    attribution_complete: bool
+
+    def users_of(self, block_id: int) -> tuple[tuple[int, str], ...]:
+        for bid, users in self.knob_users:
+            if bid == block_id:
+                return users
+        return ()
 
 
 class ReductionCategory(enum.Enum):
@@ -517,6 +827,10 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     | {
         "num_threads",
         "cute_vector_widths",
+        "cute_lane_layouts",
+        "cute_reduction_reloads",
+        "cute_cluster_n",
+        "cute_min_blocks_per_mp",
         "load_cache_modifiers",
         "store_cache_modifiers",
         "pallas_loop_type",
@@ -555,6 +869,10 @@ VALID_KEYS: frozenset[str] = frozenset(
         "pallas_indirect_access_mode",
         "pallas_pre_broadcast",
         "cute_vector_widths",
+        "cute_lane_layouts",
+        "cute_reduction_reloads",
+        "cute_cluster_n",
+        "cute_min_blocks_per_mp",
         *BACKEND_TUNABLE_KEYS,
         "advanced_controls_file",
         "epilogue_subtile",
@@ -614,6 +932,12 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
 # the same worker process.
 def get_valid_eviction_policies(backend_name: str) -> tuple[str, ...]:
     if backend_name == "triton" and not supports_amd_cdna_tunables():
+        return ("", "first", "last")
+    if backend_name == "cute":
+        # Lowered to ld.global L1 eviction hints
+        # (level1_eviction_priority=evict_first/evict_last) on the
+        # vectorized load sites.  Pays off for reload-from-gmem sweeps
+        # (keep re-read rows resident, evict on the final pass).
         return ("", "first", "last")
     return ("",)
 
@@ -704,6 +1028,10 @@ class ConfigSpec:
         self.cute_vector_widths: BlockIdSequence[CuteVectorWidthSpec] = (
             BlockIdSequence()
         )
+        self.cute_lane_layouts: BlockIdSequence[CuteLaneLayoutSpec] = BlockIdSequence()
+        self.cute_reduction_reloads: BlockIdSequence[CuteReductionReloadSpec] = (
+            BlockIdSequence()
+        )
         self.range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = (
             BlockIdSequence()
         )
@@ -726,6 +1054,9 @@ class ConfigSpec:
         self.restriction_reasons: list[tuple[str, str]] = []
         self.max_num_sm_multiplier: int = MAX_NUM_SM_MULTIPLIER
         self.grid_block_ids: list[int] = []
+        # Ordered root grids and nested-graph ownership, independent of any
+        # specialized matmul/reduction policy.
+        self.kernel_grid_fact: KernelGridFact | None = None
         self.tensor_numel_constraints: list[TensorNumelConstraint] = []
         self.load_eviction_policies = ListOf(
             EnumFragment(choices=get_valid_eviction_policies(self.backend_name)),
@@ -779,6 +1110,17 @@ class ConfigSpec:
         self._cute_flash_output_requires_tma: bool = False
         self._cute_flash_supports_tensor_4d_tma: bool = True
         self._cute_flash_block_size_targets: dict[int, int] = {}
+        # Memo for ``flash_autotune_fragments``: every other input is fixed
+        # ConfigSpec state, so (topology_override, pipeline_family_override) is
+        # a complete key once the env fingerprint below matches. The fragments
+        # builder resolves dozens of configs per call and normalization calls
+        # it for every candidate, so this cache dominates coverage-design cost.
+        self._cute_flash_fragments_cache: dict[
+            tuple[str | None, str | None], dict[str, ConfigSpecFragment]
+        ] = {}
+        self._cute_flash_fragments_env_fingerprint: (
+            tuple[tuple[str, str], ...] | None
+        ) = None
         # Some large attention outputs require the FA4-only TMA epilogue, but
         # odd KV-tile counts and some score plans require the incompatible WS
         # flash topology. Keep that narrow fallback explicit so codegen does
@@ -792,6 +1134,10 @@ class ConfigSpec:
         self.compiler_seed_timeout_retry_repetitions: int | None = None
         self.autotuner_heuristics: list[str] = []
         self.matmul_facts: list[MatmulFact] = []
+        # Whole-kernel composed contraction fact (built for ANY kernel with >=1
+        # matmul fact); both matmul front ends read it so workload analysis is
+        # independent of which heuristic runs.
+        self.kernel_matmul_fact: KernelMatmulFact | None = None
         # The Stage-1 categorizing product the reduction seed + allocator consume.
         self.reduction_kernel_fact: ReductionKernelFact | None = None
         self.matmul_reduction_epilogue_facts: list[MatmulWithReductionEpilogueFact] = []
@@ -952,6 +1298,54 @@ class ConfigSpec:
     def cute_tcgen05_matmul_has_non_tcgen05_operand(self, value: bool) -> None:
         self._cute_tcgen05_config.matmul_has_non_tcgen05_operand = value
 
+    def _cute_flash_autotune_fragments(
+        self,
+        topology_override: str | None = None,
+        pipeline_family_override: str | None = None,
+    ) -> dict[str, ConfigSpecFragment]:
+        """Memoized ``flash_autotune_fragments`` for this spec's flash surface.
+
+        The env fingerprint covers every ``HELION_CUTE_FLASH_*`` variable the
+        builder reads transitively, so patched environments (tests, scripts)
+        invalidate the memo instead of seeing stale fragments. The function is
+        resolved through the module attribute on every miss so tests that
+        ``patch.object`` it still intercept the real computation.
+        """
+        # Fragment values are shared: they are immutable dataclasses that all
+        # callers replace rather than mutate. The mapping is copied because
+        # callers merge it into their own field dicts.
+        fingerprint = flash_env_fingerprint()
+        if fingerprint != self._cute_flash_fragments_env_fingerprint:
+            self._cute_flash_fragments_cache.clear()
+            self._cute_flash_fragments_env_fingerprint = fingerprint
+        key = (topology_override, pipeline_family_override)
+        cached = self._cute_flash_fragments_cache.get(key)
+        if cached is None:
+            from .._compiler.cute.cute_flash import flash_autotune_fragments
+
+            assert self._cute_flash_head_dim is not None
+            assert self._cute_flash_num_kv is not None
+            cached = flash_autotune_fragments(
+                self._cute_flash_head_dim,
+                self._cute_flash_num_kv,
+                num_bh=self._cute_flash_num_bh,
+                tensor_4d_heads=self._cute_flash_tensor_4d_heads,
+                dtype=self._cute_flash_dtype,
+                is_causal=self._cute_flash_is_causal,
+                has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
+                requires_ws_overlap=self._cute_flash_requires_ws_overlap,
+                small_biased_candidate=self._cute_flash_small_biased_candidate,
+                standard_dense_output=self._cute_flash_standard_dense_output,
+                standard_causal_output=self._cute_flash_standard_causal_output,
+                target_device_capability=self.target_device_capability,
+                output_requires_tma=self._cute_flash_output_requires_tma,
+                supports_tensor_4d_tma=self._cute_flash_supports_tensor_4d_tma,
+                topology_override=topology_override,
+                pipeline_family_override=pipeline_family_override,
+            )
+            self._cute_flash_fragments_cache[key] = cached
+        return dict(cached)
+
     def _resolve_cute_flash_config(
         self, config: Mapping[str, object]
     ) -> FlashAttentionConfig:
@@ -1037,8 +1431,6 @@ class ConfigSpec:
         causal_lpt = config.get(FLASH_CAUSAL_LPT_SWIZZLE_KEY)
         if self._cute_flash_is_causal and type(causal_lpt) is int:
             config[FLASH_CAUSAL_LPT_SWIZZLE_KEY] = 1
-        from .._compiler.cute.cute_flash import flash_autotune_fragments
-
         block_size_targets = self._cute_flash_block_size_target_list()
         if fix_invalid:
             config["block_sizes"] = list(block_size_targets)
@@ -1046,6 +1438,9 @@ class ConfigSpec:
             self._normalize_cute_flash_default_sequence(config, "l2_groupings", 1)
             self._normalize_cute_flash_default_sequence(config, "num_threads", 0)
             self._normalize_cute_flash_default_sequence(config, "cute_vector_widths", 1)
+            self._normalize_cute_flash_default_sequence(
+                config, "cute_lane_layouts", "blocked"
+            )
             self._normalize_cute_flash_default_loop_orders(config)
             config.pop("epilogue_subtile", None)
         elif not self._is_cute_flash_config_envelope(config, block_size_targets):
@@ -1123,24 +1518,7 @@ class ConfigSpec:
             topology: str | None,
             family: str | None,
         ) -> dict[str, ConfigSpecFragment]:
-            return flash_autotune_fragments(
-                self._cute_flash_head_dim,
-                self._cute_flash_num_kv,
-                num_bh=self._cute_flash_num_bh,
-                tensor_4d_heads=self._cute_flash_tensor_4d_heads,
-                dtype=self._cute_flash_dtype,
-                is_causal=self._cute_flash_is_causal,
-                has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
-                requires_ws_overlap=self._cute_flash_requires_ws_overlap,
-                small_biased_candidate=self._cute_flash_small_biased_candidate,
-                standard_dense_output=self._cute_flash_standard_dense_output,
-                standard_causal_output=self._cute_flash_standard_causal_output,
-                output_requires_tma=self._cute_flash_output_requires_tma,
-                supports_tensor_4d_tma=self._cute_flash_supports_tensor_4d_tma,
-                target_device_capability=self.target_device_capability,
-                topology_override=topology,
-                pipeline_family_override=family,
-            )
+            return self._cute_flash_autotune_fragments(topology, family)
 
         if (
             fix_invalid
@@ -1278,7 +1656,7 @@ class ConfigSpec:
         else:
             schedule_default_offset = 0
         default_offset = schedule_default_offset
-        env_offset = os.environ.get("HELION_CUTE_FLASH_E2E_OFFSET")
+        env_offset = _flash_env_get("HELION_CUTE_FLASH_E2E_OFFSET")
         if env_offset is not None:
             default_offset = int(env_offset)
             if e2e_offset_period == 0:
@@ -1290,7 +1668,7 @@ class ConfigSpec:
         if not e2e_offset_was_present:
             config[FLASH_E2E_OFFSET_KEY] = default_offset
         default_offset0 = 0
-        env_offset0 = os.environ.get("HELION_CUTE_FLASH_E2E_OFFSET0")
+        env_offset0 = _flash_env_get("HELION_CUTE_FLASH_E2E_OFFSET0")
         if env_offset0 is not None:
             env_offset0_value = int(env_offset0)
             if e2e_offset_period == 0:
@@ -1425,6 +1803,8 @@ class ConfigSpec:
         self.cute_attention_generic_fallback_enabled = False
         self._cute_attention_generic_fallback_block_size_targets = {}
         self.cute_flash_search_enabled = True
+        self._cute_flash_fragments_cache.clear()
+        self._cute_flash_fragments_env_fingerprint = None
         self._cute_flash_head_dim = head_dim
         self._cute_flash_num_kv = num_kv
         self._cute_flash_num_bh = num_bh
@@ -1523,6 +1903,7 @@ class ConfigSpec:
             ("l2_groupings", 1),
             ("num_threads", 0),
             ("cute_vector_widths", 1),
+            ("cute_lane_layouts", "blocked"),
         ):
             value = config.get(key)
             if value and (
@@ -1603,6 +1984,7 @@ class ConfigSpec:
         m_block_id: int,
         n_block_id: int,
         k_block_id: int,
+        compile_time_static_extents: tuple[int | None, int | None, int | None],
         input_dtype: torch.dtype,
         has_leading_passthrough: bool,
         explicit_epi_tile_compatible: bool,
@@ -1611,6 +1993,7 @@ class ConfigSpec:
             m_block_id=m_block_id,
             n_block_id=n_block_id,
             k_block_id=k_block_id,
+            compile_time_static_extents=compile_time_static_extents,
             input_dtype=input_dtype,
             has_leading_passthrough=has_leading_passthrough,
             explicit_epi_tile_compatible=explicit_epi_tile_compatible,
@@ -1620,6 +2003,14 @@ class ConfigSpec:
         self,
     ) -> tuple[BlockSizeFragment, BlockSizeFragment, BlockSizeFragment] | None:
         return self._cute_tcgen05_config._matmul_block_fragments()
+
+    def _tcgen05_matmul_block_ids(self) -> tuple[int, int, int] | None:
+        return self._cute_tcgen05_config.matmul_block_ids
+
+    def _tcgen05_matmul_compile_time_static_extents(
+        self,
+    ) -> tuple[int | None, int | None, int | None] | None:
+        return self._cute_tcgen05_config.matmul_compile_time_static_extents
 
     def _tcgen05_matmul_seed_block_sizes(
         self, *, bm: int, bn: int, bk: int
@@ -1695,6 +2086,14 @@ class ConfigSpec:
         self._cute_tcgen05_config.allow_ab_stages_three_search(
             dtype_bytes=dtype_bytes,
             device=device,
+        )
+
+    def register_cute_tcgen05_grouped_worklist_smem_facts(
+        self, *, group_count: int, device_split_sizes: bool
+    ) -> None:
+        self._cute_tcgen05_config.register_grouped_worklist_smem_facts(
+            group_count=group_count,
+            device_split_sizes=device_split_sizes,
         )
 
     @staticmethod
@@ -1865,6 +2264,21 @@ class ConfigSpec:
     def is_supported_config(self, config: Mapping[str, object]) -> bool:
         return not self.unsupported_config_keys(config)
 
+    def normalized_config(
+        self,
+        config: helion.Config | Mapping[str, object],
+    ) -> helion.Config:
+        """Return a normalized copy without mutating the requested config."""
+        values = config.config if isinstance(config, helion.Config) else config
+        copied_values = {
+            key: _copy_config_structure(value) for key, value in values.items()
+        }
+        normalized = helion.Config(
+            **copied_values  # pyrefly: ignore[bad-argument-type]
+        )
+        self.normalize(normalized)
+        return normalized
+
     def normalize(
         self, config: helion.Config | dict[str, object], *, _fix_invalid: bool = False
     ) -> None:
@@ -1938,6 +2352,8 @@ class ConfigSpec:
             ("loop_orders", self.loop_orders, False),
             ("reduction_loops", self.reduction_loops, True),
             ("cute_vector_widths", self.cute_vector_widths, True),
+            ("cute_lane_layouts", self.cute_lane_layouts, True),
+            ("cute_reduction_reloads", self.cute_reduction_reloads, True),
             ("range_unroll_factors", self.range_unroll_factors, True),
             ("range_warp_specializes", self.range_warp_specialize, True),
             ("range_num_stages", self.range_num_stages, True),
@@ -2078,8 +2494,16 @@ class ConfigSpec:
         ):
             nt_list = cast("list[int]", config.get("num_threads", []) or [])
             bs_list = cast("list[int]", config.get("block_sizes", []) or [])
+            # ``num_threads`` also carries per-rolled-rdim slots (the
+            # reduction's own thread count); only NON-reduction tile axes
+            # consume the budget the reduction competes for.  Tile slots
+            # are registered in ``block_sizes`` order, so pairing the i-th
+            # num_threads slot with block_sizes[i] stays valid for them.
+            reduction_block_ids = {spec.block_id for spec in self.reduction_loops}
             other_threads = 1
-            for i, _ in enumerate(self.num_threads):
+            for i, nt_spec in enumerate(self.num_threads):
+                if nt_spec.block_id in reduction_block_ids:
+                    continue
                 nt = nt_list[i] if i < len(nt_list) else 0
                 if not isinstance(nt, int) or nt <= 0:
                     bs = bs_list[i] if i < len(bs_list) else 1
@@ -2143,6 +2567,8 @@ class ConfigSpec:
             "flatten_loops",
             "reduction_loops",
             "cute_vector_widths",
+            "cute_lane_layouts",
+            "cute_reduction_reloads",
             "range_unroll_factors",
             "range_warp_specializes",
             "range_num_stages",
@@ -2250,7 +2676,7 @@ class ConfigSpec:
         if (
             self.supports_config_key("pallas_load_buffer_count")
             and self.has_pallas_inner_loops
-            and config.get("pallas_loop_type") == "fori_loop"
+            and config.get("pallas_loop_type") in ("fori_loop", "unroll")
         ):
             values = config.setdefault(
                 "pallas_load_buffer_count", self.pallas_load_buffer_count.default()
@@ -2737,13 +3163,19 @@ class ConfigSpec:
         self._shrink_for_numel_constraints(config)
         return config
 
+    def autotune_reference_config(self) -> helion.Config:
+        """Return the conservative fragment config used as the autotuning
+        reference."""
+        return self._base_default_config()
+
     def default_config(self) -> helion.Config:
+        """Return the config used for execution when autotuning is disabled."""
         if self.compiler_default_config is None:
-            return self._base_default_config()
+            return self.autotune_reference_config()
         # A promoted seed only specifies the knobs it cares about (e.g. block_sizes); layer it over
         # the full base defaults so every other key — including user register_tunable defaults — is
         # preserved rather than dropped.
-        merged = dict(self._base_default_config().config)
+        merged = dict(self.autotune_reference_config().config)
         merged.update(self.compiler_default_config.config)
         config = helion.Config.from_dict(merged)
         # Then normalize, so a promoted compiler default has the same canonical field set as the
@@ -2823,37 +3255,30 @@ class ConfigSpec:
             if self.cute_tcgen05_search_enabled:
                 fields.update(self._cute_tcgen05_config.flat_fields())
             elif self.cute_flash_search_enabled:
-                from .._compiler.cute.cute_flash import flash_autotune_fragments
-
-                assert self._cute_flash_head_dim is not None
-                assert self._cute_flash_num_kv is not None
                 fields.update(
-                    flash_autotune_fragments(
-                        self._cute_flash_head_dim,
-                        self._cute_flash_num_kv,
-                        num_bh=self._cute_flash_num_bh,
-                        tensor_4d_heads=self._cute_flash_tensor_4d_heads,
-                        dtype=self._cute_flash_dtype,
-                        is_causal=self._cute_flash_is_causal,
-                        has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
-                        requires_ws_overlap=self._cute_flash_requires_ws_overlap,
-                        small_biased_candidate=(
-                            self._cute_flash_small_biased_candidate
-                        ),
-                        standard_dense_output=self._cute_flash_standard_dense_output,
-                        standard_causal_output=(
-                            self._cute_flash_standard_causal_output
-                        ),
-                        target_device_capability=self.target_device_capability,
-                        output_requires_tma=self._cute_flash_output_requires_tma,
-                        supports_tensor_4d_tma=(
-                            self._cute_flash_supports_tensor_4d_tma
-                        ),
+                    self._cute_flash_autotune_fragments(
                         pipeline_family_override=_flash_pipeline_family_override,
                     )
                 )
             elif self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
+                # Rolled-reduction loop chunks are tunable on the SIMT path
+                # (LoopedReductionStrategy lane lattices).  Without this
+                # entry the chunk silently pins to its default and neither
+                # the seeds nor the search can change it.
+                if (
+                    self.supports_config_key("reduction_loops")
+                    and len(self.reduction_loops) > 0
+                ):
+                    fields["reduction_loops"] = self.reduction_loops
+                # Per-load-site L1 eviction hints (streamed rows want
+                # evict_first; re-read rows want evict_last until the
+                # final sweep).
+                if (
+                    self.supports_config_key("load_eviction_policies")
+                    and self.load_eviction_policies.length > 0
+                ):
+                    fields["load_eviction_policies"] = self.load_eviction_policies
                 # Universal pid emission honors ``loop_orders`` and the
                 # better order is shape-dependent. tcgen05 exposes the same
                 # field from CuteTcgen05Config.flat_fields().
@@ -2873,6 +3298,48 @@ class ConfigSpec:
                     and len(self.cute_vector_widths) > 0
                 ):
                     fields["cute_vector_widths"] = self.cute_vector_widths
+                # Per-block lane layout (blocked vs strided per-thread
+                # element assignment) for lane loops with more than one
+                # iteration; strided gives fully coalesced warp accesses.
+                if (
+                    self.supports_config_key("cute_lane_layouts")
+                    and len(self.cute_lane_layouts) > 0
+                ):
+                    fields["cute_lane_layouts"] = self.cute_lane_layouts
+                # Where multi-sweep rolled reductions keep re-read values
+                # (register fragment vs gmem/L2 reload); see
+                # ``CuteReductionReloadSpec``.
+                if (
+                    self.supports_config_key("cute_reduction_reloads")
+                    and len(self.cute_reduction_reloads) > 0
+                ):
+                    fields["cute_reduction_reloads"] = self.cute_reduction_reloads
+                # Thread-block cluster width for SIMT reduction kernels:
+                # splits a whole-extent lane-looped axis across cluster
+                # CTAs (register-resident slices) with a DSM cluster
+                # reduce.  Ignored (cluster 1) when the config shape
+                # doesn't qualify — see
+                # ``PerThreadNDTileStrategy._maybe_apply_cute_cluster``.
+                if (
+                    self.supports_config_key("cute_cluster_n")
+                    and len(self.cute_lane_layouts) > 0
+                    and not self.matmul_facts
+                ):
+                    fields["cute_cluster_n"] = EnumFragment(choices=(1, 2, 4, 8, 16))
+                # Minimum resident CTAs per SM (ptxas ``minnctapersm``):
+                # caps registers per thread so more CTAs fit, trading
+                # spills for occupancy.  0 leaves ptxas free.  6 is a
+                # hard squeeze (at 128 threads it caps registers at 85 ->
+                # 24 warps/SM); measured on B200 softmax rows, one extra
+                # resident CTA beats ~10 spilled registers.
+                if (
+                    self.supports_config_key("cute_min_blocks_per_mp")
+                    and len(self.cute_lane_layouts) > 0
+                    and not self.matmul_facts
+                ):
+                    fields["cute_min_blocks_per_mp"] = EnumFragment(
+                        choices=(0, 1, 2, 3, 4, 6)
+                    )
             if (
                 not self.cute_flash_search_enabled
                 and self.epilogue_subtile_autotune_choices is not None
@@ -3466,6 +3933,73 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
 
 
 _CUTE_VECTOR_WIDTH_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
+_CUTE_LANE_LAYOUT_CHOICES: tuple[str, ...] = ("blocked", "strided")
+_CUTE_REDUCTION_RELOAD_CHOICES: tuple[str, ...] = ("auto", "register", "gmem")
+
+
+class CuteReductionReloadSpec(_BlockIdItem):
+    """Where a multi-sweep rolled reduction keeps the values it re-reads.
+
+    LayerNorm/RMSNorm-style kernels sweep the same input several times
+    (reduce, then consume).  ``"register"`` caches the first sweep's loads
+    in a per-thread register fragment (fastest when the per-thread slice
+    is small; spills to local memory when it is not).  ``"gmem"`` re-loads
+    from global memory on later sweeps (the row is usually still resident
+    in L2, and no registers are burned).  ``"auto"`` (default) keeps the
+    legacy size heuristic in ``fuse_two_pass_loads``.
+    """
+
+    def __init__(self, *, block_id: int) -> None:
+        super().__init__([block_id])
+
+    def _fragment(self, base: ConfigSpec) -> EnumFragment:
+        return EnumFragment(choices=_CUTE_REDUCTION_RELOAD_CHOICES)
+
+    def _normalize(self, name: str, value: object) -> str:
+        if value not in _CUTE_REDUCTION_RELOAD_CHOICES:
+            raise InvalidConfig(
+                f"{name} must be one of {_CUTE_REDUCTION_RELOAD_CHOICES}, got {value!r}"
+            )
+        return str(value)
+
+    def _fill_missing(self) -> str:
+        return "auto"
+
+
+class CuteLaneLayoutSpec(_BlockIdItem):
+    """Per-block per-thread element assignment for CuTe lane loops.
+
+    ``"blocked"``: thread ``t`` owns ``EPT`` contiguous elements
+    (``base = offset + t*EPT + lane*V``).  Consecutive threads in a warp
+    touch addresses ``EPT*elem_size`` bytes apart, so a warp's loads/stores
+    of one lane iter span many cache lines (poor per-instruction
+    coalescing; only acceptable when the lane loop has a single iteration,
+    where both layouts coincide).
+
+    ``"strided"``: thread ``t`` owns V-wide chunks strided by the thread
+    count (``base = offset + (lane*NT + t)*V``).  Consecutive threads touch
+    consecutive V-chunks, so each warp instruction is fully coalesced.
+    """
+
+    def __init__(
+        self,
+        *,
+        block_id: int,
+    ) -> None:
+        super().__init__([block_id])
+
+    def _fragment(self, base: ConfigSpec) -> EnumFragment:
+        return EnumFragment(choices=_CUTE_LANE_LAYOUT_CHOICES)
+
+    def _normalize(self, name: str, value: object) -> str:
+        if value not in _CUTE_LANE_LAYOUT_CHOICES:
+            raise InvalidConfig(
+                f"{name} must be one of {_CUTE_LANE_LAYOUT_CHOICES}, got {value!r}"
+            )
+        return str(value)
+
+    def _fill_missing(self) -> str:
+        return "blocked"
 
 
 class CuteVectorWidthSpec(_BlockIdItem):

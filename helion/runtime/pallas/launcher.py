@@ -79,6 +79,16 @@ def _is_torch_tensor_or_jax_array(x: object) -> TypeGuard[_TorchTensorOrJaxArray
     return hasattr(x, "shape") and hasattr(x, "dtype")
 
 
+def _pallas_logical_shape(tensor: _TorchTensorOrJaxArray) -> tuple[int, ...]:
+    """Return the logical shape exposed to a generated Pallas program."""
+    shape = tuple(int(size) for size in tensor.shape)
+    # Keep this helper free of torch references: it is shared by the direct
+    # TorchTPU launcher and the torch-free standalone JAX launcher slice.
+    if str(tensor.dtype) == "torch.float4_e2m1fn_x2" and shape:
+        return (*shape[:-1], shape[-1] * 2)
+    return shape
+
+
 def _pallas_make_block_spec(
     pl: object,
     jnp: object,
@@ -97,7 +107,7 @@ def _pallas_make_block_spec(
 
     if entry is None:
         ndim = tensor.ndim
-        full_shape = tuple(max(s, 1) for s in tensor.shape)
+        full_shape = tuple(max(s, 1) for s in _pallas_logical_shape(tensor))
 
         def index_map_full(*grid_args: object, _nd: int = ndim) -> tuple[object, ...]:
             # pyrefly: ignore[missing-attribute]
@@ -108,14 +118,15 @@ def _pallas_make_block_spec(
     block_shape_template, grid_dims = entry
     # Clamp to >= 1: empty tensors (zero-work grids) would otherwise produce
     # 0-sized block dims, which the interpret machinery divides by.
+    tensor_shape = _pallas_logical_shape(tensor)
     block_shape = tuple(
-        max(min(bs, tensor.shape[d]) if bs is not None else tensor.shape[d], 1)
+        max(min(bs, tensor_shape[d]) if bs is not None else tensor_shape[d], 1)
         for d, bs in enumerate(block_shape_template)
     )
     # Block indices past the last block are clamped, matching pallas_call's
     # window clamping (index maps may run past the end, e.g. offset reads).
     max_block_index = tuple(
-        max(-(-tensor.shape[d] // bs), 1) - 1 for d, bs in enumerate(block_shape)
+        max(-(-tensor_shape[d] // bs), 1) - 1 for d, bs in enumerate(block_shape)
     )
 
     def _index_for_dim(
@@ -594,6 +605,12 @@ def _jax_placeholder_for_tensor(t: torch.Tensor) -> object:
     on CPU).
     """
     import jax
+
+    if t.dtype == torch.float4_e2m1fn_x2:
+        import jax.numpy as jnp
+
+        return jax.ShapeDtypeStruct(_pallas_logical_shape(t), jnp.float4_e2m1fn)
+
     from torch._inductor.runtime.runtime_utils import torch_dtype_to_jax_runtime
 
     jax_dtype = torch_dtype_to_jax_runtime(t.dtype)
@@ -645,6 +662,7 @@ def _pallas_jnp_dtype_map() -> dict[str, object]:
         "jnp.uint8": jnp.uint8,
         "jnp.bool_": jnp.bool_,
         "jnp.float8_e4m3fn": jnp.float8_e4m3fn,
+        "jnp.float4_e2m1fn": jnp.float4_e2m1fn,
     }
 
 
@@ -982,7 +1000,7 @@ def _pallas_apply_ds_padding_fast(
         a = args[arg_idx] if args_list is None else args_list[arg_idx]
         if not isinstance(a, torch.Tensor):
             continue
-        pad_amount = (-a.shape[dim]) % block_size + extra_pad
+        pad_amount = (-_pallas_logical_shape(a)[dim]) % block_size + extra_pad
         if pad_amount == 0:
             continue
         any_padding = True
@@ -1333,18 +1351,41 @@ class _PallasInterpretCallable:
         return tuple(jax_results)
 
 
-def _ensure_cpu_tpu_info() -> None:
-    """Register a synthetic TpuInfo for ``"cpu"`` so that
-    ``emit_pipeline`` / ``fori_loop`` interpret paths don't fail.
+def _ensure_cpu_tpu_info(device_kind: str | None = None) -> None:
+    """Register TPU metadata for Pallas traces that use CPU placeholders.
+
+    Interpret mode uses a TPU7x-compatible default.  The direct TorchTPU
+    launcher passes the physical device kind so hardware-dependent Pallas
+    lowering still targets the attached TPU while JAX remains CPU-only.
     """
     try:
         from jax._src.pallas.mosaic.tpu_info import ChipVersion
+        from jax._src.pallas.mosaic.tpu_info import chip_version_from_device_kind
         from jax._src.pallas.mosaic.tpu_info import get_tpu_info_for_chip
         from jax._src.pallas.mosaic.tpu_info import registry
     except ImportError:
         return
-    if "cpu" not in registry:
-        registry["cpu"] = lambda: get_tpu_info_for_chip(ChipVersion.TPU_7X, 1)
+
+    if device_kind is None:
+        chip_version = ChipVersion.TPU_7X
+    else:
+        # TorchTPU calls the split-core TPU7 device "TPU v7", while JAX calls
+        # the same target "TPU7x".
+        pallas_device_kind = "TPU7x" if device_kind == "TPU v7" else device_kind
+        chip_version = chip_version_from_device_kind(pallas_device_kind)
+        if chip_version is None:
+            raise RuntimeError(f"Unsupported TorchTPU device: {device_kind}")
+    info = get_tpu_info_for_chip(chip_version, 1)
+    registry["cpu"] = lambda: info
+
+
+def _ensure_torch_tpu_cpu_export_info() -> None:
+    """Expose the physical TPU target to a CPU-only JAX export trace."""
+    from torch_tpu._internal.utils.hardware import (  # pyrefly: ignore[missing-import]
+        get_tpu_device_name,
+    )
+
+    _ensure_cpu_tpu_info(get_tpu_device_name())
 
 
 def _pallas_apply_ds_padding(
@@ -1368,7 +1409,7 @@ def _pallas_apply_ds_padding(
         a = args_list[arg_idx]
         if not isinstance(a, torch.Tensor):
             continue
-        pad_amount = (-a.shape[dim]) % block_size + extra_pad
+        pad_amount = (-_pallas_logical_shape(a)[dim]) % block_size + extra_pad
         if pad_amount == 0:
             continue
         if arg_idx in output_set and arg_idx not in orig_output_tensors:
@@ -2065,6 +2106,8 @@ def _pallas_install_launcher_cache(
     )
     if interpret:
         _ensure_cpu_tpu_info()
+    else:
+        _ensure_torch_tpu_cpu_export_info()
 
     output_indices = _output_indices if _output_indices is not None else []
 
@@ -2705,6 +2748,8 @@ def _pallas_install_compact_launcher_cache(
     )
     if interpret:
         _ensure_cpu_tpu_info()
+    else:
+        _ensure_torch_tpu_cpu_export_info()
     output_indices = _output_indices if _output_indices is not None else []
 
     spec_args = args

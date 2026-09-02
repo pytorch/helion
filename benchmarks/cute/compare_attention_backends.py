@@ -163,6 +163,8 @@ ALL_IMPLS = (
 )
 HELION_IMPLS = ("helion-cute", "helion-tileir", "helion-triton")
 _STRICT_FINAL_CORRECTNESS_LAUNCHES = 64
+_DEFAULT_MEASURE_COOLDOWN_MARGIN_C = 3.0
+_COOLDOWN_MAX_WAIT_S = 300.0
 _CUTE_FLASH_LANE_POLICY_VERSION = 14
 _FLASH_TERMINAL_REFINEMENT_SCHEMA_VERSION = 2
 _FLASH_TERMINAL_REFINEMENT_POLICY_VERSION = 2
@@ -615,44 +617,188 @@ def _validate_strict_gpu_selection(require_full_autotune: bool) -> None:
         )
 
 
+def _selected_physical_gpu() -> str:
+    """The physical GPU index the benchmark runs on, for nvidia-smi -i."""
+    visible = _physical_gpu_selection()
+    physical_gpu = visible.split(",", 1)[0].strip()
+    if not physical_gpu:
+        if not torch.cuda.is_available():
+            raise RuntimeError("no CUDA device selected")
+        physical_gpu = str(torch.cuda.current_device())
+    return physical_gpu
+
+
+def _query_gpu_field(field: str) -> float:
+    """Query one numeric nvidia-smi field for the selected physical GPU.
+
+    Raises on any failure; callers decide whether that is fatal.
+    """
+    proc = subprocess.run(
+        [
+            "nvidia-smi",
+            "-i",
+            _selected_physical_gpu(),
+            f"--query-gpu={field}",
+            "--format=csv,noheader,nounits",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    output_lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    return float(output_lines[0])
+
+
 def _verify_power_cap_w(requested: int | None) -> int | None:
     """Return the measured power limit, rejecting mislabeled benchmark runs."""
     if requested is None:
         return None
 
-    visible = _physical_gpu_selection()
-    physical_gpu = visible.split(",", 1)[0].strip()
-    if not physical_gpu:
-        if not torch.cuda.is_available():
-            raise SystemExit("cannot verify a GPU power cap without CUDA")
-        physical_gpu = str(torch.cuda.current_device())
     try:
-        proc = subprocess.run(
-            [
-                "nvidia-smi",
-                "-i",
-                physical_gpu,
-                "--query-gpu=power.limit",
-                "--format=csv,noheader,nounits",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        output_lines = [
-            line.strip() for line in proc.stdout.splitlines() if line.strip()
-        ]
-        actual = float(output_lines[0])
-    except (IndexError, OSError, subprocess.CalledProcessError, ValueError) as exc:
+        actual = _query_gpu_field("power.limit")
+    except (
+        IndexError,
+        OSError,
+        RuntimeError,
+        subprocess.SubprocessError,
+        ValueError,
+    ) as exc:
         raise SystemExit(
-            f"failed to verify the power limit for physical GPU {physical_gpu}"
+            "failed to verify the power limit for physical GPU "
+            f"{_physical_gpu_selection() or '<current>'}"
         ) from exc
     if abs(actual - requested) > 0.5:
         raise SystemExit(
-            f"physical GPU {physical_gpu} has a {actual:g} W power limit; "
-            f"requested benchmark label is {requested} W"
+            f"physical GPU {_selected_physical_gpu()} has a {actual:g} W power "
+            f"limit; requested benchmark label is {requested} W"
         )
     return int(round(actual))
+
+
+def _gpu_temperature_c() -> float | None:
+    """Current core temperature of the selected physical GPU, or None."""
+    try:
+        return _query_gpu_field("temperature.gpu")
+    except (
+        IndexError,
+        OSError,
+        RuntimeError,
+        subprocess.SubprocessError,
+        ValueError,
+    ):
+        return None
+
+
+_STARTUP_GPU_TEMP_C: float | None = None
+
+
+def _capture_startup_gpu_temperature() -> None:
+    """Record the GPU temperature before this process does any GPU work.
+
+    The pre-measurement cooldown targets this reference plus a small margin:
+    "restore the thermal state the process started in" is the invariant that
+    makes a row measured after hours of in-process work (a full autotune
+    search) comparable to a baseline measured in a fresh process, and unlike
+    an absolute threshold it holds on chassis with different idle
+    temperatures. Leaves the reference as None (disabling the cooldown) when
+    the temperature cannot be read.
+    """
+    global _STARTUP_GPU_TEMP_C
+    _STARTUP_GPU_TEMP_C = _gpu_temperature_c()
+
+
+def _wait_for_gpu_cooldown(
+    max_temp_c: float,
+    *,
+    timeout_s: float = _COOLDOWN_MAX_WAIT_S,
+    poll_s: float = 5.0,
+    plateau_window_s: float = 30.0,
+    plateau_delta_c: float = 1.0,
+) -> dict[str, Any] | None:
+    """Idle until the GPU cools to ``max_temp_c`` (or plateaus / times out).
+
+    Sustained load before a measurement (a multi-hour autotune search, or a
+    long-running prior benchmark) heat-soaks the GPU; under a power cap a
+    heat-soaked B200 sustains ~1% lower attention throughput than one that
+    starts near idle temperature, and that bias lands only on the impls that
+    do heavy pre-measurement work. Cooling back to the target (in practice
+    the process-startup temperature plus a margin) keeps such rows comparable
+    to baselines measured in fresh processes. The plateau exit covers targets
+    made unreachable by ambient drift, and ``timeout_s`` is a hard wall-clock
+    cap: every iteration advances ``waited`` by at least ``poll_s``, so the
+    wait is bounded by ``timeout_s`` plus one poll no matter what the
+    temperature does. Returns a provenance dict describing the wait, or None
+    when the GPU temperature cannot be read.
+    """
+    start_temp = _gpu_temperature_c()
+    if start_temp is None:
+        return None
+    provenance: dict[str, Any] = {
+        "requested_max_temp_c": max_temp_c,
+        "startup_reference_c": _STARTUP_GPU_TEMP_C,
+        "start_temp_c": start_temp,
+    }
+    started_at = time.perf_counter()
+    window: list[tuple[float, float]] = [(0.0, start_temp)]
+    waited = 0.0
+    temp = start_temp
+    reason = "already_cool" if start_temp <= max_temp_c else None
+    if reason is None:
+        print(
+            f"cooldown: idling until the GPU cools from {start_temp:g}C to "
+            f"{max_temp_c:g}C (plateau/timeout fallbacks, up to {timeout_s:g}s)",
+            file=sys.stderr,
+            flush=True,
+        )
+    while reason is None:
+        if waited >= timeout_s:
+            reason = "timeout"
+            break
+        time.sleep(poll_s)
+        waited = time.perf_counter() - started_at
+        polled = _gpu_temperature_c()
+        if polled is None:
+            reason = "temperature_unavailable"
+            break
+        temp = polled
+        if temp <= max_temp_c:
+            reason = "reached"
+            break
+        window.append((waited, temp))
+        window = [(t, c) for t, c in window if waited - t <= plateau_window_s]
+        if (
+            waited - window[0][0] >= plateau_window_s - poll_s / 2
+            # A plateau requires the temperature to have stopped falling
+            # (flat counts); a RISING trace (another process heating the
+            # GPU) must keep waiting until the timeout rather than exit hot.
+            and 0.0 <= window[0][1] - temp < plateau_delta_c
+        ):
+            reason = "plateau"
+            break
+    provenance["end_temp_c"] = temp
+    provenance["waited_s"] = waited
+    provenance["reason"] = reason
+    if waited > 0:
+        print(
+            f"cooldown: {start_temp:g}C -> {temp:g}C after {waited:.0f}s "
+            f"({reason}; threshold {max_temp_c:g}C)",
+            file=sys.stderr,
+            flush=True,
+        )
+    return provenance
+
+
+def _cooldown_target_temp_c(args: argparse.Namespace) -> float | None:
+    """Cooldown target: the process-startup GPU temperature plus a margin.
+
+    Returns None (cooldown disabled) when the margin is negative or the
+    startup reference was never captured / could not be read.
+    """
+    margin = getattr(args, "measure_cooldown_margin_c", None)
+    if margin is None or float(margin) < 0 or _STARTUP_GPU_TEMP_C is None:
+        return None
+    return _STARTUP_GPU_TEMP_C + float(margin)
 
 
 def _attention_flops(args: argparse.Namespace) -> float:
@@ -1592,21 +1738,31 @@ def _bench_steady(
     do_bench_fn: Callable[..., Any] | None = None,
     cache_warmup_calls: int = 5,
     thermal_warmup_ms: int = 10000,
+    cooldown_max_temp_c: float | None = None,
 ) -> dict[str, Any]:
     """Steady-state benchmark.
 
-    1. Cache warmup: call fn() a few times to populate per-launch caches.
-    2. Thermal warmup: drive the GPU to a stable clock state.
-    3. Measurement: ``num_runs`` of do_bench(warmup, rep). Returns
+    1. Cooldown (optional): idle until the GPU sheds heat soak from earlier
+       work in this process, so every impl measures from the same near-idle
+       thermal state regardless of how much pre-measurement work it did.
+    2. Cache warmup: call fn() a few times to populate per-launch caches.
+    3. Thermal warmup: drive the GPU to a stable clock state.
+    4. Measurement: ``num_runs`` of do_bench(warmup, rep). Returns
        best/mom-median/mean across runs; mom-median is the gate metric,
-       best-of-N is diagnostic only. CuTe can inject the backend wall-clock
-       timer here because CUDA-event timing mis-times CuTe kernels on Blackwell.
+       best-of-N is diagnostic only. CuTe can inject a synchronized
+       wall-clock timer here (``--helion-cute-benchmark-timer wall``) for
+       cross-checks against the default CUDA-event path.
     """
     bench_fn = do_bench_fn
     if bench_fn is None:
         from triton.testing import do_bench
 
         bench_fn = cast("Callable[..., Any]", do_bench)
+
+    cooldown = None
+    if cooldown_max_temp_c is not None and cooldown_max_temp_c > 0:
+        torch.cuda.synchronize()
+        cooldown = _wait_for_gpu_cooldown(cooldown_max_temp_c)
 
     for _ in range(cache_warmup_calls):
         fn()
@@ -1626,13 +1782,16 @@ def _bench_steady(
         assert isinstance(ms, float)
         runs.append(ms)
 
-    return {
+    stats: dict[str, Any] = {
         "best_ms": min(runs),
         "median_ms": statistics.median(runs),
         "mean_ms": sum(runs) / len(runs),
         "std_ms": statistics.stdev(runs) if len(runs) > 1 else 0.0,
         "runs_ms": runs,
     }
+    if cooldown is not None:
+        stats["thermal_cooldown"] = cooldown
+    return stats
 
 
 def _result(
@@ -1676,6 +1835,8 @@ def _result(
                 "mom_median_tflops": _tflops(args, stats["median_ms"]),
             }
         )
+        if "thermal_cooldown" in stats:
+            payload["thermal_cooldown"] = stats["thermal_cooldown"]
     if config is not None:
         payload["config"] = config
     if codegen is not None:
@@ -9699,6 +9860,7 @@ def _benchmark_sdpa(args: argparse.Namespace) -> dict[str, Any]:
             num_runs=args.num_runs,
             warmup_ms=args.warmup_ms,
             rep_ms=args.rep_ms,
+            cooldown_max_temp_c=_cooldown_target_temp_c(args),
         )
     return _result(
         "sdpa",
@@ -10016,6 +10178,7 @@ def _benchmark_kernelagent(args: argparse.Namespace) -> dict[str, Any]:
                 num_runs=args.num_runs,
                 warmup_ms=args.warmup_ms,
                 rep_ms=args.rep_ms,
+                cooldown_max_temp_c=_cooldown_target_temp_c(args),
             )
 
     selection = manifest.get("selection", {})
@@ -10206,6 +10369,7 @@ def _benchmark_flexattention(args: argparse.Namespace) -> dict[str, Any]:
             num_runs=args.num_runs,
             warmup_ms=args.warmup_ms,
             rep_ms=args.rep_ms,
+            cooldown_max_temp_c=_cooldown_target_temp_c(args),
         )
     return _result(
         impl,
@@ -10290,6 +10454,7 @@ def _benchmark_gluon(args: argparse.Namespace) -> dict[str, Any]:
         num_runs=args.num_runs,
         warmup_ms=args.warmup_ms,
         rep_ms=args.rep_ms,
+        cooldown_max_temp_c=_cooldown_target_temp_c(args),
     )
     return _result(
         "gluon",
@@ -10338,6 +10503,7 @@ def _benchmark_tlx(args: argparse.Namespace) -> dict[str, Any]:
         num_runs=args.num_runs,
         warmup_ms=args.warmup_ms,
         rep_ms=args.rep_ms,
+        cooldown_max_temp_c=_cooldown_target_temp_c(args),
     )
     best_config = getattr(module._attn_fwd_ws, "best_config", None)
     return _result(
@@ -10502,6 +10668,7 @@ def _benchmark_fa4(args: argparse.Namespace) -> dict[str, Any]:
             num_runs=args.num_runs,
             warmup_ms=args.warmup_ms,
             rep_ms=args.rep_ms,
+            cooldown_max_temp_c=_cooldown_target_temp_c(args),
         )
     notes = (
         ["Timed eager torch.relu after FA4; ReLU FLOPs are excluded."]
@@ -10549,6 +10716,7 @@ def _benchmark_tilegym_tileir(args: argparse.Namespace) -> dict[str, Any]:
         num_runs=args.num_runs,
         warmup_ms=args.warmup_ms,
         rep_ms=args.rep_ms,
+        cooldown_max_temp_c=_cooldown_target_temp_c(args),
     )
     best_config = get_best_config()
     config = (
@@ -10575,30 +10743,26 @@ def _benchmark_tilegym_tileir(args: argparse.Namespace) -> dict[str, Any]:
 
 def _helion_benchmark_timer(args: argparse.Namespace, backend: str) -> str:
     if backend == "cute":
-        return str(getattr(args, "helion_cute_benchmark_timer", "wall"))
+        return str(getattr(args, "helion_cute_benchmark_timer", "event"))
     return "event"
 
 
-def _validate_strict_helion_benchmark_timer(
-    args: argparse.Namespace, backend: str
-) -> None:
-    if (
-        backend == "cute"
-        and bool(getattr(args, "helion_require_full_autotune", 0))
-        and _helion_benchmark_timer(args, backend) != "wall"
-    ):
-        raise SystemExit(
-            "--helion-require-full-autotune requires "
-            "--helion-cute-benchmark-timer=wall because CUDA events can mis-time "
-            "CuTe kernels on Blackwell"
-        )
-
-
 def _helion_do_bench_fn(
-    bound: object, args: argparse.Namespace, backend: str
+    args: argparse.Namespace, backend: str
 ) -> Callable[..., Any] | None:
+    # ``event`` (default) uses the same CUDA-event do_bench as every other
+    # backend; event timing was re-validated against synchronized wall-clock
+    # timing on B200 (<0.1ms delta across flash families, including CLC+PDL
+    # and multi-second kernels) once compiled launchers removed the ~200ms
+    # per-launch host dispatch that originally made events unusable. ``wall``
+    # remains available for cross-checks but charges the compiled-launcher
+    # host overhead to the kernel (measured ~0.2ms per launch on B200: the
+    # same kernel reads 48.86ms wall vs 48.67ms event), which the event timer
+    # and the other backends' rows do not.
     if _helion_benchmark_timer(args, backend) == "wall":
-        return cast("Any", bound).env.backend.get_do_bench()
+        from helion.autotuner.benchmarking import do_bench_generic
+
+        return do_bench_generic
     return None
 
 
@@ -10634,9 +10798,6 @@ def _benchmark_helion(args: argparse.Namespace) -> dict[str, Any]:
     """
     _validate_epilogue_workload(args)
     require_full_autotune = bool(getattr(args, "helion_require_full_autotune", 0))
-    _validate_strict_helion_benchmark_timer(
-        args, str(getattr(args, "helion_backend", "cute"))
-    )
     _validate_strict_gpu_selection(require_full_autotune)
     initial_source: dict[str, object] | None = None
     if require_full_autotune:
@@ -10845,7 +11006,8 @@ def _benchmark_helion_in_environment(
             num_runs=args.num_runs,
             warmup_ms=args.warmup_ms,
             rep_ms=args.rep_ms,
-            do_bench_fn=_helion_do_bench_fn(bound, args, backend),
+            do_bench_fn=_helion_do_bench_fn(args, backend),
+            cooldown_max_temp_c=_cooldown_target_temp_c(args),
         )
         if require_full_autotune:
             _validate_post_measurement_source(autotune_provenance)
@@ -10958,7 +11120,13 @@ def _build_subprocess_cmd(args: argparse.Namespace, impl: str) -> list[str]:
         "--helion-return-lse",
         str(int(getattr(args, "helion_return_lse", 0))),
         "--helion-cute-benchmark-timer",
-        str(getattr(args, "helion_cute_benchmark_timer", "wall")),
+        str(getattr(args, "helion_cute_benchmark_timer", "event")),
+        "--measure-cooldown-margin-c",
+        str(
+            getattr(
+                args, "measure_cooldown_margin_c", _DEFAULT_MEASURE_COOLDOWN_MARGIN_C
+            )
+        ),
         "--json",
     ]
     power_cap_w = getattr(args, "power_cap_w", None)
@@ -12086,7 +12254,13 @@ def _run_shape_subprocess(
         "--helion-return-lse",
         str(int(getattr(args, "helion_return_lse", 0))),
         "--helion-cute-benchmark-timer",
-        str(getattr(args, "helion_cute_benchmark_timer", "wall")),
+        str(getattr(args, "helion_cute_benchmark_timer", "event")),
+        "--measure-cooldown-margin-c",
+        str(
+            getattr(
+                args, "measure_cooldown_margin_c", _DEFAULT_MEASURE_COOLDOWN_MARGIN_C
+            )
+        ),
         "--json",
     ]
     power_cap_w = getattr(args, "power_cap_w", None)
@@ -12442,13 +12616,28 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--measure-cooldown-margin-c",
+        type=float,
+        default=_DEFAULT_MEASURE_COOLDOWN_MARGIN_C,
+        help=(
+            "Before the measurement phase, idle until the GPU core "
+            "temperature returns to its process-startup value plus this "
+            "margin, so heavy pre-measurement work (e.g. a full autotune "
+            "search) cannot heat-soak the GPU and depress only that impl's "
+            "numbers. A no-op for processes that start near idle. Bounded "
+            f"by plateau detection and a hard {_COOLDOWN_MAX_WAIT_S:g}s "
+            "cap; set to a negative value to disable."
+        ),
+    )
+    parser.add_argument(
         "--helion-cute-benchmark-timer",
         choices=("wall", "event"),
-        default="wall",
+        default="event",
         help=(
-            "Timer for Helion-CuTe benchmark samples. The default wall-clock "
-            "path matches CuTe autotune timing; event mode uses the same CUDA "
-            "event timing path as FlexAttention/SDPA/FA4 for opt-in comparisons."
+            "Timer for Helion-CuTe benchmark samples. The default event mode "
+            "uses the same CUDA event timing path as FlexAttention/SDPA/FA4; "
+            "wall mode uses synchronized wall-clock timing for cross-checks "
+            "(it additionally charges per-launch host overhead to the kernel)."
         ),
     )
     parser.add_argument(
@@ -12555,6 +12744,10 @@ def main() -> None:
     if args.merge_json:
         _run_merge_json(args)
         return
+    # Sample the thermal reference before any GPU work; the pre-measurement
+    # cooldown restores this state so long-running setup (autotune) cannot
+    # bias the measurement.
+    _capture_startup_gpu_temperature()
     _validate_epilogue_workload(args)
     if args.all_shapes:
         _validate_all_shapes_full_autotune(args)

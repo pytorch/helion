@@ -193,6 +193,7 @@ class LFBOPatternSearch(PatternSearch):
         best_available_pad_random: bool = PATTERN_SEARCH_DEFAULTS.best_available_pad_random,
         num_neighbors_cap: int = -1,
         finishing_rounds: int = 0,
+        polish_rounds: int = 10,
         compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
         compile_timeout_quantile: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_quantile,
         flash_structural_search: FlashStructuralSearchConfig | None = None,
@@ -217,6 +218,10 @@ class LFBOPatternSearch(PatternSearch):
             compile_timeout_lower_bound=compile_timeout_lower_bound,
             compile_timeout_quantile=compile_timeout_quantile,
         )
+        # Parallel to train_x/train_y: the live member behind each training
+        # row (None for externally seeded rows). Used to sync labels with
+        # rebenchmarked timings before each surrogate fit.
+        self._train_members: list[PopulationMember | None] = []
 
         # Number of neighbors and how many to evalaute
         self.num_neighbors = num_neighbors
@@ -224,6 +229,7 @@ class LFBOPatternSearch(PatternSearch):
         self.frac_selected = frac_selected
         self.patience = patience
         self.similarity_penalty = similarity_penalty
+        self.polish_rounds = polish_rounds
         self.surrogate: RandomForestClassifier | None = None
 
         # Save training data
@@ -277,7 +283,13 @@ class LFBOPatternSearch(PatternSearch):
         policy = super()._algorithm_cache_policy()
         policy.update(
             {
-                "lfbo_version": 1,
+                # 2: benchmarked-only visited set, per-copy selection floor,
+                # incumbent retention, and rebenchmark-synced surrogate labels
+                # became unconditional.
+                # 3: a full-neighborhood polish descent runs after the main
+                # loop (see polish_rounds).
+                "lfbo_version": 3,
+                "polish_rounds": self.polish_rounds,
                 "num_neighbors": self.num_neighbors,
                 "radius": self.radius,
                 "frac_selected": self.frac_selected,
@@ -369,9 +381,11 @@ class LFBOPatternSearch(PatternSearch):
         perf: float,
         config: Config,
         fn: object,
+        member: PopulationMember | None = None,
     ) -> None:
         self.train_x.append(encoded)
         self.train_y.append(perf)
+        self._train_members.append(member)
         if self.train_configs is None:
             return
         if self.train_source_hashes is None:
@@ -420,7 +434,18 @@ class LFBOPatternSearch(PatternSearch):
             ):
                 self.train_y[index] = math.inf
 
+    def _sync_training_labels(self) -> None:
+        """Refresh train_y from live members so rebenchmarked timings (which
+        replace noisy one-shot measurements) are what the surrogate learns
+        from. Rows without a live member keep their recorded label."""
+        for index, member in enumerate(self._train_members):
+            if member is None or index >= len(self.train_y):
+                continue
+            if member.perfs and math.isfinite(self.train_y[index]):
+                self.train_y[index] = member.perf
+
     def _fit_surrogate(self) -> None:
+        self._sync_training_labels()
         train_x = np.array(self.train_x)
         train_y = np.array(self.train_y)
 
@@ -642,6 +667,7 @@ class LFBOPatternSearch(PatternSearch):
                 member.perf,
                 member.config,
                 member.fn,
+                member=member,
             )
 
         # Fit model
@@ -698,9 +724,6 @@ class LFBOPatternSearch(PatternSearch):
                     disable_early_stopping=self._path_exhausts_generation_budget(
                         constraints
                     ),
-                    selected_only_visited=bool(
-                        self._cute_flash_lane_policy_enabled and not constraints
-                    ),
                 )
             )
 
@@ -754,12 +777,54 @@ class LFBOPatternSearch(PatternSearch):
                         member.perf,
                         member.config,
                         member.fn,
+                        member=member,
                     )
                 # Fit model
                 self._fit_surrogate()
 
+        self._polish_descent(visited)
         # Final verification, finishing phase, and (TPU-only) final-pick re-rank.
         return self._finalize()
+
+    def _polish_descent(self, visited: set[Config]) -> None:
+        """Full-neighborhood descent after the surrogate-guided main loop.
+
+        Run plain pattern-search descent from the incumbent: benchmark the
+        *entire* deterministic radius-1 neighborhood (no surrogate pruning)
+        and move to the best neighbor until a round fails to improve, up to
+        ``polish_rounds`` rounds. Recovers local wins the surrogate's
+        selection fraction skipped, at a bounded extra eval cost.
+        """
+        rounds = self.polish_rounds
+        if rounds <= 0 or self.config_spec.cute_flash_search_enabled:
+            return
+        current = self.best
+        for round_num in self._budgeted_range(1, rounds + 1):
+            candidates = [current]
+            for flat_config in PatternSearch._generate_neighbors(
+                self, current.flat_values
+            ):
+                member = self.make_unbenchmarked(flat_config)
+                if member is not None and member.config not in visited:
+                    visited.add(member.config)
+                    candidates.append(member)
+            if len(candidates) <= 1:
+                self.log(f"Polish round {round_num}: no unvisited neighbors")
+                break
+            self.set_generation(self._autotune_metrics.num_generations + 1)
+            self.benchmark_population(candidates[1:], desc=f"Polish round {round_num}")
+            self.rebenchmark_population(
+                candidates, desc=f"Polish round {round_num}: verifying"
+            )
+            self.population.extend(candidates[1:])
+            best = min(candidates, key=performance)
+            self.log(
+                f"Polish round {round_num}: {len(candidates) - 1} neighbors, "
+                f"best {self.format_performance(best.perf)}"
+            )
+            if self._check_early_stopping(best, current):
+                break
+            current = best
 
     @staticmethod
     def _flash_structural_leaf(
@@ -1517,6 +1582,7 @@ class LFBOPatternSearch(PatternSearch):
                         member.perf,
                         member.config,
                         member.fn,
+                        member=member,
                     )
                 self._fit_surrogate()
                 self.population.sort(key=performance)
@@ -3065,7 +3131,6 @@ class LFBOPatternSearch(PatternSearch):
                     required_leaf=required_leaf,
                     conditional_surface=required_leaf is not None,
                     disable_early_stopping=True,
-                    selected_only_visited=unrestricted,
                 )
             )
 
@@ -4729,7 +4794,6 @@ class LFBOPatternSearch(PatternSearch):
         conditional_surface: bool = False,
         disable_early_stopping: bool = False,
         neighbor_limit: int | None = None,
-        selected_only_visited: bool = False,
     ) -> Iterator[list[PopulationMember]]:
         """
         Run a single copy of pattern search from the given starting point.
@@ -4798,25 +4862,23 @@ class LFBOPatternSearch(PatternSearch):
                 ):
                     candidates.append(new_member)
                     generated_configs.add(new_member.config)
-                    if not constraints and not selected_only_visited:
-                        # Preserve historical LFBO behavior outside the CuTe
-                        # structural-qualification path.
-                        visited.add(new_member.config)
 
-            # score candidates
+            # Score candidates. Only the selected (i.e. benchmarked)
+            # candidates enter `visited`, so proposals the surrogate rejects
+            # can be re-proposed after it learns more. The incumbent is always
+            # retained and at least one real neighbor is selected so a copy
+            # cannot die from selection-quota truncation.
             n_sorted = int(len(candidates) * self.frac_selected)
-            if constraints and len(candidates) > 1:
+            if len(candidates) > 1:
                 n_sorted = max(2, n_sorted)
             if selected_limit is not None:
                 n_sorted = min(n_sorted, selected_limit)
             candidates = self._surrogate_select(candidates, n_sorted)
-            if constraints or selected_only_visited:
-                selected_neighbors = [
-                    member for member in candidates if member.config != current.config
-                ]
-                candidates = [current, *selected_neighbors[: max(0, n_sorted - 1)]]
-            if constraints or selected_only_visited:
-                visited.update(member.config for member in candidates)
+            selected_neighbors = [
+                member for member in candidates if member.config != current.config
+            ]
+            candidates = [current, *selected_neighbors[: max(0, n_sorted - 1)]]
+            visited.update(member.config for member in candidates)
 
             if len(candidates) <= 1:
                 self.log(f"Copy {copy_idx} finish because of no candidates")
@@ -4933,6 +4995,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
         best_available_pad_random: bool = PATTERN_SEARCH_DEFAULTS.best_available_pad_random,
         num_neighbors_cap: int = -1,
         finishing_rounds: int = 0,
+        polish_rounds: int = 10,
         compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
         compile_timeout_quantile: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_quantile,
         flash_structural_search: FlashStructuralSearchConfig | None = None,
@@ -4954,6 +5017,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
             best_available_pad_random=best_available_pad_random,
             num_neighbors_cap=num_neighbors_cap,
             finishing_rounds=finishing_rounds,
+            polish_rounds=polish_rounds,
             compile_timeout_lower_bound=compile_timeout_lower_bound,
             compile_timeout_quantile=compile_timeout_quantile,
             flash_structural_search=flash_structural_search,

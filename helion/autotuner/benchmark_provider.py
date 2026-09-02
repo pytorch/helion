@@ -579,6 +579,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._effective_atol, self._effective_rtol = (
             self._compute_effective_tolerances()
         )
+        # Scale the atol floor per tensor only when the user did not pin an
+        # explicit absolute tolerance (see accuracy.assert_close).
+        self._scale_atol = self.settings.autotune_baseline_atol is None
         self._jobs = self._decide_num_jobs()
 
     def _record_accuracy_failure(self, config: Config) -> None:
@@ -715,7 +718,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
 
         The baseline is computed in one of two ways:
         - If settings.autotune_baseline_fn is provided, use that custom function
-        - Otherwise, run the kernel with the default config
+        - Otherwise, run the kernel with the conservative autotuning reference
         """
         new_args = _clone_args(self.args, self.kernel.env.process_group_name)
 
@@ -730,8 +733,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     f"Baseline function: {self.settings.autotune_baseline_fn}\n"
                 ) from e
         else:
-            # Use default config
-            baseline_config = self.config_spec.default_config()
+            baseline_config = self.config_spec.autotune_reference_config()
             try:
                 baseline_output = self.kernel.compile_config(
                     baseline_config, allow_print=False
@@ -749,8 +751,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 )
                 self.kernel.maybe_log_repro(self.log.error, new_args, baseline_config)
                 raise exc.InvalidConfig(
-                    "Default config failed while computing baseline.\n"
-                    f"Default config: {decorator}\n"
+                    "Autotuning reference config failed while computing baseline.\n"
+                    f"Reference config: {decorator}\n"
                     f"{SUPPRESSED_TRITON_CODE_MSG}\n"
                     "To work around this error, you could set `@helion.kernel(autotune_baseline_fn=...)` "
                     "to provide a custom baseline function (e.g. PyTorch eager implementation of your kernel)."
@@ -954,6 +956,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self.budget_exceeded_fn = _never_exceeded
 
     def _subprocess_benchmark_uses_wall_clock(self) -> bool:
+        # Always False for the stock cute backend since it inherits the
+        # default (event-timed) get_do_bench; this hook remains for a backend
+        # that opts into wall-clock timing while still supporting the simple
+        # subprocess benchmark job shape.
         backend = getattr(self.config_spec, "backend", None)
         if backend is None:
             return False
@@ -961,10 +967,11 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         return backend.name == "cute" and custom_bench is do_bench_generic
 
     def _probe_long_cute_flash_kernel(self) -> bool:
-        return bool(
-            self.config_spec.cute_flash_search_enabled
-            and self._subprocess_benchmark_uses_wall_clock()
-        )
+        # Flash attention candidates can run for multiple seconds per launch;
+        # probing from a single call (instead of the 5-call estimate loop)
+        # keeps those benchmarks to ~3 launches on both the event-timed and
+        # wall-clock paths.
+        return bool(self.config_spec.cute_flash_search_enabled)
 
     def _effective_source_dedup_enabled(self) -> bool:
         """Whether this provider may collapse source-identical candidates.
@@ -1024,6 +1031,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     self._baseline_output,
                     atol=self._effective_atol,
                     rtol=self._effective_rtol,
+                    scale_atol_by_expected_rms=self._scale_atol,
                 )
                 if os.getenv("CHECK_INPUT_ACCURACY", "1") == "1":
                     if len(self.mutated_arg_indices) > 0:
@@ -1036,6 +1044,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                             self._baseline_post_args,
                             atol=self._effective_atol,
                             rtol=self._effective_rtol,
+                            scale_atol_by_expected_rms=self._scale_atol,
                         )
         except AssertionError as e:
             if not self.settings.autotune_ignore_errors:
@@ -1597,11 +1606,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 benchmark_runner = (
                     _backend.get_do_bench() if _backend is not None else None
                 ) or do_bench
-                if (
-                    benchmark_runner is do_bench_generic
-                    and self._probe_long_cute_flash_kernel()
-                ):
-                    res = do_bench_generic(
+                # Only the cute backend enables flash search, and it uses the
+                # default do_bench, which accepts probe_long_kernel.
+                if self._probe_long_cute_flash_kernel():
+                    res = benchmark_runner(
                         functools.partial(benchmark_function, *working_args),
                         return_mode="median",
                         warmup=1,  # we are already warmed up above
@@ -1881,6 +1889,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             baseline_path=self._precompile_baseline_path,
             atol=self._effective_atol,
             rtol=self._effective_rtol,
+            scale_atol=self._scale_atol,
         )
         return cast(
             "AccuracyCheckResult",

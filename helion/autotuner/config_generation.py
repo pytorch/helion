@@ -10,6 +10,7 @@ import random
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Literal
+from typing import TypeVar
 from typing import cast
 
 from .._compat import warps_to_threads
@@ -52,6 +53,30 @@ class CoordinateNeighborProjection:
 
 TRITON_MAX_TENSOR_NUMEL = 1048576
 _FLASH_STRUCTURAL_LEAF_GOAL_KEY = "__flash_structural_leaf__"
+
+_CallableT = TypeVar("_CallableT", bound=Callable[..., object])
+
+
+def _flash_env_scoped(fn: _CallableT) -> _CallableT:
+    """Run one ConfigGeneration pass under a flash env snapshot.
+
+    Pass-level operations normalize thousands of candidate configs, and every
+    normalization reads dozens of ``HELION_CUTE_FLASH_*`` env vars through
+    ``resolve_flash_config``. Snapshotting at pass entry keeps those reads out
+    of the hot loop while still honoring env patches made between passes
+    (tests rely on ``mock.patch.dict`` taking effect per operation).
+    """
+
+    @functools.wraps(fn)
+    def wrapper(self: ConfigGeneration, *args: object, **kwargs: object) -> object:
+        if not self.config_spec.cute_flash_search_enabled:
+            return fn(self, *args, **kwargs)
+        from .._compiler.cute.cute_flash import flash_env_snapshot_scope
+
+        with flash_env_snapshot_scope():
+            return fn(self, *args, **kwargs)
+
+    return cast("_CallableT", wrapper)
 
 
 def _flash_log_maximin_refinements(
@@ -549,6 +574,7 @@ class ConfigGeneration:
             "leaves": leaves,
         }
 
+    @_flash_env_scoped
     def coordinate_neighbor_projections(
         self, base: FlatConfig, *, radius: int = 1
     ) -> list[CoordinateNeighborProjection]:
@@ -610,6 +636,7 @@ class ConfigGeneration:
                 )
         return result
 
+    @_flash_env_scoped
     def canonicalize_coordinate_projections(
         self,
         projections: Sequence[CoordinateNeighborProjection],
@@ -781,15 +808,14 @@ class ConfigGeneration:
 
     def default_flat(self) -> FlatConfig:
         """
-        Retrieve the default flat configuration.
+        Retrieve the conservative autotuning reference configuration.
 
         Returns:
             The default flat configuration values.
         """
-        if self.config_spec.compiler_default_config is None:
-            return self._fragment_default_flat()
-        return self.flatten(self.config_spec.default_config())
+        return self._fragment_default_flat()
 
+    @_flash_env_scoped
     def _flash_deterministic_coverage_flats(self) -> list[FlatConfig]:
         """Build a normalized covering design for active flash choices.
 
@@ -1694,6 +1720,7 @@ class ConfigGeneration:
             ),
         )
 
+    @_flash_env_scoped
     def flash_deterministic_population_configs(self) -> list[Config]:
         """Return the full normalized structural-coverage design.
 
@@ -1714,6 +1741,7 @@ class ConfigGeneration:
             result.append(config)
         return result
 
+    @_flash_env_scoped
     def flash_low_confound_schedule_anchor_configs(self) -> list[Config]:
         """Enumerate neutral anchors for every live flash schedule protocol.
 
@@ -1786,6 +1814,7 @@ class ConfigGeneration:
             result.append(config)
         return result
 
+    @_flash_env_scoped
     def flash_exact_effective_search_space_configs(
         self, max_raw_configs: int
     ) -> list[Config] | None:
@@ -1980,6 +2009,7 @@ class ConfigGeneration:
             f"failed to generate a valid random config after 64 attempts: {summary}"
         )
 
+    @_flash_env_scoped
     def random_population_flat(
         self,
         n: int,

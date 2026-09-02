@@ -320,8 +320,9 @@ class Tcgen05LayoutOverrides:
 # - ``64`` → ``{K|MN}_SW64``  (64-byte swizzle pattern)
 # - ``128``→ ``{K|MN}_SW128`` (128-byte swizzle pattern)
 #
-# The K/MN prefix is determined by the operand's major mode (A is K-major,
-# B is MN-major in Helion's tcgen05 lowering today). ``MN_SW128_32B``
+# The K/MN prefix follows the resolved operand mode.  Canonical lowering uses
+# K-major A and MN-major B; grouped N,M can instead select MN-major A and
+# K-major B through the operand's ``k_major`` value. ``MN_SW128_32B``
 # (a fp32-only variant) is intentionally not exposed: Helion's tcgen05
 # path only runs on bf16/fp16 today, and exposing the variant without a
 # matching dtype gate would produce ``ValueError`` at codegen time.
@@ -389,7 +390,7 @@ def tcgen05_smem_layout_expr(
     num_stages: int,
     operand: str,
     swizzle_override: int | None,
-    b_k_major: bool = False,
+    k_major: bool,
 ) -> str:
     """Emit the CuTe expression that builds the staged SMEM layout for A or B.
 
@@ -414,61 +415,36 @@ def tcgen05_smem_layout_expr(
     selection: partition_shape → append num_stages → make atom →
     tile_to_mma_shape with the major-mode-determined ``order``.
 
-    Helion's tcgen05 lowering wires ``OperandMajorMode.K`` for A and
-    ``OperandMajorMode.MN`` for B (see ``make_trivial_tiled_mma``
-    call in ``runtime._append_cute_wrapper_plan``), so the ``order``
-    and atom-kind prefix below are hard-coded to that contract.
+    Helion's canonical tcgen05 lowering wires ``OperandMajorMode.K`` for A
+    and ``OperandMajorMode.MN`` for B. Grouped N,M lowering can transpose
+    those physical operand roles, so ``k_major`` selects the matching atom
+    prefix and axis order for the requested operand.
     """
-    if operand == "a":
-        if swizzle_override is None:
-            return (
-                "cutlass.utils.blackwell_helpers.make_smem_layout_a("
-                f"{tiled_mma}, ({bm}, {bn}, {bk}), {dtype_str}, {num_stages})"
-            )
-        atom_kind = (
-            f"cute.nvgpu.tcgen05.SmemLayoutAtomKind.K_"
-            f"{smem_swizzle_atom_kind_suffix(swizzle_override)}"
-        )
-        # A is K-major: partition shape uses dice (1, None, 1); the
-        # tile_to_mma_shape ``order`` is (1, 2, 3) (matches the
-        # is_k_major=True branch of ``make_smem_layout_a``).
-        return (
-            "cute.nvgpu.tcgen05.tile_to_mma_shape("
-            f"cute.nvgpu.tcgen05.make_smem_layout_atom({atom_kind}, {dtype_str}), "
-            f"cute.append({tiled_mma}.partition_shape_A("
-            f"cute.dice(({bm}, {bn}, {bk}), (1, None, 1))), {num_stages}), "
-            "order=(1, 2, 3))"
-        )
-    assert operand == "b", f"unexpected operand {operand!r}"
-    if b_k_major:
-        # K-major (column-major / K-contiguous) B. Delegate to CuTe's helper
-        # with ``is_k_major=True`` so the SMEM atom selection mirrors the
-        # K-major A path exactly; the smem_swizzle_b override knob is not
-        # plumbed through this path (correctness-first), which is fine
-        # since the fp8 default path uses swizzle_override=None.
-        return (
-            "cutlass.utils.blackwell_helpers.make_smem_layout_b("
-            f"{tiled_mma}, ({bm}, {bn}, {bk}), {dtype_str}, {num_stages}, "
-            "is_k_major=True)"
-        )
+    assert operand in ("a", "b"), f"unexpected operand {operand!r}"
+    helper = f"make_smem_layout_{operand}"
+    canonical_k_major = operand == "a"
     if swizzle_override is None:
+        major_arg = "" if k_major == canonical_k_major else f", is_k_major={k_major}"
         return (
-            "cutlass.utils.blackwell_helpers.make_smem_layout_b("
-            f"{tiled_mma}, ({bm}, {bn}, {bk}), {dtype_str}, {num_stages})"
+            f"cutlass.utils.blackwell_helpers.{helper}("
+            f"{tiled_mma}, ({bm}, {bn}, {bk}), {dtype_str}, {num_stages}"
+            f"{major_arg})"
         )
+
+    major = "K" if k_major else "MN"
+    partition = operand.upper()
+    dice = "(1, None, 1)" if operand == "a" else "(None, 1, 1)"
+    order = "(1, 2, 3)" if k_major else "(2, 1, 3)"
     atom_kind = (
-        f"cute.nvgpu.tcgen05.SmemLayoutAtomKind.MN_"
+        f"cute.nvgpu.tcgen05.SmemLayoutAtomKind.{major}_"
         f"{smem_swizzle_atom_kind_suffix(swizzle_override)}"
     )
-    # B is MN-major: partition shape uses dice (None, 1, 1); the
-    # tile_to_mma_shape ``order`` is (2, 1, 3) (matches the
-    # is_k_major=False branch of ``make_smem_layout_b``).
     return (
         "cute.nvgpu.tcgen05.tile_to_mma_shape("
         f"cute.nvgpu.tcgen05.make_smem_layout_atom({atom_kind}, {dtype_str}), "
-        f"cute.append({tiled_mma}.partition_shape_B("
-        f"cute.dice(({bm}, {bn}, {bk}), (None, 1, 1))), {num_stages}), "
-        "order=(2, 1, 3))"
+        f"cute.append({tiled_mma}.partition_shape_{partition}("
+        f"cute.dice(({bm}, {bn}, {bk}), {dice})), {num_stages}), "
+        f"order={order})"
     )
 
 
@@ -817,7 +793,7 @@ def tcgen05_explicit_d_store_tile_expr(tile_m: int, d_store_box_n: int) -> str:
 # sync with ``VALID_PID_TYPES`` in ``config_spec.py``; widening that
 # tuple without revisiting this helper is a contract drift the assert
 # below catches loudly.
-_KNOWN_PID_TYPES_FOR_PERSISTENCE_MODEL: frozenset[str] = frozenset(
+TCGEN05_PERSISTENCE_MODEL_PID_TYPES: frozenset[str] = frozenset(
     {"flat", "xyz", "persistent_blocked", "persistent_interleaved"}
 )
 
@@ -844,9 +820,9 @@ def derive_persistence_model_from_pid_type(
     loudly instead of silently mapping the new value to
     ``NON_PERSISTENT``.
     """
-    assert pid_type in _KNOWN_PID_TYPES_FOR_PERSISTENCE_MODEL, (
+    assert pid_type in TCGEN05_PERSISTENCE_MODEL_PID_TYPES, (
         f"derive_persistence_model_from_pid_type: unknown pid_type "
-        f"{pid_type!r}; update _KNOWN_PID_TYPES_FOR_PERSISTENCE_MODEL "
+        f"{pid_type!r}; update TCGEN05_PERSISTENCE_MODEL_PID_TYPES "
         "to include the new value (or extend the mapping if the new "
         "pid_type implies a different persistence model)."
     )

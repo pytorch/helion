@@ -14,7 +14,6 @@ import re
 import tempfile
 from typing import TYPE_CHECKING
 from typing import Any
-from typing import Callable
 from typing import Sequence
 
 import sympy
@@ -193,6 +192,7 @@ def _detect_grouped_rank3_specialized_mma_loop(
 ) -> bool:
     from ..compile_environment import CompileEnvironment
     from ..host_function import HostFunction
+    from .cute_mma import _rank3_grouped_root_axes
 
     device_ir = HostFunction.current().device_ir
     if len(device_ir.grid_block_ids) != 1 or len(block_ids) != 1:
@@ -200,7 +200,25 @@ def _detect_grouped_rank3_specialized_mma_loop(
     root_grid_ids = device_ir.grid_block_ids[0]
     if any(block_id in root_grid_ids for block_id in block_ids):
         return False
-    if len(root_grid_ids) == 2:
+    env = CompileEnvironment.current()
+    semantic_block_ids = env.config_spec._tcgen05_matmul_block_ids()
+    axes = None
+    if semantic_block_ids is not None:
+        m_block_id, n_block_id, k_block_id = semantic_block_ids
+        if env.canonical_block_id(k_block_id) == env.canonical_block_id(block_ids[0]):
+            axes = _rank3_grouped_root_axes(
+                env,
+                device_ir,
+                m_block_id=m_block_id,
+                n_block_id=n_block_id,
+                k_block_id=block_ids[0],
+            )
+    if semantic_block_ids is not None and axes is None:
+        return False
+    if axes is not None:
+        segment_root_grid_id = axes.segment_block_id
+        mn_root_grid_ids = [axes.m_block_id, axes.n_block_id]
+    elif len(root_grid_ids) == 2:
         segment_root_grid_id = None
         mn_root_grid_ids = root_grid_ids
     elif len(root_grid_ids) == 3:
@@ -208,8 +226,6 @@ def _detect_grouped_rank3_specialized_mma_loop(
         mn_root_grid_ids = root_grid_ids[1:]
     else:
         return False
-
-    env = CompileEnvironment.current()
     if segment_root_grid_id is not None:
         segment_block = env.block_sizes[segment_root_grid_id].from_config(config)
         segment_threads = env.config_spec.num_threads.config_get(
@@ -889,6 +905,10 @@ class CuteBackend(Backend):
         if (
             key == "num_threads"
             or key == "cute_vector_widths"
+            or key == "cute_lane_layouts"
+            or key == "cute_reduction_reloads"
+            or key == "cute_cluster_n"
+            or key == "cute_min_blocks_per_mp"
             or key.startswith(("tcgen05_", "cute_flash_"))
         ):
             return True
@@ -908,6 +928,8 @@ class CuteBackend(Backend):
             # does not support scalar dereference for its 4-bit type yet, so
             # SIMT scalar loads treat the tensor as raw byte storage.
             return "cutlass.Uint8"
+        if dtype is torch.uint32:
+            return "cutlass.Uint32"
         if dtype is torch.uint64:
             return "cutlass.Int64"
 
@@ -1054,23 +1076,15 @@ class CuteBackend(Backend):
             return "warn"
         return None
 
-    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
-        # The default Triton do_bench uses CUDA events that mis-time the CuTe
-        # path on Blackwell - launches show up as ~5ms when the kernel is
-        # actually 250ms+. Use synchronized wall-clock timing instead so
-        # autotune scores reflect real performance.
-        from ...autotuner.benchmarking import do_bench_generic
-
-        return do_bench_generic
-
-    def get_interleaved_bench(self) -> Callable[..., list[float]]:
-        # Same rationale as get_do_bench: the default interleaved bench uses
-        # CUDA events that mis-time the CuTe path. Use the synchronized
-        # wall-clock fallback so the autotuner's interleaved compare path
-        # produces real timings.
-        from ...autotuner.benchmarking import interleaved_bench_generic
-
-        return interleaved_bench_generic
+    # Note: this backend intentionally does NOT override get_do_bench /
+    # get_interleaved_bench. CUDA-event timing once mis-read CuTe launches
+    # (~5ms reported for 250ms kernels) because the pre-compiled-launcher
+    # per-call ``@cute.jit`` dispatch path spent ~200ms on the host per
+    # launch; with ``_CompiledCuteLauncher`` kernels launch on the Torch
+    # current stream and event timing matches synchronized wall-clock timing
+    # to <0.1ms on B200 across flash families (including CLC+PDL and
+    # multi-second launches). Event timing avoids charging per-launch host
+    # overhead to the kernel, which the wall path does.
 
     def autotune(
         self,
@@ -1141,6 +1155,9 @@ class CuteBackend(Backend):
             "_cute_grouped_reduce_shared_tree": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_tree",
             "_cute_grouped_reduce_shared_two_stage": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage",
             "_cute_grouped_reduce_warp": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_warp",
+            "_cute_grouped_reduce_cluster": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_cluster",
+            "_cute_grouped_reduce_block": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_block",
+            "_cute_grouped_reduce_cluster_online_pair": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_cluster_online_pair",
             "_cute_pre_vec_fold": "from helion._compiler.cute.reduce_helpers import _cute_pre_vec_fold",
             "_cute_store_shared_remote_x4": "from helion._compiler.cute.cluster_helpers import store_shared_remote_x4 as _cute_store_shared_remote_x4",
             "_cute_issue_clc_query_nomulticast": "from helion._compiler.cute.clc_helpers import issue_clc_query_nomulticast as _cute_issue_clc_query_nomulticast",
@@ -1150,6 +1167,7 @@ class CuteBackend(Backend):
             "_cute_float4_e2m1fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x2_to_float32 as _cute_float4_e2m1fn_x2_to_float32",
             "_cute_float4_e2m1fn_x16_to_float16": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x16_to_float16 as _cute_float4_e2m1fn_x16_to_float16",
             "_cute_bfloat16_x16_to_float16": "from helion._compiler.cute.quantized_helpers import bfloat16_x16_to_float16 as _cute_bfloat16_x16_to_float16",
+            "_cute_store_u16_vec": "from helion._compiler.cute.vec_utils import store_u16_vec as _cute_store_u16_vec",
             "_cute_grid_barrier": "from helion._compiler.cute.grid_barrier import grid_barrier as _cute_grid_barrier",
             "_cute_atomic_max_float32": "from helion._compiler.cute.atomic_helpers import atomic_max_float32 as _cute_atomic_max_float32",
             "_cute_atomic_min_float32": "from helion._compiler.cute.atomic_helpers import atomic_min_float32 as _cute_atomic_min_float32",
@@ -1232,6 +1250,12 @@ class CuteBackend(Backend):
 
     def lane_offset_expr(self, lane_var: str) -> str:
         return f"cutlass.Int32({lane_var})"
+
+    def thread_index_expr(self, *, axis: int) -> str:
+        from ..compile_environment import CompileEnvironment
+
+        index_dtype = CompileEnvironment.current().index_type()
+        return f"{index_dtype}(cute.arch.thread_idx()[{axis}])"
 
     def sympy_printer_expr(self, expr: sympy.Expr) -> str:
         from .printer import cute_texpr
@@ -1341,6 +1365,19 @@ class CuteBackend(Backend):
         return f"cutlass.Int32(cute.arch.thread_idx()[{axis}]) < ({block_size_var})"
 
     def force_tile_mask(self) -> bool:
+        # Masks are elided per-axis when the extent is a known multiple of
+        # the block size (same rule as the Triton backend) AND the launch
+        # cannot run the axis wider than the tile (see
+        # ``launches_surplus_tile_threads``).  Every per-element mask costs
+        # a compare + select in the SIMT lane loop, which is significant
+        # for memory-bound reduction kernels.
+        return False
+
+    def launches_surplus_tile_threads(self) -> bool:
+        # Mutually exclusive kernel sections (e.g. persistent stages around
+        # an ``hl.barrier()``) share one launch whose block dims are the
+        # elementwise max across sections, so a section can run with more
+        # threads on an axis than its own tile is wide.
         return True
 
     def full_expr(

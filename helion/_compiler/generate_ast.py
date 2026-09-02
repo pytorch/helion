@@ -274,19 +274,28 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
     def _compute_intra_loop_barriers(self) -> None:
         """Mark loads that read a tensor an earlier store in the same body wrote,
-        so the Triton ``load`` codegen emits a ``tl.debug_barrier()`` before them.
+        so the Triton ``load`` codegen emits a ``tl.debug_barrier()`` before them
+        (the CuTe ``load`` codegen emits ``cute.arch.sync_threads()``).
 
-        Gated on Triton for the same reason as ``_compute_inter_loop_barriers``:
+        TileIR is excluded for the same reason as ``_compute_inter_loop_barriers``:
         ``tl.debug_barrier()`` lowers to ``ttg.barrier`` which the TileIR pass
         pipeline does not legalize.
         """
         from .loop_dependency_checker import mark_intra_loop_raw_barriers
 
         env = CompileEnvironment.current()
-        if env.codegen_name != "triton" or env.backend.name == "tileir":
+        if env.backend.name != "cute" and (
+            env.codegen_name != "triton" or env.backend.name == "tileir"
+        ):
             return
         mark_intra_loop_raw_barriers(
-            self.codegen_graphs, self.host_function.device_ir.root_ids
+            self.codegen_graphs,
+            self.host_function.device_ir.root_ids,
+            # A CuTe SIMT branch condition can vary per thread, and the
+            # convergent ``sync_threads`` barrier deadlocks in a divergent
+            # branch.  Triton branches are uniform per program, so the
+            # barrier is always placeable there.
+            mark_in_divergent_control_flow=env.backend.name != "cute",
         )
 
     def _triton_global_barrier_tensor_names(self, names: frozenset[str]) -> set[str]:

@@ -304,57 +304,19 @@ def discover_tcgen05_aux_tensor_descriptors(
 def host_function_has_tcgen05_aux_kernel_pattern(
     host_function: HostFunction,
 ) -> bool:
-    """Conservative pre-codegen detector for kernels whose tcgen05
-    matmul is followed by an aux-fused store
+    """Pre-codegen detector for kernels whose tcgen05 matmul is followed
+    by an aux-fused store
     (``out[tile] = (acc + residual[tile]).to(...)`` and the
     bias / rowvec variants — see :class:`_AuxiliaryTensorLoadExpr`
     for the accepted forms).
 
-    Runs at autotune-surface configuration time (post-FX-graph
-    build, pre-autotune-sample) where the
-    :func:`discover_tcgen05_aux_tensor_descriptors` walker is
-    unavailable — that walker requires a populated
-    ``DeviceFunction.cute_state.matmul_fx_nodes`` set, which
-    is only registered at MMA-codegen time per config sample.
-    The aux pipeline only fires when the productive-body gate
-    sees aux descriptors, so the autotune surface only needs
-    to widen ``tcgen05_warp_spec_c_input_warps`` when this
-    detector returns True; otherwise the C-input warp is
-    inert and sampling ``c_input_warps=1`` would be a strict
-    resource cost for pure-matmul kernels (the inert warp
-    occupies an SM slot without delivering work).
-
-    Implementation: walk every FX graph in
-    ``host_function.device_ir.graphs`` and look for the
-    coarse pattern "the kernel has at least one MMA-anchor
-    call AND at least one ``memory_ops.load`` call whose
-    result is NOT used as one of the MMA operands". MMA
-    anchors include both the aten paths
-    (``aten.addmm`` / ``aten.baddbmm`` / ``aten.mm`` /
-    ``aten.bmm``) AND the ``hl.dot`` HOP — both ends up
-    in the tcgen05 MMA lowering, and the canonical Helion
-    residual kernel uses ``hl.dot``. Operand resolution
-    traces through the same ``convert_element_type``
-    wrappers the MMA codegen accepts
-    (``cute_mma._trace_to_load`` /
-    ``_TRACE_THROUGH_TARGETS``); without this trace,
-    kernels written as ``lhs.to(dtype) @ rhs.to(dtype)``
-    would have their operand loads classified as aux and
-    the detector would over-fire on pure matmul.
-
-    The detector is **conservative**: a false positive
-    only widens the autotune search by one enum value
-    (the productive-body safety gates handle the resulting
-    invalid combinations at codegen time and the
-    inert-body fallback handles invalid runs); a false
-    negative would miss the residual c_input=1 win. The
-    chain analyzer at codegen time
-    (``analyze_tcgen05_unary_epilogue_chain``) remains the
-    source of truth for which aux shapes are *accepted*
-    by the productive-body codegen; this detector
-    intentionally over-approximates so the autotune surface
-    admits the productive shape whenever any aux load is
-    plausibly involved.
+    This runs after the FX graphs are built but before an autotune sample has
+    registered its MMA nodes in ``DeviceFunction.cute_state``. Use the MMA
+    anchors already present in the host graphs and the same store-chain
+    analyzer as codegen so only loads in an accepted per-subtile epilogue widen
+    the search surface. Unrelated loads used for scheduler metadata, indirect
+    indices, or masks must not expose aux-only knobs such as
+    ``tcgen05_aux_load_placement``.
 
     Caught patterns include:
 
@@ -369,22 +331,15 @@ def host_function_has_tcgen05_aux_kernel_pattern(
     if not graphs:
         return False
 
-    mma_nodes, operand_load_nodes = _tcgen05_aux_detector_mma_facts(graphs)
+    mma_nodes = _tcgen05_aux_detector_mma_nodes(graphs)
     if not mma_nodes:
         return False
-    # Second pass: any ``memory_ops.load`` call whose result
-    # is NOT a resolved MMA-operand load is treated as aux.
-    # Operand loads feed the dot directly (after optional
-    # casts); aux loads feed an arithmetic op that combines
-    # with the dot's result on the way to a store.
-    for graph_info in graphs:
-        for node in graph_info.graph.nodes:
-            if (
-                node.op == "call_function"
-                and node.target is memory_ops.load
-                and node not in operand_load_nodes
-            ):
-                return True
+    for mma_node in mma_nodes:
+        analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
+        if analyzed_stores is not None and any(
+            chain.auxiliary_tensor_loads for _, chain in analyzed_stores
+        ):
+            return True
     return False
 
 
@@ -415,7 +370,7 @@ def host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
     if not graphs:
         return False
 
-    mma_nodes, _operand_load_nodes = _tcgen05_aux_detector_mma_facts(graphs)
+    mma_nodes = _tcgen05_aux_detector_mma_nodes(graphs)
     if not mma_nodes:
         return False
 
@@ -435,13 +390,11 @@ def host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
     )
 
 
-def _tcgen05_aux_detector_mma_facts(
+def _tcgen05_aux_detector_mma_nodes(
     graphs: Sequence[GraphInfo],
-) -> tuple[set[torch.fx.Node], set[torch.fx.Node]]:
-    # MMA anchor targets: both the aten paths and the ``hl.dot`` HOP
-    # (the canonical Helion API entrypoint).
+) -> set[torch.fx.Node]:
+    """Return aten and ``hl.dot`` MMA anchors from the host FX graphs."""
     mma_nodes: set[torch.fx.Node] = set()
-    operand_load_nodes: set[torch.fx.Node] = set()
     for graph_info in graphs:
         for node in graph_info.graph.nodes:
             if (
@@ -450,14 +403,7 @@ def _tcgen05_aux_detector_mma_facts(
             ):
                 continue
             mma_nodes.add(node)
-            # Treat every positional arg that resolves through the same operand
-            # trace accepted by MMA codegen as an operand load.
-            for arg in node.args:
-                if isinstance(arg, torch.fx.Node):
-                    load_node = _trace_to_load_through_casts(arg)
-                    if load_node is not None:
-                        operand_load_nodes.add(load_node)
-    return mma_nodes, operand_load_nodes
+    return mma_nodes
 
 
 def host_function_matmul_has_non_tcgen05_operand(

@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import statistics
+import sys
 import tempfile
 import time
 from typing import TYPE_CHECKING
@@ -62,12 +63,12 @@ def _mirrored_bench_call_layout(desired_calls: int) -> tuple[int, int, int]:
 def _make_l2_cache_clearer() -> Callable[[], None]:
     """Return a callable that flushes the GPU L2 cache, or a no-op.
 
-    The generic (wall-clock) bench used by the CuTe backend otherwise times
-    kernels with the operands resident in L2 (warm), biasing the autotuner
-    toward shallow-prefetch configs that starve the pipeline in the cold-L2 /
-    streamed-once regime that deployment and tritonbench (which clears L2 by
-    default) actually measure. Flushing L2 between timed calls makes the
-    autotune regime match the deployment regime.
+    The generic (wall-clock) bench for backends without event timing
+    otherwise times kernels with the operands resident in L2 (warm), biasing
+    the autotuner toward shallow-prefetch configs that starve the pipeline in
+    the cold-L2 / streamed-once regime that deployment and tritonbench (which
+    clears L2 by default) actually measure. Flushing L2 between timed calls
+    makes the autotune regime match the deployment regime.
 
     Uses Triton's CUDA-only cache-clear primitive. Returns a no-op when not on
     CUDA (e.g. TPU/Pallas backends that also use the generic bench).
@@ -234,12 +235,37 @@ def compute_repeat_generic(
     return max(min_repeat, min(max_repeat, max(1, repeat)))
 
 
+def _interleaved_repeat_cap(
+    fns: list[Callable[[], object]],
+    clear_cache: Callable[[], None],
+    max_total_ms: float,
+) -> int:
+    """Bound interleaved repeats by the measured cost of one full sweep.
+
+    Repeat counts are sized from candidate kernel time alone, but for
+    microsecond kernels the fixed per-call cost (L2 flush, launch and wrapper
+    overhead) dominates, so an unbounded repeat can take minutes of wall clock
+    on slow hosts. One timed sweep captures the true per-iteration cost.
+    """
+    synchronize_device()
+    start = time.perf_counter()
+    for fn in fns:
+        clear_cache()
+        fn()
+    synchronize_device()
+    sweep_ms = (time.perf_counter() - start) * 1000
+    if not math.isfinite(sweep_ms) or sweep_ms <= 0:
+        return sys.maxsize
+    return max(3, int(max_total_ms / sweep_ms))
+
+
 def interleaved_bench(
     fns: list[Callable[[], object]],
     *,
     repeat: int,
     desc: str | None = None,
     default_cudagraph: bool = False,
+    max_total_ms: float | None = None,
 ) -> list[float]:
     """
     Benchmark multiple functions at once, interleaving their executions to reduce
@@ -250,6 +276,8 @@ def interleaved_bench(
         fns: List of functions to benchmark
         repeat: Number of times to repeat each benchmark
         desc: Optional description for progress bar
+        max_total_ms: Optional wall-clock budget for the whole timed loop;
+            ``repeat`` is lowered so one measured sweep times ``repeat`` fits
     """
     from triton import runtime
 
@@ -262,6 +290,8 @@ def interleaved_bench(
     )
     clear_cache()
     di = runtime.driver.active.get_device_interface()  # type: ignore[attr-defined]
+    if max_total_ms is not None:
+        repeat = min(repeat, _interleaved_repeat_cap(fns, clear_cache, max_total_ms))
     start_events = [
         [di.Event(enable_timing=True) for _ in range(repeat)] for _ in range(len(fns))
     ]
@@ -307,6 +337,7 @@ def interleaved_bench_generic(
     repeat: int,
     desc: str | None = None,
     default_cudagraph: bool = False,  # accepted for API symmetry; wall-clock timing doesn't use CG
+    max_total_ms: float | None = None,
 ) -> list[float]:
     """
     Benchmark multiple functions using wall-clock timing.
@@ -319,6 +350,8 @@ def interleaved_bench_generic(
     synchronize_device()
 
     clear_l2 = _make_l2_cache_clearer()
+    if max_total_ms is not None:
+        repeat = min(repeat, _interleaved_repeat_cap(fns, clear_l2, max_total_ms))
     all_times: list[list[float]] = [[] for _ in range(len(fns))]
 
     iterator = iter_with_progress(
@@ -632,6 +665,7 @@ def do_bench(
     *,
     default_cudagraph: bool = False,
     fixed_repetitions: int | None = None,
+    probe_long_kernel: bool = False,
 ) -> float | tuple[float, ...]:
     """
     Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
@@ -651,6 +685,10 @@ def do_bench(
     :type return_mode: str
     :param fixed_repetitions: Skip adaptive estimation and time exactly this many
         calls after the initial setup call.
+    :param probe_long_kernel: Estimate from a single call first and skip the
+        four remaining estimate calls when that call already exceeds both
+        timing windows; CuTe flash enables it for multi-second attention
+        candidates.
     """
     from triton import runtime
     from triton.testing import _summarize_statistics
@@ -671,7 +709,27 @@ def do_bench(
 
     cache = runtime.driver.active.get_empty_cache_for_benchmark()  # pyrefly: ignore
 
-    if fixed_repetitions is None:
+    if fixed_repetitions is None and probe_long_kernel:
+
+        def run_estimate_batch(count: int) -> float:
+            batch_start = di.Event(enable_timing=True)
+            batch_end = di.Event(enable_timing=True)
+            batch_start.record()
+            for _ in range(count):
+                runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
+                benchmark_function()
+            batch_end.record()
+            di.synchronize()
+            return float(batch_start.elapsed_time(batch_end))
+
+        estimate_ms, n_warmup = _estimate_runtime_and_warmup(
+            run_estimate_batch,
+            warmup=warmup,
+            rep=rep,
+            process_group_name=process_group_name,
+        )
+        n_repeat = max(1, int(rep / estimate_ms))
+    elif fixed_repetitions is None:
         # Estimate the runtime of the function
         start_event = di.Event(enable_timing=True)
         end_event = di.Event(enable_timing=True)

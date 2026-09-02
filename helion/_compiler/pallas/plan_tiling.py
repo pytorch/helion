@@ -75,6 +75,8 @@ class NonePattern(IndexingPattern):
 class TensorIndexPattern(IndexingPattern):
     """Tensor-valued index - no tiling. Resolved for indirect load/store codegen."""
 
+    index_ndim: int = 1
+
 
 @dataclass
 class ContiguousRangeIndexPattern(IndexingPattern):
@@ -328,6 +330,7 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
 
     is_all_scalar = all(
         isinstance(p, (ArbitraryIndexPattern, TileBeginWithOffsetPattern, NonePattern))
+        or (isinstance(p, TensorIndexPattern) and p.index_ndim == 0)
         for p in indexing_patterns
     )
     has_contiguous_hbm_window = any(
@@ -735,7 +738,7 @@ def _detect_indexing_pattern(
         # A tensor-valued index that didn't match any arithmetic-of-tile
         # pattern is an indirect gather (e.g. table[idx, :]).
         if isinstance(idx_val, torch.Tensor):
-            return TensorIndexPattern()
+            return TensorIndexPattern(index_ndim=idx_val.ndim)
         # Indices produced by other FX nodes, such as indices[tile] used in
         # tensor-indexed atomics, are legal but cannot participate in Pallas
         # tiling.

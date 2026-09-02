@@ -25,9 +25,16 @@ def torch_matmul_replacement(
             "torch.matmul(..., out=...) is not supported in Helion kernel"
         )
     if a.dim() != b.dim():
-        raise NotImplementedError(
-            "torch.matmul with different input tensor dims is not supported in Helion kernel"
-        )
+        # torch.matmul broadcasts a 2-D operand against a 3-D one; expand the
+        # smaller side so the batched path below sees matching ranks.
+        if a.dim() == 3 and b.dim() == 2:
+            b = b.unsqueeze(0).expand(a.size(0), -1, -1)
+        elif a.dim() == 2 and b.dim() == 3:
+            a = a.unsqueeze(0).expand(b.size(0), -1, -1)
+        else:
+            raise NotImplementedError(
+                "torch.matmul with different input tensor dims is not supported in Helion kernel"
+            )
     if a.dim() == 2 and b.dim() == 2:
         return original_matmul(a, b)
     if a.dim() == 3 and b.dim() == 3:

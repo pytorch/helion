@@ -428,6 +428,31 @@ class TileStrategyDispatch:
                 axis += strategy.thread_axes_used()
         return None
 
+    def strategies_can_coexecute(
+        self, first: TileStrategy, second: TileStrategy
+    ) -> bool:
+        """Whether two strategies occur in at least one common execution branch."""
+        return any(
+            first in branch and second in branch for branch in self._strategy_branches()
+        )
+
+    def executable_reduction_block_ids(self) -> set[int]:
+        """Reduction block IDs that correspond to executable reduction work."""
+        spec = CompileEnvironment.current().config_spec
+        block_ids = set(spec.reduction_loops.valid_block_ids())
+        if spec.reduction_kernel_fact is not None:
+            block_ids.update(
+                reduction.block_id
+                for reduction in spec.reduction_kernel_fact.reductions
+            )
+        if spec.kernel_matmul_fact is not None:
+            block_ids.update(
+                matmul.fact.k_block_id
+                for matmul in spec.kernel_matmul_fact.matmuls
+                if matmul.fact.k_block_id is not None
+            )
+        return block_ids
+
     def thread_axis_for_block_id(self, target_block_id: int) -> int | None:
         """Return the launch thread axis assigned to a specific logical block id."""
         for strategy in self.strategies:
@@ -494,6 +519,61 @@ class TileStrategyDispatch:
                 if block_id == target_block_id:
                     return size
         return None
+
+    def has_surplus_threads_for_strategy(self, strategy: TileStrategy) -> bool:
+        """Whether the launch may run any of a strategy's thread axes wider
+        than the strategy requested.
+
+        Mutually exclusive kernel sections (e.g. two persistent stages around
+        an ``hl.barrier()``) share one launch whose block dims are the
+        elementwise max across sections, so a section can execute with more
+        threads on an axis than its own tile is wide.  Those surplus threads
+        index past the tile, so bounds masks for the axis must not be elided.
+        """
+        base_axis = self.thread_axis_for_strategy(strategy)
+        if base_axis is None:
+            return False
+        dims = self.thread_block_dims()
+        for _block_id, local_axis, size, _expr in self._iter_strategy_thread_axes(
+            strategy
+        ):
+            axis = base_axis + local_axis
+            # ``size is None`` means the extent is dynamic; the static launch
+            # dims cannot prove the launch matches, so keep the mask.
+            if size is None or axis >= len(dims) or dims[axis] > size:
+                return True
+        return False
+
+    def has_surplus_threads_for_block_id(self, target_block_id: int) -> bool:
+        """Per-block variant of :meth:`has_surplus_threads_for_strategy`.
+
+        ``False`` for blocks that do not claim a thread axis: their index is
+        uniform across the CTA, so extra launched threads only duplicate the
+        owning thread's in-bounds work.
+        """
+        for strategy in self.strategies:
+            if target_block_id not in strategy.block_ids or isinstance(
+                strategy, ReductionStrategy
+            ):
+                continue
+            base_axis = self.thread_axis_for_strategy(strategy)
+            if base_axis is None:
+                return False
+            dims = self.thread_block_dims()
+            for (
+                block_id,
+                local_axis,
+                size,
+                _expr,
+            ) in self._iter_strategy_thread_axes(strategy):
+                if block_id != target_block_id:
+                    continue
+                axis = base_axis + local_axis
+                if size is None or axis >= len(dims):
+                    return True
+                return dims[axis] > size
+            return False
+        return False
 
     def thread_axis_sizes(self) -> dict[int, int]:
         dims = self.thread_block_dims()

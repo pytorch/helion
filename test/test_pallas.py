@@ -88,6 +88,14 @@ def pallas_sigmoid(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_sign(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(out.size()):
+        out[tile] = torch.sign(x[tile])
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_pointwise_chain(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(out.size()):
@@ -140,6 +148,28 @@ def pallas_matmul_bf16(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         for tile_k in hl.tile(k):
             acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_fp8_fp4_matmul(
+    x: torch.Tensor, weight: torch.Tensor, output_columns: int
+) -> torch.Tensor:
+    """Multiply FP8 activations by a packed E2M1 RHS on TPU."""
+    output_columns = hl.specialize(output_columns)
+    m, k = x.size()
+    n = output_columns
+    out = torch.empty([m, n], device=x.device, dtype=torch.float32)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(
+                x[tile_m, tile_k],
+                weight[tile_k, tile_n],
+                acc=acc,
+                out_dtype=torch.float32,
+            )
         out[tile_m, tile_n] = acc
     return out
 
@@ -684,6 +714,63 @@ def pallas_scaled_add_dynamic_window(
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_fixed_dynamic_window(
+    x: torch.Tensor,
+    starts: torch.Tensor,
+    EXTENT: hl.constexpr,
+) -> torch.Tensor:
+    """Sum a fixed-size window whose starting row is selected at runtime."""
+    A = hl.specialize(x.size(1))
+    B = hl.specialize(x.size(2))
+    out = torch.empty([1, A, B], dtype=torch.float32, device=x.device)
+    for owner in hl.grid(1):
+        start = starts[owner]
+        end = start + EXTENT
+        acc = hl.zeros([A, B], dtype=torch.float32)
+        for tile in hl.tile(start, end):
+            acc = acc + x[tile, :, :].to(torch.float32).sum(dim=0)
+        out[owner, :, :] = acc
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_prefetched_aligned_dynamic_window(
+    table: torch.Tensor, starts: torch.Tensor
+) -> torch.Tensor:
+    rows = hl.specialize(table.size(0))
+    out = torch.empty(
+        [starts.size(0), rows, 128], dtype=table.dtype, device=table.device
+    )
+    for _ in hl.grid(1):
+        for tile in hl.tile(starts.size(0), block_size=1):
+            begin = starts[tile.begin] * 128
+            out[tile, :, :] = table[:, begin + hl.arange(128)][None, :, :]
+    return out
+
+
+@helion.kernel(
+    backend="pallas",
+    static_shapes=True,
+    config=helion.Config(pallas_loop_type="fori_loop"),
+)
+def pallas_two_aligned_dynamic_windows(
+    table: torch.Tensor, starts: torch.Tensor
+) -> torch.Tensor:
+    """Read two distinct aligned windows from one HBM tensor per iteration."""
+    rows = hl.specialize(table.size(0))
+    out = torch.empty(
+        [starts.size(0), rows, 128], dtype=table.dtype, device=table.device
+    )
+    for _ in hl.grid(1):
+        for tile in hl.tile(starts.size(0), block_size=1):
+            begin = starts[tile.begin] * 128
+            first = table[:, begin + hl.arange(128)]
+            second = table[:, begin + 128 + hl.arange(128)]
+            out[tile, :, :] = (first + second)[None, :, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_computed_static_slice(x: torch.Tensor) -> torch.Tensor:
     rows = x.size(0)
     out = torch.empty([rows, 128], dtype=x.dtype, device=x.device)
@@ -797,6 +884,19 @@ def _topk_pallas_kernel(x: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Te
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def _prefix_sum_pallas_kernel(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    forward = torch.empty_like(x)
+    reverse = torch.empty_like(x)
+    for _program in hl.grid(1):
+        values = x[:]
+        forward[:] = torch.cumsum(values, dim=-1)
+        reverse[:] = hl.cumsum(values, dim=-1, reverse=True)
+    return forward, reverse
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def _constant_pad_pallas_kernel(x: torch.Tensor) -> torch.Tensor:
     """F.pad -> aten.constant_pad_nd -> jnp.pad on the pallas backend (pad the
     lane dim, mirroring the spec-decode sampler's in-kernel output padding)."""
@@ -823,6 +923,21 @@ def _constant_pad_neg_inf_pallas_kernel(x: torch.Tensor) -> torch.Tensor:
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    def test_prefix_sum(self) -> None:
+        x = torch.arange(256, device=DEVICE, dtype=torch.int32) % 7
+        _code, (forward, reverse) = code_and_output(
+            _prefix_sum_pallas_kernel,
+            (x,),
+            block_sizes=[],
+        )
+        torch.testing.assert_close(forward, torch.cumsum(x, dim=-1).to(x.dtype))
+        torch.testing.assert_close(
+            reverse,
+            torch.flip(torch.cumsum(torch.flip(x, dims=(-1,)), dim=-1), dims=(-1,)).to(
+                x.dtype
+            ),
+        )
+
     def test_cat_columns(self) -> None:
         x = torch.randn(128, 64, device=DEVICE, dtype=torch.bfloat16)
         y = torch.randn(128, 64, device=DEVICE, dtype=torch.bfloat16)
@@ -833,6 +948,52 @@ class TestPallas(TestCase):
         )
         self.assertIn("jnp.concatenate((", code)
         torch.testing.assert_close(result.cpu(), torch.cat((x, y), dim=1).cpu())
+
+    @skipIfPallasInterpret("packed FP4 execution requires a real TPU")
+    def test_fp8_fp4_matmul(self) -> None:
+        generator = torch.Generator().manual_seed(0)
+        m, k, n = 16, 256, 128
+        x_cpu = torch.randn(m, k, generator=generator).to(torch.float8_e4m3fn)
+        packed_cpu = torch.randint(
+            0,
+            256,
+            (k, n // 2),
+            generator=generator,
+            dtype=torch.uint8,
+        )
+        packed = packed_cpu.to(DEVICE)
+        weight = torch.empty_like(packed, dtype=torch.float4_e2m1fn_x2)
+        weight.copy_(packed.view(dtype=torch.float4_e2m1fn_x2))
+
+        _, result = code_and_output(
+            pallas_fp8_fp4_matmul,
+            (x_cpu.to(DEVICE), weight, n),
+            block_sizes=[16, 128, 256],
+        )
+
+        codes = torch.stack(
+            (packed_cpu & 0x0F, (packed_cpu >> 4) & 0x0F), dim=-1
+        ).reshape(k, n)
+        magnitude = codes & 0x07
+        decoded = torch.where(
+            magnitude < 4,
+            magnitude.float() * 0.5,
+            torch.where(
+                magnitude < 6,
+                magnitude.float() - 2,
+                magnitude.float() * 2 - 8,
+            ),
+        )
+        decoded = torch.where((codes & 0x08) == 0, decoded, -decoded)
+        expected = x_cpu.float() @ decoded
+        actual = result.cpu().float()
+        difference = (actual - expected).abs()
+        relative_mean = difference.mean() / expected.abs().mean().clamp_min(1e-6)
+        cosine = torch.nn.functional.cosine_similarity(
+            actual.flatten(), expected.flatten(), dim=0
+        )
+        self.assertLess(relative_mean.item(), 0.01)
+        self.assertGreater(cosine.item(), 0.999)
 
     def test_aligned_dynamic_window_uses_direct_hbm_dma(self) -> None:
         table = torch.randn(8, 512, device=DEVICE, dtype=torch.float32)
@@ -878,6 +1039,51 @@ class TestPallas(TestCase):
         )
         lanes = torch.arange(128, device=DEVICE)
         expected = torch.stack((table[:, lanes], table[:, 256 + lanes]))
+        torch.testing.assert_close(result.cpu(), expected.cpu())
+
+    def test_dynamic_begin_fixed_extent(self) -> None:
+        x = torch.randn(256, 8, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([3], device=DEVICE, dtype=torch.int32)
+        for extent in (128, 127):
+            with self.subTest(extent=extent):
+                _, result = code_and_output(
+                    pallas_fixed_dynamic_window,
+                    (x, starts, extent),
+                    block_sizes=[16],
+                    pallas_loop_type="fori_loop",
+                )
+                expected = x[3 : 3 + extent].sum(dim=0, keepdim=True)
+                torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+    @skipIfPallasInterpret("dynamic HBM DMA offsets require a real TPU")
+    def test_aligned_dynamic_window_prefetch(self) -> None:
+        table = torch.randn(8, 512, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 1, 2, 3], device=DEVICE, dtype=torch.int32)
+        expected = torch.stack(
+            [table[:, begin : begin + 128] for begin in range(0, 512, 128)]
+        )
+
+        for loop_type in ("fori_loop", "unroll"):
+            with self.subTest(pallas_loop_type=loop_type):
+                _, result = code_and_output(
+                    pallas_prefetched_aligned_dynamic_window,
+                    (table, starts),
+                    pallas_load_buffer_count=[2, 1],
+                    pallas_loop_type=loop_type,
+                )
+                torch.testing.assert_close(result.cpu(), expected.cpu())
+
+    @skipIfPallasInterpret("dynamic HBM DMA offsets require a real TPU")
+    def test_two_aligned_dynamic_windows(self) -> None:
+        table = torch.randn(8, 640, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 1, 2, 3], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(pallas_two_aligned_dynamic_windows, (table, starts))
+        expected = torch.stack(
+            [
+                table[:, begin : begin + 128] + table[:, begin + 128 : begin + 256]
+                for begin in range(0, 512, 128)
+            ]
+        )
         torch.testing.assert_close(result.cpu(), expected.cpu())
 
     def test_computed_static_slice(self) -> None:
@@ -1095,6 +1301,11 @@ class TestPallas(TestCase):
         args = (torch.randn(1024, device=DEVICE), torch.randn(1024, device=DEVICE))
         code, result = code_and_output(add_kernel, args, block_size=256)
         torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_sign(self) -> None:
+        x = torch.linspace(-2, 2, 1024, device=DEVICE)
+        _, result = code_and_output(pallas_sign, (x,), block_size=256)
+        torch.testing.assert_close(result.cpu(), torch.sign(x).cpu())
 
     def test_add_large(self) -> None:
         args = (torch.randn(4096, device=DEVICE), torch.randn(4096, device=DEVICE))
@@ -1860,6 +2071,26 @@ class TestPallas(TestCase):
         self.assertIn("[pl.ds(1, 2), :, :]", code)
         torch.testing.assert_close(out, torch.full_like(out, 8.0))
 
+    def test_resident_fori_loop_scalar_index_uses_current_iteration(self) -> None:
+        """A scalar row index into a resident tensor advances with the loop."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def select_rows(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for _request in hl.grid(1):
+                for row in hl.tile(x.size(1), block_size=1):
+                    hl.store(out, [0, row.begin, slice(None)], x[0, row.begin, :] + 1)
+            return out
+
+        x = torch.arange(4 * 128, device=DEVICE, dtype=torch.float32).reshape(1, 4, 128)
+        _, actual = code_and_output(
+            select_rows,
+            (x,),
+            pallas_loop_type="fori_loop",
+            pallas_load_buffer_count=[1],
+        )
+        torch.testing.assert_close(actual, x + 1)
+
     def test_resident_subview_of_untiled_dimension(self) -> None:
         """A direct run may address any aligned dimension of the resident Ref."""
 
@@ -2408,6 +2639,149 @@ class TestPallas(TestCase):
 
         expected = torch.zeros_like(values)
         expected[indices.to(torch.int64)] = values
+        torch.testing.assert_close(result, expected)
+
+    def test_scalar_tensor_index_store(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scalar_tensor_index_store(
+            values: torch.Tensor, output_row: torch.Tensor
+        ) -> torch.Tensor:
+            m, n = values.size()
+            out = torch.zeros([4, m, n], dtype=values.dtype, device=values.device)
+            row = output_row[0]
+            for tile_m, tile_n in hl.tile(values.size()):
+                out[row, tile_m, tile_n] = values[tile_m, tile_n]
+            return out
+
+        values = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        output_row = torch.tensor([2], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            scalar_tensor_index_store,
+            (values, output_row),
+            block_sizes=[8, 128],
+        )
+
+        expected = torch.zeros(4, 8, 128, device=DEVICE)
+        expected[2] = values
+        torch.testing.assert_close(result, expected)
+
+    def test_computed_scalar_tensor_index_store(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def computed_scalar_tensor_index_store(
+            values: torch.Tensor, output_row: torch.Tensor
+        ) -> torch.Tensor:
+            m, n = values.size()
+            out = torch.zeros([4, m, n], dtype=values.dtype, device=values.device)
+            row = (output_row[0] + 1) % 4
+            for tile_m, tile_n in hl.tile(values.size()):
+                out[row, tile_m, tile_n] = values[tile_m, tile_n]
+            return out
+
+        values = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        output_row = torch.tensor([2], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            computed_scalar_tensor_index_store,
+            (values, output_row),
+            block_sizes=[8, 128],
+        )
+
+        expected = torch.zeros(4, 8, 128, device=DEVICE)
+        expected[3] = values
+        torch.testing.assert_close(result, expected)
+
+    def test_scalar_tensor_index_loads_metadata(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def load_metadata(values: torch.Tensor, starts: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                [starts.size(0), 8], dtype=values.dtype, device=values.device
+            )
+            for block in hl.grid(starts.size(0)):
+                start = starts[block]
+                for lane in hl.static_range(8):
+                    out[block, lane] = values[start + lane]
+            return out
+
+        values = torch.arange(64, device=DEVICE, dtype=torch.int32)
+        starts = torch.tensor([0, 8, 24, 48], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            load_metadata,
+            (values, starts),
+            pallas_loop_type="fori_loop",
+        )
+
+        expected = torch.stack([values[start : start + 8] for start in starts.tolist()])
+        torch.testing.assert_close(result, expected)
+
+    def test_computed_scalar_selects_staged_matmul_weight(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def dynamic_weight_matmul(
+            values: torch.Tensor,
+            weights: torch.Tensor,
+            expert_ids: torch.Tensor,
+        ) -> torch.Tensor:
+            blocks, rows, k = values.size()
+            n = weights.size(2)
+            out = torch.empty(
+                [blocks, rows, n], dtype=values.dtype, device=values.device
+            )
+            for block in hl.grid(blocks):
+                expert = expert_ids[block]
+                for tile_m, tile_n in hl.tile([rows, n]):
+                    acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                    for tile_k in hl.tile(k):
+                        acc = torch.addmm(
+                            acc,
+                            values[block, tile_m, tile_k],
+                            weights[expert, tile_k, tile_n],
+                        )
+                    out[block, tile_m, tile_n] = acc
+            return out
+
+        values = torch.randn(3, 8, 256, device=DEVICE, dtype=torch.bfloat16)
+        weights = torch.randn(4, 256, 128, device=DEVICE, dtype=torch.bfloat16)
+        expert_ids = torch.tensor([2, 0, 3], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            dynamic_weight_matmul,
+            (values, weights, expert_ids),
+            block_sizes=[8, 128, 128],
+            pallas_loop_type="fori_loop",
+        )
+
+        expected = torch.stack(
+            [values[0] @ weights[2], values[1] @ weights[0], values[2] @ weights[3]]
+        )
+        torch.testing.assert_close(result, expected)
+
+    @skipIfPallasInterpret("JAX Pallas interpret cannot dynamically slice a VMEM Ref")
+    def test_scalar_tensor_index_with_minor_dimension_selects(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def select_member_and_minor_dimensions(
+            table: torch.Tensor,
+            member_ids: torch.Tensor,
+        ) -> torch.Tensor:
+            blocks = member_ids.size(0)
+            rows = table.size(1)
+            cols = table.size(3)
+            out = torch.empty(
+                [blocks, rows, cols], dtype=table.dtype, device=table.device
+            )
+            for block in hl.grid(blocks):
+                member = member_ids[block]
+                for tile_m, tile_n in hl.tile([rows, cols]):
+                    out[block, tile_m, tile_n] = table[member, tile_m, 0, tile_n, 1]
+            return out
+
+        table = torch.randn(4, 8, 2, 128, 2, device=DEVICE, dtype=torch.bfloat16)
+        member_ids = torch.tensor([2, 0, 3], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            select_member_and_minor_dimensions,
+            (table, member_ids),
+            block_sizes=[8, 128],
+        )
+
+        expected = torch.stack(
+            [table[2, :, 0, :, 1], table[0, :, 0, :, 1], table[3, :, 0, :, 1]]
+        )
         torch.testing.assert_close(result, expected)
 
     def test_tensor_index_atomic_add_raises(self) -> None:
@@ -3585,6 +3959,51 @@ class TestPallas(TestCase):
         self.assertLess(prefetch, min(waits))
         self.assertGreaterEqual(sum(i < compute for i in waits), 2)
         torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_static_unroll_tensor_load_buffering(self) -> None:
+        """Static unroll retains the selected depth-two DMA pipeline."""
+        args = (
+            torch.randn(64, 256, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 256, device=DEVICE, dtype=torch.float32),
+        )
+        _, result = code_and_output(
+            pallas_inner_loop_add,
+            args,
+            block_sizes=[8, 128],
+            pallas_loop_type="unroll",
+            pallas_load_buffer_count=[2, 1],
+        )
+
+        torch.testing.assert_close(result.cpu(), (args[0] + args[1]).cpu())
+
+    def test_static_unroll_uses_python_if_for_tile_predicate(self) -> None:
+        """A static tile predicate does not leave a side-effectful lax.cond."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def alternating_add(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                for tile_n in hl.tile(n):
+                    if tile_n.begin == 0:
+                        out[tile_m, tile_n] = x[tile_m, tile_n] + 1
+                    else:
+                        out[tile_m, tile_n] = x[tile_m, tile_n] + 2
+            return out
+
+        x = torch.randn(16, 256, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(
+            alternating_add,
+            (x,),
+            block_sizes=[8, 128],
+            pallas_loop_type="unroll",
+            pallas_load_buffer_count=[2],
+        )
+
+        expected = x.clone()
+        expected[:, :128] += 1
+        expected[:, 128:] += 2
+        torch.testing.assert_close(result.cpu(), expected.cpu())
 
     def test_fori_loop_repeated_loads_share_buffer(self) -> None:
         """Repeated loads of one input reuse its tensor-keyed DMA route."""
@@ -6642,6 +7061,43 @@ class TestPallasIndirectGather(TestCase):
             table.cpu()[indices.long().cpu()].to(device=DEVICE),
         )
 
+    @skipIfPallasInterpret("computed grouped HBM DMA requires TPU lowering")
+    def test_computed_fori_indirect_gather_tpu_correctness(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def gather_state(table: torch.Tensor) -> torch.Tensor:
+            rows = 32
+            out = torch.empty(
+                [rows, *table.shape[1:]],
+                dtype=table.dtype,
+                device=table.device,
+            )
+            for _ in hl.grid(1):
+                for tile_b in hl.tile(rows, block_size=8):
+                    selected = ((tile_b.index * 3 + 5) % table.size(0)).to(torch.int32)
+                    out[tile_b, :, :, :] = hl.load(
+                        table,
+                        [selected, slice(None), slice(None), slice(None)],
+                    )
+            return out
+
+        table = torch.randn(
+            512,
+            3,
+            4,
+            128,
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        )
+        _, result = code_and_output(
+            gather_state,
+            (table,),
+            pallas_loop_type="fori_loop",
+            pallas_load_buffer_count=[1],
+            pallas_indirect_access_mode="dma",
+        )
+        indices = (torch.arange(32) * 3 + 5) % table.size(0)
+        torch.testing.assert_close(result.cpu(), table.cpu()[indices])
+
     @skipIfPallasInterpret("grouped HBM DMA requires TPU lowering")
     def test_indirect_roundtrip_uses_shared_state_scratch(self) -> None:
         roundtrip_state = self._state_roundtrip_kernel()
@@ -7485,6 +7941,28 @@ class TestPallasJaxFn(TestCase):
             return x
 
         f = jax.jit(increment_inplace.jax_fn)
+        x = jnp.zeros((128, 128), dtype=jnp.float32)
+        result = jax.block_until_ready(f(x))
+        self.assertTrue(bool(jnp.all(result == 1.0)))
+
+    def test_jax_fn_rebinds_reshaped_output_to_base(self) -> None:
+        """A launch through an output view must update the returned base."""
+        jax, jnp = self._import_jax()
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[128]),
+        )
+        def write_through_view(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            out_view = out.reshape(x.size(0), 1, x.size(1))
+            x_view = x.reshape(x.size(0), 1, x.size(1))
+            for tile_m in hl.tile(x.size(0)):
+                out_view[tile_m, :, :] = x_view[tile_m, :, :] + 1.0
+            return out
+
+        f = jax.jit(write_through_view.jax_fn)
         x = jnp.zeros((128, 128), dtype=jnp.float32)
         result = jax.block_until_ready(f(x))
         self.assertTrue(bool(jnp.all(result == 1.0)))
