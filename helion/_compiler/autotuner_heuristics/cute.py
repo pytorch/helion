@@ -7,6 +7,7 @@ from typing import cast
 
 import torch
 
+from ...autotuner.config_spec import get_valid_eviction_policies
 from ...runtime.config import Config
 from ..cute.cutedsl_compat import tcgen05_runtime_n_ptx_compatible
 from ..cute.cutedsl_compat import warn_tcgen05_runtime_n_ptx_fallback
@@ -2452,6 +2453,21 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
         }
         if flatten:
             seed["flatten_loops"] = [True for _ in spec.flatten_loops]
+        # Streamed-once pointwise inputs benefit from L2::evict_last on the
+        # hoisted vec loads (triton's pointwise winners routinely carry
+        # evict_last; measured +1.7% on fp32 mul under do_bench's flush).
+        # Seed-only: this heuristic never promotes to the autotune-off
+        # default, and a plain-policy alternate is planted alongside.
+        # Sized from the live spec, not memory_op_facts: loads carrying an
+        # explicit ``hl.load(..., eviction_policy=...)`` get no config slot,
+        # so the fact count can exceed the list the search space expects.
+        n_evict = (
+            spec.load_eviction_policies.length
+            if spec.supports_config_key("load_eviction_policies")
+            else 0
+        )
+        if n_evict and "l2_last" in get_valid_eviction_policies("cute"):
+            seed["load_eviction_policies"] = ["l2_last"] * n_evict
         try:
             return Config(**seed)
         except Exception:
@@ -2492,6 +2508,14 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
                     with contextlib.suppress(Exception):
                         seeds.append(Config(**flat_seed))
                         base_variants.append(flat_seed)
+        # Plain-eviction alternate of the primary (which seeds l2_last on
+        # every load): keeps a no-hint starting point in the population for
+        # regimes where the L2 policy is a wash.
+        if primary.config.get("load_eviction_policies"):
+            plain_seed: dict[str, Any] = dict(primary.config)
+            plain_seed.pop("load_eviction_policies", None)
+            with contextlib.suppress(Exception):
+                seeds.append(Config(**plain_seed))
         return seeds
 
 

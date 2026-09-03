@@ -934,7 +934,12 @@ def get_valid_eviction_policies(backend_name: str) -> tuple[str, ...]:
         # 57.3us -> 47.1us on cross-entropy 32768x2048 fp32 on B200
         # under do_bench's dirty-L2 flush; triton's evict_first hints L2
         # too, so this closes a structural gap vs the triton backend).
-        return ("", "first", "last", "streaming")
+        # "l2_last" emits createpolicy.fractional.L2::evict_last +
+        # ld.global.L2::cache_hint (inline PTX) on 16-byte hoisted vec
+        # loads only — triton's evict_last equivalent, which keeps up to
+        # ~L2-size of a streaming input resident across other traffic
+        # (+1.7% on fp32 elementwise mul on B200).
+        return ("", "first", "last", "streaming", "l2_last")
     return ("",)
 
 

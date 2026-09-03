@@ -108,6 +108,15 @@ def _div1d_fastmath(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute", static_shapes=True)
+def _add_explicit_evict(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        a = hl.load(x, [tile], eviction_policy="evict_last")
+        out[tile] = a + y[tile]
+    return out
+
+
 @onlyBackends(["cute"])
 class TestCutePointwiseVec(TestCase):
     def test_nd_grid_vec_bf16(self) -> None:
@@ -290,6 +299,22 @@ class TestCutePointwiseVec(TestCase):
         self.assertIn("block=(64, 1, 1)", code)
         torch.testing.assert_close(out, x + y)
 
+    def test_l2_last_eviction_policy(self) -> None:
+        """``load_eviction_policies=["l2_last", ...]`` routes 16-byte vec
+        hoists through the inline-PTX L2::evict_last cache-hint load."""
+        x = torch.randn(2**16, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(2**16, device=DEVICE, dtype=torch.float32)
+        code, out = code_and_output(
+            _mul1d,
+            (x, y),
+            block_sizes=[1024],
+            num_threads=[256],
+            cute_vector_widths=[4],
+            load_eviction_policies=["l2_last", "l2_last"],
+        )
+        self.assertIn("_cute_load_l2_evict_last", code)
+        torch.testing.assert_close(out, x * y)
+
     def test_fast_math_setting_routes_cute_fastmath(self) -> None:
         """The ``fast_math`` SETTING (user opt-in) routes fastmath=True into
         cute.math calls; without it the accurate form is emitted.  Numerics
@@ -330,6 +355,31 @@ class TestCutePointwiseVec(TestCase):
         code, out = code_and_output(_div1d_fastmath, (x, y), block_sizes=[1024])
         self.assertIn("cute.math.div", code)
         torch.testing.assert_close(out, x / y, rtol=1e-4, atol=1e-4)
+
+    def test_seed_eviction_list_sized_from_spec_slots(self) -> None:
+        """Regression: a load carrying an explicit ``hl.load(...,
+        eviction_policy=...)`` gets no config slot, so the l2_last seed must
+        size ``load_eviction_policies`` from the spec (not the load count) or
+        the flat search surface rejects it (`Expected list of length 1`)."""
+        x = torch.randn(2**14, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(2**14, device=DEVICE, dtype=torch.float32)
+        bound = _add_explicit_evict.bind((x, y))
+        spec = bound.env.config_spec
+        n_slots = spec.load_eviction_policies.length
+        self.assertEqual(n_slots, 1)
+        seeds = spec.compiler_seed_configs
+        self.assertTrue(seeds)
+        seeded_policies = [
+            s.config["load_eviction_policies"]
+            for s in seeds
+            if s.config.get("load_eviction_policies")
+        ]
+        self.assertTrue(seeded_policies)
+        for policies in seeded_policies:
+            self.assertEqual(list(policies), ["l2_last"] * n_slots)
+        config_gen = spec.create_config_generation()
+        for seed in seeds:
+            config_gen.canonicalize_flat(config_gen.flatten(seed))
 
 
 if __name__ == "__main__":
