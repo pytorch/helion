@@ -10979,6 +10979,120 @@ class TestCuteLowerings(unittest.TestCase):
         # the validator-surface coverage lives in
         # ``test_cute_tcgen05_strategy_invariants_cluster_n``).
 
+    def test_tcgen05_clc_cluster_n2_runtime_correctness(self) -> None:
+        """CLC dynamic persistence with the 4-CTA (2x2) cluster.
+
+        The CLC leader's scheduler warp broadcasts each work tile to all
+        ``cluster_m * cluster_n`` peers with per-peer (M, N) coordinates
+        (Quack's dynamic-persistent 2x2 topology). Before the broadcast was
+        generalized, cluster-N peers never received the mailbox publish and
+        the kernel hung; the strategy invariant rejected the combination.
+        Runs a full-tile grid AND an l2-grouped peer-splitting grid so the
+        publish composes with the cluster-aware l2 decode.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_clc_cluster_n2(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        for m, n, k, l2g in ((1024, 1024, 256, 1), (4096, 1024, 256, 4)):
+            with self.subTest(m=m, n=n, k=k, l2g=l2g):
+                args = (
+                    torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16),
+                    torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16),
+                )
+                with patch_cute_mma_support():
+                    bound = cute_matmul_clc_cluster_n2.bind(args)
+                    bound.env.config_spec.cute_tcgen05_search_enabled = True
+                    cfg = _make_tcgen05_persistent_config(
+                        block_sizes=[256, 256, 128],
+                        l2_groupings=[l2g],
+                        pid_type="persistent_interleaved",
+                        tcgen05_cluster_m=2,
+                        tcgen05_cluster_n=2,
+                        tcgen05_ab_stages=2,
+                        tcgen05_acc_stages=2,
+                        tcgen05_c_stages=2,
+                        tcgen05_persistence_model="clc_persistent",
+                        tcgen05_strategy="role_local_with_scheduler",
+                        tcgen05_warp_spec_scheduler_warps=1,
+                    )
+                    bound.set_config(cfg)
+                    out = bound(*args)
+                expected = args[0] @ args[1]
+                torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_clc_cluster_n2_codegen_broadcast_markers(self) -> None:
+        """CLC 4-CTA broadcast codegen pins.
+
+        The scheduler-warp publish must fan out to all four peers
+        (``lane < 4``) and derive each peer's (M, N) offsets from the
+        x-fastest cluster rank. The cluster_n=1 emission stays on the
+        two-peer M-only form.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_clc_n2_markers(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(1024, 128, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(128, 1024, device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_clc_n2_markers.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                l2_groupings=[1],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_cluster_n=2,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+                tcgen05_persistence_model="clc_persistent",
+                tcgen05_strategy="role_local_with_scheduler",
+                tcgen05_warp_spec_scheduler_warps=1,
+            )
+            code = bound.to_triton_code(cfg)
+        self.assertIn("tcgen05_clc_sched_peer_n", code)
+        peer_rank_var = "tcgen05_clc_sched_peer_rank"
+        self.assertIn(f"{peer_rank_var} < cutlass.Int32(4)", code)
+        self.assertIn("% cutlass.Int32(2)", code)
+        self.assertIn("// cutlass.Int32(2)", code)
+
     def test_tcgen05_persistent_cluster_n2_two_cta_runtime_correctness(
         self,
     ) -> None:
