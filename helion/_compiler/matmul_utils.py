@@ -6,6 +6,7 @@ import sympy
 import torch
 
 from .._compat import min_dot_size
+from .._compat import sm100_dot_tmem_lhs_broken
 from .ast_extension import expr_from_string
 from .compile_environment import CompileEnvironment
 from .device_function import DeviceFunction
@@ -246,6 +247,57 @@ def _resolve_dim_size(
     return v
 
 
+def _dot_lhs_stays_in_smem(node: torch.fx.Node) -> bool:
+    """Whether Triton keeps this ``tl.dot`` LHS operand out of tensor memory.
+
+    Mirrors Triton's ``PromoteLHSToTMem`` heuristic on sm100: an LHS that is a
+    plain load (possibly through casts/transposes, including values passed in
+    from an enclosing graph) stays in shared memory; anything else (another
+    dot's output, elementwise math, constants) is staged through tensor
+    memory, which is broken for wide accumulators there (see
+    ``sm100_dot_tmem_lhs_broken``).  Loop-carried values resolve to their
+    initial value, so an LHS that starts as a load but is rebound to computed
+    values across iterations can be misclassified as safe.
+    """
+    # Imported here to avoid circular imports with helion.language.
+    from ..language._tracing_ops import _new_var
+    from ..language.memory_ops import load
+    from .device_ir import NodeArgsGraphInfo
+    from .host_function import HostFunction
+
+    transparent_targets = (
+        _new_var,
+        torch.ops.prims.convert_element_type.default,
+        torch.ops.aten._to_copy.default,
+        torch.ops.aten.permute.default,
+        torch.ops.aten.t.default,
+        torch.ops.aten.transpose.int,
+    )
+    # Codegen interprets per-config graph copies, but placeholder_to_outer_arg
+    # on a copy returns nodes from the original traced graphs, so search both.
+    graphs = [
+        *DeviceFunction.current().codegen.codegen_graphs,
+        *HostFunction.current().device_ir.graphs,
+    ]
+    while True:
+        if node.op == "placeholder":
+            graph_info = next((g for g in graphs if g.graph is node.graph), None)
+            if isinstance(graph_info, NodeArgsGraphInfo):
+                node = graph_info.placeholder_to_outer_arg(node)
+                continue
+            return False
+        if node.op != "call_function":
+            return False
+        if node.target is load:
+            return True
+        if node.target in transparent_targets and isinstance(
+            node.args[0], torch.fx.Node
+        ):
+            node = node.args[0]
+            continue
+        return False
+
+
 def _pad_tensor(
     tensor: ast.AST,
     pad_dim: int,
@@ -281,6 +333,7 @@ def emit_tl_dot_with_padding(
     lhs_shape: list[int | torch.SymInt],
     rhs_shape: list[int | torch.SymInt],
     acc_shape: list[int | torch.SymInt] | None = None,
+    lhs_fx_node: torch.fx.Node | None = None,
 ) -> ast.AST:
     device_fn = DeviceFunction.current()
     shape_str = device_fn.tile_strategy.shape_str
@@ -372,14 +425,71 @@ def emit_tl_dot_with_padding(
         pad_needed[d] = dim_value is not None and dim_value < min_sizes[d]
     need_padding = any(pad_needed.values())
 
-    if not need_padding:
-        result = _emit_tl_dot(
-            lhs_cast,
-            rhs_cast,
-            acc=acc_for_dot,
-            input_precision=input_precision,
-            out_dtype=dot_out_dtype,
+    # Triton crashes with a misaligned address on sm100 when a tl.dot LHS is
+    # promoted to tensor memory while the accumulator is wider than 256
+    # columns (triton-lang/triton#10309).  Split such dots into two M=32
+    # halves; splitting along N instead runs out of tensor memory because both
+    # halves' accumulators are live at the join.
+    split_m = (
+        lhs_fx_node is not None
+        and isinstance(m, int)
+        and m == 64
+        and isinstance(n, int)
+        and n > 256
+        and common_dtype.itemsize in (2, 4)
+        and (len(lhs_shape_list) == 2 or need_squeeze_dim)
+        and not (pad_needed["m"] or pad_needed["n"])
+        and env.backend.name == "triton"
+        and sm100_dot_tmem_lhs_broken(env.device)
+        and not _dot_lhs_stays_in_smem(lhs_fx_node)
+    )
+
+    def emit_dot(
+        lhs_final: ast.AST,
+        rhs_final: ast.AST,
+        acc_final: ast.AST | None,
+        k_final: int | torch.SymInt | sympy.Expr,
+    ) -> ast.AST:
+        if not split_m:
+            return _emit_tl_dot(
+                lhs_final,
+                rhs_final,
+                acc=acc_final,
+                input_precision=input_precision,
+                out_dtype=dot_out_dtype,
+            )
+
+        def split_half(x: ast.AST, last_dim: object, index: int) -> ast.AST:
+            # pyrefly: ignore [bad-argument-type]
+            shape = shape_str([2, 32, last_dim])
+            return expr_from_string(
+                f"tl.split(tl.permute(tl.reshape({{x}}, {shape}), [1, 2, 0]))[{index}]",
+                x=x,
+            )
+
+        halves = []
+        for index in (0, 1):
+            halves.append(
+                _emit_tl_dot(
+                    split_half(lhs_final, k_final, index),
+                    rhs_final,
+                    acc=split_half(acc_final, n, index)
+                    if acc_final is not None
+                    else None,
+                    input_precision=input_precision,
+                    out_dtype=dot_out_dtype,
+                )
+            )
+        # pyrefly: ignore [bad-argument-type]
+        out_shape = shape_str([m, n])
+        return expr_from_string(
+            f"tl.reshape(tl.permute(tl.join({{lo}}, {{hi}}), [2, 0, 1]), {out_shape})",
+            lo=halves[0],
+            hi=halves[1],
         )
+
+    if not need_padding:
+        result = emit_dot(lhs_cast, rhs_cast, acc_for_dot, k)
     else:
         lhs_pad, rhs_pad, acc_pad = lhs_cast, rhs_cast, acc_for_dot
         pad_specs = [
@@ -407,13 +517,7 @@ def emit_tl_dot_with_padding(
                     # pyrefly: ignore [unbound-name]
                     acc_pad = _pad_tensor(acc_pad, axis, cur, min_dim, other)
 
-        result = _emit_tl_dot(
-            lhs_pad,
-            rhs_pad,
-            acc=acc_pad,
-            input_precision=input_precision,
-            out_dtype=dot_out_dtype,
-        )
+        result = emit_dot(lhs_pad, rhs_pad, acc_pad, min_k if pad_needed["k"] else k)
 
         unpad_specs = [
             (
