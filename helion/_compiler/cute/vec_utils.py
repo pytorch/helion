@@ -24,3 +24,12 @@ def store_u16_vec(ptr: object, vals: list) -> None:
     vecty = ir.VectorType.get([len(vals)], cutlass.Uint16.mlir_type)
     packed = _vector_dialect.from_elements(vecty, [v.ir_value() for v in vals])
     cute.arch.store(ptr, packed)
+
+
+def store_u32_vec(ptr: object, vals: list) -> None:
+    """``store_u16_vec`` for ``cutlass.Uint32`` lanes (fp32 stores bitcast
+    their values to Uint32 first): one ST.64/ST.128 instead of per-element
+    4-byte stores."""
+    vecty = ir.VectorType.get([len(vals)], cutlass.Uint32.mlir_type)
+    packed = _vector_dialect.from_elements(vecty, [v.ir_value() for v in vals])
+    cute.arch.store(ptr, packed)

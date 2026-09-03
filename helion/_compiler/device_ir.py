@@ -1124,6 +1124,31 @@ class DeviceIR:
         # non-reduction tile slots after them (keeps the rdim slot at index 0).
         if env.backend_name == "cute":
             self._register_cute_tile_vec_slots(env)
+            self._scan_cute_transcendentals(env)
+
+    def _scan_cute_transcendentals(self, env: CompileEnvironment) -> None:
+        """Set ``config_spec.cute_has_transcendentals`` when any device graph
+        contains a transcendental op — gates the ``cute_fastmath`` knob so
+        FMA-only kernels don't grow a dead search dimension."""
+        aten = torch.ops.aten
+        targets = {
+            aten.exp.default,
+            aten.exp2.default,
+            aten.log.default,
+            aten.log2.default,
+            aten.tanh.default,
+            aten.sigmoid.default,
+            aten.rsqrt.default,
+            aten.sqrt.default,
+            aten.sin.default,
+            aten.cos.default,
+            aten.erf.default,
+        }
+        for graph_info in self.graphs:
+            for node in graph_info.graph.nodes:
+                if node.op == "call_function" and node.target in targets:
+                    env.config_spec.cute_has_transcendentals = True
+                    return
 
     def _register_cute_tile_vec_slots(self, env: CompileEnvironment) -> None:
         """Eagerly register cute_vector_widths slots for non-reduction tile blocks.

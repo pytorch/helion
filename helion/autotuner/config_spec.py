@@ -819,6 +819,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_reduction_reloads",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
+        "cute_fastmath",
         "load_cache_modifiers",
         "store_cache_modifiers",
         "pallas_loop_type",
@@ -862,6 +863,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_reduction_reloads",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
+        "cute_fastmath",
         *BACKEND_TUNABLE_KEYS,
         "advanced_controls_file",
         "epilogue_subtile",
@@ -1145,6 +1147,10 @@ class ConfigSpec:
         self.pointwise_facts: list[PointwiseElementwiseFact] = []
         self.store_indices: list[int] = []
         self.memory_op_facts: list[MemoryOpFact] = []
+        # True when the device IR contains transcendental ops (exp/tanh/...);
+        # gates the ``cute_fastmath`` search dimension (device_ir sets it
+        # during cute registration).
+        self.cute_has_transcendentals: bool = False
         self.backend_tunable_fragments = self.backend.tunable_fragments()
         unknown_tunables = set(self.backend_tunable_fragments) - BACKEND_TUNABLE_KEYS
         if unknown_tunables:
@@ -3387,6 +3393,17 @@ class ConfigSpec:
                     fields["cute_min_blocks_per_mp"] = EnumFragment(
                         choices=(0, 1, 2, 3, 4, 6)
                     )
+                # Fast-math transcendentals (MUFU tanh / ex2 / rcp / rsqrt
+                # instead of the accurate SASS expansions).  Only searched
+                # when the kernel actually contains transcendental ops; the
+                # autotuner's baseline accuracy check rejects it wherever
+                # the numerics drift past tolerance, so it is self-gating.
+                if (
+                    self.supports_config_key("cute_fastmath")
+                    and self.cute_has_transcendentals
+                    and not self.matmul_facts
+                ):
+                    fields["cute_fastmath"] = EnumFragment(choices=(False, True))
             if (
                 not self.cute_flash_search_enabled
                 and self.epilogue_subtile_autotune_choices is not None

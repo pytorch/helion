@@ -1921,12 +1921,36 @@ class ForiLoopState(DeviceLoopOrGridState):
 
 
 @dataclasses.dataclass
+class VecLaneWrapper:
+    """Pre-built outer x constexpr-V lane structure for a GRID lane loop.
+
+    Grid lane loops are materialized late (``DeviceGridState.wrap_body``),
+    but the vec-load/store hoist protocol needs the outer-lane body list and
+    the constexpr V-loop node to exist DURING body codegen (memory_ops
+    splices hoisted ``cute.arch.load(..., V)`` statements into it).  So
+    ``PerThreadNDTileStrategy.codegen_grid`` pre-builds the structure and
+    ``wrap_body`` just plugs the user body into ``vloop.body``.
+    """
+
+    outer_for: ast.For
+    vloop: ast.For
+    vec_lane_var: str
+    base_index_var: str
+
+
+@dataclasses.dataclass
 class DeviceGridState(DeviceLoopOrGridState):
     lane_loops: list[tuple[str, int]] = dataclasses.field(default_factory=list)
     lane_loop_blocks: set[int] = dataclasses.field(default_factory=set)
     lane_setup_statements: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
+    # lane_var -> pre-built vec partition (see VecLaneWrapper).  Only grid
+    # lane loops whose block has ``cute_vector_widths[block] > 1`` (and a
+    # divisible elements-per-thread) get an entry.
+    vec_lane_wrappers: dict[str, VecLaneWrapper] = dataclasses.field(
+        default_factory=dict
+    )
 
     def has_lane_loops(self) -> bool:
         return bool(self.lane_loops)
@@ -1948,6 +1972,16 @@ class DeviceGridState(DeviceLoopOrGridState):
         needed: set[str] = set()
         for stmt in body:
             needed |= set(ReadWrites.from_ast(stmt).reads)
+        # A vec wrapper whose lane body received memory_ops splices (hoisted
+        # vec loads before the V-loop, store flushes after it) must be kept
+        # regardless of what the inner body reads: the flush IS the store.
+        # Its splices also read setup vars (masks, sibling index vars), so
+        # fold those reads in before selecting kept_setup.
+        spliced_wrappers: set[str] = set()
+        for lane_var, wrapper in self.vec_lane_wrappers.items():
+            if len(wrapper.outer_for.body) > 2:  # more than [base, vloop]
+                spliced_wrappers.add(lane_var)
+                needed |= set(ReadWrites.from_ast(wrapper.outer_for).reads)
         kept_setup: list[ast.AST] = []
         for stmt in reversed(self.lane_setup_statements):
             rw = ReadWrites.from_ast(stmt)
@@ -1957,6 +1991,18 @@ class DeviceGridState(DeviceLoopOrGridState):
         kept_setup.reverse()
         wrapped: list[ast.AST] = [*kept_setup, *body]
         for lane_var, extent in reversed(self.lane_loops):
+            wrapper = self.vec_lane_wrappers.get(lane_var)
+            if wrapper is not None:
+                # The per-element index var reads ``base_index_var`` +
+                # ``vec_lane_var`` (not ``lane_var`` directly), so test all
+                # three before dropping the structure as dead.
+                if lane_var not in spliced_wrappers and not (
+                    {lane_var, wrapper.vec_lane_var, wrapper.base_index_var} & needed
+                ):
+                    continue
+                wrapper.vloop.body = wrapped  # type: ignore[assignment]
+                wrapped = [wrapper.outer_for]
+                continue
             if lane_var not in needed:
                 continue
             wrapped = [_create_lane_loop(lane_var, extent, wrapped)]
@@ -4118,6 +4164,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
 
         lane_setup_statements: list[ast.AST] = []
         outer_setup_statements: list[ast.AST] = []
+        vec_wrappers: dict[str, VecLaneWrapper] = {}
         tracker = ThreadAxisTracker()
         thread_axis_offset = self._thread_axis_offset(state)
         thread_axis_map = self._thread_axis_map()
@@ -4185,7 +4232,85 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             else:
                 idx_expr = offset_var
             if lane_var := self._lane_var_by_block.get(block_idx):
-                idx_expr = f"{idx_expr} + {env.backend.lane_offset_expr(lane_var)}"
+                vec_width = self._cute_lane_vec_width_by_block.get(block_idx, 1)
+                lane_strided = (
+                    self._cute_lane_layout_by_block.get(block_idx, "blocked")
+                    == "strided"
+                    and uses_thread_axis
+                    and isinstance(static_extent, int)
+                )
+                if (
+                    vec_width > 1
+                    and uses_thread_axis
+                    and elements_per_thread % vec_width == 0
+                    # A matmul fallback may suppress root lane loops AFTER
+                    # loads already hoisted into the wrapper (cute_mma's
+                    # request_root_lane_loop_suppression), which would strand
+                    # the hoists; keep grid vec to matmul-free kernels.
+                    and not env.config_spec.matmul_facts
+                ):
+                    # Same outer x constexpr-V lane partition as
+                    # ``codegen_device_loop`` (see the comments there), so
+                    # the memory_ops vec-load/store hoist protocol applies
+                    # to GRID lane loops too.  The loops themselves are
+                    # materialized later by ``DeviceGridState.wrap_body``
+                    # from the pre-built ``VecLaneWrapper``.
+                    vec_lane_var = self.fn.new_var(f"vec_lane_{block_idx}", dce=False)
+                    self._cute_vec_lane_var_by_block[block_idx] = vec_lane_var
+                    inner_for = cast(
+                        "ast.For",
+                        ast.parse(
+                            f"for {vec_lane_var} in cutlass.range_constexpr({vec_width}):\n"
+                            f"    pass"
+                        ).body[0],
+                    )
+                    lane_body: list[ast.AST] = [inner_for]
+                    self._cute_lane_body_by_block[block_idx] = lane_body
+                    self._cute_lane_vloop_by_block[block_idx] = inner_for
+                    base_index_var = self.fn.new_var(
+                        f"lane_base_{block_idx}", dce=False
+                    )
+                    self._cute_lane_base_index_var_by_block[block_idx] = base_index_var
+                    if lane_strided:
+                        # ``base = offset + (outer*NT + tid) * V``
+                        base_expr = (
+                            f"{offset_var} + "
+                            f"({env.backend.lane_offset_expr(lane_var)} "
+                            f"* {static_extent} + "
+                            f"{env.backend.thread_index_expr(axis=axis)}) "
+                            f"* {vec_width}"
+                        )
+                    else:
+                        # ``base = offset + tid*EPT + outer*V``
+                        base_expr = (
+                            f"{idx_expr} + "
+                            f"{env.backend.lane_offset_expr(lane_var)} "
+                            f"* {vec_width}"
+                        )
+                    lane_body.insert(
+                        0,
+                        statement_from_string(f"{base_index_var} = {base_expr}"),
+                    )
+                    outer_for = _create_lane_loop(
+                        lane_var, elements_per_thread // vec_width, lane_body
+                    )
+                    vec_wrappers[lane_var] = VecLaneWrapper(
+                        outer_for=outer_for,
+                        vloop=inner_for,
+                        vec_lane_var=vec_lane_var,
+                        base_index_var=base_index_var,
+                    )
+                    idx_expr = f"{base_index_var} + cutlass.Int32({vec_lane_var})"
+                elif lane_strided:
+                    # ``idx = offset + tid + lane * NT`` — consecutive
+                    # threads touch consecutive elements each lane iter.
+                    idx_expr = (
+                        f"{offset_var} + {env.backend.thread_index_expr(axis=axis)}"
+                        f" + {env.backend.lane_offset_expr(lane_var)}"
+                        f" * {static_extent}"
+                    )
+                else:
+                    idx_expr = f"{idx_expr} + {env.backend.lane_offset_expr(lane_var)}"
                 target = lane_setup_statements
             else:
                 # Setup that does not depend on a lane variable can be hoisted
@@ -4246,6 +4371,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             outer_prefix=outer_setup_statements,
             thread_axis_sizes=tracker.sizes,
             block_thread_axes=tracker.block_axes,
+            vec_lane_wrappers=vec_wrappers,
         )
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
@@ -4541,6 +4667,52 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         self._lane_var: str | None = None
         if num_threads > 0 and isinstance(block_size, int) and num_threads < block_size:
             self._lane_var = self.new_var("lane", dce=False)
+        # Vec-partition state for the memory_ops ``tile_unroll`` hoist
+        # protocol (same shape as ``PerThreadNDTileStrategy``).  Only the
+        # single-block (1D) form participates: with multiple flattened
+        # blocks the per-dim index vars are div/mod-derived per element, so
+        # a hoisted base pointer built from ``index_exprs`` would reference
+        # per-element vars that do not exist at the hoist point.
+        self._cute_lane_layout: str = "blocked"
+        self._cute_lane_vec_width_by_block: dict[int, int] = {}
+        self._cute_vec_lane_var_by_block: dict[int, str] = {}
+        self._cute_lane_base_index_var_by_block: dict[int, str] = {}
+        self._cute_lane_body_by_block: dict[int, list] = {}
+        self._cute_lane_vloop_by_block: dict[int, ast.For] = {}
+        self._cute_lane_vec_stores_by_block: dict[int, dict] = {}
+        self._cute_lane_vec_loads_by_block: dict[int, dict] = {}
+        if self._lane_var is not None and len(block_ids) == 1:
+            env = CompileEnvironment.current()
+            block_id = block_ids[0]
+            cfg = fn.config.config
+            if block_id in env.config_spec.cute_lane_layouts.valid_block_ids():
+                layout = env.config_spec.cute_lane_layouts.config_get(
+                    cast("list[str]", cfg.get("cute_lane_layouts", []) or []),
+                    block_id,
+                    "blocked",
+                )
+                if isinstance(layout, str):
+                    self._cute_lane_layout = layout
+            if block_id in env.config_spec.cute_vector_widths.valid_block_ids():
+                vec_width = env.config_spec.cute_vector_widths.config_get(
+                    cast("list[int]", cfg.get("cute_vector_widths", []) or []),
+                    block_id,
+                    1,
+                )
+                assert isinstance(block_size, int)
+                elements_per_thread = block_size // num_threads
+                if (
+                    isinstance(vec_width, int)
+                    and vec_width > 1
+                    and elements_per_thread % vec_width == 0
+                ):
+                    self._cute_lane_vec_width_by_block[block_id] = vec_width
+
+    def _configured_block_size_int(self, block_size: SymIntLike) -> int | None:
+        # Shared with the tile_unroll hoist protocol (see the identically
+        # named method on PerThreadNDTileStrategy); the flattened block size
+        # is already a plain int whenever the lane path is active.
+        return block_size if isinstance(block_size, int) else None
 
     @property
     def _elements_per_thread(self) -> int:
@@ -4609,12 +4781,88 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         env = CompileEnvironment.current()
         total_numel = sympy.S.One
         lane_setup_statements: list[ast.AST] = []
-
-        lane_setup_statements.append(
-            statement_from_string(
-                f"{offsets_var} = {offsets_base_var} + {env.backend.lane_offset_expr(self._lane_var)}"
-            )
+        vec_wrappers: dict[str, VecLaneWrapper] = {}
+        axis = self._flat_thread_axis()
+        thread_extent = self._thread_extent()
+        vec_width = self._cute_lane_vec_width_by_block.get(block_ids[0], 1)
+        lane_strided = self._cute_lane_layout == "strided" and isinstance(
+            thread_extent, int
         )
+
+        if vec_width > 1 and env.config_spec.matmul_facts:
+            # See the matmul-fallback lane-loop-suppression note in
+            # ``PerThreadNDTileStrategy.codegen_grid``.
+            vec_width = 1
+        if vec_width > 1:
+            # Same outer x constexpr-V lane partition as
+            # ``PerThreadNDTileStrategy.codegen_grid`` so the memory_ops
+            # tile_unroll vec-hoist protocol applies to flattened (1D)
+            # grid tiles too.
+            block_id = block_ids[0]
+            vec_lane_var = self.new_var("vec_lane", dce=False)
+            self._cute_vec_lane_var_by_block[block_id] = vec_lane_var
+            inner_for = cast(
+                "ast.For",
+                ast.parse(
+                    f"for {vec_lane_var} in cutlass.range_constexpr({vec_width}):\n"
+                    f"    pass"
+                ).body[0],
+            )
+            lane_body: list[ast.AST] = [inner_for]
+            self._cute_lane_body_by_block[block_id] = lane_body
+            self._cute_lane_vloop_by_block[block_id] = inner_for
+            base_index_var = self.new_var("lane_base", dce=False)
+            self._cute_lane_base_index_var_by_block[block_id] = base_index_var
+            if lane_strided:
+                # ``base = pid*BS + (outer*NT + tid) * V``
+                base_expr = (
+                    f"{offsets_base_var} + "
+                    f"({env.backend.lane_offset_expr(self._lane_var)} "
+                    f"* {thread_extent} + "
+                    f"{env.backend.thread_index_expr(axis=axis)}) "
+                    f"* {vec_width}"
+                )
+            else:
+                # ``base = pid*BS + tid*EPT + outer*V``
+                base_expr = (
+                    f"{offsets_base_var} + "
+                    f"{env.backend.lane_offset_expr(self._lane_var)} "
+                    f"* {vec_width}"
+                )
+            lane_body.insert(
+                0, statement_from_string(f"{base_index_var} = {base_expr}")
+            )
+            outer_for = _create_lane_loop(
+                self._lane_var, self._elements_per_thread // vec_width, lane_body
+            )
+            vec_wrappers[self._lane_var] = VecLaneWrapper(
+                outer_for=outer_for,
+                vloop=inner_for,
+                vec_lane_var=vec_lane_var,
+                base_index_var=base_index_var,
+            )
+            lane_setup_statements.append(
+                statement_from_string(
+                    f"{offsets_var} = {base_index_var} + cutlass.Int32({vec_lane_var})"
+                )
+            )
+        elif lane_strided:
+            # ``offsets = pid*BS + tid + lane * NT`` — consecutive threads
+            # touch consecutive elements each lane iter (coalesced even
+            # without vectorization).
+            lane_setup_statements.append(
+                statement_from_string(
+                    f"{offsets_var} = {offsets_base_var} + "
+                    f"{env.backend.lane_offset_expr(self._lane_var)}"
+                    f" * {thread_extent}"
+                )
+            )
+        else:
+            lane_setup_statements.append(
+                statement_from_string(
+                    f"{offsets_var} = {offsets_base_var} + {env.backend.lane_offset_expr(self._lane_var)}"
+                )
+            )
         for i, block_idx in enumerate(self._reorder(block_ids)):
             numel = env.block_sizes[block_idx].numel
             block_index_var = self.index_var(block_idx)
@@ -4641,10 +4889,20 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         if isinstance(state.device_function.pid, ForEachProgramID):
             pids.shared_pid_var = state.device_function.pid.shared_pid_var
         pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
-        axis = self._flat_thread_axis()
-        state.add_statement(
-            f"{offsets_base_var} = {env.backend.lane_index_expr(f'({pid_var}) * ({block_size_var})', self._elements_per_thread, axis=axis)}"
-        )
+        if vec_width > 1 and lane_strided:
+            # The strided vec base folds the thread index in itself.
+            state.add_statement(
+                f"{offsets_base_var} = ({pid_var}) * ({block_size_var})"
+            )
+        elif lane_strided:
+            # ``offsets_base = pid*BS + tid`` (per-lane term adds lane*NT).
+            state.add_statement(
+                f"{offsets_base_var} = {env.backend.lane_index_expr(f'({pid_var}) * ({block_size_var})', 1, axis=axis)}"
+            )
+        else:
+            state.add_statement(
+                f"{offsets_base_var} = {env.backend.lane_index_expr(f'({pid_var}) * ({block_size_var})', self._elements_per_thread, axis=axis)}"
+            )
         pids.codegen(state)
         if isinstance(state.device_function.pid, ForEachProgramID):
             shared_pid = state.device_function.pid
@@ -4657,7 +4915,6 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         if self._lane_var is not None:
             lane_loops = [(self._lane_var, self._elements_per_thread)]
         tracker = ThreadAxisTracker()
-        thread_extent = self._thread_extent()
         if self._uses_thread_axis() and isinstance(thread_extent, int):
             tracker.record_all(self.block_ids, axis, thread_extent)
         return DeviceGridState(
@@ -4668,6 +4925,7 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
             lane_setup_statements=lane_setup_statements,
             thread_axis_sizes=tracker.sizes,
             block_thread_axes=tracker.block_axes,
+            vec_lane_wrappers=vec_wrappers,
         )
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:

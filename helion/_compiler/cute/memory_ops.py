@@ -1836,7 +1836,7 @@ def _(state: CodegenState) -> ast.AST:
         store_uses_pointer
         and topk_lane_expr is None
         and extra_mask is None
-        and tensor.dtype in (torch.float16, torch.bfloat16)
+        and tensor.dtype in (torch.float16, torch.bfloat16, torch.float32)
     ):
         vec_ctx = _cute_vector_load_ctx(state, tensor, subscript, index_exprs, None)
         if vec_ctx is not None and vec_ctx[2] == "tile_unroll":
@@ -1855,6 +1855,7 @@ def _(state: CodegenState) -> ast.AST:
                 index_exprs,
                 ast.unparse(value),
                 mask_expr,
+                tensor.dtype,
             )
             if append_stmt is not None:
                 state.add_statement(append_stmt)
@@ -1874,6 +1875,7 @@ def _(state: CodegenState) -> ast.AST:
                     index_exprs,
                     ast.unparse(value),
                     mask_expr,
+                    tensor.dtype,
                 )
                 if append_stmt is not None:
                     state.add_statement(append_stmt)
@@ -2034,6 +2036,7 @@ def _cute_vector_load_ctx(
     # position.
     inner_block_id: int | None = None
     lane_axis_pos: int | None = None
+    lane_on_stride1 = False
     expr_pos = -1
     tensor_dim = 0
     for idx in subscript:
@@ -2046,6 +2049,7 @@ def _cute_vector_load_ctx(
                 if tensor_dim == stride1_tensor_dim or inner_block_id is None:
                     inner_block_id = bid
                     lane_axis_pos = expr_pos
+                    lane_on_stride1 = tensor_dim == stride1_tensor_dim
         elif isinstance(idx, slice) and idx == slice(None):
             if tensor_dim < tensor.ndim:
                 dim_size = tensor.shape[tensor_dim]
@@ -2095,6 +2099,7 @@ def _cute_vector_load_ctx(
                     if tensor_dim == stride1_tensor_dim or inner_block_id is None:
                         inner_block_id = cand
                         lane_axis_pos = expr_pos
+                        lane_on_stride1 = tensor_dim == stride1_tensor_dim
         tensor_dim += 1
     if inner_block_id is None or lane_axis_pos is None:
         return None
@@ -2144,6 +2149,13 @@ def _cute_vector_load_ctx(
     from ..tile_strategy import BlockSizeTileStrategy
 
     if isinstance(strategy, BlockSizeTileStrategy):
+        # The hoisted load reads V CONTIGUOUS elements from the per-thread
+        # base, so the lane axis must actually be the tensor's stride-1
+        # dim.  A lane block accepted via the ``inner_block_id is None``
+        # fallback (e.g. ``x[tile_m, 0]`` where dim 1 is contiguous) would
+        # vectorize along the wrong dim and read garbage.
+        if not lane_on_stride1:
+            return None
         vec_by_block = getattr(strategy, "_cute_lane_vec_width_by_block", None)
         if not isinstance(vec_by_block, dict):
             return None

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 from .common import dedupe_configs
 from .cute import CuteFlashAttentionHeuristic
 from .cute import CuteFp8GemmSkinnyMHeuristic
+from .cute import CutePointwiseVecHeuristic
 from .cute import CuteReductionTileHeuristic
 from .cute import CuteReductionWideChunkHeuristic
 from .cute import CuteResidentMultiRowHeuristic
@@ -65,6 +66,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteResidentRowHeuristic,
         CuteResidentRowWideClusterHeuristic,
         CuteResidentMultiRowHeuristic,
+        CutePointwiseVecHeuristic,
     ),
     "triton": (
         # The two sm90 front ends are disjoint and share the B200 decision flow,

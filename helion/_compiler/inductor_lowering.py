@@ -1206,8 +1206,13 @@ class GenerateASTFromInductor(DefaultHandler):
     def rsqrt(self, x: object) -> str:  # type: ignore[override]
         backend_name = CompileEnvironment.current().backend_name
         if backend_name == "cute":
+            from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import (
+                _CUTEDSL_FAST_MATH,
+            )
+
+            suffix = ", fastmath=True" if _CUTEDSL_FAST_MATH.get() else ""
             return self._lift(
-                expr_from_string("cute.math.rsqrt({x})", x=self._to_ast(x))
+                expr_from_string(f"cute.math.rsqrt({{x}}{suffix})", x=self._to_ast(x))
             )
         if backend_name == "pallas":
             return self._lift(expr_from_string("lax.rsqrt({x})", x=self._to_ast(x)))
