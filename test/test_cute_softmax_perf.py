@@ -525,7 +525,9 @@ class TestCuteCanonicalSoftmaxArtifact(TestCase):
         # ``di``) must survive.
         self.assertNotIn("v_10 = v_9 - mi", code)
         self.assertNotIn("v_6 = v_5 - v_1", code)
-        self.assertIn("di = v_4 + sum_1", code)
+        # The online-softmax rescale update contracts to a single FMA
+        # (``di = di*exp(mi-mi_next) + sum`` — same fusion quack applies).
+        self.assertIn("di = cute.math.fma(di, v_3, sum_1)", code)
         # P17 invariance canonicalization: the ``mi`` scale hoist for
         # the consume sweep lives BETWEEN the two outer for-loops
         # (after the reduce loop finishes mutating ``mi`` via the

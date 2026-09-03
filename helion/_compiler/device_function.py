@@ -1161,6 +1161,26 @@ class DeviceFunction:
             kernel_body = hoist_loop_invariant_recips(
                 kernel_body, rename_groups=rename_groups
             )
+            # Contract single-use fp32 ``t = a*b; w = t + c`` chains into
+            # ``cute.math.fma`` (the DSL's arith ops carry no contract
+            # flag, so NVVM won't fuse them itself).  Triton contracts by
+            # default, so this brings cute numerics closer to the triton
+            # backend.
+            from .cute.fuse_fma import fuse_fma
+
+            # Skipped for matmul kernels: tcgen05 scheduling passes pin
+            # exact statement sequences, and the MMA path gains nothing
+            # from contracting stray scalar epilogue math.
+            if not env.config_spec.matmul_facts:
+                kernel_body = fuse_fma(kernel_body, rename_groups=rename_groups)
+            # Issue all of a grid lane loop's vec loads before its first
+            # store (ptxas cannot prove the store doesn't alias the next
+            # iteration's load, so unsplit loops keep only ONE load in
+            # flight per thread; the triton backend and handwritten CuTe
+            # kernels both load the whole tile fragment first).
+            from .cute.split_lane_loads import split_lane_loads
+
+            kernel_body = split_lane_loads(kernel_body)
             # P18: software-pipeline the per-iteration vec load by one
             # stage.  Pre-issue iter 0's load above the loop and, inside
             # the body, issue iter N+1's load BEFORE iter N's compute
