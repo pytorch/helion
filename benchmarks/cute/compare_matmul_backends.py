@@ -956,7 +956,11 @@ def _check_close(
     actual: torch.Tensor, expected: torch.Tensor, dtype: torch.dtype
 ) -> None:
     if dtype == torch.float32:
-        torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+        # fp32 matmul is benchmarked under Helion's default semantics: fp32
+        # data with tf32 tensor-core compute (settings.dot_precision == "tf32",
+        # matching triton's tl.dot default). The reference is strict fp32, so
+        # allow tf32-level accumulation error (~2^-11 relative per element).
+        torch.testing.assert_close(actual, expected, atol=5e-2, rtol=1e-2)
     elif _is_fp8(dtype):
         # fp8 (e4m3) operands carry ~2 decimal digits, so the GEMM accumulates
         # substantial quantization error; use a relative-error tolerance like
@@ -1077,6 +1081,11 @@ def _result(
 
 def _benchmark_aten(args: argparse.Namespace) -> dict[str, Any]:
     dtype, a, b, bias, residual = _make_matmul_problem(args)
+    if dtype == torch.float32:
+        # Match Helion's default fp32 semantics (tf32 compute): benchmark the
+        # cuBLAS tf32 GEMM, not the strict-fp32 FFMA path, so aten is the
+        # apples-to-apples SOTA baseline for the fp32 variants.
+        torch.backends.cuda.matmul.allow_tf32 = True
     if args.epilogue == "scaled_mm":
         # ATen's fp8 rowwise GEMM is torch._scaled_mm — the SOTA baseline to
         # time against (a dequantized f32 matmul would be a misleadingly slow
@@ -1443,6 +1452,33 @@ class BiasEpilogue(NamedTuple):
         return self.fn.__closure__
 
 
+class IdentityEpilogue(NamedTuple):
+    """Explicit no-op epilogue for the ``none`` case.
+
+    Passing this instead of relying on the kernel's default lambda keeps the
+    bound args picklable, so the autotuner's killable subprocess benchmark
+    (with its per-config timeout) stays available — with the lambda default
+    the autotuner falls back to in-process benchmarking, where one hung or
+    pathologically slow config wedges the whole run.
+    """
+
+    @property
+    def fn(self) -> Callable[[torch.Tensor, tuple[torch.Tensor, ...]], torch.Tensor]:
+        def epilogue(acc: torch.Tensor, tile: tuple[torch.Tensor, ...]) -> torch.Tensor:
+            return acc
+
+        return epilogue
+
+    def __call__(
+        self, acc: torch.Tensor, tile: tuple[torch.Tensor, ...]
+    ) -> torch.Tensor:
+        return self.fn(acc, tile)
+
+    @property
+    def __closure__(self) -> tuple[Any, ...] | None:
+        return self.fn.__closure__
+
+
 class ReluEpilogue(NamedTuple):
     @property
     def fn(self) -> Callable[[torch.Tensor, tuple[torch.Tensor, ...]], torch.Tensor]:
@@ -1580,7 +1616,7 @@ def _helion_matmul_args(
     residual: torch.Tensor | None,
 ) -> tuple[Any, ...]:
     if args.epilogue == "none":
-        return (a, b)
+        return (a, b, IdentityEpilogue())
     if args.epilogue == "bias":
         assert bias is not None
         return (a, b, BiasEpilogue(bias))
