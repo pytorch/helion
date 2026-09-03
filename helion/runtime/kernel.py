@@ -1753,6 +1753,15 @@ class Kernel(Generic[_R]):
         is_compiling = torch.compiler.is_compiling()
         if (
             not is_compiling
+            and os.environ.get("HELION_EXPERIMENTAL_DIFFERENTIABLE", "0") == "1"
+            and any(isinstance(a, torch.Tensor) and a.requires_grad for a in args)
+        ):
+            # Local import to avoid circular dependency with helion.experimental.
+            from ..experimental.autograd_function import call_with_autograd
+
+            return cast("_R", call_with_autograd(self, *args))
+        if (
+            not is_compiling
             and (prepared := self._prepared_call) is not None
             and prepared.matches(self, args)
             and prepared.bound._run is not None
