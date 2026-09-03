@@ -11936,21 +11936,23 @@ class TestCuteBackendRequirements(TestCase):
         )
         from helion._compiler.cute.cutedsl_compat import CUTE_VALIDATED_VERSION
 
-        pin = (
-            (
-                Path(__file__).parents[1]
-                / ".github"
-                / "ci_commit_pins"
-                / "nvidia_cutlass_dsl.txt"
-            )
-            .read_text(encoding="utf-8")
-            .strip()
-        )
-        self.assertEqual(str(CUTE_VALIDATED_VERSION), pin)
         self.assertEqual(
             CUTE_TCGEN05_RUNTIME_N_PTX_VALIDATED_VERSION,
             CUTE_VALIDATED_VERSION,
         )
+        pin_path = (
+            Path(__file__).parents[1]
+            / ".github"
+            / "ci_commit_pins"
+            / "nvidia_cutlass_dsl.txt"
+        )
+        try:
+            pin = pin_path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            self.skipTest(
+                f"checked-in CuTe DSL pin not packaged in this environment: {pin_path}"
+            )
+        self.assertEqual(str(CUTE_VALIDATED_VERSION), pin)
 
     def test_check_does_not_raise_when_satisfied(self) -> None:
         from helion._compiler.cute.cutedsl_compat import check_cute_backend_requirements
