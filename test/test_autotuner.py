@@ -8403,8 +8403,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             config_gen.flatten(unflatten(flat)),
             unflatten(flat),
         )
-        config_gen.user_seed_flat_config_pairs = lambda _configs, _log: []
-        config_gen.seed_flat_config_pairs = lambda _log: []
+        config_gen.user_seed_flat_config_pairs = lambda _configs, _log=None: []
+        config_gen.seed_flat_config_pairs = lambda _log=None: []
         config_gen.random_flat = Mock(
             side_effect=AssertionError("an enumerated space must not draw randomly")
         )
@@ -8417,6 +8417,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         random_search.initial_population = 5
         random_search._autotune_seed_configs = list
         random_search.log = Mock()
+        # FROM_RANDOM now pins seed/default configs into final verification.
+        random_search._pinned_finalist_configs = set()
         random_population = random_search._generate_initial_population_flat()
         random_unique = [
             list(flat)

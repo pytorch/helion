@@ -12,6 +12,7 @@ import json
 import math
 from math import inf
 import os
+import pickle
 import tempfile
 import time
 from typing import TYPE_CHECKING
@@ -525,6 +526,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
     provider created by ``BaseSearch._prepare()``.
     """
 
+    # Class-level default: tests construct partially-initialized providers, so
+    # the picklability flag must resolve even before setup()/__init__ set it.
+    _args_unpicklable: bool = False
+
     def __init__(
         self,
         kernel: _AutotunableKernel,
@@ -549,6 +554,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._worker_failure_config_ids: list[int] = []
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None
+        self._args_unpicklable: bool = False
         self._precompile_baseline_path: str | None = None
         self._precompile_result_counter: count[int] = count()
         self._benchmark_worker: BenchmarkWorker | None = None
@@ -902,8 +908,23 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             or self._subprocess_benchmark_enabled()
         ):
             args_path = os.path.join(self._precompile_tmpdir.name, "args.pt")
-            torch.save(self.args, args_path)
-            self._precompile_args_path = args_path
+            try:
+                torch.save(self.args, args_path)
+            except (pickle.PicklingError, AttributeError, TypeError) as e:
+                # Kernel args holding lambdas/closures (e.g. an epilogue
+                # callable) cannot cross a spawn boundary. Fall back to the
+                # in-process benchmark/accuracy path instead of failing the
+                # whole autotune; spawn-mode precompile keeps its hard error
+                # since it cannot run at all without the args file.
+                if self.settings.autotune_precompile == "spawn":
+                    raise
+                self._args_unpicklable = True
+                self.log.warning(
+                    f"Autotune args are not picklable ({e}); benchmarking "
+                    "in-process instead of in a killable subprocess."
+                )
+            else:
+                self._precompile_args_path = args_path
         if self._subprocess_accuracy_check_enabled():
             baseline_path = os.path.join(self._precompile_tmpdir.name, "baseline.pt")
             torch.save(self._baseline_output, baseline_path)
@@ -991,6 +1012,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         """Subprocess benchmark path is opt-in and skipped for distributed /
         mutated-arg kernels where the worker's simple job shape doesn't fit."""
         if not self.settings.autotune_benchmark_subprocess:
+            return False
+        if self._args_unpicklable:
             return False
         if dist.is_initialized():
             return False
