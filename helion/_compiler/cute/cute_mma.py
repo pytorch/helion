@@ -154,7 +154,6 @@ from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
 from .tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
-from .tcgen05_constants import tcgen05_l2_grouping_cluster_consistent
 from .tcgen05_lifecycle import Tcgen05LifecycleContext
 from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
@@ -7292,25 +7291,22 @@ def _emit_mma_pipeline(
         tcgen05_cluster_n = 1
     else:
         tcgen05_cluster_n = tcgen05_cluster_n_requested
-    if tcgen05_cluster_n > 1 and not tcgen05_l2_grouping_cluster_consistent(
-        l2_grouping=_l2_grouping_value(df.config),
-        num_pid_m=(m_size + bm - 1) // bm,
-        num_pid_n=(n_size + bn - 1) // bn,
-        cluster_n=tcgen05_cluster_n,
-    ):
-        # Helion's l2_groupings remap permutes the linear tile index per-CTA
-        # without cluster awareness: the two cluster-N peers (vpids exactly
-        # num_pid_m apart) can decode DIFFERENT tile_m, and the A multicast
-        # then fills each peer's SMEM half with the wrong A tile (silent
-        # corruption, max rel err ~1.4). Reject the config unless the remap
-        # provably keeps every N-pair inside one L2 group row.
+    if tcgen05_cluster_n > 1 and ((n_size + bn - 1) // bn) % tcgen05_cluster_n != 0:
+        # The CUTLASS persistent scheduler builds its cluster grid with
+        # ceil_div and reports work validity at CLUSTER granularity, so
+        # when the N tile count is not divisible by cluster_n the padded
+        # trailing cluster hands its second CTA an out-of-range tile_n
+        # marked valid — an unmasked out-of-bounds store on the full-tile
+        # TMA path. (The l2_groupings remap itself is cluster-aware — see
+        # ``L2GroupingProgramIDs.codegen`` — so any grouping is fine on
+        # divisible grids.)
         raise exc.BackendUnsupported(
             "cute",
-            "tcgen05_cluster_n=2 with this l2_grouping/grid combination breaks "
-            "the cluster-N peer pairing that the A multicast requires "
-            "(cluster_n * num_pid_m must divide l2_grouping * num_pid_n, and "
-            "l2_grouping must divide num_pid_m). Use l2_groupings=[1] or "
-            "tcgen05_cluster_n=1 for this shape.",
+            "tcgen05_cluster_n=2 requires the N tile count (cdiv(N, block_n)) "
+            "to be divisible by cluster_n; the persistent scheduler would "
+            "otherwise pad a partial cluster whose trailing CTA computes an "
+            "out-of-range tile. Use tcgen05_cluster_n=1 or a block_n that "
+            "gives an even N tile count.",
         )
     tcgen05_role_local_k_tail_tma = (
         tcgen05_preserve_tma_for_two_cta_k_tail
@@ -12513,15 +12509,6 @@ def _tcgen05_use_2cta_instrs(
         return True
     is_fp8 = input_dtype == torch.float8_e4m3fn or input_dtype == "cutlass.Float8E4M3FN"
     return bm == 128 and is_fp8
-
-
-def _l2_grouping_value(config: object) -> int:
-    groupings = getattr(config, "config", config)
-    if isinstance(groupings, dict):
-        groupings = groupings.get("l2_groupings")
-    if isinstance(groupings, list) and groupings and isinstance(groupings[0], int):
-        return groupings[0]
-    return 1
 
 
 def _tcgen05_epi_warp_count(

@@ -11041,6 +11041,250 @@ class TestCuteLowerings(unittest.TestCase):
         expected = args[0] @ args[1]
         torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
+    def test_tcgen05_cluster_n2_l2_grouped_decode_properties(self) -> None:
+        """Pure-python mirror of the cluster-aware l2_groupings decode.
+
+        ``L2GroupingProgramIDs.codegen`` (and the matching predicate in
+        ``_tcgen05_output_full_tile_expr_for_work_tile``) must (a) stay a
+        bijection over the tile grid and (b) hand the two cluster-N peers
+        (virtual pids exactly ``num_pid_m`` apart, paired as consecutive
+        tile_n) the SAME decoded tile_m — the A multicast fills both peers'
+        SMEM from one TMA load for that tile_m. The plain per-CTA decode
+        violates (b) on many grids (empirically wrong at 16x4, 32x24 and
+        128x16 M-x-N tile grids, max rel err ~1.4); the box decode holds on
+        every LAUNCHABLE grid — the cute_mma padding gate requires the N
+        tile count to be divisible by cluster_n, and the negative check at
+        the end shows why (odd N tile counts break the bijection, matching
+        the CUTLASS scheduler's own padded-cluster hole).
+        """
+
+        def decode(
+            vpid: int, *, num_pid_m: int, num_pid_n: int, group: int, cluster_n: int
+        ) -> tuple[int, int]:
+            if cluster_n > 1:
+                lane_n = (vpid // num_pid_m) % cluster_n
+                box_pid = (
+                    (vpid // num_pid_m) // cluster_n
+                ) * num_pid_m + vpid % num_pid_m
+                num_box_n = (num_pid_n + cluster_n - 1) // cluster_n
+                num_pid_in_group = group * num_box_n
+                group_id = box_pid // num_pid_in_group
+                first_pid_m = group_id * group
+                group_size_m = min(num_pid_m - first_pid_m, group)
+                pid_m = first_pid_m + ((box_pid % num_pid_in_group) % group_size_m)
+                pid_n = (
+                    (box_pid % num_pid_in_group) // group_size_m
+                ) * cluster_n + lane_n
+                return pid_m, pid_n
+            num_pid_in_group = group * num_pid_n
+            group_id = vpid // num_pid_in_group
+            first_pid_m = group_id * group
+            group_size_m = min(num_pid_m - first_pid_m, group)
+            pid_m = first_pid_m + ((vpid % num_pid_in_group) % group_size_m)
+            pid_n = (vpid % num_pid_in_group) // group_size_m
+            return pid_m, pid_n
+
+        cluster_n = 2
+        grids = [
+            # The empirically-wrong grids under the old per-CTA decode ...
+            (16, 4),
+            (32, 24),
+            (128, 16),
+            # ... the empirically-correct ones ...
+            (8, 4),
+            (4, 8),
+            (8, 8),
+            (16, 16),
+            (4, 32),
+            (64, 64),
+            # ... and non-power-of-two / degenerate coverage.
+            (1, 2),
+            (3, 2),
+            (5, 6),
+            (13, 10),
+            (7, 62),
+        ]
+        for num_pid_m, num_pid_n in grids:
+            for group in (1, 2, 3, 4, 8, 16):
+                with self.subTest(
+                    num_pid_m=num_pid_m, num_pid_n=num_pid_n, group=group
+                ):
+                    seen: dict[tuple[int, int], int] = {}
+                    for vpid in range(num_pid_m * num_pid_n):
+                        coord = decode(
+                            vpid,
+                            num_pid_m=num_pid_m,
+                            num_pid_n=num_pid_n,
+                            group=group,
+                            cluster_n=cluster_n,
+                        )
+                        self.assertNotIn(coord, seen, "decode is not a bijection")
+                        seen[coord] = vpid
+                        self.assertLess(coord[0], num_pid_m)
+                        self.assertLess(coord[1], num_pid_n)
+                    # Peer consistency: the scheduler pairs vpids
+                    # ``m + (q*cluster_n + lane) * num_pid_m`` over lanes.
+                    for m in range(num_pid_m):
+                        for q in range(num_pid_n // cluster_n):
+                            pair = [
+                                decode(
+                                    m + (q * cluster_n + lane) * num_pid_m,
+                                    num_pid_m=num_pid_m,
+                                    num_pid_n=num_pid_n,
+                                    group=group,
+                                    cluster_n=cluster_n,
+                                )
+                                for lane in range(cluster_n)
+                            ]
+                            self.assertEqual(
+                                len({pid_m for pid_m, _ in pair}),
+                                1,
+                                "cluster-N peers decoded different tile_m",
+                            )
+                            for lane, (_, pid_n) in enumerate(pair):
+                                self.assertEqual(
+                                    pid_n % cluster_n,
+                                    lane,
+                                    "peer lane must map to its own N slot",
+                                )
+                            self.assertEqual(
+                                len({pid_n // cluster_n for _, pid_n in pair}),
+                                1,
+                                "cluster-N peers left their N box",
+                            )
+                    # cluster_n=1 must also stay a bijection (the codegen
+                    # branch for cluster_n=1 is byte-identical to the legacy
+                    # decode; this covers the mirror's else-branch).
+                    legacy = {
+                        decode(
+                            vpid,
+                            num_pid_m=num_pid_m,
+                            num_pid_n=num_pid_n,
+                            group=group,
+                            cluster_n=1,
+                        )
+                        for vpid in range(num_pid_m * num_pid_n)
+                    }
+                    self.assertEqual(len(legacy), num_pid_m * num_pid_n)
+        # Negative check: on an ODD N tile count the box decode maps some
+        # in-range vpid OUT of range (num_pid_m=2, num_pid_n=3, group=1:
+        # vpid=3 -> lane=1, box (0,1) -> pid_n=3 >= 3). This is exactly why
+        # cute_mma gates cluster_n=2 on cdiv(N, block_n) % cluster_n == 0 —
+        # the CUTLASS scheduler would pad a partial cluster there anyway.
+        odd_coords = [
+            decode(vpid, num_pid_m=2, num_pid_n=3, group=1, cluster_n=2)
+            for vpid in range(2 * 3)
+        ]
+        self.assertTrue(any(pid_n >= 3 for _, pid_n in odd_coords))
+
+    def test_tcgen05_persistent_cluster_n2_l2_grouped_runtime_correctness(
+        self,
+    ) -> None:
+        """cluster_n=2 + l2_groupings>1 on a peer-splitting grid is correct.
+
+        4096x1024x256 bf16 at bm=bn=256 gives a 16x4 M-x-N tile grid — one
+        of the empirically-corrupting grids under the old cluster-oblivious
+        l2_groupings decode (the two cluster-N peers decoded different
+        tile_m, so the A multicast filled one peer's SMEM with the wrong A
+        tile; max rel err ~1.4, and the interim gate rejected the config
+        outright). The cluster-aware box decode must make this exact
+        combination numerically correct.
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_n2_l2_grouped(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(4096, 256, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(256, 1024, device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_n2_l2_grouped.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                l2_groupings=[4],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_cluster_n=2,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+            )
+            bound.set_config(cfg)
+            out = bound(*args)
+        expected = args[0] @ args[1]
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_cluster_n2_odd_n_tile_count_rejected(self) -> None:
+        """cluster_n=2 with an odd N tile count must be rejected.
+
+        The CUTLASS persistent scheduler ceil-divs the cluster grid and
+        reports validity at cluster granularity, so a padded trailing
+        cluster hands its second CTA an out-of-range tile_n marked valid —
+        an unmasked out-of-bounds store on the full-tile TMA path (this was
+        silently reachable through ``l2_groupings=[1]`` before the gate).
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_n2_odd_n_tiles(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        # N=768 at bn=256 gives 3 N tiles: cluster_n=2 pads a partial cluster.
+        args = (
+            torch.randn(1024, 128, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(128, 768, device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_persistent_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_n2_odd_n_tiles.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported, "divisible by cluster_n"
+            ):
+                bound.to_triton_code(cfg)
+
     def test_tcgen05_persistent_cluster_m2_two_cta_grid_caps_for_recycling(
         self,
     ) -> None:
