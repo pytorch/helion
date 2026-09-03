@@ -24,6 +24,9 @@ from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
 from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K,
+)
+from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M,
 )
 from helion._compiler.cute.tcgen05_constants import (
@@ -908,13 +911,14 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertEqual(constraints.per_cta_smem_budget_bytes, b200_budget_bytes)
 
         search_fragments = spec._tcgen05_optional_fragments(for_search=True)
-        # Cycle 97: ab=3 is BUDGET-AWARE-SEARCHABLE — the for_search cap is lifted
-        # to 3 wherever the SMEM-budget constraints were recorded (here: the mocked
-        # B200 budget), so the autotuner can SAMPLE ab=3 directly. A sampled ab=3
-        # that does not fit is then demoted by ``_fix_ab_stages_search_config`` (the
-        # over-budget cases below). The validation surface is independently 3 for
-        # explicit configs.
-        self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 3)
+        # Where the SMEM-budget constraints were recorded (here: the mocked B200
+        # budget), the for_search cap is lifted to the dtype's hardware-validated
+        # stage cap (6 for 16-bit) so the autotuner can SAMPLE deep-AB pipelines
+        # (bk=64/ab=5 wins on edge shapes) directly. A sampled depth that does
+        # not fit is then demoted by ``_fix_ab_stages_search_config`` /
+        # budget-clamped by ``_validate_direct_entry_ab_stage_envelope`` (the
+        # over-budget cases below).
+        self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 6)
         validation_fragments = spec._tcgen05_optional_fragments(for_search=False)
         # 16-bit 4096^3 is FFI-eligible (fp16 == bf16 parity), so the validation
         # surface admits the deeper FFI direct-entry stage tuples — up to ab=6
@@ -1008,10 +1012,15 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # round-trip even on a device the gate is off for.
         validation_fragments = spec._tcgen05_optional_fragments(for_search=False)
         self.assertEqual(validation_fragments["tcgen05_ab_stages"].high, 3)
-        # The cluster_m2 seed exists but does *not* carry ab=3.
+        # The full-tile cluster_m=2 family now seeds four configs (the
+        # canonical static-persistent seed, the CLC dynamic-persistence
+        # scheduler seed, the 4-CTA cluster_n=2 seed, and the CLC + cluster_n=2
+        # seed) — none of which may carry ab=3 when the gate is off.
         seeds = spec.compiler_seed_configs
-        self.assertEqual(len(seeds), 1)
+        self.assertEqual(len(seeds), 4)
         self.assertNotIn("tcgen05_ab_stages", seeds[0].config)
+        for seed in seeds:
+            self.assertNotEqual(seed.config.get("tcgen05_ab_stages"), 3)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_ab_stages_three_uses_analyzed_block_indices(
@@ -1035,7 +1044,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 )
             self.assertIsNotNone(spec._tcgen05_ab_stages_three_search_constraints)
             search_fragments = spec._tcgen05_optional_fragments(for_search=True)
-            self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 3)
+            # Constraints recorded -> search cap is the 16-bit hard cap.
+            self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 6)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_ab_stages_three_seeded_in_initial_population(
@@ -1614,7 +1624,15 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 constraints,
             )
         )
-        self.assertFalse(spec._tcgen05_cluster_m2_bk_is_valid(64, constraints))
+        # The deep-AB family admits bk=64 on the edge/K-tail family; other
+        # K tiles stay out of the validated set.
+        self.assertTrue(
+            spec._tcgen05_cluster_m2_bk_is_valid(
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K,
+                constraints,
+            )
+        )
+        self.assertFalse(spec._tcgen05_cluster_m2_bk_is_valid(32, constraints))
 
     def test_tcgen05_edge_tile_detection_skips_unknown_dims(self) -> None:
         config_spec = SimpleNamespace(
@@ -1854,7 +1872,15 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 constraints,
             )
         )
-        self.assertFalse(spec._tcgen05_cluster_m2_bk_is_valid(64, constraints))
+        # The deep-AB family admits bk=64 on the edge/K-tail family; other
+        # K tiles stay out of the validated set.
+        self.assertTrue(
+            spec._tcgen05_cluster_m2_bk_is_valid(
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K,
+                constraints,
+            )
+        )
+        self.assertFalse(spec._tcgen05_cluster_m2_bk_is_valid(32, constraints))
 
     def test_restrict_tcgen05_num_epi_warps_search_helper(self) -> None:
         """Direct unit test for ``restrict_tcgen05_num_epi_warps_search``.
@@ -2718,16 +2744,16 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
     def test_cute_tcgen05_strategy_invariants_clc_persistent_cluster_n(
         self,
     ) -> None:
-        """``CLC_PERSISTENT`` + ``cluster_n>1`` is rejected.
+        """``CLC_PERSISTENT`` cluster_n accept set is ``{1, 2}``.
 
-        The CLC scheduler-warp body in
+        The CLC leader's scheduler-warp broadcast in
         ``program_id._build_scheduler_warp_role_local_while_clc``
-        publishes the work tile to peer CTAs by iterating lanes
-        ``< cluster_m``; cluster_n>1 CTAs would never receive the
-        CLC mailbox publish and would hang at ``producer_acquire``.
-        The paired ``(strategy, persistence_model)`` invariant
-        rejects this combination at validate time so the runtime
-        path is unreachable.
+        iterates lanes ``< cluster_m * cluster_n`` and publishes each
+        peer's own (M, N) tile coordinates, so the full 4-CTA cluster
+        (cluster_n=2) is dynamic-persistence capable. Values outside
+        the validated set are still rejected by the paired
+        ``(strategy, persistence_model)`` invariant so an unvalidated
+        cluster shape cannot reach the runtime.
         """
         with_sched = dataclasses.replace(
             ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC, scheduler_warps=1
@@ -2763,9 +2789,9 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         )
         self.assertEqual(errors, [], msg=str(errors))
 
-        # Negative control: CLC + cluster_n=2 rejected. The CLC
-        # broadcast is cluster_m-only; second-N-lane CTAs never
-        # receive the mailbox publish.
+        # Positive control: CLC + cluster_n=2 accepts (the generalized
+        # 4-CTA leader broadcast publishes per-peer tile coordinates to
+        # all cluster_m * cluster_n peers).
         errors = validate_tcgen05_strategy_invariants(
             strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
             persistence_model=Tcgen05PersistenceModel.CLC_PERSISTENT,
@@ -2777,9 +2803,25 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             cluster_n=2,
             arch_major=10,
         )
+        self.assertEqual(errors, [], msg=str(errors))
+
+        # Negative control: CLC + cluster_n=4 rejected — outside the
+        # validated {1, 2} accept set of the paired
+        # (strategy, persistence_model) invariant.
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
+            persistence_model=Tcgen05PersistenceModel.CLC_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=with_sched,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="persistent_blocked",
+            cluster_m=2,
+            cluster_n=4,
+            arch_major=10,
+        )
         self.assertTrue(
             any(
-                "clc_persistent" in e and "tcgen05_cluster_n in [1]" in e
+                "clc_persistent" in e and "tcgen05_cluster_n in [1, 2]" in e
                 for e in errors
             ),
             msg=str(errors),

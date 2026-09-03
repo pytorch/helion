@@ -54,6 +54,39 @@ if TYPE_CHECKING:
     from .type_info import TensorType
 
 
+def _flatten_starred_args(args: list[ast.expr]) -> list[ast.expr]:
+    """Expand ``f(*xs)`` into per-element nodes (``xs[0]``, ``xs[1]``, ...).
+
+    Type propagation flattens starred args the same way (see
+    `TypePropagation.visit_Call`), so host codegen must match it to keep the ast
+    args aligned with the proxy args of an API function.
+    """
+    from .type_info import SequenceType
+
+    if not any(isinstance(arg, ast.Starred) for arg in args):
+        return args
+    result: list[ast.expr] = []
+    for arg in args:
+        if not isinstance(arg, ast.Starred):
+            result.append(arg)
+            continue
+        value = arg.value
+        assert isinstance(value, ExtendedAST)
+        seq_type = value._type_info
+        assert isinstance(seq_type, SequenceType)
+        for i, element_type in enumerate(seq_type.unpack()):
+            result.append(
+                create(
+                    ast.Subscript,
+                    value=value,
+                    slice=create(ast.Constant, value=i, kind=None),
+                    ctx=ast.Load(),
+                    _type_info=element_type,
+                )
+            )
+    return result
+
+
 @dataclasses.dataclass(frozen=True)
 class ResidentPrepLowering:
     hoist: ResidentPrepHoist
@@ -1066,8 +1099,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         assert isinstance(iter_node, ast.Call)
                         args = []
                         kwargs = {}
-                        for arg_node in iter_node.args:
-                            assert not isinstance(arg_node, ast.Starred)
+                        for arg_node in _flatten_starred_args(iter_node.args):
                             assert isinstance(arg_node, ExtendedAST)
                             assert arg_node._type_info is not None
                             args.append(arg_node._type_info.proxy())
@@ -1286,8 +1318,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             ast_kwargs = {}
             proxy_args = []
             proxy_kwargs = {}
-            for arg in node.args:
-                assert not isinstance(arg, ast.Starred)
+            for arg in _flatten_starred_args(node.args):
                 assert isinstance(arg, ExtendedAST)
                 assert arg._type_info is not None
                 ast_args.append(arg)

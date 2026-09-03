@@ -51,7 +51,8 @@ def register_block_size(min_or_max: int, max_or_none: int | None = None, /) -> i
         hl.register_block_size(min, max)
 
     Where min and max are integers that control the range of block_sizes searched by
-    the autotuner.  Max may be a symbolic shape, but min must be a constant integer.
+    the autotuner.  Both may be symbolic shapes, in which case their size hints are
+    used to bound the search.
     """
     raise exc.NotInsideKernel
 
@@ -77,11 +78,16 @@ def _(
         raise exc.IncorrectTileUsage(
             f"expected max to be an integer or size, got {max_proxy!s}"
         )
-    if not isinstance(min_proxy, int):
+    if not isinstance(min_proxy, (int, torch.SymInt)):
         raise exc.IncorrectTileUsage(
-            f"expected min to be an integer constant, got {min_proxy!s}"
+            f"expected min to be an integer or size, got {min_proxy!s}"
         )
     env = CompileEnvironment.current()
+    # Host scalars (globals, int arguments, `*args` unpacked from a tuple) are
+    # faked into SymInts during type propagation, so min may arrive symbolic even
+    # when the user wrote a constant.  Both bounds only shape the autotuner search
+    # space, so resolve them to hints the same way.
+    min_proxy = env.size_hint(min_proxy)
     existing_block_id = (
         env.get_block_id(max_proxy) if isinstance(max_proxy, torch.SymInt) else None
     )

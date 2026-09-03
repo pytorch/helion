@@ -278,21 +278,6 @@ class _PureExpressionVisitor(ast.NodeVisitor):
     def visit_Constant(self, node: ast.Constant) -> None:
         pass
 
-    def visit_Num(self, node: ast.Num) -> None:
-        pass
-
-    def visit_Str(self, node: ast.Str) -> None:
-        pass
-
-    def visit_Bytes(self, node: ast.Bytes) -> None:
-        pass
-
-    def visit_NameConstant(self, node: ast.NameConstant) -> None:
-        pass
-
-    def visit_Ellipsis(self, node: ast.Ellipsis) -> None:
-        pass
-
     def visit_Name(self, node: ast.Name) -> None:
         pass
 

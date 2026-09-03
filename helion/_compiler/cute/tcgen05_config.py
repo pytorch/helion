@@ -130,6 +130,7 @@ from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNTS
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_ACC_STAGES
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_K_RANGE_FLATTEN
@@ -140,6 +141,7 @@ from .tcgen05_constants import (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_K_RANGE_WARP_SPECIALIZE,
 )
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_L2_GROUPING
+from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_ACC_STAGES
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
@@ -580,9 +582,13 @@ class CuteTcgen05Config:
         if bk <= 0:
             return False
         if constraints.allow_edge_k_tail_family:
+            # bk=64 halves the per-stage AB SMEM so a 16-bit edge kernel can
+            # run a 5-deep AB pipeline (bf16 5000^3: 948 vs 815 TFLOP/s at the
+            # bk=128 seed); the K tail stays a clamped TMA box either way.
             return (
                 bk
                 in (
+                    TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K,
                     TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
                     TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K,
                 )
@@ -803,6 +809,228 @@ class CuteTcgen05Config:
                 ]
         return Config(**seed_config)
 
+    def _plain_clc_seed_config(self) -> Config | None:
+        """Autotune seed for the plain full-tile cluster_m=2 CLC family.
+
+        Mirrors ``_c_input_seed_config``'s full-tile branch but for kernels
+        without aux operands: ROLE_LOCAL_WITH_SCHEDULER + a scheduler warp
+        driving CLC dynamic persistence, no C-input warp. Besides giving the
+        search a head start, this seed widens the strategy/scheduler-warps/
+        persistence fragments via the compiler-seed mechanism so neighboring
+        configs stay explorable.
+        """
+        if not self._plain_clc_persistence_search_enabled():
+            return None
+        if not self._clc_persistence_search_enabled():
+            return None
+        constraints = self.cluster_m2_search_constraints
+        if constraints is None:
+            return None
+        if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
+            return None
+        fragments = self._matmul_block_fragments()
+        if fragments is None:
+            return None
+        bm_fragment, bn_fragment, bk_fragment = fragments
+        if not (
+            bm_fragment.low <= TCGEN05_TWO_CTA_BLOCK_M <= bm_fragment.high
+            and bn_fragment.low <= TCGEN05_TWO_CTA_BLOCK_N <= bn_fragment.high
+        ):
+            return None
+        bk = bk_fragment.high
+        while bk >= bk_fragment.low:
+            if self.cluster_m2_bk_is_valid(bk, constraints):
+                break
+            bk //= 2
+        else:
+            return None
+        ab_stages = (
+            3
+            if self.ab_stages_three_fits(
+                bm=TCGEN05_TWO_CTA_BLOCK_M,
+                bn=TCGEN05_TWO_CTA_BLOCK_N,
+                bk=bk,
+                cluster_m=2,
+            )
+            else 2
+        )
+        seed_config: dict[str, Any] = {
+            "block_sizes": [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                bk,
+            ],
+            "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            # L2 grouping matters even under the hardware scheduler: CLC
+            # preserves the interleaved rasterization order it cancels into,
+            # and l2_groupings=[1] costs ~13% at fp16 16384^3 (780 vs 899
+            # TFLOP/s pinned) vs the measured-good [4].
+            "l2_groupings": [4],
+            "tcgen05_cluster_m": 2,
+            "tcgen05_num_epi_warps": 4,
+            "tcgen05_ab_stages": ab_stages,
+            TCGEN05_STRATEGY_CONFIG_KEY: (
+                Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+            ),
+            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
+                Tcgen05PersistenceModel.CLC_PERSISTENT.value
+            ),
+            TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: 1,
+        }
+        if self.config_spec.indexing.length == 3:
+            seed_config["indexing"] = ["tensor_descriptor"] * 3
+        return Config(**seed_config)
+
+    def _plain_edge_deep_ab_stages(self, bk: int) -> int:
+        """Deepest AB pipeline that leaves room for the TMA-store epilogue's
+        C ring on the 256x256 cluster_m=2 tile.
+
+        Overflowing the C ring silently demotes the kernel to the much slower
+        all-SIMT store (ab=6 fits bare AB at bk=64 but not AB + C, and
+        measures far below ab=5 + TMA store), so walk down from the bare-AB
+        maximum until AB + C fits.
+        """
+        ab_stages = self.max_ab_stages_that_fit(
+            bm=TCGEN05_TWO_CTA_BLOCK_M,
+            bn=TCGEN05_TWO_CTA_BLOCK_N,
+            bk=bk,
+            cluster_m=2,
+        )
+        while (
+            ab_stages > TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES
+            and not self.c_stages_fits(
+                bm=TCGEN05_TWO_CTA_BLOCK_M,
+                bn=TCGEN05_TWO_CTA_BLOCK_N,
+                bk=bk,
+                cluster_m=2,
+                ab_stages=ab_stages,
+                c_stages=2,
+                has_source_c=False,
+            )
+        ):
+            ab_stages -= 1
+        return ab_stages
+
+    def _plain_edge_seed_config(self) -> Config | None:
+        """Autotune seed for the plain (no-aux) edge+K-tail cluster_m=2 family.
+
+        The deep-AB edge regime: bk=64 halves per-stage AB SMEM so a 16-bit
+        kernel fits a 5-stage AB pipeline (bf16 5000^3: 948 TFLOP/s vs 815 at
+        the bk=128/ab=2 projection). Partial stripes and the K tail stay
+        clamped TMA boxes; the TMA-store epilogue covers fringe output tiles
+        via descriptor clamping. Seeding also widens the ab-stages fragment
+        via the compiler-seed mechanism so nearby depths stay explorable.
+        """
+        if self.aux_kernel_detected or self.matmul_has_leading_passthrough:
+            return None
+        constraints = self.cluster_m2_search_constraints
+        if constraints is None or not constraints.allow_edge_k_tail_family:
+            return None
+        if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
+            return None
+        fragments = self._matmul_block_fragments()
+        if fragments is None:
+            return None
+        bm_fragment, bn_fragment, bk_fragment = fragments
+        if not (
+            bm_fragment.low <= TCGEN05_TWO_CTA_BLOCK_M
+            and bn_fragment.low <= TCGEN05_TWO_CTA_BLOCK_N
+        ):
+            return None
+        bk = TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K
+        if not (
+            bk_fragment.low <= bk <= bk_fragment.high
+            and self.cluster_m2_bk_is_valid(bk, constraints)
+        ):
+            bk = TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+            if not (
+                bk_fragment.low <= bk <= bk_fragment.high
+                and self.cluster_m2_bk_is_valid(bk, constraints)
+            ):
+                return None
+        ab_stages = self._plain_edge_deep_ab_stages(bk)
+        if ab_stages <= 0:
+            return None
+        seed_config: dict[str, Any] = {
+            "block_sizes": [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                bk,
+            ],
+            "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            "l2_groupings": [4],
+            "tcgen05_cluster_m": 2,
+            "tcgen05_num_epi_warps": 4,
+            "tcgen05_ab_stages": ab_stages,
+        }
+        if self._clc_persistence_search_enabled():
+            # CLC dynamic persistence also wins on the deep-AB edge family
+            # (bf16 5000^3: 883 vs 859 TFLOP/s static, same-GPU pair).
+            seed_config[TCGEN05_STRATEGY_CONFIG_KEY] = (
+                Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+            )
+            seed_config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY] = (
+                Tcgen05PersistenceModel.CLC_PERSISTENT.value
+            )
+            seed_config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 1
+        if self.config_spec.indexing.length == 3:
+            seed_config["indexing"] = ["tensor_descriptor"] * 3
+        return Config(**seed_config)
+
+    def _plain_cluster_n2_seed_config(self) -> Config | None:
+        """Autotune seed for the 4-CTA (cluster 2x2) multicast family.
+
+        B multicast on top of the 2-CTA A multicast halves B traffic, which
+        wins on B-heavy full-tile shapes (fp16 4096x4096x32768: 911 vs 824
+        TFLOP/s); cuBLAS's nvjet picks 2x2 clusters for the same shape. This
+        seeds the static-persistent monolithic family; a CLC-persistent
+        variant is layered on in ``autotune_seed_configs`` and the search's
+        terminal refinement arbitrates between them.
+        """
+        if self.aux_kernel_detected or self.matmul_has_leading_passthrough:
+            return None
+        constraints = self.cluster_m2_search_constraints
+        if constraints is None or constraints.allow_edge_k_tail_family:
+            return None
+        if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
+            return None
+        fragments = self._matmul_block_fragments()
+        if fragments is None:
+            return None
+        bm_fragment, bn_fragment, bk_fragment = fragments
+        if not (
+            bm_fragment.low <= TCGEN05_TWO_CTA_BLOCK_M <= bm_fragment.high
+            and bn_fragment.low <= TCGEN05_TWO_CTA_BLOCK_N <= bn_fragment.high
+        ):
+            return None
+        bk = bk_fragment.high
+        while bk >= bk_fragment.low:
+            if self.cluster_m2_bk_is_valid(bk, constraints):
+                break
+            bk //= 2
+        else:
+            return None
+        seed_config: dict[str, Any] = {
+            "block_sizes": [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                bk,
+            ],
+            "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            "l2_groupings": [4],
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 2,
+            "tcgen05_num_epi_warps": 4,
+            # ab=3 only where the SMEM-budget gate admits it (B200-class
+            # optin); sub-B200 devices keep the known-good ab=2 envelope.
+            "tcgen05_ab_stages": (
+                3 if self.ab_stages_three_search_constraints is not None else 2
+            ),
+        }
+        if self.config_spec.indexing.length == 3:
+            seed_config["indexing"] = ["tensor_descriptor"] * 3
+        return Config(**seed_config)
+
     def _aux_tma_edge_search_enabled(self) -> bool:
         # The TMA aux producer's original admission: the validated Target8-style
         # double-edge + K-tail family with ``cluster_m=2``. The CLC-persistent
@@ -971,6 +1199,23 @@ class CuteTcgen05Config:
 
     def autotune_seed_configs(self) -> list[Config]:
         seeds: list[Config] = []
+        plain_clc_seed = self._plain_clc_seed_config()
+        if plain_clc_seed is not None:
+            seeds.append(plain_clc_seed)
+        plain_edge_seed = self._plain_edge_seed_config()
+        if plain_edge_seed is not None:
+            seeds.append(plain_edge_seed)
+        plain_cluster_n2_seed = self._plain_cluster_n2_seed_config()
+        if plain_cluster_n2_seed is not None:
+            seeds.append(plain_cluster_n2_seed)
+            if plain_clc_seed is not None:
+                # 4-CTA multicast + CLC dynamic persistence (Quack's
+                # dynamic-persistent 2x2 topology): reuse the validated CLC
+                # seed shape (WITH_SCHEDULER + scheduler warp) and add the
+                # cluster-N multicast on top.
+                clc_n2_seed_config: dict[str, Any] = dict(plain_clc_seed.config)
+                clc_n2_seed_config["tcgen05_cluster_n"] = 2
+                seeds.append(Config(**clc_n2_seed_config))
         c_input_seed = self._c_input_seed_config()
         if c_input_seed is not None:
             seeds.append(c_input_seed)
@@ -1033,11 +1278,21 @@ class CuteTcgen05Config:
         edge_k_tail_family = constraints.allow_edge_k_tail_family
         is_narrow_clc_aux_tma = self._is_clc_aux_tma_narrow_n_request(config)
         if edge_k_tail_family:
-            block_sizes[k_index] = (
-                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K
-                if is_narrow_clc_aux_tma
-                else TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
-            )
+            # Plain (no-aux) kernels may keep a sampled deep-AB bk (the
+            # bk=64/ab=5 family, see _plain_edge_deep_ab_stages); aux kernels
+            # stay projected onto their validated bk=128/256 regimes.
+            sampled_bk = block_sizes[k_index]
+            if not (
+                not self.aux_kernel_detected
+                and isinstance(sampled_bk, int)
+                and not isinstance(sampled_bk, bool)
+                and self.cluster_m2_bk_is_valid(sampled_bk, constraints)
+            ):
+                block_sizes[k_index] = (
+                    TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K
+                    if is_narrow_clc_aux_tma
+                    else TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+                )
         bk = block_sizes[k_index]
         if not isinstance(bk, int) or isinstance(bk, bool):
             config["tcgen05_cluster_m"] = 1
@@ -1082,6 +1337,20 @@ class CuteTcgen05Config:
         else:
             block_sizes[n_index] = TCGEN05_TWO_CTA_BLOCK_N
         if edge_k_tail_family:
+            if (
+                not self.aux_kernel_detected
+                and not is_narrow_clc_aux_tma
+                and bk == TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K
+            ):
+                # Plain deep-AB edge family (bk=64): pin the AB depth to the
+                # deepest stage count that still fits next to the TMA-store
+                # epilogue's C ring (the measured winner; bf16 5000^3 runs
+                # 948 TFLOP/s at ab=5 vs 815 for the legacy bk=128/ab=2
+                # projection below). Other knobs keep their sampled values —
+                # the legacy placement overrides were calibrated for the
+                # shallow bk=128 pipeline and measure neutral here.
+                config["tcgen05_ab_stages"] = self._plain_edge_deep_ab_stages(bk)
+                return
             # This family is pinned to measured production stage/pipeline
             # values after search projection.
             # Placement keys remain available for non-edge diagnostic/search
@@ -1927,7 +2196,12 @@ class CuteTcgen05Config:
             config["tcgen05_ab_stages"] = 2
 
     def _fix_with_scheduler_search_config(self, config: dict[str, object]) -> None:
-        if not (self.search_enabled and self.aux_kernel_detected):
+        if not (
+            self.search_enabled
+            and (
+                self.aux_kernel_detected or self._plain_clc_persistence_search_enabled()
+            )
+        ):
             return
         strategy = config.get(TCGEN05_STRATEGY_CONFIG_KEY)
         scheduler_warps = config.get(TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY)
@@ -2042,18 +2316,40 @@ class CuteTcgen05Config:
         )
 
     def _clc_persistence_search_enabled(self) -> bool:
-        """CLC search is the sm100+ slice of the aux-TMA edge+K-tail gate.
+        """CLC (hardware tile-scheduler) persistence search gate, sm100+ only.
 
-        Cycle 46 widened ``_aux_tma_search_enabled`` to also admit the full-tile
-        cluster_m=2 family, but the CLC-persistent perf knobs and validated
-        candidate shape are still scoped to ``_aux_tma_edge_search_enabled``.
+        Two validated families: the aux-TMA edge+K-tail family (its original
+        scope) and the plain full-tile cluster_m=2 family (see
+        ``_plain_clc_persistence_search_enabled``).
         """
-        if not self._aux_tma_edge_search_enabled():
-            return False
         capability = self.config_spec.target_device_capability
         if capability is None:
             return False
-        return capability[0] >= 10 and "flat" in self.allowed_pid_types
+        if capability[0] < 10 or "flat" not in self.allowed_pid_types:
+            return False
+        return (
+            self._aux_tma_edge_search_enabled()
+            or self._plain_clc_persistence_search_enabled()
+        )
+
+    def _plain_clc_persistence_search_enabled(self) -> bool:
+        """Full-tile cluster_m=2 CLC for matmuls without aux operands.
+
+        The CLC scheduler warp replaces the static tile sweep with the
+        hardware tile scheduler, which keeps CTAs fed as tiles finish at
+        uneven rates. On B200 this wins across full-tile shapes (fp16
+        16384^3: 890 vs 738 TFLOP/s; bf16 8192x28672x8192: 956 vs 906; fp16
+        2048x128256x4096: 914 vs 878; fp16 4096^3: 1038 vs 981 — same-GPU
+        probe pairs) and on the deep-AB edge family (bf16 5000^3: 883 vs 859),
+        matching quack's is_dynamic_persistent=True default. The aux families
+        keep their own aux-TMA/CLC regimes.
+        """
+        constraints = self.cluster_m2_search_constraints
+        return (
+            not self.aux_kernel_detected
+            and not self.matmul_has_leading_passthrough
+            and constraints is not None
+        )
 
     def _is_clc_aux_tma_request(self, config: dict[str, object]) -> bool:
         return (
@@ -2140,12 +2436,14 @@ class CuteTcgen05Config:
             )
         ):
             return
-        # FP8 (1-byte) operands fit a deeper AB pipeline than the bf16-tuned
-        # cap of 3; admit ab_stages > 3 for fp8 as long as the AB SMEM fits the
-        # per-CTA budget. This lets Helion emit the same deeply-pipelined
-        # CtaGroup.TWO kernel CUTLASS uses for fp8 compute-bound GEMMs.
+        # Operands whose AB SMEM fits the per-CTA budget can run a deeper AB
+        # pipeline than the historical bk=128-tuned cap of 3: fp8 (1-byte)
+        # always could, and 16-bit operands fit 4-5 stages at bk=64 (worth
+        # ~5-25% on edge shapes where the K-tail already forces bk=64/128).
+        # This lets Helion emit the same deeply-pipelined CtaGroup.TWO kernel
+        # CUTLASS uses for compute-bound GEMMs.
         constraints = self.ab_stages_three_search_constraints
-        if constraints is not None and constraints.dtype_bytes == 1:  # FP8
+        if constraints is not None:
             config_view = self._matmul_config_view(config)
             cluster_m = cast("int", config.get("tcgen05_cluster_m", 1))
             if config_view is not None:
@@ -2175,6 +2473,39 @@ class CuteTcgen05Config:
     ) -> bool:
         if not self._clc_persistence_search_enabled():
             return False
+        if self._plain_clc_persistence_search_enabled():
+            # Plain (no-aux) families: scheduler warp only, no C-input warp
+            # (there is no source-C / aux producer to feed). Accept the
+            # full-tile candidate shape or the edge family's projected
+            # cluster_m=2 shape (bm/bn are forced to the 256x256 tile and bk
+            # to a valid edge bk by _fix_cluster_m2_search_config).
+            if not (
+                self._is_validated_cluster_m2_full_tile_search_candidate(config)
+                or self._is_validated_cluster_m2_edge_search_candidate(config)
+            ):
+                return False
+            if config.get("pid_type") != TCGEN05_TWO_CTA_SEED_PID_TYPE:
+                return False
+            # cluster_n=2 rides the generalized 4-CTA CLC leader broadcast
+            # (Quack's dynamic-persistent 2x2 topology).
+            if config.get("tcgen05_cluster_n", 1) not in (1, 2):
+                return False
+            if (
+                config.get(TCGEN05_STRATEGY_CONFIG_KEY)
+                != Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+                or config.get(TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY) != 1
+                or config.get(TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY, 0) != 0
+            ):
+                return False
+            if self.config_spec.supports_config_key("indexing"):
+                indexing = config.get("indexing")
+                if (
+                    not isinstance(indexing, list)
+                    or indexing
+                    != ["tensor_descriptor"] * self.config_spec.indexing.length
+                ):
+                    return False
+            return True
         if not self._is_validated_cluster_m2_edge_search_candidate(config):
             return False
         if config.get("pid_type") != TCGEN05_TWO_CTA_SEED_PID_TYPE:
@@ -2635,7 +2966,19 @@ class CuteTcgen05Config:
             cluster_m_choices = self.cluster_m_search_choices
         else:
             cluster_m_choices = (1, 2)
-        cluster_n_choices: tuple[int, ...] = (1,) if for_search else (1, 2)
+        # cluster_n=2 (the Quack-canonical 4-CTA cluster: B multicast on top
+        # of the 2-CTA A multicast) is searchable on full-tile shapes — it
+        # wins big on B-heavy problems (fp16 4096x4096x32768: 911 vs 824
+        # TFLOP/s) and cuBLAS's nvjet picks 2x2 clusters for the same shape.
+        # Edge/K-tail shapes keep the (1,) surface: their double-edge SIMT
+        # epilogue and CLC scheduler broadcast are cluster_n=1-only.
+        cluster_n_full_tile_searchable = (
+            self.cluster_m2_search_constraints is not None
+            and not self.cluster_m2_search_constraints.allow_edge_k_tail_family
+        )
+        cluster_n_choices: tuple[int, ...] = (
+            (1, 2) if not for_search or cluster_n_full_tile_searchable else (1,)
+        )
         if for_search and self.num_epi_warps_search_choices is not None:
             num_epi_warps_fragment: ConfigSpecFragment = EnumFragment(
                 self.num_epi_warps_search_choices
@@ -2673,16 +3016,17 @@ class CuteTcgen05Config:
             # sampled ab=3 that does not fit (the residual/source-C ring overflows;
             # cluster_m=1 256x256 overflows bare-AB) before codegen, so admission is
             # free but an overflowing kernel is never generated.
-            ab_stages_max = 3
-            # FP8 (1-byte) operands fit a deeper AB pipeline; widen the
-            # validation range so an explicit deep-staged fp8 config is
-            # accepted (``_validate_direct_entry_ab_stage_envelope`` clamps it to
-            # the actual per-CTA SMEM budget for the chosen block sizes).
+            # Search up to the dtype's hardware-validated stage cap (6 for
+            # 16-bit, 12 for fp8): smaller K tiles (bk=64) fit deep AB
+            # pipelines that win on edge shapes (bf16 5000^3: ab=5/bk=64 at
+            # 948 TFLOP/s vs the ab=2/bk=128 seed's 815), and the
+            # budget-aware ``_validate_direct_entry_ab_stage_envelope``
+            # fix-invalid pass clamps any sampled depth to the per-CTA SMEM
+            # fit for the chosen block sizes, so over-deep samples degrade to
+            # the old behavior instead of overflowing.
             constraints = self.ab_stages_three_search_constraints
-            if constraints is not None and constraints.dtype_bytes == 1:  # FP8
-                ab_stages_max = self._get_dtype_ab_stages_hard_cap(
-                    constraints.dtype_bytes
-                )
+            assert constraints is not None
+            ab_stages_max = self._get_dtype_ab_stages_hard_cap(constraints.dtype_bytes)
         else:
             ab_stages_max = 2
         if for_search:
@@ -2943,6 +3287,17 @@ class CuteTcgen05Config:
             )
             scheduler_warps_choices: tuple[int, ...] = (0, 1)
             c_input_warps_choices: tuple[int, ...] = (0, 1)
+        elif self._plain_clc_persistence_search_enabled():
+            # Plain full-tile cluster_m=2 matmuls search the scheduler-warp
+            # strategy too (its CLC dynamic persistence wins on large grids;
+            # see _plain_clc_persistence_search_enabled). No C-input warp:
+            # there is no aux/source-C producer to host.
+            strategy_choices = (
+                Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+                Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+            )
+            scheduler_warps_choices = (0, 1)
+            c_input_warps_choices = (0,)
         else:
             strategy_choices = (Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,)
             scheduler_warps_choices = (0,)
@@ -3182,10 +3537,18 @@ class CuteTcgen05Config:
                 config, fix_invalid=fix_invalid
             )
         else:
-            for key in optional_fragments:
+            for key, fragment in optional_fragments.items():
                 if key not in config:
                     continue
-                if fix_invalid:
+                # Cross-shape config reuse (``Kernel.configs`` pinning, the
+                # autotune cache) legitimately carries default-valued tcgen05
+                # keys tuned on a tcgen05-capable bind onto binds that are not
+                # (e.g. a unit-sized M); inert defaults are dropped. Values
+                # that encode a real tcgen05 strategy still fail loudly — the
+                # config cannot be honored and silently changing strategy
+                # could mask a miscompute (see
+                # ``test_batched_two_cta_partial_edge_tiles_rejected``).
+                if fix_invalid or config[key] == fragment.default():
                     config.pop(key, None)
                 else:
                     raise InvalidConfig(
@@ -3200,7 +3563,15 @@ class CuteTcgen05Config:
             ):
                 if key not in config:
                     continue
-                if fix_invalid:
+                strategy_fragment = strategy_validation_fragments.get(key)
+                default_value = (
+                    strategy_fragment.default()
+                    if strategy_fragment is not None
+                    # The layout-override keys have no fragment here; ``None``
+                    # is their inert value.
+                    else None
+                )
+                if fix_invalid or config[key] == default_value:
                     config.pop(key, None)
                 else:
                     raise InvalidConfig(

@@ -984,15 +984,13 @@ _STRATEGY_SUPPORTED_CLUSTER_N: dict[Tcgen05Strategy, frozenset[int]] = {
 # (strategy, persistence_model)-conditional cluster_n accept set. Used to
 # reject combinations where the (strategy, persistence) pair has a
 # cluster-broadcast topology that has not been generalized to cluster_n>1.
-# Today's only entry: ``CLC_PERSISTENT`` under ``ROLE_LOCAL_WITH_SCHEDULER``
-# is cluster_m-only — the CLC scheduler-warp body iterates lanes
-# ``< cluster_m`` to publish to peer CTAs (see ``program_id.py``
-# ``_build_scheduler_warp_role_local_while_clc``); cluster_n>1 CTAs would
-# never receive the CLC mailbox publish and would hang on the
-# ``producer_acquire`` wait. Generalizing the CLC broadcast to cluster_n>1
-# is out of scope for cycle 33 (deferred to a future cycle alongside the
-# ``cluster_n>1`` C-input pipeline work). When a (strategy, persistence)
-# pair appears here, it overrides the per-strategy
+# ``CLC_PERSISTENT`` under ``ROLE_LOCAL_WITH_SCHEDULER`` now supports the
+# full 4-CTA cluster: the CLC leader's scheduler-warp broadcast iterates
+# lanes ``< cluster_m * cluster_n`` and publishes each peer's own (M, N)
+# tile coordinates (see ``program_id.py``
+# ``_build_scheduler_warp_role_local_while_clc``), matching Quack's
+# dynamic-persistent 2x2 topology. When a (strategy, persistence) pair
+# appears here, it overrides the per-strategy
 # ``_STRATEGY_SUPPORTED_CLUSTER_N`` entry; missing entries fall back to
 # the per-strategy capability.
 _STRATEGY_PERSISTENCE_SUPPORTED_CLUSTER_N: dict[
@@ -1001,7 +999,7 @@ _STRATEGY_PERSISTENCE_SUPPORTED_CLUSTER_N: dict[
     (
         Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER,
         Tcgen05PersistenceModel.CLC_PERSISTENT,
-    ): frozenset({1}),
+    ): frozenset({1, 2}),
 }
 
 

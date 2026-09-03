@@ -37,6 +37,10 @@ TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM = 4096
 TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K = 128
 TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES = 2
 TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES = 1
+# Half-depth K tile for the deep-AB edge family: bk=64 halves the per-stage
+# AB SMEM so 16-bit operands fit a 5-stage AB pipeline within the B200 budget
+# (bf16 5000^3 measures 948 vs 815 TFLOP/s against the bk=128 edge seed).
+TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K = 64
 # The post row-vector-staging Target8 CLC + aux-TMA edge rows now measure
 # fastest with two accumulator stages. Keep the historical edge-family default
 # above for non-CLC/non-aux variants. Narrow-N keeps a separate value above.

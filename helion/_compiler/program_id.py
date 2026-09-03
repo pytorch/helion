@@ -902,22 +902,75 @@ class L2GroupingProgramIDs(ProgramIDs):
             inner_2d_assignments.append((inner_2d_pid, pid))
 
         assignments.extend(inner_2d_assignments)
-        assignments.extend(
-            [
-                (num_pid_in_group, f"{self.group_size} * {num_pid_n}"),
-                (group_id, f"{inner_2d_pid} // {num_pid_in_group}"),
-                (first_pid_m, f"{group_id} * {self.group_size}"),
-                (group_size_m, f"min({num_pid_m} - {first_pid_m}, {self.group_size})"),
-                (
-                    parent_pids[fastest_m_idx].pid_var,
-                    f"{first_pid_m} + (({inner_2d_pid} % {num_pid_in_group}) % {group_size_m})",
-                ),
-                (
-                    parent_pids[fastest_n_idx].pid_var,
-                    f"({inner_2d_pid} % {num_pid_in_group}) // {group_size_m}",
-                ),
-            ]
-        )
+        cluster_n = self._decode_cluster_n()
+        if cluster_n > 1:
+            # Cluster-aware grouped decode (tcgen05 cluster_n > 1). The
+            # CUTLASS persistent scheduler hands the ``cluster_n`` CTAs
+            # paired along the cluster's N axis the same tile_m and
+            # consecutive tile_n — virtual pids exactly ``num_pid_m``
+            # apart — and the A multicast fills every peer's SMEM half
+            # from one TMA load issued for that shared tile_m. The plain
+            # grouped decode below permutes each CTA's virtual pid
+            # independently, so peers can decode DIFFERENT tile_m and
+            # silently corrupt the multicast. Decode at cluster-box
+            # granularity instead ((1 M tile) x (cluster_n N tiles)):
+            # peers collapse to one box pid, the grouped raster permutes
+            # whole boxes, and the within-box lane recovers each peer's
+            # N tile. Reduces to the plain decode at cluster_n=1.
+            lane_n = new_var("cluster_lane_n", dce=True)
+            box_pid = new_var("cluster_box_pid", dce=True)
+            num_box_n = new_var("num_cluster_box_n", dce=True)
+            assignments.extend(
+                [
+                    (lane_n, f"({inner_2d_pid} // {num_pid_m}) % {cluster_n}"),
+                    (
+                        box_pid,
+                        (
+                            f"(({inner_2d_pid} // {num_pid_m}) // {cluster_n})"
+                            f" * {num_pid_m} + {inner_2d_pid} % {num_pid_m}"
+                        ),
+                    ),
+                    (num_box_n, f"({num_pid_n} + {cluster_n - 1}) // {cluster_n}"),
+                    (num_pid_in_group, f"{self.group_size} * {num_box_n}"),
+                    (group_id, f"{box_pid} // {num_pid_in_group}"),
+                    (first_pid_m, f"{group_id} * {self.group_size}"),
+                    (
+                        group_size_m,
+                        f"min({num_pid_m} - {first_pid_m}, {self.group_size})",
+                    ),
+                    (
+                        parent_pids[fastest_m_idx].pid_var,
+                        f"{first_pid_m} + (({box_pid} % {num_pid_in_group}) % {group_size_m})",
+                    ),
+                    (
+                        parent_pids[fastest_n_idx].pid_var,
+                        (
+                            f"(({box_pid} % {num_pid_in_group}) // {group_size_m})"
+                            f" * {cluster_n} + {lane_n}"
+                        ),
+                    ),
+                ]
+            )
+        else:
+            assignments.extend(
+                [
+                    (num_pid_in_group, f"{self.group_size} * {num_pid_n}"),
+                    (group_id, f"{inner_2d_pid} // {num_pid_in_group}"),
+                    (first_pid_m, f"{group_id} * {self.group_size}"),
+                    (
+                        group_size_m,
+                        f"min({num_pid_m} - {first_pid_m}, {self.group_size})",
+                    ),
+                    (
+                        parent_pids[fastest_m_idx].pid_var,
+                        f"{first_pid_m} + (({inner_2d_pid} % {num_pid_in_group}) % {group_size_m})",
+                    ),
+                    (
+                        parent_pids[fastest_n_idx].pid_var,
+                        f"({inner_2d_pid} % {num_pid_in_group}) // {group_size_m}",
+                    ),
+                ]
+            )
 
         # Process remaining dimensions (if any) using standard decomposition
         for i in range(2, num_dims):
@@ -941,6 +994,29 @@ class L2GroupingProgramIDs(ProgramIDs):
             *statements,
             *state.codegen.statements_stack[-1],
         ]
+
+    def _decode_cluster_n(self) -> int:
+        """The cluster-N width the grouped decode must respect.
+
+        Only the tcgen05 persistent scheduler pairs CTAs along a cluster N
+        axis (A-multicast peers must decode the same tile_m). This runs at
+        grid-lowering time, before the tcgen05 matmul plan is registered,
+        so ``_tcgen05_cluster_n`` reads the config knob. Safe because the
+        pid strategy and the mma lowering derive the tcgen05 choice from
+        the same ``_kernel_specialized_mma_impl`` probe: when this parent
+        is ``Tcgen05PersistentProgramIDs`` and the kernel compiles, the
+        launch uses the knob's cluster_n — cute_mma raises
+        ``BackendUnsupported`` on the tcgen05 cluster_n demotion paths,
+        and a late non-tcgen05 fallback never registers a matmul plan,
+        which the tcgen05 persistent layout asserts on before any launch.
+        The padding gate in cute_mma (N tile count divisible by
+        cluster_n) keeps the box decode a bijection over in-range tiles
+        for every launchable grid.
+        """
+        parent = self.parent_strategy
+        if isinstance(parent, Tcgen05PersistentProgramIDs):
+            return parent._tcgen05_cluster_n()
+        return 1
 
     @property
     def virtual_program_id(self) -> str:
@@ -1598,7 +1674,39 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         virtual_pid = self._tcgen05_linear_virtual_pid_expr(work_tile_var)
         num_pid_m = m_pid.num_pids_expr(is_device=True)
         l2_group = l2_grouping()
-        if l2_group > 1:
+        cluster_n = self._tcgen05_cluster_n()
+        if l2_group > 1 and cluster_n > 1:
+            # Mirror ``L2GroupingProgramIDs.codegen``'s cluster-aware box
+            # decode exactly: the predicate must classify tiles by the same
+            # post-remap (pid_m, pid_n) the consumer decodes, or grouped PID
+            # order sends fringe tiles down the full-tile TMA-store path.
+            num_pid_n = n_pid.num_pids_expr(is_device=True)
+            lane_n = (
+                f"((({virtual_pid}) // ({num_pid_m})) % cutlass.Int32({cluster_n}))"
+            )
+            box_pid = (
+                f"(((({virtual_pid}) // ({num_pid_m})) // cutlass.Int32({cluster_n}))"
+                f" * ({num_pid_m}) + ({virtual_pid}) % ({num_pid_m}))"
+            )
+            num_box_n = (
+                f"((({num_pid_n}) + cutlass.Int32({cluster_n - 1}))"
+                f" // cutlass.Int32({cluster_n}))"
+            )
+            num_pid_in_group = f"cutlass.Int32({l2_group}) * ({num_box_n})"
+            group_id = f"({box_pid}) // ({num_pid_in_group})"
+            first_pid_m = f"({group_id}) * cutlass.Int32({l2_group})"
+            group_size_m = (
+                f"min(({num_pid_m}) - ({first_pid_m}), cutlass.Int32({l2_group}))"
+            )
+            m_coord = (
+                f"({first_pid_m}) + "
+                f"((({box_pid}) % ({num_pid_in_group})) % ({group_size_m}))"
+            )
+            n_coord = (
+                f"(((({box_pid}) % ({num_pid_in_group})) // ({group_size_m}))"
+                f" * cutlass.Int32({cluster_n}) + {lane_n})"
+            )
+        elif l2_group > 1:
             num_pid_n = n_pid.num_pids_expr(is_device=True)
             num_pid_in_group = f"cutlass.Int32({l2_group}) * ({num_pid_n})"
             group_id = f"({virtual_pid}) // ({num_pid_in_group})"
@@ -4692,13 +4800,37 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             sched_producer_state if staged_work_tile_mailbox else sched_consumer_state
         )
         producer_smem_ptr = self._tcgen05_work_tile_producer_smem_ptr(layout)
+        # Full cluster size for the leader broadcast: with cluster_n > 1 the
+        # CLC leader must feed every CTA in the (cluster_m x cluster_n)
+        # cluster, publishing each peer's own (M, N) tile coordinates.
+        # CUDA cluster ranks are x-fastest, so peer rank r sits at
+        # ``(r % cluster_m, r // cluster_m)`` in the cluster.
+        sched_cluster_size = layout.cluster_m * layout.cluster_n
         if layout.cluster_m > 1:
             sched_barrier_ptr = device_function.new_var("tcgen05_clc_sched_barrier_ptr")
             sched_peer_rank = device_function.new_var("tcgen05_clc_sched_peer_rank")
             sched_peer_m = device_function.new_var("tcgen05_clc_sched_peer_m")
+            if layout.cluster_n > 1:
+                sched_peer_n = device_function.new_var("tcgen05_clc_sched_peer_n")
+                peer_coord_stmts = [
+                    statement_from_string(
+                        f"{sched_peer_m} = "
+                        f"{sched_peer_rank} % cutlass.Int32({layout.cluster_m})"
+                    ),
+                    statement_from_string(
+                        f"{sched_peer_n} = "
+                        f"{sched_peer_rank} // cutlass.Int32({layout.cluster_m})"
+                    ),
+                ]
+                publish_bidy_expr = f"{cluster_bidy_var} + {sched_peer_n}"
+            else:
+                peer_coord_stmts = [
+                    statement_from_string(f"{sched_peer_m} = {sched_peer_rank}")
+                ]
+                publish_bidy_expr = cluster_bidy_var
             # Whole-warp prelude: every lane runs ``producer_acquire``
             # (mbarrier wait) and computes the warp-uniform barrier
-            # pointer + lane id. Lanes ``cluster_m..31`` no-op past
+            # pointer + lane id. Lanes ``cluster_size..31`` no-op past
             # the per-peer broadcast branch.
             per_tile_publish_warp = [
                 statement_from_string(
@@ -4714,10 +4846,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 create(
                     ast.If,
                     test=expr_from_string(
-                        f"{sched_peer_rank} < cutlass.Int32({layout.cluster_m})"
+                        f"{sched_peer_rank} < cutlass.Int32({sched_cluster_size})"
                     ),
                     body=[
-                        statement_from_string(f"{sched_peer_m} = {sched_peer_rank}"),
+                        *peer_coord_stmts,
                         statement_from_string(
                             "cute.arch.mbarrier_arrive_and_expect_tx("
                             f"{sched_barrier_ptr}, 16, {sched_peer_rank})"
@@ -4725,7 +4857,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                         statement_from_string(
                             f"_cute_store_shared_remote_x4("
                             f"{cluster_bidx_var} + {sched_peer_m}, "
-                            f"{cluster_bidy_var}, "
+                            f"{publish_bidy_expr}, "
                             f"{cluster_bidz_var}, "
                             f"{valid_var}, "
                             f"smem_ptr={producer_smem_ptr}, "
@@ -4918,7 +5050,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 create(
                     ast.If,
                     test=expr_from_string(
-                        f"{sched_peer_rank} < cutlass.Int32({layout.cluster_m})"
+                        f"{sched_peer_rank} < cutlass.Int32({sched_cluster_size})"
                     ),
                     body=[
                         statement_from_string(
