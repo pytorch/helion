@@ -57,7 +57,7 @@ class CandidateDotWork(NamedTuple):
     """Tensor-core work executed by one candidate CTA."""
 
     total: int
-    tcgen05_eligible: int
+    warpgroup_eligible: int
     uncertain: bool = False
 
 
@@ -353,6 +353,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
     ACC_BUDGET = 32768  # fp32 [bm,bn] accumulator elems, register-file capacity
     SMEM_BUDGET = 228 * 1024  # per-CTA shared memory ceiling (bytes)
     DOT_MIN = 16  # tl.dot min M/N
+    REUSE_FREE_OUTPUT_N_FLOOR = DOT_MIN
     BASE_BM_CAP = 128  # base clamp on bm (wide-N aspect: bn = 2*bm, N is the coalesced store axis)
     BASE_BN_CAP = 256  # base clamp on bn
     WARPS_HI_ELEMS = 16384  # tile elems at/above which num_warps ramps 4 -> 8
@@ -362,10 +363,10 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
     SAT_TILE_BM = 64  # saturated batched-dot occupancy tile cap (bm)
     SAT_TILE_BN = 128  # saturated batched-dot occupancy tile cap (bn)
     # Optional tighter ceiling when the dot's K loop covers one partition of an
-    # enclosing grid tile. Inactive on the frozen sm90 path.
+    # enclosing grid tile. Inactive until a measured hardware carrier enables it.
     SAT_PARTITIONED_K_BM: int | None = None
     SAT_PARTITIONED_K_BN: int | None = None
-    SAT_NUM_WARPS = (
+    SAT_NUM_WARPS: int | None = (
         None  # sm100 forces min-warps on a saturated tiny tile (None = use the ramp)
     )
     SAT_MAX_STAGES = (
@@ -390,22 +391,27 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
     # different epilogue.
     EPILOGUE_ACC_ITEMSIZE = 4
     # Whether to ENFORCE the SMEM budget by shrinking the tile (steps 4'/5' and the alt-1 gate).
-    # Separate from the term above, and deliberately OFF on sm90: there `_smem_bytes` reduces to the
-    # operand ring charged at full num_stages, which OVER-estimates -- its worst case [16,2048,16] fp32
-    # computes 264192 but the hardware measures 132096 and fits. Enforcing would shrink tiles for a
-    # phantom overflow and break the sm90 byte-identical freeze.
+    # The legacy base leaves this off because its operand ring charges full num_stages and can
+    # overestimate badly. Hardware carriers enable it only with calibrated hard-allocation
+    # accounting.
     ENFORCE_SMEM_BUDGET = False
     # Slack for allocations too small to model individually (mbarriers are 8B each). Measured: an
     # otherwise-exact bound is violated by exactly 16 B, so a formula must not be tight to the byte.
     SMEM_SLACK = 0
+    # Some pipelines that publish a store reserve one fewer operand buffer
+    # than the global stage count. None disables this architecture model.
+    HARD_SMEM_16BIT_STORE_STAGE_OFFSET: int | None = None
     # Per-CTA tensor-memory ceiling in BYTES. None = no tensor memory on this arch.
-    TMEM_BUDGET = None
+    TMEM_BUDGET: int | None = None
     # Smallest block_m that lowers to tcgen05 (below it the dot uses a non-TMEM path, so TMEM is free).
     TCGEN05_MIN_BM = 64
+    # Smallest block_m that can use this architecture's warpgroup MMA path.
+    # tcgen05 and WGMMA share the same measured boundary today.
+    WARPGROUP_MIN_BM = TCGEN05_MIN_BM
     # --- whole-kernel resource accounting (see _tmem_columns / _warps_for_live_set) ---
     # tcgen05 tensor memory is allocated as TMEM_LANES lanes x TMEM_COLUMN_BUDGET columns of 32
     # bits, and a request is denominated in COLUMNS. None = the arch has no tensor memory, so the
-    # column check is inert (which is what keeps sm90 byte-identical).
+    # column check is inert.
     TMEM_LANES = 128
     TMEM_COLUMN_BUDGET: int | None = None
     TMEM_ALLOC_COLUMNS = 0
@@ -418,25 +424,18 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
     # Warps in a tcgen05 warpgroup. Below this the MMA path is unavailable and the fp32
     # accumulator falls back into the register file.
     TCGEN05_WARPGROUP_WARPS = 4
+    WARPGROUP_WARPS = TCGEN05_WARPGROUP_WARPS
+    # Whether a warpgroup MMA moves eligible accumulators out of registers.
+    # WGMMA does not; the B200 policy carrier enables this for tcgen05.
+    ACCUMULATORS_IN_TMEM = False
     MAX_NUM_WARPS = 8
     MAX_THREADS_PER_SM = 2048
     MAX_CTAS_PER_SM = 32
     REGISTER_FILE_BYTES_PER_SM = 65536 * 4
     TMEM_COLUMNS_PER_SM: int | None = None
-    # Where the register-driven warp ladder STOPS climbing -- see _warps_for_live_set for why an
-    # arch with tensor memory wants to stop at a warpgroup rather than at MAX_NUM_WARPS. Held as a
-    # per-arch class attribute (like ENFORCE_SMEM_BUDGET and TMEM_COLUMN_BUDGET) rather than
-    # branched on inside the ladder: hardware selection lives in is_eligible via HARDWARE_TARGETS,
-    # so a method body that re-derives the arch duplicates a dispatch that already happened.
-    #
-    # MAX_NUM_WARPS here leaves the sm90 ladder exactly as it was. That is a decision to hold the
-    # frozen sm90 emit still, NOT a claim about H100 physics -- the cap was measured on B200 only,
-    # and sm90 has no measurement either way. Note also that _register_live_bytes drops the
-    # accumulators at TCGEN05_WARPGROUP_WARPS UNCONDITIONALLY, without consulting
-    # TMEM_COLUMN_BUDGET, so on an arch with no tensor memory the two are already inconsistent
-    # about the same physical fact. That is pre-existing and is not repaired here, because
-    # repairing it would move the frozen sm90 emit; it is recorded so the next reader of this
-    # constant does not mistake MAX_NUM_WARPS for a measured sm90 answer.
+    # Where the register-driven warp ladder stops climbing. An architecture
+    # whose warpgroup path moves accumulators out of registers may stop at one
+    # warpgroup; register-resident WGMMA may continue to the maximum.
     REG_CLIMB_MAX_WARPS = MAX_NUM_WARPS
     # Ceiling for the GRADED (sequential-pipeline) stage model. Measured over all 34 scored
     # curriculum bodies, the optimum coincides with MAX_STAGES: 4, 6 and 12 land within 0.002
@@ -485,8 +484,8 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
     # but not that pipeline/barrier overhead is free. Allow that proof to recover
     # triple buffering while preserving any depth the grid-only model already chose.
     OCCUPANCY_RELAXED_MAX_STAGES = 3
-    # Master switches for the generalized/graded machinery, so an arch that has not been measured
-    # keeps its exact incumbent behavior (sm90 is a byte-identical freeze).
+    # Master switches for the generalized/graded machinery. A measured hardware carrier enables
+    # them together; the legacy base retains its narrower behavior.
     GENERALIZED_AXES = False
     GRADED_STAGES = False
     WORK_AWARE_WARPS = False
@@ -496,15 +495,15 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
     # Candidate-work regime boundaries. Inactive unless REGIME_AWARE_WARPS is
     # enabled by a measured architecture subclass.
     SUBSTANTIAL_DOT_WORK = 1 << 20
-    TCGEN05_DOT_WORK = 1 << 20
+    WARPGROUP_DOT_WORK = 1 << 20
     # Every work-driven warp transition pays for any effective CTA residency it
     # gives up, but never for queued launch waves after residency is saturated.
     WARP_TRANSITION_OCCUPANCY_PENALTY_MAX = 4.0
     EIGHT_WARP_DOT_WORK = 1 << 26
-    NON_TCGEN_WIDE_N = 128
+    NON_WARPGROUP_WIDE_N = 128
     WARP1_SOFT_PRESSURE = 1.2
     FORCED_MMA_SOFT_PRESSURE = 1.2
-    TCGEN_CATASTROPHIC_PRESSURE = 1.75
+    WARPGROUP_CATASTROPHIC_PRESSURE = 1.75
     # With one enclosing trip, a second top-level stage can still overlap a
     # dot's operand movement. Prefer it only while the one-stage tile retains
     # register headroom; at higher pressure the measured compiler schedule
@@ -703,9 +702,9 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         in this body: hardware selection already happened in ``is_eligible`` via
         ``HARDWARE_TARGETS``, so re-deriving the arch here -- whether by reading it directly or by
         proxying it through ``TMEM_COLUMN_BUDGET is not None`` -- duplicates a dispatch the class
-        hierarchy performs and adds a second place for the two to disagree. The sm90 carrier leaves
-        it at ``MAX_NUM_WARPS``, which holds that frozen emit still rather than asserting anything
-        about H100, where the cap is unmeasured.
+        hierarchy performs and adds a second place for the two to disagree. The H100 carrier leaves
+        it at ``MAX_NUM_WARPS`` because WGMMA accumulators remain register-resident, so unresolved
+        pressure can still justify climbing beyond one warpgroup.
 
         Both halves are measured, by sweeping ``num_warps`` over 1/2/4/8 at the emitted tile for
         75 curriculum cells and scoring against each cell's own measured optimum over the 53
@@ -788,7 +787,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         p1 = pressure(1)
         p2 = pressure(2)
         wide_register_accumulator = any(
-            rows < cls.TCGEN05_MIN_BM and cols >= cls.NON_TCGEN_WIDE_N
+            rows < cls.WARPGROUP_MIN_BM and cols >= cls.NON_WARPGROUP_WIDE_N
             for rows, cols, _inner, _itemsize in cls._all_dot_acc_tiles(
                 env, block_sizes
             )
@@ -800,14 +799,14 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                 resident_ctas(upper),
             )
 
-        if work.tcgen05_eligible >= (
+        if work.warpgroup_eligible >= (
             cls.EIGHT_WARP_DOT_WORK
-            * transition_penalty(cls.TCGEN05_WARPGROUP_WARPS, cls.MAX_NUM_WARPS)
+            * transition_penalty(cls.WARPGROUP_WARPS, cls.MAX_NUM_WARPS)
         ):
             warps = 8
-        elif work.tcgen05_eligible > (
-            cls.TCGEN05_DOT_WORK * transition_penalty(2, cls.TCGEN05_WARPGROUP_WARPS)
-        ) or (not work.tcgen05_eligible and wide_register_accumulator):
+        elif work.warpgroup_eligible > (
+            cls.WARPGROUP_DOT_WORK * transition_penalty(2, cls.WARPGROUP_WARPS)
+        ) or (not work.warpgroup_eligible and wide_register_accumulator):
             warps = 4
         elif work.total >= (cls.SUBSTANTIAL_DOT_WORK * transition_penalty(1, 2)):
             warps = 2
@@ -815,29 +814,31 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             warps = 1 if p1 <= cls.WARP1_SOFT_PRESSURE else 2
 
         # Spill pressure is a guardrail, not the objective. With every dot forced
-        # onto register MMA, adding warps cannot accidentally cross into tcgen05,
-        # so relieve even a modest overshoot. A tcgen05-eligible tile has a much
-        # more expensive 2 -> 4 transition and crosses it only for enough work or
-        # genuinely catastrophic pressure.
-        if not work.tcgen05_eligible:
+        # onto register MMA, adding warps cannot accidentally cross into a
+        # warpgroup path, so relieve even a modest overshoot. A warpgroup-eligible
+        # tile has a much more expensive 2 -> 4 transition and crosses it only for
+        # enough work or genuinely catastrophic pressure.
+        if not work.warpgroup_eligible:
             while (
                 warps < cls.MAX_NUM_WARPS
                 and pressure(warps) > cls.FORCED_MMA_SOFT_PRESSURE
             ):
                 next_warps = warps * 2
-                if pressure(warps) <= cls.TCGEN_CATASTROPHIC_PRESSURE and resident_ctas(
+                if pressure(
+                    warps
+                ) <= cls.WARPGROUP_CATASTROPHIC_PRESSURE and resident_ctas(
                     next_warps
                 ) < resident_ctas(warps):
                     break
                 warps = next_warps
         else:
-            if warps < cls.TCGEN05_WARPGROUP_WARPS and (
-                p2 > cls.TCGEN_CATASTROPHIC_PRESSURE
+            if warps < cls.WARPGROUP_WARPS and (
+                p2 > cls.WARPGROUP_CATASTROPHIC_PRESSURE
             ):
-                warps = cls.TCGEN05_WARPGROUP_WARPS
+                warps = cls.WARPGROUP_WARPS
             if (
-                warps == cls.TCGEN05_WARPGROUP_WARPS
-                and pressure(warps) > cls.TCGEN_CATASTROPHIC_PRESSURE
+                warps == cls.WARPGROUP_WARPS
+                and pressure(warps) > cls.WARPGROUP_CATASTROPHIC_PRESSURE
                 and resident_ctas(warps * 2) >= resident_ctas(warps)
             ):
                 warps *= 2
@@ -1010,13 +1011,22 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             # the ring, so those bytes ADD. A region with no store is a plain K-loop whose
             # ring is dead by the time the epilogue converts, which is the liveness-packed
             # case the incumbent ``max(ring, epilogue)`` already models.
+            has_store = any(tile.kind == "store" for tile in tiles)
+
+            def tile_stages(tile: LiveTile) -> int:
+                if tile.kind != "load" or tile.stageable is False:
+                    return 1
+                depth = max(1, stages)
+                if hard_allocation and tile.itemsize <= 2:
+                    if has_store and cls.HARD_SMEM_16BIT_STORE_STAGE_OFFSET is not None:
+                        depth = max(
+                            1,
+                            depth - cls.HARD_SMEM_16BIT_STORE_STAGE_OFFSET,
+                        )
+                return depth
+
             return sum(
-                cls._resolve_tile_bytes(tile, block_of)
-                * (
-                    max(1, stages)
-                    if tile.kind == "load" and tile.stageable is not False
-                    else 1
-                )
+                cls._resolve_tile_bytes(tile, block_of) * tile_stages(tile)
                 for tile in tiles
                 if tile.kind in ("load", "store")
             )
@@ -1240,7 +1250,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         assert mm is not None
         block_of = cls._full_block_map(env, block_sizes)
         total = 0
-        tcgen05_eligible = 0
+        warpgroup_eligible = 0
         uncertain = False
         selected = range(len(mm.matmuls)) if indices is None else indices
         for index in selected:
@@ -1256,15 +1266,15 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                     block_sizes,
                     site.loop_axes,
                 )
-                # Unknown work is not evidence that tcgen05 setup can be
+                # Unknown work is not evidence that warpgroup setup can be
                 # amortized. Retain one proven invocation as a lower bound.
                 trips = resolved_trips if resolved_trips is not None else 1
                 uncertain = uncertain or resolved_trips is None
             work = m * n * k * trips
             total += work
-            if m >= cls.TCGEN05_MIN_BM:
-                tcgen05_eligible += work
-        return CandidateDotWork(total, tcgen05_eligible, uncertain)
+            if m >= cls.WARPGROUP_MIN_BM:
+                warpgroup_eligible += work
+        return CandidateDotWork(total, warpgroup_eligible, uncertain)
 
     @classmethod
     def _register_live_bytes(
@@ -1306,7 +1316,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             return 0
         block_of = cls._full_block_map(env, block_sizes)
         ceiling = cls.MAX_NUM_WARPS * 32 * cls.REG_BYTES_PER_THREAD
-        tmem_absorbs = num_warps >= cls.TCGEN05_WARPGROUP_WARPS
+        tmem_absorbs = cls.ACCUMULATORS_IN_TMEM and num_warps >= cls.WARPGROUP_WARPS
         peak = 0
         for step in mm.live_tile_steps:
             total = 0
@@ -1318,7 +1328,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                     continue
                 if tile.kind == "dot_out" and tmem_absorbs:
                     shape = cls._single_matrix_shape(tile, block_of)
-                    if shape is not None and shape[0] >= cls.TCGEN05_MIN_BM:
+                    if shape is not None and shape[0] >= cls.WARPGROUP_MIN_BM:
                         continue
                 total += nbytes
             peak = max(peak, total)
@@ -1405,6 +1415,18 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         num_sm: int,
     ) -> None:
         """Architecture hook for role-aware block-size corrections."""
+
+    @classmethod
+    def _pipeline_stage_cap(
+        cls,
+        env: CompileEnvironment,
+        mm: KernelMatmulFact,
+        block_sizes: list[int],
+        *,
+        num_warps: int,
+    ) -> int | None:
+        """Architecture hook for structural pipeline limits."""
+        return None
 
     @classmethod
     def _graded_stage_depth(
@@ -1582,7 +1604,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         if (
             include_tmem
             and cls.TMEM_COLUMNS_PER_SM is not None
-            and warps >= cls.TCGEN05_WARPGROUP_WARPS
+            and warps >= cls.WARPGROUP_WARPS
         ):
             columns = cls._candidate_tmem_columns(
                 env,
@@ -1635,7 +1657,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             grid=cls._launch_grid(env, block_sizes),
             num_sm=num_sm,
         )
-        return cls._graded_stage_depth(
+        stages = cls._graded_stage_depth(
             smem_of,
             loop_trips=loop_trips,
             grid=stage_grid,
@@ -1643,6 +1665,18 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             resident_ctas=resident_ctas,
             allow_one_trip_stage2=allow_one_trip_stage2,
         )
+        mm = env.config_spec.kernel_matmul_fact
+        assert mm is not None
+        if (
+            cap := cls._pipeline_stage_cap(
+                env,
+                mm,
+                block_sizes,
+                num_warps=num_warps,
+            )
+        ) is not None:
+            stages = min(stages, cap)
+        return stages
 
     @classmethod
     def _solve_candidate_warps(
@@ -1709,7 +1743,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                             include_lhs_scratch=True,
                             resource_policy=resource_policy,
                         )
-                        if num_warps >= cls.TCGEN05_WARPGROUP_WARPS
+                        if num_warps >= cls.WARPGROUP_WARPS
                         else 0
                     ),
                     cls.TMEM_COLUMN_BUDGET,
@@ -1835,7 +1869,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                 and block_sizes[slot_of[bid]] // 2 >= max(floors[bid], cls.DOT_MIN)
             ]
             # Keep per-dot work fixed while scoring trials: only crossing the
-            # tcgen05 eligibility boundary should change this preference.
+            # warpgroup eligibility boundary should change this preference.
             dot_weights = tuple(
                 cls._candidate_dot_work(
                     env,
@@ -1867,10 +1901,10 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                 if impact is None:
                     continue
                 legal = all(demand <= budget for demand, budget in trial_resources)
-                tcgen05_work = 0
-                if trial_warps >= cls.TCGEN05_WARPGROUP_WARPS:
+                warpgroup_work = 0
+                if trial_warps >= cls.WARPGROUP_WARPS:
                     trial_blocks = cls._full_block_map(env, trial)
-                    tcgen05_work = sum(
+                    warpgroup_work = sum(
                         weight
                         for resolved, weight in zip(
                             mm.matmuls, dot_weights, strict=True
@@ -1880,7 +1914,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                             resolved.axes,
                             trial_blocks,
                         )[0]
-                        >= cls.TCGEN05_MIN_BM
+                        >= cls.WARPGROUP_MIN_BM
                     )
                 legacy_tiebreak = (
                     block_sizes[slot_of[bid]] if largest_first else -position
@@ -1891,7 +1925,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                         (
                             int(legal),
                             cleared,
-                            tcgen05_work,
+                            warpgroup_work,
                             0.0 if legal else normalized_relief,
                             legacy_tiebreak,
                         ),
@@ -1938,8 +1972,8 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         (4')/(5') are the final enforcement -- give up tile area when no cheaper knob can make the
         config legal. Both budgets reserve for their worst case UNCONDITIONALLY, with no attempt to
         predict Triton's operand-promotion or epilogue-conversion choices, so the accounting can only
-        err toward being too strict. Both are inert on sm90 (no tensor memory, no epilogue staging
-        buffer), which is what keeps that path byte-identical.
+        err toward being too strict. Hardware carriers choose which budgets to enforce and may refine
+        hard-allocation depth where compiled metadata supports it.
         """
         from ..._utils import prev_power_of_2
 
@@ -2000,8 +2034,8 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             waves = (g + num_sm - 1) // num_sm
             return g / (waves * num_sm)
 
-        # (2.7) TMEM-budget tile growth (sm100 only; TMEM_BUDGET is None on sm90, so H100 is
-        # unchanged). On Blackwell the fp32 accumulator lives in tcgen05 tensor memory rather than the
+        # (2.7) TMEM-budget tile growth (TMEM-capable carriers only). On Blackwell the fp32
+        # accumulator lives in tcgen05 tensor memory rather than the
         # register file, so the tile is limited by TMEM_BUDGET, not ACC_BUDGET. Keep doubling an axis
         # while the reservation still fits: N first, since it is the coalesced store / B-reuse axis and
         # a narrow-N tile is a large regression. Each step must also still fill a wave.
@@ -2030,8 +2064,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
 
         # Shrink the larger tile axis while the grid is under one full wave and shrinking helps;
         # already-saturated tiles are left untouched. WAVE_FILL_STRICT requires a STRICT wave-eff
-        # gain to shrink (a shrink that leaves occupancy flat only destroys operand reuse) — a
-        # universal fix, but sm90 keeps the old `>=` to stay byte-identical (frozen).
+        # gain to shrink (a shrink that leaves occupancy flat only destroys operand reuse).
         def _better(a: float, b: float) -> bool:
             return a > b if cls.WAVE_FILL_STRICT else a >= b
 
@@ -2100,8 +2133,8 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         #   (5') TENSOR memory -- the accumulator plus the A operand. Applies to EVERY case, including
         #        batched dots, which skip the (2.7) growth loop but still use tensor memory (measured:
         #        a pinned-batch dot at [256,256,32] reports tmem_size=512).
-        # Both are inert on sm90, which has neither an epilogue staging buffer nor tensor memory; that
-        # is what keeps the sm90 path byte-identical.
+        # Each check is controlled by the hardware carrier. H100 has no tensor memory but does
+        # enforce its calibrated shared-memory model.
         def _shrink_larger_axis() -> bool:
             """Halve the larger tile axis. False when both are already at the dot minimum."""
             nonlocal bm, bn, bk, num_stages
@@ -2114,11 +2147,8 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             bk, num_stages = _bk_and_stages(bm, bn)
             return True
 
-        # (4') is sm100-only: on sm90 `_smem_bytes` degenerates to the plain operand ring, and that
-        # model OVER-estimates -- its worst case [16,2048,16] fp32 computes 264192 but the hardware
-        # measures 132096 and fits fine. Shrinking there would cost real perf for a phantom overflow
-        # and break the sm90 byte-identical freeze, so the enforcement is gated on the conservative
-        # accounting being active.
+        # The legacy base leaves (4') off because a plain full-depth operand ring can overestimate
+        # badly. Measured hardware carriers enable it only when their allocation model is calibrated.
         if cls.ENFORCE_SMEM_BUDGET:
             while cls._smem_bytes(bm, bn, bk, itemsize, num_stages) > smem_budget:
                 if not _shrink_larger_axis():
@@ -2271,7 +2301,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         recompute_stages: bool,
         min_warps: int | None = None,
         max_warps: int | None = None,
-        keep_tcgen05: bool = False,
+        keep_warpgroup: bool = False,
         apply_role_correction: bool = True,
         protected_block_ids: Collection[int] = (),
         min_stages: int | None = None,
@@ -2287,7 +2317,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             cls._apply_knob_roles(env, mm, draft.block_sizes, num_sm)
 
         m_ids, n_ids, k_ids = axis_ids
-        if keep_tcgen05:
+        if keep_warpgroup:
             for block_id in m_ids:
                 try:
                     slot = env.config_spec.block_sizes.block_id_to_index(block_id)
@@ -2297,7 +2327,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                     env,
                     draft.block_sizes,
                     block_id,
-                    max(draft.block_sizes[slot], cls.TCGEN05_MIN_BM),
+                    max(draft.block_sizes[slot], cls.WARPGROUP_MIN_BM),
                 )
 
         keep_stage_blocks = recompute_stages and getattr(cls, "ROLE_KEEP_STAGES", False)
@@ -2305,7 +2335,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         shrinkable = list(dict.fromkeys((*n_ids, *k_ids, *m_ids)))
         protected = set(protected_block_ids)
         shrinkable = [block_id for block_id in shrinkable if block_id not in protected]
-        if keep_tcgen05:
+        if keep_warpgroup:
             shrinkable = [block_id for block_id in shrinkable if block_id not in m_ids]
 
         seen: set[tuple[tuple[int, ...], int, int]] = set()
@@ -2368,8 +2398,8 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         else:
             return None
 
-        if keep_tcgen05 and not any(
-            bm >= cls.TCGEN05_MIN_BM
+        if keep_warpgroup and not any(
+            bm >= cls.WARPGROUP_MIN_BM
             for bm, _bn, _bk, _itemsize in cls._all_dot_acc_tiles(
                 env,
                 draft.block_sizes,
@@ -2392,8 +2422,8 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         for warps in (1, 2):
             draft = base.copy()
             targets = (
-                cls.TCGEN05_MIN_BM,
-                warps * cls.TMEM_ALLOC_COLUMNS,
+                cls.WARPGROUP_MIN_BM,
+                warps * max(cls.DOT_MIN, cls.TMEM_ALLOC_COLUMNS),
                 warps * cls.DOT_MIN,
             )
             for block_ids, target in zip(axis_ids, targets, strict=True):
@@ -2466,7 +2496,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             log2_deltas: tuple[int, int, int],
             stage_delta: int,
             *,
-            keep_tcgen05: bool = False,
+            keep_warpgroup: bool = False,
         ) -> MatmulSeedDraft:
             draft = base.copy()
             changed = cls._scale_seed_axes(
@@ -2489,8 +2519,8 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
                     num_sm=num_sm,
                     axis_ids=axis_ids,
                     recompute_stages=False,
-                    min_warps=(cls.TCGEN05_WARPGROUP_WARPS if keep_tcgen05 else None),
-                    keep_tcgen05=keep_tcgen05,
+                    min_warps=(cls.WARPGROUP_WARPS if keep_warpgroup else None),
+                    keep_warpgroup=keep_warpgroup,
                 )
                 or base.copy()
             )
@@ -2498,7 +2528,7 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         return [
             build((0, 0, -1), 1),
             build((0, 0, 1), -1),
-            build((-1, -1, -1), -1, keep_tcgen05=True),
+            build((-1, -1, -1), -1, keep_warpgroup=True),
         ]
 
     @classmethod
@@ -2876,11 +2906,8 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
         # bm, so re-check the resource accounting: the alternate is a real search seed and an
         # over-budget one would just fail to compile (or, on the TMEM path, fail at launch).
         #
-        # Gated on the conservative accounting being active (i.e. sm100), for the same reason step
-        # (4')/(5') are: on sm90 ``_smem_bytes`` degenerates to the ring formula, which is a NEW
-        # constraint on alt-1 (it never had a SMEM check) and which that arch's own primary path
-        # deliberately does not enforce because the model over-estimates there. Applying it on sm90
-        # would drop ~15% of alt-1 seeds and break the byte-identical freeze.
+        # Gated on calibrated conservative accounting, for the same reason step (4')/(5') are:
+        # the legacy ring formula overestimates and was never a constraint on alt-1.
         cap_m = max(16, prev_power_of_2(max(1, fact.static_m)))
         bm2, bn2 = min(cap_m, bm * 2), max(16, bn // 2)
         conservative = cls.ENFORCE_SMEM_BUDGET
@@ -3018,15 +3045,14 @@ class TritonB200FormulaMatmulHeuristic(TritonH100MatmulHeuristic):
     # smaller ceiling across both B200 front ends.
     SAT_PARTITIONED_K_BM = 32
     SAT_PARTITIONED_K_BN = 64
-    SAT_NUM_WARPS = 1
-    # Strict wave-fill shrink (see the shrink loop). A universal fix; gated to sm100 only to keep the
-    # sm90 freeze byte-identical — the principled end-state is to flip the base default once H100 can
-    # be re-benched (it would shift a few N=11008 shapes).
+    SAT_NUM_WARPS: int | None = 1
+    # Strict wave-fill shrink (see the shrink loop). The H100 port inherits this after separate
+    # validation; the legacy base retains its original non-strict default.
     WAVE_FILL_STRICT = True
     # --- conservative resource accounting (sm100 only; see _tmem_bytes / _smem_bytes) ---
     # Full tcgen05 tensor memory: 128 lanes x 512 columns x 32 bit = 262144 bytes. The [256,256] fp32
     # accumulator EXACTLY fills it, which is why a promoted A operand cannot coexist with that square.
-    TMEM_BUDGET = 128 * 512 * 4
+    TMEM_BUDGET: int | None = 128 * 512 * 4
     # The SAME tensor memory counted the way the hardware allocates it: 512 columns of 128 lanes.
     # Kept alongside the byte budget rather than replacing it, because the column count is the
     # faithful unit (a bm<128 accumulator costs full columns) and can therefore only ever REJECT a
@@ -3042,7 +3068,8 @@ class TritonB200FormulaMatmulHeuristic(TritonH100MatmulHeuristic):
     # absorption boundary it is derived from cannot drift apart. Measured: 0.9591 against a
     # per-cell optimum over 53 cells where num_warps moves time, where climbing on to
     # MAX_NUM_WARPS scores 0.8959. See _warps_for_live_set.
-    REG_CLIMB_MAX_WARPS = TritonH100MatmulHeuristic.TCGEN05_WARPGROUP_WARPS
+    REG_CLIMB_MAX_WARPS = TritonH100MatmulHeuristic.WARPGROUP_WARPS
+    ACCUMULATORS_IN_TMEM = True
     # EPILOGUE_ACC_ITEMSIZE is inherited (the term is arch-independent). What is sm100-specific is
     # ENFORCING it: only here can the tile reach bm*bn=65536, where the term actually exceeds the cap.
     ENFORCE_SMEM_BUDGET = True
@@ -3074,6 +3101,7 @@ class TritonB200FormulaMatmulHeuristic(TritonH100MatmulHeuristic):
     # same tensor memory while issuing less MMA work. M uses the tcgen05 row
     # threshold, and launch-grid knobs use their legal block minimum.
     TMEM_ALLOC_COLUMNS = 32
+    REUSE_FREE_OUTPUT_N_FLOOR = TMEM_ALLOC_COLUMNS
 
     @classmethod
     def _knob_amortizes(cls, mm: KernelMatmulFact, block_id: int) -> bool:
@@ -3134,11 +3162,10 @@ class TritonB200FormulaMatmulHeuristic(TritonH100MatmulHeuristic):
           while the launch is below one wave and the shrink strictly improves wave
           utilization.
 
-        Reuse-free N axes stop at the tensor-memory column granularity. M axes
-        stop at ``TCGEN05_MIN_BM`` so this correction does not remove tcgen05
-        from the later regime-aware warp solve. Grid axes stop at their legal
-        block minimum; tensor-memory allocation granularity is not a launch-grid
-        constraint.
+        Reuse-free N axes stop at the architecture's configured output floor.
+        M axes stop at ``WARPGROUP_MIN_BM`` so this correction does not remove
+        the warpgroup path from the later regime-aware warp solve. Grid axes
+        stop at their legal block minimum.
         """
         spec = env.config_spec
         grid_ids = set(spec.grid_block_ids)
@@ -3152,9 +3179,9 @@ class TritonB200FormulaMatmulHeuristic(TritonH100MatmulHeuristic):
         def output_floor(users: tuple[tuple[int, str], ...]) -> int | None:
             roles = {axis for _index, axis in users}
             if "m" in roles:
-                return cls.TCGEN05_MIN_BM
+                return cls.WARPGROUP_MIN_BM
             if "n" in roles:
-                return cls.TMEM_ALLOC_COLUMNS
+                return cls.REUSE_FREE_OUTPUT_N_FLOOR
             return None
 
         # (1) reuse-free output knobs -> the allocation floor.
@@ -3201,6 +3228,57 @@ class TritonB200FormulaMatmulHeuristic(TritonH100MatmulHeuristic):
             guard += 1
             victim = max(candidates, key=lambda b: block_sizes[slot_of[b]])
             block_sizes[slot_of[victim]] //= 2
+
+
+class TritonH100FormulaMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
+    """SM90 formula front end using the B200 policy with H100 resources."""
+
+    name = "triton_h100_formula_matmul"
+    HARDWARE_TARGETS = (("cuda", "sm90"),)
+
+    # WGMMA accumulators remain register-resident. TMEM capacity, allocation,
+    # residency, and epilogue-driven hard correction therefore do not apply.
+    SMEM_BUDGET = 232448
+    TMEM_BUDGET = None
+    TMEM_COLUMN_BUDGET = None
+    TMEM_COLUMNS_PER_SM = None
+    TMEM_ALLOC_COLUMNS = 0
+    REUSE_FREE_OUTPUT_N_FLOOR = 32
+    ACCUMULATORS_IN_TMEM = False
+    REG_CLIMB_MAX_WARPS = TritonH100MatmulHeuristic.MAX_NUM_WARPS
+    ENFORCE_SMEM_BUDGET = True
+    SMEM_SLACK = 0
+    HARD_SMEM_16BIT_STORE_STAGE_OFFSET = 1
+    SAT_NUM_WARPS = None
+    WARPGROUP_DOT_WORK = 1 << 19
+
+    @classmethod
+    def _pipeline_stage_cap(
+        cls,
+        env: CompileEnvironment,
+        mm: KernelMatmulFact,
+        block_sizes: list[int],
+        *,
+        num_warps: int,
+    ) -> int | None:
+        block_of = cls._full_block_map(env, block_sizes)
+        tiles = cls._all_dot_acc_tiles(env, block_sizes)
+        for resolved, (rows, _cols, _inner, _itemsize) in zip(
+            mm.matmuls, tiles, strict=True
+        ):
+            batch_id = resolved.site.rank_reduction_scaled_accumulator_batch_block_id
+            if (
+                batch_id is not None
+                and rows >= cls.WARPGROUP_MIN_BM
+                and num_warps >= cls.WARPGROUP_WARPS
+                and block_of[batch_id] == 1
+            ):
+                # HACK: Triton's SM90 layout solver crashes when a dot-derived
+                # rank reduction rescales a WGMMA acc= pipeline at stages > 1.
+                # This is not a hardware limit; replace this workaround with a
+                # Triton lowering/compiler fix once that path is repaired.
+                return 1
+        return None
 
 
 class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
@@ -3641,7 +3719,7 @@ class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
 
             high_launch = large_k.copy()
             high_launch.num_warps = max(
-                cls.TCGEN05_WARPGROUP_WARPS,
+                cls.WARPGROUP_WARPS,
                 high_launch.num_warps,
             )
             high_launch.num_stages = min(
@@ -3655,7 +3733,7 @@ class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
                 num_sm=num_sm,
                 axis_ids=axis_ids,
                 recompute_stages=False,
-                min_warps=cls.TCGEN05_WARPGROUP_WARPS,
+                min_warps=cls.WARPGROUP_WARPS,
                 apply_role_correction=False,
                 protected_block_ids=k_ids,
                 min_stages=high_launch.num_stages,
@@ -3666,7 +3744,7 @@ class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
 
         if register_mma:
             small_high_launch = register_mma[0].copy()
-            small_high_launch.num_warps = cls.TCGEN05_WARPGROUP_WARPS
+            small_high_launch.num_warps = cls.WARPGROUP_WARPS
             small_high_launch.num_stages = min(
                 cls.HW_MAX_STAGES,
                 max(3, small_high_launch.num_stages),
@@ -3678,8 +3756,8 @@ class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
                 num_sm=num_sm,
                 axis_ids=axis_ids,
                 recompute_stages=False,
-                min_warps=cls.TCGEN05_WARPGROUP_WARPS,
-                max_warps=cls.TCGEN05_WARPGROUP_WARPS,
+                min_warps=cls.WARPGROUP_WARPS,
+                max_warps=cls.WARPGROUP_WARPS,
                 apply_role_correction=False,
                 protected_block_ids=tuple(
                     dict.fromkeys(block_id for ids in axis_ids for block_id in ids)
@@ -3925,17 +4003,27 @@ class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
         return cls._multi_ranked(env) or None
 
 
+class TritonH100MultiMatmulHeuristic(
+    TritonB200MultiMatmulHeuristic,
+    TritonH100FormulaMatmulHeuristic,
+):
+    """SM90 multi-matmul front end using the shared B200 composition policy."""
+
+    name = "triton_h100_multi_matmul"
+    HARDWARE_TARGETS = (("cuda", "sm90"),)
+
+
 # Module-level shims delegating to the class (tests + lab harness call these by name).
 def _h100_matmul_tile(
     m: int, n: int, k: int, itemsize: int, num_sm: int, pinned_grid: int = 1
 ) -> tuple[int, int, int, int, int, int]:
-    return TritonH100MatmulHeuristic._matmul_tile(
+    return TritonH100FormulaMatmulHeuristic._matmul_tile(
         m, n, k, itemsize, num_sm, pinned_grid
     )
 
 
 def _h100_ranked_configs(env: CompileEnvironment, fact: MatmulFact) -> list[Config]:
-    return TritonH100MatmulHeuristic._ranked_configs(env, fact)
+    return TritonH100FormulaMatmulHeuristic._ranked_configs(env, fact)
 
 
 class TritonPointwiseSeedHeuristic(AutotunerHeuristic):
