@@ -135,6 +135,30 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
             # Check that evict_last appears in the generated code
             self.assertIn("evict_last", code)
 
+    @skipIfTileIR("tileir backend will ignore `eviction_policy` hint")
+    @skipIfRocm("ROCm does not support eviction policy")
+    def test_scalar_eviction_policy_applies_to_every_load(self) -> None:
+        @helion.kernel(
+            config={
+                "block_size": 16,
+                "load_eviction_policies": "last",
+                "indexing": "pointer",
+            }
+        )
+        def kernel_with_eviction(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        x = torch.randn([128], device=DEVICE, dtype=torch.float32)
+        y = torch.randn([128], device=DEVICE, dtype=torch.float32)
+
+        code, result = code_and_output(kernel_with_eviction, (x, y))
+
+        torch.testing.assert_close(result, x + y)
+        self.assertEqual(code.count("eviction_policy='evict_last'"), 2)
+
     @parametrize("indexing", ("pointer", "block_ptr", "tensor_descriptor"))
     @skipIfTileIR("tileir backend will ignore `eviction_policy` hint")
     def test_explicit_eviction_policy_overrides_tunable(self, indexing: str):
