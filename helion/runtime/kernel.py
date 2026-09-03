@@ -1499,7 +1499,9 @@ class Kernel(Generic[_R]):
         Every argument set must bind normally to the same exact, current accelerator
         device. Distributed processes are not supported. A non-empty ``cache_tag`` is
         required for custom callbacks, dynamic-shape tuning, and runtime numeric
-        arguments; callers own tag invalidation in those cases.
+        arguments; callers own tag invalidation in those cases. Structural differences
+        in per-operation fields are allowed when a scalar override broadcasts across
+        every operation.
 
         Args:
             arg_sets: Non-empty sequence of representative kernel argument sequences.
@@ -1657,9 +1659,31 @@ class Kernel(Generic[_R]):
         anchor_backend = anchor.env.backend.name
         anchor_capability = target_device_capability(anchor.env.device)
         advanced_controls_files = self.settings.autotune_search_acf or None
-        anchor_fingerprint = anchor.config_spec.structural_fingerprint(
-            advanced_controls_files=advanced_controls_files
+        broadcastable_per_operation_fields = frozenset(
+            {
+                "indexing",
+                "atomic_indexing",
+                "load_eviction_policies",
+            }
         )
+        scalar_overridden_config_keys = frozenset(
+            key
+            for key, value in (self.settings.autotune_config_overrides or {}).items()
+            if key in broadcastable_per_operation_fields and isinstance(value, str)
+        )
+
+        def effective_fingerprint(
+            bound_kernel: BoundKernel[_R],
+        ) -> tuple[tuple[str | int, ...], ...]:
+            return tuple(
+                field
+                for field in bound_kernel.config_spec.structural_fingerprint(
+                    advanced_controls_files=advanced_controls_files
+                )
+                if field[0] not in scalar_overridden_config_keys
+            )
+
+        anchor_fingerprint = effective_fingerprint(anchor)
         for case_index, (bound_kernel, _) in enumerate(cases):
             if bound_kernel.env.process_group_name is not None:
                 raise exc.InvalidAPIUsage(
@@ -1679,9 +1703,7 @@ class Kernel(Generic[_R]):
                 raise exc.InvalidAPIUsage(
                     "autotune_multi requires every case to have the same device capability"
                 )
-            fingerprint = bound_kernel.config_spec.structural_fingerprint(
-                advanced_controls_files=advanced_controls_files
-            )
+            fingerprint = effective_fingerprint(bound_kernel)
             if fingerprint != anchor_fingerprint:
                 raise exc.InvalidAPIUsage(
                     "autotune_multi requires structurally compatible ConfigSpec "
