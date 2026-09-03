@@ -2615,7 +2615,10 @@ class ConfigSpec:
             "indexing",
             "atomic_indexing",
         ):
-            if not config.get(name):
+            value = config.get(name)
+            if name == "load_eviction_policies" and value == "":
+                continue
+            if not value:
                 config.pop(name, None)
 
         # Remove unsupported keys before setting defaults

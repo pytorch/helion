@@ -44,7 +44,9 @@ class Config(Mapping[str, object]):
         range_flattens: list[bool | None] | None = None,
         static_ranges: list[bool] | None = None,
         pallas_load_buffer_count: list[int] | None = None,
-        load_eviction_policies: list[EvictionPolicyLiteral] | None = None,
+        load_eviction_policies: (
+            EvictionPolicyLiteral | list[EvictionPolicyLiteral] | None
+        ) = None,
         load_cache_modifiers: list[LoadCacheModifierLiteral] | None = None,
         store_cache_modifiers: list[StoreCacheModifierLiteral] | None = None,
         num_warps: int | None = None,
@@ -79,7 +81,9 @@ class Config(Mapping[str, object]):
             pallas_load_buffer_count: Pallas-only load buffer count (1 or 2) for
                 each input tensor. Tensors without an existing DMA route use the
                 ordinary path.
-            load_eviction_policies: Eviction policies for load operations ("", "first", "last").
+            load_eviction_policies: Eviction policies for load operations. A single
+                value applies to every load; a list specifies one value per load.
+                Valid values are "", "first", and "last".
             load_cache_modifiers: Cache modifiers for load operations ("", ".cg").
             store_cache_modifiers: Cache modifiers for store operations ("", ".cs", ".wt").
             num_warps: Number of warps per block.
@@ -343,9 +347,12 @@ class Config(Mapping[str, object]):
         return cast("list[int]", self.config.get("pallas_load_buffer_count", []))
 
     @property
-    def load_eviction_policies(self) -> list[EvictionPolicyLiteral]:
+    def load_eviction_policies(
+        self,
+    ) -> EvictionPolicyLiteral | list[EvictionPolicyLiteral]:
         return cast(
-            "list[EvictionPolicyLiteral]", self.config.get("load_eviction_policies", [])
+            "EvictionPolicyLiteral | list[EvictionPolicyLiteral]",
+            self.config.get("load_eviction_policies", []),
         )
 
     @property
