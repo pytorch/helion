@@ -78,6 +78,10 @@ class TritonBackend(Backend):
         return host_str
 
     def supports_config_key(self, key: str) -> bool:
+        if key == "cross_loop_schedule":
+            from ..._compat import is_hip
+
+            return self.name == "triton" and not is_hip()
         if key in ("load_cache_modifiers", "store_cache_modifiers"):
             return True
         if key == "waves_per_eu":
@@ -475,17 +479,19 @@ class TritonBackend(Backend):
             f"tl.full([{', '.join(shape_dims)}], {value_expr}, {self.dtype_str(dtype)})"
         )
 
-    def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
-        from ..._compat import supports_maxnreg
-
+    def effective_num_warps(self, config: Config) -> int:
         # Workaround for triton bug: warp_specialize requires at least 4 warps
         # See: https://github.com/triton-lang/triton/issues/7354
         num_warps = config.num_warps
         if any(config.range_warp_specializes):
             num_warps = max(4, num_warps)
+        return num_warps
+
+    def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
+        from ..._compat import supports_maxnreg
 
         args = [
-            f"num_warps={num_warps}",
+            f"num_warps={self.effective_num_warps(config)}",
             f"num_stages={config.num_stages}",
             *(["launch_cooperative_grid=True"] if has_barrier else []),
         ] + [
@@ -563,6 +569,17 @@ class TritonBackend(Backend):
                 for tensor, numel in device_fn.triton_remote_copy_scratch_specs
             )
             out.append(f"_remote_copy_scratch_specs=({specs},)")
+        if device_fn.triton_persistent_state_specs:
+            specs = ", ".join(
+                f"({tensor}, {numel}, {dtype})"
+                for tensor, numel, dtype in device_fn.triton_persistent_state_specs
+            )
+            out.append(f"_persistent_state_specs=({specs},)")
+        if device_fn.triton_minimum_resident_programs is not None:
+            out.append(
+                "_minimum_resident_programs="
+                f"{device_fn.triton_minimum_resident_programs}"
+            )
         out.extend(self.launcher_keyword_args(config, has_barrier=has_barrier))
         return out
 

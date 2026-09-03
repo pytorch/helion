@@ -167,6 +167,8 @@ def default_launcher(
     _remote_barrier_signal_slots_per_program: int = 0,
     _remote_barrier_process_group_name: str | None = None,
     _remote_copy_scratch_specs: tuple[tuple[torch.Tensor, int], ...] = (),
+    _persistent_state_specs: tuple[tuple[torch.Tensor, int, torch.dtype], ...] = (),
+    _minimum_resident_programs: int = 0,
     ptx_options: str | None = None,
     launch_cooperative_grid: bool = False,
     **kwargs: dict,
@@ -208,6 +210,26 @@ def default_launcher(
             math.prod(grid) * numel_per_program,
         )
         args = (*args, scratch)
+    if _persistent_state_specs:
+        persistent_state_namespace = (
+            tuple(grid),
+            num_warps,
+            num_stages,
+            ptx_options,
+            launch_cooperative_grid,
+            tuple(sorted((name, repr(value)) for name, value in kwargs.items())),
+            tuple((numel, dtype) for _, numel, dtype in _persistent_state_specs),
+        )
+        for slot, (state_like, numel, dtype) in enumerate(_persistent_state_specs):
+            state = _get_persistent_state(
+                triton_kernel,
+                state_like,
+                persistent_state_namespace,
+                slot,
+                numel,
+                dtype,
+            )
+            args = (*args, state)
     # For both CUDA and MTIA, use the same kernel execution.
     run_kwargs: dict = {
         "grid": grid,
@@ -219,6 +241,20 @@ def default_launcher(
     }
     if ptx_options is not None:
         run_kwargs["ptx_options"] = ptx_options
+    if _minimum_resident_programs:
+        # ``triton_kernel`` is a JITFunction.  Resource information belongs to
+        # its exact compiled specialization, so compile (but do not launch)
+        # that specialization before asking CUDA for its occupancy.
+        compiled_kernel = triton_kernel.run(  # type: ignore[union-attr]
+            *args,
+            **{**run_kwargs, "warmup": True},
+        )
+        _validate_resident_program_capacity(
+            compiled_kernel,
+            args,
+            num_warps=num_warps,
+            required_programs=_minimum_resident_programs,
+        )
     return triton_kernel.run(  # type: ignore[union-attr]
         *args,
         **run_kwargs,
@@ -319,3 +355,84 @@ def _get_remote_copy_scratch(
         )
         cache[key] = scratch
     return scratch
+
+
+def _get_persistent_state(
+    triton_kernel: object,
+    like: torch.Tensor,
+    namespace: tuple[object, ...],
+    slot: int,
+    required_numel: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return stream-local compiler state retained across kernel launches."""
+    if like.device.type != "cuda":
+        raise RuntimeError("persistent Triton state requires a CUDA tensor")
+    stream = torch.cuda.current_stream(like.device)
+    cache = vars(triton_kernel).setdefault("_helion_persistent_state_cache", {})
+    key = (like.device, dtype, stream.cuda_stream, namespace, slot)
+    state = cache.get(key)
+    if state is None or state.numel() < required_numel:
+        state = torch.zeros(required_numel, dtype=dtype, device=like.device)
+        cache[key] = state
+    return state
+
+
+def _validate_resident_program_capacity(
+    compiled_kernel: object,
+    args: tuple[object, ...],
+    *,
+    num_warps: int,
+    required_programs: int,
+) -> None:
+    """Reject a polling schedule whose required CTA cohort cannot be resident."""
+    import importlib
+
+    tensor = next((arg for arg in args if isinstance(arg, torch.Tensor)), None)
+    if tensor is None or tensor.device.type != "cuda":
+        raise RuntimeError("cross-loop residency checks require a CUDA tensor")
+
+    if compiled_kernel is None:
+        raise RuntimeError("unable to compile cross-loop scheduled kernel")
+
+    # Accessing ``run`` initializes Triton's module/function handles without
+    # launching the kernel.  Cache the exact driver result on the compiled
+    # specialization because this wrapper is also called during graph capture.
+    _run = compiled_kernel.run  # type: ignore[attr-defined]
+    function = getattr(compiled_kernel, "function", None)
+    metadata = getattr(compiled_kernel, "metadata", None)
+    shared = getattr(metadata, "shared", None)
+    if function is None or not isinstance(shared, int):
+        raise RuntimeError("unable to query cross-loop kernel occupancy")
+
+    device = tensor.device
+    cache = vars(compiled_kernel).setdefault(
+        "_helion_resident_program_capacity_cache", {}
+    )
+    key = (device, num_warps, shared)
+    capacity = cache.get(key)
+    if capacity is None:
+        cuda_driver = importlib.import_module("cuda.bindings.driver")
+        with torch.cuda.device(device):
+            error, blocks_per_sm = (
+                cuda_driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                    cuda_driver.CUfunction(int(function)),
+                    num_warps * 32,
+                    shared,
+                )
+            )
+        if error != cuda_driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(
+                f"CUDA occupancy query failed for cross-loop kernel: {error}"
+            )
+        properties = torch.cuda.get_device_properties(device)
+        capacity = int(blocks_per_sm) * int(properties.multi_processor_count)
+        cache[key] = capacity
+    if required_programs > capacity:
+        raise RuntimeError(
+            "Cross-loop scheduling requires "
+            f"{required_programs} concurrently resident programs, but this "
+            f"kernel/device can residently execute only {capacity}. Choose a "
+            "lower-resource configuration, a smaller ready prefix, or a "
+            "root barrier."
+        )

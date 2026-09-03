@@ -48,7 +48,6 @@ if TYPE_CHECKING:
     from ..runtime import Config
     from .device_ir import GraphInfo
     from .host_function import HostFunction
-    from .loop_dependency_checker import LoopDependencyChecker
     from .pallas.compact_worklist import ResidentPrepHoist
     from .pallas.dma import DmaResources
     from .tile_strategy import DeviceLoopOrGridState
@@ -248,10 +247,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         if loops := self.active_device_loops[block_idx]:
             return loops[-1].strategy.mask_var(block_idx)
         return None
-
-    def _phase_checker(self, root_id: int) -> LoopDependencyChecker:
-        phase_idx = self.host_function.device_ir.phase_for_root(root_id)
-        return self.host_function.device_ir.phases[phase_idx].loop_dependency_checker
 
     def _compute_inter_loop_barriers(self) -> None:
         """Walk every codegen graph; for each pair of consecutive sibling
@@ -1065,9 +1060,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             assert not node.orelse
 
             assert node._root_id is not None
-            # Loop dependency checks were already run during lowering; phase checker kept for symmetry/debug.
-            self._phase_checker(node._root_id)
-
             if len(self.host_function.device_ir.root_ids) == 1:
                 body = self.device_function.body
             else:
@@ -1379,10 +1371,16 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
     def host_dead_code_elimination(self) -> None:
         dce_vars: OrderedSet[str] = OrderedSet()
+        allow_compiler_shape_helpers = (
+            self.device_function.config.cross_loop_schedule == "static_pipeline"
+        )
         for stmt in self.host_statements:
             if (
                 isinstance(stmt, ast.Assign)
-                and definitely_does_not_have_side_effects(stmt.value)
+                and definitely_does_not_have_side_effects(
+                    stmt.value,
+                    allow_compiler_shape_helpers=allow_compiler_shape_helpers,
+                )
                 and all(isinstance(name, ast.Name) for name in stmt.targets)
             ):
                 for name in stmt.targets:

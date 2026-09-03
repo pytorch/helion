@@ -7,8 +7,11 @@ from typing import Literal
 from unittest import mock
 
 import sympy
+import torch
 
+import helion
 from helion import exc
+from helion._compiler.device_ir_analysis import DeviceIRAnalysis
 from helion._compiler.tile_dependency import AllocationRegion
 from helion._compiler.tile_dependency import CoordinateDomain
 from helion._compiler.tile_dependency import CoordinateRelation
@@ -24,8 +27,26 @@ from helion._compiler.tile_dependency import build_tile_dependency_graph
 from helion._compiler.tile_dependency import coordinate_axis_symbol
 from helion._compiler.tile_dependency import instantiate_coordinate_domains
 from helion._compiler.tile_dependency import instantiate_symbolic_dependencies
+from helion._compiler.tile_dependency import owner_roots_by_graph_id
 from helion._compiler.tile_dependency import pid_task_order
+from helion._testing import DEVICE
 from helion._testing import TestCase
+from helion._testing import skipIfNotCUDA
+from helion._testing import skipIfRefEager
+import helion.language as hl
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def cartesian_affine_stage(x: torch.Tensor) -> torch.Tensor:
+    batch, width = x.size()
+    out = torch.empty_like(x)
+
+    for tile_batch, tile_width in hl.tile([batch, width]):
+        out[tile_batch, tile_width] = x[tile_batch, tile_width] + 1
+    return out
 
 
 def _axis_geometry(
@@ -182,6 +203,15 @@ class TestTileDependency(TestCase):
                 (_access(0, root=0, allocation_id=-1, kind="store"),),
                 [[0], [1]],
             )
+
+    def test_unresolved_allocation_is_allowed_across_source_phases(self) -> None:
+        plan = build_tile_dependency_graph(
+            (_access(0, root=0, allocation_id=-1, kind="store"),),
+            [[0], [1]],
+            root_phases=(0, 1),
+        )
+
+        self.assertEqual(plan.edges, ())
 
     def test_coordinate_domain_separates_geometry_from_linearization_order(
         self,
@@ -946,6 +976,53 @@ class TestTileDependency(TestCase):
                 for offset in range(2)
             )
             self.assertEqual(relation.targets(consumer_task), expected)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("compiled DeviceIR is unavailable in ref eager mode")
+    def test_shared_device_graph_preserves_every_root_owner(self) -> None:
+        x = torch.empty((2, 64), device=DEVICE, dtype=torch.float32)
+        bound = cartesian_affine_stage.bind((x,))
+        assert bound.host_function is not None
+        device_ir = bound.host_function.device_ir
+        shared_graph_id = device_ir.root_ids[0]
+        shared_family = device_ir.task_families[0]
+        shared_grid_block_ids = device_ir.grid_block_ids[0]
+        original_root_ids = device_ir.root_ids
+        original_task_families = device_ir.task_families
+        original_grid_block_ids = device_ir.grid_block_ids
+        try:
+            device_ir.root_ids = [shared_graph_id, shared_graph_id]
+            device_ir.task_families = [shared_family, shared_family]
+            device_ir.grid_block_ids = [shared_grid_block_ids, shared_grid_block_ids]
+            owners = owner_roots_by_graph_id(device_ir)
+            self.assertEqual(owners[shared_graph_id], (0, 1))
+            with bound.env, bound.host_function:
+                analysis = DeviceIRAnalysis.build(device_ir, bound.env)
+                accesses = analysis.tile_accesses(
+                    device_ir,
+                    bound.env,
+                    bound.host_function,
+                )
+            self.assertEqual(
+                sorted((access.root, access.kind) for access in accesses),
+                [(0, "load"), (0, "store"), (1, "load"), (1, "store")],
+            )
+            dependency_graph = build_tile_dependency_graph(
+                accesses,
+                device_ir=device_ir,
+            )
+            self.assertTrue(dependency_graph.edges_between(0, 1))
+            self.assertTrue(
+                all(
+                    all(site.root == access.root for site in sites)
+                    for access in dependency_graph.accesses
+                    for sites in (dependency_graph.sites_for_access(access.access_id),)
+                )
+            )
+        finally:
+            device_ir.root_ids = original_root_ids
+            device_ir.task_families = original_task_families
+            device_ir.grid_block_ids = original_grid_block_ids
 
     def test_noninjective_regions_are_not_coordinate_disjoint(self) -> None:
         for layout, left_interval, right_interval, second_dimension in (

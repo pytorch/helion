@@ -61,7 +61,6 @@ from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
-from .loop_dependency_checker import LoopDependencyChecker
 from .matmul_utils import tensor_matmul_replacement
 from .matmul_utils import torch_matmul_replacement
 from .node_masking import defer_pallas_load_masks
@@ -99,6 +98,7 @@ if TYPE_CHECKING:
     from .cute.layout import CuTeGridExecutionPlan
     from .device_ir_analysis import DeviceIRAnalysis
     from .tile_dependency import TaskFamily
+    from .tile_dependency import TileDependencyGraph
 
     class _TLS(Protocol):
         device_irs: list[DeviceIR]
@@ -372,10 +372,20 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         # pyrefly: ignore [missing-attribute]
         state.codegen._cute_active_graph_info = self
         try:
+            device_loop = state.device_function.tile_strategy.codegen_device_loop(
+                state, self.block_ids
+            )
+            if state.fx_node is not None:
+                from .tile_dependency import TILE_DEPENDENCY_SITE_ID_ATTR
+                from .tile_dependency import TILE_DEPENDENCY_SITE_IDS_META
+
+                site_ids = dict(
+                    state.fx_node.meta.get(TILE_DEPENDENCY_SITE_IDS_META, ())
+                )
+                if (site_id := site_ids.get(0)) is not None:
+                    setattr(device_loop.for_node, TILE_DEPENDENCY_SITE_ID_ATTR, site_id)
             with state.codegen.add_device_loop(
-                state.device_function.tile_strategy.codegen_device_loop(
-                    state, self.block_ids
-                ),
+                device_loop,
                 needs_barrier_before=self.needs_barrier_before,
             ):
                 return codegen_call_with_graph(
@@ -689,9 +699,6 @@ class RolledReductionInfo(NamedTuple):
 class KernelPhase:
     roots: list[int]  # store root indices
     root_nodes: list[ast.For]
-    loop_dependency_checker: LoopDependencyChecker = dataclasses.field(
-        default_factory=LoopDependencyChecker
-    )
 
 
 def _tensor_to_inter_loop_rw_name(host: HostFunction, t: torch.Tensor) -> str | None:
@@ -803,6 +810,8 @@ class DeviceIR:
         self.root_ids: list[int] = []
         self.rolled_reductions: list[RolledReductionInfo] = []
         self.phases: list[KernelPhase] = []
+        self.implicit_dependency_starts: frozenset[int] = frozenset()
+        self.tile_dependency_graph: TileDependencyGraph | None = None
         self.task_families: list[TaskFamily] = []
         self.grid_block_ids: list[list[int]] = []
         self.noncanonical_task_origin_block_ids: set[int] = set()
@@ -1685,7 +1694,12 @@ class WalkDeviceAST(NodeVisitor):
 
     @staticmethod
     def _rw_names(rw: ReadWrites) -> tuple[str, ...]:
-        ordered = dict.fromkeys([*rw.reads.keys(), *rw.writes.keys()])
+        ordered = dict.fromkeys(
+            [
+                *(name for name in rw.reads if name not in rw.augassign_reads),
+                *rw.writes.keys(),
+            ]
+        )
         return tuple(ordered)
 
     def _trace_graph(
@@ -1970,6 +1984,19 @@ class WalkDeviceAST(NodeVisitor):
             for var in iter_vars:
                 assert isinstance(var, (TileIndexType, GridIndexType))
                 block_ids.append(var.block_id)
+            begin_values = begin if isinstance(begin, (list, tuple)) else [begin]
+            step_values = (
+                step if isinstance(step, (list, tuple)) else [step] * len(block_ids)
+            )
+            for block_id, begin_value, step_value in zip(
+                block_ids, begin_values, step_values, strict=True
+            ):
+                if (
+                    not isinstance(begin_value, int)
+                    or begin_value != 0
+                    or step_value not in (None, 1)
+                ):
+                    self.device_ir.noncanonical_task_origin_block_ids.add(block_id)
 
             host_reads, host_writes = rw.read_and_write_name_frozensets()
             graph_idx, outputs = self._trace_graph(
@@ -2273,7 +2300,9 @@ class WalkDeviceAST(NodeVisitor):
             return self.scope[node.id]
         assert isinstance(node, ExtendedAST)
         type_info = node._type_info
-        assert type_info is not None and type_info.origin.is_host()
+        assert type_info is not None
+        if type_info.origin.is_device():
+            raise exc.CrossRootDeviceValue(node.id)
         try:
             return type_info.proxy()
         except NotImplementedError:
@@ -2658,6 +2687,54 @@ class LiftTensorArgs:
         return result
 
 
+def _literal_sequence_is(
+    expr: ast.expr,
+    *,
+    rank: int,
+    value: int,
+) -> bool:
+    if isinstance(expr, ast.Constant) and expr.value == value:
+        return True
+    if not isinstance(expr, (ast.List, ast.Tuple)) or len(expr.elts) != rank:
+        return False
+    return all(
+        isinstance(item, ast.Constant) and item.value == value for item in expr.elts
+    )
+
+
+def _root_loop_has_canonical_task_origin(
+    iter_expr: ast.expr,
+    rank: int,
+    *,
+    supports_step: bool,
+) -> bool:
+    """Return whether local PIDs map to zero-based, unit-stride coordinates."""
+    if not isinstance(iter_expr, ast.Call) or not iter_expr.args:
+        return False
+    if len(iter_expr.args) == 1 or (
+        len(iter_expr.args) >= 2
+        and isinstance(iter_expr.args[1], ast.Constant)
+        and iter_expr.args[1].value is None
+    ):
+        zero_start = True
+    else:
+        zero_start = _literal_sequence_is(iter_expr.args[0], rank=rank, value=0)
+    if not zero_start:
+        return False
+    if not supports_step:
+        return True
+
+    step = (
+        iter_expr.args[2]
+        if len(iter_expr.args) >= 3
+        else next(
+            (keyword.value for keyword in iter_expr.keywords if keyword.arg == "step"),
+            None,
+        )
+    )
+    return step is None or _literal_sequence_is(step, rank=rank, value=1)
+
+
 class WalkHostAST(NodeVisitor):
     def __init__(self, device_ir: DeviceIR) -> None:
         super().__init__()
@@ -2666,6 +2743,16 @@ class WalkHostAST(NodeVisitor):
         self.current_phase_roots: list[int] = []
         self.phases: list[KernelPhase] = []
         self.root_nodes: list[ast.For] = []
+
+    def _flush_current_phase(self) -> None:
+        assert self.current_phase_roots
+        self.phases.append(
+            KernelPhase(
+                roots=self.current_phase_roots,
+                root_nodes=[self.root_nodes[r] for r in self.current_phase_roots],
+            )
+        )
+        self.current_phase_roots = []
 
     def visit_For(self, node: ast.For) -> None:
         assert isinstance(node, ExtendedAST)
@@ -2684,6 +2771,41 @@ class WalkHostAST(NodeVisitor):
                 # pyrefly: ignore [missing-attribute]
                 block_ids = [inner.block_id]
             self.device_ir.grid_block_ids.append(block_ids)
+            supports_step = (
+                all(isinstance(value, GridIndexType) for value in inner.unpack())
+                if isinstance(inner, SequenceType)
+                else isinstance(inner, GridIndexType)
+            )
+            canonical_origin = _root_loop_has_canonical_task_origin(
+                node.iter,
+                len(block_ids),
+                supports_step=supports_step,
+            )
+            if not canonical_origin:
+                self.device_ir.noncanonical_task_origin_block_ids.update(block_ids)
+            from .tile_dependency import TaskAxis
+            from .tile_dependency import TaskFamily
+
+            env = CompileEnvironment.current()
+            self.device_ir.task_families.append(
+                TaskFamily(
+                    axes=tuple(
+                        TaskAxis(
+                            block_id=block_id,
+                            extent=(
+                                env.block_sizes[block_id].numel
+                                if isinstance(
+                                    env.block_sizes[block_id].size,
+                                    (int, torch.SymInt),
+                                )
+                                else None
+                            ),
+                            canonical_origin=canonical_origin,
+                        )
+                        for block_id in block_ids
+                    ),
+                )
+            )
             # store root index (position) not graph id
             self.root_nodes.append(node)
             self.current_phase_roots.append(len(self.device_ir.root_ids) - 1)
@@ -2702,25 +2824,13 @@ class WalkHostAST(NodeVisitor):
         if is_barrier:
             if self.root_index == 0 or not self.current_phase_roots:
                 raise exc.BarrierOnlyAllowedAtTopLevel
-            self.phases.append(
-                KernelPhase(
-                    roots=self.current_phase_roots,
-                    root_nodes=[self.root_nodes[r] for r in self.current_phase_roots],
-                )
-            )
-            self.current_phase_roots = []
+            self._flush_current_phase()
             return
         self.generic_visit(node)
 
     def flush_phases(self) -> None:
         if self.current_phase_roots:
-            self.phases.append(
-                KernelPhase(
-                    roots=self.current_phase_roots,
-                    root_nodes=[self.root_nodes[r] for r in self.current_phase_roots],
-                )
-            )
-            self.current_phase_roots = []
+            self._flush_current_phase()
 
 
 def _indexing_uses_tensor_descriptor(
@@ -2909,6 +3019,63 @@ def _register_cute_lane_vector_width_specs(config_spec: ConfigSpec) -> None:
             existing_layouts.add(block_id)
 
 
+def _root_phases(phases: list[KernelPhase], root_count: int) -> tuple[int, ...]:
+    result = [-1] * root_count
+    for phase_index, phase in enumerate(phases):
+        for root in phase.roots:
+            result[root] = phase_index
+    assert all(phase >= 0 for phase in result)
+    return tuple(result)
+
+
+def _install_dependency_phases(
+    device_ir: DeviceIR,
+    root_nodes: list[ast.For],
+    dependency_graph: TileDependencyGraph,
+    source_phase_starts: frozenset[int],
+) -> None:
+    if dependency_graph.edges and source_phase_starts:
+        raise exc.CrossLoopSchedulingError(
+            "mixing explicit hl.barrier() phases with implicit "
+            "tile-dependency stages is not supported yet"
+        )
+
+    predecessors_by_consumer: list[list[int]] = [[] for _ in device_ir.task_families]
+    for edge in dependency_graph.edges:
+        predecessors_by_consumer[edge.consumer_root].append(edge.producer_root)
+    stage_by_root: list[int] = []
+    implicit_starts: set[int] = set()
+    stage = 0
+    for root in range(len(device_ir.task_families)):
+        if root in source_phase_starts:
+            stage += 1
+        if any(
+            stage_by_root[producer] == stage
+            for producer in predecessors_by_consumer[root]
+        ):
+            implicit_starts.add(root)
+            stage += 1
+        stage_by_root.append(stage)
+
+    device_ir.implicit_dependency_starts = frozenset(implicit_starts)
+    stage_count = stage_by_root[-1] + 1 if stage_by_root else 0
+    roots_by_stage = [[] for _ in range(stage_count)]
+    for root, root_stage in enumerate(stage_by_root):
+        roots_by_stage[root_stage].append(root)
+    device_ir.phases = [
+        KernelPhase(
+            roots=roots,
+            root_nodes=[root_nodes[root] for root in roots],
+        )
+        for roots in roots_by_stage
+    ]
+    for phase_index, phase in enumerate(device_ir.phases):
+        for root in phase.roots:
+            graph_info = device_ir.graphs[device_ir.root_ids[root]]
+            assert isinstance(graph_info, RootGraphInfo)
+            graph_info.phase_index = phase_index
+
+
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:
     device_ir = DeviceIR()
     device_ir.host_function = func
@@ -2918,11 +3085,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             visitor.visit(stmt)
         visitor.flush_phases()
         device_ir.phases = visitor.phases
-        # Run dependency checks once, per phase, so codegen does not redo it per-config.
-        for phase in device_ir.phases:
-            checker = phase.loop_dependency_checker
-            for loop_node in phase.root_nodes:
-                checker.register_loop(loop_node)
+        source_root_phases = _root_phases(device_ir.phases, len(device_ir.root_ids))
+        source_phase_starts = frozenset(
+            phase.roots[0] for phase in device_ir.phases[1:]
+        )
         for phase_idx, phase in enumerate(device_ir.phases):
             for ridx in phase.roots:
                 graph_info = device_ir.graphs[device_ir.root_ids[ridx]]
@@ -3170,7 +3336,41 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         # Collect per-load/store metadata so heuristics can map each Config.indexing
         # slot to its graph op.
         memory_op_facts = analysis.memory_op_facts(env, func)
+        tile_accesses = analysis.tile_accesses(device_ir, env, func)
         config_spec.memory_op_facts = memory_op_facts
+        from .tile_dependency import build_tile_dependency_graph
+
+        if len(device_ir.task_families) > 1:
+            device_ir.tile_dependency_graph = build_tile_dependency_graph(
+                tile_accesses,
+                device_ir=device_ir,
+                root_phases=source_root_phases,
+            )
+            _install_dependency_phases(
+                device_ir,
+                visitor.root_nodes,
+                device_ir.tile_dependency_graph,
+                source_phase_starts,
+            )
+            if device_ir.implicit_dependency_starts:
+                if env.device.type != "cuda" or not config_spec.supports_config_key(
+                    "cross_loop_schedule"
+                ):
+                    edge = next(
+                        edge
+                        for edge in device_ir.tile_dependency_graph.edges
+                        if edge.consumer_root in device_ir.implicit_dependency_starts
+                    )
+                    names = sorted(edge.tensor_names)
+                    raise exc.LoopDependencyError(
+                        names[0] if names else "tensor allocation"
+                    )
+                reason = (
+                    "tile dependencies require a persistent blocked kernel for "
+                    "tile-dependency scheduling"
+                )
+                env.require_persistent_blocked(reason)
+                config_spec.enable_cross_loop_schedule()
         if config_spec.supports_config_key("pallas_load_buffer_count"):
             config_spec.pallas_load_buffer_count.length = len(
                 LiftTensorArgs(dict(func.params.arguments)).get_tensor_args()

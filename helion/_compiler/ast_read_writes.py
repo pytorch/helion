@@ -18,7 +18,11 @@ class _ReadWriteVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         super().__init__()
         self.rw = ReadWrites(
-            collections.Counter(), collections.Counter(), collections.Counter()
+            collections.Counter(),
+            collections.Counter(),
+            collections.Counter(),
+            set(),
+            set(),
         )
 
     def _update(self, name: str, ctx: ast.expr_context) -> None:
@@ -38,12 +42,12 @@ class _ReadWriteVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
-        # Detect atomic operations (hl.atomic_*) as writes to their first argument.
-        # e.g. hl.atomic_add(x, [i], value) means x is mutated in-place.
+        # Detect explicit memory/atomic operations as writes to their first
+        # argument.  e.g. hl.store(x, [i], value) and hl.atomic_add(x, ...).
         func = node.func
         if (
             isinstance(func, ast.Attribute)
-            and func.attr.startswith("atomic_")
+            and (func.attr == "store" or func.attr.startswith("atomic_"))
             and isinstance(func.value, ast.Name)
             and node.args
         ):
@@ -51,6 +55,18 @@ class _ReadWriteVisitor(ast.NodeVisitor):
             if isinstance(first_arg, ast.Name):
                 self.rw.writes[first_arg.id] += 1
                 self.rw.inplace_writes[first_arg.id] += 1
+                if func.attr.startswith("atomic_"):
+                    self.rw.atomic_reads.add(first_arg.id)
+        self.generic_visit(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        target = node.target
+        if isinstance(target, ast.Name):
+            self.rw.reads[target.id] += 1
+            self.rw.augassign_reads.add(target.id)
+        elif isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+            self.rw.reads[target.value.id] += 1
+            self.rw.augassign_reads.add(target.value.id)
         self.generic_visit(node)
 
     def visit_For(self, node: ast.For) -> None:
@@ -70,6 +86,13 @@ class ReadWrites(typing.NamedTuple):
     # methods inside kernels (e.g. x.copy_(), x.fill_()), the visitor should
     # be updated to detect those as well.
     inplace_writes: dict[str, int]
+    # AugAssign targets are reads semantically, but branch argument ordering
+    # historically placed them with writes. Keep that ordering stable while
+    # exposing the read to analyses that consume ``reads`` directly.
+    augassign_reads: set[str]
+    # Atomic operations are read-modify-writes even when the generic Name walk
+    # sees only the synthetic first-argument read paired with the in-place write.
+    atomic_reads: set[str]
 
     def __iter__(self) -> typing.Iterator[str]:
         return iter({**self.reads, **self.writes})
@@ -244,6 +267,10 @@ class _PureExpressionVisitor(ast.NodeVisitor):
     AST visitor that determines if an expression is guaranteed to be pure.
     """
 
+    def __init__(self, *, allow_compiler_shape_helpers: bool = False) -> None:
+        super().__init__()
+        self.allow_compiler_shape_helpers = allow_compiler_shape_helpers
+
     def generic_visit(self, node: ast.AST) -> None:
         # Anything without a specific visitor is not pure
         raise _NotPureException
@@ -284,12 +311,26 @@ class _PureExpressionVisitor(ast.NodeVisitor):
         self.visit(node.value)
 
     def visit_Call(self, node: ast.Call) -> None:
-        # Math methods are all pure, so allow them
-        if not (
+        # Math methods and compiler-emitted integer shape helpers are pure.
+        is_math = (
             isinstance(node.func, ast.Attribute)
             and isinstance(node.func.value, ast.Name)
             and node.func.value.id == "math"
-        ):
+        )
+        is_triton_shape_helper = (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "triton"
+            and node.func.attr in {"cdiv", "next_power_of_2"}
+        )
+        is_backend_shape_helper = isinstance(node.func, ast.Name) and node.func.id in {
+            "_cdiv",
+            "_next_power_of_2",
+        }
+        is_compiler_shape_helper = (
+            is_triton_shape_helper or is_backend_shape_helper
+        ) and self.allow_compiler_shape_helpers
+        if not (is_math or is_compiler_shape_helper):
             raise _NotPureException
 
         # Recurse into children except for func
@@ -300,9 +341,15 @@ class _PureExpressionVisitor(ast.NodeVisitor):
             self.visit(keyword.value)
 
 
-def definitely_does_not_have_side_effects(expr: ast.expr) -> bool:
+def definitely_does_not_have_side_effects(
+    expr: ast.expr,
+    *,
+    allow_compiler_shape_helpers: bool = False,
+) -> bool:
     try:
-        _PureExpressionVisitor().visit(expr)
+        _PureExpressionVisitor(
+            allow_compiler_shape_helpers=allow_compiler_shape_helpers
+        ).visit(expr)
         return True
     except _NotPureException:
         return False

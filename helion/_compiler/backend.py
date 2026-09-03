@@ -908,6 +908,10 @@ class Backend(abc.ABC):
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         return []
 
+    def effective_num_warps(self, config: Config) -> int:
+        """Return the warp count the backend will actually launch."""
+        return config.num_warps
+
     def customize_ast(self, hf: HostFunction) -> None:
         """Run backend-specific AST customizations.
 

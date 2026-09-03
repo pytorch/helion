@@ -6,7 +6,9 @@ from typing import Literal
 from unittest import mock
 
 import sympy
+import torch
 
+import helion
 from helion._compiler.cross_loop_scheduler import FinalArrivalContinuation
 from helion._compiler.cross_loop_scheduler import ReadinessConsumer
 from helion._compiler.cross_loop_scheduler import ReadinessCounterPlan
@@ -47,7 +49,50 @@ from helion._compiler.tile_dependency import coordinate_axis_symbol
 from helion._compiler.tile_dependency import instantiate_coordinate_domains
 from helion._compiler.tile_dependency import instantiate_symbolic_dependencies
 from helion._compiler.tile_dependency import pid_task_order
+from helion._testing import DEVICE
 from helion._testing import TestCase
+from helion._testing import skipIfNotCUDA
+from helion._testing import skipIfNotTriton
+from helion._testing import skipIfRefEager
+import helion.language as hl
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def streamed_singleton_reduction(x: torch.Tensor) -> torch.Tensor:
+    batch, width = x.size()
+    tmp = torch.empty_like(x)
+    out = torch.empty((batch,), dtype=torch.float32, device=x.device)
+
+    for producer_batch, producer_width in hl.tile([batch, width]):
+        tmp[producer_batch, producer_width] = x[producer_batch, producer_width] + 1
+    for consumer_batch in hl.tile(batch, block_size=1):
+        acc = hl.zeros([consumer_batch], dtype=torch.float32)
+        for reduction_width in hl.tile(width, block_size=16):
+            acc = acc + torch.sum(
+                tmp[consumer_batch, reduction_width].to(torch.float32), dim=-1
+            )
+        out[consumer_batch] = acc + tmp[consumer_batch, 0].to(torch.float32)
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def nested_store_chain(x: torch.Tensor) -> torch.Tensor:
+    batch, width = x.size()
+    tmp = torch.empty_like(x)
+    out = torch.empty_like(x)
+
+    for producer_batch in hl.tile(batch, block_size=1):
+        for producer_width in hl.tile(width, block_size=16):
+            tmp[producer_batch, producer_width] = x[producer_batch, producer_width] + 1
+    for consumer_batch, consumer_width in hl.tile([batch, width], block_size=[1, 16]):
+        out[consumer_batch, consumer_width] = tmp[consumer_batch, consumer_width] * 2
+    return out
 
 
 def readiness_consumer_source_order(
@@ -1079,6 +1124,157 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(len(unrelated), 1)
         self.assertEqual(unrelated[0].readiness_key_count, 2)
         self.assertIsNone(unrelated[0].root_barrier_producer_root)
+
+    @skipIfNotCUDA()
+    @skipIfNotTriton("cross-loop scheduling is currently Triton-only")
+    @skipIfRefEager("compiled DeviceIR is unavailable in ref eager mode")
+    def test_device_ir_sites_preserve_nested_producer_and_consumer_axes(
+        self,
+    ) -> None:
+        x = torch.empty((2, 64), device=DEVICE, dtype=torch.float32)
+
+        producer_ir = nested_store_chain.bind((x,)).host_function.device_ir
+        assert producer_ir.tile_dependency_graph is not None
+        producer_graph = producer_ir.tile_dependency_graph
+        producer_store = next(
+            access
+            for access in producer_graph.accesses
+            if access.root == 0 and access.kind == "store"
+        )
+        (producer_site,) = producer_graph.sites_for_access(producer_store.access_id)
+        self.assertEqual(producer_site.kind, "loop")
+        self.assertEqual(len(producer_site.callsite_path), 1)
+        self.assertEqual(
+            producer_site.logical_axis_order,
+            (
+                *producer_ir.task_families[0].logical_axis_order,
+                *producer_site.local_axis_order,
+            ),
+        )
+        self.assertTrue(producer_site.executes_unconditionally)
+        self.assertTrue(producer_site.can_split_loop)
+
+        producer_outer_axis = producer_ir.task_families[0].logical_axis_order[0]
+        consumer_batch_axis, consumer_width_axis = producer_ir.task_families[
+            1
+        ].logical_axis_order
+        producer_domains = (
+            _domain((producer_outer_axis, 2, 1)),
+            _domain((consumer_batch_axis, 2, 1), (consumer_width_axis, 4, 16)),
+        )
+        producer_axis_geometry = {
+            producer_outer_axis: (2, 1),
+            producer_site.local_axis_order[0]: (4, 16),
+            consumer_batch_axis: (2, 1),
+            consumer_width_axis: (4, 16),
+        }
+        producer_events = _configured_readiness_graph(
+            producer_graph,
+            root_domains=producer_domains,
+            axis_geometry=producer_axis_geometry,
+        )
+        producer_event = next(
+            event
+            for event in producer_events.events
+            if any(
+                readiness_producer.producer_site_id == producer_site.site_id
+                for readiness_producer in event.producers
+            )
+        )
+        self.assertEqual(producer_event.readiness_key_count, 8)
+        self.assertEqual(
+            _expected_arrivals(
+                producer_event.readiness_key_domain, producer_event.producers
+            ),
+            (1,) * 8,
+        )
+        self.assertEqual(producer_event.consumers[0].consumer_site_id, None)
+
+        synchronous_events = _configured_readiness_graph(
+            producer_graph,
+            root_domains=producer_domains,
+            axis_geometry=producer_axis_geometry,
+            publishable_site_ids=frozenset(),
+        )
+        self.assertFalse(
+            any(
+                readiness_producer.producer_site_id is not None
+                for event in synchronous_events.events
+                for readiness_producer in event.producers
+            )
+        )
+
+        consumer_ir = streamed_singleton_reduction.bind((x,)).host_function.device_ir
+        assert consumer_ir.tile_dependency_graph is not None
+        consumer_graph = consumer_ir.tile_dependency_graph
+        consumer_load = next(
+            access
+            for access in consumer_graph.accesses
+            if access.root == 1
+            and access.kind == "load"
+            and any(
+                site.kind == "loop"
+                for site in consumer_graph.sites_for_access(access.access_id)
+            )
+        )
+        (consumer_site,) = consumer_graph.sites_for_access(consumer_load.access_id)
+        self.assertEqual(consumer_site.kind, "loop")
+        self.assertEqual(len(consumer_site.callsite_path), 1)
+        self.assertEqual(
+            consumer_site.logical_axis_order,
+            (
+                *consumer_ir.task_families[1].logical_axis_order,
+                *consumer_site.local_axis_order,
+            ),
+        )
+        self.assertTrue(consumer_site.executes_unconditionally)
+        self.assertTrue(consumer_site.can_split_loop)
+
+        producer_batch_axis, producer_width_axis = consumer_ir.task_families[
+            0
+        ].logical_axis_order
+        consumer_outer_axis = consumer_ir.task_families[1].logical_axis_order[0]
+        consumer_domains = (
+            _domain((producer_batch_axis, 2, 1), (producer_width_axis, 4, 16)),
+            _domain((consumer_outer_axis, 2, 1)),
+        )
+        consumer_axis_geometry = {
+            producer_batch_axis: (2, 1),
+            producer_width_axis: (4, 16),
+            consumer_outer_axis: (2, 1),
+            consumer_site.local_axis_order[0]: (4, 16),
+        }
+        consumer_events = _configured_readiness_graph(
+            consumer_graph,
+            root_domains=consumer_domains,
+            axis_geometry=consumer_axis_geometry,
+        )
+        nested_event = next(
+            event
+            for event in consumer_events.events
+            if any(
+                readiness_consumer.consumer_site_id == consumer_site.site_id
+                for readiness_consumer in event.consumers
+            )
+        )
+        self.assertEqual(nested_event.readiness_key_count, 8)
+        self.assertEqual(
+            _expected_arrivals(
+                nested_event.readiness_key_domain, nested_event.producers
+            ),
+            (1,) * 8,
+        )
+        (nested_keys_by_consumer,) = nested_event.consumers
+        nested_keys = nested_keys_by_consumer.keys_by_consumer.materialize(
+            source_axis_order=readiness_consumer_source_order(
+                consumer_events, nested_keys_by_consumer
+            )
+        )
+        self.assertTrue(all(len(keys) == 1 for keys in nested_keys))
+        self.assertEqual(
+            {next(iter(keys)) for keys in nested_keys},
+            set(range(8)),
+        )
 
     def test_semantic_readiness_graph_composes_arbitrary_chain_depth(self) -> None:
         graph = _dependency_graph(

@@ -4351,7 +4351,7 @@ def build_tile_dependency_graph(
     device_ir: DeviceIR | None = None,
     task_families: tuple[TaskFamily, ...] | None = None,
     root_phases: tuple[int, ...] | None = None,
-    noncanonical_task_origin_block_ids: frozenset[int] = frozenset(),
+    noncanonical_task_origin_block_ids: frozenset[int] | None = None,
 ) -> TileDependencyGraph:
     """Build the minimal source-ordered allocation hazard graph.
 
@@ -4360,8 +4360,15 @@ def build_tile_dependency_graph(
     task readiness for the strict affine subset. Anything else remains a
     root-barrier dependency.
     """
-    if task_families is None and device_ir is not None:
-        task_families = tuple(device_ir.task_families)
+    if device_ir is not None:
+        if task_families is None:
+            task_families = tuple(device_ir.task_families)
+        if noncanonical_task_origin_block_ids is None:
+            noncanonical_task_origin_block_ids = frozenset(
+                device_ir.noncanonical_task_origin_block_ids
+            )
+    if noncanonical_task_origin_block_ids is None:
+        noncanonical_task_origin_block_ids = frozenset()
     if task_families is None:
         if grid_block_ids is None:
             raise TypeError(
@@ -4393,8 +4400,11 @@ def build_tile_dependency_graph(
     elif len(root_phases) != root_count:
         raise ValueError("root_phases must have one entry per task family")
     grid_block_ids = [list(family.logical_axis_order) for family in task_families]
+    roots_per_phase = {phase: root_phases.count(phase) for phase in set(root_phases)}
     if root_count > 1 and any(
-        0 <= access.root < root_count and access.allocation_id < 0
+        0 <= access.root < root_count
+        and access.allocation_id < 0
+        and roots_per_phase[root_phases[access.root]] > 1
         for access in accesses
     ):
         raise exc.CrossLoopSchedulingError(
