@@ -1124,31 +1124,6 @@ class DeviceIR:
         # non-reduction tile slots after them (keeps the rdim slot at index 0).
         if env.backend_name == "cute":
             self._register_cute_tile_vec_slots(env)
-            self._scan_cute_transcendentals(env)
-
-    def _scan_cute_transcendentals(self, env: CompileEnvironment) -> None:
-        """Set ``config_spec.cute_has_transcendentals`` when any device graph
-        contains a transcendental op — gates the ``cute_fastmath`` knob so
-        FMA-only kernels don't grow a dead search dimension."""
-        aten = torch.ops.aten
-        targets = {
-            aten.exp.default,
-            aten.exp2.default,
-            aten.log.default,
-            aten.log2.default,
-            aten.tanh.default,
-            aten.sigmoid.default,
-            aten.rsqrt.default,
-            aten.sqrt.default,
-            aten.sin.default,
-            aten.cos.default,
-            aten.erf.default,
-        }
-        for graph_info in self.graphs:
-            for node in graph_info.graph.nodes:
-                if node.op == "call_function" and node.target in targets:
-                    env.config_spec.cute_has_transcendentals = True
-                    return
 
     def _register_cute_tile_vec_slots(self, env: CompileEnvironment) -> None:
         """Eagerly register cute_vector_widths slots for non-reduction tile blocks.
@@ -3405,6 +3380,24 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         # reduction/matmul/accumulator fact) so the pointwise seed can size a BW-saturating
         # tile instead of the starved block_size=32 default.
         device_ir.build_pointwise_facts(analysis)
+        # Cute-only: re-register flatten_loops choices dropped by the
+        # vector-model partial-access gate now that the kernel is proven
+        # PURE pointwise (see ``update_allow_flattened``).  Flat V-chunks
+        # are the only way to vectorize odd-row-length pointwise kernels.
+        # Only when NO flatten spec survived: appending next to survivors
+        # would scramble the positional ``flatten_loops`` config semantics
+        # for multi-loop kernels.  Sorted by block id == declaration order.
+        env = CompileEnvironment.current()
+        spec = env.config_spec
+        if (
+            env.backend_name == "cute"
+            and spec.pointwise_facts
+            and not len(spec.flatten_loops)
+        ):
+            for fspec in sorted(
+                spec.cute_reflatten_candidates, key=lambda f: f.block_ids[0]
+            ):
+                spec.flatten_loops.append(fspec)
 
         return device_ir
 

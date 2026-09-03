@@ -7,7 +7,7 @@ outer x constexpr-V lane partition + hoisted ``cute.arch.load(..., V)`` /
 
 Covers both strategies (``PerThreadNDTileStrategy`` for N-D tiles,
 ``PerThreadFlattenedTileStrategy`` for 1D), fp32 Uint32-carrier stores, the
-``cute_fastmath`` knob, and two regressions found in review:
+``fast_math`` setting on cute, and two regressions found in review:
 
 - an index-independent store value must not drop the vec wrapper (the store
   flush lives inside it),
@@ -69,6 +69,42 @@ def _tanh1d(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(out.size()):
         out[tile] = torch.tanh(x[tile])
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _bias_add2d(x: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile(out.size()):
+        out[tile_m, tile_n] = x[tile_m, tile_n] + b[tile_n]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _tile_index_bias(x: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile(x.size()):
+        out[tile_m, tile_n] = (
+            x[tile_m, tile_n]
+            + b[tile_n]
+            + hl.tile_index(tile_m).to(torch.float32)[:, None]
+        )
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, fast_math=True)
+def _tanh1d_fastmath(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(out.size()):
+        out[tile] = torch.tanh(x[tile])
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, fast_math=True)
+def _div1d_fastmath(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(out.size()):
+        out[tile] = x[tile] / y[tile]
     return out
 
 
@@ -166,20 +202,113 @@ class TestCutePointwiseVec(TestCase):
         self.assertNotIn("ir.VectorType.get([8]", code)
         torch.testing.assert_close(out, x[:, 0] * 2.0)
 
-    def test_cute_fastmath_knob(self) -> None:
-        """``cute_fastmath=True`` routes fastmath=True into cute.math calls;
-        results stay within loose tolerance of the accurate form."""
+    def test_flat_multi_vec_full_cover(self) -> None:
+        """flatten_loops + vec on a 2D kernel: full-cover contiguous tensors
+        get FLAT base-pointer hoists; results match eager."""
+        x = torch.randn(64, 4096, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(64, 4096, device=DEVICE, dtype=torch.bfloat16)
+        code, out = code_and_output(
+            _add2d,
+            (x, y),
+            block_sizes=[1, 2048],
+            num_threads=[1, 256],
+            cute_vector_widths=[1, 8],
+            flatten_loops=[True],
+        )
+        self.assertIn("ir.VectorType.get([8], cutlass.Uint16.mlir_type)", code)
+        torch.testing.assert_close(out, x + y)
+
+    def test_flat_multi_vec_odd_row_broadcast(self) -> None:
+        """ODD row length (V does not divide N, but divides the total):
+        x/out vectorize via flat chunks that straddle rows; the broadcast
+        bias fails the full-cover gate and stays scalar per element."""
+        m, n = 64, 4093
+        x = torch.randn(m, n, device=DEVICE, dtype=torch.float16)
+        b = torch.randn(n, device=DEVICE, dtype=torch.float16)
+        code, out = code_and_output(
+            _bias_add2d,
+            (x, b),
+            block_sizes=[1, 4096],
+            num_threads=[1, 512],
+            cute_vector_widths=[1, 8],
+            flatten_loops=[True],
+        )
+        self.assertIn("ir.VectorType.get([8], cutlass.Uint16.mlir_type)", code)
+        torch.testing.assert_close(out, x + b)
+
+    def test_flat_multi_vec_reordered_loops_stays_scalar(self) -> None:
+        """A non-identity loop_order breaks the row-major flat equivalence;
+        the ctx gate must fall back to scalar and stay correct."""
+        x = torch.randn(64, 4096, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(64, 4096, device=DEVICE, dtype=torch.bfloat16)
+        code, out = code_and_output(
+            _add2d,
+            (x, y),
+            block_sizes=[1, 2048],
+            num_threads=[1, 256],
+            cute_vector_widths=[1, 8],
+            flatten_loops=[True],
+            loop_orders=[[1, 0]],
+        )
+        self.assertNotIn("ir.VectorType.get([8]", code)
+        torch.testing.assert_close(out, x + y)
+
+    def test_tile_index_disables_flatten_reregistration(self) -> None:
+        """Regression: hl.tile_index only disabled flatten at CODEGEN time,
+        so the pointwise flatten re-registration resurrected it -> wrong
+        results under flatten_loops=[True]."""
+        x = torch.randn(64, 512, device=DEVICE, dtype=torch.float32)
+        b = torch.randn(512, device=DEVICE, dtype=torch.float32)
+        spec = _tile_index_bias.bind((x, b)).config_spec
+        self.assertEqual(len(spec.flatten_loops), 0)
+        _, out = code_and_output(
+            _tile_index_bias, (x, b), block_sizes=[16, 128], num_threads=[1, 64]
+        )
+        ref = (
+            x + b + torch.arange(x.size(0), device=DEVICE, dtype=torch.float32)[:, None]
+        )
+        torch.testing.assert_close(out, ref)
+
+    def test_fast_math_setting_routes_cute_fastmath(self) -> None:
+        """The ``fast_math`` SETTING (user opt-in) routes fastmath=True into
+        cute.math calls; without it the accurate form is emitted.  Numerics
+        changes are never a tunable config knob — only this setting."""
         x = torch.randn(2**14, device=DEVICE, dtype=torch.float32)
+        code, out = code_and_output(
+            _tanh1d_fastmath,
+            (x,),
+            block_sizes=[1024],
+            num_threads=[256],
+            cute_vector_widths=[4],
+        )
+        self.assertIn("fastmath=True", code)
+        torch.testing.assert_close(out, torch.tanh(x), rtol=1e-4, atol=1e-4)
         code, out = code_and_output(
             _tanh1d,
             (x,),
             block_sizes=[1024],
             num_threads=[256],
             cute_vector_widths=[4],
-            cute_fastmath=True,
         )
-        self.assertIn("fastmath=True", code)
-        torch.testing.assert_close(out, torch.tanh(x), rtol=1e-4, atol=1e-4)
+        self.assertNotIn("fastmath=True", code)
+        torch.testing.assert_close(out, torch.tanh(x))
+
+    def test_fastmath_div_non_fp32_keeps_accurate_path(self) -> None:
+        """Regression: ``cute.math.div`` lowers to fp32-only NVVM intrinsics,
+        so under ``fast_math`` a 16-bit division must keep the accurate IEEE
+        path instead of raising at DSL trace time; fp32 still gets the
+        approx+ftz form."""
+        for dtype in (torch.float16, torch.bfloat16):
+            x = torch.randn(2**14, device=DEVICE, dtype=dtype)
+            y = torch.rand(2**14, device=DEVICE, dtype=dtype) + 0.5
+            code, out = code_and_output(_div1d_fastmath, (x, y), block_sizes=[1024])
+            self.assertNotIn("cute.math.div", code)
+            torch.testing.assert_close(out, x / y)
+        x = torch.randn(2**14, device=DEVICE, dtype=torch.float32)
+        y = torch.rand(2**14, device=DEVICE, dtype=torch.float32) + 0.5
+        code, out = code_and_output(_div1d_fastmath, (x, y), block_sizes=[1024])
+        self.assertIn("cute.math.div", code)
+        torch.testing.assert_close(out, x / y, rtol=1e-4, atol=1e-4)
 
 
 if __name__ == "__main__":

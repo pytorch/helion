@@ -3188,17 +3188,31 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         flatten_loops = env.config_spec.flatten_loops
         for spec in [*flatten_loops]:
             block_ids = spec.block_ids
-            if not (
+            disable = not (
                 all(x in used_indices for x in block_ids)
                 or all(x not in used_indices for x in block_ids)
-            ):
+            )
+            if not disable:
+                for i, j in itertools.pairwise(block_ids):
+                    if i in used_indices and used_indices[i] + 1 != used_indices[j]:
+                        # The block indices must be contiguous
+                        disable = True
+                        break
+            if disable:
                 flatten_loops.disable_block_id(block_ids[0])
-                continue
-            for i, j in itertools.pairwise(block_ids):
-                if i in used_indices and used_indices[i] + 1 != used_indices[j]:
-                    # The block indices must be contiguous
-                    flatten_loops.disable_block_id(block_ids[0])
-                    break
+                if env.backend_name == "cute":
+                    # This gate exists for vector-model backends, where a
+                    # partial-block access (``bias[tile_n]``) cannot
+                    # broadcast against a flattened [BS] value vector.  The
+                    # cute per-thread SCALAR model recomputes per-dim index
+                    # vars from the flat offset per element, so a PURE
+                    # pointwise kernel can flatten safely — record the spec
+                    # and let device-IR analysis re-register it once the
+                    # PointwiseElementwiseFact (no reductions / matmuls /
+                    # accumulators) is known.
+                    cands = env.config_spec.cute_reflatten_candidates
+                    if all(c.block_ids != block_ids for c in cands):
+                        cands.append(spec)
 
     def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
         # Keep axis structure intact for multi-phase kernels (e.g., barrier) to
@@ -4668,12 +4682,14 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         if num_threads > 0 and isinstance(block_size, int) and num_threads < block_size:
             self._lane_var = self.new_var("lane", dce=False)
         # Vec-partition state for the memory_ops ``tile_unroll`` hoist
-        # protocol (same shape as ``PerThreadNDTileStrategy``).  Only the
-        # single-block (1D) form participates: with multiple flattened
-        # blocks the per-dim index vars are div/mod-derived per element, so
-        # a hoisted base pointer built from ``index_exprs`` would reference
-        # per-element vars that do not exist at the hoist point.
+        # protocol (same shape as ``PerThreadNDTileStrategy``).  The vec
+        # slot lives on the LAST (stride-1) block; for the multi-block
+        # (flattened N-D) form ``_cute_flat_multi`` is set and the hoist
+        # emits FLAT base pointers (``t.iterator + lane_base``) — valid
+        # only for contiguous tensors covering the whole iteration space,
+        # which ``_cute_vector_load_ctx`` gates per tensor.
         self._cute_lane_layout: str = "blocked"
+        self._cute_flat_multi: bool = len(block_ids) > 1
         self._cute_lane_vec_width_by_block: dict[int, int] = {}
         self._cute_vec_lane_var_by_block: dict[int, str] = {}
         self._cute_lane_base_index_var_by_block: dict[int, str] = {}
@@ -4681,9 +4697,9 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         self._cute_lane_vloop_by_block: dict[int, ast.For] = {}
         self._cute_lane_vec_stores_by_block: dict[int, dict] = {}
         self._cute_lane_vec_loads_by_block: dict[int, dict] = {}
-        if self._lane_var is not None and len(block_ids) == 1:
+        if self._lane_var is not None:
             env = CompileEnvironment.current()
-            block_id = block_ids[0]
+            block_id = block_ids[-1]
             cfg = fn.config.config
             if block_id in env.config_spec.cute_lane_layouts.valid_block_ids():
                 layout = env.config_spec.cute_lane_layouts.config_get(
@@ -4784,7 +4800,7 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         vec_wrappers: dict[str, VecLaneWrapper] = {}
         axis = self._flat_thread_axis()
         thread_extent = self._thread_extent()
-        vec_width = self._cute_lane_vec_width_by_block.get(block_ids[0], 1)
+        vec_width = self._cute_lane_vec_width_by_block.get(block_ids[-1], 1)
         lane_strided = self._cute_lane_layout == "strided" and isinstance(
             thread_extent, int
         )
@@ -4796,9 +4812,9 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         if vec_width > 1:
             # Same outer x constexpr-V lane partition as
             # ``PerThreadNDTileStrategy.codegen_grid`` so the memory_ops
-            # tile_unroll vec-hoist protocol applies to flattened (1D)
-            # grid tiles too.
-            block_id = block_ids[0]
+            # tile_unroll vec-hoist protocol applies to flattened grid
+            # tiles too (the multi-block form via flat base pointers).
+            block_id = block_ids[-1]
             vec_lane_var = self.new_var("vec_lane", dce=False)
             self._cute_vec_lane_var_by_block[block_id] = vec_lane_var
             inner_for = cast(

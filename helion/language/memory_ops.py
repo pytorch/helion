@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import functools
 import logging
+import operator
 import textwrap
 from typing import TYPE_CHECKING
 
@@ -975,10 +977,15 @@ def _cute_register_tile_unroll_vec_store(
     vloop_by_block = getattr(strategy, "_cute_lane_vloop_by_block", None)
     if not isinstance(vloop_by_block, dict) or vloop_by_block.get(block_id) is None:
         return None
-    lane_pos = _cute_lane_axis_pos(strategy, block_id, index_exprs)
-    base_exprs = list(index_exprs)
-    base_exprs[lane_pos] = base_index_var
-    base_ptr_expr = _cute_scalar_pointer_expr(tensor_name, base_exprs)
+    if getattr(strategy, "_cute_flat_multi", False):
+        # See the flat-multi note in ``_cute_register_tile_unroll_vec_hoist``.
+        index_dtype = CompileEnvironment.current().index_type()
+        base_ptr_expr = f"({tensor_name}.iterator + {index_dtype}({base_index_var}))"
+    else:
+        lane_pos = _cute_lane_axis_pos(strategy, block_id, index_exprs)
+        base_exprs = list(index_exprs)
+        base_exprs[lane_pos] = base_index_var
+        base_ptr_expr = _cute_scalar_pointer_expr(tensor_name, base_exprs)
     sites_by_block = getattr(strategy, "_cute_lane_vec_stores_by_block", None)
     if sites_by_block is None:
         sites_by_block = {}
@@ -1110,14 +1117,25 @@ def _cute_register_tile_unroll_vec_hoist(
     assert isinstance(base_index_var, str)
     assert isinstance(lane_body, list)
     assert isinstance(vec_lane_var, str)
-    # The lane-axis index_expr (stride-1 dim) is swapped with the per-lane
-    # base so the vec load points at the start of the V-wide chunk this
-    # thread owns.  The position is the last entry for a row-major lhs, or
-    # the recorded position for a K-major rhs.
-    lane_pos = _cute_lane_axis_pos(strategy, block_id, index_exprs)
-    base_exprs = list(index_exprs)
-    base_exprs[lane_pos] = base_index_var
-    base_ptr_expr = _cute_scalar_pointer_expr(tensor_name, base_exprs)
+    flat_multi = bool(getattr(strategy, "_cute_flat_multi", False))
+    if flat_multi:
+        # Flattened multi-dim tile: the ctx gate guarantees the tensor is
+        # contiguous and covers the whole iteration space, so the V-wide
+        # chunk starting at flat ``lane_base`` is memory-contiguous even
+        # when it straddles a row boundary.
+        env_flat = CompileEnvironment.current()
+        index_dtype = env_flat.index_type()
+        lane_pos = -1
+        base_ptr_expr = f"({tensor_name}.iterator + {index_dtype}({base_index_var}))"
+    else:
+        # The lane-axis index_expr (stride-1 dim) is swapped with the
+        # per-lane base so the vec load points at the start of the V-wide
+        # chunk this thread owns.  The position is the last entry for a
+        # row-major lhs, or the recorded position for a K-major rhs.
+        lane_pos = _cute_lane_axis_pos(strategy, block_id, index_exprs)
+        base_exprs = list(index_exprs)
+        base_exprs[lane_pos] = base_index_var
+        base_ptr_expr = _cute_scalar_pointer_expr(tensor_name, base_exprs)
     cache_key = (tensor_name, base_ptr_expr)
     cache_by_block = getattr(strategy, "_cute_lane_vec_loads_by_block", None)
     if cache_by_block is None:
@@ -1141,7 +1159,14 @@ def _cute_register_tile_unroll_vec_hoist(
         # fetched bytes are then ignored downstream by the per-lane
         # mask gate that wraps the bitcast result.
         env_local = CompileEnvironment.current()
-        numel = env_local.block_sizes[block_id].numel
+        if flat_multi:
+            # Bounds are in FLAT elements over the whole iteration space.
+            numel = functools.reduce(
+                operator.mul,
+                [env_local.block_sizes[bid].numel for bid in strategy.block_ids],  # pyrefly: ignore
+            )
+        else:
+            numel = env_local.block_sizes[block_id].numel
         numel_expr = state.sympy_expr(numel)
         block_pos = strategy.block_ids.index(block_id)  # pyrefly: ignore
         bs_obj = strategy.block_size  # pyrefly: ignore
@@ -1159,11 +1184,25 @@ def _cute_register_tile_unroll_vec_hoist(
             numel_int = int(numel)
         except (TypeError, ValueError):
             numel_int = None
+        # GRID tiles have no software-pipelined prefetch past the end, so a
+        # mask-free extent that divides evenly into blocks means every
+        # per-thread vec base is provably in-bounds.  (The pipelining pass'
+        # pipeline_inner_loads only matches an outer ``range`` loop wrapping
+        # an inner lane For, which a grid lane loop can never be — if that
+        # ever changes, this elision must learn about it.)
+        from .._compiler.tile_strategy import DeviceGridState
+
+        loops_for_block = state.codegen.active_device_loops.get(block_id)
+        is_grid_state = bool(loops_for_block) and isinstance(
+            loops_for_block[-1], DeviceGridState
+        )
         if (
             mask_elided
             and isinstance(static_bs, int)
             and numel_int is not None
-            and static_bs >= numel_int
+            and (
+                static_bs >= numel_int or (is_grid_state and numel_int % static_bs == 0)
+            )
         ):
             # Single-trip tile loop whose block provably covers the extent
             # (the strategy elided the bounds mask): every per-thread vec
@@ -1171,7 +1210,8 @@ def _cute_register_tile_unroll_vec_hoist(
             # clamp (the software-pipelining pass, which prefetches one
             # tile PAST the loop end, needs the guard on multi-trip
             # loops).  Dropping the pointer select saves ~14 registers per
-            # thread on the resident-row softmax family.
+            # thread on the resident-row softmax family.  Same for exact
+            # grid tilings (numel % block == 0).
             guarded_ptr = base_ptr_expr
         else:
             # Build the "anchor" pointer: same index_exprs but with the
@@ -1179,9 +1219,13 @@ def _cute_register_tile_unroll_vec_hoist(
             # ``tile_offset == 0, lane_var == 0, vec_lane_var == 0`` base
             # for the very first outer-tile iter, which is always
             # in-bounds for any grid block.
-            anchor_exprs = list(index_exprs)
-            anchor_exprs[lane_pos] = "0"
-            anchor_ptr_expr = _cute_scalar_pointer_expr(tensor_name, anchor_exprs)
+            if flat_multi:
+                index_dtype_local = CompileEnvironment.current().index_type()
+                anchor_ptr_expr = f"({tensor_name}.iterator + {index_dtype_local}(0))"
+            else:
+                anchor_exprs = list(index_exprs)
+                anchor_exprs[lane_pos] = "0"
+                anchor_ptr_expr = _cute_scalar_pointer_expr(tensor_name, anchor_exprs)
             guarded_ptr = (
                 f"({base_ptr_expr} if {base_index_var} < {numel_expr} "
                 f"else {anchor_ptr_expr})"

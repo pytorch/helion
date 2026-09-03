@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
@@ -2371,9 +2370,12 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
     @classmethod
     def _vec_axis_and_width(
         cls, env: CompileEnvironment
-    ) -> tuple[int, int, int] | None:
-        """Returns (vec_block_id, V, axis size_hint), or None if no axis
-        can host a vec lane loop."""
+    ) -> tuple[int, int, int, bool] | None:
+        """Returns (vec_block_id, V, size_hint, flatten) or None if no axis
+        can host a vec lane loop.  ``flatten`` is True when the innermost
+        extent is not V-divisible but the flattened total is: the seed then
+        flattens the tile (flat V-chunks stay memory-contiguous for
+        full-cover contiguous tensors, odd row length or not)."""
         spec = env.config_spec
         if not spec.pointwise_facts:
             return None
@@ -2393,13 +2395,28 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
         if vec_block not in spec.num_threads.valid_block_ids():
             return None
         size_hint = spec.block_sizes.block_id_lookup(vec_block).size_hint
-        vec = 16 // max(1, fact.storage_itemsize)
+        full_vec = 16 // max(1, fact.storage_itemsize)
         # The hoist requires numel % V == 0; shrink V until it divides.
+        vec = full_vec
         while vec > 1 and size_hint % vec != 0:
+            vec //= 2
+        if vec > 1:
+            return vec_block, vec, size_hint, False
+        # Innermost extent is odd: flatten and vectorize the flat space.
+        flatten_group = next(
+            (f for f in spec.flatten_loops if vec_block in f.block_ids), None
+        )
+        if flatten_group is None:
+            return None
+        total = 1
+        for bid in flatten_group.block_ids:
+            total *= spec.block_sizes.block_id_lookup(bid).size_hint
+        vec = full_vec
+        while vec > 1 and total % vec != 0:
             vec //= 2
         if vec <= 1:
             return None
-        return vec_block, vec, size_hint
+        return vec_block, vec, total, True
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -2413,7 +2430,7 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
         picked = cls._vec_axis_and_width(env)
         if picked is None:
             return None
-        vec_block, vec, size_hint = picked
+        vec_block, vec, size_hint, flatten = picked
         bs_high = spec.block_sizes.block_id_lookup(vec_block)._fragment(spec).high
         nt, unroll = cls.NT, cls.UNROLL
         while nt * vec * unroll > bs_high and unroll > 1:
@@ -2432,36 +2449,12 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
                 spec.cute_vector_widths, {vec_block: vec}
             ),
         }
+        if flatten:
+            seed["flatten_loops"] = [True for _ in spec.flatten_loops]
         try:
             return Config(**seed)
         except Exception:
             return None
-
-    @classmethod
-    def get_seed_configs(
-        cls, env: CompileEnvironment, device_ir: DeviceIR
-    ) -> list[Config] | None:
-        primary = cls.get_seed_config(env, device_ir)
-        if primary is None:
-            return None
-        spec = env.config_spec
-        seeds = [primary]
-        # Transcendental-heavy pointwise kernels (gelu/silu/...) are often
-        # SFU/ALU-bound with accurate math; plant a fastmath alternate so the
-        # search benchmarks it (the baseline accuracy check drops it where
-        # numerics drift past tolerance).
-        fact = spec.pointwise_facts[0] if spec.pointwise_facts else None
-        if (
-            fact is not None
-            and fact.sfu_ops > 0
-            and spec.cute_has_transcendentals
-            and spec.supports_config_key("cute_fastmath")
-        ):
-            fm_seed: dict[str, Any] = dict(primary.config)
-            fm_seed["cute_fastmath"] = True
-            with contextlib.suppress(Exception):
-                seeds.append(Config(**fm_seed))
-        return seeds
 
 
 class CuteFp8GemmSkinnyMHeuristic(AutotunerHeuristic):
