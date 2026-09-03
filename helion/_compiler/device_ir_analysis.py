@@ -377,25 +377,14 @@ def tile_rank(dims: tuple[int | None, ...]) -> int:
     return sum(dim is not None for dim in dims)
 
 
-def tile_set_rank_profile(
-    tiles: Iterable[tuple[int | None, ...]],
-    max_rank: int,
-) -> tuple[int, ...]:
-    """Block-size-free lexicographic footprint key, highest rank first."""
-    by_rank: dict[int, int] = {}
-    for tile in tiles:
-        rank = tile_rank(tile)
-        if rank:
-            by_rank[rank] = by_rank.get(rank, 0) + 1
-    return tuple(by_rank.get(rank, 0) for rank in range(max_rank, 0, -1))
-
-
 def _live_tile_kind(node: torch.fx.Node, dot_targets: frozenset[object]) -> str:
     from ..language import memory_ops
 
     if node.op == "placeholder":
         return "carry"
     if node.op == "call_function":
+        if node.target is _tracing_ops._host_tensor:
+            return "global"
         if node.target in dot_targets:
             return "dot_out"
         if node.target is memory_ops.load:
@@ -524,13 +513,11 @@ class GraphAnalysis:
     block_ids: frozenset[int]
     block_id_order: tuple[int, ...]
     live_tile_steps: tuple[tuple[LiveTile, ...], ...]
-    peak_live_tiles: tuple[LiveTile, ...]
     peak_dot_output_tiles: tuple[LiveTile, ...]
     peak_promoted_lhs_tiles: tuple[LiveTile, ...]
     dot_nodes: tuple[torch.fx.Node, ...]
     reduction_occurrences: tuple[int, ...]
     reduction_axis_by_node_id: dict[int, int]
-    reduction_input_itemsizes: tuple[tuple[int, int], ...]
     memory_tiles: tuple[tuple[torch.fx.Node, LiveTile], ...]
     _memory_tiles_by_loop_axes: dict[frozenset[int], tuple[LiveTile, ...]] = (
         dataclasses.field(
@@ -562,7 +549,6 @@ class GraphAnalysis:
         reduction_occurrences: list[int] = []
         seen_reductions: set[int] = set()
         reduction_axis_by_node_id: dict[int, int] = {}
-        reduction_input_itemsizes: list[tuple[int, int]] = []
         memory_tiles: list[tuple[torch.fx.Node, LiveTile]] = []
         operand_positions = matmul_operand_positions()
         promoted_lhs_nodes: set[torch.fx.Node] = set()
@@ -585,7 +571,10 @@ class GraphAnalysis:
             for input_node in node.all_input_nodes:
                 last_use[input_node] = index
 
-            kind = _live_tile_kind(node, dot_targets)
+            kind_node = resolve_placeholder(node) if node.op == "placeholder" else node
+            kind = _live_tile_kind(kind_node, dot_targets)
+            if node.op == "placeholder" and kind != "global":
+                kind = "carry"
             tile = _tile_from_tensor(node.meta.get("val"), env, kind=kind)
             if tile is not None and kind == "dot_out":
                 dot_details[node] = tile
@@ -608,13 +597,6 @@ class GraphAnalysis:
                     if block_id not in seen_reductions:
                         seen_reductions.add(block_id)
                         reduction_occurrences.append(block_id)
-                    for input_node in node.all_input_nodes:
-                        input_value = input_node.meta.get("val")
-                        if isinstance(input_value, torch.Tensor):
-                            reduction_input_itemsizes.append(
-                                (block_id, input_value.element_size())
-                            )
-                            break
 
             if node.op != "call_function":
                 continue
@@ -639,12 +621,6 @@ class GraphAnalysis:
 
         live_tile_steps: list[tuple[LiveTile, ...]] = []
         seen_steps: set[frozenset[int]] = set()
-        max_rank = max(
-            (tile_rank(tile.dim_block_ids) for tile in tile_details.values()),
-            default=0,
-        )
-        best_key: tuple[int, ...] = ()
-        peak_live_tiles: tuple[LiveTile, ...] = ()
         for live in _live_node_steps(nodes, tile_details, last_use):
             if live:
                 step_key = frozenset(id(value) for value in live)
@@ -652,13 +628,6 @@ class GraphAnalysis:
                 if step_key not in seen_steps:
                     seen_steps.add(step_key)
                     live_tile_steps.append(step)
-                key = tile_set_rank_profile(
-                    (tile_details[value].dim_block_ids for value in live),
-                    max_rank,
-                )
-                if key > best_key:
-                    best_key = key
-                    peak_live_tiles = step
 
         def peak_role_tiles(
             details: dict[torch.fx.Node, LiveTile],
@@ -696,13 +665,11 @@ class GraphAnalysis:
             block_ids=frozenset(getattr(graph_info, "block_ids", ()) or ()),
             block_id_order=tuple(getattr(graph_info, "block_ids", ()) or ()),
             live_tile_steps=tuple(live_tile_steps),
-            peak_live_tiles=peak_live_tiles,
             peak_dot_output_tiles=peak_dot_output_tiles,
             peak_promoted_lhs_tiles=peak_promoted_lhs_tiles,
             dot_nodes=tuple(dot_nodes),
             reduction_occurrences=tuple(reduction_occurrences),
             reduction_axis_by_node_id=reduction_axis_by_node_id,
-            reduction_input_itemsizes=tuple(reduction_input_itemsizes),
             memory_tiles=tuple(memory_tiles),
         )
 
@@ -768,6 +735,7 @@ class DeviceIRAnalysis:
         env: CompileEnvironment,
     ) -> DeviceIRAnalysis:
         from .device_ir import ForLoopGraphInfo
+        from .device_ir import HelperFunctionGraphInfo
         from .device_ir import NodeArgsGraphInfo
         from .device_ir import ReductionLoopGraphInfo
 
@@ -781,7 +749,9 @@ class DeviceIRAnalysis:
             while node.op == "placeholder" and node not in seen:
                 seen.add(node)
                 graph_info = graph_info_by_graph.get(node.graph)
-                if not isinstance(graph_info, NodeArgsGraphInfo):
+                if not isinstance(graph_info, NodeArgsGraphInfo) or isinstance(
+                    graph_info, HelperFunctionGraphInfo
+                ):
                     break
                 try:
                     node = graph_info.placeholder_to_outer_arg(node)
@@ -892,16 +862,14 @@ class DeviceIRAnalysis:
             for block_id in graph.reduction_occurrences
         )
 
-    def reduction_input_itemsize(self, block_id: int) -> int:
-        """Legacy last-occurrence input width for one reduction axis."""
-        itemsize = 0
-        for graph in self.graphs:
-            for axis, width in graph.reduction_input_itemsizes:
-                if axis == block_id:
-                    itemsize = width
-        return itemsize
-
     def kernel_live_tile_steps(self) -> tuple[tuple[LiveTile, ...], ...]:
+        """Every original graph step, kept separate across sequential regions.
+
+        Loop-body placeholders already represent the values carried into that
+        body, including enclosing-loop carries. Flattening the graph-local
+        timelines therefore preserves complete body residency without summing
+        state from sequential graphs or mutually exclusive branches.
+        """
         return tuple(
             step
             for graph in self.non_reduction_graphs
@@ -940,51 +908,6 @@ class DeviceIRAnalysis:
     def kernel_peak_promoted_lhs(self) -> tuple[LiveTile, ...]:
         """Peak transformed-LHS set after adding ancestor loop graphs."""
         return self._kernel_peak_role_tiles("peak_promoted_lhs_tiles")
-
-    def group_live_tiles(
-        self,
-        group_graph_ids: list[int],
-    ) -> dict[int, list[tuple[int | None, ...]]]:
-        """Resident peak-live tiles attributed to reduction co-residency groups."""
-        group_axes = {
-            graph_id: set(self.by_id[graph_id].reduction_occurrences)
-            for graph_id in group_graph_ids
-        }
-        peak_of = {
-            graph.graph_id: [tile.dim_block_ids for tile in graph.peak_live_tiles]
-            for graph in self.non_reduction_graphs
-        }
-
-        def max_by_profile(
-            lhs: list[tuple[int | None, ...]],
-            rhs: list[tuple[int | None, ...]],
-        ) -> list[tuple[int | None, ...]]:
-            max_rank = max(
-                (tile_rank(tile) for tile in lhs + rhs),
-                default=0,
-            )
-            lhs_key = tile_set_rank_profile(lhs, max_rank)
-            rhs_key = tile_set_rank_profile(rhs, max_rank)
-            return lhs if lhs_key >= rhs_key else rhs
-
-        group_keys = set(group_graph_ids)
-        result: dict[int, list[tuple[int | None, ...]]] = {}
-        for graph_id in group_graph_ids:
-            axes = group_axes[graph_id]
-            tiles = list(peak_of.get(graph_id, ()))
-            seen_bodies = {graph_id}
-            frontier = [graph_id]
-            while frontier:
-                current = frontier.pop()
-                for body_id, block_ids in self.child_loops.get(current, ()):
-                    if body_id in seen_bodies or body_id in group_keys:
-                        continue
-                    if not axes or (block_ids & axes):
-                        seen_bodies.add(body_id)
-                        tiles = max_by_profile(tiles, peak_of.get(body_id, []))
-                        frontier.append(body_id)
-            result[graph_id] = tiles
-        return result
 
     def accumulator_facts(
         self,
