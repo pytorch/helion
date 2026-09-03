@@ -3624,9 +3624,14 @@ class TestCuteLowerings(unittest.TestCase):
         )
         bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
         bound.env.config_spec.cute_tcgen05_search_enabled = True
+        # fp32 operands historically forced the non-tcgen05 fallback (the
+        # "requires active-K-loop tcgen05 MMA lowering" rejection); with the
+        # tf32 tcgen05 path they instead reach the flat-role guard, which
+        # rejects them for being outside the 16-bit guarded family. Either
+        # way flat_role_coordinates=True must fail loudly for this config.
         with self.assertRaisesRegex(
             exc.BackendUnsupported,
-            r"requires active-K-loop tcgen05 MMA lowering",
+            TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
         ):
             bound.to_triton_code(cfg)
 
@@ -17768,7 +17773,16 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertNotIn("tcgen05_edge_src = cute.logical_divide(", code)
 
     def test_aux_tma_mode_without_aux_keeps_full_edge_store_split(self) -> None:
-        """A stale aux-TMA config key alone does not enable partial TMA stores."""
+        """A no-aux edge kernel stores every tile through the clamping TMA path.
+
+        Historically the partial-output TMA store was admitted only for the
+        productive aux-TMA family and this test pinned the hybrid
+        full-tile/SIMT-fringe split for a stale aux-TMA key without aux
+        operands. With no aux GMEM operands there is nothing to read out of
+        bounds, so the D descriptor's clamping now covers fringe tiles too:
+        the kernel must NOT emit the hybrid dispatch or the SIMT edge-copy
+        fallback.
+        """
 
         @helion.kernel(backend="cute")
         def cute_matmul_no_aux(
@@ -17810,8 +17824,8 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
 
         self.assertNotIn("'kind': 'tcgen05_aux_tma'", code)
         self.assertIn("'kind': 'tcgen05_d_tma'", code)
-        self.assertIn("if tcgen05_full_tile:", code)
-        self.assertIn("tcgen05_edge_src = cute.logical_divide(", code)
+        self.assertNotIn("if tcgen05_full_tile:", code)
+        self.assertNotIn("tcgen05_edge_src = cute.logical_divide(", code)
 
     def test_aux_tma_partial_store_keeps_guard_for_unaligned_rowvec_tail(
         self,
@@ -19675,11 +19689,19 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             bound = cute_matmul_pure.bind(args)
         self.assertFalse(bound.env.config_spec.cute_tcgen05_aux_kernel_detected)
         frags = bound.env.config_spec._tcgen05_strategy_autotune_fragments()
+        # Pure matmuls on a full-tile cluster_m=2 shape now search the
+        # scheduler-warp strategy too (its CLC dynamic persistence is the
+        # plain-matmul family; see _plain_clc_persistence_search_enabled),
+        # but the C-input warp surface stays narrowed to 0: with no aux /
+        # source-C operand there is nothing for that warp to produce.
         self.assertEqual(
             frags["tcgen05_strategy"].choices,
-            (Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,),
+            (
+                Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+                Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+            ),
         )
-        self.assertEqual(frags["tcgen05_warp_spec_scheduler_warps"].choices, (0,))
+        self.assertEqual(frags["tcgen05_warp_spec_scheduler_warps"].choices, (0, 1))
         self.assertEqual(frags["tcgen05_warp_spec_c_input_warps"].choices, (0,))
 
     def test_aux_autotune_surface_does_not_narrow_for_multistore_fanout(

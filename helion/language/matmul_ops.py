@@ -460,13 +460,20 @@ def _plan_cute_tcgen05_search_candidate(
     m_hint = static_m if static_m is not None else env.size_hint(m)
     n_hint = static_n if static_n is not None else env.size_hint(n)
     k_hint = static_k if static_k is not None else env.size_hint(k)
+    from .._compiler.cute.mma_support import cute_fp32_dot_uses_tf32
+
     is_fp8 = lhs.dtype == torch.float8_e4m3fn
-    mma_k = 32 if is_fp8 else 16
-    min_tcgen05_n = 16 if is_fp8 else 8
+    is_tf32 = lhs.dtype == torch.float32 and cute_fp32_dot_uses_tf32()
+    mma_k = 32 if is_fp8 else (8 if is_tf32 else 16)
+    # tf32's bn >= 32 floor mirrors _mma_impl_matches_problem_shape.
+    min_tcgen05_n = 16 if is_fp8 else (32 if is_tf32 else 8)
     is_small_n = static_n is not None and static_n < min_tcgen05_n
     if (
         env.backend_name != "cute"
-        or lhs.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+        or (
+            lhs.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+            and not is_tf32
+        )
         or rhs.dtype != lhs.dtype
         or m_hint < 64
         # Size-one tile axes are fixed to block size one before this analysis,
@@ -489,7 +496,9 @@ def _plan_cute_tcgen05_search_candidate(
     from .._compiler.cute.mma_support import get_cute_mma_support
 
     support = get_cute_mma_support()
-    if not (support.tcgen05_f8 if is_fp8 else support.tcgen05_f16bf16):
+    from .._compiler.cute.mma_support import tcgen05_supports_input_dtype
+
+    if not tcgen05_supports_input_dtype(support, lhs.dtype):
         return reject()
 
     def pow2_floor_at_least(value: int, minimum: int) -> int:

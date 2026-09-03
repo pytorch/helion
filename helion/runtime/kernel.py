@@ -294,7 +294,13 @@ class _CompilerSeedSpecializationExtractor:
 
     def for_device(self, device: torch.device) -> Hashable:
         from . import get_num_sm
+        from .settings import is_pallas_interpret
 
+        if device.type == "cpu" and not is_pallas_interpret():
+            # CPU tensors bound on a GPU backend (e.g. type-propagation debug
+            # binds) have no SM count and can never launch; any stable key
+            # keeps the specialization cache coherent.
+            return self.fact, 0
         if self.fact == "device_num_sm":
             return self.fact, get_num_sm(device)
         assert self.fact == "config_num_sm"
