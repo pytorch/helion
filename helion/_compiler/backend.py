@@ -390,6 +390,16 @@ class Backend(abc.ABC):
         """
         return requested
 
+    def reduction_block_size_is_inlined_constexpr(self) -> bool:
+        """Whether the reduction-loop block size is inlined as a module-level
+        literal instead of a constexpr kernel param.
+
+        FlyDSL's scf.for step must be a value produced inside the loop, not an
+        external constexpr param, so it inlines the block size as a literal.
+        Other backends return False and use a constexpr kernel param.
+        """
+        return False
+
     def create_synthetic_reduction_lanes(
         self,
         thread_count: int,
@@ -795,6 +805,26 @@ class Backend(abc.ABC):
             self.cast_expr("{x}", self.dtype_str(target_dtype)),
             x=x,
         )
+
+    def cast_scalar_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
+        """Cast a plain scalar (e.g. a bare number lifted from an index expr) to
+        ``target_dtype``.
+
+        Defaults to ``cast_ast``. Backends that write casts as ``value.to(dtype)``
+        must override this, because a bare number has no ``.to()`` method --
+        FlyDSL, for example, uses ``fx.Float16(5)`` instead.
+        """
+        return self.cast_ast(x, target_dtype)
+
+    def expands_broadcast_dims(self) -> bool:
+        """Whether the backend needs Triton-style ``[None, :]`` broadcast-expand
+        of sub-rank tensors.
+
+        Tile-level backends (Triton, etc.) broadcast-expand a sub-rank operand up
+        to the output rank. Backends whose per-thread vectors carry the tile/row
+        axis implicitly (e.g. FlyDSL) return False to skip the expansion.
+        """
+        return True
 
     @property
     @abc.abstractmethod

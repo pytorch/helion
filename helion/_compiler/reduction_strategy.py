@@ -1365,6 +1365,20 @@ class LoopedReductionStrategy(ReductionStrategy):
         )
         return result_var
 
+    def _register_block_size_constexpr(
+        self, state: CodegenState, block_size_var: str
+    ) -> None:
+        # Register the loop block size as a constexpr kernel param, defined host-side.
+        if CompileEnvironment.current().backend.reduction_block_size_is_inlined_constexpr():
+            # FlyDSL's scf.for step must be a value inside the loop, not an
+            # external constexpr param, so inline the block size as a literal.
+            state.device_function.constexpr_arg(block_size_var, self._loop_block_size)
+            return
+        if state.device_function.constexpr_arg(block_size_var):
+            state.codegen.host_statements.append(
+                statement_from_string(f"{block_size_var} = {self._loop_block_size!r}")
+            )
+
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
         env = CompileEnvironment.current()
         block_index = self.block_index
@@ -1373,10 +1387,7 @@ class LoopedReductionStrategy(ReductionStrategy):
         index_var = self.index_var(block_index)
         block_size_var = self.block_size_var(block_index)
         assert block_size_var is not None
-        if state.device_function.constexpr_arg(block_size_var):
-            state.codegen.host_statements.append(
-                statement_from_string(f"{block_size_var} = {self._loop_block_size!r}")
-            )
+        self._register_block_size_constexpr(state, block_size_var)
         inner_body: list[ast.AST] = [
             statement_from_string(
                 f"{index_var} = {offset_var} + {self._index_init_expr(f'({block_size_var})', env.index_type(), block_index)}"

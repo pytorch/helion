@@ -16,6 +16,7 @@ from .backend import MetalBackend
 from .backend import PallasBackend
 from .backend import TileIRBackend
 from .backend import TritonBackend
+from .flydsl.backend import FlyDSLBackend
 
 if TYPE_CHECKING:
     from .backend import Backend
@@ -26,6 +27,7 @@ _BUILTIN_BACKENDS: list[type[Backend]] = [
     CuteBackend,
     TileIRBackend,
     MetalBackend,
+    FlyDSLBackend,
 ]
 
 _REGISTRY: dict[str, type[Backend]] = {}
