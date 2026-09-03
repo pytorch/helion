@@ -3318,6 +3318,18 @@ class ConfigSpec:
                 )
             elif self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
+                # Loop flattening is a real codegen choice on the SIMT path
+                # (flattened multi-dim tiles vectorize odd-row-length
+                # pointwise kernels via flat base pointers).  Without this
+                # entry the flat form was unreachable: seeds carrying
+                # ``flatten_loops=[True]`` silently lost the flag in the
+                # flat-config round trip and were benchmarked as their
+                # (much slower) N-D counterparts.
+                if (
+                    self.supports_config_key("flatten_loops")
+                    and len(self.flatten_loops) > 0
+                ):
+                    fields["flatten_loops"] = self.flatten_loops
                 # Rolled-reduction loop chunks are tunable on the SIMT path
                 # (LoopedReductionStrategy lane lattices).  Without this
                 # entry the chunk silently pins to its default and neither

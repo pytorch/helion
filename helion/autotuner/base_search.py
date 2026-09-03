@@ -1878,14 +1878,24 @@ class PopulationBasedSearch(BaseSearch):
     def _final_rebenchmark_use_isolated(self) -> bool:
         from ..runtime.settings import _env_get_bool
 
+        # Default to ISOLATED finalist timing on cute: the interleaved bench
+        # lets L2 cache-POLICY state leak between candidates that read the
+        # same input tensors (an ``l2_last`` candidate pins its inputs in L2
+        # and every rival free-rides on the hits, so the config CAUSING the
+        # speedup can never out-measure the others).  Isolated mode times
+        # each finalist in its own steady window — the same regime the
+        # deployment-style do_bench measures — with suspicious-result
+        # confirmation guarding against thermal drift between windows.
+        backend_name = getattr(getattr(self, "config_spec", None), "backend_name", None)
+        default = backend_name == "cute"
         try:
-            return _env_get_bool(_FINAL_REBENCHMARK_ISOLATED_ENV, False)
+            return _env_get_bool(_FINAL_REBENCHMARK_ISOLATED_ENV, default)
         except ValueError:
             self.log.warning(
                 f"Ignoring invalid {_FINAL_REBENCHMARK_ISOLATED_ENV}="
-                f"{os.getenv(_FINAL_REBENCHMARK_ISOLATED_ENV)!r}; using False."
+                f"{os.getenv(_FINAL_REBENCHMARK_ISOLATED_ENV)!r}; using {default}."
             )
-            return False
+            return default
 
     def _final_rebenchmark_pinned_tolerance(self) -> float:
         raw = os.getenv(_FINAL_REBENCHMARK_PINNED_TOLERANCE_ENV)

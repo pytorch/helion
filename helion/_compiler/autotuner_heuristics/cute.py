@@ -2516,6 +2516,33 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
             plain_seed.pop("load_eviction_policies", None)
             with contextlib.suppress(Exception):
                 seeds.append(Config(**plain_seed))
+        # Wide-thread sibling (NT*2, one vector per thread): kernels whose
+        # per-element pipeline is ALU-heavier (e.g. a broadcast gather's
+        # per-element div/mod) prefer more threads over per-thread unroll
+        # (bias_add 4096x50257: 3.0 -> 4.9 TB/s on B200).
+        if picked is not None:
+            vec_block, vec = picked[0], picked[1]
+            nt_ids = [s.block_id for s in spec.num_threads]
+            if vec_block in nt_ids:
+                nt_pos = nt_ids.index(vec_block)
+                for base in [*base_variants]:
+                    nt_list = list(base.get("num_threads") or [])
+                    if nt_pos >= len(nt_list):
+                        continue
+                    nt2 = int(nt_list[nt_pos]) * 2
+                    block_list = base.get("block_sizes") or []
+                    bs_pos = [s.block_id for s in spec.block_sizes].index(vec_block)
+                    block = int(block_list[bs_pos]) if bs_pos < len(block_list) else 0
+                    if nt2 <= 0 or nt2 > 1024 or block % (nt2 * vec) != 0:
+                        continue
+                    wide_seed: dict[str, Any] = dict(base)
+                    wide_seed["num_threads"] = [
+                        *nt_list[:nt_pos],
+                        nt2,
+                        *nt_list[nt_pos + 1 :],
+                    ]
+                    with contextlib.suppress(Exception):
+                        seeds.append(Config(**wide_seed))
         return seeds
 
 
