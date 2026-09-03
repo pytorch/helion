@@ -1096,6 +1096,22 @@ class TestHardwareConfigSpecRanges(TestCase):
             ("", "first", "last"),
         )
 
+    def test_scalar_empty_eviction_policy_survives_normalization(self) -> None:
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_spec import ConfigSpec
+
+        with patch(
+            "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+            return_value=False,
+        ):
+            config_spec = ConfigSpec(backend=TritonBackend())
+        config_spec.load_eviction_policies.length = 2
+        config = helion.Config(load_eviction_policies="")
+
+        config_spec.normalize(config)
+
+        self.assertEqual(config.load_eviction_policies, "")
+
     def test_load_cache_modifier_choices_do_not_leak_mocked_amd_state(self) -> None:
         """Mocked AMD capability detection should not poison later Triton specs."""
         from helion._compiler.backend import TritonBackend
