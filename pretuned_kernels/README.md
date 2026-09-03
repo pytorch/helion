@@ -6,11 +6,11 @@ points for common kernel patterns while also being runnable examples for people
 who want to quickly try Helion.
 
 The checked-in heuristics let these kernels run immediately without online
-autotuning.  Heuristics ship for both NVIDIA H100 (`sm90`) and B200 (`sm100`);
-Helion picks the matching file at runtime.  Treat the files as kernel recipes:
-copy the kernel and its local `_helion_aot_*` heuristic into your code, then
-retune when your target shapes or hardware differ materially from the included
-sweep.
+autotuning.  Each entry lists the NVIDIA architecture it supports (currently
+H100, B200, or both), and Helion picks the matching file at runtime.  Treat the
+files as kernel recipes: copy the kernel and its local `_helion_aot_*` heuristic
+into your code, then retune when your target shapes or hardware differ
+materially from the included sweep.
 
 Each kernel module has a `main()` that benchmarks against one or more named
 reference baselines.
@@ -45,7 +45,10 @@ pretuned_kernels/
 ├── silu_and_mul_per_block_quant/
 ├── fused_qk_norm_rope/
 ├── causal_conv1d/                    # TPU/Pallas fixed-config decode kernel
-└── gdn_decode/                       # TPU/Pallas fixed-config recurrent decode
+├── gdn_decode/                       # TPU/Pallas fixed-config recurrent decode
+└── megakernels/
+    ├── qwen3_decode_layer/          # Qwen3-8B decode layer
+    └── gemma4_a4b_moe/              # Gemma 4 26B-A4B MoE
 ```
 
 Each kernel ships with one heuristic file per supported compute capability.
@@ -76,6 +79,8 @@ At runtime Helion picks the file matching the current GPU.
 | `fused_qk_norm_rope` | vLLM `(num_tokens, q_heads, kv_heads)` shapes | torch-native fused QK-RMSNorm + RoPE |
 | `causal_conv1d` | TPU decode `N=512, H=4, D=128, W=4` | tpu-inference `ragged_causal_conv1d` |
 | `gdn_decode` | TPU decode `N=512, H=2, K=V=128` | tpu-inference `fused_decoding_gdn` |
+| `qwen3_decode_layer` | Qwen3-8B FP8 batch-1 decode, context 8192, 128 attention splits | compiled vLLM `Qwen3DecoderLayer` with default backends |
+| `gemma4_a4b_moe` | Gemma 4 26B-A4B BF16 batch-1 MoE | vLLM Gemma 4 router + fused MoE with default backend selection |
 
 Most kernels additionally benchmark against `torch.compile` of the listed
 PyTorch baseline (a speedup-comparison baseline only -- correctness is checked
@@ -96,6 +101,22 @@ group while excluding aligned padding from the common correctness contract.
 Both grouped benchmarks replay pre-captured graphs, clear L2 before every
 measurement, warm the GPU before each case, and rotate/reverse implementation
 order to reduce clock and ordering bias.
+
+The two model-region entries are intentionally single-shape B200 examples.
+Each Helion definition contains the complete computation in one generated
+Triton kernel; the checked-in source does not import or assemble code from the
+probe directory. Their benchmark baselines require vLLM and correctness is
+checked before timing. Qwen executes the compiled `Qwen3DecoderLayer` with
+vLLM's `auto` policy for attention and FP8 linears. Gemma likewise leaves MoE
+dispatch on `auto`; its printed baseline name records the backend available in
+the installed vLLM/FlashInfer build. The Qwen check compares final numerical
+results against that production layer. When vLLM selects DeepGEMM, it also
+rounds dynamic activation scales to UE8M0; the Helion kernel retains its FP32
+activation scales, so the comparison is not instruction-for-instruction.
+
+The model-region benchmarks measure each captured implementation sequentially,
+with a fresh thermal warmup and cold-L2 samples, so one implementation's graph
+does not perturb the other's measurement.
 
 The kernels ported from vLLM (`vllm/kernels/helion/ops`) benchmark each fused
 Helion kernel under CUDA graphs against a torch-native (unfused, eager)
