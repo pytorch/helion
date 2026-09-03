@@ -31,11 +31,8 @@ from .triton import TritonH100MultiMatmulHeuristic
 from .triton import TritonMatmulReductionEpilogueHeuristic
 from .triton import TritonNarrowReductionHeuristic
 from .triton import TritonPointwiseSeedHeuristic
+from .triton import TritonReductionHeuristic
 from .triton import TritonSkinnyGemmHeuristic
-from .triton import TritonStandardReductionHeuristicSM90
-from .triton import TritonStandardReductionHeuristicSM100
-from .triton import TritonUserTiledReductionHeuristicSM90
-from .triton import TritonUserTiledReductionHeuristicSM100
 
 if TYPE_CHECKING:
     import torch
@@ -78,10 +75,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         TritonB200FormulaMatmulHeuristic,
         TritonB200MultiMatmulHeuristic,
         TritonMatmulReductionEpilogueHeuristic,
-        TritonStandardReductionHeuristicSM90,
-        TritonStandardReductionHeuristicSM100,
-        TritonUserTiledReductionHeuristicSM90,
-        TritonUserTiledReductionHeuristicSM100,
+        TritonReductionHeuristic,
         TritonNarrowReductionHeuristic,
         TritonPointwiseSeedHeuristic,
     ),

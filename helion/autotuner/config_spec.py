@@ -255,7 +255,7 @@ class DotAxes(NamedTuple):
 
 
 class LiveTile(NamedTuple):
-    """One simultaneously-live tensor tile at a graph's peak-live step.
+    """One simultaneously-live tensor tile at one graph step.
 
     Extends the bare ``dim_block_ids`` liveness view with the two things a resource
     estimate cannot be written without: how WIDE an element is, and WHO produced
@@ -268,7 +268,9 @@ class LiveTile(NamedTuple):
     - ``static_dims`` — the extent at each ``None`` position, so a footprint can be
       computed without re-resolving shapes (``None`` where unresolvable).
     - ``itemsize`` — element width in bytes.
-    - ``kind`` — ``"dot_out"`` | ``"load"`` | ``"carry"`` | ``"other"``.
+    - ``kind`` — ``"dot_out"`` | ``"load"`` | ``"carry"`` | ``"other"`` |
+      ``"global"``. A global tensor handle is retained in the structural
+      timeline but is not register-resident.
     - ``stageable`` — for a loop-body load, whether its index is proven to
       vary with the enclosing loop. ``None`` means uncertain and is charged
       conservatively as stageable.
@@ -498,7 +500,9 @@ class ReductionCategory(enum.Enum):
     - ``FULL_GRID`` — a full-extent axis on the grid, block == extent (fully resident per program).
     - ``GRID_TILE`` — a grid axis reduced over but NOT full-extent: the grid parallelizes the
       reduction across programs, so the whole-axis size is not a per-program extent.
-    - ``USER_TILE`` — an inner sequential ``hl.tile`` the user wrote over the reduction axis.
+    - ``USER_TILE`` — a tunable inner sequential ``hl.tile`` over the reduction axis.
+    - ``FIXED_TILE`` — an inner sequential ``hl.tile`` whose explicit fixed block differs from
+      the full iteration extent.
     - ``DECLINED`` — no static extent (e.g. jagged / data-dependent); recorded but never sized.
     """
 
@@ -506,17 +510,19 @@ class ReductionCategory(enum.Enum):
     FULL_GRID = "full_grid"
     GRID_TILE = "grid_tile"
     USER_TILE = "user_tile"
+    FIXED_TILE = "fixed_tile"
     DECLINED = "declined"
 
 
-# Categories the seed sizes a per-program reduction extent for. GRID_TILE (grid-parallelized
-# partial) stays a grid row and DECLINED (no static extent) falls back to the default, so neither
-# is sized as a reduction.
+# Categories for which the seed has a statically modelable per-program reduction width.
+# FIXED_TILE is already fixed rather than chosen by the seed. GRID_TILE (grid-parallelized
+# partial) stays a grid row and DECLINED (no static extent) falls back to the default.
 SIZED_REDUCTION_CATEGORIES = frozenset(
     {
         ReductionCategory.FULL_SLICE,
         ReductionCategory.FULL_GRID,
         ReductionCategory.USER_TILE,
+        ReductionCategory.FIXED_TILE,
     }
 )
 # Categories that occupy the full reduction extent within one program.
@@ -527,71 +533,49 @@ FULL_EXTENT_CATEGORIES = frozenset(
 
 class ReductionDescriptor(NamedTuple):
     """One reduction OCCURRENCE: a (``graph_id``, ``block_id``) reduction on the ORIGINAL
-    (pre-roll) device graphs. Stage 1 emits a list of these; the Stage-2 allocator consumes them.
+    (pre-roll) device graphs. Stage 1 emits a list of these; the allocator consumes them.
 
     A reduction axis may occur in more than one original graph (e.g. a kernel that reduces the
     same axis in two separate passes) — each occurrence is its own descriptor, so sequential
     passes over one axis are NOT collapsed.
 
-    Descriptors with the same ``graph_id`` are co-resident (the compiler fused them into one graph
-    -> shared resident working set). ``graph_id`` is read off the ORIGINAL graphs only (rolled
-    ``ReductionLoopGraphInfo`` subgraphs excluded), so it is invariant to the autotuner flipping a
+    ``graph_id`` is read off the ORIGINAL graphs only (rolled ``ReductionLoopGraphInfo``
+    subgraphs excluded), so it is invariant to the autotuner flipping a
     ``reduction_loops`` knob.
 
     Fields:
     - ``category``: the :class:`ReductionCategory`.
-    - ``block_id`` / ``graph_id``: the reduction axis + its original-graph co-residency key.
-    - ``size_hint`` / ``itemsize`` / ``input_load_itemsize``: extent (element count), the
-      fp32-promoted accumulator itemsize, and the HBM-load element width feeding it.
-    - ``carried_2d_count``: the NUMBER of >=2-D ``[M_BLOCK, R_BLOCK]`` loop-carried accumulators
-      whose last dim is this rdim (e.g. kl_div=1, jsd=2); those tiles stay resident the whole loop.
-      A count (not a bool) because the carried byte cap divides the budget by it. 0 = none here.
-    - ``row_reread`` / ``reread_eviction_index`` / ``num_load``: per-reduction memory-op signals.
+    - ``block_id`` / ``graph_id``: the reduction axis and original graph.
+    - ``size_hint`` / ``input_load_itemsize``: logical extent and the HBM-load element width
+      feeding it.
+    - ``fixed_tile_size_hint``: fixed per-iteration width for ``FIXED_TILE``; ``None`` otherwise.
+    - ``row_reread`` / ``reread_eviction_index``: per-reduction memory-op signals.
     """
 
     category: ReductionCategory
     block_id: int
     graph_id: int
     size_hint: int
-    itemsize: int
     input_load_itemsize: int = 0
-    carried_2d_count: int = 0
     row_reread: bool = False
     reread_eviction_index: int | None = None
-    num_load: int = 0
-
-
-class CoResidencyGroup(NamedTuple):
-    """A ``graph_id`` equivalence class of reductions whose working tiles are live at the same
-    time, so ONE budget must fit them all. ``descriptor_indices`` indexes into
-    ``ReductionKernelFact.reductions``.
-
-    ``live_tiles`` is the group's resident tile set — one ``dim_block_ids`` tuple per
-    register-resident tile (the block id each dim spans, ``None`` for a static/broadcast dim). It
-    is the peak live set of the group's home graph, combined with the for-loop bodies the group
-    drives and its If/Else branch siblings (see device_ir ``_group_live_tiles``). Each loop-carried
-    accumulator is captured inline at its real shape, so the Stage-2 footprint can sum ``∏(dim
-    widths)`` per actual tile. Empty when the fact is built without a live env (a bare-spec test).
-    """
-
-    graph_id: int
-    descriptor_indices: tuple[int, ...]
-    live_tiles: tuple[tuple[int | None, ...], ...] = ()
+    fixed_tile_size_hint: int | None = None
 
 
 class ReductionKernelFact(NamedTuple):
-    """The per-kernel Stage-1 product that Stage 2 consumes: the list of reduction descriptors,
-    their co-residency groups (``graph_id`` classes), the non-reduction user-tiled loops (sized as
-    a separate pass), and the parallel grid axes (rows with no reduction over them).
+    """The per-kernel reduction product: reduction descriptors, every tunable off-grid
+    non-reduction loop, parallel grid axes, the complete live-tile timeline, and axes whose
+    contiguous memory access makes them coalescing-sensitive.
 
     Built by ``build_reduction_kernel_fact``. ``reductions`` may be empty (a kernel with only
     GRID_TILE / DECLINED reductions, or none) — the seed then declines.
     """
 
     reductions: tuple[ReductionDescriptor, ...]
-    coresidency_groups: tuple[CoResidencyGroup, ...]
     non_reduction_loop_block_ids: tuple[int, ...] = ()
     grid_axis_block_ids: tuple[int, ...] = ()
+    live_tile_steps: tuple[tuple[LiveTile, ...], ...] = ()
+    coalescing_sensitive_block_ids: tuple[int, ...] = ()
 
 
 class MatmulWithReductionEpilogueFact(NamedTuple):
@@ -687,9 +671,7 @@ class MemoryOpFact(NamedTuple):
 class AccumulatorFact(NamedTuple):
     """One loop-carried tensor accumulator in a reduction loop, recorded at compile time.
     Reduction-AGNOSTIC (like ``MemoryOpFact``): ``dim_block_ids`` is the per-dim block-id
-    provenance (``None`` for a static dim), ``itemsize`` the element size. Accumulators whose last
-    dim is the reduction axis feed ``ReductionDescriptor.carried_2d_count`` (a 1-D ``[M_BLOCK]``
-    scalar accumulator counts as 0).
+    provenance (``None`` for a static dim), and ``itemsize`` is the element size.
     """
 
     dim_block_ids: tuple[int | None, ...]
