@@ -1228,13 +1228,18 @@ class CuteBackend(Backend):
             @staticmethod
             # pyrefly: ignore [bad-override]
             def sigmoid(x: CuteDSLArg) -> CuteDSLArg:
-                # The base lowering divides with an accurate IEEE fp32 div
-                # (a ~20-instruction SASS sequence).  Under fastmath use
-                # RCP.APPROX + EX2.APPROX like quack's sigmoid: at 2
-                # bytes/element these kernels are instruction-throughput
-                # bound and the accurate div costs ~20% of peak.
-                if not HelionCuteDSLOpOverrides._fastmath_on():
-                    return CuteDSLOpOverrides.sigmoid(x)
+                # RCP.APPROX + EX2.APPROX, the same sequence triton's default
+                # tl.sigmoid compiles to (one MUFU.EX2 + one MUFU.RCP).  The
+                # base lowering's accurate IEEE div is a ~20-instruction
+                # BRANCHY SASS expansion (BSSY/BSYNC reconvergence per
+                # element) that buys no accuracy here: sigmoid's error is
+                # dominated by the shared x*log2e argument rounding, and both
+                # forms measure max 64 ulp / mean 3.5 ulp vs an fp64
+                # reference on [-87, 87] (identical distributions), with
+                # specials preserved (nan->nan, +-inf->1/0, saturation->0).
+                # Only denormal OUTPUTS differ: this form flushes them to
+                # zero, as triton kernels do by default.  fp16 sigmoid
+                # 67108864: 4943 -> 5805 GB/s (B200, cold autotune).
                 x_cse = CuteDSLOpOverrides._get_cse_var(x)
                 if x_cse is not None:
                     x_fp32: CuteDSLArg = CuteDSLOpOverrides.to_dtype(

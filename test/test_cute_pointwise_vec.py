@@ -92,6 +92,14 @@ def _tile_index_bias(x: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute", static_shapes=True)
+def _sigmoid1d(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(out.size()):
+        out[tile] = torch.sigmoid(x[tile])
+    return out
+
+
 @helion.kernel(backend="cute", static_shapes=True, fast_math=True)
 def _tanh1d_fastmath(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
@@ -398,6 +406,27 @@ class TestCutePointwiseVec(TestCase):
         config_gen = spec.create_config_generation()
         for seed in seeds:
             config_gen.canonicalize_flat(config_gen.flatten(seed))
+
+    def test_default_sigmoid_rcp_approx(self) -> None:
+        """Default (no fast_math) sigmoid lowers through the triton-parity
+        RCP.APPROX + EX2.APPROX sequence: same accuracy class as the branchy
+        IEEE-div form it replaces (both are dominated by the x*log2e
+        argument rounding; max 64 ulp / mean 3.5 ulp vs fp64 on [-87, 87])
+        and ~20% faster on fp16 streams.  Specials must be preserved."""
+        x = torch.randn(2**14, device=DEVICE, dtype=torch.float16)
+        code, out = code_and_output(_sigmoid1d, (x,), block_sizes=[1024])
+        self.assertIn("cute.math.rcp", code)
+        self.assertNotIn("1.0 / ", code)
+        torch.testing.assert_close(
+            out, torch.sigmoid(x.to(torch.float32)).to(torch.float16)
+        )
+        xs = torch.tensor(
+            [0.0, -0.0, float("inf"), float("-inf"), float("nan"), -200.0, 200.0, 30.0],
+            device=DEVICE,
+            dtype=torch.float32,
+        )
+        _, out32 = code_and_output(_sigmoid1d, (xs,), block_sizes=[8])
+        torch.testing.assert_close(out32, torch.sigmoid(xs), equal_nan=True)
 
 
 if __name__ == "__main__":

@@ -16900,7 +16900,11 @@ class TestCuteLowerings(unittest.TestCase):
             bound.set_config(config)
             actual = bound(*args)
         self.assertIn("for tcgen05_epi_position", code)
-        self.assertIn("1.0 /", code)
+        # The default sigmoid lowering is the triton-parity RCP.APPROX +
+        # EX2.APPROX sequence (same accuracy class as the IEEE-div form it
+        # replaced); strict math means the fragment-level ftz HELPER —
+        # which skips the epilogue pipeline entirely — stays fastmath-only.
+        self.assertIn("cute.math.rcp", code)
         self.assertNotIn("_cute_sigmoid_approx_ftz_f32", code)
         acc = torch.einsum("mk,hkd->hmd", args[0].float(), args[1].float())
         pairs = acc.view(1, 128, 32, 2)
