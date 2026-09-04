@@ -269,6 +269,27 @@ class TestCutePointwiseVec(TestCase):
         )
         torch.testing.assert_close(out, ref)
 
+    def test_scalar_strided_lane_keeps_launch_width(self) -> None:
+        """Regression: a SCALAR lane loop with cute_lane_layouts=strided
+        must not change the launch width.  The launch-dim recovery regex
+        derives the thread extent from the ``thread_idx()[a] * epT``
+        multiplier of ``indices_*`` lines; an ``offset + tid + lane*NT``
+        form parsed as epT=1 and inflated the launch to block_size,
+        sending surplus threads out of bounds (cudaErrorIllegalAddress
+        during autotuning)."""
+        x = torch.randn(1024, 512, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(1024, 512, device=DEVICE, dtype=torch.bfloat16)
+        code, out = code_and_output(
+            _add2d,
+            (x, y),
+            block_sizes=[128, 512],
+            num_threads=[64, 1],
+            cute_vector_widths=[1, 1],
+            cute_lane_layouts=["strided", "strided"],
+        )
+        self.assertIn("block=(64, 1, 1)", code)
+        torch.testing.assert_close(out, x + y)
+
     def test_fast_math_setting_routes_cute_fastmath(self) -> None:
         """The ``fast_math`` SETTING (user opt-in) routes fastmath=True into
         cute.math calls; without it the accurate form is emitted.  Numerics

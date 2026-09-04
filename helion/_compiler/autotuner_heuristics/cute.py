@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
@@ -2455,6 +2456,43 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
             return Config(**seed)
         except Exception:
             return None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        primary = cls.get_seed_config(env, device_ir)
+        if primary is None:
+            return None
+        spec = env.config_spec
+        seeds = [primary]
+        # Flattened alternate for multi-dim tiles: flat V-chunks often beat
+        # the N-D row form (fewer pid div/mods, tail-free tiling), and the
+        # handwritten-CuTe comparison kernels iterate flat.  Skip when the
+        # primary already flattens (odd innermost extent).
+        base_variants: list[dict[str, Any]] = [dict(primary.config)]
+        picked = cls._vec_axis_and_width(env)
+        if (
+            picked is not None
+            and not picked[3]
+            and len(spec.block_sizes) > 1
+            and spec.flatten_loops
+        ):
+            vec_block, vec = picked[0], picked[1]
+            flatten_group = next(
+                (f for f in spec.flatten_loops if vec_block in f.block_ids), None
+            )
+            if flatten_group is not None:
+                total = 1
+                for bid in flatten_group.block_ids:
+                    total *= spec.block_sizes.block_id_lookup(bid).size_hint
+                if total % vec == 0:
+                    flat_seed: dict[str, Any] = dict(primary.config)
+                    flat_seed["flatten_loops"] = [True for _ in spec.flatten_loops]
+                    with contextlib.suppress(Exception):
+                        seeds.append(Config(**flat_seed))
+                        base_variants.append(flat_seed)
+        return seeds
 
 
 class CuteFp8GemmSkinnyMHeuristic(AutotunerHeuristic):

@@ -4315,15 +4315,16 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                         base_index_var=base_index_var,
                     )
                     idx_expr = f"{base_index_var} + cutlass.Int32({vec_lane_var})"
-                elif lane_strided:
-                    # ``idx = offset + tid + lane * NT`` — consecutive
-                    # threads touch consecutive elements each lane iter.
-                    idx_expr = (
-                        f"{offset_var} + {env.backend.thread_index_expr(axis=axis)}"
-                        f" + {env.backend.lane_offset_expr(lane_var)}"
-                        f" * {static_extent}"
-                    )
                 else:
+                    # NOTE: no SCALAR strided form here — the launch-dim
+                    # recovery regex (cute/backend.py ``indices_line_re``)
+                    # reads the thread extent from the ``thread_idx()[a] *
+                    # epT`` multiplier on ``indices_*`` lines; an ``offset
+                    # + tid + lane*NT`` line parses as epT=1 and inflates
+                    # the launch to block_size, sending surplus threads
+                    # out of bounds.  ``cute_lane_layouts`` affects grid
+                    # tiles only in the vec-partitioned form (whose index
+                    # lines never mention thread_idx directly).
                     idx_expr = f"{idx_expr} + {env.backend.lane_offset_expr(lane_var)}"
                 target = lane_setup_statements
             else:
