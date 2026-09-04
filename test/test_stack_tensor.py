@@ -272,6 +272,55 @@ class TestStackTensor(RefEagerTestDisabled, TestCase):
         for i, tensor in enumerate(tensor_list):
             assert tensor.eq(i).all().item()
 
+    def test_stack_load_ellipsis(self):
+        @helion.kernel
+        def stack_load_kernel(
+            dev_ptrs: torch.Tensor,
+            example_tensor: torch.Tensor,
+        ) -> torch.Tensor:
+            M = hl.specialize(dev_ptrs.size(0))
+            N = example_tensor.size(0)
+            out = torch.empty(M, N, dtype=torch.bfloat16, device=dev_ptrs.device)
+            for _ in hl.grid(1):
+                ptr_tile = dev_ptrs[:]
+                tensors = hl.stacktensor_like(example_tensor, ptr_tile)
+                out[:, :] = tensors[...]
+            return out
+
+        tensor_list = [
+            torch.randn(4, device=DEVICE, dtype=torch.bfloat16) for _ in range(4)
+        ]
+        tensor_ptrs = torch.as_tensor(
+            [p.data_ptr() for p in tensor_list], device=DEVICE, dtype=torch.uint64
+        )
+        code, result = code_and_output(stack_load_kernel, (tensor_ptrs, tensor_list[0]))
+        torch.testing.assert_close(result, torch.stack(tensor_list))
+
+    def test_stack_load_ellipsis_2d(self):
+        @helion.kernel
+        def stack_load_kernel(
+            dev_ptrs: torch.Tensor,
+            example_tensor: torch.Tensor,
+        ) -> torch.Tensor:
+            M = hl.specialize(dev_ptrs.size(0))
+            N = example_tensor.size(1)
+            out = torch.empty(M, N, dtype=torch.bfloat16, device=dev_ptrs.device)
+            for _ in hl.grid(1):
+                ptr_tile = dev_ptrs[:]
+                tensors = hl.stacktensor_like(example_tensor, ptr_tile)
+                out[:, :] = tensors[0, ...]
+            return out
+
+        tensor_list = [
+            torch.randn(4, 6, device=DEVICE, dtype=torch.bfloat16) for _ in range(4)
+        ]
+        tensor_ptrs = torch.as_tensor(
+            [p.data_ptr() for p in tensor_list], device=DEVICE, dtype=torch.uint64
+        )
+        code, result = code_and_output(stack_load_kernel, (tensor_ptrs, tensor_list[0]))
+        expected = torch.stack([t[0] for t in tensor_list])
+        torch.testing.assert_close(result, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
