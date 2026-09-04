@@ -1448,12 +1448,10 @@ def generate_ast(
             extra_params=extra_params,
         )
         fast_math_cm: contextlib.AbstractContextManager[None] = contextlib.nullcontext()
-        if env.backend_name == "cute" and (
-            env.settings.fast_math or bool(config.config.get("cute_fastmath", False))
-        ):
-            # Route the ``cute_fastmath`` config knob (or the global
-            # ``fast_math`` setting) into the inductor CuteDSL op overrides:
-            # every cute.math call in this codegen gets ``fastmath=True``.
+        if env.backend_name == "cute" and env.settings.fast_math:
+            # Route the global ``fast_math`` setting into the inductor
+            # CuteDSL op overrides: every cute.math call in this codegen
+            # gets ``fastmath=True``.
             from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import (
                 use_cutedsl_fast_math,
             )

@@ -909,7 +909,6 @@ class CuteBackend(Backend):
             or key == "cute_reduction_reloads"
             or key == "cute_cluster_n"
             or key == "cute_min_blocks_per_mp"
-            or key == "cute_fastmath"
             or key.startswith(("tcgen05_", "cute_flash_"))
         ):
             return True
@@ -1216,6 +1215,68 @@ class CuteBackend(Backend):
                         x, "cute.math.exp2({x}, fastmath=True)"
                     )
                 return CuteDSLOpOverrides.exp2(x)
+
+            @staticmethod
+            def _fastmath_on() -> bool:
+                from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import (
+                    _CUTEDSL_FAST_MATH,
+                )
+
+                return _CUTEDSL_FAST_MATH.get()
+
+            @staticmethod
+            # pyrefly: ignore [bad-override]
+            def sigmoid(x: CuteDSLArg) -> CuteDSLArg:
+                # The base lowering divides with an accurate IEEE fp32 div
+                # (a ~20-instruction SASS sequence).  Under fastmath use
+                # RCP.APPROX + EX2.APPROX like quack's sigmoid: at 2
+                # bytes/element these kernels are instruction-throughput
+                # bound and the accurate div costs ~20% of peak.
+                if not HelionCuteDSLOpOverrides._fastmath_on():
+                    return CuteDSLOpOverrides.sigmoid(x)
+                x_cse = CuteDSLOpOverrides._get_cse_var(x)
+                if x_cse is not None:
+                    x_fp32: CuteDSLArg = CuteDSLOpOverrides.to_dtype(
+                        x_cse,
+                        torch.float32,
+                        use_compute_types=False,
+                    )
+                else:
+                    x_fp32 = CuteDSLOpOverrides._cast_expr(str(x), torch.float32)
+                result = CuteDSLOpOverrides._apply_unary_op(
+                    x_fp32,
+                    f"cute.math.rcp(1.0 + cute.math.exp2("
+                    f"-{{x}} * {CuteDSLOpOverrides.LOG2_E}, fastmath=True), "
+                    f"approx=True, ftz=True)",
+                )
+                expected = CuteDSLOpOverrides._expected_tensor_val()
+                expected_dtype = expected.dtype if expected is not None else None
+                if expected_dtype is not None and expected_dtype != torch.float32:
+                    result_cse = CuteDSLOpOverrides._get_cse_var(result)
+                    if result_cse is not None:
+                        return CuteDSLOpOverrides.to_dtype(
+                            result_cse,
+                            expected_dtype,
+                            use_compute_types=False,
+                        )
+                    return CuteDSLOpOverrides._cast_expr(str(result), expected_dtype)
+                return result
+
+            @staticmethod
+            def truediv(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
+                # cute.math.div lowers to an NVVM intrinsic that only accepts
+                # fp32 scalars; 16/64-bit operands raise at DSL trace time, so
+                # keep the accurate IEEE path for every other dtype.
+                expected = CuteDSLOpOverrides._expected_tensor_val()
+                if (
+                    HelionCuteDSLOpOverrides._fastmath_on()
+                    and expected is not None
+                    and expected.dtype == torch.float32
+                ):
+                    return CuteDSLOpOverrides._apply_binary_op(
+                        a, b, "cute.math.div({a}, {b}, approx=True, ftz=True)"
+                    )
+                return CuteDSLOpOverrides.truediv(a, b)
 
             @staticmethod
             def floordiv(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:

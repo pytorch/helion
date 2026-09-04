@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import functools
 import logging
 import operator
 from typing import TYPE_CHECKING
@@ -1947,6 +1948,50 @@ def _cute_load_feeds_sort_or_scan(load_node: object) -> bool:
     return False
 
 
+def _cute_flat_multi_cover_ok(
+    env: CompileEnvironment,
+    strategy: object,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+) -> bool:
+    """True when a flat base pointer equals the per-dim indexed pointer for
+    every element of a flattened multi-dim tile: the tensor is row-major
+    contiguous, its dims match the iteration dims in order, and the
+    strategy's div/mod decomposition follows row-major order."""
+    block_ids = list(strategy.block_ids)  # pyrefly: ignore
+    # reorder[0] (the ``offsets % n`` fastest-varying dim) must be the LAST
+    # block: the identity loop_order reverses into exactly that.
+    if list(getattr(strategy, "loop_order", [])) != list(range(len(block_ids))):
+        return False
+    sub_blocks: list[int | None] = []
+    for idx in subscript:
+        if idx is None:
+            continue
+        sub_blocks.append(
+            env.get_block_id(idx) if isinstance(idx, torch.SymInt) else None
+        )
+    if sub_blocks != block_ids:
+        return False
+    if tensor.ndim != len(block_ids):
+        return False
+    expected_stride = 1
+    for d in reversed(range(tensor.ndim)):
+        stride_d = tensor.stride(d)
+        size_d = tensor.shape[d]
+        if not isinstance(stride_d, int) or not isinstance(size_d, int):
+            return False
+        if stride_d != expected_stride:
+            return False
+        try:
+            block_numel = int(env.block_sizes[block_ids[d]].numel)
+        except (TypeError, ValueError):
+            return False
+        if size_d != block_numel:
+            return False
+        expected_stride *= size_d
+    return True
+
+
 def _cute_vector_load_ctx(
     state: CodegenState,
     tensor: torch.Tensor,
@@ -2182,14 +2227,33 @@ def _cute_vector_load_ctx(
             or inner_block_id not in vec_lane_var_by_block
         ):
             return None
-        # When the per-thread vec base could straddle the tensor edge
-        # (e.g. ``numel`` not a multiple of V), the masked-tail iter
-        # could load garbage in some lanes.  Gate the per-element mask
-        # path correctly by requiring ``numel % V == 0`` so partial-vec
-        # straddles are impossible.
-        numel = env.block_sizes[inner_block_id].numel
-        if not env.known_multiple(numel, vec_width):
-            return None
+        if getattr(strategy, "_cute_flat_multi", False):
+            # Flattened multi-dim tile: the hoist emits FLAT base pointers
+            # (``t.iterator + lane_base``), which is only sound when the
+            # tensor is contiguous and covers the whole iteration space in
+            # iteration order (then a V-chunk that straddles a row boundary
+            # is still memory-contiguous).  Broadcast operands (bias[N])
+            # fail the cover check and stay on per-element scalar loads.
+            if not _cute_flat_multi_cover_ok(env, strategy, tensor, subscript):
+                return None
+            numel = functools.reduce(  # pyrefly: ignore [incompatible-overload-residual]
+                operator.mul,
+                [
+                    env.block_sizes[bid].numel
+                    for bid in strategy.block_ids  # pyrefly: ignore
+                ],
+            )
+            if not env.known_multiple(numel, vec_width):
+                return None
+        else:
+            # When the per-thread vec base could straddle the tensor edge
+            # (e.g. ``numel`` not a multiple of V), the masked-tail iter
+            # could load garbage in some lanes.  Gate the per-element mask
+            # path correctly by requiring ``numel % V == 0`` so partial-vec
+            # straddles are impossible.
+            numel = env.block_sizes[inner_block_id].numel
+            if not env.known_multiple(numel, vec_width):
+                return None
         # Record the index_exprs position of the stride-1 lane axis so the
         # hoist substitutes the per-lane base there.  Row-major lhs loads
         # use the last position; a column-major rhs (K-major ``y``) uses
