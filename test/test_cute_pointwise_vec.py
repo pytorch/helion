@@ -315,6 +315,24 @@ class TestCutePointwiseVec(TestCase):
         self.assertIn("_cute_load_l2_evict_last", code)
         torch.testing.assert_close(out, x * y)
 
+    def test_epilogue_subtile_disables_vec(self) -> None:
+        """Regression: epilogue_subtile stages stores through smem with a
+        sync inside the per-element pipeline; combined with the vec
+        hoist/flush protocol it silently corrupted ~50% of the output.
+        Subtiled configs must stay on the scalar form."""
+        x = torch.randn(64, 2048, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(64, 2048, device=DEVICE, dtype=torch.float32)
+        code, out = code_and_output(
+            _add2d,
+            (x, y),
+            block_sizes=[1, 2048],
+            num_threads=[1, 256],
+            cute_vector_widths=[1, 4],
+            epilogue_subtile=2,
+        )
+        self.assertNotIn("ir.VectorType.get(", code)
+        torch.testing.assert_close(out, x + y)
+
     def test_fast_math_setting_routes_cute_fastmath(self) -> None:
         """The ``fast_math`` SETTING (user opt-in) routes fastmath=True into
         cute.math calls; without it the accurate form is emitted.  Numerics

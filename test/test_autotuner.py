@@ -11428,13 +11428,16 @@ class TestCuteAutotuner(TestCase):
         # surface. ``cute_vector_widths`` is the per-axis vec width slot
         # registered for non-reduction tile blocks.
         # ``load_eviction_policies`` carries per-load-site L1 eviction
-        # hints (lowered on the vectorized load forms). The set still
-        # excludes Triton-style knobs that the CuTe path does not consume.
+        # hints (lowered on the vectorized load forms). ``flatten_loops``
+        # selects the flattened multi-dim tile form (flat base-pointer
+        # vectorization). The set still excludes Triton-style knobs that
+        # the CuTe path does not consume.
         self.assertEqual(
             flat_keys,
             {
                 "block_sizes",
                 "num_threads",
+                "flatten_loops",
                 "loop_orders",
                 "cute_vector_widths",
                 "cute_lane_layouts",
@@ -11458,6 +11461,7 @@ class TestCuteAutotuner(TestCase):
                 {
                     "block_sizes",
                     "num_threads",
+                    "flatten_loops",
                     "loop_orders",
                     "cute_vector_widths",
                     "cute_lane_layouts",

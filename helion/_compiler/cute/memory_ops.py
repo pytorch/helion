@@ -2206,6 +2206,13 @@ def _cute_vector_load_ctx(
         # vectorize along the wrong dim and read garbage.
         if not lane_on_stride1:
             return None
+        # Epilogue subtiling stages stores through smem with sync_threads
+        # inside the per-element pipeline; the vec hoist/flush protocol
+        # silently corrupts that form — stay scalar (matches pre-vec
+        # behavior, which is correct under subtiling).
+        subtile = state.config.config.get("epilogue_subtile")
+        if isinstance(subtile, int) and subtile > 1:
+            return None
         vec_by_block = getattr(strategy, "_cute_lane_vec_width_by_block", None)
         if not isinstance(vec_by_block, dict):
             return None

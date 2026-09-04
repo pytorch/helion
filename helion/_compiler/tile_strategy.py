@@ -1920,6 +1920,12 @@ class ForiLoopState(DeviceLoopOrGridState):
     )
 
 
+def _cute_epilogue_subtile_active(config: object) -> bool:
+    """True when the config requests epilogue subtiling (>= 2)."""
+    value = getattr(config, "config", {}).get("epilogue_subtile")
+    return isinstance(value, int) and value > 1
+
+
 @dataclasses.dataclass
 class VecLaneWrapper:
     """Pre-built outer x constexpr-V lane structure for a GRID lane loop.
@@ -4262,6 +4268,12 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                     # request_root_lane_loop_suppression), which would strand
                     # the hoists; keep grid vec to matmul-free kernels.
                     and not env.config_spec.matmul_facts
+                    # Epilogue subtiling stages stores through smem with a
+                    # sync_threads INSIDE the per-element pipeline, which the
+                    # vec store-collection protocol silently corrupts (50%
+                    # wrong output measured); keep such configs on the
+                    # (correct) scalar form.
+                    and not _cute_epilogue_subtile_active(self.fn.config)
                 ):
                     # Same outer x constexpr-V lane partition as
                     # ``codegen_device_loop`` (see the comments there), so
@@ -4806,8 +4818,12 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
             thread_extent, int
         )
 
-        if vec_width > 1 and env.config_spec.matmul_facts:
-            # See the matmul-fallback lane-loop-suppression note in
+        if vec_width > 1 and (
+            env.config_spec.matmul_facts
+            or _cute_epilogue_subtile_active(self.fn.config)
+        ):
+            # See the matmul-fallback lane-loop-suppression and the
+            # epilogue-subtile smem-staging notes in
             # ``PerThreadNDTileStrategy.codegen_grid``.
             vec_width = 1
         if vec_width > 1:
