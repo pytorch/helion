@@ -3920,6 +3920,13 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             return
         if len(self._lane_var_by_block) != 1:
             return
+        # Statements outside the cluster-split loop execute once per
+        # cluster CTA — benign for plain (idempotent) stores, but a
+        # read-modify-write would repeat ``cluster_n`` times.
+        from .host_function import HostFunction
+
+        if HostFunction.current().device_ir.has_atomic_ops():
+            return
         # The cluster reduce combines across the WHOLE CTA, so the grid
         # strategy must not put sibling axes on thread dims (e.g. a
         # multi-row grid tile with block_m > 1) — those rows would be

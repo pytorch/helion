@@ -746,16 +746,7 @@ def _fx_trace_tensor_arg_rw_names(
     return out2
 
 
-def _reduction_fx_inter_loop_rw_names(
-    graph: torch.fx.Graph,
-    host: HostFunction,
-) -> tuple[frozenset[str], frozenset[str]]:
-    """Infer host buffer names read/written in a rolled reduction FX subgraph.
-
-    Resolves every hl.load / hl.store / atomic_* tensor arg back to host-named buffers.
-    Args not resolving to a host name are device-internal temporaries (no cross-wavefront
-    coherence) and are excluded.
-    """
+def _atomic_funcs() -> frozenset[Callable[..., object]]:
     from ..language import atomic_add
     from ..language import atomic_and
     from ..language import atomic_cas
@@ -764,9 +755,8 @@ def _reduction_fx_inter_loop_rw_names(
     from ..language import atomic_or
     from ..language import atomic_xchg
     from ..language import atomic_xor
-    from ..language import memory_ops
 
-    atomic_funcs = frozenset(
+    return frozenset(
         {
             atomic_add,
             atomic_and,
@@ -778,6 +768,21 @@ def _reduction_fx_inter_loop_rw_names(
             atomic_xor,
         }
     )
+
+
+def _reduction_fx_inter_loop_rw_names(
+    graph: torch.fx.Graph,
+    host: HostFunction,
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Infer host buffer names read/written in a rolled reduction FX subgraph.
+
+    Resolves every hl.load / hl.store / atomic_* tensor arg back to host-named buffers.
+    Args not resolving to a host name are device-internal temporaries (no cross-wavefront
+    coherence) and are excluded.
+    """
+    from ..language import memory_ops
+
+    atomic_funcs = _atomic_funcs()
     reads: set[str] = set()
     writes: set[str] = set()
 
@@ -816,6 +821,24 @@ class DeviceIR:
         self.noncanonical_task_origin_block_ids: set[int] = set()
         # Owning HostFunction (captured in ``lower_to_device_ir``).
         self.host_function: HostFunction | None = None
+        self._has_atomic_ops: bool | None = None
+
+    def has_atomic_ops(self) -> bool:
+        """True when any FX graph contains an ``hl.atomic_*`` call.
+
+        Used to gate optimizations that would replay side effects — e.g.
+        the CuTe cluster row-split executes every non-rolled statement once
+        per cluster CTA, which is benign for plain (idempotent) stores but
+        would repeat a read-modify-write ``cluster_n`` times.
+        """
+        if self._has_atomic_ops is None:
+            atomic_funcs = _atomic_funcs()
+            self._has_atomic_ops = any(
+                node.op == "call_function" and node.target in atomic_funcs
+                for info in self.graphs
+                for node in info.graph.nodes
+            )
+        return self._has_atomic_ops
 
     def __str__(self) -> str:
         return "\n\n".join(map(str, self.graphs))
