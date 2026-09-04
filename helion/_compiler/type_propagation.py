@@ -833,10 +833,16 @@ class TypePropagation(ast.NodeVisitor):
 
     def visit_Subscript(self, node: ast.Subscript) -> TypeInfo:
         value_type = self.visit(node.value)
-        # ellipsis expansion not yet supported for StackTensorType.
+        ndim = None
         if isinstance(value_type, TensorType):
-            self._expand_ellipsis_in_subscript(node, value_type.fake_value.ndim)
-            self._pad_trailing_dims(node, value_type.fake_value.ndim)
+            ndim = value_type.fake_value.ndim
+        elif isinstance(value_type, StackTensorType):
+            tensor_like_type = value_type.element_types["tensor_like"]
+            assert isinstance(tensor_like_type, TensorType)
+            ndim = tensor_like_type.fake_value.ndim
+        if ndim is not None:
+            self._expand_ellipsis_in_subscript(node, ndim)
+            self._pad_trailing_dims(node, ndim)
         slice_type = self.visit(node.slice)
         return value_type.propagate_getitem(slice_type, self.origin())
 
