@@ -130,7 +130,11 @@ def _load_kind(node: ast.AST) -> str | None:
     """
     if _looks_like_tracked_load(node) is not None:
         return "masked"
-    if _looks_like_vec_load(node) is not None:
+    # A cache-hinted SCALAR load also routes through ``cute.arch.load``
+    # (``(ptr).load()`` has no hint kwargs), so "vec" additionally requires
+    # a VectorType dtype argument; scalar arch loads fall through to
+    # "unmasked".
+    if _looks_like_vec_load(node) is not None and _vec_width(node) is not None:
         return "vec"
     if _looks_like_unmasked_load(node) is not None:
         return "unmasked"
@@ -201,15 +205,57 @@ def _trip_count_for(
     return (e - s + t - 1) // t
 
 
+def _scalar_load_ptr_text(node: ast.AST) -> str | None:
+    """Pointer text of a SCALAR gmem load in either emitted form:
+    ``(PTR).load(...)`` or ``cute.arch.load(PTR, <scalar dtype>, ...)``.
+
+    A cache-hinted scalar site routes through ``cute.arch.load`` while its
+    unhinted twin in the other sweep stays ``(PTR).load()``; the two must
+    compare equal for cross-sweep fusion, so both normalize to the pointer
+    expression.  Returns None for vec loads and non-load expressions.
+    """
+    if not isinstance(node, ast.Call):
+        return None
+    func = node.func
+    if not isinstance(func, ast.Attribute) or func.attr != "load":
+        return None
+    if _looks_like_vec_load(node) is not None:
+        if _vec_width(node) is not None:
+            return None
+        if node.args:
+            return ast.unparse(node.args[0])
+        return None
+    return ast.unparse(func.value)
+
+
+def _normalized_load_text(node: ast.AST) -> str:
+    """Unparse with cache hints stripped and the two scalar load forms
+    collapsed onto one spelling (see ``_scalar_load_ptr_text``)."""
+    ptr = _scalar_load_ptr_text(node)
+    if ptr is not None:
+        return f"__scalar_load__({ptr})"
+    if isinstance(node, ast.IfExp):
+        body_ptr = _scalar_load_ptr_text(node.body)
+        if body_ptr is not None:
+            return (
+                f"(__scalar_load__({body_ptr}) if {ast.unparse(node.test)} "
+                f"else {ast.unparse(node.orelse)})"
+            )
+    return re.sub(
+        r",\s*(?:level1_eviction_priority|cop)='[a-z_]+'", "", ast.unparse(node)
+    )
+
+
 def _node_text(node: ast.AST) -> str:
     """Stable text key for matching AST nodes.
 
-    Per-load-site L1 eviction hints are stripped from the key: the same
-    logical load in different sweeps carries a different (independently
-    tunable) hint, and the hint must not defeat cross-sweep fusion — the
-    surviving first-sweep load keeps its own hint.
+    Per-load-site cache hints are stripped from the key (and the hinted /
+    unhinted scalar load spellings collapse): the same logical load in
+    different sweeps carries a different (independently tunable) hint, and
+    the hint must not defeat cross-sweep fusion — the surviving first-sweep
+    load keeps its own hint.
     """
-    return re.sub(r",\s*level1_eviction_priority='[a-z_]+'", "", ast.unparse(node))
+    return _normalized_load_text(node)
 
 
 def _unmasked_load_tensor_dtype(
@@ -284,7 +330,7 @@ def _canonical_load_text(node: ast.AST, lane_var_alias: dict[str, str]) -> str:
     """
     # Per-load-site eviction hints differ between sweeps and must not
     # defeat matching (see _node_text).
-    text = re.sub(r",\s*level1_eviction_priority='[a-z_]+'", "", ast.unparse(node))
+    text = _normalized_load_text(node)
     for old, new in lane_var_alias.items():
         # Word-boundary replacement so suffixed vars don't pick up matches
         # for shorter prefixes.

@@ -2330,9 +2330,12 @@ def _(state: CodegenState) -> object:
         tensor=tensor,
         include_tensor_index_masks=False,
     )
-    # Autotunable per-load-site L1 eviction hint, applied to the vectorized
-    # load forms (``cute.arch.load``); scalar ``(ptr).load()`` sites ignore
-    # it.  Same site-order indexing scheme as the Triton backend.
+    # Autotunable per-load-site cache hint, applied to the ``cute.arch.load``
+    # forms (vectorized, and scalar when a hint is set).  "first"/"last" are
+    # L1 eviction priorities; "streaming" is the ``ld.global.cs`` cache
+    # operator (evict-first at both L1 and L2 — single-use streaming reads
+    # stop displacing useful L2 lines).  Same site-order indexing scheme as
+    # the Triton backend.
     eviction_suffix = ""
     if state.codegen.on_device:
         device_fn = state.device_function
@@ -2340,8 +2343,10 @@ def _(state: CodegenState) -> object:
         device_fn.device_load_index += 1
         policies = state.config.load_eviction_policies
         if load_idx < len(policies):
-            mapped = _CUTE_EVICTION_POLICY_MAP.get(policies[load_idx], "")
-            if mapped:
+            policy = policies[load_idx]
+            if policy == "streaming":
+                eviction_suffix = ", cop='cs'"
+            elif mapped := _CUTE_EVICTION_POLICY_MAP.get(policy, ""):
                 eviction_suffix = f", level1_eviction_priority={mapped!r}"
     vec_ctx = _cute_vector_load_ctx(state, tensor, subscript, index_exprs, extra_mask)
     if vec_ctx is not None:
@@ -2400,7 +2405,12 @@ def _(state: CodegenState) -> object:
                 eviction_suffix=eviction_suffix,
             )
     else:
-        load_expr = _cute_scalar_load_expr(tensor_name, index_exprs, tensor.dtype)
+        load_expr = _cute_scalar_load_expr(
+            tensor_name,
+            index_exprs,
+            tensor.dtype,
+            eviction_suffix=eviction_suffix,
+        )
     if tensor.dtype is torch.bool:
         load_expr = f"({load_expr} != cutlass.Uint8(0))"
         if mask_expr is None:

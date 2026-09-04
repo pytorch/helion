@@ -923,11 +923,18 @@ def get_valid_eviction_policies(backend_name: str) -> tuple[str, ...]:
     if backend_name == "triton" and not supports_amd_cdna_tunables():
         return ("", "first", "last")
     if backend_name == "cute":
-        # Lowered to ld.global L1 eviction hints
+        # "first"/"last" lower to ld.global L1 eviction hints
         # (level1_eviction_priority=evict_first/evict_last) on the
         # vectorized load sites.  Pays off for reload-from-gmem sweeps
         # (keep re-read rows resident, evict on the final pass).
-        return ("", "first", "last")
+        # "streaming" lowers to the ld.global.cs cache operator
+        # (evict-first at BOTH L1 and L2): single-use streaming reads
+        # stop displacing useful/dirty L2 lines, which is worth ~20% on
+        # row reductions whose footprint is within ~2x of L2 (measured
+        # 57.3us -> 47.1us on cross-entropy 32768x2048 fp32 on B200
+        # under do_bench's dirty-L2 flush; triton's evict_first hints L2
+        # too, so this closes a structural gap vs the triton backend).
+        return ("", "first", "last", "streaming")
     return ("",)
 
 
