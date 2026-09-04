@@ -811,14 +811,23 @@ _CUTE_VECTOR_DTYPES: dict[torch.dtype, tuple[str, int]] = {
     torch.bfloat16: ("cutlass.BFloat16", _CUTE_VECTOR_MAX_BYTES // 2),
 }
 
-# ``unroll`` mode loads bf16/fp16 inputs as Uint16 vectors and bitcasts each
-# extracted lane back to the original dtype.  This avoids the CuTe DSL
-# crash that fires when subscripting a bf16/fp16 vector value.  Cutlass
-# scalar type for the extracted lane is paired with the vec-element type
-# name used in ``ir.VectorType.get``.
+# ``unroll`` mode loads inputs as same-width INTEGER vectors (Uint16 for
+# bf16/fp16, Uint32 for fp32) and bitcasts each extracted lane back to the
+# original dtype.  This avoids the CuTe DSL crash that fires when
+# subscripting a bf16/fp16 vector value, and for fp32 sidesteps the retired
+# explicit-vec mode (see ``_cute_vec_kernel_mode``).  Maps the tensor dtype
+# to the cutlass scalar type of the extracted lane.
 _CUTE_VECTOR_UNROLL_DTYPES: dict[torch.dtype, str] = {
     torch.float16: "cutlass.Float16",
     torch.bfloat16: "cutlass.BFloat16",
+    torch.float32: "cutlass.Float32",
+}
+
+# Integer carrier type for an unroll-mode vector load of a given dtype.
+_CUTE_VECTOR_UNROLL_CARRIER: dict[torch.dtype, str] = {
+    torch.float16: "cutlass.Uint16",
+    torch.bfloat16: "cutlass.Uint16",
+    torch.float32: "cutlass.Uint32",
 }
 
 # 1-byte fp8 dtypes also use ``unroll`` mode.  Rather than a
@@ -855,14 +864,15 @@ def _cute_is_unroll_dtype(dtype: torch.dtype) -> bool:
 def _cute_unroll_vec_elem_type(dtype: torch.dtype, vec_width: int = 1) -> str:
     """Cutlass load type for an ``unroll``-mode hoisted vec load.
 
-    fp8 loads ``vec_width`` bytes as a single packed integer; bf16/fp16 load a
-    ``Uint16`` vector element (the ``VectorType`` width is applied by callers).
+    fp8 loads ``vec_width`` bytes as a single packed integer; bf16/fp16/fp32
+    load a same-width integer vector element (the ``VectorType`` width is
+    applied by callers).
     """
     if _cute_is_byte_packed(dtype):
         pack = _CUTE_BYTE_PACK_TYPE.get(vec_width)
         assert pack is not None, f"unsupported fp8 vec_width {vec_width}"
         return pack
-    return "cutlass.Uint16"
+    return _CUTE_VECTOR_UNROLL_CARRIER[dtype]
 
 
 def _cute_lane_axis_pos(strategy: object, block_id: int, index_exprs: list[str]) -> int:
@@ -889,7 +899,7 @@ def _cute_unroll_vec_load_expr(
         return f"cute.arch.load({ptr_expr}, {pack}{eviction_suffix})"
     return (
         f"cute.arch.load({ptr_expr}, "
-        f"ir.VectorType.get([{vec_width}], cutlass.Uint16.mlir_type)"
+        f"ir.VectorType.get([{vec_width}], {_cute_unroll_vec_elem_type(dtype)}.mlir_type)"
         f"{eviction_suffix})"
     )
 
@@ -905,7 +915,8 @@ def _cute_unroll_vec_extract(hoist_var: str, idx: str, dtype: torch.dtype) -> st
     if dtype in _CUTE_VECTOR_UNROLL_BYTE_DTYPES:
         return f"cutlass.Uint8(({hoist_var} >> (8 * ({idx}))) & 0xFF)"
     elem_dtype = _CUTE_VECTOR_UNROLL_DTYPES[dtype]
-    return f"cutlass.Uint16({hoist_var}[{idx}]).bitcast({elem_dtype})"
+    carrier = _CUTE_VECTOR_UNROLL_CARRIER[dtype]
+    return f"{carrier}({hoist_var}[{idx}]).bitcast({elem_dtype})"
 
 
 def _cute_lane_vloop_insert_pos(

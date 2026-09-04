@@ -147,16 +147,20 @@ def _strategies_concurrent_with_block(
 
 
 def _cute_vec_kernel_mode() -> str:
-    """Return ``"vec"`` when all reduction-feeding loads are vec-eligible
-    without a degrading dtype cast (i.e. fp32 -> fp32 pipeline), ``"unroll"``
-    when at least one load uses the bf16/fp16 -> fp32 cast pattern that the
-    CuTe DSL's ``Float32(vec)`` constructor would silently scalarise, or
-    ``"none"`` when there's no looped reduction at all.
+    """Return the vec-lattice mode for looped reductions: always ``"unroll"``.
 
-    ``"vec"`` lets the strategy emit a single ``cute.arch.load(..., V)`` +
-    V-fold per lane iter.  ``"unroll"`` falls back to a constexpr V-loop
-    around per-element scalar loads — the CUTLASS DSL cannot iterate the
-    elements of a bf16/fp16 vector without crashing during compile.
+    ``"unroll"`` partitions the lane extent into outer x V and walks each
+    V-chunk with a hoisted integer-vector load (Uint16 for bf16/fp16,
+    Uint32 for fp32) plus per-lane bitcasts; loads that cannot vectorize
+    fall back to per-element scalar loads INSIDE the V-loop, which keeps
+    the lattice and the loads consistent.
+
+    The retired ``"vec"`` mode (explicit ``cute.arch.load(..., V)`` +
+    ``_cute_pre_vec_fold``) was selected for pure-fp32 kernels but its
+    load-side gate (``feeds_reduction``) never matched aten reduction
+    targets, so every fp32 config with V > 1 emitted vec-lattice indexing
+    with SCALAR loads — reading 1/V of the row and silently corrupting
+    results (only the autotuner's accuracy check filtered such configs).
     """
     from .host_function import HostFunction
     from .host_function import NoCurrentFunction
@@ -167,30 +171,7 @@ def _cute_vec_kernel_mode() -> str:
         return "none"
     if hf._device_ir is None:
         return "none"
-    cast_targets = {
-        "convert_element_type.default",
-        "convert_element_type",
-        "_to_copy.default",
-        "_to_copy",
-    }
-    from ..language import memory_ops as _memory_ops
-
-    load_target = _memory_ops.load
-    has_cast = False
-    for graph_info in hf.device_ir.graphs:
-        for node in graph_info.graph.nodes:
-            if node.target is not load_target:
-                continue
-            for user in node.users:
-                target_name = getattr(user.target, "__name__", "") or ""
-                if target_name in cast_targets:
-                    has_cast = True
-                    break
-            if has_cast:
-                break
-        if has_cast:
-            break
-    return "unroll" if has_cast else "vec"
+    return "unroll"
 
 
 def _cute_cluster_reduce_smem_vars(
@@ -1238,7 +1219,10 @@ class LoopedReductionStrategy(ReductionStrategy):
         self._cute_reduction_vec_width = 1
         # ``"vec"`` (fp32 fast path) or ``"unroll"`` (bf16/fp16 fallback)
         # — controls how the lane body emits each per-iter load.
-        self._cute_reduction_vec_mode = "vec"
+        # "unroll" is the only live vec mode; the retired "vec" mode
+        # miscompiled (see _cute_vec_kernel_mode) so it must never be the
+        # default a forgotten assignment falls back to.
+        self._cute_reduction_vec_mode = "unroll"
         # Masks queued by vec loads inside the lane loop; consumed by
         # codegen_reduction to wrap the V-fold scalar.
         self._cute_pending_vec_masks: list[str] = []
