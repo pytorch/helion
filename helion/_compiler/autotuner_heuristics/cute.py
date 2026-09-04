@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
@@ -2343,6 +2344,124 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
                 "tensor_descriptor",
             ]
         return Config(**seed)
+
+
+class CutePointwiseVecHeuristic(AutotunerHeuristic):
+    """Seed config for PURE pointwise kernels (add, gelu, cast, ...).
+
+    The cute default maps one thread per element with scalar loads (~5% of
+    HBM on B200).  Seed the vectorized lane-loop form instead: the stride-1
+    tile axis gets ``block = NT * V * UNROLL`` elements served by ``NT``
+    threads with ``cute_vector_widths = V`` sized to a 16-byte LDG.128
+    (V=8 for 16-bit dtypes, V=4 for fp32); every other tiled axis stays at
+    block 1.  Works for both the flattened (1D) and N-D grid strategies —
+    both share the tile_unroll vec-hoist protocol.
+
+    Fires on the presence of ``PointwiseElementwiseFact`` (built only in
+    the absence of reduction/matmul/accumulator facts, so it never claws a
+    reducing kernel into this track).
+    """
+
+    name = "cute_pointwise_vec"
+    backend = "cute"
+
+    NT = 256  # threads per CTA
+    UNROLL = 2  # vectors per thread (outer lane iters)
+
+    @classmethod
+    def _vec_axis_and_width(
+        cls, env: CompileEnvironment
+    ) -> tuple[int, int, int] | None:
+        """Returns (vec_block_id, V, axis size_hint), or None if no axis
+        can host a vec lane loop."""
+        spec = env.config_spec
+        if not spec.pointwise_facts:
+            return None
+        fact = spec.pointwise_facts[0]
+        if not spec.block_sizes:
+            return None
+        candidates = [s.block_id for s in spec.block_sizes]
+        vec_block = None
+        for bid in reversed(candidates):
+            if bid in fact.contig_block_ids:
+                vec_block = bid
+                break
+        if vec_block is None:
+            vec_block = candidates[-1]
+        if vec_block not in spec.cute_vector_widths.valid_block_ids():
+            return None
+        if vec_block not in spec.num_threads.valid_block_ids():
+            return None
+        size_hint = spec.block_sizes.block_id_lookup(vec_block).size_hint
+        vec = 16 // max(1, fact.storage_itemsize)
+        # The hoist requires numel % V == 0; shrink V until it divides.
+        while vec > 1 and size_hint % vec != 0:
+            vec //= 2
+        if vec <= 1:
+            return None
+        return vec_block, vec, size_hint
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._vec_axis_and_width(env) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        spec = env.config_spec
+        picked = cls._vec_axis_and_width(env)
+        if picked is None:
+            return None
+        vec_block, vec, size_hint = picked
+        bs_high = spec.block_sizes.block_id_lookup(vec_block)._fragment(spec).high
+        nt, unroll = cls.NT, cls.UNROLL
+        while nt * vec * unroll > bs_high and unroll > 1:
+            unroll //= 2
+        while nt * vec * unroll > bs_high and nt > 1:
+            nt //= 2
+        block = nt * vec * unroll
+        if block > bs_high or nt <= 1:
+            return None
+        seed: dict[str, Any] = {
+            "block_sizes": [
+                block if s.block_id == vec_block else 1 for s in spec.block_sizes
+            ],
+            "num_threads": _seq_config_list(spec.num_threads, {vec_block: nt}),
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {vec_block: vec}
+            ),
+        }
+        try:
+            return Config(**seed)
+        except Exception:
+            return None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        primary = cls.get_seed_config(env, device_ir)
+        if primary is None:
+            return None
+        spec = env.config_spec
+        seeds = [primary]
+        # Transcendental-heavy pointwise kernels (gelu/silu/...) are often
+        # SFU/ALU-bound with accurate math; plant a fastmath alternate so the
+        # search benchmarks it (the baseline accuracy check drops it where
+        # numerics drift past tolerance).
+        fact = spec.pointwise_facts[0] if spec.pointwise_facts else None
+        if (
+            fact is not None
+            and fact.sfu_ops > 0
+            and spec.cute_has_transcendentals
+            and spec.supports_config_key("cute_fastmath")
+        ):
+            fm_seed: dict[str, Any] = dict(primary.config)
+            fm_seed["cute_fastmath"] = True
+            with contextlib.suppress(Exception):
+                seeds.append(Config(**fm_seed))
+        return seeds
 
 
 class CuteFp8GemmSkinnyMHeuristic(AutotunerHeuristic):

@@ -948,13 +948,15 @@ def _cute_register_tile_unroll_vec_store(
     index_exprs: list[str],
     value_expr: str,
     mask_expr: str | None,
+    dtype: torch.dtype = torch.float16,
 ) -> ast.stmt | None:
     """Vector-store counterpart of ``_cute_register_tile_unroll_vec_hoist``.
 
     Replaces the per-lane scalar ``(ptr).store(value)`` inside the constexpr
     V-loop with an append onto a compile-time Python list, and splices ONE
-    ``_cute_store_u16_vec(base_ptr, vals)`` flush AFTER the V-loop, emitting
-    an ST.64/ST.128 instead of V scalar 2-byte stores.
+    ``_cute_store_u16_vec(base_ptr, vals)`` (bf16/fp16; ``_cute_store_u32_vec``
+    for fp32) flush AFTER the V-loop, emitting an ST.64/ST.128 instead of V
+    scalar stores.
 
     Caller must guarantee the per-element mask is uniform across the V
     lanes (``numel % V == 0``, no extra_mask); the flush reuses the scalar
@@ -990,7 +992,11 @@ def _cute_register_tile_unroll_vec_store(
     sites.append(list_var)
     vloop_pos = _cute_lane_vloop_insert_pos(strategy, block_id, lane_body)
     lane_body.insert(vloop_pos, statement_from_string(f"{list_var} = []"))
-    flush_expr = f"_cute_store_u16_vec({base_ptr_expr}, {list_var})"
+    carrier = _CUTE_VECTOR_UNROLL_CARRIER[dtype]
+    flush_helper = (
+        "_cute_store_u32_vec" if dtype is torch.float32 else "_cute_store_u16_vec"
+    )
+    flush_expr = f"{flush_helper}({base_ptr_expr}, {list_var})"
     if mask_expr is not None:
         flush_stmt = statement_from_string(f"if {mask_expr}:\n    {flush_expr}")
     else:
@@ -1002,7 +1008,7 @@ def _cute_register_tile_unroll_vec_store(
         flush_stmt,
     )
     return statement_from_string(
-        f"{list_var}.append(({value_expr}).bitcast(cutlass.Uint16))"
+        f"{list_var}.append(({value_expr}).bitcast({carrier}))"
     )
 
 
@@ -1013,6 +1019,7 @@ def _cute_register_reduction_unroll_vec_store(
     index_exprs: list[str],
     value_expr: str,
     mask_expr: str | None,
+    dtype: torch.dtype = torch.float16,
 ) -> ast.stmt | None:
     """Reduction-lane variant of ``_cute_register_tile_unroll_vec_store``.
 
@@ -1058,7 +1065,11 @@ def _cute_register_reduction_unroll_vec_store(
     )
     sites.append(list_var)
     lane_body.insert(_vloop_pos(), statement_from_string(f"{list_var} = []"))
-    flush_expr = f"_cute_store_u16_vec({base_ptr_expr}, {list_var})"
+    carrier = _CUTE_VECTOR_UNROLL_CARRIER[dtype]
+    flush_helper = (
+        "_cute_store_u32_vec" if dtype is torch.float32 else "_cute_store_u16_vec"
+    )
+    flush_expr = f"{flush_helper}({base_ptr_expr}, {list_var})"
     if mask_expr is not None:
         flush_stmt = statement_from_string(f"if {mask_expr}:\n    {flush_expr}")
     else:
@@ -1067,7 +1078,7 @@ def _cute_register_reduction_unroll_vec_store(
     # emitted store order matches the source order.
     lane_body.insert(_vloop_pos() + 1 + site_index, flush_stmt)
     return statement_from_string(
-        f"{list_var}.append(({value_expr}).bitcast(cutlass.Uint16))"
+        f"{list_var}.append(({value_expr}).bitcast({carrier}))"
     )
 
 
@@ -1132,19 +1143,24 @@ def _cute_register_tile_unroll_vec_hoist(
         env_local = CompileEnvironment.current()
         numel = env_local.block_sizes[block_id].numel
         numel_expr = state.sympy_expr(numel)
-        mask_vars = getattr(strategy, "mask_vars", None)
         block_pos = strategy.block_ids.index(block_id)  # pyrefly: ignore
-        static_bs = strategy._configured_block_size_int(  # pyrefly: ignore
-            strategy.block_size[block_pos]  # pyrefly: ignore
-        )
+        bs_obj = strategy.block_size  # pyrefly: ignore
+        if isinstance(bs_obj, (list, tuple)):
+            bs_obj = bs_obj[block_pos]
+        static_bs = strategy._configured_block_size_int(bs_obj)  # pyrefly: ignore
+        mask_vars = getattr(strategy, "mask_vars", None)
+        if isinstance(mask_vars, dict):
+            # PerThreadNDTileStrategy: per-block mask registry.
+            mask_elided = block_id in mask_vars and mask_vars[block_id] is None
+        else:
+            # FlattenedTileStrategy keeps a single (elision-aware) mask var.
+            mask_elided = strategy.mask_var(block_id) is None  # pyrefly: ignore
         try:
             numel_int = int(numel)
         except (TypeError, ValueError):
             numel_int = None
         if (
-            isinstance(mask_vars, dict)
-            and block_id in mask_vars
-            and (mask_vars[block_id] is None)
+            mask_elided
             and isinstance(static_bs, int)
             and numel_int is not None
             and static_bs >= numel_int

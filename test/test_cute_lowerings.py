@@ -14052,12 +14052,14 @@ class TestCuteLowerings(unittest.TestCase):
         grid_strategy = SimpleNamespace(
             _lane_var_by_block={0: "lane_0", 1: "lane_1"},
             _elements_per_thread_for_block=lambda block_id: 2,
+            _cute_lane_vec_width_by_block={},
         )
         grid_state = SimpleNamespace(
             block_thread_axes={0: 0, 1: 1},
             has_lane_loops=lambda: True,
             lane_loops=[("lane_0", 2), ("lane_1", 2)],
             strategy=grid_strategy,
+            vec_lane_wrappers={},
         )
         cg = _FakeGenerateAST({0, 1}, current_grid_state=grid_state)
         ctx = SimpleNamespace(cg=cg, env={inp: ast.Name(id="inp_tile", ctx=ast.Load())})
@@ -14079,6 +14081,49 @@ class TestCuteLowerings(unittest.TestCase):
         emitted = "\n".join(ast.unparse(stmt) for stmt in cg.statements)
         self.assertIn("if lane_1 == 1:", emitted)
         self.assertNotIn("if lane_0 == 1:", emitted)
+
+    def test_codegen_cute_argreduce_scan_gate_on_vec_lane_loop(self) -> None:
+        """A vec'd lane loop runs its outer var over EPT // V; the scan-ready
+        gate must fire on the last vec lane of the last outer iteration (the
+        full-EPT condition would never be true)."""
+        graph = Graph()
+        inp = graph.placeholder("inp")
+        argmax = graph.call_function(torch.ops.aten.argmax.default, args=(inp, 1))
+        graph.output(argmax)
+        inp.meta["val"] = torch.empty(4, 8)
+        argmax.meta["val"] = torch.empty(4, dtype=torch.int64)
+
+        grid_strategy = SimpleNamespace(
+            _lane_var_by_block={0: "lane_0", 1: "lane_1"},
+            _elements_per_thread_for_block=lambda block_id: 4,
+            _cute_lane_vec_width_by_block={1: 2},
+        )
+        grid_state = SimpleNamespace(
+            block_thread_axes={0: 0, 1: 1},
+            has_lane_loops=lambda: True,
+            lane_loops=[("lane_0", 4), ("lane_1", 4)],
+            strategy=grid_strategy,
+            vec_lane_wrappers={"lane_1": SimpleNamespace(vec_lane_var="vec_lane_1")},
+        )
+        cg = _FakeGenerateAST({0, 1}, current_grid_state=grid_state)
+        ctx = SimpleNamespace(cg=cg, env={inp: ast.Name(id="inp_tile", ctx=ast.Load())})
+        env = _fake_env({4: 0, 8: 1})
+
+        with (
+            patch.object(CompileEnvironment, "current", return_value=env),
+            patch("helion._compiler.generate_ast.GenerateAST", _FakeGenerateAST),
+        ):
+            codegen_cute_tile_argreduce(
+                ctx,
+                argmax,
+                "argmax",
+                dim=1,
+                keepdim=False,
+            )
+
+        emitted = "\n".join(ast.unparse(stmt) for stmt in cg.statements)
+        self.assertIn("if lane_1 == 1 and vec_lane_1 == 1:", emitted)
+        self.assertNotIn("lane_1 == 3", emitted)
 
     def test_loop_contains_matmul_for_root_grid_phase(self) -> None:
         root_graph = Graph()
