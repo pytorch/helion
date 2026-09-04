@@ -784,6 +784,9 @@ def _cute_scalar_load_expr(
             f"cute.arch.load({_cute_scalar_pointer_expr(tensor_name, index_exprs)}, "
             "cutlass.Uint8)"
         )
+    if eviction_suffix == _CUTE_L2_LAST_SUFFIX:
+        # The L2 policy helper only exists in 16-byte vector form.
+        eviction_suffix = ""
     if eviction_suffix and dtype.itemsize >= 4 and dtype is not torch.bool:
         # ``(ptr).load()`` has no cache-hint kwargs; route hinted scalar
         # sites through ``cute.arch.load`` instead.  Sub-32-bit dtypes stay
@@ -892,10 +895,26 @@ def _cute_lane_axis_pos(strategy: object, block_id: int, index_exprs: list[str])
     return len(index_exprs) - 1
 
 
+# Sentinel eviction "suffix" for the ``l2_last`` policy: not a kwarg on
+# ``cute.arch.load`` (which has no L2 policy support) but a marker that the
+# 16-byte unroll-hoist load should go through the inline-PTX
+# ``createpolicy.fractional.L2::evict_last`` helper.  Non-16-byte or scalar
+# sites silently drop the hint.
+_CUTE_L2_LAST_SUFFIX = "__l2_last__"
+
+
 def _cute_unroll_vec_load_expr(
     ptr_expr: str, dtype: torch.dtype, vec_width: int, eviction_suffix: str = ""
 ) -> str:
     """Build the ``cute.arch.load(...)`` RHS for an unroll-mode hoist."""
+    if eviction_suffix == _CUTE_L2_LAST_SUFFIX:
+        if not _cute_is_byte_packed(dtype) and vec_width * dtype.itemsize == 16:
+            return (
+                f"_cute_load_l2_evict_last({ptr_expr}, "
+                f"ir.VectorType.get([{vec_width}], "
+                f"{_cute_unroll_vec_elem_type(dtype)}.mlir_type))"
+            )
+        eviction_suffix = ""
     if _cute_is_byte_packed(dtype):
         pack = _cute_unroll_vec_elem_type(dtype, vec_width)
         return f"cute.arch.load({ptr_expr}, {pack}{eviction_suffix})"

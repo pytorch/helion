@@ -22,6 +22,7 @@ from torch.fx.node import map_arg
 
 from ... import exc
 from ...language import _decorators
+from ...language.memory_ops import _CUTE_L2_LAST_SUFFIX
 from ...language.memory_ops import _CUTE_VECTOR_DTYPES
 from ...language.memory_ops import _CUTE_VECTOR_UNROLL_CARRIER
 from ...language.memory_ops import _CUTE_VECTOR_UNROLL_DTYPES
@@ -40,6 +41,7 @@ from ...language.memory_ops import _cute_scalar_load_expr
 from ...language.memory_ops import _cute_scalar_pointer_expr
 from ...language.memory_ops import _cute_tensor_dim_size_expr
 from ...language.memory_ops import _cute_unique_graph_block_id
+from ...language.memory_ops import _cute_unroll_vec_load_expr
 from ...language.memory_ops import _matching_block_ids
 from ...language.memory_ops import _maybe_codegen_cute_packed_affine_lhs_load
 from ...language.memory_ops import load
@@ -183,6 +185,10 @@ def _cute_vector_load_expr(
 ) -> str:
     elem_str, _ = _CUTE_VECTOR_DTYPES[dtype]
     ptr = _cute_scalar_pointer_expr(tensor_name, index_exprs)
+    if eviction_suffix == _CUTE_L2_LAST_SUFFIX:
+        # Explicit-vec ("vec" mode) loads return FLOAT vectors, not the
+        # carrier form the L2 helper produces; drop the hint here.
+        eviction_suffix = ""
     return (
         f"cute.arch.load({ptr}, "
         f"ir.VectorType.get([{vec_width}], {elem_str}.mlir_type)"
@@ -252,9 +258,8 @@ def _cute_register_unroll_vec_hoist(
         )
         cache[cache_key] = (hoist_var, tensor.dtype)
         hoist_stmt = statement_from_string(
-            f"{hoist_var} = cute.arch.load({base_ptr_expr}, "
-            f"ir.VectorType.get([{vec_width}], {carrier}.mlir_type)"
-            f"{eviction_suffix})"
+            f"{hoist_var} = "
+            f"{_cute_unroll_vec_load_expr(base_ptr_expr, tensor.dtype, vec_width, eviction_suffix)}"
         )
         # Insert the hoist just BEFORE the constexpr V-loop.
         lane_body.insert(lane_body.index(constexpr_loop), hoist_stmt)
@@ -2414,6 +2419,10 @@ def _(state: CodegenState) -> object:
             policy = policies[load_idx]
             if policy == "streaming":
                 eviction_suffix = ", cop='cs'"
+            elif policy == "l2_last":
+                # L2::evict_last policy loads (inline PTX; only the 16-byte
+                # unroll-hoist form honors it — see _CUTE_L2_LAST_SUFFIX).
+                eviction_suffix = _CUTE_L2_LAST_SUFFIX
             elif mapped := _CUTE_EVICTION_POLICY_MAP.get(policy, ""):
                 eviction_suffix = f", level1_eviction_priority={mapped!r}"
     vec_ctx = _cute_vector_load_ctx(state, tensor, subscript, index_exprs, extra_mask)
