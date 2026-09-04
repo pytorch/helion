@@ -419,6 +419,8 @@ class DeviceFunction:
         # the emit_pipeline codegen when the tile is a legal map axis; read by
         # the store codegen to stitch the boundary across neighbouring groups.
         self.carry_tiles: dict[int, CarryBoundaryTile] = {}
+        # Pallas: jagged tile block_id -> proven runtime-window alignment.
+        self.aligned_tiles: dict[int, int] = {}
         # CarryScratchKey(row block_id, output name) -> carry scratch var name.
         # One scratch per output buffer (a tile may feed several stores),
         # allocated at the store.
