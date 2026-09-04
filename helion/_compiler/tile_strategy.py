@@ -37,6 +37,7 @@ from .program_id import PIDInfo
 from .program_id import ProgramIDs
 from .program_id import Tcgen05PersistentProgramIDs
 from .program_id import XYZProgramIDs
+from .variable_origin import GridOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -4673,6 +4674,29 @@ class PerThreadNDTileStrategy(NDTileStrategy):
         return False
 
 
+def _is_noncanonical_scalar_grid(block_ids: list[int]) -> bool:
+    """Whether ``block_ids`` is a lone root ``hl.grid`` with a begin or a step.
+
+    Such a loop yields a scalar index (``GridOrigin``) rather than a tile, and
+    ``device_ir.noncanonical_task_origin_block_ids`` marks the ones whose index
+    is not simply ``0, 1, 2, ...``.  ``grid_block_ids`` also lists root
+    ``hl.tile`` loops, so the ``GridOrigin`` check is what separates the two.
+    """
+    if len(block_ids) != 1:
+        return False
+    (block_id,) = block_ids
+    host_fn = HostFunction.current()
+    device_ir = host_fn.device_ir
+    if block_id not in device_ir.noncanonical_task_origin_block_ids:
+        return False
+    if not any(block_id in ids for ids in device_ir.grid_block_ids):
+        return False
+    return any(
+        type(origin.origin) is GridOrigin and origin.origin.block_id == block_id
+        for origin in host_fn.expr_to_origin.values()
+    )
+
+
 class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
     """Flattened tiling with one scalar index per thread.
 
@@ -4694,6 +4718,16 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         self._lane_var: str | None = None
         if num_threads > 0 and isinstance(block_size, int) and num_threads < block_size:
             self._lane_var = self.new_var("lane", dce=False)
+        # ``hl.grid(begin, end, step)`` registers its block with block size ==
+        # step (a stride, not a tile width) and a ``GridOrigin`` symbol that
+        # ``DeviceFunction.sympy_expr`` renders as ``offset_var``.  Here
+        # ``offset_var`` is the raw ``pid * block_size + tid`` thread offset, so
+        # ``begin``/``step`` would be silently dropped.  Flag the shape so
+        # ``codegen_grid`` emits the one-thread-per-trip form ``NDTileStrategy``
+        # uses for the same loop.
+        self._scalar_grid_offsets = _is_noncanonical_scalar_grid(block_ids)
+        if self._scalar_grid_offsets:
+            self._lane_var = None
         # Vec-partition state for the memory_ops ``tile_unroll`` hoist
         # protocol (same shape as ``PerThreadNDTileStrategy``).  The vec
         # slot lives on the LAST (stride-1) block; for the multi-block
@@ -4752,6 +4786,10 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         return self.block_size // self._num_threads
 
     def _thread_extent(self) -> SymIntLike:
+        if self._scalar_grid_offsets:
+            # ``block_size`` is the grid's step, not a tile width: the loop runs
+            # one thread per trip (see ``_codegen_scalar_grid``).
+            return 1
         if self._num_threads == 0:
             return self.block_size
         backend_name = CompileEnvironment.current().backend.name
@@ -4798,7 +4836,70 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         thread_extent = self._thread_extent()
         return not (isinstance(thread_extent, int) and thread_extent == 1)
 
+    def _codegen_scalar_grid(self, state: CodegenState) -> DeviceGridState:
+        """Emit ``offsets = begin + pid * step`` for a scalar root ``hl.grid``.
+
+        ``offset_var`` is what the loop's ``GridOrigin`` symbol renders as, so it
+        has to hold the logical index.  Launching one thread per trip (rather
+        than ``cdiv(trip_count, step)`` groups of ``step`` threads) keeps the
+        launch exact, so the surplus threads a partial last group would create
+        -- which the scalar subscript path has no mask to guard -- never exist.
+        This mirrors ``NDTileStrategy.codegen_grid``, which pins
+        ``block_size_var`` to ``1`` for a stepped grid.
+        """
+        (begin,), (end,), (step,) = self._extract_root_bounds(state)
+        (block_id,) = self.block_ids
+        offsets_var = self._offsets_var
+        trip_count = self._range_trip_count(begin, end, step)
+
+        pid_var = state.device_function.new_var("pid_flat", dce=True)
+        pids = self.select_pid_strategy()
+        if isinstance(state.device_function.pid, ForEachProgramID):
+            pids.shared_pid_var = state.device_function.pid.shared_pid_var
+        pids.append(PIDInfo(pid_var, "1", trip_count, block_id))
+
+        env = CompileEnvironment.current()
+        dtype = env.index_type()
+
+        def bound_expr(value: object) -> str:
+            # Non-literal bounds arrive as kernel arguments whose scalar type is
+            # not the index type (a float scalar tensor on Metal), so cast the
+            # way ``NDTileStrategy.codegen_grid`` does before doing index math.
+            rendered = self._expr_str(value)
+            if isinstance(value, int):
+                return rendered
+            return env.backend.ast_to_dtype_expr(rendered, dtype)
+
+        expr = pid_var
+        if step not in (None, 1):
+            expr = f"({expr}) * ({bound_expr(step)})"
+        if begin != 0:
+            expr = f"({bound_expr(begin)}) + ({expr})"
+        state.add_statement(f"{offsets_var} = {expr}")
+        state.add_statement(f"{self.index_var(block_id)} = {offsets_var}")
+        mask_var = self.mask_var(-1)
+        if mask_var is not None:
+            state.add_statement(
+                f"{mask_var} = {pid_var} < ({self._numel_str(state, trip_count)})"
+            )
+
+        pids.codegen(state)
+        if isinstance(state.device_function.pid, ForEachProgramID):
+            shared_pid = state.device_function.pid
+            shared_pid.cases.append(pids)
+            shared_pid.codegen(state)
+        else:
+            state.device_function.set_pid(pids)
+        return DeviceGridState(
+            self,
+            block_id_to_info=self._create_block_id_info_dict(
+                state, ends_override=[end]
+            ),
+        )
+
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
+        if self._scalar_grid_offsets:
+            return self._codegen_scalar_grid(state)
         if self._lane_var is None:
             return super().codegen_grid(state)
 
