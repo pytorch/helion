@@ -345,6 +345,41 @@ def pallas_nested_buffered_panel_sum(table: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_nested_buffered_multi_panel_sum(
+    expert_ids: torch.Tensor,
+    lhs: torch.Tensor,
+    first: torch.Tensor,
+    second: torch.Tensor,
+    third: torch.Tensor,
+    fourth: torch.Tensor,
+) -> torch.Tensor:
+    """Consume several weight-panel streams selected by one outer index."""
+    experts, panels, _, columns = first.size()
+    rows = lhs.size(1)
+    out = torch.empty(
+        [experts, rows, columns],
+        dtype=first.dtype,
+        device=first.device,
+    )
+    for _ in hl.grid(1):
+        for output in hl.tile(experts, block_size=1):
+            expert = expert_ids[output.begin]
+            total = hl.zeros([rows, columns], dtype=torch.float32)
+            for panel in hl.tile(panels, block_size=1):
+                lhs_panel = lhs[panel.begin, :, :]
+                first_panel = first[expert, panel.begin, :, :]
+                second_panel = second[expert, panel.begin, :, :]
+                third_panel = third[expert, panel.begin, :, :]
+                fourth_panel = fourth[expert, panel.begin, :, :]
+                total = total + hl.dot(lhs_panel, first_panel, out_dtype=torch.float32)
+                total = total + hl.dot(lhs_panel, second_panel, out_dtype=torch.float32)
+                total = total + hl.dot(lhs_panel, third_panel, out_dtype=torch.float32)
+                total = total + hl.dot(lhs_panel, fourth_panel, out_dtype=torch.float32)
+            out[output, :, :] = total.to(first.dtype)[None, :, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_inner_loop_newaxis_add(x: torch.Tensor) -> torch.Tensor:
     """Inner-loop load whose logical result has a leading newaxis."""
     m, n = x.size()
@@ -4017,6 +4052,62 @@ class TestPallas(TestCase):
                 .to(torch.float32)
                 .sum(dim=0)
                 .to(table.dtype)
+                for output in range(4)
+            ]
+        )
+        torch.testing.assert_close(result.cpu(), expected.cpu())
+
+    @skipIfPallasInterpret("nested HBM DMA pipeline requires a real TPU")
+    def test_nested_fori_shared_address_correctness(self) -> None:
+        expert_ids = torch.tensor(
+            [2, 0, 3, 1],
+            device=DEVICE,
+            dtype=torch.int32,
+        )
+        lhs = torch.randn(
+            2,
+            8,
+            128,
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        )
+        tables = tuple(
+            torch.randn(
+                4,
+                2,
+                128,
+                128,
+                device=DEVICE,
+                dtype=torch.bfloat16,
+            )
+            for _ in range(4)
+        )
+        _, result = code_and_output(
+            pallas_nested_buffered_multi_panel_sum,
+            (expert_ids, lhs, *tables),
+            pallas_loop_type="fori_loop",
+            pallas_load_buffer_count=[1, 1, 2, 2, 2, 2],
+        )
+        expected = torch.stack(
+            [
+                sum(
+                    (
+                        torch.matmul(
+                            lhs.to(torch.float32),
+                            table[expert_ids[output]].to(torch.float32),
+                        )
+                        for table in tables
+                    ),
+                    start=torch.zeros(
+                        2,
+                        8,
+                        128,
+                        device=DEVICE,
+                        dtype=torch.float32,
+                    ),
+                )
+                .sum(dim=0)
+                .to(tables[0].dtype)
                 for output in range(4)
             ]
         )
