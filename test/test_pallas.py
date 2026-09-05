@@ -326,6 +326,25 @@ def pallas_inner_loop_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_nested_buffered_panel_sum(table: torch.Tensor) -> torch.Tensor:
+    """Consume buffered HBM panels from an index chosen by an outer loop."""
+    experts, panels, rows, columns = table.size()
+    out = torch.empty(
+        [experts, rows, columns],
+        dtype=table.dtype,
+        device=table.device,
+    )
+    for _ in hl.grid(1):
+        for output in hl.tile(experts, block_size=1):
+            expert = (output.begin * 3) % experts
+            total = hl.zeros([rows, columns], dtype=torch.float32)
+            for panel in hl.tile(panels, block_size=1):
+                total = total + table[expert, panel.begin, :, :]
+            out[output, :, :] = total.to(table.dtype)[None, :, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_inner_loop_newaxis_add(x: torch.Tensor) -> torch.Tensor:
     """Inner-loop load whose logical result has a leading newaxis."""
     m, n = x.size()
@@ -3975,6 +3994,33 @@ class TestPallas(TestCase):
         )
 
         torch.testing.assert_close(result.cpu(), (args[0] + args[1]).cpu())
+
+    @skipIfPallasInterpret("nested HBM DMA pipeline requires a real TPU")
+    def test_nested_fori_buffered_load_correctness(self) -> None:
+        table = torch.randn(
+            4,
+            2,
+            8,
+            128,
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        )
+        _, result = code_and_output(
+            pallas_nested_buffered_panel_sum,
+            (table,),
+            pallas_loop_type="fori_loop",
+            pallas_load_buffer_count=[2],
+        )
+        expected = torch.stack(
+            [
+                table[(output * 3) % table.size(0)]
+                .to(torch.float32)
+                .sum(dim=0)
+                .to(table.dtype)
+                for output in range(4)
+            ]
+        )
+        torch.testing.assert_close(result.cpu(), expected.cpu())
 
     def test_static_unroll_uses_python_if_for_tile_predicate(self) -> None:
         """A static tile predicate does not leave a side-effectful lax.cond."""

@@ -1908,6 +1908,7 @@ class ForiLoopState(DeviceLoopOrGridState):
 
     body_fn_name: str
     loop_var_name: str  # The fori_loop index variable (e.g., "_j")
+    iteration_count: str | None = None
     static_unroll: bool = False
     inner_statements: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
