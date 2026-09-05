@@ -1300,6 +1300,14 @@ class ConfigSpec:
         self._cute_tcgen05_config.exact_shape_aux_kernel_detected = value
 
     @property
+    def cute_tcgen05_fragment_aux_kernel_detected(self) -> bool:
+        return self._cute_tcgen05_config.fragment_aux_kernel_detected
+
+    @cute_tcgen05_fragment_aux_kernel_detected.setter
+    def cute_tcgen05_fragment_aux_kernel_detected(self, value: bool) -> None:
+        self._cute_tcgen05_config.fragment_aux_kernel_detected = value
+
+    @property
     def cute_tcgen05_matmul_has_non_tcgen05_operand(self) -> bool:
         return self._cute_tcgen05_config.matmul_has_non_tcgen05_operand
 

@@ -300,6 +300,7 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
     ab_stage_count: int
     c_stage_count: int
     epi_warp_count: int
+    output_rank: int = 2
     ab_load_warp_count: int = 1
     one_shot_role_scheduler: bool = False
     # Dedicated scheduler warp count for ROLE_LOCAL_WITH_SCHEDULER. Default
@@ -373,9 +374,10 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
     def c_input_aux_tensor_descriptors(self) -> tuple[Tcgen05AuxTensorDescriptor, ...]:
         """Aux descriptors staged by the C-input warp.
 
-        Exact-shape rank-2 MxN aux tensors use the SMEM-ring producer.
-        Broadcast row vectors and leading-passthrough rank-3 residuals stay on
-        the direct per-thread load path; the producer scheduler is 2-D only.
+        Ordinary epilogue chains stage exact-shape rank-2 MxN tensors. Fragment
+        plans may additionally provide a proven proportional rank-2 source
+        tile. Broadcast row vectors and leading-passthrough rank-3 residuals
+        stay on the direct per-thread load path; the producer scheduler is 2-D.
         """
         return tuple(
             d
