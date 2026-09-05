@@ -442,6 +442,7 @@ _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
     },
     "fused_qk_norm_rope": {
         "sm90": ExpectedPerf(helion_wins=21, total=21, geomean=7.2, wins_slack=2),
+        "sm100": ExpectedPerf(helion_wins=21, total=21, geomean=1.27, wins_slack=1),
     },
     "qwen3_decode_layer": {
         "sm100": ExpectedPerf(helion_wins=1, total=1, geomean=1.05, wins_slack=0),
