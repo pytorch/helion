@@ -66,6 +66,12 @@ def jagged_dense_bmm_2d_loop(
     return out
 
 
+_BMM_KERNELS = [
+    jagged_dense_bmm,
+    jagged_dense_bmm_2d_loop,
+]
+
+
 def _ref_jagged_bmm(
     seq_offsets: torch.Tensor, jagged: torch.Tensor, dense: torch.Tensor
 ) -> torch.Tensor:
@@ -106,7 +112,7 @@ class TestPallasJaggedCarrySimple(TestCase):
 
     @xfailIfPallasInterpret(_XFAIL_INTERPRET)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
-    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
+    @parametrize("kernel", _BMM_KERNELS)
     def test_single_group(self, dtype: torch.dtype, kernel) -> None:
         # One group: exercises the aligned-enclosing read and the tail mask,
         # with no carry between groups.
@@ -116,7 +122,7 @@ class TestPallasJaggedCarrySimple(TestCase):
 
     @xfailIfPallasInterpret(_XFAIL_INTERPRET)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
-    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
+    @parametrize("kernel", _BMM_KERNELS)
     def test_aligned_groups_carry_dormant(self, dtype: torch.dtype, kernel) -> None:
         # Aligned boundaries: carry path is emitted but its runtime guard never fires.
         seq_offsets, jagged, dense = _inputs([0, 16, 32], 128, 128, dtype)
@@ -125,7 +131,7 @@ class TestPallasJaggedCarrySimple(TestCase):
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
     @xfailIfPallasInterpret(_XFAIL_INTERPRET)
-    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
+    @parametrize("kernel", _BMM_KERNELS)
     def test_carry_keeps_both_groups(self, kernel) -> None:
         # Two groups [0, 3) and [3, 16) share the [0, 16) boundary.  With
         # identity weights out == jagged, so a clobbered carry would be obvious.
@@ -255,7 +261,7 @@ class TestPallasJaggedCarryBmm(TestCase):
             [0, 3, 7, 16],  # several tiny groups in one boundary (cumulative carry)
         ],
     )
-    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
+    @parametrize("kernel", _BMM_KERNELS)
     def test_bmm_block_eq_sublane(
         self, dtype: torch.dtype, offsets: list[int], kernel
     ) -> None:
@@ -266,7 +272,7 @@ class TestPallasJaggedCarryBmm(TestCase):
 
     @xfailIfPallasInterpret(_XFAIL_INTERPRET)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
-    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
+    @parametrize("kernel", _BMM_KERNELS)
     def test_bmm_block_gt_group(self, dtype: torch.dtype, kernel) -> None:
         # Two groups (13 rows) are smaller than block_row=32, total L=200 >> block_row.
         seq_offsets, jagged, dense = _inputs([0, 13, 100, 113, 200], 128, 128, dtype)
@@ -275,7 +281,7 @@ class TestPallasJaggedCarryBmm(TestCase):
 
     @xfailIfPallasInterpret(_XFAIL_INTERPRET)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
-    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
+    @parametrize("kernel", _BMM_KERNELS)
     def test_bmm_multi_k_tile(self, dtype: torch.dtype, kernel) -> None:
         # K=256 with block_col=128 gives two output-column tiles; the carry stacks
         # the per-column-tile boundaries along its scratch row dim.
@@ -285,7 +291,7 @@ class TestPallasJaggedCarryBmm(TestCase):
 
     @xfailIfPallasInterpret(_XFAIL_INTERPRET)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
-    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
+    @parametrize("kernel", _BMM_KERNELS)
     def test_bmm_many_groups(self, dtype: torch.dtype, kernel) -> None:
         # 50 unaligned groups; carry scratch is per column-tile, not per group.
         offsets = list(range(0, 13 * 51, 13))  # 50 groups
@@ -304,7 +310,7 @@ class TestPallasJaggedCarryBmm(TestCase):
             [0, 16, 16],  # trailing empty
         ],
     )
-    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
+    @parametrize("kernel", _BMM_KERNELS)
     def test_bmm_empty_groups(
         self, dtype: torch.dtype, offsets: list[int], kernel
     ) -> None:
@@ -601,7 +607,7 @@ class TestPallasJaggedReductions(TestCase):
 class TestPallasJaggedCarryRejects(TestCase):
     """Shapes the carry refuses (or routes elsewhere) rather than miscompiling."""
 
-    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
+    @parametrize("kernel", _BMM_KERNELS)
     def test_block_not_multiple_of_sublane_raises(self, kernel) -> None:
         # bf16 sublane S=16; block_row=8 is not a multiple, so the carry rejects it
         # loudly instead of clobbering the boundary with a plain store.
