@@ -11,6 +11,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import matchesBackends
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
@@ -50,7 +51,19 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
     @skipIfRefEager("Config tests not applicable in ref eager mode")
     def test_broadcast_no_flatten(self):
         args = [torch.randn(512, 512, device=DEVICE), torch.randn(512, device=DEVICE)]
-        assert not broadcast_fn.bind(args).config_spec.flatten_loops
+        flatten_loops = broadcast_fn.bind(args).config_spec.flatten_loops
+        if matchesBackends(["cute"]):
+            # The cute per-thread scalar model recomputes per-dim index vars
+            # from the flat offset, so PURE pointwise kernels keep the
+            # flatten choice even with partial-block (broadcast) accesses
+            # (re-registered after device-IR analysis proves the pointwise
+            # fact) — and flattened codegen must stay correct.
+            assert flatten_loops
+            _check_broadcast_fn(block_sizes=[16, 8], flatten_loops=[True])
+        else:
+            # Vector-model backends cannot mix a flat [BS] value vector with
+            # a partial-block access, so the choice is disabled.
+            assert not flatten_loops
 
     def test_broadcast1(self):
         _check_broadcast_fn(

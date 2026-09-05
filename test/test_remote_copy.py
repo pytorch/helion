@@ -298,6 +298,49 @@ def _pipeline_remote_copy(
 
 @helion.kernel(
     static_shapes=True,
+    config=helion.Config(
+        block_sizes=[],
+        pallas_loop_type="fori_loop",
+        pallas_load_buffer_count=[2, 1, 1, 1],
+    ),
+)
+def _nested_computed_row_remote_copy(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    peers: torch.Tensor,
+    valid_counts: torch.Tensor,
+) -> torch.Tensor:
+    """Send each row of a computed VMEM tile from a nested device loop."""
+    num_steps = hl.specialize(src.size(1))
+    num_rows = hl.specialize(src.size(2))
+    width = hl.specialize(src.size(3))
+    stage = torch.empty(
+        (num_rows, 1, width),
+        dtype=src.dtype,
+        device=src.device,
+    )
+    for _program in hl.grid(1):
+        hl.remote_barrier(peers[0, 0])
+        for step in hl.tile(num_steps, block_size=1):
+            valid_count = hl.load(valid_counts, [step.begin])
+            stage[:, 0, :] = hl.zeros([num_rows, width], dtype=stage.dtype)
+            if valid_count > 0:
+                stage[:, 0, :] = src[0, step.begin, :, :] + 1
+            for row in hl.tile(num_rows, block_size=1):
+                copy = hl.make_async_remote_copy(
+                    stage,
+                    [row.begin],
+                    peers[0, 0],
+                    dst=dst,
+                    dst_index=[0, step.begin, row.begin],
+                )
+                copy.start()
+                copy.wait()
+    return dst
+
+
+@helion.kernel(
+    static_shapes=True,
     config=helion.Config(block_sizes=[]),
 )
 def _computed_fp8_remote_copy(
@@ -376,6 +419,68 @@ def _route_forward_then_consume(
         for token in hl.tile(routed.size(3), block_size=8):
             output[:, :, :, token, :] = routed[:, :, :, token, :] + 1
     return routed, output
+
+
+@helion.kernel(
+    backend="pallas",
+    static_shapes=True,
+    config=helion.Config(block_sizes=[]),
+)
+def _body_local_remote_scratch(
+    src: torch.Tensor,
+    peers: torch.Tensor,
+) -> torch.Tensor:
+    """Exchange through a private VMEM buffer that does not escape the kernel."""
+    output = torch.empty_like(src)
+    scratch = torch.empty(
+        [2, 1, 128],
+        dtype=src.dtype,
+        device=src.device,
+    )
+    for _program in hl.grid(1):
+        scratch[0, :, :] = src[0, :, :]
+        hl.remote_barrier(peers[0, 0])
+        copy = hl.make_async_remote_copy(
+            scratch,
+            [0],
+            peers[0, 0],
+            dst=scratch,
+            dst_index=[1],
+        )
+        copy.start()
+        copy.wait()
+        output[0, :, :] = scratch[1, :, :] + 1
+    return output
+
+
+@helion.kernel(
+    backend="pallas",
+    static_shapes=True,
+    config=helion.Config(block_sizes=[]),
+)
+def _returned_remote_scratch_alias(
+    src: torch.Tensor,
+    peers: torch.Tensor,
+) -> torch.Tensor:
+    """Return an alias of a remote-copy buffer; it must remain an output."""
+    scratch = torch.empty(
+        [2, 1, 128],
+        dtype=src.dtype,
+        device=src.device,
+    )
+    for _program in hl.grid(1):
+        scratch[0, :, :] = src[0, :, :]
+        copy = hl.make_async_remote_copy(
+            scratch,
+            [0],
+            peers[0, 0],
+            dst=scratch,
+            dst_index=[1],
+        )
+        copy.start()
+        copy.wait()
+    result = scratch
+    return result  # noqa: RET504 - exercise return-alias escape analysis
 
 
 @helion.kernel(
@@ -867,6 +972,20 @@ class TestRemoteCopyGPU(TestCase, MultiProcessTestCase):
 @onlyBackends(["pallas"])
 class TestRemoteCopyJaxRuntime(TestCase):
     @staticmethod
+    def _body_local_remote_scratch_source() -> str:
+        return _body_local_remote_scratch.bind(
+            (
+                torch.zeros(1, 1, _WIDTH),
+                torch.zeros(1, 1, dtype=torch.int32),
+            )
+        ).to_code(
+            options=helion.OutputCodeOptions(
+                allow_helion_deps=False,
+                jax_fn=True,
+            )
+        )
+
+    @staticmethod
     def _run_one_shot_copy(mesh, mesh_axis, kernel_fn) -> None:
         import jax
         import jax.numpy as jnp
@@ -1129,6 +1248,73 @@ class TestRemoteCopyJaxRuntime(TestCase):
         world_size = 2
         mesh = jax.make_mesh((world_size,), ("peer",), devices=devices[:world_size])
         self._run_ring_all_gather(mesh)
+
+    def test_returned_remote_scratch_alias_remains_an_output(self) -> None:
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "wrapper-created in-place outputs",
+        ):
+            _returned_remote_scratch_alias.bind(
+                (
+                    torch.zeros(1, 1, _WIDTH),
+                    torch.zeros(1, 1, dtype=torch.int32),
+                )
+            ).to_code(
+                options=helion.OutputCodeOptions(
+                    allow_helion_deps=False,
+                    jax_fn=True,
+                )
+            )
+
+    @skipIfPallasInterpret("body-local remote scratch requires physical TPU devices")
+    def test_body_local_remote_scratch(self) -> None:
+        import types
+
+        import jax
+        import jax.numpy as jnp
+
+        devices = [device for device in jax.local_devices() if device.platform == "tpu"]
+        if len(devices) < 2:
+            self.skipTest("requires at least two TPU devices")
+
+        source = self._body_local_remote_scratch_source()
+
+        name = "precompiled_body_local_remote_scratch_test"
+        module = types.ModuleType(name)
+        sys.modules[name] = module
+        self.addCleanup(sys.modules.pop, name, None)
+        exec(compile(source, name, "exec"), module.__dict__)
+
+        world_size = 2
+        mesh = jax.make_mesh((world_size,), ("peer",), devices=devices[:world_size])
+        partition = jax.sharding.PartitionSpec
+        src_spec = partition("peer", None, None)
+        peer_spec = partition("peer", None)
+        ranks = jnp.arange(world_size, dtype=jnp.float32)[:, None, None]
+        columns = jnp.arange(_WIDTH, dtype=jnp.float32)[None, None, :]
+        src = ranks * 1000 + columns
+        peers = (1 - jnp.arange(world_size, dtype=jnp.int32))[:, None]
+        inputs = tuple(
+            jax.device_put(value, jax.sharding.NamedSharding(mesh, spec))
+            for value, spec in zip(
+                (src, peers),
+                (src_spec, peer_spec),
+                strict=True,
+            )
+        )
+        exchange = jax.jit(
+            jax.shard_map(
+                module._body_local_remote_scratch,
+                mesh=mesh,
+                in_specs=(src_spec, peer_spec),
+                out_specs=src_spec,
+                check_vma=False,
+            )
+        )
+        expected = np.asarray(src)[::-1] + 1
+        for _invocation in range(2):
+            result = np.asarray(jax.block_until_ready(exchange(*inputs)))
+            np.testing.assert_array_equal(result, expected)
 
     @skipIfPallasInterpret("remote-copy pipelines require TPU VMEM lowering")
     def test_computed_pipeline_copy(self) -> None:
@@ -1572,6 +1758,32 @@ def _remote_copy_torch_tpu_worker(rank: int, world_size: int, master_port: int) 
         result = gather_op(local_values, gathered, peers, slots)
         expected = torch.from_numpy(_expected_all_gather(world_size)).unsqueeze(1)
         assert result.shape == (world_size, 1, _GATHER_ROWS, _WIDTH)
+        torch.testing.assert_close(result.cpu(), expected)
+
+        rank_value = torch.tensor(rank * 1000, dtype=torch.float32, device=device)
+        steps = torch.arange(
+            _PIPELINE_STEPS, dtype=torch.float32, device=device
+        ).reshape(1, _PIPELINE_STEPS, 1, 1)
+        rows = torch.arange(_GATHER_ROWS, dtype=torch.float32, device=device).reshape(
+            1, 1, _GATHER_ROWS, 1
+        )
+        columns = torch.arange(_WIDTH, dtype=torch.float32, device=device).reshape(
+            1, 1, 1, _WIDTH
+        )
+        src = rank_value + steps * 100 + rows * 10 + columns
+        dst = torch.full(
+            (1, _PIPELINE_STEPS, _GATHER_ROWS, 1, _WIDTH),
+            -7,
+            dtype=torch.float32,
+            device=device,
+        )
+        peers = torch.tensor(
+            [[(rank + 1) % world_size]], dtype=torch.int32, device=device
+        )
+        valid_counts = torch.ones(_PIPELINE_STEPS, dtype=torch.int32, device=device)
+        result = _nested_computed_row_remote_copy(src, dst, peers, valid_counts)
+        previous_rank = (rank - 1) % world_size
+        expected = (src.cpu() - rank * 1000 + previous_rank * 1000 + 1).unsqueeze(-2)
         torch.testing.assert_close(result.cpu(), expected)
 
     run_checks()

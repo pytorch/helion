@@ -12,6 +12,7 @@ import json
 import math
 from math import inf
 import os
+import pickle
 import tempfile
 import time
 from typing import TYPE_CHECKING
@@ -525,6 +526,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
     provider created by ``BaseSearch._prepare()``.
     """
 
+    # Class-level default: tests construct partially-initialized providers, so
+    # the picklability flag must resolve even before setup()/__init__ set it.
+    _args_unpicklable: bool = False
+
     def __init__(
         self,
         kernel: _AutotunableKernel,
@@ -549,6 +554,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._worker_failure_config_ids: list[int] = []
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None
+        self._args_unpicklable: bool = False
         self._precompile_baseline_path: str | None = None
         self._precompile_result_counter: count[int] = count()
         self._benchmark_worker: BenchmarkWorker | None = None
@@ -579,6 +585,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._effective_atol, self._effective_rtol = (
             self._compute_effective_tolerances()
         )
+        # Scale the atol floor per tensor only when the user did not pin an
+        # explicit absolute tolerance (see accuracy.assert_close).
+        self._scale_atol = self.settings.autotune_baseline_atol is None
         self._jobs = self._decide_num_jobs()
 
     def _record_accuracy_failure(self, config: Config) -> None:
@@ -715,7 +724,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
 
         The baseline is computed in one of two ways:
         - If settings.autotune_baseline_fn is provided, use that custom function
-        - Otherwise, run the kernel with the default config
+        - Otherwise, run the kernel with the conservative autotuning reference
         """
         new_args = _clone_args(self.args, self.kernel.env.process_group_name)
 
@@ -730,8 +739,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     f"Baseline function: {self.settings.autotune_baseline_fn}\n"
                 ) from e
         else:
-            # Use default config
-            baseline_config = self.config_spec.default_config()
+            baseline_config = self.config_spec.autotune_reference_config()
             try:
                 baseline_output = self.kernel.compile_config(
                     baseline_config, allow_print=False
@@ -749,8 +757,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 )
                 self.kernel.maybe_log_repro(self.log.error, new_args, baseline_config)
                 raise exc.InvalidConfig(
-                    "Default config failed while computing baseline.\n"
-                    f"Default config: {decorator}\n"
+                    "Autotuning reference config failed while computing baseline.\n"
+                    f"Reference config: {decorator}\n"
                     f"{SUPPRESSED_TRITON_CODE_MSG}\n"
                     "To work around this error, you could set `@helion.kernel(autotune_baseline_fn=...)` "
                     "to provide a custom baseline function (e.g. PyTorch eager implementation of your kernel)."
@@ -900,8 +908,23 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             or self._subprocess_benchmark_enabled()
         ):
             args_path = os.path.join(self._precompile_tmpdir.name, "args.pt")
-            torch.save(self.args, args_path)
-            self._precompile_args_path = args_path
+            try:
+                torch.save(self.args, args_path)
+            except (pickle.PicklingError, AttributeError, TypeError) as e:
+                # Kernel args holding lambdas/closures (e.g. an epilogue
+                # callable) cannot cross a spawn boundary. Fall back to the
+                # in-process benchmark/accuracy path instead of failing the
+                # whole autotune; spawn-mode precompile keeps its hard error
+                # since it cannot run at all without the args file.
+                if self.settings.autotune_precompile == "spawn":
+                    raise
+                self._args_unpicklable = True
+                self.log.warning(
+                    f"Autotune args are not picklable ({e}); benchmarking "
+                    "in-process instead of in a killable subprocess."
+                )
+            else:
+                self._precompile_args_path = args_path
         if self._subprocess_accuracy_check_enabled():
             baseline_path = os.path.join(self._precompile_tmpdir.name, "baseline.pt")
             torch.save(self._baseline_output, baseline_path)
@@ -990,6 +1013,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         mutated-arg kernels where the worker's simple job shape doesn't fit."""
         if not self.settings.autotune_benchmark_subprocess:
             return False
+        if self._args_unpicklable:
+            return False
         if dist.is_initialized():
             return False
         if len(self.mutated_arg_indices) > 0:
@@ -1029,6 +1054,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     self._baseline_output,
                     atol=self._effective_atol,
                     rtol=self._effective_rtol,
+                    scale_atol_by_expected_rms=self._scale_atol,
                 )
                 if os.getenv("CHECK_INPUT_ACCURACY", "1") == "1":
                     if len(self.mutated_arg_indices) > 0:
@@ -1041,6 +1067,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                             self._baseline_post_args,
                             atol=self._effective_atol,
                             rtol=self._effective_rtol,
+                            scale_atol_by_expected_rms=self._scale_atol,
                         )
         except AssertionError as e:
             if not self.settings.autotune_ignore_errors:
@@ -1885,6 +1912,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             baseline_path=self._precompile_baseline_path,
             atol=self._effective_atol,
             rtol=self._effective_rtol,
+            scale_atol=self._scale_atol,
         )
         return cast(
             "AccuracyCheckResult",

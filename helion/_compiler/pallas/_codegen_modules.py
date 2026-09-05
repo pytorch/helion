@@ -19,5 +19,6 @@ from . import distributed_ops  # noqa: F401
 from . import gelu_tanh_approx  # noqa: F401
 from . import matmul_ops  # noqa: F401
 from . import memory_ops  # noqa: F401
+from . import scan_ops  # noqa: F401
 from . import tracing_ops  # noqa: F401
 from . import view_ops  # noqa: F401

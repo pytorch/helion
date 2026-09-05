@@ -1,28 +1,31 @@
 from __future__ import annotations
 
 from itertools import starmap
-import json
 from types import SimpleNamespace
 from typing import Any
+from typing import cast
 from unittest.mock import patch
 
 import sympy
 import torch
 
 import helion
-from helion._compiler.autotuner_heuristics.triton import _B200_MATMUL_HEURISTICS_PATH
+from helion._compiler.autotuner_heuristics.triton import MatmulSeedDraft
 from helion._compiler.autotuner_heuristics.triton import (
     TritonB200FormulaMatmulHeuristic,
 )
-from helion._compiler.autotuner_heuristics.triton import TritonB200MatmulHeuristic
 from helion._compiler.autotuner_heuristics.triton import (
     TritonB200MultiMatmulHeuristic as _MULTI,
 )
+from helion._compiler.autotuner_heuristics.triton import (
+    TritonH100FormulaMatmulHeuristic,
+)
 from helion._compiler.autotuner_heuristics.triton import TritonH100MatmulHeuristic
+from helion._compiler.autotuner_heuristics.triton import (
+    TritonH100MultiMatmulHeuristic as _H100_MULTI,
+)
 from helion._compiler.autotuner_heuristics.triton import _batched_static_matmul_fact
 from helion._compiler.autotuner_heuristics.triton import _generalized_static_matmul_fact
-from helion._compiler.autotuner_heuristics.triton import _seed_config_for_bucket
-from helion._compiler.autotuner_heuristics.triton import _seed_config_for_config_spec
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import IntegerFragment
 from helion.autotuner.config_fragment import ListOf
@@ -36,16 +39,6 @@ from helion.autotuner.config_spec import MatmulFact
 from helion.autotuner.config_spec import PipelinedRegion
 from helion.autotuner.config_spec import RootGridFact
 from helion.autotuner.config_spec import SymbolicLoopBound
-
-_SHAPE_BUCKET_KEYS = {
-    "dtype",
-    "k_bucket",
-    "m_bucket",
-    "n_bucket",
-    "k_value",
-    "m_value",
-    "n_value",
-}
 
 
 def _matmul_fact(
@@ -97,122 +90,18 @@ def _matmul_config_spec(
     )
 
 
-def _bucket(m: int, n: int, k: int) -> dict[str, object]:
-    return {
-        "dtype": "fp16_bf16",
-        "m_value": m,
-        "n_value": n,
-        "k_value": k,
-    }
-
-
-def test_matmul_heuristic_rules_have_unique_shape_buckets() -> None:
-    data = json.loads(_B200_MATMUL_HEURISTICS_PATH.read_text())
-    keys = [json.dumps(rule["shape_bucket"], sort_keys=True) for rule in data["rules"]]
-
-    assert set(data) == {"rules"}
-    assert len(keys) == len(set(keys))
-    for rule in data["rules"]:
-        assert set(rule) == {"shape_bucket", "templates"}
-        assert set(rule["shape_bucket"]).issubset(_SHAPE_BUCKET_KEYS)
-        for key in ("k_bucket", "m_bucket", "n_bucket"):
-            value = rule["shape_bucket"].get(key)
-            if value is not None:
-                values = value if isinstance(value, list) else [value]
-                assert all(isinstance(item, str) for item in values)
-                assert all(item.startswith("(") for item in values)
-                assert all(item.endswith(("]", ")")) for item in values)
-        for key in ("k_value", "m_value", "n_value"):
-            value = rule["shape_bucket"].get(key)
-            if value is not None:
-                values = value if isinstance(value, list) else [value]
-                assert all(isinstance(item, int) for item in values)
-        assert rule["templates"]
-        assert all("template" not in template for template in rule["templates"])
-
-
-def test_matmul_bucket_matching_generates_seed_config() -> None:
-    seed = _seed_config_for_bucket(
-        _bucket(1024, 1024, 1024),
-        config_spec=_matmul_config_spec(),
-    )
-
-    assert seed is not None
-    assert dict(seed)["block_sizes"] == [128, 64, 64]
-    assert dict(seed)["l2_groupings"] == [2]
-
-    assert (
-        _seed_config_for_bucket(
-            _bucket(128, 128, 128),
-            config_spec=_matmul_config_spec(),
-        )
-        is None
-    )
-
-
-def test_matmul_fact_generates_compiler_seed_config() -> None:
-    config_spec = _matmul_config_spec(matmul_facts=[_matmul_fact()])
-
-    seed = _seed_config_for_config_spec(config_spec)
-
-    assert seed is not None
-    assert dict(seed)["block_sizes"] == [128, 64, 64]
-
-    config_spec = _matmul_config_spec(
-        matmul_facts=[_matmul_fact(), _matmul_fact()],
-    )
-
-    assert _seed_config_for_config_spec(config_spec) is None
-
-
-def test_triton_b200_matmul_heuristic_gates_on_hardware() -> None:
-    env = SimpleNamespace(device=None, config_spec=_matmul_config_spec())
-    env.config_spec.matmul_facts.append(_matmul_fact())
-    b200 = SimpleNamespace(
-        device_kind="cuda",
-        hardware_name="NVIDIA B200",
-        compute_capability="sm100",
-    )
-    h100 = SimpleNamespace(
-        device_kind="cuda",
-        hardware_name="NVIDIA H100",
-        compute_capability="sm90",
-    )
-
-    with patch(
-        "helion._hardware.get_hardware_info",
-        return_value=b200,
-    ) as get_hardware_info:
-        assert TritonB200MatmulHeuristic.is_eligible(env, SimpleNamespace())
-        seed = TritonB200MatmulHeuristic.get_seed_config(env, SimpleNamespace())
-        get_hardware_info.assert_called_once_with(None)
-
-    assert seed is not None
-    assert dict(seed)["block_sizes"] == [128, 64, 64]
-
-    with patch(
-        "helion._hardware.get_hardware_info",
-        return_value=h100,
-    ) as get_hardware_info:
-        assert not TritonB200MatmulHeuristic.is_eligible(env, SimpleNamespace())
-        get_hardware_info.assert_called_once_with(None)
-
-
-def test_b200_formula_subsumes_table_promotion_wiring() -> None:
-    # The sm100 FORMULA owns the compiler default; the TABLE is demoted to a search seed.
-    assert TritonB200FormulaMatmulHeuristic.promote_seed_to_default is True
-    assert TritonB200MatmulHeuristic.promote_seed_to_default is False
-    assert _MULTI.promote_seed_to_default is False
-    assert TritonB200FormulaMatmulHeuristic.HARDWARE_TARGETS == (("cuda", "sm100"),)
-    # The formula is a subclass of the H100 budget formula (inherits _matmul_tile).
-    assert issubclass(TritonB200FormulaMatmulHeuristic, TritonH100MatmulHeuristic)
-    # Registered AFTER the table so it wins the last-promote-wins default loop.
+def test_arch_formula_front_ends_supply_execution_defaults() -> None:
     from helion._compiler.autotuner_heuristics import get_heuristics
 
     order = [h.__name__ for h in get_heuristics("triton")]
-    assert order.index("TritonB200FormulaMatmulHeuristic") > order.index(
-        "TritonB200MatmulHeuristic"
-    )
+    for formula, multi, arch in (
+        (TritonH100FormulaMatmulHeuristic, _H100_MULTI, "sm90"),
+        (TritonB200FormulaMatmulHeuristic, _MULTI, "sm100"),
+    ):
+        assert formula.promote_seed_to_default is True
+        assert multi.promote_seed_to_default is True
+        assert (("cuda", arch),) == formula.HARDWARE_TARGETS
+        assert order.index(formula.__name__) < order.index(multi.__name__)
 
 
 def test_h100_base_tile_is_unchanged_by_tmem_budget() -> None:
@@ -369,6 +258,7 @@ def test_sm90_conservative_accounting_is_inert() -> None:
 
 _FML = TritonB200FormulaMatmulHeuristic
 _H100 = TritonH100MatmulHeuristic
+_H100_FML = TritonH100FormulaMatmulHeuristic
 
 
 def _axes(
@@ -396,6 +286,9 @@ class _BlockSizesStub(list):
 
     def valid_block_ids(self) -> list[int]:
         return list(self._ids)
+
+    def block_id_to_index(self, block_id: int) -> int:
+        return self._ids.index(block_id)
 
 
 def _block_sizes_stub(block_ids: list[int]) -> _BlockSizesStub:
@@ -435,7 +328,7 @@ def _generalized_spec(
         resident_regions=(),
         attribution_complete=True,
     )
-    return SimpleNamespace(
+    spec = SimpleNamespace(
         matmul_facts=[fact],
         kernel_matmul_fact=mm,
         kernel_grid_fact=None,
@@ -445,6 +338,8 @@ def _generalized_spec(
             block_sizes=[1] * len(valid_block_ids)
         ),
     )
+    spec.autotune_reference_config = lambda: spec._base_default_config()
+    return spec
 
 
 def test_generalized_gate_admits_a_fixed_contraction_axis() -> None:
@@ -548,27 +443,27 @@ def test_tmem_is_counted_in_columns_and_sums_over_live_accumulators() -> None:
     costs ``ceil(bm/128) * bn`` COLUMNS and a bm<128 accumulator costs the same as a
     full-lane one. Measured on B200: a kernel's ``tmem_size`` equals its accumulator's N
     extent exactly ([64,64] -> 64, [128,128] -> 128, [128,256] -> 256)."""
-    assert _FML._tmem_columns([(64, 64, 2)]) == 64
-    assert _FML._tmem_columns([(128, 128, 2)]) == 128
-    assert _FML._tmem_columns([(128, 256, 2)]) == 256
+    assert _FML._tmem_columns([(64, 64)]) == 64
+    assert _FML._tmem_columns([(128, 128)]) == 128
+    assert _FML._tmem_columns([(128, 256)]) == 256
     # A byte model divides by the lanes a narrow accumulator does not use; the column model
     # does not, which is the whole point.
-    assert _FML._tmem_columns([(64, 256, 2)]) == 256
+    assert _FML._tmem_columns([(64, 256)]) == 256
     # bm past a lane group needs a second one.
-    assert _FML._tmem_columns([(256, 256, 2)]) == 512
+    assert _FML._tmem_columns([(256, 256)]) == 512
     # Live accumulators ADD -- this is the measured failure
     # (``tensor memory, Required: 768, limit 512``) reproduced as arithmetic.
-    assert _FML._tmem_columns([(128, 256, 2)] * 3) == 768
-    assert _FML._tmem_columns([(128, 256, 2)] * 3) > _FML.TMEM_COLUMN_BUDGET
+    assert _FML._tmem_columns([(128, 256)] * 3) == 768
+    assert _FML._tmem_columns([(128, 256)] * 3) > _FML.TMEM_COLUMN_BUDGET
     # ...and one accumulator under the incumbent caps never binds, so the single-GEMM path
     # is unaffected by adding this check.
-    assert _FML._tmem_columns([(128, _FML.BASE_BN_CAP, 2)]) <= _FML.TMEM_COLUMN_BUDGET
+    assert _FML._tmem_columns([(128, _FML.BASE_BN_CAP)]) <= _FML.TMEM_COLUMN_BUDGET
     # Below the tcgen05 minimum the dot uses no tensor memory at all (measured
     # ``tmem_size == 0``), so charging it would reject a tiny tile for a resource it never
     # touches.
-    assert _FML._tmem_columns([(32, 256, 2)]) == 0
+    assert _FML._tmem_columns([(32, 256)]) == 0
     # sm90 has no tensor memory: the check must be completely inert there.
-    assert TritonH100MatmulHeuristic._tmem_columns([(128, 256, 2)] * 8) == 0
+    assert TritonH100MatmulHeuristic._tmem_columns([(128, 256)] * 8) == 0
 
 
 def test_tmem_hard_budget_includes_all_lhs_promotion_scratch() -> None:
@@ -586,9 +481,104 @@ def test_tmem_hard_budget_includes_all_lhs_promotion_scratch() -> None:
         (64, 128, 128, 2),
         (128, 128, 64, 2),
     ]
-    assert _FML._tmem_columns(tiles) == 512
-    assert _FML._tmem_columns(tiles, include_lhs_scratch=True) == 736
-    assert _FML._tmem_columns(tiles, include_lhs_scratch=True) > _FML.TMEM_COLUMN_BUDGET
+    accumulators = [(bm, bn) for bm, bn, _bk, _itemsize in tiles]
+    lhs_scratch = [(bm, bk, itemsize) for bm, _bn, bk, itemsize in tiles]
+    assert _FML._tmem_columns(accumulators) == 512
+    assert _FML._tmem_columns(accumulators, lhs_scratch_tiles=lhs_scratch) == 736
+    assert (
+        _FML._tmem_columns(accumulators, lhs_scratch_tiles=lhs_scratch)
+        > _FML.TMEM_COLUMN_BUDGET
+    )
+
+
+def test_optimistic_tmem_uses_peak_live_accumulators_and_transformed_lhs() -> None:
+    env, mm = _knob_spec(
+        knob_users=(
+            (0, ((0, "m"), (1, "m"))),
+            (1, ((0, "n"), (1, "n"))),
+            (2, ((0, "k"), (1, "k"))),
+        ),
+        block_ids=[0, 1, 2],
+        extents={0: 1024, 1: 1024, 2: 1024},
+    )
+    fact = _matmul_fact()
+    mm.matmuls = (
+        SimpleNamespace(fact=fact, axes=_axes()),
+        SimpleNamespace(fact=fact, axes=_axes()),
+    )
+    output = LiveTile((0, 1), (None, None), 4, "dot_out")
+    transformed_lhs = LiveTile(
+        (0, 2),
+        (None, None),
+        2,
+        "other",
+        promoted_lhs=True,
+    )
+    mm.live_tile_steps = ((output,), (output, transformed_lhs))
+    mm.live_dot_outputs = (output,)
+    mm.live_promoted_lhs = (transformed_lhs,)
+    blocks = [128, 128, 64]
+
+    assert (
+        _FML._candidate_tmem_columns(
+            env,
+            blocks,
+            include_lhs_scratch=True,
+            resource_policy="strict",
+        )
+        == 320
+    )
+    assert (
+        _FML._candidate_tmem_columns(
+            env,
+            blocks,
+            include_lhs_scratch=True,
+            resource_policy="optimistic",
+        )
+        == 160
+    )
+
+    mm.live_tile_steps = ((output, transformed_lhs, transformed_lhs),)
+    mm.live_promoted_lhs = (transformed_lhs, transformed_lhs)
+    assert (
+        _FML._candidate_tmem_columns(
+            env,
+            blocks,
+            include_lhs_scratch=True,
+            resource_policy="optimistic",
+        )
+        == 192
+    )
+
+    mm.live_tile_steps = ((output,), (output,))
+    mm.live_promoted_lhs = ()
+    assert (
+        _FML._candidate_tmem_columns(
+            env,
+            blocks,
+            include_lhs_scratch=True,
+            resource_policy="optimistic",
+        )
+        == 128
+    )
+
+    batched_output = LiveTile(
+        (None, 0, 1),
+        (16, None, None),
+        4,
+        "dot_out",
+    )
+    mm.live_tile_steps = ((batched_output,),)
+    mm.live_dot_outputs = (batched_output,)
+    assert (
+        _FML._candidate_tmem_columns(
+            env,
+            blocks,
+            include_lhs_scratch=True,
+            resource_policy="optimistic",
+        )
+        == 0
+    )
 
 
 def test_register_estimate_picks_its_peak_by_resolved_bytes() -> None:
@@ -651,6 +641,8 @@ def test_register_estimate_picks_its_peak_by_resolved_bytes() -> None:
     # ...and a dot below the tcgen05 minimum stays register-resident at any warp count.
     narrow = (tile("dot_out", 32, 64),)
     assert _FML._register_live_bytes(env_with((narrow,)), [], 8) == 32 * 64 * 4
+    batched = (LiveTile((None, None, None), (2, 64, 64), 4, "dot_out"),)
+    assert _FML._register_live_bytes(env_with((batched,)), [], 4) == 2 * 64 * 64 * 4
 
 
 def test_graded_stage_depth_falls_off_with_outer_parallelism() -> None:
@@ -719,7 +711,7 @@ def test_warp_selection_accounts_for_four_to_eight_residency_loss() -> None:
     """Eight warps must earn back any residency lost relative to four."""
     work = SimpleNamespace(
         total=_FML.EIGHT_WARP_DOT_WORK,
-        tcgen05_eligible=_FML.EIGHT_WARP_DOT_WORK,
+        warpgroup_eligible=_FML.EIGHT_WARP_DOT_WORK,
         uncertain=False,
     )
 
@@ -962,6 +954,26 @@ def test_kernel_smem_separates_useful_depth_from_hard_allocation() -> None:
         6,
         hard_allocation=True,
     ) == (per_stage * 6,)
+    assert _H100_FML._smem_region_demands(
+        env,
+        blocks,
+        6,
+        hard_allocation=True,
+    ) == (per_stage * 6,)
+
+    store = _live("store", 0, 1)
+    env = _kernel_smem_env(
+        (fact,),
+        block_ids=[0, 1, 2],
+        pipelined_regions=(PipelinedRegion((LoopAxisFact(2, 32),), (*loads, store)),),
+    )
+    store_bytes = 64 * 32 * 2
+    assert _H100_FML._smem_region_demands(
+        env,
+        blocks,
+        6,
+        hard_allocation=True,
+    ) == (per_stage * 5 + store_bytes,)
 
 
 def test_symbolic_loop_bounds_resolve_candidates_and_preserve_unknowns() -> None:
@@ -1066,15 +1078,8 @@ def test_multi_dot_proposal_preconditions_with_complete_kernel_smem_map() -> Non
     assert all(block_sizes[3] == 1 for block_sizes in seen)
 
 
-def test_sm90_keeps_the_incumbent_gate_and_every_switch_off() -> None:
-    """Every measurement behind the generalized machinery is B200, so sm90 must be a
-    byte-identical freeze: same eligibility precondition, no graded stages, no work-aware
-    warps, no tensor-memory column budget."""
-    cls = TritonH100MatmulHeuristic
-    assert cls.GENERALIZED_AXES is False
-    assert cls.GRADED_STAGES is False
-    assert cls.WORK_AWARE_WARPS is False
-    assert cls.TMEM_COLUMN_BUDGET is None
+def test_sm90_formula_admits_generalized_axes() -> None:
+    cls = _H100_FML
     fixed = MatmulFact(
         lhs_ndim=2,
         rhs_ndim=2,
@@ -1092,10 +1097,39 @@ def test_sm90_keeps_the_incumbent_gate_and_every_switch_off() -> None:
         _axes(k=DotAxisKind.FIXED_FULL_EXTENT, k_extent=64),
         valid_block_ids=[0, 1],
     )
-    # sm90 routes through the incumbent gate, which declines the fixed-axis dot.
-    assert cls._eligible_fact(spec) is None
-    # ...while sm100 admits it.
-    assert _FML._eligible_fact(spec) is fixed
+    assert TritonH100MatmulHeuristic._eligible_fact(spec) is None
+    assert cls._eligible_fact(spec) is fixed
+
+
+def test_sm90_caps_only_reduction_scaled_wgmma_accumulator_bug() -> None:
+    site = SimpleNamespace(
+        rank_reduction_scaled_accumulator_batch_block_id=0,
+    )
+    mm = SimpleNamespace(matmuls=(SimpleNamespace(site=site),))
+    env = SimpleNamespace()
+
+    def cap(*, rows: int = 64, batch: int = 1, warps: int = 4) -> int | None:
+        with (
+            patch.object(_H100_FML, "_full_block_map", return_value={0: batch}),
+            patch.object(
+                _H100_FML,
+                "_all_dot_acc_tiles",
+                return_value=[(rows, 64, 32, 2)],
+            ),
+        ):
+            return _H100_FML._pipeline_stage_cap(
+                env,
+                mm,
+                [batch],
+                num_warps=warps,
+            )
+
+    assert cap() == 1
+    assert cap(rows=32) is None
+    assert cap(warps=2) is None
+    assert cap(batch=2) is None
+    site.rank_reduction_scaled_accumulator_batch_block_id = None
+    assert cap() is None
 
 
 def test_multi_matmul_front_end_declines_whatever_front_end_one_owns() -> None:
@@ -1113,11 +1147,7 @@ def test_multi_matmul_front_end_declines_whatever_front_end_one_owns() -> None:
         return_value=True,
     ):
         assert _MULTI.is_eligible(env, None) is False
-    # Keep single-contraction seeds ahead of the disjoint multi-contraction path.
-    from helion._compiler.autotuner_heuristics import HEURISTICS_BY_BACKEND
-
-    triton_order = HEURISTICS_BY_BACKEND["triton"]
-    assert triton_order.index(_MULTI) > triton_order.index(_FML)
+        assert _H100_MULTI.is_eligible(env, None) is False
 
 
 def _live(kind: str, *block_ids: int | None) -> LiveTile:
@@ -1155,6 +1185,7 @@ def _knob_spec(
         grid_block_ids=grid_block_ids,
         _base_default_config=lambda: helion.Config(block_sizes=[1] * len(block_ids)),
     )
+    spec.autotune_reference_config = lambda: spec._base_default_config()
     env = SimpleNamespace(
         config_spec=spec,
         block_sizes=[
@@ -1333,7 +1364,12 @@ def test_reuse_free_output_knob_drops_to_the_allocation_floor() -> None:
     )
     block_sizes = [128]
     _MULTI._apply_knob_roles(env, env.config_spec.kernel_matmul_fact, block_sizes, 148)
-    assert block_sizes == [_MULTI.TMEM_ALLOC_COLUMNS]
+    assert block_sizes == [_MULTI.REUSE_FREE_OUTPUT_N_FLOOR]
+    block_sizes = [128]
+    _H100_MULTI._apply_knob_roles(
+        env, env.config_spec.kernel_matmul_fact, block_sizes, 148
+    )
+    assert block_sizes == [_H100_MULTI.REUSE_FREE_OUTPUT_N_FLOOR]
 
     env, _mm = _knob_spec(
         knob_users=((4, ((0, "n"),)),),
@@ -1409,6 +1445,237 @@ def test_grid_knob_shrinks_only_when_wave_utilization_improves() -> None:
     assert block_sizes == [128]
 
 
+def test_multi_seed_recipes_use_the_shared_bounded_fixups() -> None:
+    env, mm = _knob_spec(
+        knob_users=(
+            (0, ((0, "m"),)),
+            (1, ((0, "n"),)),
+            (2, ((0, "k"),)),
+        ),
+        block_ids=[0, 1, 2],
+        extents={0: 4096, 1: 4096, 2: 4096},
+    )
+    seen_stage_warps: list[int] = []
+    assert _MULTI._seed_axis_ids({0: ("m",), 1: ("n", "k")}) == (
+        (0,),
+        (1,),
+        (1,),
+    )
+
+    def solve_stages(
+        _env: object,
+        _blocks: list[int],
+        *,
+        num_warps: int,
+        **_kwargs: object,
+    ) -> int:
+        seen_stage_warps.append(num_warps)
+        return 3
+
+    with (
+        patch.object(_FML, "_select_num_warps", return_value=8),
+        patch.object(_FML, "_kernel_smem_bytes", return_value=0),
+        patch.object(_FML, "_solve_candidate_stages", side_effect=solve_stages),
+        patch.object(
+            _FML,
+            "_fixup_candidate_resources",
+            side_effect=lambda _env, _blocks, stages, warps, **_kwargs: (
+                stages,
+                warps,
+            ),
+        ),
+    ):
+        drafts = _FML._register_mma_seed_drafts(
+            env,
+            mm,
+            MatmulSeedDraft([128, 256, 64], 8, 4),
+            num_sm=148,
+            axis_ids=((0,), (1,), (2,)),
+        )
+
+    assert [draft.num_warps for draft in drafts] == [1, 2]
+    assert set(seen_stage_warps) == {1, 2}
+
+
+def test_b200_single_matmul_emits_the_compact_seed_families() -> None:
+    fact = _matmul_fact(static_m=4096, static_n=4096, static_k=4096)
+    spec = _generalized_spec(fact, _axes(), valid_block_ids=[0, 1, 2])
+    spec.kernel_matmul_fact.knob_users = (
+        (0, ((0, "m"),)),
+        (1, ((0, "n"),)),
+        (2, ((0, "k"),)),
+    )
+    spec.grid_block_ids = (7,)
+    spec.kernel_grid_fact = SimpleNamespace(
+        group_for_graph=lambda _graph_id: (7,),
+        groups_for_graphs=lambda _graph_ids: ((7,),),
+        grid_groups=((7,),),
+    )
+    spec.l2_groupings = _block_sizes_stub([0, 7])
+    spec._base_default_config = lambda: helion.Config(
+        block_sizes=[16, 16, 16],
+        l2_groupings=[2, 3],
+        num_warps=4,
+        num_stages=1,
+    )
+    env = SimpleNamespace(
+        config_spec=spec,
+        block_sizes=[],
+        device=None,
+        size_hint=int,
+    )
+
+    with patch("helion.runtime.get_num_sm", return_value=148):
+        ranked = _FML._ranked_configs(env, fact)
+
+    assert ranked[0] == helion.Config(
+        block_sizes=[64, 32, 64],
+        l2_groupings=[2, 1],
+        num_warps=4,
+        num_stages=4,
+    )
+    assert (
+        helion.Config(
+            block_sizes=[128, 256, 64],
+            l2_groupings=[2, 1],
+            num_warps=8,
+            num_stages=4,
+        )
+        in ranked
+    )
+    assert len(ranked) == 9
+    assert all(config["l2_groupings"] == [2, 1] for config in ranked[1:])
+    register_mma = [
+        config
+        for config in ranked
+        if config["num_warps"] <= 2 and config["block_sizes"][2] <= 32
+    ]
+    assert len(register_mma) >= 2
+    assert any(
+        config["num_warps"] >= 4
+        and config["block_sizes"][0] >= _FML.TCGEN05_MIN_BM
+        and config["block_sizes"][2] == 32
+        for config in ranked
+    )
+    assert ranked[-1]["num_warps"] >= _FML.TCGEN05_WARPGROUP_WARPS
+    assert ranked[-1]["block_sizes"][0] >= _FML.TCGEN05_MIN_BM
+
+    spec.kernel_matmul_fact.matmuls[0].site.loop_axes = (
+        LoopAxisFact(2, 4096, bounded_by_block_id=0),
+    )
+    capped = _FML._projected_tile_for_dot(
+        env,
+        fact,
+        _axes(),
+        2,
+        148,
+        site=spec.kernel_matmul_fact.matmuls[0].site,
+    )
+    with patch("helion.runtime.get_num_sm", return_value=148):
+        split_k_ranked = _FML._ranked_configs(env, fact)
+    assert capped[:2] == (
+        _FML.SAT_PARTITIONED_K_BM,
+        _FML.SAT_PARTITIONED_K_BN,
+    )
+    assert ranked[1] in split_k_ranked
+
+
+def test_multi_focal_seeds_default_fill_and_canonical_dedupe() -> None:
+    fact = _matmul_fact()
+    mm = SimpleNamespace(
+        matmuls=tuple(
+            SimpleNamespace(fact=fact, site=SimpleNamespace(graph_id=index % 2))
+            for index in range(15)
+        ),
+        attribution_complete=True,
+    )
+    spec = SimpleNamespace(
+        kernel_matmul_fact=mm,
+        kernel_grid_fact=SimpleNamespace(
+            group_for_graph=lambda graph_id: (0,) if graph_id == 0 else (7,)
+        ),
+        block_sizes=_block_sizes_stub([0, 1, 2, 7]),
+        l2_groupings=_block_sizes_stub([0, 7]),
+        _base_default_config=lambda: helion.Config(
+            block_sizes=[16, 16, 16, 128],
+            l2_groupings=[1, 1],
+            num_warps=4,
+            num_stages=2,
+        ),
+        _flat_fields=lambda: {
+            "block_sizes": None,
+            "l2_groupings": None,
+            "num_warps": None,
+            "num_stages": None,
+        },
+        allowed_pid_types=(),
+    )
+    spec.autotune_reference_config = lambda: spec._base_default_config()
+    current_limit: list[int | None] = [None]
+
+    def normalize(
+        config: helion.Config | dict[str, object],
+        *,
+        _fix_invalid: bool,
+    ) -> None:
+        values = config.config if isinstance(config, helion.Config) else config
+        values.setdefault("l2_groupings", [1, 1])
+        if current_limit[0] is not None:
+            blocks = cast("list[int]", values["block_sizes"])
+            blocks[0] = min(
+                current_limit[0],
+                blocks[0],
+            )
+
+    spec.normalize = normalize
+    spec._shrink_for_numel_constraints = lambda _config: None
+    env = SimpleNamespace(config_spec=spec, block_sizes=[])
+    invalid_primary = helion.Config(block_sizes=[3])
+    alternate = helion.Config(block_sizes=[4])
+    with patch.object(
+        _MULTI,
+        "_canonical_seed_config",
+        side_effect=(None, alternate, alternate),
+    ):
+        assert _MULTI._dedupe_seed_pool(
+            env,
+            (invalid_primary, alternate, alternate),
+        ) == [invalid_primary, alternate]
+    proposals = {
+        index: (
+            16 << (index % 4),
+            16 << (index // 4),
+            16,
+            1,
+            2,
+            1,
+        )
+        for index in range(15)
+    }
+
+    root_configs = _MULTI._focal_seed_configs(
+        env,
+        mm,
+        dict.fromkeys(range(2), (16, 16, 16, 1, 2, 4)),
+    )
+    assert {tuple(config["l2_groupings"]) for config in root_configs} == {
+        (4, 1),
+        (1, 4),
+    }
+
+    for m_limit, expected in ((32, 8), (None, 15)):
+        current_limit[0] = m_limit
+        configs = _MULTI._focal_seed_configs(
+            env,
+            mm,
+            proposals,
+        )
+
+        assert len(configs) == expected
+        assert all(config["block_sizes"][3] == 128 for config in configs)
+        assert all(config["l2_groupings"] == [1, 1] for config in configs)
+
+
 def test_role_correction_runs_once_per_front_end() -> None:
     """Front end 1 corrects its projected tile; front end 2 corrects only its merged draft."""
     assert _FML.SINGLE_ROLE_AWARE_KNOBS is True
@@ -1477,6 +1744,10 @@ def test_register_estimate_lets_tensor_memory_absorb_wide_accumulators() -> None
     assert _FML._register_live_bytes(_steps_env(wide), [], 1) == 128 * 128 * 4
     assert _FML._register_live_bytes(_steps_env(wide), [], 2) == 128 * 128 * 4
     assert _FML._register_live_bytes(_steps_env(wide), [], 4) == 0
+    # H100 WGMMA issues as a warpgroup too, but its accumulator remains in
+    # registers at four and eight warps.
+    assert _H100_FML._register_live_bytes(_steps_env(wide), [], 4) == 128 * 128 * 4
+    assert _H100_FML._register_live_bytes(_steps_env(wide), [], 8) == 128 * 128 * 4
     narrow = (
         ((32, 128, 4, "dot_out"),),
     )  # below TCGEN05_MIN_BM: never in tensor memory
@@ -1517,20 +1788,20 @@ def test_register_climb_stops_at_a_warpgroup_not_at_max_warps() -> None:
     stopping at a warpgroup scores 0.9591 -- above the hand-tuned key's 0.9363."""
     # A live set far past ANY register file must still stop at a warpgroup, not run to eight.
     huge = tuple([tuple((128, 128, 4, "other") for _ in range(8))])  # 512 KiB
-    assert (
-        _FML._warps_for_live_set(1, _steps_env(huge), [])
-        == _FML.TCGEN05_WARPGROUP_WARPS
-    )
-    assert _FML.TCGEN05_WARPGROUP_WARPS < _FML.MAX_NUM_WARPS
+    assert _FML._warps_for_live_set(1, _steps_env(huge), []) == _FML.WARPGROUP_WARPS
+    assert _FML.WARPGROUP_WARPS < _FML.MAX_NUM_WARPS
     # Eight is still reachable -- it just has to come from the work term, which this rule keeps.
     assert _FML._warps_for_live_set(8, _steps_env(huge), []) == 8
     # The stop is a per-arch class attribute, not an arch test inside the ladder: hardware
     # selection already happened in is_eligible via HARDWARE_TARGETS. Pin that the sm100 carrier
     # ties it to the absorption boundary it is derived from, so the two cannot drift apart...
-    assert _FML.REG_CLIMB_MAX_WARPS == _FML.TCGEN05_WARPGROUP_WARPS
-    # ...and that the sm90 carrier is left where it was, holding that frozen emit still.
-    assert _H100.REG_CLIMB_MAX_WARPS == _H100.MAX_NUM_WARPS
-    assert _H100._warps_for_live_set(1, _steps_env(huge), []) == _H100.MAX_NUM_WARPS
+    assert _FML.REG_CLIMB_MAX_WARPS == _FML.WARPGROUP_WARPS
+    # Register-resident WGMMA keeps climbing when pressure remains unresolved.
+    assert _H100_FML.REG_CLIMB_MAX_WARPS == _H100_FML.MAX_NUM_WARPS
+    assert (
+        _H100_FML._warps_for_live_set(1, _steps_env(huge), [])
+        == _H100_FML.MAX_NUM_WARPS
+    )
 
 
 def test_no_structural_warp_floor_survives() -> None:

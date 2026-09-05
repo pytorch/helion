@@ -6944,6 +6944,26 @@ class TestCuteBackend(TestCase):
         self.assertIn("ir.VectorType.get([4], cutlass.Uint16.mlir_type)", code)
         self.assertIn(".bitcast(cutlass.BFloat16)", code)
 
+    def test_fp32_unroll_mode_emits_uint32_vec_load_and_bitcast(self) -> None:
+        """A pure-fp32 reduction with V=4 loads each V-chunk as a Uint32
+        vector and bitcasts each lane back to fp32.  Regression test: the
+        retired explicit-vec mode emitted vec-lattice indexing with SCALAR
+        loads for this exact config (its load-side gate never matched aten
+        reduction targets), silently reading 1/V of each row."""
+        args = (torch.randn(2, 16384, device=DEVICE, dtype=torch.float32) + 2.0,)
+        code, out = code_and_output(
+            cute_normalize_by_sum,
+            args,
+            block_sizes=[1],
+            reduction_loop=8192,
+            cute_vector_widths=[4],
+        )
+        (x,) = args
+        expected = x / x.sum(-1, keepdim=True)
+        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+        self.assertIn("ir.VectorType.get([4], cutlass.Uint32.mlir_type)", code)
+        self.assertIn(".bitcast(cutlass.Float32)", code)
+
     def test_two_pass_load_fusion_shape_b_wide_chunk(self) -> None:
         """Shape B: V=1 wide-chunk reduction emits a lane loop inside the
         outer offset loop, and the fuser caches loaded x values across the
@@ -11936,21 +11956,23 @@ class TestCuteBackendRequirements(TestCase):
         )
         from helion._compiler.cute.cutedsl_compat import CUTE_VALIDATED_VERSION
 
-        pin = (
-            (
-                Path(__file__).parents[1]
-                / ".github"
-                / "ci_commit_pins"
-                / "nvidia_cutlass_dsl.txt"
-            )
-            .read_text(encoding="utf-8")
-            .strip()
-        )
-        self.assertEqual(str(CUTE_VALIDATED_VERSION), pin)
         self.assertEqual(
             CUTE_TCGEN05_RUNTIME_N_PTX_VALIDATED_VERSION,
             CUTE_VALIDATED_VERSION,
         )
+        pin_path = (
+            Path(__file__).parents[1]
+            / ".github"
+            / "ci_commit_pins"
+            / "nvidia_cutlass_dsl.txt"
+        )
+        try:
+            pin = pin_path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            self.skipTest(
+                f"checked-in CuTe DSL pin not packaged in this environment: {pin_path}"
+            )
+        self.assertEqual(str(CUTE_VALIDATED_VERSION), pin)
 
     def test_check_does_not_raise_when_satisfied(self) -> None:
         from helion._compiler.cute.cutedsl_compat import check_cute_backend_requirements

@@ -131,8 +131,13 @@ def _(state: CodegenState) -> ast.AST:
     # If no explicit eviction_policy and we're in device code, use tunable
     if eviction_policy is None and state.codegen.on_device:
         policies = state.config.load_eviction_policies
-        if load_idx < len(policies):
+        if isinstance(policies, str):
+            policy_value = policies
+        elif load_idx < len(policies):
             policy_value = policies[load_idx]
+        else:
+            policy_value = None
+        if policy_value is not None:
             eviction_policy = _EVICTION_POLICY_MAP.get(policy_value, policy_value)
 
     if eviction_policy is not None:

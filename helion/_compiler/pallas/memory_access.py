@@ -15,6 +15,21 @@ if TYPE_CHECKING:
 MEMORY_ACCESS_META = "pallas_memory_access"
 
 
+def tensor_origin_key(tensor: torch.Tensor) -> str | int:
+    """Stable key for a tensor's host-side origin expression."""
+    from ..host_function import HostFunction
+
+    origin = HostFunction.current().tensor_to_origin.get(tensor)
+    return origin.host_str() if origin is not None else id(tensor)
+
+
+def tensors_share_origin_or_storage(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
+    """Whether two fake tensors can address the same host allocation."""
+    return tensor_origin_key(lhs) == tensor_origin_key(rhs) or id(
+        lhs.untyped_storage()
+    ) == id(rhs.untyped_storage())
+
+
 class MemoryAccessKind(Enum):
     """Logical effect of one Helion memory operation."""
 
@@ -111,11 +126,14 @@ def indirect_access(access: MemoryAccess) -> IndirectAccess | None:
 
 
 def tensor_index_positions(access: MemoryAccess) -> tuple[int, ...]:
-    """Return all tensor-indexed subscript positions."""
+    """Return positions that require an indirect tensor access plan.
+
+    Rank-zero tensor indices are scalar addresses and use ordinary Ref indexing.
+    """
     from .plan_tiling import TensorIndexPattern
 
     return tuple(
         position
         for position, pattern in enumerate(access.patterns)
-        if isinstance(pattern, TensorIndexPattern)
+        if isinstance(pattern, TensorIndexPattern) and pattern.index_ndim > 0
     )

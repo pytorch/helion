@@ -752,6 +752,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         provider._precompile_baseline_path = "/tmp/baseline.pt"
         provider._effective_atol = 0.0
         provider._effective_rtol = 0.0
+        provider._scale_atol = True
         provider._benchmark_worker = Mock()
         provider._benchmark_worker.run.return_value = object()
         provider._subprocess_accuracy_check_enabled = lambda: True

@@ -617,6 +617,28 @@ def _fp8_block_ptr_padding_broken() -> bool:
     return version.parse("3.8.0") <= triton_version < version.parse("3.9.0")
 
 
+def sm100_dot_tmem_lhs_broken(device: torch.device) -> bool:
+    # call private func we can patch in testing
+    return _sm100_dot_tmem_lhs_broken(device)
+
+
+def _sm100_dot_tmem_lhs_broken(device: torch.device) -> bool:
+    """Whether ``tl.dot`` crashes with a misaligned address on sm100 when its LHS
+    operand is promoted to tensor memory and the accumulator is wider than 256.
+
+    On Blackwell, Triton's ``PromoteLHSToTMem`` pass places any dot LHS that is
+    not a plain load (e.g. the result of another dot, or any elementwise op) in
+    tensor memory.  With an M block of 64 the resulting TMEM allocation must
+    share rows with the accumulator, but an accumulator wider than 256 columns
+    is interleaved across both row halves, which the tcgen05 lowering
+    mishandles (triton-lang/triton#10309, unfixed as of triton 3.8/main).
+    Worked around in ``emit_tl_dot_with_padding`` by splitting the dot into two
+    M=32 halves; drop the workaround once the upstream fix ships.
+    """
+    capability = target_device_capability(device)
+    return capability is not None and capability[0] == 10
+
+
 @functools.cache
 def _regs_per_block() -> int:
     """Max 32-bit registers per block on the current CUDA device."""

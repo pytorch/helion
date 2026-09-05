@@ -199,16 +199,18 @@ def indirect_group_statements(
     return result
 
 
-def emit_grid_indirect_transfer(
+def emit_immediate_indirect_transfer(
     state: CodegenState,
     plan: DmaAccessPlan,
     name: str,
 ) -> None:
-    """Emit the immediate start/wait policy for a root-grid DMA plan."""
+    """Emit a start/wait transfer at an indirect load or store site."""
     from . import codegen as pallas_codegen
     from .memory_access import MemoryAccessKind
 
     resources = pallas_codegen.grid_memory_op_dma_binding(state)
+    if resources is None and plan.spec.index_access is None:
+        resources = pallas_codegen.fori_memory_op_dma_binding(state)
     if resources is None:
         return
     ast_subscripts = state.ast_args[1]

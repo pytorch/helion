@@ -147,16 +147,20 @@ def _strategies_concurrent_with_block(
 
 
 def _cute_vec_kernel_mode() -> str:
-    """Return ``"vec"`` when all reduction-feeding loads are vec-eligible
-    without a degrading dtype cast (i.e. fp32 -> fp32 pipeline), ``"unroll"``
-    when at least one load uses the bf16/fp16 -> fp32 cast pattern that the
-    CuTe DSL's ``Float32(vec)`` constructor would silently scalarise, or
-    ``"none"`` when there's no looped reduction at all.
+    """Return the vec-lattice mode for looped reductions: always ``"unroll"``.
 
-    ``"vec"`` lets the strategy emit a single ``cute.arch.load(..., V)`` +
-    V-fold per lane iter.  ``"unroll"`` falls back to a constexpr V-loop
-    around per-element scalar loads — the CUTLASS DSL cannot iterate the
-    elements of a bf16/fp16 vector without crashing during compile.
+    ``"unroll"`` partitions the lane extent into outer x V and walks each
+    V-chunk with a hoisted integer-vector load (Uint16 for bf16/fp16,
+    Uint32 for fp32) plus per-lane bitcasts; loads that cannot vectorize
+    fall back to per-element scalar loads INSIDE the V-loop, which keeps
+    the lattice and the loads consistent.
+
+    The retired ``"vec"`` mode (explicit ``cute.arch.load(..., V)`` +
+    ``_cute_pre_vec_fold``) was selected for pure-fp32 kernels but its
+    load-side gate (``feeds_reduction``) never matched aten reduction
+    targets, so every fp32 config with V > 1 emitted vec-lattice indexing
+    with SCALAR loads — reading 1/V of the row and silently corrupting
+    results (only the autotuner's accuracy check filtered such configs).
     """
     from .host_function import HostFunction
     from .host_function import NoCurrentFunction
@@ -167,30 +171,37 @@ def _cute_vec_kernel_mode() -> str:
         return "none"
     if hf._device_ir is None:
         return "none"
-    cast_targets = {
-        "convert_element_type.default",
-        "convert_element_type",
-        "_to_copy.default",
-        "_to_copy",
-    }
-    from ..language import memory_ops as _memory_ops
+    return "unroll"
 
-    load_target = _memory_ops.load
-    has_cast = False
-    for graph_info in hf.device_ir.graphs:
-        for node in graph_info.graph.nodes:
-            if node.target is not load_target:
-                continue
-            for user in node.users:
-                target_name = getattr(user.target, "__name__", "") or ""
-                if target_name in cast_targets:
-                    has_cast = True
-                    break
-            if has_cast:
-                break
-        if has_cast:
-            break
-    return "unroll" if has_cast else "vec"
+
+def _cute_cluster_reduce_smem_vars(
+    fn: DeviceFunction, group_span: int, cluster_n: int
+) -> tuple[str, str]:
+    """Allocate + initialize the SMEM receive buffer and single-phase
+    mbarrier for one ``_cute_grouped_reduce_cluster`` site in the kernel
+    preamble, and count the site so ``codegen_function_def`` emits ONE
+    ``mbarrier_init_fence`` + cluster arrive/wait covering every site (a
+    per-site cluster barrier costs ~10% of kernel time at cluster_n=16).
+    """
+    slots = (group_span // 32) * cluster_n
+    buf_var = fn.new_var("_cluster_red_buf", dce=False)
+    mbar_var = fn.new_var("_cluster_red_mbar", dce=False)
+    fn.preamble.append(
+        statement_from_string(
+            f"{buf_var} = cute.arch.alloc_smem(cutlass.Float32, {slots})"
+        )
+    )
+    fn.preamble.append(
+        statement_from_string(f"{mbar_var} = cute.arch.alloc_smem(cutlass.Int64, 1)")
+    )
+    fn.preamble.append(
+        statement_from_string(
+            "if cutlass.Int32(cute.arch.thread_idx()[0]) == 0:"
+            f"\n    cute.arch.mbarrier_init({mbar_var}, 1)"
+        )
+    )
+    fn.cute_state.simt_cluster_reduce_sites += 1
+    return buf_var, mbar_var
 
 
 def _block_has_indexed_reduction(fn: DeviceFunction, block_index: int) -> bool:
@@ -300,6 +311,24 @@ class ReductionStrategy(TileStrategy):
                 ):
                     return True
         return False
+
+    def _lane_reduce_cluster_n(self) -> int:
+        """Thread-block-cluster width of the lane-looped strategy that
+        distributes this reduction block, or 1 when not cluster-split."""
+        codegen = getattr(self, "_codegen", None)
+        if codegen is None:
+            return 1
+        for loops in codegen.active_device_loops.values():
+            for loop_state in loops:
+                if (
+                    isinstance(loop_state, DeviceLoopState)
+                    and self.block_index in loop_state.lane_loop_blocks
+                ):
+                    strategy = loop_state.strategy
+                    cluster_by_block = getattr(strategy, "_cute_cluster_by_block", None)
+                    if isinstance(cluster_by_block, dict):
+                        return cluster_by_block.get(self.block_index, 1)
+        return 1
 
     def _lane_reduce_threads_in_group(self) -> int | None:
         """Return ``threads_in_group`` for a two-pass lane reduction over this
@@ -1163,6 +1192,18 @@ class LoopedReductionStrategy(ReductionStrategy):
             ):
                 max_threads = min(max_threads, _CUTE_WARP_REDUCTION_THREADS)
             thread_count = next_power_of_2(min(block_size, max_threads))
+            if env.backend.name == "cute":
+                # Autotunable per-rdim thread count: fewer threads per row
+                # (each covering more elements via the lane loop) is often
+                # faster for memory-bound row reductions. 0 = auto (keep the
+                # chunk-derived count above).
+                requested = env.config_spec.num_threads.config_get(
+                    cast("list[int]", fn.config.config.get("num_threads", []) or []),
+                    block_index,
+                    0,
+                )
+                if isinstance(requested, int) and 0 < requested < thread_count:
+                    thread_count = requested
         else:
             thread_count = 0
         tile_dispatch = getattr(fn, "tile_strategy", None)
@@ -1178,7 +1219,10 @@ class LoopedReductionStrategy(ReductionStrategy):
         self._cute_reduction_vec_width = 1
         # ``"vec"`` (fp32 fast path) or ``"unroll"`` (bf16/fp16 fallback)
         # — controls how the lane body emits each per-iter load.
-        self._cute_reduction_vec_mode = "vec"
+        # "unroll" is the only live vec mode; the retired "vec" mode
+        # miscompiled (see _cute_vec_kernel_mode) so it must never be the
+        # default a forgotten assignment falls back to.
+        self._cute_reduction_vec_mode = "unroll"
         # Masks queued by vec loads inside the lane loop; consumed by
         # codegen_reduction to wrap the V-fold scalar.
         self._cute_pending_vec_masks: list[str] = []
@@ -1237,6 +1281,79 @@ class LoopedReductionStrategy(ReductionStrategy):
         )
         self.offset_vars[block_index] = fn.new_var(f"roffset_{block_index}", dce=True)
         self.index_vars[block_index] = fn.new_var(f"rindex_{block_index}", dce=True)
+        # ``cute_cluster_n`` split of the rolled range across a thread-block
+        # cluster; decided lazily at the first ``codegen_device_loop`` (see
+        # ``_maybe_apply_cute_rolled_cluster``).
+        self._cute_rolled_cluster_n = 1
+        self._cute_rolled_cluster_checked = False
+
+    def _maybe_apply_cute_rolled_cluster(self, state: CodegenState) -> None:
+        """Decide whether ``cute_cluster_n`` applies to this rolled
+        reduction (mirrors ``PerThreadNDTileStrategy._maybe_apply_cute_cluster``
+        for the tile-loop form).
+
+        When applied, each of the ``cluster_n`` CTAs of a thread-block
+        cluster rolls over its own contiguous ``numel/cluster_n`` slice of
+        the reduction range, the finalize combines the partials across the
+        cluster with one DSM exchange (every CTA receives the full result,
+        so downstream row-scalar stores stay redundant-but-identical), and
+        the consume sweep re-iterates only the CTA's slice — so loads and
+        stores are sliced automatically.  The owning ``DeviceFunction``'s
+        ``cute_state.simt_cluster_n`` is set so the host-side call emits the
+        extra grid dim + cluster launch shape.
+        """
+        if self._cute_rolled_cluster_checked:
+            return
+        self._cute_rolled_cluster_checked = True
+        env = CompileEnvironment.current()
+        if env.backend.name != "cute":
+            return
+        cl = self.fn.config.config.get("cute_cluster_n", 1)
+        if not isinstance(cl, int) or cl <= 1:
+            return
+        if getattr(self.fn.cute_state, "simt_cluster_n", 1) > 1:
+            # Another device loop's strategy already claimed the cluster
+            # rank; splitting a second axis on the same rank would leave
+            # only the diagonal rank x rank slices covered.
+            return
+        # The finalize must go through the cross-warp two-stage path (the
+        # warp-shuffle path never crosses CTAs), and argreduce has no
+        # cluster combine.
+        if (
+            self._thread_count <= 32
+            or self._thread_count % 32 != 0
+            or _block_has_indexed_reduction(self.fn, self.block_index)
+        ):
+            return
+        # A masked roll cannot be cluster-split: the mask compares against
+        # the full extent, so a partial trailing chunk would read into the
+        # next rank's slice and double-count it.
+        if self._mask_var is not None:
+            return
+        # Statements outside the roll loop execute once per cluster CTA —
+        # benign for plain (idempotent) stores, but a read-modify-write
+        # would repeat ``cluster_n`` times.
+        if HostFunction.current().device_ir.has_atomic_ops():
+            return
+        # Sibling thread axes (e.g. a multi-row grid tile with block_m > 1)
+        # would make the whole-CTA cluster reduce fold unrelated rows.
+        grid_axis_sizes = getattr(
+            state.codegen.current_grid_state, "thread_axis_sizes", None
+        )
+        if isinstance(grid_axis_sizes, dict) and any(
+            size > 1 for size in grid_axis_sizes.values()
+        ):
+            return
+        numel = env.block_sizes[self.block_index].numel
+        try:
+            numel_int = int(numel)
+        except (TypeError, ValueError):
+            return
+        # Each CTA must roll whole chunks of its own contiguous slice.
+        if numel_int % (cl * self._loop_block_size) != 0:
+            return
+        self._cute_rolled_cluster_n = cl
+        self.fn.cute_state.simt_cluster_n = cl
 
     def _reduction_thread_count(self) -> int:
         return self._thread_count
@@ -1275,11 +1392,25 @@ class LoopedReductionStrategy(ReductionStrategy):
     ) -> str | None:
         env = CompileEnvironment.current()
         backend = env.backend
+        # Once ``_maybe_apply_cute_rolled_cluster`` sliced the roll range,
+        # every CTA holds only a partial sum — any fallback to a
+        # non-cluster reduction would silently drop the peer CTAs'
+        # contributions, so every bail-out below must hard-fail instead.
+        cluster_n = self._cute_rolled_cluster_n
+
+        def unsupported(reason: str) -> None:
+            if cluster_n > 1:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"cute_cluster_n > 1 rolled reduction: {reason}",
+                )
+
         if (
             backend.name != "cute"
             or self._thread_count <= 32
             or backend.is_indexed_reduction(reduction_type)
         ):
+            unsupported("requires a cross-warp non-indexed reduce")
             return None
 
         axis_sizes = self._active_thread_axis_sizes(state, device_loop)
@@ -1292,6 +1423,7 @@ class LoopedReductionStrategy(ReductionStrategy):
             num_threads *= size
         group_span = self._thread_count
         if num_threads % group_span != 0:
+            unsupported("thread axes do not tile the reduce group")
             return None
         # The two-stage shared-memory reduction assumes its ``lane_var`` is
         # the linear thread index across ALL of the launch block's threads.
@@ -1303,15 +1435,51 @@ class LoopedReductionStrategy(ReductionStrategy):
         planned_dims = self._planned_thread_dims()
         planned_block_threads = planned_dims[0] * planned_dims[1] * planned_dims[2]
         if num_threads != planned_block_threads:
+            unsupported("another strategy contributes unentered thread axes")
             return None
         lane_expr = backend.thread_linear_index_expr(axis_sizes)
         if lane_expr is None:
+            unsupported("no linear thread index for the block layout")
             return None
 
         identity_expr = backend.cast_expr(
             constant_repr(default_value), _dtype_str(dtype)
         )
         group_count = num_threads // group_span
+        if cluster_n > 1:
+            if group_count != 1:
+                # The cluster reduce combines across the WHOLE CTA; a
+                # multi-group reduce (several rows per CTA) would fold
+                # unrelated rows together.
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "cute_cluster_n > 1 requires a whole-CTA reduce group "
+                    "for the rolled reduction",
+                )
+            if reduction_type not in ("sum", "max", "min"):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"cute_cluster_n > 1 does not support {reduction_type!r} "
+                    "rolled reductions",
+                )
+            if dtype != torch.float32:
+                # The cluster exchange buffers every partial as Float32
+                # (see _cute_grouped_reduce_cluster) — a wider accumulator
+                # would silently lose precision through the round trip.
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "cute_cluster_n > 1 requires an fp32 reduction "
+                    f"accumulator, got {dtype}",
+                )
+            return self._emit_rolled_cluster_reduce(
+                device_loop=device_loop,
+                input_name=input_name,
+                reduction_type=reduction_type,
+                identity_expr=identity_expr,
+                lane_expr=lane_expr,
+                group_span=group_span,
+                cluster_n=cluster_n,
+            )
         lane_var = self.fn.new_var("looped_reduce_lane", dce=True)
         lane_in_group_var = self.fn.new_var("looped_reduce_lane_in_group", dce=True)
         lane_mod_pre_var = self.fn.new_var("looped_reduce_lane_mod_pre", dce=True)
@@ -1335,8 +1503,45 @@ class LoopedReductionStrategy(ReductionStrategy):
         )
         return result_var
 
+    def _emit_rolled_cluster_reduce(
+        self,
+        *,
+        device_loop: DeviceLoopState,
+        input_name: str,
+        reduction_type: str,
+        identity_expr: str,
+        lane_expr: str,
+        group_span: int,
+        cluster_n: int,
+    ) -> str:
+        """Finalize a cluster-split rolled reduction: combine the CTA's
+        partial across its warps AND the ``cluster_n`` peer CTAs with one
+        DSM exchange (every CTA receives the full result).  The SMEM
+        receive buffer and mbarrier are allocated + initialized in the
+        kernel preamble; ``codegen_function_def`` emits ONE
+        ``mbarrier_init_fence`` + cluster arrive/wait covering every site.
+        """
+        buf_var, mbar_var = _cute_cluster_reduce_smem_vars(
+            self.fn, group_span, cluster_n
+        )
+        lane_var = self.fn.new_var("looped_reduce_lane", dce=True)
+        result_var = self.fn.new_var("looped_reduce_result", dce=True)
+        device_loop.outer_suffix.append(
+            statement_from_string(f"{lane_var} = {lane_expr}")
+        )
+        device_loop.outer_suffix.append(
+            statement_from_string(
+                f"{result_var} = _cute_grouped_reduce_cluster("
+                f"{input_name}, {reduction_type!r}, {identity_expr}, "
+                f"{lane_var}, {buf_var}, {mbar_var}, "
+                f"group_span={group_span}, cluster_n={cluster_n})"
+            )
+        )
+        return result_var
+
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
         env = CompileEnvironment.current()
+        self._maybe_apply_cute_rolled_cluster(state)
         block_index = self.block_index
         numel = env.block_sizes[block_index].numel
         offset_var = self.offset_var(block_index)
@@ -1382,6 +1587,13 @@ class LoopedReductionStrategy(ReductionStrategy):
         # in ``unroll`` mode — the dispatcher uses this to compute the vec
         # pointer offset once.
         self._cute_lane_base_index_var: str | None = None
+        # The constexpr V-loop node of the current lane body (see
+        # codegen_device_loop); used to position vec hoists and vec-store
+        # flushes relative to the V-loop.
+        self._cute_lane_vloop: ast.For | None = None
+        # Vec-store flush sites already spliced into the current lane body
+        # (list of list-var names), in source order.
+        self._cute_lane_vec_stores: list[str] = []
         vec_lane_var: str | None = None
         base_expr: str = ""
         if reduction_lane_var is not None:
@@ -1448,6 +1660,10 @@ class LoopedReductionStrategy(ReductionStrategy):
                         lane_body,
                     )
                 ]
+                # Record the V-loop node so hoists (inserted before it) and
+                # vec-store flushes (appended after it) can locate it even
+                # once it is no longer the last lane_body entry.
+                self._cute_lane_vloop = vec_for
                 # Stash the lane body list so the dispatcher can splice
                 # hoists in (BETWEEN base_stmt and vec_for) as it runs.
                 self._cute_lane_body = lane_body
@@ -1460,6 +1676,17 @@ class LoopedReductionStrategy(ReductionStrategy):
                     )
                 ]
 
+        range_begin = "0"
+        range_end = state.sympy_expr(numel)
+        if self._cute_rolled_cluster_n > 1:
+            # Cluster split: each of the ``cluster_n`` CTAs rolls over its
+            # own contiguous slice (the launch adds a grid dim of
+            # ``cluster_n`` CTAs per outer index); the finalize combines
+            # the partials across the cluster.
+            slice_len = int(numel) // self._cute_rolled_cluster_n
+            rank_expr = env.backend.program_id_expr(1, index_dtype="cutlass.Int32")
+            range_begin = f"{rank_expr} * {slice_len}"
+            range_end = f"{rank_expr} * {slice_len} + {slice_len}"
         for_node = create(
             ast.For,
             target=create(ast.Name, id=offset_var, ctx=ast.Store()),
@@ -1467,8 +1694,8 @@ class LoopedReductionStrategy(ReductionStrategy):
                 self.get_range_call_str(
                     state.config,
                     [self.block_index],
-                    begin="0",
-                    end=state.sympy_expr(numel),
+                    begin=range_begin,
+                    end=range_end,
                     step=block_size_var,
                 ),
             ),
@@ -2250,6 +2477,16 @@ class BlockReductionStrategy(ReductionStrategy):
                     > smem_budget_bytes
                 ):
                     return None
+                if self._lane_reduce_cluster_n() > 1 and (pre != 1 or group_count != 1):
+                    # The cluster split covers the whole CTA; an
+                    # interleaved / multi-group reduce cannot combine
+                    # across the cluster and would silently drop the
+                    # peer CTAs' contributions.
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        "cute_cluster_n > 1 requires a whole-CTA reduce "
+                        "group (pre == 1 and group_count == 1)",
+                    )
                 return self._strided_thread_reduction_expr_shared_two_stage(
                     state=state,
                     input_name=input_name,
@@ -2270,6 +2507,12 @@ class BlockReductionStrategy(ReductionStrategy):
                 > smem_budget_bytes
             ):
                 return None
+            if self._lane_reduce_cluster_n() > 1:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "cute_cluster_n > 1 is not supported with the "
+                    "shared-tree reduction layout",
+                )
             return self._strided_thread_reduction_expr_shared_tree(
                 state=state,
                 input_name=input_name,
@@ -2285,6 +2528,12 @@ class BlockReductionStrategy(ReductionStrategy):
                 group_count=group_count,
             )
 
+        if self._lane_reduce_cluster_n() > 1:
+            raise exc.BackendUnsupported(
+                "cute",
+                "cute_cluster_n > 1 requires a cross-warp reduce group; "
+                "this config reduces within single warps",
+            )
         return (
             "_cute_grouped_reduce_warp("
             f"{input_name}, {reduction_type!r}, {identity_expr}, {lane_expr}, "
@@ -2307,6 +2556,31 @@ class BlockReductionStrategy(ReductionStrategy):
         group_count: int,
     ) -> str:
         result_var = self.fn.new_var("strided_reduce_result", dce=True)
+        cluster_n = self._lane_reduce_cluster_n()
+        if cluster_n > 1 and pre == 1 and group_count == 1:
+            # The reduced axis is additionally split across the CTAs of a
+            # thread-block cluster (``cute_cluster_n``): combine within-CTA
+            # warps and across the cluster with one DSM exchange.
+            acc_dtype = get_computation_dtype(fake_input.dtype)
+            if acc_dtype != torch.float32:
+                # The cluster exchange buffers every partial as Float32
+                # (see _cute_grouped_reduce_cluster) — a wider accumulator
+                # would silently lose precision through the round trip.
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "cute_cluster_n > 1 requires an fp32 reduction "
+                    f"accumulator, got {acc_dtype}",
+                )
+            buf_var, mbar_var = _cute_cluster_reduce_smem_vars(
+                self.fn, group_span, cluster_n
+            )
+            state.add_statement(
+                f"{result_var} = _cute_grouped_reduce_cluster("
+                f"{input_name}, {reduction_type!r}, {identity_expr}, "
+                f"{lane_var}, {buf_var}, {mbar_var}, "
+                f"group_span={group_span}, cluster_n={cluster_n})"
+            )
+            return result_var
         state.add_statement(
             f"{result_var} = _cute_grouped_reduce_shared_two_stage("
             f"{input_name}, {reduction_type!r}, {identity_expr}, "
@@ -2401,6 +2675,13 @@ class BlockReductionStrategy(ReductionStrategy):
                     constant_repr(default), _dtype_str(acc_dtype)
                 )
                 group_params = self._lane_loop_cross_warp_group_params()
+                cluster_n = self._lane_reduce_cluster_n()
+                if cluster_n > 1 and group_params is None:
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        "cute_cluster_n > 1 requires the cross-warp "
+                        "grouped reduce path",
+                    )
                 if group_params is not None:
                     # The reduce group is spread across warps (the reduced tile
                     # dim sits ABOVE a sibling tile axis on the linear thread
@@ -2418,6 +2699,7 @@ class BlockReductionStrategy(ReductionStrategy):
                         group_span=group_span,
                         group_lane_expr=group_lane_expr,
                         group_count=group_count,
+                        group_cluster_n=cluster_n,
                     )
                 else:
                     expr = _lane_reduce_marker_expr(

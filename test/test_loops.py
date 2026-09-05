@@ -38,6 +38,7 @@ import helion.language as hl
 datadir = Path(__file__).parent / "data"
 basic_kernels = import_path(datadir / "basic_kernels.py")
 FIXED_BLOCK_SIZE = 16
+BLOCK_SIZE_CHOICES = (32, 256)
 
 
 @helion.kernel
@@ -69,6 +70,41 @@ def inplace_nested_loop_kernel(x: torch.Tensor) -> torch.Tensor:
         for tile_inner in hl.tile(x.size(1)):
             x[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
     return x
+
+
+@helion.kernel()
+def inplace_then_independent_reduction(
+    x: torch.Tensor, a: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, k = a.size()
+    _, n = b.size()
+    out = torch.empty([m, n], device=a.device, dtype=a.dtype)
+    for tile in hl.tile(x.size(0)):
+        x[tile] = x[tile] + 1
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
+        out[tile_m, tile_n] = acc
+    return x, out
+
+
+@helion.kernel()
+def atomic_then_independent_reduction(
+    x: torch.Tensor, a: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, k = a.size()
+    _, n = b.size()
+    out = torch.empty([m, n], device=a.device, dtype=a.dtype)
+    for tile_outer in hl.tile(x.size(0)):
+        for tile_inner in hl.tile(x.size(1)):
+            hl.atomic_add(x, [tile_outer, tile_inner], 1.0)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
+        out[tile_m, tile_n] = acc
+    return x, out
 
 
 @onlyBackends(["triton", "cute", "pallas"])
@@ -522,6 +558,49 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertEqual(spec.min_size, 32)
         self.assertEqual(spec.max_size, 256)
 
+    @xfailIfPallas("config_spec introspection not applicable on pallas")
+    @skipIfRefEager(
+        "Accessing config_spec.block_sizes is not supported in ref eager mode"
+    )
+    def test_register_block_size_host_bounds(self):
+        # min/max may come from host values rather than literals, including via
+        # `*args` unpacking of a global tuple.
+        @helion.kernel()
+        def starred(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            bs = hl.register_block_size(*BLOCK_SIZE_CHOICES)
+            for tile0 in hl.tile(x.size(0), block_size=bs):
+                out[tile0] = x[tile0] + 1
+            return out
+
+        @helion.kernel()
+        def indexed(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            bs = hl.register_block_size(BLOCK_SIZE_CHOICES[0], BLOCK_SIZE_CHOICES[1])
+            for tile0 in hl.tile(x.size(0), block_size=bs):
+                out[tile0] = x[tile0] + 1
+            return out
+
+        args = (torch.randn([1024], device=DEVICE, dtype=torch.float32),)
+        for fn in (starred, indexed):
+            code, result = code_and_output(fn, args, block_size=64)
+            torch.testing.assert_close(result, args[0] + 1)
+            spec = fn.bind(args).config_spec.block_sizes[0]
+            self.assertEqual((spec.min_size, spec.max_size), BLOCK_SIZE_CHOICES)
+
+    def test_tile_starred_args(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            sizes = [x.size(0), x.size(1)]
+            for tile0, tile1 in hl.tile(*[sizes]):
+                out[tile0, tile1] = x[tile0, tile1] + 1
+            return out
+
+        args = (torch.randn([64, 64], device=DEVICE, dtype=torch.float32),)
+        code, result = code_and_output(fn, args, block_sizes=[16, 16])
+        torch.testing.assert_close(result, args[0] + 1)
+
     @skipIfTileIR("Result mismatch with tileir backend")
     @skipIfFn(
         lambda: _get_backend() == "cute",
@@ -969,6 +1048,32 @@ class TestLoops(RefEagerTestBase, TestCase):
         args = (torch.randn([16, 16], device=DEVICE),)
         spec = inplace_nested_loop_kernel.bind(args).config_spec
         self.assertEqual(len(spec.range_num_stages), 0)
+
+    @xfailIfPallas("range_num_stages is Triton-specific")
+    @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
+    @skipIfRefEager("not supported in ref eager mode")
+    def test_inplace_loop_only_disables_its_own_pipeline(self):
+        args = (
+            torch.randn([16], device=DEVICE),
+            torch.randn([16, 16], device=DEVICE),
+            torch.randn([16, 16], device=DEVICE),
+        )
+        spec = inplace_then_independent_reduction.bind(args).config_spec
+        self.assertGreater(len(spec.range_num_stages), 0)
+
+    @xfailIfPallas("range_num_stages is Triton-specific")
+    @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
+    @skipIfRefEager("not supported in ref eager mode")
+    def test_atomic_loop_only_disables_its_own_pipeline(self):
+        args = (
+            torch.randn([16, 16], device=DEVICE),
+            torch.randn([16, 16], device=DEVICE),
+            torch.randn([16, 16], device=DEVICE),
+        )
+        spec = atomic_then_independent_reduction.bind(args).config_spec
+        valid_block_ids = spec.range_num_stages.valid_block_ids()
+        self.assertNotIn(1, valid_block_ids)
+        self.assertIn(4, valid_block_ids)
 
     @skipIfTileIR("tileir backend will ignore `range_multi_buffers` hint")
     @skipIfNotTriton("range loop hints are Triton-specific")
@@ -1464,6 +1569,43 @@ class TestLoops(RefEagerTestBase, TestCase):
         # Logic for modifying num_stages and loop unrolling factors should
         # change num_stages=1
         self.assertIn("num_stages=1", code)
+
+        one_warp_code, one_warp_result = code_and_output(
+            matmul,
+            (a, b),
+            block_sizes=[64, 16, 16],
+            indexing="block_ptr",
+            loop_orders=[[1, 0]],
+            num_warps=1,
+            pid_type="persistent_blocked",
+            range_num_stages=[4, 2],
+            range_unroll_factors=[4, 4],
+        )
+        torch.testing.assert_close(one_warp_result, expected, atol=1e-2, rtol=1e-2)
+        self.assertIn("num_stages=4", one_warp_code)
+
+        if torch.cuda.is_available() and torch.cuda.get_device_capability() >= (10, 0):
+            effective_multi_warp_code, effective_multi_warp_result = code_and_output(
+                matmul,
+                (a, b),
+                block_sizes=[64, 16, 16],
+                indexing="block_ptr",
+                loop_orders=[[1, 0]],
+                num_warps=1,
+                pid_type="persistent_blocked",
+                range_num_stages=[4, 2],
+                range_unroll_factors=[4, 4],
+                range_warp_specializes=[None, True],
+            )
+            torch.testing.assert_close(
+                effective_multi_warp_result,
+                expected,
+                atol=1e-2,
+                rtol=1e-2,
+            )
+            self.assertIn("warp_specialize=True", effective_multi_warp_code)
+            self.assertIn("num_warps=4", effective_multi_warp_code)
+            self.assertNotIn("num_stages=4", effective_multi_warp_code)
 
     def test_loop_with_symbolic_bounds(self):
         @helion.kernel(

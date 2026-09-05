@@ -32,6 +32,9 @@ from ...language._tracing_ops import _new_var
 from ...language._tracing_ops import _not
 from ...language._tracing_ops import _phi
 from ...language._tracing_ops import _pre_broadcast_tile
+from ...language._tracing_ops import _while_loop
+from ...language._tracing_ops import is_for_loop_target
+from ..ast_extension import create
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
@@ -52,6 +55,8 @@ from .tensorcore_plan import build_dma_access_candidates
 
 log = logging.getLogger(__name__)
 
+_PALLAS_LOOP_LOAD_COUNT_META = "_helion_pallas_loop_load_count"
+
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
@@ -65,6 +70,7 @@ if TYPE_CHECKING:
     from ..tile_strategy import TileStrategy
     from .compact_worklist import ResidentPrepHoist
     from .dma import DmaDirection
+    from .plan_tiling import ContiguousRangeIndexPattern
 
 
 @_decorators.codegen(_not, "pallas")
@@ -195,6 +201,14 @@ def _raise_unsupported_dynamic_unroll() -> None:
     )
 
 
+def _uses_buffered_static_unroll(state: CodegenState) -> bool:
+    """Whether a static loop requested the existing depth-two load route."""
+    if state.config.get("pallas_loop_type", "unroll") != "unroll":
+        return False
+    counts = state.config.get("pallas_load_buffer_count", ())
+    return isinstance(counts, (list, tuple)) and 2 in counts
+
+
 def _extract_subscript_vals(subscript: object) -> list[object]:
     """Extract meta values from a subscript argument in an FX graph.
 
@@ -243,6 +257,8 @@ def _(state: CodegenState) -> object:
         return _codegen_dynamic_unroll(state)
     if _has_dynamic_unroll_bound(state):
         _raise_unsupported_dynamic_unroll()
+    if _uses_buffered_static_unroll(state):
+        return _codegen_fori_loop(state, static_unroll=True)
     # unroll: fall through to common codegen path
     # pyrefly: ignore[bad-return]
     return state.get_graph(state.proxy_arg(0)).codegen(state)
@@ -281,6 +297,9 @@ def _(state: CodegenState) -> None:
         return None
     if _has_dynamic_unroll_bound(state):
         _raise_unsupported_dynamic_unroll()
+    if _uses_buffered_static_unroll(state):
+        _codegen_fori_loop(state, static_unroll=True)
+        return None
     # pyrefly: ignore[bad-return]
     return state.get_graph(state.proxy_arg(0)).codegen(state)
 
@@ -602,7 +621,13 @@ def _classify_loop_tensors(
                 key = id(fake)
                 if key not in loaded_tensors:
                     sub_vals = _extract_subscript_vals(subscript)
-                    loaded_tensors[key] = (fake, tensor_node, sub_vals)
+                    loaded_tensors[key] = (fake, node, sub_vals)
+                    node.meta[_PALLAS_LOOP_LOAD_COUNT_META] = 1
+                else:
+                    first_load = loaded_tensors[key][1]
+                    first_load.meta[_PALLAS_LOOP_LOAD_COUNT_META] = (
+                        int(first_load.meta[_PALLAS_LOOP_LOAD_COUNT_META]) + 1
+                    )
         elif node.target is _store_op:
             tensor_node = node.args[0]
             subscript = node.args[1]
@@ -617,6 +642,152 @@ def _classify_loop_tensors(
                     stored_tensors[key] = (fake, tensor_node, sub_vals)
 
     return loaded_tensors, stored_tensors
+
+
+def _scalar_address_expr(
+    value: object,
+    *,
+    state: CodegenState,
+    captured_exprs: dict[torch.fx.Node, str],
+    block_ids: list[int] | None = None,
+    begin_exprs: list[str] | None = None,
+    iter_step_exprs: list[str] | None = None,
+    iteration_indices: list[str] | None = None,
+) -> str | None:
+    """Render a scalar HBM address captured by an inner device loop."""
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, torch.SymInt):
+        return state.device_function.literal_expr(value)
+    if not isinstance(value, torch.fx.Node):
+        return None
+    if value.op == "placeholder":
+        return captured_exprs.get(value)
+    if value.op != "call_function":
+        return None
+    if value.target is _new_var and value.args:
+        return _scalar_address_expr(
+            value.args[0],
+            state=state,
+            captured_exprs=captured_exprs,
+            block_ids=block_ids,
+            begin_exprs=begin_exprs,
+            iter_step_exprs=iter_step_exprs,
+            iteration_indices=iteration_indices,
+        )
+
+    from ...language import memory_ops
+    from ...language.tile_ops import tile_begin
+
+    if (
+        value.target is tile_begin
+        and block_ids is not None
+        and begin_exprs is not None
+        and iter_step_exprs is not None
+        and iteration_indices is not None
+    ):
+        return _contiguous_range_base_expr(
+            value,
+            state=state,
+            block_ids=block_ids,
+            begin_exprs=begin_exprs,
+            iter_step_exprs=iter_step_exprs,
+            iteration_indices=iteration_indices,
+        )
+
+    if value.target is memory_ops.load:
+        tensor_node, subscript = value.args[:2]
+        if not isinstance(tensor_node, torch.fx.Node):
+            return None
+        tensor = tensor_node.meta.get("val")
+        if not isinstance(tensor, torch.Tensor):
+            return None
+        if not isinstance(subscript, (list, tuple)) or len(subscript) != 1:
+            return None
+        index = _scalar_address_expr(
+            subscript[0],
+            state=state,
+            captured_exprs=captured_exprs,
+            block_ids=block_ids,
+            begin_exprs=begin_exprs,
+            iter_step_exprs=iter_step_exprs,
+            iteration_indices=iteration_indices,
+        )
+        if index is None:
+            return None
+        captured_tensor_node = tensor_node
+        while (
+            captured_tensor_node.op == "call_function"
+            and captured_tensor_node.target is _new_var
+            and captured_tensor_node.args
+            and isinstance(captured_tensor_node.args[0], torch.fx.Node)
+        ):
+            captured_tensor_node = captured_tensor_node.args[0]
+        name = captured_exprs.get(captured_tensor_node)
+        if name is None:
+            name = state.device_function.tensor_arg(tensor).name
+        from .vmem_scalar_load import classify_vmem_scalar_load
+        from .vmem_scalar_load import emit_vmem_scalar_load
+
+        scalar_load = classify_vmem_scalar_load(
+            state,
+            tensor,
+            [index],
+            list(value.meta.get("indexing_patterns") or ()),
+        )
+        if scalar_load is not None:
+            return ast.unparse(
+                emit_vmem_scalar_load(tensor, name, [index], scalar_load)
+            )
+        return f"{name}[{index}]"
+
+    binary_operators = {
+        operator.add: "+",
+        operator.floordiv: "//",
+        operator.mod: "%",
+        operator.mul: "*",
+        operator.sub: "-",
+        torch.ops.aten.add.Scalar: "+",
+        torch.ops.aten.add.Tensor: "+",
+        torch.ops.aten.mul.Scalar: "*",
+        torch.ops.aten.mul.Tensor: "*",
+        torch.ops.aten.sub.Scalar: "-",
+        torch.ops.aten.sub.Tensor: "-",
+    }
+    if value.target not in binary_operators or len(value.args) < 2:
+        return None
+    if (
+        value.target
+        in (
+            torch.ops.aten.add.Scalar,
+            torch.ops.aten.add.Tensor,
+            torch.ops.aten.sub.Scalar,
+            torch.ops.aten.sub.Tensor,
+        )
+        and value.kwargs.get("alpha", 1) != 1
+    ):
+        return None
+    lhs = _scalar_address_expr(
+        value.args[0],
+        state=state,
+        captured_exprs=captured_exprs,
+        block_ids=block_ids,
+        begin_exprs=begin_exprs,
+        iter_step_exprs=iter_step_exprs,
+        iteration_indices=iteration_indices,
+    )
+    rhs = _scalar_address_expr(
+        value.args[1],
+        state=state,
+        captured_exprs=captured_exprs,
+        block_ids=block_ids,
+        begin_exprs=begin_exprs,
+        iter_step_exprs=iter_step_exprs,
+        iteration_indices=iteration_indices,
+    )
+    if lhs is None or rhs is None:
+        return None
+    return f"({lhs}) {binary_operators[value.target]} ({rhs})"
 
 
 def _dma_plan_for_node(node: torch.fx.Node) -> DmaAccessPlan | None:
@@ -667,6 +838,22 @@ def _collect_indirect_accesses(
             assert plan is not None
             node = spec.node
             tensor = plan.access.tensor
+            if plan.spec.index_access is None:
+                if plan.spec.index_node.graph is not graph_info.graph:
+                    raise InvalidConfig(
+                        "computed indirect DMA indices must be produced in the "
+                        "same device region as their gather"
+                    )
+                admitted.append(
+                    IndirectDmaTransfer(
+                        tensor=tensor,
+                        subscript=tuple(_extract_subscript_vals(node.args[1])),
+                        direction="load",
+                        plan=plan,
+                    )
+                )
+                continue
+            assert plan.spec.index_block_id is not None
             extent = block_extents.get(plan.spec.index_block_id)
             if plan.spec.index_block_id not in block_ids or extent is None:
                 raise InvalidConfig(
@@ -751,9 +938,12 @@ def _collect_fori_indirect_accesses(
         return [], set()
     begin, end = _get_loop_begin_and_end(state, 0)
     try:
-        extent = int(end) - int(begin)
+        block_extents = {block_ids[0]: int(end) - int(begin)}
     except (TypeError, ValueError):
-        return [], set()
+        # Locally computed DMA indices do not depend on a static loop trip
+        # count. Memory-backed metadata still requires an entry here and is
+        # rejected by _collect_indirect_accesses when the bound is dynamic.
+        block_extents = {}
 
     active_block_ids = {
         block_id
@@ -764,7 +954,7 @@ def _collect_fori_indirect_accesses(
         list(state.codegen.codegen_graphs),
         graph_info,
         block_ids,
-        {block_ids[0]: extent},
+        block_extents,
         active_block_ids,
     )
     from ..device_function import DeviceFunction
@@ -853,6 +1043,131 @@ def _get_dim_block_ids(
         elif isinstance(idx, slice) and idx == slice(None):
             pass
     return dim_to_bid
+
+
+def _contiguous_range_patterns(
+    loaded_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+) -> dict[int, dict[int, ContiguousRangeIndexPattern]]:
+    """Return direct HBM range patterns keyed by tensor and tensor dimension."""
+    from .plan_tiling import ContiguousRangeIndexPattern
+    from .plan_tiling import NonePattern
+
+    result: dict[int, dict[int, ContiguousRangeIndexPattern]] = {}
+    for fake, load_node, _subscript in loaded_tensors.values():
+        tensor_dim = 0
+        ranges: dict[int, ContiguousRangeIndexPattern] = {}
+        for pattern in load_node.meta.get("indexing_patterns", ()):
+            if isinstance(pattern, NonePattern):
+                continue
+            if isinstance(pattern, ContiguousRangeIndexPattern):
+                ranges[tensor_dim] = pattern
+            tensor_dim += 1
+        if ranges:
+            result[id(fake)] = ranges
+    return result
+
+
+def _contiguous_range_base_expr(
+    value: object,
+    *,
+    state: CodegenState,
+    block_ids: list[int],
+    begin_exprs: list[str],
+    iter_step_exprs: list[str],
+    iteration_indices: list[str],
+) -> str | None:
+    """Render a supported scalar address expression for one loop iteration."""
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, torch.SymInt):
+        return state.device_function.literal_expr(value)
+    if not isinstance(value, torch.fx.Node) or value.op != "call_function":
+        return None
+
+    from ...language import memory_ops
+    from ...language.tile_ops import tile_begin
+
+    if value.target is tile_begin:
+        symbolic_value = value.meta.get("val")
+        if not isinstance(symbolic_value, torch.SymInt):
+            return None
+        block_id = CompileEnvironment.current().get_block_id(symbolic_value)
+        if block_id is None or block_id not in block_ids:
+            return None
+        position = block_ids.index(block_id)
+        return (
+            f"({begin_exprs[position]}) + ({iteration_indices[position]}) * "
+            f"({iter_step_exprs[position]})"
+        )
+
+    binary_operators = {
+        operator.add: "+",
+        operator.floordiv: "//",
+        operator.mod: "%",
+        operator.mul: "*",
+        operator.sub: "-",
+        torch.ops.aten.add.Scalar: "+",
+        torch.ops.aten.add.Tensor: "+",
+        torch.ops.aten.mul.Scalar: "*",
+        torch.ops.aten.mul.Tensor: "*",
+        torch.ops.aten.sub.Scalar: "-",
+        torch.ops.aten.sub.Tensor: "-",
+    }
+    if value.target in binary_operators and len(value.args) >= 2:
+        if (
+            value.target
+            in (
+                torch.ops.aten.add.Scalar,
+                torch.ops.aten.add.Tensor,
+                torch.ops.aten.sub.Scalar,
+                torch.ops.aten.sub.Tensor,
+            )
+            and value.kwargs.get("alpha", 1) != 1
+        ):
+            return None
+        lhs = _contiguous_range_base_expr(
+            value.args[0],
+            state=state,
+            block_ids=block_ids,
+            begin_exprs=begin_exprs,
+            iter_step_exprs=iter_step_exprs,
+            iteration_indices=iteration_indices,
+        )
+        rhs = _contiguous_range_base_expr(
+            value.args[1],
+            state=state,
+            block_ids=block_ids,
+            begin_exprs=begin_exprs,
+            iter_step_exprs=iter_step_exprs,
+            iteration_indices=iteration_indices,
+        )
+        if lhs is None or rhs is None:
+            return None
+        return f"({lhs}) {binary_operators[value.target]} ({rhs})"
+
+    if value.target is memory_ops.load:
+        tensor_node, subscript = value.args[:2]
+        if not isinstance(tensor_node, torch.fx.Node):
+            return None
+        tensor = tensor_node.meta.get("val")
+        if not isinstance(tensor, torch.Tensor):
+            return None
+        if not isinstance(subscript, (list, tuple)) or len(subscript) != 1:
+            return None
+        index = _contiguous_range_base_expr(
+            subscript[0],
+            state=state,
+            block_ids=block_ids,
+            begin_exprs=begin_exprs,
+            iter_step_exprs=iter_step_exprs,
+            iteration_indices=iteration_indices,
+        )
+        if index is None:
+            return None
+        name = state.device_function.tensor_arg(tensor).name
+        return f"{name}[{index}]"
+
+    return None
 
 
 def _find_strategy(
@@ -986,6 +1301,245 @@ def _compact_block_variant(state: CodegenState, factor: int) -> Iterator[None]:
         fn.expr_to_var_info = original_expr_cache
 
 
+def _clean_region_predicate(
+    state: CodegenState,
+    graph: torch.fx.Graph,
+    block_ids: list[int],
+    begin_exprs: list[str],
+    iter_step_exprs: list[str],
+    end_exprs: list[str],
+    slice_size_exprs: list[str],
+    aligned_dim: dict[int, int],
+    physical_mask_bounds: dict[int, set[str]] | None = None,
+) -> tuple[str, list[int]] | None:
+    """Condition under which the ordered and compact bounds masks are all-true.
+
+    Two parts, both read straight off the loop bounds -- no analysis of what the
+    kernel does with the tile:
+
+    * the inner tile lies wholly inside the ordered range, so its own extent
+      mask is all-true;
+    * every shortened input DMA covers the whole tile, so its per-load physical
+      extent mask is also all-true;
+    * the enclosing compact tile is uniformly full, so the compact extent mask
+      is all-true too.  Without this, expressions that combine masks from the
+      inner and enclosing axes still need the compact-axis factor.
+
+    Returns the predicate and the block ids whose masks it licenses dropping.
+    """
+    from .compact_worklist import compact_ref_names
+
+    env = CompileEnvironment.current()
+    plan = env.compact_worklist_plan
+    if plan is None or len(block_ids) != 1 or not _is_compact_ordered_inner_loop(state):
+        return None
+    bid = block_ids[0]
+    cbid = plan.compact_axis.block_id
+    if env.is_jagged_tile(bid) or env.is_jagged_tile(cbid):
+        return None
+    if not _clean_region_body_is_replay_safe(state, graph):
+        return None
+    if not _graph_uses_tile_mask(graph, {bid, cbid}):
+        return None
+
+    # ``extent == full`` proves the compact mask all-true only for the current
+    # one-sided compact-loop mask.  Pin that invariant explicitly so a future
+    # aligned/two-sided compact lowering cannot silently invalidate the proof.
+    compact_loops = state.codegen.active_device_loops.get(cbid)
+    if not compact_loops:
+        return None
+    compact_info = compact_loops[-1].block_id_to_info.get(cbid)
+    if compact_info is None or compact_info.mask_has_lower_bound:
+        return None
+
+    tile_start = (
+        f"({begin_exprs[0]}) + (_helion_compat_pipeline_indices[0]) "
+        f"* ({iter_step_exprs[0]})"
+    )
+    tile_end = f"({tile_start}) + ({slice_size_exprs[0]})"
+    inner_clean = f"({tile_end}) <= ({end_exprs[0]})"
+    for physical_bound in sorted((physical_mask_bounds or {}).get(bid, ())):
+        inner_clean = (
+            f"jnp.logical_and({inner_clean}, ({tile_end}) <= ({physical_bound}))"
+        )
+    if bid in aligned_dim:
+        original_begin, _ = _get_loop_begin_and_end(state, 0)
+        lower_clean = f"({tile_start}) >= ({original_begin})"
+        inner_clean = f"jnp.logical_and({lower_clean}, {inner_clean})"
+    extent_ref = f"{compact_ref_names(plan)[1]}_ref"
+    full = env.block_sizes[cbid].from_config(state.config)
+    return (
+        f"jnp.logical_and({inner_clean}, {extent_ref}[_wid] == {full})",
+        [bid, cbid],
+    )
+
+
+def _graph_has_nested_device_control_flow(graph: torch.fx.Graph) -> bool:
+    """Whether codegen of ``graph`` recursively enters another device graph."""
+    return any(
+        node.op == "call_function"
+        and (
+            is_for_loop_target(node.target)
+            or node.target is _if
+            or node.target is _while_loop
+        )
+        for node in graph.nodes
+    )
+
+
+def _is_distributed_op_target(target: object) -> bool:
+    """Whether ``target`` belongs to Helion's distributed device API."""
+    from ...language import distributed_ops
+
+    return getattr(target, "__module__", None) == distributed_ops.__name__
+
+
+def _graph_uses_tile_mask(graph: torch.fx.Graph, block_ids: set[int]) -> bool:
+    """Whether suppressing these tile masks can change generated body code."""
+    from .memory_access import MEMORY_ACCESS_META
+    from .memory_access import MemoryAccess
+
+    env = CompileEnvironment.current()
+    for node in graph.nodes:
+        if node.op == "call_function" and node.target is _mask_to:
+            value = node.meta.get("val")
+            if isinstance(value, torch.Tensor) and any(
+                env.resolve_block_id(size) in block_ids for size in value.shape
+            ):
+                return True
+        access = node.meta.get(MEMORY_ACCESS_META)
+        if isinstance(access, MemoryAccess) and any(
+            # This is intentionally broad: offset/index variants still show
+            # that suppressing this axis's generated mask can change the body.
+            getattr(pattern, "block_id", None) in block_ids
+            for pattern in access.patterns
+        ):
+            return True
+    return False
+
+
+def _clean_region_body_is_replay_safe(
+    state: CodegenState, graph: torch.fx.Graph
+) -> bool:
+    """Reject bodies whose codegen can allocate resources or recurse."""
+    from .memory_access import MEMORY_ACCESS_META
+    from .memory_access import MemoryAccess
+
+    if _graph_has_nested_device_control_flow(graph):
+        return False
+    for node in graph.nodes:
+        if node.op == "call_function" and _is_distributed_op_target(node.target):
+            return False
+        access = node.meta.get(MEMORY_ACCESS_META)
+        if isinstance(
+            access, MemoryAccess
+        ) and state.device_function.is_pallas_remote_copy_operand(access.tensor):
+            return False
+    return True
+
+
+_CODEGEN_VARIANT_COUNTERS = (
+    "atomic_op_index",
+    "device_load_index",
+    "device_load_cache_modifier_index",
+    "device_store_index",
+    "device_store_cache_modifier_index",
+    "device_memory_op_index",
+)
+
+
+@contextlib.contextmanager
+def _suppressed_tile_masks(state: CodegenState, block_ids: list[int]) -> Iterator[None]:
+    """Render with the bounds masks of ``block_ids`` proven away.
+
+    ``codegen.mask_var`` reads the live strategy for each axis, so nulling the
+    entry there is enough for both ``_mask_to`` and load codegen to skip that
+    dim -- the same per-axis granularity Pallas load codegen already has via
+    ``pallas_deferred_mask_block_ids``.
+    """
+    saved: list[tuple[object, int, str | None]] = []
+    saved_physical_proofs: list[tuple[object, set[int]]] = []
+    for bid in block_ids:
+        loops = state.codegen.active_device_loops[bid]
+        if not loops:
+            continue
+        loop = loops[-1]
+        strategy = loop.strategy
+        saved.append((strategy, bid, strategy.mask_var(bid)))
+        strategy.mask_vars[bid] = None  # pyrefly: ignore[missing-attribute]
+        proven = getattr(loop, "_proven_physical_mask_block_ids", None)
+        if isinstance(proven, set):
+            saved_physical_proofs.append((loop, set(proven)))
+            proven.add(bid)
+    try:
+        yield
+    finally:
+        for strategy, bid, mask in saved:
+            strategy.mask_vars[bid] = mask  # pyrefly: ignore[missing-attribute]
+        for loop, previous in saved_physical_proofs:
+            loop._proven_physical_mask_block_ids.clear()  # pyrefly: ignore[missing-attribute]
+            loop._proven_physical_mask_block_ids.update(previous)  # pyrefly: ignore[missing-attribute]
+
+
+def _emit_pipeline_clean_region(
+    state: CodegenState,
+    graph_info: object,
+    body_stmts: list[ast.AST],
+    clean_expr: str,
+    mask_block_ids: list[int],
+    body_args: list[ast.AST],
+    scratch_names: list[str],
+    carried: set[int],
+    has_loop_state: bool,
+) -> None:
+    """Emit masked and provably mask-free pipeline body variants."""
+    from ..inductor_lowering import codegen_call_with_graph
+
+    fn = state.device_function
+    clean_var = fn.new_var("_region_clean", dce=True)
+    body_stmts.append(statement_from_string(f"{clean_var} = {clean_expr}"))
+
+    saved = {name: getattr(fn, name) for name in _CODEGEN_VARIANT_COUNTERS}
+    expected_after: dict[str, int] | None = None
+    for suppress_masks in (True, False):
+        for name, value in saved.items():
+            setattr(fn, name, value)
+        branch: list[ast.AST] = []
+        with state.codegen.set_statements(branch):
+            mask_context = (
+                _suppressed_tile_masks(state, mask_block_ids)
+                if suppress_masks
+                else contextlib.nullcontext()
+            )
+            with mask_context:
+                results = codegen_call_with_graph(
+                    state.codegen,
+                    graph_info.graph,  # pyrefly: ignore[missing-attribute]
+                    body_args,
+                )
+                if has_loop_state:
+                    _write_back_loop_carried(state, scratch_names, carried, results)
+        branch_after = {name: getattr(fn, name) for name in _CODEGEN_VARIANT_COUNTERS}
+        if expected_after is None:
+            expected_after = branch_after
+        elif branch_after != expected_after:
+            # These are the same graph with only generated bounds masks changed,
+            # so unlike the grouped factor variants they must allocate identical
+            # codegen slots and may safely share the surrounding pipeline state.
+            raise AssertionError(
+                "pipeline clean-region variants consumed different codegen slots: "
+                f"{branch_after} != {expected_after}"
+            )
+        predicate = clean_var if suppress_masks else f"jnp.logical_not({clean_var})"
+        label = "_region_clean" if suppress_masks else "_region_masked"
+        body_stmts.append(
+            _pl_when(state, predicate, label, cast("list[ast.stmt]", branch))
+        )
+    assert expected_after is not None
+    for name, value in expected_after.items():
+        setattr(fn, name, value)
+
+
 def _compact_output_initializers(state: CodegenState) -> list[ast.stmt]:
     """Zero the full max-sized output window before the one-tile body."""
     from ..device_function import TensorArg
@@ -1025,16 +1579,8 @@ def _codegen_grouped_compact_tile(state: CodegenState) -> None:
     branch_defs: list[ast.FunctionDef] = []
     extent_ref = f"{compact_ref_names(plan)[1]}_ref"
 
-    counter_names = (
-        "atomic_op_index",
-        "device_load_index",
-        "device_load_cache_modifier_index",
-        "device_store_index",
-        "device_store_cache_modifier_index",
-        "device_memory_op_index",
-    )
     initial_counters = {
-        name: getattr(state.device_function, name) for name in counter_names
+        name: getattr(state.device_function, name) for name in _CODEGEN_VARIANT_COUNTERS
     }
     final_counters: dict[str, int] | None = None
     previous_common = codegen.grouped_compact_common_statements
@@ -1057,7 +1603,8 @@ def _codegen_grouped_compact_tile(state: CodegenState) -> None:
             if factor == 1:
                 branch_body[:0] = _compact_output_initializers(state)
                 final_counters = {
-                    name: getattr(state.device_function, name) for name in counter_names
+                    name: getattr(state.device_function, name)
+                    for name in _CODEGEN_VARIANT_COUNTERS
                 }
 
             fn_name = state.device_function.new_var(f"_compact_group_{factor}")
@@ -1161,6 +1708,7 @@ def _loop_dim_infos(
     state: CodegenState,
     block_ids: list[int],
     env: CompileEnvironment,
+    aligned_dim: dict[int, int] | None = None,
 ) -> dict[int, LoopDimInfo]:
     """Per-dim bounds for an inner device loop, shared by every loop lowering.
 
@@ -1170,6 +1718,7 @@ def _loop_dim_infos(
     """
     from ..tile_strategy import LoopDimInfo
 
+    aligned_dim = aligned_dim or {}
     infos: dict[int, LoopDimInfo] = {}
     for i, block_id in enumerate(block_ids):
         block_size = env.block_sizes[block_id]
@@ -1179,8 +1728,167 @@ def _loop_dim_infos(
             end_var_name=end_expr,
             # No SymPy numel exists when the block size has no static size.
             end_expr=block_size.numel if block_size.size is not None else None,
+            mask_has_lower_bound=block_id in aligned_dim,
         )
     return infos
+
+
+def _pl_when(
+    state: CodegenState,
+    condition: str,
+    name_hint: str,
+    statements: list[ast.stmt],
+) -> ast.FunctionDef:
+    """Wrap ``statements`` in a ``@pl.when(condition)`` nested function."""
+    fn_name = state.device_function.new_var(name_hint)
+    fn_def = statement_from_string(f"@pl.when({condition})\ndef {fn_name}():\n    pass")
+    assert isinstance(fn_def, ast.FunctionDef)
+    fn_def.body = statements or [ast.Pass()]
+    return fn_def
+
+
+def _tensor_dim_size_expr(size: object, state: CodegenState) -> str | None:
+    """Render a backing-tensor dim size as a device expression, or ``None``.
+
+    ``None`` means the extent is not expressible here, in which case callers
+    must fall back to host-side padding rather than clamping against it.
+    """
+    if isinstance(size, int):
+        return str(size)
+    if isinstance(size, torch.SymInt):
+        return state.sympy_expr(_symint_sympy_expr(size))
+    return None
+
+
+def _pipeline_load_has_packed_worklist_bound(
+    tensor: torch.Tensor,
+    block_id: int,
+) -> bool:
+    """Whether this load uses the compact-worklist packed-offset bound.
+
+    This identifies the narrow shape for which shortened DMA is currently
+    enabled; it does not prove that the logical end is within the backing
+    tensor. The caller installs a separate physical-extent mask for that.
+    ``False`` means unproven, not necessarily unsafe; other emit-pipeline shapes
+    retain host-side padding until they gain their own analysis.
+    """
+    from .compact_worklist import ordered_resident_bound_arg
+    from .compact_worklist import resident_ordered_entries
+    from .memory_access import tensor_origin_key
+
+    plan = CompileEnvironment.current().compact_worklist_plan
+    if plan is None:
+        return False
+    ordered = plan.ordered_axis
+    if (
+        ordered is None
+        or ordered.block_id != block_id
+        or ordered_resident_bound_arg(plan) is None
+    ):
+        return False
+    tensor_key = tensor_origin_key(tensor)
+    return isinstance(tensor_key, str) and any(
+        policy.arg_name == tensor_key for policy in resident_ordered_entries(plan)
+    )
+
+
+def _pipeline_load_physical_mask_plan(
+    state: CodegenState,
+    graph: torch.fx.Graph,
+    tensor: torch.Tensor,
+    block_id: int,
+    dma_dim_expr: str,
+) -> dict[torch.fx.Node, set[str]] | None:
+    """Plan downstream physical masks for a shortened pipeline transfer.
+
+    A short ``BoundedSlice`` DMA can leave the unused VMEM tail stale.  Reuse
+    ``defer_pallas_load_masks``'s dataflow proof, but fail closed on nested
+    control flow, aliases with an unknown access shape, non-plain tile patterns,
+    and bounds that are not the ordered packed-offset idiom.  Every load must
+    defer this tile mask to a downstream ``_mask_to(_, 0)``; its ``jnp.where``
+    is extended with the backing tensor's physical bound so it also clears stale
+    NaN/Inf tails when the logical packed offset exceeds the tensor extent.
+    """
+    from ...language.memory_ops import load
+    from ..node_masking import PALLAS_DEFERRED_MASK_CONSUMERS_META
+    from .memory_access import MEMORY_ACCESS_META
+    from .memory_access import MemoryAccess
+    from .memory_access import MemoryAccessKind
+    from .memory_access import tensors_share_origin_or_storage
+    from .plan_tiling import TilePattern
+
+    if _graph_has_nested_device_control_flow(graph):
+        return None
+    if not _pipeline_load_has_packed_worklist_bound(tensor, block_id):
+        return None
+
+    relevant = False
+    graph_nodes = {node.name: node for node in graph.nodes}
+    physical_masks: dict[torch.fx.Node, set[str]] = {}
+    for node in graph.nodes:
+        if node.op == "call_function" and _is_distributed_op_target(node.target):
+            return None
+        access = node.meta.get(MEMORY_ACCESS_META)
+        if (
+            node.op == "call_function"
+            and node.target is load
+            and not isinstance(access, MemoryAccess)
+        ):
+            return None
+        if not isinstance(access, MemoryAccess):
+            continue
+        if not tensors_share_origin_or_storage(access.tensor, tensor):
+            continue
+        if access.tensor is not tensor:
+            # A distinct view gets its own pipeline argument and BlockSpec, so
+            # its physical extent belongs only on its own downstream masks.
+            # Still reject writes through any alias of this input: remapping
+            # one view to a private DMA scratch would otherwise split accesses
+            # that must observe the same backing allocation.
+            if access.kind is not MemoryAccessKind.LOAD:
+                return None
+            continue
+        if access.kind is not MemoryAccessKind.LOAD:
+            return None
+
+        tensor_dim = 0
+        block_tensor_dims: list[int] = []
+        for index, pattern in zip(access.subscript, access.patterns, strict=True):
+            if index is None:
+                continue
+            if getattr(pattern, "block_id", None) == block_id:
+                if type(pattern) is not TilePattern:
+                    return None
+                block_tensor_dims.append(tensor_dim)
+            tensor_dim += 1
+        # Shortening a DMA needs the exact extent-mask relationship represented
+        # by a plain TilePattern. Offset patterns can carry the same block id but
+        # do not inherit that proof, so they fail closed here.
+        if len(block_tensor_dims) != 1:
+            return None
+        relevant = True
+        if block_id not in (node.meta.get("pallas_deferred_mask_block_ids") or ()):
+            return None
+
+        access_dim_expr = _tensor_dim_size_expr(
+            access.tensor.shape[block_tensor_dims[0]], state
+        )
+        if access_dim_expr is None:
+            return None
+        consumers = node.meta.get(PALLAS_DEFERRED_MASK_CONSUMERS_META)
+        if not isinstance(consumers, dict):
+            return None
+        consumer_names = consumers.get(block_id)
+        if not isinstance(consumer_names, tuple) or not consumer_names:
+            return None
+        for consumer_name in consumer_names:
+            consumer = graph_nodes.get(consumer_name)
+            if consumer is None:
+                return None
+            physical_masks.setdefault(consumer, set()).update(
+                (dma_dim_expr, access_dim_expr)
+            )
+    return physical_masks if relevant else None
 
 
 def _is_static_int(expr: str) -> bool:
@@ -2535,6 +3243,8 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     body_params: list[str] = []
     pipeline_in_args: list[str] = []
     pipeline_out_args: list[str] = []
+    deferred_physical_mask_bounds: dict[torch.fx.Node, dict[int, set[str]]] = {}
+    clean_physical_mask_bounds: dict[int, set[str]] = {}
 
     # Map outer grid block_ids to program_id variable names.
     # Compute program_ids before emit_pipeline so the BlockSpec lambda
@@ -2589,7 +3299,6 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 extra_pad = _compute_pipeline_or_dma_extra_pad(
                     begin_expr, bid, env, state, bid_idx
                 )
-                _record_pad_info(state, fake, dim_idx, bid, extra_pad)
                 begin_is_zero = begin_expr == "0"
                 end_expr = end_exprs[bid_idx]
                 dim_size = shape[dim_idx]
@@ -2607,6 +3316,9 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                     and isinstance(dim_size, int)
                     and int(end_expr) == dim_size
                 )
+                # Set when the emitted access is clamped to the backing tensor,
+                # so it cannot overrun and needs no host-side padding.
+                clamped_to_tensor = False
                 # Loads need a dynamic ``pl.ds`` only for a non-zero begin (a
                 # block-aligned index can't express an arbitrary start; the
                 # over-read past ``end`` is zeroed by the inner-loop mask).
@@ -2624,7 +3336,22 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                         f"({begin_expr}) + ({lambda_params[bid_idx]}) "
                         f"* ({iter_step_expr})"
                     )
-                    if is_store and bid not in state.device_function.carry_tiles:
+                    is_carry = bid in state.device_function.carry_tiles
+                    dim_expr = None
+                    physical_mask_plan = None
+                    if not is_store and not is_carry:
+                        candidate_dim_expr = _tensor_dim_size_expr(dim_size, state)
+                        if candidate_dim_expr is not None:
+                            physical_mask_plan = _pipeline_load_physical_mask_plan(
+                                state,
+                                graph_info.graph,
+                                fake,
+                                bid,
+                                candidate_dim_expr,
+                            )
+                            if physical_mask_plan is not None:
+                                dim_expr = candidate_dim_expr
+                    if is_store and not is_carry:
                         # Clamp the store extent to min(block, end - offset) so a
                         # short final tile writes only its valid rows
                         # [begin, end) instead of overrunning into the next
@@ -2639,6 +3366,36 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                             f"jnp.minimum({slice_size_expr}, "
                             f"({end_exprs[bid_idx]}) - ({start_expr}))"
                         )
+                    elif not is_store and dim_expr is not None:
+                        # Clamp the LOAD extent to the backing tensor instead of
+                        # padding the tensor host-side.  A full-block read at a
+                        # data-dependent offset can run off the end of the last
+                        # tile, which is why the alternative is
+                        # ``_ds_pad_dims`` -> ``torch.nn.functional.pad`` on every
+                        # call -- a full copy of the operand per launch.  Letting
+                        # the index map pick the transfer SIZE is the same trick
+                        # ``_compact_window_block_spec`` already uses for the
+                        # outer worklist windows; a short transfer just leaves the
+                        # tail of the block stale instead of zero.  This arm is
+                        # admitted only when ``defer_pallas_load_masks`` proved
+                        # every use reaches a downstream ``_mask_to(_, 0)``. The
+                        # lowering adds this tensor's physical extent to that
+                        # select, clearing stale NaN/Inf even when packed logical
+                        # offsets extend beyond the backing allocation.
+                        size_expr = (
+                            f"jnp.clip(({dim_expr}) - ({start_expr}), 0, "
+                            f"{slice_size_expr})"
+                        )
+                        start_expr = f"jnp.minimum(({start_expr}), ({dim_expr}))"
+                        assert physical_mask_plan is not None
+                        for mask_node, bounds in physical_mask_plan.items():
+                            deferred_physical_mask_bounds.setdefault(
+                                mask_node, {}
+                            ).setdefault(bid, set()).update(bounds)
+                            clean_physical_mask_bounds.setdefault(bid, set()).update(
+                                bounds
+                            )
+                        clamped_to_tensor = True
                     else:
                         size_expr = slice_size_expr
                     if bid in state.device_function.carry_tiles:
@@ -2655,6 +3412,8 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                         lambda_parts.append(
                             f"(({begin_expr}) + ({lambda_params[bid_idx]}) * ({iter_step_expr})) // ({slice_size_expr})"
                         )
+                if not clamped_to_tensor:
+                    _record_pad_info(state, fake, dim_idx, bid, extra_pad)
             elif bid is not None and bid in _bid_to_pid_var:
                 # Outer grid dim -- select via captured program_id variable
                 pid_var = _bid_to_pid_var[bid]
@@ -2722,7 +3481,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         )
 
     def _make_load_block_spec(fake: torch.Tensor, subscript_meta: list[object]) -> str:
-        """BlockSpec for a pipelined input (full-block ``pl.ds``; mask zeroes over-read)."""
+        """BlockSpec for a pipelined input, clamped when tail zeroing is proven."""
         return _make_block_spec(fake, subscript_meta, is_store=False)
 
     def _make_store_block_spec(fake: torch.Tensor, subscript_meta: list[object]) -> str:
@@ -2846,7 +3605,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     ]
 
     # Build block_id_to_info for the pipeline state
-    block_id_to_info = _loop_dim_infos(state, block_ids, env)
+    block_id_to_info = _loop_dim_infos(state, block_ids, env, aligned_dim)
 
     strategy = _find_strategy(state, block_ids)
     # Emit offset_<bid>/indices_<bid> at the body prologue.
@@ -2922,24 +3681,54 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         body_fn_name=body_fn_name,
         inner_statements=body_stmts,
         _tensor_to_dma_scratch=tensor_to_dma_scratch,
+        _deferred_physical_mask_bounds={
+            node: {bid: tuple(sorted(bounds)) for bid, bounds in by_block.items()}
+            for node, by_block in deferred_physical_mask_bounds.items()
+        },
     )
 
-    # For loop-carried state, remap args to scratch reads inside the body
+    # For loop-carried state, remap args to scratch reads inside the body.
     body_args = (
         _remap_args_to_scratch(args, scratch_names, state)
         if has_loop_state
         else [*args]
     )
+    clean_region = _clean_region_predicate(
+        state,
+        graph_info.graph,
+        block_ids,
+        begin_exprs,
+        iter_step_exprs,
+        end_exprs,
+        slice_size_exprs,
+        aligned_dim,
+        clean_physical_mask_bounds,
+    )
 
-    # Generate body code within the pipeline context
+    # Generate body code within the pipeline context.  add_emit_pipeline_loop is
+    # not re-entrant (it appends to active_device_loops and would extend
+    # outer_prefix twice), so it is entered once and each variant gets its own
+    # statement list nested inside.
     with state.codegen.add_emit_pipeline_loop(pipeline_state):
-        graph_results = codegen_call_with_graph(
-            state.codegen, graph_info.graph, body_args
-        )
-
-        # Write updated loop-carried values back to scratch
-        if has_loop_state:
-            _write_back_loop_carried(state, scratch_names, carried, graph_results)
+        if clean_region is None:
+            graph_results = codegen_call_with_graph(
+                state.codegen, graph_info.graph, body_args
+            )
+            if has_loop_state:
+                _write_back_loop_carried(state, scratch_names, carried, graph_results)
+        else:
+            clean_expr, clean_block_ids = clean_region
+            _emit_pipeline_clean_region(
+                state,
+                graph_info,
+                body_stmts,
+                clean_expr,
+                clean_block_ids,
+                body_args,
+                scratch_names,
+                carried,
+                has_loop_state,
+            )
 
     _emit_nonlocal_scratch_declarations(state, body_stmts)
 
@@ -3078,16 +3867,20 @@ def _compute_vmem_shapes(
     slice_size_exprs: list[str],
     env: CompileEnvironment,
     state: CodegenState,
+    contiguous_ranges: dict[int, dict[int, ContiguousRangeIndexPattern]],
 ) -> list[tuple[int, ...]]:
     """Compute VMEM buffer shapes for each tensor in the fori_loop body."""
     vmem_shapes: list[tuple[int, ...]] = []
     for fake, sub_meta, _direction in all_tensor_info:
         dim_to_bid = _get_dim_block_ids(sub_meta, env)
         tensor_subscripts = _tensor_dim_subscripts(sub_meta)
+        range_dims = contiguous_ranges.get(id(fake), {})
         parts: list[int] = []
         for dim_idx in range(len(fake.shape)):
             bid = dim_to_bid.get(dim_idx)
-            if bid is not None and bid in block_ids:
+            if dim_idx in range_dims:
+                parts.append(range_dims[dim_idx].length)
+            elif bid is not None and bid in block_ids:
                 bid_idx = block_ids.index(bid)
                 block_value_sym = sympy.sympify(slice_size_exprs[bid_idx])
                 if isinstance(block_value_sym, sympy.Integer):
@@ -3179,8 +3972,14 @@ def _classify_pipelined_tensors(
     outer_access_targets = ATOMIC_OPS | {_load_op, _store_op}
 
     all_tensor_info = _resident_loop_tensor_info(loaded_tensors, stored_tensors)
+    contiguous_ranges = _contiguous_range_patterns(loaded_tensors)
     vmem_shapes = _compute_vmem_shapes(
-        all_tensor_info, block_ids, slice_size_exprs, env, state
+        all_tensor_info,
+        block_ids,
+        slice_size_exprs,
+        env,
+        state,
+        contiguous_ranges,
     )
     device_ir = HostFunction.current().device_ir
 
@@ -3219,6 +4018,27 @@ def _classify_pipelined_tensors(
     for (fake, sub_meta, direction), vmem_shape in zip(
         all_tensor_info, vmem_shapes, strict=True
     ):
+        if state.device_function.pallas_internal_scratch_name(fake) is not None:
+            # This tensor already names a VMEM allocation owned by the kernel.
+            # Routing it through the inner-loop HBM DMA path would allocate a
+            # second VMEM buffer and emit pointless copies from an HBM argument
+            # that no longer exists.
+            continue
+        if direction == "load":
+            first_load = loaded_tensors[id(fake)][1]
+            if int(first_load.meta.get(_PALLAS_LOOP_LOAD_COUNT_META, 1)) > 1:
+                # Tensor-level prefetching is keyed by input tensor, not load
+                # site. Dynamic ranges can remain in HBM so each load site
+                # stages its own exact window. Ordinary tiled loads must keep
+                # their outer BlockSpec: raw HBM load-site staging is defined
+                # only for dynamic ranges and remote-copy operands.
+                if id(fake) in contiguous_ranges:
+                    from ..device_function import PallasMemorySpace
+
+                    state.device_function.pallas_memory_space[id(fake)] = (
+                        PallasMemorySpace.HBM
+                    )
+                    continue
         dim_to_bid = _get_dim_block_ids(sub_meta, env)
         if state.device_function.is_pallas_remote_copy_operand(fake) and not set(
             dim_to_bid.values()
@@ -3236,6 +4056,23 @@ def _classify_pipelined_tensors(
             continue
         if id(fake.untyped_storage()) in atomic_storages:
             continue
+        if range_patterns := contiguous_ranges.get(id(fake)):
+            can_render_ranges = all(
+                _contiguous_range_base_expr(
+                    pattern.base,
+                    state=state,
+                    block_ids=block_ids,
+                    begin_exprs=["0"] * len(block_ids),
+                    iter_step_exprs=["1"] * len(block_ids),
+                    iteration_indices=["0"] * len(block_ids),
+                )
+                is not None
+                for pattern in range_patterns.values()
+            )
+            if not can_render_ranges:
+                # The load-site lowering can still stage this window, but the
+                # loop prefetcher cannot safely synthesize its next address.
+                continue
         pipelined_ids.add(id(fake))
     return all_tensor_info, vmem_shapes, pipelined_ids
 
@@ -3381,12 +4218,13 @@ def _codegen_dynamic_unroll(state: CodegenState) -> object:
     return [expr_from_string(f"{result_var}[{i}]") for i in range(len(carried))]
 
 
-def _codegen_fori_loop(state: CodegenState) -> object:
+def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> object:
     """Emit inner device loops using jax.lax.fori_loop.
 
     Tensors admitted by the existing streaming classifier use explicit DMA.
     Selected read-only input tensors use two DMA buffers; all other routes keep
-    their existing single-buffered lowering.
+    their existing single-buffered lowering. ``static_unroll`` retains that DMA
+    schedule while using Python ``range`` so JAX traces a straight-line program.
     """
     from ..device_ir import ForLoopGraphInfo
     from ..device_ir import LiftTensorArgs
@@ -3412,6 +4250,23 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     grid_parts, block_size_vars = _compute_grid_and_block_sizes(state, block_ids, env)
 
     loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
+    placeholders = list(graph_info.graph.find_nodes(op="placeholder"))
+    placeholder_exprs = {
+        placeholder: ast.unparse(arg)
+        for placeholder, arg in zip(placeholders, args, strict=True)
+    }
+    scalar_index_nodes: dict[int, torch.fx.Node] = {}
+    for _fake, load_node, _subscript in loaded_tensors.values():
+        load_indices = load_node.args[1]
+        if not isinstance(load_indices, (list, tuple)):
+            continue
+        for index_node in load_indices:
+            if not isinstance(index_node, torch.fx.Node):
+                continue
+            index_value = index_node.meta.get("val")
+            if isinstance(index_value, torch.Tensor) and index_value.ndim == 0:
+                scalar_index_nodes[id(index_value)] = index_node
+    contiguous_ranges = _contiguous_range_patterns(loaded_tensors)
     begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
         state, block_ids, block_size_vars
     )
@@ -3510,9 +4365,13 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     dma_stores: list[ScheduledDmaTransfer] = []
     scheduled_by_hbm_name: dict[str, ScheduledDmaTransfer] = {}
     memory_op_to_dma_scratch: dict[torch.fx.Node, DmaResources] = {}
-    # compact_worklist shares this lowering but keeps its compact/resident routes;
-    # only an actual fori_loop config enables depth-two staging.
-    load_buffer_counts_active = state.config.get("pallas_loop_type") == "fori_loop"
+    # compact_worklist shares this lowering but keeps its compact/resident routes.
+    # Ordinary fori loops and explicitly buffered static unrolls honor the
+    # per-input depth; other callers keep the historical single-buffer route.
+    load_buffer_counts_active = state.config.get("pallas_loop_type") in (
+        "fori_loop",
+        "unroll",
+    )
 
     input_tensors = cast(
         "list[torch.Tensor]",
@@ -3556,6 +4415,10 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     for transfer, vmem_shape in dma_transfers:
         fake = transfer.tensor
         storage_id = id(fake.untyped_storage())
+        computed_indirect_index = (
+            isinstance(transfer, IndirectDmaTransfer)
+            and transfer.plan.spec.index_access is None
+        )
         input_slots = input_slots_by_id.get(
             id(fake), input_slots_by_storage.get(storage_id)
         )
@@ -3563,6 +4426,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             state.config.pallas_load_buffer_count[input_slots[0]]
             if load_buffer_counts_active
             and transfer.direction == "load"
+            and not computed_indirect_index
             and storage_id not in stored_tensor_storages
             and storage_id not in indirect_store_storages
             and input_slots is not None
@@ -3637,7 +4501,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             dma_stores.append(scheduled)
         elif uses_load_prefetch:
             prefetched_loads.append(scheduled)
-        elif isinstance(transfer, IndirectDmaTransfer):
+        elif isinstance(transfer, IndirectDmaTransfer) and not computed_indirect_index:
             immediate_loads.append(scheduled)
 
     # ``all_tensor_info`` represents a read-modify-write tensor only by its
@@ -3711,6 +4575,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         block_id_to_info=block_id_to_info,
         body_fn_name="_fori_body_0",
         loop_var_name=loop_vars[-1],
+        static_unroll=static_unroll,
         inner_statements=body_stmts,
         _tensor_to_dma_scratch=tensor_to_dma_scratch,
         _tensor_to_sem=tensor_to_sem,
@@ -3763,7 +4628,28 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 vmem_parts.append(":")
                 continue
             bid = dim_to_bid.get(dim_idx)
-            if bid is not None and bid in block_ids:
+            range_pattern = contiguous_ranges.get(id(fake), {}).get(dim_idx)
+            if range_pattern is not None:
+                base_expr = _contiguous_range_base_expr(
+                    range_pattern.base,
+                    state=state,
+                    block_ids=block_ids,
+                    begin_exprs=begin_exprs,
+                    iter_step_exprs=iter_step_exprs,
+                    iteration_indices=iteration_indices,
+                )
+                if base_expr is None:
+                    raise RuntimeError(
+                        "Pallas could not render a planned contiguous HBM range"
+                    )
+                hbm_parts.append(
+                    "pl.ds(pl.multiple_of("
+                    f"{base_expr}, {range_pattern.alignment}), "
+                    f"{range_pattern.length})"
+                )
+                vmem_parts.append(":")
+                hbm_needs_slice = True
+            elif bid is not None and bid in block_ids:
                 bid_idx = block_ids.index(bid)
                 begin_expr = begin_exprs[bid_idx]
                 iter_step_expr = iter_step_exprs[bid_idx]
@@ -3775,7 +4661,13 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 # ragged store on a last-two dim can't clamp and is rejected.
                 if clamp and dim_idx < len(shape) - 2:
                     end_expr = _get_loop_begin_and_end(state, bid_idx)[1]
-                    slice_size_expr = f"jnp.minimum({slice_size_expr}, ({end_expr}) - ({offset_expr}))"
+                    # Static unroll resolves the iteration in Python. Keep the
+                    # DMA extent static too: a traced jnp.minimum here creates
+                    # a dynamic HBM subview that Mosaic cannot place reliably.
+                    minimum = "min" if static_unroll else "jnp.minimum"
+                    slice_size_expr = (
+                        f"{minimum}({slice_size_expr}, ({end_expr}) - ({offset_expr}))"
+                    )
                     vmem_parts.append(f"pl.ds(0, {slice_size_expr})")
                     vmem_needs_slice = True
                 elif clamp and is_dynamic_bound_tile(state, bid):
@@ -3858,7 +4750,21 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 from helion._utils import is_scalar_index
 
                 if is_scalar_index(idx_meta):
-                    offset_expr = state.device_function.literal_expr(idx_meta)
+                    offset_expr = None
+                    if isinstance(idx_meta, torch.Tensor):
+                        index_node = scalar_index_nodes.get(id(idx_meta))
+                        if index_node is not None:
+                            offset_expr = _scalar_address_expr(
+                                index_node,
+                                state=state,
+                                captured_exprs=placeholder_exprs,
+                                block_ids=block_ids,
+                                begin_exprs=begin_exprs,
+                                iter_step_exprs=iter_step_exprs,
+                                iteration_indices=iteration_indices,
+                            )
+                    if offset_expr is None:
+                        offset_expr = state.device_function.literal_expr(idx_meta)
                     hbm_parts.append(
                         offset_expr if resident_source else f"pl.ds({offset_expr}, 1)"
                     )
@@ -3941,6 +4847,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
 
         plan = transfer.plan
         index_access = plan.spec.index_access
+        if index_access is None:
+            raise AssertionError("computed-index DMA is emitted at the gather site")
         metadata_fake = index_access.tensor
         metadata_patterns = list(index_access.patterns)
         hbm_name = state.device_function.tensor_arg(transfer.tensor).name
@@ -4001,13 +4909,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     def _guarded_statements(
         condition: str, name_hint: str, statements: list[ast.stmt]
     ) -> ast.FunctionDef:
-        fn_name = state.device_function.new_var(name_hint)
-        fn_def = statement_from_string(
-            f"@pl.when({condition})\ndef {fn_name}():\n    pass"
-        )
-        assert isinstance(fn_def, ast.FunctionDef)
-        fn_def.body = statements or [ast.Pass()]
-        return fn_def
+        return _pl_when(state, condition, name_hint, statements)
 
     prime_statements: list[ast.stmt] = []
     body_prefetch: ast.FunctionDef | None = None
@@ -4116,7 +5018,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             state.add_statement(stmt)
         return None
 
-    _emit_nonlocal_scratch_declarations(state, body_stmts)
+    if not static_unroll:
+        _emit_nonlocal_scratch_declarations(state, body_stmts)
 
     # Emit nested fori_loop calls — one per dimension.
     # Build inside-out: innermost function wraps body_stmts, each outer
@@ -4127,6 +5030,23 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     # not affect correctness; for loop-carried state the user's source order
     # (block_ids order) is the correct semantic order.
     current_body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
+    if static_unroll:
+        for dim in reversed(range(len(loop_vars))):
+            loop = statement_from_string(
+                f"for {loop_vars[dim]} in range({grid_parts[dim]}):\n    pass"
+            )
+            assert isinstance(loop, ast.For)
+            loop.body = current_body  # pyrefly: ignore[bad-assignment]
+            if dim == len(loop_vars) - 1:
+                current_body = [*prime_statements, loop]
+            else:
+                current_body = [loop]
+        for statement in current_body:
+            state.add_statement(statement)
+        if has_loop_state:
+            return _read_final_loop_state(state, result_vars)
+        return None
+
     for dim in reversed(range(len(loop_vars))):
         fn_name = state.device_function.new_var(f"_fori_body_{dim}")
         fn_def = statement_from_string(f"def {fn_name}({loop_vars[dim]}, _): pass")
@@ -4150,6 +5070,46 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     if has_loop_state:
         return _read_final_loop_state(state, result_vars)
     return None
+
+
+def _is_static_unroll_predicate(state: CodegenState) -> bool:
+    """Whether this predicate is resolved by a surrounding Python tile loop."""
+    test = state.proxy_arg(0)
+    if isinstance(test, (bool, int)):
+        return True
+    if not isinstance(test, torch.SymBool):
+        return False
+
+    from ..tile_strategy import ForiLoopState
+    from ..variable_origin import BlockSizeOrigin
+    from ..variable_origin import GridOrigin
+
+    static_block_ids: set[int] = set()
+    for loops in state.codegen.active_device_loops.values():
+        for loop in loops:
+            if isinstance(loop, ForiLoopState) and loop.static_unroll:
+                static_block_ids.update(loop.block_ids)
+    if not static_block_ids:
+        return False
+
+    expr = test._sympy_()
+    if not isinstance(expr, sympy.Basic):
+        return False
+    origins = HostFunction.current().expr_to_origin
+    for symbol in expr.free_symbols:
+        origin_info = origins.get(symbol)
+        if origin_info is None:
+            return False
+        origin = origin_info.origin
+        base_type = origin.base_type()
+        if issubclass(base_type, BlockSizeOrigin):
+            continue
+        if not issubclass(base_type, GridOrigin):
+            return False
+        block_id = getattr(origin, "block_id", None)
+        if block_id not in static_block_ids:
+            return False
+    return True
 
 
 @_decorators.codegen(_if, "pallas")
@@ -4207,6 +5167,20 @@ def _(state: CodegenState) -> list[object]:
     if_return_names, else_return_names = graph_info.get_branches_return_names(
         state, if_outputs, else_outputs
     )
+
+    if (
+        _is_static_unroll_predicate(state)
+        and not if_return_names
+        and not else_return_names
+    ):
+        if_node = create(
+            ast.If,
+            test=test,
+            body=if_body_stmts or [ast.Pass()],
+            orelse=else_body_stmts or [ast.Pass()],
+        )
+        state.add_statement(if_node)
+        return []
 
     if_arg_ids = {arg.id for arg in if_args}
     union_args = if_args + [a for a in else_args if a.id not in if_arg_ids]
@@ -4272,6 +5246,26 @@ def _(state: CodegenState) -> None:
     return expr_from_string("{lhs} & {rhs}", lhs=state.ast_arg(0), rhs=state.ast_arg(1))
 
 
+def _pipeline_physical_mask_bounds(
+    state: CodegenState, block_id: int
+) -> tuple[str, ...]:
+    """Physical bounds attached to this deferred ``_mask_to`` consumer."""
+    from ..tile_strategy import EmitPipelineLoopState
+
+    assert state.fx_node is not None
+    for loop in reversed(state.codegen.active_device_loops.get(block_id, ())):
+        if not isinstance(loop, EmitPipelineLoopState):
+            continue
+        if block_id in loop._proven_physical_mask_block_ids:
+            return ()
+        bounds = loop._deferred_physical_mask_bounds.get(state.fx_node, {}).get(
+            block_id, ()
+        )
+        if bounds:
+            return bounds
+    return ()
+
+
 @_decorators.codegen(_mask_to, "pallas")
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
@@ -4283,20 +5277,29 @@ def _(state: CodegenState) -> ast.AST:
     env = CompileEnvironment.current()
     backend = env.backend
     for dim, size in enumerate(input_sizes):
-        if (index := env.resolve_block_id(size)) is not None and (
-            mask_var := state.codegen.mask_var(index)
-        ) is not None:
-            expand = state.tile_strategy.expand_str(input_sizes, dim)
-            if env.is_jagged_tile(index):
-                mask_shape = env.jagged_tile_mask_shapes[index]
-                expand = state.tile_strategy.jagged_tile_expand_str(
-                    mask_shape, input_sizes
-                )
-            # Cast bool mask to float before expanding — Mosaic cannot
-            # reshape bool vectors (e.g. vector<32xi1> → vector<32x1xi1>).
-            expr = f"({mask_var}.astype(jnp.float32){expand})"
-            if expr not in mask_exprs:
-                mask_exprs.append(expr)
+        index = env.resolve_block_id(size)
+        if index is None:
+            continue
+        mask_var = state.codegen.mask_var(index)
+        physical_bounds = _pipeline_physical_mask_bounds(state, index)
+        if mask_var is None and not physical_bounds:
+            continue
+        mask_terms = [] if mask_var is None else [mask_var]
+        if physical_bounds:
+            index_var = state.codegen.index_var(index)
+            mask_terms.extend(
+                f"(({index_var}) < ({bound}))" for bound in physical_bounds
+            )
+        expand = state.tile_strategy.expand_str(input_sizes, dim)
+        if env.is_jagged_tile(index):
+            mask_shape = env.jagged_tile_mask_shapes[index]
+            expand = state.tile_strategy.jagged_tile_expand_str(mask_shape, input_sizes)
+        # Cast bool mask to float before expanding — Mosaic cannot
+        # reshape bool vectors (e.g. vector<32xi1> → vector<32x1xi1>).
+        mask = " & ".join(f"({term})" for term in mask_terms)
+        expr = f"(({mask}).astype(jnp.float32){expand})"
+        if expr not in mask_exprs:
+            mask_exprs.append(expr)
     if not mask_exprs:
         return state.ast_arg(0)
     # Combine float masks via multiplication (equivalent to bool AND).

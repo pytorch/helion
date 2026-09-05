@@ -31,6 +31,7 @@ from .ast_extension import statement_from_string
 from .ast_read_writes import ReadWrites
 from .ast_read_writes import ast_rename
 from .ast_read_writes import dead_assignment_elimination
+from .ast_read_writes import dead_expression_elimination
 from .ast_read_writes import dead_lane_loop_elimination
 from .backend_registry import all_reserved_launch_param_names
 from .compile_environment import CompileEnvironment
@@ -107,6 +108,22 @@ def contains_only_block_size_symbols(expr: sympy.Expr) -> bool:
     """Check if expression contains only block size symbols (no other variables)."""
     _, non_block = find_block_size_symbols(expr)
     return len(non_block) == 0
+
+
+def _clone_extended_ast(value: object) -> object:
+    """Clone Python/ExtendedAST nodes without dropping Helion source metadata."""
+    if isinstance(value, list):
+        return [_clone_extended_ast(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_extended_ast(item) for item in value)
+    if isinstance(value, ast.AST):
+        fields = {
+            field: _clone_extended_ast(getattr(value, field)) for field in value._fields
+        }
+        if isinstance(value, ExtendedAST):
+            return value.copy(**fields)
+        return ast.copy_location(type(value)(**fields), value)
+    return value
 
 
 @dataclasses.dataclass
@@ -257,6 +274,7 @@ class DeviceFunction:
         self.name = name
         self.config = config
         self.codegen = codegen
+        self.has_barrier = CompileEnvironment.current().has_barrier
         self.arguments: list[Argument] = []
         self.preamble: list[ast.AST] = []
         self.body: list[ast.AST] = []
@@ -351,7 +369,22 @@ class DeviceFunction:
         # into compiler-owned global scratch before the transfer starts.
         self.triton_remote_copy_scratch_args: list[str] = []
         self.triton_remote_copy_scratch_specs: list[tuple[str, str]] = []
-
+        # Compiler-owned state that must persist across launches (for example,
+        # epoch-scaled tile-dependency counters). The Triton launcher allocates it
+        # once per kernel/device/stream and appends it to the kernel arguments.
+        self.triton_persistent_state_args: list[str] = []
+        self.triton_persistent_state_specs: list[tuple[str, str, str]] = []
+        # Cross-grid polling is safe in isolation only when the required worker
+        # cohort can reside together. The launcher validates exact compiled
+        # occupancy, but does not reserve capacity against concurrent streams.
+        self.triton_minimum_resident_programs: str | None = None
+        # Opaque tile bodies can be outlined behind Triton helper boundaries.
+        # Most helpers are inlined; selected scheduling regions remain
+        # ``noinline`` to bound register lifetimes in the fused kernel.
+        self.triton_outlined_helpers: list[
+            tuple[str, tuple[str, ...], tuple[ast.stmt, ...], bool]
+        ] = []
+        self.triton_outlined_helper_constexprs: dict[str, int] = {}
         # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`
         self.pallas_tensor_dim_tilings: dict[int, list[DimensionTiling]] = {}
         # Track Pallas remote-copy operands by tensor and storage identity. The
@@ -359,6 +392,14 @@ class DeviceFunction:
         # nested control-flow graphs.
         self.pallas_remote_copy_tensor_ids: set[int] = set()
         self.pallas_remote_copy_storage_ids: set[int] = set()
+        # Read-only inputs selected for explicit local HBM-to-VMEM DMA at
+        # their load sites, rather than launcher-managed VMEM BlockSpecs.
+        self.pallas_direct_hbm_load_tensor_ids: set[int] = set()
+        self.pallas_hoisted_direct_dma_copy_names: set[str] = set()
+        # Body-local ``torch.empty`` tensors that are read and written but do
+        # not escape the kernel return can live entirely in compiler-managed
+        # VMEM scratch instead of becoming hidden HBM in/out arguments.
+        self.pallas_internal_scratch_storage_names: dict[int, str] = {}
         # Pallas: id(fake_tensor) → memory space, determined during
         # tracing (HBM for pipeline) and codegen (SMEM for scalar access).
         # NOTE: Currently each tensor can only have one memory space.
@@ -392,6 +433,18 @@ class DeviceFunction:
             id(tensor) in self.pallas_remote_copy_tensor_ids
             or id(tensor.untyped_storage()) in self.pallas_remote_copy_storage_ids
         )
+
+    def is_pallas_direct_hbm_load(self, tensor: torch.Tensor) -> bool:
+        return id(tensor) in self.pallas_direct_hbm_load_tensor_ids
+
+    def pallas_internal_scratch_name(self, tensor: torch.Tensor) -> str | None:
+        return self.pallas_internal_scratch_storage_names.get(
+            id(tensor.untyped_storage())
+        )
+
+    def pallas_tensor_ref_name(self, tensor: torch.Tensor) -> str:
+        scratch = self.pallas_internal_scratch_name(tensor)
+        return scratch if scratch is not None else self.tensor_arg(tensor).name
 
     def allocate_store_index(self) -> int:
         """Bump store counters and return the indexing strategy slot."""
@@ -878,7 +931,14 @@ class DeviceFunction:
 
     def sorted_args(self) -> list[Argument]:
         self.arguments.sort(key=lambda arg: arg.sort_key())
-        return self.arguments
+        return [
+            arg
+            for arg in self.arguments
+            if not (
+                isinstance(arg, TensorArg)
+                and self.pallas_internal_scratch_name(arg.fake_value) is not None
+            )
+        ]
 
     def codegen_function_def(self) -> list[ast.stmt]:
         prefix = []
@@ -924,6 +984,7 @@ class DeviceFunction:
         # the launcher's canonical signal-then-scratch append order, independent
         # of which descriptor kind the kernel encounters first.
         remote_copy_params = set(self.triton_remote_copy_scratch_args)
+        remote_copy_params.update(self.triton_persistent_state_args)
         if self.triton_remote_copy_signal_arg is not None:
             remote_copy_params.add(self.triton_remote_copy_signal_arg)
         if self.triton_remote_barrier_signal_arg is not None:
@@ -936,6 +997,7 @@ class DeviceFunction:
         if self.triton_remote_barrier_signal_arg is not None:
             wrapper_only_params.append(self.triton_remote_barrier_signal_arg)
         wrapper_only_params.extend(self.triton_remote_copy_scratch_args)
+        wrapper_only_params.extend(self.triton_persistent_state_args)
         args.extend(create_arg(name) for name in wrapper_only_params)
 
         # Generate inlined constexpr assignments at module level
@@ -960,11 +1022,21 @@ class DeviceFunction:
         )
         if function_decorator:
             decorators.append(expr_from_string(function_decorator))
+        cluster_sync: list[ast.stmt] = []
+        if getattr(self.cute_state, "simt_cluster_reduce_sites", 0) > 0:
+            # One fence + cluster barrier covering every cluster-reduce
+            # site's mbarrier init (emitted into the preamble above).
+            cluster_sync = [
+                statement_from_string("cute.arch.mbarrier_init_fence()"),
+                statement_from_string("cute.arch.cluster_arrive_relaxed()"),
+                statement_from_string("cute.arch.cluster_wait()"),
+            ]
         kernel_body: list[ast.stmt] = cast(
             "list[ast.stmt]",
             [
                 *scalar_preamble,
                 *self.preamble,
+                *cluster_sync,
                 *self.body,
             ],
         )
@@ -1006,10 +1078,41 @@ class DeviceFunction:
                 )
             except Exception:
                 thread_block_dims = (1, 1, 1)
+            # Best-effort map for the fuser's cache-dtype resolution;
+            # ``dtype_str`` raises for dtypes the cute backend has no
+            # canonical spelling for (e.g. uint32 barrier flags, which
+            # SIMT loads treat as raw bytes) — such tensors simply don't
+            # participate in load fusion.
+            tensor_dtypes = {}
+            for arg in self.arguments:
+                if isinstance(arg, TensorArg):
+                    try:
+                        tensor_dtypes[arg.name] = backend.dtype_str(
+                            arg.fake_value.dtype
+                        )
+                    except ValueError:
+                        continue
+            # Autotuner-selected reload mode per rolled reduction dim
+            # ("auto" / "register" / "gmem"); the fuser keys the sweep
+            # loops back to their block id via the ``roffset_<id>`` /
+            # ``tile_offset_<id>`` loop offset variable.
+            env = CompileEnvironment.current()
+            reload_cfg = cast(
+                "list[str]",
+                self.config.config.get("cute_reduction_reloads", []) or [],
+            )
+            reload_modes = {
+                block_id: env.config_spec.cute_reduction_reloads.config_get(
+                    reload_cfg, block_id, "auto"
+                )
+                for block_id in env.config_spec.cute_reduction_reloads.valid_block_ids()
+            }
             kernel_body = fuse_two_pass_loads(
                 kernel_body,
                 constexpr_values,
                 thread_block_dims=thread_block_dims,
+                tensor_dtypes=tensor_dtypes,
+                reload_modes=reload_modes,
             )
             # Hoist warp reductions out of constexpr V-loops to collapse
             # 4 per-V-lane warp reductions into 1 V-fold + 1 warp reduce.
@@ -1017,8 +1120,13 @@ class DeviceFunction:
             # from ~396 to ~99 (4x fewer SHFL trees).
             from .cute.hoist_warp_reduce import hoist_warp_reduce_from_vloop
 
+            # The collapse stage needs the post-rename canonical map to see
+            # through loop-carried alias vars (``v_1`` renaming to ``mi``).
+            rename_groups = {k: v[0] for k, v in self._variable_renames.items()}
             kernel_body = hoist_warp_reduce_from_vloop(
-                kernel_body, running_sum_accumulators=self.cute_matmul_running_sums
+                kernel_body,
+                running_sum_accumulators=self.cute_matmul_running_sums,
+                rename_groups=rename_groups,
             )
             # Merge adjacent constexpr V-loops that share an identical
             # statement prefix.  Caches the last common per-V-lane value
@@ -1053,6 +1161,26 @@ class DeviceFunction:
             kernel_body = hoist_loop_invariant_recips(
                 kernel_body, rename_groups=rename_groups
             )
+            # Contract single-use fp32 ``t = a*b; w = t + c`` chains into
+            # ``cute.math.fma`` (the DSL's arith ops carry no contract
+            # flag, so NVVM won't fuse them itself).  Triton contracts by
+            # default, so this brings cute numerics closer to the triton
+            # backend.
+            from .cute.fuse_fma import fuse_fma
+
+            # Skipped for matmul kernels: tcgen05 scheduling passes pin
+            # exact statement sequences, and the MMA path gains nothing
+            # from contracting stray scalar epilogue math.
+            if not env.config_spec.matmul_facts:
+                kernel_body = fuse_fma(kernel_body, rename_groups=rename_groups)
+            # Issue all of a grid lane loop's vec loads before its first
+            # store (ptxas cannot prove the store doesn't alias the next
+            # iteration's load, so unsplit loops keep only ONE load in
+            # flight per thread; the triton backend and handwritten CuTe
+            # kernels both load the whole tile fragment first).
+            from .cute.split_lane_loads import split_lane_loads
+
+            kernel_body = split_lane_loads(kernel_body)
             # P18: software-pipeline the per-iteration vec load by one
             # stage.  Pre-issue iter 0's load above the loop and, inside
             # the body, issue iter N+1's load BEFORE iter N's compute
@@ -1072,7 +1200,40 @@ class DeviceFunction:
             kernel_body = pipeline_inner_loads(
                 kernel_body, constexpr_values, rename_groups=rename_groups
             )
-        return [
+            # Fuse an online-softmax (max, sum) pair of cluster reduces into
+            # ONE packed DSM exchange: the max reduce relocalizes to a
+            # CTA-local block reduce, the sum site exchanges the
+            # ``(local_max, local_sum)`` pair once and folds with the
+            # online-softmax rescale, and the write sweep reuses the sum
+            # sweep's cached exp values.  Saves a full cluster round-trip
+            # per row (+5..9% at cluster_n 2..16 on B200 softmax).
+            from .cute.cluster_online_pair import fuse_cluster_online_pair
+
+            kernel_body = fuse_cluster_online_pair(
+                kernel_body,
+                constexpr_values,
+                rename_groups=rename_groups,
+                fast_math=CompileEnvironment.current().settings.fast_math,
+            )
+            # ``ex2.approx.ftz`` is a numerics change (denormal exp outputs
+            # flush to zero), so it is gated on the fast_math SETTING —
+            # tuned configs must never change numerics.
+            if CompileEnvironment.current().settings.fast_math:
+                from .cute.exp2_fastmath import apply_exp2_fastmath
+
+                kernel_body = apply_exp2_fastmath(kernel_body)
+            # The DSM cluster reduce uses a single-phase mbarrier, so each
+            # call site must execute exactly ONCE per kernel.  The
+            # lane-reduce collapse normally hoists it out of the (staged,
+            # multi-trip) lane loop; when the collapse bails for a config,
+            # the call would run once per lane iteration and DEADLOCK in
+            # ``mbarrier_wait`` (an unkillable kernel that wedges the
+            # autotuner's benchmark worker).  Reject such configs loudly so
+            # the autotuner skips them.
+            from .cute.hoist_warp_reduce import validate_cluster_reduce_placement
+
+            validate_cluster_reduce_placement(kernel_body, constexpr_values)
+        result = [
             *prefix,
             ast_rename(
                 create(
@@ -1086,6 +1247,29 @@ class DeviceFunction:
                 {k: v[0] for k, v in self._variable_renames.items()},
             ),
         ]
+        simt_cluster_n = getattr(self.cute_state, "simt_cluster_n", 1)
+        if simt_cluster_n > 1:
+            # The CuTe launcher reads this attribute to launch the kernel
+            # with a (1, cluster_n, 1) thread-block cluster.
+            result.append(
+                statement_from_string(
+                    f"{self.name}._helion_cute_cluster_shape = (1, {simt_cluster_n}, 1)"
+                )
+            )
+        min_blocks = self.config.config.get("cute_min_blocks_per_mp", 0)
+        if (
+            CompileEnvironment.current().backend.name == "cute"
+            and isinstance(min_blocks, int)
+            and min_blocks > 0
+        ):
+            # ptxas ``minnctapersm``: caps registers so ``min_blocks`` CTAs
+            # stay resident per SM (occupancy over spills).
+            result.append(
+                statement_from_string(
+                    f"{self.name}._helion_cute_min_blocks_per_mp = {min_blocks}"
+                )
+            )
+        return result
 
     def codegen_function_call(self) -> ast.AST:
         env = CompileEnvironment.current()
@@ -1112,6 +1296,20 @@ class DeviceFunction:
         assert pid is not None
 
         call_grid_expr = pid.codegen_grid()
+        simt_cluster_n = getattr(self.cute_state, "simt_cluster_n", 1)
+        if simt_cluster_n > 1:
+            # The cluster splits each row across ``cluster_n`` CTAs on a new
+            # trailing grid dim.  Only a 1-D grid can host the cluster dim.
+            if not (
+                isinstance(call_grid_expr, ast.Tuple) and len(call_grid_expr.elts) == 1
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "cute_cluster_n > 1 requires a 1-D launch grid",
+                )
+            call_grid_expr = expr_from_string(
+                f"(*{{grid}}, {simt_cluster_n})", grid=call_grid_expr
+            )
         # Extra params are positional and must come before any keyword args that
         # build_launcher_args appends (e.g. num_warps=, num_stages=).
         args.extend(self.codegen._extra_params)
@@ -1120,7 +1318,7 @@ class DeviceFunction:
             tensor_host_args=tensor_host_args,
             has_rng_ops=self.has_rng_ops(),
             config=self.config,
-            has_barrier=env.has_barrier,
+            has_barrier=self.has_barrier,
             sorted_args=arg_objects,
         )
         # Check if the backend wants to capture return values for output-only tensors.
@@ -1194,9 +1392,143 @@ class DeviceFunction:
         name = self.namespace.create_name(helper_graph_info.name, None)
         self.helper_manager.register_helper_function(helper_graph_info, name)
 
+    def register_triton_outlined_helper(
+        self,
+        name_hint: str,
+        body: list[ast.stmt],
+        *,
+        extra_argument_names: tuple[str, ...] = (),
+        noinline: bool = False,
+    ) -> tuple[str, tuple[str, ...]]:
+        """Outline an opaque body without changing its computation AST."""
+        if CompileEnvironment.current().backend_name != "triton":
+            raise AssertionError("outlined Triton helpers require the Triton backend")
+        cloned_body = cast("list[ast.stmt]", _clone_extended_ast(body))
+        if tuple(
+            ast.dump(statement, include_attributes=False) for statement in cloned_body
+        ) != tuple(ast.dump(statement, include_attributes=False) for statement in body):
+            raise AssertionError("outlining changed an opaque tile body")
+        # Case extraction can carry common, compiler-generated index definitions
+        # into more than one branch. Standalone kernels eliminate those too; do
+        # the same before choosing helper parameters so dead definitions cannot
+        # accidentally turn a module constexpr into a host-wrapper local.
+        dead_assignment_elimination(cast("list[ast.AST]", cloned_body), self.dce_vars)
+        dead_expression_elimination(cast("list[ast.AST]", cloned_body))
+        reads = set(ReadWrites.from_list(cloned_body).reads)
+        local_names = {
+            node.id
+            for statement in cloned_body
+            for node in ast.walk(statement)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+        }
+        helper_names = {name for name, _, _, _ in self.triton_outlined_helpers}
+        environment = CompileEnvironment.current()
+        for name in reads:
+            if not name.startswith("_BLOCK_SIZE_"):
+                continue
+            suffix = name.removeprefix("_BLOCK_SIZE_")
+            if not suffix.isdigit():
+                continue
+            block_id = int(suffix)
+            self.triton_outlined_helper_constexprs[name] = int(
+                environment.block_sizes[block_id].from_config_assert(self.config)
+            )
+        argument_names = [
+            argument.name
+            for argument in self.arguments
+            if argument.name in reads
+            and not (
+                isinstance(argument, ConstExprArg) and _is_literal_constexpr(argument)
+            )
+        ]
+        argument_names.extend(
+            name
+            for name in self.wrapper_only_params
+            if name in reads and name not in argument_names
+        )
+        # Outlined roots may read values synthesized by compiler preamble code
+        # rather than kernel arguments.  Tensor descriptors are the common
+        # example: the preamble constructs ``*_desc`` from the underlying
+        # pointer/shape/stride arguments, and the opaque root calls methods on
+        # that descriptor.  Treat every such live preamble definition as part
+        # of the generated helper ABI instead of leaving a free name that only
+        # exists in the parent kernel scope.
+        preamble_writes = ReadWrites.from_list(self.preamble).writes
+        argument_names.extend(
+            name
+            for name in preamble_writes
+            if name in reads and name not in local_names and name not in argument_names
+        )
+        argument_names.extend(
+            name
+            for name in extra_argument_names
+            if name in reads and name not in argument_names
+        )
+        # Ready actions can create an outlined child before their enclosing
+        # scheduled helper exists. Capture those compiler-owned parent locals
+        # by namespace; ordinary source names must still enter through the
+        # kernel, preamble, or explicit generated ABI above.
+        argument_names.extend(
+            name
+            for name in sorted(reads)
+            if name.startswith("tile_dependency_")
+            and name not in local_names
+            and name not in helper_names
+            and name not in argument_names
+        )
+        helper_name = self.namespace.create_name(name_hint, None)
+        self.triton_outlined_helpers.append(
+            (helper_name, tuple(argument_names), tuple(cloned_body), noinline)
+        )
+        return helper_name, tuple(argument_names)
+
     def codegen_helper_functions(self) -> list[ast.stmt]:
         """Generate helper function definitions at global scope."""
-        return self.helper_manager.codegen_helper_functions()
+        existing_module_assignments = {
+            target.id
+            for statement in self.codegen.module_statements
+            if isinstance(statement, ast.Assign)
+            for target in statement.targets
+            if isinstance(target, ast.Name)
+        }
+        helpers = [
+            statement_from_string(f"{name} = tl.constexpr({value})")
+            for name, value in self.triton_outlined_helper_constexprs.items()
+            if name not in existing_module_assignments
+        ]
+        helpers.extend(self.helper_manager.codegen_helper_functions())
+        renames = {name: values[0] for name, values in self._variable_renames.items()}
+        argument_by_name = {argument.name: argument for argument in self.arguments}
+        for name, argument_names, body, noinline in self.triton_outlined_helpers:
+            arguments: list[ast.arg] = []
+            for argument_name in argument_names:
+                argument = argument_by_name.get(argument_name)
+                if argument is None:
+                    argument_node = create_arg(argument_name)
+                else:
+                    argument_node = argument.arg_def_node()
+                argument_node.arg = renames.get(argument_node.arg, argument_node.arg)
+                arguments.append(argument_node)
+            helper_module = ast.Module(
+                body=cast("list[ast.stmt]", _clone_extended_ast(list(body))),
+                type_ignores=[],
+            )
+            ast_rename(helper_module, renames)
+            helpers.append(
+                create(
+                    ast.FunctionDef,
+                    name=name,
+                    args=create_arguments(arguments),
+                    body=helper_module.body,
+                    decorator_list=[
+                        expr_from_string(
+                            "triton.jit(noinline=True)" if noinline else "triton.jit"
+                        )
+                    ],
+                    type_params=[],
+                )
+            )
+        return helpers
 
     def flush_deferred_rdim_defs(self, codegen: GenerateAST) -> None:
         """Add all deferred RDIM definitions to host statements."""

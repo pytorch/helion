@@ -159,6 +159,7 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
             "pid_type": st.sampled_from(
                 ["flat", "xyz", "persistent_blocked", "persistent_interleaved"]
             ),
+            "cross_loop_schedule": st.sampled_from(["barrier", "static_pipeline"]),
             "indexing": st.sampled_from(["pointer", "tensor_descriptor"]),
         }
     )
@@ -192,6 +193,7 @@ def _unknown_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
                     "num_warps",
                     "num_stages",
                     "pid_type",
+                    "cross_loop_schedule",
                     "indexing",
                 }
             )
@@ -215,7 +217,7 @@ class TestPallasLoadBufferCountConfig(TestCase):
         spec = self._config_spec(2)
         field = spec._flat_fields()["pallas_load_buffer_count"]
         self.assertEqual(field.default(), [1, 1])
-        self.assertEqual(field.pattern_neighbors([1, 1]), [[2, 1], [1, 2]])
+        self.assertEqual(field.pattern_neighbors([1, 1]), [[2, 1], [1, 2], [2, 2]])
         self.assertIn(
             ("pallas_load_buffer_count", *field.fingerprint()),
             spec.structural_fingerprint(),
@@ -231,6 +233,12 @@ class TestPallasLoadBufferCountConfig(TestCase):
         )
         spec.normalize(config)
         self.assertEqual(config.pallas_load_buffer_count, [2, 1])
+
+        unroll_config = helion.Config(
+            pallas_loop_type="unroll", pallas_load_buffer_count=[2, 1]
+        )
+        spec.normalize(unroll_config)
+        self.assertEqual(unroll_config.pallas_load_buffer_count, [2, 1])
 
     def test_inactive_field_is_ignored(self) -> None:
         cases = (
@@ -380,6 +388,7 @@ class TestConfigAPI(TestCase):
             "num_warps",
             "num_stages",
             "pid_type",
+            "cross_loop_schedule",
             "indexing",
         }
 
@@ -391,6 +400,82 @@ class TestConfigAPI(TestCase):
         }
         # Expected kwargs must be present as keyword-only
         self.assertTrue(expected.issubset(kwonly))
+
+    def test_cross_loop_schedule_is_an_admitted_triton_field(self) -> None:
+        from helion.autotuner.config_generation import ConfigGeneration
+
+        self.assertEqual(helion.Config().cross_loop_schedule, "barrier")
+        self.assertEqual(
+            helion.Config(cross_loop_schedule="static_pipeline").cross_loop_schedule,
+            "static_pipeline",
+        )
+
+        with patch("helion._compat.is_hip", return_value=False):
+            spec = ConfigSpec(backend=TritonBackend())
+            self.assertTrue(spec.supports_config_key("cross_loop_schedule"))
+            self.assertNotIn("cross_loop_schedule", spec._flat_fields())
+            with self.assertRaisesRegex(
+                exc.InvalidConfig,
+                "only for kernels with compiler-inferred cross-loop dependencies",
+            ):
+                spec.normalize(helion.Config(cross_loop_schedule="barrier"))
+
+            spec.enable_cross_loop_schedule()
+            field = spec._flat_fields()["cross_loop_schedule"]
+            self.assertIsInstance(field, EnumFragment)
+            assert isinstance(field, EnumFragment)
+            self.assertIs(field, spec.cross_loop_schedule)
+            self.assertEqual(field.choices, ("barrier", "static_pipeline"))
+            self.assertEqual(
+                spec.default_config()["cross_loop_schedule"],
+                "barrier",
+            )
+
+            static_config = spec.default_config()
+            static_config.config["cross_loop_schedule"] = "static_pipeline"
+            spec.normalize(static_config)
+            generation = ConfigGeneration(spec)
+            round_trip = generation.unflatten(generation.flatten(static_config))
+            self.assertEqual(
+                round_trip["cross_loop_schedule"],
+                "static_pipeline",
+            )
+
+            with self.assertRaisesRegex(
+                exc.InvalidConfig,
+                "must be one of",
+            ):
+                spec.normalize(
+                    helion.Config.from_dict({"cross_loop_schedule": "unknown"})
+                )
+
+    def test_cross_loop_schedule_is_not_supported_on_amd(self) -> None:
+        with patch("helion._compat.is_hip", return_value=True):
+            spec = ConfigSpec(backend=TritonBackend())
+            self.assertFalse(spec.supports_config_key("cross_loop_schedule"))
+            with self.assertRaisesRegex(
+                exc.InvalidConfig,
+                "is not supported by backend",
+            ):
+                spec.enable_cross_loop_schedule()
+
+    def test_cross_loop_schedule_is_not_supported_on_xpu(self) -> None:
+        with patch("helion._compat.is_hip", return_value=False):
+            spec = ConfigSpec(
+                backend=TritonBackend(),
+                device=torch.device("xpu"),
+                num_sm=1,
+            )
+            self.assertFalse(spec.supports_config_key("cross_loop_schedule"))
+
+    def test_warp_specialization_uses_effective_launcher_warp_count(self) -> None:
+        backend = TritonBackend()
+        config = helion.Config(
+            num_warps=1,
+            range_warp_specializes=[None, True],
+        )
+
+        self.assertEqual(backend.effective_num_warps(config), 4)
 
     def test_mapping_behavior_len_iter_dict_roundtrip(self) -> None:
         data = {
@@ -1010,6 +1095,22 @@ class TestHardwareConfigSpecRanges(TestCase):
             nvidia_spec.load_eviction_policies.inner.choices,
             ("", "first", "last"),
         )
+
+    def test_scalar_empty_eviction_policy_survives_normalization(self) -> None:
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_spec import ConfigSpec
+
+        with patch(
+            "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+            return_value=False,
+        ):
+            config_spec = ConfigSpec(backend=TritonBackend())
+        config_spec.load_eviction_policies.length = 2
+        config = helion.Config(load_eviction_policies="")
+
+        config_spec.normalize(config)
+
+        self.assertEqual(config.load_eviction_policies, "")
 
     def test_load_cache_modifier_choices_do_not_leak_mocked_amd_state(self) -> None:
         """Mocked AMD capability detection should not poison later Triton specs."""

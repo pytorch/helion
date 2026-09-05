@@ -440,6 +440,10 @@ class Backend(abc.ABC):
         """Called during `type_propagation` when processing a `load` memory op on fake tensors"""
         return
 
+    def normalize_input_fake_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Return the tensor metadata used while tracing a kernel input."""
+        return tensor
+
     def fake_subscript_shape(
         self,
         tensor: torch.Tensor,
@@ -709,6 +713,11 @@ class Backend(abc.ABC):
         """Cast a lane variable for addition to an index expression."""
         raise exc.BackendUnsupported(self.name, "lane offset")
 
+    def thread_index_expr(self, *, axis: int) -> str:
+        """Bare thread index expression (no elements-per-thread stride),
+        used by the strided lane layout."""
+        raise exc.BackendUnsupported(self.name, "thread index")
+
     def reduction_combine_expr(
         self,
         reduction_type: str,
@@ -898,6 +907,10 @@ class Backend(abc.ABC):
 
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         return []
+
+    def effective_num_warps(self, config: Config) -> int:
+        """Return the warp count the backend will actually launch."""
+        return config.num_warps
 
     def customize_ast(self, hf: HostFunction) -> None:
         """Run backend-specific AST customizations.

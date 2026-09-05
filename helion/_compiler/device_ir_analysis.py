@@ -9,6 +9,7 @@ from typing import cast
 
 import torch
 
+from .. import language as hl
 from ..autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
 from ..autotuner.config_spec import AccumulatorFact
 from ..autotuner.config_spec import DotAxes
@@ -33,6 +34,8 @@ from .indexing_strategy import subscript_index_scale
 from .indexing_strategy import subscript_tile_info
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Container
     from collections.abc import Iterable
 
     import sympy
@@ -42,6 +45,7 @@ if TYPE_CHECKING:
     from .device_ir import DeviceIR
     from .device_ir import GraphInfo
     from .host_function import HostFunction
+    from .tile_dependency import TileAccess
 
 
 log = logging.getLogger(__name__)
@@ -79,6 +83,75 @@ def trace_back_to_load(arg: object, load_op: object) -> torch.fx.Node | None:
         if len(tensor_inputs) != 1:
             return None
         cur = tensor_inputs[0]
+    return None
+
+
+def _rank_reduction_scaled_baddbmm_batch_block_id(
+    node: torch.fx.Node,
+    env: CompileEnvironment,
+) -> int | None:
+    """Detect the narrow Triton bug pattern for the H100 matmul heuristic.
+
+    Triton's SM90 layout solver fails above ``num_stages=1`` when a dot-derived
+    row reduction rescales a loop-carried ``baddbmm`` accumulator. Return its
+    batch axis so the heuristic can recognize the singleton-batch WGMMA form
+    and force one stage; this fact is not a general hardware constraint.
+    """
+    if node.target is not torch.ops.aten.baddbmm.default:
+        return None
+    output = node.meta.get("val")
+    if not isinstance(output, torch.Tensor) or output.ndim != 3:
+        return None
+    scaled_acc = node.args[0]
+    if not isinstance(scaled_acc, torch.fx.Node):
+        return None
+    if scaled_acc.target is not torch.ops.aten.mul.Tensor:
+        return None
+
+    def is_carried(value: object) -> bool:
+        if not isinstance(value, torch.fx.Node):
+            return False
+        tensor = value.meta.get("val")
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or tensor.ndim != output.ndim
+            or not all(map(env.known_equal, tensor.shape, output.shape))
+        ):
+            return False
+        return value.op == "placeholder" or (
+            value.target is _tracing_ops._new_var
+            and bool(value.args)
+            and isinstance(value.args[0], torch.fx.Node)
+            and value.args[0].op == "placeholder"
+        )
+
+    accumulator, scale = scaled_acc.args[:2]
+    if not is_carried(accumulator):
+        accumulator, scale = scale, accumulator
+    if not is_carried(accumulator) or not isinstance(scale, torch.fx.Node):
+        return None
+
+    from .inductor_lowering import ReductionLowering
+
+    dot_targets = matmul_operand_positions()
+    pending = [(scale, False)]
+    seen: set[tuple[torch.fx.Node, bool]] = set()
+    while pending:
+        candidate, reduced = pending.pop()
+        value = candidate.meta.get("val")
+        reduced |= (
+            isinstance(candidate.meta.get("lowering"), ReductionLowering)
+            and isinstance(value, torch.Tensor)
+            and len(value.shape) == 2
+            and all(map(env.known_equal, value.shape, output.shape[:-1]))
+        )
+        state = (candidate, reduced)
+        if state in seen:
+            continue
+        seen.add(state)
+        if reduced and candidate.target in dot_targets:
+            return env.get_block_id(output.shape[0])
+        pending.extend((parent, reduced) for parent in candidate.all_input_nodes)
     return None
 
 
@@ -130,6 +203,121 @@ def _subscript_block_id(env: CompileEnvironment, subscript: object) -> int | Non
     """Return the block axis indexed by a tile-provenance subscript."""
     info = subscript_tile_info(env, subscript)
     return info.block_id if info is not None else None
+
+
+def _subscript_is_scalar_tile_index(subscript: object) -> bool:
+    """Return whether an affine subscript is derived from ``tile.id``."""
+    if isinstance(subscript, int):
+        return True
+    if not isinstance(subscript, torch.fx.Node) or isinstance(
+        subscript.meta.get("val"), torch.Tensor
+    ):
+        return False
+    node = subscript
+    seen: set[torch.fx.Node] = set()
+    while node not in seen:
+        seen.add(node)
+        if node.target is hl.tile_id:
+            return True
+        node_args = [arg for arg in node.args if isinstance(arg, torch.fx.Node)]
+        if len(node_args) != 1:
+            return False
+        node = node_args[0]
+    return False
+
+
+def _subscript_static_offset(
+    env: CompileEnvironment,
+    subscript: object,
+) -> int | None:
+    """Recover a constant offset through affine and shape-only FX nodes."""
+    if isinstance(subscript, int):
+        return subscript
+    if not isinstance(subscript, torch.fx.Node):
+        return None
+    node = subscript
+    scale = 1
+    offset = 0
+    seen: set[torch.fx.Node] = set()
+    while node not in seen:
+        seen.add(node)
+        info = subscript_tile_info(env, node)
+        if info is not None:
+            if isinstance(info.offset, int):
+                return offset + scale * info.offset
+            if env.known_equal(info.offset, 0):
+                return offset
+            return None
+        if node.target is torch.ops.prims.iota.default:
+            start = node.kwargs.get("start", 0)
+            step = node.kwargs.get("step", 1)
+            if isinstance(start, int) and step == 1:
+                return offset + scale * start
+            return None
+        args = node.args
+        if node.target is torch.ops.aten.add.Tensor and len(args) == 2:
+            constant, operand = args[1], args[0]
+            if not isinstance(constant, int):
+                constant, operand = operand, constant
+            if isinstance(constant, int) and isinstance(operand, torch.fx.Node):
+                offset += scale * constant
+                node = operand
+                continue
+            return None
+        if node.target is torch.ops.aten.mul.Tensor and len(args) == 2:
+            factor, operand = args[1], args[0]
+            if not isinstance(factor, int):
+                factor, operand = operand, factor
+            if isinstance(factor, int) and isinstance(operand, torch.fx.Node):
+                scale *= factor
+                node = operand
+                continue
+            return None
+        node_args = [arg for arg in args if isinstance(arg, torch.fx.Node)]
+        if len(node_args) != 1:
+            return None
+        node = node_args[0]
+    return None
+
+
+def _subscript_static_extent(subscript: object) -> int | None:
+    """Return the width of a proved contiguous static index vector."""
+    if isinstance(subscript, int):
+        return 1
+    if not isinstance(subscript, torch.fx.Node):
+        return None
+    node = subscript
+    seen: set[torch.fx.Node] = set()
+    while node not in seen:
+        seen.add(node)
+        if node.target is torch.ops.prims.iota.default:
+            length = node.args[0] if node.args else None
+            start = node.kwargs.get("start", 0)
+            step = node.kwargs.get("step", 1)
+            if (
+                isinstance(length, int)
+                and length >= 0
+                and isinstance(start, int)
+                and step == 1
+            ):
+                return length
+            return None
+        args = node.args
+        if node.target is torch.ops.aten.add.Tensor and len(args) == 2:
+            constant, operand = args[1], args[0]
+            if not isinstance(constant, int):
+                constant, operand = operand, constant
+            if isinstance(constant, int) and isinstance(operand, torch.fx.Node):
+                node = operand
+                continue
+            return None
+        return None
+    return None
+
+
+def _subscript_is_full_slice(subscript: object) -> bool:
+    """Return whether a tensor subscript covers its complete dimension."""
+    return isinstance(subscript, slice) and subscript == slice(None)
 
 
 def _store_axis_key(
@@ -189,25 +377,14 @@ def tile_rank(dims: tuple[int | None, ...]) -> int:
     return sum(dim is not None for dim in dims)
 
 
-def tile_set_rank_profile(
-    tiles: Iterable[tuple[int | None, ...]],
-    max_rank: int,
-) -> tuple[int, ...]:
-    """Block-size-free lexicographic footprint key, highest rank first."""
-    by_rank: dict[int, int] = {}
-    for tile in tiles:
-        rank = tile_rank(tile)
-        if rank:
-            by_rank[rank] = by_rank.get(rank, 0) + 1
-    return tuple(by_rank.get(rank, 0) for rank in range(max_rank, 0, -1))
-
-
 def _live_tile_kind(node: torch.fx.Node, dot_targets: frozenset[object]) -> str:
     from ..language import memory_ops
 
     if node.op == "placeholder":
         return "carry"
     if node.op == "call_function":
+        if node.target is _tracing_ops._host_tensor:
+            return "global"
         if node.target in dot_targets:
             return "dot_out"
         if node.target is memory_ops.load:
@@ -308,6 +485,24 @@ def _index_depends_on_loop(
     return False
 
 
+def _live_node_steps(
+    nodes: tuple[torch.fx.Node, ...],
+    tracked_nodes: Container[torch.fx.Node],
+    last_use: dict[torch.fx.Node, int],
+    *,
+    last_use_default: int = -1,
+) -> Iterable[set[torch.fx.Node]]:
+    """Yield the tracked nodes live after each graph node is introduced."""
+    live: set[torch.fx.Node] = set()
+    for index, node in enumerate(nodes):
+        if node in tracked_nodes:
+            live.add(node)
+        yield live
+        live = {
+            value for value in live if last_use.get(value, last_use_default) > index
+        }
+
+
 @dataclasses.dataclass
 class GraphAnalysis:
     """Shared structural and liveness observations for one DeviceIR graph."""
@@ -318,11 +513,11 @@ class GraphAnalysis:
     block_ids: frozenset[int]
     block_id_order: tuple[int, ...]
     live_tile_steps: tuple[tuple[LiveTile, ...], ...]
-    peak_live_tiles: tuple[LiveTile, ...]
+    peak_dot_output_tiles: tuple[LiveTile, ...]
+    peak_promoted_lhs_tiles: tuple[LiveTile, ...]
     dot_nodes: tuple[torch.fx.Node, ...]
     reduction_occurrences: tuple[int, ...]
     reduction_axis_by_node_id: dict[int, int]
-    reduction_input_itemsizes: tuple[tuple[int, int], ...]
     memory_tiles: tuple[tuple[torch.fx.Node, LiveTile], ...]
     _memory_tiles_by_loop_axes: dict[frozenset[int], tuple[LiveTile, ...]] = (
         dataclasses.field(
@@ -339,6 +534,7 @@ class GraphAnalysis:
         *,
         is_reduction_loop: bool,
         dot_targets: frozenset[object],
+        resolve_placeholder: Callable[[torch.fx.Node], torch.fx.Node],
     ) -> GraphAnalysis:
         from ..language import memory_ops
         from .inductor_lowering import ReductionLowering
@@ -347,19 +543,44 @@ class GraphAnalysis:
         nodes = tuple(graph.nodes)
         last_use: dict[torch.fx.Node, int] = {}
         tile_details: dict[torch.fx.Node, LiveTile] = {}
+        dot_details: dict[torch.fx.Node, LiveTile] = {}
+        promoted_lhs_details: dict[torch.fx.Node, LiveTile] = {}
         dot_nodes: list[torch.fx.Node] = []
         reduction_occurrences: list[int] = []
         seen_reductions: set[int] = set()
         reduction_axis_by_node_id: dict[int, int] = {}
-        reduction_input_itemsizes: list[tuple[int, int]] = []
         memory_tiles: list[tuple[torch.fx.Node, LiveTile]] = []
+        operand_positions = matmul_operand_positions()
+        promoted_lhs_nodes: set[torch.fx.Node] = set()
+        for node in nodes:
+            positions = operand_positions.get(node.target)
+            if (
+                node.op != "call_function"
+                or positions is None
+                or positions[0] >= len(node.args)
+            ):
+                continue
+            lhs = node.args[positions[0]]
+            if (
+                isinstance(lhs, torch.fx.Node)
+                and resolve_placeholder(lhs).target is not memory_ops.load
+            ):
+                promoted_lhs_nodes.add(lhs)
 
         for index, node in enumerate(nodes):
             for input_node in node.all_input_nodes:
                 last_use[input_node] = index
 
-            kind = _live_tile_kind(node, dot_targets)
+            kind_node = resolve_placeholder(node) if node.op == "placeholder" else node
+            kind = _live_tile_kind(kind_node, dot_targets)
+            if node.op == "placeholder" and kind != "global":
+                kind = "carry"
             tile = _tile_from_tensor(node.meta.get("val"), env, kind=kind)
+            if tile is not None and kind == "dot_out":
+                dot_details[node] = tile
+            if tile is not None and node in promoted_lhs_nodes:
+                tile = tile._replace(promoted_lhs=True)
+                promoted_lhs_details[node] = tile
             if tile is not None and any(
                 block_id is not None for block_id in tile.dim_block_ids
             ):
@@ -376,13 +597,6 @@ class GraphAnalysis:
                     if block_id not in seen_reductions:
                         seen_reductions.add(block_id)
                         reduction_occurrences.append(block_id)
-                    for input_node in node.all_input_nodes:
-                        input_value = input_node.meta.get("val")
-                        if isinstance(input_value, torch.Tensor):
-                            reduction_input_itemsizes.append(
-                                (block_id, input_value.element_size())
-                            )
-                            break
 
             if node.op != "call_function":
                 continue
@@ -407,30 +621,42 @@ class GraphAnalysis:
 
         live_tile_steps: list[tuple[LiveTile, ...]] = []
         seen_steps: set[frozenset[int]] = set()
-        max_rank = max(
-            (tile_rank(tile.dim_block_ids) for tile in tile_details.values()),
-            default=0,
-        )
-        best_key: tuple[int, ...] = ()
-        peak_live_tiles: tuple[LiveTile, ...] = ()
-        live: set[torch.fx.Node] = set()
-        for index, node in enumerate(nodes):
-            if node in tile_details:
-                live.add(node)
+        for live in _live_node_steps(nodes, tile_details, last_use):
             if live:
                 step_key = frozenset(id(value) for value in live)
                 step = tuple(tile_details[value] for value in live)
                 if step_key not in seen_steps:
                     seen_steps.add(step_key)
                     live_tile_steps.append(step)
-                key = tile_set_rank_profile(
-                    (tile_details[value].dim_block_ids for value in live),
-                    max_rank,
+
+        def peak_role_tiles(
+            details: dict[torch.fx.Node, LiveTile],
+            *,
+            last_use_default: int = -1,
+        ) -> tuple[LiveTile, ...]:
+            best: tuple[LiveTile, ...] = ()
+            best_key = (-1, -1)
+            for live in _live_node_steps(
+                nodes,
+                details,
+                last_use,
+                last_use_default=last_use_default,
+            ):
+                tiles = tuple(details[value] for value in live)
+                key = (
+                    sum(tile_rank(tile.dim_block_ids) for tile in tiles),
+                    len(tiles),
                 )
                 if key > best_key:
                     best_key = key
-                    peak_live_tiles = step
-            live = {value for value in live if last_use.get(value, -1) > index}
+                    best = tiles
+            return best
+
+        peak_dot_output_tiles = peak_role_tiles(
+            dot_details,
+            last_use_default=len(nodes),
+        )
+        peak_promoted_lhs_tiles = peak_role_tiles(promoted_lhs_details)
 
         return cls(
             graph_id=graph_info.graph_id,
@@ -439,11 +665,11 @@ class GraphAnalysis:
             block_ids=frozenset(getattr(graph_info, "block_ids", ()) or ()),
             block_id_order=tuple(getattr(graph_info, "block_ids", ()) or ()),
             live_tile_steps=tuple(live_tile_steps),
-            peak_live_tiles=peak_live_tiles,
+            peak_dot_output_tiles=peak_dot_output_tiles,
+            peak_promoted_lhs_tiles=peak_promoted_lhs_tiles,
             dot_nodes=tuple(dot_nodes),
             reduction_occurrences=tuple(reduction_occurrences),
             reduction_axis_by_node_id=reduction_axis_by_node_id,
-            reduction_input_itemsizes=tuple(reduction_input_itemsizes),
             memory_tiles=tuple(memory_tiles),
         )
 
@@ -509,9 +735,30 @@ class DeviceIRAnalysis:
         env: CompileEnvironment,
     ) -> DeviceIRAnalysis:
         from .device_ir import ForLoopGraphInfo
+        from .device_ir import HelperFunctionGraphInfo
+        from .device_ir import NodeArgsGraphInfo
         from .device_ir import ReductionLoopGraphInfo
 
         dot_targets = frozenset(matmul_operand_positions())
+        graph_info_by_graph = {
+            graph_info.graph: graph_info for graph_info in device_ir.graphs
+        }
+
+        def resolve_placeholder(node: torch.fx.Node) -> torch.fx.Node:
+            seen: set[torch.fx.Node] = set()
+            while node.op == "placeholder" and node not in seen:
+                seen.add(node)
+                graph_info = graph_info_by_graph.get(node.graph)
+                if not isinstance(graph_info, NodeArgsGraphInfo) or isinstance(
+                    graph_info, HelperFunctionGraphInfo
+                ):
+                    break
+                try:
+                    node = graph_info.placeholder_to_outer_arg(node)
+                except KeyError:
+                    break
+            return node
+
         graphs = tuple(
             GraphAnalysis.build(
                 graph_info,
@@ -521,6 +768,7 @@ class DeviceIRAnalysis:
                     ReductionLoopGraphInfo,
                 ),
                 dot_targets=dot_targets,
+                resolve_placeholder=resolve_placeholder,
             )
             for graph_info in device_ir.graphs
         )
@@ -614,66 +862,52 @@ class DeviceIRAnalysis:
             for block_id in graph.reduction_occurrences
         )
 
-    def reduction_input_itemsize(self, block_id: int) -> int:
-        """Legacy last-occurrence input width for one reduction axis."""
-        itemsize = 0
-        for graph in self.graphs:
-            for axis, width in graph.reduction_input_itemsizes:
-                if axis == block_id:
-                    itemsize = width
-        return itemsize
-
     def kernel_live_tile_steps(self) -> tuple[tuple[LiveTile, ...], ...]:
+        """Every original graph step, kept separate across sequential regions.
+
+        Loop-body placeholders already represent the values carried into that
+        body, including enclosing-loop carries. Flattening the graph-local
+        timelines therefore preserves complete body residency without summing
+        state from sequential graphs or mutually exclusive branches.
+        """
         return tuple(
             step
             for graph in self.non_reduction_graphs
             for step in graph.live_tile_steps
         )
 
-    def group_live_tiles(
-        self,
-        group_graph_ids: list[int],
-    ) -> dict[int, list[tuple[int | None, ...]]]:
-        """Resident peak-live tiles attributed to reduction co-residency groups."""
-        group_axes = {
-            graph_id: set(self.by_id[graph_id].reduction_occurrences)
-            for graph_id in group_graph_ids
-        }
-        peak_of = {
-            graph.graph_id: [tile.dim_block_ids for tile in graph.peak_live_tiles]
+    def _kernel_peak_role_tiles(self, field: str) -> tuple[LiveTile, ...]:
+        """Peak role-specific tile set after adding ancestor loop graphs."""
+        tiles_of = {
+            graph.graph_id: cast("tuple[LiveTile, ...]", getattr(graph, field))
             for graph in self.non_reduction_graphs
         }
-
-        def max_by_profile(
-            lhs: list[tuple[int | None, ...]],
-            rhs: list[tuple[int | None, ...]],
-        ) -> list[tuple[int | None, ...]]:
-            max_rank = max(
-                (tile_rank(tile) for tile in lhs + rhs),
-                default=0,
+        best: tuple[LiveTile, ...] = ()
+        best_key = (-1, -1)
+        for graph_id, own in tiles_of.items():
+            chain = list(own)
+            current = self.parent_of.get(graph_id, -1)
+            seen = {graph_id}
+            while current in tiles_of and current not in seen:
+                seen.add(current)
+                chain.extend(tiles_of[current])
+                current = self.parent_of.get(current, -1)
+            key = (
+                sum(tile_rank(tile.dim_block_ids) for tile in chain),
+                len(chain),
             )
-            lhs_key = tile_set_rank_profile(lhs, max_rank)
-            rhs_key = tile_set_rank_profile(rhs, max_rank)
-            return lhs if lhs_key >= rhs_key else rhs
+            if key > best_key:
+                best_key = key
+                best = tuple(chain)
+        return best
 
-        group_keys = set(group_graph_ids)
-        result: dict[int, list[tuple[int | None, ...]]] = {}
-        for graph_id in group_graph_ids:
-            axes = group_axes[graph_id]
-            tiles = list(peak_of.get(graph_id, ()))
-            seen_bodies = {graph_id}
-            frontier = [graph_id]
-            while frontier:
-                current = frontier.pop()
-                for body_id, block_ids in self.child_loops.get(current, ()):
-                    if body_id in seen_bodies or body_id in group_keys:
-                        continue
-                    if not axes or (block_ids & axes):
-                        seen_bodies.add(body_id)
-                        tiles = max_by_profile(tiles, peak_of.get(body_id, []))
-                        frontier.append(body_id)
-            result[graph_id] = tiles
-        return result
+    def kernel_peak_dot_outputs(self) -> tuple[LiveTile, ...]:
+        """Peak dot-output set after adding accumulator ancestor chains."""
+        return self._kernel_peak_role_tiles("peak_dot_output_tiles")
+
+    def kernel_peak_promoted_lhs(self) -> tuple[LiveTile, ...]:
+        """Peak transformed-LHS set after adding ancestor loop graphs."""
+        return self._kernel_peak_role_tiles("peak_promoted_lhs_tiles")
 
     def accumulator_facts(
         self,
@@ -859,6 +1093,141 @@ class DeviceIRAnalysis:
         return [
             fact._replace(matmul_operand=operands.get(node)) for node, fact in records
         ]
+
+    def tile_accesses(
+        self,
+        device_ir: DeviceIR,
+        env: CompileEnvironment,
+        host: HostFunction,
+    ) -> tuple[TileAccess, ...]:
+        """Record allocation-coordinate accesses used for cross-root scheduling."""
+        from ..language import memory_ops
+        from ..language.atomic_ops import ATOMIC_OPS
+        from .tile_dependency import TileAccess
+        from .tile_dependency import owner_roots_by_graph_id
+
+        if len(device_ir.root_ids) <= 1:
+            return ()
+
+        graph_owners = owner_roots_by_graph_id(device_ir)
+        allocation_ids: dict[int, int] = {}
+        accesses: list[TileAccess] = []
+        memory_op_index = 0
+
+        for graph_analysis in self.graphs:
+            for graph_node_index, node in enumerate(graph_analysis.nodes):
+                if node.op != "call_function":
+                    continue
+                is_load = node.target is memory_ops.load
+                is_store = node.target is memory_ops.store
+                is_atomic = node.target in ATOMIC_OPS
+                if not (is_load or is_store or is_atomic):
+                    continue
+
+                fake = _accessed_tensor_fake(node)
+                origin = host.tensor_to_origin.get(fake) if fake is not None else None
+                allocation_id = -1
+                tensor_shape: tuple[int, ...] = ()
+                tensor_strides: tuple[int, ...] = ()
+                storage_offset = 0
+                subscript_dims: tuple[int, ...] = ()
+                subscript_affine_block_ids: tuple[int | None, ...] = ()
+                subscript_index_scales: tuple[int, ...] = ()
+                subscript_offsets: tuple[int | None, ...] = ()
+                subscript_is_scalar: tuple[bool, ...] = ()
+                subscript_is_full_slice: tuple[bool, ...] = ()
+                subscript_static_extents: tuple[int | None, ...] = ()
+                layout_is_static = False
+
+                if fake is not None:
+                    storage = fake.untyped_storage()
+                    storage_key = int(getattr(storage, "_cdata", id(storage)))
+                    allocation_id = allocation_ids.setdefault(
+                        storage_key, len(allocation_ids)
+                    )
+                    tensor_shape = tuple(env.size_hint(dim) for dim in fake.shape)
+                    tensor_strides = tuple(
+                        env.size_hint(stride) for stride in fake.stride()
+                    )
+                    storage_offset = env.size_hint(fake.storage_offset())
+                    layout_is_static = env.settings.static_shapes or all(
+                        type(value) is int
+                        for value in (
+                            *fake.shape,
+                            *fake.stride(),
+                            fake.storage_offset(),
+                        )
+                    )
+                    index_list = node.args[1] if len(node.args) >= 2 else None
+                    if isinstance(index_list, (list, tuple)):
+                        subscript_dims = tuple(range(min(len(index_list), fake.ndim)))
+                        affine = tuple(
+                            subscript_index_scale(env, index_list[position])
+                            for position in subscript_dims
+                        )
+                        subscript_affine_block_ids = tuple(
+                            block_id for block_id, _scale in affine
+                        )
+                        subscript_index_scales = tuple(
+                            scale for _block_id, scale in affine
+                        )
+                        subscript_offsets = tuple(
+                            _subscript_static_offset(env, index_list[position])
+                            for position in subscript_dims
+                        )
+                        subscript_is_scalar = tuple(
+                            _subscript_is_scalar_tile_index(index_list[position])
+                            for position in subscript_dims
+                        )
+                        subscript_is_full_slice = tuple(
+                            _subscript_is_full_slice(index_list[position])
+                            for position in subscript_dims
+                        )
+                        subscript_static_extents = tuple(
+                            _subscript_static_extent(index_list[position])
+                            for position in subscript_dims
+                        )
+
+                has_explicit_mask = (
+                    not is_atomic
+                    and len(node.args) > (2 if is_load else 3)
+                    and node.args[2 if is_load else 3] is not None
+                )
+                owner_roots = (
+                    graph_owners[graph_analysis.graph_id]
+                    if graph_analysis.graph_id < len(graph_owners)
+                    else ()
+                )
+                for owner_root in owner_roots:
+                    accesses.append(
+                        TileAccess(
+                            access_id=len(accesses),
+                            memory_op_index=memory_op_index if not is_atomic else -1,
+                            graph_id=graph_analysis.graph_id,
+                            root=owner_root,
+                            allocation_id=allocation_id,
+                            kind="load" if is_load else "store",
+                            tensor_name=origin.root_rw_name() if origin else None,
+                            tensor_shape=tensor_shape,
+                            tensor_strides=tensor_strides,
+                            storage_offset=storage_offset,
+                            subscript_dims=subscript_dims,
+                            subscript_affine_block_ids=subscript_affine_block_ids,
+                            subscript_index_scales=subscript_index_scales,
+                            subscript_offsets=subscript_offsets,
+                            subscript_is_scalar=subscript_is_scalar,
+                            has_explicit_mask=has_explicit_mask,
+                            subscript_is_full_slice=subscript_is_full_slice,
+                            subscript_static_extents=subscript_static_extents,
+                            is_atomic=is_atomic,
+                            layout_is_static=layout_is_static,
+                            graph_node_index=graph_node_index,
+                        )
+                    )
+                if not is_atomic:
+                    memory_op_index += 1
+
+        return tuple(accesses)
 
     def pointwise_fact(
         self,
@@ -1504,6 +1873,14 @@ class DeviceIRAnalysis:
                     self.by_id[graph_id].reaches_output(node)
                     and graph_id in self.loop_block_ids
                 )
+                rank_reduction_scaled_accumulator_batch_block_id = (
+                    _rank_reduction_scaled_baddbmm_batch_block_id(
+                        node,
+                        env,
+                    )
+                    if updates_carry
+                    else None
+                )
                 loop_axes = loop_axes_for(graph_id)
                 exact_loop_trips = (
                     inferred_work_trips.get((graph_id, loop_axes[0].block_id))
@@ -1517,6 +1894,7 @@ class DeviceIRAnalysis:
                         loop_axes,
                         exact_loop_trips,
                         max_trips_for(graph_id),
+                        rank_reduction_scaled_accumulator_batch_block_id,
                     )
                 )
         if not attribution_complete:
@@ -1559,6 +1937,8 @@ class DeviceIRAnalysis:
                 for block_id in sorted(knob_users)
             ),
             sequential_loop_trips=sequential_loop_trips,
+            live_dot_outputs=tuple(self.kernel_peak_dot_outputs()),
+            live_promoted_lhs=tuple(self.kernel_peak_promoted_lhs()),
             live_tile_steps=tuple(self.kernel_live_tile_steps()),
             pipelined_regions=tuple(pipelined_regions),
             resident_regions=tuple(resident_regions),

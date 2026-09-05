@@ -98,6 +98,178 @@ class TestClosures(RefEagerTestBase, TestCase):
         code, out = code_and_output(call_func_arg_on_host, args)
         torch.testing.assert_close(out, args[0].sin())
 
+    def test_nested_def_simple(self):
+        @helion.kernel
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+
+            def double(a):
+                return a * 2.0
+
+            for tile in hl.tile(x.size(0)):
+                out[tile] = double(x[tile])
+            return out
+
+        x = torch.randn(128, device=DEVICE)
+        code, result = code_and_output(fn, (x,))
+        torch.testing.assert_close(result, x * 2.0)
+
+    def test_nested_def_closure(self):
+        @helion.kernel
+        def fn(x: torch.Tensor, scale: float) -> torch.Tensor:
+            out = torch.empty_like(x)
+
+            def transform(a):
+                return a * scale
+
+            for tile in hl.tile(x.size(0)):
+                out[tile] = transform(x[tile])
+            return out
+
+        x = torch.randn(128, device=DEVICE)
+        code, result = code_and_output(fn, (x, 3.0))
+        torch.testing.assert_close(result, x * 3.0)
+
+    def test_nested_def_multi_stmt(self):
+        @helion.kernel
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+
+            def clamp_and_scale(a):
+                clamped = torch.clamp(a, min=0.0)
+                return clamped * 2.0
+
+            for tile in hl.tile(x.size(0)):
+                out[tile] = clamp_and_scale(x[tile])
+            return out
+
+        x = torch.randn(128, device=DEVICE)
+        code, result = code_and_output(fn, (x,))
+        torch.testing.assert_close(result, torch.clamp(x, min=0.0) * 2.0)
+
+    def test_nested_def_multi_args(self):
+        @helion.kernel
+        def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+
+            def weighted_add(a, b):
+                return a * 0.7 + b * 0.3
+
+            for tile in hl.tile(x.size(0)):
+                out[tile] = weighted_add(x[tile], y[tile])
+            return out
+
+        x = torch.randn(128, device=DEVICE)
+        y = torch.randn(128, device=DEVICE)
+        code, result = code_and_output(fn, (x, y))
+        torch.testing.assert_close(result, x * 0.7 + y * 0.3)
+
+    def test_nested_def_calls_nested_def(self):
+        @helion.kernel
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+
+            def a(v):
+                return v * 2.0
+
+            def b(v):
+                return a(v) + 1.0
+
+            for tile in hl.tile(x.size(0)):
+                out[tile] = b(x[tile])
+            return out
+
+        x = torch.randn(128, device=DEVICE)
+        _, result = code_and_output(fn, (x,))
+        torch.testing.assert_close(result, x * 2.0 + 1.0)
+
+    def test_nested_def_tuple_return_unpack(self):
+        @helion.kernel
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+
+            def pair(v):
+                return v * 2.0, v * 3.0
+
+            for tile in hl.tile(x.size(0)):
+                a, b = pair(x[tile])
+                out[tile] = a + b
+            return out
+
+        x = torch.randn(128, device=DEVICE)
+        _, result = code_and_output(fn, (x,))
+        torch.testing.assert_close(result, x * 5.0)
+
+    def test_nested_def_alias(self):
+        @helion.kernel
+        def fn(x: torch.tensor) -> torch.tensor:
+            out = torch.empty_like(x)
+
+            def double(v):
+                return v * 2.0
+
+            g = double
+            for tile in hl.tile(x.size(0)):
+                out[tile] = g(x[tile])
+            return out
+
+        x = torch.randn(128, device=DEVICE)
+        _, result = code_and_output(fn, (x,))
+        torch.testing.assert_close(result, x * 2.0)
+
+    def test_nested_def_in_control_flow(self):
+        # A nested function defined inside a branch is still callable afterwards.
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            if x.size(0) > 0:
+
+                def double(a):
+                    return a * 2.0
+
+            for tile in hl.tile(x.size(0)):
+                out[tile] = double(x[tile])
+            return out
+
+        x = torch.randn(128, device=DEVICE)
+        _, result = code_and_output(fn, (x,))
+        torch.testing.assert_close(result, x * 2.0)
+
+    def test_nested_def_dead_code_after_return(self):
+        @helion.kernel
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+
+            def f(a):  # noqa: RET503
+                b = a * 2.0
+                return b  # noqa: RET504
+                # dead code
+                c = a * 3.0  # noqa: F841
+
+            for tile in hl.tile(x.size(0)):
+                out[tile] = f(x[tile])
+            return out
+
+        x = torch.randn(128, device=DEVICE)
+        _, result = code_and_output(fn, (x,))
+        torch.testing.assert_close(result, x * 2.0)
+
+    def test_nested_def_called_on_host(self):
+        @helion.kernel
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            def allocate():
+                return torch.empty_like(x)
+
+            out = allocate()
+
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * 2.0
+            return out
+
+        x = torch.randn(128, device=DEVICE)
+        _, result = code_and_output(fn, (x,))
+        torch.testing.assert_close(result, x * 2.0)
+
 
 if __name__ == "__main__":
     unittest.main()

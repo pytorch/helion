@@ -209,11 +209,9 @@ _HEURISTIC_PURPOSES: Mapping[str, str] = {
         "skinny GEMM (one operand dim >> the other): tile the long dims and "
         "use a deep K tile"
     ),
-    "triton_reduction_tile": (
-        "canonical row reduction (softmax/rms_norm/cross_entropy): one row per "
-        "program with a single persistent pass over the reduction axis "
-        "(reduction_loops null, not a rolled loop), warps scaled to the "
-        "reduction width"
+    "triton_reduction": (
+        "reduction kernel: size all live tiles together, choose reduction "
+        "persistence or chunking, and scale warps to selected parallel work"
     ),
 }
 
@@ -288,7 +286,7 @@ def build_initial_prompt(
     compile_timeout_s: int | None,
 ) -> str:
     """Build the full initial user prompt sent to the LLM."""
-    default_config = config_spec.default_config()
+    default_config = config_spec.autotune_reference_config()
     workload_hints = compute_workload_hints(
         args,
         workload_traits=detect_workload_traits(kernel, config_spec=config_spec),

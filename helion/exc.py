@@ -103,6 +103,17 @@ class LoopDependencyError(BaseError):
     )
 
 
+class CrossRootDeviceValue(BaseError):
+    message = (
+        "Device value '{0}' cannot be carried between top-level loops. "
+        "Materialize it in a tensor so the dependency can be scheduled."
+    )
+
+
+class CrossLoopSchedulingError(BaseError):
+    message = "Cross-loop scheduling cannot safely lower dependency {0}."
+
+
 class TopLevelStatementBetweenLoops(BaseError):
     message = "Statements cannot appear between top level loops."
 

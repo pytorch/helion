@@ -90,7 +90,8 @@ class PatternSearch(PopulationBasedSearch):
 
     def _algorithm_cache_policy(self) -> dict[str, object]:
         return {
-            "pattern_version": 1,
+            # 2: ListOf.pattern_neighbors also proposes uniform lists.
+            "pattern_version": 2,
             "initial_population": self.initial_population,
             "copies": self.copies,
             "max_generations": self.max_generations,
@@ -221,11 +222,29 @@ class PatternSearch(PopulationBasedSearch):
                 n_random = max(0, self.initial_population - len(pop))
                 pop.extend(self.config_gen.random_flat() for _ in range(n_random))
             return pop
-        return self.config_gen.random_population_flat(
+        population = self.config_gen.random_population_flat(
             self.initial_population,
             user_seed_configs=self._autotune_seed_configs(),
             log_func=self.log,
         )
+        # Pin the seed/default configs into final verification (mirroring the
+        # FROM_BEST_AVAILABLE path): a seed's single in-search reading is often
+        # burst-inflated, and without the pin a 2-6% real winner dies to a
+        # noisy rival before the steady final rebenchmark can arbitrate.
+        pinned_seed_configs = [
+            config
+            for _flat, config in (
+                *self.config_gen.user_seed_flat_config_pairs(
+                    self._autotune_seed_configs()
+                ),
+                *self.config_gen.seed_flat_config_pairs(),
+            )
+        ]
+        pinned_seed_configs.append(
+            self.config_gen.unflatten(self.config_gen.default_flat())
+        )
+        self.pin_finalist_configs(pinned_seed_configs)
+        return population
 
     def _autotune(self) -> Config:
         initial_population_name = self.initial_population_strategy.name

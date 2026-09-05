@@ -93,7 +93,8 @@ def dot(
 
     This operation performs matrix multiplication with inputs of various dtypes including
     float16, bfloat16, float32, int8, and FP8 formats (e4m3fn, e5m2). The computation is
-    performed with appropriate precision based on the input dtypes.
+    performed with appropriate precision based on the input dtypes. On Pallas,
+    a packed E2M1 RHS may use ``torch.float4_e2m1fn_x2``.
 
     Args:
         mat1: First matrix (2D or 3D tensor of torch.float16, torch.bfloat16, torch.float32, torch.int8, torch.float8_e4m3fn, or torch.float8_e5m2)
@@ -146,6 +147,8 @@ def _(
         torch.float8_e4m3fn,
         torch.float8_e5m2,
     )
+    if CompileEnvironment.current().backend_name == "pallas":
+        supported_dtypes += (torch.float4_e2m1fn_x2,)
 
     # Validate input types
     if mat1.dtype not in supported_dtypes:
@@ -457,13 +460,20 @@ def _plan_cute_tcgen05_search_candidate(
     m_hint = static_m if static_m is not None else env.size_hint(m)
     n_hint = static_n if static_n is not None else env.size_hint(n)
     k_hint = static_k if static_k is not None else env.size_hint(k)
+    from .._compiler.cute.mma_support import cute_fp32_dot_uses_tf32
+
     is_fp8 = lhs.dtype == torch.float8_e4m3fn
-    mma_k = 32 if is_fp8 else 16
-    min_tcgen05_n = 16 if is_fp8 else 8
+    is_tf32 = lhs.dtype == torch.float32 and cute_fp32_dot_uses_tf32()
+    mma_k = 32 if is_fp8 else (8 if is_tf32 else 16)
+    # tf32's bn >= 32 floor mirrors _mma_impl_matches_problem_shape.
+    min_tcgen05_n = 16 if is_fp8 else (32 if is_tf32 else 8)
     is_small_n = static_n is not None and static_n < min_tcgen05_n
     if (
         env.backend_name != "cute"
-        or lhs.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+        or (
+            lhs.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+            and not is_tf32
+        )
         or rhs.dtype != lhs.dtype
         or m_hint < 64
         # Size-one tile axes are fixed to block size one before this analysis,
@@ -486,7 +496,9 @@ def _plan_cute_tcgen05_search_candidate(
     from .._compiler.cute.mma_support import get_cute_mma_support
 
     support = get_cute_mma_support()
-    if not (support.tcgen05_f8 if is_fp8 else support.tcgen05_f16bf16):
+    from .._compiler.cute.mma_support import tcgen05_supports_input_dtype
+
+    if not tcgen05_supports_input_dtype(support, lhs.dtype):
         return reject()
 
     def pow2_floor_at_least(value: int, minimum: int) -> int:
@@ -505,6 +517,21 @@ def _plan_cute_tcgen05_search_candidate(
         if static_m is None
         else min(max_tcgen05_m, pow2_floor_at_least(static_m, 64))
     )
+    # block_m=512 (tcgen05 M-paired tiles): two 256-row CtaGroup.TWO UMMA
+    # subtiles share each K stage's B buffer, halving B's SMEM/L2/DRAM
+    # traffic (fp16 16384^3: 0.92 -> 1.01 vs cuBLAS). Only searchable on the
+    # 16-bit full-tile plain family the codegen validates; the tcgen05
+    # config projections demote ineligible 512 samples back to 256.
+    if (
+        max_tcgen05_m == 256
+        and not is_fp8
+        and not is_tf32
+        and static_m is not None
+        and static_m % 512 == 0
+        and static_n is not None
+        and max_tcgen05_n >= 128
+    ):
+        max_search_m = 512
     max_search_n = max_tcgen05_n
     max_search_k = (
         128 if static_k is None else min(128, pow2_floor_at_least(static_k, mma_k))
