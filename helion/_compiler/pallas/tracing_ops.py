@@ -4221,18 +4221,50 @@ def _codegen_dynamic_unroll(state: CodegenState) -> object:
 class _AdvanceLoopIndex(ast.NodeTransformer):
     """Rewrite reads of one loop index to refer to its next iteration."""
 
-    def __init__(self, loop_var: str) -> None:
+    def __init__(self, loop_var: str, *, upper_bound: str | None = None) -> None:
         self.loop_var = loop_var
+        self.upper_bound = upper_bound
 
     def visit_Name(self, node: ast.Name) -> ast.AST:
         if node.id != self.loop_var or not isinstance(node.ctx, ast.Load):
             return node
+        advanced = ast.BinOp(
+            left=ast.Name(id=self.loop_var, ctx=ast.Load()),
+            op=ast.Add(),
+            right=ast.Constant(value=1),
+        )
+        if self.upper_bound is not None:
+            advanced = ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id="jnp", ctx=ast.Load()),
+                    attr="minimum",
+                    ctx=ast.Load(),
+                ),
+                args=[
+                    advanced,
+                    ast.BinOp(
+                        left=cast("ast.expr", expr_from_string(self.upper_bound)),
+                        op=ast.Sub(),
+                        right=ast.Constant(value=1),
+                    ),
+                ],
+                keywords=[],
+            )
+        return ast.copy_location(advanced, node)
+
+
+class _RenameNames(ast.NodeTransformer):
+    """Rename generated local variables while preserving their AST context."""
+
+    def __init__(self, replacements: dict[str, str]) -> None:
+        self.replacements = replacements
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        replacement = self.replacements.get(node.id)
+        if replacement is None:
+            return node
         return ast.copy_location(
-            ast.BinOp(
-                left=ast.Name(id=self.loop_var, ctx=ast.Load()),
-                op=ast.Add(),
-                right=ast.Constant(value=1),
-            ),
+            ast.Name(id=replacement, ctx=node.ctx),
             node,
         )
 
@@ -4383,12 +4415,44 @@ def _hoist_nested_fori_prefetch(
         "_prime_first_outer_loads",
         prime_starts,
     )
-    outer_body[insertion_index:insertion_index] = [setup, first_prime]
-
     advance = _AdvanceLoopIndex(enclosing_loop.loop_var_name)
+    shared_dependencies: list[ast.stmt] = []
+    shared_names: dict[str, str] = {}
+    if len(starts_by_last_use) > 1:
+        dependency_writes: set[str] = set()
+        for statement in dependencies:
+            dependency_writes.update(ReadWrites.from_ast(statement).writes)
+        shared_names = {
+            name: state.device_function.new_var(f"_next_outer_{name}")
+            for name in sorted(dependency_writes)
+        }
+        shared_dependencies = _clone_statements(dependencies)
+        safe_advance = _AdvanceLoopIndex(
+            enclosing_loop.loop_var_name,
+            upper_bound=enclosing_loop.iteration_count,
+        )
+        shared_dependencies = [
+            safe_advance.visit(statement) for statement in shared_dependencies
+        ]
+        rename = _RenameNames(shared_names)
+        shared_dependencies = [
+            rename.visit(statement) for statement in shared_dependencies
+        ]
+
+    outer_body[insertion_index:insertion_index] = [
+        setup,
+        first_prime,
+        *shared_dependencies,
+    ]
+
     for last_use, starts in sorted(starts_by_last_use.items(), reverse=True):
-        next_starts = _clone_statements([*dependencies, *starts])
+        next_starts = _clone_statements(
+            starts if shared_dependencies else [*dependencies, *starts]
+        )
         next_starts = [advance.visit(statement) for statement in next_starts]
+        if shared_names:
+            rename = _RenameNames(shared_names)
+            next_starts = [rename.visit(statement) for statement in next_starts]
         inner_body.insert(
             last_use + 1,
             guarded(condition, "_prefetch_next_outer_loads", next_starts),
