@@ -1224,6 +1224,85 @@ def test_dense_resident_value_graph_runs_on_the_one_cta_pipeline() -> None:
         assert "resident_softmax_value_graph" not in source, family
 
 
+def test_kv_tile_width_is_legalized_against_tmem_and_the_sequence() -> None:
+    """A wider KV tile is accepted only where it can actually be emitted.
+
+    FA4's tuned sm_103 plans all use a 160-wide KV tile and gain ~9.6% from it,
+    so the width has to be a real dimension rather than a constant. It is legal
+    only when it is a tcgen05 N, leaves the score and output accumulators inside
+    512 TMEM columns, and divides the sequence -- the masked tail tile is not
+    implemented, so an indivisible width would silently drop KV blocks.
+    """
+    fits = cute_flash._flash_kv_tile_n_fits_tmem
+    assert fits(160, 64, 2)  # 2*160 + 2*64 = 448
+    assert fits(192, 64, 2)  # 2*192 + 2*64 = 512
+    assert not fits(224, 64, 2)  # 2*224 + 2*64 = 576
+
+    supported = cute_flash._flash_kv_tile_n_supported
+    common = {"head_dim": 64, "topology": "fa4", "is_causal": False, "s_stage": 2}
+    # num_kv counts default-width tiles, so the sequence is num_kv * 128.
+    assert supported(160, num_kv=1280, **common)  # 163840 % 160 == 0
+    # An indivisible width is fine: the trailing partial tile is masked, which
+    # needs the descending order that visits it first.
+    assert supported(160, num_kv=256, **common)  # 32768 % 160 != 0
+    assert not supported(160, num_kv=256, **{**common, "desc_kv": False})
+    assert not supported(224, num_kv=1280, **common)  # will not fit TMEM
+    assert not supported(160, num_kv=1280, **{**common, "is_causal": True})
+    assert not supported(160, num_kv=1280, **{**common, "topology": "ws_overlap"})
+    # The default width is always available.
+    assert supported(128, num_kv=256, **common)
+    assert supported(128, num_kv=1280, **{**common, "is_causal": True})
+
+
+def test_kv_tile_width_reaches_the_emitted_tile_shapes() -> None:
+    """The emitted MMA/TMEM shapes follow the configured KV tile width."""
+    default_source = _emit_dense_resident_value_graph_source(num_kv=1280)
+    wide_source = _emit_dense_resident_value_graph_source(
+        num_kv=1280,
+        config_overrides={cute_flash.FLASH_KV_TILE_N_KEY: 160},
+    )
+
+    assert "partition_shape_C((128, 128))" in default_source
+    assert "partition_shape_C((128, 160))" in wide_source
+    assert "cute.make_identity_tensor((128, 128))" in default_source
+    assert "cute.make_identity_tensor((128, 160))" in wide_source
+    # S1 sits one score tile past S0, and the two O accumulators follow both:
+    # 128 -> 256, 320 becomes 160 -> 320, 384.
+    for offset in ("+ 128", "+ 256", "+ 320"):
+        assert f"flash_tmem_ptr {offset}" in default_source, offset
+    for offset in ("+ 160", "+ 320", "+ 384"):
+        assert f"flash_tmem_ptr {offset}" in wide_source, offset
+    assert "flash_tmem_ptr + 128" not in wide_source
+
+
+def test_indivisible_kv_tile_masks_the_trailing_partial_tile() -> None:
+    """A width that does not divide the sequence peels a masked tail tile.
+
+    TMA zero-fills past the tensor extent, and a zero score is not a no-op:
+    exp2(0 - max) would contribute to the row sum. The partial tile's
+    out-of-range columns must be forced to -inf, and because the hardware TMEM
+    row reduction folds the max into the load, that tile's row max has to be
+    recomputed in software from the masked fragment.
+    """
+    divisible = _emit_dense_resident_value_graph_source(
+        num_kv=1280,
+        config_overrides={cute_flash.FLASH_KV_TILE_N_KEY: 160},
+    )
+    # 32768 = 204 * 160 + 128, so the last tile carries 128 valid columns.
+    ragged = _emit_dense_resident_value_graph_source(
+        num_kv=256,
+        config_overrides={cute_flash.FLASH_KV_TILE_N_KEY: 160},
+    )
+
+    assert "mask_r2p_sm100_rank1" not in divisible
+    assert "flash_kv_tail_iter" not in divisible
+    assert "mask_r2p_sm100_rank1(tLDrS, cutlass.Int32(128))" in ragged
+    assert "flash_kv_tail_iter" in ragged
+    # The masked tile reduces in software; the rest keep the hardware reduction.
+    assert ragged.count("fmax_reduce_packed") >= 1
+    assert "flash_hw_row_max" in ragged
+
+
 def test_dense_resident_softmax_lowering_dispatch_is_exhaustive() -> None:
     policy = get_flash_target_policy((10, 3)).tuning
     shape_policy = policy.dense_policy(256)
