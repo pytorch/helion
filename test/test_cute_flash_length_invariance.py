@@ -1925,7 +1925,9 @@ def test_ws_search_has_bounded_effective_active_value_coverage(
     assert _active_choices(
         enum_fragments[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
     ) == frozenset(("ws_overlap",))
-    assert len(active_values) <= 52
+    # 53: the ws surface pins every dimension it cannot vary to one value,
+    # including the KV tile width.
+    assert len(active_values) <= 53
     for key, value in active_values:
         requested = {**base, key: value}
         resolved = cute_flash.resolve_flash_config(

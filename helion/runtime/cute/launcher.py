@@ -488,7 +488,11 @@ def _append_cute_wrapper_plan(
         use_cga2_local_cta = bool(plan.get("use_cga2_local_cta"))
         use_clc_scheduler = bool(plan.get("use_clc_scheduler"))
         cluster_m = 2 if use_2cta_instrs or use_cga2_local_cta else 1
-        num_kv = (seq + 127) // 128
+        # KV tile width. 128 is the historical fixed value; a wider tile
+        # amortizes the per-tile softmax correction over more columns, which is
+        # where FA4's tuned plans get their edge on sm_103.
+        kv_n = plan_int("kv_tile_n", default=128)
+        num_kv = (seq + kv_n - 1) // kv_n
         # Static-persistent scheduler: total_tiles = num_bh * num_m_tiles (the
         # flat tile-id space the device-body strided while loop walks). When
         # persistent, the host clamps grid_x down to min(total_tiles, num_SMs)
@@ -511,8 +515,8 @@ def _append_cute_wrapper_plan(
         # (S, D, H, Z), matching FA4's tensor-map rank for contiguous q[z,h,s,d].
         bw = "cutlass.utils.blackwell_helpers"
         mma_m = 256 if use_2cta_instrs else 128
-        qkd = f"({mma_m}, 128, {hd})"
-        pvd = f"({mma_m}, {hd}, 128)"
+        qkd = f"({mma_m}, {kv_n}, {hd})"
+        pvd = f"({mma_m}, {hd}, {kv_n})"
         if use_tensor_4d_tma:
             bh_stride = seq * hd
             batch_stride = tensor_4d_heads * bh_stride
@@ -549,7 +553,7 @@ def _append_cute_wrapper_plan(
             # V is MN-major: (D, S, B).
             f"_flash_mV = cute.make_tensor(arg{v_idx}.iterator, {dsb})",
             f"_flash_mO = cute.make_tensor(arg{o_idx}.iterator, {sdb})",
-            f"_flash_qk_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg}, ({mma_m}, 128))",
+            f"_flash_qk_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg}, ({mma_m}, {kv_n}))",
             f"_flash_pv_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, cute.nvgpu.OperandMajorMode.MN, cutlass.Float32, {cg}, ({mma_m}, {hd}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
             f"_flash_cluster_layout_vmnk = cute.tiled_divide(cute.make_layout(({2 if use_2cta_instrs else 1}, 1, 1)), (_flash_qk_mma.thr_id.shape,))",
             f"_flash_qsl = {bw}.make_smem_layout_a(_flash_qk_mma, {qkd}, {dtype}, {q_stage})",

@@ -73,6 +73,9 @@ class FlashScheduleSpec:
     final_only_stat_handoff: bool = False
     stat_release_mapping: FlashStatReleaseMapping = FlashStatReleaseMapping.CROSS_SLOT
     query_slots_have_equal_kv_iterations: bool = False
+    # KV tile width. Only the K/V staging rings scale with it; the query and
+    # output tiles stay 128 rows wide.
+    kv_tile_n: int = 128
 
 
 @dataclasses.dataclass(frozen=True)
@@ -174,9 +177,10 @@ def _kv_node_name(kind: str, cta_rank: int, multicast: bool) -> str:
 
 def _shared_memory_bytes(spec: FlashScheduleSpec) -> int:
     tile_bytes = 128 * spec.head_dim * spec.dtype_bytes
+    kv_tile_bytes = spec.kv_tile_n * spec.head_dim * spec.dtype_bytes
     q_bytes = spec.query_slots_per_cta * tile_bytes
     kv_rings = 2 if spec.separate_kv else 1
-    kv_bytes = kv_rings * spec.kv_depth * tile_bytes
+    kv_bytes = kv_rings * spec.kv_depth * kv_tile_bytes
     output_bytes = spec.query_slots_per_cta * tile_bytes if spec.stage_output else 0
     # Scale/stat transport plus aligned barrier storage in the current FA4 layout.
     return q_bytes + kv_bytes + output_bytes + 3072

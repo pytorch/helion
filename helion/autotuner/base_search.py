@@ -2106,15 +2106,18 @@ class PopulationBasedSearch(BaseSearch):
         )
         if warmup_ms <= 0:
             return
-        fn = next(
-            (member.fn for member in finalists if math.isfinite(member.perf)), None
+        member = next(
+            (member for member in finalists if math.isfinite(member.perf)), None
         )
-        if fn is None:
+        if member is None:
             return
+        # A member's ``fn`` is the compiled kernel, which still takes the
+        # kernel arguments; the benchmark paths bind them the same way.
+        run = functools.partial(member.fn, *self.args)
         deadline = time.perf_counter() + warmup_ms / 1000.0
         try:
             while time.perf_counter() < deadline:
-                fn()
+                run()
             synchronize_device()
         except Exception as warmup_error:
             self.log.warning(f"Final-verification warmup skipped: {warmup_error}")
