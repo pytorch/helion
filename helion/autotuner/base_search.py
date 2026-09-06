@@ -50,6 +50,7 @@ from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
 from .benchmarking import interleaved_bench
 from .benchmarking import mirrored_bench_generic
+from .benchmarking import synchronize_device
 from .logger import AutotuningLogger
 from .metrics import AutotuneMetrics
 from .metrics import KernelMetadata
@@ -99,6 +100,13 @@ _FINAL_REBENCHMARK_TOP_K_CUTE = 32
 _FINAL_REBENCHMARK_TARGET_MS_ENV = "HELION_AUTOTUNE_FINAL_REBENCHMARK_TARGET_MS"
 _FINAL_REBENCHMARK_TARGET_MS_DEFAULT = 5000.0
 _FINAL_REBENCHMARK_TARGET_MS_MAX = 60000.0
+# Steady-state warmup before the final finalist comparison. Long enough for a
+# power-capped part to leave its boost-clock transient, short enough to be
+# negligible against a search.
+_FINAL_REBENCHMARK_WARMUP_MS_ENV = "HELION_AUTOTUNE_FINAL_REBENCHMARK_WARMUP_MS"
+_FINAL_REBENCHMARK_WARMUP_MS_DEFAULT = 10000.0
+# Cap the warmup at this fraction of the search's own wall time.
+_FINAL_REBENCHMARK_WARMUP_FRACTION = 0.02
 _FINAL_REBENCHMARK_ISOLATED_ENV = "HELION_AUTOTUNE_FINAL_REBENCHMARK_ISOLATED"
 _FINAL_REBENCHMARK_PINNED_TOLERANCE_ENV = (
     "HELION_AUTOTUNE_FINAL_REBENCHMARK_PINNED_TOLERANCE"
@@ -2021,6 +2029,7 @@ class PopulationBasedSearch(BaseSearch):
         # opts into isolated finalist timing, keep suspicious confirmation
         # enabled for the in-process fallback.
         use_isolated = self._final_rebenchmark_use_isolated()
+        self._warm_up_for_final_rebenchmark(finalists)
         self.rebenchmark(
             finalists,
             desc=f"Final verification top {len(finalists)} configs",
@@ -2046,6 +2055,69 @@ class PopulationBasedSearch(BaseSearch):
                 f"{self.format_performance(after.perf)}"
             )
         return after
+
+    def _final_rebenchmark_warmup_ms(self) -> float:
+        raw = os.getenv(_FINAL_REBENCHMARK_WARMUP_MS_ENV)
+        if raw is None:
+            return _FINAL_REBENCHMARK_WARMUP_MS_DEFAULT
+        try:
+            warmup_ms = float(raw)
+        except ValueError:
+            self.log.warning(
+                f"Ignoring non-numeric {_FINAL_REBENCHMARK_WARMUP_MS_ENV}={raw!r}; "
+                f"using {_FINAL_REBENCHMARK_WARMUP_MS_DEFAULT}."
+            )
+            return _FINAL_REBENCHMARK_WARMUP_MS_DEFAULT
+        if not math.isfinite(warmup_ms) or warmup_ms < 0:
+            return _FINAL_REBENCHMARK_WARMUP_MS_DEFAULT
+        return warmup_ms
+
+    def _warm_up_for_final_rebenchmark(
+        self, finalists: Sequence[PopulationMember]
+    ) -> None:
+        """Drive the GPU to its steady clock state before ranking finalists.
+
+        Every earlier timing window in a search is short and starts from a
+        comparatively cool device, so finalists get ranked in the boost-clock
+        regime rather than the one the kernel will actually run in. On a
+        power-capped part that inverts the ranking: a config that draws more
+        power per clock looks best while the clocks are still high and then
+        loses once they settle.
+
+        Measured on a 1400 W GB300, dense 2x32x32768x64 fp16 attention, two
+        finalists that the search rated 13.21 ms and 13.41 ms:
+
+            cool device      2-CTA 13.22 ms   1-CTA 13.45 ms
+            after warmup     2-CTA 13.77 ms   1-CTA 13.49 ms
+
+        The search picked the 2-CTA config; the 1-CTA config is 2.1% faster in
+        the steady state. Spend one warmup here so the last, decisive
+        comparison happens in that state. This costs a fixed few seconds per
+        search, not per candidate.
+        """
+        warmup_ms = self._final_rebenchmark_warmup_ms()
+        # Keep the warmup proportional to the search it is protecting. A long
+        # search pays the full budget for a correct final ranking; a seconds-long
+        # search (CI, tiny kernels) is not power-limited anyway and pays almost
+        # nothing.
+        elapsed_s = time.perf_counter() - self._autotune_budget_start
+        warmup_ms = min(
+            warmup_ms, elapsed_s * 1000.0 * _FINAL_REBENCHMARK_WARMUP_FRACTION
+        )
+        if warmup_ms <= 0:
+            return
+        fn = next(
+            (member.fn for member in finalists if math.isfinite(member.perf)), None
+        )
+        if fn is None:
+            return
+        deadline = time.perf_counter() + warmup_ms / 1000.0
+        try:
+            while time.perf_counter() < deadline:
+                fn()
+            synchronize_device()
+        except Exception as warmup_error:
+            self.log.warning(f"Final-verification warmup skipped: {warmup_error}")
 
     def compare(self, a: PopulationMember, b: PopulationMember) -> int:
         """
