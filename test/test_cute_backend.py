@@ -3048,14 +3048,14 @@ class TestCuteBackend(TestCase):
                 fallback_code = resident_bound.to_triton_code(resident_config)
             self.assertNotIn("resident_softmax_value_graph", fallback_code)
 
-        nonpolicy_config = helion.Config(
+        off_seed_config = helion.Config(
             **{**resident_config.config, "cute_flash_e2e_offset": 4}
         )
         with patch.object(
             resident_bound.env.config_spec, "target_device_capability", (10, 3)
         ):
-            nonpolicy_code = resident_bound.to_triton_code(nonpolicy_config)
-        self.assertNotIn("resident_softmax_value_graph", nonpolicy_code)
+            off_seed_code = resident_bound.to_triton_code(off_seed_config)
+        self.assertIn("resident_softmax_value_graph", off_seed_code)
 
         q, k, v = (
             torch.empty(1, 1, 262144, 64, dtype=torch.float16, device=DEVICE)

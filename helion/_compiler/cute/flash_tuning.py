@@ -52,7 +52,8 @@ _FLASH_POLICY_FP16_HD64_PIPELINE_FAMILIES = frozenset(
 _FLASH_POLICY_ROLE_MAPS = frozenset({"helion", "fa4"})
 _FLASH_POLICY_BASE_EXP2_PACKETS = frozenset({"1x1", "4x1", "4x2", "8x1", "8x2"})
 _FLASH_POLICY_DEGREE1_EXP2_PACKETS = frozenset({"deg1_16x8", "deg1_8x2_corr10"})
-_FLASH_FLOAT16_MAX_LOG2 = math.log2(65504.0)
+FLASH_FLOAT16_MAX_LOG2 = math.log2(65504.0)
+_FLASH_FLOAT16_MAX_LOG2 = FLASH_FLOAT16_MAX_LOG2
 
 
 def _validate_policy_choice(name: str, value: str, choices: frozenset[str]) -> None:
