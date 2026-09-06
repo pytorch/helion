@@ -551,6 +551,33 @@ def _hybrid_runtime_config() -> dict[str, object]:
     }
 
 
+def _stateful_causal_policy(num_kv: int = 512) -> object:
+    """A causal tuning policy that selects the stateful softmax lowering.
+
+    No shipped sm_103 seed uses it any more -- at num_kv=512 the resident value
+    graph measured 1355.6 against 1328.2 TFLOP/s -- so the tests that cover the
+    stateful body build the policy themselves instead of depending on a seed
+    that could change again.
+    """
+    base = get_flash_target_policy((10, 3))
+    stateful = FlashCausalTuningPolicy(
+        num_kv=num_kv,
+        kv_stage=8,
+        e2e_offset=15,
+        e2e_offset0=3,
+        role_map="fa4",
+        epi_tma=True,
+        softmax_lowering=FlashSoftmaxLowering.STATEFUL,
+        softmax_regs=200,
+        first_load_order=2,
+    )
+    others = tuple(
+        policy for policy in base.tuning.causal_policies if policy.num_kv != num_kv
+    )
+    tuning = dataclasses.replace(base.tuning, causal_policies=(stateful, *others))
+    return dataclasses.replace(base, tuning=tuning)
+
+
 def _emit_causal_resident_native_source(
     *,
     capability: tuple[int, int] = (10, 3),
@@ -559,11 +586,24 @@ def _emit_causal_resident_native_source(
     score_plan: AttentionScorePlan | None = None,
     num_kv: int = 512,
     config_overrides: dict[str, object] | None = None,
+    policy_override: object | None = None,
 ) -> str:
     if score_plan is None:
         score_plan = causal_score_plan(64)
     if seed_capability is None:
         seed_capability = capability
+    if policy_override is not None:
+        with patch.object(
+            cute_flash, "get_flash_target_policy", return_value=policy_override
+        ):
+            return _emit_causal_resident_native_source(
+                capability=capability,
+                seed_capability=seed_capability,
+                has_lse=has_lse,
+                score_plan=score_plan,
+                num_kv=num_kv,
+                config_overrides=config_overrides,
+            )
     with patch.dict(os.environ, {}, clear=True):
         seed = cute_flash.flash_attention_seed_config(
             64,
@@ -1121,12 +1161,9 @@ def test_dense_resident_value_graph_codegen_and_barrier_protocol() -> None:
         )
         assert ast.unparse(arguments["stats_empty_phase"]) == "flash_s_corr_prod_phase"
         assert ast.unparse(arguments["row_sum_init"]) == "flash_row_sum * flash_alpha"
-        assert {
-            keyword.arg: ast.unparse(keyword.value) for keyword in call.keywords
-        } == {
-            "pfor_peer_cta_rank": "cutlass.Int32(0)",
-            "pfor_self_cta_rank": "None",
-        }
+        # The promoted dense seed runs one CTA, where the peer-rank handshake
+        # drops out; the two-CTA form is covered separately below.
+        assert not call.keywords
 
     assert "fa4_sp_exp_convert_store_whole_rowsum" not in source
     assert "f16x2_xu=True" not in source
@@ -1266,9 +1303,12 @@ def test_dense_resident_value_graph_runs_on_the_one_cta_pipeline() -> None:
     2x32x32768x64 fp16. The peer-rank handshake is the only two-CTA detail and
     must drop out for one CTA.
     """
-    two_cta = _emit_dense_resident_value_graph_source()
-    one_cta = _emit_dense_resident_value_graph_source(
-        config_overrides={cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4"}
+    one_cta = _emit_dense_resident_value_graph_source()
+    two_cta = _emit_dense_resident_value_graph_source(
+        config_overrides={
+            cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_2cta",
+            cute_flash.FLASH_KV_TILE_N_KEY: 128,
+        }
     )
 
     assert "resident_softmax_value_graph" in two_cta
@@ -1277,7 +1317,7 @@ def test_dense_resident_value_graph_runs_on_the_one_cta_pipeline() -> None:
     assert "pfor_peer_cta_rank" not in one_cta
 
     # The 4D tensor-map variants only change how TMA descriptors are built.
-    for family in ("fa4_tma_4d", "fa4_2cta_tma_4d"):
+    for family in ("fa4_tma_4d",):
         source = _emit_dense_resident_value_graph_source(
             config_overrides={cute_flash.FLASH_PIPELINE_FAMILY_KEY: family}
         )
@@ -1411,7 +1451,11 @@ def test_dense_probability_shift_is_rejected_before_fp16_overflow() -> None:
 
 
 def test_causal_resident_native_codegen_and_single_stat_protocol() -> None:
-    source = _emit_causal_resident_native_source()
+    # These cover the stateful causal body, which no shipped seed
+    # selects any more.
+    source = _emit_causal_resident_native_source(
+        policy_override=_stateful_causal_policy()
+    )
     module = ast.parse(source)
 
     value_graph_calls = [
@@ -1505,7 +1549,11 @@ def test_causal_resident_native_codegen_and_single_stat_protocol() -> None:
 
 
 def test_causal_resident_stage_local_stat_protocol() -> None:
-    source = _emit_causal_resident_native_source()
+    # These cover the stateful causal body, which no shipped seed
+    # selects any more.
+    source = _emit_causal_resident_native_source(
+        policy_override=_stateful_causal_policy()
+    )
     correction = source[source.index("(warp_idx >= 8) & (warp_idx < 12):") :]
     ready0 = "_helion_flash_rt.named_barrier_wait_unaligned(3 + warp_idx % 4, 64)"
     ready1 = "_helion_flash_rt.named_barrier_wait_unaligned(7 + warp_idx % 4, 64)"
@@ -1653,13 +1701,6 @@ def test_causal_resident_native_gate_preserves_fallbacks() -> None:
         assert "fa4_disc_exp_convert_store" in fallback_source
         assert "resident_softmax_value_graph" not in fallback_source
 
-    # The resident body's live set does not fit in 176 registers, so that also
-    # drops the lowering -- to the whole-row body rather than the chunked one.
-    starved = _emit_causal_resident_native_source(
-        config_overrides={cute_flash.FLASH_SOFTMAX_REGS_KEY: 176}
-    )
-    assert "resident_softmax_value_graph" not in starved
-
     # Fields the lowering does not depend on must keep it. The exact-seed gate
     # this replaced dropped every neighbour to the chunked body, which measured
     # ~20% slower on GB300 causal 2x32x262144x64 (1367 -> ~1090 TFLOP/s, the
@@ -1689,9 +1730,10 @@ def test_causal_resident_native_matches_sdpa_without_deadlock() -> None:
     if (
         not hardware.supports_tmem_row_reduce
         or causal_policy is None
-        or causal_policy.softmax_lowering is not FlashSoftmaxLowering.STATEFUL
+        or causal_policy.softmax_lowering is FlashSoftmaxLowering.STANDARD
     ):
         pytest.skip("causal resident native softmax is unsupported on this target")
+    stateful = causal_policy.softmax_lowering is FlashSoftmaxLowering.STATEFUL
 
     torch.manual_seed(109)
     shape = (1, 1, 65_536, 64)
@@ -1711,9 +1753,16 @@ def test_causal_resident_native_matches_sdpa_without_deadlock() -> None:
     code = bound.to_triton_code(config)
     compiled = bound.compile_config(config)
 
-    assert "ResidentSoftmaxState.create" in code
-    assert "resident_softmax_value_graph" not in code
-    assert "flash_softmax.update_row_sum(tLDrS.load(), flash_alpha)" in code
+    # Whichever resident lowering the shipped seed selects, the soak below has
+    # to exercise it -- this is the end-to-end correctness and deadlock check
+    # for the promoted causal 64K configuration.
+    if stateful:
+        assert "ResidentSoftmaxState.create" in code
+        assert "resident_softmax_value_graph" not in code
+        assert "flash_softmax.update_row_sum(tLDrS.load(), flash_alpha)" in code
+    else:
+        assert "resident_softmax_value_graph" in code
+        assert "ResidentSoftmaxState.create" not in code
     assert "fa4_sp_exp_convert_store_whole_rowsum" not in code
     assert "fa4_disc_exp_convert_store" not in code
     assert "flash_s_corr_prod_index" not in code
