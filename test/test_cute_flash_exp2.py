@@ -25,6 +25,8 @@ from helion._compiler.cute.causal_range import CausalRangeProof
 from helion._compiler.cute.flash_policy import get_flash_target_policy
 from helion._compiler.cute.flash_policy import registered_flash_target_policies
 from helion._compiler.cute.flash_tuning import FlashCausalTuningPolicy
+from helion._compiler.cute.flash_tuning import FlashDenseTuningPolicy
+from helion._compiler.cute.flash_tuning import FlashPackedExp2Mode
 from helion._compiler.cute.flash_tuning import FlashSoftmaxLowering
 from helion._testing import DEVICE
 from helion._testing import code_and_output
@@ -599,6 +601,43 @@ def _emit_causal_resident_native_source(
     return ast.unparse(ast.Module(body=body, type_ignores=[]))
 
 
+def _packed_exp2_policy(num_kv: int) -> object:
+    """A dense tuning policy that selects the packed f16x2 exp2 lowering.
+
+    No shipped sm_103 seed uses this lowering any more -- the resident value
+    graph measured faster at every promoted KV size -- so the tests that cover
+    the packed rewrite build the policy themselves rather than depending on a
+    seed that could change again.
+    """
+    base = get_flash_target_policy((10, 3))
+    packed = FlashDenseTuningPolicy(
+        num_kv=num_kv,
+        exp2_packet="deg1_16x8",
+        e2e_schedule="16/8",
+        e2e_offset=0,
+        e2e_offset0=10,
+        stat_transport="single_final",
+        packed_exp2_mode=FlashPackedExp2Mode.ALL_XU,
+        probability_log2_shift=7,
+        corr_regs=80,
+        other_regs=32,
+        epi_tma=True,
+        kv_order="descending",
+        precompute_qk_desc=True,
+        rescale_chunk_cols=8,
+        first_load_order=4,
+        corr_tile_size=8,
+        role_map="helion",
+        softmax_regs=192,
+        split_p_arrive=True,
+        softmax_disc=False,
+        disc_pipe_depth=1,
+        sp_row_sum="whole",
+    )
+    tuning = dataclasses.replace(base.tuning, dense_policies=(packed,))
+    return dataclasses.replace(base, tuning=tuning)
+
+
 def _emit_dense_resident_value_graph_source(
     *,
     capability: tuple[int, int] = (10, 3),
@@ -607,11 +646,24 @@ def _emit_dense_resident_value_graph_source(
     score_plan: AttentionScorePlan | None = None,
     num_kv: int = 256,
     config_overrides: dict[str, object] | None = None,
+    policy_override: object | None = None,
 ) -> str:
     if score_plan is None:
         score_plan = dense_score_plan(64)
     if seed_capability is None:
         seed_capability = capability
+    if policy_override is not None:
+        with patch.object(
+            cute_flash, "get_flash_target_policy", return_value=policy_override
+        ):
+            return _emit_dense_resident_value_graph_source(
+                capability=capability,
+                seed_capability=seed_capability,
+                has_lse=has_lse,
+                score_plan=score_plan,
+                num_kv=num_kv,
+                config_overrides=config_overrides,
+            )
     with patch.dict(os.environ, {}, clear=True):
         seed = cute_flash.flash_attention_seed_config(
             64,
@@ -937,14 +989,19 @@ def test_sm103_packed_f16x2_rewrite_follows_the_schedule_not_the_seed() -> None:
     field it does depend on. A KV size the policy does not name still gets the
     standard body, because the lowering choice itself is still policy-owned.
     """
-    promoted_source = _emit_dense_resident_value_graph_source(num_kv=2048)
+    packed_policy = _packed_exp2_policy(2048)
+    promoted_source = _emit_dense_resident_value_graph_source(
+        num_kv=2048, policy_override=packed_policy
+    )
     off_seed_source = _emit_dense_resident_value_graph_source(
         num_kv=2048,
         config_overrides={cute_flash.FLASH_E2E_OFFSET0_KEY: 9},
+        policy_override=packed_policy,
     )
     broken_precondition_source = _emit_dense_resident_value_graph_source(
         num_kv=2048,
         config_overrides={cute_flash.FLASH_SP_ROW_SUM_KEY: "fragment"},
+        policy_override=packed_policy,
     )
     unseeded_source = _emit_dense_resident_value_graph_source(
         num_kv=384,
@@ -970,10 +1027,14 @@ def test_sm103_scaled_all_xu_probability_shift_fits_the_rescale_threshold() -> N
     lowers the shift and keeps the packed body; it must not silently drop back
     to the standard body, which costs ~14% on GB300.
     """
-    all_xu_source = _emit_dense_resident_value_graph_source(num_kv=2048)
+    packed_policy = _packed_exp2_policy(2048)
+    all_xu_source = _emit_dense_resident_value_graph_source(
+        num_kv=2048, policy_override=packed_policy
+    )
     raised_source = _emit_dense_resident_value_graph_source(
         num_kv=2048,
         config_overrides={cute_flash.FLASH_RESCALE_THRESHOLD_KEY: 12.0},
+        policy_override=packed_policy,
     )
     all_xu_module = ast.parse(all_xu_source)
     raised_module = ast.parse(raised_source)
@@ -1045,7 +1106,11 @@ def test_dense_resident_value_graph_codegen_and_barrier_protocol() -> None:
         and node.func.attr == "resident_softmax_value_graph"
     ]
 
-    assert len(value_graph_calls) == 2
+    # One call per softmax stage, doubled because the promoted KV tile width
+    # does not divide this sequence and the trailing partial tile is peeled
+    # into its own masked segment. Every copy must use the same handshake.
+    assert "flash_kv_tail_iter" in source
+    assert len(value_graph_calls) == 4
     parameter_names = tuple(
         inspect.signature(_flash_runtime.resident_softmax_value_graph).parameters
     )
@@ -1077,8 +1142,10 @@ def test_dense_resident_value_graph_codegen_and_barrier_protocol() -> None:
         "_helion_flash_rt.mbar_spin_wait(flash_s0_corr_empty_ptr + 0, "
         "flash_s_corr_prod_phase, 10000000)"
     )
+    # One acquire at role entry plus one per KV-loop body. The trailing partial
+    # tile is peeled into its own loop here, so there are two bodies.
     assert softmax0.count(empty_wait) == 2
-    assert softmax0.count("flash_s_corr_prod_phase ^= 1") == 2
+    assert softmax0.count("flash_s_corr_prod_phase ^= 1") == 3
     entry_wait = softmax0.index(empty_wait)
     alpha_store = softmax0.index(
         "flash_scale_t[0 * 128 + flash_local_tidx] = flash_alpha"
@@ -1150,7 +1217,9 @@ def test_dense_resident_value_graph_gate_preserves_fallbacks() -> None:
         _emit_dense_resident_value_graph_source(
             capability=(999, 999), seed_capability=(10, 3)
         ),
-        _emit_dense_resident_value_graph_source(num_kv=2048),
+        _emit_dense_resident_value_graph_source(
+            num_kv=2048, policy_override=_packed_exp2_policy(2048)
+        ),
         _emit_dense_resident_value_graph_source(has_lse=True),
         _emit_dense_resident_value_graph_source(score_plan=modified_plan),
         # Schedule fields the resident body depends on.
