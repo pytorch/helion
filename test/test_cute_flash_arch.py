@@ -194,21 +194,25 @@ def test_sm103_flash_target_policy() -> None:
             72,
             40,
         ),
+        # The packed f16x2 exp2 lowering used to be seeded here. The resident
+        # value graph measured faster once the KV tile width became tunable
+        # (1226.0 -> 1332.9 TFLOP/s at width 160 on GB300), so every promoted
+        # sm_103 dense seed now uses the resident lowering.
         2048: (
-            "deg1_16x8",
-            "16/8",
-            0,
-            10,
-            "single_final",
+            "deg1_8x2_corr10",
+            "8/2",
+            2,
+            1,
+            "single",
             "fa4_2cta",
             6,
             False,
             8.0,
-            FlashPackedExp2Mode.ALL_XU,
+            FlashPackedExp2Mode.DISABLED,
             7,
-            FlashSoftmaxLowering.STANDARD,
-            80,
-            32,
+            FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH,
+            72,
+            40,
         ),
     }
     assert {shape.num_kv for shape in policy.dense_policies} == set(expected_dense)
