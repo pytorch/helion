@@ -1,0 +1,90 @@
+{
+  "step": 10,
+  "name": "baseline-8-shapes",
+  "timestamp_utc": "2026-09-06T17:09:30Z",
+  "elapsed_from_t0": "21h18m",
+  "gpu": "NVIDIA GB300",
+  "physical_gpu": "3",
+  "power_limit_w": 1400,
+  "baseline": "fa4-tuned: FA4 at the per-shape plans from helion_paper/data/attention_fa4_tuned_gb300.csv",
+  "method": "pooled median of every do_bench sample from interleaved fa4/helion rounds on one idle GPU",
+  "shapes": {
+    "dense_32768": {
+      "helion_tflops": 1268.9,
+      "fa4_tuned_tflops": 1367.5,
+      "ratio": 0.9279,
+      "samples": 18,
+      "accuracy": "PASS"
+    },
+    "dense_65536": {
+      "helion_tflops": 1323.2,
+      "fa4_tuned_tflops": 1371.8,
+      "ratio": 0.9645,
+      "samples": 18,
+      "accuracy": "PASS"
+    },
+    "dense_131072": {
+      "helion_tflops": 1280.1,
+      "fa4_tuned_tflops": 1362.4,
+      "ratio": 0.9396,
+      "samples": 18,
+      "accuracy": "PASS"
+    },
+    "dense_262144": {
+      "helion_tflops": 1223.5,
+      "fa4_tuned_tflops": 1365.1,
+      "ratio": 0.8963,
+      "samples": 18,
+      "accuracy": "PASS"
+    },
+    "causal_65536": {
+      "helion_tflops": 1326.4,
+      "fa4_tuned_tflops": 1347.7,
+      "ratio": 0.9842,
+      "samples": 18,
+      "accuracy": "PASS"
+    },
+    "causal_131072": {
+      "helion_tflops": 1353.9,
+      "fa4_tuned_tflops": 1367.1,
+      "ratio": 0.9904,
+      "samples": 18,
+      "accuracy": "PASS"
+    },
+    "causal_262144": {
+      "helion_tflops": 1325.4,
+      "fa4_tuned_tflops": 1372.4,
+      "ratio": 0.9657,
+      "samples": 18,
+      "accuracy": "PASS"
+    },
+    "causal_524288": {
+      "helion_tflops": 1287.7,
+      "fa4_tuned_tflops": 1372.1,
+      "ratio": 0.9385,
+      "samples": 18,
+      "accuracy": "PASS"
+    }
+  },
+  "geomean_ratio": 0.9504,
+  "changes": "origin/main compiler seeds",
+  "helion_commit": "6a57b12f94b22db1c66f5a43acc28039f5593897",
+  "artifacts": [
+    "artifacts/attn8/base8_causal_131072_cute_1.json",
+    "artifacts/attn8/base8_causal_131072_fa4_1.json",
+    "artifacts/attn8/base8_causal_262144_cute_1.json",
+    "artifacts/attn8/base8_causal_262144_fa4_1.json",
+    "artifacts/attn8/base8_causal_524288_cute_1.json",
+    "artifacts/attn8/base8_causal_524288_fa4_1.json",
+    "artifacts/attn8/base8_causal_65536_cute_1.json",
+    "artifacts/attn8/base8_causal_65536_fa4_1.json",
+    "artifacts/attn8/base8_dense_131072_cute_1.json",
+    "artifacts/attn8/base8_dense_131072_fa4_1.json",
+    "artifacts/attn8/base8_dense_262144_cute_1.json",
+    "artifacts/attn8/base8_dense_262144_fa4_1.json",
+    "artifacts/attn8/base8_dense_32768_cute_1.json",
+    "artifacts/attn8/base8_dense_32768_fa4_1.json",
+    "artifacts/attn8/base8_dense_65536_cute_1.json",
+    "artifacts/attn8/base8_dense_65536_fa4_1.json"
+  ]
+}
