@@ -1189,6 +1189,41 @@ def test_dense_resident_value_graph_gate_preserves_fallbacks() -> None:
         assert "resident_softmax_value_graph" in neighbour_source, neighbour
 
 
+def test_dense_resident_value_graph_runs_on_the_one_cta_pipeline() -> None:
+    """The resident body is CTA-count agnostic, like the causal one already is.
+
+    Restricting it to fa4_2cta left the whole one-CTA family on the standard
+    body, which measured 16.4 ms against 13.4 ms on GB300 dense
+    2x32x32768x64 fp16. The peer-rank handshake is the only two-CTA detail and
+    must drop out for one CTA.
+    """
+    two_cta = _emit_dense_resident_value_graph_source()
+    one_cta = _emit_dense_resident_value_graph_source(
+        config_overrides={cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4"}
+    )
+
+    assert "resident_softmax_value_graph" in two_cta
+    assert "resident_softmax_value_graph" in one_cta
+    assert "pfor_peer_cta_rank" in two_cta
+    assert "pfor_peer_cta_rank" not in one_cta
+
+    # The 4D tensor-map variants only change how TMA descriptors are built.
+    for family in ("fa4_tma_4d", "fa4_2cta_tma_4d"):
+        source = _emit_dense_resident_value_graph_source(
+            config_overrides={cute_flash.FLASH_PIPELINE_FAMILY_KEY: family}
+        )
+        assert "resident_softmax_value_graph" in source, family
+
+    # Families whose barrier graph the body was not written against keep the
+    # standard lowering. (fa4_clc is not in this list: with a nonpersistent
+    # config the resolver canonicalizes it back to plain fa4.)
+    for family in ("fa4_deep_1cta", "fa4_cga2_local"):
+        source = _emit_dense_resident_value_graph_source(
+            config_overrides={cute_flash.FLASH_PIPELINE_FAMILY_KEY: family}
+        )
+        assert "resident_softmax_value_graph" not in source, family
+
+
 def test_dense_resident_softmax_lowering_dispatch_is_exhaustive() -> None:
     policy = get_flash_target_policy((10, 3)).tuning
     shape_policy = policy.dense_policy(256)
