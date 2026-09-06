@@ -1304,7 +1304,8 @@ def test_kv_tile_width_is_legalized_against_tmem_and_the_sequence() -> None:
     """
     fits = cute_flash._flash_kv_tile_n_fits_tmem
     assert fits(160, 64, 2)  # 2*160 + 2*64 = 448
-    assert fits(192, 64, 2)  # 2*192 + 2*64 = 512
+    # 192 fits exactly (512) and produces NaN, so the check demands headroom.
+    assert not fits(192, 64, 2)
     assert not fits(224, 64, 2)  # 2*224 + 2*64 = 576
 
     supported = cute_flash._flash_kv_tile_n_supported
@@ -1315,6 +1316,7 @@ def test_kv_tile_width_is_legalized_against_tmem_and_the_sequence() -> None:
     # needs the descending order that visits it first.
     assert supported(160, num_kv=256, **common)  # 32768 % 160 != 0
     assert not supported(160, num_kv=256, **{**common, "desc_kv": False})
+    assert not supported(192, num_kv=1280, **common)  # no TMEM headroom
     assert not supported(224, num_kv=1280, **common)  # will not fit TMEM
     assert not supported(160, num_kv=1280, **{**common, "is_causal": True})
     assert not supported(160, num_kv=1280, **{**common, "topology": "ws_overlap"})
@@ -1609,7 +1611,7 @@ def test_causal_resident_softmax_lowering_dispatch_is_exhaustive() -> None:
     assert "resident_softmax_value_graph" in value_graph_source
 
 
-@pytest.mark.parametrize(("num_kv", "kv_stage"), ((1024, 3), (2048, 3), (4096, 6)))
+@pytest.mark.parametrize(("num_kv", "kv_stage"), ((1024, 6), (2048, 8), (4096, 6)))
 def test_causal_resident_native_additional_stage_codegen(
     num_kv: int, kv_stage: int
 ) -> None:
@@ -1646,13 +1648,35 @@ def test_causal_resident_native_gate_preserves_fallbacks() -> None:
         _emit_causal_resident_native_source(
             config_overrides={cute_flash.FLASH_EXP2_PACKET_KEY: "4x1"}
         ),
-        _emit_causal_resident_native_source(
-            config_overrides={cute_flash.FLASH_SOFTMAX_REGS_KEY: 176}
-        ),
     )
     for fallback_source in fallback_sources:
         assert "fa4_disc_exp_convert_store" in fallback_source
         assert "resident_softmax_value_graph" not in fallback_source
+
+    # The resident body's live set does not fit in 176 registers, so that also
+    # drops the lowering -- to the whole-row body rather than the chunked one.
+    starved = _emit_causal_resident_native_source(
+        config_overrides={cute_flash.FLASH_SOFTMAX_REGS_KEY: 176}
+    )
+    assert "resident_softmax_value_graph" not in starved
+
+    # Fields the lowering does not depend on must keep it. The exact-seed gate
+    # this replaced dropped every neighbour to the chunked body, which measured
+    # ~20% slower on GB300 causal 2x32x262144x64 (1367 -> ~1090 TFLOP/s, the
+    # same value for every single-field perturbation).
+    # num_kv=512 is seeded with the stateful lowering; 1024 is the resident one.
+    assert "resident_softmax_value_graph" in _emit_causal_resident_native_source(
+        num_kv=1024
+    )
+    for neighbour in (
+        {cute_flash.FLASH_ROLE_MAP_KEY: "helion"},
+        {cute_flash.FLASH_E2E_OFFSET_KEY: 8},
+        {cute_flash.FLASH_E2E_OFFSET0_KEY: 5},
+    ):
+        neighbour_source = _emit_causal_resident_native_source(
+            num_kv=1024, config_overrides=neighbour
+        )
+        assert "resident_softmax_value_graph" in neighbour_source, neighbour
 
 
 @onlyBackends(["cute"])
@@ -1786,7 +1810,7 @@ def test_causal_target_seed_match_ignores_conflicting_environment() -> None:
         )
         policy = get_flash_target_policy((10, 3)).tuning.causal_policy(512)
         assert causal_cfg.wait_hint == 0
-        assert cute_flash._flash_causal_resident_native_seed_matches(causal_cfg, policy)
+        assert cute_flash._flash_causal_resident_schedule_supported(causal_cfg, policy)
 
     effective = cute_flash._flash_resident_softmax_config(causal_cfg)
     assert causal_cfg.exp2_packet == _DEG2_PACKET
