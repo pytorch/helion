@@ -3799,6 +3799,16 @@ def _flash_fitted_probability_log2_shift(shift: int, rescale_threshold: float) -
     return max(0, min(shift, headroom))
 
 
+# FA4 pipeline families whose barrier graph the specialized dense softmax
+# bodies can run under. The bodies themselves are CTA-count agnostic -- the
+# causal resident lowering already runs on a one-CTA pipeline -- so the only
+# requirement is the plain FA4 topology without a separate K/V ring, CGA2
+# pairing or the CLC scheduler.
+_FLASH_DENSE_LOWERING_FAMILIES = frozenset(
+    {"fa4", "fa4_2cta", "fa4_tma_4d", "fa4_2cta_tma_4d"}
+)
+
+
 def _flash_dense_lowering_schedule_supported(
     cfg: FlashAttentionConfig,
     policy: FlashDenseTuningPolicy | None,
@@ -3827,7 +3837,7 @@ def _flash_dense_lowering_schedule_supported(
     ):
         return False
     if not (
-        cfg.pipeline_family == "fa4_2cta"
+        cfg.pipeline_family in _FLASH_DENSE_LOWERING_FAMILIES
         and not cfg.persistent
         and cfg.q_tile_count == 2
         and cfg.split_p_arrive
@@ -7181,7 +7191,6 @@ def emit_flash_fa4_device_body(
         and not has_lse
         # Both bodies read the score tile through the whole-row TMEM reduction.
         and use_tmem_row_reduce
-        and cfg.use_2cta_instrs
         and not cfg.separate_kv_rings
         and not cfg.softmax_disc
         and cfg.p_store_repetition == 16
@@ -9465,7 +9474,7 @@ if warp_idx == 15:
                 f""",
                 pfor_peer_cta_rank=cutlass.Int32(0),
                 pfor_self_cta_rank={pfor_self_cta_rank}"""
-                if dense_resident_value_graph_candidate
+                if dense_resident_value_graph_candidate and use_2cta_instrs
                 else ""
             )
             sp_exp_block = f"""            flash_row_sum = _helion_flash_rt.resident_softmax_value_graph(
