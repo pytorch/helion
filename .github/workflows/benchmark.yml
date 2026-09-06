@@ -198,6 +198,14 @@ jobs:
           mkdir -p "$TEST_REPORTS_DIR"
           echo "$TEST_REPORTS_DIR"
 
+          CUDAGRAPH_ARGS=(--cudagraph)
+          if [[ "${{ inputs.runtime-version }}" == rocm* ]]; then
+            # Repeated PyTorch CUDAGraph timing can abort ROCm queues with
+            # HSA_STATUS_ERROR_INVALID_PACKET_FORMAT. Use Triton's regular
+            # event-based benchmarker on ROCm while retaining graphs on CUDA.
+            CUDAGRAPH_ARGS=()
+          fi
+
           KERNEL_LIST="${{ inputs.kernels }}"
           for kernel in ${KERNEL_LIST//,/ }; do
             echo "=========================================="
@@ -237,7 +245,7 @@ jobs:
                 --metrics speedup,accuracy,latency \
                 --measure-compile-time \
                 --latency-measure-mode triton_do_bench \
-                --cudagraph \
+                "${CUDAGRAPH_ARGS[@]}" \
                 --only $IMPLS \
                 --only-match-mode prefix-with-baseline \
                 --baseline $BASELINE \
