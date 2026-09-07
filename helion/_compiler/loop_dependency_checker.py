@@ -4,8 +4,6 @@ import ast
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from .device_ir import GraphInfo
 
 
@@ -149,6 +147,103 @@ def _update_host_aliases(stmt: ast.stmt, aliases: dict[str, str]) -> None:
         _update_alias_target(target, value, aliases)
 
 
+def _storage_ids(graphs: list[GraphInfo], graph_id: int, obj: object) -> set[int]:
+    import torch
+
+    from .device_ir import NodeArgsGraphInfo
+
+    if isinstance(obj, (list, tuple)):
+        result: set[int] = set()
+        for item in obj:
+            result.update(_storage_ids(graphs, graph_id, item))
+        return result
+    if not isinstance(obj, torch.fx.Node):
+        return set()
+    graph_info = graphs[graph_id]
+    value = obj.meta.get("val")
+    result = {id(value.untyped_storage())} if isinstance(value, torch.Tensor) else set()
+    if (
+        obj.op == "placeholder"
+        and obj.graph is graph_info.graph
+        and isinstance(graph_info, NodeArgsGraphInfo)
+    ):
+        result.update(
+            _storage_ids(graphs, graph_id, graph_info.placeholder_to_outer_arg(obj))
+        )
+    if result:
+        return result
+    for arg in obj.args:
+        result.update(_storage_ids(graphs, graph_id, arg))
+    return result
+
+
+def graph_memory_access_storage_ids(
+    graphs: list[GraphInfo], graph_id: int
+) -> tuple[set[int], set[int]]:
+    """Return storage identities read and written by a graph and its subgraphs."""
+    from ..language import memory_ops
+    from ..language._tracing_ops import _for_loop
+    from ..language._tracing_ops import _for_loop_step
+    from ..language._tracing_ops import _if
+    from ..language._tracing_ops import _while_loop
+    from ..language.atomic_ops import ATOMIC_OPS
+    from .device_ir import IfGraphInfo
+    from .device_ir import WhileLoopGraphInfo
+
+    reads: set[int] = set()
+    writes: set[int] = set()
+
+    def update_from_subgraph(subgraph_id: int) -> None:
+        subgraph_reads, subgraph_writes = graph_memory_access_storage_ids(
+            graphs, subgraph_id
+        )
+        reads.update(subgraph_reads)
+        writes.update(subgraph_writes)
+
+    for node in graphs[graph_id].graph.nodes:
+        if node.op != "call_function":
+            continue
+        if node.target is memory_ops.load:
+            reads.update(_storage_ids(graphs, graph_id, node.args[0]))
+            continue
+        if node.target is memory_ops.store:
+            writes.update(_storage_ids(graphs, graph_id, node.args[0]))
+            continue
+        if node.target in ATOMIC_OPS:
+            storage_ids = _storage_ids(graphs, graph_id, node.args[0])
+            reads.update(storage_ids)
+            writes.update(storage_ids)
+            continue
+        # Handle subgraphs for control flow constructs
+        if node.target in (_for_loop, _for_loop_step):
+            subgraph_id = node.args[0]
+            assert isinstance(subgraph_id, int)
+            update_from_subgraph(subgraph_id)
+            continue
+        if node.target is _if:
+            subgraph_id = node.args[1]
+            assert isinstance(subgraph_id, int)
+            update_from_subgraph(subgraph_id)
+            if_info = graphs[subgraph_id]
+            assert isinstance(if_info, IfGraphInfo)
+            if if_info.else_branch is not None:
+                else_graph_id = (
+                    if_info.else_branch
+                    if isinstance(if_info.else_branch, int)
+                    else if_info.else_branch.graph_id
+                )
+                update_from_subgraph(else_graph_id)
+            continue
+        if node.target is _while_loop:
+            subgraph_id = node.args[1]
+            assert isinstance(subgraph_id, int)
+            body_info = graphs[subgraph_id]
+            assert isinstance(body_info, WhileLoopGraphInfo)
+            update_from_subgraph(body_info.cond_graph_id)
+            update_from_subgraph(subgraph_id)
+    return reads, writes
+
+
 def mark_intra_loop_raw_barriers(
     graphs: list[GraphInfo],
     root_graph_ids: list[int],
@@ -163,8 +258,7 @@ def mark_intra_loop_raw_barriers(
     an element written by one thread is read back by another with no
     synchronization in between -- a data race (observed corrupting ~0.8% of
     outputs on B200). Helion already inserts ``tl.debug_barrier()`` for the
-    analogous hazard *between* sequential top-level loops
-    (``needs_inter_loop_debug_barrier_for_global_raw``); this extends the same
+    analogous hazard *between* sequential top-level loops; this extends the same
     guarantee to a store->load *within* one loop body.
 
     We mark the load's FX node; the Triton ``load`` codegen emits a
@@ -197,37 +291,6 @@ class _IntraLoopRawBarrierMarker:
         self.graphs = graphs
         self.mark_in_divergent_control_flow = mark_in_divergent_control_flow
 
-    def _storage_ids(self, graph_id: int, obj: object) -> set[int]:
-        import torch
-
-        from .device_ir import NodeArgsGraphInfo
-
-        if isinstance(obj, (list, tuple)):
-            result: set[int] = set()
-            for item in obj:
-                result.update(self._storage_ids(graph_id, item))
-            return result
-        if not isinstance(obj, torch.fx.Node):
-            return set()
-        graph_info = self.graphs[graph_id]
-        value = obj.meta.get("val")
-        result = (
-            {id(value.untyped_storage())} if isinstance(value, torch.Tensor) else set()
-        )
-        if (
-            obj.op == "placeholder"
-            and obj.graph is graph_info.graph
-            and isinstance(graph_info, NodeArgsGraphInfo)
-        ):
-            result.update(
-                self._storage_ids(graph_id, graph_info.placeholder_to_outer_arg(obj))
-            )
-        if result:
-            return result
-        for arg in obj.args:
-            result.update(self._storage_ids(graph_id, arg))
-        return result
-
     def run_graph(
         self, graph_id: int, written: set[int], *, divergent: bool = False
     ) -> set[int]:
@@ -245,12 +308,12 @@ class _IntraLoopRawBarrierMarker:
             if node.op != "call_function":
                 continue
             if node.target is memory_ops.store:
-                pending.update(self._storage_ids(graph_id, node.args[0]))
+                pending.update(_storage_ids(self.graphs, graph_id, node.args[0]))
                 continue
             if node.target is memory_ops.load:
                 if node.meta.get(INTRA_LOOP_RAW_BARRIER_META):
                     pending.clear()
-                elif pending & self._storage_ids(graph_id, node.args[0]):
+                elif pending & _storage_ids(self.graphs, graph_id, node.args[0]):
                     if divergent and not self.mark_in_divergent_control_flow:
                         # Cannot place a convergent barrier here; leave the
                         # hazard pending so a later uniform load re-arms it.
@@ -307,19 +370,3 @@ class _IntraLoopRawBarrierMarker:
                 # The condition executes at least once; the body may not execute.
                 pending = condition_pending | body_pending
         return pending
-
-
-def needs_inter_loop_debug_barrier_for_global_raw(
-    prev_global_writes: set[str],
-    host_loop_reads: frozenset[str],
-    *,
-    global_barrier_tensor_names: Callable[[frozenset[str]], set[str]],
-) -> bool:
-    """Whether to emit ``tl.debug_barrier()`` before the next sequential device loop.
-
-    Returns True when the union of host-named global writes accumulated from
-    all prior siblings (since the last emitted barrier) intersects the current
-    loop's host-named read set.
-    """
-    cur_global_reads = global_barrier_tensor_names(host_loop_reads)
-    return bool(prev_global_writes & cur_global_reads)
