@@ -1256,13 +1256,20 @@ def _flash_deep_1cta_kv_stage_cap(head_dim: int) -> int:
     return 0
 
 
-def _flash_aliased_kv_stage_cap(head_dim: int, *, stage_output: bool) -> int:
-    """Largest legal aliased K/V depth for the requested output storage."""
+def _flash_aliased_kv_stage_cap(
+    head_dim: int, *, stage_output: bool, kv_tile_n: int = 128
+) -> int:
+    """Largest legal aliased K/V depth for the requested output storage.
+
+    A wider KV tile makes each staging slot proportionally larger, so the depth
+    that fits in shared memory drops with it.
+    """
     return max_fa4_kv_depth(
         FlashScheduleSpec(
             head_dim=head_dim,
             kv_depth=2,
             stage_output=stage_output,
+            kv_tile_n=kv_tile_n,
         )
     )
 
@@ -1643,12 +1650,16 @@ class FlashAttentionConfig:
 # TMEM is 512 columns. The FA4 score pipeline holds ``s_stage`` score buffers of
 # ``kv_tile_n`` columns plus two ``head_dim``-wide output accumulators.
 FLASH_TMEM_COLUMNS = 512
-FLASH_KV_TILE_N_CHOICES = (128, 160, 192)
+# Validated KV tile widths. 192 exactly saturates TMEM at head-dim 64 with two
+# score buffers (2*192 + 2*64 == 512) and produces NaN, so the budget check
+# below demands headroom rather than a fit; it is also slower than 160 on every
+# part measured, so nothing is lost by leaving it out of the choice set.
+FLASH_KV_TILE_N_CHOICES = (128, 160)
 
 
 def _flash_kv_tile_n_fits_tmem(kv_tile_n: int, head_dim: int, s_stage: int) -> bool:
-    """Return whether the score and output accumulators fit in TMEM."""
-    return s_stage * kv_tile_n + 2 * head_dim <= FLASH_TMEM_COLUMNS
+    """Return whether the score and output accumulators leave TMEM headroom."""
+    return s_stage * kv_tile_n + 2 * head_dim < FLASH_TMEM_COLUMNS
 
 
 def _flash_kv_tile_n_supported(
@@ -1660,6 +1671,7 @@ def _flash_kv_tile_n_supported(
     is_causal: bool,
     s_stage: int,
     desc_kv: bool = True,
+    softmax_disc: bool = False,
 ) -> bool:
     """Return whether a non-default KV tile width is legal for this shape.
 
@@ -1678,7 +1690,13 @@ def _flash_kv_tile_n_supported(
     if not _flash_kv_tile_n_fits_tmem(kv_tile_n, head_dim, s_stage):
         return False
     sequence_extent = num_kv * 128
-    return sequence_extent % kv_tile_n == 0 or desc_kv
+    if sequence_extent % kv_tile_n == 0:
+        return True
+    # The trailing partial tile has to be masked, and only the whole-row softmax
+    # body does that; the chunked ("disc") body would consume the out-of-range
+    # columns as real zero scores. It also needs the descending KV order that
+    # visits the partial tile first.
+    return desc_kv and not softmax_disc
 
 
 def _flash_bool_env(name: str, default: bool) -> bool:
@@ -3138,10 +3156,31 @@ def resolve_flash_config(
         e2e_offset = 0
         e2e_offset0 = 0
         causal_lpt_swizzle = 0
+    kv_tile_n = int(_flash_env_get("HELION_CUTE_FLASH_KV_TILE_N", "128") or "128")
+    kv_tile_n_cfg = _cfg(FLASH_KV_TILE_N_KEY)
+    if kv_tile_n_cfg is not None:
+        kv_tile_n = int(cast("int", kv_tile_n_cfg))
+    if not _flash_kv_tile_n_supported(
+        kv_tile_n,
+        head_dim=head_dim,
+        num_kv=num_kv,
+        topology=topology,
+        is_causal=is_causal,
+        s_stage=s_stage,
+        desc_kv=kv_order == "descending",
+        softmax_disc=softmax_disc,
+    ):
+        kv_tile_n = 128
+
     if topology == "fa4" and not separate_kv_rings and head_dim in (64, 128):
+        # The staging depth has to be capped for the *configured* tile width:
+        # each K/V slot is ``kv_tile_n * head_dim`` elements, so a wider tile
+        # fits fewer stages, and exceeding the budget makes the launch fail
+        # with cudaErrorInvalidValue rather than falling back.
         aliased_kv_stage_cap = _flash_aliased_kv_stage_cap(
             head_dim,
             stage_output=epi_tma or epi_stg,
+            kv_tile_n=kv_tile_n,
         )
         kv_stage = min(max(kv_stage, 2), aliased_kv_stage_cap)
     pipeline_family = _flash_pipeline_family_from_flags(
@@ -3237,21 +3276,6 @@ def resolve_flash_config(
     )
     if epi_tma_setup not in ("shared", "role_local") or not epi_tma_setup_eligible:
         epi_tma_setup = "shared"
-
-    kv_tile_n = int(_flash_env_get("HELION_CUTE_FLASH_KV_TILE_N", "128") or "128")
-    kv_tile_n_cfg = _cfg(FLASH_KV_TILE_N_KEY)
-    if kv_tile_n_cfg is not None:
-        kv_tile_n = int(cast("int", kv_tile_n_cfg))
-    if not _flash_kv_tile_n_supported(
-        kv_tile_n,
-        head_dim=head_dim,
-        num_kv=num_kv,
-        topology=topology,
-        is_causal=is_causal,
-        s_stage=s_stage,
-        desc_kv=kv_order == "descending",
-    ):
-        kv_tile_n = 128
 
     if exp2_packet in _FLASH_CAUSAL_HD128_RESIDENT_EXP2_PACKETS and (
         pipeline_family != "fa4" or not causal_loop_split
@@ -3950,17 +3974,34 @@ def _flash_resident_softmax_config(
     )
 
 
-def _flash_causal_resident_native_seed_matches(
+def _flash_causal_resident_schedule_supported(
     cfg: FlashAttentionConfig,
     policy: FlashCausalTuningPolicy | None,
 ) -> bool:
-    """Return whether ``cfg`` is the validated causal resident seed shape."""
-    return policy is not None and _flash_config_matches_tuning_values(
-        cfg,
-        {
-            **_flash_causal_tuning_overrides(policy),
-            FLASH_Q_TILE_COUNT_KEY: 2,
-        },
+    """Return whether ``cfg``'s schedule can host the causal resident lowering.
+
+    Same reasoning as the dense gate: list the structural requirements the
+    lowering actually has, not a byte-exact comparison against the promoted
+    seed. The exact match cost ~20% for every neighbour of the causal seed on
+    GB300 (1367 -> ~1090 TFLOP/s on 2x32x262144x64 fp16, the same number for
+    every single-field perturbation), which is a cliff the autotuner cannot
+    climb out of.
+    """
+    if policy is None:
+        return False
+    return (
+        cfg.pipeline_family == "fa4"
+        and not cfg.persistent
+        and cfg.q_tile_count == 2
+        # The degree-2 causal body is written against this exp2 packet and its
+        # paired masked/unmasked cadence.
+        and cfg.exp2_packet == _FLASH_DEG2_EXP2_PACKET
+        and cfg.e2e_schedule == "16/6"
+        and cfg.masked_e2e_schedule == "16/6"
+        and cfg.split_p_arrive
+        and cfg.rescale_threshold > 0.0
+        and cfg.p_store_repetition == 16
+        and cfg.s_load_repetition == 32
     )
 
 
@@ -7307,10 +7348,10 @@ def emit_flash_fa4_device_body(
     causal_tuning = (
         tuning_policy.causal_policy(num_kv) if tuning_policy is not None else None
     )
-    causal_seed_matches = _flash_causal_resident_native_seed_matches(cfg, causal_tuning)
+    causal_schedule_ok = _flash_causal_resident_schedule_supported(cfg, causal_tuning)
     use_causal_resident_native = (
         causal_tuning is not None
-        and causal_seed_matches
+        and causal_schedule_ok
         and use_tmem_row_reduce
         and is_causal
         and not has_lse
