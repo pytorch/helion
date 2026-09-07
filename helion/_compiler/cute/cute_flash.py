@@ -3786,6 +3786,7 @@ def _flash_dense_tuning_overrides(
     policy: FlashDenseTuningPolicy,
 ) -> dict[str, object]:
     values: dict[str, object] = {
+        FLASH_KV_TILE_N_KEY: policy.kv_tile_n,
         FLASH_PIPELINE_FAMILY_KEY: policy.pipeline_family,
         FLASH_KV_STAGE_KEY: policy.kv_stage,
         FLASH_PERSISTENT_KEY: policy.persistent,
@@ -5055,13 +5056,25 @@ def flash_autotune_fragments(
     )
 
     # A wider KV tile amortizes the per-tile softmax correction over more
-    # columns. The choice set is deliberately length-independent: which widths
-    # are *legal* depends on the sequence (a width that does not divide it needs
-    # the masked tail tile), and letting that leak into the search surface would
-    # make the surface length-dependent, which this design forbids. The resolver
-    # clamps an illegal width back to 128. Only 128 is searched until the masked
-    # tail lands; a wider tile is reachable now through an explicit config.
-    kv_tile_n = enum(defaults.kv_tile_n, FLASH_KV_TILE_N_CHOICES, (128,))
+    # columns. Now that the trailing partial tile is masked, a width no longer
+    # has to divide the sequence, so which widths are legal depends only on the
+    # workload class -- head dim, dtype, causality, topology and the TMEM
+    # budget -- and the search surface stays length-independent.
+    kv_tile_n_search = tuple(
+        width
+        for width in FLASH_KV_TILE_N_CHOICES
+        if _flash_kv_tile_n_supported(
+            width,
+            head_dim=head_dim,
+            num_kv=num_kv,
+            topology=defaults.topology,
+            is_causal=is_causal,
+            s_stage=defaults.s_stage,
+        )
+    )
+    kv_tile_n = enum(
+        defaults.kv_tile_n, FLASH_KV_TILE_N_CHOICES, kv_tile_n_search or (128,)
+    )
 
     fragments: dict[str, ConfigSpecFragment] = {
         FLASH_KV_TILE_N_KEY: kv_tile_n,
