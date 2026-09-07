@@ -4,7 +4,6 @@ import functools
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
-from typing_extensions import Never
 
 import sympy
 from torch._inductor.bounds import ValueRangeAnalysis
@@ -449,7 +448,7 @@ class MaskedValueAnalysisInductor(ValueRangeAnalysis):
         return self.input_name_lookup[name]
 
     @classmethod
-    def index_expr(cls, index: Never, dtype: torch.dtype) -> ValueRangesAny:
+    def index_expr(cls, index: object, dtype: torch.dtype) -> ValueRangesAny:
         return ValueRanges.unknown()
 
 
