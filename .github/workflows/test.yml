@@ -268,7 +268,6 @@ jobs:
           set -e -o pipefail
           source .venv/bin/activate
           uv pip install pytest-xdist
-          uv pip install pytest-rerunfailures
           # Conditionally enable ref-eager and golden-accept/dtype-assert test modes
           if [[ "${{ matrix.dtype-asserts }}" == "true" ]]; then export HELION_DEBUG_DTYPE_ASSERTS=1; fi
           if [[ "${{ matrix.expecttest-accept }}" == "true" ]]; then export EXPECTTEST_ACCEPT=1; fi
