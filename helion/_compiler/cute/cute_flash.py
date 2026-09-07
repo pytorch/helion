@@ -1631,6 +1631,54 @@ class FlashAttentionConfig:
     # Causal descending KV can run the short masked diagonal prefix separately
     # from the hot unmasked suffix, removing a per-KV branch from most tiles.
     causal_loop_split: bool = False
+    # KV tile width for the FA4 score/probability tile. 128 is the historical
+    # fixed value. A wider tile amortizes the per-KV-tile softmax correction --
+    # which sits on the critical path -- over more columns; FA4's tuned sm_103
+    # plans all use 160 and gain ~9.6% from it. Legality: a multiple of 32 that
+    # keeps two S buffers plus two O buffers inside 512 TMEM columns, and (until
+    # the masked tail tile lands) one that divides the sequence.
+    kv_tile_n: int = 128
+
+
+# TMEM is 512 columns. The FA4 score pipeline holds ``s_stage`` score buffers of
+# ``kv_tile_n`` columns plus two ``head_dim``-wide output accumulators.
+FLASH_TMEM_COLUMNS = 512
+FLASH_KV_TILE_N_CHOICES = (128, 160, 192)
+
+
+def _flash_kv_tile_n_fits_tmem(kv_tile_n: int, head_dim: int, s_stage: int) -> bool:
+    """Return whether the score and output accumulators fit in TMEM."""
+    return s_stage * kv_tile_n + 2 * head_dim <= FLASH_TMEM_COLUMNS
+
+
+def _flash_kv_tile_n_supported(
+    kv_tile_n: int,
+    *,
+    head_dim: int,
+    num_kv: int,
+    topology: str,
+    is_causal: bool,
+    s_stage: int,
+    desc_kv: bool = True,
+) -> bool:
+    """Return whether a non-default KV tile width is legal for this shape.
+
+    ``kv_tile_n`` must be a tcgen05-legal MMA N and must leave the score and
+    output accumulators inside TMEM. A width that does not divide the sequence
+    is allowed: the trailing partial tile is masked, which needs the descending
+    KV order that puts it first. Causal keeps the default width because its
+    diagonal masking is written against 128-column tiles.
+    """
+    if kv_tile_n == 128:
+        return True
+    if kv_tile_n not in FLASH_KV_TILE_N_CHOICES or kv_tile_n % 32:
+        return False
+    if is_causal or topology != "fa4":
+        return False
+    if not _flash_kv_tile_n_fits_tmem(kv_tile_n, head_dim, s_stage):
+        return False
+    sequence_extent = num_kv * 128
+    return sequence_extent % kv_tile_n == 0 or desc_kv
 
 
 def _flash_bool_env(name: str, default: bool) -> bool:
@@ -3190,6 +3238,21 @@ def resolve_flash_config(
     if epi_tma_setup not in ("shared", "role_local") or not epi_tma_setup_eligible:
         epi_tma_setup = "shared"
 
+    kv_tile_n = int(_flash_env_get("HELION_CUTE_FLASH_KV_TILE_N", "128") or "128")
+    kv_tile_n_cfg = _cfg(FLASH_KV_TILE_N_KEY)
+    if kv_tile_n_cfg is not None:
+        kv_tile_n = int(cast("int", kv_tile_n_cfg))
+    if not _flash_kv_tile_n_supported(
+        kv_tile_n,
+        head_dim=head_dim,
+        num_kv=num_kv,
+        topology=topology,
+        is_causal=is_causal,
+        s_stage=s_stage,
+        desc_kv=kv_order == "descending",
+    ):
+        kv_tile_n = 128
+
     if exp2_packet in _FLASH_CAUSAL_HD128_RESIDENT_EXP2_PACKETS and (
         pipeline_family != "fa4" or not causal_loop_split
     ):
@@ -3268,6 +3331,7 @@ def resolve_flash_config(
         local_tma_partition=local_tma_partition,
         tensor_4d_tma=tensor_4d_tma,
         causal_loop_split=causal_loop_split,
+        kv_tile_n=kv_tile_n,
     )
 
 
@@ -3345,6 +3409,7 @@ FLASH_CAUSAL_LOOP_SPLIT_KEY = "cute_flash_causal_loop_split"
 FLASH_PERSISTENT_LOOP_KEY = "cute_flash_persistent_loop"
 FLASH_SP_ROW_SUM_KEY = "cute_flash_sp_row_sum"
 FLASH_SOFTMAX_SETUP_KEY = "cute_flash_softmax_setup"
+FLASH_KV_TILE_N_KEY = "cute_flash_kv_tile_n"
 FLASH_EPI_TMA_SETUP_KEY = "cute_flash_epi_tma_setup"
 
 
@@ -3438,6 +3503,7 @@ FLASH_AUTOTUNE_CONFIG_KEYS: tuple[str, ...] = (
     FLASH_SP_ROW_SUM_KEY,
     FLASH_SOFTMAX_SETUP_KEY,
     FLASH_EPI_TMA_SETUP_KEY,
+    FLASH_KV_TILE_N_KEY,
 )
 
 FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS: tuple[str, ...] = (
@@ -3519,6 +3585,7 @@ def flash_effective_config_values(
         FLASH_SP_ROW_SUM_KEY: config.sp_row_sum,
         FLASH_SOFTMAX_SETUP_KEY: config.softmax_setup,
         FLASH_EPI_TMA_SETUP_KEY: config.epi_tma_setup,
+        FLASH_KV_TILE_N_KEY: config.kv_tile_n,
     }
 
 
@@ -4987,7 +5054,17 @@ def flash_autotune_fragments(
         else ("shared",),
     )
 
+    # A wider KV tile amortizes the per-tile softmax correction over more
+    # columns. The choice set is deliberately length-independent: which widths
+    # are *legal* depends on the sequence (a width that does not divide it needs
+    # the masked tail tile), and letting that leak into the search surface would
+    # make the surface length-dependent, which this design forbids. The resolver
+    # clamps an illegal width back to 128. Only 128 is searched until the masked
+    # tail lands; a wider tile is reachable now through an explicit config.
+    kv_tile_n = enum(defaults.kv_tile_n, FLASH_KV_TILE_N_CHOICES, (128,))
+
     fragments: dict[str, ConfigSpecFragment] = {
+        FLASH_KV_TILE_N_KEY: kv_tile_n,
         FLASH_S_STAGE_KEY: s_stage,
         FLASH_KV_STAGE_KEY: kv_stage,
         FLASH_PERSISTENT_KEY: persistent,
@@ -7165,6 +7242,17 @@ def emit_flash_fa4_device_body(
         split_range_proof=causal_split_proof,
         query_slots_per_cta=q_stage,
     )
+    # KV tile width for the score/probability tile. The resolver already
+    # clamped an illegal request back to the historical 128. A width that does
+    # not divide the sequence leaves a partial trailing tile whose out-of-range
+    # columns must be masked to -inf before the row max.
+    kv_n = cfg.kv_tile_n
+    # ``num_kv`` counts default-width tiles and is the shape key the tuning
+    # policy is indexed by; the actual trip count follows the configured width.
+    kv_tile_count = -(-sequence_extent // kv_n)
+    kv_tail_cols = sequence_extent - (kv_tile_count - 1) * kv_n
+    assert 0 < kv_tail_cols <= kv_n
+    has_kv_tail = kv_tail_cols != kv_n
     dense_tuning = (
         tuning_policy.dense_policy(num_kv) if tuning_policy is not None else None
     )
@@ -7336,6 +7424,7 @@ def emit_flash_fa4_device_body(
                     stat_depth=1 if fa4_stat_handoff else 2,
                     pipelined_stat_handoff=acknowledged_stat_pipeline,
                     final_only_stat_handoff=final_only_stat_pipeline,
+                    kv_tile_n=kv_n,
                 )
             )
         )
@@ -7360,6 +7449,7 @@ def emit_flash_fa4_device_body(
                     stat_depth=1 if fa4_stat_handoff else 2,
                     pipelined_stat_handoff=acknowledged_stat_pipeline,
                     final_only_stat_handoff=final_only_stat_pipeline,
+                    kv_tile_n=kv_n,
                 )
             )
         )
@@ -7509,8 +7599,7 @@ def emit_flash_fa4_device_body(
     epi_smem = cfg.epi_tma or cfg.epi_stg
     role_chain = cfg.role_chain
     storage_extra_args = f", {epi_smem!s}, {use_clc_scheduler!s}, {cfg.clc_stages}"
-    if separate_kv_rings:
-        storage_extra_args += ", True"
+    storage_extra_args += f", {separate_kv_rings!s}, {kv_n}"
     prefetch_epi_tma = (
         "\n    cute_cpasync_flash.prefetch_descriptor(_flash_tma_o)"
         if cfg.epi_tma
@@ -7771,9 +7860,9 @@ flash_P_STORE32_CHUNKS = cute.size(tST32tS0, mode=[2])"""
         ""
         if use_local_tma_partition
         else f"""
-gQ = cute.flat_divide(_flash_mQt, cute.select(({mma_m}, 128, {hd}), mode=[0, 2]))
-gK = cute.flat_divide(_flash_mKt, cute.select(({mma_m}, 128, {hd}), mode=[1, 2]))
-gV = cute.flat_divide(_flash_mVt, cute.select(({mma_m}, {hd}, 128), mode=[1, 2]))
+gQ = cute.flat_divide(_flash_mQt, cute.select(({mma_m}, {kv_n}, {hd}), mode=[0, 2]))
+gK = cute.flat_divide(_flash_mKt, cute.select(({mma_m}, {kv_n}, {hd}), mode=[1, 2]))
+gV = cute.flat_divide(_flash_mVt, cute.select(({mma_m}, {hd}, {kv_n}), mode=[1, 2]))
 tSgQ = flash_qkt.partition_A(gQ)
 tSgK = flash_qkt.partition_B(gK)
 tOgV = flash_pvt.partition_B(gV)
@@ -7897,7 +7986,7 @@ flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
 {setup_tma_partitions}
     """
 
-    tmem_fragment_setup = f"""    flash_qk_acc_shape = flash_qkt.partition_shape_C(({mma_m}, 128))
+    tmem_fragment_setup = f"""    flash_qk_acc_shape = flash_qkt.partition_shape_C(({mma_m}, {kv_n}))
     tStS = flash_qkt.make_fragment_C(flash_qk_acc_shape)
     flash_pv_acc_shape = flash_pvt.partition_shape_C(({mma_m}, {hd}))
     tOtO = flash_pvt.make_fragment_C(flash_pv_acc_shape)
@@ -7906,9 +7995,9 @@ flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
         2, 13 * 32)
     flash_tmem_ptr = flash_tmem.retrieve_ptr(cutlass.Float32)
     tStS0_full = cute.make_tensor(flash_tmem_ptr, tStS.layout)
-    tStS1_full = cute.make_tensor(flash_tmem_ptr + 128, tStS.layout)
-    tOtO0_full = cute.make_tensor(flash_tmem_ptr + 256, tOtO.layout)
-    tOtO1_full = cute.make_tensor(flash_tmem_ptr + {256 + hd}, tOtO.layout)
+    tStS1_full = cute.make_tensor(flash_tmem_ptr + {kv_n}, tStS.layout)
+    tOtO0_full = cute.make_tensor(flash_tmem_ptr + {2 * kv_n}, tOtO.layout)
+    tOtO1_full = cute.make_tensor(flash_tmem_ptr + {2 * kv_n + hd}, tOtO.layout)
 {textwrap.indent(tmem_local_views.strip(), "    ")}
 """
     tmem_mma_setup = (
@@ -7952,7 +8041,7 @@ flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
     )
     tmem_softmax_setup = (
         tmem_base_setup
-        + f"""    cS = cute.make_identity_tensor((128, 128))
+        + f"""    cS = cute.make_identity_tensor((128, {kv_n}))
     tScS = flash_qkt.partition_C(cS)
     flash_ld_atom = cute.make_copy_atom(
         cute_tcgen05_flash.{flash_ld_op}(cute_tcgen05_flash.Repetition({
@@ -7970,7 +8059,7 @@ flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
 
     # Staged-P store atom repetition is autotuned. Rep16 preserves the original
     # 4-chunk FA4 granularity; Rep32 halves the P r2t chunk count on hd64.
-    flash_tilePlikeFP32 = 128 // cutlass.Float32.width * {io_dtype}.width
+    flash_tilePlikeFP32 = {kv_n} // cutlass.Float32.width * {io_dtype}.width
     flash_P_layout = cute.composition(
         tStS.layout, cute.make_layout((128, flash_tilePlikeFP32)))
     tStS0_P = cute.make_tensor({p0_store_iter}, flash_P_layout)
@@ -8008,7 +8097,7 @@ flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
     ) and not mixed_p_store
 
     def _tmem_softmax_setup_stage(stage: str) -> str:
-        ptr_expr = "flash_tmem_ptr" if stage == "0" else "flash_tmem_ptr + 128"
+        ptr_expr = "flash_tmem_ptr" if stage == "0" else f"flash_tmem_ptr + {kv_n}"
         p_store_iter = p0_store_iter if stage == "0" else p1_store_iter
         stage_score_store_setup = ""
         if score_store_needed:
@@ -8044,10 +8133,10 @@ flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
         return f"""    _helion_flash_rt.named_barrier_wait_unaligned(
         2, 13 * 32)
     flash_tmem_ptr = flash_tmem.retrieve_ptr(cutlass.Float32)
-    flash_qk_acc_shape = flash_qkt.partition_shape_C(({mma_m}, 128))
+    flash_qk_acc_shape = flash_qkt.partition_shape_C(({mma_m}, {kv_n}))
     tStS = flash_qkt.make_fragment_C(flash_qk_acc_shape)
     tStS{stage} = cute.make_tensor({ptr_expr}, tStS.layout)
-    cS = cute.make_identity_tensor((128, 128))
+    cS = cute.make_identity_tensor((128, {kv_n}))
     tScS = flash_qkt.partition_C(cS)
     flash_ld_atom = cute.make_copy_atom(
         cute_tcgen05_flash.{flash_ld_op}(cute_tcgen05_flash.Repetition({
@@ -8063,7 +8152,7 @@ flash_pvt = _flash_pv_mma.get_slice(flash_mma_tile_coord_v)
 
     # Staged-P store atom repetition is autotuned. Rep16 preserves the original
     # 4-chunk FA4 granularity; Rep32 halves the P r2t chunk count on hd64.
-    flash_tilePlikeFP32 = 128 // cutlass.Float32.width * {io_dtype}.width
+    flash_tilePlikeFP32 = {kv_n} // cutlass.Float32.width * {io_dtype}.width
     flash_P_layout = cute.composition(
         tStS.layout, cute.make_layout((128, flash_tilePlikeFP32)))
     tStS{stage}_P = cute.make_tensor({p_store_iter}, flash_P_layout)
@@ -8965,18 +9054,21 @@ if warp_idx == 15:
     else:
         sp_minus_max_scale = "(0.0 - flash_row_max_safe) * _flash_scale_log2"
     if cfg.rescale_threshold > 0.0:
-        sp_pin_condition = (
-            f"({softmax_not_first}) & (flash_acc_log >= -{cfg.rescale_threshold})"
-        )
-        _sp_alpha_pre = f"""            flash_acc_log = _flash_scale_log2 * (flash_old_row_max - flash_row_max_safe)
+
+        def _sp_alpha_pre_for(not_first: str) -> str:
+            pin = f"({not_first}) & (flash_acc_log >= -{cfg.rescale_threshold})"
+            return f"""            flash_acc_log = _flash_scale_log2 * (flash_old_row_max - flash_row_max_safe)
             flash_alpha = cute.math.exp2(flash_acc_log, fastmath=True)
-            if {sp_pin_condition}:
+            if {pin}:
                 flash_row_max = flash_old_row_max
                 flash_row_max_safe = flash_old_row_max
                 flash_alpha = cutlass.Float32(1.0)
             flash_minus_max_scale = {sp_minus_max_scale}"""
+
+        _sp_alpha_pre = _sp_alpha_pre_for(softmax_not_first)
         _sp_alpha_post = ""
     else:
+        _sp_alpha_pre_for = None  # type: ignore[assignment]
         _sp_alpha_pre = f"            flash_minus_max_scale = {sp_minus_max_scale}"
         _sp_alpha_post = """            flash_alpha = cute.math.exp2(
                 _flash_scale_log2 * (flash_old_row_max - flash_row_max_safe), fastmath=True)"""
@@ -9563,23 +9655,22 @@ if warp_idx == 15:
         else:
             sp_exp_block = softmax_exp_block
             sp_p_store_block = p_store_block
-        if not cfg.skip_rescale_stats:
+
+        def _sp_corr_publish_alpha_for(not_first: str) -> str:
+            if cfg.skip_rescale_stats:
+                return ""
             if acknowledged_stat_pipeline:
-                sp_corr_publish_alpha = f"""            if {softmax_not_first}:
+                return f"""            if {not_first}:
 {corr_publish_alpha}
             else:
 {corr_publish_dummy}"""
-            else:
-                sp_corr_publish_alpha = f"""            if {softmax_not_first}:
+            return f"""            if {not_first}:
 {corr_publish_alpha}"""
+
+        if not cfg.skip_rescale_stats:
+            sp_corr_publish_alpha = _sp_corr_publish_alpha_for(softmax_not_first)
         fa4_publish_alpha_before_exp = fa4_stat_handoff and (
             cfg.rescale_threshold > 0.0 or fa4_stat_pipeline
-        )
-        sp_alpha_publish_pre = (
-            sp_corr_publish_alpha if fa4_publish_alpha_before_exp else ""
-        )
-        sp_alpha_publish_post = (
-            "" if fa4_publish_alpha_before_exp else sp_corr_publish_alpha
         )
         fa4_entry_stat_acquire = (
             f"""        _helion_flash_rt.mbar_spin_wait(
@@ -9806,25 +9897,99 @@ if warp_idx == 15:
             if dense_resident_value_graph_candidate
             else _FLASH_ONLINE_STATISTICS_UPDATE
         )
-        iteration = _FlashOnlineSoftmaxIteration(
-            load_and_reduce=f"""            tLDrS = cute.make_rmem_tensor(tLDcS.shape, cutlass.Float32)
-{sp_score_load}
-{sp_rowmax}""",
-            alpha_pre_probability=_sp_alpha_pre,
-            alpha_publish_pre_probability=sp_alpha_publish_pre,
-            probability_update=sp_exp_block,
-            alpha_post_probability=_sp_alpha_post,
-            alpha_publish_post_probability=sp_alpha_publish_post,
-            statistics_acquire=post_p_stat_acquire,
-            statistics_update=statistics_update,
-            post_statistics=sp_p_store_block,
-        )
-        loop = _format_fa4_online_softmax_loop(
-            softmax_segment,
-            iteration,
-            stage=stage,
-            wait_hint=cfg.wait_hint,
-        )
+        # A KV tile width that does not divide the sequence leaves one partial
+        # trailing tile. Its out-of-range columns arrive as zeros (TMA
+        # zero-fills past the tensor extent), and a zero score is not a
+        # no-op: exp2(0 - max) contributes to the row sum. Mask them to -inf.
+        # The hardware TMEM row-reduce folds the max into the load, so the
+        # masked tile must use the plain load and reduce in software -- the
+        # same pair the causal diagonal already uses. Descending KV order puts
+        # the partial tile first, so it peels off as a one-iteration prefix.
+        if has_kv_tail:
+            assert desc_kv
+            # Reuse the ordinary load. When it carries the hardware row
+            # reduction the max it produces covers the out-of-range columns, so
+            # it is discarded and the row max is recomputed in software from
+            # the masked fragment.
+            tail_score_load = (
+                f"{sp_score_load}\n"
+                "            _helion_flash_rt.mask_r2p_sm100_rank1(\n"
+                f"                tLDrS, cutlass.Int32({kv_tail_cols}))"
+            )
+            tail_rowmax = (
+                "            flash_row_max = "
+                "_helion_flash_rt.fmax_reduce_packed(tLDrS, flash_row_max)"
+            )
+            tail_segment = _FlashSoftmaxLoopSegment(
+                loop_var="flash_kv_tail_iter",
+                loop_bound="cutlass.Int32(1)",
+                kv_expr=f"{kv_loop_bound} - cutlass.Int32(1)",
+            )
+            body_segment = _FlashSoftmaxLoopSegment(
+                loop_var="flash_kv_iter",
+                loop_bound=f"{kv_loop_bound} - cutlass.Int32(1)",
+                kv_expr=f"{kv_loop_bound} - cutlass.Int32(2) - flash_kv_iter",
+                continues_previous_segment=True,
+            )
+
+        def _dense_iteration(
+            score_load: str,
+            rowmax: str,
+            segment: _FlashSoftmaxLoopSegment | None = None,
+        ) -> _FlashOnlineSoftmaxIteration:
+            # A split loop has a different "is this the first KV tile" proof per
+            # segment, and both the alpha pin and the alpha publish depend on it.
+            not_first = None if segment is None else segment.not_first_condition
+            alpha_pre = (
+                _sp_alpha_pre
+                if not_first is None or _sp_alpha_pre_for is None
+                else _sp_alpha_pre_for(not_first)
+            )
+            publish = (
+                sp_corr_publish_alpha
+                if not_first is None
+                else _sp_corr_publish_alpha_for(not_first)
+            )
+            return _FlashOnlineSoftmaxIteration(
+                load_and_reduce=(
+                    "            tLDrS = cute.make_rmem_tensor("
+                    "tLDcS.shape, cutlass.Float32)\n"
+                    f"{score_load}\n{rowmax}"
+                ),
+                alpha_pre_probability=alpha_pre,
+                alpha_publish_pre_probability=(
+                    publish if fa4_publish_alpha_before_exp else ""
+                ),
+                probability_update=sp_exp_block,
+                alpha_post_probability=_sp_alpha_post,
+                alpha_publish_post_probability=(
+                    "" if fa4_publish_alpha_before_exp else publish
+                ),
+                statistics_acquire=post_p_stat_acquire,
+                statistics_update=statistics_update,
+                post_statistics=sp_p_store_block,
+            )
+
+        if has_kv_tail:
+            loop = "\n".join(
+                _format_fa4_online_softmax_loop(
+                    segment,
+                    _dense_iteration(score_load, rowmax, segment),
+                    stage=stage,
+                    wait_hint=cfg.wait_hint,
+                )
+                for segment, score_load, rowmax in (
+                    (tail_segment, tail_score_load, tail_rowmax),
+                    (body_segment, sp_score_load, sp_rowmax),
+                )
+            )
+        else:
+            loop = _format_fa4_online_softmax_loop(
+                softmax_segment,
+                _dense_iteration(sp_score_load, sp_rowmax),
+                stage=stage,
+                wait_hint=cfg.wait_hint,
+            )
         return f"""{
             fa4_entry_stat_acquire
         }        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
@@ -10971,6 +11136,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         "batch": batch,
         "scale_log2": scale_log2,
         "kv_stage": cfg.kv_stage,
+        "kv_tile_n": cfg.kv_tile_n,
         "s_stage": cfg.s_stage,
         "persistent": cfg.persistent,
         "persistent_ctas_per_sm": cfg.persistent_ctas_per_sm,
