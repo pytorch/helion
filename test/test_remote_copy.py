@@ -376,6 +376,7 @@ def _parent_store_nested_remote_copy(
     """Initialize a resident exchange buffer before copying from a child loop."""
     num_steps = hl.specialize(src.size(1))
     for _program in hl.grid(1):
+        hl.remote_barrier(peers[0, 0])
         for step in hl.tile(num_steps, block_size=1):
             exchange[0, 0, step.begin, :] = src[0, step.begin, :]
             for peer_step in hl.tile(1, block_size=1):
