@@ -622,8 +622,6 @@ def promote_partitioned_output_axis(
                 graph=graph.graph,
                 node_args=graph.node_args,
                 block_ids=[],
-                host_loop_reads=graph.host_loop_reads,
-                host_loop_writes=graph.host_loop_writes,
             )
         parent.args = (
             parent.args[0],
