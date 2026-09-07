@@ -215,9 +215,9 @@ class FlashDenseTuningPolicy:
                 raise ValueError(
                     "specialized dense lowerings require a positive rescale threshold"
                 )
-            if self.pipeline_family != "fa4_2cta" or self.persistent:
+            if self.pipeline_family not in ("fa4", "fa4_2cta") or self.persistent:
                 raise ValueError(
-                    "specialized dense lowerings require the nonpersistent fa4_2cta pipeline"
+                    "specialized dense lowerings require a nonpersistent fa4 pipeline"
                 )
             if self.e2e_schedule == "xu":
                 raise ValueError(

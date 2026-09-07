@@ -147,12 +147,12 @@ def test_sm103_flash_target_policy() -> None:
 
     expected_dense = {
         256: (
-            "deg1_8x2_corr10",
+            "1x1",
             "8/2",
             5,
             1,
             "single",
-            "fa4_2cta",
+            "fa4",
             6,
             False,
             8.0,
@@ -163,12 +163,12 @@ def test_sm103_flash_target_policy() -> None:
             40,
         ),
         512: (
-            "deg1_8x2_corr10",
+            "1x1",
             "8/2",
             2,
             1,
             "single",
-            "fa4_2cta",
+            "fa4",
             6,
             False,
             8.0,
@@ -179,12 +179,12 @@ def test_sm103_flash_target_policy() -> None:
             40,
         ),
         1024: (
-            "deg1_8x2_corr10",
+            "1x1",
             "8/2",
             2,
             1,
             "single",
-            "fa4_2cta",
+            "fa4",
             6,
             False,
             8.0,
@@ -199,12 +199,12 @@ def test_sm103_flash_target_policy() -> None:
         # (1226.0 -> 1332.9 TFLOP/s at width 160 on GB300), so every promoted
         # sm_103 dense seed now uses the resident lowering.
         2048: (
-            "deg1_8x2_corr10",
+            "1x1",
             "8/2",
             2,
             1,
             "single",
-            "fa4_2cta",
+            "fa4",
             6,
             False,
             8.0,
@@ -239,15 +239,15 @@ def test_sm103_flash_target_policy() -> None:
 
     expected_causal = {
         512: (
-            8,
+            6,
             FlashCausalSeedTemplate.DEGREE2_V1,
-            15,
-            3,
+            1,
+            14,
             "fa4",
-            True,
-            FlashSoftmaxLowering.STATEFUL,
-            200,
-            2,
+            False,
+            FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH,
+            184,
+            0,
             True,
             "descending",
         ),
@@ -443,15 +443,29 @@ def test_flash_policy_rejects_invalid_field_combinations() -> None:
             "ring2",
             softmax_lowering=FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH,
         )
-    with pytest.raises(ValueError, match="nonpersistent fa4_2cta"):
+    # fa4 and fa4_2cta both host the specialized lowerings; other families and
+    # a persistent grid do not.
+    with pytest.raises(ValueError, match="nonpersistent fa4 pipeline"):
         FlashDenseTuningPolicy(
             256,
-            "deg1_8x2_corr10",
+            "1x1",
+            "8/2",
+            0,
+            0,
+            "single",
+            pipeline_family="fa4_deep_1cta",
+            softmax_lowering=FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH,
+        )
+    with pytest.raises(ValueError, match="nonpersistent fa4 pipeline"):
+        FlashDenseTuningPolicy(
+            256,
+            "1x1",
             "8/2",
             0,
             0,
             "single",
             pipeline_family="fa4",
+            persistent=True,
             softmax_lowering=FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH,
         )
     with pytest.raises(ValueError, match="degree-1 exp2 packet"):
