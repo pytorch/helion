@@ -21,7 +21,7 @@ EvictionPolicyLiteral = Literal["", "first", "last"]
 LoadCacheModifierLiteral = Literal["", ".cg"]
 StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
 NumSmMultiplierLiteral = Literal[1, 2, 4, 8]
-MaxnregLiteral = Literal[32, 64, 128, 256] | None
+MaxnregLiteral = Literal[32, 64, 80, 128, 256] | None
 
 
 class Config(Mapping[str, object]):
@@ -96,7 +96,8 @@ class Config(Mapping[str, object]):
             num_sm_multiplier: Multiplier for the number of SMs in persistent
                 kernels (1, 2, 4, 8).
                 Controls multi-occupancy by launching N * num_sms thread blocks instead of just num_sms.
-            maxnreg: Maximum number of registers per thread (None, 32, 64, 128, 256).
+            maxnreg: Maximum number of registers per thread
+                (None, 32, 64, 80, 128, 256).
                 Lower values allow higher occupancy but may hurt performance. Used with persistent kernels
                 to ensure multi-occupancy can be achieved.
             indexing: Indexing strategy for load and store operations. Can be:

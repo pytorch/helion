@@ -22,6 +22,7 @@ from helion._compiler.tile_dependency import TileAccess
 from helion._compiler.tile_dependency import TileDependency
 from helion._compiler.tile_dependency import TileDependencyKind
 from helion._compiler.tile_dependency import _CoordinateRelationPiece
+from helion._compiler.tile_dependency import _dense_mixed_radix_converse
 from helion._compiler.tile_dependency import allocation_regions_may_overlap
 from helion._compiler.tile_dependency import build_tile_dependency_graph
 from helion._compiler.tile_dependency import coordinate_axis_symbol
@@ -185,6 +186,28 @@ def _one_dimensional_domains(
             (20,),
             ((20, consumer_count),),
             ((20, consumer_block),),
+        ),
+    )
+
+
+def _bounded_coordinate_relation(size: int) -> CoordinateRelation:
+    source = CoordinateDomain(
+        (10, 11),
+        ((10, 2), (11, size)),
+        kind="site",
+    )
+    target = CoordinateDomain((20,), ((20, 4),), kind="allocation")
+    retained = coordinate_axis_symbol(10)
+    bounded = coordinate_axis_symbol(11)
+    value = retained + 2 * sympy.Mod(sympy.floor(bounded / 64), 2)
+    return CoordinateRelation.point_map(
+        source,
+        target,
+        (
+            (
+                ((10, 0, 2, 1), (11, 0, size, 1)),
+                (value,),
+            ),
         ),
     )
 
@@ -493,6 +516,173 @@ class TestTileDependency(TestCase):
             sources_by_target.materialize(),
             tuple(expected[target] for target in range(target_domain.size)),
         )
+
+    def test_converse_normalizes_bounded_shifted_modulo(self) -> None:
+        producer = CoordinateDomain((10,), ((10, 684),), identity=0)
+        keys = CoordinateDomain((0,), ((0, 3),), kind="event", identity=0)
+        source = coordinate_axis_symbol(10)
+        key = sympy.Mod(sympy.floor(source / 16) + 2, 3)
+        producer_to_key = CoordinateRelation(
+            producer,
+            keys,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 400, 448, 1),),
+                    ((0, key, key + 1, 1),),
+                ),
+            ),
+        )
+
+        producers_by_key = producer_to_key.converse()
+
+        self.assertIsNotNone(producers_by_key)
+        assert producers_by_key is not None
+        self.assertEqual(
+            producers_by_key.materialize(),
+            tuple(
+                frozenset(
+                    range(
+                        400 + key_index * 16,
+                        400 + (key_index + 1) * 16,
+                    )
+                )
+                for key_index in range(3)
+            ),
+        )
+
+    def test_project_source_folds_only_small_bounded_constants(self) -> None:
+        small = _bounded_coordinate_relation(64)
+        large = _bounded_coordinate_relation(65)
+        retained = CoordinateDomain((10,), ((10, 2),), kind="site")
+
+        projected = small.project_source(retained)
+
+        self.assertIsNotNone(projected)
+        assert projected is not None
+        self.assertEqual(
+            projected.materialize(),
+            (frozenset((0,)), frozenset((1,))),
+        )
+        self.assertIsNone(large.project_source(retained))
+
+    def test_factor_through_folds_only_small_bounded_constants(self) -> None:
+        small = _bounded_coordinate_relation(64)
+        large = _bounded_coordinate_relation(65)
+        key_domain = CoordinateDomain((10,), ((10, 2),), kind="event")
+        small_quotient = CoordinateRelation.projection(
+            small.source_domain,
+            key_domain,
+        )
+        large_quotient = CoordinateRelation.projection(
+            large.source_domain,
+            key_domain,
+        )
+        assert small_quotient is not None and large_quotient is not None
+
+        factored = small.factor_through(small_quotient)
+
+        self.assertIsNotNone(factored)
+        assert factored is not None
+        self.assertEqual(
+            factored.materialize(),
+            (frozenset((0,)), frozenset((1,))),
+        )
+        self.assertIsNone(large.factor_through(large_quotient))
+
+    def test_source_axes_fold_only_small_bounded_constants(self) -> None:
+        self.assertEqual(
+            _bounded_coordinate_relation(64).source_axes_affecting_targets(),
+            (10,),
+        )
+        self.assertEqual(
+            _bounded_coordinate_relation(65).source_axes_affecting_targets(),
+            (10, 11),
+        )
+
+    def test_dense_converse_lifts_full_singleton_target_axis(self) -> None:
+        source = CoordinateDomain((0,), ((0, 2),), kind="event")
+        target = CoordinateDomain(
+            (10, 11),
+            ((10, 1), (11, 8)),
+            kind="site",
+        )
+        source_index = coordinate_axis_symbol(0)
+        relation = CoordinateRelation(
+            source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    ((0, 0, 2, 1),),
+                    (
+                        (10, sympy.Integer(0), sympy.Integer(1), 1),
+                        (11, 4 * source_index, 4 * source_index + 4, 1),
+                    ),
+                ),
+            ),
+        )
+        target_counts = relation.target_count_by_source()
+        assert target_counts is not None
+
+        converse = _dense_mixed_radix_converse(relation, target_counts)
+
+        self.assertIsNotNone(converse)
+        assert converse is not None
+        self.assertEqual(
+            converse.materialize(),
+            (frozenset((0,)),) * 4 + (frozenset((1,)),) * 4,
+        )
+
+    def test_dense_converse_rejects_nonfull_singleton_target_axis(self) -> None:
+        source = CoordinateDomain((0,), ((0, 2),), kind="event")
+        target = CoordinateDomain(
+            (10, 11),
+            ((10, 1), (11, 8)),
+            kind="site",
+        )
+        source_index = coordinate_axis_symbol(0)
+        relation = CoordinateRelation(
+            source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    ((0, 0, 2, 1),),
+                    (
+                        (10, sympy.Integer(0), sympy.Integer(0), 1),
+                        (11, 4 * source_index, 4 * source_index + 4, 1),
+                    ),
+                ),
+            ),
+        )
+        target_counts = relation.target_count_by_source()
+        assert target_counts is not None
+
+        self.assertIsNone(_dense_mixed_radix_converse(relation, target_counts))
+
+    def test_dense_converse_rejects_multiple_nontrivial_target_axes(self) -> None:
+        source = CoordinateDomain((0,), ((0, 2),), kind="event")
+        target = CoordinateDomain(
+            (10, 11),
+            ((10, 2), (11, 8)),
+            kind="site",
+        )
+        source_index = coordinate_axis_symbol(0)
+        relation = CoordinateRelation(
+            source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    ((0, 0, 2, 1),),
+                    (
+                        (10, sympy.Integer(0), sympy.Integer(2), 1),
+                        (11, 4 * source_index, 4 * source_index + 4, 1),
+                    ),
+                ),
+            ),
+        )
+        target_counts = relation.target_count_by_source()
+        assert target_counts is not None
+
+        self.assertIsNone(_dense_mixed_radix_converse(relation, target_counts))
 
     def test_target_enumeration_preserves_multi_piece_bijection(self) -> None:
         producer = CoordinateDomain((10,), ((10, 8),), identity=0)
@@ -843,6 +1033,51 @@ class TestTileDependency(TestCase):
         self.assertFalse(relation.has_total_source())
         self.assertFalse(relation.is_total_function())
         self.assertEqual(relation.materialize()[-2:], (frozenset(), frozenset()))
+
+    def test_pointwise_strict_order_is_proved_on_common_affine_partition(
+        self,
+    ) -> None:
+        source = CoordinateDomain((10,), ((10, 8),), identity=0)
+        values = CoordinateDomain((0,), ((0, 32),), kind="value")
+        coordinate = coordinate_axis_symbol(10)
+        left = CoordinateRelation.point_map(
+            source,
+            values,
+            (
+                (((10, 0, 4, 1),), (coordinate,)),
+                (((10, 4, 8, 1),), (coordinate + 2,)),
+            ),
+        )
+        right = CoordinateRelation.point_map(
+            source,
+            values,
+            (
+                (((10, 0, 2, 1),), (coordinate + 1,)),
+                (((10, 2, 4, 1),), (coordinate + 3,)),
+                (((10, 4, 8, 1),), (coordinate + 3,)),
+            ),
+        )
+
+        self.assertTrue(left.is_pointwise_strictly_less_than(right))
+        self.assertTrue(left.is_pointwise_equal_to(left))
+        self.assertFalse(right.is_pointwise_strictly_less_than(left))
+        self.assertFalse(left.is_pointwise_strictly_less_than(left))
+
+        partial_right = CoordinateRelation.point_map(
+            source,
+            values,
+            ((((10, 0, 7, 1),), (coordinate + 1,)),),
+        )
+        self.assertFalse(left.is_pointwise_strictly_less_than(partial_right))
+        partial_left = CoordinateRelation.point_map(
+            source,
+            values,
+            ((((10, 0, 7, 1),), (coordinate,)),),
+        )
+        self.assertTrue(
+            partial_left.is_pointwise_strictly_less_than_where_defined(right)
+        )
+        self.assertFalse(partial_right.is_pointwise_equal_to(right))
 
     def test_partitioned_total_function_avoids_global_canonicalization(self) -> None:
         source = CoordinateDomain((10,), ((10, 128),), identity=0)
@@ -1648,6 +1883,110 @@ class TestTileDependency(TestCase):
                 ),
             ),
             tuple(frozenset((task,)) for task in range(4)),
+        )
+
+    def test_distinct_fixed_scalar_regions_do_not_alias(self) -> None:
+        plan = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    shape=(8,),
+                    block_ids=(None,),
+                    offsets=(3,),
+                    scalar=(True,),
+                    static_extents=(1,),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    shape=(8,),
+                    block_ids=(None,),
+                    offsets=(4,),
+                    scalar=(True,),
+                    static_extents=(1,),
+                ),
+            ),
+            [[10], [20]],
+        )
+
+        self.assertEqual(plan.edges, ())
+
+    def test_dynamic_scalar_offset_remains_conservative(self) -> None:
+        plan = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    shape=(8,),
+                    block_ids=(None,),
+                    offsets=(None,),
+                    scalar=(True,),
+                    static_extents=(1,),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    shape=(8,),
+                    block_ids=(None,),
+                    offsets=(4,),
+                    scalar=(True,),
+                    static_extents=(1,),
+                ),
+            ),
+            [[10], [20]],
+        )
+
+        self.assertEqual(
+            tuple((edge.producer_root, edge.consumer_root) for edge in plan.edges),
+            ((0, 1),),
+        )
+
+    def test_masked_fixed_scalar_store_does_not_kill_previous_writer(self) -> None:
+        plan = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    shape=(8,),
+                    block_ids=(None,),
+                    offsets=(3,),
+                    scalar=(True,),
+                    static_extents=(1,),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="store",
+                    shape=(8,),
+                    block_ids=(None,),
+                    offsets=(3,),
+                    scalar=(True,),
+                    static_extents=(1,),
+                    masked=True,
+                ),
+                _access(
+                    2,
+                    root=2,
+                    kind="load",
+                    shape=(8,),
+                    block_ids=(None,),
+                    offsets=(3,),
+                    scalar=(True,),
+                    static_extents=(1,),
+                ),
+            ),
+            [[10], [20], [30]],
+        )
+
+        self.assertEqual(
+            tuple((edge.producer_root, edge.consumer_root) for edge in plan.edges),
+            ((0, 1), (0, 2), (1, 2)),
         )
 
     def test_multiple_stores_fall_back_to_root(self) -> None:

@@ -16,7 +16,12 @@ from .compile_environment import CompileEnvironment
 from .cross_loop_scheduler import ReadinessConsumer
 from .cross_loop_scheduler import ReadinessCounterPlan
 from .cross_loop_scheduler import ReadinessProducer
+from .cross_loop_scheduler import WorkerInterval
+from .cross_loop_scheduler import WorkerScheduleSegment
+from .cross_loop_scheduler import _normalize_intervals
+from .cross_loop_scheduler import _root_schedule_traversal
 from .cross_loop_scheduler import build_static_pipeline_plan
+from .cross_loop_scheduler import root_barrier_publication_plan
 from .device_function import TensorArg
 from .host_function import HostFunction
 from .program_id import _clone_ast_value
@@ -190,19 +195,6 @@ def _clone_opaque_statements_with_loop_segments(
             f"missing dependency site {site_id}; found {present_site_ids}"
         )
     return cloned
-
-
-def _phase_root_ranges(owner: ForEachProgramID) -> list[tuple[int, int]]:
-    result: list[tuple[int, int]] = []
-    begin = 0
-    for index in range(1, len(owner.case_phases) + 1):
-        if (
-            index == len(owner.case_phases)
-            or owner.case_phases[index] != owner.case_phases[index - 1]
-        ):
-            result.append((begin, index))
-            begin = index
-    return result
 
 
 def _extract_case_bodies(
@@ -513,6 +505,31 @@ def _outline_opaque_tile_body(
     )
 
 
+def _triton_root_requires_kernel_scope(
+    body: list[ast.stmt],
+    target_device_capability: tuple[int, int] | None,
+) -> bool:
+    """Return whether a Triton root may allocate kernel-scoped resources.
+
+    Blackwell lowers sufficiently large ``tl.dot`` operations through tensor
+    memory.  Triton's tensor-memory allocation must remain in the kernel body;
+    placing the operation in an outlined device function fails during lowering.
+    Conservatively keep every Blackwell dot root in kernel scope because the
+    eventual tensor-memory choice is made after Helion emits its AST.
+    """
+    if target_device_capability is None or target_device_capability[0] < 10:
+        return False
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "tl"
+        and node.func.attr in {"dot", "dot_scaled"}
+        for statement in body
+        for node in ast.walk(statement)
+    )
+
+
 def emit_cross_loop_schedule(
     owner: ForEachProgramID,
     strategy: PersistentProgramIDs,
@@ -544,7 +561,8 @@ def emit_cross_loop_schedule(
     case_geometries = tuple(
         geometry for geometry in configured_case_geometries if geometry is not None
     )
-    worker = typed_program_id(0)
+    program = typed_program_id(0)
+    worker = program
     epoch_var = device_function.new_var("tile_dependency_epoch", dce=False)
     base_body = cast(
         "list[ast.stmt]",
@@ -556,6 +574,14 @@ def emit_cross_loop_schedule(
     )
     case_bodies = _extract_case_bodies(owner, base_body)
     opaque_case_fingerprints = tuple(_ast_fingerprint(body) for body in case_bodies)
+    target_device_capability = (
+        CompileEnvironment.current().config_spec.target_device_capability
+    )
+    kernel_scope_roots = frozenset(
+        root
+        for root, body in enumerate(case_bodies)
+        if _triton_root_requires_kernel_scope(body, target_device_capability)
+    )
     dependency_graph = HostFunction.current().device_ir.tile_dependency_graph
     assert dependency_graph is not None
     indexing = device_function.config.get("indexing", ())
@@ -635,6 +661,12 @@ def emit_cross_loop_schedule(
         site_domains=site_domains,
         worker_count=configured_worker_count,
         publishable_site_ids=publishable_site_ids,
+        allow_transient_source=(
+            CompileEnvironment.current().backend_name == "triton"
+            and CompileEnvironment.current().device.type == "cuda"
+            and CompileEnvironment.current().settings.persistent_reserved_sms == 0
+            and device_function.config.get("num_sm_multiplier", 1) == 1
+        ),
     )
     root_barrier_edges = static_pipeline_plan.root_barrier_edges
     all_readiness_counter_plans = static_pipeline_plan.readiness_counters
@@ -655,9 +687,28 @@ def emit_cross_loop_schedule(
         )
     )
     launch_worker_count = static_pipeline_plan.worker_schedule.worker_count
+    transient_source_root = static_pipeline_plan.transient_source_root
+    transient_source_task_count = (
+        root_domains[transient_source_root].size
+        if transient_source_root is not None
+        else 0
+    )
+    launch_program_count = launch_worker_count + transient_source_task_count
+    resident_grid_size_expr = strategy.grid_size_expr
+    if transient_source_root is not None:
+        if static_pipeline_plan.worker_schedule.segments_for_root(
+            transient_source_root
+        ):
+            raise AssertionError(
+                "a transient source must not appear in the resident schedule"
+            )
+        worker = device_function.new_var("tile_dependency_resident_worker", dce=True)
 
-    active_worker_counts_by_root = {
-        root: len(static_pipeline_plan.worker_schedule.workers_for_root(root))
+    root_publication_plans = {
+        root: root_barrier_publication_plan(
+            static_pipeline_plan.worker_schedule,
+            root,
+        )
         for root in range(len(root_domains))
     }
     continuation_task_count_by_root: dict[int, int] = {}
@@ -674,15 +725,22 @@ def emit_cross_loop_schedule(
         )
 
     def root_barrier_arrival_count(root: int) -> int:
-        return active_worker_counts_by_root[root] + continuation_task_count_by_root.get(
-            root, 0
+        scheduled_arrivals = (
+            root_domains[root].size
+            if root == transient_source_root
+            else root_publication_plans[root].resident_arrival_count
         )
+        return scheduled_arrivals + continuation_task_count_by_root.get(root, 0)
 
     # Reject grids that cannot residently fit when the device is otherwise
     # idle. Concurrent-stream residency remains an explicit unresolved
     # contract for this non-cooperative static lowering.
-    device_function.triton_minimum_resident_programs = strategy.grid_size_expr
+    device_function.triton_minimum_resident_programs = resident_grid_size_expr
     device_function.preamble.extend(strategy._persistent_setup_statements(total_expr))
+    if transient_source_root is not None:
+        strategy.grid_size_expr = (
+            f"({resident_grid_size_expr} + {transient_source_task_count})"
+        )
     readiness_counter_offsets: dict[ReadinessCounterPlan, int] = {}
     readiness_counter_count = 0
     readiness_counter_stride = _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
@@ -714,8 +772,9 @@ def emit_cross_loop_schedule(
     root_barrier_state_offset = reserve_state(
         len(root_barrier_producer_roots) * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
     )
+    epoch_state_count = launch_program_count if transient_source_root is None else 0
     static_state_base = str(
-        (launch_worker_count + _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS - 1)
+        (epoch_state_count + _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS - 1)
         // _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
         * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
     )
@@ -724,6 +783,16 @@ def emit_cross_loop_schedule(
         name_hint="tile_dependency_state",
         numel=f"{static_state_base} + {state_count}",
         dtype=_CROSS_LOOP_COUNTER_DTYPE,
+    )
+    dispatch_ticket_arg = (
+        _register_cross_loop_state(
+            device_function,
+            name_hint="tile_dependency_dispatch_ticket",
+            numel="1",
+            dtype=torch.uint64,
+        )
+        if transient_source_root is not None
+        else None
     )
 
     def state_section(offset: int | None) -> str | None:
@@ -735,10 +804,38 @@ def emit_cross_loop_schedule(
     readiness_counter_arg = state_section(readiness_counter_state_offset)
     root_barrier_counter_arg = state_section(root_barrier_state_offset)
 
-    phase_root_ranges = _phase_root_ranges(owner)
-    result: list[ast.stmt] = [
-        statement_from_string(f"{epoch_var} = tl.load({epoch_arg} + {worker}) + 1")
-    ]
+    dispatch_ticket: str | None = None
+    if transient_source_root is None:
+        result: list[ast.stmt] = [
+            statement_from_string(f"{epoch_var} = tl.load({epoch_arg} + {worker}) + 1")
+        ]
+    else:
+        assert dispatch_ticket_arg is not None
+        raw_dispatch_ticket = device_function.new_var(
+            "tile_dependency_raw_dispatch_ticket", dce=False
+        )
+        dispatch_ticket = device_function.new_var(
+            "tile_dependency_dispatch_ticket", dce=True
+        )
+        result = [
+            statement_from_string(
+                f"{raw_dispatch_ticket} = tl.atomic_add("
+                f"{dispatch_ticket_arg}, 1, sem='relaxed', scope='gpu')"
+            ),
+            statement_from_string(
+                f"{dispatch_ticket} = tl.cast("
+                f"{raw_dispatch_ticket} % tl.cast("
+                f"{launch_program_count}, tl.uint64), tl.int32)"
+            ),
+            statement_from_string(
+                f"{epoch_var} = tl.cast("
+                f"{raw_dispatch_ticket} // tl.cast("
+                f"{launch_program_count}, tl.uint64) + 1, tl.uint32)"
+            ),
+            statement_from_string(
+                f"{worker} = {dispatch_ticket} - {transient_source_task_count}"
+            ),
+        ]
     continuation_roots = {
         continuation_consumer.consumer_root
         for plan in readiness_counter_plans
@@ -832,14 +929,21 @@ def emit_cross_loop_schedule(
         for readiness_producers in producer_counters_by_site.values()
         for _plan, readiness_producer in readiness_producers
     }
-    scheduled_task_roots = {
-        root
-        for root, task_order in enumerate(root_task_orders)
-        if any(
-            segment.task_order != task_order
-            for segment in static_pipeline_plan.worker_schedule.segments_for_root(root)
-        )
-    }
+    root_schedule_traversals = {}
+    scheduled_task_roots: set[int] = set()
+    for root, task_order in enumerate(root_task_orders):
+        segments = static_pipeline_plan.worker_schedule.segments_for_root(root)
+        if not segments:
+            continue
+        traversal = _root_schedule_traversal(segments, task_order)
+        if traversal is None:
+            raise exc.InvalidConfig(
+                "cross_loop_schedule='static_pipeline' does not have a "
+                f"symbolically bijective traversal for root {root}"
+            )
+        root_schedule_traversals[root] = traversal
+        if not traversal.matches_reference:
+            scheduled_task_roots.add(root)
     readiness_consumers_by_root: dict[
         int,
         list[tuple[ReadinessCounterPlan, ReadinessConsumer]],
@@ -1481,31 +1585,35 @@ def emit_cross_loop_schedule(
         """Map one root-local task-order index to its logical task ID."""
         if root not in scheduled_task_roots:
             return None
-        worker_schedule = static_pipeline_plan.worker_schedule
-        root_domain = root_domains[root]
-        assignment = worker_schedule.dense_assignment(root)
-        if (
-            assignment is None
-            or assignment[0] != 0
-            or assignment[1] != worker_schedule.worker_count
-            or assignment[3] != root_domain.size
-        ):
-            raise AssertionError(
-                f"root {root} does not occupy one contiguous schedule interval"
+        traversal = root_schedule_traversals[root]
+        forward = traversal.scheduled_ordinal_to_logical_task
+        if forward is not None:
+            task_order_coordinates = flat_task_coordinates(
+                task_order_index,
+                forward.source_domain.axis_order,
+                forward.source_domain.axis_counts,
             )
-        dispatch_offset = assignment[2]
-        segments = sorted(
-            worker_schedule.segments_for_root(root),
-            key=lambda segment: segment.dispatch_offset,
-        )
+            task_coordinates, membership = relation_point_coordinates(
+                forward,
+                task_order_coordinates,
+            )
+            if membership != "True":
+                raise AssertionError(
+                    "proved root traversal is not total during codegen"
+                )
+            return logical_task_from_coordinates(root, task_coordinates)
 
+        # Some existing PID permutations have no single representable forward
+        # relation.  Render the certificate's own segment ranges directly;
+        # never reconstruct their boundaries or ordering in codegen.
         expression = ""
-        for segment in reversed(segments):
-            task_order_begin = segment.dispatch_offset - dispatch_offset
-            task_order_delta = f"(({task_order_index}) - {task_order_begin})"
+        for segment, ordinal_begin, ordinal_end in reversed(
+            traversal.segment_ordinal_ranges
+        ):
+            task_order_delta = f"(({task_order_index}) - {ordinal_begin})"
             membership = (
                 f"({task_order_delta}) >= 0 and "
-                f"({task_order_delta}) < {segment.task_count}"
+                f"({task_order_delta}) < {ordinal_end - ordinal_begin}"
             )
             task_order_coordinates = flat_task_coordinates(
                 task_order_delta,
@@ -1518,16 +1626,14 @@ def emit_cross_loop_schedule(
             )
             if relation_membership != "True":
                 membership = f"({membership}) and ({relation_membership})"
-            segment_task = logical_task_from_coordinates(
-                root,
-                task_coordinates,
+            segment_task = logical_task_from_coordinates(root, task_coordinates)
+            expression = (
+                segment_task
+                if not expression
+                else f"tl.where({membership}, {segment_task}, {expression})"
             )
-            if not expression:
-                expression = segment_task
-                continue
-            expression = f"tl.where({membership}, {segment_task}, {expression})"
         if not expression:
-            raise AssertionError(f"root {root} has no static schedule")
+            raise AssertionError(f"root {root} has no certified traversal")
         return expression
 
     def scheduled_root_task_body(
@@ -1637,32 +1743,37 @@ def emit_cross_loop_schedule(
                     scheduled_root_body,
                     scheduled_coordinates,
                 )
-            opaque_call = _outline_cross_loop_region(
-                device_function,
-                name_hint=f"tile_dependency_root_{root}",
-                body=[
-                    statement_from_string(
-                        f"{owner.shared_pid_var} = {scheduled_logical_pid}"
-                    ),
-                    *scheduled_root_body,
-                ],
-                extra_argument_names=extra_argument_names,
-            )
-        else:
-            opaque_call = _outline_opaque_tile_body(
-                owner,
-                device_function,
-                root=root,
-                logical_pid=scheduled_logical_pid,
-                body=body_with_nested_loop_publications(
-                    root,
-                    case_bodies[root],
-                    scheduled_coordinates,
+            tile_body = [
+                statement_from_string(
+                    f"{owner.shared_pid_var} = {scheduled_logical_pid}"
                 ),
-                extra_argument_names=extra_argument_names,
-                noinline=force_noinline,
+                *scheduled_root_body,
+            ]
+        else:
+            tile_body = [
+                statement_from_string(
+                    f"{owner.shared_pid_var} = {scheduled_logical_pid}"
+                ),
+                *_clone_opaque_statements(
+                    body_with_nested_loop_publications(
+                        root,
+                        case_bodies[root],
+                        scheduled_coordinates,
+                    )
+                ),
+            ]
+        if root in kernel_scope_roots:
+            body.extend(tile_body)
+        else:
+            body.append(
+                _outline_cross_loop_region(
+                    device_function,
+                    name_hint=f"tile_dependency_root_{root}",
+                    body=tile_body,
+                    extra_argument_names=extra_argument_names,
+                    noinline=force_noinline,
+                )
             )
-        body.append(opaque_call)
         if producer_counters:
             has_task_scheduling = True
             body.append(_publication_sync(device_function))
@@ -1674,7 +1785,7 @@ def emit_cross_loop_schedule(
                     scheduled_coordinates,
                 )
             )
-        if not has_task_scheduling:
+        if not has_task_scheduling or root in kernel_scope_roots:
             return body
         return [
             _outline_cross_loop_region(
@@ -1686,37 +1797,71 @@ def emit_cross_loop_schedule(
             )
         ]
 
-    dense_assignment_by_root: dict[int, tuple[int, int, int]] = {}
-    for root, root_domain in enumerate(root_domains):
-        assignment = static_pipeline_plan.worker_schedule.dense_assignment(root)
-        if assignment is None:
-            if static_pipeline_plan.worker_schedule.segments_for_root(root):
-                raise exc.InvalidConfig(
-                    "cross_loop_schedule='static_pipeline' cannot lower "
-                    f"root {root}'s non-dense worker assignment"
-                )
+    static_segments_by_root: dict[int, tuple[WorkerScheduleSegment, ...]] = {}
+    for root in range(len(root_domains)):
+        segments = static_pipeline_plan.worker_schedule.segments_for_root(root)
+        if not segments:
             continue
-        worker_begin, worker_count, dispatch_offset, task_count = assignment
-        if task_count != root_domain.size or dispatch_offset % worker_count:
+        traversal = root_schedule_traversals.get(root)
+        if traversal is None or any(
+            segment.dispatch_offset % segment.worker_count for segment in segments
+        ):
             raise exc.InvalidConfig(
                 "cross_loop_schedule='static_pipeline' does not "
                 f"support root {root}'s worker assignment"
             )
-        dense_assignment_by_root[root] = (
-            worker_begin,
-            worker_count,
-            root_domain.size,
+        static_segments_by_root[root] = segments
+
+    def worker_membership_condition(
+        intervals: tuple[WorkerInterval, ...],
+    ) -> str:
+        """Render compact membership in symbolic resident-worker intervals."""
+        intervals = _normalize_intervals(intervals)
+        if not intervals:
+            raise AssertionError("an executable segment requires an active worker")
+        return " or ".join(
+            (
+                f"({worker}) == {begin}"
+                if end == begin + 1
+                else f"(({worker}) >= {begin} and ({worker}) < {end})"
+            )
+            for begin, end in intervals
         )
 
-    def static_root_body(root: int) -> list[ast.stmt]:
+    shared_scheduled_task_body_by_root: dict[int, list[ast.stmt]] = {}
+
+    def shared_scheduled_task_body(root: int) -> list[ast.stmt]:
+        """Build one reusable task executor for every occurrence of a root."""
+        body = shared_scheduled_task_body_by_root.get(root)
+        if body is None:
+            root_local_pid_task = f"({strategy.virtual_pid_var}) - {case_offsets[root]}"
+            body = scheduled_root_task_body(
+                root,
+                root_local_pid_task,
+                strategy.virtual_pid_var,
+                (strategy.virtual_pid_var,),
+            )
+            shared_scheduled_task_body_by_root[root] = body
+        return _clone_opaque_statements(body)
+
+    def static_segment_body(
+        segment: WorkerScheduleSegment,
+        *,
+        task_order_begin: int,
+        publish_root_barrier_workers: tuple[WorkerInterval, ...],
+    ) -> list[ast.stmt]:
+        """Lower one run at its authoritative position in the segment stream."""
+        root = segment.root
         if root in continuation_roots:
-            return []
-        assignment = dense_assignment_by_root.get(root)
-        if assignment is None:
-            return []
-        worker_begin, worker_count, task_count = assignment
+            raise AssertionError("continuation-owned root has a static segment")
+        if segment not in static_segments_by_root.get(root, ()):
+            raise AssertionError("static segment is not owned by its root")
         task_dispatch: list[ast.stmt]
-        if task_count == 1:
+        if (
+            segment.task_count == 1
+            and root_domains[root].size == 1
+            and len(static_segments_by_root[root]) == 1
+        ):
             task_dispatch = scheduled_root_task_body(
                 root,
                 "0",
@@ -1725,7 +1870,8 @@ def emit_cross_loop_schedule(
                 force_noinline=True,
             )
         else:
-            root_local_pid_task = f"({strategy.virtual_pid_var}) - {case_offsets[root]}"
+            segment_begin = case_offsets[root] + task_order_begin
+            segment_end = segment_begin + segment.task_count
             task_dispatch = [
                 create(
                     ast.For,
@@ -1735,27 +1881,21 @@ def emit_cross_loop_schedule(
                         ctx=ast.Store(),
                     ),
                     iter=expr_from_string(
-                        f"tl.range((({worker}) - {worker_begin}) + "
-                        f"({case_offsets[root]}), "
-                        f"({case_offsets[root] + task_count}), {worker_count})"
+                        f"tl.range((({worker}) - {segment.worker_begin}) + "
+                        f"({segment_begin}), ({segment_end}), "
+                        f"{segment.worker_count})"
                     ),
-                    body=scheduled_root_task_body(
-                        root,
-                        root_local_pid_task,
-                        strategy.virtual_pid_var,
-                        (strategy.virtual_pid_var,),
-                    ),
+                    body=shared_scheduled_task_body(root),
                     orelse=[],
                     type_comment=None,
                 )
             ]
         incoming_roots = root_barrier_incoming.get(root, ())
-        publishes_root_barrier = root in root_barrier_indices
+        segment_workers = segment.worker_intervals()
         if (
-            worker_begin == 0
-            and worker_count == launch_worker_count
+            segment_workers == ((0, launch_worker_count),)
             and not incoming_roots
-            and not publishes_root_barrier
+            and not publish_root_barrier_workers
         ):
             return task_dispatch
 
@@ -1765,31 +1905,110 @@ def emit_cross_loop_schedule(
             prefix="tile_dependency_root_barrier_wait",
         )
         active_body.extend(task_dispatch)
-        if publishes_root_barrier:
-            active_body.extend(root_barrier_publication(root))
-        condition = (
-            f"({worker}) == {worker_begin}"
-            if worker_count == 1
-            else (
-                f"({worker}) >= {worker_begin} and "
-                f"({worker}) < {worker_begin + worker_count}"
-            )
-        )
+        if publish_root_barrier_workers:
+            publications = root_barrier_publication(root)
+            if publish_root_barrier_workers == segment_workers:
+                active_body.extend(publications)
+            else:
+                active_body.append(
+                    create(
+                        ast.If,
+                        test=expr_from_string(
+                            worker_membership_condition(publish_root_barrier_workers)
+                        ),
+                        body=publications,
+                        orelse=[],
+                    )
+                )
         return [
             create(
                 ast.If,
-                test=expr_from_string(condition),
+                test=expr_from_string(worker_membership_condition(segment_workers)),
                 body=active_body,
                 orelse=[],
             )
         ]
 
-    for root_begin, root_end in phase_root_ranges:
-        for root in range(root_begin, root_end):
-            result.extend(static_root_body(root))
-    result.append(
-        statement_from_string(f"tl.store({epoch_arg} + {worker}, {epoch_var})")
-    )
+    publication_workers_by_segment = {
+        publication.segment_index: publication.worker_intervals
+        for root in root_barrier_indices
+        for publication in root_publication_plans[root].publications
+    }
+
+    resident_body: list[ast.stmt] = []
+    next_segment_range_by_root: dict[int, int] = {}
+    for segment_index, segment in enumerate(
+        static_pipeline_plan.worker_schedule.segments
+    ):
+        root = segment.root
+        range_index = next_segment_range_by_root.get(root, 0)
+        ranges = root_schedule_traversals[root].segment_ordinal_ranges
+        if range_index >= len(ranges):
+            raise AssertionError("segment stream exceeds its proved root traversal")
+        certified_segment, task_order_begin, task_order_end = ranges[range_index]
+        if (
+            certified_segment != segment
+            or task_order_end - task_order_begin != segment.task_count
+        ):
+            raise AssertionError("segment stream disagrees with its proved traversal")
+        next_segment_range_by_root[root] = range_index + 1
+        resident_body.extend(
+            static_segment_body(
+                segment,
+                task_order_begin=task_order_begin,
+                publish_root_barrier_workers=publication_workers_by_segment.get(
+                    segment_index, ()
+                ),
+            )
+        )
+    if any(
+        next_segment_range_by_root.get(root, 0) != len(traversal.segment_ordinal_ranges)
+        for root, traversal in root_schedule_traversals.items()
+    ):
+        raise AssertionError("proved root traversal has unconsumed segments")
+    if transient_source_root is None:
+        result.extend(resident_body)
+        result.append(
+            statement_from_string(f"tl.store({epoch_arg} + {worker}, {epoch_var})")
+        )
+    else:
+        assert dispatch_ticket is not None
+        if (
+            transient_source_root in readiness_consumers_by_root
+            or transient_source_root in root_barrier_incoming
+        ):
+            raise AssertionError(
+                "a transient source may not have incoming dependencies"
+            )
+        transient_body = scheduled_root_task_body(
+            transient_source_root,
+            dispatch_ticket,
+            f"{case_offsets[transient_source_root]} + {dispatch_ticket}",
+            (dispatch_ticket,),
+        )
+        transient_body.extend(root_barrier_publication(transient_source_root))
+        if kernel_scope_roots - {transient_source_root}:
+            resident_branch = resident_body
+        else:
+            resident_branch = [
+                _outline_cross_loop_region(
+                    device_function,
+                    name_hint="tile_dependency_resident_worker",
+                    body=resident_body,
+                    extra_argument_names=(worker, epoch_var),
+                    noinline=True,
+                )
+            ]
+        result.append(
+            create(
+                ast.If,
+                test=expr_from_string(
+                    f"{dispatch_ticket} < {transient_source_task_count}"
+                ),
+                body=transient_body,
+                orelse=resident_branch,
+            )
+        )
     if (
         tuple(_ast_fingerprint(body) for body in case_bodies)
         != opaque_case_fingerprints

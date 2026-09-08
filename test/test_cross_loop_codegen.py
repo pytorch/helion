@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 from types import SimpleNamespace
 from typing import Any
 from typing import cast
@@ -9,6 +10,7 @@ from unittest import mock
 import torch
 
 import helion
+from helion._compiler import cross_loop_codegen
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cross_loop_codegen import _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
 from helion._compiler.cross_loop_codegen import _ast_fingerprint
@@ -17,6 +19,10 @@ from helion._compiler.cross_loop_codegen import _clone_opaque_statements
 from helion._compiler.cross_loop_codegen import (
     _clone_opaque_statements_with_loop_segments,
 )
+from helion._compiler.cross_loop_codegen import _triton_root_requires_kernel_scope
+from helion._compiler.cross_loop_scheduler import WorkerSchedule
+from helion._compiler.cross_loop_scheduler import WorkerScheduleSegment
+from helion._compiler.cross_loop_scheduler import _task_order_slice
 from helion._compiler.device_function import DeviceFunction
 from helion._compiler.tile_dependency import TILE_DEPENDENCY_SITE_ID_ATTR
 from helion._testing import DEVICE
@@ -544,6 +550,18 @@ def specialized_quotient_chain(
 
 
 class TestCrossLoopCodegenHelpers(TestCase):
+    def test_blackwell_dot_root_stays_in_kernel_scope(self) -> None:
+        dot_body = ast.parse("acc = tl.dot(lhs, rhs, acc=acc)\n").body
+        scaled_body = ast.parse(
+            "acc = tl.dot_scaled(lhs, lhs_scale, 'e4m3', rhs, rhs_scale, 'e4m3')\n"
+        ).body
+        ordinary_body = ast.parse("value = tl.load(pointer)\n").body
+
+        self.assertTrue(_triton_root_requires_kernel_scope(dot_body, (10, 0)))
+        self.assertTrue(_triton_root_requires_kernel_scope(scaled_body, (10, 0)))
+        self.assertFalse(_triton_root_requires_kernel_scope(dot_body, (9, 0)))
+        self.assertFalse(_triton_root_requires_kernel_scope(ordinary_body, (10, 0)))
+
     def test_opaque_tile_body_clone_is_structurally_identical(self) -> None:
         body = ast.parse("value = value * 2\nout[index] = value\n").body
         cloned = _clone_opaque_statements(body)
@@ -1146,6 +1164,294 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_codegen_follows_authoritative_segment_order(self) -> None:
+        x = torch.arange(128, device=DEVICE, dtype=torch.float32).reshape(2, 64)
+        original_build = cross_loop_codegen.build_static_pipeline_plan
+
+        def build_with_reordered_independent_roots(**kwargs: Any):
+            plan = original_build(**kwargs)
+            segments = list(plan.worker_schedule.segments)
+            producer_segments = {
+                segment.root: segment for segment in segments if segment.root in (0, 1)
+            }
+            self.assertEqual(set(producer_segments), {0, 1})
+            reordered = [
+                producer_segments[1],
+                producer_segments[0],
+                *(segment for segment in segments if segment.root not in (0, 1)),
+            ]
+            worker_step = 0
+            normalized = []
+            for segment in reordered:
+                normalized.append(
+                    dataclasses.replace(
+                        segment,
+                        dispatch_offset=worker_step * segment.worker_count,
+                    )
+                )
+                worker_step += (
+                    segment.task_count + segment.worker_count - 1
+                ) // segment.worker_count
+            return dataclasses.replace(
+                plan,
+                worker_schedule=WorkerSchedule(
+                    worker_count=plan.worker_schedule.worker_count,
+                    segments=tuple(normalized),
+                ),
+            )
+
+        with mock.patch.object(
+            cross_loop_codegen,
+            "build_static_pipeline_plan",
+            side_effect=build_with_reordered_independent_roots,
+        ):
+            code, out = code_and_output(
+                cartesian_affine_join,
+                (x,),
+                block_sizes=[1, 16, 1, 16, 1, 32],
+                pid_type="persistent_blocked",
+                cross_loop_schedule="static_pipeline",
+                num_sm_multiplier=1,
+                num_warps=1,
+            )
+
+        torch.testing.assert_close(out, x * 2)
+        self.assertLess(
+            code.index("def tile_dependency_root_1"),
+            code.index("def tile_dependency_root_0"),
+        )
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_codegen_lowers_permuted_root_across_interleaved_segments(self) -> None:
+        x = torch.arange(128, device=DEVICE, dtype=torch.float32).reshape(2, 64)
+        original_build = cross_loop_codegen.build_static_pipeline_plan
+
+        def build_with_split_root(**kwargs: Any):
+            plan = original_build(**kwargs)
+            segments = {
+                segment.root: segment for segment in plan.worker_schedule.segments
+            }
+            first = segments[0]
+            second = segments[1]
+            prefix = _task_order_slice(first.task_order, 0, 4)
+            suffix = _task_order_slice(first.task_order, 4, first.task_count - 4)
+            assert prefix is not None and suffix is not None
+            interleaved = (
+                WorkerScheduleSegment(
+                    root=0,
+                    task_order=suffix,
+                    worker_begin=0,
+                    worker_count=4,
+                    dispatch_offset=0,
+                ),
+                WorkerScheduleSegment(
+                    root=1,
+                    task_order=second.task_order,
+                    worker_begin=4,
+                    worker_count=second.worker_count,
+                    dispatch_offset=0,
+                ),
+                WorkerScheduleSegment(
+                    root=0,
+                    task_order=prefix,
+                    worker_begin=0,
+                    worker_count=4,
+                    dispatch_offset=4,
+                ),
+            )
+            return dataclasses.replace(
+                plan,
+                worker_schedule=WorkerSchedule(
+                    worker_count=plan.worker_schedule.worker_count,
+                    segments=interleaved,
+                ),
+            )
+
+        with mock.patch.object(
+            cross_loop_codegen,
+            "build_static_pipeline_plan",
+            side_effect=build_with_split_root,
+        ):
+            code, out = code_and_output(
+                cartesian_affine_join,
+                (x,),
+                block_sizes=[1, 16, 1, 16, 1, 32],
+                pid_type="persistent_blocked",
+                cross_loop_schedule="static_pipeline",
+                num_sm_multiplier=1,
+                num_warps=1,
+            )
+
+        torch.testing.assert_close(out, x * 2)
+        self.assertIn("tile_dependency_scheduled_logical_task", code)
+        self.assertEqual(code.count("def tile_dependency_root_0("), 1)
+        self.assertEqual(code.count("def tile_dependency_root_0_scheduled_task"), 1)
+        root_zero_calls = [
+            line
+            for line in code.splitlines()
+            if "tile_dependency_root_0_scheduled_task(" in line
+            and not line.startswith("def ")
+        ]
+        self.assertEqual(len(root_zero_calls), 2)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_split_root_workers_publish_after_their_final_segment(self) -> None:
+        x = torch.arange(128, device=DEVICE, dtype=torch.float32)
+        original_build = cross_loop_codegen.build_static_pipeline_plan
+
+        def build_with_split_producer(**kwargs: Any):
+            kwargs["allow_transient_source"] = False
+            plan = original_build(**kwargs)
+            segments = {
+                segment.root: segment for segment in plan.worker_schedule.segments
+            }
+            producer = segments[0]
+            consumer = segments[1]
+            prefix_count = producer.task_count // 2
+            prefix = _task_order_slice(producer.task_order, 0, prefix_count)
+            suffix = _task_order_slice(
+                producer.task_order,
+                prefix_count,
+                producer.task_count - prefix_count,
+            )
+            assert prefix is not None and suffix is not None
+            suffix_worker_count = max(1, suffix.source_domain.size // 2)
+            consumer_step = (
+                1
+                + (suffix.source_domain.size + suffix_worker_count - 1)
+                // suffix_worker_count
+            )
+            split = (
+                WorkerScheduleSegment(
+                    root=0,
+                    task_order=prefix,
+                    worker_begin=0,
+                    worker_count=prefix_count,
+                    dispatch_offset=0,
+                ),
+                WorkerScheduleSegment(
+                    root=0,
+                    task_order=suffix,
+                    worker_begin=0,
+                    worker_count=suffix_worker_count,
+                    dispatch_offset=suffix_worker_count,
+                ),
+                WorkerScheduleSegment(
+                    root=1,
+                    task_order=consumer.task_order,
+                    worker_begin=0,
+                    worker_count=consumer.worker_count,
+                    dispatch_offset=consumer_step * consumer.worker_count,
+                ),
+            )
+            return dataclasses.replace(
+                plan,
+                worker_schedule=WorkerSchedule(
+                    worker_count=plan.worker_schedule.worker_count,
+                    segments=split,
+                ),
+            )
+
+        with mock.patch.object(
+            cross_loop_codegen,
+            "build_static_pipeline_plan",
+            side_effect=build_with_split_producer,
+        ):
+            code, out = code_and_output(
+                offset_affine_chain,
+                (x,),
+                block_sizes=[16, 16],
+                pid_type="persistent_blocked",
+                cross_loop_schedule="static_pipeline",
+                num_sm_multiplier=1,
+                num_warps=1,
+            )
+
+        torch.testing.assert_close(out, (x[32:] + 1) * 2)
+        lines = code.splitlines()
+        producer_calls = [
+            index
+            for index, line in enumerate(lines)
+            if "tile_dependency_root_0(" in line and not line.startswith("def ")
+        ]
+        barrier_publications = [
+            index
+            for index, line in enumerate(lines)
+            if "tl.atomic_add(tile_dependency_state" in line
+        ]
+        barrier_waits = [
+            index
+            for index, line in enumerate(lines)
+            if "tile_dependency_root_barrier_wait =" in line
+        ]
+        consumer_calls = [
+            index
+            for index, line in enumerate(lines)
+            if "tile_dependency_root_1(" in line and not line.startswith("def ")
+        ]
+        self.assertEqual(len(producer_calls), 2)
+        self.assertEqual(len(barrier_publications), 2)
+        self.assertTrue(barrier_waits)
+        self.assertEqual(len(consumer_calls), 1)
+        self.assertLess(producer_calls[0], barrier_publications[0])
+        self.assertLess(barrier_publications[0], producer_calls[1])
+        self.assertLess(producer_calls[1], barrier_publications[1])
+        self.assertLess(barrier_publications[1], barrier_waits[0])
+        self.assertLess(barrier_waits[-1], consumer_calls[0])
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_transient_source_publishes_one_root_arrival_per_ticket(self) -> None:
+        x = torch.arange(128, device=DEVICE, dtype=torch.float32)
+        original_build = cross_loop_codegen.build_static_pipeline_plan
+
+        def build_with_transient_source(**kwargs: Any):
+            kwargs["allow_transient_source"] = False
+            plan = original_build(**kwargs)
+            resident_segments = tuple(
+                dataclasses.replace(segment, dispatch_offset=0)
+                for segment in plan.worker_schedule.segments
+                if segment.root != 0
+            )
+            return dataclasses.replace(
+                plan,
+                worker_schedule=WorkerSchedule(
+                    worker_count=plan.worker_schedule.worker_count,
+                    segments=resident_segments,
+                ),
+                transient_source_root=0,
+            )
+
+        with mock.patch.object(
+            cross_loop_codegen,
+            "build_static_pipeline_plan",
+            side_effect=build_with_transient_source,
+        ):
+            code, out = code_and_output(
+                offset_affine_chain,
+                (x,),
+                block_sizes=[16, 16],
+                pid_type="persistent_blocked",
+                cross_loop_schedule="static_pipeline",
+                num_sm_multiplier=1,
+                num_warps=1,
+            )
+
+        torch.testing.assert_close(out, (x[32:] + 1) * 2)
+        self.assertIn("tile_dependency_dispatch_ticket", code)
+        self.assertIn("tl.cast(6, tl.uint32)", code)
+        self.assertEqual(
+            sum(
+                "tl.atomic_add(tile_dependency_state" in line
+                for line in code.splitlines()
+            ),
+            1,
+        )
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_singleton_root_waits_for_multiple_producers(self) -> None:
         x = torch.arange(64, device=DEVICE, dtype=torch.float32).reshape(1, 64)
         code, out = code_and_output(
@@ -1159,7 +1465,9 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, torch.sum(x * 2, dim=-1))
-        self.assertGreaterEqual(code.count("tile_dependency_root_barrier_wait"), 2)
+        self.assertIn("tile_dependency_readiness_wait", code)
+        self.assertIn("tl.cast(8, tl.uint32)", code)
+        self.assertNotIn("tile_dependency_root_barrier", code)
         self.assertIn("if tl.program_id(0) == 0:", code)
 
     @skipIfNotCUDA()
@@ -1184,6 +1492,50 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 self.assertNotIn("tile_dependency_ordered_group", code)
                 self.assertIn("tile_dependency_nested_loop_wait", code)
                 self.assertNotIn("tile_dependency_root_barrier", code)
+                self.assertIn("tile_dependency_dispatch_ticket", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_single_wave_source_does_not_use_transient_tickets(self) -> None:
+        x = torch.arange(2048, device=DEVICE, dtype=torch.float32).reshape(1, 2048)
+        code, out = code_and_output(
+            streamed_singleton_reduction,
+            (x,),
+            block_sizes=[1, 16],
+            pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+
+        torch.testing.assert_close(out, torch.sum(x + 1, dim=-1) + x[:, 0] + 1)
+        self.assertNotIn("tile_dependency_dispatch_ticket", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_real_planner_declines_unproved_resident_nested_interleave(self) -> None:
+        x = torch.arange(8192, device=DEVICE, dtype=torch.float32).reshape(1, 8192)
+        code, out = code_and_output(
+            streamed_singleton_reduction,
+            (x,),
+            block_sizes=[1, 16],
+            pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
+            num_sm_multiplier=2,
+            num_warps=1,
+        )
+
+        torch.testing.assert_close(out, torch.sum(x + 1, dim=-1) + x[:, 0] + 1)
+        scheduled_calls = [
+            0 if "tile_dependency_root_0_scheduled_task(" in line else 1
+            for line in code.splitlines()
+            if "_scheduled_task(" in line and not line.lstrip().startswith("def ")
+        ]
+        # A CTA-level rank cannot justify admitting a resident nested waiter
+        # before a later producer wave.  Until the scheduler models internal
+        # checkpoints for arbitrary resident roots, retain the baseline order.
+        self.assertEqual(scheduled_calls, [0, 1])
+        self.assertNotIn("tile_dependency_dispatch_ticket", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")

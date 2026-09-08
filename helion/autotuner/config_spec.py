@@ -890,7 +890,7 @@ EPILOGUE_SUBTILE_MIN_K_HINT = 1024
 EPILOGUE_SUBTILE_MIN_K_HINT_EXTENDED = 16384
 # maxnreg values: None means no limit, otherwise limit to this many registers per thread
 # Lower values allow higher occupancy but may hurt performance for register-heavy kernels
-VALID_MAXNREG = (None, 32, 64, 128, 256)
+VALID_MAXNREG = (None, 32, 64, 80, 128, 256)
 DEFAULT_MAXNREG = None
 _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
     {
