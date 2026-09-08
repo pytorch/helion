@@ -257,7 +257,47 @@ class MetalBackend(Backend):
         """
         config = self._config_with_mpp_thread_budget(fn, block_ids, config)
         # pyrefly: ignore[bad-argument-type]
-        return CuteBackend.create_loop_strategy(self, fn, block_ids, config)
+        strategy = CuteBackend.create_loop_strategy(self, fn, block_ids, config)
+        self._reject_dynamic_thread_extents(strategy)
+        return strategy
+
+    def _reject_dynamic_thread_extents(self, strategy: TileStrategy) -> None:
+        """Reject a thread axis whose extent Helion cannot resolve statically.
+
+        A dropped extent launches the axis one thread wide while its index stays
+        ``offset + tid``, leaving most of the output silently wrong.  Removable
+        once ``launcher_keyword_args`` takes the launch shape from the shared
+        ``thread_block_dim_exprs`` rather than baking literal ``_block_dims``.
+        """
+        from ..tile_strategy import PerThreadFlattenedTileStrategy
+        from ..tile_strategy import PerThreadNDTileStrategy
+
+        if isinstance(strategy, PerThreadNDTileStrategy):
+            dynamic = [
+                block_size
+                for block_id, block_size in zip(
+                    strategy.block_ids, strategy.block_size, strict=True
+                )
+                if strategy._uses_thread_axis_for_block(block_id, block_size)
+                and strategy._static_thread_extent_for_block(block_id, block_size)
+                is None
+            ]
+        elif isinstance(strategy, PerThreadFlattenedTileStrategy):
+            dynamic = []
+            if strategy._uses_thread_axis() and not isinstance(
+                strategy._thread_extent(), int
+            ):
+                dynamic.append(strategy.block_size)
+        else:
+            return
+        if dynamic:
+            raise exc.BackendUnsupported(
+                self.name,
+                f"thread extent {dynamic[0]} is not known until the kernel "
+                "runs, and Helion fixes the Metal threadgroup shape at codegen "
+                "time; give the tile a block_size the config can resolve, or "
+                "compile the kernel with static_shapes=True",
+            )
 
     def _config_with_mpp_thread_budget(
         self, fn: DeviceFunction, block_ids: list[int], config: Config
