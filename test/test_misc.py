@@ -1596,8 +1596,8 @@ class TestLauncher(TestCase):
         finally:
             gdict[name] = original
 
-    def test_correct_result_on_each_cuda_device(self) -> None:
-        """The same kernel called on ``cuda:0`` then ``cuda:1`` must
+    def test_correct_result_on_each_device(self) -> None:
+        """The same kernel called on device 0 then device 1 must
         yield correct numeric results landing on each device. Whether
         the two calls share a ``BoundKernel`` (cache key collapses on
         ``device.type``) or get distinct entries (key includes the
@@ -1605,13 +1605,13 @@ class TestLauncher(TestCase):
         ``test_static_launcher.py``; this contract test only pins
         down per-device correctness.
 
-        Triton's launcher requires the current CUDA context to match
+        Triton's launcher requires the current device context to match
         the tensor's device — like raw Triton, Helion expects the
-        caller to set the device via ``torch.cuda.device(N)`` (or
-        ``torch.cuda.set_device(N)``) before launching on a
-        non-default device."""
-        if torch.cuda.device_count() < 2:
-            self.skipTest("requires >= 2 CUDA devices")
+        caller to set the device via ``torch.accelerator.device_index(N)``
+        (or ``torch.accelerator.set_device_index(N)``) before launching
+        on a non-default device."""
+        if torch.accelerator.device_count() < 2:
+            self.skipTest("requires >= 2 accelerator devices")
 
         @helion.kernel(
             static_shapes=True,
@@ -1627,14 +1627,14 @@ class TestLauncher(TestCase):
         device1 = torch.device(DEVICE.type, 1)
 
         x0 = torch.randn(1024, device=device0, dtype=torch.float32)
-        with torch.cuda.device(device0.index):
+        with torch.accelerator.device_index(device0.index):
             out0 = add(x0, x0)
-        torch.cuda.synchronize(0)
+        torch.accelerator.synchronize(device0)
 
         x1 = torch.randn(1024, device=device1, dtype=torch.float32)
-        with torch.cuda.device(device1.index):
+        with torch.accelerator.device_index(device1.index):
             out1 = add(x1, x1)
-        torch.cuda.synchronize(1)
+        torch.accelerator.synchronize(device1)
 
         self.assertEqual(out0.device, device0)
         self.assertEqual(out1.device, device1)

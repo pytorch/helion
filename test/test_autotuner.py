@@ -11311,7 +11311,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         expected = torch.full([128], 3.0, device=DEVICE) + epsilon
         torch.testing.assert_close(out, expected)
 
-    @skipIfXPU("CUDA specific API used to check memory usage")
     def test_chunked_allclose_memory(self):
         """Test that autotuning accuracy checks use chunked comparison for large tensors."""
         import helion.autotuner.accuracy as _accuracy
@@ -11345,11 +11344,11 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # on tensors of the same size
         ref_a = torch.randn(numel, device=DEVICE)
         ref_b = ref_a.clone()
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        base_mem = torch.cuda.memory_allocated()
+        torch.accelerator.empty_cache()
+        torch.accelerator.reset_peak_memory_stats()
+        base_mem = torch.accelerator.memory_allocated()
         torch.testing.assert_close(ref_a, ref_b, atol=1e-2, rtol=1e-2)
-        naive_peak = torch.cuda.max_memory_allocated() - base_mem
+        naive_peak = torch.accelerator.max_memory_allocated() - base_mem
         del ref_a, ref_b
 
         # Patch the moved chunked helper to record peak memory delta per call.
@@ -11357,10 +11356,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         peaks: list[int] = []
 
         def measuring_chunked_assert_close(*args, **kwargs):
-            torch.cuda.reset_peak_memory_stats()
-            before = torch.cuda.memory_allocated()
+            torch.accelerator.reset_peak_memory_stats()
+            before = torch.accelerator.memory_allocated()
             real_chunked_assert_close(*args, chunk_size=chunk_size, **kwargs)
-            peak = torch.cuda.max_memory_allocated() - before
+            peak = torch.accelerator.max_memory_allocated() - before
             peaks.append(peak)
 
         with patch.object(

@@ -515,7 +515,7 @@ def onlyBackends(
 def skipUnlessTensorDescriptor(reason: str) -> Callable[[Callable], Callable]:
     """Skip test unless tensor descriptors are supported."""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
-    return skipIfFn(lambda: not is_cuda() or not supports_tensor_descriptor(), reason)
+    return skipIfFn(lambda: not supports_tensor_descriptor(), reason)
 
 
 def skipUnlessTf32Supported(

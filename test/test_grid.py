@@ -13,7 +13,6 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfMetal
-from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
 import helion.language as hl
@@ -40,7 +39,6 @@ def grid_2d_pytorch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 class TestGrid(RefEagerTestBase, TestCase):
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
-    @skipIfXPU("Timeout on XPU")
     def test_grid_1d(self):
         @helion.kernel(static_shapes=True)
         def grid_1d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -83,7 +81,6 @@ class TestGrid(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, grid_1d_pytorch(args[0], args[1]))
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
-    @skipIfXPU("XPU tensor descriptor path has accuracy issue for this grid test")
     def test_grid_2d_idx_list(self):
         @helion.kernel(static_shapes=True)
         def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
