@@ -1324,6 +1324,119 @@ class TestCrossLoopScheduler(TestCase):
                 )
             )
 
+    def test_semantic_barrier_uses_zero_cost_fanout_node(self) -> None:
+        producer_domain, consumer_domain = _identify_root_domains(
+            (_domain((10, 100, 1)), _domain((20, 100, 1)))
+        )
+        graph = _readiness_graph((producer_domain, consumer_domain))
+        tasks = tuple(
+            (root, task)
+            for root, domain in enumerate(graph.root_domains)
+            for task in range(domain.size)
+        )
+
+        with mock.patch.object(cross_loop_scheduler, "_MAX_GLOBAL_LIST_EDGES", 200):
+            successors = _semantic_task_successors(
+                graph,
+                (),
+                frozenset(((0, 1),)),
+                tasks,
+                nested_entry_only=True,
+            )
+        self.assertIsNotNone(successors)
+        assert successors is not None
+        self.assertEqual(len(successors), 201)
+        self.assertEqual(sum(len(items) for items in successors), 200)
+        with mock.patch.object(cross_loop_scheduler, "_MAX_GLOBAL_LIST_EDGES", 199):
+            self.assertIsNone(
+                _semantic_task_successors(
+                    graph,
+                    (),
+                    frozenset(((0, 1),)),
+                    tasks,
+                    nested_entry_only=True,
+                )
+            )
+
+    def test_semantic_counter_uses_one_zero_cost_node_per_key(self) -> None:
+        producer_domain, consumer_domain = _identify_root_domains(
+            (_domain((10, 4, 1)), _domain((20, 6, 1)))
+        )
+        key_domain = _domain((0, 2), kind="event", identity=0)
+        key = coordinate_axis_symbol(0)
+        producer = ReadinessProducer(
+            producer_root=0,
+            producers_by_key=CoordinateRelation(
+                key_domain,
+                producer_domain,
+                (
+                    _CoordinateRelationPiece(
+                        ((0, 0, 2, 1),),
+                        ((10, 2 * key, 2 * key + 2, 1),),
+                    ),
+                ),
+            ),
+        )
+        consumer = ReadinessConsumer(
+            consumer_root=1,
+            keys_by_consumer=_full_point_map(
+                consumer_domain,
+                key_domain,
+                sympy.floor(coordinate_axis_symbol(20) / 3),
+            ),
+        )
+        event = ReadinessEvent(producers=(producer,), consumers=(consumer,))
+        graph = _readiness_graph((producer_domain, consumer_domain), event)
+        plan = ReadinessCounterPlan(event.producers, event.consumers)
+        tasks = tuple(
+            (root, task)
+            for root, domain in enumerate(graph.root_domains)
+            for task in range(domain.size)
+        )
+
+        successors = _semantic_task_successors(
+            graph,
+            (plan,),
+            frozenset(),
+            tasks,
+            nested_entry_only=True,
+        )
+
+        self.assertIsNotNone(successors)
+        assert successors is not None
+        self.assertEqual(len(successors), len(tasks) + 2)
+        self.assertEqual(successors[:4], ((10,), (10,), (11,), (11,)))
+        self.assertEqual(successors[10:], ((4, 5, 6), (7, 8, 9)))
+        self.assertEqual(sum(map(len, successors)), 10)
+
+    def test_semantic_event_nodes_count_toward_node_budget(self) -> None:
+        producer_domain, consumer_domain = _identify_root_domains(
+            (_domain((10, 1, 1)), _domain((20, 1, 1)))
+        )
+        graph = _readiness_graph((producer_domain, consumer_domain))
+        tasks = ((0, 0), (1, 0))
+
+        with mock.patch.object(cross_loop_scheduler, "_MAX_GLOBAL_LIST_NODES", 3):
+            self.assertIsNotNone(
+                _semantic_task_successors(
+                    graph,
+                    (),
+                    frozenset(((0, 1),)),
+                    tasks,
+                    nested_entry_only=True,
+                )
+            )
+        with mock.patch.object(cross_loop_scheduler, "_MAX_GLOBAL_LIST_NODES", 2):
+            self.assertIsNone(
+                _semantic_task_successors(
+                    graph,
+                    (),
+                    frozenset(((0, 1),)),
+                    tasks,
+                    nested_entry_only=True,
+                )
+            )
+
     def test_external_source_does_not_consume_resident_dag_budget(self) -> None:
         source_domain, consumer_domain = _identify_root_domains(
             (
@@ -1370,7 +1483,7 @@ class TestCrossLoopScheduler(TestCase):
                     nested_entry_only=True,
                     external_producer_roots=frozenset((0,)),
                 ),
-                ((),),
+                ((), (0,)),
             )
 
     def test_global_list_schedule_starts_ready_critical_consumer(self) -> None:
@@ -1490,6 +1603,130 @@ class TestCrossLoopScheduler(TestCase):
             )
         validate_worker_schedule(readiness_graph, scheduled)
 
+    def test_global_list_schedule_contracts_final_arrival_continuation(self) -> None:
+        producer_domain, continuation_domain, independent_domain, sink_domain = (
+            _identify_root_domains(
+                (
+                    _domain((10, 2, 1)),
+                    _domain((20, 2, 1)),
+                    _domain((30, 2, 1)),
+                    _domain((40, 2, 1)),
+                )
+            )
+        )
+        first_keys = _domain((0, 2), kind="event", identity=0)
+        first_event = ReadinessEvent(
+            producers=(
+                ReadinessProducer(
+                    producer_root=0,
+                    producers_by_key=_full_point_map(
+                        first_keys,
+                        producer_domain,
+                        coordinate_axis_symbol(0),
+                    ),
+                ),
+            ),
+            consumers=(
+                ReadinessConsumer(
+                    consumer_root=1,
+                    keys_by_consumer=_full_point_map(
+                        continuation_domain,
+                        first_keys,
+                        coordinate_axis_symbol(20),
+                    ),
+                ),
+            ),
+        )
+        second_keys = _domain((0, 2), kind="event", identity=1)
+        second_event = ReadinessEvent(
+            producers=(
+                ReadinessProducer(
+                    producer_root=1,
+                    producers_by_key=_full_point_map(
+                        second_keys,
+                        continuation_domain,
+                        coordinate_axis_symbol(0),
+                    ),
+                ),
+            ),
+            consumers=(
+                ReadinessConsumer(
+                    consumer_root=3,
+                    keys_by_consumer=_full_point_map(
+                        sink_domain,
+                        second_keys,
+                        coordinate_axis_symbol(40),
+                    ),
+                ),
+            ),
+        )
+        graph = _readiness_graph(
+            (
+                producer_domain,
+                continuation_domain,
+                independent_domain,
+                sink_domain,
+            ),
+            first_event,
+            second_event,
+        )
+        continuation = FinalArrivalContinuation(event_id=0, consumer_index=0)
+        plans = (
+            ReadinessCounterPlan(
+                first_event.producers,
+                first_event.consumers,
+                continuation_consumer_index=0,
+            ),
+            ReadinessCounterPlan(second_event.producers, second_event.consumers),
+        )
+        baseline = _baseline_worker_schedule(
+            graph.root_domains,
+            worker_count=4,
+        ).without_roots(frozenset((1,)))
+
+        scheduled = _global_unit_list_schedule(
+            graph,
+            baseline,
+            plans,
+            frozenset(),
+        )
+
+        self.assertIsNotNone(scheduled)
+        assert scheduled is not None
+        self.assertEqual(scheduled.segments_for_root(1), ())
+        self.assertEqual(placement(scheduled, 0, 0), (0, 0))
+        self.assertEqual(placement(scheduled, 2, 0), (2, 0))
+        self.assertEqual(placement(scheduled, 3, 0), (0, 1))
+        with _forbid_schedule_enumeration():
+            self.assertTrue(
+                cross_loop_scheduler._schedule_is_progress_safe(
+                    scheduled,
+                    graph,
+                    plans,
+                    frozenset(),
+                )
+            )
+        validate_worker_schedule(graph, scheduled, (continuation,))
+
+    def test_global_list_schedule_accepts_more_than_4096_tasks(self) -> None:
+        (domain,) = _identify_root_domains((_domain((10, 5_000, 1)),))
+        graph = _readiness_graph((domain,))
+        baseline = _baseline_worker_schedule(graph.root_domains, worker_count=148)
+
+        scheduled = _global_unit_list_schedule(
+            graph,
+            baseline,
+            (),
+            frozenset(),
+        )
+
+        self.assertIsNotNone(scheduled)
+        assert scheduled is not None
+        self.assertEqual(
+            sum(segment.task_count for segment in scheduled.segments),
+            5_000,
+        )
+
     def test_task_order_slice_preserves_symbolic_traversal(self) -> None:
         (domain,) = _identify_root_domains((_domain((10, 2, 1), (11, 3, 1)),))
         task_order = pid_task_order(domain, (11, 10))
@@ -1502,6 +1739,132 @@ class TestCrossLoopScheduler(TestCase):
         self.assertIsNone(_task_order_slice(task_order, -1, 1))
         self.assertIsNone(_task_order_slice(task_order, 0, 0))
         self.assertIsNone(_task_order_slice(task_order, 4, 3))
+
+    def test_task_order_slice_preserves_piecewise_dense_bijection(self) -> None:
+        target_domain = _domain((10, 1, 1), (11, 1536, 1), identity=17)
+        source_domain = _domain((-1, 16), (0, 96), kind="task_order")
+        inner = coordinate_axis_symbol(-1)
+        outer = coordinate_axis_symbol(0)
+        task_order = CoordinateRelation(
+            source_domain,
+            target_domain,
+            (
+                _CoordinateRelationPiece(
+                    ((-1, 0, 8, 1), (0, 0, 96, 1)),
+                    (
+                        (10, sympy.Integer(0), sympy.Integer(1), 1),
+                        (
+                            11,
+                            8 * outer + sympy.Mod(inner, 8),
+                            8 * outer + sympy.Mod(inner, 8) + 1,
+                            1,
+                        ),
+                    ),
+                ),
+                _CoordinateRelationPiece(
+                    ((-1, 8, 16, 1), (0, 0, 96, 1)),
+                    (
+                        (10, sympy.Integer(0), sympy.Integer(1), 1),
+                        (
+                            11,
+                            8 * outer + sympy.Mod(inner, 8) + 768,
+                            8 * outer + sympy.Mod(inner, 8) + 769,
+                            1,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        prefix = _task_order_slice(task_order, 0, 1184)
+        suffix = _task_order_slice(task_order, 1184, 352)
+
+        self.assertIsNotNone(prefix)
+        self.assertIsNotNone(suffix)
+        assert prefix is not None and suffix is not None
+        self.assertEqual(prefix.source_domain.shape, (16, 74))
+        self.assertEqual(suffix.source_domain.shape, (16, 22))
+        self.assertIsNotNone(prefix.converse())
+        self.assertIsNotNone(suffix.converse())
+        with mock.patch.object(
+            cross_loop_scheduler,
+            "_MAX_TASK_ORDER_SLICE_PIECES",
+            15,
+        ):
+            self.assertIsNone(_task_order_slice(task_order, 1, 1184))
+        schedule = WorkerSchedule(
+            1184,
+            (
+                WorkerScheduleSegment(0, prefix, 0, 1184, 0),
+                WorkerScheduleSegment(0, suffix, 0, 352, 352),
+            ),
+        )
+        self.assertTrue(_validate_worker_schedule_tasks(schedule, (task_order,)))
+
+    def test_woven_task_order_has_symbolic_flat_traversal_certificate(self) -> None:
+        target = _domain(
+            (20, 2, 1),
+            (21, 8, 1),
+            (22, 44, 1),
+            identity=17,
+        )
+        source = _domain((-1, 32), (0, 2), (1, 11), kind="task_order")
+        inner = coordinate_axis_symbol(-1)
+        batch = coordinate_axis_symbol(0)
+        outer = coordinate_axis_symbol(1)
+        woven = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (
+                    ((-1, 0, 32, 1), (0, 0, 2, 1), (1, 0, 11, 1)),
+                    (
+                        batch,
+                        sympy.Mod(inner, 8),
+                        4 * outer + sympy.floor(sympy.Mod(inner, 32) / 8),
+                    ),
+                ),
+            ),
+        )
+        reference = pid_task_order(target, target.axis_order)
+        schedule = WorkerSchedule(
+            444,
+            (WorkerScheduleSegment(0, woven, 0, 444, 0),),
+        )
+
+        with _forbid_schedule_enumeration():
+            self.assertTrue(_validate_worker_schedule_tasks(schedule, (reference,)))
+
+    def test_segmented_traversal_proves_exact_once_without_materializing(self) -> None:
+        target = _domain((20, 2, 1), (21, 11, 1), identity=19)
+        reference = pid_task_order(target, target.axis_order)
+        prefix = _task_order_slice(reference, 0, 19)
+        suffix = _task_order_slice(reference, 19, 3)
+        duplicate = _task_order_slice(reference, 16, 3)
+        self.assertIsNotNone(prefix)
+        self.assertIsNotNone(suffix)
+        self.assertIsNotNone(duplicate)
+        assert prefix is not None and suffix is not None and duplicate is not None
+        valid = WorkerSchedule(
+            22,
+            (
+                WorkerScheduleSegment(0, prefix, 0, 19, 0),
+                WorkerScheduleSegment(0, suffix, 19, 3, 0),
+            ),
+        )
+        overlapping_with_gap = WorkerSchedule(
+            22,
+            (
+                WorkerScheduleSegment(0, prefix, 0, 19, 0),
+                WorkerScheduleSegment(0, duplicate, 19, 3, 0),
+            ),
+        )
+
+        with _forbid_schedule_enumeration():
+            self.assertTrue(_validate_worker_schedule_tasks(valid, (reference,)))
+            self.assertFalse(
+                _validate_worker_schedule_tasks(overlapping_with_gap, (reference,))
+            )
 
     def test_worker_schedule_tuple_order_must_match_each_worker_strand(self) -> None:
         first_domain, second_domain = _identify_root_domains(
@@ -1822,6 +2185,160 @@ class TestCrossLoopScheduler(TestCase):
                     transient_source_root=0,
                 )
             )
+
+    def test_progress_rejects_cycle_across_disjoint_worker_waits(self) -> None:
+        domains = _identify_root_domains(
+            tuple(_domain((10 + root, 1, 1)) for root in range(4))
+        )
+
+        def event(producer_root: int, consumer_root: int, event_id: int):
+            key_domain = _domain((0, 1), kind="event", identity=event_id)
+            zero = sympy.Integer(0)
+            return ReadinessEvent(
+                producers=(
+                    ReadinessProducer(
+                        producer_root,
+                        _full_point_map(key_domain, domains[producer_root], zero),
+                    ),
+                ),
+                consumers=(
+                    ReadinessConsumer(
+                        consumer_root,
+                        _full_point_map(domains[consumer_root], key_domain, zero),
+                    ),
+                ),
+            )
+
+        first = event(0, 1, 0)
+        second = event(2, 3, 1)
+        readiness_graph = _readiness_graph(domains, first, second)
+        # Worker 0 executes B -> C; worker 1 executes D -> A.  The two
+        # individually disjoint waits close A -> B -> C -> D -> A.
+        schedule = _schedule(
+            2,
+            _segment(
+                1,
+                readiness_graph.root_task_orders[1],
+                workers=(0, 1),
+                dispatch_offset=0,
+            ),
+            _segment(
+                3,
+                readiness_graph.root_task_orders[3],
+                workers=(1, 1),
+                dispatch_offset=0,
+            ),
+            _segment(
+                2,
+                readiness_graph.root_task_orders[2],
+                workers=(0, 1),
+                dispatch_offset=1,
+            ),
+            _segment(
+                0,
+                readiness_graph.root_task_orders[0],
+                workers=(1, 1),
+                dispatch_offset=1,
+            ),
+        )
+        plans = (
+            ReadinessCounterPlan(first.producers, first.consumers),
+            ReadinessCounterPlan(second.producers, second.consumers),
+        )
+
+        with _forbid_schedule_enumeration():
+            self.assertFalse(
+                cross_loop_scheduler._schedule_is_progress_safe(
+                    schedule,
+                    readiness_graph,
+                    plans,
+                    frozenset(),
+                )
+            )
+
+    def test_progress_uses_exact_segment_support_for_partial_producer(self) -> None:
+        producer_domain, consumer_domain = _identify_root_domains(
+            (_domain((10, 2, 1)), _domain((20, 1, 1)))
+        )
+        key_domain = _domain((0, 1), kind="event", identity=0)
+        zero = sympy.Integer(0)
+
+        def graph_and_plan(producer_task: int):
+            event = ReadinessEvent(
+                producers=(
+                    ReadinessProducer(
+                        0,
+                        _full_point_map(
+                            key_domain,
+                            producer_domain,
+                            sympy.Integer(producer_task),
+                        ),
+                    ),
+                ),
+                consumers=(
+                    ReadinessConsumer(
+                        1,
+                        _full_point_map(consumer_domain, key_domain, zero),
+                    ),
+                ),
+            )
+            graph = _readiness_graph((producer_domain, consumer_domain), event)
+            return graph, ReadinessCounterPlan(event.producers, event.consumers)
+
+        safe_graph, safe_plan = graph_and_plan(0)
+        safe = _schedule(
+            2,
+            _segment(
+                0,
+                _one_dimensional_task_range(producer_domain, 0, 1),
+                workers=(0, 1),
+                dispatch_offset=0,
+            ),
+            _segment(
+                1,
+                safe_graph.root_task_orders[1],
+                workers=(1, 1),
+                dispatch_offset=0,
+            ),
+            _segment(
+                0,
+                _one_dimensional_task_range(producer_domain, 1, 1),
+                workers=(1, 1),
+                dispatch_offset=1,
+            ),
+        )
+        unsafe_graph, unsafe_plan = graph_and_plan(1)
+
+        with _forbid_schedule_enumeration():
+            self.assertTrue(
+                cross_loop_scheduler._schedule_is_progress_safe(
+                    safe,
+                    safe_graph,
+                    (safe_plan,),
+                    frozenset(),
+                )
+            )
+            self.assertFalse(
+                cross_loop_scheduler._schedule_is_progress_safe(
+                    safe,
+                    unsafe_graph,
+                    (unsafe_plan,),
+                    frozenset(),
+                )
+            )
+            with mock.patch.object(
+                cross_loop_scheduler,
+                "_MAX_GLOBAL_LIST_EDGES",
+                2,
+            ):
+                self.assertFalse(
+                    cross_loop_scheduler._schedule_is_progress_safe(
+                        safe,
+                        safe_graph,
+                        (safe_plan,),
+                        frozenset(),
+                    )
+                )
 
     def test_nested_counter_projects_unused_owning_task_axis(self) -> None:
         producer_domain, consumer_domain = _identify_root_domains(
@@ -3585,8 +4102,13 @@ class TestCrossLoopScheduler(TestCase):
             ),
             (3, 1),
         )
-        self.assertEqual(placement(schedule.worker_schedule, 2, 0), (5, 1))
-        self.assertEqual(placement(schedule.worker_schedule, 0, 6), (0, 1))
+        consumer_placement = placement(schedule.worker_schedule, 2, 0)
+        producer_placement = placement(schedule.worker_schedule, 0, 6)
+        self.assertIsNotNone(consumer_placement)
+        self.assertIsNotNone(producer_placement)
+        assert consumer_placement is not None and producer_placement is not None
+        self.assertEqual((consumer_placement[1], producer_placement[1]), (1, 1))
+        self.assertNotEqual(consumer_placement[0], producer_placement[0])
 
         exact = _configured_static_pipeline_plan(**{**kwargs, "worker_count": 7})
         self.assertEqual(exact.worker_schedule.worker_count, 7)
@@ -4499,5 +5021,13 @@ class TestCrossLoopScheduler(TestCase):
             [(1, 2, (3, 1)), (4, 5, (3, 1))],
         )
         self.assertEqual(overlapped.root_barrier_edges, frozenset())
-        self.assertEqual(placement(overlapped.worker_schedule, 2, 0), (5, 1))
-        self.assertEqual(placement(overlapped.worker_schedule, 5, 0), (5, 5))
+        first_sink_placement = placement(overlapped.worker_schedule, 2, 0)
+        second_sink_placement = placement(overlapped.worker_schedule, 5, 0)
+        self.assertIsNotNone(first_sink_placement)
+        self.assertIsNotNone(second_sink_placement)
+        assert first_sink_placement is not None and second_sink_placement is not None
+        self.assertEqual(
+            (first_sink_placement[1], second_sink_placement[1]),
+            (2, 2),
+        )
+        self.assertNotEqual(first_sink_placement[0], second_sink_placement[0])

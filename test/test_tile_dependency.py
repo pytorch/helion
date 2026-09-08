@@ -50,6 +50,53 @@ def cartesian_affine_stage(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def flattened_affine_stage(x: torch.Tensor) -> torch.Tensor:
+    partial = torch.empty((8, 2, 4), device=x.device, dtype=x.dtype)
+    partial_storage = partial.view(-1)
+    out = torch.empty((2, 8), device=x.device, dtype=x.dtype)
+    for tile_split, tile_group, tile_head in hl.tile([8, 2, 4], block_size=[1, 1, 4]):
+        partial[tile_split, tile_group, tile_head] = x[tile_group, tile_head][
+            None, :, :
+        ]
+    for tile_chunk, tile_head in hl.tile([2, 8], block_size=[1, 1]):
+        split = tile_chunk.index[:, None] * 4 + hl.arange(4)[None, :]
+        offsets = split[:, :, None] * 8 + tile_head.index[None, None, :]
+        out[tile_chunk, tile_head] = torch.sum(partial_storage[offsets], dim=1)
+    return out
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def flattened_qwen_attention_stages(x: torch.Tensor) -> torch.Tensor:
+    partial = torch.empty((128, 2, 4, 128), device=x.device, dtype=x.dtype)
+    partial_storage = partial.view(-1)
+    chunk = torch.empty((16, 8, 128), device=x.device, dtype=x.dtype)
+    chunk_storage = chunk.view(-1)
+    out = torch.empty((8, 128), device=x.device, dtype=x.dtype)
+    for tile_split, tile_group, tile_head in hl.tile(
+        [128, 2, 4], block_size=[1, 1, 4]
+    ):
+        partial[tile_split, tile_group, tile_head, :] = x[
+            tile_group, tile_head
+        ][None, :, :, None]
+    for tile_chunk, tile_head in hl.tile([16, 8], block_size=[1, 1]):
+        split = tile_chunk.index[:, None] * 8 + hl.arange(8)[None, :]
+        base = split[:, :, None] * 8 + tile_head.index[None, None, :]
+        offsets = base[:, :, :, None] * 128 + hl.arange(128)[None, None, None, :]
+        chunk[tile_chunk, tile_head, :] = torch.sum(
+            partial_storage[offsets], dim=1
+        )
+    for tile_head in hl.tile(8, block_size=1):
+        chunk_index = hl.arange(16)
+        offsets = (
+            (chunk_index[:, None] * 8 + tile_head.index[None, :])[:, :, None]
+            * 128
+            + hl.arange(128)[None, None, :]
+        )
+        out[tile_head, :] = torch.sum(chunk_storage[offsets], dim=0)
+    return out
+
+
 def _axis_geometry(
     root_domains: tuple[CoordinateDomain, ...],
 ) -> dict[int, tuple[int, int]]:
@@ -93,6 +140,7 @@ def _access(
     tensor_name: str = "tmp",
     storage_offset: int = 0,
     layout_is_static: bool = True,
+    affine_subscript_ranges=None,
 ) -> TileAccess:
     return TileAccess(
         access_id=access_id,
@@ -114,6 +162,7 @@ def _access(
         subscript_is_full_slice=full_slice or tuple(False for _ in block_ids),
         subscript_static_extents=static_extents or (),
         layout_is_static=layout_is_static,
+        affine_subscript_ranges=affine_subscript_ranges,
     )
 
 
@@ -254,6 +303,183 @@ class TestTileDependency(TestCase):
             domain.index({10: 1, 20: 0}, linearization_order=(20, 10)),
             3,
         )
+
+    def test_piecewise_dense_point_converse_is_exact_transpose(self) -> None:
+        inner = coordinate_axis_symbol(10)
+        outer = coordinate_axis_symbol(11)
+        source = CoordinateDomain(
+            (10, 11),
+            ((10, 4), (11, 3)),
+            kind="task_order",
+        )
+        target = CoordinateDomain((20,), ((20, 12),), kind="site")
+        relation = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (
+                    ((10, 0, 2, 1), (11, 0, 3, 1)),
+                    (2 * outer + inner,),
+                ),
+                (
+                    ((10, 2, 4, 1), (11, 0, 3, 1)),
+                    (2 * outer + inner + 4,),
+                ),
+            ),
+        )
+
+        converse = relation.converse()
+        self.assertIsNotNone(converse)
+        assert converse is not None
+        expected: list[set[int]] = [set() for _ in range(target.size)]
+        for source_index, target_indices in enumerate(relation.materialize()):
+            for target_index in target_indices:
+                expected[target_index].add(source_index)
+        self.assertEqual(
+            converse.materialize(),
+            tuple(frozenset(indices) for indices in expected),
+        )
+        derived, target_counts = relation.derive_converse_and_target_counts()
+        self.assertIsNotNone(derived)
+        self.assertIsNotNone(target_counts)
+        assert derived is not None
+        self.assertEqual(derived.materialize(), converse.materialize())
+
+    def test_piecewise_point_converse_declines_non_dense_layout(self) -> None:
+        inner = coordinate_axis_symbol(10)
+        outer = coordinate_axis_symbol(11)
+        source = CoordinateDomain(
+            (10, 11),
+            ((10, 2), (11, 3)),
+            kind="task_order",
+        )
+        target = CoordinateDomain((20,), ((20, 8),), kind="site")
+        relation = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (
+                    ((10, 0, 2, 1), (11, 0, 3, 1)),
+                    (3 * outer + inner,),
+                ),
+            ),
+        )
+
+        self.assertIsNone(relation.converse())
+
+    def test_piecewise_mixed_radix_point_converse_is_exact_transpose(self) -> None:
+        ordinal = coordinate_axis_symbol(10)
+        source = CoordinateDomain((10,), ((10, 12),), kind="task_order")
+        target = CoordinateDomain(
+            (20, 21, 22),
+            ((20, 2), (21, 3), (22, 2)),
+            kind="site",
+        )
+
+        def relation(second_batch: int) -> CoordinateRelation:
+            return CoordinateRelation.point_map(
+                source,
+                target,
+                (
+                    (
+                        ((10, 0, 6, 1),),
+                        (
+                            sympy.Integer(0),
+                            sympy.Mod(ordinal, 3),
+                            sympy.floor(ordinal / 3),
+                        ),
+                    ),
+                    (
+                        ((10, 6, 12, 1),),
+                        (
+                            sympy.Integer(second_batch),
+                            sympy.Mod(ordinal, 3),
+                            sympy.floor(ordinal / 3) - 2,
+                        ),
+                    ),
+                ),
+            )
+
+        bijection = relation(1)
+        converse = bijection.converse()
+        self.assertIsNotNone(converse)
+        assert converse is not None
+        expected: list[set[int]] = [set() for _ in range(target.size)]
+        for source_index, target_indices in enumerate(bijection.materialize()):
+            for target_index in target_indices:
+                expected[target_index].add(source_index)
+        self.assertEqual(
+            converse.materialize(),
+            tuple(frozenset(indices) for indices in expected),
+        )
+
+        # Mapping the second source interval onto the first interval's target
+        # box would make the inverse multi-valued, so this specialized proof
+        # must decline it.
+        self.assertIsNone(relation(0).converse())
+
+    def test_woven_mixed_radix_converse_is_exact_and_symbolic(self) -> None:
+        ordinal = coordinate_axis_symbol(10)
+        source = CoordinateDomain((10,), ((10, 704),), kind="task_order")
+        target = CoordinateDomain(
+            (20, 21, 22),
+            ((20, 2), (21, 8), (22, 44)),
+            kind="site",
+        )
+        relation = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (
+                    ((10, 0, 704, 1),),
+                    (
+                        sympy.Mod(sympy.floor(ordinal / 32), 2),
+                        sympy.Mod(ordinal, 8),
+                        4 * sympy.floor(ordinal / 64)
+                        + sympy.floor(sympy.Mod(ordinal, 32) / 8),
+                    ),
+                ),
+            ),
+        )
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("converse proof must remain symbolic"),
+        ):
+            converse = relation.converse()
+        self.assertIsNotNone(converse)
+        assert converse is not None
+        self.assertTrue(converse.is_total_function())
+
+        expected: list[set[int]] = [set() for _ in range(target.size)]
+        for source_index, target_indices in enumerate(relation.materialize()):
+            for target_index in target_indices:
+                expected[target_index].add(source_index)
+        self.assertEqual(
+            converse.materialize(),
+            tuple(frozenset(indices) for indices in expected),
+        )
+
+    def test_woven_mixed_radix_converse_rejects_reused_input_digit(self) -> None:
+        ordinal = coordinate_axis_symbol(10)
+        source = CoordinateDomain((10,), ((10, 8),), kind="task_order")
+        target = CoordinateDomain((20, 21), ((20, 2), (21, 4)), kind="site")
+        noninjective = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (
+                    ((10, 0, 8, 1),),
+                    (
+                        sympy.Mod(ordinal, 2),
+                        sympy.Mod(ordinal, 4),
+                    ),
+                ),
+            ),
+        )
+
+        self.assertIsNone(noninjective.converse())
 
     def test_relation_axis_renaming_preserves_positional_coordinates(self) -> None:
         source = CoordinateDomain((10, 20), ((10, 2), (20, 3)))
@@ -1212,6 +1438,217 @@ class TestTileDependency(TestCase):
             )
             self.assertEqual(relation.targets(consumer_task), expected)
 
+    def test_flattened_qwen_merge_matches_multidimensional_dependency(self) -> None:
+        domains = (
+            CoordinateDomain(
+                (15, 16, 17),
+                ((15, 128), (16, 16), (17, 1)),
+                ((15, 1), (16, 1), (17, 4)),
+            ),
+            CoordinateDomain(
+                (20, 21),
+                ((20, 16), (21, 64)),
+                ((20, 1), (21, 1)),
+            ),
+        )
+        lse_plan = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    shape=(128, 16, 4),
+                    strides=(64, 4, 1),
+                    block_ids=(15, 16, 17),
+                    scales=(1, 1, 1),
+                    offsets=(0, 0, 0),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    shape=(8192,),
+                    strides=(1,),
+                    block_ids=(None,),
+                    offsets=(None,),
+                    affine_subscript_ranges=((((20, 512), (21, 1)), 0, 512, 64),),
+                ),
+            ),
+            [[15, 16, 17], [20, 21]],
+        )
+        output_ranges = tuple(
+            (((20, 65536), (21, 128)), offset, offset + 128, 1)
+            for offset in range(0, 65536, 8192)
+        )
+        output_plan = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    shape=(128, 16, 4, 128),
+                    strides=(8192, 512, 128, 1),
+                    block_ids=(15, 16, 17, None),
+                    scales=(1, 1, 1, 1),
+                    offsets=(0, 0, 0, None),
+                    full_slice=(False, False, False, True),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    shape=(1048576,),
+                    strides=(1,),
+                    block_ids=(None,),
+                    offsets=(None,),
+                    affine_subscript_ranges=output_ranges,
+                ),
+            ),
+            [[15, 16, 17], [20, 21]],
+        )
+
+        lse = _root_producers_by_consumer(lse_plan, domains)
+        output = _root_producers_by_consumer(output_plan, domains)
+
+        self.assertEqual(lse, output)
+        assert lse is not None
+        for consumer_task, producers in enumerate(lse):
+            coordinates = domains[1].coordinates(consumer_task)
+            chunk = coordinates[20]
+            head = coordinates[21]
+            expected = frozenset(
+                split_index + 128 * (head // 4)
+                for split_index in range(8 * chunk, 8 * chunk + 8)
+            )
+            self.assertEqual(producers, expected)
+
+        relation = _symbolic_root_relation(
+            lse_plan,
+            _axis_geometry(domains),
+        )
+        assert relation is not None
+        quotient = relation.producer_set_quotient()
+        self.assertIsNotNone(quotient)
+        assert quotient is not None
+        keys_by_consumer, producers_by_key = quotient
+        self.assertEqual(keys_by_consumer.target_domain.shape, (16, 16))
+        producer_count = producers_by_key.target_count_by_source()
+        assert producer_count is not None
+        self.assertEqual(producer_count.constant_value(), 8)
+
+    def test_strided_flattened_hull_is_not_treated_as_contiguous(self) -> None:
+        plan = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    shape=(16,),
+                    strides=(1,),
+                    block_ids=(10,),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    shape=(16,),
+                    strides=(1,),
+                    block_ids=(None,),
+                    offsets=(None,),
+                    affine_subscript_ranges=((((20, 0),), 0, 16, 2),),
+                ),
+            ),
+            [[10], [20]],
+        )
+        domains = (
+            CoordinateDomain((10,), ((10, 16),), ((10, 1),)),
+            CoordinateDomain((20,), ((20, 1),), ((20, 1),)),
+        )
+
+        self.assertIsNone(_root_producers_by_consumer(plan, domains))
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("compiled DeviceIR is unavailable in ref eager mode")
+    def test_device_analysis_retains_flattened_affine_iota_pattern(self) -> None:
+        x = torch.randn((2, 4), device=DEVICE)
+        bound = flattened_affine_stage.bind((x,))
+        assert bound.host_function is not None
+        device_ir = bound.host_function.device_ir
+        with bound.env, bound.host_function:
+            accesses = DeviceIRAnalysis.build(device_ir, bound.env).tile_accesses(
+                device_ir,
+                bound.env,
+                bound.host_function,
+            )
+
+        flattened_loads = tuple(
+            access
+            for access in accesses
+            if access.kind == "load"
+            and access.tensor_shape == (64,)
+            and access.affine_subscript_ranges is not None
+        )
+        self.assertEqual(len(flattened_loads), 1)
+        (flattened_load,) = flattened_loads
+        assert flattened_load.affine_subscript_ranges is not None
+        self.assertEqual(
+            tuple(
+                (begin, end, step)
+                for _coefficients, begin, end, step in (
+                    flattened_load.affine_subscript_ranges
+                )
+            ),
+            ((0, 32, 8),),
+        )
+        self.assertEqual(
+            tuple(
+                coefficient
+                for coefficients, _begin, _end, _step in (
+                    flattened_load.affine_subscript_ranges
+                )
+                for _axis, coefficient in coefficients
+            ),
+            (32, 1),
+        )
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("compiled DeviceIR is unavailable in ref eager mode")
+    def test_device_analysis_retains_qwen_value_and_final_patterns(self) -> None:
+        x = torch.randn((2, 4), device=DEVICE)
+        bound = flattened_qwen_attention_stages.bind((x,))
+        assert bound.host_function is not None
+        device_ir = bound.host_function.device_ir
+        with bound.env, bound.host_function:
+            accesses = DeviceIRAnalysis.build(device_ir, bound.env).tile_accesses(
+                device_ir,
+                bound.env,
+                bound.host_function,
+            )
+
+        flattened_loads = tuple(
+            access
+            for access in accesses
+            if access.kind == "load" and access.affine_subscript_ranges is not None
+        )
+        self.assertEqual(
+            tuple(access.tensor_shape for access in flattened_loads),
+            ((131072,), (16384,)),
+        )
+        self.assertEqual(
+            tuple(len(access.affine_subscript_ranges or ()) for access in flattened_loads),
+            (8, 16),
+        )
+        self.assertEqual(
+            tuple(
+                (end - begin) // step
+                for access in flattened_loads
+                for _coefficients, begin, end, step in (
+                    access.affine_subscript_ranges or ()
+                )
+            ),
+            (128,) * 24,
+        )
+
     @skipIfNotCUDA()
     @skipIfRefEager("compiled DeviceIR is unavailable in ref eager mode")
     def test_shared_device_graph_preserves_every_root_owner(self) -> None:
@@ -1581,7 +2018,7 @@ class TestTileDependency(TestCase):
             tuple(frozenset((task,)) for task in range(256)),
         )
 
-    def test_nontrivial_reshape_still_falls_back_to_root(self) -> None:
+    def test_dense_nontrivial_reshape_maps_exactly(self) -> None:
         plan = build_tile_dependency_graph(
             (
                 _access(
@@ -1613,7 +2050,23 @@ class TestTileDependency(TestCase):
             CoordinateDomain((20,), ((20, 256),), ((20, 16),)),
         )
         relation = _root_producers_by_consumer(plan, root_domains)
-        self.assertIsNone(relation)
+        producer_domain, consumer_domain = root_domains
+        self.assertEqual(
+            relation,
+            tuple(
+                frozenset(
+                    (
+                        producer_domain.index(
+                            {
+                                10: (consumer_task * 16) // 128,
+                                11: ((consumer_task * 16) % 128) // 16,
+                            }
+                        ),
+                    )
+                )
+                for consumer_task in range(consumer_domain.size)
+            ),
+        )
 
     def test_unequal_tiles_map_to_every_overlapping_producer(self) -> None:
         plan = build_tile_dependency_graph(

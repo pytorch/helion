@@ -20,7 +20,6 @@ CrossLoopScheduleLiteral = Literal["barrier", "static_pipeline"]
 EvictionPolicyLiteral = Literal["", "first", "last"]
 LoadCacheModifierLiteral = Literal["", ".cg"]
 StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
-NumSmMultiplierLiteral = Literal[1, 2, 4, 8]
 MaxnregLiteral = Literal[32, 64, 80, 128, 256] | None
 
 
@@ -53,7 +52,7 @@ class Config(Mapping[str, object]):
         num_stages: int | None = None,
         pid_type: PidTypeLiteral | None = None,
         cross_loop_schedule: CrossLoopScheduleLiteral | None = None,
-        num_sm_multiplier: NumSmMultiplierLiteral | None = None,
+        num_sm_multiplier: int | None = None,
         maxnreg: MaxnregLiteral | None = None,
         indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
         atomic_indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
@@ -93,8 +92,9 @@ class Config(Mapping[str, object]):
                 compiler-inferred cross-loop dependencies. ``"barrier"`` uses
                 grid synchronization; ``"static_pipeline"`` uses the static
                 dependency schedule. Unsupported kernels reject this field.
-            num_sm_multiplier: Multiplier for the number of SMs in persistent
-                kernels (1, 2, 4, 8).
+            num_sm_multiplier: Positive integer multiplier for the number of SMs
+                in persistent kernels. The autotuner searches powers of two, but
+                explicit configs may select intermediate occupancy points.
                 Controls multi-occupancy by launching N * num_sms thread blocks instead of just num_sms.
             maxnreg: Maximum number of registers per thread
                 (None, 32, 64, 80, 128, 256).

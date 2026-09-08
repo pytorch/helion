@@ -1238,10 +1238,19 @@ class TestNumSmMultiplier(RefEagerTestBase, TestCase):
         self.assertIn("(_NUM_SM * 4,)", code_m4)
         self.assertIn("tl.cdiv(total_pids, _NUM_SM * 4)", code_m4)
 
+        # Explicit configs can target an intermediate occupancy point even
+        # though the autotuner continues to search powers of two.
+        code_m3, result_m3 = code_and_output(
+            add_kernel, args, pid_type="persistent_blocked", num_sm_multiplier=3
+        )
+        self.assertIn("(_NUM_SM * 3,)", code_m3)
+        self.assertIn("tl.cdiv(total_pids, _NUM_SM * 3)", code_m3)
+
         # All should produce the same result
         expected = args[0] + args[1]
         torch.testing.assert_close(result_m1, expected)
         torch.testing.assert_close(result_m2, expected)
+        torch.testing.assert_close(result_m3, expected)
         torch.testing.assert_close(result_m4, expected)
 
     @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
