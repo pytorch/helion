@@ -2666,11 +2666,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             config: The configuration to set.
         """
         config = self._normalize_config(config)
-        run = self.compile_config(config)
+        self._run = self.compile_config(config)
         if _RETRY_WITH_FALLBACK:
             fallback_configs = [c for c in self.fallback_configs if c != config]
-            run = self._run_with_fallback(run, fallback_configs)
-        self._run = run
+            self._run = self._run_with_fallback(self._run, fallback_configs)
         self._config = config
         counters["best_config_decorator"][
             self.format_kernel_decorator(config, self.settings)
@@ -2679,7 +2678,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
     def _run_with_fallback(
         self, run: CompiledConfig, fallbacks: list[Config]
     ) -> CompiledConfig:
-        """Retry with each of ``fallbacks`` in order on a launch resource error."""
+        """Retry with ``fallbacks`` on a launch resource error."""
 
         def run_with_fallback(*args: object) -> _R:
             try:
@@ -2696,7 +2695,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                         compiled = self.compile_config(candidate)
                         result = compiled(*args)
                         # Cache the working config.
-                        # For dynamic shapes, other shapes in the bucket might fail as well so we keep the retry
+                        # For dynamic shapes, other shapes in the bucket might fail so we keep the retry
                         self._run = (
                             compiled
                             if self.settings.static_shapes

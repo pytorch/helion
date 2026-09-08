@@ -64,20 +64,11 @@ class DecisionTreeBackend(HeuristicBackend):
         assert data.selected_config_indices is not None, (
             "selected_config_indices must be set"
         )
-        # Most-robust-first, so fallbacks try never-failing configs first.
-        selected_indices = data.selected_config_indices
-        failures = [
-            int(np.sum(~np.isfinite(data.timings[:, idx]))) for idx in selected_indices
-        ]
-        order = sorted(range(len(selected_indices)), key=lambda j: failures[j])
-        selected_indices = [selected_indices[j] for j in order]
-        selected_configs = [selected_configs[j] for j in order]
-
         y = np.zeros(n_shapes, dtype=int)
         for i in range(n_shapes):
             best_timing = np.inf
             best_config = 0
-            for j, config_idx in enumerate(selected_indices):
+            for j, config_idx in enumerate(data.selected_config_indices):
                 timing = data.timings[i, config_idx]
                 if timing < best_timing:
                     best_timing = timing

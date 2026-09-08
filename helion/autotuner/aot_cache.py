@@ -42,6 +42,7 @@ import torch
 
 from .._hardware import get_hardware_info
 from ..runtime.config import Config
+from ..runtime.kernel import _RETRY_WITH_FALLBACK
 from .aot_kernel import _flatten_key_value
 from .aot_kernel import extract_key_features
 from .aot_kernel import extract_shape_features
@@ -348,7 +349,8 @@ class AOTAutotuneCache(AutotuneCacheBase):
         self._tuned_configs: dict[str, list[TunedConfig]] = self._load_tuned_configs()
         self.shape_key = self._create_shape_key()
         self._verbose = is_aot_verbose()
-        self._set_fallback_configs()
+        if _RETRY_WITH_FALLBACK:
+            self._set_fallback_configs()
 
         # Look up optional collect_fn/measure_fn from the Kernel object
         # These are set by @aot_kernel() decorator
@@ -755,7 +757,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
         )
 
     def _load_heuristic_module(self, heuristic_file: Path) -> object | None:
-        """Import the heuristic file, caching the module across kernels."""
+        """Load heuristic module from cache or import fresh."""
         if (module := AOTAutotuneCache._heuristic_modules.get(heuristic_file)) is None:
             spec = importlib.util.spec_from_file_location("heuristic", heuristic_file)
             if spec is None or spec.loader is None:
@@ -767,10 +769,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
         return module
 
     def _set_fallback_configs(self) -> None:
-        """Prepend the heuristic's configs to the kernel's launch-failure fallbacks.
-
-        Called once per cache, so the parse stays off the kernel launch path.
-        """
+        """Prepend the heuristic's configs to the kernel's launch-failure fallbacks."""
         heuristic_file = self._find_heuristic_file()
         if heuristic_file is None:
             return

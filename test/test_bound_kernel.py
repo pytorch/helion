@@ -5,6 +5,7 @@ backend DSL only, or ``jax`` alone for ``jax_fn=True``)."""
 
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 import subprocess
 import sys
@@ -14,6 +15,7 @@ from typing import Any
 import unittest
 from unittest.mock import Mock
 from unittest.mock import call
+from unittest.mock import patch
 
 import torch
 from torch._inductor.runtime.triton_compat import OutOfResources
@@ -26,6 +28,8 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessPallas
 import helion.language as hl
 from helion.runtime.kernel import BoundKernel
+
+kernel_module = importlib.import_module("helion.runtime.kernel")
 
 _FREE = helion.OutputCodeOptions(allow_helion_deps=False)
 _JAX = helion.OutputCodeOptions(allow_helion_deps=False, jax_fn=True)
@@ -720,6 +724,34 @@ class TestOutOfResourcesFallback(TestCase):
 
         self.assertEqual(result, "ok")
         fallback.assert_called_once_with("arg")
+
+    @skipIfRefEager("needs a compiled kernel")
+    def test_set_config_installs_fallback_only_when_enabled(self) -> None:
+        @helion.kernel(config=helion.Config(block_sizes=[32]))
+        def add1(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        x = torch.randn(64, device=DEVICE)
+        config = helion.Config(block_sizes=[32])
+
+        with patch.object(kernel_module, "_RETRY_WITH_FALLBACK", False):
+            bound = add1.bind((x,))
+            bound.set_config(config)
+            self.assertNotEqual(bound._run.__name__, "run_with_fallback")
+            plain_run = bound._run
+
+        with patch.object(kernel_module, "_RETRY_WITH_FALLBACK", True):
+            bound = add1.bind((x,))
+            bound.set_config(config)
+            self.assertEqual(bound._run.__name__, "run_with_fallback")
+            # The default config is always available as a last resort.
+            self.assertTrue(bound.fallback_configs)
+
+        torch.testing.assert_close(plain_run(x), x + 1)
+        torch.testing.assert_close(bound._run(x), x + 1)
 
 
 if __name__ == "__main__":
