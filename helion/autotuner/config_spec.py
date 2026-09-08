@@ -995,6 +995,10 @@ class ConfigSpec:
         self.max_reduction_threads = backend.max_reduction_threads()
         self.max_reduction_loop = backend.max_reduction_loop()
         self.reduction_loop_force_threshold = self.max_reduction_threads
+        # Every reduction block, including static/non-rollable persistent
+        # dimensions that have no ReductionLoopSpec.  DeviceIR fills this
+        # before configs are normalized.
+        self.reduction_block_ids: set[int] = set()
         self.cute_indexed_reduction_block_ids: set[int] = set()
         self.user_defined_tunables = (
             {} if user_defined_tunables is None else dict(user_defined_tunables)
@@ -2408,6 +2412,29 @@ class ConfigSpec:
                 name, config.get(name, ()), flatten=flatten
             )
 
+        if self.backend_name == "cute":
+            # A persistent reduction with exactly one vector fragment per
+            # thread has only one physical assignment, so blocked/strided are
+            # identical.  Canonicalize the inactive choice to avoid duplicate
+            # autotuner candidates.  Looped reductions retain both layouts.
+            lane_layouts = config.get("cute_lane_layouts")
+            reduction_loops = cast(
+                "list[int | None]", config.get("reduction_loops", []) or []
+            )
+            if isinstance(lane_layouts, list):
+                canonical_layouts = list(lane_layouts)
+                for index, layout_spec in enumerate(self.cute_lane_layouts):
+                    block_id = layout_spec.block_id
+                    if (
+                        block_id in self.reduction_block_ids
+                        and self.reduction_loops.config_get(
+                            reduction_loops, block_id, None
+                        )
+                        is None
+                    ):
+                        canonical_layouts[index] = "blocked"
+                config["cute_lane_layouts"] = canonical_layouts
+
         # Clamp inner block sizes that are bounded by an outer block
         # (e.g. ``hl.tile(outer.begin, outer.end)``): at this point the
         # outer's concrete block size for this config is known, and the
@@ -2531,18 +2558,21 @@ class ConfigSpec:
             nt_list = cast("list[int]", config.get("num_threads", []) or [])
             bs_list = cast("list[int]", config.get("block_sizes", []) or [])
             # ``num_threads`` also carries per-rolled-rdim slots (the
-            # reduction's own thread count); only NON-reduction tile axes
-            # consume the budget the reduction competes for.  Tile slots
-            # are registered in ``block_sizes`` order, so pairing the i-th
-            # num_threads slot with block_sizes[i] stays valid for them.
-            reduction_block_ids = {spec.block_id for spec in self.reduction_loops}
+            # reduction's own thread count), plus static persistent-rdim slots
+            # that have no ``reduction_loops`` entry.  Only NON-reduction tile
+            # axes consume the budget the reduction competes for.  Resolve all
+            # values by block id because the two sequences need not share an
+            # order.
+            reduction_block_ids = self.reduction_block_ids | {
+                spec.block_id for spec in self.reduction_loops
+            }
             other_threads = 1
-            for i, nt_spec in enumerate(self.num_threads):
+            for nt_spec in self.num_threads:
                 if nt_spec.block_id in reduction_block_ids:
                     continue
-                nt = nt_list[i] if i < len(nt_list) else 0
+                nt = self.num_threads.config_get(nt_list, nt_spec.block_id, 0)
                 if not isinstance(nt, int) or nt <= 0:
-                    bs = bs_list[i] if i < len(bs_list) else 1
+                    bs = self.block_sizes.config_get(bs_list, nt_spec.block_id, 1)
                     nt = bs if isinstance(bs, int) and bs > 1 else 1
                 if nt > 1:
                     other_threads *= nt
@@ -4008,15 +4038,15 @@ _CUTE_REDUCTION_RELOAD_CHOICES: tuple[str, ...] = ("auto", "register", "gmem")
 
 
 class CuteReductionReloadSpec(_BlockIdItem):
-    """Where a multi-sweep rolled reduction keeps the values it re-reads.
+    """Where a multi-sweep reduction keeps the values it re-reads.
 
-    LayerNorm/RMSNorm-style kernels sweep the same input several times
-    (reduce, then consume).  ``"register"`` caches the first sweep's loads
-    in a per-thread register fragment (fastest when the per-thread slice
-    is small; spills to local memory when it is not).  ``"gmem"`` re-loads
-    from global memory on later sweeps (the row is usually still resident
-    in L2, and no registers are burned).  ``"auto"`` (default) keeps the
-    legacy size heuristic in ``fuse_two_pass_loads``.
+    Rolled or persistent LayerNorm/RMSNorm-style kernels sweep the same input
+    several times (reduce, then consume).  ``"register"`` caches the earliest
+    sweep's loads in a per-thread register fragment (fastest when the
+    per-thread slice is small; spills to local memory when it is not).
+    ``"gmem"`` re-loads from global memory on later sweeps (the row is usually
+    still resident in L2, and no registers are burned).  ``"auto"`` (default)
+    keeps the legacy size heuristic in ``fuse_two_pass_loads``.
     """
 
     def __init__(self, *, block_id: int) -> None:
