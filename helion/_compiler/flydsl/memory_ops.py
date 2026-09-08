@@ -9,6 +9,7 @@ eager timing as before.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from typing import cast
 
 import torch
 
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
 
     from ..compile_environment import CompileEnvironment
     from ..inductor_lowering import CodegenState
+    from .backend import FlyDSLBackend
 
 
 def _flydsl_rolled_col_block(
@@ -50,10 +52,7 @@ def _flydsl_rolled_col_block(
 
     for ax, idx in enumerate(subscript):
         if isinstance(idx, slice) and idx == slice(None):
-            try:
-                ax_hint = env.size_hint(tensor.size(ax))
-            except Exception:
-                continue
+            ax_hint = env.size_hint(tensor.size(ax))
             for bid in loop_blocks:
                 if env.block_sizes[bid].size_hint() == ax_hint:
                     return bid
@@ -149,16 +148,20 @@ def _flydsl_buffer_setup(
     _tc = 0
     _lb = 0
     if is_rolled_col:
+        from ..reduction_strategy import LoopedReductionStrategy
+
         assert col_block_id is not None
         _rs = state.device_function.tile_strategy.block_id_to_strategy.get(
             (col_block_id,)
         )
-        _tc = getattr(_rs, "_thread_count", 0) or 0
-        _lb = getattr(_rs, "_loop_block_size", 0) or 0
-
-        if _rs is not None and _tc > 0 and _lb >= _tc:
-            rolled_col_vec = max(1, _lb // _tc)
-            rolled_col_offset = _rs.offset_var(col_block_id)
+        # A rolled ``:`` column resolves to a LoopedReductionStrategy, the only
+        # strategy carrying _thread_count / _loop_block_size.
+        if isinstance(_rs, LoopedReductionStrategy):
+            _tc = _rs._thread_count
+            _lb = _rs._loop_block_size
+            if _tc > 0 and _lb >= _tc:
+                rolled_col_vec = max(1, _lb // _tc)
+                rolled_col_offset = _rs.offset_var(col_block_id)
     # Column tail: when N is not a multiple of the chunk (64*V), the last pass
     # runs past column N. Build a per-element predicate to drop those columns.
     rolled_col_pred: str | None = None
@@ -285,9 +288,9 @@ def _(state: CodegenState) -> None:
     assert isinstance(subscript, (list, tuple))
 
     env = CompileEnvironment.current()
-    backend = env.backend
+    backend = cast("FlyDSLBackend", env.backend)
     tensor_name = state.device_function.tensor_arg(tensor).name
-    use_buffer = getattr(backend, "_tensor_use_buffer", {}).get(id(tensor), False)
+    use_buffer = backend._tensor_use_buffer.get(id(tensor), False)
 
     if use_buffer:
         _info = _flydsl_buffer_setup(env, state, tensor, tensor_name, subscript)
@@ -415,9 +418,9 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(subscript, (list, tuple))
 
     env = CompileEnvironment.current()
-    backend = env.backend
+    backend = cast("FlyDSLBackend", env.backend)
     tensor_name = state.device_function.tensor_arg(tensor).name
-    use_buffer = getattr(backend, "_tensor_use_buffer", {}).get(id(tensor), False)
+    use_buffer = backend._tensor_use_buffer.get(id(tensor), False)
 
     if use_buffer:
         # buffer tensor path for both x[tile_n,:] and x[tile_m,tile_n].

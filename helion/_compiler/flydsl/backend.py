@@ -27,6 +27,11 @@ if TYPE_CHECKING:
     InductorOpOverrides = OpsHandler[Any]
 
 
+def _flydsl_minimum_expr(a: str, b: str) -> str:
+    # flydsl Vector has no ``.minimumf``; min(a,b) = -max(-a,-b).
+    return f"(-((-({a})).maximumf((-({b})))))"
+
+
 class FlyDSLBackend(Backend):
     """FlyDSL (ROCm) code generation backend."""
 
@@ -59,6 +64,13 @@ class FlyDSLBackend(Backend):
         }
     )
 
+    def __init__(self) -> None:
+        super().__init__()
+        # Set per-compile by pre_codegen; initialized here so function_decorator
+        # and the memory-op codegen can read them directly without defaults.
+        self._flydsl_num_threads: int = 64
+        self._tensor_use_buffer: dict[int, bool] = {}
+
     @property
     def name(self) -> str:
         return "flydsl"
@@ -88,7 +100,7 @@ class FlyDSLBackend(Backend):
 
     @property
     def function_decorator(self) -> str:
-        n_threads = getattr(self, "_flydsl_num_threads", 64)
+        n_threads = self._flydsl_num_threads
         return f"flyc.kernel(known_block_size=[{n_threads}, 1, 1])"
 
     @property
@@ -233,6 +245,7 @@ class FlyDSLBackend(Backend):
 
         # Benchmark in-process: FlyDSL's JIT/HIP-stream state does not survive
         # the precompile/benchmark subprocess workers, so disable both paths.
+        # In-place mutation of per-bind settings mirrors the base autotune().
         bound_kernel.settings.autotune_precompile = None
         bound_kernel.settings.autotune_benchmark_subprocess = False
 
@@ -248,28 +261,14 @@ class FlyDSLBackend(Backend):
     ) -> None:
         from ...language import memory_ops
 
-        _BITS: dict[torch.dtype, int] = {
-            torch.float16: 16,
-            torch.bfloat16: 16,
-            torch.float32: 32,
-            torch.float64: 64,
-            torch.int32: 32,
-            torch.int64: 64,
-        }
-
-        # Reset per-compilation state so helpers are re-emitted on each compile.
-        self._flydsl_helpers_emitted = False
         # Elementwise regime: block_sizes = [bm] (or [bm, 256]) -> bm rows/block,
         # one warp (64 lanes) per row, block = 64*bm threads.
-        bs = getattr(config, "block_sizes", None) or [1]
-        bm = int(bs[0]) if bs else 1
-
-        self._flydsl_bm = bm
+        bs = config.block_sizes or [1]
+        bm = int(bs[0])
         self._flydsl_num_threads = 64 * bm
 
-        self._tensor_use_buffer: dict[int, bool] = {}
-        self._tensor_vec_width: dict[int, int] = {}
-
+        # Reset per-compile; every load/store tensor takes the vectorized buffer path.
+        self._tensor_use_buffer = {}
         for graph_info in graphs:
             for node in graph_info.graph.nodes:
                 if node.op != "call_function":
@@ -284,10 +283,7 @@ class FlyDSLBackend(Backend):
                 if not isinstance(tensor, torch.Tensor):
                     continue
 
-                tid = id(tensor)
-                self._tensor_use_buffer[tid] = True  # always vectorized buffer path
-                bits = _BITS.get(tensor.dtype, 32)
-                self._tensor_vec_width[tid] = 128 // bits
+                self._tensor_use_buffer[id(tensor)] = True
 
     def grid_index_expr(
         self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
@@ -513,8 +509,7 @@ class FlyDSLBackend(Backend):
 
             @staticmethod
             def minimum(a: str, b: str) -> str:
-                # flydsl Vector has no ``.minimumf``; min(a,b) = -max(-a,-b).
-                return f"(-((-({a})).maximumf((-({b})))))"
+                return _flydsl_minimum_expr(a, b)
 
             @staticmethod
             def where(a: str, b: str, c: str) -> str:
@@ -548,5 +543,4 @@ class FlyDSLBackend(Backend):
         return f"({mask}).select({true_val}, {false_val})"
 
     def minimum_expr(self, a: str, b: str) -> str:
-        # flydsl Vector has no ``.minimumf``; min(a,b) = -max(-a,-b).
-        return f"(-((-({a})).maximumf((-({b})))))"
+        return _flydsl_minimum_expr(a, b)

@@ -50,6 +50,15 @@ class TestFlydslElementwise(TestCase):
             _, out = code_and_output(elementwise_double, (x,), block_sizes=[bm])
             torch.testing.assert_close(out, x * 2.0)
 
+    def test_generated_code_uses_buffer_ops(self) -> None:
+        # Codegen-only assertion (no kernel run): the elementwise buffer path
+        # must emit flydsl's vectorized load/store ops, not a scalar fallback.
+        x = torch.randn(16, 512, device=DEVICE, dtype=torch.float16)
+        bound = elementwise_double.bind((x,))
+        code = bound.to_triton_code(bound.config_spec.default_config())
+        self.assertIn("make_buffer_tensor", code)
+        self.assertIn("copy_atom_call", code)
+
     def test_elementwise_map_column_tail(self) -> None:
         # Non-reduction path with N not a multiple of the vector width.
         x = torch.randn(8, 300, device=DEVICE, dtype=torch.float16)

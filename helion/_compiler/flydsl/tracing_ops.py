@@ -32,6 +32,7 @@ def _(state: CodegenState) -> ast.AST:
     other = state.proxy_arg(1)
     assert isinstance(other, (int, float, bool))
 
+    from ..reduction_strategy import LoopedReductionStrategy
     from .memory_ops import _flydsl_col_tail_pred
 
     env = CompileEnvironment.current()
@@ -58,12 +59,18 @@ def _(state: CodegenState) -> ast.AST:
         if index is None:
             continue
         strategy = df.tile_strategy.block_id_to_strategy.get((index,))
-        _tc = getattr(strategy, "_thread_count", 0) or 0
-        _lb = getattr(strategy, "_loop_block_size", 0) or 0
+        # Only a LoopedReductionStrategy (the rolled ``:`` column) carries
+        # _thread_count / _loop_block_size; other dims leave _tc/_lb at 0.
+        _tc = 0
+        _lb = 0
+        looped = strategy if isinstance(strategy, LoopedReductionStrategy) else None
+        if looped is not None:
+            _tc = looped._thread_count
+            _lb = looped._loop_block_size
         mask_var = state.codegen.mask_var(index)
         if (
-            env.block_sizes[index].reduction
-            and strategy is not None
+            looped is not None
+            and env.block_sizes[index].reduction
             and _tc > 0
             and _lb >= _tc
             and not env.known_multiple(env.block_sizes[index].numel, _lb)
@@ -71,7 +78,7 @@ def _(state: CodegenState) -> ast.AST:
             _v = max(1, _lb // _tc)
             _pred = _flydsl_col_tail_pred(
                 state,
-                strategy.offset_var(index),
+                looped.offset_var(index),
                 _v,
                 state.sympy_expr(env.block_sizes[index].numel),
                 lane_mod=_tc,
