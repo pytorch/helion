@@ -946,6 +946,7 @@ class ReductionLowering(InductorLowering):
 
             strategy = BlockReductionStrategy(state, self.block_index)
 
+        env.backend.validate_reduction_input(strategy.block_index, repr_input)
         result_ast = strategy.codegen_reduction(
             state,
             output_name,

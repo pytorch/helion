@@ -615,6 +615,7 @@ class ReductionStrategy(TileStrategy):
         fake_output: torch.Tensor,
     ) -> str:
         backend = CompileEnvironment.current().backend
+        acc_dtype = get_computation_dtype(fake_input.dtype)
         if backend.is_indexed_reduction(reduction_type):
             index_var = self.index_var(self.block_index)
             return self.call_indexed_reduction(
@@ -623,12 +624,14 @@ class ReductionStrategy(TileStrategy):
                 reduction_type,
                 dim,
                 fake_output,
+                dtype=acc_dtype,
             )
         return backend.reduction_expr(
             input_name,
             reduction_type,
             dim,
             block_size_var=self.block_size_var(self.block_index),
+            dtype=acc_dtype,
         )
 
     def _index_init_expr(self, block_size_var: str, dtype: str, block_idx: int) -> str:
@@ -650,6 +653,8 @@ class ReductionStrategy(TileStrategy):
         reduction_type: str,
         dim: int,
         fake_output: torch.Tensor,
+        *,
+        dtype: torch.dtype | None = None,
     ) -> str:
         env = CompileEnvironment.current()
         return env.backend.argreduce_result_expr(
@@ -660,6 +665,7 @@ class ReductionStrategy(TileStrategy):
             fake_output.dtype,
             block_size_var=self.block_size_var(self.block_index),
             index_dtype=env.index_dtype,
+            dtype=dtype,
         )
 
     def maybe_reshape(
@@ -1748,7 +1754,9 @@ class LoopedReductionStrategy(ReductionStrategy):
             assert isinstance(default, (float, int, bool))
             assert state.fx_node is not None
             acc = self.fn.new_var(f"{state.fx_node.name}_acc", dce=True)
-            acc_full = backend.full_expr(shape_dims, constant_repr(default), acc_dtype)
+            acc_full = backend.reduction_acc_init_expr(
+                shape_dims, constant_repr(default), acc_dtype
+            )
             device_loop.outer_prefix.append(
                 statement_from_string(f"{acc} = {acc_full}")
             )
@@ -1827,6 +1835,7 @@ class LoopedReductionStrategy(ReductionStrategy):
                     acc_index=acc_index,
                     value=input_name,
                     index=index,
+                    dtype=acc_dtype,
                 ):
                     state.add_statement(stmt)
                 expr = self.call_indexed_reduction(
@@ -1835,6 +1844,7 @@ class LoopedReductionStrategy(ReductionStrategy):
                     reduction_type,
                     dim,
                     fake_output,
+                    dtype=acc_dtype,
                 )
             # Ensure the final reduction result matches torch.* dtype semantics
             expr = self.maybe_reshape(expr, dim, fake_input, fake_output)
@@ -2644,6 +2654,16 @@ class BlockReductionStrategy(ReductionStrategy):
                     shape_dims, constant_repr(default), fake_output.dtype
                 )
             )
+        has_lane_loop = (
+            self._reduction_block_has_lane_loops()
+            or self._reduction_block_in_device_lane_loop()
+        )
+        if has_lane_loop and not env.backend.supports_lane_loop_reductions():
+            raise exc.BackendUnsupported(
+                env.backend.name,
+                f"{reduction_type} reduction over an axis strided by a tile lane "
+                "loop; this backend does not support lane-loop reductions",
+            )
         if (
             strided_expr := self._strided_thread_reduction_expr(
                 state, input_name, reduction_type, dim, fake_input, default
@@ -2655,10 +2675,7 @@ class BlockReductionStrategy(ReductionStrategy):
             # active loop nest (it is iterated either by a serial device loop,
             # by a lane loop, or has no thread axis at all).
             if (
-                (
-                    self._reduction_block_has_lane_loops()
-                    or self._reduction_block_in_device_lane_loop()
-                )
+                has_lane_loop
                 and not self._lane_reduce_marker_unsupported(state)
                 and (threads := self._lane_reduce_threads_in_group()) is not None
             ):

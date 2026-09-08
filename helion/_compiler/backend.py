@@ -416,6 +416,14 @@ class Backend(abc.ABC):
         """Whether reduction strategies should occupy the first (lowest) thread axes."""
         return False
 
+    def supports_lane_loop_reductions(self) -> bool:
+        """Whether reductions may be carried by a tile strategy's lane loop."""
+        return False
+
+    def validate_reduction_input(self, block_index: int, value: torch.Tensor) -> None:
+        """Validate a value before lowering its reduction."""
+        return None
+
     def force_tile_mask(self) -> bool:
         """Whether tile strategies must emit explicit masks for all tiles."""
         return False
@@ -659,6 +667,18 @@ class Backend(abc.ABC):
     ) -> str:
         raise exc.BackendUnsupported(self.name, "full tensor creation")
 
+    def reduction_acc_init_expr(
+        self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
+    ) -> str:
+        """Initial value of a rolled reduction's per-thread accumulator.
+
+        Separate from :meth:`full_expr` because the accumulator must be as wide
+        as the backend's combine expression, which may promote (Metal reduces
+        ``int8``/``bool`` in an ``int``).  Declaring it at storage width would
+        truncate on every loop iteration.
+        """
+        return self.full_expr(shape_dims, value_expr, dtype)
+
     def reshape_expr(self, expr: str, shape: str) -> str:
         raise exc.BackendUnsupported(self.name, "reshape")
 
@@ -739,7 +759,15 @@ class Backend(abc.ABC):
         *,
         block_size_var: str | None = None,
         threads_in_group: int | None = None,
+        dtype: torch.dtype | None = None,
     ) -> str:
+        """Generate the cross-thread reduction expression.
+
+        ``dtype`` is the accumulation dtype
+        (``get_computation_dtype(input.dtype)``) when the caller knows it.
+        Backends that allocate typed scratch storage for the reduction (e.g.
+        Metal's ``threadgroup`` buffers) need it; the rest ignore it.
+        """
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
 
     def thread_linear_index_expr(self, axis_sizes: dict[int, int]) -> str | None:
@@ -773,7 +801,13 @@ class Backend(abc.ABC):
         block_size_var: str | None = None,
         index_dtype: torch.dtype | None = None,
         threads_in_group: int | None = None,
+        dtype: torch.dtype | None = None,
     ) -> str:
+        """Generate the cross-thread argmin/argmax expression.
+
+        ``dtype`` is the accumulation dtype of the *value* operand; see
+        :meth:`reduction_expr`.
+        """
         raise exc.BackendUnsupported(self.name, "argmin/argmax reductions")
 
     def argreduce_loop_update_statements(
@@ -784,7 +818,13 @@ class Backend(abc.ABC):
         acc_index: str,
         value: str,
         index: str,
+        dtype: torch.dtype | None = None,
     ) -> list[str]:
+        """Per-iteration accumulator update for a rolled argmin/argmax.
+
+        ``dtype`` is the accumulation dtype of the value operand; see
+        :meth:`reduction_expr`.
+        """
         raise exc.BackendUnsupported(self.name, "argmin/argmax reductions")
 
     def inductor_op_overrides(self) -> InductorOpOverrides:
