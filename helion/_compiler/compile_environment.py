@@ -898,10 +898,13 @@ class CompileEnvironment:
             if not isinstance(node, ast.For) or not isinstance(node, ExtendedAST):
                 continue
             rw = ReadWrites.from_list(node.body)
+            # Name traversal sees the target passed to an in-place store and
+            # host-side tensor metadata as reads, but neither reads storage.
             reads = {
                 canonical_host_tensor_name(name, aliases)
                 for name, count in rw.reads.items()
-                if count > rw.inplace_writes.get(name, 0)
+                if count
+                > rw.inplace_writes.get(name, 0) + rw.tensor_metadata_reads.get(name, 0)
             }
             reads.update(
                 canonical_host_tensor_name(name, aliases) for name in rw.atomic_reads
