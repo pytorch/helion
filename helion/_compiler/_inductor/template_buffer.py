@@ -524,7 +524,11 @@ class HelionTemplateBuffer(TemplateBuffer):
     ) -> tuple[HelionTemplateBuffer, tuple[TensorBox, ...]]:
         """Build a HelionTemplateBuffer and return ``(buf, outputs)``."""
         inputs = list(realized_inputs.values())
-        dev = inputs[0].get_device() if inputs else torch.device("cuda")
+        # With no realized inputs there is no device to read off an IRNode, so
+        # fall back to the device the kernel was actually compiled for rather
+        # than assuming CUDA.
+        bound_kernel = cast("BoundKernel", buffer_kwargs["bound_kernel"])
+        dev = inputs[0].get_device() if inputs else bound_kernel.env.device
 
         mutated_nodes = [
             realized_inputs[n] for n in mutated_input_names if n in realized_inputs

@@ -15,7 +15,6 @@ from helion._testing import TestCase
 from helion._testing import skipIfMTIA
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRocm
-from helion._testing import skipIfXPU
 from helion.autotuner.effort_profile import _PROFILES
 from helion.autotuner.effort_profile import AutotuneEffortProfile
 from helion.autotuner.effort_profile import DifferentialEvolutionConfig
@@ -35,7 +34,6 @@ for _utf8_locale in ("C.UTF-8", "en_US.UTF-8", "C.utf8", "en_US.utf8"):
 
 @skipIfMTIA("autodiff not tested on MTIA")
 @skipIfNotTriton("autodiff not tested on non Triton backends")
-@skipIfXPU("autodiff scan-path backward aborts in torch scan-HOP autograd on XPU")
 class TestAutodiff(RefEagerTestDisabled, TestCase):
     def _check_backward(
         self,

@@ -9,6 +9,7 @@ from typing import Any
 
 import torch
 
+from helion import exc
 from helion.autotuner.base_search import _AutotunableKernel
 from helion.autotuner.config_spec import ConfigSpec
 from helion.runtime.config import Config
@@ -79,6 +80,29 @@ class _FakeEnv:
     process_group_name: str | None = None
 
 
+def _infer_autotune_device(args: Sequence[Any]) -> torch.device:
+    """Pick the accelerator device to autotune on from the sample args.
+
+    Prefers a tensor argument that already lives on the current accelerator;
+    otherwise falls back to the current accelerator itself.  Never assumes
+    CUDA -- an external kernel may be tuned on ROCm, XPU or MPS.
+    """
+    accelerator = torch.accelerator.current_accelerator()
+    if accelerator is None:
+        raise exc.InvalidAPIUsage(
+            "no accelerator is available to autotune on; pass an explicit "
+            "`device=` to the autotuner"
+        )
+    return next(
+        (
+            arg.device
+            for arg in args
+            if isinstance(arg, torch.Tensor) and arg.device.type == accelerator.type
+        ),
+        accelerator,
+    )
+
+
 class _ExternalKernelAdapter(_AutotunableKernel):
     """Adapter making user-provided callables satisfy the ``_AutotunableKernel`` protocol.
 
@@ -102,17 +126,7 @@ class _ExternalKernelAdapter(_AutotunableKernel):
         self._compile_fn = compile_fn
         self._compile_cache: dict[Config, Callable[..., Any]] = {}
 
-        self._env = _FakeEnv(
-            device
-            or next(
-                (
-                    arg.device
-                    for arg in args
-                    if isinstance(arg, torch.Tensor) and arg.is_cuda
-                ),
-                torch.device("cuda"),
-            )
-        )
+        self._env = _FakeEnv(device or _infer_autotune_device(args))
         self._settings = Settings(**settings_kwargs)
         if baseline_fn is not None:
             self._settings.autotune_baseline_fn = baseline_fn
