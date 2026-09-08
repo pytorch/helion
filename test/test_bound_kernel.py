@@ -13,6 +13,7 @@ import textwrap
 from typing import Any
 import unittest
 from unittest.mock import Mock
+from unittest.mock import call
 
 import torch
 from torch._inductor.runtime.triton_compat import OutOfResources
@@ -627,7 +628,7 @@ class TestOutOfResourcesFallback(TestCase):
         fallback = Mock(return_value="ok")
         bound = Mock(compile_config=Mock(return_value=fallback))
         fallback_config = Mock()
-        wrapped = BoundKernel._run_with_fallback(bound, run, fallback_config)
+        wrapped = BoundKernel._run_with_fallback(bound, run, [fallback_config])
 
         result = wrapped("arg")
 
@@ -639,7 +640,7 @@ class TestOutOfResourcesFallback(TestCase):
     def test_no_retry_when_run_succeeds(self) -> None:
         run = Mock(return_value="ok")
         bound = Mock(compile_config=Mock())
-        wrapped = BoundKernel._run_with_fallback(bound, run, Mock())
+        wrapped = BoundKernel._run_with_fallback(bound, run, [Mock()])
 
         result = wrapped("arg")
 
@@ -649,18 +650,71 @@ class TestOutOfResourcesFallback(TestCase):
     def test_other_exceptions_are_not_caught(self) -> None:
         run = Mock(side_effect=RuntimeError("unrelated failure"))
         bound = Mock(compile_config=Mock())
-        wrapped = BoundKernel._run_with_fallback(bound, run, Mock())
+        wrapped = BoundKernel._run_with_fallback(bound, run, [Mock()])
 
         with self.assertRaises(RuntimeError):
             wrapped("arg")
 
         bound.compile_config.assert_not_called()
 
+    def test_tries_each_config_until_one_launches(self) -> None:
+        run = Mock(side_effect=OutOfResources(1, 2, "shared memory"))
+        bad = Mock(side_effect=OutOfResources(1, 2, "shared memory"))
+        good = Mock(return_value="ok")
+        bound = Mock(compile_config=Mock(side_effect=[bad, good]))
+        first, second = Mock(), Mock()
+        wrapped = BoundKernel._run_with_fallback(bound, run, [first, second])
+
+        self.assertEqual(wrapped("arg"), "ok")
+        self.assertEqual(
+            bound.compile_config.call_args_list, [call(first), call(second)]
+        )
+
+    def test_reraises_when_all_configs_fail(self) -> None:
+        run = Mock(side_effect=OutOfResources(1, 2, "shared memory"))
+        bad = Mock(side_effect=OutOfResources(1, 2, "shared memory"))
+        bound = Mock(compile_config=Mock(return_value=bad))
+        wrapped = BoundKernel._run_with_fallback(bound, run, [Mock(), Mock()])
+
+        with self.assertRaises(OutOfResources):
+            wrapped("arg")
+
+        self.assertEqual(bound.compile_config.call_count, 2)
+
+    def test_caches_working_config_for_static_shapes(self) -> None:
+        run = Mock(side_effect=OutOfResources(1, 2, "shared memory"))
+        good = Mock(return_value="ok")
+        bound = Mock(
+            compile_config=Mock(return_value=good),
+            settings=Mock(static_shapes=True),
+        )
+        wrapped = BoundKernel._run_with_fallback(bound, run, [Mock()])
+
+        self.assertEqual(wrapped("arg"), "ok")
+        # Static shapes: one BoundKernel per shape, so keep the bare callable.
+        self.assertIs(bound._run, good)
+
+    def test_keeps_retrying_for_dynamic_shapes(self) -> None:
+        run = Mock(side_effect=OutOfResources(1, 2, "shared memory"))
+        good = Mock(return_value="ok")
+        bound = Mock(
+            compile_config=Mock(return_value=good),
+            settings=Mock(static_shapes=False),
+            _run_with_fallback=BoundKernel._run_with_fallback,
+        )
+        bound._run_with_fallback = lambda *a: BoundKernel._run_with_fallback(bound, *a)
+        wrapped = BoundKernel._run_with_fallback(bound, run, [Mock()])
+
+        self.assertEqual(wrapped("arg"), "ok")
+        # Dynamic shapes share a BoundKernel, so the retry must stay installed.
+        self.assertIsNot(bound._run, good)
+        self.assertEqual(bound._run("arg"), "ok")
+
     def test_retries_on_other_launch_resource_errors(self) -> None:
         run = Mock(side_effect=RuntimeError("too many resources requested for launch"))
         fallback = Mock(return_value="ok")
         bound = Mock(compile_config=Mock(return_value=fallback))
-        wrapped = BoundKernel._run_with_fallback(bound, run, Mock())
+        wrapped = BoundKernel._run_with_fallback(bound, run, [Mock()])
 
         result = wrapped("arg")
 
