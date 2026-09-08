@@ -304,6 +304,7 @@ class DeviceFunction:
             tuple[torch.Tensor, str], TensorDescriptorArg
         ] = {}
         self._expr_args: dict[sympy.Expr, NumericArgument] = {}
+        self._constexpr_exprs: set[sympy.Expr] = set()
         self._constexpr_args: dict[str, ConstExprArg] = {}
         self._constexpr_host_defs: set[str] = set()
         self._scratch_args: list[ScratchArg] = []
@@ -859,7 +860,8 @@ class DeviceFunction:
             # A tunable-only expression is constant for each compiled config.
             arg_type = (
                 ConstExprArg
-                if sym.free_symbols and sym.free_symbols.issubset(tunable_symbols)
+                if sym in self._constexpr_exprs
+                or (sym.free_symbols and sym.free_symbols.issubset(tunable_symbols))
                 else SymbolArgument
             )
             arg = arg_type(
@@ -869,6 +871,31 @@ class DeviceFunction:
             self.arguments.append(arg)
             self._expr_args[sym] = arg
         return self._expr_args[sym]
+
+    def promote_expr_arg_to_constexpr(self, expr: object) -> None:
+        """Bake a runtime scalar into the CuTe launcher specialization key.
+
+        This is intended for fail-closed structural lowerings whose generated
+        schedule depends on an exact scalar value.  The CuTe launcher keys and
+        recompiles ``cutlass.Constexpr`` parameters by value, so a later call
+        with a different scalar cannot reuse value-specialized device code.
+        """
+
+        if isinstance(expr, (torch.SymInt, torch.SymFloat, torch.SymBool)):
+            sym = expr._sympy_()
+            if not isinstance(sym, sympy.Expr):
+                return
+        elif isinstance(expr, sympy.Expr):
+            sym = expr
+        else:
+            return
+        self._constexpr_exprs.add(sym)
+        previous = self._expr_args.get(sym)
+        if previous is None or isinstance(previous, ConstExprArg):
+            return
+        replacement = ConstExprArg(previous.name, previous.host_str())
+        self.arguments[self.arguments.index(previous)] = replacement
+        self._expr_args[sym] = replacement
 
     def constexpr_arg(self, name: str, value: object | None = None) -> bool:
         """Create a constexpr argument, returns True if created, False if already exists."""
@@ -1091,6 +1118,8 @@ class DeviceFunction:
             # register-fragment threshold (opt-in via
             # ``HELION_FUSER_MODE=smem``).
             exact_thread_block_dims = _exact_thread_block_dims(self.tile_strategy)
+            thread_block_dims_are_exact = exact_thread_block_dims is not None
+            thread_block_dims = exact_thread_block_dims or (1, 1, 1)
             # Best-effort map for the fuser's cache-dtype resolution;
             # ``dtype_str`` raises for dtypes the cute backend has no
             # canonical spelling for (e.g. uint32 barrier flags, which
@@ -1274,6 +1303,206 @@ class DeviceFunction:
             kernel_body = pipeline_inner_loads(
                 kernel_body, constexpr_values, rename_groups=rename_groups
             )
+            # For an exact in-place vector state-update pattern, optionally
+            # stage future rows through a private-per-thread cp.async ring.
+            # The AST matcher proves the row/column coverage, exact load/store
+            # address equality, and consumes cache-keyed runtime alias/stride
+            # facts before it changes any code.
+            from .program_id import XYZProgramIDs
+
+            xyz_pid = (
+                self.pid
+                if isinstance(self.pid, XYZProgramIDs)
+                and self.cute_state.simt_cluster_n == 1
+                and len(self.pid.pid_info) <= 3
+                else None
+            )
+            xyz_grid = xyz_pid is not None
+            proven_tensor_size_values = self.proven_tensor_size_values()
+            exact_grid_extent_values: dict[sympy.Expr, int] = {}
+            ambiguous_grid_extent_expressions: set[sympy.Expr] = set()
+            if (
+                xyz_grid
+                and "input_tensor_metadata" in env.compiler_fact_specialization_facts
+            ):
+                for argument in self.arguments:
+                    if not isinstance(argument, TensorArg) or isinstance(
+                        argument, TensorDescriptorArg
+                    ):
+                        continue
+                    fake_tensor = argument.fake_value
+                    if env.tensor_input_source(fake_tensor) is None:
+                        continue
+                    runtime_tensor = env.runtime_value_for_tensor(fake_tensor)
+                    if not isinstance(runtime_tensor, torch.Tensor) or isinstance(
+                        runtime_tensor, FakeTensor
+                    ):
+                        continue
+                    for dimension, size in enumerate(fake_tensor.shape):
+                        if isinstance(size, int):
+                            continue
+                        try:
+                            expression = env.shape_env.replace(size._sympy_())
+                            value = int(runtime_tensor.size(dimension))
+                            if value != int(env.size_hint(size)):
+                                continue
+                        except (RuntimeError, TypeError, ValueError):
+                            continue
+                        previous = exact_grid_extent_values.get(expression)
+                        if previous is not None and previous != value:
+                            ambiguous_grid_extent_expressions.add(expression)
+                            exact_grid_extent_values.pop(expression, None)
+                        elif expression not in ambiguous_grid_extent_expressions:
+                            exact_grid_extent_values[expression] = value
+            block_grid_dims: list[int | None] = [None, None, None]
+            if xyz_pid is not None:
+                for axis, pid_info in enumerate(xyz_pid.pid_info):
+                    numel = pid_info.numel
+                    if isinstance(numel, (int, sympy.Integer)):
+                        extent = int(numel)
+                    elif isinstance(numel, sympy.Expr):
+                        try:
+                            normalized_numel = env.shape_env.replace(numel)
+                        except (RuntimeError, TypeError, ValueError):
+                            continue
+                        if normalized_numel not in exact_grid_extent_values:
+                            continue
+                        extent = exact_grid_extent_values[normalized_numel]
+                    else:
+                        continue
+                    try:
+                        block_size = int(pid_info.block_size_var)
+                    except (TypeError, ValueError):
+                        block_size = constexpr_values.get(pid_info.block_size_var, 0)
+                    if block_size > 0 and extent >= 0:
+                        block_grid_dims[axis] = (extent + block_size - 1) // block_size
+                for axis in range(len(xyz_pid.pid_info), 3):
+                    block_grid_dims[axis] = 1
+            async_load_stages = cast(
+                "int", self.config.config.get("cute_async_load_stages", 0)
+            )
+            if async_load_stages and exact_thread_block_dims is not None:
+                from .cute.memory_ops import runtime_tensor_has_specialized_alignment
+                from .cute.pipeline_state_loads import TensorMetadata
+                from .cute.pipeline_state_loads import pipeline_state_loads
+
+                tensor_metadata: dict[str, TensorMetadata] = {}
+                tensor_names = frozenset(
+                    arg.name for arg in self.arguments if isinstance(arg, TensorArg)
+                )
+                for arg in self.arguments:
+                    if not isinstance(arg, TensorArg):
+                        continue
+                    try:
+                        shape = tuple(
+                            env.size_hint(dim) for dim in arg.fake_value.shape
+                        )
+                    except (RuntimeError, TypeError, ValueError):
+                        continue
+                    tensor_metadata[arg.name] = TensorMetadata(
+                        tensor_dtypes.get(arg.name, ""), shape
+                    )
+                kernel_body = pipeline_state_loads(
+                    kernel_body,
+                    stages=async_load_stages,
+                    lookahead=cast(
+                        "int", self.config.config.get("cute_async_load_lookahead", 4)
+                    ),
+                    group_rows=cast(
+                        "int", self.config.config.get("cute_async_load_group_rows", 2)
+                    ),
+                    cache_policy=cast(
+                        "str", self.config.config.get("cute_async_load_cache", "cg")
+                    ),
+                    store_policy=cast(
+                        "str",
+                        self.config.config.get("cute_async_store_policy", "default"),
+                    ),
+                    thread_block_dims=exact_thread_block_dims,
+                    tensor_metadata=tensor_metadata,
+                    tensor_names=tensor_names,
+                    proven_tensor_base_alignments=frozenset(
+                        arg.name
+                        for arg in self.arguments
+                        if isinstance(arg, TensorArg)
+                        and runtime_tensor_has_specialized_alignment(
+                            env, arg.fake_value, 4
+                        )
+                    ),
+                    proven_tensor_size_values=proven_tensor_size_values,
+                    proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
+                    proven_tensor_stride_values=self.proven_tensor_stride_values(),
+                    block_grid_dims=cast(
+                        "tuple[int | None, int | None, int | None]",
+                        tuple(block_grid_dims),
+                    ),
+                    constexpr_values=constexpr_values,
+                    uniform_names=frozenset(
+                        arg.name
+                        for arg in param_args
+                        if isinstance(arg, (NumericArgument, TensorPropertyArg))
+                    )
+                    | frozenset(constexpr_values),
+                    target_device_capability=(env.config_spec.target_device_capability),
+                )
+            # Pair eligible fp32 constexpr-loop lanes only after state-load
+            # pipelining has recognized and staged the original scalar update
+            # loop.  Packing first obscures that matcher and forfeits cp.async.
+            from .cute.factor_affine_reductions import hoist_packed_factored_reductions
+            from .cute.factor_affine_reductions import pack_fp32_constexpr_loops
+
+            kernel_body = pack_fp32_constexpr_loops(
+                kernel_body,
+                fast_math=CompileEnvironment.current().settings.fast_math,
+                target_device_capability=(
+                    CompileEnvironment.current().config_spec.target_device_capability
+                ),
+                float_scalar_names=float_scalar_names,
+            )
+            kernel_body = hoist_packed_factored_reductions(
+                kernel_body,
+                fast_math=CompileEnvironment.current().settings.fast_math,
+                rename_groups=rename_groups,
+            )
+            # Once the async state pass has proved a private aligned BF16
+            # recurrence, an opt-in late transform can retain the state and
+            # both reductions as native BF16x2 words.  Running after the
+            # generic fp32 pair/LICM passes gives the matcher the complete
+            # recurrence graph while keeping all earlier passes reusable.
+            from .cute.pack_bf16_recurrence import pack_bf16_recurrences
+
+            kernel_body = pack_bf16_recurrences(
+                kernel_body,
+                enabled=cast(
+                    "bool",
+                    self.config.config.get("cute_bf16x2_recurrence", False),
+                ),
+                fast_math=CompileEnvironment.current().settings.fast_math,
+                target_device_capability=(
+                    CompileEnvironment.current().config_spec.target_device_capability
+                ),
+                uniform_names=frozenset(arg.arg for arg in args)
+                | frozenset(constexpr_values),
+                thread_block_dims=exact_thread_block_dims,
+            )
+            from .cute.simplify_proven_bounds import simplify_proven_bounds
+
+            kernel_body = simplify_proven_bounds(
+                kernel_body,
+                enabled=cast(
+                    "bool",
+                    self.config.config.get("cute_proven_bounds", False),
+                )
+                and thread_block_dims_are_exact,
+                xyz_grid=xyz_grid,
+                thread_block_dims=thread_block_dims,
+                block_grid_dims=cast(
+                    "tuple[int | None, int | None, int | None]",
+                    tuple(block_grid_dims),
+                ),
+                constexpr_values=constexpr_values,
+                proven_tensor_size_values=proven_tensor_size_values,
+            )
             # Fuse an online-softmax (max, sum) pair of cluster reduces into
             # ONE packed DSM exchange: the max reduce relocalizes to a
             # CTA-local block reduce, the sum site exchanges the
@@ -1433,6 +1662,63 @@ class DeviceFunction:
                 runtime_stride = runtime.stride(dim)
                 if runtime_stride == traced_stride:
                     result[arg.name, dim] = traced_stride
+        return result
+
+    def proven_tensor_size_values(
+        self,
+    ) -> dict[tuple[str, int], tuple[str, int]]:
+        """Return cache-safe exact runtime sizes and their generated argument names."""
+        env = CompileEnvironment.current()
+        if "input_tensor_metadata" not in env.compiler_fact_specialization_facts:
+            return {}
+        result: dict[tuple[str, int], tuple[str, int]] = {}
+        for tensor_arg in self.arguments:
+            if not isinstance(tensor_arg, TensorArg) or isinstance(
+                tensor_arg, TensorDescriptorArg
+            ):
+                continue
+            fake_tensor = tensor_arg.fake_value
+            if env.tensor_input_source(fake_tensor) is None:
+                continue
+            runtime_tensor = env.runtime_value_for_tensor(fake_tensor)
+            if not isinstance(runtime_tensor, torch.Tensor) or isinstance(
+                runtime_tensor, FakeTensor
+            ):
+                continue
+            for dim, size in enumerate(fake_tensor.shape):
+                if isinstance(size, int) or isinstance(size._sympy_(), sympy.Integer):
+                    continue
+                expression = env.shape_env.replace(size._sympy_())
+                property_arg = self._tensor_properties.get((TensorSizeArg, expression))
+                if (
+                    not isinstance(property_arg, TensorSizeArg)
+                    or env.tensor_input_source(property_arg.tensor_arg.fake_value)
+                    is None
+                ):
+                    continue
+                property_runtime = env.runtime_value_for_tensor(
+                    property_arg.tensor_arg.fake_value
+                )
+                if not isinstance(property_runtime, torch.Tensor) or isinstance(
+                    property_runtime, FakeTensor
+                ):
+                    continue
+                property_fake_size = property_arg.tensor_arg.fake_value.size(
+                    property_arg.dim
+                )
+                try:
+                    runtime_size = int(runtime_tensor.size(dim))
+                    source_hint = int(env.size_hint(size))
+                    property_size = int(property_runtime.size(property_arg.dim))
+                    property_hint = int(env.size_hint(property_fake_size))
+                except (RuntimeError, TypeError, ValueError):
+                    continue
+                if not (runtime_size == source_hint == property_size == property_hint):
+                    continue
+                result[tensor_arg.name, dim] = (
+                    property_arg.name,
+                    property_hint,
+                )
         return result
 
     def codegen_function_call(self) -> ast.AST:

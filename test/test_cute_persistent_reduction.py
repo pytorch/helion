@@ -6,23 +6,32 @@ import ast
 from types import SimpleNamespace
 from typing import Any
 from typing import cast
+from unittest.mock import patch
 
 import pytest
+import sympy
 import torch
 
 import helion
 from helion._compiler import tile_strategy
+from helion._compiler.autotuner_heuristics import compiler_seed_configs
+from helion._compiler.autotuner_heuristics.cute import (
+    CuteAsyncPersistentSubwarpRowsHeuristic,
+)
+from helion._compiler.autotuner_heuristics.cute import CuteAsyncStateLoadHeuristic
 from helion._compiler.autotuner_heuristics.cute import (
     CutePersistentSubwarpRowsHeuristic,
 )
 from helion._compiler.backend import CuteBackend
 from helion._compiler.cute.memory_ops import _persistent_vec_scope_safe
+from helion._compiler.device_function import _exact_thread_block_dims
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
+from helion.autotuner.config_spec import LoopOrderSpec
 from helion.autotuner.config_spec import NumThreadsSpec
 from helion.autotuner.config_spec import ReductionLoopSpec
 import helion.language as hl
@@ -103,6 +112,49 @@ def _persistent_dynamic_grid_update(
         out[batch_index, head_index, tile_row] = updated.sum(-1).to(state.dtype)
         next_state[batch_index, head_index, tile_row, cols] = updated
     return out, next_state
+
+
+@helion.kernel(backend="cute", static_shapes=False)
+def _persistent_3d_inplace_state_update(
+    state_indices: torch.Tensor,
+    state: torch.Tensor,
+    packed: torch.Tensor,
+) -> torch.Tensor:
+    batches = hl.specialize(state_indices.size(0))
+    heads = hl.specialize(state.size(1))
+    rows = hl.specialize(state.size(2))
+    width = hl.specialize(state.size(3))
+    out = torch.empty([batches, heads, rows], dtype=state.dtype, device=state.device)
+    for tile_batch, tile_head, tile_row in hl.tile(
+        [batches, heads, rows], block_size=[1, 1, None]
+    ):
+        batch_index = tile_batch.id
+        head_index = tile_head.id
+        state_index = state_indices[batch_index]
+        cols = hl.arange(width)
+        state_values = state[state_index, head_index, tile_row, cols].float()
+        packed_values = packed[batch_index, head_index, cols].float()
+        updated = state_values + packed_values[None, :]
+        out[batch_index, head_index, tile_row] = updated.sum(-1).to(state.dtype)
+        state[state_index, head_index, tile_row, cols] = updated
+    return out
+
+
+def _bind_composed_seed_case() -> tuple[Any, Any]:
+    args = (
+        torch.tensor([0, 1], dtype=torch.int32),
+        torch.empty(3, 3, 128, 128, dtype=torch.bfloat16),
+        torch.empty(2, 3, 128, dtype=torch.bfloat16),
+    )
+    bound = _persistent_3d_inplace_state_update.bind(args)
+    host_function = bound.host_function
+    assert host_function is not None
+    bound.env.config_spec.target_device_capability = (8, 0)
+    facts = CuteAsyncStateLoadHeuristic.register_facts(
+        bound.env, host_function.device_ir
+    )
+    bound.env.compiler_fact_specialization_facts |= facts
+    return bound, host_function
 
 
 @helion.kernel(backend="cute", static_shapes=False)
@@ -500,6 +552,332 @@ def test_persistent_subwarp_recurrent_style_seed_requires_k128() -> None:
         == 4
         for seed in seeds
     )
+
+
+@onlyBackends(["cute"])
+def test_composed_async_full_row_seed_survives_flatten() -> None:
+    bound, host_function = _bind_composed_seed_case()
+    spec = bound.env.config_spec
+
+    # The early grid-size check cannot look up the two fixed-size grid axes,
+    # so xyz starts conservatively disabled for this otherwise-safe 3-D grid.
+    assert "xyz" not in spec.allowed_pid_types
+    seeds = compiler_seed_configs(bound.env, host_function.device_ir)
+    spec.compiler_seed_configs = seeds
+    composed = [
+        seed
+        for seed in seeds
+        if seed.config.get("pid_type") == "xyz"
+        and seed.config.get("cute_async_load_stages") == 5
+    ]
+    assert len(composed) == 1
+    assert "input_tensor_metadata" in bound.env.compiler_fact_specialization_facts
+
+    seed = composed[0]
+    assert seed.config["block_sizes"] == [128]
+    assert seed.config["num_threads"] == [8, 16]
+    assert seed.config["loop_orders"] == [[1, 0, 2]]
+    assert seed.config["cute_vector_widths"] == [8, 1, 1, 1]
+    assert seed.config["cute_lane_layouts"] == ["blocked"] * 4
+    assert seed.config["cute_reduction_reloads"] == ["register"]
+    assert seed.config["num_warps"] == 4
+    assert seed.config["num_stages"] == 1
+    assert seed.config["cute_async_load_lookahead"] == 4
+    assert seed.config["cute_async_load_group_rows"] == 2
+    assert seed.config["cute_async_load_cache"] == "cg"
+    assert seed.config["cute_async_store_policy"] == "default"
+    assert seed.config["cute_bf16x2_recurrence"] is True
+    assert seed.config["cute_proven_bounds"] is False
+
+    config_generation = spec.create_config_generation()
+    normalized = [
+        config
+        for _flat, config in config_generation.seed_flat_config_pairs()
+        if config.config.get("pid_type") == "xyz"
+    ]
+    assert len(normalized) == 1
+    normalized_seed = normalized[0]
+    assert normalized_seed.config["block_sizes"] == [128]
+    assert normalized_seed.config["num_threads"] == [8, 16]
+    assert normalized_seed.config["loop_orders"] == [[1, 0, 2]]
+    assert normalized_seed.config["cute_vector_widths"] == [8, 1, 1, 1]
+    assert normalized_seed.config["cute_lane_layouts"] == ["blocked"] * 4
+    assert normalized_seed.config["cute_reduction_reloads"] == ["register"]
+    assert normalized_seed.config["cute_async_load_stages"] == 5
+    assert normalized_seed.config["cute_async_load_lookahead"] == 4
+    assert normalized_seed.config["cute_async_load_group_rows"] == 2
+    assert normalized_seed.config["cute_async_load_cache"] == "cg"
+    assert normalized_seed.config["cute_async_store_policy"] == "default"
+    assert normalized_seed.config["cute_bf16x2_recurrence"] is True
+    assert normalized_seed.config["cute_proven_bounds"] is False
+    # CuTe derives the actual block dimensions from num_threads. num_warps is
+    # intentionally not another search coordinate, and its implicit value is
+    # the same four warps carried by the source seed.
+    assert normalized_seed.num_warps == 4
+    assert normalized_seed.num_stages == 1
+
+    pid_index = config_generation._key_to_flat_indices["pid_type"][0][0]
+    pid_fragment = config_generation.flat_spec[pid_index]
+    assert tuple(cast("Any", pid_fragment).choices) == ("flat", "xyz")
+    assert tuple(cast("Any", pid_fragment).search_choices) == ("flat",)
+    assert "xyz" not in spec.allowed_pid_types
+
+
+@onlyBackends(["cute"])
+def test_composed_async_seed_uses_l2_store_only_when_supported() -> None:
+    bound, host_function = _bind_composed_seed_case()
+
+    with patch(
+        "helion._compiler.cute.cutedsl_compat.fixed_l2_evict_last_store_policy_supported",
+        return_value=True,
+    ):
+        seed = CuteAsyncPersistentSubwarpRowsHeuristic.get_seed_config(
+            bound.env, host_function.device_ir
+        )
+
+    assert seed is not None
+    assert seed.config["cute_async_store_policy"] == "l2_evict_last"
+
+
+@onlyBackends(["cute"])
+def test_async_pipeline_skips_rewrite_without_exact_thread_dims() -> None:
+    args = (
+        torch.tensor([0], dtype=torch.int32),
+        torch.randn(2, 128, 128, dtype=torch.bfloat16),
+        torch.randn(1, 128, dtype=torch.bfloat16),
+        torch.randn(1, 128, dtype=torch.bfloat16),
+        torch.empty(1, 128, dtype=torch.bfloat16),
+    )
+    bound = _persistent_indexed_inplace_state_update._bind_isolated(args)
+    host_function = bound.host_function
+    assert host_function is not None
+    bound.env.config_spec.target_device_capability = (8, 0)
+    facts = CuteAsyncStateLoadHeuristic.register_facts(
+        bound.env, host_function.device_ir
+    )
+    bound.env.compiler_fact_specialization_facts |= facts
+    config = CuteAsyncStateLoadHeuristic.get_seed_config(
+        bound.env, host_function.device_ir
+    )
+    assert config is not None
+    assert config.config["cute_async_load_stages"] > 0
+    non_static_strategy = cast(
+        "Any",
+        SimpleNamespace(thread_block_dims=lambda: (sympy.Symbol("threads"), 1, 1)),
+    )
+    assert _exact_thread_block_dims(non_static_strategy) is None
+
+    with (
+        patch(
+            "helion._compiler.device_function._exact_thread_block_dims",
+            side_effect=lambda _strategy: _exact_thread_block_dims(non_static_strategy),
+        ),
+        patch(
+            "helion._compiler.cute.pipeline_state_loads.pipeline_state_loads"
+        ) as pipeline,
+    ):
+        code = bound.to_code(config)
+
+    pipeline.assert_not_called()
+    assert "cute.arch.cp_async_shared_global(" not in code
+    assert "_async_state_" not in code
+
+
+@onlyBackends(["cute"])
+def test_composed_seed_keeps_flat_pid_without_exact_grid_extent() -> None:
+    bound, host_function = _bind_composed_seed_case()
+    spec = bound.env.config_spec
+    root = spec.kernel_grid_fact
+    assert root is not None
+    leading_block_id = root.roots[0].block_ids[0]
+    original_size = bound.env.block_sizes[leading_block_id].size
+    bound.env.block_sizes[leading_block_id].size = None
+    try:
+        seed = CuteAsyncPersistentSubwarpRowsHeuristic.get_seed_config(
+            bound.env, host_function.device_ir
+        )
+    finally:
+        bound.env.block_sizes[leading_block_id].size = original_size
+
+    assert seed is not None
+    assert seed.config["pid_type"] == "flat"
+    assert seed.config["block_sizes"] == [128]
+    assert seed.config["loop_orders"] == [[1, 0, 2]]
+    assert seed.config["cute_async_load_stages"] == 5
+
+
+@pytest.mark.parametrize("axis_index", (0, 1, 2))
+@onlyBackends(["cute"])
+def test_composed_seed_keeps_flat_pid_for_oversized_grid_axis(
+    axis_index: int,
+) -> None:
+    bound, host_function = _bind_composed_seed_case()
+    spec = bound.env.config_spec
+    grid_fact = spec.kernel_grid_fact
+    assert grid_fact is not None
+    block_id = grid_fact.roots[0].block_ids[axis_index]
+    original_size = bound.env.block_sizes[block_id].size
+    bound.env.block_sizes[block_id].size = 65_536
+    try:
+        seed = CuteAsyncPersistentSubwarpRowsHeuristic.get_seed_config(
+            bound.env, host_function.device_ir
+        )
+    finally:
+        bound.env.block_sizes[block_id].size = original_size
+
+    if axis_index == 2:
+        # The innermost row axis also ceases to be a full-row schedule.
+        assert seed is None
+    else:
+        assert seed is not None
+        assert seed.config["pid_type"] == "flat"
+
+
+@onlyBackends(["cute"])
+def test_composed_seed_keeps_flat_pid_without_metadata_specialization() -> None:
+    bound, host_function = _bind_composed_seed_case()
+    original_facts = bound.env.compiler_fact_specialization_facts
+    bound.env.compiler_fact_specialization_facts = frozenset()
+    try:
+        seed = CuteAsyncPersistentSubwarpRowsHeuristic.get_seed_config(
+            bound.env, host_function.device_ir
+        )
+    finally:
+        bound.env.compiler_fact_specialization_facts = original_facts
+
+    assert seed is not None
+    assert seed.config["pid_type"] == "flat"
+
+
+@onlyBackends(["cute"])
+def test_composed_seed_does_not_override_an_unrelated_xyz_restriction() -> None:
+    bound, host_function = _bind_composed_seed_case()
+    spec = bound.env.config_spec
+    original_reason = spec.disallowed_pid_type_reasons["xyz"]
+    spec.disallowed_pid_type_reasons["xyz"] = "synthetic unrelated safety rule"
+    try:
+        seed = CuteAsyncPersistentSubwarpRowsHeuristic.get_seed_config(
+            bound.env, host_function.device_ir
+        )
+    finally:
+        spec.disallowed_pid_type_reasons["xyz"] = original_reason
+
+    assert seed is not None
+    assert seed.config["pid_type"] == "flat"
+
+
+@onlyBackends(["cute"])
+def test_composed_seed_rejects_non_3d_grid() -> None:
+    bound, host_function = _bind_composed_seed_case()
+    spec = bound.env.config_spec
+    grid_fact = spec.kernel_grid_fact
+    assert grid_fact is not None
+    root = grid_fact.roots[0]
+    spec.kernel_grid_fact = grid_fact._replace(
+        roots=(root._replace(block_ids=root.block_ids[:2]),)
+    )
+    try:
+        seed = CuteAsyncPersistentSubwarpRowsHeuristic.get_seed_config(
+            bound.env, host_function.device_ir
+        )
+    finally:
+        spec.kernel_grid_fact = grid_fact
+
+    assert seed is None
+
+
+@onlyBackends(["cute"])
+def test_composed_seed_requires_full_innermost_row_tile() -> None:
+    bound, host_function = _bind_composed_seed_case()
+    spec = bound.env.config_spec
+    grid_fact = spec.kernel_grid_fact
+    assert grid_fact is not None
+    root = grid_fact.roots[0]
+    row_spec = spec.block_sizes[0]
+
+    spec.kernel_grid_fact = grid_fact._replace(
+        roots=(
+            root._replace(
+                block_ids=(root.block_ids[-1], *root.block_ids[:-1]),
+            ),
+        )
+    )
+    try:
+        not_innermost = CuteAsyncPersistentSubwarpRowsHeuristic.get_seed_config(
+            bound.env, host_function.device_ir
+        )
+    finally:
+        spec.kernel_grid_fact = grid_fact
+    assert not_innermost is None
+
+    original_max_size = row_spec.max_size
+    row_spec.max_size = 64
+    try:
+        not_full = CuteAsyncPersistentSubwarpRowsHeuristic.get_seed_config(
+            bound.env, host_function.device_ir
+        )
+    finally:
+        row_spec.max_size = original_max_size
+    assert not_full is None
+
+    row_block_id = row_spec.block_id
+    original_row_size = bound.env.block_sizes[row_block_id].size
+    bound.env.block_sizes[row_block_id].size = 256
+    try:
+        not_full_extent = CuteAsyncPersistentSubwarpRowsHeuristic.get_seed_config(
+            bound.env, host_function.device_ir
+        )
+    finally:
+        bound.env.block_sizes[row_block_id].size = original_row_size
+    assert not_full_extent is None
+
+
+@onlyBackends(["cute"])
+def test_composed_seed_requires_async_pipeline() -> None:
+    bound, host_function = _bind_composed_seed_case()
+    spec = bound.env.config_spec
+    original_enabled = spec.cute_async_load_pipeline_enabled
+    spec.cute_async_load_pipeline_enabled = False
+    try:
+        seed = CuteAsyncPersistentSubwarpRowsHeuristic.get_seed_config(
+            bound.env, host_function.device_ir
+        )
+    finally:
+        spec.cute_async_load_pipeline_enabled = original_enabled
+
+    assert seed is None
+
+
+@onlyBackends(["cute"])
+def test_composed_seed_addresses_loop_order_by_block_id() -> None:
+    bound, host_function = _bind_composed_seed_case()
+    spec = bound.env.config_spec
+    grid_fact = spec.kernel_grid_fact
+    assert grid_fact is not None
+    root = grid_fact.roots[0]
+    reduction_block_id = next(
+        block.block_id for block in bound.env.block_sizes if block.reduction
+    )
+    spec.loop_orders.insert(0, LoopOrderSpec([reduction_block_id]))
+    try:
+        order_block_ids = [item.block_id for item in spec.loop_orders]
+        seed = CuteAsyncPersistentSubwarpRowsHeuristic.get_seed_config(
+            bound.env, host_function.device_ir
+        )
+    finally:
+        del spec.loop_orders[0]
+
+    assert seed is not None
+    orders = cast("list[list[int]]", seed.config["loop_orders"])
+    by_block_id = dict(
+        zip(
+            order_block_ids,
+            orders,
+            strict=True,
+        )
+    )
+    assert by_block_id[reduction_block_id] == [0]
+    assert by_block_id[root.block_ids[0]] == [1, 0, 2]
 
 
 @onlyBackends(["cute"])

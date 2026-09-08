@@ -801,7 +801,7 @@ class CuteBackend(Backend):
     """CuTe DSL (CUTLASS Python DSL) code generation backend."""
 
     # Bump when config_value_priors() changes its candidate distribution.
-    config_value_priors_version = 1
+    config_value_priors_version = 3
 
     @property
     def name(self) -> str:
@@ -836,6 +836,13 @@ class CuteBackend(Backend):
         from .strategies import Tcgen05Strategy
         from .tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 
+        async_store_policy_weights: dict[object, float] = {"default": 1.0}
+        if (
+            config_spec is not None
+            and config_spec.cute_l2_evict_last_store_policy_supported
+        ):
+            async_store_policy_weights = {"l2_evict_last": 4.0, "default": 1.0}
+
         priors: dict[str, ValuePrior] = {
             # Generic knobs shared by every cute kernel.
             "num_warps": weighted_choice({8: 4.0, 4: 2.0, 16: 1.0}),
@@ -850,6 +857,16 @@ class CuteBackend(Backend):
                     "persistent_blocked": 1.0,
                 }
             ),
+            # In-place vector state updates: the five-stage/two-row schedule
+            # is the measured B256 winner. Disabled remains represented so
+            # small grids can avoid the shared-memory occupancy cost.
+            "cute_async_load_stages": weighted_choice({5: 4.0, 0: 2.0, 4: 1.0, 3: 1.0}),
+            "cute_async_load_lookahead": weighted_choice({4: 4.0, 3: 1.0, 2: 1.0}),
+            "cute_async_load_group_rows": weighted_choice({2: 4.0, 4: 1.0}),
+            "cute_async_load_cache": weighted_choice({"cg": 4.0, "ca": 1.0}),
+            "cute_async_store_policy": weighted_choice(async_store_policy_weights),
+            "cute_bf16x2_recurrence": weighted_choice({True: 4.0, False: 1.0}),
+            "cute_proven_bounds": weighted_choice({False: 4.0, True: 1.0}),
             # tcgen05 / 2-CTA matmul knobs (absent on non-matmul kernels).
             "tcgen05_cluster_m": weighted_choice({2: 3.0, 1: 1.0}),
             "tcgen05_ab_stages": weighted_choice(
@@ -895,9 +912,27 @@ class CuteBackend(Backend):
         config: Config,
         tile_strategy: TileStrategyDispatch,
     ) -> None:
+        from ..device_function import DeviceFunction
+        from .fixed_token_rank1_recurrence import plan_fixed_token_rank1_recurrence
         from .layout_propagation import plan_layouts
+        from .single_token_rank1_recurrence import plan_single_token_rank1_recurrence
+        from .split_single_token_rank1_recurrence import (
+            plan_split_single_token_rank1_recurrence,
+        )
         from .view_subtile import annotate_view_subtiles
 
+        plan_single_token_rank1_recurrence(graphs, tile_strategy)
+        if DeviceFunction.current().cute_state.single_token_rank1_plan is not None:
+            return
+        split_t1_plan = plan_split_single_token_rank1_recurrence(graphs, tile_strategy)
+        DeviceFunction.current().cute_state.split_single_token_rank1_plan = (
+            split_t1_plan
+        )
+        if split_t1_plan is not None:
+            return
+        plan_fixed_token_rank1_recurrence(graphs, tile_strategy)
+        if DeviceFunction.current().cute_state.fixed_token_rank1_plan is not None:
+            return
         annotate_view_subtiles(graphs, config)
         plan_layouts(graphs, config, tile_strategy)
 
@@ -907,9 +942,12 @@ class CuteBackend(Backend):
             or key == "cute_vector_widths"
             or key == "cute_lane_layouts"
             or key == "cute_reduction_reloads"
+            or key == "cute_async_store_policy"
+            or key == "cute_bf16x2_recurrence"
+            or key == "cute_proven_bounds"
             or key == "cute_cluster_n"
             or key == "cute_min_blocks_per_mp"
-            or key.startswith(("tcgen05_", "cute_flash_"))
+            or key.startswith(("tcgen05_", "cute_flash_", "cute_async_load_"))
         ):
             return True
         return super().supports_config_key(key)
@@ -1169,7 +1207,22 @@ class CuteBackend(Backend):
             "_cute_bfloat16_x16_to_float16": "from helion._compiler.cute.quantized_helpers import bfloat16_x16_to_float16 as _cute_bfloat16_x16_to_float16",
             "_cute_store_u16_vec": "from helion._compiler.cute.vec_utils import store_u16_vec as _cute_store_u16_vec",
             "_cute_store_u32_vec": "from helion._compiler.cute.vec_utils import store_u32_vec as _cute_store_u32_vec",
+            "_cute_rank1_pack_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_pack_bf16x2 as _cute_rank1_pack_bf16x2",
+            "_cute_rank1_mul_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_mul_bf16x2 as _cute_rank1_mul_bf16x2",
+            "_cute_rank1_add_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_add_bf16x2 as _cute_rank1_add_bf16x2",
+            "_cute_rank1_fma_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_fma_bf16x2 as _cute_rank1_fma_bf16x2",
+            "_cute_rank1_load_u32x2_nc": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_load_u32x2_nc as _cute_rank1_load_u32x2_nc",
+            "_cute_rank1_load_f32x4_nc": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_load_f32x4_nc as _cute_rank1_load_f32x4_nc",
+            "_cute_rank1_load_f32_nc": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_load_f32_nc as _cute_rank1_load_f32_nc",
+            "_cute_rank1_load_u16_nc": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_load_u16_nc as _cute_rank1_load_u16_nc",
+            "_cute_rank1_load_i32_nc": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_load_i32_nc as _cute_rank1_load_i32_nc",
+            "_cute_rank1_load_i64_nc": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_load_i64_nc as _cute_rank1_load_i64_nc",
+            "_cute_rank1_load_u32x4_if_valid": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_load_u32x4_if_valid as _cute_rank1_load_u32x4_if_valid",
+            "_cute_rank1_store_u32x4_if_valid": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_store_u32x4_if_valid as _cute_rank1_store_u32x4_if_valid",
+            "_cute_rank1_store_u16_or_zero": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_store_u16_or_zero as _cute_rank1_store_u16_or_zero",
             "_cute_load_l2_evict_last": "from helion._compiler.cute.l2_policy import load_v16b_l2_evict_last as _cute_load_l2_evict_last",
+            "_cute_store_u16x8_l2_evict_last": "from helion._compiler.cute.l2_policy import store_u16x8_l2_evict_last as _cute_store_u16x8_l2_evict_last",
+            "_cute_store_u32x4_l2_evict_last": "from helion._compiler.cute.l2_policy import store_u32x4_l2_evict_last as _cute_store_u32x4_l2_evict_last",
             "_cute_grid_barrier": "from helion._compiler.cute.grid_barrier import grid_barrier as _cute_grid_barrier",
             "_cute_atomic_max_float32": "from helion._compiler.cute.atomic_helpers import atomic_max_float32 as _cute_atomic_max_float32",
             "_cute_atomic_min_float32": "from helion._compiler.cute.atomic_helpers import atomic_min_float32 as _cute_atomic_min_float32",
@@ -1836,6 +1889,30 @@ class CuteBackend(Backend):
                     f"cute_compile_options={' '.join(compile_options)!r}"
                 )
             return launcher_args
+
+        # The single-token rank-1 path owns the complete physical body.  The
+        # original B1 schedule uses 256 threads while its batched schedule uses
+        # one warp; the structural plan proves which topology was emitted.
+        single_rank1_plan = device_function.cute_state.single_token_rank1_plan
+        if single_rank1_plan is not None:
+            return launcher_args_with_compile_options(
+                f"block=({single_rank1_plan.threads}, 1, 1)"
+            )
+
+        # The split-input T=1 path owns one 32-thread warp per 16 output rows.
+        if device_function.cute_state.split_single_token_rank1_plan is not None:
+            return launcher_args_with_compile_options("block=(32, 1, 1)")
+
+        # The fixed-token grouped rank-1 path owns one physical CTA per
+        # sequence/head/value split and replaces the complete device body.
+        fixed_rank1_plan = device_function.cute_state.fixed_token_rank1_plan
+        if fixed_rank1_plan is not None:
+            fixed_rank1_threads = (
+                128 * fixed_rank1_plan.key_split // fixed_rank1_plan.value_split
+            )
+            return launcher_args_with_compile_options(
+                f"block=({fixed_rank1_threads}, 1, 1)"
+            )
 
         # Fused tcgen05 flash-attention: 128 threads (single-warpgroup Stage-3)
         # or 256 threads (Stage-4 warp-spec producer/consumer split). The custom

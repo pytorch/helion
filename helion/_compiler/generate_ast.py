@@ -379,6 +379,51 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self._clear_attention_flash_state()
         raise exc.BackendUnsupported("cute", "flash attention failed late validation")
 
+    def _try_codegen_single_token_rank1_root(self) -> bool:
+        plan = self.device_function.cute_state.single_token_rank1_plan
+        if plan is None:
+            return False
+        from .cute.single_token_rank1_recurrence import (
+            codegen_single_token_rank1_recurrence,
+        )
+
+        if codegen_single_token_rank1_recurrence(self):
+            return True
+        self.device_function.cute_state.single_token_rank1_plan = None
+        raise exc.BackendUnsupported(
+            "cute", "single-token rank-1 recurrence failed late validation"
+        )
+
+    def _try_codegen_split_single_token_rank1_root(self) -> bool:
+        plan = self.device_function.cute_state.split_single_token_rank1_plan
+        if plan is None:
+            return False
+        from .cute.split_single_token_rank1_recurrence import (
+            codegen_split_single_token_rank1_recurrence,
+        )
+
+        if codegen_split_single_token_rank1_recurrence(self, plan):
+            return True
+        self.device_function.cute_state.split_single_token_rank1_plan = None
+        raise exc.BackendUnsupported(
+            "cute", "split single-token rank-1 recurrence failed late validation"
+        )
+
+    def _try_codegen_fixed_token_rank1_root(self) -> bool:
+        plan = self.device_function.cute_state.fixed_token_rank1_plan
+        if plan is None:
+            return False
+        from .cute.fixed_token_rank1_recurrence import (
+            codegen_fixed_token_rank1_recurrence,
+        )
+
+        if codegen_fixed_token_rank1_recurrence(self):
+            return True
+        self.device_function.cute_state.fixed_token_rank1_plan = None
+        raise exc.BackendUnsupported(
+            "cute", "fixed-token rank-1 recurrence failed late validation"
+        )
+
     def add_statement(self, stmt: ast.AST | str | None) -> None:
         if stmt is None:
             return
@@ -1139,7 +1184,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                             self.statements_stack[-1]
                         )
                     root = root_graph_info.graph
-                    if not self._try_codegen_attention_flash_root():
+                    if (
+                        not self._try_codegen_single_token_rank1_root()
+                        and not self._try_codegen_split_single_token_rank1_root()
+                        and not self._try_codegen_fixed_token_rank1_root()
+                        and not self._try_codegen_attention_flash_root()
+                    ):
                         grid_state = self.current_grid_state
                         if isinstance(grid_state, DeviceGridState):
                             # Codegen the body first so synthetic free-``hl.arange``
