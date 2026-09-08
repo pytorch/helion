@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
 import os
 import pickle
 from typing import TYPE_CHECKING
@@ -167,6 +168,17 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
                 ["flat", "xyz", "persistent_blocked", "persistent_interleaved"]
             ),
             "cross_loop_schedule": st.sampled_from(["barrier", "static_pipeline"]),
+            "cute_chunk_recurrence_dv_partitions": st.sampled_from([2, 4]),
+            "cute_chunk_recurrence_register_cap": st.sampled_from([72, 76, 80]),
+            "cute_chunk_prepare_schedule": st.sampled_from(
+                [
+                    "split_alias_cpc1",
+                    "split_alias_cpc2",
+                    "split_alias_cpc3",
+                    "split_alias_cpc4",
+                    "split_alias_cpc5",
+                ]
+            ),
             "indexing": st.sampled_from(["pointer", "tensor_descriptor"]),
         }
     )
@@ -208,6 +220,9 @@ def _unknown_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
                     "num_stages",
                     "pid_type",
                     "cross_loop_schedule",
+                    "cute_chunk_recurrence_dv_partitions",
+                    "cute_chunk_recurrence_register_cap",
+                    "cute_chunk_prepare_schedule",
                     "indexing",
                 }
             )
@@ -412,6 +427,11 @@ class TestConfigAPI(TestCase):
             "cross_loop_schedule",
             "indexing",
         }
+        compiler_internal = {
+            "cute_chunk_recurrence_dv_partitions",
+            "cute_chunk_recurrence_register_cap",
+            "cute_chunk_prepare_schedule",
+        }
 
         sig = inspect.signature(helion.Config.__init__)
         kwonly = {
@@ -421,6 +441,7 @@ class TestConfigAPI(TestCase):
         }
         # Expected kwargs must be present as keyword-only
         self.assertTrue(expected.issubset(kwonly))
+        self.assertTrue(compiler_internal.isdisjoint(kwonly))
 
     def test_cross_loop_schedule_is_an_admitted_triton_field(self) -> None:
         from helion.autotuner.config_generation import ConfigGeneration
@@ -488,6 +509,134 @@ class TestConfigAPI(TestCase):
                 num_sm=1,
             )
             self.assertFalse(spec.supports_config_key("cross_loop_schedule"))
+
+    def test_cute_chunk_internal_config_mapping_serialization(self) -> None:
+        from helion.autotuner.local_cache import parse_cache_entry
+
+        values = {
+            "cute_chunk_recurrence_dv_partitions": 4,
+            "cute_chunk_recurrence_register_cap": 76,
+            "cute_chunk_prepare_schedule": "split_alias_cpc2",
+        }
+        config = helion.Config.from_dict(values)
+        self.assertEqual(dict(config), values)
+        self.assertEqual(dict(helion.Config.from_json(config.to_json())), values)
+        cache_entry = parse_cache_entry(
+            json.dumps(
+                {
+                    "key": {
+                        "fields": {
+                            "hardware": "test",
+                            "specialization_key": "test",
+                            "config_spec_hash": "test",
+                        }
+                    },
+                    "config": config.to_json(),
+                    "flat_config": json.dumps([4, 76, "split_alias_cpc2"]),
+                }
+            )
+        )
+        self.assertEqual(dict(cache_entry.config), values)
+
+    def test_cute_chunk_recurrence_register_cap_serialization_and_scope(self) -> None:
+        from helion._compiler.backend import CuteBackend
+        from helion.autotuner.config_generation import ConfigGeneration
+
+        config = helion.Config.from_dict(
+            {
+                "cute_chunk_recurrence_dv_partitions": 4,
+                "cute_chunk_recurrence_register_cap": 76,
+            }
+        )
+
+        spec = ConfigSpec(backend=CuteBackend())
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "available only for matched BT16 chunk-recurrence kernels",
+        ):
+            spec.normalize(config)
+
+        spec.enable_cute_chunk_recurrence_search(preferred_partitions=2)
+        field = spec._flat_fields()["cute_chunk_recurrence_register_cap"]
+        self.assertIs(field, spec.cute_chunk_recurrence_register_cap)
+        self.assertEqual(field.choices, (None, 72, 76, 80))
+        self.assertIsNone(
+            spec.default_config().config.get("cute_chunk_recurrence_register_cap")
+        )
+        generation = ConfigGeneration(spec)
+        round_trip = generation.unflatten(generation.flatten(config))
+        self.assertEqual(round_trip["cute_chunk_recurrence_dv_partitions"], 4)
+        self.assertEqual(round_trip["cute_chunk_recurrence_register_cap"], 76)
+        with self.assertRaisesRegex(exc.InvalidConfig, "must be one of"):
+            spec.normalize(
+                helion.Config.from_dict({"cute_chunk_recurrence_register_cap": 64})
+            )
+
+        triton_spec = ConfigSpec(backend=TritonBackend())
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "Unsupported config keys for backend 'triton'",
+        ):
+            triton_spec.normalize(
+                helion.Config.from_dict({"cute_chunk_recurrence_register_cap": 72})
+            )
+
+    def test_cute_chunk_recurrence_integer_knobs_require_exact_integers(self) -> None:
+        from helion._compiler.backend import CuteBackend
+
+        spec = ConfigSpec(backend=CuteBackend())
+        spec.enable_cute_chunk_recurrence_search(preferred_partitions=4)
+        for key, value, expected in (
+            ("cute_chunk_recurrence_dv_partitions", True, 4),
+            ("cute_chunk_recurrence_dv_partitions", 4.0, 4),
+            ("cute_chunk_recurrence_register_cap", False, None),
+            ("cute_chunk_recurrence_register_cap", 72.0, None),
+        ):
+            with self.subTest(key=key, value=value):
+                config = {key: value}
+                with self.assertRaisesRegex(exc.InvalidConfig, "must be one of"):
+                    spec.normalize(config)
+
+                spec.normalize(config, _fix_invalid=True)
+                self.assertEqual(config[key], expected)
+
+    def test_cute_chunk_prepare_schedule_serialization_and_scope(self) -> None:
+        from helion._compiler.backend import CuteBackend
+
+        config = helion.Config.from_dict(
+            {"cute_chunk_prepare_schedule": "split_alias_cpc2"}
+        )
+
+        spec = ConfigSpec(backend=CuteBackend())
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "available only for matched BT16 chunk-prepare kernels",
+        ):
+            spec.normalize(config)
+
+        spec.enable_cute_chunk_prepare_schedule_search(
+            preferred_schedule="split_alias_cpc2"
+        )
+        field = spec._flat_fields()["cute_chunk_prepare_schedule"]
+        self.assertIs(field, spec.cute_chunk_prepare_schedule)
+        self.assertEqual(
+            field.choices,
+            (
+                "split_alias_cpc2",
+                "split_alias_cpc1",
+                "split_alias_cpc3",
+                "split_alias_cpc4",
+                "split_alias_cpc5",
+            ),
+        )
+        self.assertEqual(
+            spec.default_config()["cute_chunk_prepare_schedule"],
+            "split_alias_cpc2",
+        )
+        with self.assertRaisesRegex(exc.InvalidConfig, "must be one of"):
+            spec.normalize(
+                helion.Config.from_dict({"cute_chunk_prepare_schedule": "delayed_qk"})
+            )
 
     def test_warp_specialization_uses_effective_launcher_warp_count(self) -> None:
         backend = TritonBackend()

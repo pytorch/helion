@@ -913,6 +913,8 @@ class CuteBackend(Backend):
         tile_strategy: TileStrategyDispatch,
     ) -> None:
         from ..device_function import DeviceFunction
+        from .chunk_prepare import plan_chunk_prepare
+        from .chunk_recurrence import plan_chunk_recurrence
         from .fixed_token_rank1_recurrence import plan_fixed_token_rank1_recurrence
         from .layout_propagation import plan_layouts
         from .single_token_rank1_recurrence import plan_single_token_rank1_recurrence
@@ -921,6 +923,12 @@ class CuteBackend(Backend):
         )
         from .view_subtile import annotate_view_subtiles
 
+        plan_chunk_prepare(graphs, tile_strategy)
+        if DeviceFunction.current().cute_state.chunk_prepare_plan is not None:
+            return
+        plan_chunk_recurrence(graphs, tile_strategy)
+        if DeviceFunction.current().cute_state.chunk_recurrence_plan is not None:
+            return
         plan_single_token_rank1_recurrence(graphs, tile_strategy)
         if DeviceFunction.current().cute_state.single_token_rank1_plan is not None:
             return
@@ -945,6 +953,9 @@ class CuteBackend(Backend):
             or key == "cute_async_store_policy"
             or key == "cute_bf16x2_recurrence"
             or key == "cute_proven_bounds"
+            or key == "cute_chunk_recurrence_dv_partitions"
+            or key == "cute_chunk_recurrence_register_cap"
+            or key == "cute_chunk_prepare_schedule"
             or key == "cute_cluster_n"
             or key == "cute_min_blocks_per_mp"
             or key.startswith(("tcgen05_", "cute_flash_", "cute_async_load_"))
@@ -1839,6 +1850,8 @@ class CuteBackend(Backend):
             return []
 
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
+        from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY
+        from ...autotuner.config_spec import _cute_chunk_recurrence_config_is_safe
         from ..device_function import DeviceFunction
         from ..host_function import HostFunction
         from .thread_budget import MAX_THREADS_PER_BLOCK
@@ -1861,6 +1874,32 @@ class CuteBackend(Backend):
         def launcher_args_with_compile_options(block_arg: str) -> list[str]:
             launcher_args = [block_arg]
             compile_options: list[str] = []
+            recurrence_register_cap = config.get(CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY)
+            if recurrence_register_cap is not None:
+                recurrence_plan = device_function.cute_state.chunk_recurrence_plan
+                if recurrence_plan is None or type(recurrence_register_cap) is not int:
+                    raise exc.BackendUnsupported(
+                        "cute", "invalid matched recurrence register cap"
+                    )
+                if not _cute_chunk_recurrence_config_is_safe(
+                    recurrence_plan.dv_partitions, recurrence_register_cap
+                ):
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        "register caps are unsafe for the TMEM DV2 recurrence "
+                        "schedule's dynamic register allocation",
+                    )
+                compile_options.append(
+                    "--ptxas-options='--override-directive-values "
+                    f"--maxrregcount={recurrence_register_cap}'"
+                )
+            prepare_plan = device_function.cute_state.chunk_prepare_plan
+            if prepare_plan is not None and prepare_plan.schedule.startswith(
+                "split_alias_cpc"
+            ):
+                compile_options.append(
+                    "--ptxas-options='--override-directive-values --maxrregcount=48'"
+                )
             if config.get(TCGEN05_CUBIN_LINEINFO_CONFIG_KEY) is True:
                 compile_options.append("--generate-line-info")
             # ``--enable-tvm-ffi`` is emitted in codegen only when the
@@ -1912,6 +1951,16 @@ class CuteBackend(Backend):
             )
             return launcher_args_with_compile_options(
                 f"block=({fixed_rank1_threads}, 1, 1)"
+            )
+
+        # The exact chunk-prepare and chunk-recurrence lowerings own their physical
+        # launch topology rather than the carrier's logical tile axes.
+        if device_function.cute_state.chunk_prepare_plan is not None:
+            return launcher_args_with_compile_options("block=(128, 1, 1)")
+        recurrence_plan = device_function.cute_state.chunk_recurrence_plan
+        if recurrence_plan is not None:
+            return launcher_args_with_compile_options(
+                f"block=({recurrence_plan.threads}, 1, 1)"
             )
 
         # Fused tcgen05 flash-attention: 128 threads (single-warpgroup Stage-3)

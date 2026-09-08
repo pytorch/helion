@@ -10,6 +10,10 @@ from torch._inductor.runtime.triton_heuristics import (
     get_max_y_grid,  # type: ignore[import-untyped]
 )
 
+from ...autotuner.config_spec import CUTE_CHUNK_PREPARE_SCHEDULE_KEY
+from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY
+from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY
+from ...autotuner.config_spec import _cute_chunk_recurrence_config_is_safe
 from ...autotuner.config_spec import get_valid_eviction_policies
 from ...runtime.config import Config
 from ..cute.cutedsl_compat import cp_async_supported
@@ -2746,6 +2750,137 @@ class CuteTcgen05GroupedDynamicBk64Heuristic(AutotunerHeuristic):
         config.config[TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY] = 3
         config.config["tcgen05_ab_stages"] = TCGEN05_GROUPED_DYNAMIC_AB4_STAGE
         return config
+
+
+class CuteChunkRecurrenceHeuristic(AutotunerHeuristic):
+    """Expose legal BT16 recurrence schedules and register caps."""
+
+    name = "cute_chunk_recurrence"
+    backend = "cute"
+    promote_seed_to_default = True
+    PROMOTE_TARGETS = (("cuda", "sm100"), ("cuda", "sm103"))
+    CACHE_SPECIALIZATION_FACTS = frozenset({"config_num_sm", "input_tensor_metadata"})
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        from ..cute.chunk_recurrence import _select_sm100_dv_partitions
+        from ..cute.chunk_recurrence import detect_chunk_recurrence_search_geometry
+
+        geometry = detect_chunk_recurrence_search_geometry(device_ir.graphs)
+        capability = env.config_spec.target_device_capability
+        if geometry is None or capability is None or capability[0] != 10:
+            return frozenset()
+        preferred = _select_sm100_dv_partitions(
+            total_chunks=geometry.total_chunks,
+            sequences=geometry.sequences,
+            heads=geometry.heads,
+            num_sm=env.config_spec.num_sm,
+        )
+        env.config_spec.enable_cute_chunk_recurrence_search(
+            preferred_partitions=preferred
+        )
+        return cls.CACHE_SPECIALIZATION_FACTS
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return (
+            env.config_spec.cute_chunk_recurrence_dv_partitions is not None
+            and env.config_spec.cute_chunk_recurrence_register_cap is not None
+        )
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        fragment = env.config_spec.cute_chunk_recurrence_dv_partitions
+        register_cap_fragment = env.config_spec.cute_chunk_recurrence_register_cap
+        if fragment is None or register_cap_fragment is None:
+            return None
+        register_caps = (
+            72,
+            *(
+                cap
+                for cap in register_cap_fragment.choices
+                if cap is not None and cap != 72
+            ),
+            *((None,) if None in register_cap_fragment.choices else ()),
+        )
+        return [
+            Config.from_dict(
+                {
+                    CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY: partitions,
+                    CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY: register_cap,
+                }
+            )
+            for partitions in fragment.choices
+            for register_cap in register_caps
+            if _cute_chunk_recurrence_config_is_safe(partitions, register_cap)
+        ]
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+
+class CuteChunkPrepareHeuristic(AutotunerHeuristic):
+    """Expose exact BT16 prepare schedules with a geometry-derived seed."""
+
+    name = "cute_chunk_prepare"
+    backend = "cute"
+    promote_seed_to_default = True
+    PROMOTE_TARGETS = (("cuda", "sm100"), ("cuda", "sm103"))
+    CACHE_SPECIALIZATION_FACTS = frozenset({"config_num_sm", "input_tensor_metadata"})
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        from ..cute.chunk_prepare import preferred_chunk_prepare_schedule
+
+        capability = env.config_spec.target_device_capability
+        host_function = device_ir.host_function
+        if capability is None or capability[0] != 10 or host_function is None:
+            return frozenset()
+        with host_function:
+            preferred_schedule = preferred_chunk_prepare_schedule(
+                device_ir.graphs,
+                env=env,
+                num_sm=env.config_spec.num_sm,
+            )
+        if preferred_schedule is None:
+            return frozenset()
+        env.config_spec.enable_cute_chunk_prepare_schedule_search(
+            preferred_schedule=preferred_schedule
+        )
+        return cls.CACHE_SPECIALIZATION_FACTS
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return env.config_spec.cute_chunk_prepare_schedule is not None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        fragment = env.config_spec.cute_chunk_prepare_schedule
+        if fragment is None:
+            return None
+        return [
+            Config.from_dict({CUTE_CHUNK_PREPARE_SCHEDULE_KEY: schedule})
+            for schedule in fragment.choices
+        ]
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
 
 
 class CuteFlashAttentionHeuristic(AutotunerHeuristic):

@@ -1,16 +1,26 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import math
 from typing import Any
 
 from benchmarks.cute import kda_prefill_staged
+from benchmarks.cute.kda_prefill_kernels import KDA_PREPARE_CONFIG
+from benchmarks.cute.kda_prefill_kernels import KDA_RECURRENCE_CONFIG
+from benchmarks.cute.kda_prefill_kernels import kda_chunk_prepare
+from benchmarks.cute.kda_prefill_kernels import kda_chunk_recurrence
 from benchmarks.cute.kda_prefill_staged import CuteOriginAuxDag
 from benchmarks.cute.kda_prefill_staged import KdaStagedResources
 from benchmarks.cute.kda_prefill_staged import allocate_kda_factor_workspace
+from benchmarks.cute.kda_prefill_staged import create_staged_kda_resources
 from benchmarks.cute.kda_prefill_staged import kda_group_host_metadata
 from benchmarks.cute.kda_prefill_staged import staged_longest_partition
 import pytest
 import torch
+
+import helion
+from helion._testing import skipUnlessBackends
+from helion.runtime.cute.launcher import cute_cuda_graph
 
 
 @pytest.mark.parametrize(
@@ -427,3 +437,198 @@ def _safe_gate_token_reference(
             state = state.to(torch.bfloat16).float()
 
     return output, state.to(torch.bfloat16)
+
+
+@pytest.mark.parametrize(
+    ("dv_partitions", "expected_kind"),
+    (
+        (2, "chunk_recurrence_sm100"),
+        (4, "chunk_recurrence_warp_dv4"),
+    ),
+)
+@skipUnlessBackends(["cute"])
+def test_fixed_h12_t512_staged_prefill_numerical_cuda(
+    dv_partitions: int,
+    expected_kind: str,
+) -> None:
+    device = _require_sm100_runtime()
+    generator = torch.Generator(device=device).manual_seed(20260907)
+    tokens = 512
+    heads = 12
+    width = 128
+    shape = (1, tokens, heads, width)
+
+    def random_bf16(tensor_shape: tuple[int, ...]) -> torch.Tensor:
+        return torch.randn(
+            tensor_shape,
+            generator=generator,
+            dtype=torch.float32,
+            device=device,
+        ).to(torch.bfloat16)
+
+    q = random_bf16(shape)
+    k = random_bf16(shape)
+    q[:, 0].fill_(1.0e-5)
+    k[:, 0].fill_(1.0e-5)
+    gate = random_bf16(shape)
+    beta_logits = random_bf16(shape[:-1])
+    values = random_bf16(shape)
+    a_log = torch.rand(heads, generator=generator, dtype=torch.float32, device=device)
+    dt_bias = torch.rand(
+        (heads, width), generator=generator, dtype=torch.float32, device=device
+    )
+    initial_state = (
+        torch.randn(
+            (1, heads, width, width),
+            generator=generator,
+            dtype=torch.float32,
+            device=device,
+        )
+        * 0.25
+    ).to(torch.bfloat16)
+    state = initial_state.clone()
+    output = torch.empty_like(values)
+    scale = width**-0.5
+    lower_bound = -5.0
+    gate_scale_log2 = lower_bound * math.log2(math.e)
+
+    expected_output, expected_state = _safe_gate_token_reference(
+        q,
+        k,
+        gate,
+        beta_logits,
+        a_log,
+        dt_bias,
+        values,
+        initial_state,
+        lower_bound=lower_bound,
+        scale=scale,
+    )
+    resources = create_staged_kda_resources((0, tokens), heads=heads, device=device)
+    group = resources.critical
+    metadata = group.metadata
+    workspace = group.workspace
+    prepare_args = (
+        q,
+        k,
+        gate,
+        beta_logits,
+        a_log,
+        dt_bias,
+        metadata.cu_seqlens,
+        metadata.cu_chunks,
+        metadata.chunk_to_seq,
+        workspace.kd,
+        workspace.qd,
+        workspace.ak,
+        workspace.aq,
+        workspace.g_total,
+        None,
+        gate_scale_log2,
+    )
+    recurrence_args = (
+        workspace.kd,
+        workspace.qd,
+        workspace.ak,
+        workspace.aq,
+        workspace.g_total,
+        values,
+        output,
+        state,
+        metadata.cu_seqlens,
+        metadata.cu_chunks,
+        scale,
+    )
+    prepare = kda_chunk_prepare.bind(prepare_args).compile_config(
+        helion.Config.from_dict(
+            {
+                **KDA_PREPARE_CONFIG.config,
+                "cute_chunk_prepare_schedule": "split_alias_cpc2",
+            }
+        ),
+        allow_print=False,
+    )
+    recurrence_config = {
+        **KDA_RECURRENCE_CONFIG.config,
+        "cute_chunk_recurrence_dv_partitions": dv_partitions,
+    }
+    if dv_partitions == 4:
+        recurrence_config["cute_chunk_recurrence_register_cap"] = 72
+    recurrence = kda_chunk_recurrence.bind(recurrence_args).compile_config(
+        helion.Config.from_dict(recurrence_config),
+        allow_print=False,
+    )
+    prepare_device = prepare.__globals__["_helion_kda_chunk_prepare"]
+    recurrence_device = recurrence.__globals__["_helion_kda_chunk_recurrence"]
+    assert prepare_device._helion_cute_wrapper_plans[0]["kind"] == "chunk_prepare_tma"
+    assert recurrence_device._helion_cute_wrapper_plans[0]["kind"] == expected_kind
+
+    actual_output, actual_state = kda_prefill_staged.launch_staged_kda_prefill(
+        resources,
+        q=q,
+        k=k,
+        gate=gate,
+        beta_logits=beta_logits,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        values=values,
+        output=output,
+        state=state,
+        scale=scale,
+        gate_scale_log2=gate_scale_log2,
+        prepare_kernels=(prepare,),
+        recurrence_kernels=(recurrence,),
+    )
+    torch.cuda.synchronize(device)
+
+    assert actual_output is output
+    assert actual_state is state
+    torch.testing.assert_close(
+        actual_output.float(), expected_output, atol=2e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        actual_state.float(), expected_state.float(), atol=2e-2, rtol=1e-2
+    )
+
+    state.copy_(initial_state)
+    with cute_cuda_graph() as captured:
+        kda_prefill_staged.launch_staged_kda_prefill(
+            resources,
+            q=q,
+            k=k,
+            gate=gate,
+            beta_logits=beta_logits,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            values=values,
+            output=output,
+            state=state,
+            scale=scale,
+            gate_scale_log2=gate_scale_log2,
+            prepare_kernels=(prepare,),
+            recurrence_kernels=(recurrence,),
+        )
+    # The captured prepare launch must read and transform raw A_log on every
+    # replay; a host-precomputed decay buffer would silently stay stale here.
+    a_log.add_(0.75)
+    mutated_output, mutated_state = _safe_gate_token_reference(
+        q,
+        k,
+        gate,
+        beta_logits,
+        a_log,
+        dt_bias,
+        values,
+        initial_state,
+        lower_bound=lower_bound,
+        scale=scale,
+    )
+    state.copy_(initial_state)
+    output.fill_(float("nan"))
+    captured.replay()
+    torch.cuda.synchronize(device)
+
+    torch.testing.assert_close(output.float(), mutated_output, atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        state.float(), mutated_state.float(), atol=2e-2, rtol=1e-2
+    )
