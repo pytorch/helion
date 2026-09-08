@@ -241,20 +241,19 @@ class MetalBackend(Backend):
     def create_loop_strategy(
         self, fn: DeviceFunction, block_ids: list[int], config: Config
     ) -> TileStrategy:
-        """Metal loop strategy: delegate to CuTe.
+        """Metal loop strategy: reuse CuTe's planner.
 
-        Metal and CuTe share the same scalar-thread execution model
-        (one element per thread, cooperative hardware primitives for
-        matmul), so they use the same CuteND/CuteFlattenedTileStrategy
-        with the same thread budget management, inactive block ID
-        filtering, and auto-capping logic.
+        Metal and CuTe share the same scalar-thread execution model (one
+        element per thread, cooperative hardware primitives for matmul), so
+        they use the same ``PerThreadND``/``PerThreadFlattenedTileStrategy``
+        with the same thread budget management, inactive block ID filtering,
+        and auto-capping.
 
-        Note: CuTe's flattened path raises ``BackendUnsupported("thread
-        block too large")`` when ``block_size * num_threads > 1024``
-        (the ND path auto-caps via ``_shrink_auto_thread_counts`` —
-        this asymmetry is a CuTe bug to be fixed in a follow-up).
-        Metal inherits this behavior for now; users hitting the error
-        should pick a smaller ``block_sizes`` value.
+        Both paths treat an over-subscribed threadgroup the same way: a config
+        that leaves every ``num_threads`` on auto is capped to 1024 and covers
+        the remainder with a lane loop, while one that asks for more than 1024
+        threads explicitly is rejected.  Users hitting that rejection should
+        lower ``num_threads`` or ``block_sizes``.
         """
         config = self._config_with_mpp_thread_budget(fn, block_ids, config)
         # pyrefly: ignore[bad-argument-type]

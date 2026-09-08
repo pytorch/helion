@@ -119,8 +119,6 @@ def _product(values: list[str]) -> str:
 
 @_decorators.codegen(remote_barrier, "triton")
 def _(state: CodegenState) -> ast.AST:
-    from ..compile_environment import CompileEnvironment
-
     peers = _remote_barrier_peers(state)
     if not peers:
         return expr_from_string("None")
@@ -162,7 +160,7 @@ def _(state: CodegenState) -> ast.AST:
     statements.append(statement_from_string("tl.debug_barrier()"))
     for statement in statements:
         state.codegen.add_statement(statement)
-    CompileEnvironment.current().has_barrier = True
+    state.device_function.has_barrier = True
     return expr_from_string("None")
 
 
@@ -443,9 +441,7 @@ def _prepare_remote_copy(state: CodegenState) -> ast.AST:
         )
         src_ptr = scratch_src
         src_placeholders = {}
-        from ..compile_environment import CompileEnvironment
-
-        CompileEnvironment.current().has_barrier = True
+        state.device_function.has_barrier = True
     device_id = state.ast_args[2]
     if isinstance(device_id, int):
         device_id = expr_from_string(repr(device_id))

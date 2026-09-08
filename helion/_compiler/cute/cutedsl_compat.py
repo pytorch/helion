@@ -1,28 +1,82 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import lru_cache
 import importlib.metadata
+import logging
 
 from packaging.version import InvalidVersion
 from packaging.version import Version
 
-# The cute backend hard-requires the CuTe DSL 4.5.1 API generation, the
+log = logging.getLogger(__name__)
+
+# The cute backend hard-requires the CuTe DSL 4.7 API generation, the
 # apache-tvm-ffi package, and CUDA >= 13. ``check_cute_backend_requirements``
 # (wired through ``CuteBackend.validate_environment``) enforces this up front so
 # the rest of the backend can assume the modern APIs unconditionally rather than
 # carry per-build compatibility shims and inline workarounds.
 CUTE_MIN_CUDA_VERSION = "13"
-CUTE_MIN_VERSION = Version("4.5.1")
-CUTE_MATH_MIN_MAX_VERSION = Version("4.6.0")
+# Central validated CuTe compatibility generation. A bump must revalidate the
+# raw tcgen05 runtime-N PTX fallback in ``cute_mma`` alongside the typed APIs;
+# the pin-consistency test makes every checked-in DSL upgrade pass this line.
+CUTE_VALIDATED_VERSION = Version("4.7.0")
+CUTE_MIN_VERSION = CUTE_VALIDATED_VERSION
+CUTE_TCGEN05_RUNTIME_N_PTX_VALIDATED_VERSION = CUTE_VALIDATED_VERSION
+
+
+@dataclass(frozen=True)
+class _CuteDSLVersionProbe:
+    version: Version | None = None
+    missing: bool = False
+    invalid: str | None = None
 
 
 @lru_cache(maxsize=1)
-def cute_math_min_max_available() -> bool:
-    """Return whether ``cute.math.min/max`` are available in this CuTe DSL."""
-    return (
-        Version(importlib.metadata.version("nvidia-cutlass-dsl"))
-        >= CUTE_MATH_MIN_MAX_VERSION
-    )
+def _installed_cute_dsl_version() -> _CuteDSLVersionProbe:
+    """Probe and cache the installed DSL version, including failure states."""
+    try:
+        return _CuteDSLVersionProbe(
+            version=Version(importlib.metadata.version("nvidia-cutlass-dsl"))
+        )
+    except importlib.metadata.PackageNotFoundError:
+        return _CuteDSLVersionProbe(missing=True)
+    except InvalidVersion as error:
+        return _CuteDSLVersionProbe(invalid=str(error))
+
+
+def tcgen05_runtime_n_ptx_compatible() -> bool:
+    """Whether the installed DSL matches the raw runtime-N PTX validation."""
+
+    installed = _installed_cute_dsl_version().version
+    if installed is None:
+        return False
+    return installed == CUTE_TCGEN05_RUNTIME_N_PTX_VALIDATED_VERSION
+
+
+@lru_cache(maxsize=1)
+def warn_tcgen05_runtime_n_ptx_fallback() -> None:
+    """Warn once when a grouped worklist needs the newer-DSL fallback.
+
+    This is intentionally separate from the side-effect-free compatibility
+    probe. Callers invoke the warning only after proving a grouped N,M worklist
+    candidate or selecting its explicit runtime-direct codegen path.
+    """
+
+    installed = _installed_cute_dsl_version().version
+    if installed is None:
+        return
+    if installed > CUTE_TCGEN05_RUNTIME_N_PTX_VALIDATED_VERSION:
+        log.warning(
+            "Installed nvidia-cutlass-dsl %s is newer than the exact %s version "
+            "validated for grouped tcgen05 runtime-N PTX. Grouped runtime-N "
+            "compiler seeds and promoted defaults are disabled; explicit "
+            "runtime-direct worklist configs fall back to typed static-width "
+            "MMA, including for ragged source-M tails. Use %s for the validated "
+            "narrow runtime-N path.",
+            installed,
+            CUTE_TCGEN05_RUNTIME_N_PTX_VALIDATED_VERSION,
+            CUTE_TCGEN05_RUNTIME_N_PTX_VALIDATED_VERSION,
+        )
 
 
 @lru_cache(maxsize=1)
@@ -31,18 +85,19 @@ def _cute_backend_requirement_error() -> str | None:
 
     Cached because the answer is fixed for the lifetime of the process.
     """
-    try:
-        installed_version = Version(importlib.metadata.version("nvidia-cutlass-dsl"))
-    except importlib.metadata.PackageNotFoundError:
+    probe = _installed_cute_dsl_version()
+    installed_version = probe.version
+    if probe.missing:
         return (
             "the CuTe DSL is not installed "
             f"(need nvidia-cutlass-dsl >= {CUTE_MIN_VERSION})"
         )
-    except InvalidVersion as e:
+    if probe.invalid is not None:
         return (
             "the installed CuTe DSL version is invalid "
-            f"(need >= {CUTE_MIN_VERSION}): {e}"
+            f"(need >= {CUTE_MIN_VERSION}): {probe.invalid}"
         )
+    assert installed_version is not None
     if installed_version < CUTE_MIN_VERSION:
         return (
             "the installed CuTe DSL is too old "

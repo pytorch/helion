@@ -11,6 +11,7 @@ import importlib.util
 import math
 import os
 import sys
+from typing import TYPE_CHECKING
 import unittest
 
 import pytest
@@ -27,6 +28,10 @@ from helion._testing import is_cuda
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfSharedMemoryLessThan
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _under_xdist() -> bool:
@@ -40,13 +45,18 @@ def _current_compute_capability() -> str | None:
         return None
 
 
+def _pretuned_kernel_directory(name: str) -> Path:
+    megakernel = PRETUNED_KERNELS_DIR / "megakernels" / name
+    return megakernel if megakernel.is_dir() else PRETUNED_KERNELS_DIR / name
+
+
 def _import_pretuned_kernel_module(name):
     # Flat private module name (no dotted parent package, which Helion's
     # global-scope resolution would try to import) avoids clashing with
     # ``examples/<name>.py``.
     module_name = f"_helion_pretuned_kernels_test_{name}"
     if module_name not in sys.modules:
-        file_path = PRETUNED_KERNELS_DIR / name / f"{name}.py"
+        file_path = _pretuned_kernel_directory(name) / f"{name}.py"
         spec = importlib.util.spec_from_file_location(module_name, file_path)
         assert spec is not None
         assert spec.loader is not None
@@ -56,6 +66,94 @@ def _import_pretuned_kernel_module(name):
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
     return sys.modules[module_name]
+
+
+def _import_pretuned_heuristic(name: str, compute: str = "sm100"):
+    module_name = f"_helion_pretuned_heuristic_test_{name}_{compute}"
+    if module_name not in sys.modules:
+        file_path = (
+            _pretuned_kernel_directory(name) / f"_helion_aot_{name}_cuda_{compute}.py"
+        )
+        spec = importlib.util.spec_from_file_location(module_name, file_path)
+        assert spec is not None
+        assert spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[module_name]
+
+
+@pytest.mark.parametrize("name", ("qwen3_decode_layer", "gemma4_a4b_moe"))
+def test_megakernel_aot_key_is_fixed_shape(name: str) -> None:
+    heuristic = _import_pretuned_heuristic(name)
+    signatures = heuristic._TENSOR_SIGNATURES
+    meta_device = torch.device("meta")
+    args = [
+        torch.empty(shape, dtype=dtype, device=meta_device)
+        for shape, dtype in signatures
+    ] + list(heuristic._STATIC_ARGS)
+    key = getattr(heuristic, f"key_{name}")
+    assert key(*args) == 0
+
+    for index, (shape, dtype) in enumerate(signatures):
+        for replacement in (
+            torch.empty((*shape, 1), dtype=dtype, device=meta_device),
+            torch.empty(shape, dtype=torch.float64, device=meta_device),
+        ):
+            changed = list(args)
+            changed[index] = replacement
+            with pytest.raises(ValueError):
+                key(*changed)
+
+    for index, value in enumerate(heuristic._STATIC_ARGS, start=len(signatures)):
+        changed = list(args)
+        changed[index] = value + 1
+        with pytest.raises(ValueError):
+            key(*changed)
+
+
+def test_pre_captured_graph_sweep_passes_resets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pretuned_kernels import _bench
+
+    batches: list[tuple[str, ...]] = []
+    reset_batches: list[tuple[object, ...] | None] = []
+
+    def timer(functions, rep, resets=None):
+        values = tuple(function() for function in functions)
+        batches.append(values)
+        reset_batches.append(None if resets is None else tuple(resets))
+        assert rep == 7
+        return [1.0 if value == "helion" else 2.0 for value in values]
+
+    def helion_reset() -> None:
+        pass
+
+    def baseline_reset() -> None:
+        pass
+
+    monkeypatch.setattr(_bench, "bench_pre_captured_cudagraphs", timer)
+    monkeypatch.setattr(_bench, "thermal_warmup", lambda _duration_ms: None)
+
+    metrics = _bench.run_sweep(
+        [None],
+        lambda _shape: (
+            lambda: "helion",
+            [("baseline", lambda: "baseline")],
+            "shape",
+        ),
+        use_cudagraph=False,
+        pre_captured_cudagraph=True,
+        make_resets=lambda _shape: (helion_reset, baseline_reset),
+        shape_header="shape",
+        rep=7,
+        verbose=False,
+    )
+
+    assert batches == [("helion", "baseline")]
+    assert reset_batches == [(helion_reset, baseline_reset)]
+    assert metrics["geomean"] == 2.0
 
 
 def _run_pretuned_kernel_main_and_parse_summary(name):
@@ -345,6 +443,12 @@ _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
     "fused_qk_norm_rope": {
         "sm90": ExpectedPerf(helion_wins=21, total=21, geomean=7.2, wins_slack=2),
     },
+    "qwen3_decode_layer": {
+        "sm100": ExpectedPerf(helion_wins=1, total=1, geomean=1.05, wins_slack=0),
+    },
+    "gemma4_a4b_moe": {
+        "sm100": ExpectedPerf(helion_wins=1, total=1, geomean=1.80, wins_slack=0),
+    },
 }
 
 # Geomean must stay within this fraction below expected. Catches regressions
@@ -392,6 +496,10 @@ class TestPretunedKernelsCorrectness(TestCase):
     def test_rope_bwd(self):
         self._run_correctness("rope_bwd")
 
+    @skipIfSharedMemoryLessThan(
+        147456,
+        reason="pretuned sm90 scaled_mm config exceeds device shared memory limit",
+    )
     def test_scaled_mm(self):
         if not is_cuda():
             self.skipTest("Pretuned kernels require CUDA / ROCm.")
@@ -447,10 +555,51 @@ class TestPretunedKernelsCorrectness(TestCase):
     def test_fused_qk_norm_rope(self):
         self._run_vllm_ported_correctness("fused_qk_norm_rope", needs_fp8=False)
 
+    @pytest.mark.timeout(300)
+    def test_qwen3_decode_layer(self):
+        if not is_cuda() or torch.cuda.get_device_capability() != (10, 0):
+            self.skipTest("qwen3_decode_layer is pretuned for NVIDIA SM100.")
+        module = _import_pretuned_kernel_module("qwen3_decode_layer")
+        if not module.has_vllm():
+            self.skipTest("qwen3_decode_layer correctness requires vLLM.")
+        module.correctness_check()
+
+    @pytest.mark.timeout(300)
+    def test_gemma4_a4b_moe(self):
+        if not is_cuda() or torch.cuda.get_device_capability() != (10, 0):
+            self.skipTest("gemma4_a4b_moe is pretuned for NVIDIA SM100.")
+        module = _import_pretuned_kernel_module("gemma4_a4b_moe")
+        if not module.has_vllm():
+            self.skipTest("gemma4_a4b_moe correctness requires vLLM.")
+        module.correctness_check()
+
 
 @onlyBackends(["cute"])
 @skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
 class TestPretunedCuteCodegen(TestCase):
+    def _run_tcgen05_fragment_epilogue_correctness(self, name: str) -> None:
+        if not is_cuda() or torch.cuda.get_device_capability() < (10, 0):
+            self.skipTest(f"{name} requires tcgen05 support (SM100+).")
+        module = _import_pretuned_kernel_module(name)
+        module.correctness_check()
+
+    def test_projection_rotary(self) -> None:
+        self._run_tcgen05_fragment_epilogue_correctness("projection_rotary")
+
+    def test_interleaved_swiglu(self) -> None:
+        self._run_tcgen05_fragment_epilogue_correctness("interleaved_swiglu")
+
+    def test_tcgen05_fragment_epilogues_are_registered_for_b200(self) -> None:
+        path = PRETUNED_KERNELS_DIR / "run.py"
+        spec = importlib.util.spec_from_file_location("_pretuned_runner", path)
+        assert spec is not None and spec.loader is not None
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        for name in ("projection_rotary", "interleaved_swiglu"):
+            with self.subTest(name=name):
+                self.assertIn(name, runner.KERNELS)
+                self.assertEqual(runner._supported_hardware(name), {"b200"})
+
     def test_scale_mm_pretuned_explicit_epilogue_configs(self) -> None:
         path = (
             PRETUNED_KERNELS_DIR
@@ -875,6 +1024,20 @@ class TestPretunedKernelsPerformance(TestCase):
     @pytest.mark.timeout(600)
     def test_fused_qk_norm_rope(self):
         self._run_pretuned_kernel_perf("fused_qk_norm_rope")
+
+    @pytest.mark.timeout(600)
+    def test_qwen3_decode_layer(self):
+        module = _import_pretuned_kernel_module("qwen3_decode_layer")
+        if not module.has_vllm():
+            self.skipTest("qwen3_decode_layer performance requires vLLM.")
+        self._run_pretuned_kernel_perf("qwen3_decode_layer")
+
+    @pytest.mark.timeout(600)
+    def test_gemma4_a4b_moe(self):
+        module = _import_pretuned_kernel_module("gemma4_a4b_moe")
+        if not module.has_vllm():
+            self.skipTest("gemma4_a4b_moe performance requires vLLM.")
+        self._run_pretuned_kernel_perf("gemma4_a4b_moe")
 
 
 if __name__ == "__main__":

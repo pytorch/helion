@@ -283,8 +283,10 @@ class TestCuteFMAScaleHoist(TestCase):
         self.assertNotIn("v_10 = v_9 - mi", code)
         # Same for the inner reduce V-loop ``v_6 = v_5 - v_1``.
         self.assertNotIn("v_6 = v_5 - v_1", code)
-        # But statements that ARE read MUST NOT be DCE'd.
-        self.assertIn("di = v_4 + sum_1", code)
+        # But statements that ARE read MUST NOT be DCE'd (the surviving
+        # ``di = v_4 + sum_1`` update is subsequently contracted by the
+        # fuse_fma pass into a single FMA).
+        self.assertIn("di = cute.math.fma(di, v_3, sum_1)", code)
 
     def test_invariance_canonicalization_does_not_break_consume(self) -> None:
         """The pass must use the post-rename canonical name map for

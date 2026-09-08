@@ -129,6 +129,8 @@ class APIFunc(Protocol):
             tracing and compilation.
         _prepare_args: A callable that preprocesses the arguments before they're
             passed to the actual function implementation.
+        _post_create_proxy: An optional callback invoked with the newly created FX
+            node and prepared arguments.
         _get_masked_value: A callable that retrieves the masked value for a node,
         _signature: The function signature for binding and validating arguments.
     """
@@ -144,6 +146,7 @@ class APIFunc(Protocol):
     _codegen: CodegenDict
     _fake_fn: Callable[..., object] | None
     _prepare_args: Callable[[tuple[object, ...]], tuple[object, ...]]
+    _post_create_proxy: Callable[..., None] | None
     _get_masked_value: Callable[[torch.fx.Node], float | bool | None] | None
     _to_device_ir: Callable[..., object] | None
     _allow_host_tensor: bool
@@ -240,6 +243,8 @@ def api(
                         wrapper,
                         *args_to_proxies(tracer, flat_args, {}),
                     )
+                    if api._post_create_proxy is not None:
+                        api._post_create_proxy(proxy_out.node, *flat_args)
                     assert api._fake_fn is not None
                     out = api._fake_fn(*flat_args)
                     proxy_tensor.track_tensor_tree(
@@ -260,6 +265,7 @@ def api(
         api._type_function = None
         api._codegen = CodegenDict()
         api._fake_fn = None
+        api._post_create_proxy = None
         api._get_masked_value = None
         api._to_device_ir = None
         api._allow_host_tensor = allow_host_tensor
@@ -319,6 +325,23 @@ def prepare_args(
             f"{type_propagation.__qualname__} can only be used on API functions"
         )
         original_fn._prepare_args = prep_fn
+        return _no_call
+
+    # pyrefly: ignore [bad-return]
+    return _impl
+
+
+def post_create_proxy(
+    original_fn: Callable[..., object],
+) -> _NoReturnDecorator[None]:
+    """Register a callback that annotates an API call's newly created FX node."""
+
+    def _impl(callback: Callable[..., None]) -> Callable[..., Never]:
+        assert is_api_func(original_fn), (
+            f"{post_create_proxy.__qualname__} can only be used on API functions"
+        )
+        assert original_fn._post_create_proxy is None
+        original_fn._post_create_proxy = callback
         return _no_call
 
     # pyrefly: ignore [bad-return]

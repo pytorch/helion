@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import sympy
 import torch
 from torch._inductor.codegen.simd import constant_repr
 from torch._inductor.runtime.runtime_utils import next_power_of_2
@@ -11,6 +12,8 @@ from .._compiler.ast_extension import ExtendedAST
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import AutoSize
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.compile_environment import ConfigValueExpression
+from .._compiler.compile_environment import _symint_expr
 from .._compiler.type_info import TileIndexType
 from .._compiler.type_info import TypeInfo
 from .._compiler.type_info import _to_proxy
@@ -48,7 +51,8 @@ def register_block_size(min_or_max: int, max_or_none: int | None = None, /) -> i
         hl.register_block_size(min, max)
 
     Where min and max are integers that control the range of block_sizes searched by
-    the autotuner.  Max may be a symbolic shape, but min must be a constant integer.
+    the autotuner.  Both may be symbolic shapes, in which case their size hints are
+    used to bound the search.
     """
     raise exc.NotInsideKernel
 
@@ -74,11 +78,16 @@ def _(
         raise exc.IncorrectTileUsage(
             f"expected max to be an integer or size, got {max_proxy!s}"
         )
-    if not isinstance(min_proxy, int):
+    if not isinstance(min_proxy, (int, torch.SymInt)):
         raise exc.IncorrectTileUsage(
-            f"expected min to be an integer constant, got {min_proxy!s}"
+            f"expected min to be an integer or size, got {min_proxy!s}"
         )
     env = CompileEnvironment.current()
+    # Host scalars (globals, int arguments, `*args` unpacked from a tuple) are
+    # faked into SymInts during type propagation, so min may arrive symbolic even
+    # when the user wrote a constant.  Both bounds only shape the autotuner search
+    # space, so resolve them to hints the same way.
+    min_proxy = env.size_hint(min_proxy)
     existing_block_id = (
         env.get_block_id(max_proxy) if isinstance(max_proxy, torch.SymInt) else None
     )
@@ -178,7 +187,18 @@ def _register_tunable_type(
     python_type = type(fragment_val.default())
     if not issubclass(python_type, (int, float, bool)):
         raise exc.TunableTypeNotSupported(python_type)
-    return NumericType.subtype(python_type).new_unbacked(origin)
+    result = NumericType.subtype(python_type).new_unbacked(origin)
+    # Codegen uses this provenance to annotate device arguments as constexpr.
+    for symbol in result.value._sympy_().free_symbols:
+        assert isinstance(symbol, sympy.Symbol)
+        env.tunable_symbols.add(symbol)
+    if isinstance(result.value, torch.SymInt):
+        expr = _symint_expr(result.value)
+        if expr is not None:
+            env.config_value_expressions[expr] = ConfigValueExpression(
+                "config", (name_val,)
+            )
+    return result
 
 
 @_decorators.codegen(register_tunable, "common")

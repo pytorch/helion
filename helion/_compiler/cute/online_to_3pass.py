@@ -753,16 +753,20 @@ class _OnlineToThreePassTransformer(ast.NodeTransformer):
 
 def _min_n_for_rewrite() -> int:
     """The reduction-axis extent (``N``) at or above which the 3-pass form
-    is profitable.  Defaults to 2048; set ``HELION_ONLINE_TO_3PASS_MIN_N``
-    to override (e.g. ``0`` to always fire, useful for A/B tests).
+    is profitable.  Defaults to 0 (always rewrite): with the lane-reduce
+    collapse (one grouped reduce per sweep) and cross-sweep load fusion,
+    the 3-pass form beats the online merge even at N=1024 on B200
+    (measured +10% on both the warp-looped and resident-row config
+    families).  Set ``HELION_ONLINE_TO_3PASS_MIN_N`` to override (useful
+    for A/B tests).
     """
     val = os.environ.get("HELION_ONLINE_TO_3PASS_MIN_N")
     if val is None:
-        return 2048
+        return 0
     try:
         return int(val)
     except ValueError:
-        return 2048
+        return 0
 
 
 def _reduction_axis_extent(func: HostFunction) -> int | None:

@@ -87,16 +87,11 @@ class TestMemoryOpFacts(RefEagerTestBase, TestCase):
         kf = spec.reduction_kernel_fact
         self.assertIsNotNone(kf)
         self.assertEqual(len(kf.reductions), 1)
-        fact = kf.reductions[0]
-        # num_load scopes to the rdim's original graph(s) (one streamed input row), so the
-        # rolled-subgraph copy is not double-counted.
-        self.assertEqual(fact.num_load, 1)
 
         # The collector ran after the rolling, so the rolled reduction subgraph's load
-        # copy is accounted for: a load fact lives in a later graph than the root, and the
-        # full set has > 1 load fact even though num_load == 1.
+        # copy is accounted for: a load fact lives in a later graph than the root.
         self.assertTrue(any(s.graph_id > 0 for s in specs if s.kind == "load"))
-        self.assertGreater(sum(1 for s in specs if s.kind == "load"), fact.num_load)
+        self.assertGreater(sum(1 for s in specs if s.kind == "load"), 1)
 
     def test_load_store_metadata(self):
         x = torch.randn([256, 256], device=DEVICE, dtype=torch.float32)

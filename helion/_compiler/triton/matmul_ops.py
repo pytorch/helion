@@ -67,6 +67,8 @@ def _(state: CodegenState) -> object:
     acc_arg = None if is_acc_none else acc_ast
     acc_dtype_arg = acc_dtype if not is_acc_none else None
 
+    lhs_fx_node = state.fx_node.args[0] if state.fx_node is not None else None
+
     # Perform dot with optional padding
     return emit_tl_dot_with_padding(
         lhs_ast,
@@ -79,6 +81,7 @@ def _(state: CodegenState) -> object:
         rhs_shape=rhs_shape,
         acc_shape=acc_shape,
         out_dtype=out_dtype,
+        lhs_fx_node=lhs_fx_node if isinstance(lhs_fx_node, torch.fx.Node) else None,
     )
 
 

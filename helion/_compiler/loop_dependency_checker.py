@@ -1,13 +1,9 @@
 from __future__ import annotations
 
-import itertools
+import ast
 from typing import TYPE_CHECKING
 
-from .. import exc
-from .ast_read_writes import ReadWrites
-
 if TYPE_CHECKING:
-    import ast
     from collections.abc import Callable
 
     from .device_ir import GraphInfo
@@ -17,8 +13,147 @@ if TYPE_CHECKING:
 INTRA_LOOP_RAW_BARRIER_META = "_needs_debug_barrier_before"
 
 
+def collect_host_tensor_aliases(body: list[ast.stmt]) -> dict[str, str]:
+    """Collect conservative base-storage aliases from host-wrapper statements."""
+    aliases: dict[str, str] = {}
+    for stmt in body:
+        if not isinstance(stmt, ast.For):
+            _update_host_aliases(stmt, aliases)
+    return aliases
+
+
+def canonical_host_tensor_name(name: str, aliases: dict[str, str]) -> str:
+    """Resolve ``name`` through aliases collected by collect_host_tensor_aliases."""
+    return _canonical_alias(name, aliases)
+
+
+_ALIAS_PRESERVING_METHODS = frozenset(
+    {
+        "as_strided",
+        "detach",
+        "expand",
+        "flatten",
+        "movedim",
+        "narrow",
+        "permute",
+        "reshape",
+        "select",
+        "squeeze",
+        "swapaxes",
+        "swapdims",
+        "transpose",
+        "unbind",
+        "unflatten",
+        "unsqueeze",
+        "view",
+    }
+)
+
+
+def _canonical_alias(name: str, aliases: dict[str, str]) -> str:
+    """Resolve a host name to the base storage name tracked by the analysis."""
+    path: list[str] = []
+    while (base := aliases.get(name)) is not None and base != name:
+        path.append(name)
+        name = base
+    for alias in path:
+        aliases[alias] = name
+    return name
+
+
+def _alias_base_name(expr: ast.expr, aliases: dict[str, str]) -> str | None:
+    """Return the conservative base name for a host-side tensor alias expression.
+
+    Basic slicing and the standard view-like tensor methods preserve storage.
+    Treating an advanced-indexing subscript as an alias is conservative: it can
+    add a dependency but cannot remove one.
+    """
+    if isinstance(expr, ast.Name):
+        return _canonical_alias(expr.id, aliases)
+    if isinstance(expr, ast.Subscript):
+        return _alias_base_name(expr.value, aliases)
+    if isinstance(expr, ast.Attribute) and expr.attr in {"T", "mT", "data"}:
+        return _alias_base_name(expr.value, aliases)
+    if isinstance(expr, ast.Call):
+        if (
+            isinstance(expr.func, ast.Attribute)
+            and isinstance(expr.func.value, ast.Name)
+            and expr.func.value.id == "torch"
+            and expr.func.attr in _ALIAS_PRESERVING_METHODS
+            and expr.args
+        ):
+            return _alias_base_name(expr.args[0], aliases)
+        if (
+            isinstance(expr.func, ast.Attribute)
+            and expr.func.attr in _ALIAS_PRESERVING_METHODS
+        ):
+            return _alias_base_name(expr.func.value, aliases)
+    return None
+
+
+def _target_names(target: ast.expr) -> tuple[str, ...]:
+    if isinstance(target, ast.Name):
+        return (target.id,)
+    if isinstance(target, (ast.List, ast.Tuple)):
+        return tuple(name for element in target.elts for name in _target_names(element))
+    return ()
+
+
+def _update_alias_target(
+    target: ast.expr,
+    value: ast.expr,
+    aliases: dict[str, str],
+) -> None:
+    """Apply one host assignment to the conservative storage-alias map."""
+    if isinstance(target, ast.Name):
+        base = _alias_base_name(value, aliases)
+        if base is None:
+            aliases.pop(target.id, None)
+        else:
+            aliases[target.id] = base
+        return
+
+    if not isinstance(target, (ast.List, ast.Tuple)):
+        return
+
+    # Pairwise tuple/list assignment preserves the more precise base for each
+    # element.  Calls such as ``q, k, v = qkv.unbind(0)`` return multiple views
+    # of one storage, so every unpacked name conservatively aliases the call's
+    # receiver even though the RHS is not an AST tuple.
+    if isinstance(value, (ast.List, ast.Tuple)) and len(target.elts) == len(value.elts):
+        for target_element, value_element in zip(target.elts, value.elts, strict=True):
+            _update_alias_target(target_element, value_element, aliases)
+        return
+
+    base = _alias_base_name(value, aliases)
+    for name in _target_names(target):
+        if base is None:
+            aliases.pop(name, None)
+        else:
+            aliases[name] = base
+
+
+def _update_host_aliases(stmt: ast.stmt, aliases: dict[str, str]) -> None:
+    """Update base-storage aliases from a host-wrapper assignment."""
+    value: ast.expr | None = None
+    targets: tuple[ast.expr, ...] = ()
+    if isinstance(stmt, ast.Assign):
+        targets = tuple(stmt.targets)
+        value = stmt.value
+    elif isinstance(stmt, ast.AnnAssign):
+        targets = (stmt.target,)
+        value = stmt.value
+    if value is None:
+        return
+    for target in targets:
+        _update_alias_target(target, value, aliases)
+
+
 def mark_intra_loop_raw_barriers(
-    graphs: list[GraphInfo], root_graph_ids: list[int]
+    graphs: list[GraphInfo],
+    root_graph_ids: list[int],
+    *,
+    mark_in_divergent_control_flow: bool = True,
 ) -> None:
     """Mark loads that read storage written earlier in a device-loop body.
 
@@ -33,20 +168,34 @@ def mark_intra_loop_raw_barriers(
     guarantee to a store->load *within* one loop body.
 
     We mark the load's FX node; the Triton ``load`` codegen emits a
-    ``tl.debug_barrier()`` before it. The barrier flushes every prior write in the
+    ``tl.debug_barrier()`` before it (the CuTe codegen a
+    ``cute.arch.sync_threads()``). The barrier flushes every prior write in the
     block, so once emitted the pending-write set is cleared and later loads need a
     new store to re-arm. Storage identity comes from the fake tensor's underlying
     storage, so distinct FX nodes for aliases and views compare equal. The walk
     follows Helion control-flow subgraphs and merges pending writes at joins.
+
+    ``mark_in_divergent_control_flow=False`` skips marking loads inside ``hl.if``
+    / while bodies: a CuTe SIMT branch condition can vary per thread, and a
+    convergent CTA barrier inside a divergent branch deadlocks.  Loop bodies stay
+    markable — Helion device-loop trip structure is uniform across the CTA.
     """
-    marker = _IntraLoopRawBarrierMarker(graphs)
+    marker = _IntraLoopRawBarrierMarker(
+        graphs, mark_in_divergent_control_flow=mark_in_divergent_control_flow
+    )
     for graph_id in root_graph_ids:
         marker.run_graph(graph_id, set())
 
 
 class _IntraLoopRawBarrierMarker:
-    def __init__(self, graphs: list[GraphInfo]) -> None:
+    def __init__(
+        self,
+        graphs: list[GraphInfo],
+        *,
+        mark_in_divergent_control_flow: bool = True,
+    ) -> None:
         self.graphs = graphs
+        self.mark_in_divergent_control_flow = mark_in_divergent_control_flow
 
     def _storage_ids(self, graph_id: int, obj: object) -> set[int]:
         import torch
@@ -79,7 +228,9 @@ class _IntraLoopRawBarrierMarker:
             result.update(self._storage_ids(graph_id, arg))
         return result
 
-    def run_graph(self, graph_id: int, written: set[int]) -> set[int]:
+    def run_graph(
+        self, graph_id: int, written: set[int], *, divergent: bool = False
+    ) -> set[int]:
         from ..language import memory_ops
         from ..language._tracing_ops import _for_loop
         from ..language._tracing_ops import _for_loop_step
@@ -100,6 +251,10 @@ class _IntraLoopRawBarrierMarker:
                 if node.meta.get(INTRA_LOOP_RAW_BARRIER_META):
                     pending.clear()
                 elif pending & self._storage_ids(graph_id, node.args[0]):
+                    if divergent and not self.mark_in_divergent_control_flow:
+                        # Cannot place a convergent barrier here; leave the
+                        # hazard pending so a later uniform load re-arms it.
+                        continue
                     node.meta[INTRA_LOOP_RAW_BARRIER_META] = True
                     pending.clear()
                 continue
@@ -108,7 +263,7 @@ class _IntraLoopRawBarrierMarker:
                 assert isinstance(if_graph_id, int)
                 if_info = self.graphs[if_graph_id]
                 assert isinstance(if_info, IfGraphInfo)
-                if_pending = self.run_graph(if_graph_id, pending)
+                if_pending = self.run_graph(if_graph_id, pending, divergent=True)
                 if if_info.else_branch is None:
                     pending |= if_pending
                 else:
@@ -117,7 +272,9 @@ class _IntraLoopRawBarrierMarker:
                         if isinstance(if_info.else_branch, int)
                         else if_info.else_branch.graph_id
                     )
-                    else_pending = self.run_graph(else_graph_id, pending)
+                    else_pending = self.run_graph(
+                        else_graph_id, pending, divergent=True
+                    )
                     pending = if_pending | else_pending
                 continue
             if node.target in (_for_loop, _for_loop_step):
@@ -126,7 +283,9 @@ class _IntraLoopRawBarrierMarker:
                 loop_info = self.graphs[loop_graph_id]
                 assert isinstance(loop_info, ForLoopGraphInfo)
                 loop_input = set() if loop_info.needs_barrier_before else pending
-                loop_pending = self.run_graph(loop_graph_id, loop_input)
+                loop_pending = self.run_graph(
+                    loop_graph_id, loop_input, divergent=divergent
+                )
                 # Without a pre-loop barrier, zero iterations preserve the input state.
                 pending = (
                     loop_pending
@@ -139,8 +298,12 @@ class _IntraLoopRawBarrierMarker:
                 assert isinstance(body_graph_id, int)
                 body_info = self.graphs[body_graph_id]
                 assert isinstance(body_info, WhileLoopGraphInfo)
-                condition_pending = self.run_graph(body_info.cond_graph_id, pending)
-                body_pending = self.run_graph(body_graph_id, condition_pending)
+                condition_pending = self.run_graph(
+                    body_info.cond_graph_id, pending, divergent=True
+                )
+                body_pending = self.run_graph(
+                    body_graph_id, condition_pending, divergent=True
+                )
                 # The condition executes at least once; the body may not execute.
                 pending = condition_pending | body_pending
         return pending
@@ -160,51 +323,3 @@ def needs_inter_loop_debug_barrier_for_global_raw(
     """
     cur_global_reads = global_barrier_tensor_names(host_loop_reads)
     return bool(prev_global_writes & cur_global_reads)
-
-
-class LoopDependencyChecker:
-    """
-    A class to check dependencies between top-level for loops in a Helion kernel.
-
-    This class tracks memory accesses (reads and writes) for each top-level for loop
-    and raises an error if a later loop reads or writes to anything written in a
-    previous loop.
-    """
-
-    def __init__(self) -> None:
-        self.reads: set[str] = set()
-        self.writes: set[str] = set()
-        self._barrier_after_root: set[int] = set()
-        self._root_counter: int = 0
-        self.disabled: bool = False
-
-    def insert_barrier_after_root(self, root_id: int) -> None:
-        """Record that a barrier separates root_id and root_id+1."""
-        self._barrier_after_root.add(root_id)
-
-    def register_loop(self, loop_node: ast.For, root_id: int | None = None) -> None:
-        if self.disabled:
-            return
-        current_root = root_id if root_id is not None else self._root_counter
-        if (current_root - 1) in self._barrier_after_root:
-            self.reads.clear()
-            self.writes.clear()
-            self._barrier_after_root.discard(current_root - 1)
-        rw = ReadWrites.from_list(loop_node.body)
-
-        self._check_dependencies(rw)
-
-        self.reads |= set(rw.reads)
-        self.writes |= set(rw.writes)
-        self._root_counter = current_root + 1
-
-    def _check_dependencies(self, rw: ReadWrites) -> None:
-        """
-        Check for dependencies between the current loop and previous loops.
-
-        Raises:
-            exc.LoopDependencyError: If a dependency is detected
-        """
-        for name in sorted(itertools.chain(rw.reads, rw.writes)):
-            if name in self.writes:
-                raise exc.LoopDependencyError(name)

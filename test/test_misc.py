@@ -35,6 +35,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 from helion.runtime.settings import _get_backend
@@ -721,16 +722,55 @@ class TestMisc(RefEagerTestBase, TestCase):
     def test_sequence_assert(self, static_shapes):
         @helion.kernel(static_shapes=static_shapes)
         def kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-            assert a.size() == b.size()
+            assert a.shape == b.shape
             out = torch.empty_like(a)
 
             for tile in hl.tile(a.size()):
-                out[tile] = a[tile] + b[tile]
+                out[tile] = a[tile] + b[tile] + b.size(0) + b.size(1)
             return out
 
-        a = torch.randn(16, 1, device=DEVICE)
-        code, result = code_and_output(kernel, (a, a))
-        torch.testing.assert_close(result, a + a)
+        a = torch.randn(16, 8, device=DEVICE)
+        b = torch.randn_like(a)
+        code, result = code_and_output(kernel, (a, b))
+        torch.testing.assert_close(result, a + b + sum(b.shape))
+
+        if (
+            not static_shapes
+            and _get_backend() == "triton"
+            and not self._in_ref_eager_mode
+        ):
+            self.assertIn("a_size_0", code)
+            self.assertNotIn("b_size_", code)
+            bound = kernel.bind((a, b))
+            compiled = bound.compile_config(bound.config_spec.default_config())
+            with self.assertRaises(AssertionError):
+                compiled(a, torch.randn(16, 7, device=DEVICE))
+
+    def test_size_assert_unifies_symbols(self):
+        @helion.kernel(static_shapes=False)
+        def kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            # Equality expressions in messages and nested asserts must not unify.
+            assert a.size(0) == b.size(1), a.size(1) == b.size(0)
+            if a.size(0) > 0:
+                assert a.size(1) == b.size(0)
+            out = torch.empty_like(a)
+
+            for tile in hl.tile((b.size(1), a.size(1))):
+                out[tile] = a[tile] + a.size(0) + b.size(0) + b.size(1)
+            return out
+
+        a = torch.randn(16, 8, device=DEVICE)
+        b = torch.randn(8, 16, device=DEVICE)
+        code, result = code_and_output(kernel, (a, b), block_size=[8, 8])
+        torch.testing.assert_close(
+            result,
+            a + a.size(0) + b.size(0) + b.size(1),
+        )
+
+        if _get_backend() == "triton":
+            self.assertIn("a_size_0", code)
+            self.assertNotIn("b_size_1", code)
+            self.assertIn("b_size_0", code)
 
     @skipIfRefEager("no code execution")
     def test_triton_repro_add(self):
@@ -1067,6 +1107,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         if _get_backend() == "triton":
             self.assertIn("tl.associative_scan", code)
 
+    @skipIfXPU("Triton topk produces incorrect values on XPU")
     def test_torch_topk_in_kernel(self):
         """Test that torch.topk works inside Helion kernels.
 
@@ -1097,6 +1138,7 @@ class TestMisc(RefEagerTestBase, TestCase):
             # Uses tl.topk for largest=True
             self.assertIn("tl.topk", code)
 
+    @skipIfXPU("Triton sort produces incorrect values on XPU")
     def test_torch_topk_smallest(self):
         """Test torch.topk with largest=False (k smallest elements)."""
 

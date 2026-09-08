@@ -111,7 +111,7 @@ jobs:
 
           # On OSDC, route through the pypi-cache /whl proxy (deps stay reachable behind the egress firewall) and clear the cache index vars so it wins over the cache default; off OSDC PYPI_CACHE_WHL_URL is unset so we hit download.pytorch.org.
           PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
-          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "torch==2.11.*" --index-url "${PYTORCH_INDEX%/whl/*}/whl/${{ inputs.runtime-version }}"
+          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "torch==2.13.*" --index-url "${PYTORCH_INDEX%/whl/*}/whl/${{ inputs.runtime-version }}"
 
       - name: Install Helion
         run: |
@@ -175,10 +175,8 @@ jobs:
           set -x
           source .venv/bin/activate
           uv pip install pip
-          # Newer FLA allows gated backward on Hopper with Triton 3.7.1+;
-          # torch 2.12.1 provides that Triton version.
-          PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
-          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "torch==2.12.1" --index-url "${PYTORCH_INDEX%/whl/*}/whl/${{ inputs.runtime-version }}"
+          # PyTorch 2.13 provides Triton 3.7.1+, which enables gated backward
+          # on Hopper in newer FLA releases.
           uv pip install einops transformers
           uv pip install "git+https://github.com/fla-org/flash-linear-attention@6bd90692588c81fe102ee6e12ac70686359658a2" --no-deps
           python -c "from packaging.version import Version; import torch, triton; print('torch', torch.__version__, 'triton', triton.__version__); assert torch.cuda.is_available(); assert Version(triton.__version__) >= Version('3.7.1'), triton.__version__"

@@ -279,8 +279,13 @@ class TestEpilogueSubtiling(TestCase):
         _, out_s4 = code_and_output(
             matmul_with_bias, args, block_sizes=[64, 64, 64], epilogue_subtile=4
         )
-        torch.testing.assert_close(out_none, out_s2, atol=1e-5, rtol=1e-5)
-        torch.testing.assert_close(out_none, out_s4, atol=1e-5, rtol=1e-5)
+        # The subtile variants must agree bit-tightly with each other: subtiling
+        # only splits the store. The no-subtile config may take a different MMA
+        # lowering (on cute, fp32 without epilogue_subtile runs tcgen05 as tf32
+        # while subtile configs keep the exact SIMT lowering), so it is compared
+        # at tf32-friendly tolerance instead.
+        torch.testing.assert_close(out_s2, out_s4, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(out_none, out_s2, atol=1e-1, rtol=1e-2)
 
     @onlyBackends("triton")
     @skipIfRefEager("test checks generated backend code")

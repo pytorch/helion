@@ -1,15 +1,36 @@
 # ruff: noqa: ANN401, E402
-"""Compare Helion with CUTLASS CuTeDSL grouped GEMM.
+"""Compare Helion grouped GEMM with reproducible backend baselines.
 
-The comparison is intentionally narrow: FP16 NT grouped GEMM, a 128x64 MMA
-tile, a 1x1 cluster, and seven CUTLASS-example-derived heterogeneous validation
-cases (3--4 GEMMs, including M/N tails). Every case runs in a fresh subprocess
-with fresh compiler caches. Both implementations consume the same A/B tensors,
+``--provider-defaults`` runs the fixed BF16 publication protocol against
+DeepGEMM, QuACK, cuDNN, cuBLASLt, and CUTLASS. Use
+``--provider-defaults-plan`` to inspect that protocol without a GPU.
+CUTLASS has no ranked public default, so its adapter tunes every supported
+public-registry operator before the final paired measurement. Dependency
+versions follow Helion's validated project pins.
+
+Inspect or run the fixed protocol::
+
+    python benchmarks/cute/compare_grouped_gemm_backends.py \
+      --provider-defaults-plan
+
+    CUDA_VISIBLE_DEVICES=0 python \
+      benchmarks/cute/compare_grouped_gemm_backends.py \
+      --provider-defaults \
+      --provider-output-dir /path/to/results \
+      --provider-deepgemm-root /path/to/DeepGEMM \
+      --provider-quack-root /path/to/quack \
+      --provider-cutlass-root /path/to/cutlass
+
+The original CUTLASS comparison remains available without either provider
+flag. It is intentionally narrow: FP16 NT grouped GEMM, a 128x64 MMA tile, a
+1x1 cluster, and seven CUTLASS-example-derived heterogeneous validation cases
+(3--4 GEMMs, including M/N tails). Every case runs in a fresh subprocess with
+fresh compiler caches. Both implementations consume the same A/B tensors,
 write the same output buffers sequentially, and are timed through the shared
 cold-L2 CUDA graph-replay timer. The comparison times only device work, with
 every pointer table initialized before graph capture.
 
-Use ``grouped_gemm.py`` from NVIDIA/cutlass commit
+For the original mode, use ``grouped_gemm.py`` from NVIDIA/cutlass commit
 ``db1c288993354c88e551c40c19a8fb93a774a241``::
 
     CUDA_VISIBLE_DEVICES=0 python benchmarks/cute/compare_grouped_gemm_backends.py \
@@ -44,9 +65,36 @@ if TYPE_CHECKING:
 hl: Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
+
+
+def _prioritize_repo_root() -> None:
+    repo_path = str(REPO_ROOT)
+
+    def is_competing_checkout(entry: str) -> bool:
+        root = Path(entry).resolve()
+        return root != REPO_ROOT and any(
+            (root / relative).is_file()
+            for relative in (
+                "benchmarks/__init__.py",
+                "pretuned_kernels/__init__.py",
+                "benchmarks/cute/grouped_gemm_provider_campaign.py",
+            )
+        )
+
+    sys.path[:] = [
+        entry
+        for entry in sys.path
+        if entry != repo_path and not is_competing_checkout(entry)
+    ]
+    sys.path.insert(0, repo_path)
+
+
+if __name__ == "__main__":
+    _prioritize_repo_root()
+elif str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from benchmarks.cute.grouped_gemm_workloads import PROVIDER_CLI_MODES
 from pretuned_kernels._bench import bench_pre_captured_cudagraphs
 from pretuned_kernels._bench import thermal_warmup
 
@@ -791,8 +839,13 @@ def _run_all(args: argparse.Namespace) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] in PROVIDER_CLI_MODES:
+        from benchmarks.cute import grouped_gemm_provider_campaign
+
+        return grouped_gemm_provider_campaign.main(arguments)
     parser = _parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(arguments)
     args.out_dir = args.out_dir.expanduser().resolve()
     if args.list_cases:
         cases = _selected_cases(args)

@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
     from ...runtime.settings import DotPrecision
+    from ..aten_lowering import Lowering
     from ..device_function import Argument
     from ..device_ir import GraphInfo
     from ..host_function import HostFunction
@@ -112,6 +113,7 @@ _TORCH_TO_JAX_DTYPE: dict[str, str] = {
     "torch.float8_e5m2": "jnp.float8_e5m2",
     "torch.float8_e5m2fnuz": "jnp.float8_e5m2fnuz",
     "torch.float8_e8m0fnu": "jnp.float8_e8m0fnu",
+    "torch.float4_e2m1fn_x2": "jnp.float4_e2m1fn",
 }
 
 
@@ -193,6 +195,20 @@ class PallasBackend(Backend):
         if key not in _TORCH_TO_JAX_DTYPE:
             raise ValueError(f"Unsupported dtype for Pallas backend: {dtype}")
         return _TORCH_TO_JAX_DTYPE[key]
+
+    def normalize_input_fake_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Trace packed FP4 inputs with their logical JAX shape.
+
+        Torch stores two E2M1 values in each element of
+        ``float4_e2m1fn_x2``, while TorchTPU presents those values to Pallas as
+        two separate elements on the last axis.  Matching that logical shape
+        during Helion tracing keeps indexing, tiling, and matmul dimensions in
+        the same coordinate system as the generated Pallas program.
+        """
+        if tensor.dtype != torch.float4_e2m1fn_x2 or tensor.ndim == 0:
+            return tensor
+        logical_shape = (*tensor.shape[:-1], tensor.shape[-1] * 2)
+        return torch.empty(logical_shape, dtype=tensor.dtype, device=tensor.device)
 
     def acc_type(self, dtype: torch.dtype) -> str:
         # Promote half-precision types to float32 for numerical stability
@@ -294,6 +310,7 @@ class PallasBackend(Backend):
             "pallas_worklist_grouping",
             "pallas_loop_type",
             "pallas_load_buffer_count",
+            "pallas_indirect_access_mode",
             "pallas_pre_broadcast",
         }
     )
@@ -358,9 +375,15 @@ class PallasBackend(Backend):
         tensor_host_args: list[str],
     ) -> str:
         from ..device_function import SymbolArgument
+        from ..device_function import TensorArg
         from ..device_function import TensorSizeArg
         from ..device_function import TensorStrideArg
 
+        if isinstance(arg, TensorArg) and arg.fake_value.ndim == 0:
+            # Mosaic requires every Pallas input to have rank >= 1. Preserve a
+            # host scalar tensor as a one-element input; its device users load
+            # element zero explicitly.
+            return f"{host_str}.reshape(1)"
         if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
             from ..compile_environment import CompileEnvironment
 
@@ -1481,6 +1504,13 @@ class PallasBackend(Backend):
             return self.default_launcher_name
         return self.build_launcher_name(device_fn.config)
 
+    def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
+        from .aten_lowering import cat_lowering_pallas
+
+        if node.target is torch.ops.aten.cat.default:
+            return cat_lowering_pallas
+        return None
+
     def pre_codegen(
         self,
         graphs: list[GraphInfo],
@@ -1503,6 +1533,9 @@ class PallasBackend(Backend):
 
         env = CompileEnvironment.current()
 
+        from .internal_scratch import plan_internal_remote_scratch
+
+        plan_internal_remote_scratch()
         plan_tiling(graphs, config, tile_strategy)
         build_tensorcore_plans(graphs, config)
 
@@ -1523,6 +1556,10 @@ class PallasBackend(Backend):
 
         if grouping in (1, 2):
             self._setup_compact_worklist(graphs, config)
+
+        from .tracing_ops import plan_grid_indirect_accesses
+
+        plan_grid_indirect_accesses(graphs)
 
         from .view_ops import plan_resident_ref_views
 
@@ -1598,9 +1635,7 @@ class PallasBackend(Backend):
             from ...runtime.pallas.launcher import _get_vmem_limit_bytes
             from .compact_worklist import build_resident_cache_admission
 
-            # Choose C from the conservative device-reported VMEM budget. The
-            # higher Mosaic compile ceiling used by the runtime is not an
-            # allocation budget.
+            # Choose C from the conservative device-reported VMEM budget.
             admission = build_resident_cache_admission(
                 graphs,
                 plan,

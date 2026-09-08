@@ -162,7 +162,7 @@ def _remote_ref_expr(
     assert isinstance(proxy_index, (list, tuple))
     assert isinstance(ast_index, list)
     try:
-        name = state.device_function.tensor_arg(tensor).name
+        name = state.device_function.pallas_tensor_ref_name(tensor)
     except KeyError:
         if not materialize_device_value:
             raise exc.TypeInferenceError(

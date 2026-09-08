@@ -3,8 +3,9 @@
 The CuTe backend pre-processes the user's AST before tracing.  When
 the body matches the canonical two-loop online softmax pattern
 (a running ``mi``/``di`` update sweep followed by a normalize sweep)
-AND the reduction-axis extent is at or above the cutoff (default 2048),
-the pass rewrites the body into THREE inner ``for tile_n`` loops:
+AND the reduction-axis extent is at or above the cutoff (default 0 —
+always rewrite; override via ``HELION_ONLINE_TO_3PASS_MIN_N``), the pass
+rewrites the body into THREE inner ``for tile_n`` loops:
 
   1. max-only sweep
   2. sum-only sweep
@@ -119,12 +120,15 @@ class TestCuteOnlineTo3PassRewrite(TestCase):
         # 3 inner sweeps now (was 2 in the original online form).
         self.assertEqual(self._generated_loop_count(code), 3)
 
-    def test_shape_gate_skips_small_n(self) -> None:
-        """For (4096, 256) the rewrite MUST be skipped by the
-        reduction-axis-extent gate (256 < default cutoff 2048), so the
-        generated kernel still has TWO inner sweeps (the original
-        online form).
+    def test_shape_gate_env_override_skips_small_n(self) -> None:
+        """With ``HELION_ONLINE_TO_3PASS_MIN_N=2048``, (4096, 256) MUST
+        be skipped by the reduction-axis-extent gate, so the generated
+        kernel still has TWO inner sweeps (the original online form).
+        (The default cutoff is 0 — always rewrite — since the
+        lane-reduce collapse made the 3-pass form win at every measured
+        extent.)
         """
+        self._set_env("HELION_ONLINE_TO_3PASS_MIN_N", "2048")
         x = torch.randn(4096, 256, device=DEVICE, dtype=HALF_DTYPE)
         code, out = code_and_output(
             _online_two_pass_kernel,

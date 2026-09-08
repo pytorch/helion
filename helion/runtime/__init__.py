@@ -75,6 +75,8 @@ def default_launcher(
     _remote_barrier_signal_slots_per_program: int = 0,
     _remote_barrier_process_group_name: str | None = None,
     _remote_copy_scratch_specs: tuple[tuple[torch.Tensor, int], ...] = (),
+    _persistent_state_specs: tuple[tuple[torch.Tensor, int, torch.dtype], ...] = (),
+    _minimum_resident_programs: int = 0,
     ptx_options: str | None = None,
     launch_cooperative_grid: bool = False,
     **kwargs: dict,
@@ -97,6 +99,8 @@ def default_launcher(
             _remote_barrier_signal_slots_per_program=_remote_barrier_signal_slots_per_program,
             _remote_barrier_process_group_name=_remote_barrier_process_group_name,
             _remote_copy_scratch_specs=_remote_copy_scratch_specs,
+            _persistent_state_specs=_persistent_state_specs,
+            _minimum_resident_programs=_minimum_resident_programs,
             ptx_options=ptx_options,
             launch_cooperative_grid=launch_cooperative_grid,
             **kwargs,
@@ -105,6 +109,8 @@ def default_launcher(
         message = str(error)
         if "Cannot make_shape_compatible: incompatible dimensions" in message:
             raise exc.ShapeMismatch("kernel operands", message) from error
+        if message.startswith("Cross-loop scheduling requires "):
+            raise exc.InvalidConfig(message) from error
         raise
 
 

@@ -28,5 +28,8 @@ def check_thread_limit(
                  (e.g. block sizes or node name).
     """
     if num_threads > MAX_THREADS_PER_BLOCK:
-        msg = f"thread block too large for cute kernel: {context or num_threads}"
-        raise exc.BackendUnsupported("cute", msg)
+        from ..compile_environment import CompileEnvironment
+
+        backend_name = CompileEnvironment.current().backend.name
+        msg = f"thread block too large for {backend_name} kernel: {context or num_threads}"
+        raise exc.BackendUnsupported(backend_name, msg)

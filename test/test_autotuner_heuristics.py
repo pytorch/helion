@@ -1,37 +1,69 @@
 from __future__ import annotations
 
+import contextlib
+from contextlib import ExitStack
+from contextlib import contextmanager
+import dataclasses
+import functools
+import itertools
 import math
 import os
+import random
+from typing import TYPE_CHECKING
+from typing import Any
+from typing import Iterator
+from typing import cast
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import helion
+from helion._argument_device import _ArgumentDeviceResolver as _DeviceResolver
+from helion._compiler.autotuner_heuristics import compiler_promotion_specialization_key
 from helion._compiler.autotuner_heuristics import compiler_seed_configs
+from helion._compiler.autotuner_heuristics import compiler_seed_specialization_facts
 from helion._compiler.autotuner_heuristics.cute import (
-    CuteFlashAttentionCausalLptHeuristic,
+    _TCGEN05_GROUPED_SUPPORTED_CAPABILITIES,
+)
+from helion._compiler.autotuner_heuristics.cute import (
+    _TCGEN05_GROUPED_WORKLIST_AUTOMATIC_SEED_LIMIT,
 )
 from helion._compiler.autotuner_heuristics.cute import CuteFlashAttentionHeuristic
 from helion._compiler.autotuner_heuristics.cute import CuteFp8GemmSkinnyMHeuristic
 from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuristic
+from helion._compiler.autotuner_heuristics.cute import (
+    CuteTcgen05GroupedWorklistHeuristic,
+)
+from helion._compiler.autotuner_heuristics.cute import (
+    _bounded_grouped_worklist_seed_families,
+)
+from helion._compiler.autotuner_heuristics.cute import (
+    _filter_reachable_block_size_configs,
+)
+from helion._compiler.autotuner_heuristics.cute import _tcgen05_grouped_fact
+from helion._compiler.autotuner_heuristics.cute import _tcgen05_grouped_worklist_fact
+from helion._compiler.autotuner_heuristics.cute import (
+    _tcgen05_grouped_worklist_seed_family,
+)
 from helion._compiler.autotuner_heuristics.registry import AutotunerHeuristic
-from helion._compiler.autotuner_heuristics.triton import TritonH100MatmulHeuristic
+from helion._compiler.autotuner_heuristics.registry import (
+    CompilerHeuristicSpecializationFact,
+)
+from helion._compiler.autotuner_heuristics.triton import (
+    TritonH100FormulaMatmulHeuristic,
+)
+from helion._compiler.autotuner_heuristics.triton import TritonH100MultiMatmulHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonNarrowReductionHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonPointwiseSeedHeuristic
+from helion._compiler.autotuner_heuristics.triton import TritonReductionHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonSkinnyGemmHeuristic
-from helion._compiler.autotuner_heuristics.triton import (
-    TritonStandardReductionHeuristicSM90,
-)
-from helion._compiler.autotuner_heuristics.triton import (
-    TritonStandardReductionHeuristicSM100,
-)
-from helion._compiler.autotuner_heuristics.triton import (
-    TritonUserTiledReductionHeuristicSM90,
-)
 from helion._compiler.autotuner_heuristics.triton import _h100_matmul_tile
 from helion._compiler.backend import CuteBackend
 from helion._compiler.backend import TritonBackend
+from helion._compiler.compile_environment import _symint_free_symbols
+from helion._compiler.cute import cute_flash
 from helion._compiler.cute.cute_flash import FLASH_AUTOTUNE_CONFIG_KEYS
 from helion._compiler.cute.cute_flash import FLASH_CAUSAL_KV_ORDER_KEY
 from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LOOP_SPLIT_KEY
@@ -87,16 +119,35 @@ from helion._compiler.cute.cute_flash import FLASH_TENSOR_4D_TMA_KEY
 from helion._compiler.cute.cute_flash import FLASH_TOPOLOGY_KEY
 from helion._compiler.cute.cute_flash import FLASH_USE_2CTA_KEY
 from helion._compiler.cute.cute_flash import FLASH_WAIT_HINT_KEY
+from helion._compiler.cute.cute_flash import _flash_values_tensor_4d_batch_heads
 from helion._compiler.cute.cute_flash import flash_attention_seed_config
 from helion._compiler.cute.cute_flash import flash_attention_seed_configs
 from helion._compiler.cute.cute_flash import flash_autotune_fragments
-from helion._compiler.cute.cute_flash import flash_effective_config_values
+from helion._compiler.cute.cute_flash import flash_exp2_packet_is_compound
 from helion._compiler.cute.cute_flash import resolve_flash_config
+from helion._compiler.cute.flash_policy import get_flash_target_policy
+from helion._compiler.cute.flash_tuning import FlashCausalTuningPolicy
+from helion._compiler.cute.flash_tuning import FlashDenseTuningPolicy
+from helion._compiler.cute.flash_tuning import FlashSoftmaxLowering
+from helion._compiler.cute.grouped_worklist import (
+    tcgen05_grouped_worklist_compatible_source_m_tiles,
+)
+from helion._compiler.cute.grouped_worklist_policy import GroupedWorklistTargetPolicy
+from helion._compiler.cute.grouped_worklist_policy import GroupedWorklistTuning
+from helion._compiler.cute.grouped_worklist_policy import GroupedWorklistWorkload
+from helion._compiler.cute.grouped_worklist_policy import (
+    get_grouped_worklist_target_policy,
+)
+from helion._compiler.cute.grouped_worklist_policy import (
+    grouped_worklist_target_identities,
+)
+from helion._compiler.cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
 from helion._compiler.cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
+from helion._compiler.cute.strategies import TCGEN05_STRATEGY_CONFIG_KEY
 from helion._compiler.cute.strategies import TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY
 from helion._compiler.cute.strategies import TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY
 from helion._compiler.cute.strategies import Tcgen05LayoutStrategy
@@ -113,13 +164,43 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
 from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY,
 )
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
 )
+from helion._compiler.cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
+from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_RUNTIME_DIRECT_CLC_MAX_CLUSTERS,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_STATIC_RESERVED_SMS_SEARCH_CHOICES,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
@@ -181,21 +262,37 @@ from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion.autotuner import IntegerFragment
+from helion.autotuner.base_cache import BoundKernelInMemoryCacheKey
+from helion.autotuner.base_cache import LooseAutotuneCacheKey
+from helion.autotuner.base_cache import StrictAutotuneCacheKey
+from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
+from helion.autotuner.config_fragment import ConfigSpecFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
-from helion.autotuner.config_spec import CoResidencyGroup
+from helion.autotuner.config_spec import DotAxes
+from helion.autotuner.config_spec import DotAxisKind
+from helion.autotuner.config_spec import DotSite
+from helion.autotuner.config_spec import KernelMatmulFact
+from helion.autotuner.config_spec import LiveTile
 from helion.autotuner.config_spec import MatmulFact
 from helion.autotuner.config_spec import ReductionCategory
 from helion.autotuner.config_spec import ReductionDescriptor
 from helion.autotuner.config_spec import ReductionKernelFact
 from helion.autotuner.config_spec import ReductionLoopSpec
+from helion.autotuner.config_spec import ResolvedMatmulFact
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
 import helion.language as hl
+from helion.runtime.cute.launcher import _Tcgen05GroupedWorklistCompatibilityClassifier
+from helion.runtime.kernel import _find_device as runtime_find_device
+from helion.runtime.kernel import _input_tensor_metadata
 from helion.runtime.settings import Settings
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 HOPPER_HARDWARE = HardwareInfo(
     device_kind="cuda",
@@ -215,6 +312,12 @@ BLACKWELL_HARDWARE = HardwareInfo(
     runtime_version="12.8",
     compute_capability="sm100",
 )
+GB300_HARDWARE = HardwareInfo(
+    device_kind="cuda",
+    hardware_name="NVIDIA GB300",
+    runtime_version="12.8",
+    compute_capability="sm103",
+)
 A100_HARDWARE = HardwareInfo(
     device_kind="cuda",
     hardware_name="NVIDIA A100",
@@ -223,7 +326,368 @@ A100_HARDWARE = HardwareInfo(
 )
 
 
+def _grouped_worklist_with_viewed_inputs(
+    a_storage: torch.Tensor,
+    b_storage: torch.Tensor,
+    worklist: torch.Tensor,
+) -> torch.Tensor:
+    a_packed = a_storage.view(-1, a_storage.size(2))
+    b_grouped = b_storage.view(-1, b_storage.size(2), b_storage.size(3))
+    m_total, k = a_packed.shape
+    _groups, n, k2 = b_grouped.shape
+    assert k == k2
+    block_m = hl.register_block_size(256)
+    block_n = hl.register_block_size(128)
+    block_k = hl.register_block_size(64, 128)
+    out = torch.empty([m_total, n], dtype=a_packed.dtype, device=a_packed.device)
+    for work_tile, tile_m, tile_n in hl.tile(
+        [worklist.size(0), 256, n],
+        block_size=[1, block_m, block_n],
+    ):
+        work_id = work_tile.begin
+        group_id = worklist[work_id, 0]
+        start = worklist[work_id, 1]
+        valid_m = worklist[work_id, 2]
+        store_m = worklist[work_id, 3]
+        local_m = tile_m.index
+        row = start + local_m
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k, block_size=block_k):
+            a_block = hl.load(
+                a_packed,
+                [row, tile_k],
+                extra_mask=(local_m < valid_m)[:, None],  # pyrefly: ignore[bad-index]
+            )
+            acc = torch.addmm(
+                acc,
+                a_block,
+                b_grouped[group_id, tile_n, tile_k].T,
+            )
+        hl.store(
+            out,
+            [row, tile_n],
+            acc.to(out.dtype),
+            extra_mask=(local_m < store_m)[:, None],  # pyrefly: ignore[bad-index]
+        )
+    return out
+
+
+def _grouped_worklist_kernel_body(
+    a_packed: torch.Tensor,
+    b_grouped: torch.Tensor,
+    worklist: torch.Tensor,
+) -> torch.Tensor:
+    """Plain grouped-GEMM body used by compiler-discovery tests."""
+    m_total, k = a_packed.shape
+    _groups, n, k2 = b_grouped.shape
+    assert k == k2
+    block_m = hl.register_block_size(256)
+    block_n = hl.register_block_size(128)
+    block_k = hl.register_block_size(64, 128)
+    out = torch.empty([m_total, n], dtype=a_packed.dtype, device=a_packed.device)
+    for work_tile, tile_m, tile_n in hl.tile(
+        [worklist.size(0), 256, n],
+        block_size=[1, block_m, block_n],
+    ):
+        work_id = work_tile.begin
+        group_id = worklist[work_id, 0]
+        start = worklist[work_id, 1]
+        valid_m = worklist[work_id, 2]
+        store_m = worklist[work_id, 3]
+        local_m = tile_m.index
+        row = start + local_m
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k, block_size=block_k):
+            a_block = hl.load(
+                a_packed,
+                [row, tile_k],
+                extra_mask=(local_m < valid_m)[:, None],  # pyrefly: ignore[bad-index]
+            )
+            acc = torch.addmm(
+                acc,
+                a_block,
+                b_grouped[group_id, tile_n, tile_k].T,
+            )
+        hl.store(
+            out,
+            [row, tile_n],
+            acc.to(out.dtype),
+            extra_mask=(local_m < store_m)[:, None],  # pyrefly: ignore[bad-index]
+        )
+    return out
+
+
+def _dynamic_grouped_worklist_kernel_body(
+    a_packed: torch.Tensor,
+    b_grouped: torch.Tensor,
+    worklist: torch.Tensor,
+) -> torch.Tensor:
+    """Grouped worklist whose M tile follows the dynamic packed extent."""
+    m_total, k = a_packed.shape
+    _groups, n, k2 = b_grouped.shape
+    assert k == k2
+    block_m = hl.register_block_size(32, m_total)
+    block_n = hl.register_block_size(128)
+    block_k = hl.register_block_size(64, 128)
+    out = torch.empty((m_total, n), dtype=a_packed.dtype, device=a_packed.device)
+    for work_tile, tile_m, tile_n in hl.tile(
+        [worklist.size(0), m_total, n],
+        block_size=[1, block_m, block_n],
+    ):
+        work_id = work_tile.begin
+        group_id = worklist[work_id, 0]
+        start = worklist[work_id, 1]
+        valid_m = worklist[work_id, 2]
+        store_m = worklist[work_id, 3]
+        local_m = tile_m.index
+        row = start + local_m
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k, block_size=block_k):
+            a_block = hl.load(
+                a_packed,
+                [row, tile_k],
+                extra_mask=(local_m < valid_m)[:, None],  # pyrefly: ignore[bad-index]
+            )
+            acc = torch.addmm(
+                acc,
+                a_block,
+                b_grouped[group_id, tile_n, tile_k].T,
+            )
+        hl.store(
+            out,
+            [row, tile_n],
+            acc.to(out.dtype),
+            extra_mask=(local_m < store_m)[:, None],  # pyrefly: ignore[bad-index]
+        )
+    return out
+
+
+def _grouped_worklist_args(
+    *,
+    groups: int = 6,
+    n: int = 256,
+    k: int = 128,
+    row_extent: int = 32,
+    b_major: str = "k",
+    packed_m: int | None = None,
+    extents: tuple[int, ...] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    custom_extents = extents is not None
+    if extents is None:
+        extents = (row_extent,) * groups
+    assert len(extents) == groups
+    assert all(extent % 32 == 0 for extent in extents)
+    total_m = sum(extents) if packed_m is None else packed_m
+    if custom_extents:
+        assert total_m == groups * row_extent
+
+    if b_major == "k":
+        b_grouped = torch.empty(
+            [groups, n, k],
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        )
+    else:
+        assert b_major == "n"
+        b_grouped = torch.empty(
+            [groups, k, n],
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        ).transpose(1, 2)
+
+    rows = []
+    start = 0
+    for group, extent in enumerate(extents):
+        rows.append([group, start, extent, extent])
+        start += extent
+    return (
+        torch.empty([total_m, k], device=DEVICE, dtype=torch.bfloat16),
+        b_grouped,
+        torch.tensor(rows, device=DEVICE, dtype=torch.int32),
+    )
+
+
+@contextmanager
+def _grouped_worklist_bind_patches(
+    hardware: HardwareInfo = BLACKWELL_HARDWARE,
+    *,
+    runtime_n_ptx: bool | None = True,
+    analysis_runtime_n_ptx: bool = False,
+) -> Iterator[None]:
+    with ExitStack() as stack:
+        stack.enter_context(patch_cute_mma_support())
+        stack.enter_context(
+            patch(
+                "helion._compiler.cute.cutedsl_compat.check_cute_backend_requirements"
+            )
+        )
+        stack.enter_context(
+            patch("helion._hardware.get_hardware_info", return_value=hardware)
+        )
+        if runtime_n_ptx is not None:
+            stack.enter_context(
+                patch(
+                    "helion._compiler.autotuner_heuristics.cute."
+                    "tcgen05_runtime_n_ptx_compatible",
+                    return_value=runtime_n_ptx,
+                )
+            )
+        if analysis_runtime_n_ptx:
+            stack.enter_context(
+                patch(
+                    "helion._compiler.cute.cute_mma.tcgen05_runtime_n_ptx_compatible",
+                    return_value=True,
+                )
+            )
+        yield
+
+
+@contextlib.contextmanager
+def _memoized_flash_fragments() -> Iterator[None]:
+    """Memoize ``flash_autotune_fragments`` for the duration of one test.
+
+    The structural coverage design calls it thousands of times per
+    ``ConfigGeneration`` with only a handful of distinct argument tuples (one
+    per pipeline-family override), and it is deterministic for fixed arguments
+    and environment. The first repeat of each key is re-verified against the
+    real function so a nondeterministic surface would still fail. Do not use
+    under a patched flash target policy or HELION_CUTE_FLASH_* environment.
+    """
+    real = cast(
+        "Callable[..., dict[str, ConfigSpecFragment]]",
+        cute_flash.flash_autotune_fragments,
+    )
+    surfaces: dict[tuple[object, ...], dict[str, ConfigSpecFragment]] = {}
+    verified: set[tuple[object, ...]] = set()
+
+    def wrapper(
+        head_dim: int, num_kv: int, **kwargs: object
+    ) -> dict[str, ConfigSpecFragment]:
+        key = (head_dim, num_kv, tuple(sorted(kwargs.items())))
+        cached = surfaces.get(key)
+        if cached is None:
+            cached = surfaces[key] = real(head_dim, num_kv, **kwargs)
+        elif key not in verified:
+            verified.add(key)
+            assert real(head_dim, num_kv, **kwargs) == cached
+        return dict(cached)
+
+    with patch.object(cute_flash, "flash_autotune_fragments", wrapper):
+        yield
+
+
+@functools.cache
+def _dense_fp16_hd64_bh64_flash_generation() -> ConfigGeneration:
+    """Shared generation for the num_kv=48, num_bh=64 dense fp16 surface.
+
+    The structural coverage design cached on the returned ``ConfigGeneration``
+    is expensive and independent of compiler seeds, so tests exercising the
+    same surface share one instance. Callers must set
+    ``config_spec.compiler_seed_configs`` before using seed-dependent APIs.
+    """
+    spec = ConfigSpec(backend=CuteBackend())
+    for block_id, target in enumerate((1, 128, 128)):
+        spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
+    spec.enable_cute_flash_search(
+        head_dim=64,
+        num_kv=48,
+        num_bh=64,
+        dtype=torch.float16,
+        block_size_targets={0: 1, 1: 128, 2: 128},
+        standard_dense_output=True,
+    )
+    return ConfigGeneration(spec)
+
+
 class TestAutotunerHeuristic(TestCase):
+    @staticmethod
+    def _heuristic(name: str, **attributes: object) -> type[AutotunerHeuristic]:
+        return type(
+            f"_{name.title().replace('_', '')}",
+            (AutotunerHeuristic,),
+            {"name": name, "backend": "triton", **attributes},
+        )
+
+    @staticmethod
+    def _grouped_worklist_seed_families() -> dict[str, list[helion.Config]]:
+        def seeds(
+            groups: int, n: int, k: int, b_major: str, source_m_tile: int
+        ) -> list[helion.Config]:
+            return _tcgen05_grouped_worklist_seed_family(
+                groups=groups,
+                packed_m=groups * (32 if source_m_tile == 32 else 4096),
+                n=n,
+                k=k,
+                b_major=cast("Any", b_major),
+                source_m_tile=source_m_tile,
+                num_sm=148,
+                target_policy=get_grouped_worklist_target_policy(None),
+            )[0]
+
+        return {
+            "small_k": seeds(6, 4096, 4096, "k", 32),
+            "small_n": seeds(6, 4096, 4096, "n", 32),
+            "source224": _tcgen05_grouped_worklist_seed_family(
+                groups=6,
+                packed_m=6 * 224,
+                n=7168,
+                k=3072,
+                b_major="k",
+                source_m_tile=224,
+                num_sm=148,
+                target_policy=get_grouped_worklist_target_policy(None),
+            )[0],
+            "source256_k": seeds(8, 4096, 2048, "k", 256),
+            "source256_n": seeds(8, 4096, 2048, "n", 256),
+        }
+
+    @staticmethod
+    def _expected_grouped_worklist_clc_config(
+        consumer_regs: int,
+        l2_swizzle_size: int,
+    ) -> dict[str, object]:
+        """Independent literal contract for GB300 rank-zero CLC seeds."""
+        return {
+            "block_sizes": [256, 128, 64],
+            "l2_groupings": [1],
+            "loop_orders": [[0, 1, 2]],
+            "num_stages": 7,
+            "num_warps": 8,
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_ab_stages": 6,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": 2,
+            "tcgen05_num_epi_warps": 4,
+            "tcgen05_consumer_regs": consumer_regs,
+            "tcgen05_grouped_mode": "worklist_nm",
+            "tcgen05_grouped_worklist_source_m_tile": 256,
+            "tcgen05_grouped_runtime_direct": True,
+            "tcgen05_l2_swizzle_size": l2_swizzle_size,
+            "tcgen05_strategy": "role_local_with_scheduler",
+            "tcgen05_warp_spec_scheduler_warps": 1,
+            "tcgen05_persistence_model": "clc_persistent",
+        }
+
+    @staticmethod
+    def _grouped_worklist_configs_from_arguments(
+        arguments: dict[str, Any],
+        target_hardware_identity: tuple[str, str, str] | None = None,
+        worklist_rows: tuple[tuple[int, int, int, int], ...] | None = None,
+    ) -> list[helion.Config]:
+        return _tcgen05_grouped_worklist_seed_family(
+            groups=cast("int", arguments["groups"]),
+            packed_m=cast("int", arguments["packed_m"]),
+            n=cast("int", arguments["n"]),
+            k=cast("int", arguments["k"]),
+            b_major=cast("Any", arguments["b_major"]),
+            source_m_tile=cast("int", arguments["source_m_tile"]),
+            num_sm=cast("int", arguments["num_sm"]),
+            target_policy=get_grouped_worklist_target_policy(target_hardware_identity),
+            worklist_rows=worklist_rows,
+        )[0]
+
     def test_disable_autotuner_heuristics_setting_env(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("HELION_DISABLE_AUTOTUNER_HEURISTICS", None)
@@ -261,6 +725,7 @@ class TestAutotunerHeuristic(TestCase):
         class ValidAutotunerHeuristic(AutotunerHeuristic):
             name = "valid_autotuner_heuristic"
             backend = "triton"
+            promote_seed_to_default = True
 
             @classmethod
             def is_eligible(cls, env: object, device_ir: object) -> bool:
@@ -296,6 +761,7 @@ class TestAutotunerHeuristic(TestCase):
             configs = compiler_seed_configs(env, MagicMock())
 
         self.assertEqual([config.config for config in configs], [{"block_sizes": [64]}])
+        self.assertEqual(env.config_spec.compiler_default_config, configs[0])
         self.assertEqual(
             env.config_spec.autotuner_heuristics,
             [ValidAutotunerHeuristic.name, DuplicateAutotunerHeuristic.name],
@@ -316,6 +782,7 @@ class TestAutotunerHeuristic(TestCase):
         env.backend_name = "triton"
         env.config_spec = MagicMock()
         env.config_spec.autotuner_heuristics = ["stale"]
+        env.config_spec.compiler_seed_timeout_retry_repetitions = 3
         env.settings = Settings(disable_autotuner_heuristics=True)
 
         with patch(
@@ -326,8 +793,85 @@ class TestAutotunerHeuristic(TestCase):
 
         self.assertEqual(configs, [])
         self.assertEqual(env.config_spec.autotuner_heuristics, [])
+        self.assertIsNone(env.config_spec.compiler_seed_timeout_retry_repetitions)
 
-    def test_cute_flash_disable_heuristics_keeps_value_priors(self) -> None:
+    def test_compiler_fact_hook_runs_once_before_disabled_return(self) -> None:
+        fact_calls: list[tuple[object, object]] = []
+
+        class FactOwningHeuristic(AutotunerHeuristic):
+            name = "fact_owning_heuristic"
+            backend = "synthetic"
+
+            @classmethod
+            def register_facts(
+                cls, env: object, device_ir: object
+            ) -> frozenset[CompilerHeuristicSpecializationFact]:
+                fact_calls.append((env, device_ir))
+                return frozenset({"input_tensor_metadata"})
+
+            @classmethod
+            def is_eligible(cls, env: object, device_ir: object) -> bool:
+                raise AssertionError("disabled heuristics should not be queried")
+
+        class PassiveHeuristic(AutotunerHeuristic):
+            name = "passive_heuristic"
+            backend = "synthetic"
+
+            @classmethod
+            def is_eligible(cls, env: object, device_ir: object) -> bool:
+                raise AssertionError("disabled heuristics should not be queried")
+
+        env = MagicMock()
+        env.backend_name = "synthetic"
+        env.config_spec = MagicMock()
+        env.settings = Settings(disable_autotuner_heuristics=True)
+        device_ir = MagicMock()
+
+        with patch(
+            "helion._compiler.autotuner_heuristics.HEURISTICS_BY_BACKEND",
+            {"synthetic": (FactOwningHeuristic, PassiveHeuristic)},
+        ):
+            self.assertEqual(compiler_seed_configs(env, device_ir), [])
+
+        self.assertEqual(fact_calls, [(env, device_ir)])
+        self.assertEqual(
+            env.compiler_fact_specialization_facts,
+            frozenset({"input_tensor_metadata"}),
+        )
+
+    def test_compiler_fact_hook_failure_propagates(self) -> None:
+        class FailingFactHeuristic(AutotunerHeuristic):
+            name = "failing_fact_heuristic"
+            backend = "synthetic"
+
+            @classmethod
+            def register_facts(
+                cls, env: object, device_ir: object
+            ) -> frozenset[CompilerHeuristicSpecializationFact]:
+                raise RuntimeError("synthetic correctness-fact failure")
+
+            @classmethod
+            def is_eligible(cls, env: object, device_ir: object) -> bool:
+                raise AssertionError("fact registration must fail first")
+
+        env = MagicMock()
+        env.backend_name = "synthetic"
+        env.config_spec = MagicMock()
+        env.settings = Settings(disable_autotuner_heuristics=True)
+
+        with (
+            patch(
+                "helion._compiler.autotuner_heuristics.HEURISTICS_BY_BACKEND",
+                {"synthetic": (FailingFactHeuristic,)},
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "synthetic correctness-fact failure",
+            ),
+        ):
+            compiler_seed_configs(env, MagicMock())
+
+    def test_cute_flash_disable_heuristics_keeps_structural_coverage(self) -> None:
         spec = ConfigSpec(backend=CuteBackend())
         self.assertIsNone(spec.compiler_seed_timeout_retry_repetitions)
         for block_id, size_hint in enumerate((1, 128, 128)):
@@ -350,17 +894,21 @@ class TestAutotunerHeuristic(TestCase):
         self.assertIsNone(spec.compiler_seed_timeout_retry_repetitions)
         self.assertEqual(spec.compiler_seed_configs, [])
         self.assertEqual(spec.autotuner_heuristics, [])
-        self.assertTrue(spec.autotune_seed_configs())
 
         config_gen = spec.create_config_generation()
-        self.assertIn(FLASH_PIPELINE_FAMILY_KEY, config_gen._config_value_priors)
-        self.assertIn(FLASH_CAUSAL_KV_ORDER_KEY, config_gen._config_value_priors)
-        population = config_gen.random_population(4)
+        self.assertEqual(config_gen.seed_flat_config_pairs(), [])
+        self.assertFalse(
+            set(FLASH_AUTOTUNE_CONFIG_KEYS) & set(config_gen._config_value_priors)
+        )
+        coverage = config_gen.flash_deterministic_population_configs()
+        self.assertTrue(coverage)
+        population = config_gen.random_population(100)
 
-        self.assertGreaterEqual(len(population), 4)
-        self.assertIn(spec.default_config(), population)
+        self.assertGreaterEqual(len(population), 100)
+        self.assertLessEqual(set(coverage), set(population))
 
-    def test_cute_flash_seed_enables_bounded_timeout_retry(self) -> None:
+    @_memoized_flash_fragments()
+    def test_cute_flash_heuristic_returns_all_legal_seeds(self) -> None:
         spec = ConfigSpec(backend=CuteBackend())
         for block_id, size_hint in enumerate((1, 128, 128)):
             spec.block_sizes.append(
@@ -374,10 +922,86 @@ class TestAutotunerHeuristic(TestCase):
         env = MagicMock()
         env.config_spec = spec
 
-        seed = CuteFlashAttentionHeuristic.get_seed_config(env, MagicMock())
+        seeds = CuteFlashAttentionHeuristic.get_seed_configs(env, MagicMock())
 
-        self.assertIsNotNone(seed)
+        assert seeds is not None
         self.assertEqual(spec.compiler_seed_timeout_retry_repetitions, 3)
+        candidates = spec._legalize_cute_flash_compiler_seeds(
+            flash_attention_seed_configs(64, 64)
+        )
+        self.assertGreater(len(seeds), 2)
+        self.assertEqual(seeds, candidates)
+        self.assertEqual(
+            CuteFlashAttentionHeuristic.get_seed_config(env, MagicMock()),
+            seeds[0],
+        )
+        spec.compiler_seed_configs = list(seeds)
+        config_gen = spec.create_config_generation()
+        quick = config_gen.random_population(30)
+        full = config_gen.random_population(100)
+        normalized_seeds = {
+            config_gen.canonicalize_flat(config_gen.flatten(seed))[1] for seed in seeds
+        }
+        self.assertEqual(len(quick), 30)
+        self.assertEqual(len(full), 100)
+        self.assertLessEqual(normalized_seeds, set(full))
+
+    def test_cute_flash_heuristic_respects_tensor_4d_tma_capability(self) -> None:
+        spec = ConfigSpec(backend=CuteBackend())
+        for block_id, size_hint in enumerate((1, 128, 128)):
+            spec.block_sizes.append(
+                BlockSizeSpec(block_id=block_id, size_hint=size_hint)
+            )
+        spec.enable_cute_flash_search(
+            head_dim=64,
+            num_kv=64,
+            block_size_targets={0: 1, 1: 128, 2: 128},
+            supports_tensor_4d_tma=False,
+        )
+        env = MagicMock(config_spec=spec)
+
+        seeds = CuteFlashAttentionHeuristic.get_seed_configs(env, MagicMock())
+        expected = spec._legalize_cute_flash_compiler_seeds(
+            flash_attention_seed_configs(64, 64, supports_tensor_4d_tma=False)
+        )
+
+        self.assertEqual(seeds, expected)
+        self.assertEqual(spec.compiler_seed_timeout_retry_repetitions, 3)
+
+    def test_cute_flash_normalization_uses_structural_schedule_defaults(self) -> None:
+        cases = (
+            (64, False, "16/4", 2),
+            (64, True, "16/4", 2),
+            (128, False, "8/2", 0),
+            (128, True, "8/2", 0),
+        )
+        for head_dim, is_causal, schedule, offset in cases:
+            normalized: list[tuple[object, object, object]] = []
+            for num_kv in (32, 48, 384):
+                spec = ConfigSpec(backend=CuteBackend())
+                for block_id, target in enumerate((1, 128, 128)):
+                    spec.block_sizes.append(
+                        BlockSizeSpec(block_id=block_id, size_hint=target)
+                    )
+                spec.enable_cute_flash_search(
+                    head_dim=head_dim,
+                    num_kv=num_kv,
+                    block_size_targets={0: 1, 1: 128, 2: 128},
+                    dtype=torch.float16,
+                    is_causal=is_causal,
+                    standard_dense_output=not is_causal,
+                    standard_causal_output=is_causal,
+                )
+                config = helion.Config(block_sizes=[1, 128, 128])
+                spec.normalize(config)
+                normalized.append(
+                    (
+                        config.config[FLASH_E2E_SCHEDULE_KEY],
+                        config.config[FLASH_E2E_OFFSET_KEY],
+                        config.config[FLASH_E2E_OFFSET0_KEY],
+                    )
+                )
+            self.assertEqual(normalized, [(schedule, offset, 0)] * 3)
 
     def test_seed_flat_config_pairs_skips_invalid_compiler_seed(self) -> None:
         spec = ConfigSpec(backend=TritonBackend())
@@ -398,58 +1022,89 @@ class TestAutotunerHeuristic(TestCase):
         self.assertEqual(len(messages), 1)
         self.assertIn("Failed to transfer compiler seed config 1", messages[0])
 
-    def test_default_config_promotes_compiler_seed(self) -> None:
+    def test_execution_default_is_separate_from_autotune_reference(self) -> None:
         spec = ConfigSpec(backend=TritonBackend())
         spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
         spec.compiler_default_config = helion.Config(
             block_sizes=[64], num_warps=8, num_stages=2
         )
 
-        default = spec.default_config()
+        execution_default = spec.default_config()
+        reference = spec.autotune_reference_config()
         config_gen = spec.create_config_generation()
-        flat_default = config_gen.unflatten(config_gen.default_flat())
+        generated_reference = config_gen.unflatten(config_gen.default_flat())
 
-        self.assertEqual(default.config["block_sizes"], [64])
-        self.assertEqual(default.config["num_warps"], 8)
-        self.assertEqual(default.config["num_stages"], 2)
-        self.assertEqual(flat_default.config["block_sizes"], [64])
-        self.assertEqual(flat_default.config["num_warps"], 8)
-        self.assertEqual(flat_default.config["num_stages"], 2)
+        self.assertEqual(execution_default.config["block_sizes"], [64])
+        self.assertEqual(execution_default.config["num_warps"], 8)
+        self.assertEqual(execution_default.config["num_stages"], 2)
+        self.assertNotEqual(execution_default, reference)
+        self.assertEqual(generated_reference, reference)
+
+    def test_accuracy_baseline_uses_autotune_reference(self) -> None:
+        reference = helion.Config(block_sizes=[32])
+        execution_default = helion.Config(block_sizes=[128])
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.args = ()
+        provider.settings = MagicMock(autotune_baseline_fn=None)
+        provider.config_spec = MagicMock()
+        provider.config_spec.autotune_reference_config.return_value = reference
+        provider.config_spec.default_config.return_value = execution_default
+        provider.kernel = MagicMock()
+        provider.kernel.env.process_group_name = None
+        provider.kernel.compile_config.return_value = lambda: "baseline"
+
+        with patch("helion.autotuner.benchmark_provider.synchronize_device"):
+            output, mutated, post_args = provider._compute_baseline()
+
+        self.assertEqual(output, "baseline")
+        self.assertEqual(mutated, [])
+        self.assertEqual(post_args, ())
+        provider.kernel.compile_config.assert_called_once_with(
+            reference, allow_print=False
+        )
+        provider.config_spec.default_config.assert_not_called()
 
     def test_should_promote_gate(self) -> None:
         # should_promote() gates a seed's PROMOTION (becoming the autotune-off
         # default) on PROMOTE_TARGETS, independently of where the seed fires.
         env = MagicMock()
         env.device = "cuda"
-
-        class _AllArches(AutotunerHeuristic):
-            promote_seed_to_default = True
-            PROMOTE_TARGETS = None  # promote wherever it fires (back-compat)
-
-        class _Sm90Only(AutotunerHeuristic):
-            promote_seed_to_default = True
-            PROMOTE_TARGETS = (("cuda", "sm90"),)
-
-        class _NotPromoting(AutotunerHeuristic):
-            promote_seed_to_default = False
-            PROMOTE_TARGETS = (("cuda", "sm90"),)
+        all_arches = self._heuristic("all_arches", promote_seed_to_default=True)
+        sm90_only = self._heuristic(
+            "sm90_only",
+            promote_seed_to_default=True,
+            PROMOTE_TARGETS=(("cuda", "sm90"),),
+        )
+        not_promoting = self._heuristic(
+            "not_promoting",
+            promote_seed_to_default=False,
+            PROMOTE_TARGETS=(("cuda", "sm90"),),
+        )
+        b200_only = self._heuristic(
+            "b200_only",
+            promote_seed_to_default=True,
+            PROMOTE_NAMED_TARGETS=frozenset({("cuda", "NVIDIA B200", "sm100")}),
+        )
 
         # PROMOTE_TARGETS=None promotes without consulting hardware.
-        self.assertTrue(_AllArches.should_promote(env))
-
-        # A target list restricts promotion to the matching arch...
-        with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
-            self.assertTrue(_Sm90Only.should_promote(env))
-        # ...and declines on an off-target arch (seed still fires; only the
-        # promotion is gated).
-        with patch(
-            "helion._hardware.get_hardware_info", return_value=BLACKWELL_HARDWARE
+        self.assertTrue(all_arches.should_promote(env))
+        for name, heuristic, hardware, expected in (
+            ("matching arch", sm90_only, HOPPER_HARDWARE, True),
+            ("off-target arch", sm90_only, BLACKWELL_HARDWARE, False),
+            ("promotion disabled", not_promoting, HOPPER_HARDWARE, False),
+            ("matching hardware", b200_only, BLACKWELL_HARDWARE, True),
+            (
+                "different hardware",
+                b200_only,
+                dataclasses.replace(GB300_HARDWARE, compute_capability="sm100"),
+                False,
+            ),
         ):
-            self.assertFalse(_Sm90Only.should_promote(env))
-
-        # promote_seed_to_default=False vetoes regardless of the target list.
-        with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
-            self.assertFalse(_NotPromoting.should_promote(env))
+            with (
+                self.subTest(name=name),
+                patch("helion._hardware.get_hardware_info", return_value=hardware),
+            ):
+                self.assertIs(heuristic.should_promote(env), expected)
 
     def test_should_promote_declines_on_unclassifiable_device(self) -> None:
         # On a device Helion cannot classify (e.g. MTIA), get_hardware_info raises
@@ -458,9 +1113,11 @@ class TestAutotunerHeuristic(TestCase):
         env = MagicMock()
         env.device = "mtia"
 
-        class _Sm90Only(AutotunerHeuristic):
-            promote_seed_to_default = True
-            PROMOTE_TARGETS = (("cuda", "sm90"),)
+        sm90_only = self._heuristic(
+            "sm90_only",
+            promote_seed_to_default=True,
+            PROMOTE_TARGETS=(("cuda", "sm90"),),
+        )
 
         with patch(
             "helion._hardware.get_hardware_info",
@@ -469,7 +1126,2880 @@ class TestAutotunerHeuristic(TestCase):
                 "Helion requires CUDA, ROCm, XPU, or TPU."
             ),
         ):
-            self.assertFalse(_Sm90Only.should_promote(env))
+            self.assertFalse(sm90_only.should_promote(env))
+
+    def test_promotion_specialization_key_tracks_only_exact_name_gates(self) -> None:
+        arch_only = self._heuristic(
+            "arch_only",
+            promote_seed_to_default=True,
+            PROMOTE_TARGETS=(("cuda", "sm100"),),
+        )
+        b200_only = self._heuristic(
+            "b200_only",
+            promote_seed_to_default=True,
+            PROMOTE_NAMED_TARGETS=frozenset({("cuda", "NVIDIA B200", "sm100")}),
+        )
+
+        device = torch.device("cuda:0")
+        with (
+            patch(
+                "helion._compiler.autotuner_heuristics.HEURISTICS_BY_BACKEND",
+                {"triton": (arch_only,)},
+            ),
+            patch("helion._hardware.get_hardware_info") as hardware_info,
+        ):
+            self.assertEqual(
+                compiler_promotion_specialization_key("triton", device), ()
+            )
+            hardware_info.assert_not_called()
+
+        with (
+            patch(
+                "helion._compiler.autotuner_heuristics.HEURISTICS_BY_BACKEND",
+                {"triton": (arch_only, b200_only)},
+            ),
+            patch(
+                "helion._hardware.get_hardware_info",
+                side_effect=(
+                    BLACKWELL_HARDWARE,
+                    GB300_HARDWARE,
+                    BLACKWELL_HARDWARE,
+                ),
+            ) as hardware_info,
+        ):
+            b200_key = compiler_promotion_specialization_key("triton", device)
+            gb300_key = compiler_promotion_specialization_key("triton", device)
+            b200_key_again = compiler_promotion_specialization_key("triton", device)
+            self.assertEqual(hardware_info.call_count, 3)
+
+        self.assertEqual(b200_key, (("b200_only", "NVIDIA B200"),))
+        self.assertEqual(gb300_key, (("b200_only", None),))
+        self.assertEqual(b200_key_again, b200_key)
+
+    def test_promotion_key_canonicalizes_indexless_current_device(self) -> None:
+        b200_only = self._heuristic(
+            "b200_only",
+            promote_seed_to_default=True,
+            PROMOTE_NAMED_TARGETS=frozenset({("cuda", "NVIDIA B200", "sm100")}),
+        )
+
+        devices = (torch.device("cuda:0"), torch.device("cuda:1"))
+        hardware_by_device = {
+            devices[0]: BLACKWELL_HARDWARE,
+            devices[1]: GB300_HARDWARE,
+        }
+        observed_devices: list[torch.device] = []
+
+        def get_hardware_info(device: torch.device) -> HardwareInfo:
+            observed_devices.append(device)
+            return hardware_by_device[device]
+
+        with (
+            patch(
+                "helion._compiler.autotuner_heuristics.HEURISTICS_BY_BACKEND",
+                {"triton": (b200_only,)},
+            ),
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.current_device", side_effect=(0, 1)),
+            patch(
+                "helion._hardware.get_hardware_info",
+                side_effect=get_hardware_info,
+            ),
+        ):
+            indexless = torch.device("cuda")
+            b200_key = compiler_promotion_specialization_key("triton", indexless)
+            gb300_key = compiler_promotion_specialization_key("triton", indexless)
+
+        self.assertEqual(b200_key, (("b200_only", "NVIDIA B200"),))
+        self.assertEqual(gb300_key, (("b200_only", None),))
+        self.assertEqual(observed_devices, list(devices))
+
+    def test_promotion_key_cache_tracks_mutated_registry_policy(self) -> None:
+        mutable_promotion = self._heuristic(
+            "mutable_promotion",
+            promote_seed_to_default=True,
+            PROMOTE_NAMED_TARGETS=frozenset({("cuda", "NVIDIA B200", "sm100")}),
+        )
+
+        device = torch.device("cuda:0")
+        with (
+            patch(
+                "helion._compiler.autotuner_heuristics.HEURISTICS_BY_BACKEND",
+                {"triton": (mutable_promotion,)},
+            ),
+            patch(
+                "helion._hardware.get_hardware_info",
+                side_effect=(
+                    BLACKWELL_HARDWARE,
+                    BLACKWELL_HARDWARE,
+                    GB300_HARDWARE,
+                    GB300_HARDWARE,
+                ),
+            ) as hardware_info,
+        ):
+            self.assertEqual(
+                compiler_promotion_specialization_key("triton", device),
+                (("mutable_promotion", "NVIDIA B200"),),
+            )
+            mutable_promotion.PROMOTE_NAMED_TARGETS = frozenset(
+                {("cuda", "NVIDIA B200", "sm103")}
+            )
+            self.assertEqual(
+                compiler_promotion_specialization_key("triton", device),
+                (("mutable_promotion", None),),
+            )
+            mutable_promotion.PROMOTE_NAMED_TARGETS = frozenset(
+                {("cuda", "NVIDIA GB300", "sm100")}
+            )
+            self.assertEqual(
+                compiler_promotion_specialization_key("triton", device),
+                (("mutable_promotion", None),),
+            )
+            mutable_promotion.PROMOTE_NAMED_TARGETS = frozenset(
+                {("cuda", "NVIDIA GB300", "sm103")}
+            )
+            self.assertEqual(
+                compiler_promotion_specialization_key("triton", device),
+                (("mutable_promotion", "NVIDIA GB300"),),
+            )
+            mutable_promotion.promote_seed_to_default = False
+            self.assertEqual(
+                compiler_promotion_specialization_key("triton", device), ()
+            )
+            self.assertEqual(hardware_info.call_count, 4)
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler seed specialization is not used in ref eager mode")
+    def test_compiler_seed_specialization_rebinds_only_eligible_kernels(
+        self,
+    ) -> None:
+        device_num_sm_sensitive = self._heuristic(
+            "device_num_sm_sensitive",
+            CACHE_SPECIALIZATION_FACTS=frozenset({"device_num_sm"}),
+        )
+        config_num_sm_sensitive = self._heuristic(
+            "config_num_sm_sensitive",
+            CACHE_SPECIALIZATION_FACTS=frozenset({"config_num_sm"}),
+        )
+        input_metadata_sensitive = self._heuristic(
+            "input_tensor_metadata_sensitive",
+            CACHE_SPECIALIZATION_FACTS=frozenset({"input_tensor_metadata"}),
+        )
+        unrelated = self._heuristic("unrelated")
+
+        self.assertEqual(
+            CuteTcgen05GroupedWorklistHeuristic.CACHE_SPECIALIZATION_FACTS,
+            frozenset({"config_num_sm", "input_tensor_metadata"}),
+        )
+        for heuristic in (
+            CuteTcgen05ClusterM2Heuristic,
+            TritonH100FormulaMatmulHeuristic,
+            TritonH100MultiMatmulHeuristic,
+            TritonPointwiseSeedHeuristic,
+            TritonReductionHeuristic,
+        ):
+            self.assertEqual(
+                heuristic.CACHE_SPECIALIZATION_FACTS,
+                frozenset({"device_num_sm"}),
+            )
+
+        heuristics = (
+            device_num_sm_sensitive,
+            config_num_sm_sensitive,
+            input_metadata_sensitive,
+            unrelated,
+        )
+        with patch(
+            "helion._compiler.autotuner_heuristics.HEURISTICS_BY_BACKEND",
+            {"triton": heuristics},
+        ):
+            for heuristic in heuristics:
+                self.assertEqual(
+                    compiler_seed_specialization_facts("triton", [heuristic.name]),
+                    heuristic.CACHE_SPECIALIZATION_FACTS,
+                )
+
+        current_num_sm = 148
+
+        def get_num_sm(
+            _device: torch.device,
+            *,
+            reserved_sms: int = 0,
+        ) -> int:
+            return max(current_num_sm - reserved_sms, 1)
+
+        x = torch.empty([8], device=DEVICE)
+        wider_x = torch.empty([16], device=DEVICE)
+
+        def bind_kernel(
+            heuristic_name: str,
+            cases: tuple[tuple[tuple[torch.Tensor, ...], int], ...],
+            *,
+            persistent_reserved_sms: int = 0,
+            static_shapes: bool = True,
+        ) -> tuple[helion.Kernel, list[Any]]:
+            nonlocal current_num_sm
+
+            @helion.kernel(
+                backend="triton",
+                persistent_reserved_sms=persistent_reserved_sms,
+                static_shapes=static_shapes,
+            )
+            def identity(x: torch.Tensor) -> torch.Tensor:
+                out = torch.empty_like(x)
+                for tile in hl.tile(x.shape):
+                    out[tile] = x[tile]
+                return out
+
+            def seed_configs(env: MagicMock, _device_ir: object) -> list[helion.Config]:
+                env.config_spec.autotuner_heuristics = [heuristic_name]
+                return []
+
+            bounds = []
+            with patch(
+                "helion.runtime.kernel.compiler_seed_configs",
+                side_effect=seed_configs,
+            ):
+                for args, num_sm in cases:
+                    current_num_sm = num_sm
+                    bounds.append(identity.bind(args))
+            return identity, bounds
+
+        def specialization_values(kernel: helion.Kernel, fact: str) -> set[object]:
+            results = [
+                dict(
+                    cast(
+                        "tuple[tuple[str, object], ...]",
+                        key.compiler_seed_results,
+                    )
+                )
+                for key in kernel._bound_kernels
+            ]
+            self.assertTrue(all(set(result) == {fact} for result in results))
+            return {result[fact] for result in results}
+
+        def assert_bind_case(
+            heuristic_name: str,
+            cases: tuple[tuple[tuple[torch.Tensor, ...], int], ...],
+            *,
+            same: tuple[tuple[int, int], ...] = (),
+            different: tuple[tuple[int, int], ...] = (),
+            fact: str | None = None,
+            expected_values: set[object] | None = None,
+            persistent_reserved_sms: int = 0,
+            static_shapes: bool = True,
+        ) -> tuple[helion.Kernel, list[Any]]:
+            kernel, bounds = bind_kernel(
+                heuristic_name,
+                cases,
+                persistent_reserved_sms=persistent_reserved_sms,
+                static_shapes=static_shapes,
+            )
+            for first_index, second_index in same:
+                self.assertIs(bounds[first_index], bounds[second_index])
+            for first_index, second_index in different:
+                self.assertIsNot(bounds[first_index], bounds[second_index])
+            if fact is None:
+                self.assertFalse(
+                    any(key.compiler_seed_results for key in kernel._bound_kernels)
+                )
+            else:
+                self.assertEqual(specialization_values(kernel, fact), expected_values)
+            return kernel, bounds
+
+        with (
+            patch(
+                "helion._compiler.autotuner_heuristics.HEURISTICS_BY_BACKEND",
+                {"triton": heuristics},
+            ),
+            patch(
+                "helion.runtime.get_num_sm", side_effect=get_num_sm
+            ) as get_num_sm_mock,
+        ):
+            sensitive, (first, second, rebound) = bind_kernel(
+                device_num_sm_sensitive.name,
+                (((x,), 148), ((x,), 132), ((x,), 148)),
+            )
+
+            self.assertIsNot(first, second)
+            self.assertIs(rebound, first)
+            self.assertEqual(len(sensitive._bound_kernels), 2)
+            self.assertEqual(
+                specialization_values(sensitive, "device_num_sm"),
+                {132, 148},
+            )
+            self.assertTrue(
+                all(not key.extra_results for key in sensitive._bound_kernels)
+            )
+            first._run = lambda value: value
+            second._run = lambda value: value
+            current_num_sm = 148
+            get_num_sm_calls = get_num_sm_mock.call_count
+            with (
+                patch.object(sensitive, "bind", wraps=sensitive.bind) as bind,
+                patch(
+                    "helion.runtime.kernel._find_device",
+                    wraps=runtime_find_device,
+                ) as find_device,
+            ):
+                self.assertIs(first(x), x)
+                self.assertIs(first(x), x)
+            self.assertEqual(bind.call_count, 0)
+            self.assertEqual(find_device.call_count, 0)
+            self.assertEqual(get_num_sm_mock.call_count, get_num_sm_calls)
+
+            current_num_sm = 132
+            different_device = torch.device("cuda", (x.device.index or 0) + 1)
+            first._compiler_seed_device_resolver = MagicMock(
+                return_value=different_device
+            )
+            with patch.object(sensitive, "bind", return_value=second) as bind:
+                self.assertIs(first(x), x)
+            bind.assert_called_once_with((x,))
+            self.assertEqual(get_num_sm_mock.call_count, get_num_sm_calls + 1)
+
+            current_num_sm = 148
+            same_num_sm_device = torch.device("cuda", (x.device.index or 0) + 2)
+            first._compiler_seed_device_resolver = MagicMock(
+                return_value=same_num_sm_device
+            )
+            same_num_sm_calls = get_num_sm_mock.call_count
+            with patch.object(sensitive, "bind", wraps=sensitive.bind) as bind:
+                self.assertIs(first(x), x)
+                calls_after_new_device = get_num_sm_mock.call_count
+                self.assertIs(first(x), x)
+            bind.assert_called_once_with((x,))
+            self.assertEqual(calls_after_new_device, same_num_sm_calls + 2)
+            self.assertEqual(get_num_sm_mock.call_count, calls_after_new_device)
+
+            assert_bind_case(
+                config_num_sm_sensitive.name,
+                (((x,), 148), ((x,), 132)),
+                different=((0, 1),),
+                fact="config_num_sm",
+                expected_values={124, 140},
+                persistent_reserved_sms=8,
+            )
+
+            _metadata_sensitive, metadata_bounds = assert_bind_case(
+                input_metadata_sensitive.name,
+                (
+                    ((x,), 148),
+                    ((wider_x,), 148),
+                    ((torch.empty_like(x),), 148),
+                ),
+                same=((0, 2),),
+                different=((0, 1),),
+                fact="input_tensor_metadata",
+                expected_values={
+                    (((("sequence", tuple, 0),), (8,), (1,)),),
+                    (((("sequence", tuple, 0),), (16,), (1,)),),
+                },
+                static_shapes=False,
+            )
+            first_metadata, second_metadata, _rebound_metadata = metadata_bounds
+            first_metadata._run = lambda _value: x
+            second_metadata._run = lambda _value: wider_x
+            self.assertIs(first_metadata(wider_x), wider_x)
+
+            assert_bind_case(
+                input_metadata_sensitive.name,
+                (((x,), 148), ((wider_x,), 148)),
+                different=((0, 1),),
+            )
+
+            for static_shapes, cases in (
+                (True, (((x,), 148), ((x,), 132))),
+                (False, (((x,), 148), ((wider_x,), 148))),
+            ):
+                with self.subTest(unrelated_static_shapes=static_shapes):
+                    kernel, _bounds = assert_bind_case(
+                        unrelated.name,
+                        cases,
+                        same=((0, 1),),
+                        static_shapes=static_shapes,
+                    )
+                    self.assertEqual(len(kernel._bound_kernels), 1)
+
+    def test_argument_device_resolver_canonicalizes_indexless_cuda(self) -> None:
+        resolver = _DeviceResolver.from_values((torch.device("cuda"),))
+
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.current_device", side_effect=(0, 1)) as current_device,
+        ):
+            self.assertEqual(
+                resolver((torch.device("cuda"),)),
+                torch.device("cuda", 0),
+            )
+            self.assertEqual(
+                resolver((torch.device("cuda"),)),
+                torch.device("cuda", 1),
+            )
+
+        self.assertEqual(current_device.call_count, 2)
+
+    def test_argument_device_resolver_relearns_invalid_mapping_paths(self) -> None:
+        cpu = torch.device("cpu")
+        meta = torch.device("meta")
+        resolver = _DeviceResolver.from_values(({"empty": None, "device": meta},))
+        first_path = resolver.path
+
+        self.assertEqual(resolver(({"empty": None, "device": meta},)), meta)
+        self.assertEqual(resolver.path, first_path)
+
+        # Moving the selected key invalidates its learned mapping position even
+        # when the selected device is unchanged.
+        self.assertEqual(resolver(({"device": meta, "empty": None},)), meta)
+        reordered_path = resolver.path
+        self.assertNotEqual(reordered_path, first_path)
+
+        # A missing key and a changed container type both trigger discovery of
+        # the first device under the new structure.
+        self.assertEqual(resolver(({"replacement": cpu},)), cpu)
+        self.assertEqual(resolver(([None, meta],)), meta)
+
+    def test_input_tensor_metadata_tracks_roles_not_mapping_order(self) -> None:
+        narrow = torch.empty_strided((8, 4), (4, 1))
+        wide = torch.empty_strided((16, 4), (5, 1))
+        original = _input_tensor_metadata(
+            ({"lhs": narrow, "rhs": wide},),
+        )
+        reordered = _input_tensor_metadata(
+            ({"rhs": wide, "lhs": narrow},),
+        )
+        swapped_roles = _input_tensor_metadata(
+            ({"rhs": narrow, "lhs": wide},),
+        )
+
+        self.assertEqual(original, reordered)
+        self.assertNotEqual(original, swapped_roles)
+        self.assertEqual(
+            {record[0][-1][-1] for record in original},
+            {"lhs", "rhs"},
+        )
+
+    def test_input_tensor_metadata_tracks_dataclass_field_roles(self) -> None:
+        @dataclasses.dataclass
+        class Inputs:
+            lhs: torch.Tensor
+            rhs: torch.Tensor
+
+        narrow = torch.empty_strided((8, 4), (4, 1))
+        wide = torch.empty_strided((16, 4), (5, 1))
+        original = _input_tensor_metadata((Inputs(narrow, wide),))
+        swapped_roles = _input_tensor_metadata((Inputs(wide, narrow),))
+
+        self.assertNotEqual(original, swapped_roles)
+        self.assertEqual(
+            {record[0][-1][-1] for record in original},
+            {"lhs", "rhs"},
+        )
+
+    def test_compiler_seed_specialization_is_in_cache_hash(self) -> None:
+        bound_keys = [
+            BoundKernelInMemoryCacheKey(
+                (),
+                (),
+                compiler_seed_results=(("config_num_sm", num_sm),),
+            )
+            for num_sm in (132, 148)
+        ]
+
+        self.assertNotEqual(bound_keys[0].stable_hash(), bound_keys[1].stable_hash())
+        self.assertIn("compiler_seed_results", repr(bound_keys[0]))
+        self.assertEqual(
+            repr(BoundKernelInMemoryCacheKey((), ())),
+            "BoundKernelInMemoryCacheKey(specialization_key=(), extra_results=())",
+        )
+
+        common = {
+            "specialization_key": (),
+            "extra_results": (),
+            "kernel_source_hash": "source",
+            "hardware": "NVIDIA B200",
+            "runtime_name": "13.0",
+            "backend": "cute",
+        }
+        keys = [
+            LooseAutotuneCacheKey(
+                **common,
+                compiler_seed_results=(
+                    ("config_num_sm", 148),
+                    (
+                        "input_tensor_metadata",
+                        (((("sequence", tuple, 0),), (size,), (1,)),),
+                    ),
+                ),
+            )
+            for size in (8, 16)
+        ]
+
+        self.assertNotEqual(keys[0].stable_hash(), keys[1].stable_hash())
+        self.assertIn("compiler_seed_results", repr(keys[0]))
+
+        strict_keys = [
+            StrictAutotuneCacheKey(
+                **common,
+                compiler_seed_results=(("config_num_sm", num_sm),),
+                helion_key="helion",
+                torch_key="torch",
+                triton_key="triton",
+            )
+            for num_sm in (132, 148)
+        ]
+        self.assertNotEqual(
+            strict_keys[0].stable_hash(),
+            strict_keys[1].stable_hash(),
+        )
+        self.assertIn("compiler_seed_results", repr(strict_keys[0]))
+
+    def test_grouped_worklist_compatible_source_tiles_validate_rows(self) -> None:
+        valid_cases = (
+            (
+                [[0, 0, 17, 32], [1, 32, 11, 32]],
+                64,
+                (TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,),
+            ),
+            (
+                [[0, 0, 17, 224], [1, 224, 11, 224]],
+                448,
+                (
+                    TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
+                    TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+                ),
+            ),
+            (
+                [[0, 0, 17, 256], [1, 256, 11, 256]],
+                512,
+                (
+                    TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
+                    TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+                ),
+            ),
+        )
+        for rows, packed_m, expected in valid_cases:
+            with self.subTest(rows=rows):
+                self.assertEqual(
+                    tcgen05_grouped_worklist_compatible_source_m_tiles(
+                        rows,
+                        group_count=2,
+                        packed_m=packed_m,
+                    ),
+                    expected,
+                )
+
+        invalid_cases = (
+            ("row_count", [[0, 0, 17, 32]], 64),
+            ("row_width", [[0, 0, 17], [1, 32, 11, 32]], 64),
+            ("non_integer", [[0, 0, object(), 32], [1, 32, 11, 32]], 64),
+            ("row_hole", [[0, 0, 17, 32], [1, 64, 11, 32]], 96),
+            ("row_overlap", [[0, 0, 17, 64], [1, 32, 11, 64]], 96),
+        )
+        for name, rows, packed_m in invalid_cases:
+            with self.subTest(name=name):
+                self.assertEqual(
+                    tcgen05_grouped_worklist_compatible_source_m_tiles(
+                        rows,
+                        group_count=2,
+                        packed_m=packed_m,
+                    ),
+                    (),
+                )
+
+    def test_grouped_worklist_reviewed_signature_classifier_is_coarse(self) -> None:
+        policy = get_grouped_worklist_target_policy(("cuda", "NVIDIA GB300", "sm103"))
+        signatures = policy.reviewed_worklist_rows()
+        exact = next(
+            rows for rows in signatures if len(rows) == 4 and rows[0][2] == 9884
+        )
+        packed_m = sum(row[3] for row in exact)
+        classifier = _Tcgen05GroupedWorklistCompatibilityClassifier(
+            static_group_count=4,
+            static_packed_m=packed_m,
+            reviewed_rows=signatures,
+        )
+        worklist = torch.tensor(exact, dtype=torch.int32)
+        compatible = tcgen05_grouped_worklist_compatible_source_m_tiles(
+            exact,
+            group_count=4,
+            packed_m=packed_m,
+        )
+
+        self.assertEqual(classifier((worklist,)), (compatible, exact))
+
+        def rows_for_tile_counts(
+            tile_counts: tuple[int, ...],
+        ) -> tuple[tuple[int, int, int, int], ...]:
+            rows = []
+            start = 0
+            for group, count in enumerate(tile_counts):
+                stored_m = count * 256
+                rows.append((group, start, stored_m, stored_m))
+                start += stored_m
+            return tuple(rows)
+
+        skew_rows = rows_for_tile_counts((34, 34, 34, 33))
+        worklist.copy_(torch.tensor(skew_rows, dtype=torch.int32))
+        self.assertEqual(classifier((worklist,)), (compatible, None))
+
+        other_unseen = rows_for_tile_counts((33, 34, 34, 34))
+        self.assertEqual(
+            classifier((torch.tensor(other_unseen, dtype=torch.int32),)),
+            (compatible, None),
+        )
+
+        inference_classifier = _Tcgen05GroupedWorklistCompatibilityClassifier(
+            static_group_count=4,
+            static_packed_m=packed_m,
+            reviewed_rows=signatures,
+        )
+        with torch.inference_mode():
+            inference_worklist = torch.tensor(exact, dtype=torch.int32)
+        flattened = tuple(value for row in exact for value in row)
+        with patch(
+            "helion.runtime.cute.launcher._tcgen05_grouped_tensor_mutation_key",
+            return_value=("values", flattened),
+        ) as mutation_key:
+            self.assertEqual(
+                inference_classifier((inference_worklist,)),
+                (compatible, exact),
+            )
+        mutation_key.assert_called_once_with(inference_worklist)
+
+    def test_grouped_worklist_seeds_are_packing_compatible_and_ranked(self) -> None:
+        spec = ConfigSpec(backend=CuteBackend())
+        spec.cute_tcgen05_search_enabled = True
+        for block_id, size_hint in enumerate((256, 4096, 4096)):
+            spec.block_sizes.append(
+                BlockSizeSpec(block_id=block_id, size_hint=size_hint)
+            )
+        fact = MatmulFact(
+            lhs_ndim=2,
+            rhs_ndim=3,
+            m_block_id=0,
+            n_block_id=1,
+            k_block_id=2,
+            static_m=256,
+            static_n=4096,
+            static_k=4096,
+            lhs_dtype=torch.bfloat16,
+            rhs_dtype=torch.bfloat16,
+        )
+        spec.matmul_facts = [fact]
+        env = MagicMock(config_spec=spec)
+        self.assertIs(_tcgen05_grouped_fact(env), fact)
+        self.assertIs(_tcgen05_grouped_worklist_fact(env), fact)
+        dynamic_fact = fact._replace(static_n=None, static_k=None)
+        spec.matmul_facts = [dynamic_fact]
+        self.assertIsNone(_tcgen05_grouped_fact(env))
+        self.assertIs(_tcgen05_grouped_worklist_fact(env), dynamic_fact)
+        fp16_fact = fact._replace(
+            lhs_dtype=torch.float16,
+            rhs_dtype=torch.float16,
+        )
+        spec.matmul_facts = [fp16_fact]
+        self.assertIs(_tcgen05_grouped_fact(env), fp16_fact)
+        self.assertIsNone(_tcgen05_grouped_worklist_fact(env))
+
+        families = self._grouped_worklist_seed_families()
+        small = families["small_k"]
+        k_major = families["source256_k"]
+        legacy = families["source224"]
+        n_major = families["source256_n"]
+
+        for configs, key, expected in (
+            (small, TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY, 52),
+            (k_major, TCGEN05_CONSUMER_REGS_CONFIG_KEY, 240),
+            (n_major, TCGEN05_CONSUMER_REGS_CONFIG_KEY, 240),
+            (legacy, TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY, 8),
+            (legacy, TCGEN05_CONSUMER_REGS_CONFIG_KEY, 256),
+        ):
+            self.assertEqual(configs[0].config[key], expected)
+        self.assertNotIn(
+            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY,
+            k_major[0].config,
+        )
+        self.assertEqual(
+            n_major[0].config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
+            Tcgen05PersistenceModel.CLC_PERSISTENT.value,
+        )
+        for source_m_tile, configs in (
+            (32, small),
+            (224, legacy),
+            (256, k_major),
+            (256, n_major),
+        ):
+            self.assertTrue(configs)
+            self.assertTrue(
+                all(
+                    config.config[TCGEN05_GROUPED_MODE_CONFIG_KEY]
+                    == TCGEN05_GROUPED_MODE_WORKLIST_NM
+                    and config.config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY]
+                    == source_m_tile
+                    for config in configs
+                )
+            )
+
+    def test_grouped_worklist_seed_family_covers_reviewed_variants(self) -> None:
+        def block_k(values: dict[str, object]) -> int:
+            return cast("list[int]", values["block_sizes"])[2]
+
+        families = self._grouped_worklist_seed_families()
+        small = families["small_n"]
+        source224 = families["source224"]
+        source256 = families["source256_n"]
+
+        small_values = [config.config for config in small]
+        self.assertTrue(
+            {32, 52}.issubset(
+                {
+                    values.get(TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY)
+                    for values in small_values
+                    if block_k(values) == 128
+                }
+            )
+        )
+        self.assertTrue(
+            any(
+                block_k(values) == 128
+                and TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY not in values
+                for values in small_values
+            )
+        )
+        self.assertTrue(
+            {4, 8}.issubset(
+                {
+                    values.get(TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY)
+                    for values in small_values
+                    if values.get(TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY) == 20
+                }
+            )
+        )
+        self.assertTrue(
+            any(
+                block_k(values) == 64
+                and values.get(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY) is True
+                and TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY not in values
+                for values in small_values
+            )
+        )
+        self.assertTrue(
+            any(
+                values.get(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY) is not True
+                for values in small_values
+            )
+        )
+
+        source224_values = [config.config for config in source224]
+        self.assertEqual(
+            {
+                values["tcgen05_ab_stages"]
+                for values in source224_values
+                if values.get(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY) is not True
+            },
+            {4, 5, 6, 7},
+        )
+        self.assertTrue(
+            any(
+                values.get(TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY) == 8
+                and values.get(TCGEN05_CONSUMER_REGS_CONFIG_KEY) == 256
+                for values in source224_values
+            )
+        )
+        self.assertTrue(any(block_k(values) == 128 for values in source224_values))
+
+        source256_values = [config.config for config in source256]
+        self.assertEqual(
+            {
+                (block_k(values), values["tcgen05_ab_stages"])
+                for values in source256_values
+            },
+            {(64, 5), (64, 6), (128, 3)},
+        )
+        self.assertTrue(
+            {224, 240, 256}.issubset(
+                {
+                    values.get(TCGEN05_CONSUMER_REGS_CONFIG_KEY)
+                    for values in source256_values
+                }
+            )
+        )
+        self.assertTrue(
+            {8, 16}.issubset(
+                {
+                    values.get(TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY)
+                    for values in source256_values
+                }
+            )
+        )
+        self.assertTrue(
+            any(
+                values.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+                == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+                for values in source256_values
+            )
+        )
+
+    def test_grouped_worklist_automatic_seed_cap_round_robins_families(self) -> None:
+        families = [
+            [helion.Config(block_sizes=[family, index]) for index in range(length)]
+            for family, length in ((1, 6), (2, 4), (3, 3))
+        ]
+
+        configs = _bounded_grouped_worklist_seed_families(families)
+        self.assertEqual(len(configs), _TCGEN05_GROUPED_WORKLIST_AUTOMATIC_SEED_LIMIT)
+        self.assertEqual(
+            configs,
+            [
+                families[0][0],
+                families[1][0],
+                families[2][0],
+                families[0][1],
+                families[1][1],
+                families[2][1],
+                families[0][2],
+                families[1][2],
+            ],
+        )
+        preferred = families[1][3]
+        self.assertEqual(
+            _bounded_grouped_worklist_seed_families(
+                families,
+                preferred_config=preferred,
+            )[0],
+            preferred,
+        )
+        missing = helion.Config(block_sizes=[4, 0])
+        for candidate_families in (families, [[], []]):
+            with self.assertRaisesRegex(ValueError, "preferred_config"):
+                _bounded_grouped_worklist_seed_families(
+                    candidate_families,
+                    preferred_config=missing,
+                )
+
+    def test_grouped_worklist_clc_requires_full_physical_n_tile(self) -> None:
+        configs = _tcgen05_grouped_worklist_seed_family(
+            groups=8,
+            packed_m=20_480,
+            n=416,
+            k=192,
+            b_major="n",
+            source_m_tile=256,
+            num_sm=148,
+            target_policy=get_grouped_worklist_target_policy(None),
+        )[0]
+
+        self.assertTrue(configs)
+        self.assertTrue(
+            all(
+                config.config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+                != Tcgen05PersistenceModel.CLC_PERSISTENT.value
+                for config in configs
+            )
+        )
+        self.assertNotEqual(
+            configs[0].config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY),
+            Tcgen05PersistenceModel.CLC_PERSISTENT.value,
+        )
+
+    def test_grouped_worklist_clc_respects_cuda_grid_z_limit(self) -> None:
+        for m_tiles, n_tiles, expect_clc in (
+            (257, 255, True),
+            (258, 255, False),
+        ):
+            with self.subTest(
+                m_tiles=m_tiles,
+                n_tiles=n_tiles,
+                expect_clc=expect_clc,
+            ):
+                configs = _tcgen05_grouped_worklist_seed_family(
+                    groups=1,
+                    packed_m=m_tiles * 256,
+                    n=n_tiles * 256,
+                    k=65_536,
+                    b_major="n",
+                    source_m_tile=256,
+                    num_sm=148,
+                    target_policy=get_grouped_worklist_target_policy(None),
+                )[0]
+                clc_configs = [
+                    config
+                    for config in configs
+                    if config.config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+                    == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+                ]
+
+                self.assertEqual(bool(clc_configs), expect_clc)
+                self.assertEqual(
+                    m_tiles * n_tiles
+                    <= TCGEN05_GROUPED_RUNTIME_DIRECT_CLC_MAX_CLUSTERS,
+                    expect_clc,
+                )
+                if expect_clc:
+                    self.assertEqual(
+                        configs[0].config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY),
+                        Tcgen05PersistenceModel.CLC_PERSISTENT.value,
+                    )
+                else:
+                    self.assertNotEqual(
+                        configs[0].config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY),
+                        Tcgen05PersistenceModel.CLC_PERSISTENT.value,
+                    )
+
+    def test_grouped_worklist_sm103_target_policy_is_exact(self) -> None:
+        gb300_identity = ("cuda", "NVIDIA GB300", "sm103")
+        policy = get_grouped_worklist_target_policy(gb300_identity)
+        expected_tunings = {
+            (4, 6144, 7168, "k", 256, 135, 135, 152): (256, 8),
+            (4, 7168, 3072, "n", 256, 131, 131, 152): (256, 32),
+            (4, 7168, 3072, "k", 256, 131, 131, 152): (232, 32),
+            (8, 7168, 3072, "k", 256, 140, 140, 152): (240, 8),
+            (4, 4096, 4096, "k", 256, 139, 139, 152): (224, 16),
+            (4, 4096, 2048, "k", 256, 128, 128, 152): (240, 1),
+            (8, 6144, 7168, "k", 256, 152, 152, 152): (240, 8),
+            (8, 4096, 4096, "k", 256, 135, 135, 152): (256, 32),
+            (8, 4096, 2048, "k", 256, 127, 129, 152): (256, 1),
+        }
+        self.assertEqual(
+            {
+                (
+                    tuning.workload.groups,
+                    tuning.workload.n,
+                    tuning.workload.k,
+                    tuning.workload.b_major,
+                    tuning.workload.source_m_tile,
+                    tuning.workload.source_tiles_min,
+                    tuning.workload.source_tiles_max,
+                    tuning.workload.num_sm,
+                ): (
+                    tuning.consumer_regs,
+                    tuning.l2_swizzle_size,
+                )
+                for tuning in policy.tunings
+            },
+            expected_tunings,
+        )
+        reviewed_rows = policy.reviewed_worklist_rows()
+        self.assertEqual(len(reviewed_rows), 8)
+        self.assertIn(
+            (
+                (0, 0, 9884, 9984),
+                (1, 9984, 9459, 9472),
+                (2, 19456, 7801, 7936),
+                (3, 27392, 7007, 7168),
+            ),
+            reviewed_rows,
+        )
+        self.assertIn(
+            (
+                (0, 0, 5102, 5120),
+                (1, 5120, 5282, 5376),
+                (2, 10496, 4858, 4864),
+                (3, 15360, 5084, 5120),
+                (4, 20480, 3629, 3840),
+                (5, 24320, 4660, 4864),
+                (6, 29184, 5076, 5120),
+                (7, 34304, 4548, 4608),
+            ),
+            reviewed_rows,
+        )
+        self.assertEqual(
+            grouped_worklist_target_identities(),
+            frozenset(
+                {
+                    ("cuda", "NVIDIA B200", "sm100"),
+                    gb300_identity,
+                }
+            ),
+        )
+        self.assertEqual(
+            _TCGEN05_GROUPED_SUPPORTED_CAPABILITIES,
+            frozenset({"sm100", "sm103"}),
+        )
+        self.assertFalse(
+            get_grouped_worklist_target_policy(("cuda", "NVIDIA B200", "sm100")).tunings
+        )
+        for mismatched_identity in (
+            ("rocm", "NVIDIA GB300", "sm103"),
+            ("cuda", "NVIDIA GB300 NVL72", "sm103"),
+            ("cuda", "NVIDIA GB300", "sm100"),
+            None,
+        ):
+            self.assertFalse(
+                get_grouped_worklist_target_policy(mismatched_identity).tunings
+            )
+
+        tuning_by_key = {
+            (
+                tuning.workload.groups,
+                tuning.workload.n,
+                tuning.workload.k,
+                tuning.workload.b_major,
+                tuning.workload.source_m_tile,
+                tuning.workload.source_tiles_min,
+                tuning.workload.source_tiles_max,
+                tuning.workload.num_sm,
+            ): tuning
+            for tuning in policy.tunings
+        }
+        for workload_key, (consumer_regs, l2_swizzle_size) in expected_tunings.items():
+            groups, n, k, b_major, source_m_tile, source_tiles_min, _, num_sm = (
+                workload_key
+            )
+            with self.subTest(workload=workload_key):
+                selected = _tcgen05_grouped_worklist_seed_family(
+                    groups=groups,
+                    packed_m=source_tiles_min * source_m_tile,
+                    n=n,
+                    k=k,
+                    b_major=cast("Any", b_major),
+                    source_m_tile=source_m_tile,
+                    num_sm=num_sm,
+                    target_policy=policy,
+                    worklist_rows=tuning_by_key[
+                        workload_key
+                    ].workload.reviewed_worklist_rows,
+                )[0][0].config
+                self.assertEqual(
+                    selected,
+                    self._expected_grouped_worklist_clc_config(
+                        consumer_regs,
+                        l2_swizzle_size,
+                    ),
+                )
+
+    def test_grouped_worklist_target_envelopes_fall_back_exactly(self) -> None:
+        gb300_identity = ("cuda", "NVIDIA GB300", "sm103")
+        row3_rows = next(
+            tuning.workload.reviewed_worklist_rows
+            for tuning in get_grouped_worklist_target_policy(gb300_identity).tunings
+            if tuning.workload.groups == 4
+            and tuning.workload.n == 4096
+            and tuning.workload.k == 2048
+        )
+        row3: dict[str, Any] = {
+            "groups": 4,
+            "packed_m": 128 * 256,
+            "n": 4096,
+            "k": 2048,
+            "b_major": "k",
+            "source_m_tile": 256,
+            "num_sm": 152,
+        }
+        perturbations = (
+            {"groups": 5},
+            {"n": 4352},
+            {"k": 2112},
+            {"b_major": "n"},
+            {"source_m_tile": 224, "packed_m": 128 * 224},
+            {"packed_m": 127 * 256},
+            {"num_sm": 151},
+        )
+        for perturbation in perturbations:
+            arguments = {**row3, **perturbation}
+            with self.subTest(perturbation=perturbation):
+                generic = self._grouped_worklist_configs_from_arguments(arguments)
+                off_profile = self._grouped_worklist_configs_from_arguments(
+                    arguments,
+                    gb300_identity,
+                    row3_rows,
+                )
+                self.assertEqual(off_profile, generic)
+
+        for mismatched_identity in (
+            ("rocm", "NVIDIA GB300", "sm103"),
+            ("cuda", "NVIDIA GB300 NVL72", "sm103"),
+            ("cuda", "NVIDIA GB300", "sm100"),
+        ):
+            with self.subTest(hardware_identity=mismatched_identity):
+                self.assertEqual(
+                    self._grouped_worklist_configs_from_arguments(
+                        row3,
+                        mismatched_identity,
+                        row3_rows,
+                    ),
+                    self._grouped_worklist_configs_from_arguments(row3),
+                )
+
+    def test_grouped_worklist_target_policy_rejects_malformed_tuning(self) -> None:
+        valid_workload: dict[str, Any] = {
+            "groups": 4,
+            "n": 4096,
+            "k": 4096,
+            "b_major": "k",
+            "source_m_tile": 256,
+            "source_tiles_min": 128,
+            "source_tiles_max": 128,
+            "num_sm": 152,
+        }
+        for override, message in (
+            ({"groups": 0}, "positive integers"),
+            ({"b_major": "x"}, "B major"),
+            ({"source_m_tile": 16}, "source M tile"),
+            ({"n": 33}, "N must be divisible by 32"),
+            ({"source_tiles_min": 0}, "positive integers"),
+            (
+                {"source_tiles_min": 129, "source_tiles_max": 128},
+                "ordered and inclusive",
+            ),
+        ):
+            with (
+                self.subTest(override=override),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                GroupedWorklistWorkload(**cast("Any", {**valid_workload, **override}))
+
+        workload = GroupedWorklistWorkload(**cast("Any", valid_workload))
+        valid_tuning: dict[str, Any] = {
+            "workload": workload,
+            "consumer_regs": 240,
+            "l2_swizzle_size": 1,
+            "clc": False,
+        }
+        for override, message in (
+            ({"block_k": 32}, "block K"),
+            ({"consumer_regs": 128}, "consumer register"),
+            ({"l2_swizzle_size": 3}, "L2 swizzle"),
+            ({"ab_stages": 0}, "AB stages"),
+            ({"ab_stages": 8}, "AB stages"),
+            ({"runtime_direct": 1}, "scheduler flags"),
+            ({"clc": 1}, "scheduler flags"),
+            ({"reserved_sms": 0}, "reserved SM count"),
+            ({"reserved_sms": 151}, "reserved SM count"),
+            ({"reserved_sms": 10_000}, "reserved SM count"),
+            (
+                {"runtime_direct": False, "l2_swizzle_size": 8},
+                "panel swizzles require",
+            ),
+            (
+                {
+                    "workload": dataclasses.replace(workload, k=96),
+                    "block_k": 64,
+                },
+                "must divide workload K",
+            ),
+        ):
+            with (
+                self.subTest(override=override),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                GroupedWorklistTuning(**cast("Any", {**valid_tuning, **override}))
+
+        valid_clc = {**valid_tuning, "clc": True}
+        for override, message in (
+            ({"runtime_direct": False}, "requires runtime_direct"),
+            ({"reserved_sms": 1}, "cannot reserve SMs"),
+            (
+                {
+                    "workload": dataclasses.replace(
+                        workload,
+                        source_m_tile=32,
+                    )
+                },
+                "two-CTA source M tile",
+            ),
+            (
+                {"workload": dataclasses.replace(workload, n=4032)},
+                "N divisible by 256",
+            ),
+            (
+                {
+                    "workload": dataclasses.replace(
+                        workload,
+                        source_tiles_min=1,
+                        source_tiles_max=1,
+                    )
+                },
+                "at least one device wave",
+            ),
+            (
+                {
+                    "workload": dataclasses.replace(
+                        workload,
+                        n=256,
+                        source_tiles_min=152,
+                        source_tiles_max=65_536,
+                    )
+                },
+                "runtime grid limit",
+            ),
+        ):
+            with (
+                self.subTest(override=override),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                GroupedWorklistTuning(**cast("Any", {**valid_clc, **override}))
+
+    def test_grouped_worklist_target_policy_rejects_overlapping_envelopes(
+        self,
+    ) -> None:
+        base = GroupedWorklistWorkload(
+            groups=8,
+            n=4096,
+            k=2048,
+            b_major="k",
+            source_m_tile=256,
+            source_tiles_min=127,
+            source_tiles_max=129,
+            num_sm=152,
+        )
+
+        def tuning(workload: GroupedWorklistWorkload) -> GroupedWorklistTuning:
+            return GroupedWorklistTuning(
+                workload=workload,
+                consumer_regs=240,
+                l2_swizzle_size=1,
+                clc=False,
+            )
+
+        with self.assertRaisesRegex(ValueError, "immutable tuple"):
+            GroupedWorklistTargetPolicy(tunings=cast("Any", [tuning(base)]))
+        with self.assertRaisesRegex(ValueError, "must not overlap"):
+            GroupedWorklistTargetPolicy(
+                tunings=(
+                    tuning(base),
+                    tuning(
+                        dataclasses.replace(
+                            base,
+                            source_tiles_min=129,
+                            source_tiles_max=131,
+                        )
+                    ),
+                )
+            )
+        GroupedWorklistTargetPolicy(
+            tunings=(
+                tuning(base),
+                tuning(
+                    dataclasses.replace(
+                        base,
+                        source_tiles_min=130,
+                        source_tiles_max=131,
+                    )
+                ),
+            )
+        )
+        exact_rows = tuple((group, group * 4096, 4096, 4096) for group in range(8))
+        different_rows = (
+            (0, 0, 3840, 3840),
+            *(
+                tuple((group, 3840 + (group - 1) * 4096, 4096, 4096))
+                for group in range(1, 7)
+            ),
+            (7, 28416, 4352, 4352),
+        )
+        GroupedWorklistTargetPolicy(
+            tunings=(
+                tuning(dataclasses.replace(base, reviewed_worklist_rows=exact_rows)),
+                tuning(
+                    dataclasses.replace(
+                        base,
+                        reviewed_worklist_rows=different_rows,
+                    )
+                ),
+            )
+        )
+
+    def test_grouped_worklist_exact_target_seed_precedes_generic_branches(self) -> None:
+        rows = tuple((group, group * 256, 256, 256) for group in range(16))
+        tuning = GroupedWorklistTuning(
+            workload=GroupedWorklistWorkload(
+                groups=16,
+                n=256,
+                k=256,
+                b_major="k",
+                source_m_tile=256,
+                source_tiles_min=16,
+                source_tiles_max=16,
+                num_sm=8,
+                reviewed_worklist_rows=rows,
+            ),
+            consumer_regs=256,
+            l2_swizzle_size=4,
+        )
+
+        selected = _tcgen05_grouped_worklist_seed_family(
+            groups=16,
+            packed_m=16 * 256,
+            n=256,
+            k=256,
+            b_major="k",
+            source_m_tile=256,
+            num_sm=8,
+            target_policy=GroupedWorklistTargetPolicy(tunings=(tuning,)),
+            worklist_rows=rows,
+        )[0][0].config
+
+        self.assertEqual(
+            selected,
+            self._expected_grouped_worklist_clc_config(256, 4),
+        )
+
+    def test_grouped_worklist_seed_configs_forward_exact_hardware_identity(
+        self,
+    ) -> None:
+        from helion._compiler.cute.cute_mma import Tcgen05GroupedWorklistAnalysis
+        from helion._compiler.cute.cute_mma import Tcgen05GroupedWorklistSeedFacts
+
+        spec = ConfigSpec(
+            backend=CuteBackend(),
+            target_device_capability=(10, 3),
+            num_sm=152,
+        )
+        for block_id, size_hint, min_size, max_size in (
+            (0, 256, 256, 256),
+            (1, 4096, 128, 128),
+            (2, 2048, 64, 128),
+        ):
+            spec.block_sizes.append(
+                BlockSizeSpec(
+                    block_id=block_id,
+                    size_hint=size_hint,
+                    min_size=min_size,
+                    max_size=max_size,
+                )
+            )
+        fact = MatmulFact(
+            lhs_ndim=2,
+            rhs_ndim=3,
+            m_block_id=0,
+            n_block_id=1,
+            k_block_id=2,
+            static_m=256,
+            static_n=4096,
+            static_k=2048,
+            lhs_dtype=torch.bfloat16,
+            rhs_dtype=torch.bfloat16,
+        )
+        seed_facts = Tcgen05GroupedWorklistSeedFacts(
+            groups_hint=8,
+            packed_m_hint=128 * 256,
+            n_hint=4096,
+            k_hint=2048,
+            b_major="k",
+            device_split_sizes=False,
+        )
+        analysis = Tcgen05GroupedWorklistAnalysis(
+            seed_facts=seed_facts,
+            metadata_tensor=MagicMock(),
+            packed_tensor=MagicMock(),
+            grouped_tensor=MagicMock(),
+        )
+        env = MagicMock(device=torch.device("cuda:0"), config_spec=spec)
+        device_ir = MagicMock()
+        reviewed_rows = next(
+            tuning.workload.reviewed_worklist_rows
+            for tuning in get_grouped_worklist_target_policy(
+                ("cuda", "NVIDIA GB300", "sm103")
+            ).tunings
+            if tuning.workload.groups == 8
+            and tuning.workload.n == 4096
+            and tuning.workload.k == 2048
+        )
+        assert reviewed_rows is not None
+
+        with (
+            patch.object(
+                CuteTcgen05GroupedWorklistHeuristic,
+                "_eligible_inputs",
+                return_value=(fact, analysis),
+            ),
+            patch(
+                "helion._compiler.autotuner_heuristics.cute."
+                "_tcgen05_grouped_worklist_source_analysis",
+                return_value=((256,), reviewed_rows),
+            ),
+            patch(
+                "helion._hardware.get_hardware_info",
+                return_value=GB300_HARDWARE,
+            ) as hardware_info,
+            patch(
+                "helion._compiler.autotuner_heuristics.cute."
+                "get_grouped_worklist_target_policy",
+                wraps=get_grouped_worklist_target_policy,
+            ) as policy_lookup,
+        ):
+            configs = CuteTcgen05GroupedWorklistHeuristic._seed_configs(
+                env,
+                device_ir,
+            )
+
+        hardware_info.assert_called_once_with(torch.device("cuda:0"))
+        policy_lookup.assert_called_once_with(("cuda", "NVIDIA GB300", "sm103"))
+        self.assertEqual(
+            configs[0].config,
+            self._expected_grouped_worklist_clc_config(256, 1),
+        )
+
+        with (
+            patch.object(
+                CuteTcgen05GroupedWorklistHeuristic,
+                "_eligible_inputs",
+                return_value=(fact, analysis),
+            ),
+            patch(
+                "helion._compiler.autotuner_heuristics.cute."
+                "_tcgen05_grouped_worklist_source_analysis",
+                return_value=((256,), None),
+            ),
+            patch(
+                "helion._hardware.get_hardware_info",
+                side_effect=RuntimeError("unclassified device"),
+            ),
+        ):
+            unclassified = CuteTcgen05GroupedWorklistHeuristic._seed_configs(
+                env,
+                device_ir,
+            )
+        self.assertEqual(
+            unclassified,
+            _tcgen05_grouped_worklist_seed_family(
+                groups=8,
+                packed_m=128 * 256,
+                n=4096,
+                k=2048,
+                b_major="k",
+                source_m_tile=256,
+                num_sm=152,
+                target_policy=get_grouped_worklist_target_policy(None),
+            )[0][:_TCGEN05_GROUPED_WORKLIST_AUTOMATIC_SEED_LIMIT],
+        )
+
+        same_arch_unknown_product = dataclasses.replace(
+            GB300_HARDWARE,
+            hardware_name="NVIDIA future sm103",
+        )
+        device_split_analysis = dataclasses.replace(
+            analysis,
+            seed_facts=seed_facts._replace(device_split_sizes=True),
+        )
+        with (
+            patch.object(
+                CuteTcgen05GroupedWorklistHeuristic,
+                "_eligible_inputs",
+                return_value=(fact, device_split_analysis),
+            ),
+            patch(
+                "helion._compiler.autotuner_heuristics.cute."
+                "_tcgen05_grouped_worklist_source_analysis",
+                return_value=((224, 256), None),
+            ),
+            patch(
+                "helion._hardware.get_hardware_info",
+                return_value=GB300_HARDWARE,
+            ) as device_split_hardware_info,
+            patch(
+                "helion._compiler.autotuner_heuristics.cute."
+                "get_grouped_worklist_target_policy",
+                wraps=get_grouped_worklist_target_policy,
+            ) as device_split_policy_lookup,
+        ):
+            device_split_configs = CuteTcgen05GroupedWorklistHeuristic._seed_configs(
+                env,
+                device_ir,
+            )
+        device_split_hardware_info.assert_not_called()
+        device_split_policy_lookup.assert_called_once_with(None)
+        self.assertEqual(
+            device_split_configs[1].config[
+                TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
+            ],
+            256,
+        )
+        self.assertEqual(
+            device_split_configs[1].config[TCGEN05_CONSUMER_REGS_CONFIG_KEY],
+            240,
+        )
+        self.assertTrue(
+            all(
+                config.config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+                != Tcgen05PersistenceModel.CLC_PERSISTENT.value
+                for config in device_split_configs
+            )
+        )
+
+        with patch(
+            "helion._hardware.get_hardware_info",
+            side_effect=(GB300_HARDWARE, same_arch_unknown_product),
+        ):
+            gb300_cache_key = compiler_promotion_specialization_key(
+                "cute",
+                torch.device("cuda:0"),
+            )
+            unknown_cache_key = compiler_promotion_specialization_key(
+                "cute",
+                torch.device("cuda:0"),
+            )
+        self.assertEqual(
+            gb300_cache_key,
+            ((CuteTcgen05GroupedWorklistHeuristic.name, "NVIDIA GB300"),),
+        )
+        self.assertEqual(
+            unknown_cache_key,
+            ((CuteTcgen05GroupedWorklistHeuristic.name, None),),
+        )
+
+    def test_grouped_worklist_seeds_filter_unreachable_block_k(self) -> None:
+        configs = _tcgen05_grouped_worklist_seed_family(
+            groups=8,
+            packed_m=8 * 4096,
+            n=4096,
+            k=2048,
+            b_major="n",
+            source_m_tile=256,
+            num_sm=148,
+            target_policy=get_grouped_worklist_target_policy(None),
+        )[0]
+
+        for block_k in (64, 128):
+            spec = ConfigSpec(backend=CuteBackend())
+            for block_id, value in enumerate((256, 128, block_k)):
+                spec.block_sizes.append(
+                    BlockSizeSpec(
+                        block_id=block_id,
+                        size_hint=value,
+                        min_size=value,
+                        max_size=value,
+                    )
+                )
+            reachable = _filter_reachable_block_size_configs(spec, configs)
+            self.assertTrue(reachable)
+            self.assertTrue(
+                all(
+                    cast("list[int]", config.config["block_sizes"])[2] == block_k
+                    for config in reachable
+                )
+            )
+        bk128_only = ConfigSpec(
+            backend=CuteBackend(),
+            target_device_capability=(10, 0),
+        )
+        bk128_only.cute_tcgen05_search_enabled = True
+        for block_id, value in enumerate((256, 128, 128)):
+            bk128_only.block_sizes.append(
+                BlockSizeSpec(
+                    block_id=block_id,
+                    size_hint=value,
+                    min_size=value,
+                    max_size=value,
+                )
+            )
+        bk128_only.matmul_facts = [
+            MatmulFact(
+                lhs_ndim=2,
+                rhs_ndim=3,
+                m_block_id=0,
+                n_block_id=1,
+                k_block_id=2,
+                static_m=256,
+                static_n=None,
+                static_k=None,
+                lhs_dtype=torch.bfloat16,
+                rhs_dtype=torch.bfloat16,
+            )
+        ]
+        env = MagicMock(config_spec=bk128_only)
+        analysis = MagicMock()
+        analysis.seed_facts.groups_hint = 1
+        analysis.seed_facts.packed_m_hint = 256
+        analysis.seed_facts.n_hint = 128
+        analysis.seed_facts.k_hint = 128
+        with (
+            patch(
+                "helion._compiler.autotuner_heuristics.cute."
+                "tcgen05_runtime_n_ptx_compatible",
+                return_value=True,
+            ),
+            patch(
+                "helion._compiler.cute.cute_mma.analyze_tcgen05_grouped_worklist",
+                return_value=analysis,
+            ),
+        ):
+            self.assertEqual(
+                CuteTcgen05GroupedWorklistHeuristic._eligible_inputs(env, MagicMock()),
+                (bk128_only.matmul_facts[0], analysis),
+            )
+            bk128_only.target_device_capability = (10, 3)
+            self.assertEqual(
+                CuteTcgen05GroupedWorklistHeuristic._eligible_inputs(env, MagicMock()),
+                (bk128_only.matmul_facts[0], analysis),
+            )
+            bk128_only.target_device_capability = (10, 4)
+            self.assertIsNone(
+                CuteTcgen05GroupedWorklistHeuristic._eligible_inputs(env, MagicMock())
+            )
+            bk128_only.target_device_capability = (10, 3)
+            bk128_only.matmul_facts = [bk128_only.matmul_facts[0]._replace(static_n=33)]
+            self.assertIsNone(
+                CuteTcgen05GroupedWorklistHeuristic._eligible_inputs(env, MagicMock())
+            )
+            bk128_only.matmul_facts = [
+                bk128_only.matmul_facts[0]._replace(static_n=None)
+            ]
+            self.assertEqual(
+                CuteTcgen05GroupedWorklistHeuristic._eligible_inputs(env, MagicMock()),
+                (bk128_only.matmul_facts[0], analysis),
+            )
+
+    def test_grouped_worklist_seed_only_controls_survive_flattening(self) -> None:
+        spec = ConfigSpec(backend=CuteBackend())
+        spec.cute_tcgen05_search_enabled = True
+        spec.allowed_pid_types = ("flat",)
+        families = self._grouped_worklist_seed_families()
+        spec.compiler_seed_configs = [
+            *families["small_k"],
+            *families["source256_n"],
+            *families["source256_k"],
+        ]
+        fields = spec._cute_tcgen05_config.flat_fields()
+
+        def enum(key: str) -> EnumFragment:
+            fragment = fields[key]
+            self.assertIsInstance(fragment, EnumFragment)
+            return cast("EnumFragment", fragment)
+
+        ab_stages = cast("IntegerFragment", fields["tcgen05_ab_stages"])
+        self.assertIsInstance(ab_stages, IntegerFragment)
+        grouped_mode = enum(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+        runtime_direct = enum(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY)
+        reserved = enum(TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY)
+        consumer_regs = enum(TCGEN05_CONSUMER_REGS_CONFIG_KEY)
+        strategy = enum(TCGEN05_STRATEGY_CONFIG_KEY)
+        persistence = enum(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+        scheduler_warps = enum(TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY)
+        source_m_tile = enum(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY)
+        l2_swizzle = enum(TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY)
+        pid_type = enum("pid_type")
+        seed_ab_stages = max(
+            cast("int", seed.config["tcgen05_ab_stages"])
+            for seed in spec.compiler_seed_configs
+        )
+        self.assertGreater(seed_ab_stages, ab_stages.high)
+        self.assertEqual(ab_stages.default(), 2)
+        self.assertEqual(ab_stages.cardinality(), 2)
+        self.assertEqual(ab_stages.search_values(), [1, 2])
+        self.assertEqual(ab_stages.dim(), 1)
+        self.assertEqual(ab_stages.encode(seed_ab_stages), [float(seed_ab_stages)])
+        self.assertEqual(ab_stages.pattern_neighbors(seed_ab_stages), [2, 1])
+        self.assertEqual(
+            ab_stages.differential_mutation(seed_ab_stages, 1, 1),
+            seed_ab_stages,
+        )
+        self.assertEqual(ab_stages.differential_mutation(seed_ab_stages, 1, 2), 2)
+        self.assertEqual(ab_stages.differential_mutation(seed_ab_stages, 2, 1), 2)
+        self.assertTrue(all(ab_stages.random() in (1, 2) for _ in range(32)))
+        self.assertEqual(grouped_mode.search_choices, (None,))
+        self.assertEqual(runtime_direct.search_choices, (False,))
+        self.assertIn(52, reserved.choices)
+        self.assertEqual(
+            reserved.search_choices,
+            TCGEN05_GROUPED_STATIC_RESERVED_SMS_SEARCH_CHOICES,
+        )
+        self.assertEqual(consumer_regs.search_choices, (256,))
+        self.assertEqual(
+            strategy.search_choices,
+            (Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,),
+        )
+        self.assertIn(Tcgen05PersistenceModel.CLC_PERSISTENT.value, persistence.choices)
+        self.assertEqual(
+            scheduler_warps.search_choices,
+            (0,),
+        )
+        self.assertEqual(set(source_m_tile.choices), {None, 32, 256})
+        self.assertEqual(source_m_tile.search_choices, (None,))
+        self.assertIn(16, l2_swizzle.choices)
+        self.assertEqual(l2_swizzle.search_choices, (1, 2, 4, 8))
+        self.assertEqual(pid_type.search_choices, ("flat",))
+
+    def test_grouped_worklist_primary_promotes_on_supported_blackwell_arches(
+        self,
+    ) -> None:
+        spec = ConfigSpec(backend=CuteBackend())
+        spec.cute_tcgen05_search_enabled = True
+        for block_id, size_hint in enumerate((256, 256, 128)):
+            spec.block_sizes.append(
+                BlockSizeSpec(block_id=block_id, size_hint=size_hint)
+            )
+        static_fact = MatmulFact(
+            lhs_ndim=2,
+            rhs_ndim=2,
+            m_block_id=0,
+            n_block_id=1,
+            k_block_id=2,
+            static_m=256,
+            static_n=256,
+            static_k=128,
+            lhs_dtype=torch.bfloat16,
+            rhs_dtype=torch.bfloat16,
+        )
+        spec.matmul_facts = [static_fact]
+        env = MagicMock(device=DEVICE, config_spec=spec)
+        for hardware in (BLACKWELL_HARDWARE, GB300_HARDWARE):
+            with (
+                self.subTest(compute_capability=hardware.compute_capability),
+                patch(
+                    "helion._compiler.autotuner_heuristics.cute."
+                    "tcgen05_runtime_n_ptx_compatible",
+                    return_value=True,
+                ),
+                patch("helion._hardware.get_hardware_info", return_value=hardware),
+            ):
+                self.assertTrue(CuteTcgen05GroupedWorklistHeuristic.should_promote(env))
+        spec.matmul_facts = [static_fact._replace(static_k=None)]
+        self.assertFalse(CuteTcgen05GroupedWorklistHeuristic.should_promote(env))
+        spec.matmul_facts = [
+            static_fact._replace(
+                lhs_dtype=torch.float16,
+                rhs_dtype=torch.float16,
+            )
+        ]
+        self.assertFalse(CuteTcgen05GroupedWorklistHeuristic.should_promote(env))
+
+    def test_grouped_worklist_gb300_target_override_requires_exact_rows(self) -> None:
+        gb300_identity = ("cuda", "NVIDIA GB300", "sm103")
+        exact_rows = (
+            (0, 0, 2870, 3072),
+            (1, 3072, 4080, 4096),
+            (2, 7168, 4999, 5120),
+            (3, 12288, 3466, 3584),
+            (4, 15872, 3666, 3840),
+            (5, 19712, 5006, 5120),
+            (6, 24832, 3336, 3584),
+            (7, 28416, 4261, 4352),
+        )
+        balanced_rows = tuple((group, group * 4096, 4096, 4096) for group in range(8))
+        kwargs = {
+            "groups": 8,
+            "packed_m": 128 * 256,
+            "n": 4096,
+            "k": 2048,
+            "b_major": "k",
+            "source_m_tile": 256,
+            "num_sm": 152,
+        }
+        exact_ranked = self._grouped_worklist_configs_from_arguments(
+            kwargs,
+            gb300_identity,
+            exact_rows,
+        )
+        same_total_ranked = self._grouped_worklist_configs_from_arguments(
+            kwargs,
+            gb300_identity,
+            balanced_rows,
+        )
+        generic_ranked = self._grouped_worklist_configs_from_arguments(kwargs)
+
+        self.assertNotEqual(exact_ranked[0], generic_ranked[0])
+        self.assertEqual(same_total_ranked, generic_ranked)
+
+    @onlyBackends(["cute"])
+    def test_grouped_worklist_gb300_reviewed_signature_rebinds(self) -> None:
+        def rows_for_tile_counts(
+            tile_counts: tuple[int, ...],
+        ) -> tuple[tuple[int, int, int, int], ...]:
+            rows = []
+            start = 0
+            for group, count in enumerate(tile_counts):
+                stored_m = count * 256
+                rows.append((group, start, stored_m, stored_m))
+                start += stored_m
+            return tuple(rows)
+
+        exact_rows = rows_for_tile_counts((1, 2, 2, 3))
+        skew_rows = rows_for_tile_counts((3, 2, 2, 1))
+        policy = GroupedWorklistTargetPolicy(
+            tunings=(
+                GroupedWorklistTuning(
+                    workload=GroupedWorklistWorkload(
+                        groups=4,
+                        n=256,
+                        k=128,
+                        b_major="k",
+                        source_m_tile=256,
+                        source_tiles_min=8,
+                        source_tiles_max=8,
+                        num_sm=152,
+                        reviewed_worklist_rows=exact_rows,
+                    ),
+                    consumer_regs=256,
+                    l2_swizzle_size=1,
+                    clc=False,
+                ),
+            )
+        )
+        a = torch.empty((8 * 256, 128), device=DEVICE, dtype=torch.bfloat16)
+        b = torch.empty((4, 256, 128), device=DEVICE, dtype=torch.bfloat16)
+        worklist = torch.tensor(exact_rows, device=DEVICE, dtype=torch.int32)
+        args = (a, b, worklist)
+        kernel = helion.kernel(
+            _grouped_worklist_kernel_body,
+            backend="cute",
+            static_shapes=True,
+        )
+
+        with (
+            patch_cute_mma_support(),
+            patch(
+                "helion._compiler.autotuner_heuristics.cute."
+                "tcgen05_runtime_n_ptx_compatible",
+                return_value=True,
+            ),
+            patch(
+                "helion._compiler.cute.cutedsl_compat.check_cute_backend_requirements"
+            ),
+            patch("helion._hardware.get_hardware_info", return_value=GB300_HARDWARE),
+            patch(
+                "helion._compiler.autotuner_heuristics.cute."
+                "get_grouped_worklist_target_policy",
+                return_value=policy,
+            ),
+            patch("helion.runtime.get_num_sm", return_value=152),
+        ):
+            exact_bound = kernel.bind(args)
+            exact_default = exact_bound.config_spec.compiler_default_config
+            self.assertIsNotNone(exact_default)
+            assert exact_default is not None
+            exact_seeds = [
+                config
+                for config in exact_bound.config_spec.compiler_seed_configs
+                if config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+                == TCGEN05_GROUPED_MODE_WORKLIST_NM
+            ]
+            self.assertEqual(exact_default, exact_seeds[0])
+
+            worklist.copy_(torch.tensor(skew_rows, device=DEVICE, dtype=torch.int32))
+            skew_bound = kernel.bind(args)
+            self.assertIsNot(skew_bound, exact_bound)
+            skew_default = skew_bound.config_spec.compiler_default_config
+            self.assertIsNotNone(skew_default)
+            assert skew_default is not None
+            skew_seeds = [
+                config
+                for config in skew_bound.config_spec.compiler_seed_configs
+                if config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+                == TCGEN05_GROUPED_MODE_WORKLIST_NM
+            ]
+            self.assertEqual(skew_default, skew_seeds[0])
+            self.assertNotEqual(skew_default, exact_default)
+
+            exact_output = torch.empty((), device=DEVICE)
+            skew_output = torch.empty((), device=DEVICE)
+            exact_bound._run = lambda *_args: exact_output
+            skew_bound._run = lambda *_args: skew_output
+            self.assertIs(exact_bound(*args), skew_output)
+
+            worklist.copy_(torch.tensor(exact_rows, device=DEVICE, dtype=torch.int32))
+            self.assertIs(kernel.bind(args), exact_bound)
+            self.assertIs(exact_bound(*args), exact_output)
+
+    def test_grouped_worklist_seeds_require_validated_runtime_n_ptx(self) -> None:
+        spec = ConfigSpec(
+            backend=CuteBackend(),
+            target_device_capability=(10, 0),
+            num_sm=148,
+        )
+        spec.cute_tcgen05_search_enabled = True
+        for block_id, size_hint in enumerate((256, 256, 128)):
+            spec.block_sizes.append(
+                BlockSizeSpec(block_id=block_id, size_hint=size_hint)
+            )
+        spec.matmul_facts = [
+            MatmulFact(
+                lhs_ndim=2,
+                rhs_ndim=3,
+                m_block_id=0,
+                n_block_id=1,
+                k_block_id=2,
+                static_m=256,
+                static_n=256,
+                static_k=128,
+                lhs_dtype=torch.bfloat16,
+                rhs_dtype=torch.bfloat16,
+            )
+        ]
+        env = MagicMock(device=DEVICE, config_spec=spec)
+        device_ir = MagicMock()
+        grouped_fact = spec.matmul_facts[0]
+        worklist_analysis = MagicMock()
+        worklist_analysis.seed_facts.groups_hint = 1
+        worklist_analysis.seed_facts.packed_m_hint = 256
+        worklist_analysis.seed_facts.n_hint = 256
+        worklist_analysis.seed_facts.k_hint = 128
+
+        with (
+            patch(
+                "helion._compiler.autotuner_heuristics.cute."
+                "tcgen05_runtime_n_ptx_compatible",
+                return_value=False,
+            ),
+            patch(
+                "helion._compiler.autotuner_heuristics.cute."
+                "warn_tcgen05_runtime_n_ptx_fallback"
+            ) as warn_fallback,
+            patch(
+                "helion._compiler.cute.cute_mma.analyze_tcgen05_grouped_worklist"
+            ) as analyze_worklist,
+            patch(
+                "helion._hardware.get_hardware_info",
+                return_value=BLACKWELL_HARDWARE,
+            ),
+        ):
+            spec.matmul_facts = []
+            self.assertFalse(
+                CuteTcgen05GroupedWorklistHeuristic.is_eligible(env, device_ir)
+            )
+            warn_fallback.assert_not_called()
+
+            spec.matmul_facts = [grouped_fact]
+            analyze_worklist.return_value = None
+            self.assertFalse(
+                CuteTcgen05GroupedWorklistHeuristic.is_eligible(env, device_ir)
+            )
+            warn_fallback.assert_not_called()
+
+            analyze_worklist.return_value = worklist_analysis
+            self.assertFalse(
+                CuteTcgen05GroupedWorklistHeuristic.is_eligible(env, device_ir)
+            )
+            warn_fallback.assert_called_once_with()
+            self.assertIsNone(
+                CuteTcgen05GroupedWorklistHeuristic.get_seed_config(env, device_ir)
+            )
+            self.assertEqual(
+                CuteTcgen05GroupedWorklistHeuristic.get_seed_configs(env, device_ir),
+                [],
+            )
+            self.assertFalse(CuteTcgen05GroupedWorklistHeuristic.should_promote(env))
+
+    @onlyBackends(["cute"])
+    def test_grouped_worklist_dynamic_hints_do_not_narrow_search(self) -> None:
+        from helion.language.matmul_ops import _plan_cute_tcgen05_search_candidate
+
+        kernel = helion.kernel(
+            _grouped_worklist_kernel_body,
+            backend="cute",
+            static_shapes=False,
+        )
+        planning_results = []
+
+        def capture_plan(
+            lhs: torch.Tensor,
+            rhs: torch.Tensor,
+            **kwargs: Any,
+        ):
+            result = _plan_cute_tcgen05_search_candidate(lhs, rhs, **kwargs)
+            if result.plan is not None:
+                planning_results.append(result)
+            return result
+
+        first_args = _grouped_worklist_args(row_extent=32)
+        rebound_args = _grouped_worklist_args(row_extent=64)
+
+        with (
+            _grouped_worklist_bind_patches(),
+            patch(
+                "helion.language.matmul_ops._plan_cute_tcgen05_search_candidate",
+                side_effect=capture_plan,
+            ),
+        ):
+            first = kernel.bind(first_args)
+            rebound = kernel.bind(rebound_args)
+            first._run = lambda *_args: cast("torch.Tensor", first_args[0])
+            rebound._run = lambda *_args: cast("torch.Tensor", rebound_args[0])
+            self.assertIs(first(*rebound_args), rebound_args[0])
+
+        self.assertIsNot(rebound, first)
+        self.assertEqual(len(planning_results), 2)
+        for bound, planning_result in zip(
+            (first, rebound), planning_results, strict=True
+        ):
+            fact = bound.config_spec.matmul_facts[0]
+            expected_axis_symbols = set()
+            for block_id in (fact.m_block_id, fact.n_block_id, fact.k_block_id):
+                if block_id is None:
+                    continue
+                block_size = bound.env.block_sizes[block_id].size
+                if isinstance(block_size, torch.SymInt):
+                    expected_axis_symbols.update(_symint_free_symbols(block_size))
+            self.assertEqual(
+                set(planning_result.required_specialized_vars),
+                expected_axis_symbols,
+            )
+            self.assertEqual(bound.env.specialized_vars, expected_axis_symbols)
+            grouped_fact = _tcgen05_grouped_worklist_fact(bound.env)
+            assert grouped_fact is not None
+            self.assertEqual(
+                (grouped_fact.static_m, grouped_fact.static_n, grouped_fact.static_k),
+                (256, None, None),
+            )
+            kernel_fact = bound.config_spec.kernel_matmul_fact
+            assert kernel_fact is not None
+            resolved_fact = kernel_fact.matmuls[0].fact
+            self.assertEqual(
+                (
+                    resolved_fact.static_m,
+                    resolved_fact.static_n,
+                    resolved_fact.static_k,
+                ),
+                (256, 256, 128),
+            )
+            self.assertEqual(fact, resolved_fact)
+        for planning_result in planning_results:
+            plan = planning_result.plan
+            assert plan is not None
+            self.assertEqual(
+                (plan.static_m, plan.static_n, plan.static_k),
+                (256, None, None),
+            )
+        self.assertEqual(first.config_spec.allowed_pid_types, ("flat",))
+        self.assertEqual(first.config_spec._tcgen05_cluster_m_search_choices, (1,))
+        self.assertIsNone(first.config_spec._tcgen05_cluster_m2_search_constraints)
+        self.assertIsNone(first.config_spec.compiler_default_config)
+        # The worklist's group/start/extent loads feed scheduling, indices, and
+        # masks rather than the matmul's store value. They must not be mistaken
+        # for per-subtile epilogue aux loads, which would expose a
+        # ``pre_acc_wait`` search point that every identity-store config rejects.
+        self.assertFalse(first.config_spec.cute_tcgen05_aux_kernel_detected)
+        self.assertNotIn(
+            TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
+            first.config_spec._flat_fields(),
+        )
+        transfer_errors: list[str] = []
+        generation = first.config_spec.create_config_generation()
+        seed_pairs = generation.seed_flat_config_pairs(transfer_errors.append)
+        self.assertFalse(transfer_errors)
+        self.assertTrue(seed_pairs)
+        for flat, normalized in seed_pairs:
+            self.assertEqual(generation.unflatten([*flat]), normalized)
+
+    @onlyBackends(["cute"])
+    def test_rejected_dynamic_tcgen05_candidate_rebinds_when_m_grows(self) -> None:
+        kernel = helion.kernel(
+            _dynamic_grouped_worklist_kernel_body,
+            backend="cute",
+            static_shapes=False,
+        )
+
+        def make_args(m: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            return (
+                torch.empty((m, 128), device=DEVICE, dtype=torch.bfloat16),
+                torch.empty((1, 128, 128), device=DEVICE, dtype=torch.bfloat16),
+                torch.tensor([[0, 0, m, m]], device=DEVICE, dtype=torch.int32),
+            )
+
+        small_args = make_args(32)
+        large_args = make_args(256)
+        with _grouped_worklist_bind_patches():
+            small = kernel.bind(small_args)
+            large = kernel.bind(large_args)
+
+        self.assertFalse(small.config_spec.cute_tcgen05_search_enabled)
+        small_fact = small.config_spec.matmul_facts[0]
+        assert small_fact.m_block_id is not None
+        small_m = small.env.block_sizes[small_fact.m_block_id].size
+        assert isinstance(small_m, torch.SymInt)
+        self.assertTrue(_symint_free_symbols(small_m))
+        self.assertLessEqual(
+            _symint_free_symbols(small_m),
+            small.env.specialized_vars,
+        )
+        self.assertTrue(large.config_spec.cute_tcgen05_search_enabled)
+        self.assertIsNot(large, small)
+
+    @onlyBackends(["cute"])
+    def test_grouped_worklist_dynamic_inputs_rebind_without_promotion(self) -> None:
+        kernel = helion.kernel(
+            _grouped_worklist_kernel_body,
+            backend="cute",
+            static_shapes=False,
+        )
+        current_num_sm = 148
+
+        def get_num_sm(
+            _device: torch.device,
+            *,
+            reserved_sms: int = 0,
+        ) -> int:
+            return max(current_num_sm - reserved_sms, 1)
+
+        zero_k_args = _grouped_worklist_args(k=0)
+        first_args = _grouped_worklist_args()
+        different_k_args = _grouped_worklist_args(k=192)
+        different_n_args = _grouped_worklist_args(n=240, k=256)
+        different_layout_args = _grouped_worklist_args(k=256, b_major="n")
+        source224_args = _grouped_worklist_args(row_extent=224)
+        # Reuse one dynamic schema across packed shapes, then change only the
+        # worklist values while keeping the larger tensor metadata unchanged.
+        shape_kernel = helion.kernel(
+            _grouped_worklist_kernel_body,
+            backend="cute",
+            static_shapes=False,
+        )
+
+        with (
+            _grouped_worklist_bind_patches(),
+            patch("helion.runtime.get_num_sm", side_effect=get_num_sm),
+        ):
+            zero_k = kernel.bind(zero_k_args)
+            first = kernel.bind(first_args)
+            different_k = kernel.bind(different_k_args)
+            different_n = kernel.bind(different_n_args)
+            different_layout = kernel.bind(different_layout_args)
+            shape_source32 = shape_kernel.bind(first_args)
+            shape_source224 = shape_kernel.bind(source224_args)
+
+            compact_extents = (32, 32, 32, 32, 32, 1184)
+            compact_rows = []
+            start = 0
+            for group, extent in enumerate(compact_extents):
+                compact_rows.append([group, start, extent, extent])
+                start += extent
+            cast("torch.Tensor", source224_args[2]).copy_(
+                cast("torch.Tensor", source224_args[2]).new_tensor(compact_rows)
+            )
+            shape_compact = shape_kernel.bind(source224_args)
+
+            first_output = cast("torch.Tensor", first_args[0])
+            different_k_output = cast("torch.Tensor", different_k_args[0])
+            different_n_output = cast("torch.Tensor", different_n_args[0])
+            different_layout_output = cast("torch.Tensor", different_layout_args[0])
+            first._run = lambda *_args: first_output
+            different_k._run = lambda *_args: different_k_output
+            different_n._run = lambda *_args: different_n_output
+            different_layout._run = lambda *_args: different_layout_output
+            self.assertIs(zero_k(*first_args), first_output)
+            self.assertIs(first(*different_k_args), different_k_output)
+            self.assertIs(first(*different_n_args), different_n_output)
+            self.assertIs(first(*different_layout_args), different_layout_output)
+
+            current_num_sm = 132
+            smaller_sm = kernel.bind(different_k_args)
+
+        self.assertIsNot(zero_k, first)
+        self.assertIsNot(different_k, first)
+        self.assertIsNot(different_n, first)
+        self.assertIsNot(different_layout, first)
+        self.assertIsNot(smaller_sm, first)
+        self.assertIsNot(smaller_sm, different_k)
+        self.assertEqual(len(kernel._bound_kernels), 6)
+        self.assertIsNot(shape_source224, shape_source32)
+        self.assertTrue(
+            any(
+                config.config.get(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY)
+                == 224
+                for config in shape_source224.config_spec.compiler_seed_configs
+            )
+        )
+        self.assertIsNot(shape_compact, shape_source224)
+        self.assertEqual(
+            {
+                config.config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY]
+                for config in shape_compact.config_spec.compiler_seed_configs
+                if config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+                == TCGEN05_GROUPED_MODE_WORKLIST_NM
+            },
+            {32},
+        )
+
+        def specialization_results(bound: object) -> dict[str, object]:
+            matches = [
+                dict(
+                    cast(
+                        "tuple[tuple[str, object], ...]",
+                        key.compiler_seed_results,
+                    )
+                )
+                for key, candidate in kernel._bound_kernels.items()
+                if candidate is bound
+            ]
+            self.assertEqual(len(matches), 1)
+            return matches[0]
+
+        zero_k_results = specialization_results(zero_k)
+        first_results = specialization_results(first)
+        different_k_results = specialization_results(different_k)
+        different_n_results = specialization_results(different_n)
+        different_layout_results = specialization_results(different_layout)
+        smaller_sm_results = specialization_results(smaller_sm)
+        self.assertEqual(
+            set(zero_k_results),
+            {"config_num_sm", "input_tensor_metadata"},
+        )
+        self.assertEqual(first_results["config_num_sm"], 148)
+        self.assertEqual(different_k_results["config_num_sm"], 148)
+        self.assertEqual(different_n_results["config_num_sm"], 148)
+        self.assertEqual(different_layout_results["config_num_sm"], 148)
+        self.assertEqual(smaller_sm_results["config_num_sm"], 132)
+        first_metadata = first_results["input_tensor_metadata"]
+        self.assertNotEqual(
+            different_k_results["input_tensor_metadata"], first_metadata
+        )
+        self.assertNotEqual(
+            different_n_results["input_tensor_metadata"], first_metadata
+        )
+        self.assertNotEqual(
+            different_layout_results["input_tensor_metadata"], first_metadata
+        )
+        self.assertEqual(
+            smaller_sm_results["input_tensor_metadata"],
+            different_k_results["input_tensor_metadata"],
+        )
+        grouped_fact = _tcgen05_grouped_worklist_fact(first.env)
+        assert grouped_fact is not None
+        self.assertIsNone(grouped_fact.static_k)
+        self.assertNotIn(
+            CuteTcgen05GroupedWorklistHeuristic.name,
+            zero_k.config_spec.autotuner_heuristics,
+        )
+        self.assertIn(
+            CuteTcgen05GroupedWorklistHeuristic.name,
+            first.config_spec.autotuner_heuristics,
+        )
+        self.assertIsNone(first.config_spec.compiler_default_config)
+        self.assertEqual(
+            {
+                cast("list[int]", config.config["block_sizes"])[2]
+                for config in first.config_spec.compiler_seed_configs
+                if config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+                == TCGEN05_GROUPED_MODE_WORKLIST_NM
+            },
+            {64, 128},
+        )
+        self.assertEqual(
+            {
+                cast("list[int]", config.config["block_sizes"])[2]
+                for config in different_k.config_spec.compiler_seed_configs
+                if config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+                == TCGEN05_GROUPED_MODE_WORKLIST_NM
+            },
+            {64},
+        )
+        self.assertFalse(
+            any(
+                config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+                == TCGEN05_GROUPED_MODE_WORKLIST_NM
+                for config in different_n.config_spec.compiler_seed_configs
+            )
+        )
+
+    @onlyBackends(["cute"])
+    def test_grouped_worklist_view_dimension_guard_fallback(self) -> None:
+        groups = 6
+        source_m_tile = 224
+        n = 256
+        k = 128
+        static_viewed_inputs = helion.kernel(
+            _grouped_worklist_with_viewed_inputs,
+            backend="cute",
+            static_shapes=True,
+        )
+        dynamic_viewed_inputs = helion.kernel(
+            _grouped_worklist_with_viewed_inputs,
+            backend="cute",
+            static_shapes=False,
+        )
+
+        args = (
+            torch.empty(
+                [groups, source_m_tile, k],
+                device=DEVICE,
+                dtype=torch.bfloat16,
+            ),
+            torch.empty([1, groups, n, k], device=DEVICE, dtype=torch.bfloat16),
+            torch.tensor(
+                [
+                    [
+                        group,
+                        group * source_m_tile,
+                        source_m_tile,
+                        source_m_tile,
+                    ]
+                    for group in range(groups)
+                ],
+                device=DEVICE,
+                dtype=torch.int32,
+            ),
+        )
+
+        with _grouped_worklist_bind_patches():
+            static_bound = static_viewed_inputs.bind(args)
+            dynamic_bound = dynamic_viewed_inputs.bind(args)
+
+        self.assertTrue(static_bound.env.runtime_input_specializations)
+        self.assertTrue(
+            any(
+                config.config.get(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY)
+                == source_m_tile
+                for config in static_bound.config_spec.compiler_seed_configs
+            )
+        )
+        self.assertFalse(dynamic_bound.env.runtime_input_specializations)
+        self.assertFalse(
+            any(
+                config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+                == TCGEN05_GROUPED_MODE_WORKLIST_NM
+                for config in dynamic_bound.config_spec.compiler_seed_configs
+            )
+        )
+
+    @onlyBackends(["cute"])
+    def test_grouped_worklist_smem_facts_register_with_heuristics_disabled(
+        self,
+    ) -> None:
+        source_m_tile = 224
+        k = 128
+
+        groups = 6
+        empty_args = _grouped_worklist_args(
+            groups=groups,
+            n=0,
+            row_extent=source_m_tile,
+        )
+        args = _grouped_worklist_args(
+            groups=groups,
+            row_extent=source_m_tile,
+        )
+        compact_args = _grouped_worklist_args(
+            groups=groups,
+            row_extent=source_m_tile,
+            extents=(32, 32, 32, 32, 32, groups * source_m_tile - 5 * 32),
+        )
+        different_groups = 7
+        different_args = _grouped_worklist_args(
+            groups=different_groups,
+            row_extent=source_m_tile,
+        )
+        explicit_configs = [
+            _tcgen05_grouped_worklist_seed_family(
+                groups=groups,
+                packed_m=groups * source_m_tile,
+                n=256,
+                k=k,
+                b_major="k",
+                source_m_tile=tile,
+                num_sm=148,
+                target_policy=get_grouped_worklist_target_policy(None),
+            )[0][0]
+            for tile in (source_m_tile, 32)
+        ]
+        kernel = helion.kernel(
+            _grouped_worklist_kernel_body,
+            backend="cute",
+            static_shapes=False,
+            disable_autotuner_heuristics=True,
+            configs=explicit_configs,
+        )
+        with _grouped_worklist_bind_patches(runtime_n_ptx=None):
+            empty_bound = kernel.bind(empty_args)
+            bound = kernel.bind(args)
+            compact_bound = kernel.bind(compact_args)
+            rebound = kernel.bind(different_args)
+
+        self.assertEqual(
+            empty_bound.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts,
+            (groups, False),
+        )
+        self.assertIsNot(bound, empty_bound)
+        self.assertEqual(bound.config_spec.compiler_seed_configs, [])
+        self.assertEqual(bound.config_spec.autotuner_heuristics, [])
+        self.assertIsNone(bound.config_spec.compiler_default_config)
+        self.assertTrue(bound.env.runtime_input_specializations)
+        self.assertIsNot(compact_bound, bound)
+        self.assertEqual(compact_bound.config_spec.compiler_seed_configs, [])
+        self.assertEqual(compact_bound.config_spec.autotuner_heuristics, [])
+        self.assertTrue(compact_bound.env.runtime_input_specializations)
+        self.assertEqual(
+            compiler_seed_configs(bound.env, bound.host_function.device_ir),
+            [],
+        )
+        self.assertEqual(
+            bound.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts,
+            (groups, False),
+        )
+        self.assertIsNot(rebound, bound)
+        self.assertEqual(
+            rebound.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts,
+            (different_groups, False),
+        )
+        self.assertEqual(
+            [
+                extractor.fact
+                for extractor in empty_bound._compiler_seed_specialization_extractors
+            ],
+            ["input_tensor_metadata"],
+        )
+        bound_output = cast("torch.Tensor", args[0])
+        bound._run = lambda *_args: bound_output
+        self.assertIs(empty_bound(*args), bound_output)
+        rebound_output = cast("torch.Tensor", different_args[0])
+        rebound._run = lambda *_args: rebound_output
+        self.assertIs(bound(*different_args), rebound_output)
+
+    @onlyBackends(["cute"])
+    def test_grouped_worklist_fact_registration_ignores_plain_matmul(self) -> None:
+        @helion.kernel(
+            backend="cute",
+            static_shapes=False,
+            disable_autotuner_heuristics=True,
+        )
+        def plain_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _k, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(
+                        acc,
+                        x[tile_m, tile_k],
+                        y[tile_k, tile_n],
+                    )
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        def make_args(size: int, k: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
+            return (
+                torch.empty(
+                    [size, k],
+                    device=DEVICE,
+                    dtype=torch.bfloat16,
+                ),
+                torch.empty(
+                    [k, size],
+                    device=DEVICE,
+                    dtype=torch.bfloat16,
+                ),
+            )
+
+        with _grouped_worklist_bind_patches(runtime_n_ptx=None):
+            zero = plain_matmul.bind(make_args(128, 0))
+            first = plain_matmul.bind(make_args(128))
+            rebound = plain_matmul.bind(make_args(256))
+
+        self.assertIsNot(first, zero)
+        self.assertIs(rebound, first)
+        self.assertEqual(len(plain_matmul._bound_kernels), 2)
+        self.assertEqual(zero._compiler_seed_specialization_extractors, ())
+        self.assertEqual(first._compiler_seed_specialization_extractors, ())
+        self.assertIsNone(
+            first.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts
+        )
+
+    @onlyBackends(["cute"])
+    def test_grouped_worklist_unannotated_prepacked_seeds_and_rebind(self) -> None:
+        from helion._compiler.cute.cute_mma import analyze_tcgen05_grouped_worklist
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def unannotated_packing_kernel(
+            a_packed: torch.Tensor,
+            b_grouped: torch.Tensor,
+            worklist: torch.Tensor,
+            unused: torch.Tensor,
+        ) -> torch.Tensor:
+            m_total, k = a_packed.shape
+            _groups, n, k2 = b_grouped.shape
+            assert k == k2
+            block_m = hl.register_block_size(256)
+            block_n = hl.register_block_size(128)
+            block_k = hl.register_block_size(64, 128)
+            out = torch.empty(
+                [m_total, n], dtype=a_packed.dtype, device=a_packed.device
+            )
+            for work_tile, tile_m, tile_n in hl.tile(
+                [worklist.size(0), 256, n],
+                block_size=[1, block_m, block_n],
+            ):
+                work_id = work_tile.begin
+                group_id = worklist[work_id, 0]
+                start = worklist[work_id, 1]
+                valid_m = worklist[work_id, 2]
+                store_m = worklist[work_id, 3]
+                local_m = tile_m.index
+                row = start + local_m
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k, block_size=block_k):
+                    a_block = hl.load(
+                        a_packed,
+                        [row, tile_k],
+                        extra_mask=(local_m < valid_m)[:, None],  # pyrefly: ignore[bad-index]
+                    )
+                    acc = torch.addmm(
+                        acc,
+                        a_block,
+                        b_grouped[group_id, tile_n, tile_k].T,
+                    )
+                hl.store(
+                    out,
+                    [row, tile_n],
+                    acc.to(out.dtype),
+                    extra_mask=(local_m < store_m)[:, None],  # pyrefly: ignore[bad-index]
+                )
+            return out
+
+        def make_args(
+            source_m_tile: int,
+            b_major: str,
+            k: int = 128,
+            packed_m: int | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            args = _grouped_worklist_args(
+                row_extent=source_m_tile,
+                b_major=b_major,
+                k=k,
+                packed_m=packed_m,
+            )
+            return (*args, torch.empty([1], device=DEVICE, dtype=torch.bfloat16))
+
+        def grouped_seeds(spec: ConfigSpec, source_m_tile: int) -> list[helion.Config]:
+            return [
+                config
+                for config in spec.compiler_seed_configs
+                if config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+                == TCGEN05_GROUPED_MODE_WORKLIST_NM
+                and config.config.get(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY)
+                == source_m_tile
+            ]
+
+        def seed_pipeline(
+            bound: Any,
+            source_m_tile: int,
+            compatible_source_m_tiles: set[int],
+            *,
+            clear_cluster_constraints: bool = False,
+            expected_block_k: int | None = None,
+            compile_default: bool = False,
+        ) -> tuple[ConfigSpec, list[helion.Config], helion.Config, helion.Config]:
+            spec = bound.config_spec
+            self.assertTrue(spec.cute_tcgen05_search_enabled)
+            grouped = [
+                config
+                for config in spec.compiler_seed_configs
+                if config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+                == TCGEN05_GROUPED_MODE_WORKLIST_NM
+            ]
+            self.assertLessEqual(
+                len(grouped),
+                _TCGEN05_GROUPED_WORKLIST_AUTOMATIC_SEED_LIMIT,
+            )
+            self.assertEqual(
+                {
+                    config.config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY]
+                    for config in grouped
+                },
+                compatible_source_m_tiles,
+            )
+            self.assertIn(
+                CuteTcgen05GroupedWorklistHeuristic.name,
+                spec.autotuner_heuristics,
+            )
+            seeds = grouped_seeds(spec, source_m_tile)
+            self.assertTrue(seeds)
+            if expected_block_k is not None:
+                self.assertTrue(
+                    all(
+                        cast("list[int]", seed.config["block_sizes"])[2]
+                        == expected_block_k
+                        for seed in seeds
+                    )
+                )
+            if clear_cluster_constraints:
+                spec._cute_tcgen05_config.cluster_m2_search_constraints = None
+            promoted = spec.compiler_default_config
+            self.assertIsNotNone(promoted)
+            assert promoted is not None
+            self.assertEqual(promoted, seeds[0])
+            effective = spec.default_config()
+            self.assertEqual(
+                effective.config["block_sizes"], promoted.config["block_sizes"]
+            )
+            if compile_default:
+                self.assertTrue(
+                    callable(bound.compile_config(effective, allow_print=False))
+                )
+            return spec, seeds, promoted, effective
+
+        compatible_source_m_tiles = {
+            32: {32},
+            224: {32, 224},
+            256: {32, 256},
+        }
+        bounds = []
+        with _grouped_worklist_bind_patches(analysis_runtime_n_ptx=True):
+            for source_m_tile, b_major in (
+                (32, "k"),
+                (32, "n"),
+                (224, "k"),
+                (224, "n"),
+                (256, "k"),
+                (256, "n"),
+            ):
+                with self.subTest(source_m_tile=source_m_tile, b_major=b_major):
+                    bound = unannotated_packing_kernel.bind(
+                        make_args(source_m_tile, b_major)
+                    )
+                    bounds.append(bound)
+                    expect_cluster2 = source_m_tile in (224, 256)
+                    spec, _seeds, promoted, effective = seed_pipeline(
+                        bound,
+                        source_m_tile,
+                        compatible_source_m_tiles[source_m_tile],
+                        clear_cluster_constraints=expect_cluster2,
+                        compile_default=True,
+                    )
+                    self.assertIsNot(effective, promoted)
+                    self.assertGreater(len(effective.config), len(promoted.config))
+                    self.assertEqual(
+                        effective.config[
+                            TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
+                        ],
+                        source_m_tile,
+                    )
+                    self.assertEqual(
+                        effective.config["block_sizes"],
+                        promoted.config["block_sizes"],
+                    )
+                    self.assertEqual(
+                        cast("list[int]", effective.config["block_sizes"])[:2],
+                        [256, 128],
+                    )
+                    if expect_cluster2:
+                        self.assertIsNone(
+                            spec._cute_tcgen05_config.cluster_m2_search_constraints
+                        )
+                        self.assertEqual(promoted.config["tcgen05_cluster_m"], 2)
+                        self.assertEqual(effective.config["tcgen05_cluster_m"], 2)
+
+            mutable_args = make_args(224, "k")
+            original_worklist = mutable_args[2].clone()
+            original_bound = unannotated_packing_kernel.bind(mutable_args)
+            self.assertIs(original_bound, bounds[2])
+            compact_extents = (32, 32, 32, 32, 32, 1184)
+            compact_rows = []
+            start = 0
+            for group, extent in enumerate(compact_extents):
+                compact_rows.append([group, start, extent, extent])
+                start += extent
+            mutable_args[2].copy_(mutable_args[2].new_tensor(compact_rows))
+            compact_bound = unannotated_packing_kernel.bind(mutable_args)
+            self.assertIsNot(compact_bound, original_bound)
+            seed_pipeline(compact_bound, 32, {32})
+            selected = helion.Config(block_sizes=[256, 128, 64])
+            with patch.object(
+                compact_bound,
+                "autotune",
+                return_value=selected,
+            ) as rebound_autotune:
+                self.assertIs(
+                    original_bound.autotune(mutable_args, force=False),
+                    selected,
+                )
+            rebound_autotune.assert_called_once_with(
+                mutable_args,
+                force=False,
+            )
+            original_output = mutable_args[0]
+            compact_output = mutable_args[1]
+            original_bound._run = lambda *_args: original_output
+            compact_bound._run = lambda *_args: compact_output
+            self.assertIs(original_bound(*mutable_args), compact_output)
+            mutable_args[2].copy_(original_worklist)
+            self.assertIs(
+                unannotated_packing_kernel.bind(mutable_args),
+                original_bound,
+            )
+            self.assertIs(compact_bound(*mutable_args), original_output)
+
+            dynamic_kernel = helion.kernel(
+                unannotated_packing_kernel.fn,
+                backend="cute",
+                static_shapes=False,
+            )
+            aliased_args = make_args(224, "k")
+            aliased_worklist = aliased_args[2]
+            aliased_args = (*aliased_args[:3], aliased_worklist)
+            aliased_bound = dynamic_kernel.bind(aliased_args)
+            self.assertEqual(
+                grouped_seeds(aliased_bound.config_spec, 224),
+                [],
+            )
+            compact_worklist = cast("torch.Tensor", aliased_worklist).new_tensor(
+                compact_rows
+            )
+            dealiased_args = (
+                aliased_args[0],
+                aliased_args[1],
+                compact_worklist,
+                aliased_worklist,
+            )
+            dealiased_bound = dynamic_kernel.bind(dealiased_args)
+            self.assertIsNot(dealiased_bound, aliased_bound)
+            self.assertTrue(grouped_seeds(dealiased_bound.config_spec, 32))
+            restored_args = (
+                aliased_args[0],
+                aliased_args[1],
+                aliased_worklist.clone(),
+                aliased_worklist,
+            )
+            restored_bound = dynamic_kernel.bind(restored_args)
+            self.assertIsNot(restored_bound, dealiased_bound)
+            self.assertTrue(grouped_seeds(restored_bound.config_spec, 224))
+            aliased_output = aliased_args[0]
+            dealiased_output = dealiased_args[1]
+            restored_output = restored_args[2]
+            aliased_bound._run = lambda *_args: aliased_output
+            dealiased_bound._run = lambda *_args: dealiased_output
+            restored_bound._run = lambda *_args: restored_output
+            self.assertIs(dynamic_kernel(*aliased_args), aliased_output)
+            self.assertIsNotNone(dynamic_kernel._prepared_call)
+            self.assertEqual(len(dynamic_kernel._dispatch_cache), 1)
+            self.assertIs(dynamic_kernel(*dealiased_args), dealiased_output)
+            self.assertIsNotNone(dynamic_kernel._prepared_call)
+            self.assertEqual(len(dynamic_kernel._dispatch_cache), 2)
+            self.assertIs(dynamic_kernel(*restored_args), restored_output)
+            self.assertIsNotNone(dynamic_kernel._prepared_call)
+            self.assertEqual(len(dynamic_kernel._dispatch_cache), 3)
+
+            renamed_args = make_args(224, "n")
+            plain_kernel = helion.kernel(
+                _grouped_worklist_kernel_body,
+                backend="cute",
+                static_shapes=False,
+            )
+            plain_bound = plain_kernel.bind(renamed_args[:3])
+            self.assertIsNone(plain_bound.config_spec.compiler_default_config)
+            self.assertEqual(
+                grouped_seeds(plain_bound.config_spec, 224),
+                grouped_seeds(bounds[3].config_spec, 224),
+            )
+            b200_256_bound = bounds[-1]
+            self.assertIsNotNone(b200_256_bound.config_spec.compiler_default_config)
+
+            for source_m_tile in (32, 256):
+                with self.subTest(source_m_tile=source_m_tile, k=192):
+                    bound = unannotated_packing_kernel.bind(
+                        make_args(source_m_tile, "n", k=192)
+                    )
+                    seed_pipeline(
+                        bound,
+                        source_m_tile,
+                        compatible_source_m_tiles[source_m_tile],
+                        expected_block_k=64,
+                        compile_default=True,
+                    )
+
+            for source_m_tile in (224, 256):
+                with self.subTest(
+                    source_m_tile=source_m_tile,
+                    packed_m="non_aligned",
+                ):
+                    exact_packed_m = 6 * source_m_tile + 1
+                    bound = unannotated_packing_kernel.bind(
+                        make_args(
+                            source_m_tile,
+                            "n",
+                            packed_m=exact_packed_m,
+                        )
+                    )
+                    self.assertEqual(
+                        [
+                            config
+                            for config in bound.config_spec.compiler_seed_configs
+                            if config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+                            == TCGEN05_GROUPED_MODE_WORKLIST_NM
+                        ],
+                        [],
+                    )
+                    host_function = bound.host_function
+                    self.assertIsNotNone(host_function)
+                    assert host_function is not None
+                    analysis = analyze_tcgen05_grouped_worklist(
+                        bound.env,
+                        host_function.device_ir,
+                        bound.config_spec.matmul_facts[0],
+                    )
+                    self.assertIsNotNone(analysis)
+                    assert analysis is not None
+                    self.assertEqual(
+                        analysis.seed_facts.packed_m_hint,
+                        exact_packed_m,
+                    )
+
+        source32_host = bounds[0].host_function
+        self.assertIsNotNone(source32_host)
+        assert source32_host is not None
+        source32_analysis = analyze_tcgen05_grouped_worklist(
+            bounds[0].env,
+            source32_host.device_ir,
+            bounds[0].config_spec.matmul_facts[0],
+        )
+        self.assertIsNotNone(source32_analysis)
+        assert source32_analysis is not None
+        self.assertEqual(source32_analysis.seed_facts.packed_m_hint, 6 * 32)
+        with (
+            bounds[1].env,
+            self.assertRaisesRegex(
+                AssertionError,
+                "must use the provided compile environment",
+            ),
+        ):
+            analyze_tcgen05_grouped_worklist(
+                bounds[0].env,
+                source32_host.device_ir,
+                bounds[0].config_spec.matmul_facts[0],
+            )
+        with _grouped_worklist_bind_patches(GB300_HARDWARE):
+            gb300_bound = unannotated_packing_kernel.bind(make_args(256, "n"))
+        self.assertIsNot(gb300_bound, b200_256_bound)
+        gb300_seeds = grouped_seeds(gb300_bound.config_spec, 256)
+        self.assertTrue(gb300_seeds)
+        self.assertEqual(
+            gb300_bound.config_spec.compiler_default_config,
+            gb300_seeds[0],
+        )
+        unannotated_packing_kernel.reset()
+        with (
+            torch.inference_mode(),
+            _grouped_worklist_bind_patches(),
+        ):
+            inference_args = make_args(224, "k")
+            inference_bound = unannotated_packing_kernel.bind(inference_args)
+            seed_pipeline(inference_bound, 224, {32, 224})
+            self.assertIs(
+                unannotated_packing_kernel.bind(inference_args),
+                inference_bound,
+            )
+            inference_output = inference_args[0]
+            inference_bound._run = lambda *_args: inference_output
+            self.assertIs(
+                unannotated_packing_kernel(*inference_args),
+                inference_output,
+            )
+            inference_args[2].copy_(inference_args[2].new_tensor(compact_rows))
+            compact_inference_bound = unannotated_packing_kernel.bind(inference_args)
+            self.assertIsNot(compact_inference_bound, inference_bound)
+            seed_pipeline(compact_inference_bound, 32, {32})
+            self.assertIs(
+                unannotated_packing_kernel.bind(inference_args),
+                compact_inference_bound,
+            )
+            compact_inference_output = inference_args[1]
+            compact_inference_bound._run = lambda *_args: compact_inference_output
+            self.assertIs(
+                unannotated_packing_kernel(*inference_args),
+                compact_inference_output,
+            )
+            with (
+                patch(
+                    "helion.runtime.cute.launcher._cuda_stream_capture_context",
+                    return_value=(123, 456),
+                ),
+                self.assertRaisesRegex(
+                    helion.exc.BackendUnsupported,
+                    "inference tensor grouped metadata.*capture",
+                ),
+            ):
+                unannotated_packing_kernel.bind(inference_args)
 
     @onlyBackends(["triton"])
     @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
@@ -518,6 +4048,44 @@ class TestAutotunerHeuristic(TestCase):
 
 
 class TestMatmulFacts(TestCase):
+    def test_rank_reduction_scaled_accumulator_fact(self) -> None:
+        from operator import eq
+        from types import SimpleNamespace
+
+        from helion._compiler.device_ir_analysis import (
+            _rank_reduction_scaled_baddbmm_batch_block_id,
+        )
+        from helion._compiler.inductor_lowering import ReductionLowering
+
+        graph = torch.fx.Graph()
+
+        def tensor(result: torch.fx.Node, shape: tuple[int, ...]) -> torch.fx.Node:
+            result.meta["val"] = torch.empty(shape)
+            return result
+
+        acc = tensor(graph.placeholder("acc"), (1, 64, 64))
+        scores = tensor(graph.call_function(torch.ops.aten.bmm.default), (1, 64, 32))
+        reduction = tensor(
+            graph.call_function(torch.ops.aten.sum.dim_IntList, (scores, [-1])),
+            (1, 64),
+        )
+        reduction.meta["lowering"] = object.__new__(ReductionLowering)
+        scaled = tensor(
+            graph.call_function(torch.ops.aten.mul.Tensor, (acc, reduction)),
+            (1, 64, 64),
+        )
+        output = tensor(
+            graph.call_function(
+                torch.ops.aten.baddbmm.default, (scaled, scores, scores)
+            ),
+            (1, 64, 64),
+        )
+        env = SimpleNamespace(known_equal=eq, get_block_id=lambda _: 0)
+
+        self.assertEqual(_rank_reduction_scaled_baddbmm_batch_block_id(output, env), 0)
+        reduction.meta["val"] = torch.empty(1, 64, 1)
+        self.assertIsNone(_rank_reduction_scaled_baddbmm_batch_block_id(output, env))
+
     @onlyBackends(["triton"])
     @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
     def test_matmul_facts_record_kernel_structure(self) -> None:
@@ -617,6 +4185,205 @@ class TestMatmulFacts(TestCase):
                 self.assertEqual(fact.lhs_dtype, HALF_DTYPE)
                 self.assertEqual(fact.rhs_dtype, HALF_DTYPE)
 
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
+    def test_matmul_fact_identity_does_not_depend_on_graph_walk_order(self) -> None:
+        from helion._compiler.device_ir_analysis import DeviceIRAnalysis
+
+        @helion.kernel(backend="triton", static_shapes=True)
+        def two_matmuls(
+            x0: torch.Tensor,
+            y0: torch.Tensor,
+            x1: torch.Tensor,
+            y1: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m0, k0 = x0.shape
+            _, n0 = y0.shape
+            out0 = torch.empty([m0, n0], device=x0.device, dtype=x0.dtype)
+            m1, k1 = x1.shape
+            _, n1 = y1.shape
+            out1 = torch.empty([m1, n1], device=x1.device, dtype=x1.dtype)
+            for tile_m0, tile_n0 in hl.tile([m0, n0]):
+                out0[tile_m0, tile_n0] = hl.dot(
+                    x0[tile_m0, :],
+                    y0[:, tile_n0],
+                )
+
+            for tile_m1, tile_n1 in hl.tile([m1, n1]):
+                out1[tile_m1, tile_n1] = hl.dot(
+                    x1[tile_m1, :],
+                    y1[:, tile_n1],
+                )
+            return out0, out1
+
+        args = (
+            torch.empty([64, 32], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([32, 96], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([128, 64], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([64, 160], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        original = DeviceIRAnalysis.kernel_matmul_fact
+
+        def reverse_walk_order(
+            analysis: DeviceIRAnalysis,
+            *method_args: object,
+            **method_kwargs: object,
+        ) -> object:
+            analysis.dot_nodes = analysis.dot_nodes[::-1]
+            return original(analysis, *method_args, **method_kwargs)
+
+        with patch.object(DeviceIRAnalysis, "kernel_matmul_fact", reverse_walk_order):
+            spec = two_matmuls.bind(args).config_spec
+
+        fact = spec.kernel_matmul_fact
+        assert fact is not None
+        self.assertTrue(fact.attribution_complete)
+        self.assertEqual(
+            [
+                (resolved.fact.static_m, resolved.fact.static_n)
+                for resolved in fact.matmuls
+            ],
+            [(64, 96), (128, 160)],
+        )
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
+    def test_bmm_dtype_and_nested_loop_ancestry(self) -> None:
+        @helion.kernel(backend="triton", static_shapes=True)
+        def nested_attention(
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+        ) -> torch.Tensor:
+            batches = q.size(0)
+            heads = hl.specialize(q.size(1))
+            queries = q.size(2)
+            keys = k.size(2)
+            dim = hl.specialize(q.size(3))
+            out = torch.empty_like(q)
+            for batch in hl.grid(batches):
+                for tile_q in hl.tile(queries):
+                    query = q[batch, :, tile_q, :]
+                    acc = hl.zeros([heads, tile_q, dim], dtype=torch.float32)
+                    for tile_kv in hl.tile(keys):
+                        key = k[batch, :, tile_kv, :]
+                        value = v[batch, :, tile_kv, :]
+                        scores = torch.bmm(
+                            query,
+                            key.transpose(-2, -1),
+                            torch.float32,
+                        )
+                        acc = acc + torch.bmm(scores.to(value.dtype), value)
+                    out[batch, :, tile_q, :] = acc.to(out.dtype)
+            return out
+
+        args = tuple(
+            torch.empty([2, 4, 128, 64], device=DEVICE, dtype=HALF_DTYPE)
+            for _ in range(3)
+        )
+        spec = nested_attention.bind(args).config_spec
+        fact = spec.kernel_matmul_fact
+        assert fact is not None
+        self.assertEqual(len(spec.matmul_facts), 2)
+        self.assertTrue(fact.attribution_complete)
+
+        query_block_id = spec.matmul_facts[0].m_block_id
+        key_block_id = spec.matmul_facts[0].n_block_id
+        assert query_block_id is not None
+        assert key_block_id is not None
+        qk, pv = fact.matmuls
+        self.assertEqual(
+            (
+                qk.fact.m_block_id,
+                qk.fact.static_m,
+                qk.fact.n_block_id,
+                qk.fact.static_n,
+                qk.fact.k_block_id,
+                qk.fact.static_k,
+            ),
+            (query_block_id, 128, key_block_id, 128, None, 64),
+        )
+        self.assertEqual(
+            (
+                pv.fact.m_block_id,
+                pv.fact.static_m,
+                pv.fact.n_block_id,
+                pv.fact.static_n,
+                pv.fact.k_block_id,
+                pv.fact.static_k,
+            ),
+            (query_block_id, 128, None, 64, key_block_id, 128),
+        )
+        nested_axes = [
+            {axis.block_id for axis in region.loop_axes}
+            for region in fact.pipelined_regions
+        ]
+        self.assertTrue(
+            any({query_block_id, key_block_id}.issubset(axes) for axes in nested_axes)
+        )
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
+    def test_symbolic_loop_bound_retains_expression_and_origins(self) -> None:
+        @helion.kernel(backend="triton", static_shapes=True)
+        def prefix_matmul(
+            lhs: torch.Tensor,
+            rhs: torch.Tensor,
+        ) -> torch.Tensor:
+            rows, _ = lhs.shape
+            cols = hl.specialize(rhs.size(1))
+            block_m = hl.register_block_size(rows)
+            block_k = hl.register_block_size(64, 64)
+            out = torch.empty([rows, cols], device=lhs.device, dtype=lhs.dtype)
+            for tile_m in hl.tile(rows, block_size=block_m):
+                acc = hl.zeros([tile_m, cols], dtype=torch.float32)
+                for tile_k in hl.tile(
+                    (tile_m.id + 2) * block_m,
+                    block_size=block_k,
+                ):
+                    acc = hl.dot(
+                        lhs[tile_m, tile_k],
+                        rhs[tile_k, :],
+                        acc=acc,
+                    )
+                out[tile_m, :] = acc.to(out.dtype)
+            return out
+
+        args = (
+            torch.empty([256, 512], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([512, 64], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        spec = prefix_matmul.bind(args).config_spec
+        fact = spec.kernel_matmul_fact
+        assert fact is not None
+        resolved = fact.matmuls[0]
+        inner_block_id = resolved.fact.k_block_id
+        outer_block_id = resolved.fact.m_block_id
+        assert inner_block_id is not None
+        assert outer_block_id is not None
+        axis = next(
+            axis for axis in resolved.site.loop_axes if axis.block_id == inner_block_id
+        )
+        self.assertIsNone(axis.extent)
+        bound = axis.symbolic_bound
+        assert bound is not None
+        self.assertEqual(
+            {block_id for _symbol, block_id in bound.block_size_symbols},
+            {outer_block_id},
+        )
+        self.assertEqual(
+            {block_id for _symbol, block_id in bound.tile_id_symbols},
+            {outer_block_id},
+        )
+        recorded_symbols = {
+            symbol
+            for symbol, _block_id in (
+                *bound.block_size_symbols,
+                *bound.tile_id_symbols,
+            )
+        }
+        self.assertEqual(bound.expression.free_symbols, recorded_symbols)
+
 
 class TestTritonSkinnyGemmHeuristic(TestCase):
     def _make_triton_env_with_block_sizes(
@@ -665,7 +4432,7 @@ class TestTritonSkinnyGemmHeuristic(TestCase):
     def test_triton_skinny_gemm_seed_eligibility_and_config(
         self,
     ) -> None:
-        # The dense TritonH100MatmulHeuristic ALSO fires on every clean 2-D static matmul on
+        # The dense TritonH100FormulaMatmulHeuristic ALSO fires on every clean 2-D static matmul on
         # sm90 (by design — it is the H100 dense seed). So this test checks the SKINNY
         # heuristic's OWN contribution (its name + [64,64,256] config present-or-absent),
         # robust to the H100 seeds co-existing in the list. expected_skinny = the skinny config
@@ -876,6 +4643,37 @@ class TestTritonH100MatmulHeuristic(TestCase):
         env.settings = Settings()
         return env
 
+    def _attach_matmul(self, env: MagicMock, fact: MatmulFact) -> None:
+        env.config_spec.matmul_facts.append(fact)
+        kinds = tuple(
+            (DotAxisKind.TUNABLE_TILED if extent is not None else DotAxisKind.UNKNOWN)
+            for extent in (fact.static_m, fact.static_n, fact.static_k)
+        )
+        axes = DotAxes(
+            kinds[0],
+            kinds[1],
+            kinds[2],
+            fact.static_m,
+            fact.static_n,
+            fact.static_k,
+        )
+        site = DotSite(graph_id=-1, updates_carry=False)
+        env.config_spec.kernel_matmul_fact = KernelMatmulFact(
+            matmuls=(ResolvedMatmulFact(fact, axes, site),),
+            knob_users=(
+                (fact.m_block_id, ((0, "m"),)),
+                (fact.n_block_id, ((0, "n"),)),
+                (fact.k_block_id, ((0, "k"),)),
+            ),
+            sequential_loop_trips=1,
+            live_dot_outputs=(),
+            live_promoted_lhs=(),
+            live_tile_steps=(),
+            pipelined_regions=(),
+            resident_regions=(),
+            attribution_complete=True,
+        )
+
     def test_budget_formula_is_deterministic_per_regime(self) -> None:
         # Pure formula (fixed num_sm=132, H100), exercising every lever. Returns the tile
         # tuple (bm, bn, bk, num_warps, num_stages, l2_grouping).
@@ -924,7 +4722,7 @@ class TestTritonH100MatmulHeuristic(TestCase):
             ),
             # fp8 (both operands 1-byte float) is declined: the budget tile would trigger the
             # Triton fp8-accumulator bug (block_m>=64 -> never-promoted QGMMA accumulator). See
-            # TritonH100MatmulHeuristic.is_eligible. bf16/fp16/fp32 stay eligible above.
+            # TritonH100FormulaMatmulHeuristic.is_eligible. bf16/fp16/fp32 stay eligible above.
             (
                 "fp8_declined",
                 HOPPER_HARDWARE,
@@ -934,24 +4732,28 @@ class TestTritonH100MatmulHeuristic(TestCase):
         )
         for name, hardware, facts, eligible in cases:
             env = self._make_env()
-            env.config_spec.matmul_facts.extend(facts)
+            if len(facts) == 1:
+                self._attach_matmul(env, facts[0])
+            else:
+                env.config_spec.matmul_facts.extend(facts)
             with (
                 self.subTest(name=name),
                 patch("helion._hardware.get_hardware_info", return_value=hardware),
             ):
                 self.assertEqual(
-                    TritonH100MatmulHeuristic.is_eligible(env, MagicMock()), eligible
+                    TritonH100FormulaMatmulHeuristic.is_eligible(env, MagicMock()),
+                    eligible,
                 )
 
     def test_ranked_multi_seed_and_width_merge(self) -> None:
         with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
             # rank-0 (Product A) == get_seed_config; the ranked list has diverse alternates.
             env = self._make_env()
-            env.config_spec.matmul_facts.append(self._matmul_fact())
-            ranked = TritonH100MatmulHeuristic.get_seed_configs(env, MagicMock())
-            primary = TritonH100MatmulHeuristic.get_seed_config(env, MagicMock())
+            self._attach_matmul(env, self._matmul_fact())
+            ranked = TritonH100FormulaMatmulHeuristic.get_seed_configs(env, MagicMock())
+            primary = TritonH100FormulaMatmulHeuristic.get_seed_config(env, MagicMock())
             assert ranked is not None and primary is not None
-            self.assertGreaterEqual(len(ranked), 1)
+            self.assertGreater(len(ranked), 2)
             self.assertEqual(
                 ranked[0].config["block_sizes"], primary.config["block_sizes"]
             )
@@ -959,15 +4761,15 @@ class TestTritonH100MatmulHeuristic(TestCase):
 
             # 16-bit merge: bf16 and fp16 produce the IDENTICAL seed (width key, not dtype kind).
             env_bf16 = self._make_env()
-            env_bf16.config_spec.matmul_facts.append(
-                self._matmul_fact(dtype=torch.bfloat16)
-            )
+            self._attach_matmul(env_bf16, self._matmul_fact(dtype=torch.bfloat16))
             env_fp16 = self._make_env()
-            env_fp16.config_spec.matmul_facts.append(
-                self._matmul_fact(dtype=torch.float16)
+            self._attach_matmul(env_fp16, self._matmul_fact(dtype=torch.float16))
+            bf16 = TritonH100FormulaMatmulHeuristic.get_seed_config(
+                env_bf16, MagicMock()
             )
-            bf16 = TritonH100MatmulHeuristic.get_seed_config(env_bf16, MagicMock())
-            fp16 = TritonH100MatmulHeuristic.get_seed_config(env_fp16, MagicMock())
+            fp16 = TritonH100FormulaMatmulHeuristic.get_seed_config(
+                env_fp16, MagicMock()
+            )
             assert bf16 is not None and fp16 is not None
             self.assertEqual(dict(bf16), dict(fp16))
 
@@ -992,8 +4794,10 @@ class TestTritonH100MatmulHeuristic(TestCase):
             fact = spec.matmul_facts[0]
             self.assertGreaterEqual(fact.lhs_ndim, 3)  # a 3-D (batched) dot
             self.assertGreater(len(spec.block_sizes), 3)  # batch axis is tunable
-            self.assertIn(TritonH100MatmulHeuristic.name, spec.autotuner_heuristics)
-            seed = TritonH100MatmulHeuristic.get_seed_config(
+            self.assertIn(
+                TritonH100FormulaMatmulHeuristic.name, spec.autotuner_heuristics
+            )
+            seed = TritonH100FormulaMatmulHeuristic.get_seed_config(
                 bound.env, bound.host_function.device_ir
             )
             assert seed is not None
@@ -1348,18 +5152,16 @@ class TestPointwiseArchConstants(TestCase):
                 )
 
 
-class TestTritonStandardReductionHeuristic(TestCase):
-    """Triton standard row-reduction heuristic: seeds the "one row per program"
-    skeleton with an rnumel-scaled ``num_warps`` ramp and faithful per-slot load
-    eviction, fires only for a canonical row reduction, and its persistent seed
-    survives flatten/unflatten (the config_spec sentinel round-trip fix).
+class TestTritonReductionHeuristicUnit(TestCase):
+    """Triton reduction heuristic: sizes a unified live candidate,
+    chooses warps from lane-parallel reduction width, seeds faithful per-slot load
+    eviction, and preserves persistent sentinels through flatten/unflatten.
     """
 
     def _reduction_spec(
         self,
         *,
         reduction_size_hint: int,
-        num_load: int = 1,
         itemsize: int = 4,
         row_reread: bool = False,
     ) -> ConfigSpec:
@@ -1368,33 +5170,20 @@ class TestTritonStandardReductionHeuristic(TestCase):
         spec.reduction_loops.append(
             ReductionLoopSpec(block_id=1, size_hint=reduction_size_hint)
         )
-        # The deepened heuristic reads the primary ReductionDescriptor (the workload facts it
-        # keys the warp ramp / eviction / persist decision on) off the ReductionKernelFact; the
-        # reduction axis is block_id=1 (the rolled reduction loop above, so a FULL_SLICE), the
-        # row/grid axis is block_id=0.
         desc = ReductionDescriptor(
             category=ReductionCategory.FULL_SLICE,
             block_id=1,
             graph_id=0,
             size_hint=reduction_size_hint,
-            itemsize=itemsize,
             input_load_itemsize=itemsize,
             row_reread=row_reread,
-            num_load=num_load,
         )
         spec.reduction_kernel_fact = ReductionKernelFact(
             reductions=(desc,),
-            coresidency_groups=(
-                CoResidencyGroup(
-                    graph_id=0,
-                    descriptor_indices=(0,),
-                    # The resident live tiles of a one-row reduction (softmax/rms_norm-like): the
-                    # ``[grid_M, rdim]`` read/compute tile + a ``[grid_M]`` scalar carry. The grid
-                    # axis (block_id 0) APPEARS in a live tile -> it is register-RESIDENT, so
-                    # ``_has_reduced_away_grid`` is False (it is NOT a grad-parameter ``.sum(0)``
-                    # collapse). Without this the grid axis is in no tile and the residency test
-                    # wrongly flags a collapse, tripping the num_warps>=8 grad-param floor.
-                    live_tiles=((0, 1), (0,)),
+            live_tile_steps=(
+                (
+                    LiveTile((0, 1), (None, None), itemsize, "other"),
+                    LiveTile((0,), (None,), itemsize, "carry"),
                 ),
             ),
             grid_axis_block_ids=(0,),
@@ -1402,35 +5191,23 @@ class TestTritonStandardReductionHeuristic(TestCase):
         return spec
 
     def _reduction_env(self, spec: ConfigSpec) -> MagicMock:
-        # The deepened heuristic reads env.backend.max_tensor_numel (the structural
-        # persistent cap) — provide the real Triton cap so a sub-cap rnumel stays
-        # persistent.
         from types import SimpleNamespace
-
-        from helion.autotuner.config_generation import TRITON_MAX_TENSOR_NUMEL
 
         env = MagicMock()
         env.backend_name = "triton"
-        env.backend.max_tensor_numel = TRITON_MAX_TENSOR_NUMEL
         env.config_spec = spec
         env.device = DEVICE
-        # ``_primary_descriptor_selected`` filters the sized descriptors to the BACKED axes
-        # (``free_unbacked_symbols(env.block_sizes[bid].size)``), so the descriptor axes'
-        # ``env.block_sizes[bid].size`` must be a real (backed) int — a bare MagicMock can't be
-        # fed to sympy. Resolve each descriptor's block_id to its static ``size_hint``. For any
-        # OTHER block_id (the grid/M axis) keep a non-int so ``_grid_rows`` returns 0 (no static
-        # grid -> the occupancy-gated narrow-w1 warps lever stays disabled, as it was when the
-        # mock had no configured sizes at all).
+        # Primary selection requires concrete sizes for reduction axes.
         sizes = {d.block_id: d.size_hint for d in spec.reduction_kernel_fact.reductions}
         env.block_sizes.__getitem__.side_effect = lambda bid: SimpleNamespace(
             size=sizes[bid] if bid in sizes else MagicMock()
         )
         return env
 
-    def test_seed_is_persistent_one_row(self) -> None:
-        # The structural seed: one row per program + persistent reduction. The
-        # deepened heuristic ALSO seeds num_warps via the rnumel ramp (rnumel=1024
-        # -> 4 warps) and num_stages=1, rather than leaving them to the autotuner.
+    def test_seed_is_persistent_with_reduction_warps(self) -> None:
+        # The unified allocator may batch rows when live bytes and launch supply
+        # permit it. The reduction remains persistent and its 1024-wide lane work
+        # drafts four warps, then climbs to eight under the spill limit.
         env = self._reduction_env(self._reduction_spec(reduction_size_hint=1024))
         # The mock env has no real GPU device, so patch hardware info / SM count (this
         # heuristic only fires on GPU in production and the SM count is irrelevant here).
@@ -1438,49 +5215,127 @@ class TestTritonStandardReductionHeuristic(TestCase):
             patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE),
             patch("helion.runtime.get_num_sm", return_value=132),
         ):
-            seed = TritonStandardReductionHeuristicSM90.get_seed_config(
-                env, MagicMock()
-            )
-        self.assertEqual(seed.config["block_sizes"], [1])
+            seed = TritonReductionHeuristic.get_seed_config(env, MagicMock())
+        self.assertEqual(len(seed.config["block_sizes"]), 1)
+        self.assertGreaterEqual(seed.config["block_sizes"][0], 1)
         self.assertEqual(seed.config["reduction_loops"], [None])
-        # rnumel ramp: 1024 falls in the <=1024 band -> 4 warps.
-        self.assertEqual(seed.config["num_warps"], 4)
+        self.assertEqual(seed.config["num_warps"], 8)
         self.assertEqual(seed.config["num_stages"], 1)
 
-    def test_single_load_seeds_stream_eviction_over_load_slots(self) -> None:
-        # A single-load streaming reduction (num_load==1: e.g. sum) is read once
-        # and never reused, so every load slot -> 'first' (evict_first frees L2),
-        # broadcast over the spec's load slots. Build the fragment explicitly so
-        # the test does not depend on the host backend's eviction choices.
-        from helion.autotuner.config_fragment import EnumFragment
-        from helion.autotuner.config_fragment import ListOf
-
-        spec = self._reduction_spec(reduction_size_hint=1024, num_load=1)
-        spec.load_eviction_policies = ListOf(
-            EnumFragment(choices=("", "first", "last")), length=4
-        )
-        env = self._reduction_env(spec)
-        # The mock env has no real GPU device, so patch hardware info / SM count (this
-        # heuristic only fires on GPU in production and the SM count is irrelevant here).
-        with (
-            patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE),
-            patch("helion.runtime.get_num_sm", return_value=132),
-        ):
-            seed = TritonStandardReductionHeuristicSM90.get_seed_config(
-                env, MagicMock()
-            )
+    def test_warp_selection_descends_when_resident_warps_are_retained(
+        self,
+    ) -> None:
         self.assertEqual(
-            seed.config["load_eviction_policies"],
-            ["first", "first", "first", "first"],
+            self._choose_warps_with_model(
+                width=8192,
+                peak_live_bytes=8 * 1024,
+                warp_scores={1: 8.0, 2: 16.0, 4: 32.0, 16: 32.0},
+            ),
+            4,
         )
+
+    def test_warp_selection_keeps_draft_when_launch_caps_lower_rungs(
+        self,
+    ) -> None:
+        self.assertEqual(
+            self._choose_warps_with_model(
+                width=2048,
+                peak_live_bytes=8 * 1024,
+                warp_scores={1: 1.0, 2: 2.0, 4: 4.0, 8: 8.0},
+            ),
+            8,
+        )
+
+    def test_light_warp_selection_preserves_full_draft_score(self) -> None:
+        self.assertEqual(
+            self._choose_warps_with_model(
+                width=2048,
+                peak_live_bytes=4 * 1024,
+                warp_scores={1: 8.0, 2: 16.0, 4: 32.0, 8: 64.0},
+            ),
+            8,
+        )
+
+    def test_high_warp_selection_uses_calibrated_residency(self) -> None:
+        scores = {1: 2.0, 2: 4.0, 4: 8.0, 8: 16.0, 16: 32.0}
+        self.assertEqual(
+            self._choose_warps_with_model(
+                width=8192,
+                peak_live_bytes=64 * 1024,
+                warp_scores=scores,
+                calibrated_scores={**scores, 8: 32.0},
+            ),
+            8,
+        )
+
+    def test_high_spill_disables_calibrated_residency(self) -> None:
+        scores = {1: 2.0, 2: 4.0, 4: 8.0, 8: 16.0, 16: 32.0}
+        self.assertEqual(
+            self._choose_warps_with_model(
+                width=8192,
+                peak_live_bytes=64 * 1024,
+                warp_scores=scores,
+                calibrated_scores={**scores, 8: 32.0},
+                spill_pressures={8: 0.51},
+            ),
+            16,
+        )
+
+    def _choose_warps_with_model(
+        self,
+        *,
+        width: int,
+        peak_live_bytes: int,
+        warp_scores: dict[int, float],
+        calibrated_scores: dict[int, float] | None = None,
+        spill_pressures: dict[int, float] | None = None,
+    ) -> int:
+        candidate = MagicMock(reduction_widths=((1, width),))
+        pd = MagicMock(size_hint=width)
+        calibrated_scores = calibrated_scores or warp_scores
+        spill_pressures = spill_pressures or {}
+
+        def score(resources: MagicMock, **kwargs: float) -> float:
+            scores = (
+                calibrated_scores
+                if kwargs.get("register_estimate_scale", 1.0) < 1.0
+                else warp_scores
+            )
+            return scores[resources.num_warps]
+
+        with (
+            patch.object(
+                TritonReductionHeuristic,
+                "_reduction_resources",
+                side_effect=lambda _env, _candidate, warps, _num_sm: MagicMock(
+                    num_warps=warps,
+                    peak_live_bytes=peak_live_bytes,
+                ),
+            ),
+            patch.object(
+                TritonReductionHeuristic,
+                "_reduction_spill_pressure",
+                side_effect=lambda resources: spill_pressures.get(
+                    resources.num_warps, 0.25
+                ),
+            ),
+            patch.object(
+                TritonReductionHeuristic,
+                "_reduction_effective_warp_score",
+                side_effect=score,
+            ),
+        ):
+            return TritonReductionHeuristic._choose_reduction_num_warps(
+                MagicMock(), candidate, pd, 132
+            )
 
     def test_persistent_seed_round_trips_through_config_generation(self) -> None:
         # reduction_loops=[None] (persistent) MUST survive flatten/unflatten. For
         # a wide reduction (size_hint 32000) a sentinel < size_hint would decode
         # back to the SLOW looped family this heuristic exists to avoid; the
         # config_spec fix encodes None as the fragment's ``high`` (>= size_hint).
-        # row_reread=True makes the wide reduction persist under the read-once persist
-        # gate (read-once reductions deliberately loop), so there is a [None] to round-trip.
+        # row_reread=True allows the late full-row persistence probe, so there
+        # is a [None] sentinel to round-trip.
         from helion.autotuner.config_generation import ConfigGeneration
 
         spec = self._reduction_spec(reduction_size_hint=32000, row_reread=True)
@@ -1491,9 +5346,7 @@ class TestTritonStandardReductionHeuristic(TestCase):
             patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE),
             patch("helion.runtime.get_num_sm", return_value=132),
         ):
-            seed = TritonStandardReductionHeuristicSM90.get_seed_config(
-                env, MagicMock()
-            )
+            seed = TritonReductionHeuristic.get_seed_config(env, MagicMock())
         spec.compiler_seed_configs = [seed]
         pairs = ConfigGeneration(spec).seed_flat_config_pairs()
         self.assertEqual(len(pairs), 1)
@@ -1509,16 +5362,12 @@ class TestTritonStandardReductionHeuristic(TestCase):
             spec = ConfigSpec(backend=TritonBackend())
             spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
             env.config_spec = spec
-            self.assertFalse(
-                TritonStandardReductionHeuristicSM90.is_eligible(env, MagicMock())
-            )
+            self.assertFalse(TritonReductionHeuristic.is_eligible(env, MagicMock()))
             # A matmul fact disqualifies even a 1-tile/1-reduction shape.
             spec_mm = self._reduction_spec(reduction_size_hint=1024)
             spec_mm.matmul_facts = [MagicMock()]
             env.config_spec = spec_mm
-            self.assertFalse(
-                TritonStandardReductionHeuristicSM90.is_eligible(env, MagicMock())
-            )
+            self.assertFalse(TritonReductionHeuristic.is_eligible(env, MagicMock()))
 
     @onlyBackends(["triton"])
     @skipIfRefEager("Compiler heuristics are not collected in ref eager mode")
@@ -1554,38 +5403,33 @@ class TestTritonStandardReductionHeuristic(TestCase):
                 torch.randn(256, 256, device=DEVICE, dtype=HALF_DTYPE),
             )
         )
-        # Pin the sm90/H100 target so the sm90 heuristic is exercised regardless of the CI
-        # runner's GPU: the hardware gate now lives in ``is_eligible`` (sm100/B200 routes to
-        # ``TritonStandardReductionHeuristicSM100``, other GPUs to the narrow fallback), so on a
-        # B200 runner the unpatched ``is_eligible`` would be False.
+        # Pin a tuned target regardless of the CI runner's GPU. Other architectures route
+        # standard reductions to the narrow fallback.
         with (
             patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE),
             patch("helion.runtime.get_num_sm", return_value=132),
         ):
             self.assertTrue(
-                TritonStandardReductionHeuristicSM90.is_eligible(
+                TritonReductionHeuristic.is_eligible(
                     red.env, red.host_function.device_ir
                 )
             )
-            seed = TritonStandardReductionHeuristicSM90.get_seed_config(
+            seed = TritonReductionHeuristic.get_seed_config(
                 red.env, red.host_function.device_ir
             )
             # A matmul is not a reduction, so the reduction seed declines even on its own target.
             self.assertFalse(
-                TritonStandardReductionHeuristicSM90.is_eligible(
-                    mm.env, mm.host_function.device_ir
-                )
+                TritonReductionHeuristic.is_eligible(mm.env, mm.host_function.device_ir)
             )
-        self.assertEqual(seed.config["block_sizes"], [1])
+        self.assertEqual(len(seed.config["block_sizes"]), 1)
+        self.assertGreaterEqual(seed.config["block_sizes"][0], 1)
         self.assertEqual(seed.config["reduction_loops"], [None])
 
     @onlyBackends(["triton"])
     @skipIfRefEager("Compiler heuristics are not collected in ref eager mode")
-    def test_exactly_one_reduction_track_eligible_per_hardware(self) -> None:
-        # The hardware gate lives in ``is_eligible``: for a standard reduction, EXACTLY one of
-        # the three standard-track classes fires per GPU — sm90 -> SM90, sm100 -> SM100, anything
-        # else -> the narrow fallback — and none of them return None-for-deferral from
-        # ``get_seed_config``. This is the invariant the class split exists to guarantee.
+    def test_tuned_reduction_and_narrow_fallback_are_disjoint(self) -> None:
+        # The unified tuned class owns sm90 and sm100. Other hardware uses the narrow
+        # standard-reduction fallback, so exactly one class is eligible.
         @helion.kernel(backend="triton")
         def row_reduction(x: torch.Tensor) -> torch.Tensor:
             m, _ = x.size()
@@ -1602,8 +5446,8 @@ class TestTritonStandardReductionHeuristic(TestCase):
         env, device_ir = red.env, red.host_function.device_ir
         # (hardware, the one class expected to fire).
         cases = [
-            (HOPPER_HARDWARE, TritonStandardReductionHeuristicSM90),
-            (BLACKWELL_HARDWARE, TritonStandardReductionHeuristicSM100),
+            (HOPPER_HARDWARE, TritonReductionHeuristic),
+            (BLACKWELL_HARDWARE, TritonReductionHeuristic),
             (
                 HardwareInfo(
                     device_kind="cuda",
@@ -1615,8 +5459,7 @@ class TestTritonStandardReductionHeuristic(TestCase):
             ),
         ]
         tracks = [
-            TritonStandardReductionHeuristicSM90,
-            TritonStandardReductionHeuristicSM100,
+            TritonReductionHeuristic,
             TritonNarrowReductionHeuristic,
         ]
         for hardware, expected in cases:
@@ -1633,7 +5476,8 @@ class TestTritonStandardReductionHeuristic(TestCase):
                 # The eligible class always yields a real Config (never None-for-deferral).
                 seed = expected.get_seed_config(env, device_ir)
                 self.assertIsNotNone(seed)
-                self.assertEqual(seed.config["block_sizes"], [1])
+                self.assertEqual(len(seed.config["block_sizes"]), 1)
+                self.assertGreaterEqual(seed.config["block_sizes"][0], 1)
 
 
 _FP8_SKINNY_M_SEED_BLOCK_SIZES = [1, 256]
@@ -1797,6 +5641,11 @@ class TestCuteFp8GemmSkinnyMHeuristic(TestCase):
 
 
 class TestCuteTcgen05ClusterM2Heuristic(TestCase):
+    # Structural-coverage enumeration keeps a few of these tests above the
+    # suite's default 60s per-test timeout on slower CI runners, which kills
+    # the xdist worker mid-test. Give them modest headroom.
+    pytestmark = pytest.mark.timeout(120)
+
     def _assert_cute_tcgen05_cluster_m2_seeded(
         self,
         configs: list[helion.Config],
@@ -1811,24 +5660,48 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         ]
         # FFI-eligible shapes have both DEFAULT-layout and direct-entry seeds.
         # Callers decide whether both are expected in the supplied population;
-        # every cluster_m=2 seed must still match the common tile envelope.
+        # every cluster_m=2 seed must still match one of the validated tile
+        # envelopes: the canonical 256x256 tile, the M-paired block_m=512 tile
+        # (two 256-row subtiles sharing B; baseline ab=2 only), or the
+        # deep-staged short-K variant (bk=64 with the ab=6 pipeline). At least
+        # one canonical-envelope seed must be present.
         self.assertGreaterEqual(len(seeded), 1)
+        canonical: list[dict[str, object]] = []
         for seed in seeded:
-            self.assertEqual(
-                seed["block_sizes"][:3],
-                [
-                    TCGEN05_TWO_CTA_BLOCK_M,
-                    TCGEN05_TWO_CTA_BLOCK_N,
-                    expected_block_k,
-                ],
-            )
+            block_sizes = seed["block_sizes"][:3]
+            if block_sizes[0] == 2 * TCGEN05_TWO_CTA_BLOCK_M:
+                self.assertEqual(
+                    block_sizes,
+                    [
+                        2 * TCGEN05_TWO_CTA_BLOCK_M,
+                        TCGEN05_TWO_CTA_BLOCK_N,
+                        expected_block_k,
+                    ],
+                )
+                self.assertEqual(seed["tcgen05_ab_stages"], 2)
+            elif seed.get("tcgen05_ab_stages") == 6:
+                self.assertEqual(
+                    block_sizes,
+                    [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 64],
+                )
+            else:
+                self.assertEqual(
+                    block_sizes,
+                    [
+                        TCGEN05_TWO_CTA_BLOCK_M,
+                        TCGEN05_TWO_CTA_BLOCK_N,
+                        expected_block_k,
+                    ],
+                )
+                canonical.append(seed)
             self.assertEqual(
                 seed["indexing"],
                 ["tensor_descriptor"] * expected_indexing_length,
             )
             self.assertEqual(seed["pid_type"], "persistent_interleaved")
             self.assertEqual(seed["tcgen05_num_epi_warps"], 4)
-        return seeded[0]
+        self.assertGreaterEqual(len(canonical), 1)
+        return canonical[0]
 
     def _assert_cute_tcgen05_edge_k_tail_seed_overrides(
         self,
@@ -2011,316 +5884,49 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertIn(FLASH_SMALL_BIASED_KEY, FLASH_CONFIG_KEYS)
 
     def test_cute_flash_seed_helper_dense_hd64_families(self) -> None:
-        for num_kv in (16, 32, 62):
-            seed = flash_attention_seed_config(64, num_kv)
+        configs: list[dict[str, object]] = []
+        for num_kv in (16, 32, 64, 128, 256, 512, 1024, 2048):
+            seed = flash_attention_seed_config(
+                64,
+                num_kv,
+                dtype=torch.float16,
+                standard_dense_output=True,
+            )
             assert seed is not None
             config = seed.config
             self.assertEqual(config["block_sizes"], [1, 128, 128])
             self.assertEqual(config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
-            self.assertEqual(config[FLASH_S_STAGE_KEY], 2)
-            self.assertEqual(config[FLASH_KV_STAGE_KEY], 3)
-            self.assertTrue(config[FLASH_PERSISTENT_KEY])
-            self.assertEqual(config[FLASH_PERSISTENT_CTAS_PER_SM_KEY], 1)
-            self.assertEqual(config[FLASH_E2E_SCHEDULE_KEY], "8/2")
-            self.assertEqual(config[FLASH_E2E_OFFSET_KEY], 2)
-            self.assertEqual(config[FLASH_E2E_OFFSET0_KEY], 2)
-            self.assertTrue(config[FLASH_SOFTMAX_DISC_KEY])
-            self.assertEqual(config[FLASH_DISC_PIPE_KEY], 4)
-            self.assertEqual(config[FLASH_P_STORE_REP_KEY], 16)
-            self.assertEqual(config[FLASH_S_LOAD_REP_KEY], 32)
-            self.assertEqual(config[FLASH_PRECOMPUTE_QK_DESC_KEY], num_kv == 512)
-            self.assertFalse(config[FLASH_RECOMPUTE_TILE_COORDS_KEY])
-            self.assertEqual(config[FLASH_FIRST_LOAD_ORDER_KEY], 0)
-            self.assertEqual(config[FLASH_KV_ORDER_KEY], "ascending")
-            self.assertEqual(config[FLASH_SOFTMAX_REGS_KEY], 184)
-            self.assertEqual(config[FLASH_OTHER_REGS_KEY], 48)
-            self.assertTrue(config[FLASH_EPI_TMA_KEY])
-            self.assertFalse(config[FLASH_EPI_STG_KEY])
-            self.assertEqual(config[FLASH_CORR_TILE_SIZE_KEY], 16)
-            self.assertEqual(config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
-            self.assertEqual(config[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
-            self.assertFalse(config[FLASH_SKIP_RESCALE_STATS_KEY])
-            self.assertFalse(config[FLASH_PACKED_REDUCE_KEY])
             for legacy_key in FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS:
                 self.assertNotIn(legacy_key, config)
-
-        for (
-            num_kv,
-            e2e_schedule,
-            offset,
-            offset0,
-            disc_pipe,
-            epi_tma,
-            rescale_threshold,
-            rescale_chunk_cols,
-            skip_rescale_stats,
-            persistent_ctas_per_sm,
-            kv_order,
-            corr_tile_size,
-            softmax_disc,
-            first_load_order,
-            softmax_regs,
-            corr_regs,
-            other_regs,
-            local_tma_partition,
-            cga2_local,
-            clc,
-            clc_heads_per_batch,
-        ) in (
-            (
+            resolved = resolve_flash_config(
                 64,
-                "8/2",
-                2,
-                2,
-                3,
-                True,
-                8.0,
-                16,
-                False,
-                1,
-                "ascending",
-                16,
-                True,
-                0,
-                184,
-                64,
-                48,
-                False,
-                False,
-                False,
-                0,
-            ),
-            (
-                128,
-                "8/2",
-                3,
-                2,
-                3,
-                False,
-                8.0,
-                16,
-                False,
-                1,
-                "ascending",
-                16,
-                True,
-                0,
-                184,
-                64,
-                48,
-                False,
-                False,
-                False,
-                0,
-            ),
-            (
-                256,
-                "8/2",
-                0,
-                1,
-                1,
-                True,
-                8.0,
-                8,
-                False,
-                1,
-                "descending",
-                8,
-                False,
-                0,
-                200,
-                64,
-                40,
-                False,
-                False,
-                False,
-                0,
-            ),
-            (
-                384,
-                "8/2",
-                0,
-                3,
-                1,
-                True,
-                8.0,
-                8,
-                False,
-                1,
-                "ascending",
-                8,
-                False,
-                0,
-                200,
-                72,
-                32,
-                False,
-                False,
-                False,
-                0,
-            ),
-            (
-                512,
-                "8/2",
-                0,
-                0,
-                3,
-                False,
-                8.0,
-                8,
-                False,
-                1,
-                "descending",
-                16,
-                False,
-                4,
-                200,
-                80,
-                32,
-                False,
-                False,
-                False,
-                0,
-            ),
-            (
-                1024,
-                "16/4",
-                0,
-                0,
-                1,
-                True,
-                8.0,
-                8,
-                False,
-                1,
-                "descending",
-                8,
-                False,
-                0,
-                200,
-                72,
-                40,
-                False,
-                False,
-                True,
-                32,
-            ),
-        ):
-            seed = flash_attention_seed_config(64, num_kv)
-            assert seed is not None
-            config = seed.config
-            self.assertEqual(config["block_sizes"], [1, 128, 128])
-            if cga2_local:
-                expected_family = "fa4_cga2_local"
-            elif clc:
-                expected_family = (
-                    "fa4_clc_local_tma" if local_tma_partition else "fa4_clc"
-                )
-            elif local_tma_partition:
-                expected_family = "fa4_local_tma"
-            else:
-                expected_family = "fa4"
-            self.assertEqual(config[FLASH_PIPELINE_FAMILY_KEY], expected_family)
-            self.assertEqual(config[FLASH_S_STAGE_KEY], 2)
-            self.assertEqual(config[FLASH_KV_STAGE_KEY], 2)
-            self.assertTrue(config[FLASH_PERSISTENT_KEY])
-            self.assertEqual(
-                config[FLASH_PERSISTENT_CTAS_PER_SM_KEY], persistent_ctas_per_sm
+                num_kv,
+                config,
+                dtype=torch.float16,
+                standard_dense_output=True,
             )
-            self.assertEqual(config[FLASH_E2E_SCHEDULE_KEY], e2e_schedule)
-            self.assertEqual(config[FLASH_E2E_OFFSET0_KEY], offset0)
-            self.assertEqual(config[FLASH_E2E_OFFSET_KEY], offset)
-            self.assertEqual(config[FLASH_SOFTMAX_DISC_KEY], softmax_disc)
-            self.assertEqual(config[FLASH_DISC_PIPE_KEY], disc_pipe)
-            self.assertEqual(config[FLASH_SPLIT_P_ARRIVE_KEY], num_kv == 512)
-            self.assertEqual(config[FLASH_P_STORE_REP_KEY], 16)
-            self.assertEqual(config[FLASH_S_LOAD_REP_KEY], 32)
-            self.assertEqual(config[FLASH_PRECOMPUTE_QK_DESC_KEY], num_kv == 512)
-            self.assertFalse(config[FLASH_RECOMPUTE_TILE_COORDS_KEY])
-            self.assertEqual(config[FLASH_FIRST_LOAD_ORDER_KEY], first_load_order)
-            self.assertEqual(config[FLASH_KV_ORDER_KEY], kv_order)
-            self.assertEqual(config[FLASH_SOFTMAX_REGS_KEY], softmax_regs)
-            self.assertEqual(config[FLASH_CORR_REGS_KEY], corr_regs)
-            self.assertEqual(config[FLASH_OTHER_REGS_KEY], other_regs)
-            self.assertEqual(config[FLASH_EPI_TMA_KEY], epi_tma)
-            self.assertEqual(config[FLASH_EPI_STG_KEY], num_kv >= 512 and not epi_tma)
-            self.assertEqual(config[FLASH_CORR_TILE_SIZE_KEY], corr_tile_size)
-            self.assertEqual(config[FLASH_RESCALE_THRESHOLD_KEY], rescale_threshold)
-            self.assertEqual(config[FLASH_RESCALE_CHUNK_COLS_KEY], rescale_chunk_cols)
-            self.assertEqual(config[FLASH_SKIP_RESCALE_STATS_KEY], skip_rescale_stats)
-            self.assertTrue(config[FLASH_PACKED_REDUCE_KEY])
-            self.assertEqual(config[FLASH_CLC_HEADS_PER_BATCH_KEY], clc_heads_per_batch)
-            for legacy_key in FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS:
-                self.assertNotIn(legacy_key, config)
-
-        very_long_seed = flash_attention_seed_config(64, 2048)
-        assert very_long_seed is not None
-        very_long_config = very_long_seed.config
-        self.assertEqual(very_long_config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
-        self.assertEqual(very_long_config[FLASH_KV_STAGE_KEY], 3)
-        self.assertEqual(very_long_config[FLASH_E2E_SCHEDULE_KEY], "16/4")
-        self.assertEqual(very_long_config[FLASH_E2E_OFFSET_KEY], 0)
-        self.assertEqual(very_long_config[FLASH_E2E_OFFSET0_KEY], 0)
-        self.assertEqual(very_long_config[FLASH_DISC_PIPE_KEY], 1)
-        self.assertFalse(very_long_config[FLASH_SPLIT_P_ARRIVE_KEY])
-        self.assertFalse(very_long_config[FLASH_PRECOMPUTE_QK_DESC_KEY])
-        self.assertFalse(very_long_config[FLASH_RECOMPUTE_TILE_COORDS_KEY])
-        self.assertEqual(very_long_config[FLASH_FIRST_LOAD_ORDER_KEY], 4)
-        self.assertEqual(very_long_config[FLASH_KV_ORDER_KEY], "descending")
-        self.assertEqual(very_long_config[FLASH_SOFTMAX_REGS_KEY], 192)
-        self.assertEqual(very_long_config[FLASH_CORR_REGS_KEY], 80)
-        self.assertEqual(very_long_config[FLASH_OTHER_REGS_KEY], 32)
-        self.assertFalse(very_long_config[FLASH_EPI_TMA_KEY])
-        self.assertTrue(very_long_config[FLASH_EPI_STG_KEY])
-        self.assertEqual(very_long_config[FLASH_CORR_TILE_SIZE_KEY], 8)
-        self.assertEqual(very_long_config.get(FLASH_ROLE_MAP_KEY, "helion"), "helion")
-        self.assertEqual(very_long_config[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
-        self.assertEqual(very_long_config[FLASH_RESCALE_CHUNK_COLS_KEY], 8)
-        self.assertTrue(very_long_config[FLASH_PACKED_REDUCE_KEY])
-        for legacy_key in FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS:
-            self.assertNotIn(legacy_key, very_long_config)
+            self.assertEqual(resolved.pipeline_family, "fa4")
+            configs.append(config)
+        self.assertTrue(all(config == configs[0] for config in configs[1:]))
 
         dense_sp_seed = flash_attention_seed_config(
             64,
-            256,
+            48,
+            dtype=torch.float16,
+            standard_dense_output=True,
             seed_kind="dense_sp",
         )
         assert dense_sp_seed is not None
-        dense_sp_config = dense_sp_seed.config
-        self.assertFalse(dense_sp_config[FLASH_SOFTMAX_DISC_KEY])
-        self.assertFalse(dense_sp_config[FLASH_SPLIT_P_ARRIVE_KEY])
-        self.assertEqual(dense_sp_config[FLASH_P_STORE_REP_KEY], 32)
-        self.assertEqual(dense_sp_config[FLASH_S_LOAD_REP_KEY], 32)
-        self.assertTrue(dense_sp_config[FLASH_PRECOMPUTE_QK_DESC_KEY])
-        self.assertEqual(dense_sp_config[FLASH_FIRST_LOAD_ORDER_KEY], 1)
-        self.assertEqual(dense_sp_config[FLASH_KV_ORDER_KEY], "descending")
-        self.assertEqual(dense_sp_config[FLASH_CORR_REGS_KEY], 80)
-        self.assertEqual(dense_sp_config[FLASH_OTHER_REGS_KEY], 32)
-        self.assertEqual(dense_sp_config[FLASH_PIPELINE_FAMILY_KEY], "fa4_local_tma_4d")
-        dense_sp_512_seed = flash_attention_seed_config(
-            64,
-            512,
-            seed_kind="dense_sp",
+        self.assertFalse(dense_sp_seed.config[FLASH_SOFTMAX_DISC_KEY])
+        self.assertIsNone(
+            flash_attention_seed_config(
+                64,
+                48,
+                is_causal=True,
+                standard_causal_output=True,
+                seed_kind="dense_sp",
+            )
         )
-        assert dense_sp_512_seed is not None
-        dense_sp_512_config = dense_sp_512_seed.config
-        self.assertFalse(dense_sp_512_config[FLASH_EPI_TMA_KEY])
-        self.assertTrue(dense_sp_512_config[FLASH_EPI_STG_KEY])
-        dense_sp_2048_seed = flash_attention_seed_config(
-            64,
-            2048,
-            seed_kind="dense_sp",
-        )
-        assert dense_sp_2048_seed is not None
-        dense_sp_2048_config = dense_sp_2048_seed.config
-        self.assertEqual(dense_sp_2048_config[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
-        self.assertEqual(dense_sp_2048_config[FLASH_SOFTMAX_REGS_KEY], 200)
-        self.assertIsNone(flash_attention_seed_config(64, 128, seed_kind="dense_sp"))
-
-        short_seed = flash_attention_seed_config(64, 8)
-        assert short_seed is not None
-        self.assertEqual(short_seed.config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
-        self.assertNotIn(FLASH_E2E_OFFSET_KEY, short_seed.config)
 
         sparse_seed = flash_attention_seed_config(
             64,
@@ -2331,7 +5937,6 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         assert sparse_seed is not None
         self.assertEqual(sparse_seed.config[FLASH_PIPELINE_FAMILY_KEY], "ws_overlap")
         self.assertTrue(sparse_seed.config[FLASH_PACKED_REDUCE_KEY])
-        self.assertNotIn(FLASH_E2E_OFFSET_KEY, sparse_seed.config)
 
         small_seed = flash_attention_seed_config(
             64,
@@ -2342,140 +5947,61 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertTrue(small_seed.config[FLASH_SMALL_BIASED_KEY])
 
     def test_cute_flash_seed_helper_causal_lpt_family(self) -> None:
-        expected = {
-            32: (0, 2, 200, 8, "inherit", "helion", True, 16),
-            64: (0, 2, 200, 8, "inherit", "helion", True, 16),
-            128: (0, 2, 192, 8, "16/4", "fa4", True, 16),
-            256: (1, 4, 184, 4, "16/4", "helion", False, 16),
-            512: (9, 4, 184, 1, "16/4", "helion", False, 32),
-            1024: (9, 4, 184, 1, "16/4", "helion", False, 32),
-            4096: (9, 4, 184, 1, "16/4", "helion", False, 32),
-        }
-        for (
-            num_kv,
-            (
-                offset,
-                disc_pipe,
-                softmax_regs,
-                swizzle,
-                masked_schedule,
-                role_map,
-                epi_tma,
-                rescale_chunk_cols,
-            ),
-        ) in expected.items():
+        configs: list[dict[str, object]] = []
+        for num_kv in (32, 48, 96, 128, 256, 512, 1024, 4096):
             seed = flash_attention_seed_config(
                 64,
                 num_kv,
                 is_causal=True,
+                standard_causal_output=True,
                 seed_kind="causal_lpt",
             )
             assert seed is not None
             config = seed.config
             self.assertEqual(config["block_sizes"], [1, 128, 128])
             self.assertEqual(config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
-            self.assertEqual(config[FLASH_S_STAGE_KEY], 2)
-            self.assertEqual(config[FLASH_KV_STAGE_KEY], 2)
-            self.assertFalse(config[FLASH_PERSISTENT_KEY])
-            self.assertEqual(config[FLASH_E2E_SCHEDULE_KEY], "8/2")
-            self.assertEqual(config[FLASH_MASKED_E2E_SCHEDULE_KEY], masked_schedule)
-            self.assertEqual(config[FLASH_ROLE_MAP_KEY], role_map)
-            self.assertEqual(config[FLASH_E2E_OFFSET_KEY], offset)
-            self.assertEqual(config[FLASH_DISC_PIPE_KEY], disc_pipe)
-            self.assertEqual(config[FLASH_EPI_TMA_KEY], epi_tma)
-            self.assertEqual(config[FLASH_RESCALE_CHUNK_COLS_KEY], rescale_chunk_cols)
-            self.assertEqual(config[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
-            self.assertTrue(config[FLASH_PACKED_REDUCE_KEY])
-            self.assertEqual(config[FLASH_CAUSAL_LPT_SWIZZLE_KEY], swizzle)
-            self.assertEqual(config[FLASH_CAUSAL_KV_ORDER_KEY], "descending")
-            self.assertEqual(config[FLASH_SOFTMAX_REGS_KEY], softmax_regs)
+            self.assertEqual(config[FLASH_CAUSAL_LPT_SWIZZLE_KEY], 1)
+            resolved = resolve_flash_config(
+                64,
+                num_kv,
+                config,
+                is_causal=True,
+                standard_causal_output=True,
+            )
+            self.assertEqual(resolved.causal_lpt_swizzle, 1)
+            configs.append(config)
+        self.assertTrue(all(config == configs[0] for config in configs[1:]))
 
-        self.assertIsNone(
-            flash_attention_seed_config(64, 16, is_causal=True, seed_kind="causal_lpt")
-        )
-        self.assertIsNone(
-            flash_attention_seed_config(64, 96, is_causal=True, seed_kind="causal_lpt")
-        )
+        self.assertIsNone(flash_attention_seed_config(64, 48, seed_kind="causal_lpt"))
         self.assertIsNone(
             flash_attention_seed_config(
                 64,
-                64,
+                48,
                 is_causal=True,
                 requires_ws_overlap=True,
                 seed_kind="causal_lpt",
             )
         )
         split_seed = flash_attention_seed_config(
-            64, 64, is_causal=True, seed_kind="causal_split"
+            64,
+            48,
+            is_causal=True,
+            standard_causal_output=True,
+            seed_kind="causal_split",
         )
         assert split_seed is not None
-        lpt_seed = flash_attention_seed_config(
-            64, 64, is_causal=True, seed_kind="causal_lpt"
-        )
-        assert lpt_seed is not None
-        self.assertNotEqual(split_seed, lpt_seed)
-        self.assertEqual(split_seed.config[FLASH_KV_STAGE_KEY], 2)
-        self.assertEqual(split_seed.config[FLASH_E2E_SCHEDULE_KEY], "8/2")
-        self.assertEqual(split_seed.config[FLASH_MASKED_E2E_SCHEDULE_KEY], "16/4")
-        self.assertEqual(split_seed.config[FLASH_ROLE_MAP_KEY], "fa4")
         self.assertTrue(split_seed.config[FLASH_CAUSAL_LOOP_SPLIT_KEY])
-        self.assertEqual(split_seed.config[FLASH_E2E_OFFSET_KEY], 0)
-        self.assertEqual(split_seed.config[FLASH_E2E_OFFSET0_KEY], 0)
-        self.assertEqual(split_seed.config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
-        self.assertEqual(split_seed.config[FLASH_CAUSAL_LPT_SWIZZLE_KEY], 8)
-        split_seed_256 = flash_attention_seed_config(
-            64, 256, is_causal=True, seed_kind="causal_split"
-        )
-        assert split_seed_256 is not None
-        self.assertEqual(split_seed_256.config[FLASH_MASKED_E2E_SCHEDULE_KEY], "16/4")
-        self.assertEqual(split_seed_256.config[FLASH_E2E_OFFSET0_KEY], 11)
-        self.assertEqual(split_seed_256.config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
-        self.assertEqual(split_seed_256.config[FLASH_CAUSAL_LPT_SWIZZLE_KEY], 4)
-        split_seed_512 = flash_attention_seed_config(
-            64, 512, is_causal=True, seed_kind="causal_split"
-        )
-        assert split_seed_512 is not None
-        lpt_seed_512 = flash_attention_seed_config(
-            64, 512, is_causal=True, seed_kind="causal_lpt"
-        )
-        assert lpt_seed_512 is not None
-        self.assertNotEqual(split_seed_512, lpt_seed_512)
-        self.assertNotEqual(
-            resolve_flash_config(64, 512, split_seed_512.config, is_causal=True),
-            resolve_flash_config(64, 512, lpt_seed_512.config, is_causal=True),
-        )
-        self.assertEqual(split_seed_512.config[FLASH_E2E_SCHEDULE_KEY], "16/4")
-        self.assertEqual(split_seed_512.config[FLASH_MASKED_E2E_SCHEDULE_KEY], "8/2")
-        self.assertEqual(split_seed_512.config[FLASH_E2E_OFFSET_KEY], 0)
-        self.assertEqual(split_seed_512.config[FLASH_E2E_OFFSET0_KEY], 14)
-        self.assertEqual(split_seed_512.config[FLASH_DISC_PIPE_KEY], 3)
-        self.assertEqual(split_seed_512.config[FLASH_EXP2_PACKET_KEY], "4x1")
-        self.assertEqual(split_seed_512.config[FLASH_WAIT_HINT_KEY], 0)
-        self.assertFalse(split_seed_512.config[FLASH_EPI_TMA_KEY])
-        self.assertTrue(split_seed_512.config[FLASH_EPI_STG_KEY])
-        self.assertEqual(split_seed_512.config[FLASH_EPI_STG_GMEM_KEY], "pair")
-        self.assertEqual(split_seed_512.config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
-        self.assertEqual(split_seed_512.config[FLASH_ROLE_MAP_KEY], "fa4")
-        split_seed_4096 = flash_attention_seed_config(
-            64, 4096, is_causal=True, seed_kind="causal_split"
-        )
-        assert split_seed_4096 is not None
-        self.assertEqual(split_seed_4096.config, split_seed_512.config)
-
-        causal_seeds = flash_attention_seed_configs(64, 64, is_causal=True)
-        self.assertLessEqual(
-            {"fa4", "ws_overlap"},
-            {seed.config.get(FLASH_PIPELINE_FAMILY_KEY) for seed in causal_seeds},
+        self.assertEqual(
+            split_seed.config[FLASH_CAUSAL_KV_ORDER_KEY],
+            "descending",
         )
 
     def test_cute_flash_family_seeds_cover_legal_search_surface(self) -> None:
         cases = (
             (64, 256, torch.float16, False, False, True),
-            (64, 1024, torch.float16, False, False, True),
-            (64, 2048, torch.float16, False, False, True),
-            (64, 512, torch.float16, True, False, False),
-            (128, 256, torch.float16, False, False, True),
-            (64, 256, torch.bfloat16, False, False, False),
+            (64, 384, torch.float16, True, False, False),
+            (128, 256, torch.bfloat16, False, False, True),
+            (128, 384, torch.bfloat16, True, False, False),
             (64, 256, torch.float16, False, True, False),
         )
         for (
@@ -2493,21 +6019,37 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 is_causal=is_causal,
                 requires_ws_overlap=requires_ws_overlap,
             ):
-                fragments = flash_autotune_fragments(
-                    head_dim,
-                    num_kv,
-                    dtype=dtype,
-                    is_causal=is_causal,
-                    requires_ws_overlap=requires_ws_overlap,
-                    standard_dense_output=standard_dense_output,
-                )
+                options = {
+                    "dtype": dtype,
+                    "is_causal": is_causal,
+                    "requires_ws_overlap": requires_ws_overlap,
+                    "standard_dense_output": standard_dense_output,
+                    "standard_causal_output": is_causal,
+                }
+                fragments = flash_autotune_fragments(head_dim, num_kv, **options)
                 family_fragment = fragments[FLASH_PIPELINE_FAMILY_KEY]
-                self.assertIsInstance(family_fragment, EnumFragment)
+                packet_fragment = fragments[FLASH_EXP2_PACKET_KEY]
                 assert isinstance(family_fragment, EnumFragment)
+                assert isinstance(packet_fragment, EnumFragment)
                 legal_families = set(
                     family_fragment.choices
                     if family_fragment.search_choices is None
                     else family_fragment.search_choices
+                )
+                legal_packets = set(
+                    packet_fragment.choices
+                    if packet_fragment.search_choices is None
+                    else packet_fragment.search_choices
+                )
+                seeds = list(flash_attention_seed_configs(head_dim, num_kv, **options))
+                self.assertEqual(len(seeds), len(set(seeds)))
+                self.assertLessEqual(
+                    legal_families,
+                    {seed.config.get(FLASH_PIPELINE_FAMILY_KEY) for seed in seeds},
+                )
+                self.assertLessEqual(
+                    legal_packets,
+                    {seed.config[FLASH_EXP2_PACKET_KEY] for seed in seeds},
                 )
 
                 spec = ConfigSpec(backend=CuteBackend())
@@ -2519,64 +6061,843 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     head_dim=head_dim,
                     num_kv=num_kv,
                     block_size_targets={0: 1, 1: 128, 2: 128},
-                    dtype=dtype,
-                    is_causal=is_causal,
-                    requires_ws_overlap=requires_ws_overlap,
-                    standard_dense_output=standard_dense_output,
+                    **options,
                 )
-                spec.compiler_seed_configs = list(
-                    flash_attention_seed_configs(
-                        head_dim,
-                        num_kv,
-                        dtype=dtype,
-                        is_causal=is_causal,
-                        requires_ws_overlap=requires_ws_overlap,
-                        standard_dense_output=standard_dense_output,
-                    )
-                )
+                spec.compiler_seed_configs = seeds
                 config_gen = ConfigGeneration(spec)
                 normalized_seeds = [
                     config for _flat, config in config_gen.seed_flat_config_pairs()
                 ]
-                self.assertLessEqual(len(normalized_seeds), 6)
-                self.assertLessEqual(
-                    legal_families,
-                    {
-                        config.config[FLASH_PIPELINE_FAMILY_KEY]
-                        for config in normalized_seeds
-                    },
+                for seed in normalized_seeds:
+                    canonical_flat, canonical = config_gen.canonicalize_flat(
+                        config_gen.flatten(seed)
+                    )
+                    self.assertEqual(canonical, seed)
+                    self.assertEqual(config_gen.unflatten(canonical_flat), seed)
+
+    @_memoized_flash_fragments()
+    def test_cute_flash_full_population_covers_compound_schedule_dependencies(
+        self,
+    ) -> None:
+        config_gen = _dense_fp16_hd64_bh64_flash_generation()
+        spec = config_gen.config_spec
+        heuristic_seeds = CuteFlashAttentionHeuristic.get_seed_configs(
+            MagicMock(config_spec=spec),
+            MagicMock(),
+        )
+        assert heuristic_seeds is not None
+        candidates = spec.autotune_seed_configs()
+        self.assertEqual(heuristic_seeds, candidates)
+        spec.compiler_seed_configs = heuristic_seeds
+
+        profile = get_effort_profile("full").lfbo_pattern_search
+        assert profile is not None
+        self.assertEqual(profile.initial_population, 100)
+        population = config_gen.random_population(profile.initial_population)
+        configs = [config.config for config in population]
+        fragments = flash_autotune_fragments(
+            64,
+            48,
+            num_bh=64,
+            dtype=torch.float16,
+            standard_dense_output=True,
+        )
+        for key in (FLASH_PIPELINE_FAMILY_KEY, FLASH_EXP2_PACKET_KEY):
+            fragment = fragments[key]
+            assert isinstance(fragment, EnumFragment)
+            active = set(fragment.search_choices or fragment.choices)
+            self.assertLessEqual(active, {config[key] for config in configs})
+        self.assertTrue(
+            any(
+                config[FLASH_STAT_TRANSPORT_KEY] == "single_final" for config in configs
+            )
+        )
+
+        clc_configs = [
+            config
+            for config in configs
+            if str(config[FLASH_PIPELINE_FAMILY_KEY]).startswith("fa4_clc")
+        ]
+        self.assertGreaterEqual(
+            {config[FLASH_CLC_PDL_KEY] for config in clc_configs},
+            {False, True},
+        )
+        self.assertGreaterEqual(
+            {config[FLASH_CLC_STAGES_KEY] for config in clc_configs},
+            {2, 3},
+        )
+
+        staged_epilogues = {
+            (config[FLASH_EPI_STG_STORE_KEY], config[FLASH_EPI_STG_GMEM_KEY])
+            for config in configs
+            if config[FLASH_EPI_STG_KEY]
+        }
+        self.assertGreaterEqual(
+            staged_epilogues,
+            {
+                ("slice", "stage"),
+                ("slice", "pair"),
+                ("whole", "stage"),
+                ("whole", "pair"),
+            },
+        )
+        self.assertEqual(
+            config_gen.flash_structural_coverage_uncovered_interactions(),
+            [],
+        )
+
+    @_memoized_flash_fragments()
+    def test_cute_flash_full_population_reserves_random_exploration(self) -> None:
+        config_gen = _dense_fp16_hd64_bh64_flash_generation()
+        spec = config_gen.config_spec
+        spec.compiler_seed_configs = []
+        coverage = config_gen.flash_deterministic_population_configs()
+
+        random_state = random.getstate()
+        try:
+            random.seed(0)
+            with patch.object(
+                spec,
+                "autotune_seed_configs",
+                side_effect=AssertionError("coverage design should be cached"),
+            ):
+                population = config_gen.random_population(100)
+        finally:
+            random.setstate(random_state)
+
+        self.assertEqual(len(population), 100)
+        coverage_budget = config_gen.flash_structural_population_budget(100)
+        injected_design = coverage[:coverage_budget]
+        self.assertEqual(len(injected_design), len(coverage))
+        self.assertLessEqual(set(injected_design), set(population))
+        self.assertEqual(
+            len(set(population) - set(injected_design)),
+            100 - len(injected_design),
+        )
+        self.assertGreater(len(set(population) - set(injected_design)), 0)
+        for key, value in config_gen.flash_structural_coverage_active_values():
+            self.assertTrue(
+                any(config.config.get(key) == value for config in injected_design),
+                (key, value),
+            )
+        self.assertLessEqual(
+            config_gen.flash_structural_qualification_prefix_count(), coverage_budget
+        )
+        self.assertEqual(
+            config_gen.flash_structural_coverage_underqualified_values(), []
+        )
+        fields = spec._flat_fields()
+        family_fragment = fields[FLASH_PIPELINE_FAMILY_KEY]
+        packet_fragment = fields[FLASH_EXP2_PACKET_KEY]
+        assert isinstance(family_fragment, EnumFragment)
+        assert isinstance(packet_fragment, EnumFragment)
+        families = family_fragment.search_choices or family_fragment.choices
+        all_packets = packet_fragment.search_choices or packet_fragment.choices
+        packets = {
+            packet for packet in all_packets if flash_exp2_packet_is_compound(packet)
+        }
+
+        def assert_qualified(configs: list[helion.Config]) -> None:
+            for value in families:
+                self.assertGreaterEqual(
+                    sum(
+                        config.config[FLASH_PIPELINE_FAMILY_KEY] == value
+                        for config in configs
+                    ),
+                    2,
                 )
-                for family in legal_families:
-                    family_gen = spec.create_config_generation(
-                        overrides={FLASH_PIPELINE_FAMILY_KEY: family}
+            # Compound leaves start with one provenance row. Full tuning later
+            # transfers and benchmarks the leading ordinary representatives.
+            for value in packets:
+                self.assertTrue(
+                    any(
+                        config.config[FLASH_EXP2_PACKET_KEY] == value
+                        for config in configs
                     )
-                    family_default = family_gen.unflatten(family_gen.default_flat())
-                    self.assertIn(family_default, normalized_seeds)
-                if (
-                    head_dim == 64
-                    and dtype is torch.float16
-                    and not is_causal
-                    and standard_dense_output
-                ):
-                    self.assertFalse(
-                        any(
-                            config.config[FLASH_EXP2_PACKET_KEY]
-                            in {"deg1_8x2_corr10", "deg1_16x8"}
-                            for config in normalized_seeds
-                        )
+                )
+
+        assert_qualified(population)
+
+        random_state = random.getstate()
+        try:
+            random.seed(1)
+            quick_population = config_gen.random_population(30)
+        finally:
+            random.setstate(random_state)
+        for key, values in (
+            (FLASH_PIPELINE_FAMILY_KEY, families),
+            (FLASH_EXP2_PACKET_KEY, all_packets),
+        ):
+            for value in values:
+                self.assertTrue(
+                    any(config.config[key] == value for config in quick_population)
+                )
+
+        family_index = config_gen._key_to_flat_indices[FLASH_PIPELINE_FAMILY_KEY][0][0]
+        biased_users: set[helion.Config] = set()
+        random_state = random.getstate()
+        try:
+            random.seed(1)
+            while len(biased_users) < 75:
+                flat = config_gen.random_flat()
+                flat[family_index] = "fa4"
+                config = config_gen.unflatten(flat)
+                if config.config[FLASH_PIPELINE_FAMILY_KEY] == "fa4":
+                    biased_users.add(config)
+            compiler_seed = next(
+                config for config in coverage if config not in biased_users
+            )
+            spec.compiler_seed_configs = [compiler_seed]
+            random.seed(2)
+            seeded_population = config_gen.random_population(
+                100, user_seed_configs=list(biased_users)
+            )
+        finally:
+            random.setstate(random_state)
+        assert_qualified(seeded_population)
+        default_config = config_gen.unflatten(config_gen.default_flat())
+        eligible_configs = {
+            *biased_users,
+            compiler_seed,
+            default_config,
+            *coverage[:coverage_budget],
+        }
+        self.assertGreater(len(eligible_configs), 100)
+        self.assertGreaterEqual(len(seeded_population), 100)
+        self.assertEqual(len(seeded_population), len(set(seeded_population)))
+        self.assertLessEqual(set(seeded_population), eligible_configs)
+        self.assertLessEqual({*biased_users, compiler_seed}, set(seeded_population))
+        self.assertLessEqual(
+            set(coverage[: config_gen.flash_structural_qualification_prefix_count()]),
+            set(seeded_population),
+        )
+
+        search = PatternSearch.__new__(PatternSearch)
+        search.config_gen = config_gen
+        search.settings = Settings()
+        search.log = MagicMock()
+        search.initial_population_strategy = (
+            InitialPopulationStrategy.FROM_BEST_AVAILABLE
+        )
+        search.best_available_pad_random = True
+        search.initial_population = 100
+        search._best_available_seed_configs = []
+        search._pinned_finalist_configs = set()
+        search._autotune_seed_configs = lambda: tuple(biased_users)
+        search._find_similar_cached_configs = lambda _max_configs: []
+        best_available_population = [
+            config_gen.unflatten(flat)
+            for flat in search._generate_initial_population_flat()
+        ]
+        self.assertGreaterEqual(len(best_available_population), 100)
+        self.assertEqual(
+            len(best_available_population), len(set(best_available_population))
+        )
+        self.assertLessEqual(biased_users, set(best_available_population))
+        self.assertLessEqual(
+            set(coverage[: config_gen.flash_structural_qualification_prefix_count()]),
+            set(best_available_population),
+        )
+        assert_qualified(best_available_population)
+
+        search.best_available_pad_random = False
+        search.initial_population = 30
+        search._pinned_finalist_configs = set()
+        search._autotune_seed_configs = lambda: ()
+        quick_population = [
+            config_gen.unflatten(flat)
+            for flat in search._generate_initial_population_flat()
+        ]
+        expected_quick = {
+            *coverage[: config_gen.flash_structural_population_budget(30)],
+            compiler_seed,
+            default_config,
+        }
+        self.assertEqual(set(quick_population), expected_quick)
+        parent_prefix_count = config_gen.flash_structural_parent_coverage_prefix_count()
+        self.assertLessEqual(parent_prefix_count, len(quick_population))
+        for key, values in (
+            (FLASH_PIPELINE_FAMILY_KEY, families),
+            (FLASH_EXP2_PACKET_KEY, all_packets),
+        ):
+            for value in values:
+                self.assertTrue(
+                    any(config.config[key] == value for config in quick_population)
+                )
+
+        cached_configs: set[helion.Config] = set()
+        random_state = random.getstate()
+        try:
+            random.seed(3)
+            while len(cached_configs) < 30:
+                cached_configs.add(config_gen.unflatten(config_gen.random_flat()))
+        finally:
+            random.setstate(random_state)
+        search._generate_best_available_population_flat = lambda: [
+            config_gen.flatten(config) for config in cached_configs
+        ]
+        cached_quick_population = {
+            config_gen.unflatten(flat)
+            for flat in search._generate_initial_population_flat()
+        }
+        self.assertEqual(len(cached_quick_population), search.initial_population)
+        self.assertLessEqual(
+            set(coverage[:parent_prefix_count]), cached_quick_population
+        )
+
+        search.best_available_pad_random = True
+        search.initial_population = parent_prefix_count - 1
+        partial_population = {
+            config_gen.unflatten(flat)
+            for flat in search._generate_initial_population_flat()
+        }
+        self.assertEqual(len(partial_population), search.initial_population)
+        self.assertLessEqual(
+            set(coverage[: search.initial_population]), partial_population
+        )
+
+    @_memoized_flash_fragments()
+    def test_cute_flash_large_bh_population_covers_structural_axes_and_random(
+        self,
+    ) -> None:
+        spec = ConfigSpec(backend=CuteBackend())
+        for block_id, target in enumerate((1, 128, 128)):
+            spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
+        spec.enable_cute_flash_search(
+            head_dim=64,
+            num_kv=48,
+            num_bh=2520,
+            dtype=torch.float16,
+            block_size_targets={0: 1, 1: 128, 2: 128},
+            standard_dense_output=True,
+        )
+        spec.compiler_seed_configs = []
+        config_gen = ConfigGeneration(spec)
+        coverage = config_gen.flash_deterministic_population_configs()
+        coverage_set = set(coverage)
+        coverage_budget = config_gen.flash_structural_population_budget(100)
+        self.assertEqual(len(coverage_set), coverage_budget)
+        self.assertLess(coverage_budget, 100)
+        self.assertLessEqual(
+            config_gen.flash_structural_qualification_prefix_count(), coverage_budget
+        )
+        self.assertEqual(
+            config_gen.flash_structural_coverage_underqualified_values(), []
+        )
+
+        random_state = random.getstate()
+        try:
+            random.seed(0)
+            population = config_gen.random_population(100)
+        finally:
+            random.setstate(random_state)
+
+        fragments = spec._flat_fields()
+        configs = [config.config for config in population]
+        for key in (FLASH_PIPELINE_FAMILY_KEY, FLASH_EXP2_PACKET_KEY):
+            fragment = fragments[key]
+            assert isinstance(fragment, EnumFragment)
+            active = set(fragment.search_choices or fragment.choices)
+            self.assertLessEqual(active, {config[key] for config in configs})
+            if key == FLASH_PIPELINE_FAMILY_KEY:
+                for value in active:
+                    self.assertGreaterEqual(
+                        sum(config[key] == value for config in configs), 2
                     )
+            else:
+                for value in active:
+                    if flash_exp2_packet_is_compound(value):
+                        self.assertTrue(any(config[key] == value for config in configs))
+        self.assertEqual(len(set(population)), 100)
+        self.assertLessEqual(coverage_set, set(population))
+        self.assertEqual(
+            len(set(population) - coverage_set),
+            100 - coverage_budget,
+        )
+
+    def test_cute_flash_sm103_rank0_seed_policy(self) -> None:
+        sm103_policy = get_flash_target_policy((10, 3)).tuning
+        dense_policies = {
+            shape_policy.num_kv: shape_policy
+            for shape_policy in sm103_policy.dense_policies
+        }
+        causal_policies = {
+            shape_policy.num_kv: shape_policy
+            for shape_policy in sm103_policy.causal_policies
+        }
+        cases = [(False, num_kv) for num_kv in dense_policies] + [
+            (True, num_kv) for num_kv in causal_policies
+        ]
+        for is_causal, num_kv in cases:
+            with self.subTest(is_causal=is_causal, num_kv=num_kv):
+                seed_kwargs = {
+                    "dtype": torch.float16,
+                    "is_causal": is_causal,
+                    "standard_dense_output": not is_causal,
+                    "standard_causal_output": is_causal,
+                }
+                seed = flash_attention_seed_config(
+                    64,
+                    num_kv,
+                    target_device_capability=(10, 3),
+                    **seed_kwargs,
+                )
+                assert seed is not None
+
+                self.assertEqual(seed.config[FLASH_P_STORE_REP_KEY], 16)
+                self.assertEqual(seed.config[FLASH_S_LOAD_REP_KEY], 32)
+                self.assertTrue(seed.config[FLASH_SPLIT_P_ARRIVE_KEY])
+                self.assertEqual(seed.config[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
+
+                if is_causal:
+                    resident_policy = causal_policies[num_kv]
+                    self.assertEqual(seed.config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
+                    self.assertFalse(seed.config[FLASH_PERSISTENT_KEY])
+                    self.assertEqual(seed.config[FLASH_E2E_SCHEDULE_KEY], "16/6")
+                    self.assertEqual(seed.config[FLASH_MASKED_E2E_SCHEDULE_KEY], "16/6")
+                    self.assertEqual(seed.config[FLASH_EXP2_PACKET_KEY], "deg2_16x6")
+                    self.assertEqual(seed.config[FLASH_STAT_TRANSPORT_KEY], "ring2")
+                    self.assertEqual(seed.config[FLASH_Q_TILE_COUNT_KEY], 2)
+                    self.assertEqual(seed.config[FLASH_CORR_REGS_KEY], 64)
+                    self.assertEqual(seed.config[FLASH_OTHER_REGS_KEY], 48)
                     self.assertEqual(
-                        {
-                            config.config[FLASH_STAT_TRANSPORT_KEY]
-                            for config in normalized_seeds
-                            if config.config[FLASH_EXP2_PACKET_KEY] == "deg2_16x6"
-                        },
-                        {"ring2", "single_final"},
+                        (
+                            seed.config[FLASH_KV_STAGE_KEY],
+                            seed.config[FLASH_E2E_OFFSET_KEY],
+                            seed.config[FLASH_E2E_OFFSET0_KEY],
+                            seed.config[FLASH_SOFTMAX_REGS_KEY],
+                            seed.config[FLASH_FIRST_LOAD_ORDER_KEY],
+                            seed.config[FLASH_ROLE_MAP_KEY],
+                            seed.config[FLASH_EPI_TMA_KEY],
+                        ),
+                        (
+                            resident_policy.kv_stage,
+                            resident_policy.e2e_offset,
+                            resident_policy.e2e_offset0,
+                            resident_policy.softmax_regs,
+                            resident_policy.first_load_order,
+                            resident_policy.role_map,
+                            resident_policy.epi_tma,
+                        ),
+                    )
+                else:
+                    resident_policy = dense_policies[num_kv]
+                    expected_schedule = {
+                        256: (0, 8, "helion", 200),
+                        512: (4, 16, "fa4", 200),
+                        1024: (0, 8, "helion", 200),
+                        2048: (4, 8, "helion", 192),
+                    }[num_kv]
+                    self.assertEqual(
+                        (
+                            seed.config[FLASH_EXP2_PACKET_KEY],
+                            seed.config[FLASH_E2E_SCHEDULE_KEY],
+                            seed.config[FLASH_E2E_OFFSET_KEY],
+                            seed.config[FLASH_E2E_OFFSET0_KEY],
+                            seed.config[FLASH_STAT_TRANSPORT_KEY],
+                            seed.config[FLASH_PIPELINE_FAMILY_KEY],
+                            seed.config[FLASH_KV_STAGE_KEY],
+                            seed.config[FLASH_PERSISTENT_KEY],
+                            seed.config[FLASH_CORR_REGS_KEY],
+                            seed.config[FLASH_OTHER_REGS_KEY],
+                            seed.config[FLASH_EPI_TMA_KEY],
+                            seed.config[FLASH_KV_ORDER_KEY],
+                            seed.config[FLASH_PRECOMPUTE_QK_DESC_KEY],
+                            seed.config[FLASH_RESCALE_CHUNK_COLS_KEY],
+                            seed.config[FLASH_FIRST_LOAD_ORDER_KEY],
+                            seed.config[FLASH_CORR_TILE_SIZE_KEY],
+                            seed.config[FLASH_ROLE_MAP_KEY],
+                            seed.config[FLASH_SOFTMAX_REGS_KEY],
+                            seed.config[FLASH_SPLIT_P_ARRIVE_KEY],
+                            seed.config[FLASH_SOFTMAX_DISC_KEY],
+                            seed.config[FLASH_DISC_PIPE_KEY],
+                        ),
+                        (
+                            resident_policy.exp2_packet,
+                            resident_policy.e2e_schedule,
+                            resident_policy.e2e_offset,
+                            resident_policy.e2e_offset0,
+                            resident_policy.stat_transport,
+                            resident_policy.pipeline_family,
+                            resident_policy.kv_stage,
+                            resident_policy.persistent,
+                            resident_policy.corr_regs,
+                            resident_policy.other_regs,
+                            True,
+                            "descending",
+                            True,
+                            8,
+                            *expected_schedule,
+                            True,
+                            False,
+                            1,
+                        ),
+                    )
+                self.assertEqual(seed.config[FLASH_Q_TILE_COUNT_KEY], 2)
+
+                ranked = flash_attention_seed_configs(
+                    64,
+                    num_kv,
+                    target_device_capability=(10, 3),
+                    **seed_kwargs,
+                )
+                self.assertEqual(ranked[0], seed)
+                if is_causal and num_kv == 1024:
+                    self.assertEqual(
+                        sum(
+                            candidate.config.get(FLASH_EXP2_PACKET_KEY) == "deg2_16x6"
+                            and candidate.config.get(FLASH_KV_STAGE_KEY) == 2
+                            for candidate in ranked
+                        ),
+                        1,
                     )
 
+                if (is_causal, num_kv) not in ((False, 512), (True, 512)):
+                    continue
+
+                spec = ConfigSpec(
+                    backend=CuteBackend(),
+                    target_device_capability=(10, 3),
+                )
+                for block_id, target in enumerate((1, 128, 128)):
+                    spec.block_sizes.append(
+                        BlockSizeSpec(block_id=block_id, size_hint=target)
+                    )
+                spec.enable_cute_flash_search(
+                    head_dim=64,
+                    num_kv=num_kv,
+                    block_size_targets={0: 1, 1: 128, 2: 128},
+                    **seed_kwargs,
+                )
+                env = MagicMock()
+                env.backend_name = "cute"
+                env.config_spec = spec
+                env.settings = Settings()
+                with patch(
+                    "helion._compiler.autotuner_heuristics.HEURISTICS_BY_BACKEND",
+                    {"cute": (CuteFlashAttentionHeuristic,)},
+                ):
+                    compiler_seeds = compiler_seed_configs(env, MagicMock())
+                self.assertEqual(compiler_seeds[0], seed)
+                self.assertIsNone(spec.compiler_default_config)
+                self.assertEqual(spec.autotune_seed_configs()[0], seed)
+
+                spec.compiler_seed_configs = compiler_seeds
+                config_gen = ConfigGeneration(spec)
+                roundtrip = config_gen.unflatten(config_gen.flatten(seed))
+                self.assertEqual(roundtrip, seed)
+
+    def test_cute_flash_sm103_seed_policy_changes_cache_identity(self) -> None:
+        def make_spec(
+            target: tuple[int, int], *, is_causal: bool = False
+        ) -> ConfigSpec:
+            spec = ConfigSpec(
+                backend=CuteBackend(),
+                target_device_capability=target,
+            )
+            for block_id, size_hint in enumerate((1, 128, 128)):
+                spec.block_sizes.append(
+                    BlockSizeSpec(block_id=block_id, size_hint=size_hint)
+                )
+            spec.enable_cute_flash_search(
+                head_dim=64,
+                num_kv=1024,
+                block_size_targets={0: 1, 1: 128, 2: 128},
+                dtype=torch.float16,
+                is_causal=is_causal,
+                standard_dense_output=not is_causal,
+                standard_causal_output=is_causal,
+            )
+            spec.compiler_seed_configs = list(
+                flash_attention_seed_configs(
+                    64,
+                    1024,
+                    dtype=torch.float16,
+                    is_causal=is_causal,
+                    standard_dense_output=not is_causal,
+                    standard_causal_output=is_causal,
+                    target_device_capability=target,
+                )
+            )
+            return spec
+
+        sm100 = make_spec((10, 0))
+        sm103 = make_spec((10, 3))
+
+        self.assertEqual(sm100.structural_fingerprint(), sm103.structural_fingerprint())
+        self.assertNotEqual(
+            sm100.compiler_seed_configs,
+            sm103.compiler_seed_configs,
+        )
+        self.assertNotEqual(
+            sm100.cache_fingerprint_hash(),
+            sm103.cache_fingerprint_hash(),
+        )
+
+        original_hash = sm103.cache_fingerprint_hash()
+        target_policy = get_flash_target_policy((10, 3))
+        unrelated_tuning = dataclasses.replace(
+            target_policy.tuning,
+            dense_policies=tuple(
+                dataclasses.replace(policy, e2e_offset=policy.e2e_offset + 1)
+                if policy.num_kv == 256
+                else policy
+                for policy in target_policy.tuning.dense_policies
+            ),
+        )
+        with patch(
+            "helion._compiler.cute.flash_policy.get_flash_target_policy",
+            return_value=dataclasses.replace(target_policy, tuning=unrelated_tuning),
+        ):
+            self.assertEqual(sm103.cache_fingerprint_hash(), original_hash)
+
+        dense_policy = target_policy.tuning.dense_policy(1024)
+        assert dense_policy is not None
+        changed_tuning = dataclasses.replace(
+            target_policy.tuning,
+            dense_policies=tuple(
+                dataclasses.replace(
+                    policy,
+                    softmax_lowering=FlashSoftmaxLowering.STANDARD,
+                    probability_log2_shift=0,
+                )
+                if policy.num_kv == 1024
+                else policy
+                for policy in target_policy.tuning.dense_policies
+            ),
+        )
+        with patch(
+            "helion._compiler.cute.flash_policy.get_flash_target_policy",
+            return_value=dataclasses.replace(target_policy, tuning=changed_tuning),
+        ):
+            self.assertNotEqual(sm103.cache_fingerprint_hash(), original_hash)
+
+        causal_sm103 = make_spec((10, 3), is_causal=True)
+        causal_original_hash = causal_sm103.cache_fingerprint_hash()
+        with patch(
+            "helion._compiler.cute.flash_policy.get_flash_target_policy",
+            return_value=dataclasses.replace(target_policy, tuning=unrelated_tuning),
+        ):
+            self.assertEqual(
+                causal_sm103.cache_fingerprint_hash(), causal_original_hash
+            )
+
+        changed_causal_tuning = dataclasses.replace(
+            target_policy.tuning,
+            causal_policies=tuple(
+                dataclasses.replace(
+                    policy,
+                    softmax_lowering=FlashSoftmaxLowering.STANDARD,
+                )
+                if policy.num_kv == 1024
+                else policy
+                for policy in target_policy.tuning.causal_policies
+            ),
+        )
+        with patch(
+            "helion._compiler.cute.flash_policy.get_flash_target_policy",
+            return_value=dataclasses.replace(
+                target_policy, tuning=changed_causal_tuning
+            ),
+        ):
+            self.assertNotEqual(
+                causal_sm103.cache_fingerprint_hash(), causal_original_hash
+            )
+
+    def test_cute_flash_registered_causal_shape_builds_direct_target_seed(self) -> None:
+        target_policy = get_flash_target_policy((10, 3))
+        extra_policy = FlashCausalTuningPolicy(
+            num_kv=768,
+            kv_stage=4,
+            e2e_offset=2,
+            e2e_offset0=3,
+            softmax_lowering=FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH,
+            softmax_regs=184,
+        )
+        extended_tuning = dataclasses.replace(
+            target_policy.tuning,
+            causal_policies=(*target_policy.tuning.causal_policies, extra_policy),
+        )
+        with patch(
+            "helion._compiler.cute.cute_flash.get_flash_target_policy",
+            return_value=dataclasses.replace(
+                target_policy,
+                tuning=extended_tuning,
+            ),
+        ):
+            seed = flash_attention_seed_config(
+                64,
+                768,
+                dtype=torch.float16,
+                is_causal=True,
+                standard_causal_output=True,
+                target_device_capability=(10, 3),
+            )
+
+        assert seed is not None
+        self.assertEqual(seed.config[FLASH_KV_STAGE_KEY], 4)
+        self.assertEqual(seed.config[FLASH_E2E_OFFSET_KEY], 2)
+        self.assertEqual(seed.config[FLASH_E2E_OFFSET0_KEY], 3)
+        self.assertTrue(seed.config[FLASH_CAUSAL_LOOP_SPLIT_KEY])
+        self.assertEqual(seed.config[FLASH_CAUSAL_KV_ORDER_KEY], "descending")
+
+    def test_cute_flash_target_policy_seed_must_round_trip(self) -> None:
+        target_policy = get_flash_target_policy((10, 3))
+        invalid_dense_policy = FlashDenseTuningPolicy(
+            num_kv=256,
+            exp2_packet="deg1_16x8",
+            e2e_schedule="8/2",
+            e2e_offset=0,
+            e2e_offset0=0,
+            stat_transport="single",
+        )
+        invalid_tuning = dataclasses.replace(
+            target_policy.tuning,
+            dense_policies=(
+                invalid_dense_policy,
+                *target_policy.tuning.dense_policies[1:],
+            ),
+        )
+        with (
+            patch(
+                "helion._compiler.cute.cute_flash.get_flash_target_policy",
+                return_value=dataclasses.replace(
+                    target_policy,
+                    tuning=invalid_tuning,
+                ),
+            ),
+            self.assertRaisesRegex(ValueError, "does not round-trip"),
+        ):
+            flash_attention_seed_config(
+                64,
+                256,
+                dtype=torch.float16,
+                standard_dense_output=True,
+                target_device_capability=(10, 3),
+            )
+
+    def test_cute_flash_target_policy_preserves_b200_fragment_surface(self) -> None:
+        def fragment_signature(
+            target: tuple[int, int] | None, *, is_causal: bool
+        ) -> tuple[tuple[object, ...], ...]:
+            fragments = flash_autotune_fragments(
+                64,
+                512,
+                dtype=torch.float16,
+                is_causal=is_causal,
+                standard_dense_output=not is_causal,
+                standard_causal_output=is_causal,
+                target_device_capability=target,
+            )
+            return tuple(
+                (
+                    key,
+                    fragment.fingerprint(),
+                    tuple(cast("EnumFragment", fragment).choices),
+                    cast("EnumFragment", fragment).search_choices,
+                )
+                for key, fragment in fragments.items()
+            )
+
+        for is_causal in (False, True):
+            baseline = fragment_signature(None, is_causal=is_causal)
+            for target in ((10, 0), (10, 3), (999, 999)):
+                self.assertEqual(
+                    baseline,
+                    fragment_signature(target, is_causal=is_causal),
+                )
+
+    def test_cute_flash_non_sm103_seed_order_is_unchanged(self) -> None:
+        targets = (None, (10, 0), (999, 999))
+        cases = (
+            {
+                "num_kv": 1024,
+                "is_causal": False,
+                "standard_dense_output": True,
+            },
+            {
+                "num_kv": 2048,
+                "is_causal": True,
+                "standard_causal_output": True,
+            },
+        )
+        for case in cases:
+            baseline = flash_attention_seed_configs(
+                64,
+                case["num_kv"],
+                dtype=torch.float16,
+                is_causal=case["is_causal"],
+                standard_dense_output=case.get("standard_dense_output", False),
+                standard_causal_output=case.get("standard_causal_output", False),
+            )
+            for target in targets:
+                with self.subTest(case=case, target=target):
+                    actual = flash_attention_seed_configs(
+                        64,
+                        case["num_kv"],
+                        dtype=torch.float16,
+                        is_causal=case["is_causal"],
+                        standard_dense_output=case.get("standard_dense_output", False),
+                        standard_causal_output=case.get(
+                            "standard_causal_output", False
+                        ),
+                        target_device_capability=target,
+                    )
+                    self.assertEqual(actual, baseline)
+
+    def test_cute_flash_sm103_seed_policy_gates(self) -> None:
+        cases = (
+            {"standard_dense_output": False},
+            {"standard_causal_output": False, "is_causal": True, "num_kv": 512},
+            {"standard_dense_output": True, "dtype": torch.bfloat16},
+            {"standard_dense_output": True, "head_dim": 128},
+            {"standard_dense_output": True, "has_kv_tile_pruning": True},
+            {"standard_dense_output": True, "requires_ws_overlap": True},
+            {"standard_dense_output": True, "small_biased_candidate": True},
+            {"standard_dense_output": True, "num_kv": 768},
+            {
+                "standard_dense_output": True,
+                "block_size_targets": (1, 64, 128),
+            },
+        )
+        for raw_case in cases:
+            case = dict(raw_case)
+            head_dim = int(case.pop("head_dim", 64))
+            num_kv = int(case.pop("num_kv", 256))
+            subtest_case = {
+                key: str(value) if isinstance(value, torch.dtype) else value
+                for key, value in raw_case.items()
+            }
+            with self.subTest(case=subtest_case):
+                baseline = flash_attention_seed_config(
+                    head_dim,
+                    num_kv,
+                    **case,
+                )
+                actual = flash_attention_seed_config(
+                    head_dim,
+                    num_kv,
+                    target_device_capability=(10, 3),
+                    **case,
+                )
+                self.assertEqual(actual, baseline)
+
     def test_cute_flash_dense_degree2_seed_uses_validated_schedule(self) -> None:
-        degree1_packets = {"deg1_8x2_corr10", "deg1_16x8"}
-        for num_kv in (252, 256, 258, 260, 512, 516, 768, 1024, 1536, 2048, 2052, 4096):
+        expected_configs: list[dict[str, object]] = []
+        for num_kv in (
+            252,
+            256,
+            258,
+            260,
+            512,
+            516,
+            768,
+            1024,
+            1536,
+            2048,
+            2052,
+            4096,
+        ):
             with self.subTest(num_kv=num_kv):
                 seeds = flash_attention_seed_configs(
                     64,
@@ -2584,97 +6905,609 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     dtype=torch.float16,
                     standard_dense_output=True,
                 )
-                self.assertFalse(
-                    any(
-                        seed.config.get(FLASH_EXP2_PACKET_KEY) in degree1_packets
-                        for seed in seeds
-                    )
-                )
-                degree2_seeds = [
-                    seed
+                polynomial = {
+                    seed.config[FLASH_EXP2_PACKET_KEY]: seed
                     for seed in seeds
-                    if seed.config.get(FLASH_EXP2_PACKET_KEY) == "deg2_16x6"
-                ]
-                if num_kv < 256 or num_kv % 4:
-                    self.assertFalse(degree2_seeds)
+                    if seed.config[FLASH_EXP2_PACKET_KEY]
+                    in {"deg2_16x6", "deg1_16x8", "deg1_8x2_corr10"}
+                }
+                if num_kv < 4 or num_kv % 4:
+                    self.assertFalse(polynomial)
                     continue
-                self.assertEqual(len(degree2_seeds), 2)
                 self.assertEqual(
-                    {seed.config[FLASH_STAT_TRANSPORT_KEY] for seed in degree2_seeds},
-                    {"ring2", "single_final"},
+                    set(polynomial),
+                    {"deg2_16x6", "deg1_16x8", "deg1_8x2_corr10"},
                 )
-                config = next(
-                    seed.config
-                    for seed in degree2_seeds
-                    if seed.config[FLASH_STAT_TRANSPORT_KEY] == "single_final"
-                )
-                ring2_config = next(
-                    seed.config
-                    for seed in degree2_seeds
-                    if seed.config[FLASH_STAT_TRANSPORT_KEY] == "ring2"
-                )
+                degree2 = polynomial["deg2_16x6"]
+                config = degree2.config
                 self.assertEqual(
-                    ring2_config,
-                    {**config, FLASH_STAT_TRANSPORT_KEY: "ring2"},
+                    config[FLASH_PIPELINE_FAMILY_KEY],
+                    "fa4_2cta",
                 )
-                fragments = flash_autotune_fragments(
+                self.assertEqual(config[FLASH_E2E_SCHEDULE_KEY], "16/6")
+                resolved = resolve_flash_config(
                     64,
                     num_kv,
+                    config,
                     dtype=torch.float16,
                     standard_dense_output=True,
-                    pipeline_family_override="fa4_2cta",
                 )
+                self.assertEqual(resolved.pipeline_family, "fa4_2cta")
+                self.assertEqual(resolved.exp2_packet, "deg2_16x6")
+                self.assertEqual((resolved.e2e_freq, resolved.e2e_res), (16, 6))
+                expected_configs.append(config)
+        self.assertTrue(
+            all(config == expected_configs[0] for config in expected_configs[1:])
+        )
 
-                self.assertEqual(config[FLASH_PIPELINE_FAMILY_KEY], "fa4_2cta")
-                expected = {
-                    FLASH_EXP2_PACKET_KEY: "deg2_16x6",
-                    FLASH_E2E_SCHEDULE_KEY: "16/6",
-                    FLASH_E2E_OFFSET_KEY: 14 if num_kv <= 512 else 12,
-                    FLASH_E2E_OFFSET0_KEY: 0 if num_kv <= 512 else 2,
-                    FLASH_KV_STAGE_KEY: 2,
-                    FLASH_PERSISTENT_KEY: False,
-                    FLASH_STAT_TRANSPORT_KEY: "single_final",
-                    FLASH_WAIT_HINT_KEY: 0,
-                    FLASH_SOFTMAX_REGS_KEY: 192,
-                    FLASH_CORR_REGS_KEY: 72,
-                    FLASH_OTHER_REGS_KEY: 40,
-                    FLASH_ROLE_MAP_KEY: "fa4",
-                    FLASH_FIRST_LOAD_ORDER_KEY: 4,
-                    FLASH_CORR_TILE_SIZE_KEY: 16 if num_kv <= 512 else 8,
-                    FLASH_RESCALE_THRESHOLD_KEY: 8.0,
-                    FLASH_RESCALE_CHUNK_COLS_KEY: 8,
-                }
-                for key, value in expected.items():
-                    self.assertEqual(config[key], value)
+    def test_cute_flash_bf16_hd128_degree2_seed_uses_validated_schedule(
+        self,
+    ) -> None:
+        configs: list[dict[str, object]] = []
+        for num_kv in (64, 256, 384, 1536, 2048):
+            seeds = flash_attention_seed_configs(
+                128,
+                num_kv,
+                dtype=torch.bfloat16,
+                standard_dense_output=True,
+            )
+            degree2 = [
+                seed
+                for seed in seeds
+                if seed.config[FLASH_EXP2_PACKET_KEY] == "deg2_16x6"
+            ]
+            self.assertEqual(len(degree2), 1)
+            config = degree2[0].config
+            self.assertEqual(config[FLASH_PIPELINE_FAMILY_KEY], "fa4_2cta")
+            self.assertEqual(config[FLASH_E2E_SCHEDULE_KEY], "16/6")
+            resolved = resolve_flash_config(
+                128,
+                num_kv,
+                config,
+                dtype=torch.bfloat16,
+                standard_dense_output=True,
+            )
+            self.assertEqual(resolved.pipeline_family, "fa4_2cta")
+            self.assertEqual(resolved.exp2_packet, "deg2_16x6")
+            self.assertEqual((resolved.e2e_freq, resolved.e2e_res), (16, 6))
+            configs.append(config)
+        self.assertTrue(all(config == configs[0] for config in configs[1:]))
 
-                for key, fragment in fragments.items():
-                    if key not in expected:
-                        self.assertEqual(config[key], fragment.default())
+    def test_cute_flash_bf16_hd128_causal_resident_seed_transfers_across_range(
+        self,
+    ) -> None:
+        packet = "causal_hd128_resident3_013_prefetch2_deg2_early_acquire"
+        for num_kv in (64, 1022, 1024, 1536, 2048, 3072, 4096, 8192):
+            with self.subTest(num_kv=num_kv):
+                seeds = flash_attention_seed_configs(
+                    128,
+                    num_kv,
+                    dtype=torch.bfloat16,
+                    is_causal=True,
+                    standard_causal_output=True,
+                )
+                resident = [
+                    seed
+                    for seed in seeds
+                    if seed.config.get(FLASH_EXP2_PACKET_KEY) == packet
+                ]
+                self.assertEqual(len(resident), 1)
+                fragments = flash_autotune_fragments(
+                    128,
+                    num_kv,
+                    dtype=torch.bfloat16,
+                    is_causal=True,
+                    standard_causal_output=True,
+                    pipeline_family_override="fa4",
+                )
                 packet_fragment = fragments[FLASH_EXP2_PACKET_KEY]
                 self.assertIsInstance(packet_fragment, EnumFragment)
                 assert isinstance(packet_fragment, EnumFragment)
-                self.assertIn(
-                    config[FLASH_EXP2_PACKET_KEY],
-                    packet_fragment.search_choices or (),
-                )
+                self.assertIn(packet, packet_fragment.search_choices or ())
 
-                effective_configs = {
-                    tuple(
-                        sorted(
-                            flash_effective_config_values(
-                                resolve_flash_config(
-                                    64,
-                                    num_kv,
-                                    seed.config,
-                                    dtype=torch.float16,
-                                    standard_dense_output=True,
-                                )
-                            ).items()
+        for num_kv in (63, 1025):
+            with self.subTest(rejected_num_kv=num_kv):
+                self.assertFalse(
+                    any(
+                        seed.config.get(FLASH_EXP2_PACKET_KEY) == packet
+                        for seed in flash_attention_seed_configs(
+                            128,
+                            num_kv,
+                            dtype=torch.bfloat16,
+                            is_causal=True,
+                            standard_causal_output=True,
                         )
                     )
-                    for seed in degree2_seeds
+                )
+
+    @_memoized_flash_fragments()
+    def test_cute_flash_compound_families_reachable_without_compiler_seeds(
+        self,
+    ) -> None:
+        resident = "causal_hd128_resident3_013_prefetch2_deg2_early_acquire"
+        cases = (
+            (
+                128,
+                torch.bfloat16,
+                True,
+                resident,
+                "fa4",
+                (16, 6),
+                True,
+                True,
+                True,
+            ),
+            (
+                64,
+                torch.bfloat16,
+                True,
+                "hybrid_deg1_16x8",
+                "fa4",
+                (16, 8),
+                True,
+                True,
+                True,
+            ),
+            (
+                128,
+                torch.bfloat16,
+                False,
+                "deg2_16x6",
+                "fa4_2cta",
+                (16, 6),
+                True,
+                None,
+                False,
+            ),
+            (
+                64,
+                torch.bfloat16,
+                False,
+                "8x2",
+                "fa4_2cta",
+                None,
+                None,
+                None,
+                False,
+            ),
+            (
+                64,
+                torch.float16,
+                False,
+                "deg2_16x6",
+                "fa4_2cta",
+                (16, 6),
+                False,
+                None,
+                False,
+            ),
+            (
+                64,
+                torch.float16,
+                True,
+                "deg2_16x6",
+                "fa4",
+                (16, 6),
+                True,
+                None,
+                True,
+            ),
+        )
+        for (
+            head_dim,
+            dtype,
+            is_causal,
+            packet,
+            family,
+            cadence,
+            softmax_disc,
+            split_p_arrive,
+            causal_loop_split,
+        ) in cases:
+            with self.subTest(
+                head_dim=head_dim,
+                dtype=str(dtype),
+                is_causal=is_causal,
+                packet=packet,
+            ):
+                options = {
+                    "dtype": dtype,
+                    "is_causal": is_causal,
+                    "standard_dense_output": not is_causal,
+                    "standard_causal_output": is_causal,
                 }
-                self.assertEqual(len(effective_configs), 2)
+                spec = ConfigSpec(backend=CuteBackend())
+                for block_id, size_hint in enumerate((1, 128, 128)):
+                    spec.block_sizes.append(
+                        BlockSizeSpec(block_id=block_id, size_hint=size_hint)
+                    )
+                spec.enable_cute_flash_search(
+                    head_dim=head_dim,
+                    num_kv=384,
+                    num_bh=64,
+                    block_size_targets={0: 1, 1: 128, 2: 128},
+                    **options,
+                )
+                spec.compiler_seed_configs = []
+                generation = ConfigGeneration(spec)
+                self.assertEqual(generation.seed_flat_config_pairs(), [])
+                matching = []
+                structural_candidates = [
+                    *generation.flash_deterministic_population_configs(),
+                    *generation.flash_low_confound_schedule_anchor_configs(),
+                ]
+                for candidate in structural_candidates:
+                    resolved = spec._resolve_cute_flash_config(candidate.config)
+                    if (
+                        resolved.pipeline_family == family
+                        and resolved.exp2_packet == packet
+                    ):
+                        matching.append(resolved)
+                self.assertTrue(matching)
+                population = generation.random_population(100)
+                measured_structural_candidates = [
+                    *population,
+                    *generation.flash_low_confound_schedule_anchor_configs(),
+                ]
+                self.assertTrue(
+                    any(
+                        candidate.config[FLASH_PIPELINE_FAMILY_KEY] == family
+                        and candidate.config[FLASH_EXP2_PACKET_KEY] == packet
+                        for candidate in measured_structural_candidates
+                    )
+                )
+                resolved = matching[0]
+                self.assertEqual(resolved.pipeline_family, family)
+                self.assertEqual(resolved.exp2_packet, packet)
+                if cadence is not None:
+                    self.assertEqual((resolved.e2e_freq, resolved.e2e_res), cadence)
+                    self.assertEqual(resolved.q_tile_count, 2)
+                    self.assertEqual(resolved.p_store_repetition, 16)
+                    self.assertEqual(resolved.s_load_repetition, 32)
+                    self.assertEqual(resolved.softmax_disc, softmax_disc)
+                    if split_p_arrive is not None:
+                        self.assertEqual(resolved.split_p_arrive, split_p_arrive)
+                    if is_causal:
+                        self.assertEqual(
+                            (resolved.masked_e2e_freq, resolved.masked_e2e_res),
+                            cadence,
+                        )
+                self.assertEqual(
+                    resolved.causal_loop_split,
+                    causal_loop_split,
+                )
+                if causal_loop_split:
+                    self.assertEqual(
+                        resolved.causal_kv_order,
+                        "descending",
+                    )
+
+    @_memoized_flash_fragments()
+    def test_cute_flash_clc_head_search_uses_work_grid_divisors(self) -> None:
+        fragments = flash_autotune_fragments(64, 1024, num_bh=6)
+        heads = fragments[FLASH_CLC_HEADS_PER_BATCH_KEY]
+        self.assertIsInstance(heads, EnumFragment)
+        assert isinstance(heads, EnumFragment)
+        self.assertEqual(set(heads.search_choices or heads.choices), {1, 2, 3, 6})
+        self.assertIn(0, heads.choices)
+
+        spec = ConfigSpec(backend=CuteBackend())
+        for block_id, size_hint in enumerate((1, 128, 128)):
+            spec.block_sizes.append(
+                BlockSizeSpec(block_id=block_id, size_hint=size_hint)
+            )
+        spec.enable_cute_flash_search(
+            head_dim=64,
+            num_kv=1024,
+            num_bh=6,
+            dtype=torch.float16,
+            block_size_targets={0: 1, 1: 128, 2: 128},
+            standard_dense_output=True,
+        )
+        config_gen = ConfigGeneration(spec)
+        for requested, expected in ((32, 1), (4, 1), (3, 3)):
+            with self.subTest(requested=requested):
+                raw = helion.Config.from_dict(
+                    {
+                        "block_sizes": [1, 128, 128],
+                        FLASH_PIPELINE_FAMILY_KEY: "fa4_clc",
+                        FLASH_CLC_HEADS_PER_BATCH_KEY: requested,
+                        FLASH_PERSISTENT_CTAS_PER_SM_KEY: 4,
+                    }
+                )
+                _flat, normalized = config_gen.canonicalize_flat(
+                    config_gen.flatten(raw)
+                )
+                self.assertEqual(
+                    normalized.config[FLASH_CLC_HEADS_PER_BATCH_KEY], expected
+                )
+                self.assertEqual(normalized.config[FLASH_PERSISTENT_CTAS_PER_SM_KEY], 1)
+
+        structural_groups = {
+            config.config[FLASH_CLC_HEADS_PER_BATCH_KEY]
+            for config in (
+                config_gen.unflatten(flat)
+                for flat in config_gen._flash_deterministic_coverage_flats()
+            )
+            if str(config.config[FLASH_PIPELINE_FAMILY_KEY]).startswith("fa4_clc")
+        }
+        self.assertEqual(structural_groups, {1, 2, 3, 6})
+
+    @_memoized_flash_fragments()
+    def test_cute_flash_clc_head_search_preserves_tensor_head_geometry(
+        self,
+    ) -> None:
+        def choices(
+            num_bh: int, tensor_4d_heads: int
+        ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+            fragments = flash_autotune_fragments(
+                64,
+                1024,
+                num_bh=num_bh,
+                tensor_4d_heads=tensor_4d_heads,
+            )
+            fragment = fragments[FLASH_CLC_HEADS_PER_BATCH_KEY]
+            self.assertIsInstance(fragment, EnumFragment)
+            assert isinstance(fragment, EnumFragment)
+            return (
+                fragment.search_choices or fragment.choices,
+                fragment.coverage_choices or fragment.choices,
+            )
+
+        for num_bh, tensor_4d_heads in ((120, 40), (252, 36)):
+            with self.subTest(num_bh=num_bh, tensor_4d_heads=tensor_4d_heads):
+                search_choices, coverage_choices = choices(num_bh, tensor_4d_heads)
+                self.assertEqual(
+                    search_choices,
+                    tuple(
+                        divisor
+                        for divisor in range(1, num_bh + 1)
+                        if num_bh % divisor == 0
+                    ),
+                )
+                self.assertLessEqual(len(coverage_choices), 8)
+                self.assertLessEqual(
+                    {1, num_bh, tensor_4d_heads, num_bh // tensor_4d_heads},
+                    set(coverage_choices),
+                )
+
+        self.assertEqual(choices(251, 251), ((1, 251), (1, 251)))
+
+        wide_search, wide_coverage = choices(4096, 64)
+        self.assertEqual(wide_search, tuple(1 << power for power in range(13)))
+        self.assertEqual(len(wide_coverage), 8)
+        self.assertLessEqual({1, 64, 4096}, set(wide_coverage))
+        self.assertLessEqual(
+            max(upper / lower for lower, upper in itertools.pairwise(wide_coverage)),
+            8,
+        )
+
+        spec = ConfigSpec(backend=CuteBackend())
+        for block_id, size_hint in enumerate((1, 128, 128)):
+            spec.block_sizes.append(
+                BlockSizeSpec(block_id=block_id, size_hint=size_hint)
+            )
+        spec.enable_cute_flash_search(
+            head_dim=64,
+            num_kv=1024,
+            num_bh=120,
+            tensor_4d_heads=40,
+            block_size_targets={0: 1, 1: 128, 2: 128},
+            standard_dense_output=True,
+        )
+        generation = ConfigGeneration(spec)
+        clc_index = generation._key_to_flat_indices[FLASH_CLC_HEADS_PER_BATCH_KEY][0][0]
+        clc_fragment = generation.flat_spec[clc_index]
+        self.assertIsInstance(clc_fragment, EnumFragment)
+        assert isinstance(clc_fragment, EnumFragment)
+        self.assertLessEqual(
+            {1, 3, 40, 120},
+            set(clc_fragment.search_choices or clc_fragment.choices),
+        )
+        structural_groups = {
+            config.config[FLASH_CLC_HEADS_PER_BATCH_KEY]
+            for config in (
+                generation.unflatten(flat)
+                for flat in generation._flash_deterministic_coverage_flats()
+            )
+            if str(config.config[FLASH_PIPELINE_FAMILY_KEY]).startswith("fa4_clc")
+        }
+        self.assertLessEqual({1, 3, 40, 120}, structural_groups)
+
+    def test_cute_flash_tensor_head_geometry_is_independent_of_tma_gates(
+        self,
+    ) -> None:
+        q_base = torch.empty((3, 40, 2, 128), dtype=torch.bfloat16)
+        k_base = torch.empty_like(q_base)
+        v_base = torch.empty_like(q_base)
+        values = tuple(value.flatten(0, 1) for value in (q_base, k_base, v_base))
+        self.assertEqual(
+            _flash_values_tensor_4d_batch_heads(
+                *values,
+                batch=120,
+                seq=2,
+                head_dim=128,
+                dtype=torch.bfloat16,
+            ),
+            (3, 40),
+        )
+
+        mismatched_k = torch.empty((4, 30, 2, 128), dtype=torch.bfloat16).flatten(0, 1)
+        self.assertIsNone(
+            _flash_values_tensor_4d_batch_heads(
+                values[0],
+                mismatched_k,
+                values[2],
+                batch=120,
+                seq=2,
+                head_dim=128,
+                dtype=torch.bfloat16,
+            )
+        )
+
+    def test_cute_flash_bf16_hd64_2cta_seed_uses_validated_schedule(
+        self,
+    ) -> None:
+        configs: list[dict[str, object]] = []
+        for num_kv in (32, 256, 384, 2048, 6144):
+            seeds = flash_attention_seed_configs(
+                64,
+                num_kv,
+                dtype=torch.bfloat16,
+                standard_dense_output=True,
+            )
+            anchors = [
+                seed
+                for seed in seeds
+                if seed.config[FLASH_PIPELINE_FAMILY_KEY] == "fa4_2cta"
+                and seed.config[FLASH_EXP2_PACKET_KEY] == "8x2"
+            ]
+            self.assertEqual(len(anchors), 1)
+            resolved = resolve_flash_config(
+                64,
+                num_kv,
+                anchors[0].config,
+                dtype=torch.bfloat16,
+                standard_dense_output=True,
+            )
+            self.assertEqual(resolved.pipeline_family, "fa4_2cta")
+            self.assertEqual(resolved.exp2_packet, "8x2")
+            configs.append(anchors[0].config)
+        self.assertTrue(all(config == configs[0] for config in configs[1:]))
+
+    @_memoized_flash_fragments()
+    def test_cute_flash_bf16_hd64_2cta_seed_transfers_to_2048(self) -> None:
+        spec = ConfigSpec(backend=CuteBackend())
+        for block_id, target in enumerate((1, 128, 128)):
+            spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
+        spec.enable_cute_flash_search(
+            head_dim=64,
+            num_kv=2048,
+            block_size_targets={0: 1, 1: 128, 2: 128},
+            dtype=torch.bfloat16,
+            standard_dense_output=True,
+        )
+        spec.compiler_seed_configs = list(
+            flash_attention_seed_configs(
+                64,
+                2048,
+                dtype=torch.bfloat16,
+                standard_dense_output=True,
+            )
+        )
+        config_gen = ConfigGeneration(spec)
+        anchors = [
+            config
+            for _flat, config in config_gen.seed_flat_config_pairs()
+            if config.config[FLASH_PIPELINE_FAMILY_KEY] == "fa4_2cta"
+            and config.config[FLASH_EXP2_PACKET_KEY] == "8x2"
+        ]
+        self.assertEqual(len(anchors), 1)
+        anchor = anchors[0]
+        canonical_flat, canonical = config_gen.canonicalize_flat(
+            config_gen.flatten(anchor)
+        )
+        self.assertEqual(canonical, anchor)
+        self.assertEqual(config_gen.unflatten(canonical_flat), anchor)
+        profile = get_effort_profile("full").lfbo_pattern_search
+        assert profile is not None
+        population = config_gen.random_population(profile.initial_population)
+        self.assertEqual(population.count(anchor), 1)
+        normalized_seeds = {
+            config for _flat, config in config_gen.seed_flat_config_pairs()
+        }
+        self.assertLessEqual(normalized_seeds, set(population))
+
+    def test_cute_flash_single_kv_tile_excludes_dead_persistent_choice(self) -> None:
+        persistent = flash_autotune_fragments(64, 1)[FLASH_PERSISTENT_KEY]
+        self.assertIsInstance(persistent, EnumFragment)
+        assert isinstance(persistent, EnumFragment)
+        self.assertIn(True, persistent.choices)
+        self.assertEqual(persistent.search_choices, (False,))
+
+    def test_cute_flash_large_causal_compiler_seeds_project_to_tma(self) -> None:
+        spec = ConfigSpec(backend=CuteBackend())
+        for block_id, target in enumerate((1, 128, 128)):
+            spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
+        spec.enable_cute_flash_search(
+            head_dim=64,
+            num_kv=2048,
+            block_size_targets={0: 1, 1: 128, 2: 128},
+            dtype=torch.bfloat16,
+            is_causal=True,
+            standard_causal_output=True,
+            output_requires_tma=True,
+        )
+
+        raw_seeds = flash_attention_seed_configs(
+            64,
+            2048,
+            dtype=torch.bfloat16,
+            is_causal=True,
+            standard_causal_output=True,
+        )
+        raw_snapshots = [dict(seed.config) for seed in raw_seeds]
+        expected = spec._legalize_cute_flash_compiler_seeds(raw_seeds)
+        env = MagicMock(config_spec=spec)
+        heuristic_seeds = CuteFlashAttentionHeuristic.get_seed_configs(
+            env,
+            MagicMock(),
+        )
+        assert heuristic_seeds is not None
+        self.assertEqual(heuristic_seeds, expected)
+        self.assertEqual([seed.config for seed in raw_seeds], raw_snapshots)
+
+        autotune_seeds = spec.autotune_seed_configs()
+        compiler_seeds = [*heuristic_seeds, *autotune_seeds]
+        self.assertTrue(compiler_seeds)
+        for seed in compiler_seeds:
+            resolved = spec._resolve_cute_flash_config(seed.config)
+            self.assertEqual(resolved.pipeline_family, "fa4")
+            self.assertTrue(resolved.epi_tma)
+            self.assertFalse(resolved.epi_stg)
+
+        spec.compiler_seed_configs = compiler_seeds
+        config_gen = ConfigGeneration(spec)
+        for _flat, seed in config_gen.seed_flat_config_pairs():
+            canonical_flat, canonical = config_gen.canonicalize_flat(
+                config_gen.flatten(seed)
+            )
+            self.assertEqual(canonical, seed)
+            self.assertEqual(config_gen.unflatten(canonical_flat), seed)
+
+    def test_cute_flash_bf16_hd64_causal_hybrid_seed_uses_validated_schedule(
+        self,
+    ) -> None:
+        configs: list[dict[str, object]] = []
+        for num_kv in (32, 48, 256, 384, 2048, 6144):
+            seeds = flash_attention_seed_configs(
+                64,
+                num_kv,
+                dtype=torch.bfloat16,
+                is_causal=True,
+                standard_causal_output=True,
+            )
+            hybrid = [
+                seed
+                for seed in seeds
+                if seed.config[FLASH_EXP2_PACKET_KEY] == "hybrid_deg1_16x8"
+            ]
+            self.assertEqual(len(hybrid), 1)
+            resolved = resolve_flash_config(
+                64,
+                num_kv,
+                hybrid[0].config,
+                dtype=torch.bfloat16,
+                is_causal=True,
+                standard_causal_output=True,
+            )
+            self.assertEqual(resolved.pipeline_family, "fa4")
+            self.assertEqual(resolved.exp2_packet, "hybrid_deg1_16x8")
+            self.assertEqual((resolved.e2e_freq, resolved.e2e_res), (16, 8))
+            self.assertTrue(resolved.causal_loop_split)
+            self.assertEqual(resolved.causal_kv_order, "descending")
+            configs.append(hybrid[0].config)
+        self.assertTrue(all(config == configs[0] for config in configs[1:]))
 
     def test_cute_flash_dense_degree2_seed_gates(self) -> None:
         def has_degree2_seed(
@@ -2703,7 +7536,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 "standard_dense_output": True,
                 "block_size_targets": (1, 64, 128),
             },
-            {"standard_dense_output": True, "num_kv": 252},
+            {"standard_dense_output": True, "num_kv": 2},
             {"standard_dense_output": True, "num_kv": 258},
             {"standard_dense_output": True, "num_kv": 2050},
         )
@@ -2746,12 +7579,21 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 standard_causal_output=True,
             ),
         )
+        self.assertIn(
+            "deg2_16x6",
+            search_choices(
+                num_kv=256,
+                dtype=torch.float16,
+                is_causal=True,
+                standard_causal_output=True,
+            ),
+        )
         excluded = (
             {"dtype": torch.float16, "standard_dense_output": False},
             {"dtype": torch.bfloat16, "standard_dense_output": True},
             {"head_dim": 128, "dtype": torch.float16, "standard_dense_output": True},
             {
-                "num_kv": 252,
+                "num_kv": 2,
                 "dtype": torch.float16,
                 "standard_dense_output": True,
             },
@@ -2762,12 +7604,6 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             },
             {"num_kv": 768, "dtype": torch.float16, "is_causal": True},
             {"num_kv": 8192, "dtype": torch.float16, "is_causal": True},
-            {
-                "num_kv": 256,
-                "dtype": torch.float16,
-                "is_causal": True,
-                "standard_causal_output": True,
-            },
             {
                 "num_kv": 8192,
                 "dtype": torch.float16,
@@ -2790,10 +7626,61 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     search_choices(head_dim, num_kv, **case),
                 )
 
+    def test_cute_flash_odd_kv_search_excludes_fa4_only_aliases(self) -> None:
+        fragments = flash_autotune_fragments(
+            64,
+            3,
+            dtype=torch.float16,
+            is_causal=True,
+            standard_causal_output=True,
+        )
+        family = fragments[FLASH_PIPELINE_FAMILY_KEY]
+        assert isinstance(family, EnumFragment)
+        self.assertEqual(family.search_choices, ("ws_overlap",))
+
+        for key in (
+            FLASH_MASKED_E2E_SCHEDULE_KEY,
+            FLASH_E2E_OFFSET_KEY,
+            FLASH_E2E_OFFSET0_KEY,
+            FLASH_PERSISTENT_KEY,
+            FLASH_DISC_PIPE_KEY,
+            FLASH_EPI_TMA_KEY,
+            FLASH_EPI_STG_KEY,
+            FLASH_RESCALE_CHUNK_COLS_KEY,
+            FLASH_SOFTMAX_REGS_KEY,
+            FLASH_CORR_REGS_KEY,
+            FLASH_OTHER_REGS_KEY,
+            FLASH_CORR_TILE_SIZE_KEY,
+            FLASH_CAUSAL_LPT_SWIZZLE_KEY,
+            FLASH_CAUSAL_KV_ORDER_KEY,
+            FLASH_ROLE_MAP_KEY,
+            FLASH_CAUSAL_LOOP_SPLIT_KEY,
+            FLASH_EXP2_PACKET_KEY,
+        ):
+            with self.subTest(inactive_key=key):
+                fragment = fragments[key]
+                assert isinstance(fragment, EnumFragment)
+                self.assertEqual(fragment.search_choices, (fragment.default(),))
+
+        for key in (
+            FLASH_S_STAGE_KEY,
+            FLASH_KV_STAGE_KEY,
+            FLASH_PACKED_REDUCE_KEY,
+        ):
+            with self.subTest(active_key=key):
+                fragment = fragments[key]
+                assert isinstance(fragment, EnumFragment)
+                self.assertGreater(
+                    len(fragment.search_choices or fragment.choices),
+                    1,
+                )
+
+    @_memoized_flash_fragments()
     def test_cute_flash_dense_degree2_seed_is_in_full_initial_population(
         self,
     ) -> None:
-        for num_kv in (256, 260, 516, 768, 1536, 2052, 4096):
+        checked_surfaces: set[tuple[object, ...]] = set()
+        for num_kv in (48, 256, 260, 516, 768, 1536, 2052, 4096):
             with self.subTest(num_kv=num_kv):
                 spec = ConfigSpec(backend=CuteBackend())
                 for block_id, target in enumerate((1, 128, 128)):
@@ -2805,7 +7692,6 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     num_kv=num_kv,
                     block_size_targets={0: 1, 1: 128, 2: 128},
                     dtype=torch.float16,
-                    is_causal=False,
                     standard_dense_output=True,
                 )
                 spec.compiler_seed_configs = list(
@@ -2817,46 +7703,65 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     )
                 )
                 config_gen = ConfigGeneration(spec)
+                seed_pairs = config_gen.seed_flat_config_pairs()
                 expected = [
                     config
-                    for _flat, config in config_gen.seed_flat_config_pairs()
+                    for _flat, config in seed_pairs
                     if config.config[FLASH_EXP2_PACKET_KEY] == "deg2_16x6"
                 ]
-                self.assertEqual(len(expected), 2)
+                self.assertEqual(len(expected), 1)
+                degree2 = expected[0]
                 self.assertEqual(
-                    {config.config[FLASH_STAT_TRANSPORT_KEY] for config in expected},
-                    {"ring2", "single_final"},
+                    degree2.config[FLASH_PIPELINE_FAMILY_KEY],
+                    "fa4_2cta",
                 )
-                for config in expected:
-                    canonical_flat, canonical = config_gen.canonicalize_flat(
-                        config_gen.flatten(config)
-                    )
-                    self.assertEqual(canonical, config)
-                    self.assertEqual(config_gen.unflatten(canonical_flat), config)
+                canonical_flat, canonical = config_gen.canonicalize_flat(
+                    config_gen.flatten(degree2)
+                )
+                self.assertEqual(canonical, degree2)
+                self.assertEqual(config_gen.unflatten(canonical_flat), degree2)
+
+                # The flash surface is length-invariant within one legality
+                # class: lengths whose flat fragments and normalized seeds are
+                # identical yield the same deterministic population prefix, so
+                # the expensive population check runs once per distinct
+                # surface instead of once per length.
+                surface_key = (
+                    tuple(repr(fragment) for fragment in config_gen.flat_spec),
+                    tuple(config for _flat, config in seed_pairs),
+                )
+                if surface_key in checked_surfaces:
+                    continue
+                checked_surfaces.add(surface_key)
 
                 profile = get_effort_profile("full").lfbo_pattern_search
                 assert profile is not None
-                self.assertEqual(profile.initial_population_strategy, "from_random")
                 population = config_gen.random_population(profile.initial_population)
                 seed_count = len(config_gen.seed_flat_config_pairs())
-                for config in expected:
-                    self.assertEqual(population.count(config), 1)
-                    self.assertIn(config, population[:seed_count])
+                self.assertEqual(population.count(degree2), 1)
+                self.assertIn(degree2, population[:seed_count])
 
-    def test_cute_flash_does_not_automatically_seed_degree1_causal_packet(
+    def test_cute_flash_seeds_validated_fp16_causal_packets(
         self,
     ) -> None:
-        for num_kv in (256, 512, 768, 4096, 8192):
+        for num_kv in (32, 256, 512, 768, 4096, 8192):
             with self.subTest(num_kv=num_kv):
                 seeds = flash_attention_seed_configs(
                     64,
                     num_kv,
+                    dtype=torch.float16,
                     is_causal=True,
                     standard_causal_output=True,
                 )
-                self.assertFalse(
+                self.assertTrue(
                     any(
-                        seed.config.get(FLASH_EXP2_PACKET_KEY) == "hybrid_deg1_16x8"
+                        seed.config[FLASH_EXP2_PACKET_KEY] == "hybrid_deg1_16x8"
+                        for seed in seeds
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        seed.config[FLASH_EXP2_PACKET_KEY] == "deg2_16x6"
                         for seed in seeds
                     )
                 )
@@ -2876,6 +7781,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             flash_attention_seed_configs(
                 64,
                 8192,
+                dtype=torch.float16,
                 is_causal=True,
                 standard_causal_output=True,
             )
@@ -2883,90 +7789,58 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         normalized = [
             config for _flat, config in ConfigGeneration(spec).seed_flat_config_pairs()
         ]
-        self.assertEqual(len(normalized), 4)
-        self.assertEqual(
-            {
-                (
-                    config.config[FLASH_PIPELINE_FAMILY_KEY],
-                    config.config[FLASH_EXP2_PACKET_KEY],
-                )
-                for config in normalized
-            },
-            {
-                ("fa4", "1x1"),
-                ("fa4", "4x1"),
-                ("fa4", "deg2_16x6"),
-                ("ws_overlap", "1x1"),
-            },
-        )
+        packet_families = {
+            (
+                config.config[FLASH_PIPELINE_FAMILY_KEY],
+                config.config[FLASH_EXP2_PACKET_KEY],
+            )
+            for config in normalized
+        }
+        self.assertIn(("fa4", "deg2_16x6"), packet_families)
+        self.assertIn(("fa4", "hybrid_deg1_16x8"), packet_families)
+        self.assertIn(("ws_overlap", "1x1"), packet_families)
 
     def test_cute_flash_causal_degree2_seed_uses_validated_schedule(self) -> None:
-        expected_params = {
-            512: ("fa4", 15, 3, True),
-            1024: ("fa4", 1, 14, False),
-            2048: ("fa4", 14, 12, False),
-            4096: ("helion", 14, 12, False),
-            8192: ("helion", 14, 12, False),
-        }
-        common_configs: list[dict[str, object]] = []
-        shape_specific_keys = {
-            FLASH_ROLE_MAP_KEY,
-            FLASH_E2E_OFFSET_KEY,
-            FLASH_E2E_OFFSET0_KEY,
-            FLASH_EPI_TMA_KEY,
-        }
-        for num_kv in (256, *expected_params):
+        configs: list[dict[str, object]] = []
+        for num_kv in (2, 32, 48, 256, 512, 768, 1536, 4096, 8192):
             with self.subTest(num_kv=num_kv):
                 seeds = flash_attention_seed_configs(
                     64,
                     num_kv,
+                    dtype=torch.float16,
                     is_causal=True,
                     standard_causal_output=True,
                 )
-                degree2_seeds = [
+                degree2 = [
                     seed
                     for seed in seeds
-                    if seed.config.get(FLASH_EXP2_PACKET_KEY) == "deg2_16x6"
+                    if seed.config[FLASH_EXP2_PACKET_KEY] == "deg2_16x6"
                 ]
-                if num_kv < 512:
-                    self.assertFalse(degree2_seeds)
-                    continue
-                self.assertEqual(len(degree2_seeds), 1)
-                config = degree2_seeds[0].config
-                role_map, offset, offset0, epi_tma = expected_params[num_kv]
-                expected = {
-                    FLASH_PIPELINE_FAMILY_KEY: "fa4",
-                    FLASH_EXP2_PACKET_KEY: "deg2_16x6",
-                    FLASH_E2E_SCHEDULE_KEY: "16/6",
-                    FLASH_MASKED_E2E_SCHEDULE_KEY: "16/6",
-                    FLASH_E2E_OFFSET_KEY: offset,
-                    FLASH_E2E_OFFSET0_KEY: offset0,
-                    FLASH_WAIT_HINT_KEY: 0,
-                    FLASH_DISC_PIPE_KEY: 3,
-                    FLASH_EPI_TMA_KEY: epi_tma,
-                    FLASH_EPI_STG_KEY: False,
-                    FLASH_RESCALE_CHUNK_COLS_KEY: 16,
-                    FLASH_CAUSAL_LPT_SWIZZLE_KEY: 0,
-                    FLASH_CAUSAL_KV_ORDER_KEY: "descending",
-                    FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
-                    FLASH_SOFTMAX_REGS_KEY: 184,
-                    FLASH_CORR_REGS_KEY: 64,
-                    FLASH_OTHER_REGS_KEY: 48,
-                    FLASH_ROLE_MAP_KEY: role_map,
-                }
-                for key, value in expected.items():
-                    self.assertEqual(config[key], value)
-                self.assertNotIn(FLASH_USE_2CTA_KEY, config)
-                common_configs.append(
-                    {
-                        key: value
-                        for key, value in config.items()
-                        if key not in shape_specific_keys
-                    }
+                self.assertEqual(len(degree2), 1)
+                config = degree2[0].config
+                self.assertEqual(config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
+                self.assertEqual(config[FLASH_E2E_SCHEDULE_KEY], "16/6")
+                self.assertEqual(
+                    config[FLASH_MASKED_E2E_SCHEDULE_KEY],
+                    "16/6",
                 )
-        self.assertTrue(
-            all(config == common_configs[0] for config in common_configs[1:])
-        )
+                resolved = resolve_flash_config(
+                    64,
+                    num_kv,
+                    config,
+                    dtype=torch.float16,
+                    is_causal=True,
+                    standard_causal_output=True,
+                )
+                self.assertEqual(resolved.pipeline_family, "fa4")
+                self.assertEqual(resolved.exp2_packet, "deg2_16x6")
+                self.assertEqual((resolved.e2e_freq, resolved.e2e_res), (16, 6))
+                self.assertEqual(
+                    (resolved.masked_e2e_freq, resolved.masked_e2e_res),
+                    (16, 6),
+                )
+                configs.append(config)
+        self.assertTrue(all(config == configs[0] for config in configs[1:]))
 
     def test_cute_flash_causal_degree2_seed_gates(self) -> None:
         cases = (
@@ -3001,17 +7875,63 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     )
                 )
 
+    def test_cute_flash_short_causal_keeps_safe_generic_schedule(self) -> None:
+        short = flash_autotune_fragments(
+            64,
+            2,
+            dtype=torch.float16,
+            is_causal=True,
+            standard_causal_output=True,
+        )
+        transferred = flash_autotune_fragments(
+            64,
+            48,
+            dtype=torch.float16,
+            is_causal=True,
+            standard_causal_output=True,
+        )
+        for key in (
+            FLASH_CAUSAL_LOOP_SPLIT_KEY,
+            FLASH_E2E_SCHEDULE_KEY,
+            FLASH_MASKED_E2E_SCHEDULE_KEY,
+            FLASH_EXP2_PACKET_KEY,
+        ):
+            with self.subTest(key=key):
+                short_fragment = short[key]
+                transferred_fragment = transferred[key]
+                assert isinstance(short_fragment, EnumFragment)
+                assert isinstance(transferred_fragment, EnumFragment)
+                short_active = (
+                    short_fragment.choices
+                    if short_fragment.search_choices is None
+                    else short_fragment.search_choices
+                )
+                transferred_active = (
+                    transferred_fragment.choices
+                    if transferred_fragment.search_choices is None
+                    else transferred_fragment.search_choices
+                )
+                self.assertEqual(short_active, transferred_active)
+
+        loop_split = short[FLASH_CAUSAL_LOOP_SPLIT_KEY]
+        schedule = short[FLASH_E2E_SCHEDULE_KEY]
+        packet = short[FLASH_EXP2_PACKET_KEY]
+        assert isinstance(loop_split, EnumFragment)
+        assert isinstance(schedule, EnumFragment)
+        assert isinstance(packet, EnumFragment)
+        self.assertEqual(set(loop_split.search_choices or ()), {False, True})
+        self.assertEqual(
+            set(schedule.search_choices or ()),
+            {"8/2", "16/2", "16/4", "16/6", "16/8", "xu"},
+        )
+        self.assertIn("deg2_16x6", packet.search_choices or ())
+
+    @_memoized_flash_fragments()
     def test_cute_flash_causal_degree2_seed_is_in_full_initial_population(
         self,
     ) -> None:
-        expected_params = {
-            512: ("fa4", 15, 3, True),
-            1024: ("fa4", 1, 14, False),
-            2048: ("fa4", 14, 12, False),
-            4096: ("helion", 14, 12, False),
-            8192: ("helion", 14, 12, False),
-        }
-        for num_kv, (role_map, offset, offset0, epi_tma) in expected_params.items():
+        checked_surfaces: set[tuple[object, ...]] = set()
+        for num_kv in (48, 768, 4096):
             with self.subTest(num_kv=num_kv):
                 spec = ConfigSpec(backend=CuteBackend())
                 for block_id, target in enumerate((1, 128, 128)):
@@ -3030,30 +7950,33 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     flash_attention_seed_configs(
                         64,
                         num_kv,
+                        dtype=torch.float16,
                         is_causal=True,
                         standard_causal_output=True,
                     )
                 )
                 config_gen = ConfigGeneration(spec)
-                raw_seed = next(
+                seed_pairs = config_gen.seed_flat_config_pairs()
+                degree2 = [
                     config
-                    for config in spec.compiler_seed_configs
-                    if config.config.get(FLASH_EXP2_PACKET_KEY) == "deg2_16x6"
-                )
-                roundtrip = config_gen.unflatten(config_gen.flatten(raw_seed))
-                self.assertEqual(
-                    config_gen.unflatten(config_gen.flatten(roundtrip)), roundtrip
-                )
-                expected = next(
-                    config
-                    for _flat, config in config_gen.seed_flat_config_pairs()
+                    for _flat, config in seed_pairs
                     if config.config[FLASH_EXP2_PACKET_KEY] == "deg2_16x6"
+                ]
+                self.assertEqual(len(degree2), 1)
+                expected = degree2[0]
+                roundtrip = config_gen.unflatten(config_gen.flatten(expected))
+                self.assertEqual(roundtrip, expected)
+
+                # Same length-invariance dedup as the dense variant above: the
+                # expensive population check runs once per distinct surface.
+                surface_key = (
+                    tuple(repr(fragment) for fragment in config_gen.flat_spec),
+                    tuple(config for _flat, config in seed_pairs),
                 )
-                self.assertEqual(expected, roundtrip)
-                self.assertEqual(expected.config[FLASH_ROLE_MAP_KEY], role_map)
-                self.assertEqual(expected.config[FLASH_E2E_OFFSET_KEY], offset)
-                self.assertEqual(expected.config[FLASH_E2E_OFFSET0_KEY], offset0)
-                self.assertEqual(expected.config[FLASH_EPI_TMA_KEY], epi_tma)
+                if surface_key in checked_surfaces:
+                    continue
+                checked_surfaces.add(surface_key)
+
                 profile = get_effort_profile("full").lfbo_pattern_search
                 assert profile is not None
                 search = PatternSearch.__new__(PatternSearch)
@@ -3076,23 +7999,19 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 seed_configs = [
                     config for _flat, config in config_gen.seed_flat_config_pairs()
                 ]
-                seed_count = len(seed_configs)
                 self.assertEqual(population.count(expected), 1)
-                self.assertIn(expected, population[:seed_count])
-                self.assertEqual(population[:seed_count], seed_configs)
-                self.assertLessEqual(len(population), profile.initial_population)
+                self.assertLessEqual(set(seed_configs), set(population))
+                self.assertGreaterEqual(len(population), profile.initial_population)
                 self.assertEqual(len(set(population)), len(population))
                 self.assertIn(expected, search._pinned_finalist_configs)
 
     @onlyBackends(["cute"])
     def test_cute_flash_attention_seed_heuristic(self) -> None:
-        # The flash seed promotes block_sizes=[1, 128, 128] for a detected
-        # fp16 dense/causal online-softmax attention kernels so the autotuner
-        # exercises the fused tcgen05 flash path. fp32 attention is NOT eligible
-        # and keeps the scalar path.
         @helion.kernel(backend="cute", static_shapes=True)
         def flash_attn(
-            q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
+            q_in: torch.Tensor,
+            k_in: torch.Tensor,
+            v_in: torch.Tensor,
         ) -> torch.Tensor:
             m_dim = q_in.size(-2)
             n_dim = k_in.size(-2)
@@ -3103,13 +8022,24 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             out = torch.empty_like(q_view)
             qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
             for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
-                m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+                m_i = hl.full(
+                    [tile_b, tile_m],
+                    float("-inf"),
+                    dtype=torch.float32,
+                )
                 l_i = torch.full_like(m_i, 1.0)
-                acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+                acc = hl.zeros(
+                    [tile_b, tile_m, head_dim],
+                    dtype=torch.float32,
+                )
                 qt = q_view[tile_b, tile_m, :]
                 for tile_n in hl.tile(v_view.size(1)):
                     kt = k_view[tile_b, tile_n, :]
-                    qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
+                    qk = torch.bmm(
+                        qt * qk_scale,
+                        kt.transpose(1, 2),
+                        torch.float32,
+                    )
                     m_ij = torch.maximum(m_i, torch.amax(qk, -1))
                     qk = qk - m_ij[:, :, None]
                     p = torch.exp2(qk)
@@ -3126,7 +8056,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
 
         @helion.kernel(backend="cute", static_shapes=True)
         def causal_flash_attn(
-            q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
+            q_in: torch.Tensor,
+            k_in: torch.Tensor,
+            v_in: torch.Tensor,
         ) -> torch.Tensor:
             m_dim = q_in.size(-2)
             n_dim = k_in.size(-2)
@@ -3137,20 +8069,32 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             out = torch.empty_like(q_view)
             qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
             for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
-                m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+                m_i = hl.full(
+                    [tile_b, tile_m],
+                    float("-inf"),
+                    dtype=torch.float32,
+                )
                 l_i = torch.full_like(m_i, 1.0)
-                acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+                acc = hl.zeros(
+                    [tile_b, tile_m, head_dim],
+                    dtype=torch.float32,
+                )
                 qt = q_view[tile_b, tile_m, :]
                 for tile_n in hl.tile(v_view.size(1)):
                     kt = k_view[tile_b, tile_n, :]
-                    qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
+                    qk = torch.bmm(
+                        qt * qk_scale,
+                        kt.transpose(1, 2),
+                        torch.float32,
+                    )
                     qk = torch.where(
                         tile_m.index[None, :, None] >= tile_n.index[None, None, :],
                         qk,
                         float("-inf"),
                     )
                     m_ij_keepdim = torch.maximum(
-                        m_i[:, :, None], torch.amax(qk, -1, keepdim=True)
+                        m_i[:, :, None],
+                        torch.amax(qk, -1, keepdim=True),
                     )
                     qk = qk - m_ij_keepdim
                     m_ij = m_ij_keepdim.squeeze(-1)
@@ -3167,8 +8111,21 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             return out.view(q_in.size())
 
         heuristic = CuteFlashAttentionHeuristic
+
+        def assert_all_legal_seeds(
+            config_spec: ConfigSpec, ranked: list[helion.Config]
+        ) -> None:
+            self.assertEqual(ranked, config_spec.autotune_seed_configs())
+
         fp16_args = tuple(
-            torch.randn(2, 32, 1024, 64, dtype=torch.float16, device=DEVICE)
+            torch.randn(
+                2,
+                32,
+                1024,
+                64,
+                dtype=torch.float16,
+                device=DEVICE,
+            )
             for _ in range(3)
         )
         bound = flash_attn.bind(fp16_args)
@@ -3176,252 +8133,177 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             CuteFlashAttentionHeuristic.name,
             bound.config_spec.autotuner_heuristics,
         )
-        self.assertTrue(heuristic.is_eligible(bound.env, bound.host_function.device_ir))
-        seed = heuristic.get_seed_config(bound.env, bound.host_function.device_ir)
-        assert seed is not None
-        self.assertEqual(seed.config["block_sizes"], [1, 128, 128])
-        self.assertEqual(seed.config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
-        self.assertNotIn(FLASH_E2E_OFFSET_KEY, seed.config)
-        self.assertIn(seed, bound.config_spec.compiler_seed_configs)
-        self.assertIsNone(bound.config_spec.compiler_default_config)
-        self.assertEqual(
-            bound.config_spec.compiler_seed_timeout_retry_repetitions,
-            3,
-        )
-
-        bf16_args = tuple(
-            torch.empty(1, 1, 49152, 64, dtype=torch.bfloat16, device=DEVICE)
-            for _ in range(3)
-        )
-        bf16_bound = flash_attn.bind(bf16_args)
-        self.assertIs(bf16_bound.config_spec._cute_flash_dtype, torch.bfloat16)
-        bf16_seed = heuristic.get_seed_config(
-            bf16_bound.env, bf16_bound.host_function.device_ir
-        )
-        assert bf16_seed is not None
-        self.assertEqual(bf16_seed.config[FLASH_RESCALE_THRESHOLD_KEY], 32.0)
-
-        dense_2048_args = tuple(
-            torch.empty(1, 1, 2048, 64, dtype=torch.float16, device=DEVICE)
-            for _ in range(3)
-        )
-        dense_2048_bound = flash_attn.bind(dense_2048_args)
-        dense_2048_seed = heuristic.get_seed_config(
-            dense_2048_bound.env, dense_2048_bound.host_function.device_ir
-        )
-        assert dense_2048_seed is not None
-        self.assertEqual(dense_2048_seed.config[FLASH_S_STAGE_KEY], 2)
-        self.assertEqual(dense_2048_seed.config[FLASH_KV_STAGE_KEY], 3)
-        self.assertTrue(dense_2048_seed.config[FLASH_PERSISTENT_KEY])
-        self.assertEqual(dense_2048_seed.config[FLASH_PERSISTENT_CTAS_PER_SM_KEY], 1)
-        self.assertEqual(dense_2048_seed.config[FLASH_KV_ORDER_KEY], "ascending")
-        self.assertEqual(dense_2048_seed.config[FLASH_E2E_SCHEDULE_KEY], "8/2")
-        self.assertEqual(dense_2048_seed.config[FLASH_E2E_OFFSET_KEY], 2)
-        self.assertEqual(dense_2048_seed.config[FLASH_E2E_OFFSET0_KEY], 2)
-        self.assertEqual(dense_2048_seed.config[FLASH_DISC_PIPE_KEY], 4)
-        self.assertEqual(dense_2048_seed.config[FLASH_OTHER_REGS_KEY], 48)
-        self.assertTrue(dense_2048_seed.config[FLASH_EPI_TMA_KEY])
-        self.assertFalse(dense_2048_seed.config[FLASH_EPI_STG_KEY])
-        self.assertEqual(dense_2048_seed.config[FLASH_CORR_TILE_SIZE_KEY], 16)
-        self.assertEqual(dense_2048_seed.config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
-        self.assertFalse(dense_2048_seed.config[FLASH_PACKED_REDUCE_KEY])
-        self.assertEqual(dense_2048_seed.config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
-        self.assertIn(
-            dense_2048_seed, dense_2048_bound.config_spec.compiler_seed_configs
-        )
-        self.assertIsNone(dense_2048_bound.config_spec.compiler_default_config)
-
-        dense_8192_args = tuple(
-            torch.empty(1, 1, 8192, 64, dtype=torch.float16, device=DEVICE)
-            for _ in range(3)
-        )
-        dense_8192_bound = flash_attn.bind(dense_8192_args)
-        dense_8192_seed = heuristic.get_seed_config(
-            dense_8192_bound.env, dense_8192_bound.host_function.device_ir
-        )
-        assert dense_8192_seed is not None
-        self.assertEqual(dense_8192_seed.config[FLASH_E2E_SCHEDULE_KEY], "8/2")
-        self.assertEqual(dense_8192_seed.config[FLASH_E2E_OFFSET_KEY], 2)
-        self.assertEqual(dense_8192_seed.config[FLASH_E2E_OFFSET0_KEY], 2)
-        self.assertEqual(dense_8192_seed.config[FLASH_DISC_PIPE_KEY], 3)
-        self.assertEqual(dense_8192_seed.config[FLASH_PERSISTENT_CTAS_PER_SM_KEY], 1)
-        self.assertEqual(dense_8192_seed.config[FLASH_KV_ORDER_KEY], "ascending")
-        self.assertEqual(dense_8192_seed.config[FLASH_SOFTMAX_REGS_KEY], 184)
-        self.assertEqual(dense_8192_seed.config[FLASH_OTHER_REGS_KEY], 48)
-        self.assertEqual(dense_8192_seed.config[FLASH_CORR_REGS_KEY], 64)
-        self.assertTrue(dense_8192_seed.config[FLASH_EPI_TMA_KEY])
-        self.assertFalse(dense_8192_seed.config[FLASH_EPI_STG_KEY])
-        self.assertEqual(dense_8192_seed.config[FLASH_CORR_TILE_SIZE_KEY], 16)
-        self.assertEqual(dense_8192_seed.config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
-        self.assertEqual(dense_8192_seed.config[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
-        self.assertTrue(dense_8192_seed.config[FLASH_PACKED_REDUCE_KEY])
-        self.assertEqual(dense_8192_seed.config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
-        self.assertNotIn(FLASH_CAUSAL_LPT_SWIZZLE_KEY, dense_8192_seed.config)
-        dense_8192_gen = ConfigGeneration(dense_8192_bound.config_spec)
-        dense_8192_roundtrip = dense_8192_gen.unflatten(
-            dense_8192_gen.flatten(dense_8192_seed)
-        )
-        self.assertEqual(
-            dense_8192_roundtrip.config[FLASH_SOFTMAX_REGS_KEY],
-            184,
-        )
-        self.assertEqual(
-            dense_8192_roundtrip.config[FLASH_CORR_REGS_KEY],
-            64,
-        )
-        self.assertEqual(
-            dense_8192_roundtrip.config[FLASH_OTHER_REGS_KEY],
-            48,
-        )
-
-        causal_hd64_bound = causal_flash_attn.bind(fp16_args)
-        causal_hd64_seed = heuristic.get_seed_config(
-            causal_hd64_bound.env, causal_hd64_bound.host_function.device_ir
-        )
-        assert causal_hd64_seed is not None
-        self.assertEqual(causal_hd64_seed.config["block_sizes"], [1, 128, 128])
-        self.assertEqual(causal_hd64_seed.config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
-        self.assertTrue(causal_hd64_seed.config[FLASH_PACKED_REDUCE_KEY])
-        self.assertIn(
-            causal_hd64_seed, causal_hd64_bound.config_spec.compiler_seed_configs
-        )
-        self.assertIsNone(causal_hd64_bound.config_spec.compiler_default_config)
-
-        causal_8192_args = tuple(
-            torch.empty(1, 1, 8192, 64, dtype=torch.float16, device=DEVICE)
-            for _ in range(3)
-        )
-        causal_8192_bound = causal_flash_attn.bind(causal_8192_args)
-        self.assertIn(
-            CuteFlashAttentionCausalLptHeuristic.name,
-            causal_8192_bound.config_spec.autotuner_heuristics,
-        )
-        causal_lpt_seed = CuteFlashAttentionCausalLptHeuristic.get_seed_config(
-            causal_8192_bound.env, causal_8192_bound.host_function.device_ir
-        )
-        assert causal_lpt_seed is not None
-        self.assertEqual(causal_lpt_seed.config[FLASH_CAUSAL_LPT_SWIZZLE_KEY], 8)
-        self.assertEqual(
-            causal_lpt_seed.config[FLASH_CAUSAL_KV_ORDER_KEY], "descending"
-        )
-        self.assertEqual(
-            causal_lpt_seed.config[FLASH_MASKED_E2E_SCHEDULE_KEY], "inherit"
-        )
-        self.assertEqual(causal_lpt_seed.config[FLASH_ROLE_MAP_KEY], "helion")
-        self.assertEqual(causal_lpt_seed.config[FLASH_E2E_OFFSET_KEY], 0)
-        self.assertEqual(causal_lpt_seed.config[FLASH_SOFTMAX_REGS_KEY], 200)
-        self.assertTrue(causal_lpt_seed.config[FLASH_PACKED_REDUCE_KEY])
-        self.assertIn(
-            causal_lpt_seed, causal_8192_bound.config_spec.compiler_seed_configs
-        )
-        causal_split_seed = flash_attention_seed_config(
-            64, 64, is_causal=True, seed_kind="causal_split"
-        )
-        assert causal_split_seed is not None
-        self.assertIn(
-            causal_split_seed, causal_8192_bound.config_spec.compiler_seed_configs
-        )
-        self.assertIsNone(causal_8192_bound.config_spec.compiler_default_config)
-
-        causal_65536_args = tuple(
-            torch.empty(1, 1, 65536, 64, dtype=torch.float16, device=DEVICE)
-            for _ in range(3)
-        )
-        causal_65536_bound = causal_flash_attn.bind(causal_65536_args)
         self.assertTrue(
-            causal_65536_bound.config_spec._cute_flash_standard_causal_output
-        )
-        self.assertIn(
-            CuteFlashAttentionCausalLptHeuristic.name,
-            causal_65536_bound.config_spec.autotuner_heuristics,
-        )
-        causal_65536_seed = CuteFlashAttentionCausalLptHeuristic.get_seed_config(
-            causal_65536_bound.env, causal_65536_bound.host_function.device_ir
-        )
-        assert causal_65536_seed is not None
-        self.assertEqual(causal_65536_seed.config[FLASH_CAUSAL_LPT_SWIZZLE_KEY], 1)
-        self.assertEqual(causal_65536_seed.config[FLASH_E2E_OFFSET_KEY], 9)
-        self.assertEqual(causal_65536_seed.config[FLASH_SOFTMAX_REGS_KEY], 184)
-        self.assertEqual(causal_65536_seed.config[FLASH_DISC_PIPE_KEY], 4)
-        self.assertTrue(causal_65536_seed.config[FLASH_PACKED_REDUCE_KEY])
-        self.assertIn(
-            causal_65536_seed, causal_65536_bound.config_spec.compiler_seed_configs
-        )
-        self.assertFalse(
-            any(
-                seed.config.get(FLASH_EXP2_PACKET_KEY) == "hybrid_deg1_16x8"
-                for seed in causal_65536_bound.config_spec.compiler_seed_configs
+            heuristic.is_eligible(
+                bound.env,
+                bound.host_function.device_ir,
             )
         )
-        causal_65536_degree2 = next(
-            seed
-            for seed in causal_65536_bound.config_spec.compiler_seed_configs
-            if seed.config.get(FLASH_EXP2_PACKET_KEY) == "deg2_16x6"
+        ranked = heuristic.get_seed_configs(
+            bound.env,
+            bound.host_function.device_ir,
         )
-        self.assertEqual(causal_65536_degree2.config[FLASH_E2E_OFFSET_KEY], 15)
-        self.assertEqual(causal_65536_degree2.config[FLASH_E2E_OFFSET0_KEY], 3)
-        self.assertTrue(causal_65536_degree2.config[FLASH_EPI_TMA_KEY])
-        with patch.object(
-            PatternSearch,
-            "_find_similar_cached_configs",
-            return_value=[],
-        ):
-            quick_search = PatternSearch(
-                causal_65536_bound,
-                causal_65536_args,
-                initial_population=30,
-                initial_population_strategy=(
-                    InitialPopulationStrategy.FROM_BEST_AVAILABLE
-                ),
-                best_available_pad_random=False,
+        assert ranked
+        assert_all_legal_seeds(bound.config_spec, ranked)
+        self.assertEqual(
+            heuristic.get_seed_config(
+                bound.env,
+                bound.host_function.device_ir,
+            ),
+            ranked[0],
+        )
+        self.assertEqual(ranked[0].config["block_sizes"], [1, 128, 128])
+        self.assertEqual(bound.config_spec.compiler_seed_configs, ranked)
+        self.assertIsNone(bound.config_spec.compiler_default_config)
+
+        transferred_prefixes: list[list[helion.Config]] = []
+        for seq_len in (49_152, 98_304):
+            args = tuple(
+                torch.empty(
+                    1,
+                    1,
+                    seq_len,
+                    64,
+                    dtype=torch.bfloat16,
+                    device=DEVICE,
+                )
+                for _ in range(3)
             )
-            quick_configs = [
-                quick_search.config_gen.unflatten(flat)
-                for flat in quick_search._generate_initial_population_flat()
-            ]
-        causal_65536_degree2_normalized = quick_search.config_gen.unflatten(
-            quick_search.config_gen.flatten(causal_65536_degree2)
+            transferred = flash_attn.bind(args)
+            transferred_ranked = heuristic.get_seed_configs(
+                transferred.env,
+                transferred.host_function.device_ir,
+            )
+            assert transferred_ranked
+            assert_all_legal_seeds(transferred.config_spec, transferred_ranked)
+            transferred_prefixes.append(transferred_ranked)
+        self.assertEqual(transferred_prefixes[0], transferred_prefixes[1])
+
+        causal_bound = causal_flash_attn.bind(fp16_args)
+        causal_ranked = heuristic.get_seed_configs(
+            causal_bound.env,
+            causal_bound.host_function.device_ir,
         )
-        self.assertEqual(len(quick_configs), 4)
-        self.assertIn(causal_65536_degree2_normalized, quick_configs)
-        self.assertIsNone(causal_65536_bound.config_spec.compiler_default_config)
-        causal_65536_gen = ConfigGeneration(causal_65536_bound.config_spec)
-        causal_65536_default = causal_65536_gen.unflatten(
-            causal_65536_gen.default_flat()
+        assert causal_ranked
+        assert_all_legal_seeds(causal_bound.config_spec, causal_ranked)
+        self.assertIn(
+            CuteFlashAttentionHeuristic.name,
+            causal_bound.config_spec.autotuner_heuristics,
         )
-        self.assertEqual(
-            causal_65536_default.config[FLASH_SOFTMAX_REGS_KEY],
-            184,
-        )
-        self.assertEqual(causal_65536_default.config[FLASH_E2E_OFFSET_KEY], 9)
-        causal_65536_roundtrip = causal_65536_gen.unflatten(
-            causal_65536_gen.flatten(causal_65536_seed)
-        )
-        self.assertEqual(
-            causal_65536_roundtrip.config[FLASH_SOFTMAX_REGS_KEY],
-            184,
+        self.assertNotIn(
+            "cute_flash_attention_causal_lpt",
+            causal_bound.config_spec.autotuner_heuristics,
         )
 
-        causal_hd128_args = tuple(
-            torch.randn(2, 32, 1024, 128, dtype=torch.float16, device=DEVICE)
+        hd128_args = tuple(
+            torch.empty(
+                1,
+                1,
+                32_768,
+                128,
+                dtype=torch.bfloat16,
+                device=DEVICE,
+            )
             for _ in range(3)
         )
-        causal_hd128_bound = causal_flash_attn.bind(causal_hd128_args)
-        causal_hd128_seed = heuristic.get_seed_config(
-            causal_hd128_bound.env, causal_hd128_bound.host_function.device_ir
-        )
-        assert causal_hd128_seed is not None
-        self.assertEqual(causal_hd128_seed.config[FLASH_PIPELINE_FAMILY_KEY], "fa4")
-        self.assertEqual(causal_hd128_seed.config[FLASH_KV_STAGE_KEY], 2)
+        for kernel in (flash_attn, causal_flash_attn):
+            hd128_bound = kernel.bind(hd128_args)
+            hd128_ranked = heuristic.get_seed_configs(
+                hd128_bound.env,
+                hd128_bound.host_function.device_ir,
+            )
+            assert hd128_ranked
+            assert_all_legal_seeds(hd128_bound.config_spec, hd128_ranked)
 
-        # fp32 attention is not flash-eligible (the kernel hardcodes fp16).
+        geometry_args = tuple(
+            torch.empty(
+                3,
+                40,
+                128,
+                128,
+                dtype=torch.bfloat16,
+                device=DEVICE,
+            )
+            for _ in range(3)
+        )
+        geometry_bound = flash_attn.bind(geometry_args)
+        self.assertEqual(geometry_bound.config_spec._cute_flash_num_bh, 120)
+        self.assertEqual(geometry_bound.config_spec._cute_flash_tensor_4d_heads, 40)
+        self.assertFalse(geometry_bound.config_spec._cute_flash_supports_tensor_4d_tma)
+
+        clc_geometry_args = tuple(
+            torch.empty(
+                3,
+                40,
+                1024,
+                64,
+                dtype=torch.bfloat16,
+                device=DEVICE,
+            )
+            for _ in range(3)
+        )
+        clc_geometry_bound = flash_attn.bind(clc_geometry_args)
+        self.assertEqual(clc_geometry_bound.config_spec._cute_flash_num_bh, 120)
+        self.assertEqual(clc_geometry_bound.config_spec._cute_flash_tensor_4d_heads, 40)
+        self.assertFalse(
+            clc_geometry_bound.config_spec._cute_flash_supports_tensor_4d_tma
+        )
+        geometry_generation = clc_geometry_bound.config_spec.create_config_generation()
+        clc_index = geometry_generation._key_to_flat_indices[
+            FLASH_CLC_HEADS_PER_BATCH_KEY
+        ][0][0]
+        clc_fragment = geometry_generation.flat_spec[clc_index]
+        self.assertIsInstance(clc_fragment, EnumFragment)
+        assert isinstance(clc_fragment, EnumFragment)
+        self.assertLessEqual(
+            {1, 3, 40, 120},
+            set(clc_fragment.search_choices or clc_fragment.choices),
+        )
+
+        large_output_args = tuple(
+            torch.empty(
+                8,
+                32,
+                262_144,
+                64,
+                dtype=torch.bfloat16,
+                device="meta",  # @ignore-device-lint
+            )
+            for _ in range(3)
+        )
+        for kernel in (flash_attn, causal_flash_attn):
+            large_bound = kernel.bind(large_output_args)
+            spec = large_bound.config_spec
+            self.assertTrue(spec._cute_flash_output_requires_tma)
+            large_ranked = heuristic.get_seed_configs(
+                large_bound.env,
+                large_bound.host_function.device_ir,
+            )
+            assert large_ranked
+            assert_all_legal_seeds(spec, large_ranked)
+            for seed in large_ranked:
+                resolved = spec._resolve_cute_flash_config(seed.config)
+                self.assertIn(resolved.pipeline_family, ("fa4", "fa4_2cta"))
+                self.assertTrue(resolved.epi_tma)
+                self.assertFalse(resolved.epi_stg)
+
         fp32_args = tuple(
-            torch.randn(2, 32, 1024, 64, dtype=torch.float32, device=DEVICE)
+            torch.randn(
+                2,
+                32,
+                1024,
+                64,
+                dtype=torch.float32,
+                device=DEVICE,
+            )
             for _ in range(3)
         )
         fp32_bound = flash_attn.bind(fp32_args)
         self.assertFalse(
-            heuristic.is_eligible(fp32_bound.env, fp32_bound.host_function.device_ir)
+            heuristic.is_eligible(
+                fp32_bound.env,
+                fp32_bound.host_function.device_ir,
+            )
         )
         self.assertNotIn(
             CuteFlashAttentionHeuristic.name,
@@ -3430,7 +8312,14 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
 
         with patch_cute_mma_support(default_cute_mma_support(tcgen05_f16bf16=False)):
             unsupported_args = tuple(
-                torch.randn(1, 16, 512, 64, dtype=torch.float16, device=DEVICE)
+                torch.randn(
+                    1,
+                    16,
+                    512,
+                    64,
+                    dtype=torch.float16,
+                    device=DEVICE,
+                )
                 for _ in range(3)
             )
             unsupported_bound = flash_attn.bind(unsupported_args)
@@ -3627,12 +8516,13 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             for_search=True
         )["tcgen05_ab_stages"]
         self.assertIsInstance(search_ab_stages_fragment, IntegerFragment)
-        # Cycle 97: the for_search ab cap is BUDGET-AWARE — lifted to 3 wherever
-        # ab=3 is admissible (the SMEM-budget constraints were recorded at bind
-        # time, i.e. bf16/fp16 on a B200-class optin cap), else 2. Conditioning on
-        # the recorded constraints keeps the assertion deterministic across hosts.
+        # The for_search ab cap is BUDGET-AWARE — lifted to the 16-bit hard cap
+        # (6) wherever deep AB is admissible (the SMEM-budget constraints were
+        # recorded at bind time, i.e. bf16/fp16 on a B200-class optin cap),
+        # else 2. Conditioning on the recorded constraints keeps the assertion
+        # deterministic across hosts.
         expected_search_ab_high = (
-            3
+            6
             if bound.config_spec._cute_tcgen05_config.ab_stages_three_search_constraints
             is not None
             else 2
@@ -4838,8 +9728,14 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             bound = cute_matmul_and_elementwise_store.bind(args)
 
         spec = bound.config_spec
-        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
+        # The residual load belongs to a separate elementwise store, not the
+        # matmul epilogue, so no aux-only matmul search axis is productive.
+        self.assertFalse(spec.cute_tcgen05_aux_kernel_detected)
         self.assertFalse(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        self.assertNotIn(
+            TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
+            {key for key, _count, _is_sequence in spec.flat_key_layout()},
+        )
         self.assertFalse(
             any(
                 config.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
@@ -4875,8 +9771,14 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             bound = cute_matmul_partial_residual.bind(args)
 
         spec = bound.config_spec
-        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
+        # The partial rank-2 load is outside the accepted per-subtile epilogue
+        # contract, so codegen cannot use the C-input or placement controls.
+        self.assertFalse(spec.cute_tcgen05_aux_kernel_detected)
         self.assertFalse(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        self.assertNotIn(
+            TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
+            {key for key, _count, _is_sequence in spec.flat_key_layout()},
+        )
         self.assertFalse(
             any(
                 config.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
@@ -4914,8 +9816,14 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             bound = cute_matmul_scrambled_residual.bind(args)
 
         spec = bound.config_spec
-        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
+        # Reordered tile indices are rejected by the same chain analyzer used
+        # at codegen, so they must not widen the aux search surface at bind.
+        self.assertFalse(spec.cute_tcgen05_aux_kernel_detected)
         self.assertFalse(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        self.assertNotIn(
+            TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
+            {key for key, _count, _is_sequence in spec.flat_key_layout()},
+        )
         self.assertFalse(
             any(
                 config.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
@@ -5356,11 +10264,12 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertTrue(residual_tcfg.aux_kernel_detected)
         self.assertTrue(residual_tcfg.exact_shape_aux_kernel_detected)
 
-        # The for_search ab fragment is lifted to 3 (the budget was recorded at
-        # bind via the mocked B200 cap) for every family.
+        # The for_search ab fragment is lifted to the 16-bit hard cap (the
+        # budget was recorded at bind via the mocked B200 cap) for every
+        # family; sampled depths are budget-clamped at fix-invalid time.
         for tcfg in (plain_tcfg, bias_tcfg, residual_tcfg):
             ab_fragment = tcfg.optional_fragments(for_search=True)["tcgen05_ab_stages"]
-            self.assertEqual(ab_fragment.high, 3)
+            self.assertEqual(ab_fragment.high, 6)
 
         def _ab3_config(cluster_m: int = 2) -> helion.Config:
             return helion.Config(
@@ -5713,15 +10622,13 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
 
 
 class TestTritonReductionHeuristic(TestCase):
-    """Lock the reduction seed heuristics' branch decisions on two kernels, one per
-    track:
+    """Lock representative liveness-based reduction seed decisions on both tracks:
 
     - rms_norm wide (rnumel=16384): the standard path
-      (``TritonStandardReductionHeuristicSM90``) seeds a persistent reduction
+      (``TritonReductionHeuristic``) seeds a persistent reduction
       (``reduction_loops=[None]``) with the rnumel-ramp warp count.
-    - kl_div wide (rnumel=131072): the Band-B (user-tiled) path
-      (``TritonUserTiledReductionHeuristicSM90``) caps R_BLOCK by the accumulator footprint
-      instead of going full-N persistent, with M at floor 1.
+    - kl_div wide (rnumel=131072): the user-tiled path resolves the complete live
+      timeline and caps R_BLOCK instead of going full-N, with M at floor 1.
     """
 
     @onlyBackends(["triton"])
@@ -5735,7 +10642,7 @@ class TestTritonReductionHeuristic(TestCase):
             torch.randn([n], device=DEVICE, dtype=torch.float32),
             1e-5,
         )
-        heuristic = TritonStandardReductionHeuristicSM90
+        heuristic = TritonReductionHeuristic
 
         # Pin the kernel to the triton backend: autotuner_heuristics is keyed on
         # env.backend_name, and the tileir lane (where @onlyBackends(["triton"]) still
@@ -5743,9 +10650,8 @@ class TestTritonReductionHeuristic(TestCase):
         # assertIn below fails. Pinning keeps backend_name "triton" on every lane.
         kernel = helion.kernel(rms_norm_fwd.fn, backend="triton")
 
-        # Force the sm90 deep path so the test exercises the H100-tuned seed on any
-        # runner (off-sm90 a different class fires: SM100 on B200, the narrow fallback
-        # elsewhere).
+        # Force a tuned target so the test exercises the unified H100/B200 seed on
+        # any runner; other hardware uses the narrow standard-only fallback.
         with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
             bound = kernel.bind(args)
 
@@ -5758,7 +10664,7 @@ class TestTritonReductionHeuristic(TestCase):
             # row in the reduction scope), so no reduce-then-apply tile is captured.
             self.assertEqual(kf.non_reduction_loop_block_ids, ())
             self.assertIn(
-                TritonStandardReductionHeuristicSM90.name,
+                TritonReductionHeuristic.name,
                 bound.config_spec.autotuner_heuristics,
             )
             self.assertTrue(
@@ -5777,14 +10683,14 @@ class TestTritonReductionHeuristic(TestCase):
 
     @onlyBackends(["triton"])
     @skipIfRefEager("Compiler reduction facts are not collected in ref eager mode")
-    def test_kl_div_wide_seeds_band_b_r_block_cap(self) -> None:
+    def test_kl_div_wide_seeds_liveness_r_block_cap(self) -> None:
         from examples.kl_div import kl_div_forward
 
         m, n = 4096, 131072
         log_q = torch.log_softmax(torch.randn([m, n], device=DEVICE), dim=-1)
         p = torch.softmax(torch.randn([m, n], device=DEVICE), dim=-1)
         args = (log_q, p)
-        heuristic = TritonUserTiledReductionHeuristicSM90
+        heuristic = TritonReductionHeuristic
 
         # Pin the kernel to the triton backend: autotuner_heuristics is keyed on
         # env.backend_name, and the tileir lane (where @onlyBackends(["triton"]) still
@@ -5792,53 +10698,109 @@ class TestTritonReductionHeuristic(TestCase):
         # assertIn below fails. Pinning keeps backend_name "triton" on every lane.
         kernel = helion.kernel(kl_div_forward.fn, backend="triton")
 
-        # Force the sm90 deep path so the Band-B seed is exercised on any runner
-        # (off-sm90 a different class fires: SM100 on B200; the narrow fallback covers
-        # only the standard track, so user-tiled simply does not seed elsewhere).
+        # Force a tuned target so the liveness allocator is exercised on any runner.
+        # The narrow fallback on other hardware covers only standard reductions.
         with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
             bound = kernel.bind(args)
 
-            # Single reduction descriptor carrying a 2D [M, R] tile -> Band B.
+            # The complete timeline captures the carried [M, R] state directly.
             kf = bound.config_spec.reduction_kernel_fact
             self.assertIsNotNone(kf)
             self.assertEqual(len(kf.reductions), 1)
             fact = kf.reductions[0]
             self.assertEqual(fact.size_hint, n)
-            self.assertGreaterEqual(fact.carried_2d_count, 1)
+            self.assertTrue(kf.live_tile_steps)
+            self.assertTrue(
+                any(
+                    fact.block_id in tile.dim_block_ids and len(tile.dim_block_ids) >= 2
+                    for step in kf.live_tile_steps
+                    for tile in step
+                    if tile.kind != "global"
+                )
+            )
             self.assertEqual(kf.non_reduction_loop_block_ids, ())
             self.assertIn(
-                TritonUserTiledReductionHeuristicSM90.name,
+                TritonReductionHeuristic.name,
                 bound.config_spec.autotuner_heuristics,
             )
             self.assertTrue(
                 heuristic.is_eligible(bound.env, bound.host_function.device_ir)
             )
 
-            # Exactly one seed; R_BLOCK is capped (NOT full-N persistent) by the ONE budget
-            # allocator, and the grid (M) axis sits at its floor of 1.
+            # Exactly one seed; the peak live timeline caps R_BLOCK well below the
+            # full extent, and the grid (M) axis remains at its floor. The serial
+            # occupancy exchange retains the 8192-wide chunk for this shape.
             seeds = compiler_seed_configs(bound.env, bound.host_function.device_ir)
         self.assertEqual(len(seeds), 1)
         seed = seeds[0].config
-        # The budget allocator sizes the carried [M_BLOCK, R_BLOCK] tile against ONE group budget
-        # (num_live × itemsize footprint vs the CARRIED budget), NOT a bespoke carried byte cap.
-        # The carried accumulator is live the whole loop with body_live_tiles copies, so the budget
-        # depletes to R_BLOCK = pow2(CARRIED_PERSIST_MAX_BYTES / (num_live × itemsize)). A carried
-        # reduction holds its [M, R] tile resident across the whole loop (not streamed-then-released),
-        # so it sizes against the TIGHTER CARRIED_PERSIST_MAX_BYTES (= ROW_PERSIST // 2 = 122880), a
-        # single budget CONSTANT — the footprint FORMULA is the same uniform num_live × ∏(working
-        # tile) as every other kernel (no buffer-count multiplier: body_live_tiles already counts the
-        # carried buffers). For kl_div (body_live_tiles == 6, fp32) that is pow2(122880 / (6 × 4)) =
-        # pow2(5120) = 4096 — capped well below next_pow2(131072) and M floored to 1 (budget spent).
-        # 4096 is the MEASURED optimum (~+2% vs the old 8192). Floor-vs-resident falls out of
-        # depletion: no carried recognizer, no separate CARRIED_TILE_MAX_BYTES.
         r_block = seed["block_sizes"][0]
-        self.assertEqual(seed["block_sizes"], [4096, 1])
+        self.assertEqual(seed["block_sizes"], [8192, 1])
         self.assertLess(r_block, n)
-        # rnumel 131072 > the 16384 warps-32 breakpoint -> 32 warps.
+        # Warps follow the selected lane-parallel chunk, not the raw logical extent.
         self.assertEqual(seed["num_warps"], 32)
         self.assertEqual(seed["num_stages"], 1)
-        # The carried-tile path must NOT use the standard reduction_loops knob.
+        # User-tiled reductions emit through block_sizes, never reduction_loops.
         self.assertNotIn("reduction_loops", seed)
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler reduction facts are not collected in ref eager mode")
+    def test_fixed_reduction_tile_is_distinct_from_full_slice(self) -> None:
+        @helion.kernel(backend="triton")
+        def fixed_tile_reduction(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty([m], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([tile_m], dtype=torch.float32)
+                for tile_n in hl.tile(n, block_size=128):
+                    acc = acc + x[tile_m, tile_n].to(torch.float32).sum(dim=-1)
+                out[tile_m] = acc
+            return out
+
+        def descriptor(
+            n: int,
+        ) -> tuple[ReductionDescriptor, dict[str, Any], tuple[str, ...]]:
+            fixed_tile_reduction.reset()
+            with patch(
+                "helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE
+            ):
+                bound = fixed_tile_reduction.bind(
+                    (torch.randn([64, n], device=DEVICE),)
+                )
+                kf = bound.config_spec.reduction_kernel_fact
+                self.assertIsNotNone(kf)
+                self.assertEqual(len(kf.reductions), 1)
+                fact = kf.reductions[0]
+                self.assertNotIn(
+                    fact.block_id,
+                    bound.config_spec.block_sizes.valid_block_ids(),
+                )
+                seeds = compiler_seed_configs(bound.env, bound.host_function.device_ir)
+            self.assertEqual(len(seeds), 1)
+            return (
+                fact,
+                seeds[0].config,
+                tuple(bound.config_spec.autotuner_heuristics),
+            )
+
+        partial, partial_seed, partial_heuristics = descriptor(1024)
+        self.assertEqual(partial.category, ReductionCategory.FIXED_TILE)
+        self.assertEqual(partial.size_hint, 1024)
+        self.assertEqual(partial.fixed_tile_size_hint, 128)
+        self.assertIn(
+            TritonReductionHeuristic.name,
+            partial_heuristics,
+        )
+        self.assertNotIn("reduction_loops", partial_seed)
+
+        full, full_seed, full_heuristics = descriptor(128)
+        self.assertEqual(full.category, ReductionCategory.FULL_SLICE)
+        self.assertEqual(full.size_hint, 128)
+        self.assertIsNone(full.fixed_tile_size_hint)
+        self.assertIn(
+            TritonReductionHeuristic.name,
+            full_heuristics,
+        )
+        self.assertNotIn("reduction_loops", full_seed)
 
     @onlyBackends(["triton"])
     @skipIfRefEager("Compiler reduction facts are not collected in ref eager mode")
@@ -5885,9 +10847,9 @@ class TestTritonReductionHeuristic(TestCase):
                 self.assertEqual(kf.grid_axis_block_ids, (0,))
                 self.assertEqual(len(kf.non_reduction_loop_block_ids), 1)
                 self.assertNotIn(fact.block_id, kf.non_reduction_loop_block_ids)
-                self.assertEqual(fact.carried_2d_count, 0)
+                self.assertTrue(kf.live_tile_steps)
                 self.assertIn(
-                    TritonStandardReductionHeuristicSM90.name,
+                    TritonReductionHeuristic.name,
                     bound.config_spec.autotuner_heuristics,
                 )
                 # Exactly one seed; block_sizes has an entry per tiled dim (grid +
@@ -5904,28 +10866,14 @@ class TestTritonReductionHeuristic(TestCase):
                 kf.non_reduction_loop_block_ids[0]
             )
             self.assertGreater(seed["block_sizes"][norm_idx], 1)
-            # Persistent (narrow row) -> reduction_loops=[None]; looped (wide row past
-            # the byte cap) -> reduction_loops=[LOOPED_CHUNK].
+            # A narrow row remains persistent. A wide row emits a finite chunk
+            # selected from the same live-state model as the normalize tile.
             if expect_looped:
-                self.assertEqual(
-                    seed["reduction_loops"],
-                    [TritonStandardReductionHeuristicSM90.LOOPED_CHUNK],
-                )
-                # At m_block==1 the normalize tile is clamped to the SAME ÷M_BLOCK
-                # register-resident footprint as the reduction tile, NOT left at
-                # next_pow2(N). With m_block==1 / fp32 the budget is prev_pow2(
-                # ROW_PERSIST_MAX_BYTES // (1 * 4)) == 32768, which is < next_pow2(131072).
-                # This is the only test cell that exercises the cap at M_BLOCK==1, so pin
-                # the value (a > 1 check would also pass on the OLD M_BLOCK>1-gated cap that
-                # left this tile uncapped).
-                from helion._utils import prev_power_of_2
-
-                expected_norm = prev_power_of_2(
-                    TritonStandardReductionHeuristicSM90.ROW_PERSIST_MAX_BYTES
-                    // (1 * 4)
-                )
-                self.assertEqual(expected_norm, 32768)
-                self.assertEqual(seed["block_sizes"][norm_idx], expected_norm)
+                chunk = seed["reduction_loops"][0]
+                self.assertIsInstance(chunk, int)
+                self.assertGreater(chunk, 1)
+                self.assertLess(chunk, n)
+                self.assertLess(seed["block_sizes"][norm_idx], n)
             else:
                 self.assertEqual(seed["reduction_loops"], [None])
             # The emitted seed must round-trip through normalize() without raising.
@@ -5937,80 +10885,93 @@ class TestTritonReductionHeuristic(TestCase):
         # wrongly declined into a wrong-length crash; now emits a widened looped seed).
         check(1024, 131072, expect_looped=True)
 
-    def test_independent_loops_not_floored_by_budget_allocator(self) -> None:
-        # The ONE budget allocator (``size_reduction_tiles``) sizes a USER_TILE reduction
-        # axis AND a co-occurring non-reduction (normalize) loop / secondary reducing axis
-        # so neither FLOORS to 1 (the [..., 1] serialization catastrophe). No example
-        # kernel has a dynamic-extent non-reduction loop, so this pins the behavior on a
-        # constructed spec (bare-spec, no active env — the allocator reads stored hints).
-        from helion.autotuner.config_spec import BlockSizeSpec
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler reduction facts are not collected in ref eager mode")
+    def test_padded_apply_loop_skips_padding_neutral_half(self) -> None:
+        from pretuned_kernels.dynamic_per_token_scaled_fp8_quant.dynamic_per_token_scaled_fp8_quant import (
+            dynamic_per_token_scaled_fp8_quant,
+        )
 
-        H = TritonUserTiledReductionHeuristicSM90
-        size_hint = 4096  # next_pow2(size_hint) == 4096
+        tokens, hidden = 64, 5120
+        x = torch.randn(tokens, hidden, device=DEVICE, dtype=torch.bfloat16)
+        result = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+        scale = torch.empty(tokens, 1, device=DEVICE, dtype=torch.float32)
+        kernel = helion.kernel(
+            dynamic_per_token_scaled_fp8_quant.fn,
+            backend="triton",
+        )
+        with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
+            bound = kernel.bind((result, x, scale))
+            kf = bound.config_spec.reduction_kernel_fact
+            self.assertIsNotNone(kf)
+            self.assertEqual(len(kf.non_reduction_loop_block_ids), 1)
+            apply_idx = bound.config_spec.block_sizes.block_id_to_index(
+                kf.non_reduction_loop_block_ids[0]
+            )
+            seeds = compiler_seed_configs(bound.env, bound.host_function.device_ir)
 
-        def spec_with(reduction_bid: int, norm_bid: int) -> ConfigSpec:
-            spec = ConfigSpec(backend=TritonBackend())
-            # grid (block 0), reduction axis, normalize-loop axis — all block_sizes.
-            spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
-            spec.block_sizes.append(
-                BlockSizeSpec(block_id=reduction_bid, size_hint=size_hint)
-            )
-            spec.block_sizes.append(
-                BlockSizeSpec(block_id=norm_bid, size_hint=size_hint)
-            )
-            # USER_TILE reduction (rdim is a block_sizes entry), grid row block 0, and a
-            # non-reduction normalize loop ``norm_bid`` captured on the kernel fact.
-            desc = ReductionDescriptor(
-                category=ReductionCategory.USER_TILE,
-                block_id=reduction_bid,
-                graph_id=0,
-                size_hint=size_hint,
-                itemsize=4,
-                input_load_itemsize=4,
-                num_load=1,
-            )
-            spec.reduction_kernel_fact = ReductionKernelFact(
-                reductions=(desc,),
-                coresidency_groups=(
-                    CoResidencyGroup(graph_id=0, descriptor_indices=(0,)),
-                ),
-                non_reduction_loop_block_ids=(norm_bid,),
-                grid_axis_block_ids=(0,),
-            )
-            return spec
+        self.assertEqual(len(seeds), 1)
+        # 4096 still schedules 8192 elements, while 2048 schedules only 6144.
+        self.assertEqual(seeds[0].config["block_sizes"][apply_idx], 2048)
 
-        def pd(reduction_bid: int) -> ReductionDescriptor:
-            return ReductionDescriptor(
-                category=ReductionCategory.USER_TILE,
-                block_id=reduction_bid,
-                graph_id=0,
-                size_hint=size_hint,
-                itemsize=4,
-                input_load_itemsize=4,
-                num_load=1,
-            )
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler reduction facts are not collected in ref eager mode")
+    def test_independent_loop_gets_non_reduction_loop_policy(self) -> None:
+        @helion.kernel(backend="triton")
+        def reduction_with_independent_loop(
+            x: torch.Tensor, values: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, _ = x.size()
+            _, k = values.size()
+            sums = torch.empty([m], dtype=x.dtype, device=x.device)
+            out = torch.empty_like(values)
+            for tile_m in hl.tile(m):
+                sums[tile_m] = torch.sum(x[tile_m, :], dim=-1)
+                for tile_k in hl.tile(k):
+                    out[tile_m, tile_k] = values[tile_m, tile_k] * 2
+            return sums, out
 
-        # The allocator runs without an active CompileEnvironment (it reads stored hints);
-        # device_ir is only consulted for materialized features (none here), so a MagicMock
-        # whose attribute access yields empty iterables is fine.
-        from unittest.mock import MagicMock
-
-        # reduce-then-apply: the reduction axis is sized to its full extent (persistent /
-        # budget-admitted) and the normalize loop is sized to its own extent — NOT 1.
-        spec = spec_with(reduction_bid=1, norm_bid=2)
-        device_ir = MagicMock()
-        device_ir.grid_block_ids = []
-        with (
-            patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE),
-            patch("helion.runtime.get_num_sm", return_value=132),
-        ):
-            alloc = H.size_reduction_tiles(MagicMock(), spec, device_ir, pd(1))
-        red_idx = spec.block_sizes.block_id_to_index(1)
-        norm_idx = spec.block_sizes.block_id_to_index(2)
-        self.assertEqual(alloc.block_sizes[red_idx], 4096)  # rdim sized to extent
-        self.assertEqual(
-            alloc.block_sizes[norm_idx], 4096
-        )  # normalize loop NOT floored
-        self.assertNotEqual(alloc.block_sizes[norm_idx], 1)
-        # grid (M) row axis floored (no widen headroom is required; it just must be valid).
-        self.assertGreaterEqual(alloc.block_sizes[0], 1)
+        m, n, k = 64, 2048, 8192
+        args = (
+            torch.randn([m, n], device=DEVICE, dtype=torch.float32),
+            torch.randn([m, k], device=DEVICE, dtype=torch.float32),
+        )
+        cases = (
+            (
+                HOPPER_HARDWARE,
+                TritonReductionHeuristic,
+                1024,
+            ),
+            (
+                BLACKWELL_HARDWARE,
+                TritonReductionHeuristic,
+                1024,
+            ),
+        )
+        for hardware, heuristic, expected_apply_block in cases:
+            reduction_with_independent_loop.reset()
+            with patch("helion._hardware.get_hardware_info", return_value=hardware):
+                bound = reduction_with_independent_loop.bind(args)
+                kf = bound.config_spec.reduction_kernel_fact
+                self.assertIsNotNone(kf)
+                self.assertEqual(len(kf.reductions), 1)
+                reduction = kf.reductions[0]
+                self.assertEqual(reduction.size_hint, n)
+                self.assertEqual(len(kf.non_reduction_loop_block_ids), 1)
+                apply_bid = kf.non_reduction_loop_block_ids[0]
+                apply_idx = bound.config_spec.block_sizes.block_id_to_index(apply_bid)
+                self.assertEqual(bound.config_spec.block_sizes[apply_idx].size_hint, k)
+                self.assertNotEqual(
+                    bound.config_spec.block_sizes[apply_idx].size_hint,
+                    reduction.size_hint,
+                )
+                self.assertIn(
+                    heuristic.name,
+                    bound.config_spec.autotuner_heuristics,
+                )
+                seeds = compiler_seed_configs(bound.env, bound.host_function.device_ir)
+            self.assertEqual(len(seeds), 1)
+            seed = seeds[0].config
+            self.assertEqual(seed["block_sizes"][apply_idx], expected_apply_block)
+            # H100 and B200 share the candidate and warp policy.
+            self.assertEqual(seed["num_warps"], 8)

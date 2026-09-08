@@ -48,11 +48,43 @@ if TYPE_CHECKING:
     from ..runtime import Config
     from .device_ir import GraphInfo
     from .host_function import HostFunction
-    from .loop_dependency_checker import LoopDependencyChecker
     from .pallas.compact_worklist import ResidentPrepHoist
     from .pallas.dma import DmaResources
     from .tile_strategy import DeviceLoopOrGridState
     from .type_info import TensorType
+
+
+def _flatten_starred_args(args: list[ast.expr]) -> list[ast.expr]:
+    """Expand ``f(*xs)`` into per-element nodes (``xs[0]``, ``xs[1]``, ...).
+
+    Type propagation flattens starred args the same way (see
+    `TypePropagation.visit_Call`), so host codegen must match it to keep the ast
+    args aligned with the proxy args of an API function.
+    """
+    from .type_info import SequenceType
+
+    if not any(isinstance(arg, ast.Starred) for arg in args):
+        return args
+    result: list[ast.expr] = []
+    for arg in args:
+        if not isinstance(arg, ast.Starred):
+            result.append(arg)
+            continue
+        value = arg.value
+        assert isinstance(value, ExtendedAST)
+        seq_type = value._type_info
+        assert isinstance(seq_type, SequenceType)
+        for i, element_type in enumerate(seq_type.unpack()):
+            result.append(
+                create(
+                    ast.Subscript,
+                    value=value,
+                    slice=create(ast.Constant, value=i, kind=None),
+                    ctx=ast.Load(),
+                    _type_info=element_type,
+                )
+            )
+    return result
 
 
 @dataclasses.dataclass(frozen=True)
@@ -216,10 +248,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             return loops[-1].strategy.mask_var(block_idx)
         return None
 
-    def _phase_checker(self, root_id: int) -> LoopDependencyChecker:
-        phase_idx = self.host_function.device_ir.phase_for_root(root_id)
-        return self.host_function.device_ir.phases[phase_idx].loop_dependency_checker
-
     def _compute_inter_loop_barriers(self) -> None:
         """Walk every codegen graph; for each pair of consecutive sibling
         ``_for_loop`` / ``_for_loop_step`` nodes, set ``needs_barrier_before``
@@ -274,19 +302,28 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
     def _compute_intra_loop_barriers(self) -> None:
         """Mark loads that read a tensor an earlier store in the same body wrote,
-        so the Triton ``load`` codegen emits a ``tl.debug_barrier()`` before them.
+        so the Triton ``load`` codegen emits a ``tl.debug_barrier()`` before them
+        (the CuTe ``load`` codegen emits ``cute.arch.sync_threads()``).
 
-        Gated on Triton for the same reason as ``_compute_inter_loop_barriers``:
+        TileIR is excluded for the same reason as ``_compute_inter_loop_barriers``:
         ``tl.debug_barrier()`` lowers to ``ttg.barrier`` which the TileIR pass
         pipeline does not legalize.
         """
         from .loop_dependency_checker import mark_intra_loop_raw_barriers
 
         env = CompileEnvironment.current()
-        if env.codegen_name != "triton" or env.backend.name == "tileir":
+        if env.backend.name != "cute" and (
+            env.codegen_name != "triton" or env.backend.name == "tileir"
+        ):
             return
         mark_intra_loop_raw_barriers(
-            self.codegen_graphs, self.host_function.device_ir.root_ids
+            self.codegen_graphs,
+            self.host_function.device_ir.root_ids,
+            # A CuTe SIMT branch condition can vary per thread, and the
+            # convergent ``sync_threads`` barrier deadlocks in a divergent
+            # branch.  Triton branches are uniform per program, so the
+            # barrier is always placeable there.
+            mark_in_divergent_control_flow=env.backend.name != "cute",
         )
 
     def _triton_global_barrier_tensor_names(self, names: frozenset[str]) -> set[str]:
@@ -1023,9 +1060,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             assert not node.orelse
 
             assert node._root_id is not None
-            # Loop dependency checks were already run during lowering; phase checker kept for symmetry/debug.
-            self._phase_checker(node._root_id)
-
             if len(self.host_function.device_ir.root_ids) == 1:
                 body = self.device_function.body
             else:
@@ -1065,8 +1099,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         assert isinstance(iter_node, ast.Call)
                         args = []
                         kwargs = {}
-                        for arg_node in iter_node.args:
-                            assert not isinstance(arg_node, ast.Starred)
+                        for arg_node in _flatten_starred_args(iter_node.args):
                             assert isinstance(arg_node, ExtendedAST)
                             assert arg_node._type_info is not None
                             args.append(arg_node._type_info.proxy())
@@ -1285,8 +1318,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             ast_kwargs = {}
             proxy_args = []
             proxy_kwargs = {}
-            for arg in node.args:
-                assert not isinstance(arg, ast.Starred)
+            for arg in _flatten_starred_args(node.args):
                 assert isinstance(arg, ExtendedAST)
                 assert arg._type_info is not None
                 ast_args.append(arg)
@@ -1339,10 +1371,16 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
     def host_dead_code_elimination(self) -> None:
         dce_vars: OrderedSet[str] = OrderedSet()
+        allow_compiler_shape_helpers = (
+            self.device_function.config.cross_loop_schedule == "static_pipeline"
+        )
         for stmt in self.host_statements:
             if (
                 isinstance(stmt, ast.Assign)
-                and definitely_does_not_have_side_effects(stmt.value)
+                and definitely_does_not_have_side_effects(
+                    stmt.value,
+                    allow_compiler_shape_helpers=allow_compiler_shape_helpers,
+                )
                 and all(isinstance(name, ast.Name) for name in stmt.targets)
             ):
                 for name in stmt.targets:
@@ -1409,7 +1447,17 @@ def generate_ast(
             load_transform=load_transform,
             extra_params=extra_params,
         )
-        with codegen.device_function:
+        fast_math_cm: contextlib.AbstractContextManager[None] = contextlib.nullcontext()
+        if env.backend_name == "cute" and env.settings.fast_math:
+            # Route the global ``fast_math`` setting into the inductor
+            # CuteDSL op overrides: every cute.math call in this codegen
+            # gets ``fastmath=True``.
+            from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import (
+                use_cutedsl_fast_math,
+            )
+
+            fast_math_cm = use_cutedsl_fast_math(True)
+        with codegen.device_function, fast_math_cm:
             CompileEnvironment.current().backend.pre_codegen(
                 graphs=codegen.codegen_graphs,
                 config=config,

@@ -239,6 +239,7 @@ def reduce_3d_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
         lhs_shape=lhs_shape,
         rhs_shape=rhs_shape,
         acc_shape=acc_shape,
+        lhs_fx_node=lhs_node,
     )
 
 

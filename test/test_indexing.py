@@ -2031,9 +2031,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
 
-    @skipIfNormalMode(
-        "RankMismatch: Expected ndim=2, but got ndim=1 - tensor value assignment shape mismatch"
-    )
     def test_tensor_value(self):
         """Test both setter from tensor value and getter for [i]"""
 
@@ -2059,6 +2056,24 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected_dst = val.expand(N, -1)
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
+
+    def test_tensor_value_3d(self):
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(dst: torch.Tensor, val: torch.Tensor) -> torch.Tensor:
+            N = dst.shape[0]
+            for i in hl.grid(N):
+                dst[i] = val
+            return dst
+
+        N = 8
+        dst = torch.zeros([N, 3, 4], device=DEVICE)
+        val = torch.ones([3, 4], device=DEVICE)
+
+        result = kernel(dst, val)
+
+        expected = val.expand(N, -1, -1)
+        torch.testing.assert_close(result, expected)
 
     def test_slice_to_slice(self):
         """buf[:] = zeros[:] - Full slice to slice assignment"""
@@ -2126,12 +2141,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         result = kernel(src, dst)
         torch.testing.assert_close(result, src[:, :13])
 
-    # NOTE: concat and unaligned_multi use multiple differently-sized
-    # partial slices in one kernel.  CuTe's thread axis assignment
-    # collides when two reduction blocks of different sizes map to the
-    # same axis.  Triton-only until the CuTe thread mapping is fixed.
-
-    @xfailIfCute("CuTe thread axis collision with differently-sized reduction blocks")
     @xfailIfPallas("slice-based stores not yet supported")
     def test_partial_slice_unaligned_multi(self):
         """Test multiple non-power-of-2 slices in one kernel"""
@@ -2156,7 +2165,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(dst_result, expected_dst)
         torch.testing.assert_close(out_result, src[:, :13])
 
-    @xfailIfCute("CuTe thread axis collision with differently-sized reduction blocks")
     @xfailIfPallas("slice-based stores not yet supported")
     def test_partial_slice_concat(self):
         """Test concat via full-slice load + partial-slice store"""

@@ -88,6 +88,22 @@ class PatternSearch(PopulationBasedSearch):
         self.compile_timeout_lower_bound = compile_timeout_lower_bound
         self.compile_timeout_quantile = compile_timeout_quantile
 
+    def _algorithm_cache_policy(self) -> dict[str, object]:
+        return {
+            # 2: ListOf.pattern_neighbors also proposes uniform lists.
+            "pattern_version": 2,
+            "initial_population": self.initial_population,
+            "copies": self.copies,
+            "max_generations": self.max_generations,
+            "min_improvement_delta": self.min_improvement_delta,
+            "initial_population_strategy": self.initial_population_strategy,
+            "best_available_pad_random": self.best_available_pad_random,
+            "num_neighbors_cap": self.num_neighbors_cap,
+            "finishing_rounds": self.finishing_rounds,
+            "compile_timeout_lower_bound": self.compile_timeout_lower_bound,
+            "compile_timeout_quantile": self.compile_timeout_quantile,
+        }
+
     @classmethod
     def get_kwargs_from_profile(
         cls, profile: AutotuneEffortProfile, settings: Settings
@@ -122,20 +138,113 @@ class PatternSearch(PopulationBasedSearch):
             == InitialPopulationStrategy.FROM_BEST_AVAILABLE
         ):
             pop = self._generate_best_available_population_flat()
-            if self.best_available_pad_random:
-                if self.config_gen.config_spec.cute_flash_search_enabled:
-                    pop = self._pad_initial_population_with_unique_random(
-                        pop, self.initial_population
+            if self.config_gen.config_spec.cute_flash_search_enabled:
+                design = self.config_gen.flash_deterministic_population_configs()
+                population_target = max(0, self.initial_population)
+                budget = min(
+                    population_target,
+                    self.config_gen.flash_structural_population_budget(
+                        population_target
+                    ),
+                    len(design),
+                )
+                qualification_count = min(
+                    budget,
+                    self.config_gen.flash_structural_qualification_prefix_count(),
+                )
+                pinned: list[FlatConfig] = []
+                optional: list[FlatConfig] = []
+                pinned_configs = self._pinned_finalist_configs
+                for flat in pop:
+                    try:
+                        canonical_flat, config = self.config_gen.canonicalize_flat(flat)
+                    except exc.InvalidConfig:
+                        continue
+                    (pinned if config in pinned_configs else optional).append(
+                        canonical_flat
                     )
+
+                # Structural qualification, pinned seeds/defaults, and a bounded
+                # exact space are required. Canonicalize and deduplicate them
+                # before limiting optional cache rows, so an alias cannot consume
+                # a nominal slot.
+                required = [
+                    *(
+                        self.config_gen.flatten(config)
+                        for config in design[:qualification_count]
+                    ),
+                    *pinned,
+                    *(
+                        self.config_gen.flatten(config)
+                        for config in design[qualification_count:budget]
+                    ),
+                ]
+                exact_space = None
+                if population_target > 0:
+                    exact_space = (
+                        self.config_gen.flash_exact_effective_search_space_configs(
+                            population_target
+                        )
+                    )
+                    if exact_space is not None:
+                        required.extend(
+                            self.config_gen.flatten(config) for config in exact_space
+                        )
+                ordered: list[FlatConfig] = []
+                seen: set[Config] = set()
+
+                def append_unique(flat: FlatConfig) -> None:
+                    try:
+                        canonical_flat, config = self.config_gen.canonicalize_flat(flat)
+                    except exc.InvalidConfig:
+                        return
+                    if config in seen:
+                        return
+                    seen.add(config)
+                    ordered.append(canonical_flat)
+
+                for flat in required:
+                    append_unique(flat)
+                if population_target <= 0:
+                    for flat in optional:
+                        append_unique(flat)
                 else:
-                    n_random = max(0, self.initial_population - len(pop))
-                    pop.extend(self.config_gen.random_flat() for _ in range(n_random))
+                    for flat in optional:
+                        if len(ordered) >= population_target:
+                            break
+                        append_unique(flat)
+                if self.best_available_pad_random and exact_space is None:
+                    return self._pad_initial_population_with_unique_random(
+                        ordered, population_target
+                    )
+                return ordered
+            if self.best_available_pad_random:
+                n_random = max(0, self.initial_population - len(pop))
+                pop.extend(self.config_gen.random_flat() for _ in range(n_random))
             return pop
-        return self.config_gen.random_population_flat(
+        population = self.config_gen.random_population_flat(
             self.initial_population,
             user_seed_configs=self._autotune_seed_configs(),
             log_func=self.log,
         )
+        # Pin the seed/default configs into final verification (mirroring the
+        # FROM_BEST_AVAILABLE path): a seed's single in-search reading is often
+        # burst-inflated, and without the pin a 2-6% real winner dies to a
+        # noisy rival before the steady final rebenchmark can arbitrate.
+        pinned_seed_configs = [
+            config
+            for _flat, config in (
+                *self.config_gen.user_seed_flat_config_pairs(
+                    self._autotune_seed_configs()
+                ),
+                *self.config_gen.seed_flat_config_pairs(),
+            )
+        ]
+        pinned_seed_configs.append(
+            self.config_gen.unflatten(self.config_gen.default_flat())
+        )
+        self.pin_finalist_configs(pinned_seed_configs)
+        return population
 
     def _autotune(self) -> Config:
         initial_population_name = self.initial_population_strategy.name

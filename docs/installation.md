@@ -61,14 +61,14 @@ source .venv/bin/activate
 
 ### 2. Install PyTorch
 
-Install PyTorch 2.9 or later:
+Helion supports PyTorch 2.9 or later. To install the current stable release:
 
 ```bash
-# CUDA 12.8
-pip install "torch==2.9.*" --index-url https://download.pytorch.org/whl/cu128
+# CUDA 13.0
+pip install "torch==2.13.*" --index-url https://download.pytorch.org/whl/cu130
 
-# ROCm 7.0
-pip install "torch==2.9.*" --index-url https://download.pytorch.org/whl/rocm7.0
+# ROCm 7.2
+pip install "torch==2.13.*" --index-url https://download.pytorch.org/whl/rocm7.2
 ```
 see [PyTorch installation instructions](https://pytorch.org/get-started/locally/) for other options.
 

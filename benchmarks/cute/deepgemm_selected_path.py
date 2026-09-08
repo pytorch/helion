@@ -10,34 +10,35 @@ import importlib
 import json
 import os
 from pathlib import Path
-import random
 import statistics
 import subprocess
 import sys
 import tempfile
 import time
 from typing import Any
-from typing import NamedTuple
 from typing import Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from benchmarks.cute.grouped_gemm_workloads import DEEPGEMM_COMMIT
+from benchmarks.cute.grouped_gemm_workloads import DEEPGEMM_CUTLASS_COMMIT
+from benchmarks.cute.grouped_gemm_workloads import DEEPGEMM_M_ALIGNMENT as M_ALIGNMENT
+from benchmarks.cute.grouped_gemm_workloads import OFFICIAL_SHAPES
+from benchmarks.cute.grouped_gemm_workloads import OfficialShape
+from benchmarks.cute.grouped_gemm_workloads import official_actual_ms
 import torch
 
 import helion
 import helion.language as hl
 import helion.runtime as helion_runtime
 
+# Pin the historical DeepGEMM-selected BK64 schedule. This benchmark must not
+# silently change when compiler defaults evolve.
 DEEPGEMM_SELECTED_TILE_M = 256
 DEEPGEMM_SELECTED_TILE_N = 128
 DEEPGEMM_SELECTED_TILE_K = 64
-# Pin the historical DeepGEMM-selected BK64 schedule.  This benchmark must not
-# silently change when compiler defaults evolve.
-M_ALIGNMENT = 224
-DEEPGEMM_COMMIT = "559d79fb6994a58b8a15b4b93bf13ccc16edf247"
-DEEPGEMM_CUTLASS_COMMIT = "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8"
 DEFAULT_L2_FLUSH_BYTES = 8_000_000_000
 CACHE_DIRS = {
     "CUDA_CACHE_PATH": "cuda",
@@ -49,26 +50,6 @@ CACHE_DIRS = {
     "TORCH_EXTENSIONS_DIR": "torch_extensions",
     "XDG_CACHE_HOME": "xdg",
 }
-
-
-class OfficialShape(NamedTuple):
-    row_index: int
-    groups: int
-    expected_m_per_group: int
-    n: int
-    k: int
-
-
-OFFICIAL_SHAPES = (
-    OfficialShape(0, 4, 8192, 6144, 7168),
-    OfficialShape(1, 4, 8192, 7168, 3072),
-    OfficialShape(2, 4, 8192, 4096, 4096),
-    OfficialShape(3, 4, 8192, 4096, 2048),
-    OfficialShape(4, 8, 4096, 6144, 7168),
-    OfficialShape(5, 8, 4096, 7168, 3072),
-    OfficialShape(6, 8, 4096, 4096, 4096),
-    OfficialShape(7, 8, 4096, 4096, 2048),
-)
 
 
 def align(value: int, alignment: int) -> int:
@@ -99,17 +80,6 @@ def parse_rows(value: str) -> list[int]:
         )
         raise argparse.ArgumentTypeError(message)
     return result
-
-
-def official_actual_ms(seed: int = 0) -> tuple[tuple[int, ...], ...]:
-    rng = random.Random(seed)
-    return tuple(
-        tuple(
-            int(shape.expected_m_per_group * rng.uniform(0.7, 1.3))
-            for _ in range(shape.groups)
-        )
-        for shape in OFFICIAL_SHAPES
-    )
 
 
 def selected_key(

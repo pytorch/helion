@@ -609,6 +609,26 @@ class TestMetalLargeBlock(unittest.TestCase):
         y = torch.randn(3000, device=DEVICE)
         torch.testing.assert_close(large_block_add(x, y), x + y)
 
+    def test_thread_budget_error_names_metal(self) -> None:
+        """The shared thread-budget check must not blame the CuTe backend.
+
+        Metal runs CuTe's loop-strategy planner, so before this was fixed a Mac
+        user who over-subscribed a threadgroup was told their *cute* kernel had
+        too large a thread block.
+        """
+        x = torch.randn(4096, device=DEVICE)
+        y = torch.randn(4096, device=DEVICE)
+        kernel = helion.kernel(
+            large_block_add.fn,
+            backend="metal",
+            configs=[helion.Config(block_sizes=[2048], num_threads=[4096])],
+        )
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, r"thread block too large for metal kernel"
+        ) as caught:
+            kernel(x, y)
+        self.assertNotIn("cute", str(caught.exception))
+
     def test_codegen_lane_loop(self) -> None:
         """Generated MSL must contain a for loop when block_size > 1024."""
         x = torch.randn(4096, device=DEVICE)

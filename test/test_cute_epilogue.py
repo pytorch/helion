@@ -16,6 +16,7 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._testing import DEVICE
 from helion._testing import patch_cute_mma_support
+from helion._testing import skipUnlessBackends
 import helion.language as hl
 
 
@@ -191,6 +192,7 @@ class TestCuteEpilogue(unittest.TestCase):
                 "",
             )
 
+    @skipUnlessBackends(["cute"])
     def test_tcgen05_fused_auxiliary_product_codegen(self) -> None:
         """An explicitly grouped pair of scale loads stays one epilogue step."""
 
@@ -236,6 +238,7 @@ class TestCuteEpilogue(unittest.TestCase):
         acc_pos = code.index("tcgen05_acc_loaded", loop_pos)
         self.assertLess(product_pos, acc_pos)
 
+    @skipUnlessBackends(["cute"])
     def test_tcgen05_fused_reused_auxiliary_load_codegen(self) -> None:
         """Repeated uses of one FX load retain distinct leaf-to-local bindings."""
 
@@ -283,6 +286,7 @@ class TestCuteEpilogue(unittest.TestCase):
         self.assertIn("tcgen05_aux_loaded_0", chain_lines[0])
         self.assertIn("tcgen05_aux_loaded_1", chain_lines[1])
 
+    @skipUnlessBackends(["cute"])
     def test_tcgen05_fused_auxiliary_unary_expr_codegen(self) -> None:
         """Whitelisted unary ops can consume a grouped auxiliary expression."""
 
@@ -384,6 +388,7 @@ class TestCuteEpilogue(unittest.TestCase):
             with self.assertRaises(exc.BackendUnsupported):
                 int_scalar_bound.to_triton_code(int_scalar_cfg)
 
+    @skipUnlessBackends(["cute"])
     def test_tcgen05_bm256_broadcast_scales_reuse_auxiliary_loads(self) -> None:
         """The four-CTA full-tile epilogue reuses both broadcast scales."""
 
@@ -445,19 +450,20 @@ class TestCuteEpilogue(unittest.TestCase):
             "cutlass.Int32(32), None].iterator",
             code,
         )
-        scalar_assignment = next(
-            line.strip()
-            for line in code.splitlines()
-            if "tcgen05_colvec_scalar_full" in line and " = " in line
+        scalar_hoist = (
+            "tcgen05_colvec_scalar_full_0 = tcgen05_tTR_gAux_grouped_0[0, 0, 0, 0]"
         )
-        self.assertIn("tcgen05_tTR_gAux_grouped_0[0, 0, 0, 0]", scalar_assignment)
-        scalar_name = scalar_assignment.split(" = ", 1)[0]
-        scalar_pos = code.index(scalar_assignment)
-        loop_pos = code.index("for _tcgen05_subtile in cutlass.range", scalar_pos)
-        scalar_use_pos = code.index(f"tcgen05_aux_loaded_0 = {scalar_name}", loop_pos)
+        self.assertIn(scalar_hoist, code)
+        scalar_read = "tcgen05_aux_loaded_0 = tcgen05_colvec_scalar_full_0"
+        self.assertIn(scalar_read, code)
+        self.assertNotIn(
+            "tcgen05_aux_loaded_0 = tcgen05_tTR_gAux_grouped_0.load()", code
+        )
+        loop_pos = code.index("for _tcgen05_subtile in cutlass.range")
+        self.assertLess(code.index(scalar_hoist), loop_pos)
+        scalar_use_pos = code.index(scalar_read, loop_pos)
         product_pos = code.index("tcgen05_aux_product", scalar_use_pos)
         wait_pos = code.index("tcgen05_acc_pipeline.consumer_wait", loop_pos)
-        self.assertLess(scalar_pos, loop_pos)
         self.assertLess(scalar_use_pos, product_pos)
         self.assertLess(product_pos, wait_pos)
         self.assertNotIn("tcgen05_aux_rowvec_pred_1", code)

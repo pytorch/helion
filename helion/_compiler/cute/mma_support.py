@@ -12,6 +12,7 @@ class CuteMmaSupport:
     warpgroup_f16bf16: bool
     tcgen05_f16bf16: bool
     tcgen05_f8: bool = False
+    tcgen05_tf32: bool = False
 
     @property
     def supported_impls(self) -> tuple[str, ...]:
@@ -92,6 +93,26 @@ def _probe_tcgen05_f16bf16() -> bool:
         return False
 
 
+def _probe_tcgen05_tf32() -> bool:
+    try:
+        from cutlass.cute.nvgpu import OperandMajorMode
+        from cutlass.cute.nvgpu import tcgen05
+
+        # fp32 operands run on tcgen05 as tf32 with MMA-K=8 (256 bits of K per
+        # instruction / 32-bit operands). The op takes no a/acc dtype args:
+        # tf32 in, f32 accumulate is the only shape.
+        tcgen05.MmaTF32Op(
+            (128, 8, 8),
+            tcgen05.CtaGroup.ONE,
+            tcgen05.OperandSource.SMEM,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+        )
+        return True
+    except Exception:
+        return False
+
+
 def _probe_tcgen05_f8() -> tuple[bool, str | None]:
     try:
         import cutlass
@@ -123,6 +144,7 @@ def get_cute_mma_support() -> CuteMmaSupport:
             warpgroup_f16bf16=False,
             tcgen05_f16bf16=False,
             tcgen05_f8=False,
+            tcgen05_tf32=False,
         )
 
     cutlass_arch = _current_cutlass_arch_name()
@@ -136,4 +158,38 @@ def get_cute_mma_support() -> CuteMmaSupport:
         warpgroup_f16bf16=_probe_warpgroup_f16bf16(),
         tcgen05_f16bf16=_probe_tcgen05_f16bf16(),
         tcgen05_f8=tcgen05_f8_ok,
+        tcgen05_tf32=_probe_tcgen05_tf32(),
     )
+
+
+def tcgen05_supports_input_dtype(
+    support: CuteMmaSupport, input_dtype: torch.dtype
+) -> bool:
+    """Per-dtype tcgen05 capability lookup.
+
+    A free function (not a CuteMmaSupport method) so callers keep working with
+    the duck-typed SimpleNamespace doubles tests patch in for
+    ``get_cute_mma_support``; those predate the tf32 field, hence the getattr
+    default.
+    """
+    if input_dtype == torch.float8_e4m3fn:
+        return support.tcgen05_f8
+    if input_dtype == torch.float32:
+        return getattr(support, "tcgen05_tf32", False)
+    return support.tcgen05_f16bf16
+
+
+def cute_fp32_dot_uses_tf32() -> bool:
+    """Whether fp32 matmul operands may be computed as tf32 on tensor cores.
+
+    Helion's default ``settings.dot_precision`` maps to ``"tf32"`` (matching
+    triton's ``tl.dot`` default), which permits the tcgen05 tf32 MMA path for
+    fp32 inputs. ``"ieee"``/``"tf32x3"`` keep fp32 matmuls on the exact SIMT /
+    universal-FMA lowerings.
+    """
+    from ..compile_environment import CompileEnvironment
+
+    if not CompileEnvironment.has_current():
+        return False
+    env = CompileEnvironment.current()
+    return env.backend.map_dot_precision(env.settings.dot_precision) == "tf32"

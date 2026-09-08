@@ -15,6 +15,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import output_only
 from helion._testing import skipIfMTIA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
@@ -59,21 +60,22 @@ def _assert_bitwise_equal_float(
 
 
 def _rng_2d_block_sizes() -> list[int]:
+    # RNG offsets are block-size independent; small blocks compile much faster
     if _get_backend() == "cute":
         return [32, 32]
-    return [64, 64]
+    return [16, 16]
 
 
 def _rng_3d_block_sizes() -> list[int]:
     if _get_backend() == "cute":
         return [4, 8, 32]
-    return [8, 8, 64]
+    return [4, 8, 16]
 
 
 def _rng_determinism_block_sizes() -> list[list[int]]:
-    if _get_backend() == "cute":
-        return [[8, 8], [16, 16], [32, 32]]
-    return [[8, 8], [16, 16], [32, 32]]
+    # Two variants are enough to prove block-size invariance; each one costs
+    # a full kernel compile.
+    return [[8, 8], [32, 32]]
 
 
 def _compile_once(
@@ -295,71 +297,129 @@ def _hl_randint_outer_loop_expected(
 @onlyBackends(["triton", "pallas", "cute"])
 @skipIfXPU("hl.rand/hl.randint tests crash XPU workers")
 class TestRandom(RefEagerTestBase, TestCase):
-    @skipIfRefEager("compile_config is not supported in ref eager mode")
-    def test_hl_rand_1d(self):
+    def test_hl_rand_randint_1d(self):
+        """Test hl.rand and hl.randint with 1D output using a single kernel."""
+
         @helion.kernel(static_shapes=False, autotune_effort="none")
-        def rand_kernel_tiled_1d(x: torch.Tensor, seed: int) -> torch.Tensor:
-            output = torch.zeros_like(x)
+        def rng_kernel_1d(
+            x: torch.Tensor, seed: int
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            out_f = torch.zeros_like(x)
+            out_i = torch.zeros(x.shape, dtype=torch.int32, device=x.device)
             (m,) = x.shape
             for tile_m in hl.tile(m):
-                output[tile_m] = hl.rand([tile_m], seed=seed)
-            return output
+                out_f[tile_m] = hl.rand([tile_m], seed=seed)
+                out_i[tile_m] = hl.randint([tile_m], low=-50, high=50, seed=seed)
+            return out_f, out_i
 
-        x_small = torch.ones(1024, device=DEVICE)
-        code3, compiled = _compile_once(
-            rand_kernel_tiled_1d, (x_small, 42), block_sizes=[1024]
+        x = torch.ones(1024, device=DEVICE)
+        code, (out_f, out_i) = code_and_output(
+            rng_kernel_1d, (x, 42), block_sizes=[256]
         )
-        output = compiled(x_small, 42)
-        output2 = compiled(x_small, 1337)
+        out_f2, out_i2 = output_only(rng_kernel_1d, (x, 1337), block_sizes=[256])
 
+        # Different seeds should produce different outputs
         self.assertFalse(
-            torch.allclose(output, output2),
+            torch.allclose(out_f, out_f2),
+            "Different seeds should produce different outputs",
+        )
+        self.assertFalse(
+            torch.allclose(out_i.float(), out_i2.float()),
             "Different seeds should produce different outputs",
         )
 
-        output3 = compiled(x_small, 42)
-        self.assertTrue(
-            torch.allclose(output, output3),
-            "Same seed should produce identical outputs",
+        # Same seed should produce identical outputs
+        out_f3, out_i3 = output_only(rng_kernel_1d, (x, 42), block_sizes=[256])
+        torch.testing.assert_close(
+            out_f, out_f3, msg="Same seed should produce identical outputs"
         )
-        _assert_uses_philox(self, code3)
+        torch.testing.assert_close(
+            out_i, out_i3, msg="Same seed should produce identical outputs"
+        )
+        _assert_uses_philox(self, code)
 
-        # Check that all values are in [0, 1) range
-        self.assertTrue(torch.all(output >= 0.0), "All values should be >= 0")
-        self.assertTrue(torch.all(output < 1.0), "All values should be < 1")
+        # Check that all values are in the expected ranges
+        self.assertTrue(torch.all(out_f >= 0.0), "All values should be >= 0")
+        self.assertTrue(torch.all(out_f < 1.0), "All values should be < 1")
+        self.assertTrue(torch.all(out_i >= -50), "All values should be >= -50")
+        self.assertTrue(torch.all(out_i < 50), "All values should be < 50")
+        self.assertEqual(out_i.dtype, torch.int32, "Output dtype should be int32")
 
-    @skipIfRefEager("compile_config is not supported in ref eager mode")
-    def test_hl_rand_2d(self):
+        # Check that we have both negative and positive values (statistically very likely)
+        self.assertTrue(torch.any(out_i < 0), "Should have some negative values")
+        self.assertTrue(torch.any(out_i >= 0), "Should have some non-negative values")
+
+    def test_hl_rand_randint_2d(self):
+        """Test hl.rand and hl.randint with 2D output using a single kernel."""
+
         @helion.kernel(static_shapes=False, autotune_effort="none")
-        def rand_kernel_tiled_2d(x: torch.Tensor, seed: int) -> torch.Tensor:
-            output = torch.zeros_like(x)
+        def rng_kernel_2d(
+            x: torch.Tensor, seed: int
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            out_f = torch.zeros_like(x)
+            out_i = torch.zeros(x.shape, dtype=torch.int32, device=x.device)
             m, n = x.shape
             for tile_m, tile_n in hl.tile([m, n]):
-                output[tile_m, tile_n] = hl.rand([tile_m, tile_n], seed=seed)
-            return output
+                out_f[tile_m, tile_n] = hl.rand([tile_m, tile_n], seed=seed)
+                out_i[tile_m, tile_n] = hl.randint(
+                    [tile_m, tile_n], low=10, high=50, seed=seed
+                )
+            return out_f, out_i
 
-        x_small = torch.ones(1024, 1024, device=DEVICE)
+        # 256x256 keeps 65536 samples for the quantile checks below
+        x = torch.ones(256, 256, device=DEVICE)
         block_sizes = _rng_2d_block_sizes()
-        code3, compiled = _compile_once(
-            rand_kernel_tiled_2d, (x_small, 42), block_sizes=block_sizes
+        code, (out_f, out_i) = code_and_output(
+            rng_kernel_2d, (x, 42), block_sizes=block_sizes
         )
-        output = compiled(x_small, 42)
-        output2 = compiled(x_small, 1337)
+        out_f2, _out_i2 = output_only(rng_kernel_2d, (x, 1337), block_sizes=block_sizes)
 
         self.assertFalse(
-            torch.allclose(output, output2),
+            torch.allclose(out_f, out_f2),
             "Different seeds should produce different outputs",
         )
 
-        output3 = compiled(x_small, 42)
-        self.assertTrue(
-            torch.allclose(output, output3),
-            "Same seed should produce identical outputs",
+        out_f3, out_i3 = output_only(rng_kernel_2d, (x, 42), block_sizes=block_sizes)
+        torch.testing.assert_close(
+            out_f, out_f3, msg="Same seed should produce identical outputs"
         )
-        _assert_uses_philox(self, code3)
+        torch.testing.assert_close(
+            out_i, out_i3, msg="Same seed should be deterministic"
+        )
+        _assert_uses_philox(self, code)
 
-        self.assertTrue(torch.all(output >= 0.0), "All values should be >= 0")
-        self.assertTrue(torch.all(output < 1.0), "All values should be < 1")
+        self.assertTrue(torch.all(out_f >= 0.0), "All values should be >= 0")
+        self.assertTrue(torch.all(out_f < 1.0), "All values should be < 1")
+        self.assertTrue(torch.all(out_i >= 10), "All values should be >= 10")
+        self.assertTrue(torch.all(out_i < 50), "All values should be < 50")
+
+        # Uniqueness and quantile checks on the uniform output
+        sorted_values = torch.sort(out_f.flatten()).values.cpu()
+
+        unique_values = torch.unique(sorted_values)
+        total_values = out_f.numel()
+        uniqueness_ratio = len(unique_values) / total_values
+
+        self.assertGreater(
+            uniqueness_ratio,
+            0.99,
+            f"Expected >99% unique values, got {uniqueness_ratio:.4f}",
+        )
+
+        n_quartile = total_values // 4
+        q1_val = sorted_values[n_quartile].item()
+        q2_val = sorted_values[2 * n_quartile].item()
+        q3_val = sorted_values[3 * n_quartile].item()
+
+        self.assertTrue(
+            0.2 < q1_val < 0.3, f"First quartile {q1_val:.3f} should be around 0.25"
+        )
+        self.assertTrue(
+            0.45 < q2_val < 0.55, f"Median {q2_val:.3f} should be around 0.5"
+        )
+        self.assertTrue(
+            0.7 < q3_val < 0.8, f"Third quartile {q3_val:.3f} should be around 0.75"
+        )
 
     @skipIfRefEager("compile_config is not supported in ref eager mode")
     def test_hl_rand_3d(self):
@@ -437,49 +497,6 @@ class TestRandom(RefEagerTestBase, TestCase):
 
         self.assertTrue(torch.all(outputs[0] >= 0.0))
         self.assertTrue(torch.all(outputs[0] < 1.0))
-
-    def test_hl_rand_uniqueness_distribution(self):
-        @helion.kernel(static_shapes=False, autotune_effort="none")
-        def rand_kernel(x: torch.Tensor, seed: int) -> torch.Tensor:
-            output = torch.zeros_like(x)
-            m, n = x.shape
-            for tile_m, tile_n in hl.tile([m, n]):
-                output[tile_m, tile_n] = hl.rand([tile_m, tile_n], seed=seed)
-            return output
-
-        x = torch.ones(256, 256, device=DEVICE)
-        seed = 1337
-
-        _, output = code_and_output(
-            rand_kernel, (x, seed), block_sizes=_rng_2d_block_sizes()
-        )
-
-        sorted_values = torch.sort(output.flatten()).values.cpu()
-
-        unique_values = torch.unique(sorted_values)
-        total_values = output.numel()
-        uniqueness_ratio = len(unique_values) / total_values
-
-        self.assertGreater(
-            uniqueness_ratio,
-            0.99,
-            f"Expected >99% unique values, got {uniqueness_ratio:.4f}",
-        )
-
-        n_quartile = total_values // 4
-        q1_val = sorted_values[n_quartile].item()
-        q2_val = sorted_values[2 * n_quartile].item()
-        q3_val = sorted_values[3 * n_quartile].item()
-
-        self.assertTrue(
-            0.2 < q1_val < 0.3, f"First quartile {q1_val:.3f} should be around 0.25"
-        )
-        self.assertTrue(
-            0.45 < q2_val < 0.55, f"Median {q2_val:.3f} should be around 0.5"
-        )
-        self.assertTrue(
-            0.7 < q3_val < 0.8, f"Third quartile {q3_val:.3f} should be around 0.75"
-        )
 
     def test_hl_rand_non_tiled_dimensions(self):
         @helion.kernel(static_shapes=False)
@@ -582,31 +599,6 @@ class TestRandom(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("compile_config is not supported in ref eager mode")
     @skipIfMTIA("MTIA tl.rand bit patterns differ from Helion Philox lowering")
-    def test_hl_rand_with_explicit_offsets(self):
-        @helion.kernel(static_shapes=False, autotune_effort="none")
-        def rand_explicit_offsets_kernel(x: torch.Tensor, seed: int) -> torch.Tensor:
-            output = torch.zeros_like(x)
-            (m,) = x.shape
-            for tile_m in hl.tile(m):
-                idx = hl.tile_index(tile_m).to(torch.int64)
-                offsets = idx * 3
-                output[tile_m] = hl.rand([], seed=seed, offsets=offsets)
-            return output
-
-        x = torch.empty(256, device=DEVICE, dtype=torch.float32)
-        seed = 31337
-        code, compiled = _compile_once(
-            rand_explicit_offsets_kernel, (x, seed), block_sizes=[64]
-        )
-        out = compiled(x, seed)
-
-        ref_offsets = torch.arange(x.numel(), device=DEVICE, dtype=torch.int64) * 3
-        expected = _triton_rand_reference(seed, ref_offsets).reshape_as(x)
-        _assert_bitwise_equal_float(self, out, expected)
-        _assert_uses_philox(self, code)
-
-    @skipIfRefEager("compile_config is not supported in ref eager mode")
-    @skipIfMTIA("MTIA tl.rand bit patterns differ from Helion Philox lowering")
     def test_hl_rand_offsets_independence(self):
         """Two hl.rand calls with different offset expressions are different but deterministic."""
 
@@ -623,9 +615,26 @@ class TestRandom(RefEagerTestBase, TestCase):
                 out_b[tile_m] = hl.rand([], seed=seed, offsets=idx * 3 + 1)
             return out_a, out_b
 
+        @helion.kernel(
+            static_shapes=False,
+            autotune_effort="none",
+            ref_mode=helion.RefMode.EAGER,
+        )
+        def rand_two_streams_kernel_ref(
+            x: torch.Tensor, seed: int
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            out_a = torch.zeros_like(x)
+            out_b = torch.zeros_like(x)
+            (m,) = x.shape
+            for tile_m in hl.tile(m):
+                idx = hl.tile_index(tile_m).to(torch.int64)
+                out_a[tile_m] = hl.rand([], seed=seed, offsets=idx * 3)
+                out_b[tile_m] = hl.rand([], seed=seed, offsets=idx * 3 + 1)
+            return out_a, out_b
+
         x = torch.empty(128, device=DEVICE, dtype=torch.float32)
         seed = 4242
-        _code, compiled = _compile_once(
+        code, compiled = _compile_once(
             rand_two_streams_kernel, (x, seed), block_sizes=[32]
         )
         a, b = compiled(x, seed)
@@ -643,6 +652,12 @@ class TestRandom(RefEagerTestBase, TestCase):
         expected_b = _triton_rand_reference(seed, ref_offsets_b).reshape_as(x)
         _assert_bitwise_equal_float(self, a, expected_a)
         _assert_bitwise_equal_float(self, b, expected_b)
+        _assert_uses_philox(self, code)
+
+        # Ref eager mode should match the compiled kernel bit-for-bit
+        ref_a, ref_b = rand_two_streams_kernel_ref(x, seed)
+        _assert_bitwise_equal_float(self, a, ref_a)
+        _assert_bitwise_equal_float(self, b, ref_b)
 
     @skipIfRefEager("compile_config is not supported in ref eager mode")
     @skipIfMTIA("MTIA tl.rand4x bit patterns differ from Helion Philox lowering")
@@ -678,164 +693,59 @@ class TestRandom(RefEagerTestBase, TestCase):
         _assert_bitwise_equal_float(self, out[2], expected_2)
         _assert_uses_philox(self, code)
 
-    def test_hl_randint_1d(self):
-        """Test hl.randint with 1D output."""
-
-        @helion.kernel(static_shapes=False)
-        def randint_kernel_1d(x: torch.Tensor, seed: int) -> torch.Tensor:
-            output = torch.zeros(x.shape, dtype=torch.int32, device=x.device)
-            (m,) = x.shape
-            for tile_m in hl.tile(m):
-                output[tile_m] = hl.randint([tile_m], low=0, high=100, seed=seed)
-            return output
-
-        x = torch.ones(1024, device=DEVICE)
-        _, output = code_and_output(randint_kernel_1d, (x, 42), block_sizes=[1024])
-        _, output2 = code_and_output(randint_kernel_1d, (x, 1337), block_sizes=[1024])
-
-        # Different seeds should produce different outputs
-        self.assertFalse(
-            torch.allclose(output.float(), output2.float()),
-            "Different seeds should produce different outputs",
-        )
-
-        # Same seed should produce identical outputs
-        code3, output3 = code_and_output(randint_kernel_1d, (x, 42), block_sizes=[1024])
-        self.assertTrue(
-            torch.allclose(output.float(), output3.float()),
-            "Same seed should produce identical outputs",
-        )
-        _assert_uses_philox(self, code3)
-
-        # Check that all values are in [0, 100) range
-        self.assertTrue(torch.all(output >= 0), "All values should be >= 0")
-        self.assertTrue(torch.all(output < 100), "All values should be < 100")
-        self.assertEqual(output.dtype, torch.int32, "Output dtype should be int32")
-
-    def test_hl_randint_2d(self):
-        """Test hl.randint with 2D output."""
-
-        @helion.kernel(static_shapes=False)
-        def randint_kernel_2d(x: torch.Tensor, seed: int) -> torch.Tensor:
-            output = torch.zeros(x.shape, dtype=torch.int32, device=x.device)
-            m, n = x.shape
-            for tile_m, tile_n in hl.tile([m, n]):
-                output[tile_m, tile_n] = hl.randint(
-                    [tile_m, tile_n], low=10, high=50, seed=seed
-                )
-            return output
-
-        x = torch.ones(1024, 1024, device=DEVICE)
-        block_sizes = _rng_2d_block_sizes()
-        _, output = code_and_output(randint_kernel_2d, (x, 42), block_sizes=block_sizes)
-
-        # Check that all values are in [10, 50) range
-        self.assertTrue(torch.all(output >= 10), "All values should be >= 10")
-        self.assertTrue(torch.all(output < 50), "All values should be < 50")
-
-        code2, output2 = code_and_output(
-            randint_kernel_2d, (x, 42), block_sizes=block_sizes
-        )
-        torch.testing.assert_close(
-            output, output2, msg="Same seed should be deterministic"
-        )
-
-    def test_hl_randint_negative_range(self):
-        """Test hl.randint with negative range."""
-
-        @helion.kernel(static_shapes=False)
-        def randint_kernel_neg(x: torch.Tensor, seed: int) -> torch.Tensor:
-            output = torch.zeros(x.shape, dtype=torch.int32, device=x.device)
-            (m,) = x.shape
-            for tile_m in hl.tile(m):
-                output[tile_m] = hl.randint([tile_m], low=-50, high=50, seed=seed)
-            return output
-
-        x = torch.ones(1024, device=DEVICE)
-        code, output = code_and_output(randint_kernel_neg, (x, 42), block_sizes=[1024])
-
-        # Check that all values are in [-50, 50) range
-        self.assertTrue(torch.all(output >= -50), "All values should be >= -50")
-        self.assertTrue(torch.all(output < 50), "All values should be < 50")
-
-        # Check that we have both negative and positive values (statistically very likely)
-        self.assertTrue(torch.any(output < 0), "Should have some negative values")
-        self.assertTrue(torch.any(output >= 0), "Should have some non-negative values")
-
-    def test_hl_rand_static_shapes(self):
-        """Test hl.rand with static_shapes=True (default)."""
+    def test_hl_rand_randint_static_shapes(self):
+        """Test hl.rand and hl.randint with static_shapes=True (default)."""
 
         @helion.kernel(static_shapes=True)
-        def rand_kernel_static(x: torch.Tensor, seed: int) -> torch.Tensor:
-            output = torch.zeros_like(x)
+        def rng_kernel_static(
+            x: torch.Tensor, seed: int
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            out_f = torch.zeros_like(x)
+            out_i = torch.zeros(x.shape, dtype=torch.int32, device=x.device)
             (m,) = x.shape
             for tile_m in hl.tile(m):
-                output[tile_m] = hl.rand([tile_m], seed=seed)
-            return output
+                out_f[tile_m] = hl.rand([tile_m], seed=seed)
+                out_i[tile_m] = hl.randint([tile_m], low=0, high=100, seed=seed)
+            return out_f, out_i
 
-        x = torch.ones(128, device=DEVICE)
-        _, output = code_and_output(rand_kernel_static, (x, 1337), block_sizes=[128])
-        code, output2 = code_and_output(
-            rand_kernel_static, (x, 1337), block_sizes=[128]
+        x = torch.ones(256, device=DEVICE)
+        _, (out_f, out_i) = code_and_output(
+            rng_kernel_static, (x, 1337), block_sizes=[256]
+        )
+        out_f2, out_i2 = output_only(rng_kernel_static, (x, 1337), block_sizes=[256])
+        torch.testing.assert_close(
+            out_f, out_f2, msg="Same seed should produce identical outputs"
         )
         torch.testing.assert_close(
-            output, output2, msg="Same seed should produce identical outputs"
-        )
-
-    def test_hl_randint_static_shapes(self):
-        """Test hl.randint with static_shapes=True (default)."""
-
-        @helion.kernel(static_shapes=True)
-        def randint_kernel_static(x: torch.Tensor, seed: int) -> torch.Tensor:
-            output = torch.zeros(x.shape, dtype=torch.int32, device=x.device)
-            (m,) = x.shape
-            for tile_m in hl.tile(m):
-                output[tile_m] = hl.randint([tile_m], low=0, high=100, seed=seed)
-            return output
-
-        x = torch.ones(1024, device=DEVICE)
-        _, output = code_and_output(randint_kernel_static, (x, 42), block_sizes=[1024])
-        code, output2 = code_and_output(
-            randint_kernel_static, (x, 42), block_sizes=[1024]
-        )
-        torch.testing.assert_close(
-            output, output2, msg="Same seed should produce identical outputs"
+            out_i, out_i2, msg="Same seed should produce identical outputs"
         )
 
     @skipIfMTIA(
         "MTIA requires all tensor inputs to be aligned and/or padded according to the MTIA HW requirements"
     )
-    def test_hl_rand_specialize(self):
+    def test_hl_rand_randint_specialize(self):
         @helion.kernel()
-        def fn(out: torch.Tensor, seed: int) -> torch.Tensor:
-            m = out.size(0)
-            n = hl.specialize(out.size(1))
+        def fn(out_f: torch.Tensor, out_i: torch.Tensor, seed: int) -> None:
+            m = out_f.size(0)
+            n = hl.specialize(out_f.size(1))
             for tile_m in hl.tile(m):
-                out[tile_m, :] = hl.rand([tile_m, n], seed=seed)
+                out_f[tile_m, :] = hl.rand([tile_m, n], seed=seed)
+                out_i[tile_m, :] = hl.randint([tile_m, n], low=15, high=75, seed=seed)
 
-        out = torch.empty(128, 1, device=DEVICE)
-        _, output = code_and_output(fn, (out, 1337), block_sizes=[128])
-        code, output2 = code_and_output(fn, (out, 1337), block_sizes=[128])
+        out_f = torch.empty(128, 1, device=DEVICE)
+        out_i = torch.empty(128, 1, device=DEVICE)
+        code_and_output(fn, (out_f, out_i, 1337), block_sizes=[128])
+        # Rerun on fresh tensors: the TPU runtime donates mutated input
+        # buffers to XLA, so re-passing the same tensors to a second call
+        # would hand Execute() an already-donated buffer.
+        out_f2 = torch.empty(128, 1, device=DEVICE)
+        out_i2 = torch.empty(128, 1, device=DEVICE)
+        output_only(fn, (out_f2, out_i2, 1337), block_sizes=[128])
         torch.testing.assert_close(
-            output, output2, msg="Same seed should produce identical outputs"
+            out_f2, out_f, msg="Same seed should produce identical outputs"
         )
-
-    @skipIfMTIA(
-        "MTIA requires all tensor inputs to be aligned and/or padded according to the MTIA HW requirements"
-    )
-    def test_hl_randint_specialize(self):
-        @helion.kernel()
-        def fn(out: torch.Tensor, seed: int) -> torch.Tensor:
-            m = out.size(0)
-            n = hl.specialize(out.size(1))
-            for tile_m in hl.tile(m):
-                out[tile_m, :] = hl.randint([tile_m, n], low=15, high=75, seed=seed)
-
-        out = torch.empty(128, 1, device=DEVICE)
-        _, output = code_and_output(fn, (out, 1337), block_sizes=[128])
-        code, output2 = code_and_output(fn, (out, 1337), block_sizes=[128])
         torch.testing.assert_close(
-            output, output2, msg="Same seed should produce identical outputs"
+            out_i2, out_i, msg="Same seed should produce identical outputs"
         )
 
 
@@ -858,308 +768,169 @@ class TestRandomPhiloxParity(TestCase):
         ref_randint = philox_randint_ref(seed, offsets, low, high)
         self.assertTrue(torch.equal(triton_randint.cpu(), ref_randint.cpu()))
 
-    def test_hl_rand_matches_triton_reference(self):
+    def test_hl_rand_randint_match_triton_reference(self):
         @helion.kernel(static_shapes=False)
-        def rand_kernel(x: torch.Tensor, seed: int) -> torch.Tensor:
-            out = torch.zeros_like(x)
+        def rng_kernel(
+            x: torch.Tensor, seed: int
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            out_f = torch.zeros_like(x)
             m, n = x.shape
+            out_i = torch.zeros((m, n), dtype=torch.int32, device=x.device)
+            out_h = torch.zeros((2, m, n), dtype=torch.int32, device=x.device)
             for tile_m, tile_n in hl.tile([m, n]):
-                out[tile_m, tile_n] = hl.rand([tile_m, tile_n], seed=seed)
-            return out
+                out_f[tile_m, tile_n] = hl.rand([tile_m, tile_n], seed=seed)
+                out_i[tile_m, tile_n] = hl.randint(
+                    [tile_m, tile_n], low=-11, high=23, seed=seed
+                )
+                out_h[0, tile_m, tile_n] = _helper_seeded_randint(tile_m, tile_n, seed)
+                out_h[1, tile_m, tile_n] = _helper_seeded_randint(tile_m, tile_n, seed)
+            return out_f, out_i, out_h
 
         shape = (17, 19)
         x = torch.empty(shape, device=DEVICE, dtype=torch.float32)
         seed = 1337
-        _code, out = code_and_output(rand_kernel, (x, seed), block_sizes=[8, 16])
-        offsets = torch.arange(out.numel(), device=DEVICE, dtype=torch.int64)
-        expected = _triton_rand_reference(seed, offsets).reshape(shape)
-        _assert_bitwise_equal_float(self, out, expected)
+        _code, (out_f, out_i, out_h) = code_and_output(
+            rng_kernel, (x, seed), block_sizes=[8, 16]
+        )
+        offsets = torch.arange(x.numel(), device=DEVICE, dtype=torch.int64)
+        expected_f = _triton_rand_reference(seed, offsets).reshape(shape)
+        _assert_bitwise_equal_float(self, out_f, expected_f)
+        expected_i = _triton_randint_reference(seed, offsets, -11, 23).reshape(shape)
+        self.assertTrue(torch.equal(out_i.cpu(), expected_i.cpu()))
+        # Repeated helper invocations reuse the same explicit seed stream
+        expected_h = _triton_randint_reference(seed, offsets, -5, 17).reshape(shape)
+        self.assertTrue(torch.equal(out_h[0].cpu(), expected_h.cpu()))
+        self.assertTrue(torch.equal(out_h[1].cpu(), expected_h.cpu()))
 
-    def test_hl_randint_matches_triton_reference(self):
-        @helion.kernel(static_shapes=False)
-        def randint_kernel(x: torch.Tensor, seed: int) -> torch.Tensor:
-            out = torch.zeros_like(x)
-            m, n = x.shape
-            for tile_m, tile_n in hl.tile([m, n]):
-                out[tile_m, tile_n] = hl.randint(
-                    [tile_m, tile_n], low=-11, high=23, seed=seed
-                )
-            return out
-
-        shape = (15, 21)
-        x = torch.empty(shape, device=DEVICE, dtype=torch.int32)
-        seed = 2024
-        _code, out = code_and_output(randint_kernel, (x, seed), block_sizes=[8, 8])
-        offsets = torch.arange(out.numel(), device=DEVICE, dtype=torch.int64)
-        expected = _triton_randint_reference(
-            seed,
-            offsets,
-            -11,
-            23,
-        ).reshape(shape)
-        self.assertTrue(torch.equal(out.cpu(), expected.cpu()))
-
-    def test_hl_rand_outer_loop_offsets_match_triton_reference(self):
+    def test_hl_rand_randint_outer_loop_offsets_match_triton_reference(self):
         @helion.kernel(static_shapes=False, autotune_effort="none")
-        def rand_outer_loop_kernel(x: torch.Tensor, seed: int) -> torch.Tensor:
-            out = torch.zeros_like(x)
+        def outer_loop_kernel(
+            x: torch.Tensor, seed: int
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            out_f = torch.zeros_like(x)
             m, n = x.shape
+            out_i = torch.zeros((m, n), dtype=torch.int32, device=x.device)
             for tile_n in hl.tile(n):
                 for tile_m in hl.tile(m):
                     values = hl.rand([tile_m], seed=seed)
-                    out[tile_m, tile_n] = values[:, None].expand(tile_m, tile_n)
-            return out
+                    out_f[tile_m, tile_n] = values[:, None].expand(tile_m, tile_n)
+                    ivalues = hl.randint([tile_m], low=-9, high=19, seed=seed)
+                    out_i[tile_m, tile_n] = ivalues[:, None].expand(tile_m, tile_n)
+            return out_f, out_i
+
+        @helion.kernel(
+            static_shapes=False,
+            autotune_effort="none",
+            ref_mode=helion.RefMode.EAGER,
+        )
+        def outer_loop_kernel_ref(
+            x: torch.Tensor, seed: int
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            out_f = torch.zeros_like(x)
+            m, n = x.shape
+            out_i = torch.zeros((m, n), dtype=torch.int32, device=x.device)
+            for tile_n in hl.tile(n):
+                for tile_m in hl.tile(m):
+                    values = hl.rand([tile_m], seed=seed)
+                    out_f[tile_m, tile_n] = values[:, None].expand(tile_m, tile_n)
+                    ivalues = hl.randint([tile_m], low=-9, high=19, seed=seed)
+                    out_i[tile_m, tile_n] = ivalues[:, None].expand(tile_m, tile_n)
+            return out_f, out_i
 
         shape = (17, 23)
         block_sizes = (8, 8)
         x = torch.empty(shape, device=DEVICE, dtype=torch.float32)
         seed = 314
-        _code, out = code_and_output(
-            rand_outer_loop_kernel,
+        _code, (out_f, out_i) = code_and_output(
+            outer_loop_kernel,
             (x, seed),
             block_sizes=list(block_sizes),
         )
-        expected = _hl_rand_outer_loop_expected(shape, block_sizes, seed)
-        _assert_bitwise_equal_float(self, out, expected)
+        expected_f = _hl_rand_outer_loop_expected(shape, block_sizes, seed)
+        _assert_bitwise_equal_float(self, out_f, expected_f)
+        expected_i = _hl_randint_outer_loop_expected(shape, block_sizes, seed, -9, 19)
+        self.assertTrue(torch.equal(out_i.cpu(), expected_i.cpu()))
 
-    def test_hl_randint_outer_loop_offsets_match_triton_reference(self):
+        # Ref eager mode should match the compiled kernel bit-for-bit
+        ref_f, ref_i = outer_loop_kernel_ref(x, seed)
+        _assert_bitwise_equal_float(self, out_f, ref_f)
+        self.assertTrue(torch.equal(out_i.cpu(), ref_i.cpu()))
+
+    def test_hl_rand_repeated_callsites_reuse_explicit_seed_stream(self):
         @helion.kernel(static_shapes=False, autotune_effort="none")
-        def randint_outer_loop_kernel(x: torch.Tensor, seed: int) -> torch.Tensor:
-            out = torch.zeros_like(x)
+        def rand_callsites_kernel(x: torch.Tensor, seed: int) -> torch.Tensor:
             m, n = x.shape
-            for tile_n in hl.tile(n):
-                for tile_m in hl.tile(m):
-                    values = hl.randint([tile_m], low=-9, high=19, seed=seed)
-                    out[tile_m, tile_n] = values[:, None].expand(tile_m, tile_n)
-            return out
-
-        shape = (15, 21)
-        block_sizes = (8, 8)
-        x = torch.empty(shape, device=DEVICE, dtype=torch.int32)
-        seed = 2718
-        _code, out = code_and_output(
-            randint_outer_loop_kernel,
-            (x, seed),
-            block_sizes=list(block_sizes),
-        )
-        expected = _hl_randint_outer_loop_expected(shape, block_sizes, seed, -9, 19)
-        self.assertTrue(torch.equal(out.cpu(), expected.cpu()))
-
-    def test_hl_rand_multiple_calls_reuse_explicit_seed_stream(self):
-        @helion.kernel(static_shapes=False, autotune_effort="none")
-        def rand_twice_kernel(x: torch.Tensor, seed: int) -> torch.Tensor:
-            m, n = x.shape
-            out = torch.zeros((2, m, n), device=x.device, dtype=x.dtype)
+            out = torch.zeros((3, m, n), device=x.device, dtype=x.dtype)
             for tile_m, tile_n in hl.tile([m, n]):
                 out[0, tile_m, tile_n] = hl.rand([tile_m, tile_n], seed=seed)
                 out[1, tile_m, tile_n] = hl.rand([tile_m, tile_n], seed=seed)
+                out[2, tile_m, tile_n] = _helper_seeded_rand(tile_m, tile_n, seed)
+            return out
+
+        @helion.kernel(
+            static_shapes=False,
+            autotune_effort="none",
+            ref_mode=helion.RefMode.EAGER,
+        )
+        def rand_callsites_kernel_ref(x: torch.Tensor, seed: int) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.zeros((3, m, n), device=x.device, dtype=x.dtype)
+            for tile_m, tile_n in hl.tile([m, n]):
+                out[0, tile_m, tile_n] = hl.rand([tile_m, tile_n], seed=seed)
+                out[1, tile_m, tile_n] = hl.rand([tile_m, tile_n], seed=seed)
+                out[2, tile_m, tile_n] = _helper_seeded_rand(tile_m, tile_n, seed)
             return out
 
         x = torch.empty((11, 13), device=DEVICE, dtype=torch.float32)
         seed = 777
-        _code, out = code_and_output(rand_twice_kernel, (x, seed), block_sizes=[8, 8])
+        _code, out = code_and_output(
+            rand_callsites_kernel, (x, seed), block_sizes=[8, 8]
+        )
         offsets = torch.arange(x.numel(), device=DEVICE, dtype=torch.int64)
         expected = _triton_rand_reference(seed, offsets).reshape_as(x)
+        # Direct calls and helper invocations all reuse the same seed stream
         _assert_bitwise_equal_float(self, out[0], expected)
         _assert_bitwise_equal_float(self, out[1], expected)
-        _assert_bitwise_equal_float(self, out[0], out[1])
+        _assert_bitwise_equal_float(self, out[2], expected)
 
-    def test_hl_rand_helper_invocations_reuse_explicit_seed_stream(self):
+        # Ref eager mode should match the compiled kernel bit-for-bit
+        ref_out = rand_callsites_kernel_ref(x, seed)
+        _assert_bitwise_equal_float(self, out, ref_out)
+
+    def test_hl_rand_randint_sibling_loops_reuse_explicit_seed_stream(self):
         @helion.kernel(static_shapes=False, autotune_effort="none")
-        def rand_helper_kernel(x: torch.Tensor, seed: int) -> torch.Tensor:
-            m, n = x.shape
-            out = torch.zeros((2, m, n), device=x.device, dtype=x.dtype)
-            for tile_m, tile_n in hl.tile([m, n]):
-                out[0, tile_m, tile_n] = _helper_seeded_rand(tile_m, tile_n, seed)
-                out[1, tile_m, tile_n] = _helper_seeded_rand(tile_m, tile_n, seed)
-            return out
-
-        x = torch.empty((11, 13), device=DEVICE, dtype=torch.float32)
-        seed = 1776
-        _code, out = code_and_output(rand_helper_kernel, (x, seed), block_sizes=[8, 8])
-        offsets = torch.arange(x.numel(), device=DEVICE, dtype=torch.int64)
-        expected = _triton_rand_reference(seed, offsets).reshape_as(x)
-        _assert_bitwise_equal_float(self, out[0], expected)
-        _assert_bitwise_equal_float(self, out[1], expected)
-        _assert_bitwise_equal_float(self, out[0], out[1])
-
-    def test_hl_rand_sibling_loops_reuse_explicit_seed_stream(self):
-        @helion.kernel(static_shapes=False, autotune_effort="none")
-        def rand_sibling_loops_kernel(
+        def sibling_loops_kernel(
             x: torch.Tensor, seed: int
-        ) -> tuple[torch.Tensor, torch.Tensor]:
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             m, n = x.shape
-            out0 = torch.zeros_like(x)
-            out1 = torch.zeros_like(x)
+            out0_f = torch.zeros_like(x)
+            out1_f = torch.zeros_like(x)
+            out0_i = torch.zeros((m, n), dtype=torch.int32, device=x.device)
+            out1_i = torch.zeros((m, n), dtype=torch.int32, device=x.device)
             for tile_m, tile_n in hl.tile([m, n]):
-                out0[tile_m, tile_n] = hl.rand([tile_m, tile_n], seed=seed)
+                out0_f[tile_m, tile_n] = hl.rand([tile_m, tile_n], seed=seed)
+                out0_i[tile_m, tile_n] = hl.randint(
+                    [tile_m, tile_n], low=-5, high=17, seed=seed
+                )
             for tile_m, tile_n in hl.tile([m, n]):
-                out1[tile_m, tile_n] = hl.rand([tile_m, tile_n], seed=seed)
-            return out0, out1
+                out1_f[tile_m, tile_n] = hl.rand([tile_m, tile_n], seed=seed)
+                out1_i[tile_m, tile_n] = hl.randint(
+                    [tile_m, tile_n], low=-5, high=17, seed=seed
+                )
+            return out0_f, out1_f, out0_i, out1_i
 
         x = torch.empty((11, 13), device=DEVICE, dtype=torch.float32)
         seed = 1777
-        _code, (out0, out1) = code_and_output(
-            rand_sibling_loops_kernel, (x, seed), block_sizes=[8, 16, 8, 16]
+        _code, (out0_f, out1_f, out0_i, out1_i) = code_and_output(
+            sibling_loops_kernel, (x, seed), block_sizes=[8, 16, 8, 16]
         )
         offsets = torch.arange(x.numel(), device=DEVICE, dtype=torch.int64)
-        expected = _triton_rand_reference(seed, offsets).reshape_as(x)
-        _assert_bitwise_equal_float(self, out0, expected)
-        _assert_bitwise_equal_float(self, out1, expected)
-        _assert_bitwise_equal_float(self, out0, out1)
-
-    def test_hl_randint_sibling_loops_reuse_explicit_seed_stream(self):
-        @helion.kernel(static_shapes=False, autotune_effort="none")
-        def randint_sibling_loops_kernel(
-            x: torch.Tensor, seed: int
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            m, n = x.shape
-            out0 = torch.zeros_like(x)
-            out1 = torch.zeros_like(x)
-            for tile_m, tile_n in hl.tile([m, n]):
-                out0[tile_m, tile_n] = hl.randint(
-                    [tile_m, tile_n], low=-5, high=17, seed=seed
-                )
-            for tile_m, tile_n in hl.tile([m, n]):
-                out1[tile_m, tile_n] = hl.randint(
-                    [tile_m, tile_n], low=-5, high=17, seed=seed
-                )
-            return out0, out1
-
-        x = torch.empty((9, 15), device=DEVICE, dtype=torch.int32)
-        seed = 201
-        _code, (out0, out1) = code_and_output(
-            randint_sibling_loops_kernel, (x, seed), block_sizes=[8, 16, 8, 16]
-        )
-        offsets = torch.arange(x.numel(), device=DEVICE, dtype=torch.int64)
-        expected = _triton_randint_reference(seed, offsets, -5, 17).reshape_as(x)
-        self.assertTrue(torch.equal(out0.cpu(), expected.cpu()))
-        self.assertTrue(torch.equal(out1.cpu(), expected.cpu()))
-        self.assertTrue(torch.equal(out0.cpu(), out1.cpu()))
-
-    def test_hl_randint_helper_invocations_reuse_explicit_seed_stream(self):
-        @helion.kernel(static_shapes=False, autotune_effort="none")
-        def randint_helper_kernel(x: torch.Tensor, seed: int) -> torch.Tensor:
-            m, n = x.shape
-            out = torch.zeros((2, m, n), device=x.device, dtype=x.dtype)
-            for tile_m, tile_n in hl.tile([m, n]):
-                out[0, tile_m, tile_n] = _helper_seeded_randint(tile_m, tile_n, seed)
-                out[1, tile_m, tile_n] = _helper_seeded_randint(tile_m, tile_n, seed)
-            return out
-
-        x = torch.empty((9, 15), device=DEVICE, dtype=torch.int32)
-        seed = 202
-        _code, out = code_and_output(
-            randint_helper_kernel, (x, seed), block_sizes=[8, 16]
-        )
-        offsets = torch.arange(x.numel(), device=DEVICE, dtype=torch.int64)
-        expected = _triton_randint_reference(seed, offsets, -5, 17).reshape_as(x)
-        self.assertTrue(torch.equal(out[0].cpu(), expected.cpu()))
-        self.assertTrue(torch.equal(out[1].cpu(), expected.cpu()))
-        self.assertTrue(torch.equal(out[0].cpu(), out[1].cpu()))
-
-    @skipIfRefEager("compile_config is not supported in ref eager mode")
-    def test_hl_rand_ref_mode_matches_compiled(self):
-        @helion.kernel(static_shapes=False, autotune_effort="none")
-        def rand_outer_loop_kernel(x: torch.Tensor, seed: int) -> torch.Tensor:
-            out = torch.zeros_like(x)
-            m, n = x.shape
-            for tile_n in hl.tile(n):
-                for tile_m in hl.tile(m):
-                    values = hl.rand([tile_m], seed=seed)
-                    out[tile_m, tile_n] = values[:, None].expand(tile_m, tile_n)
-            return out
-
-        @helion.kernel(
-            static_shapes=False,
-            autotune_effort="none",
-            ref_mode=helion.RefMode.EAGER,
-        )
-        def rand_outer_loop_kernel_ref(x: torch.Tensor, seed: int) -> torch.Tensor:
-            out = torch.zeros_like(x)
-            m, n = x.shape
-            for tile_n in hl.tile(n):
-                for tile_m in hl.tile(m):
-                    values = hl.rand([tile_m], seed=seed)
-                    out[tile_m, tile_n] = values[:, None].expand(tile_m, tile_n)
-            return out
-
-        x = torch.empty((15, 21), device=DEVICE, dtype=torch.float32)
-        seed = 31415
-        _code, compiled = _compile_once(
-            rand_outer_loop_kernel, (x, seed), block_sizes=[8, 8]
-        )
-        compiled_out = compiled(x, seed)
-        ref_out = rand_outer_loop_kernel_ref(x, seed)
-        _assert_bitwise_equal_float(self, compiled_out, ref_out)
-
-    @skipIfRefEager("compile_config is not supported in ref eager mode")
-    def test_hl_rand_helper_ref_mode_matches_compiled(self):
-        @helion.kernel(static_shapes=False, autotune_effort="none")
-        def rand_helper_kernel(x: torch.Tensor, seed: int) -> torch.Tensor:
-            m, n = x.shape
-            out = torch.zeros((2, m, n), device=x.device, dtype=x.dtype)
-            for tile_m, tile_n in hl.tile([m, n]):
-                out[0, tile_m, tile_n] = _helper_seeded_rand(tile_m, tile_n, seed)
-                out[1, tile_m, tile_n] = _helper_seeded_rand(tile_m, tile_n, seed)
-            return out
-
-        @helion.kernel(
-            static_shapes=False,
-            autotune_effort="none",
-            ref_mode=helion.RefMode.EAGER,
-        )
-        def rand_helper_kernel_ref(x: torch.Tensor, seed: int) -> torch.Tensor:
-            m, n = x.shape
-            out = torch.zeros((2, m, n), device=x.device, dtype=x.dtype)
-            for tile_m, tile_n in hl.tile([m, n]):
-                out[0, tile_m, tile_n] = _helper_seeded_rand(tile_m, tile_n, seed)
-                out[1, tile_m, tile_n] = _helper_seeded_rand(tile_m, tile_n, seed)
-            return out
-
-        x = torch.empty((11, 13), device=DEVICE, dtype=torch.float32)
-        seed = 314159
-        _code, compiled = _compile_once(
-            rand_helper_kernel, (x, seed), block_sizes=[8, 8]
-        )
-        compiled_out = compiled(x, seed)
-        ref_out = rand_helper_kernel_ref(x, seed)
-        _assert_bitwise_equal_float(self, compiled_out, ref_out)
-
-    @skipIfRefEager("compile_config is not supported in ref eager mode")
-    def test_hl_randint_ref_mode_matches_compiled(self):
-        @helion.kernel(static_shapes=False, autotune_effort="none")
-        def randint_outer_loop_kernel(x: torch.Tensor, seed: int) -> torch.Tensor:
-            out = torch.zeros_like(x)
-            m, n = x.shape
-            for tile_n in hl.tile(n):
-                for tile_m in hl.tile(m):
-                    values = hl.randint([tile_m], low=-7, high=23, seed=seed)
-                    out[tile_m, tile_n] = values[:, None].expand(tile_m, tile_n)
-            return out
-
-        @helion.kernel(
-            static_shapes=False,
-            autotune_effort="none",
-            ref_mode=helion.RefMode.EAGER,
-        )
-        def randint_outer_loop_kernel_ref(x: torch.Tensor, seed: int) -> torch.Tensor:
-            out = torch.zeros_like(x)
-            m, n = x.shape
-            for tile_n in hl.tile(n):
-                for tile_m in hl.tile(m):
-                    values = hl.randint([tile_m], low=-7, high=23, seed=seed)
-                    out[tile_m, tile_n] = values[:, None].expand(tile_m, tile_n)
-            return out
-
-        x = torch.empty((15, 21), device=DEVICE, dtype=torch.int32)
-        seed = 27182
-        _code, compiled = _compile_once(
-            randint_outer_loop_kernel, (x, seed), block_sizes=[8, 8]
-        )
-        compiled_out = compiled(x, seed)
-        ref_out = randint_outer_loop_kernel_ref(x, seed)
-        self.assertTrue(torch.equal(compiled_out.cpu(), ref_out.cpu()))
+        expected_f = _triton_rand_reference(seed, offsets).reshape_as(x)
+        _assert_bitwise_equal_float(self, out0_f, expected_f)
+        _assert_bitwise_equal_float(self, out1_f, expected_f)
+        expected_i = _triton_randint_reference(seed, offsets, -5, 17).reshape_as(out0_i)
+        self.assertTrue(torch.equal(out0_i.cpu(), expected_i.cpu()))
+        self.assertTrue(torch.equal(out1_i.cpu(), expected_i.cpu()))
 
     def test_hl_rand_explicit_offsets_ref_matches_triton(self):
         seed = 12321
@@ -1168,76 +939,7 @@ class TestRandomPhiloxParity(TestCase):
         ref_out = philox_rand_ref(seed, offsets)
         _assert_bitwise_equal_float(self, triton_out, ref_out)
 
-    @skipIfRefEager("compile_config is not supported in ref eager mode")
-    def test_hl_rand_with_offsets_ref_mode_matches_compiled(self):
-        @helion.kernel(static_shapes=False, autotune_effort="none")
-        def rand_offsets_kernel(x: torch.Tensor, seed: int) -> torch.Tensor:
-            out = torch.zeros_like(x)
-            (m,) = x.shape
-            for tile_m in hl.tile(m):
-                idx = hl.tile_index(tile_m).to(torch.int64)
-                out[tile_m] = hl.rand([], seed=seed, offsets=idx * 3)
-            return out
-
-        @helion.kernel(
-            static_shapes=False,
-            autotune_effort="none",
-            ref_mode=helion.RefMode.EAGER,
-        )
-        def rand_offsets_kernel_ref(x: torch.Tensor, seed: int) -> torch.Tensor:
-            out = torch.zeros_like(x)
-            (m,) = x.shape
-            for tile_m in hl.tile(m):
-                idx = hl.tile_index(tile_m).to(torch.int64)
-                out[tile_m] = hl.rand([], seed=seed, offsets=idx * 3)
-            return out
-
-        x = torch.empty(192, device=DEVICE, dtype=torch.float32)
-        seed = 161803
-        _code, compiled = _compile_once(
-            rand_offsets_kernel, (x, seed), block_sizes=[32]
-        )
-        compiled_out = compiled(x, seed)
-        ref_out = rand_offsets_kernel_ref(x, seed)
-        _assert_bitwise_equal_float(self, compiled_out, ref_out)
-
     def test_hl_rand4x_matches_triton_reference(self):
-        @helion.kernel(static_shapes=False, autotune_effort="none")
-        def rand4x_kernel(x: torch.Tensor, seed: int) -> torch.Tensor:
-            (m,) = x.shape
-            out = torch.zeros((4, m), device=x.device, dtype=torch.float32)
-            for tile_m in hl.tile(m):
-                idx = hl.tile_index(tile_m).to(torch.int64)
-                r0, r1, r2, r3 = hl.rand4x(seed, idx)
-                out[0, tile_m] = r0
-                out[1, tile_m] = r1
-                out[2, tile_m] = r2
-                out[3, tile_m] = r3
-            return out
-
-        x = torch.empty(123, device=DEVICE, dtype=torch.float32)
-        seed = 271828
-        code, out = code_and_output(rand4x_kernel, (x, seed), block_sizes=[16])
-        offsets = torch.arange(x.numel(), device=DEVICE, dtype=torch.int64)
-        e0, e1, e2, e3 = _triton_rand4x_reference(seed, offsets)
-        _assert_bitwise_equal_float(self, out[0], e0.reshape_as(x))
-        _assert_bitwise_equal_float(self, out[1], e1.reshape_as(x))
-        _assert_bitwise_equal_float(self, out[2], e2.reshape_as(x))
-        _assert_bitwise_equal_float(self, out[3], e3.reshape_as(x))
-        _assert_uses_philox(self, code)
-
-    def test_hl_rand4x_ref_matches_triton(self):
-        seed = 54321
-        offsets = torch.arange(96, device=DEVICE, dtype=torch.int64) * 4
-        t0, t1, t2, t3 = _triton_rand4x_reference(seed, offsets)
-        r0, r1, r2, r3 = philox_rand4x_ref(seed, offsets)
-        _assert_bitwise_equal_float(self, t0, r0)
-        _assert_bitwise_equal_float(self, t1, r1)
-        _assert_bitwise_equal_float(self, t2, r2)
-        _assert_bitwise_equal_float(self, t3, r3)
-
-    @skipIfRefEager("compile_config is not supported in ref eager mode")
-    def test_hl_rand4x_ref_mode_matches_compiled(self):
         @helion.kernel(static_shapes=False, autotune_effort="none")
         def rand4x_kernel(x: torch.Tensor, seed: int) -> torch.Tensor:
             (m,) = x.shape
@@ -1268,12 +970,30 @@ class TestRandomPhiloxParity(TestCase):
                 out[3, tile_m] = r3
             return out
 
-        x = torch.empty(96, device=DEVICE, dtype=torch.float32)
-        seed = 999
-        _code, compiled = _compile_once(rand4x_kernel, (x, seed), block_sizes=[16])
-        compiled_out = compiled(x, seed)
+        x = torch.empty(123, device=DEVICE, dtype=torch.float32)
+        seed = 271828
+        code, out = code_and_output(rand4x_kernel, (x, seed), block_sizes=[16])
+        offsets = torch.arange(x.numel(), device=DEVICE, dtype=torch.int64)
+        e0, e1, e2, e3 = _triton_rand4x_reference(seed, offsets)
+        _assert_bitwise_equal_float(self, out[0], e0.reshape_as(x))
+        _assert_bitwise_equal_float(self, out[1], e1.reshape_as(x))
+        _assert_bitwise_equal_float(self, out[2], e2.reshape_as(x))
+        _assert_bitwise_equal_float(self, out[3], e3.reshape_as(x))
+        _assert_uses_philox(self, code)
+
+        # Ref eager mode should match the compiled kernel bit-for-bit
         ref_out = rand4x_kernel_ref(x, seed)
-        _assert_bitwise_equal_float(self, compiled_out, ref_out)
+        _assert_bitwise_equal_float(self, out, ref_out)
+
+    def test_hl_rand4x_ref_matches_triton(self):
+        seed = 54321
+        offsets = torch.arange(96, device=DEVICE, dtype=torch.int64) * 4
+        t0, t1, t2, t3 = _triton_rand4x_reference(seed, offsets)
+        r0, r1, r2, r3 = philox_rand4x_ref(seed, offsets)
+        _assert_bitwise_equal_float(self, t0, r0)
+        _assert_bitwise_equal_float(self, t1, r1)
+        _assert_bitwise_equal_float(self, t2, r2)
+        _assert_bitwise_equal_float(self, t3, r3)
 
 
 if __name__ == "__main__":

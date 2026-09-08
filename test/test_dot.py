@@ -6,6 +6,7 @@ import itertools
 import os
 from typing import Callable
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
@@ -17,6 +18,7 @@ if _get_backend() in ("triton", "tileir"):
     import triton
 
 import helion
+from helion import _compat
 from helion._compat import min_dot_size
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
@@ -1099,6 +1101,133 @@ class TestDot(RefEagerTestBase, TestCase):
         self._test_reshape_n_2(
             lambda acc, a, b: acc + torch.matmul(a, b), rtol=1e-2, atol=5e-2
         )
+
+    def _make_chained_dot_kernel(self, with_acc: bool = False):
+        """Chained dot whose second dot has a dot-derived LHS and N=512.
+
+        Repro for https://github.com/pytorch/helion/issues/3472: on sm100
+        Triton promotes the dot-derived LHS to tensor memory and crashes with
+        a misaligned address when the accumulator is wider than 256 columns.
+        The wide dimension only appears in the second dot's RHS so the kernel
+        also fits in shared memory on smaller GPUs (e.g. A10G).
+        """
+
+        @helion.kernel(
+            autotune_effort="none",
+            static_shapes=True,
+            dot_precision=get_test_dot_precision(),
+        )
+        def chained_dot(
+            q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+        ) -> torch.Tensor:
+            m_dim, _ = q.size()
+            n_dim, _ = k.size()
+            _, out_dim = v.size()
+            out = torch.empty([m_dim, out_dim], dtype=q.dtype, device=q.device)
+            for tile_m in hl.tile(m_dim, block_size=64):
+                q_tile = q[tile_m, :]
+                acc = hl.zeros([tile_m, out_dim], dtype=torch.float32)
+                for tile_n in hl.tile(n_dim, block_size=32):
+                    k_tile = k[tile_n, :]
+                    v_tile = v[tile_n, :]
+                    qk = hl.dot(q_tile, torch.transpose(k_tile, 0, 1))
+                    acc = hl.dot(qk.to(q_tile.dtype), v_tile, acc=acc)
+                out[tile_m, :] = acc.to(q.dtype)
+            return out
+
+        @helion.kernel(
+            autotune_effort="none",
+            static_shapes=True,
+            dot_precision=get_test_dot_precision(),
+        )
+        def chained_dot_no_acc(
+            q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+        ) -> torch.Tensor:
+            m_dim, _ = q.size()
+            n_dim, _ = k.size()
+            _, out_dim = v.size()
+            out = torch.empty([m_dim, out_dim], dtype=q.dtype, device=q.device)
+            for tile_m in hl.tile(m_dim, block_size=64):
+                q_tile = q[tile_m, :]
+                for tile_n in hl.tile(n_dim, block_size=32):
+                    k_tile = k[tile_n, :]
+                    v_tile = v[tile_n, :]
+                    qk = hl.dot(q_tile, torch.transpose(k_tile, 0, 1))
+                    qk2 = hl.dot(qk.to(q_tile.dtype), v_tile)
+                    out[tile_m, :] = qk2
+            return out
+
+        return chained_dot if with_acc else chained_dot_no_acc
+
+    @staticmethod
+    def _make_chained_dot_args(
+        with_acc: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # A single inner iteration for the no-acc kernel so its full-slice
+        # store is written exactly once (order-independent reference).
+        n_dim = 64 if with_acc else 32
+        q = torch.randn(32, 64, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.randn(n_dim, 64, device=DEVICE, dtype=torch.bfloat16)
+        v = torch.randn(n_dim, 512, device=DEVICE, dtype=torch.bfloat16)
+        return q, k, v
+
+    @staticmethod
+    def _chained_dot_ref(
+        q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
+        acc = torch.zeros(q.size(0), v.size(1), dtype=torch.float32, device=q.device)
+        for i in range(0, k.size(0), 32):
+            k_tile = k[i : i + 32].float()
+            v_tile = v[i : i + 32].float()
+            qk = (q.float() @ k_tile.T).to(q.dtype)
+            acc = acc + qk.float() @ v_tile
+        return acc.to(q.dtype)
+
+    def test_chained_dot_wide_n(self):
+        # https://github.com/pytorch/helion/issues/3472: misaligned address on
+        # sm100 with the default config; exercises the split-M workaround there.
+        for with_acc in (False, True):
+            kernel = self._make_chained_dot_kernel(with_acc)
+            args = self._make_chained_dot_args(with_acc)
+            _, result = code_and_output(kernel, args)
+            ref = self._chained_dot_ref(*args)
+            torch.testing.assert_close(result, ref, atol=1.0, rtol=0.02)
+
+    @skipIfRefEager("tests generated code")
+    @skipIfNotTriton("workaround is triton-specific")
+    @patch.object(_compat, "_sm100_dot_tmem_lhs_broken", lambda device: True)
+    def test_chained_dot_wide_n_split_m_codegen(self):
+        # With the sm100 workaround forced on, a dot-derived LHS with N=512
+        # must be split into two M=32 dots (tl.join of the halves)...
+        for with_acc in (False, True):
+            kernel = self._make_chained_dot_kernel(with_acc)
+            args = self._make_chained_dot_args(with_acc)
+            code, result = code_and_output(kernel, args)
+            self.assertIn("tl.join", code)
+            ref = self._chained_dot_ref(*args)
+            torch.testing.assert_close(result, ref, atol=1.0, rtol=0.02)
+
+        # ...while a plain load-fed dot with the same shape must not be split.
+        @helion.kernel(
+            autotune_effort="none",
+            static_shapes=True,
+            dot_precision=get_test_dot_precision(),
+        )
+        def plain_dot(a: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+            m_dim, n_dim = a.size()
+            _, d_dim = k.size()
+            out = torch.empty([m_dim, d_dim], dtype=a.dtype, device=a.device)
+            for tile_m in hl.tile(m_dim, block_size=64):
+                a_tile = a[tile_m, :]
+                out[tile_m, :] = hl.dot(a_tile, k[:, :]).to(a.dtype)
+            return out
+
+        a = torch.randn(64, 32, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.randn(32, 512, device=DEVICE, dtype=torch.bfloat16)
+        code, result = code_and_output(plain_dot, (a, k))
+        self.assertNotIn("tl.join", code)
+        ref = (a.float() @ k.float()).to(a.dtype)
+        torch.testing.assert_close(result, ref, atol=1.0, rtol=0.02)
 
     def test_scalar_arg_specialization_not_reused_across_values(self):
         """A runtime scalar epilogue arg must not poison later calls.

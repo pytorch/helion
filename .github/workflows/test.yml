@@ -99,23 +99,14 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
+          restore-cache: true
+          # Pull requests can consume caches published by main/release pushes,
+          # but should not occupy accelerator runners uploading new archives.
+          save-cache: ${{ github.event_name == 'push' }}
 
       - name: Create virtual environment
         run: |
           uv venv --python ${{ matrix.python-version }}
-
-      - name: Get current month
-        id: date
-        run: echo "month=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
-
-      - name: Cache dependencies
-        id: cache
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cache/uv
-            ~/.venv
-          key: ${{ matrix.python-version }}-${{ matrix.runtime-version }}-${{ matrix.pytorch-version }}-${{ matrix.backend }}-${{ hashFiles('.github/workflows/test.yml') }}-${{ steps.date.outputs.month }}
 
       # TPU installs its (pinned) torch via the install-pytorch-for-torchtpu composite
       # action below; every other runtime installs torch here.
@@ -200,7 +191,7 @@ jobs:
         if: matrix.alias == 'pallas-interpret'
         run: |
           source .venv/bin/activate
-          uv pip install 'jax==0.11.0' 'jaxlib==0.11.0' 'absl-py'
+          uv pip install 'jax==0.11.1' 'jaxlib==0.11.1' 'absl-py'
 
       - name: Install CUTLASS CuTe DSL
         if: matrix.backend == 'cute'
@@ -274,10 +265,9 @@ jobs:
 
       - name: Run Tests
         run: |
-          set -o pipefail
+          set -e -o pipefail
           source .venv/bin/activate
           uv pip install pytest-xdist
-          uv pip install pytest-rerunfailures
           # Conditionally enable ref-eager and golden-accept/dtype-assert test modes
           if [[ "${{ matrix.dtype-asserts }}" == "true" ]]; then export HELION_DEBUG_DTYPE_ASSERTS=1; fi
           if [[ "${{ matrix.expecttest-accept }}" == "true" ]]; then export EXPECTTEST_ACCEPT=1; fi
@@ -328,21 +318,21 @@ jobs:
             # worker gets killed mid-compile. Give it headroom.
             TIMEOUT=180
           fi
-          pytest $PARALLEL -rf --timeout=$TIMEOUT --reruns=2 --timeout-method=thread $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
+          pytest $PARALLEL -rf --timeout=$TIMEOUT --timeout-method=thread $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
           # JAX and TorchTPU initialize the TPU runtime differently. Run the
           # physical remote-copy suites in fresh, sequential pytest processes.
           if [[ "${{ matrix.alias }}" == "tpu" ]]; then
-            pytest -rf --timeout=$TIMEOUT --reruns=2 --timeout-method=thread test/test_remote_copy.py::TestRemoteCopyJaxRuntime
-            HELION_TEST_TORCH_TPU_MULTIPROCESS=1 pytest -rf --timeout=$TIMEOUT --reruns=2 --timeout-method=thread test/test_remote_copy.py::TestRemoteCopyTorchTpuRuntime
+            pytest -rf --timeout=$TIMEOUT --timeout-method=thread test/test_remote_copy.py::TestRemoteCopyJaxRuntime
+            HELION_TEST_TORCH_TPU_MULTIPROCESS=1 pytest -rf --timeout=$TIMEOUT --timeout-method=thread test/test_remote_copy.py::TestRemoteCopyTorchTpuRuntime
           fi
           # Each remote-copy test launches one process per GPU, so run this class
           # serially rather than assigning its tests to concurrent xdist workers.
           if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
-            pytest -rf --timeout=$TIMEOUT --reruns=2 --timeout-method=thread $EXTRA_FLAGS test/test_remote_copy.py::TestRemoteCopyGPU | tee >(eval $SKIP_CHECK)
+            pytest -rf --timeout=$TIMEOUT --timeout-method=thread $EXTRA_FLAGS test/test_remote_copy.py::TestRemoteCopyGPU | tee >(eval $SKIP_CHECK)
           fi
 
   test-notebooks:
-    name: test-notebooks-cu130-py3.12-pytorch-2.9-a10g
+    name: test-notebooks-cu130-py3.12-pytorch-2.13-a10g
 
     container:
       image: nvidia/cuda:13.1.0-devel-ubuntu24.04
@@ -368,6 +358,8 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
+          restore-cache: true
+          save-cache: ${{ github.event_name == 'push' }}
 
       - name: Create virtual environment
         run: |
@@ -377,19 +369,6 @@ jobs:
         run: |
           source .venv/bin/activate
           uv pip install pip
-
-      - name: Get current month
-        id: date
-        run: echo "month=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
-
-      - name: Cache dependencies
-        id: cache
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cache/uv
-            ~/.venv
-          key: notebooks-3.12-cu130-${{ hashFiles('.github/workflows/test.yml') }}-${{ steps.date.outputs.month }}
 
       - name: Install notebook execution tools
         run: |

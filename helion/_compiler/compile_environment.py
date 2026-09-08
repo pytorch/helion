@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import collections
 import contextlib
 import contextvars
@@ -29,8 +30,6 @@ import torch.distributed as dist
 from torch.fx.experimental.symbolic_shapes import DimDynamic
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
-from torch.utils._sympy.symbol import SymT
-from torch.utils._sympy.symbol import symbol_is_type
 
 from .. import exc
 from .._compat import shape_env_size_hint
@@ -50,12 +49,59 @@ log = logging.getLogger(__name__)
 TensorDescriptorLayoutSignature = tuple[int | None, tuple[bool, ...]]
 
 
+@dataclasses.dataclass(frozen=True)
+class ConfigValueExpression:
+    """Small integer expression whose leaves are emitted config values."""
+
+    operation: str
+    arguments: tuple[int | str | ConfigValueExpression, ...]
+
+    def evaluate(self, config: Config) -> int:
+        def value(arg: int | str | ConfigValueExpression) -> int:
+            if isinstance(arg, ConfigValueExpression):
+                return arg.evaluate(config)
+            if isinstance(arg, str):
+                result = config[arg]
+                if not isinstance(result, int):
+                    raise TypeError(f"config value {arg!r} is not an integer")
+                return result
+            return arg
+
+        args = tuple(value(arg) for arg in self.arguments)
+        if self.operation == "config":
+            assert len(self.arguments) == 1 and isinstance(self.arguments[0], str)
+            return value(self.arguments[0])
+        if self.operation == "cdiv":
+            assert len(args) == 2
+            return (args[0] + args[1] - 1) // args[1]
+        if self.operation == "next_power_of_2":
+            assert len(args) == 1
+            return next_power_of_2(args[0])
+        raise ValueError(f"unknown config expression operation {self.operation!r}")
+
+
 @dataclasses.dataclass
 class TensorDescriptorLayoutGuard:
     ndim: int
     element_size: int
     memory_op_indices: set[int] = dataclasses.field(default_factory=set)
     atomic_op_indices: set[int] = dataclasses.field(default_factory=set)
+
+
+@dataclasses.dataclass(frozen=True)
+class RuntimeInputSpecialization:
+    """Internal runtime-input projection used to extend a kernel cache key.
+
+    ``classifier_identity`` distinguishes classifier semantics when compiler
+    discovery registers the same named projection more than once. Runtime cache
+    state is deliberately excluded from descriptor equality.
+    """
+
+    sources: tuple[Source, ...]
+    classifier_identity: typing.Hashable
+    classifier: typing.Callable[[typing.Sequence[object]], typing.Hashable] = (
+        dataclasses.field(compare=False, repr=False)
+    )
 
 
 def _is_supported_tensor_input_source(source: Source) -> bool:
@@ -201,6 +247,7 @@ if TYPE_CHECKING:
 
     from .. import Config
     from ..runtime.settings import Settings
+    from .autotuner_heuristics.registry import CompilerHeuristicSpecializationFact
     from .backend import Backend
     from .pallas.compact_worklist import CompactWorklistPlan
     from .pallas.compact_worklist import ResidentCacheDecision
@@ -296,6 +343,7 @@ class CompileEnvironment:
         # TODO(jansel): check for guards in the shapeenv
         self.fake_mode = FakeTensorMode(shape_env=self.shape_env)
         self.input_sources: dict[torch.Tensor, Source] = {}
+        self._ambiguous_tensor_input_source_ids: set[int] = set()
         self._runtime_arg_values_by_name: contextvars.ContextVar[
             dict[str, object] | None
         ] = contextvars.ContextVar(
@@ -303,6 +351,11 @@ class CompileEnvironment:
             default=None,
         )
         self.cute_resolved_wrapper_plans: list[dict[str, object]] = []
+        # Host integer helpers such as cdiv/next_power_of_2 deliberately return
+        # unbacked SymInts during tracing. Preserve the config expression beside
+        # that symbol so a fixed block size derived from a user tunable can still
+        # be resolved for each candidate configuration.
+        self.config_value_expressions: dict[sympy.Expr, ConfigValueExpression] = {}
         self.block_sizes: list[BlockSizeInfo] = []
         self.debug_shape_renames: dict[sympy.Basic, sympy.Basic] = {}
         self._debug_shape_rename_override: contextvars.ContextVar[
@@ -324,6 +377,13 @@ class CompileEnvironment:
             num_sm=_num_sm,
             log_restrictions_verbose=settings.autotune_log_search_space_verbose,
         )
+        # Correctness facts registered by compiler heuristics can depend on
+        # dynamic runtime inputs even when seed generation is disabled or later
+        # found ineligible. Bound-kernel caching consumes this set separately
+        # from specialization requirements of heuristics that emitted seeds.
+        self.compiler_fact_specialization_facts: frozenset[
+            CompilerHeuristicSpecializationFact
+        ] = frozenset()
         # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
             collections.Counter()
@@ -332,9 +392,12 @@ class CompileEnvironment:
         self.kernel_min_element_bits: int = 32  # smallest dtype bits across all tensors
         self.specialized_vars: set[sympy.Symbol] = set()
         self.specialized_strides: set[TensorPropertySource] = set()
+        # Config-backed values created by hl.register_tunable().
+        self.tunable_symbols: set[sympy.Symbol] = set()
         self.tensor_descriptor_layout_guards: dict[
             Source, TensorDescriptorLayoutGuard
         ] = {}
+        self.runtime_input_specializations: dict[str, RuntimeInputSpecialization] = {}
         self._tensor_input_source_cache: dict[int, Source | None] = {}
         self.jagged_tile_parent_ids: dict[int, list[int]] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
@@ -387,6 +450,11 @@ class CompileEnvironment:
     def _disallow_nonpersistent_pid_types(self, reason: str | None = None) -> None:
         """Restrict the search space to persistent kernels. Idempotent."""
         for pid_type in ("flat", "xyz"):
+            self.config_spec.disallow_pid_type(pid_type, reason=reason)
+
+    def require_persistent_blocked(self, reason: str) -> None:
+        """Restrict program-ID selection to blocked persistent execution."""
+        for pid_type in ("flat", "xyz", "persistent_interleaved"):
             self.config_spec.disallow_pid_type(pid_type, reason=reason)
 
     def restrict_pid_types_for_persistent(self, args: Sequence[object]) -> None:
@@ -550,6 +618,9 @@ class CompileEnvironment:
         cache_key = id(fake_tensor)
         if cache_key in self._tensor_input_source_cache:
             return self._tensor_input_source_cache[cache_key]
+        if cache_key in self._ambiguous_tensor_input_source_ids:
+            self._tensor_input_source_cache[cache_key] = None
+            return None
 
         source = self.input_sources.get(fake_tensor)
         from .host_function import HostFunction
@@ -575,6 +646,23 @@ class CompileEnvironment:
 
         self._tensor_input_source_cache[cache_key] = result
         return result
+
+    def runtime_value_for_tensor(self, fake_tensor: torch.Tensor) -> object | None:
+        """Replay a traced tensor's input source against the current real arguments."""
+        source = self.tensor_input_source(fake_tensor)
+        if source is None:
+            return None
+        return _replay_tensor_input_source(source, self.runtime_arg_values_by_name)
+
+    def register_runtime_input_specialization(
+        self,
+        key: str,
+        specialization: RuntimeInputSpecialization,
+    ) -> None:
+        """Register an internal projection from runtime inputs to a cache-key fact."""
+        previous = self.runtime_input_specializations.setdefault(key, specialization)
+        if previous != specialization:
+            raise RuntimeError(f"conflicting runtime input specializations for {key!r}")
 
     def tensor_descriptor_layout_signature(
         self, fake_tensor: torch.Tensor
@@ -785,7 +873,7 @@ class CompileEnvironment:
 
     def _disable_range_num_stages_for_aliasing(self) -> None:
         """
-        Disable range_num_stages choices if any kernel argument name is both read and written.
+        Disable pipelining only on loops that read and write the same argument.
 
         Workaround for https://github.com/triton-lang/triton/issues/8259
         """
@@ -793,17 +881,52 @@ class CompileEnvironment:
         if not self.config_spec.range_num_stages:
             return
 
+        from .ast_extension import ExtendedAST
         from .ast_read_writes import ReadWrites
         from .host_function import HostFunction
+        from .loop_dependency_checker import canonical_host_tensor_name
+        from .loop_dependency_checker import collect_host_tensor_aliases
+        from .type_info import IterType
+        from .type_info import SequenceType
+        from .type_info import TileIndexType
 
         host_fn = HostFunction.current()
-        rw = ReadWrites.from_list(host_fn.body)
-        if not (rw.reads and rw.writes):
-            return
-
         arg_names = set(host_fn.params.arguments.keys())
-        if set(rw.reads) & set(rw.writes) & arg_names:
-            self.config_spec.range_num_stages.clear()
+        aliases = collect_host_tensor_aliases(host_fn.body)
+        unsafe_block_ids: set[int] = set()
+        for node in ast.walk(ast.Module(body=host_fn.body, type_ignores=[])):
+            if not isinstance(node, ast.For) or not isinstance(node, ExtendedAST):
+                continue
+            rw = ReadWrites.from_list(node.body)
+            reads = {
+                canonical_host_tensor_name(name, aliases)
+                for name, count in rw.reads.items()
+                if count > rw.inplace_writes.get(name, 0)
+            }
+            reads.update(
+                canonical_host_tensor_name(name, aliases) for name in rw.atomic_reads
+            )
+            writes = {canonical_host_tensor_name(name, aliases) for name in rw.writes}
+            if not (reads & writes & arg_names):
+                continue
+            iter_node = node.iter
+            if not isinstance(iter_node, ExtendedAST):
+                continue
+            iter_type = iter_node._type_info
+            if not isinstance(iter_type, IterType):
+                continue
+            inner = iter_type.inner
+            if isinstance(inner, SequenceType):
+                unsafe_block_ids.update(
+                    item.block_id
+                    for item in inner.unpack()
+                    if isinstance(item, TileIndexType)
+                )
+            elif isinstance(inner, TileIndexType):
+                unsafe_block_ids.add(inner.block_id)
+        for block_id in unsafe_block_ids:
+            if block_id in self.config_spec.range_num_stages.valid_block_ids():
+                self.config_spec.range_num_stages.disable_block_id(block_id)
 
     def allocate_block_size(
         self,
@@ -868,19 +991,26 @@ class CompileEnvironment:
                 block_idx = origin_info.origin.block_id
                 existing_block = self.block_sizes[block_idx]
 
-        def _is_unbacked_symint(x: int | torch.SymInt) -> bool:
-            if not isinstance(x, torch.SymInt):
-                return False
-            expr = x._sympy_()
-            if isinstance(expr, sympy.Symbol):
-                return symbol_is_type(expr, SymT.UNBACKED_INT)
-            return False
+        def _has_unbacked(x: int | torch.SymInt) -> bool:
+            return isinstance(x, torch.SymInt) and bool(
+                free_unbacked_symbols(x._sympy_())
+            )
 
-        # Check for existing reduction dimensions with the same size
+        # Check for existing reduction dimensions with the same size. When an
+        # unbacked symbol is involved, the comparison must not guard:
+        # ``rdim.size == size`` on a mixed unbacked-SymInt/int pair forces a
+        # ShapeEnv guard that SPECIALIZES the unbacked block symbol to the
+        # rdim's concrete size (e.g. a tile_m block symbol silently becomes
+        # head_dim==64 when comparing against an existing rdim), corrupting
+        # every downstream shape of that tile. known_equal answers via
+        # _maybe_evaluate_static (no new guards) and returns False when the
+        # equality is undecidable. Backed sizes keep the guarding ``==`` so
+        # distinct input symbols that are equal by hint (e.g. x.size(1) vs
+        # weight.size(0)) still unify into a single rdim.
         for rdim in self.block_sizes:
             if not rdim.reduction or not isinstance(rdim.size, (int, torch.SymInt)):
                 continue
-            if _is_unbacked_symint(rdim.size) and _is_unbacked_symint(size):
+            if _has_unbacked(rdim.size) or _has_unbacked(size):
                 if self.known_equal(rdim.size, size):
                     return rdim
             elif rdim.size == size:
@@ -1243,7 +1373,13 @@ class CompileEnvironment:
             result = self.fake_mode.fake_tensor_converter.from_real_tensor(
                 self.fake_mode, tensor, shape_env=self.shape_env, source=source
             )
-        self.input_sources[result] = source
+        result = self.backend.normalize_input_fake_tensor(result)
+        previous_source = self.input_sources.get(result)
+        if previous_source is not None and previous_source != source:
+            self._ambiguous_tensor_input_source_ids.add(id(result))
+            self._tensor_input_source_cache.pop(id(result), None)
+        else:
+            self.input_sources[result] = source
         if isinstance(source, LocalSource):
             for i, s in enumerate(result.size()):
                 if isinstance(s, torch.SymInt) and isinstance(

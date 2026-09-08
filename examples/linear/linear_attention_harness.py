@@ -524,6 +524,27 @@ def _fla_inputs(inputs: Inputs) -> Inputs:
     return out
 
 
+def _fla_benchmark_inputs(
+    harness: LinearAttentionExampleHarness, inputs: Inputs
+) -> tuple[Inputs, list[torch.Tensor]]:
+    """Build native-layout FLA inputs whose gradient targets are real leaves."""
+    out = dataclasses.replace(_fla_inputs(inputs))
+    grad_names = set(harness.grad_tensors)
+    leaves: list[torch.Tensor] = []
+    for f in dataclasses.fields(out):
+        val = getattr(out, f.name)
+        if not isinstance(val, torch.Tensor):
+            continue
+        val = val.detach()
+        val.requires_grad_(
+            f.name in grad_names and getattr(inputs, f.name).requires_grad
+        )
+        setattr(out, f.name, val)
+        if val.requires_grad:
+            leaves.append(val)
+    return out, leaves
+
+
 def _recurrent_error(
     harness: LinearAttentionExampleHarness, inputs: Inputs, C: int
 ) -> float:
@@ -670,7 +691,7 @@ def _time_config(
         **extra,
     )
     scale = inputs.scale
-    fla_inputs = _fla_inputs(inputs)
+    fla_inputs, fla_grads = _fla_benchmark_inputs(harness, inputs)
 
     fwd_ms = do_bench(lambda: harness.helion_fwd(inputs, C))
     fla_fwd_ms = do_bench(lambda: harness.fla_fwd(fla_inputs, scale))
@@ -691,7 +712,6 @@ def _time_config(
     grad_out = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE)
     go_t = _htf(grad_out)
     h_grads = [getattr(inputs, n) for n in harness.grad_tensors]
-    fla_grads = [getattr(fla_inputs, n) for n in harness.grad_tensors]
     fb_ms = do_bench(
         lambda: harness.helion_fb(inputs, grad_out, C),
         grad_to_none=h_grads,  # pyrefly: ignore[bad-argument-type]

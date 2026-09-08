@@ -40,6 +40,7 @@ unexpected.
 from __future__ import annotations
 
 import ast
+import re
 from typing import cast
 
 from ..ast_extension import statement_from_string
@@ -65,13 +66,46 @@ _REDUCE_COMBINE: dict[str, str] = {
 }
 
 
+# Grouped-reduction helper names (multi-warp shared-memory reductions and
+# the interleaved grouped warp reduce).  These take the reduction op as a
+# string literal in args[1] and the identity element in args[2]; the pass
+# hoists them exactly like ``cute.arch.warp_reduction_*``.  Without this a
+# multi-warp config (group_span > 32) runs a full two-barrier block
+# reduction per V-lane per reduce.
+_GROUPED_REDUCE_FUNCS: frozenset[str] = frozenset(
+    {
+        "_cute_grouped_reduce_shared_two_stage",
+        "_cute_grouped_reduce_shared_tree",
+        "_cute_grouped_reduce_warp",
+        "_cute_grouped_reduce_cluster",
+    }
+)
+_GROUPED_OP_TO_KEY: dict[str, str] = {
+    "sum": "warp_reduction_sum",
+    "max": "warp_reduction_max",
+    "min": "warp_reduction_min",
+}
+
+
 def _looks_like_warp_reduce_call(node: ast.AST) -> tuple[str, ast.expr] | None:
-    """If ``node`` is ``cute.arch.warp_reduction_<op>(INPUT, threads_in_group=T)``,
-    return ``("warp_reduction_<op>", INPUT)``.  Otherwise None.
+    """If ``node`` is ``cute.arch.warp_reduction_<op>(INPUT, threads_in_group=T)``
+    or a grouped-reduce helper call ``_cute_grouped_reduce_*(INPUT, '<op>',
+    IDENTITY, ...)``, return ``("warp_reduction_<op>", INPUT)``.  Otherwise
+    None.
     """
     if not isinstance(node, ast.Call):
         return None
     func = node.func
+    if isinstance(func, ast.Name) and func.id in _GROUPED_REDUCE_FUNCS:
+        if len(node.args) < 3:
+            return None
+        op_arg = node.args[1]
+        if not (isinstance(op_arg, ast.Constant) and isinstance(op_arg.value, str)):
+            return None
+        op_key = _GROUPED_OP_TO_KEY.get(op_arg.value)
+        if op_key is None:
+            return None
+        return op_key, node.args[0]
     if not isinstance(func, ast.Attribute):
         return None
     if func.attr not in _REDUCE_IDENTITY:
@@ -376,6 +410,20 @@ def _try_hoist_one_vloop(
 
         identity = _REDUCE_IDENTITY[op]
         combine_template = _REDUCE_COMBINE[op]
+        acc_dtype_probe = _infer_input_dtype(input_def_rhs)
+        if acc_dtype_probe in (
+            "cutlass.Float32",
+            "cutlass.Float16",
+            "cutlass.BFloat16",
+        ):
+            # Python ``max``/``min`` lower to a compare + select (2 SASS
+            # insts); the hardware FMNMX is one.  fmax/fmin drop NaN
+            # instead of propagating it, matching quack's row_reduce (the
+            # warp shuffle reduction already uses the same semantics).
+            if op == "warp_reduction_max":
+                combine_template = "cute.arch.fmax(({a}), ({b}))"
+            elif op == "warp_reduction_min":
+                combine_template = "cute.arch.fmin(({a}), ({b}))"
         # Decide how to hoist the reduce.  Three cases:
         #
         #  (b) The input is a matmul-fallback PER-THREAD RUNNING SUM, flagged
@@ -404,6 +452,7 @@ def _try_hoist_one_vloop(
 
         vloop_body: list[ast.stmt] = []
         v_members = sorted(v_loop_members[reduce_pos])
+        acc_dtype: str | None = None
         if input_is_loop_carried:
             acc_name = input_name
             for j in v_members:
@@ -449,7 +498,9 @@ def _try_hoist_one_vloop(
         new_stmts.append(new_vloop_template)
 
         # Emit the reduce stmt with input -> acc.
-        new_reduce_stmt = _replace_reduce_input(reduce_stmt, call_node, acc_name)
+        new_reduce_stmt = _replace_reduce_input(
+            reduce_stmt, call_node, acc_name, acc_dtype
+        )
         if new_reduce_stmt is None:
             return None
         new_stmts.append(new_reduce_stmt)
@@ -477,7 +528,8 @@ def _rewrite_cast_wrapper(rhs: ast.expr, new_dtype: str) -> ast.expr:
     if (
         isinstance(rhs, ast.Call)
         and isinstance(rhs.func, ast.Attribute)
-        and ast.unparse(rhs.func).startswith("cutlass.Float")
+        and ast.unparse(rhs.func)
+        in ("cutlass.Float16", "cutlass.BFloat16", "cutlass.Float32")
     ):
         # Rewrite the cast wrapper to use new_dtype.
         # Parse "<new_dtype>(<args>)" template.
@@ -502,27 +554,34 @@ def _infer_input_dtype(rhs: ast.expr) -> str | None:
         return _infer_input_dtype(rhs.body)
     if isinstance(rhs, ast.Call) and isinstance(rhs.func, ast.Attribute):
         func_text = ast.unparse(rhs.func)
-        # Promote fp16/bf16 accumulators to fp32 for better perf and accuracy:
-        # the downstream uses convert to fp32 anyway, and fp16 max is no
-        # cheaper than fp32 max on B200.  Sum benefits from fp32 to avoid
-        # losing precision over the V-fold.
-        if func_text in ("cutlass.Float16", "cutlass.BFloat16"):
-            return "cutlass.Float32"
-        if func_text.startswith("cutlass.Float"):
-            return func_text
-        if func_text.startswith("cutlass.Int"):
-            return func_text
-        if func_text.startswith("cutlass.Uint"):
+        # Only match a bare dtype constructor (``cutlass.<Dtype>``); a
+        # compound expression like ``cutlass.Uint16(v[i]).bitcast`` is NOT
+        # a dtype wrapper and must fall through to the fp32 default.
+        if re.fullmatch(r"cutlass\.(?:B?Float|U?Int)\d+", func_text):
+            # Promote fp16/bf16 accumulators to fp32 for better perf and
+            # accuracy: the downstream uses convert to fp32 anyway, and
+            # fp16 max is no cheaper than fp32 max on B200.  Sum benefits
+            # from fp32 to avoid losing precision over the V-fold.
+            if func_text in ("cutlass.Float16", "cutlass.BFloat16"):
+                return "cutlass.Float32"
             return func_text
     # Conservative default — sufficient for sum/max in fp32 accumulators.
     return "cutlass.Float32"
 
 
 def _replace_reduce_input(
-    reduce_stmt: ast.stmt, call_node: ast.Call, acc_name: str
+    reduce_stmt: ast.stmt,
+    call_node: ast.Call,
+    acc_name: str,
+    acc_dtype: str | None = None,
 ) -> ast.stmt | None:
     """Return a copy of ``reduce_stmt`` with ``call_node``'s first arg replaced
     by ``Name(acc_name)``.
+
+    For grouped-reduce helper calls, the identity element (args[2]) must
+    match the input dtype (the helpers derive their smem dtype from it), so
+    when ``acc_dtype`` is given the identity's dtype wrapper is rewritten to
+    it (e.g. ``cutlass.BFloat16(float('-inf'))`` -> ``cutlass.Float32(...)``).
     """
     if not isinstance(reduce_stmt, ast.Assign):
         return None
@@ -535,6 +594,13 @@ def _replace_reduce_input(
             if node is call_node and not self.done:
                 self.done = True
                 new_args = [ast.Name(id=acc_name, ctx=ast.Load()), *node.args[1:]]
+                if (
+                    acc_dtype is not None
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id in _GROUPED_REDUCE_FUNCS
+                    and len(new_args) >= 3
+                ):
+                    new_args[2] = _rewrite_cast_wrapper(new_args[2], acc_dtype)
                 new_call = ast.Call(
                     func=node.func, args=new_args, keywords=node.keywords
                 )
@@ -585,6 +651,7 @@ def hoist_warp_reduce_from_vloop(
     body: list[ast.stmt],
     *,
     running_sum_accumulators: set[str] | None = None,
+    rename_groups: dict[str, str] | None = None,
 ) -> list[ast.stmt]:
     """Apply the hoist pass to a list of kernel-body statements.
 
@@ -598,5 +665,452 @@ def hoist_warp_reduce_from_vloop(
     after the loop rather than V-folded — the producer tells us authoritatively
     that the value already accumulates across V-lanes, so we don't re-derive it
     by pattern-matching the AST.
+
+    After the per-V-loop hoist, a second walk collapses the remaining
+    per-lane-iteration reduces: a static lane loop that runs ``REDUCE`` +
+    ``carry = combine(carry, result)`` once per iteration is rewritten to
+    fold the per-thread accumulator across ALL lane iterations and reduce
+    ONCE after the loop.  For multi-warp grouped reductions this removes
+    ``L-1`` two-barrier shared-memory reductions per sweep.
     """
-    return _hoist_in_body(body, [0], running_sum_accumulators or set())
+    new_body = _hoist_in_body(body, [0], running_sum_accumulators or set())
+    import os
+
+    if os.environ.get("HELION_DISABLE_LANE_REDUCE_COLLAPSE") != "1":
+        new_body = _collapse_in_body(new_body, new_body, rename_groups or {})
+    return new_body
+
+
+# ---------------------------------------------------------------------------
+# Lane-loop reduce collapse (second stage)
+# ---------------------------------------------------------------------------
+
+
+def _is_static_range_loop(node: ast.stmt) -> int | None:
+    """If ``node`` is ``for X in range(<int>): ...`` (a static lane loop as
+    emitted by ``_create_lane_loop``), return the trip count."""
+    if not isinstance(node, ast.For) or node.orelse:
+        return None
+    it = node.iter
+    if not (
+        isinstance(it, ast.Call)
+        and isinstance(it.func, ast.Name)
+        and it.func.id == "range"
+        and len(it.args) == 1
+        and isinstance(it.args[0], ast.Constant)
+        and isinstance(it.args[0].value, int)
+    ):
+        return None
+    if not isinstance(node.target, ast.Name):
+        return None
+    return it.args[0].value
+
+
+_COLLAPSE_UPDATE_OPS: dict[str, str] = {
+    "warp_reduction_sum": "add",
+    "warp_reduction_max": "max",
+    "warp_reduction_min": "min",
+}
+
+
+def _strip_dtype_wrap(expr: ast.expr) -> ast.expr:
+    """Peel ``cutlass.<Dtype>(x)`` wrappers off ``expr``."""
+    while (
+        isinstance(expr, ast.Call)
+        and len(expr.args) == 1
+        and not expr.keywords
+        and isinstance(expr.func, ast.Attribute)
+        and isinstance(expr.func.value, ast.Name)
+        and expr.func.value.id == "cutlass"
+    ):
+        expr = expr.args[0]
+    return expr
+
+
+def _match_carry_update(
+    stmt: ast.stmt, result_name: str, op_kind: str
+) -> tuple[str, str] | None:
+    """Match ``CARRY = combine(SRC, result_name)`` for ``op_kind``.
+
+    Returns ``(carry_name, src_name)`` (operand order-insensitive) or None.
+    """
+    if not (
+        isinstance(stmt, ast.Assign)
+        and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name)
+    ):
+        return None
+    carry_name = stmt.targets[0].id
+    rhs = stmt.value
+    operands: list[ast.expr] | None = None
+    if op_kind == "add":
+        if isinstance(rhs, ast.BinOp) and isinstance(rhs.op, ast.Add):
+            operands = [rhs.left, rhs.right]
+    elif isinstance(rhs, ast.Call):
+        func_text = ast.unparse(rhs.func)
+        if (
+            (
+                op_kind == "max"
+                and func_text in ("max", "cute.math.max", "cute.arch.fmax")
+            )
+            or (op_kind == "min" and func_text in ("min", "cute.math.min"))
+        ) and len(rhs.args) == 2:
+            operands = list(rhs.args)
+    if operands is None:
+        return None
+    names = [
+        inner.id if isinstance(inner := _strip_dtype_wrap(o), ast.Name) else None
+        for o in operands
+    ]
+    if result_name not in names:
+        return None
+    other = names[1 - names.index(result_name)]
+    if other is None:
+        return None
+    return carry_name, other
+
+
+def _count_name_reads(node: ast.AST | list[ast.stmt]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    nodes = node if isinstance(node, list) else [node]
+    for n in nodes:
+        for sub in ast.walk(n):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                counts[sub.id] = counts.get(sub.id, 0) + 1
+    return counts
+
+
+def _try_collapse_lane_reduce(
+    loop: ast.For,
+    root: list[ast.stmt],
+    rename_groups: dict[str, str],
+) -> list[ast.stmt] | None:
+    """Collapse per-lane-iteration reduces in a static lane loop.
+
+    Matches the post-hoist shape::
+
+        for LANE in range(L):
+            <pre stmts>
+            ACC = <dtype>(<identity>)
+            for V in cutlass.range_constexpr(V): ... ACC = combine(ACC, x)
+            <reduce-arg scalars (loop-invariant)>
+            R = REDUCE(ACC, ...)
+            <casts of R>
+            COPY = CARRY            # optional
+            CARRY = combine(COPY | CARRY, cast(R))
+
+    and rewrites it so ``ACC`` folds across all ``L`` iterations and the
+    reduce + carry update run once after the loop.  Valid because the
+    grouped/warp reduce distributes over its own combine op (max of maxes,
+    sum of sums).
+    """
+    body = loop.body
+    assert isinstance(loop.target, ast.Name)
+    lane_var = loop.target.id
+
+    import os as _os
+
+    _dbg = _os.environ.get("HELION_DEBUG_COLLAPSE") == "1"
+    if _dbg:
+        import sys as _sys
+
+        print("=== collapse attempt ===", file=_sys.stderr)
+        for _i, _s in enumerate(body):
+            print(_i, ast.unparse(_s)[:100].replace("\n", " | "), file=_sys.stderr)
+
+    # Locate reduce statements at the top level of the loop body.
+    reduce_entries: list[tuple[int, str, str, ast.Call, str]] = []
+    for i, stmt in enumerate(body):
+        rhs = _assignment_rhs(stmt)
+        lhs = _assignment_lhs_name(stmt)
+        if rhs is None or lhs is None:
+            continue
+        found = _find_warp_reduce_in_expr(rhs)
+        if found is None:
+            continue
+        op, input_expr, call_node = found
+        if not isinstance(input_expr, ast.Name):
+            return None
+        reduce_entries.append((i, lhs, op, call_node, input_expr.id))
+    if not reduce_entries:
+        return None
+
+    loop_written: set[str] = set()
+    for stmt in body:
+        loop_written |= _names_written(stmt)
+
+    # Global read counts over the whole kernel body (to prove that the
+    # names we move / consume have no other consumers).
+    global_reads = _count_name_reads(root)
+
+    remove_indices: set[int] = set()
+    move_out: list[int] = []  # loop-invariant reduce-arg producers, in order
+    prefix: list[ast.stmt] = []
+    tail: list[ast.stmt] = []
+
+    for idx, result_name, op, call_node, acc_name in reduce_entries:
+        op_kind = _COLLAPSE_UPDATE_OPS.get(op)
+        if op_kind is None:
+            return None
+        # (1) The accumulator: defined once by an identity init, combined
+        # only inside a single constexpr V-loop, and read only by that
+        # combine and the reduce call.
+        init_idx = None
+        for j in range(idx - 1, -1, -1):
+            if acc_name in _names_written(body[j]):
+                init_idx = j
+                break
+        if init_idx is None:
+            return None
+        init_rhs = _assignment_rhs(body[init_idx])
+        if init_rhs is None:
+            return None
+        init_text = ast.unparse(_strip_dtype_wrap(init_rhs))
+        expected_identity = _REDUCE_IDENTITY[op]
+        if init_text not in (expected_identity, f"({expected_identity})"):
+            return None
+        vloop_idx = None
+        for j in range(init_idx + 1, idx):
+            stmt = body[j]
+            if isinstance(stmt, ast.For) and _is_constexpr_v_loop(stmt) is not None:
+                if acc_name in _names_written_recursive(stmt):
+                    if vloop_idx is not None:
+                        return None
+                    vloop_idx = j
+            elif acc_name in _names_written(stmt) or acc_name in _names_read(stmt):
+                return None
+        if vloop_idx is None:
+            return None
+        # acc reads: the V-loop combine(s) + the reduce call. Anything else
+        # (elsewhere in the kernel) makes the collapse unsafe.
+        vloop_acc_reads = _count_name_reads(body[vloop_idx]).get(acc_name, 0)
+        if global_reads.get(acc_name, 0) != vloop_acc_reads + 1:
+            return None
+
+        # (2) The cast chain from R to the value consumed by the carry
+        # update, and the update itself.
+        chain_names = [result_name]
+        chain_indices: list[int] = []
+        update_idx = None
+        carry_name = src_name = None
+        j = idx + 1
+        while j < len(body) and update_idx is None:
+            stmt = body[j]
+            matched = _match_carry_update(stmt, chain_names[-1], op_kind)
+            if matched is not None:
+                update_idx = j
+                carry_name, src_name = matched
+                break
+            lhs = _assignment_lhs_name(stmt)
+            rhs = _assignment_rhs(stmt)
+            if (
+                lhs is not None
+                and rhs is not None
+                and isinstance(inner := _strip_dtype_wrap(rhs), ast.Name)
+                and inner.id == chain_names[-1]
+            ):
+                chain_indices.append(j)
+                chain_names.append(lhs)
+                j += 1
+                continue
+            return None
+        if update_idx is None or carry_name is None or src_name is None:
+            return None
+        # (3) The carry source: the carry itself, or a chain of in-loop
+        # copies of it.  Pre-rename ASTs thread loop-carried values through
+        # alias vars (``mi_copy = mi; mi_copy_0 = mi_copy; v_1 = max(
+        # mi_copy_0, ...)`` where ``v_1`` later renames to ``mi``), so
+        # resolve both ends through ``rename_groups`` canonical names.
+        carry_canon = rename_groups.get(carry_name, carry_name)
+        copy_chain: list[int] = []
+        carry_root = src_name
+        while rename_groups.get(carry_root, carry_root) != carry_canon:
+            if len(copy_chain) > 4:
+                return None
+            def_idx = None
+            for j in range(update_idx - 1, -1, -1):
+                if carry_root in _names_written(body[j]):
+                    def_idx = j
+                    break
+            if def_idx is None:
+                return None
+            rhs = _assignment_rhs(body[def_idx])
+            if rhs is None or not isinstance(inner := _strip_dtype_wrap(rhs), ast.Name):
+                return None
+            if global_reads.get(carry_root, 0) != 1:
+                return None
+            copy_chain.append(def_idx)
+            carry_root = inner.id
+        # (4) Every chain name (the reduce result and each cast link,
+        # INCLUDING a chain of length one) is consumed exactly once, by
+        # the next link / the update; the carried value's root name is
+        # read exactly once inside the loop (by the first copy, or the
+        # update itself); and nothing inside the loop reads the update's
+        # RESULT (a per-iteration consumer of the running value, e.g.
+        # ``acc = acc + f(mi)``, must keep the per-iteration update).
+        for name in chain_names:
+            if global_reads.get(name, 0) != 1:
+                return None
+        loop_reads = _count_name_reads(body)
+        if loop_reads.get(carry_root, 0) != 1:
+            return None
+        if loop_reads.get(carry_name, 0) != 0:
+            return None
+        # (5) Reduce-arg producers (e.g. the grouped reduce's lane index
+        # vars): the backward slice of the reduce call minus the acc chain.
+        # They must be loop-invariant to move out.
+        arg_names = set()
+        for arg in [*call_node.args[1:], *[kw.value for kw in call_node.keywords]]:
+            for sub in ast.walk(arg):
+                if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                    arg_names.add(sub.id)
+        closure = _compute_dependency_closure(
+            body, {i for i in range(len(body)) if _names_written(body[i]) & arg_names}
+        )
+        closure_written: set[str] = set()
+        for j in closure:
+            closure_written |= _names_written(body[j])
+        for j in sorted(closure):
+            stmt = body[j]
+            if j in remove_indices or j in move_out:
+                continue
+            # The whole closure moves out together, so reads of names other
+            # closure members write are fine; only reads of names the loop
+            # still writes (or of the lane var) make the move unsafe.
+            reads = _names_read(stmt)
+            if lane_var in reads or reads & (loop_written - closure_written):
+                return None
+            move_out.append(j)
+
+        # Build the rewritten pieces.
+        prefix.append(body[init_idx])
+        remove_indices.add(init_idx)
+        remove_indices.add(idx)
+        remove_indices.update(chain_indices)
+        remove_indices.add(update_idx)
+        remove_indices.update(copy_chain)
+        tail.append(body[idx])
+        tail.extend(body[j] for j in chain_indices)
+        tail.extend(body[j] for j in sorted(copy_chain))
+        tail.append(body[update_idx])
+
+    if not tail:
+        return None
+    remove_indices.update(move_out)
+    moved = [body[j] for j in sorted(move_out)]
+    new_loop_body = [s for i, s in enumerate(body) if i not in remove_indices]
+    if not new_loop_body:
+        return None
+    # Mutate the loop in place (preserves lane-loop marker attributes that
+    # later passes key on).
+    loop.body = new_loop_body
+    return [*prefix, loop, *moved, *tail]
+
+
+def _names_written_recursive(node: ast.AST) -> set[str]:
+    written: set[str] = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.stmt):
+            written |= _names_written(sub)
+    return written
+
+
+def _collapse_in_body(
+    body: list[ast.stmt],
+    root: list[ast.stmt],
+    rename_groups: dict[str, str],
+) -> list[ast.stmt]:
+    new_body: list[ast.stmt] = []
+    for stmt in body:
+        if isinstance(stmt, ast.For):
+            stmt.body = _collapse_in_body(stmt.body, root, rename_groups)
+            stmt.orelse = _collapse_in_body(stmt.orelse, root, rename_groups)
+            if _is_static_range_loop(stmt) is not None:
+                replacement = _try_collapse_lane_reduce(stmt, root, rename_groups)
+                if replacement is not None:
+                    new_body.extend(replacement)
+                    continue
+            new_body.append(stmt)
+        elif isinstance(stmt, ast.If):
+            stmt.body = _collapse_in_body(stmt.body, root, rename_groups)
+            stmt.orelse = _collapse_in_body(stmt.orelse, root, rename_groups)
+            new_body.append(stmt)
+        elif isinstance(stmt, (ast.With, ast.FunctionDef)):
+            stmt.body = _collapse_in_body(stmt.body, root, rename_groups)
+            new_body.append(stmt)
+        else:
+            new_body.append(stmt)
+    return new_body
+
+
+def _static_trip_count(
+    loop: ast.For, constexpr_values: dict[str, int] | None
+) -> int | None:
+    """Static trip count of a ``range(...)`` / ``cutlass.range_constexpr``
+    for-loop, or None when unknown."""
+    from .fuse_two_pass_loads import _range_bounds
+    from .fuse_two_pass_loads import _trip_count_for
+
+    it = loop.iter
+    if (
+        isinstance(it, ast.Call)
+        and isinstance(it.func, ast.Attribute)
+        and it.func.attr == "range_constexpr"
+    ):
+        # Unrolled at trace time, but a call statement inside still
+        # references the SAME preamble-allocated mbarrier on every
+        # unrolled iteration — so for once-per-kernel placement purposes
+        # the trip count is the unroll factor, not 1.
+        if (
+            it.args
+            and isinstance(it.args[0], ast.Constant)
+            and isinstance(it.args[0].value, int)
+        ):
+            return it.args[0].value
+        return None
+    bounds = _range_bounds(it)
+    if bounds is None:
+        return None
+    return _trip_count_for(*bounds, constexpr_values or {})
+
+
+def validate_cluster_reduce_placement(
+    body: list[ast.stmt], constexpr_values: dict[str, int] | None
+) -> None:
+    """Raise ``BackendUnsupported`` when a ``_cute_grouped_reduce_cluster``
+    call site can execute more than once per kernel (its single-phase
+    mbarrier would deadlock on the second execution)."""
+    from ... import exc
+
+    def walk(stmts: list[ast.stmt], multi_trip: bool) -> None:
+        for stmt in stmts:
+            inner_multi = multi_trip
+            if isinstance(stmt, ast.For):
+                trips = _static_trip_count(stmt, constexpr_values)
+                inner_multi = multi_trip or trips is None or trips > 1
+            if inner_multi:
+                for sub in ast.walk(stmt):
+                    if (
+                        isinstance(sub, ast.Call)
+                        and isinstance(sub.func, ast.Name)
+                        and sub.func.id
+                        in (
+                            "_cute_grouped_reduce_cluster",
+                            "_cute_grouped_reduce_cluster_online_pair",
+                        )
+                    ):
+                        raise exc.BackendUnsupported(
+                            "cute",
+                            "cute_cluster_n > 1 requires the cluster reduce "
+                            "to run exactly once per kernel; this config "
+                            "leaves it inside a multi-trip loop",
+                        )
+            for field in ("body", "orelse", "finalbody"):
+                nested = getattr(stmt, field, None)
+                if isinstance(nested, list) and nested:
+                    walk(
+                        cast("list[ast.stmt]", nested),
+                        inner_multi,
+                    )
+
+    walk(body, False)

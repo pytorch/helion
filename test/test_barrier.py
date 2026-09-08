@@ -333,3 +333,29 @@ class TestCuteBarrier(RefEagerTestBase, TestCase):
         )
         expected = x * 2 + 1
         torch.testing.assert_close(out, expected)
+
+    @skipIfRefEager("CuTe lane-loop lowering is unavailable in ref eager mode")
+    def test_tile_reduction_preserves_lane_loop_metadata(self) -> None:
+        @helion.kernel(backend="cute", autotune_effort="none")
+        def barrier_tile_sum(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            tmp = torch.empty([m], dtype=x.dtype, device=x.device)
+            out = torch.empty_like(tmp)
+            for tile_m, tile_n in hl.tile([m, n]):
+                tmp[tile_m] = x[tile_m, tile_n].sum(dim=1)
+            hl.barrier()
+            for tile_m in hl.tile(m):
+                out[tile_m] = tmp[tile_m]
+            return out
+
+        x = torch.randn([8, 128], device=DEVICE, dtype=torch.float32)
+        code, out = code_and_output(
+            barrier_tile_sum,
+            (x,),
+            block_sizes=[1, 128, 1],
+            num_threads=[1, 32, 1],
+            pid_type="persistent_blocked",
+        )
+
+        torch.testing.assert_close(out, x.sum(dim=1))
+        self.assertNotIn("_helion_lane_reduce", code)

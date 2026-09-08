@@ -216,6 +216,23 @@ class LLMGuidedSearch(PopulationBasedSearch):
         self._benchmark_times: list[float] = []
         self._llm_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
+    def _algorithm_cache_policy(self) -> dict[str, object]:
+        return {
+            "llm_version": 1,
+            "provider": self.provider or _infer_provider(self.model),
+            "model": self.model,
+            "configs_per_round": self.configs_per_round,
+            "max_rounds": self.max_rounds,
+            "initial_random_configs": self.initial_random_configs,
+            "finishing_rounds": self.finishing_rounds,
+            "min_improvement_delta": self.min_improvement_delta,
+            "api_base": self.api_base,
+            "request_timeout_s": self.request_timeout_s,
+            "compile_timeout_s": self.compile_timeout_s,
+            "effort_level": self.effort_level,
+            "fast_mode": self.fast_mode,
+        }
+
     @classmethod
     def get_kwargs_from_profile(
         cls, profile: AutotuneEffortProfile, settings: Settings
@@ -376,7 +393,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
     def _initialize_prompt_state(self) -> None:
         """Reset prompt state for a fresh guided-search run."""
         # Start each run from the fixed system prompt and the initial request.
-        self._default_config_dict = dict(self.config_spec.default_config())
+        self._default_config_dict = dict(self.config_spec.autotune_reference_config())
         self._messages = [
             {"role": "system", "content": self._build_system_prompt()},
             {"role": "user", "content": self._build_initial_prompt()},
@@ -385,7 +402,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
     def _build_seed_configs(self) -> list[Config]:
         """Build the initial benchmark set: default plus a few random seeds."""
         # Start from default and add only distinct random configs that unflatten cleanly.
-        seed_configs: list[Config] = [self.config_spec.default_config()]
+        seed_configs: list[Config] = [self.config_spec.autotune_reference_config()]
         seen_config_keys = {self._config_key(seed_configs[0])}
         for flat in self.config_gen.random_population_flat(
             self.initial_random_configs + 1
@@ -428,6 +445,14 @@ class LLMGuidedSearch(PopulationBasedSearch):
         bench_t0 = time.perf_counter()
         results = self.benchmark_batch(configs, desc=desc)
         self._benchmark_times.append(time.perf_counter() - bench_t0)
+        repairs = self.benchmark_provider.take_effective_source_repairs()
+        if repairs:
+            self._apply_effective_source_repairs(repairs, self.population)
+            for config, repair in repairs.items():
+                self._latest_results_by_config_key[self._config_key(config)] = repair
+            self._all_benchmark_results = list(
+                self._latest_results_by_config_key.values()
+            )
         self._ingest_results(results)
 
     def _ingest_results(self, results: list[BenchmarkResult]) -> None:

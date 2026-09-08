@@ -44,9 +44,11 @@ if TYPE_CHECKING:
     from ...runtime.config import Config
     from ..device_ir import GraphInfo
     from ..inductor_lowering import CodegenState
+    from .tensorcore_plan import DmaGatherPlan
 
 
 RESIDENT_PLAN_META = "pallas_resident_ref_plan"
+STATIC_BASIC_VALUE_SUBSCRIPT_META = "pallas_static_basic_value_subscript"
 
 # These Aten operations may preserve the address interpretation of a resident
 # Ref. Membership only permits planning; ``_reshape_variants`` still proves the
@@ -125,6 +127,127 @@ def _narrowed_dims(indices: object) -> list[int]:
     ]
 
 
+class _StaticIndexRange(NamedTuple):
+    """A compile-time contiguous tensor index represented as a Python slice."""
+
+    start: int
+    length: int
+
+
+def _static_index(
+    value: object, seen: set[torch.fx.Node] | None = None
+) -> int | _StaticIndexRange | None:
+    """Evaluate a scalar or contiguous compile-time tensor index.
+
+    Mosaic does not implement general advanced indexing on materialized VMEM
+    values. Helion's ``hl.arange`` commonly traces as an iota, however, and an
+    iota shifted by a constant is exactly a basic Python slice. Recognize that
+    deliberately small subset so Pallas codegen can retain basic indexing
+    semantics without introducing a gather.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if not isinstance(value, torch.fx.Node):
+        return None
+    seen = set() if seen is None else seen
+    if value in seen:
+        return None
+    seen.add(value)
+    if value.op != "call_function":
+        return None
+    if value.target is torch.ops.prims.iota.default:
+        length = value.args[0]
+        start = value.kwargs.get("start", 0)
+        step = value.kwargs.get("step", 1)
+        if not isinstance(length, int) or isinstance(length, bool):
+            return None
+        if not isinstance(start, int) or isinstance(start, bool):
+            return None
+        if not isinstance(step, int) or isinstance(step, bool):
+            return None
+        if length < 0 or start < 0 or step != 1:
+            return None
+        return _StaticIndexRange(start=start, length=length)
+
+    shift_arithmetic = {
+        torch.ops.aten.add.Scalar,
+        torch.ops.aten.add.Tensor,
+        torch.ops.aten.sub.Scalar,
+        torch.ops.aten.sub.Tensor,
+    }
+    if value.target not in shift_arithmetic or value.kwargs.get("alpha", 1) != 1:
+        return None
+    if len(value.args) != 2:
+        return None
+    lhs = _static_index(value.args[0], seen)
+    rhs = _static_index(value.args[1], seen)
+    if value.target in {torch.ops.aten.add.Scalar, torch.ops.aten.add.Tensor}:
+        if isinstance(lhs, _StaticIndexRange) and isinstance(rhs, int):
+            start = lhs.start + rhs
+            return _StaticIndexRange(start, lhs.length) if start >= 0 else None
+        if isinstance(lhs, int) and isinstance(rhs, _StaticIndexRange):
+            start = lhs + rhs.start
+            return _StaticIndexRange(start, rhs.length) if start >= 0 else None
+        if isinstance(lhs, int) and isinstance(rhs, int):
+            return lhs + rhs
+        return None
+    if isinstance(lhs, _StaticIndexRange) and isinstance(rhs, int):
+        start = lhs.start - rhs
+        return _StaticIndexRange(start, lhs.length) if start >= 0 else None
+    if isinstance(lhs, int) and isinstance(rhs, int):
+        return lhs - rhs
+    return None
+
+
+def _is_static_basic_value_subscript(node: torch.fx.Node, config: Config) -> bool:
+    """Whether static narrowing can use ordinary JAX basic indexing."""
+    indices = node.args[1]
+    if not isinstance(indices, (list, tuple)):
+        return False
+    if not all(
+        index is None or index == slice(None) or _static_index(index) is not None
+        for index in indices
+    ):
+        return False
+
+    input_value = _node_value(node.args[0])
+    if not isinstance(input_value, torch.Tensor):
+        return False
+    tensor_dim = 0
+    for index in indices:
+        if index is None:
+            continue
+        if tensor_dim >= input_value.ndim:
+            return False
+        if index != slice(None):
+            static_index = _static_index(index)
+            assert static_index is not None
+            size = _concrete_size(input_value.shape[tensor_dim], config, 1)
+            if size is None:
+                return False
+            if isinstance(static_index, _StaticIndexRange):
+                if static_index.start + static_index.length > size:
+                    return False
+            elif not -size <= static_index < size:
+                return False
+        tensor_dim += 1
+
+    source = node.args[0]
+    seen: set[torch.fx.Node] = set()
+    while isinstance(source, torch.fx.Node) and source not in seen:
+        seen.add(source)
+        if source.op != "call_function":
+            return False
+        if source.target in _RESIDENT_REF_ATEN_VIEW_TARGETS:
+            source = source.args[0]
+            continue
+        # An earlier narrowing subscript may still carry a resident Ref and its
+        # boundary-mask invariants. A root load, by contrast, can materialize as
+        # an ordinary value before applying this compile-time basic index.
+        return source.target is not subscript
+    return False
+
+
 def _resident_plan(node: torch.fx.Node) -> _ResidentPlan | None:
     # Codegen repair may reload this module after planning, so an existing plan
     # can be an instance of the pre-reload NamedTuple class. The private metadata
@@ -181,23 +304,12 @@ def _capture_edges(
     dict[torch.fx.Node, torch.fx.Node],
 ]:
     """Build parent and capture links on the current per-config graph copies."""
+    from ..device_ir import control_flow_parent_entries
+
     # TODO(jansel): Reuse NodeArgsGraphInfo.node_args for capture edges once kwargs()
     # remaps those nodes into per-config graph copies (see the TODO in device_ir.py).
     # Until then, reconstruct the links from the copied parent calls below.
-    parent_args: dict[int, tuple[torch.fx.Node, int]] = {}
-    for info in graphs:
-        for node in info.graph.nodes:
-            if node.op != "call_function" or not node.args:
-                continue
-            if _tracing_ops.is_for_loop_target(node.target) and isinstance(
-                node.args[0], int
-            ):
-                parent_args[node.args[0]] = (node, 3)
-            elif node.target is _tracing_ops._if and len(node.args) >= 5:
-                if isinstance(node.args[1], int):
-                    parent_args[node.args[1]] = (node, 3)
-                if isinstance(node.args[2], int):
-                    parent_args[node.args[2]] = (node, 4)
+    parent_args = control_flow_parent_entries(graphs)
 
     captures: dict[torch.fx.Node, list[tuple[torch.fx.Node, torch.fx.Node]]] = {}
     for info in graphs:
@@ -252,37 +364,17 @@ def _mutated_storage_ids(graphs: list[GraphInfo]) -> set[int]:
     return mutated_storages
 
 
-def _loop_bounds(
-    info: GraphInfo,
-    parents: dict[int, torch.fx.Node],
-    block_id: int,
-) -> tuple[object, object] | None:
-    from ..device_ir import ForLoopGraphInfo
-
-    entry = parents.get(info.graph_id)
-    if (
-        not isinstance(info, ForLoopGraphInfo)
-        or entry is None
-        or block_id not in info.block_ids
-    ):
-        return None
-    parent = entry
-    position = info.block_ids.index(block_id)
-    begins, ends = parent.args[1:3]
-    if not isinstance(begins, (list, tuple)) or not isinstance(ends, (list, tuple)):
-        return None
-    return _node_value(begins[position]), _node_value(ends[position])
-
-
 def _enclosing_loop_bounds(
     info: GraphInfo,
     parents: dict[int, torch.fx.Node],
     graph_infos: dict[torch.fx.Graph, GraphInfo],
     block_id: int,
 ) -> tuple[object, object] | None:
+    from ..device_ir import device_loop_bounds
+
     seen: set[torch.fx.Graph] = set()
     while True:
-        if (bounds := _loop_bounds(info, parents, block_id)) is not None:
+        if (bounds := device_loop_bounds(info, parents, block_id)) is not None:
             return bounds
         assert info.graph not in seen, "cycle while resolving an enclosing tile loop"
         seen.add(info.graph)
@@ -330,6 +422,15 @@ def _physical_shape(
     return cast("tuple[int, ...]", shape) if None not in shape else None
 
 
+def _indirect_dma_plan(producer: torch.fx.Node) -> DmaGatherPlan | None:
+    """Return the selected indirect DMA plan, if present."""
+    from .tensorcore_plan import TENSORCORE_PLAN_META
+    from .tensorcore_plan import DmaGatherPlan
+
+    plan = producer.meta.get(TENSORCORE_PLAN_META)
+    return plan if isinstance(plan, DmaGatherPlan) else None
+
+
 def _root_variants(
     producer: torch.fx.Node,
     graph_info: GraphInfo,
@@ -361,6 +462,18 @@ def _root_variants(
         raise exc.BackendUnsupported(
             "pallas", f"the source load at {location} has unsupported indices"
         )
+
+    dma_plan = _indirect_dma_plan(producer)
+    if dma_plan is not None:
+        shape = _physical_shape(value, context.config, 1)
+        expected = dma_plan.transfer_shape
+        if shape is None or shape != expected:
+            raise exc.BackendUnsupported(
+                "pallas",
+                f"the indirect DMA source load at {location} has physical shape "
+                f"{shape}, expected {expected}",
+            )
+        return (_ResidentVariant(1, shape, (), None),)
     if isinstance(producer.meta.get(TENSORCORE_PLAN_META), OneHotGatherPlan):
         raise exc.BackendUnsupported(
             "pallas", f"the source load at {location} uses an indirect gather"
@@ -386,7 +499,9 @@ def _root_variants(
     # the loaded Ref remains guarded until a selector proves it uses the exact live
     # extent of this source block.
     full_loop = False
-    bounds = _loop_bounds(graph_info, context.parents, outer_block_id)
+    from ..device_ir import device_loop_bounds
+
+    bounds = device_loop_bounds(graph_info, context.parents, outer_block_id)
     if bounds is not None:
         start, end = bounds
         env = CompileEnvironment.current()
@@ -456,6 +571,7 @@ def _apply_selector_to_variants(
     config: Config,
 ) -> _ResidentTransform:
     """Validate and apply a logical selector to every physical Ref variant."""
+    from .backend import PallasBackend
     from .backend import SliceAddressing
     from .backend import _slice_addressing
 
@@ -466,15 +582,6 @@ def _apply_selector_to_variants(
             logical_dim, variant.squeezed_dims, len(variant.shape)
         )
         lane_block = variant.shape[-1]
-        if (
-            _slice_addressing(input_value, logical_dim, lane_block)
-            is not SliceAddressing.DIRECT
-        ):
-            raise exc.BackendUnsupported(
-                "pallas",
-                f"the selector at {location} does not have direct VMEM "
-                "addressing for this config",
-            )
         width = (
             _variant_block_size(
                 selector.local_block_id, config, variant.worklist_factor
@@ -488,6 +595,28 @@ def _apply_selector_to_variants(
                 f"the selector at {location} has no concrete positive width "
                 "for this config",
             )
+        addressing = _slice_addressing(input_value, logical_dim, lane_block)
+        if addressing is not SliceAddressing.DIRECT:
+            dim_from_end = input_value.ndim - logical_dim - 1
+            bitwidth = input_value.dtype.itemsize * 8
+            backend = CompileEnvironment.current().backend
+            assert isinstance(backend, PallasBackend)
+            alignment = backend._get_pallas_required_alignment(
+                dim_from_end,
+                input_value.ndim,
+                bitwidth,
+            )
+            if (
+                selector.kind != "static"
+                or not isinstance(selector.begin, int)
+                or selector.begin % alignment
+                or width % alignment
+            ):
+                raise exc.BackendUnsupported(
+                    "pallas",
+                    f"the selector at {location} is not aligned for direct "
+                    "VMEM addressing in this config",
+                )
         if squeeze and width != 1:
             raise exc.BackendUnsupported(
                 "pallas",
@@ -837,7 +966,6 @@ def _registered_transform(
             output = _reshape_variants(node, context.config, variants)
             return _ResidentTransform(output, None)
         return _selector(node, graph_info, variants, context)
-
     if node.target in _RESIDENT_REF_ATEN_VIEW_TARGETS:
         output = _reshape_variants(node, context.config, variants)
         return _ResidentTransform(output, None)
@@ -885,6 +1013,39 @@ def _effective_users(
         for placeholder, _parent in edges:
             stack.append((placeholder, (*transports, placeholder)))
     return results
+
+
+def indirect_loads_requiring_resident_refs(
+    graphs: list[GraphInfo],
+) -> set[torch.fx.Node]:
+    """Find indirect loads whose resident view chains narrow their result."""
+    captures, _parents, _placeholder_to_outer = _capture_edges(graphs)
+    required: set[torch.fx.Node] = set()
+    for info in graphs:
+        for producer in info.graph.find_nodes(op="call_function", target=load):
+            indices = producer.args[1] if len(producer.args) > 1 else None
+            if not isinstance(indices, (list, tuple)) or not any(
+                isinstance(index, torch.fx.Node)
+                and isinstance(index.meta.get("val"), torch.Tensor)
+                for index in indices
+            ):
+                continue
+            seen: set[torch.fx.Node] = set()
+            stack = [producer]
+            while stack and producer not in required:
+                current = stack.pop()
+                if current in seen:
+                    continue
+                seen.add(current)
+                for user, _transports in _effective_users(current, captures):
+                    if user.target is subscript:
+                        if _narrowed_dims(user.args[1]):
+                            required.add(producer)
+                            break
+                        stack.append(user)
+                    elif user.target in _RESIDENT_REF_ATEN_VIEW_TARGETS:
+                        stack.append(user)
+    return required
 
 
 def _record_descendant_failure(
@@ -1050,11 +1211,13 @@ def plan_resident_ref_views(graphs: list[GraphInfo], config: Config) -> None:
     for info in graphs:
         for producer in info.graph.find_nodes(op="call_function", target=load):
             tensor = _node_value(producer.args[0])
+            dma_plan = _indirect_dma_plan(producer)
             # Keeping a Ref defers the physical read until its consumer. A device
             # write through an alias could therefore change program semantics.
             if (
                 isinstance(tensor, torch.Tensor)
                 and id(tensor.untyped_storage()) in mutated_storages
+                and dma_plan is None
             ):
                 _record_descendant_failure(
                     producer,
@@ -1089,7 +1252,11 @@ def plan_resident_ref_views(graphs: list[GraphInfo], config: Config) -> None:
     # so only this completeness pass decides whether a recorded failure is fatal.
     for info in graphs:
         for node in info.graph.find_nodes(op="call_function", target=subscript):
+            node.meta.pop(STATIC_BASIC_VALUE_SUBSCRIPT_META, None)
             if _resident_plan(node) is not None or not _narrowed_dims(node.args[1]):
+                continue
+            if _is_static_basic_value_subscript(node, config):
+                node.meta[STATIC_BASIC_VALUE_SUBSCRIPT_META] = True
                 continue
             failure = context.failures.get(node)
             if failure is None:
@@ -1179,6 +1346,29 @@ def _(state: CodegenState) -> ast.AST:
     assert state.fx_node is not None
     if _resident_plan(state.fx_node) is not None:
         return _codegen_resident_subscript(state)
+    indices = state.fx_node.args[1]
+    if state.fx_node.meta.get(STATIC_BASIC_VALUE_SUBSCRIPT_META):
+        assert isinstance(indices, (list, tuple))
+        placeholders: dict[str, ast.AST] = {"base": state.ast_arg(0)}
+        rendered: list[str] = []
+        for index in indices:
+            if index is None:
+                rendered.append("None")
+            elif index == slice(None):
+                rendered.append(":")
+            else:
+                static_index = _static_index(index)
+                assert static_index is not None
+                if isinstance(static_index, _StaticIndexRange):
+                    rendered.append(
+                        f"{static_index.start}:{static_index.start + static_index.length}"
+                    )
+                else:
+                    rendered.append(repr(static_index))
+        return expr_from_string(
+            f"{{base}}[{', '.join(rendered)}]",
+            **placeholders,
+        )
     # pyrefly: ignore [missing-attribute]
     return subscript._codegen["common"](state)
 

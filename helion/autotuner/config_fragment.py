@@ -294,19 +294,33 @@ class IntegerFragment(BaseIntegerFragment):
 class EnumFragment(ConfigSpecFragment):
     choices: tuple[object, ...]
     search_choices: tuple[object, ...] | None = None
+    coverage_choices: tuple[object, ...] | None = None
 
     def __post_init__(self) -> None:
-        if self.search_choices is None:
-            return
-        if not self.search_choices:
-            raise ValueError("search_choices must not be empty")
-        invalid = [
-            choice for choice in self.search_choices if choice not in self.choices
-        ]
-        if invalid:
-            raise ValueError(
-                f"search_choices must be a subset of choices, got {invalid!r}"
-            )
+        if self.search_choices is not None:
+            if not self.search_choices:
+                raise ValueError("search_choices must not be empty")
+            invalid = [
+                choice for choice in self.search_choices if choice not in self.choices
+            ]
+            if invalid:
+                raise ValueError(
+                    f"search_choices must be a subset of choices, got {invalid!r}"
+                )
+        if self.coverage_choices is not None:
+            if not self.coverage_choices:
+                raise ValueError("coverage_choices must not be empty")
+            active_choices = self._active_choices()
+            invalid = [
+                choice
+                for choice in self.coverage_choices
+                if choice not in active_choices
+            ]
+            if invalid:
+                raise ValueError(
+                    "coverage_choices must be a subset of active search choices, "
+                    f"got {invalid!r}"
+                )
 
     def _active_choices(self) -> tuple[object, ...]:
         return self.choices if self.search_choices is None else self.search_choices
@@ -318,8 +332,10 @@ class EnumFragment(ConfigSpecFragment):
         return random.choice(self._active_choices())
 
     def pattern_neighbors(self, current: object, radius: int = 1) -> list[object]:
-        if current not in self.choices:
-            raise ValueError(f"{current!r} not a valid choice")
+        # `current` can be outside `choices` when config normalization rewrote
+        # the knob to a value off the searched surface (e.g. cute tcgen05
+        # knobs on configs that opt out of tcgen05); every searched choice is
+        # then a neighbor so the search can step back onto the surface.
         return [choice for choice in self._active_choices() if choice != current]
 
     def differential_mutation(self, a: object, b: object, c: object) -> object:
@@ -350,24 +366,27 @@ class EnumFragment(ConfigSpecFragment):
         return list(active)
 
     def fingerprint(self) -> FragmentFingerprint:
-        if self.search_choices is None:
-            return ("enum", *(repr(choice) for choice in self.choices))
-        return (
-            "enum",
-            *(repr(choice) for choice in self.choices),
-            "search",
-            *(repr(choice) for choice in self.search_choices),
-        )
+        result = ["enum", *(repr(choice) for choice in self.choices)]
+        if self.search_choices is not None:
+            result.extend(("search", *(repr(choice) for choice in self.search_choices)))
+        if self.coverage_choices is not None:
+            result.extend(
+                ("coverage", *(repr(choice) for choice in self.coverage_choices))
+            )
+        return tuple(result)
 
     def encode(self, value: object) -> list[float]:
-        """Encode enum values as their index."""
+        """Encode enum values as a one-hot vector.
+
+        Values outside ``choices`` encode as all zeros rather than raising:
+        config normalization can legally rewrite a knob to a value outside
+        the searched surface (e.g. cute tcgen05 knobs on configs that opt
+        out of tcgen05), and this encoding only feeds surrogate models.
+        """
         try:
             choice_idx = self.choices.index(value)
         except ValueError:
-            raise ValueError(
-                f"Invalid enum value {value!r} for EnumFragment. "
-                f"Valid choices: {self.choices}"
-            ) from None
+            choice_idx = -1
         return [1.0 if i == choice_idx else 0.0 for i in range(len(self.choices))]
 
 
@@ -511,6 +530,23 @@ class ListOf(ConfigSpecFragment):
                 neighbor = current.copy()
                 neighbor[i] = neighbor_value
                 neighbors.append(neighbor)
+        # Also propose uniform lists (every element set to the same value):
+        # element-at-a-time moves can require crossing worse mixed
+        # configurations (e.g. flipping five memory ops from pointer to
+        # tensor_descriptor one by one), while the uniform move jumps straight
+        # across the valley.
+        if self.length > 1:
+            values: list[object] = []
+            for value in [
+                self.inner.default(),
+                *self.inner.pattern_neighbors(self.inner.default(), radius),
+            ]:
+                if value not in values:
+                    values.append(value)
+            for value in values:
+                uniform = [value] * self.length
+                if uniform != current and uniform not in neighbors:
+                    neighbors.append(uniform)
         return neighbors
 
     def differential_mutation(self, a: object, b: object, c: object) -> list[object]:

@@ -15,6 +15,21 @@ if TYPE_CHECKING:
 MEMORY_ACCESS_META = "pallas_memory_access"
 
 
+def tensor_origin_key(tensor: torch.Tensor) -> str | int:
+    """Stable key for a tensor's host-side origin expression."""
+    from ..host_function import HostFunction
+
+    origin = HostFunction.current().tensor_to_origin.get(tensor)
+    return origin.host_str() if origin is not None else id(tensor)
+
+
+def tensors_share_origin_or_storage(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
+    """Whether two fake tensors can address the same host allocation."""
+    return tensor_origin_key(lhs) == tensor_origin_key(rhs) or id(
+        lhs.untyped_storage()
+    ) == id(rhs.untyped_storage())
+
+
 class MemoryAccessKind(Enum):
     """Logical effect of one Helion memory operation."""
 
@@ -34,6 +49,15 @@ class MemoryAccess:
     subscript: tuple[object, ...]
     patterns: tuple[IndexingPattern, ...]
     value_node: torch.fx.Node | None
+
+
+@dataclass(frozen=True)
+class IndirectAccess:
+    """The single tensor-indexed dimension of a memory access."""
+
+    access: MemoryAccess
+    position: int
+    index_node: torch.fx.Node
 
 
 def build_memory_access(
@@ -68,4 +92,48 @@ def build_memory_access(
         subscript=tuple(subscript),
         patterns=tuple(patterns),
         value_node=value_node if isinstance(value_node, torch.fx.Node) else None,
+    )
+
+
+def memory_access_value(access: MemoryAccess) -> torch.Tensor | None:
+    """Return the tensor loaded or stored by ``access`` when available."""
+    value = (
+        access.node.meta.get("val")
+        if access.kind is MemoryAccessKind.LOAD
+        else access.value_node.meta.get("val")
+        if access.value_node is not None
+        else None
+    )
+    return value if isinstance(value, torch.Tensor) else None
+
+
+def memory_access_mask(access: MemoryAccess) -> object | None:
+    """Return an explicit mask, excluding automatic tile-bound masks."""
+    position = 2 if access.kind is MemoryAccessKind.LOAD else 3
+    return access.node.args[position] if len(access.node.args) > position else None
+
+
+def indirect_access(access: MemoryAccess) -> IndirectAccess | None:
+    """Return the unique tensor-indexed dimension, if there is one."""
+    positions = tensor_index_positions(access)
+    if len(positions) != 1:
+        return None
+    position = positions[0]
+    index = access.subscript[position]
+    if not isinstance(index, torch.fx.Node):
+        return None
+    return IndirectAccess(access, position, index)
+
+
+def tensor_index_positions(access: MemoryAccess) -> tuple[int, ...]:
+    """Return positions that require an indirect tensor access plan.
+
+    Rank-zero tensor indices are scalar addresses and use ordinary Ref indexing.
+    """
+    from .plan_tiling import TensorIndexPattern
+
+    return tuple(
+        position
+        for position, pattern in enumerate(access.patterns)
+        if isinstance(pattern, TensorIndexPattern) and pattern.index_ndim > 0
     )

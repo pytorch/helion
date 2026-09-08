@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from ..compile_environment import CompileEnvironment
 
 HardwareTarget = tuple[str, str | None]
+NamedHardwareTarget = tuple[str, str, str | None]
 
 # Reduction op name tokens used to detect a reduction in a traced graph. Shared
 # by the Triton split/join heuristic and the LLM workload-trait detection.
@@ -69,8 +70,11 @@ def dedupe_configs(configs: Iterable[Config]) -> list[Config]:
 
 def matches_hardware(
     env: CompileEnvironment,
-    targets: tuple[HardwareTarget, ...],
+    targets: tuple[HardwareTarget, ...] | None,
+    *,
+    named_targets: frozenset[NamedHardwareTarget] | None = None,
 ) -> bool:
+    from ..._argument_device import _canonicalize_argument_device
     from ..._hardware import get_hardware_info
 
     # A device Helion cannot classify raises RuntimeError here (e.g. MTIA, which
@@ -81,13 +85,29 @@ def matches_hardware(
     # is called outside the try/except that guards is_eligible, where an escaping
     # RuntimeError fails the whole compile.
     try:
-        hardware = get_hardware_info(env.device)
+        hardware = get_hardware_info(_canonicalize_argument_device(env.device))
     except RuntimeError:
         return False
-    return (hardware.device_kind, hardware.compute_capability) in targets or (
-        hardware.device_kind,
-        None,
-    ) in targets
+    if (
+        named_targets is not None
+        and (
+            hardware.device_kind,
+            hardware.hardware_name,
+            hardware.compute_capability,
+        )
+        not in named_targets
+        and (
+            hardware.device_kind,
+            hardware.hardware_name,
+            None,
+        )
+        not in named_targets
+    ):
+        return False
+    return targets is None or (
+        (hardware.device_kind, hardware.compute_capability) in targets
+        or (hardware.device_kind, None) in targets
+    )
 
 
 def clamp_block_size_targets(

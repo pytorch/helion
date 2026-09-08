@@ -257,7 +257,7 @@ def _plan_warp_per_row_execution(
     """
     from ..host_function import HostFunction
     from ..reduction_strategy import ReductionStrategy
-    from ..tile_strategy import CuteNDTileStrategy
+    from ..tile_strategy import PerThreadNDTileStrategy
 
     if not isinstance(graph_info, RootGraphInfo):
         return
@@ -287,21 +287,21 @@ def _plan_warp_per_row_execution(
         return
     # Find the M strategy (outer grid) and the N strategy (inner tile)
     # by walking ``tile_strategy.strategies``.  The M strategy owns
-    # ``m_block_id``; the N strategy is any other CuteNDTileStrategy
+    # ``m_block_id``; the N strategy is any other PerThreadNDTileStrategy
     # with a different block_id and at least one thread axis.
     m_strategy = tile_strategy.block_id_to_strategy.get((m_block_id,))
-    if not isinstance(m_strategy, CuteNDTileStrategy):
+    if not isinstance(m_strategy, PerThreadNDTileStrategy):
         return
     if m_strategy.thread_axes_used() != 1:
         return
     m_threads = tile_strategy.thread_extent_for_block_id(m_block_id)
     if not isinstance(m_threads, int) or m_threads < 2:
         return
-    n_strategies: list[CuteNDTileStrategy] = []
+    n_strategies: list[PerThreadNDTileStrategy] = []
     for strategy in tile_strategy.strategies:
         if strategy is m_strategy:
             continue
-        if not isinstance(strategy, CuteNDTileStrategy):
+        if not isinstance(strategy, PerThreadNDTileStrategy):
             continue
         if strategy.thread_axes_used() != 1:
             continue

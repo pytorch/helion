@@ -141,7 +141,21 @@ def _argreduce_scan_ready_expr(
         extent = lane_extents.get(lane_var)
         if extent is None or extent <= 0:
             continue
-        terms.append(f"(({lane_var}) == {extent - 1})")
+        # ``lane_loops`` records the full elements-per-thread, but a vec'd
+        # lane loop runs its outer var over extent // V with a constexpr-V
+        # inner loop: the last element is the last vec lane of the last
+        # outer iteration.
+        wrapper = grid_state.vec_lane_wrappers.get(lane_var)
+        vec_width = getattr(strategy, "_cute_lane_vec_width_by_block", {}).get(
+            block_id, 1
+        )
+        if wrapper is not None and vec_width > 1 and extent % vec_width == 0:
+            terms.append(
+                f"(({lane_var}) == {extent // vec_width - 1} "
+                f"and ({wrapper.vec_lane_var}) == {vec_width - 1})"
+            )
+        else:
+            terms.append(f"(({lane_var}) == {extent - 1})")
     if not terms:
         return None
     return " and ".join(terms)

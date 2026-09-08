@@ -5,6 +5,7 @@ import builtins
 import contextlib
 import dataclasses
 import functools
+import itertools
 import types
 from typing import TYPE_CHECKING
 from typing import NoReturn
@@ -32,6 +33,7 @@ from .type_info import CallableType
 from .type_info import CollectionType
 from .type_info import DictType
 from .type_info import LiteralType
+from .type_info import NestedFunctionType
 from .type_info import NoType
 from .type_info import NumericType
 from .type_info import SequenceType
@@ -687,7 +689,38 @@ class TypePropagation(ast.NodeVisitor):
                 comparators[i],
             )
             result = self._bool_op(ast.And(), result, new_result)
+        active_nodes = ExtendedAST.current()
+        if (
+            # Only the asserted test itself, at function scope and before the
+            # first kernel launch, is guaranteed to dominate that launch.
+            self.device_loop_count == 0
+            and len(active_nodes) == 2
+            and isinstance(active_nodes[0], ast.Assert)
+            and active_nodes[0].test is node
+            and all(isinstance(op, ast.Eq) for op in node.ops)
+        ):
+            for left, right in itertools.pairwise(comparators):
+                self.constrain_assert_equal(left, right)
         return result
+
+    def constrain_assert_equal(self, left: TypeInfo, right: TypeInfo) -> None:
+        if isinstance(left, SymIntType) and isinstance(right, SymIntType):
+            left_symbol = left.to_sympy()
+            right_symbol = right.to_sympy()
+            env = CompileEnvironment.current()
+            if (
+                left_symbol.is_Symbol
+                and right_symbol.is_Symbol
+                and env.shape_env.replace(left_symbol)
+                != env.shape_env.replace(right_symbol)
+            ):
+                env.shape_env._constrain_unify(left.value, right.value)
+        elif isinstance(left, SequenceType) and isinstance(right, SequenceType):
+            if len(left.element_types) == len(right.element_types):
+                for left_element, right_element in zip(
+                    left.unpack(), right.unpack(), strict=True
+                ):
+                    self.constrain_assert_equal(left_element, right_element)
 
     def visit_Call(self, node: ast.Call) -> TypeInfo:
         func = self.visit(node.func)
@@ -729,8 +762,50 @@ class TypePropagation(ast.NodeVisitor):
                 "Failed to unpack */** args to function, got: "
                 + ", ".join(map(str, unhandled))
             )
+        if isinstance(func, NestedFunctionType):
+            return self._call_nested_function(func, args, kwargs)  # pyrefly: ignore [bad-argument-type]
+
         # pyrefly: ignore [bad-argument-type, bad-return]
         return func.propagate_call(tuple(args), kwargs, self.origin())
+
+    def _call_nested_function(
+        self,
+        func: NestedFunctionType,
+        args: list[TypeInfo],
+        kwargs: dict[str, TypeInfo],
+    ) -> TypeInfo:
+        func_node = func.func_node
+        params = func_node.args
+        if kwargs:
+            raise exc.StatementNotSupported(
+                f"Keyword arguments are not supported when calling nested "
+                f"function '{func_node.name}'"
+            )
+        if len(args) != len(params.args):
+            raise exc.TypeInferenceError(
+                f"Function '{func_node.name}' expects "
+                f"{len(params.args)} arguments, got {len(args)}"
+            )
+        effective_return = func.find_effective_return()
+        self.push_scope()
+        for param, arg_type in zip(params.args, args, strict=True):
+            self.scope.set(param.arg, arg_type)
+        try:
+            result: TypeInfo = NoType(origin=self.origin())
+            for stmt in func_node.body:
+                if isinstance(stmt, ast.Return):
+                    result = (
+                        self.visit(stmt.value)
+                        if stmt.value is not None
+                        else NoType(origin=self.origin())
+                    )
+                    break
+                result = self.visit(stmt)
+        finally:
+            self.pop_scope()
+        if effective_return is None or effective_return.value is None:
+            return NoType(origin=self.origin())
+        return result
 
     def visit_IfExp(self, node: ast.IfExp) -> TypeInfo:
         test = self.visit(node.test)
@@ -761,6 +836,7 @@ class TypePropagation(ast.NodeVisitor):
         # ellipsis expansion not yet supported for StackTensorType.
         if isinstance(value_type, TensorType):
             self._expand_ellipsis_in_subscript(node, value_type.fake_value.ndim)
+            self._pad_trailing_dims(node, value_type.fake_value.ndim)
         slice_type = self.visit(node.slice)
         return value_type.propagate_getitem(slice_type, self.origin())
 
@@ -788,14 +864,7 @@ class TypePropagation(ast.NodeVisitor):
                 "an index can only have a single ellipsis (...)"
             )
         idx = ellipsis_indices[0]
-        dims_consumed = sum(
-            1
-            for elt in sl.elts
-            if not (
-                isinstance(elt, ast.Constant)
-                and (elt.value is ... or elt.value is None)
-            )
-        )
+        dims_consumed = _count_dims_in_subscript(sl.elts)
         n_expand = ndim - dims_consumed
         if n_expand < 0:
             raise exc.TypeInferenceError(
@@ -806,6 +875,36 @@ class TypePropagation(ast.NodeVisitor):
             for _ in range(n_expand)
         ]
         sl.elts[idx : idx + 1] = slices
+
+    def _pad_trailing_dims(self, node: ast.Subscript, ndim: int) -> None:
+        sl = node.slice
+        if isinstance(sl, ast.Tuple):
+            consumed = _count_dims_in_subscript(sl.elts)
+            missing = ndim - consumed
+            if missing > 0:
+                sl.elts.extend(
+                    create(ast.Slice, lower=None, upper=None, step=None)
+                    for _ in range(missing)
+                )
+        elif not isinstance(sl, ast.Slice):
+            slice_type = self.visit(sl)
+            if isinstance(slice_type, SequenceType):
+                consumed = sum(
+                    1
+                    for t in slice_type.element_types
+                    if not (isinstance(t, LiteralType) and t.value is None)
+                )
+            elif isinstance(slice_type, LiteralType) and slice_type.value is None:
+                consumed = 0
+            else:
+                consumed = 1
+            missing = ndim - consumed
+            if missing > 0:
+                elts = [sl] + [
+                    create(ast.Slice, lower=None, upper=None, step=None)
+                    for _ in range(missing)
+                ]
+                node.slice = create(ast.Tuple, elts=elts, ctx=ast.Load())
 
     def visit_Slice(self, node: ast.Slice) -> TypeInfo:
         lower = (
@@ -1158,9 +1257,49 @@ class TypePropagation(ast.NodeVisitor):
     # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_SetComp: _VisitMethod = _not_supported
 
-    # TODO(jansel): support closure functions defined on host
     # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
-    visit_FunctionDef: _VisitMethod = _not_supported
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> TypeInfo:
+        args = node.args
+        if args.vararg:
+            raise exc.StatementNotSupported(
+                f"*args not supported in nested function '{node.name}'"
+            )
+        if args.kwarg:
+            raise exc.StatementNotSupported(
+                f"**kwargs not supported in nested function '{node.name}'"
+            )
+        if args.posonlyargs:
+            raise exc.StatementNotSupported(
+                f"Positional-only arguments not supported in nested function '{node.name}'"
+            )
+        if args.kwonlyargs:
+            raise exc.StatementNotSupported(
+                f"Keyword-only arguments not supported in nested function '{node.name}'"
+            )
+        if args.defaults or args.kw_defaults:
+            raise exc.StatementNotSupported(
+                f"Default arguments not supported in nested function '{node.name}'"
+            )
+        for stmt in ast.walk(node):
+            if isinstance(stmt, (ast.Global, ast.Nonlocal)):
+                raise exc.StatementNotSupported(
+                    f"'global'/'nonlocal' not supported in nested function "
+                    f"'{node.name}'"
+                )
+        # direct recursion only; mutual recursion is not detected
+        for descendant in ast.walk(node):
+            if (
+                isinstance(descendant, ast.Call)
+                and isinstance(descendant.func, ast.Name)
+                and descendant.func.id == node.name
+            ):
+                raise exc.StatementNotSupported(
+                    f"Recursive nested function '{node.name}' is not supported"
+                )
+        # nested defs are inlined using the caller's scope (dynamic scoping).
+        func_type = NestedFunctionType(origin=self.origin(), func_node=node)
+        self.scope.set(node.name, func_type)
+        return func_type
 
     # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_ClassDef: _VisitMethod = _not_supported
@@ -1194,6 +1333,16 @@ class TypePropagation(ast.NodeVisitor):
     visit_MatchAs: _VisitMethod = _not_supported
     # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     visit_MatchOr: _VisitMethod = _not_supported
+
+
+def _count_dims_in_subscript(elts: list[ast.expr]) -> int:
+    return sum(
+        1
+        for elt in elts
+        if not (
+            isinstance(elt, ast.Constant) and (elt.value is ... or elt.value is None)
+        )
+    )
 
 
 def _is_barrier_stmt(statement: ast.stmt) -> bool:
