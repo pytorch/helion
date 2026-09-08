@@ -1045,6 +1045,65 @@ class CoordinateRelation:
                     == 0
                 ):
                     continue
+                if (
+                    sympy.simplify(end - begin) == 1  # pyrefly: ignore[unsupported-operation]
+                    and begin.has(sympy.Mod)
+                    and len(begin.free_symbols) == 1
+                ):
+                    (source_symbol,) = begin.free_symbols
+                    source_axis = next(
+                        (
+                            axis
+                            for axis in self.source_domain.axis_order
+                            if coordinate_axis_symbol(axis) == source_symbol
+                        ),
+                        None,
+                    )
+                    source_count = (
+                        None
+                        if source_axis is None
+                        else self.source_domain.axis_counts[source_axis]
+                    )
+                    digit = (
+                        None
+                        if source_count is None
+                        else _single_ordinal_digit(
+                            begin,
+                            source_symbol=source_symbol,
+                            source_count=source_count,
+                        )
+                    )
+                    source_bound = (
+                        None
+                        if source_axis is None
+                        else next(
+                            (
+                                (source_begin, source_end, source_step)
+                                for (
+                                    axis,
+                                    source_begin,
+                                    source_end,
+                                    source_step,
+                                ) in piece.source_bounds_items
+                                if axis == source_axis
+                            ),
+                            None,
+                        )
+                    )
+                    if (
+                        source_axis is not None
+                        and source_count is not None
+                        and digit is not None
+                        and digit == (1, target_count)
+                        and source_bound == (0, source_count, 1)
+                        and not lower_bounds[source_axis]
+                        and not upper_bounds[source_axis]
+                    ):
+                        target_coordinate = coordinate_axis_symbol(target_axis)
+                        lower_bounds[source_axis].append(target_coordinate)
+                        upper_bounds[source_axis].append(sympy.Integer(source_count))
+                        target_steps[source_axis] = target_count
+                        continue
                 interval = _single_axis_interval(
                     begin,
                     end,

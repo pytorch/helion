@@ -776,6 +776,43 @@ class TestTileDependency(TestCase):
             ),
         )
 
+    def test_converse_of_modulo_projection_is_exact(self) -> None:
+        source = CoordinateDomain(
+            (10, 11),
+            ((10, 32), (11, 3)),
+            kind="task_order",
+        )
+        keys = CoordinateDomain((20,), ((20, 16),), kind="event")
+        source_inner = coordinate_axis_symbol(10)
+        source_to_key = CoordinateRelation.point_map(
+            source,
+            keys,
+            (
+                (
+                    ((10, 0, 32, 1), (11, 0, 3, 1)),
+                    (sympy.Mod(source_inner, 16),),
+                ),
+            ),
+        )
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("converse proof must remain symbolic"),
+        ):
+            keys_to_source = source_to_key.converse()
+
+        self.assertIsNotNone(keys_to_source)
+        assert keys_to_source is not None
+        expected: list[set[int]] = [set() for _ in range(keys.size)]
+        for source_index, key_indices in enumerate(source_to_key.materialize()):
+            for key_index in key_indices:
+                expected[key_index].add(source_index)
+        self.assertEqual(
+            keys_to_source.materialize(),
+            tuple(frozenset(indices) for indices in expected),
+        )
+
     def test_project_source_folds_only_small_bounded_constants(self) -> None:
         small = _bounded_coordinate_relation(64)
         large = _bounded_coordinate_relation(65)

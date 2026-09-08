@@ -2477,16 +2477,16 @@ def build_readiness_events(
         if producer_is_root and consumer_is_root:
             continue
         root_relation = relation
-        if not consumer_is_root:
-            projected = root_relation.project_source(
-                root_domains[dependency.consumer_root]
+        if not producer_is_root:
+            projected = root_relation.project_target(
+                root_domains[dependency.producer_root]
             )
             if projected is None:
                 continue
             root_relation = projected
-        if not producer_is_root:
-            projected = root_relation.project_target(
-                root_domains[dependency.producer_root]
+        if not consumer_is_root:
+            projected = root_relation.project_source(
+                root_domains[dependency.consumer_root]
             )
             if projected is None:
                 continue
@@ -3455,15 +3455,27 @@ class _ScheduledRootTraversal:
     matches_reference: bool
 
 
-def _logical_task_to_reference_ordinal(
-    reference_task_order: CoordinateRelation,
+def _logical_task_to_order_ordinal(
+    task_order: CoordinateRelation,
     ordinal_domain: CoordinateDomain,
+    *,
+    ordinal_begin: int = 0,
 ) -> CoordinateRelation | None:
-    """Map a logical CTA to its canonical PID ordinal symbolically."""
-    if reference_task_order.source_domain.size != ordinal_domain.size:
+    """Invert one emitted traversal into its scalar ordinal coordinates.
+
+    The native multidimensional relation and its flattened spelling describe
+    the same ``task_order``. Different symbolic permutations can make only
+    one of those forms invertible, so this is the single certificate used by
+    both exact-once validation and progress-support checks.
+    """
+    if (
+        len(ordinal_domain.axis_order) != 1
+        or ordinal_begin < 0
+        or ordinal_begin + task_order.source_domain.size > ordinal_domain.size
+    ):
         return None
-    reference_to_ordinal = CoordinateRelation.point_map(
-        reference_task_order.source_domain,
+    local_to_ordinal = CoordinateRelation.point_map(
+        task_order.source_domain,
         ordinal_domain,
         (
             (
@@ -3471,35 +3483,52 @@ def _logical_task_to_reference_ordinal(
                     (
                         axis,
                         0,
-                        reference_task_order.source_domain.axis_counts[axis],
+                        task_order.source_domain.axis_counts[axis],
                         1,
                     )
-                    for axis in reference_task_order.source_domain.axis_order
+                    for axis in task_order.source_domain.axis_order
                 ),
-                (_flat_domain_index_expression(reference_task_order.source_domain),),
+                (
+                    ordinal_begin  # pyrefly: ignore[unsupported-operation]
+                    + _flat_domain_index_expression(task_order.source_domain),
+                ),
             ),
         ),
     )
-    root_to_reference = reference_task_order.converse()
-    root_to_reference = (
+    logical_to_local = task_order.converse()
+    logical_to_local = (
         None
-        if root_to_reference is None
-        else root_to_reference.canonical_single_valued()
+        if logical_to_local is None
+        else logical_to_local.canonical_single_valued()
     )
     result = (
         None
-        if root_to_reference is None
-        else root_to_reference.then(reference_to_ordinal)
+        if logical_to_local is None
+        else logical_to_local.then(local_to_ordinal)
     )
     if result is None:
-        # Some woven PID traversals cannot invert their multidimensional source
-        # relation directly, but become invertible after flattening that source.
+        # A woven PID traversal may not have a representable multidimensional
+        # inverse even though the inverse of its actual emitted order is exact.
         forward = _flat_task_order_relation(
-            reference_task_order,
+            task_order,
             ordinal_domain,
+            ordinal_begin=ordinal_begin,
         )
         result = None if forward is None else forward.converse()
-    result = None if result is None else result.canonical_single_valued()
+    return None if result is None else result.canonical_single_valued()
+
+
+def _logical_task_to_reference_ordinal(
+    reference_task_order: CoordinateRelation,
+    ordinal_domain: CoordinateDomain,
+) -> CoordinateRelation | None:
+    """Map a logical CTA to its canonical PID ordinal symbolically."""
+    if reference_task_order.source_domain.size != ordinal_domain.size:
+        return None
+    result = _logical_task_to_order_ordinal(
+        reference_task_order,
+        ordinal_domain,
+    )
     return result if result is not None and result.is_total_function() else None
 
 
@@ -3555,48 +3584,16 @@ def _root_schedule_traversal(
             or not segment.task_order.is_total_function()
         ):
             return None
-        local_to_scheduled = CoordinateRelation.point_map(
-            segment.task_order.source_domain,
-            ordinal_domain,
-            (
-                (
-                    tuple(
-                        (
-                            axis,
-                            0,
-                            segment.task_order.source_domain.axis_counts[axis],
-                            1,
-                        )
-                        for axis in segment.task_order.source_domain.axis_order
-                    ),
-                    (
-                        ordinal_begin  # pyrefly: ignore[unsupported-operation]
-                        + _flat_domain_index_expression(
-                            segment.task_order.source_domain
-                        ),
-                    ),
-                ),
-            ),
-        )
         forward_piece = _flat_task_order_relation(
             segment.task_order,
             ordinal_domain,
             ordinal_begin=ordinal_begin,
         )
-        root_to_local = segment.task_order.converse()
-        root_to_local = (
-            None if root_to_local is None else root_to_local.canonical_single_valued()
+        inverse_piece = _logical_task_to_order_ordinal(
+            segment.task_order,
+            ordinal_domain,
+            ordinal_begin=ordinal_begin,
         )
-        inverse_piece = (
-            None if root_to_local is None else root_to_local.then(local_to_scheduled)
-        )
-        if inverse_piece is None:
-            # A PID permutation may weave mixed-radix source digits across
-            # logical axes even when logical task -> flat emitted ordinal is
-            # compact.  Invert that actual emitted traversal directly.
-            inverse_piece = (
-                None if forward_piece is None else forward_piece.converse()
-            )
         if inverse_piece is None or not inverse_relation_supported:
             inverse_relation_supported = False
             root_to_scheduled = None
@@ -4024,17 +4021,11 @@ def _segment_dependency_support_overlaps(
     producers_reaching_consumer = (
         None if consumers_by_key is None else keys_by_producer.then(consumers_by_key)
     )
-    producer_flat_order = _flat_task_order_relation(
+    # Restrict by the same exact traversal certificate used for global
+    # exact-once validation; only its logical source support matters here.
+    producer_support = _logical_task_to_order_ordinal(
         producer_segment.task_order,
         _task_order_ordinal_domain(producer_segment.task_order),
-    )
-    producer_support = (
-        None if producer_flat_order is None else producer_flat_order.converse()
-    )
-    producer_support = (
-        None
-        if producer_support is None
-        else producer_support.canonical_single_valued()
     )
     if producers_reaching_consumer is None or producer_support is None:
         return None
