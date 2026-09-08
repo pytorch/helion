@@ -173,8 +173,12 @@ def default_metal_launcher(
     dispatch_fn(*tensor_args, threads=total_threads, group_size=group_size)
 
 
+# cache_key -> @flyc.jit-wrapped launcher / flyc.CompiledFunction. Both grow
+# unbounded across distinct (kernel, nargs, grid, threads) keys; acceptable for
+# the experimental backend, but revisit with eviction if a long-lived process
+# autotunes many shapes.
 _flydsl_jit_cache: dict = {}
-_flydsl_compiled_cache: dict = {}  # cache_key -> flyc.CompiledFunction
+_flydsl_compiled_cache: dict = {}
 _flydsl_stream: object = None  # one persistent HIP stream, reused across launches
 
 
@@ -187,11 +191,13 @@ def default_flydsl_launcher(
 ) -> None:
     """Default launcher for FlyDSL kernels on ROCm devices.
 
-    @flyc.kernel can only run inside @flyc.jit, so generate a temp Python file
-    wrapping it in @flyc.jit with explicit fx.Tensor params.
+    @flyc.kernel can only run inside @flyc.jit, so build a launcher wrapping it in
+    @flyc.jit with explicit fx.Tensor params. flyc's ASTRewriter re-parses the
+    wrapper via ``inspect.getsource``, so its source must be retrievable -- we
+    register it in ``linecache`` under a synthetic name rather than writing a temp
+    file (no disk I/O, nothing to leak if the process dies mid-compile).
     """
-    import importlib.util
-    import tempfile
+    import linecache
 
     kwargs.pop("num_warps", None)
     kwargs.pop("num_stages", None)
@@ -208,12 +214,14 @@ def default_flydsl_launcher(
     gz = grid[2] if len(grid) > 2 else 1
 
     # _num_threads = 64*bm from launcher_keyword_args; default 64 = bm=1.
+    # id(flydsl_kernel) is safe as a key component only because the cached closure
+    # (_make(flydsl_kernel)) keeps the kernel object alive, so its id can't be
+    # recycled for a different kernel while the entry lives.
     cache_key = (id(flydsl_kernel), n, gx, gy, gz, _num_threads)
     if cache_key not in _flydsl_jit_cache:
         params = ", ".join(f"_a{i}: fx.Tensor" for i in range(n))
         call = ", ".join(f"_a{i}" for i in range(n))
-        src = f"""
-import flydsl.expr as fx
+        src = f"""import flydsl.expr as fx
 import flydsl.compiler as flyc
 
 def _make(kernel):
@@ -226,23 +234,13 @@ def _make(kernel):
         )
     return _launch
 """
-        with tempfile.NamedTemporaryFile(
-            suffix=".py", mode="w", delete=False, prefix="_flydsl_jit_"
-        ) as tf:
-            tf.write(src)
-            fname = tf.name
-
-        try:
-            spec = importlib.util.spec_from_file_location(
-                f"_flydsl_jit_{abs(hash(cache_key))}", fname
-            )
-            mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-            spec.loader.exec_module(mod)  # type: ignore[union-attr]
-            _flydsl_jit_cache[cache_key] = mod._make(flydsl_kernel)
-        finally:
-            import os as _os
-
-            _os.unlink(fname)
+        fname = f"<flydsl_jit_{abs(hash(cache_key))}>"
+        # Register the source so inspect.getsource (used by flyc's ASTRewriter)
+        # can retrieve it from the in-memory string.
+        linecache.cache[fname] = (len(src), None, src.splitlines(keepends=True), fname)
+        mod_ns: dict = {}
+        exec(compile(src, fname, "exec"), mod_ns)
+        _flydsl_jit_cache[cache_key] = mod_ns["_make"](flydsl_kernel)
 
     # Persistent null stream (fx.Stream(None) -> stream 0), reused across launches.
     global _flydsl_stream

@@ -16,6 +16,7 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 import helion.language as hl
 
 pytest.importorskip("flydsl")
@@ -40,6 +41,7 @@ def elementwise_min(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@onlyBackends(["flydsl"])
 class TestFlydslElementwise(TestCase):
     def test_elementwise_map_no_reduction(self) -> None:
         # Non-reduction path: grid mapping + elementwise + load/store, no fold.
