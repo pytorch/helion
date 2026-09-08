@@ -283,6 +283,10 @@ class FlyDSLBackend(Backend):
                 if not isinstance(tensor, torch.Tensor):
                     continue
 
+                # Invariant: codegen looks this up by id(state.proxy_arg(0)),
+                # which must be the SAME FakeTensor object as node.meta["val"]
+                # here. If that ever breaks, the lookup misses and the load/store
+                # silently takes the scalar path (wrong indexing, not an error).
                 self._tensor_use_buffer[id(tensor)] = True
 
     def grid_index_expr(
@@ -299,6 +303,8 @@ class FlyDSLBackend(Backend):
     ) -> str:
         # Column (loop) tile -> lanes. chunk = col_offset//vec + lane_id;
         # one warp (64 lanes) per row so lane_id = thread_idx.x % 64.
+        # The literal 4 is the fp16 vec width; fp32 columns would need the width
+        # derived from element bits (see _flydsl_buffer_setup). fp16-only for now.
         if block_size_var == "1":
             return offset_var
         return f"({offset_var}) // 4 + fx.thread_idx.x % 64"
@@ -313,6 +319,8 @@ class FlyDSLBackend(Backend):
         axis: int = 0,
     ) -> str:
         # Column lane chunk: element_offset//vec + lane_id (one warp/row).
+        # The literal 4 is the fp16 vec width (fp16-only; fp32 needs the derived
+        # width, see _flydsl_buffer_setup).
         return f"{offsets_var} = ({lid}) // 4 + fx.thread_idx.x % 64"
 
     def thread_in_tile_mask_expr(

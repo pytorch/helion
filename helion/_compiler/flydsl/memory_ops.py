@@ -182,11 +182,8 @@ def _flydsl_buffer_setup(
     is_vec = col_block_id is not None
 
     device_fn = state.device_function
-    if not hasattr(device_fn, "_flydsl_setup"):
-        device_fn._flydsl_setup = {}  # pyrefly: ignore[missing-attribute]
-
     setup_key = (tensor_name, is_vec, is_rolled_col)
-    setup = device_fn._flydsl_setup.get(setup_key)  # pyrefly: ignore[missing-attribute]
+    setup = device_fn._flydsl_setup.get(setup_key)
     if setup is None:
         _hoist = None
         # A rolled ``:`` column that fits in one wavefront (N <= 64) has a loop
@@ -261,7 +258,7 @@ def _flydsl_buffer_setup(
             )
 
         setup = {"div": div.id, "atom": atom.id, "vec": vec_width, "row": row.id}
-        device_fn._flydsl_setup[setup_key] = setup  # pyrefly: ignore[missing-attribute]
+        device_fn._flydsl_setup[setup_key] = setup
 
     return {
         "setup": setup,
