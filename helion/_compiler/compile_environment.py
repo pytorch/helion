@@ -93,8 +93,12 @@ class RuntimeInputSpecialization:
     """Internal runtime-input projection used to extend a kernel cache key.
 
     ``classifier_identity`` distinguishes classifier semantics when compiler
-    discovery registers the same named projection more than once. Runtime cache
-    state is deliberately excluded from descriptor equality.
+    discovery registers the same named projection more than once.
+    ``reusable_tensor_properties`` is an optional promise that the classifier's
+    result depends only on the named storage properties (plus tensor metadata
+    already covered by eager dispatch guards), never on tensor contents.  It
+    lets repeated calls with the exact same tensors reuse a prevalidated result.
+    Runtime cache state is deliberately excluded from descriptor equality.
     """
 
     sources: tuple[Source, ...]
@@ -102,6 +106,9 @@ class RuntimeInputSpecialization:
     classifier: typing.Callable[[typing.Sequence[object]], typing.Hashable] = (
         dataclasses.field(compare=False, repr=False)
     )
+    reusable_tensor_properties: frozenset[
+        typing.Literal["data_ptr", "storage_span"]
+    ] = frozenset()
 
 
 def _is_supported_tensor_input_source(source: Source) -> bool:
@@ -398,6 +405,12 @@ class CompileEnvironment:
             Source, TensorDescriptorLayoutGuard
         ] = {}
         self.runtime_input_specializations: dict[str, RuntimeInputSpecialization] = {}
+        # Immutable classifier outputs captured from the arguments that created
+        # this BoundKernel.  Codegen may run later and obtain those arguments
+        # through weak references, after their storage metadata has changed.
+        # Runtime-dependent optimizations must match this snapshot before they
+        # consume a live alignment or aliasing fact.
+        self.bound_runtime_input_specialization_results: dict[str, typing.Hashable] = {}
         self._tensor_input_source_cache: dict[int, Source | None] = {}
         self.jagged_tile_parent_ids: dict[int, list[int]] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
@@ -663,6 +676,42 @@ class CompileEnvironment:
         previous = self.runtime_input_specializations.setdefault(key, specialization)
         if previous != specialization:
             raise RuntimeError(f"conflicting runtime input specializations for {key!r}")
+
+    def snapshot_runtime_input_specialization_results(
+        self,
+        root_values: typing.Mapping[str, object],
+    ) -> None:
+        """Capture storage facts used by runtime-dependent code generation.
+
+        Content-dependent classifiers are intentionally excluded. The codegen
+        consumers need only facts described by ``reusable_tensor_properties``;
+        filtering avoids an extra device read for worklist classifiers.
+        """
+        self.bound_runtime_input_specialization_results = {
+            key: specialization.classifier(
+                tuple(
+                    _replay_tensor_input_source(source, root_values)
+                    for source in specialization.sources
+                )
+            )
+            for key, specialization in self.runtime_input_specializations.items()
+            if specialization.reusable_tensor_properties
+            and all(
+                _is_supported_tensor_input_source(source)
+                for source in specialization.sources
+            )
+        }
+
+    def runtime_input_specialization_matches_bound(
+        self,
+        key: str,
+        result: typing.Hashable,
+    ) -> bool:
+        """Whether a live classifier result matches this bound's cache identity."""
+        return (
+            key in self.bound_runtime_input_specialization_results
+            and self.bound_runtime_input_specialization_results[key] == result
+        )
 
     def tensor_descriptor_layout_signature(
         self, fake_tensor: torch.Tensor

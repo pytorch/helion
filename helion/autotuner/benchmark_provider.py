@@ -37,6 +37,7 @@ from .accuracy import is_fp8_dtype
 from .benchmark_job import AccuracyCheckJob
 from .benchmark_job import AccuracyCheckResult
 from .benchmark_job import BenchmarkJob
+from .benchmark_job import CompiledFunctionLoadError
 from .benchmark_worker import BenchmarkSubprocessError
 from .benchmark_worker import BenchmarkTimeout
 from .benchmark_worker import BenchmarkWorker
@@ -248,47 +249,105 @@ def _clone_args(
     process_group_name: str | None,
     idx_to_clone: Sequence[int] | None = None,
 ) -> Sequence[object]:
+    """Clone selected tensor leaves while preserving their alias topology.
+
+    If a selected ordinary tensor shares storage with another tensor argument,
+    clone that whole argument alias group.  This keeps view offsets, strides,
+    mixed-dtype storage aliases, and duplicate references intact while still
+    isolating the cloned group from both the caller and other candidates.
     """
-    Clone the given arguments, but cloning only the tensors specified by
-      idx_to_clone. If idx_to_clone is None, clone all tensors.
-    """
+
+    clone_indices = None if idx_to_clone is None else set(idx_to_clone)
 
     def _should_clone(idx: int) -> bool:
-        return idx_to_clone is None or idx in idx_to_clone
+        return clone_indices is None or idx in clone_indices
 
     args_flat, tree_spec = tree_flatten(args)
-    old_arg_to_new_arg = {}
+    tensor_replacements: dict[int, torch.Tensor] = {}
+    signal_pad_replacements: dict[int, int] = {}
+    symmetric_tensor_ids: set[int] = set()
 
     for i, arg in enumerate(args_flat):
         if _should_clone(i) and is_symm_mem_tensor(arg, process_group_name):
-            new_arg = _clone_symm_mem_tensor(arg, process_group_name)
-            old_arg_to_new_arg[get_signal_pad_ptrs_dev(arg, process_group_name)] = (
-                get_signal_pad_ptrs_dev(new_arg, process_group_name)
-            )
-            old_arg_to_new_arg[arg] = new_arg  # pyrefly: ignore[unsupported-operation]
+            arg_id = id(arg)
+            symmetric_tensor_ids.add(arg_id)
+            if arg_id not in tensor_replacements:
+                new_arg = _clone_symm_mem_tensor(arg, process_group_name)
+                signal_pad_replacements[
+                    get_signal_pad_ptrs_dev(arg, process_group_name)
+                ] = get_signal_pad_ptrs_dev(new_arg, process_group_name)
+                tensor_replacements[arg_id] = new_arg
+
+    def _storage_id(tensor: torch.Tensor) -> int | None:
+        if tensor.layout is not torch.strided:
+            return None
+        try:
+            return tensor.untyped_storage()._cdata
+        except RuntimeError:
+            return None
+
+    # A partial selection must include all ordinary tensor arguments that alias
+    # a selected tensor.  Otherwise an in-place candidate sees a different
+    # alias relationship from the original invocation.
+    selected_storage_ids: set[int] = set()
+    selected_tensor_ids: set[int] = set()
+    for i, arg in enumerate(args_flat):
+        if (
+            _should_clone(i)
+            and isinstance(arg, torch.Tensor)
+            and id(arg) not in symmetric_tensor_ids
+        ):
+            selected_tensor_ids.add(id(arg))
+            storage_id = _storage_id(arg)
+            if storage_id is not None:
+                selected_storage_ids.add(storage_id)
+
+    ordinary_tensors: list[torch.Tensor] = []
+    seen_tensor_ids: set[int] = set()
+    for arg in args_flat:
+        if not isinstance(arg, torch.Tensor) or id(arg) in tensor_replacements:
+            continue
+        arg_id = id(arg)
+        storage_id = _storage_id(arg)
+        if arg_id not in selected_tensor_ids and (
+            storage_id is None or storage_id not in selected_storage_ids
+        ):
+            continue
+        if arg_id not in seen_tensor_ids:
+            seen_tensor_ids.add(arg_id)
+            ordinary_tensors.append(arg)
+
+    storage_groups: dict[tuple[str, int], list[torch.Tensor]] = {}
+    for tensor in ordinary_tensors:
+        storage_id = _storage_id(tensor)
+        key = (
+            ("storage", storage_id)
+            if storage_id is not None
+            else ("tensor", id(tensor))
+        )
+        storage_groups.setdefault(key, []).append(tensor)
+
+    for tensors in storage_groups.values():
+        if len(tensors) == 1 and tensors[0].is_contiguous():
+            # Retain the ordinary fast path (and its observable clone
+            # semantics) when there is no cross-argument alias topology to
+            # preserve.
+            clones = [tensors[0].detach().clone()]
+        else:
+            # Deepcopy aliased detached tensors together: PyTorch memoizes their
+            # storage, preserving cross-view aliases, offsets, strides, and
+            # mixed dtypes. It also preserves a lone non-contiguous layout.
+            clones = copy.deepcopy([tensor.detach() for tensor in tensors])
+        for tensor, clone in zip(tensors, clones, strict=True):
+            clone.requires_grad_(tensor.requires_grad)
+            tensor_replacements[id(tensor)] = clone
 
     for i, arg in enumerate(args_flat):
-        if arg in old_arg_to_new_arg:
-            args_flat[i] = old_arg_to_new_arg[arg]
+        if isinstance(arg, torch.Tensor) and id(arg) in tensor_replacements:
+            args_flat[i] = tensor_replacements[id(arg)]
             continue
-        if not isinstance(arg, torch.Tensor):
-            continue
-        if _should_clone(i):
-            if arg.is_contiguous():
-                clone = arg.detach().clone()
-            else:
-                # A kernel bound on a non-contiguous arg hardcodes that arg's
-                # load strides into the compiled kernel as compile-time
-                # constants. ``arg.detach().clone()`` returns a contiguous
-                # tensor with a different layout and smaller storage, so those
-                # hardcoded strides would address the wrong (or out-of-bounds)
-                # memory when the autotuner accuracy baseline reruns the kernel
-                # on the clone. ``copy.deepcopy`` does a storage-level copy that
-                # reproduces the original size, stride, and offset, and also
-                # handles broadcast/expanded views.
-                clone = copy.deepcopy(arg.detach())
-            clone.requires_grad_(arg.requires_grad)
-            args_flat[i] = clone
+        if isinstance(arg, int) and arg in signal_pad_replacements:
+            args_flat[i] = signal_pad_replacements[arg]
 
     return tree_unflatten(args_flat, tree_spec)
 
@@ -529,6 +588,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
     # Class-level default: tests construct partially-initialized providers, so
     # the picklability flag must resolve even before setup()/__init__ set it.
     _args_unpicklable: bool = False
+    _subprocess_wrapper_unloadable: bool = False
 
     def __init__(
         self,
@@ -555,6 +615,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None
         self._args_unpicklable: bool = False
+        self._subprocess_wrapper_unloadable: bool = False
         self._precompile_baseline_path: str | None = None
         self._precompile_result_counter: count[int] = count()
         self._benchmark_worker: BenchmarkWorker | None = None
@@ -1014,6 +1075,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         if not self.settings.autotune_benchmark_subprocess:
             return False
         if self._args_unpicklable:
+            return False
+        if self._subprocess_wrapper_unloadable:
             return False
         if dist.is_initialized():
             return False
@@ -1914,13 +1977,17 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             rtol=self._effective_rtol,
             scale_atol=self._scale_atol,
         )
-        return cast(
-            "AccuracyCheckResult",
-            self._benchmark_worker.run(
-                job,
-                timeout=float(self.settings.autotune_benchmark_timeout),
-            ),
-        )
+        try:
+            return cast(
+                "AccuracyCheckResult",
+                self._benchmark_worker.run(
+                    job,
+                    timeout=float(self.settings.autotune_benchmark_timeout),
+                ),
+            )
+        except CompiledFunctionLoadError as error:
+            self._disable_unloadable_benchmark_worker(error)
+            return None
 
     def _run_subprocess_benchmark_job(
         self,
@@ -1930,7 +1997,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         rep: int,
         fixed_repetitions: int | None = None,
     ) -> float | None:
-        if self._precompile_args_path is None:
+        if self._precompile_args_path is None or self._subprocess_wrapper_unloadable:
             return None
         try:
             fn_spec = _serialize_compiled_fn(fn)
@@ -1949,11 +2016,32 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             probe_long_kernel=self._probe_long_cute_flash_kernel(),
             fixed_repetitions=fixed_repetitions,
         )
-        return float(
-            self._benchmark_worker.run(
-                job,
-                timeout=float(self.settings.autotune_benchmark_timeout),
+        try:
+            return float(
+                self._benchmark_worker.run(
+                    job,
+                    timeout=float(self.settings.autotune_benchmark_timeout),
+                )
             )
+        except CompiledFunctionLoadError as error:
+            self._disable_unloadable_benchmark_worker(error)
+            return None
+
+    def _disable_unloadable_benchmark_worker(
+        self, error: CompiledFunctionLoadError
+    ) -> None:
+        # A generated wrapper can depend on a source module that exists only in
+        # the parent process (for example a module loaded under a synthetic
+        # namespace). This says nothing about whether the config itself is valid,
+        # so let callers use their existing in-process fallback and stop sending
+        # later candidates through the incompatible worker.
+        self._subprocess_wrapper_unloadable = True
+        if self._benchmark_worker is not None:
+            self._benchmark_worker.shutdown()
+            self._benchmark_worker = None
+        self.log.debug(
+            f"Benchmark worker could not load the generated wrapper; "
+            f"falling back in-process: {error}"
         )
 
     def benchmark_isolated(
@@ -1998,6 +2086,13 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     continue
                 self.log.debug(f"{desc} subprocess raised: {type(e).__name__}: {e}")
                 timing = None
+            # A wrapper-load failure disables the worker because later
+            # candidates may depend on the same unavailable source module.
+            # Treat the whole isolated batch as unavailable so the caller
+            # rebenchmarks every finalist in-process instead of mixing partial
+            # fresh timings with stale population measurements.
+            if self._subprocess_wrapper_unloadable:
+                return None
             timings.append(None if timing is None else float(timing))
         return timings
 

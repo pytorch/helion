@@ -42,6 +42,7 @@ from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_job import AccuracyCheckJob
 from helion.autotuner.benchmark_job import AccuracyCheckResult
 from helion.autotuner.benchmark_job import BenchmarkJob
+from helion.autotuner.benchmark_job import CompiledFunctionLoadError
 from helion.autotuner.benchmark_provider import BenchmarkResult
 from helion.autotuner.benchmark_provider import IsolatedBenchmarkFailure
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
@@ -309,6 +310,86 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
 
         modules_after = {name for name in sys.modules if name.startswith(module_prefix)}
         self.assertEqual(modules_after, modules_before)
+
+    def test_benchmark_job_classifies_wrapper_load_failure(self) -> None:
+        fn_spec = SerializedCompiledFunction(
+            function_name="call",
+            source_code="import helion_test_missing_worker_module_xyz\n",
+            filename=None,
+            module_name=None,
+        )
+
+        worker = BenchmarkWorker()
+        try:
+            with self.assertRaisesRegex(
+                CompiledFunctionLoadError,
+                "ModuleNotFoundError.*helion_test_missing_worker_module_xyz",
+            ):
+                worker.run(BenchmarkJob(fn_spec, "unused-args.pt"), timeout=30)
+        finally:
+            worker.shutdown()
+
+    def test_benchmark_job_classifies_non_import_load_failures(self) -> None:
+        fn_spec = SerializedCompiledFunction(
+            function_name="call",
+            source_code="raise RuntimeError('generated wrapper failed')\n",
+            filename=None,
+            module_name=None,
+        )
+
+        with self.assertRaisesRegex(
+            CompiledFunctionLoadError,
+            "RuntimeError.*generated wrapper failed",
+        ):
+            BenchmarkJob(fn_spec, "unused-args.pt")()
+
+    def test_source_module_exec_failure_is_classified_and_cleaned_up(self) -> None:
+        origin_name = "helion_test_failing_synthetic_origin_xyz"
+        sys.modules.pop(origin_name, None)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            origin_file = Path(tmpdir) / "origin.py"
+            origin_file.write_text(
+                "PARTIAL = True\nraise RuntimeError('origin exec failed')\n",
+                encoding="utf-8",
+            )
+            fn_spec = SerializedCompiledFunction(
+                function_name="call",
+                source_code=f"import {origin_name}\ndef call():\n    return None\n",
+                filename=None,
+                module_name=None,
+                source_modules=[(origin_name, str(origin_file))],
+            )
+
+            with self.assertRaisesRegex(
+                CompiledFunctionLoadError,
+                "RuntimeError.*origin exec failed",
+            ):
+                BenchmarkJob(fn_spec, "unused-args.pt")()
+
+        self.assertNotIn(origin_name, sys.modules)
+
+    def test_benchmark_job_does_not_reclassify_post_load_failure(self) -> None:
+        fn_spec = SerializedCompiledFunction(
+            function_name="call",
+            source_code="def call():\n    raise RuntimeError('kernel execution failed')\n",
+            filename=None,
+            module_name=None,
+        )
+
+        with (
+            patch(
+                "helion.autotuner.benchmark_job.load_trusted_kernel_args",
+                return_value=(),
+            ),
+            patch(
+                "helion.autotuner.benchmark_job.do_bench",
+                side_effect=lambda fn, **_kwargs: fn(),
+            ),
+            self.assertRaisesRegex(RuntimeError, "kernel execution failed") as raised,
+        ):
+            BenchmarkJob(fn_spec, "unused-args.pt")()
+
+        self.assertNotIsInstance(raised.exception, CompiledFunctionLoadError)
 
     def test_benchmark_job_can_use_wall_clock_bench(self) -> None:
         fn = _ReturnValue(torch.empty(()))
@@ -769,6 +850,36 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         _, kwargs = provider._benchmark_worker.run.call_args
         self.assertEqual(kwargs["timeout"], 17.0)
 
+    def test_accuracy_wrapper_load_failure_falls_back_and_disables_worker(
+        self,
+    ) -> None:
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.settings = Settings(autotune_benchmark_timeout=17)
+        provider._precompile_args_path = "/tmp/args.pt"
+        provider._precompile_baseline_path = "/tmp/baseline.pt"
+        provider._effective_atol = 0.0
+        provider._effective_rtol = 0.0
+        provider._scale_atol = False
+        provider.log = Mock()
+        worker = Mock()
+        provider._benchmark_worker = worker
+        provider._subprocess_wrapper_unloadable = False
+        provider._subprocess_accuracy_check_enabled = lambda: True
+        worker.run.side_effect = CompiledFunctionLoadError("origin exec failed")
+
+        with patch(
+            "helion.autotuner.benchmark_provider._serialize_compiled_fn",
+            return_value=cast("SerializedCompiledFunction", object()),
+        ):
+            result = provider._run_subprocess_accuracy_check_job(
+                cast("CompiledConfig", object())
+            )
+
+        self.assertIsNone(result)
+        self.assertTrue(provider._subprocess_wrapper_unloadable)
+        worker.shutdown.assert_called_once()
+        self.assertIsNone(provider._benchmark_worker)
+
     def test_benchmark_timeout_has_worker_metric_and_status(self) -> None:
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         provider.config_spec = SimpleNamespace(
@@ -1064,6 +1175,46 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         self.assertEqual(provider._autotune_metrics.num_worker_failures, 1)
         self.assertEqual(provider._autotune_metrics.num_compile_failures, 0)
         run_job.assert_called_once()
+
+    def test_wrapper_load_failure_falls_back_and_disables_worker(self) -> None:
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.config_spec = SimpleNamespace(
+            compiler_seed_timeout_retry_repetitions=None,
+            backend=SimpleNamespace(name="cute", get_do_bench=lambda: None),
+            cute_flash_search_enabled=False,
+        )
+        provider.settings = Settings(autotune_benchmark_subprocess=True)
+        provider.log = Mock()
+        provider.kernel = SimpleNamespace(supports_subprocess_benchmark=lambda: True)
+        provider.mutated_arg_indices = []
+        provider._args_unpicklable = False
+        provider._precompile_args_path = "args.pt"
+        worker = Mock()
+        provider._benchmark_worker = worker
+        provider._compiler_seed_configs = set()
+        provider._compiler_seed_source_hashes = set()
+        provider._subprocess_wrapper_unloadable = False
+        worker.run.side_effect = CompiledFunctionLoadError("missing source module")
+
+        with patch(
+            "helion.autotuner.benchmark_provider._serialize_compiled_fn",
+            return_value=cast("SerializedCompiledFunction", object()),
+        ):
+            first = provider._run_subprocess_benchmark_job(
+                cast("CompiledConfig", object()), warmup=1, rep=50
+            )
+            second = provider._run_subprocess_benchmark_job(
+                cast("CompiledConfig", object()), warmup=1, rep=50
+            )
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertTrue(provider._subprocess_wrapper_unloadable)
+        self.assertFalse(provider._subprocess_benchmark_enabled())
+        provider.log.debug.assert_called_once()
+        worker.run.assert_called_once()
+        worker.shutdown.assert_called_once()
+        self.assertIsNone(provider._benchmark_worker)
 
     def test_fixed_repetition_job_uses_existing_benchmark_timeout(self) -> None:
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)

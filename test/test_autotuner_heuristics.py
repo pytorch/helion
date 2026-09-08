@@ -8709,7 +8709,17 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
         with (
             patch_cute_mma_support(),
-            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+            patch(
+                "helion.runtime.kernel.target_device_capability",
+                return_value=(10, 0),
+            ),
+            patch(
+                "helion._compiler.compile_environment.target_device_capability",
+                return_value=(10, 0),
+            ),
+            patch("helion.language.loops.use_tileir_tunables", return_value=False),
+            patch("helion.language.loops._supports_warp_specialize", return_value=True),
+            patch("helion._compat._supports_tensor_descriptor", return_value=True),
         ):
             bound = cute_matmul_bias_residual_gelu.bind(args)
 
@@ -9267,12 +9277,6 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
         with (
             patch_cute_mma_support(),
-            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
-            # target_device_capability is memoized (is_hip / _is_hip pattern),
-            # so torch.cuda.get_device_capability alone no longer reaches its
-            # consumers. Patch each seam the bind path reads: the bound-kernel
-            # cache key (runtime.kernel) and the ConfigSpec arch capability,
-            # which CompileEnvironment captures onto config_spec at build time.
             patch(
                 "helion.runtime.kernel.target_device_capability",
                 return_value=(10, 0),
@@ -9281,11 +9285,13 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 "helion._compiler.compile_environment.target_device_capability",
                 return_value=(10, 0),
             ),
+            patch("helion.language.loops.use_tileir_tunables", return_value=False),
+            patch("helion.language.loops._supports_warp_specialize", return_value=True),
+            patch("helion._compat._supports_tensor_descriptor", return_value=True),
         ):
             bound = cute_matmul_bias_residual_gelu.bind(args)
         with (
             patch_cute_mma_support(),
-            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
             patch(
                 "helion.runtime.kernel.target_device_capability",
                 return_value=(9, 0),
@@ -9294,6 +9300,12 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 "helion._compiler.compile_environment.target_device_capability",
                 return_value=(9, 0),
             ),
+            patch("helion.language.loops.use_tileir_tunables", return_value=False),
+            patch(
+                "helion.language.loops._supports_warp_specialize",
+                return_value=False,
+            ),
+            patch("helion._compat._supports_tensor_descriptor", return_value=True),
         ):
             sm90_bound = cute_matmul_bias_residual_gelu.bind(args)
         self.assertIsNot(sm90_bound, bound)
@@ -9491,7 +9503,17 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
         with (
             patch_cute_mma_support(),
-            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+            patch(
+                "helion.runtime.kernel.target_device_capability",
+                return_value=(10, 0),
+            ),
+            patch(
+                "helion._compiler.compile_environment.target_device_capability",
+                return_value=(10, 0),
+            ),
+            patch("helion.language.loops.use_tileir_tunables", return_value=False),
+            patch("helion.language.loops._supports_warp_specialize", return_value=True),
+            patch("helion._compat._supports_tensor_descriptor", return_value=True),
         ):
             bound = cute_matmul_bias_residual_gelu.bind(args)
 
@@ -9573,7 +9595,17 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
         with (
             patch_cute_mma_support(),
-            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+            patch(
+                "helion.runtime.kernel.target_device_capability",
+                return_value=(10, 0),
+            ),
+            patch(
+                "helion._compiler.compile_environment.target_device_capability",
+                return_value=(10, 0),
+            ),
+            patch("helion.language.loops.use_tileir_tunables", return_value=False),
+            patch("helion.language.loops._supports_warp_specialize", return_value=True),
+            patch("helion._compat._supports_tensor_descriptor", return_value=True),
         ):
             bound = cute_matmul_bias_residual_gelu.bind(args)
 

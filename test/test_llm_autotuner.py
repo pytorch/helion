@@ -413,6 +413,7 @@ class TestLLMGuidedSearch(TestCase):
             use_isolated=True,
             confirm_suspicious=True,
             use_interleaved=True,
+            candidate_private_args=False,
         ):
             rebenchmark_descs.append(desc)
             for member in members:

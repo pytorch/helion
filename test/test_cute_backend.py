@@ -9495,6 +9495,9 @@ class TestCuteBackend(TestCase):
             patch(
                 "helion.runtime.cute.launcher._record_cute_owned_launch_tensors"
             ) as record_owned,
+            patch(
+                "helion.runtime.cute.launcher._retain_cute_capture_owned_launch_tensors"
+            ) as retain_owned,
         ):
             first = default_cute_launcher(cute_kernel, (1,), 7, block=(32, 1, 1))
             second = default_cute_launcher(cute_kernel, (1,), 7, block=(32, 1, 1))
@@ -9503,6 +9506,7 @@ class TestCuteBackend(TestCase):
         # Build (and thus the cached args) happens once; the stream is appended
         # fresh on each of the three launches.
         self.assertEqual(build_calls, [(7,)])
+        self.assertEqual(retain_owned.call_count, 3)
         self.assertEqual(record_owned.call_count, 3)
         record_owned.assert_called_with(owned_tensors)
         self.assertEqual(

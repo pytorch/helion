@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import functools
+import itertools
 import logging
 import operator
 from typing import TYPE_CHECKING
@@ -18,12 +19,15 @@ from typing import Any
 from typing import cast
 
 import torch
+from torch._dynamo.source import LocalSource
+from torch._subclasses import FakeTensor
 from torch.fx.node import map_arg
 
 from ... import exc
 from ...language import _decorators
 from ...language.memory_ops import _CUTE_L2_LAST_SUFFIX
 from ...language.memory_ops import _CUTE_VECTOR_DTYPES
+from ...language.memory_ops import _CUTE_VECTOR_MAX_BYTES
 from ...language.memory_ops import _CUTE_VECTOR_UNROLL_CARRIER
 from ...language.memory_ops import _CUTE_VECTOR_UNROLL_DTYPES
 from ...language.memory_ops import _codegen_cute_store_permute_lane_loops
@@ -49,13 +53,242 @@ from ...language.memory_ops import store
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
+from ..compile_environment import RuntimeInputSpecialization
+from ..compile_environment import _replay_tensor_input_source
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .cute_fx_walk import reach_tcgen05_matmul_anchors
 
 if TYPE_CHECKING:
+    from collections.abc import Hashable
+    from collections.abc import Sequence
+
+    from torch._guards import Source
+
     from ..inductor_lowering import CodegenState
 
 log = logging.getLogger(__name__)
+
+
+def _persistent_vec_alignment_signature(values: Sequence[object]) -> Hashable:
+    """Cache-key facts needed by persistent vector alignment/extent checks."""
+    if (
+        len(values) != 1
+        or not isinstance(values[0], torch.Tensor)
+        or isinstance(values[0], FakeTensor)
+    ):
+        return None
+    tensor = values[0]
+    element_size = tensor.element_size()
+    max_vector_elements = max(_CUTE_VECTOR_MAX_BYTES // element_size, 1)
+    return (
+        int(tensor.data_ptr()) % _CUTE_VECTOR_MAX_BYTES,
+        tuple(int(size) % max_vector_elements for size in tensor.shape),
+        tuple(
+            (
+                int(stride) == 1,
+                (int(stride) * element_size) % _CUTE_VECTOR_MAX_BYTES,
+            )
+            for stride in tensor.stride()
+        ),
+    )
+
+
+_PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY = "cute_persistent_vec_alignment_matrix_v2"
+
+
+def _persistent_vec_alignment_matrix_signature(
+    values: Sequence[object],
+) -> Hashable:
+    return tuple(_persistent_vec_alignment_signature((value,)) for value in values)
+
+
+def register_persistent_vec_alignment_specializations(
+    env: CompileEnvironment,
+) -> None:
+    """Specialize persistent-vector candidates on runtime pointer alignment.
+
+    Dynamic FakeTensors intentionally carry symbolic storage offsets.  The
+    branch-local vectorizer therefore consults the real input tensor during
+    codegen.  Register the corresponding address/stride residue in the bound
+    kernel cache key before any config is compiled, so a later unaligned view
+    can never reuse code emitted for an aligned tensor.
+    """
+    sources = tuple(
+        source
+        for tensor in env.input_sources
+        if tensor.dtype in _CUTE_VECTOR_DTYPES
+        and (source := env.tensor_input_source(tensor)) is not None
+    )
+    if not sources:
+        return
+    env.register_runtime_input_specialization(
+        _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY,
+        RuntimeInputSpecialization(
+            sources=sources,
+            classifier_identity=(
+                "byte_alignment_matrix_v2",
+                _CUTE_VECTOR_MAX_BYTES,
+                tuple(map(repr, sources)),
+            ),
+            classifier=_persistent_vec_alignment_matrix_signature,
+            reusable_tensor_properties=frozenset(("data_ptr",)),
+        ),
+    )
+
+
+def runtime_tensor_has_specialized_alignment(
+    env: CompileEnvironment,
+    tensor: torch.Tensor,
+    required_alignment: int,
+) -> bool:
+    """Return a cache-key-backed runtime base-pointer alignment proof."""
+    if required_alignment <= 0 or _CUTE_VECTOR_MAX_BYTES % required_alignment:
+        return False
+    runtime_tensor = env.runtime_value_for_tensor(tensor)
+    if not isinstance(runtime_tensor, torch.Tensor) or isinstance(
+        runtime_tensor, FakeTensor
+    ):
+        return False
+    source = env.tensor_input_source(tensor)
+    specialization = env.runtime_input_specializations.get(
+        _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
+    )
+    if source is None or specialization is None or source not in specialization.sources:
+        return False
+    runtime_values = tuple(
+        _replay_tensor_input_source(item, env.runtime_arg_values_by_name)
+        for item in specialization.sources
+    )
+    facts = specialization.classifier(runtime_values)
+    return (
+        env.runtime_input_specialization_matches_bound(
+            _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY,
+            facts,
+        )
+        and int(runtime_tensor.data_ptr()) % required_alignment == 0
+    )
+
+
+def _tensor_storage_disjoint_matrix_signature(
+    values: Sequence[object],
+) -> Hashable:
+    """Classify every pair while reading each tensor's storage only once."""
+    spans: list[tuple[torch.device, int, int] | None] = []
+    for value in values:
+        if not isinstance(value, torch.Tensor) or isinstance(value, FakeTensor):
+            spans.append(None)
+            continue
+        storage = value.untyped_storage()
+        start = int(storage.data_ptr())
+        spans.append((value.device, start, start + storage.nbytes()))
+
+    result: list[bool] = []
+    for left, right in itertools.combinations(spans, 2):
+        if left is None or right is None:
+            result.append(False)
+        elif left[1] == left[2] or right[1] == right[2] or left[0] != right[0]:
+            result.append(True)
+        else:
+            result.append(left[2] <= right[1] or right[2] <= left[1])
+    return tuple(result)
+
+
+def _tensor_alias_sources(env: CompileEnvironment) -> tuple[Source, ...]:
+    sources: list[Source] = []
+    # Enumerate direct host tensor arguments by their argument names rather
+    # than only asking FakeTensor -> Source.  FakeTensorConverter deliberately
+    # reuses one FakeTensor when the same real tensor is passed in two argument
+    # slots.  That makes the reverse mapping ambiguous, but the two explicit
+    # argument Sources remain distinct and must both participate in the
+    # cache-specialized alias matrix.
+    from ..host_function import HostFunction
+
+    for name, value in HostFunction.current().params.arguments.items():
+        if isinstance(value, torch.Tensor):
+            sources.append(LocalSource(name, is_input=True))
+    for tensor in env.input_sources:
+        source = env.tensor_input_source(tensor)
+        if source is not None and source not in sources:
+            sources.append(source)
+    return tuple(sources)
+
+
+_TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY = "cute_tensor_storage_disjoint_matrix_v1"
+
+
+def register_cute_tensor_alias_specializations(env: CompileEnvironment) -> None:
+    """Cache-key runtime alias facts used by CuTe memory reordering passes.
+
+    Different kernel argument names are not a non-aliasing proof: callers may
+    pass the same tensor or overlapping views.  Recording the storage-overlap
+    predicate in the bound-kernel key lets codegen use a positive runtime fact
+    without reusing that code for a later aliasing launch.
+    """
+    sources = _tensor_alias_sources(env)
+    if len(sources) < 2:
+        return
+    env.register_runtime_input_specialization(
+        _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY,
+        RuntimeInputSpecialization(
+            sources=sources,
+            classifier_identity=(
+                "storage_span_disjoint_matrix_v1",
+                tuple(map(repr, sources)),
+            ),
+            classifier=_tensor_storage_disjoint_matrix_signature,
+            reusable_tensor_properties=frozenset(("storage_span",)),
+        ),
+    )
+
+
+def runtime_tensors_are_proven_disjoint(
+    env: CompileEnvironment,
+    left: torch.Tensor,
+    right: torch.Tensor,
+) -> bool:
+    """Return a cache-specialized positive runtime storage-disjointness fact."""
+    left_source = env.tensor_input_source(left)
+    right_source = env.tensor_input_source(right)
+    if left_source is None or right_source is None:
+        return False
+    return runtime_tensor_sources_are_proven_disjoint(
+        env,
+        left_source,
+        right_source,
+    )
+
+
+def runtime_tensor_sources_are_proven_disjoint(
+    env: CompileEnvironment,
+    left_source: Source,
+    right_source: Source,
+) -> bool:
+    """Return a cache-specialized storage fact for explicit input Sources."""
+    if left_source == right_source:
+        return False
+    specialization = env.runtime_input_specializations.get(
+        _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
+    )
+    sources = _tensor_alias_sources(env)
+    if specialization is None or specialization.sources != sources:
+        return False
+    runtime_values = tuple(
+        _replay_tensor_input_source(source, env.runtime_arg_values_by_name)
+        for source in sources
+    )
+    facts = specialization.classifier(runtime_values)
+    if not isinstance(
+        facts, tuple
+    ) or not env.runtime_input_specialization_matches_bound(
+        _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY,
+        facts,
+    ):
+        return False
+    wanted = frozenset((left_source, right_source))
+    for pair, fact in zip(itertools.combinations(sources, 2), facts, strict=False):
+        if frozenset(pair) == wanted:
+            return fact is True
+    return False
 
 
 def _log_cute_layout(state: CodegenState, op_name: str) -> None:

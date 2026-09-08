@@ -1872,6 +1872,12 @@ class _CuteCUDAGraph(torch.cuda.CUDAGraph):
         self._helion_resources.record_replay_streams()
         super().replay()
 
+    def reset(self) -> None:
+        # Descriptor storage must outlive every graph node that holds its raw
+        # address, so destroy the graph before dropping retained ownership.
+        super().reset()
+        self._helion_resources.release()
+
 
 _CUTE_ACTIVE_CUDA_GRAPH: contextvars.ContextVar[_CuteCUDAGraph | None] = (
     contextvars.ContextVar("helion_cute_active_cuda_graph", default=None)
@@ -3943,10 +3949,26 @@ def _retain_cute_capture_owned_launch_tensors(
     owned_tensors: tuple[torch.Tensor, ...],
 ) -> None:
     """Keep raw-pointer launch tensors alive for captured graph replays."""
-    capture_contexts = tuple(
-        context for context in grouped_launch_contexts if context[3] is not None
-    )
-    if not capture_contexts or not owned_tensors:
+    if not owned_tensors:
+        return
+    contexts = list(grouped_launch_contexts)
+    contexts_by_device = {
+        (context[0], context[1]): context for context in grouped_launch_contexts
+    }
+    # Grouped tcgen05 plans already contribute their stream/capture context.
+    # Other launcher-owned allocations (notably KDA's raw TensorMap descriptor
+    # storage) have no grouped plan, so derive the missing contexts from the
+    # tensors whose pointers the captured launch embeds.
+    for tensor in owned_tensors:
+        device_key = (tensor.device.type, tensor.device.index)
+        if device_key in contexts_by_device:
+            continue
+        stream_handle, capture_id = _cuda_stream_capture_context(tensor.device)
+        context = (*device_key, stream_handle, capture_id)
+        contexts_by_device[device_key] = context
+        contexts.append(context)
+    capture_contexts = tuple(context for context in contexts if context[3] is not None)
+    if not capture_contexts:
         return
     cache = cast(
         "dict[tuple[_CuteGroupedLaunchContext, ...], dict[int, torch.Tensor]]",
@@ -4871,6 +4893,11 @@ def default_cute_launcher(
         cute_compile_options,
     )
     if last_launch is not None:
+        _retain_cute_capture_owned_launch_tensors(
+            cute_kernel,
+            grouped_launch_contexts=last_launch.arg_guard.grouped_launch_contexts,
+            owned_tensors=last_launch.launch.owned_tensors,
+        )
         _record_cute_owned_launch_tensors(last_launch.launch.owned_tensors)
         return cast("Any", last_launch.compiled)(
             *last_launch.launch.launch_args,
