@@ -128,9 +128,9 @@ jobs:
             NIGHTLY_INDEX="${PYTORCH_INDEX%/whl/*}/whl/nightly/${{ matrix.runtime-version }}"
             UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U --pre torch --index-url "$NIGHTLY_INDEX"
             if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
-              # The system package is visible to the resolver but lives outside the
-              # venv, so force a local install where PyTorch searches for bitcode.
-              UV_DEFAULT_INDEX= UV_INDEX= uv pip install --python .venv/bin/python --reinstall nvidia-nvshmem-cu13 --index-url "$NIGHTLY_INDEX"
+              # Match the system install and retain libnvshmem_device.bc, which is
+              # absent from newer NVSHMEM wheels but required by PyTorch's Triton API.
+              UV_DEFAULT_INDEX= UV_INDEX= uv pip install --python .venv/bin/python --reinstall nvidia-nvshmem-cu13==3.4.5 --index-url "$NIGHTLY_INDEX"
               python -c "from torch.distributed._symmetric_memory._nvshmem_triton import NvshmemLibFinder; print(f'NVSHMEM device library: {NvshmemLibFinder.find_device_library()}')"
             fi
           fi
