@@ -1388,6 +1388,62 @@ def _ensure_torch_tpu_cpu_export_info() -> None:
     _ensure_cpu_tpu_info(get_tpu_device_name())
 
 
+def _x64_disabled_scope() -> object:
+    """Return a context manager that disables JAX x64 for a Pallas trace."""
+    import jax
+
+    state = getattr(jax, "enable_x64", None)
+    if callable(state):
+        return state(False)
+    try:
+        from jax.experimental import x64_context
+    except ImportError:
+        x64_context = None  # type: ignore[assignment]
+    disable = getattr(x64_context, "_disable_x64", None) or getattr(
+        x64_context, "disable_x64", None
+    )
+    if disable is not None:
+        return disable()
+    raise RuntimeError(
+        "Helion needs to scope jax_enable_x64 around a Pallas kernel, but JAX "
+        f"{getattr(jax, '__version__', '?')} exposes neither jax.enable_x64 nor "
+        "jax.experimental.x64_context"
+    )
+
+
+def _is_64bit_int(x: object) -> bool:
+    dtype = getattr(x, "dtype", None)
+    kind = getattr(dtype, "kind", None)
+    return kind in ("i", "u") and getattr(dtype, "itemsize", 0) == 8
+
+
+def _x64_scoped_jit_fn(jit_fn: object) -> object:
+    """Trace a Helion Pallas kernel with JAX x64 disabled.
+
+    Pallas grid, DMA-slice, and tiling arithmetic are int32. Python integer
+    literals become int64 when global JAX x64 is enabled, which makes otherwise
+    valid Pallas index expressions fail type checking. Scope only the Helion
+    kernel trace to x32, leaving the surrounding JAX program's x64 setting
+    unchanged.
+    """
+
+    @functools.wraps(jit_fn)  # pyrefly: ignore[bad-argument-type]
+    def wrapper(*args: object, **kwargs: object) -> object:
+        wide = [a for a in args if _is_64bit_int(a)]
+        if wide:
+            raise RuntimeError(
+                "Helion cannot launch a Pallas kernel that carries 64-bit "
+                f"integer data ({', '.join(str(a.dtype) for a in wide)}): "  # type: ignore[attr-defined]
+                "the kernel is traced with jax_enable_x64 off (so that Pallas's "
+                "int32 index arithmetic stays consistent), which would silently "
+                "truncate those inputs to 32-bit. Narrow them before the kernel."
+            )
+        with _x64_disabled_scope():  # type: ignore[attr-defined]
+            return jit_fn(*args, **kwargs)  # type: ignore[operator]
+
+    return wrapper
+
+
 def _pallas_apply_ds_padding(
     args: tuple[object, ...],
     _output_indices: list[int],
@@ -1962,6 +2018,7 @@ def _pallas_compile_jit_fn(
             interpret=interpret,
             collective_id=_collective_id,
         )
+        jit_fn = _x64_scoped_jit_fn(jit_fn)
 
     return _PallasCompileResult(
         jit_fn=jit_fn,
@@ -2601,12 +2658,22 @@ def _pallas_compile_compact_jit_fn(
     n_io = n_inputs + n_outputs
     pass_positions = hbm_in_positions | {n_inputs + p for p in hbm_out_positions}
     pipe_positions = [p for p in range(n_io) if p not in pass_positions]
+    num_launch_scalar_prefetch = num_scalar_prefetch + 1
 
     def jit_fn(*jax_inputs: object) -> object:
         offsets = [jax_inputs[tp] for tp in offset_tpos]
         metadata = build_worklist(*offsets)
-        num_work = metadata.num_work  # type: ignore[attr-defined]
-        scalar_prefetch = [getattr(metadata, f) for f in metadata_fields]
+        # Keep the dynamic grid bound explicit rather than closing over the
+        # scalar. ``pl.kernel`` turns closed-over scalars into SMEM refs with a
+        # default BlockSpec; when an enclosing jit has x64 enabled, JAX can
+        # retrace that default index map after our x32 scope and emit an i64
+        # transform that Mosaic rejects. A one-element int32 buffer follows the
+        # same explicit ANY -> SMEM path as the other worklist metadata.
+        num_work = jnp.reshape(metadata.num_work, (1,))  # type: ignore[attr-defined]
+        scalar_prefetch = [
+            num_work,
+            *(getattr(metadata, f) for f in metadata_fields),
+        ]
 
         # The BlockSpec index maps and the generated kernel read the
         # worklist tables from SMEM.
@@ -2617,13 +2684,17 @@ def _pallas_compile_compact_jit_fn(
         all_scratch: list[object] = [*scratch_shapes, *smem_types]
 
         def kernel_body(*refs: object) -> None:
-            scalar_any = refs[:num_scalar_prefetch]
-            io_any = refs[num_scalar_prefetch : num_scalar_prefetch + n_io]
-            rest = refs[num_scalar_prefetch + n_io :]
+            scalar_any = refs[:num_launch_scalar_prefetch]
+            io_any = refs[
+                num_launch_scalar_prefetch : num_launch_scalar_prefetch + n_io
+            ]
+            rest = refs[num_launch_scalar_prefetch + n_io :]
             kernel_scratch = rest[:n_kernel_scratch]
             scalar_smem = rest[n_kernel_scratch:]
             for src, dst in zip(scalar_any, scalar_smem, strict=True):
                 pltpu.sync_copy(src, dst)  # type: ignore[union-attr]
+            num_work_smem = scalar_smem[0]
+            metadata_smem = scalar_smem[1:]
 
             in_specs, out_specs = _pallas_compact_in_out_specs(
                 pl,
@@ -2636,7 +2707,7 @@ def _pallas_compile_compact_jit_fn(
                 smem_set,
                 hbm_set,
                 owner_ref_pos,
-                tuple(scalar_smem),
+                tuple(metadata_smem),
                 aligned_set,
                 tile_start_ref_pos,
                 compact_block,
@@ -2656,7 +2727,7 @@ def _pallas_compile_compact_jit_fn(
                 merged = list(io_any)
                 for p, block in zip(pipe_positions, block_refs, strict=True):
                     merged[p] = block
-                reordered_kernel(*scalar_smem, *merged, *kernel_scratch)  # type: ignore[operator]
+                reordered_kernel(*metadata_smem, *merged, *kernel_scratch)  # type: ignore[operator]
 
             # Correctness relies on emit_pipeline running grid steps
             # sequentially in ascending order (a later work item re-writes
@@ -2666,7 +2737,7 @@ def _pallas_compile_compact_jit_fn(
             pltpu.emit_pipeline(  # type: ignore[union-attr]
                 pipeline_body,
                 # num_work may be 0 (empty batch): zero steps, empty output.
-                grid=(num_work,),
+                grid=(num_work_smem[0],),  # type: ignore[index]
                 in_specs=pipe_in_specs,
                 out_specs=pipe_out_specs,
             )(*pipe_any)
@@ -2694,7 +2765,7 @@ def _pallas_compile_compact_jit_fn(
         return call(*scalar_prefetch, *jax_inputs)
 
     return _PallasCompileResult(
-        jit_fn=jit_fn,
+        jit_fn=_x64_scoped_jit_fn(jit_fn),
         tensor_arg_indices=tensor_arg_indices,
         output_only_indices=output_only_indices,
         arg_to_tensor_pos=arg_to_tensor_pos,

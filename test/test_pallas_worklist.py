@@ -1558,6 +1558,8 @@ class TestWorklistConfig(unittest.TestCase):
         self.assertIn("def flatten_worklist(", free)
         self.assertNotIn("from helion.runtime.pallas.compact_worklist import", free)
         self.assertNotIn("import helion", free)
+        self.assertIn("num_work = jnp.reshape(metadata.num_work, (1,))", free)
+        self.assertIn("grid=(num_work_smem[0],)", free)
         ast.parse(free)
         # Offsets arg index is non-empty (q_offsets feeds the builder).
         self.assertRegex(code, r"_compact_offset_arg_indices=\[\d")
