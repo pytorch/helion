@@ -30,6 +30,7 @@ import torch.distributed as dist
 from torch.fx.experimental.symbolic_shapes import DimDynamic
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
+from torch.utils import _pytree as pytree
 
 from .. import exc
 from .._compat import shape_env_size_hint
@@ -344,6 +345,12 @@ class CompileEnvironment:
         self.fake_mode = FakeTensorMode(shape_env=self.shape_env)
         self.input_sources: dict[torch.Tensor, Source] = {}
         self._ambiguous_tensor_input_source_ids: set[int] = set()
+        # Positive provenance for host allocations whose layout is fixed by the
+        # generated wrapper.  Track storage rather than tensor identity so a
+        # deterministic view of such an allocation retains the proof, while a
+        # view of a user input cannot acquire it merely because it has no direct
+        # replayable input source.
+        self._symbolically_exact_layout_storages: set[torch.UntypedStorage] = set()
         self._runtime_arg_values_by_name: contextvars.ContextVar[
             dict[str, object] | None
         ] = contextvars.ContextVar(
@@ -646,6 +653,59 @@ class CompileEnvironment:
 
         self._tensor_input_source_cache[cache_key] = result
         return result
+
+    def tensor_layout_is_symbolically_exact(self, tensor: torch.Tensor) -> bool:
+        """Whether the wrapper determines this tensor's layout exactly.
+
+        This is intentionally a positive proof.  Absence from ``input_sources``
+        is insufficient: input views and aliases also commonly lack a direct
+        source.  Storage identity lets deterministic views of a proven
+        compiler allocation share the proof without separately classifying
+        every view operation.
+        """
+        return tensor.untyped_storage() in self._symbolically_exact_layout_storages
+
+    def register_tensor_factory_layout(
+        self,
+        factory: object,
+        args: typing.Sequence[object],
+        kwargs: typing.Mapping[str, object],
+        result: object,
+    ) -> None:
+        """Record exact layout provenance for supported wrapper allocations.
+
+        ``torch.empty`` creates a fresh layout determined entirely by its host
+        arguments.  ``torch.empty_like`` defaults to preserving its input's
+        layout, so it is exact only when that input already has this proof.
+        Other factories conservatively remain runtime-strided until their
+        layout contracts are added here.
+        """
+        if factory not in (torch.empty, torch.empty_like):
+            return
+        if not isinstance(result, torch.Tensor) or result.layout != torch.strided:
+            return
+        # Provenance is granted only to a true fresh allocation.  ``out=`` is
+        # an explicit non-fresh contract, and the storage check also covers
+        # positional aliases and tensors nested in ordinary pytree containers.
+        if kwargs.get("out") is not None:
+            return
+        result_storage = result.untyped_storage()
+        argument_storages = {
+            value.untyped_storage()
+            for value in pytree.tree_leaves((args, kwargs))
+            if isinstance(value, torch.Tensor)
+        }
+        if result_storage in argument_storages:
+            return
+        if factory is torch.empty:
+            is_exact = True
+        elif factory is torch.empty_like:
+            like_input = args[0] if args else kwargs.get("input")
+            is_exact = isinstance(
+                like_input, torch.Tensor
+            ) and self.tensor_layout_is_symbolically_exact(like_input)
+        if is_exact:
+            self._symbolically_exact_layout_storages.add(result_storage)
 
     def runtime_value_for_tensor(self, fake_tensor: torch.Tensor) -> object | None:
         """Replay a traced tensor's input source against the current real arguments."""

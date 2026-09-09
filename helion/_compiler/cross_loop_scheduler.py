@@ -13,6 +13,8 @@ from typing import cast
 import sympy
 from torch.utils._sympy.functions import CeilDiv
 from torch.utils._sympy.functions import FloorDiv
+from torch.utils._sympy.functions import Max as SymbolicMax
+from torch.utils._sympy.functions import Min as SymbolicMin
 
 from .. import exc
 from .tile_dependency import CoordinateDomain
@@ -1705,11 +1707,16 @@ class WorkerSchedule:
         )
 
     def worker_intervals_for_root(self, root: int) -> tuple[WorkerInterval, ...]:
-        """Return one root's exact resident-worker support symbolically."""
+        """Return one root's concrete compact resident-worker support.
+
+        Parameterized schedules expose their exact support through
+        :class:`RootBarrierPublicationPlan.participant_order` instead of
+        pretending that a runtime-rotated cohort is one static interval.
+        """
         return root_barrier_publication_plan(self, root).participant_intervals
 
-    def active_worker_count_for_root(self, root: int) -> int:
-        """Return one root's exact resident-worker count from interval lengths."""
+    def active_worker_count_for_root(self, root: int) -> int | sympy.Expr:
+        """Return one root's exact real resident-owner count."""
         return root_barrier_publication_plan(self, root).resident_arrival_count
 
     @cached_property
@@ -2063,25 +2070,202 @@ class RootBarrierPublication:
 
 @dataclasses.dataclass(frozen=True)
 class RootBarrierPublicationPlan:
-    """The sole symbolic derivation of root-barrier publication ownership."""
+    """The sole derivation of root-barrier ownership and arrival mass.
+
+    ``participant_order`` is an exact worker-to-dense-owner relation when the
+    participant cohort depends on runtime parameters.  Concrete schedules use
+    ``participant_intervals`` as a proved strength reduction.  Every emission
+    site contributes ``unit_contribution``; code generation must consume the
+    counts and support here rather than reconstructing schedule geometry.
+    """
 
     root: int
     participant_intervals: tuple[WorkerInterval, ...]
+    participant_order: CoordinateRelation | None
     publications: tuple[RootBarrierPublication, ...]
+    resident_arrival_count: int | sympy.Expr
+    continuation_arrival_count: int | sympy.Expr
+    source_stage_arrival_count: int
+    real_arrival_count: int | sympy.Expr
+    effective_arrival_count: int | sympy.Expr
+    maximum_arrival_count: int
+    unit_contribution: int = 1
+
+    def __post_init__(self) -> None:
+        if self.unit_contribution != 1:
+            raise ValueError("root barriers require unit publication contributions")
+        expected_real = sympy.simplify(
+            sympy.Add(
+                sympy.sympify(self.resident_arrival_count),
+                sympy.sympify(self.continuation_arrival_count),
+                self.source_stage_arrival_count,
+            )
+        )
+        if not _equal_integer_expressions(self.real_arrival_count, expected_real):
+            raise ValueError("root-barrier real arrival count is inconsistent")
+        if any(
+            sympy.sympify(count).is_nonnegative is not True
+            for count in (
+                self.resident_arrival_count,
+                self.continuation_arrival_count,
+                self.source_stage_arrival_count,
+                self.real_arrival_count,
+                self.effective_arrival_count,
+            )
+        ):
+            raise ValueError("root-barrier arrival counts must be nonnegative")
+        expected_effective = SymbolicMax(
+            sympy.Integer(1), sympy.sympify(self.real_arrival_count)
+        )
+        if not _equal_integer_expressions(
+            self.effective_arrival_count,
+            expected_effective,
+        ):
+            raise ValueError(
+                "root-barrier effective arrival count must be max(real, 1)"
+            )
+        if self.maximum_arrival_count <= 0:
+            raise ValueError("root-barrier maximum arrival count must be positive")
+        if not _is_provably_at_most(
+            self.effective_arrival_count,
+            self.maximum_arrival_count,
+        ):
+            raise ValueError("root-barrier arrival count exceeds its epoch bound")
+        if self.participant_order is None:
+            return
+        if self.continuation_arrival_count != 0 or self.source_stage_arrival_count:
+            raise ValueError(
+                "symbolic resident ownership cannot overlap external publication"
+            )
+        if not _equal_integer_expressions(
+            self.participant_order.target_domain.size_expr,
+            self.effective_arrival_count,
+        ):
+            raise ValueError("participant order does not cover effective arrivals")
 
     @property
-    def resident_arrival_count(self) -> int:
-        """Return the number of resident publications without enumeration."""
-        return sum(
-            _interval_cardinality(publication.worker_intervals)
-            for publication in self.publications
+    def parameter_symbols(self) -> frozenset[sympy.Symbol]:
+        """Return every runtime parameter used by publication semantics."""
+        symbols: set[sympy.Symbol] = set()
+        if self.participant_order is not None:
+            symbols.update(self.participant_order.parameter_symbols)
+        for count in (
+            self.resident_arrival_count,
+            self.continuation_arrival_count,
+            self.real_arrival_count,
+            self.effective_arrival_count,
+        ):
+            symbols.update(cast("set[sympy.Symbol]", sympy.sympify(count).free_symbols))
+        return frozenset(symbols)
+
+
+def _concrete_or_symbolic_integer(expression: int | sympy.Expr) -> int | sympy.Expr:
+    """Keep symbolic integers symbolic while normalizing exact constants."""
+    simplified = sympy.simplify(sympy.sympify(expression))
+    return int(simplified) if isinstance(simplified, sympy.Integer) else simplified
+
+
+def _is_provably_at_most(expression: int | sympy.Expr, upper_bound: int) -> bool:
+    """Prove a small integer-expression upper bound without sampling it."""
+    expression = sympy.simplify(sympy.sympify(expression))
+    difference = sympy.simplify(sympy.Integer(upper_bound) - expression)
+    if difference.is_nonnegative is True:
+        return True
+    if expression.func in (sympy.Min, SymbolicMin):
+        return any(
+            _is_provably_at_most(argument, upper_bound) for argument in expression.args
         )
+    if expression.func in (sympy.Max, SymbolicMax):
+        return all(
+            _is_provably_at_most(argument, upper_bound) for argument in expression.args
+        )
+    return False
+
+
+def _root_major_participant_order(
+    segment: WorkerScheduleSegment,
+    first_slot: sympy.Expr,
+    task_count: sympy.Expr,
+    worker_count: int,
+) -> tuple[CoordinateRelation, int | sympy.Expr, int | sympy.Expr] | None:
+    """Derive exact rotated worker support from a proved root-major relation.
+
+    The equality check is the admissibility proof: only the compiler's exact
+    packed relation may be projected to the compact ordinal formula.  No shape
+    hint, task, worker, or wave is sampled.
+    """
+    task_axis_order = _parametric_root_major_axis_order(
+        segment.task_order,
+        first_slot,
+        worker_count,
+    )
+    if task_axis_order is None or segment.task_order != _parametric_root_major_relation(
+        segment.task_order.source_domain,
+        segment.task_order.target_domain,
+        first_slot,
+        worker_count,
+        task_axis_order,
+    ):
+        return None
+    if not _equal_integer_expressions(
+        segment.task_order.target_domain.size_expr,
+        task_count,
+    ):
+        return None
+
+    _launch_stage_axis, worker_axis, _wave_axis = (
+        segment.task_order.source_domain.axis_order
+    )
+    worker_domain = CoordinateDomain(
+        axis_order=(worker_axis,),
+        axis_counts_items=((worker_axis, worker_count),),
+        kind="worker",
+    )
+    real_arrival_count = _concrete_or_symbolic_integer(
+        SymbolicMin(sympy.Integer(worker_count), task_count)
+    )
+    effective_arrival_count = _concrete_or_symbolic_integer(
+        SymbolicMax(sympy.Integer(1), sympy.sympify(real_arrival_count))
+    )
+    participant_axis = (
+        min(
+            (
+                *segment.task_order.source_domain.axis_order,
+                *segment.task_order.target_domain.axis_order,
+            )
+        )
+        - 1
+    )
+    participant_domain = CoordinateDomain(
+        axis_order=(participant_axis,),
+        axis_counts_items=((participant_axis, effective_arrival_count),),
+        kind="value",
+    )
+    worker = coordinate_axis_symbol(worker_axis)
+    local_ordinal = sympy.Mod(
+        worker + worker_count - sympy.Mod(first_slot, worker_count),  # pyrefly: ignore[unsupported-operation]
+        worker_count,
+    )
+    participant_order = CoordinateRelation.point_map(
+        worker_domain,
+        participant_domain,
+        (
+            (
+                ((worker_axis, 0, worker_count, 1),),
+                (local_ordinal,),
+            ),
+        ),
+    )
+    if not participant_order.is_single_valued():
+        raise AssertionError("root-major participant order is not single-valued")
+    return participant_order, real_arrival_count, effective_arrival_count
 
 
 @cache
 def root_barrier_publication_plan(
     worker_schedule: WorkerSchedule,
     root: int,
+    readiness_counters: tuple[ReadinessCounterPlan, ...] = (),
 ) -> RootBarrierPublicationPlan:
     """Assign every participating worker to its final root occurrence once.
 
@@ -2089,6 +2273,37 @@ def root_barrier_publication_plan(
     used for both the barrier arrival count and the codegen emission sites.
     No worker or task is enumerated.
     """
+    continuation_domains = tuple(
+        consumer.keys_by_consumer.source_domain
+        for counter in readiness_counters
+        if (consumer := counter.continuation_consumer) is not None
+        and consumer.consumer_root == root
+    )
+    if len(continuation_domains) > 1:
+        raise ValueError("one root cannot have multiple continuation owners")
+    if continuation_domains and not all(
+        counter.continuation_consumer is None
+        or counter.continuation_consumer.consumer_root != root
+        or counter.continuation_consumer.keys_by_consumer.is_total_function()
+        for counter in readiness_counters
+    ):
+        raise ValueError("a continuation must cover its complete root")
+    continuation_arrival_count: int | sympy.Expr = (
+        _concrete_or_symbolic_integer(continuation_domains[0].size_expr)
+        if continuation_domains
+        else 0
+    )
+    source_segments = tuple(
+        segment
+        for segment in worker_schedule.segments_for_root(root)
+        if segment.launch_stage == _SOURCE_LAUNCH_STAGE
+    )
+    if len(source_segments) > 1:
+        raise ValueError("one root cannot have multiple source-stage owners")
+    source_stage_arrival_count = (
+        source_segments[0].task_order.target_domain.size if source_segments else 0
+    )
+
     if (
         parameterized_geometry := _parametric_root_major_schedule_geometry(
             worker_schedule
@@ -2101,48 +2316,51 @@ def root_barrier_publication_plan(
             )
             if segment.root == root
         )
-        if len(matching) != 1:
+        if len(matching) > 1:
             raise ValueError(
                 f"parameterized root-major schedule has no unique root {root}"
             )
-        participant_intervals = ((0, worker_schedule.worker_count),)
-        return RootBarrierPublicationPlan(
-            root=root,
-            participant_intervals=participant_intervals,
-            publications=(RootBarrierPublication(matching[0], participant_intervals),),
-        )
-    if (
-        parameterized_geometry := _parametric_event_frontier_schedule_geometry(
-            worker_schedule
-        )
-    ) is not None:
-        matching_segment = next(
-            (
-                segment
-                for segment, _phase, _task_count in parameterized_geometry
-                if segment.root == root
-            ),
-            None,
-        )
-        if matching_segment is None:
-            raise ValueError(
-                f"parameterized event-frontier schedule has no root {root}"
+        if matching:
+            segment_index = matching[0]
+            segment, first_slot, task_count = parameterized_geometry[segment_index]
+            participant = _root_major_participant_order(
+                segment,
+                first_slot,
+                task_count,
+                worker_schedule.worker_count,
             )
-        segment_index = worker_schedule.segments.index(matching_segment)
-        participant_intervals = ((0, worker_schedule.worker_count),)
-        return RootBarrierPublicationPlan(
-            root=root,
-            participant_intervals=participant_intervals,
-            publications=(
-                RootBarrierPublication(segment_index, participant_intervals),
-            ),
+            if participant is None:
+                raise ValueError("root-major participant support is not proved")
+            participant_order, real_arrival_count, effective_arrival_count = participant
+            if continuation_arrival_count != 0 or source_stage_arrival_count:
+                raise ValueError(
+                    "parameterized resident ownership overlaps another execution role"
+                )
+            return RootBarrierPublicationPlan(
+                root=root,
+                participant_intervals=(),
+                participant_order=participant_order,
+                publications=(RootBarrierPublication(segment_index, ()),),
+                resident_arrival_count=real_arrival_count,
+                continuation_arrival_count=0,
+                source_stage_arrival_count=0,
+                real_arrival_count=real_arrival_count,
+                effective_arrival_count=effective_arrival_count,
+                maximum_arrival_count=worker_schedule.worker_count,
+            )
+        if continuation_arrival_count == 0 and source_stage_arrival_count == 0:
+            raise ValueError(f"parameterized root-major schedule has no root {root}")
+    if _parametric_event_frontier_schedule_geometry(worker_schedule) is not None:
+        raise ValueError(
+            "parameterized event-frontier schedules do not prove exact "
+            "root-barrier publication support"
         )
 
     later_workers: tuple[WorkerInterval, ...] = ()
     reverse_publications: list[RootBarrierPublication] = []
     for segment_index in reversed(range(len(worker_schedule.segments))):
         segment = worker_schedule.segments[segment_index]
-        if segment.root != root:
+        if segment.root != root or segment.launch_stage == _SOURCE_LAUNCH_STAGE:
             continue
         segment_workers = segment.worker_intervals()
         publication_workers = _subtract_intervals(segment_workers, later_workers)
@@ -2168,7 +2386,31 @@ def root_barrier_publication_plan(
         later_workers
     ):
         raise AssertionError("root publication ownership is not an exact partition")
-    return RootBarrierPublicationPlan(root, later_workers, publications)
+    resident_arrival_count = published_count
+    real_arrival_count = _concrete_or_symbolic_integer(
+        sympy.Add(
+            resident_arrival_count,
+            sympy.sympify(continuation_arrival_count),
+            source_stage_arrival_count,
+        )
+    )
+    if not isinstance(real_arrival_count, int) or real_arrival_count <= 0:
+        raise ValueError(
+            "root-barrier publication requires a proved positive bounded owner set"
+        )
+    maximum_arrival_count = int(real_arrival_count)
+    return RootBarrierPublicationPlan(
+        root=root,
+        participant_intervals=later_workers,
+        participant_order=None,
+        publications=publications,
+        resident_arrival_count=resident_arrival_count,
+        continuation_arrival_count=continuation_arrival_count,
+        source_stage_arrival_count=source_stage_arrival_count,
+        real_arrival_count=real_arrival_count,
+        effective_arrival_count=real_arrival_count,
+        maximum_arrival_count=maximum_arrival_count,
+    )
 
 
 def _build_parametric_root_major_worker_schedule(

@@ -113,6 +113,58 @@ def dynamic_exact_then_barrier_chain(x: torch.Tensor) -> torch.Tensor:
     autotune_effort="none",
     triton_do_not_specialize=True,
 )
+def dynamic_wrapped_root_barrier(
+    prefix: torch.Tensor,
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exercise a full active cohort whose packed first slot is nonzero."""
+    prefix_out = torch.empty_like(prefix)
+    tmp = torch.empty_like(x)
+    barrier_tmp = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for tile in hl.tile(prefix.size(0), block_size=1):
+        prefix_out[tile] = prefix[tile] + 1
+    for tile in hl.tile(x.size(0), block_size=1):
+        tmp[tile] = x[tile] + 2
+    for tile in hl.tile(x.size(0), block_size=1):
+        identity_index = tile.index + tile.index % 1
+        barrier_tmp[tile] = tmp[identity_index] * 3
+    for tile in hl.tile(x.size(0), block_size=1):
+        identity_index = tile.index + tile.index % 1
+        out[tile] = barrier_tmp[identity_index] - 4
+    return prefix_out, out
+
+
+@helion.kernel(
+    static_shapes=False,
+    autotune_effort="none",
+    triton_do_not_specialize=True,
+)
+def dynamic_readiness_with_fixed_root_barrier(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mix a fixed-count root barrier with a dynamic exact counter."""
+    fixed_tmp = torch.empty((16,), dtype=x.dtype, device=x.device)
+    fixed_out = torch.empty((16,), dtype=x.dtype, device=x.device)
+    dynamic_tmp = torch.empty((8192,), dtype=x.dtype, device=x.device)
+    dynamic_out = torch.empty_like(x)
+    for tile in hl.tile(16, block_size=1):
+        fixed_tmp[tile] = tile.index
+    for tile in hl.tile(16, block_size=1):
+        identity_index = tile.index + tile.index % 1
+        fixed_out[tile] = fixed_tmp[identity_index] + 1
+    for tile in hl.tile(x.size(0), block_size=1):
+        dynamic_tmp[tile] = x[tile] + 2
+    for tile in hl.tile(x.size(0), block_size=1):
+        dynamic_out[tile] = dynamic_tmp[tile] * 3
+    return fixed_out, dynamic_out
+
+
+@helion.kernel(
+    static_shapes=False,
+    autotune_effort="none",
+    triton_do_not_specialize=True,
+)
 def dynamic_exact_three_stage_chain(x: torch.Tensor) -> torch.Tensor:
     first_tmp = torch.empty((8192,), dtype=x.dtype, device=x.device)
     second_tmp = torch.empty((8192,), dtype=x.dtype, device=x.device)
@@ -649,9 +701,13 @@ class TestTritonTileDependencyLowering(TestCase):
         self.assertNotIn("launch_cooperative_grid=True", code)
         self.assertNotIn("tile_dependency_dispatch_ticket", code)
         self.assertIn(
-            f"* tl.cast({worker_count}, tl.uint32)",
+            f"* tl.cast({worker_count}, tl.uint64)",
             code,
         )
+        self.assertIn("tl.atomic_max(tile_dependency_parameterized_state", code)
+        self.assertIn("tl.atomic_add(tile_dependency_parameterized_state", code)
+        self.assertIn("tl.maximum(1, tl.minimum(", code)
+        self.assertIn("ld.acquire.gpu.global.u64", code)
         self.assertTrue(
             any(
                 "tl.range(" in line and "x_size_0" in line for line in code.splitlines()
@@ -1054,13 +1110,17 @@ class TestTritonTileDependencyLowering(TestCase):
         worker_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
         epoch_words = (worker_count + 15) // 16 * 16
 
-        fixed_barrier = "tile_dependency_state + 0 + 0 + 0"
-        dynamic_counter = f"tile_dependency_parameterized_state + {epoch_words} + 0 + "
+        fixed_barrier = f"tile_dependency_parameterized_state + {epoch_words} + 0 + 0"
+        dynamic_counter = (
+            f"tile_dependency_parameterized_state + {epoch_words} + 16 + 0 + "
+        )
+        self.assertIn(f"tl.atomic_max({fixed_barrier}", code)
         self.assertIn(f"tl.atomic_add({fixed_barrier}", code)
         self.assertIn("tile_dependency_root_barrier_wait", code)
         self.assertIn(f"tl.atomic_xchg({dynamic_counter}", code)
         self.assertIn("tile_dependency_readiness_wait", code)
         self.assertIn("16 * ((15 + x.size(0)) // 16)", code)
+        self.assertIn("torch.uint64", code)
 
         for launch, length in enumerate((65, 17, 0, 97, 65)):
             x = (
@@ -1069,6 +1129,57 @@ class TestTritonTileDependencyLowering(TestCase):
             )
             output = compiled(x)
             torch.testing.assert_close(output, (x + 1) * 2 - 3)
+
+    def test_wrapped_root_barrier_participants_use_euclidean_modulo(self) -> None:
+        worker_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+        prefix = torch.arange(17, device=DEVICE, dtype=torch.float32)
+        x = torch.arange(worker_count, device=DEVICE, dtype=torch.float32)
+        code, outputs = code_and_output(
+            dynamic_wrapped_root_barrier,
+            (prefix, x),
+            pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+
+        prefix_out, out = outputs
+        torch.testing.assert_close(prefix_out, prefix + 1)
+        torch.testing.assert_close(out, (x + 2) * 3 - 4)
+        self.assertIn("tile_dependency_root_barrier_wait", code)
+        self.assertIn(f") % {worker_count} + {worker_count}) % {worker_count}", code)
+
+    def test_epoch_state_places_dynamic_readiness_after_fixed_barrier(self) -> None:
+        worker_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+        epoch_words = (worker_count + 15) // 16 * 16
+        exemplar = torch.arange(17, device=DEVICE, dtype=torch.float32)
+        bound = dynamic_readiness_with_fixed_root_barrier.bind((exemplar,))
+        config = helion.Config(
+            pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+        code = bound.to_code(config)
+        compiled = bound.compile_config(config)
+
+        root_counter = f"tile_dependency_parameterized_state + {epoch_words} + 0 + 0"
+        readiness_counter = (
+            f"tile_dependency_parameterized_state + {epoch_words} + 16 + 0 + "
+        )
+        self.assertNotIn("tile_dependency_state", code)
+        self.assertIn(f"tl.atomic_max({root_counter}", code)
+        self.assertIn(f"tl.atomic_add({root_counter}", code)
+        self.assertIn(f"tl.atomic_xchg({readiness_counter}", code)
+
+        for length in (17, 0, 65, 17):
+            x = torch.arange(length, device=DEVICE, dtype=torch.float32)
+            fixed_out, dynamic_out = compiled(x)
+            torch.testing.assert_close(
+                fixed_out,
+                torch.arange(16, device=DEVICE, dtype=torch.float32) + 1,
+            )
+            torch.testing.assert_close(dynamic_out, (x + 2) * 3)
 
     def test_dynamic_counter_sections_are_replay_safe_when_offsets_move(self) -> None:
         exemplar = (

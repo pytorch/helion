@@ -9,6 +9,8 @@ from unittest import mock
 
 import sympy
 import torch
+from torch.utils._sympy.functions import Max as SymbolicMax
+from torch.utils._sympy.functions import Min as SymbolicMin
 
 import helion
 from helion._compiler import cross_loop_scheduler
@@ -24,6 +26,7 @@ from helion._compiler.cross_loop_scheduler import _event_ready_after_worker_step
 from helion._compiler.cross_loop_scheduler import _flat_task_order_relation
 from helion._compiler.cross_loop_scheduler import _global_unit_list_schedule
 from helion._compiler.cross_loop_scheduler import _has_valid_transient_source_schedule
+from helion._compiler.cross_loop_scheduler import _root_schedule_traversal
 from helion._compiler.cross_loop_scheduler import _segmented_nested_loop_counter
 from helion._compiler.cross_loop_scheduler import _select_root_barrier_edges
 from helion._compiler.cross_loop_scheduler import _task_order_ordinal_domain
@@ -1036,6 +1039,21 @@ class TestCrossLoopScheduler(TestCase):
         self.assertIsNone(scheduled.worker_step_bounds_for_root(0))
         self.assertEqual(scheduled.workers_for_root(0), frozenset())
         self.assertEqual(scheduled.active_worker_count_for_root(0), 0)
+        with _forbid_schedule_enumeration():
+            source_publication = cross_loop_scheduler.root_barrier_publication_plan(
+                scheduled,
+                0,
+                readiness_counters,
+            )
+        self.assertEqual(source_publication.participant_intervals, ())
+        self.assertIsNone(source_publication.participant_order)
+        self.assertEqual(source_publication.publications, ())
+        self.assertEqual(source_publication.resident_arrival_count, 0)
+        self.assertEqual(source_publication.continuation_arrival_count, 0)
+        self.assertEqual(source_publication.source_stage_arrival_count, 5)
+        self.assertEqual(source_publication.real_arrival_count, 5)
+        self.assertEqual(source_publication.effective_arrival_count, 5)
+        self.assertEqual(source_publication.maximum_arrival_count, 5)
         self.assertEqual(placement(scheduled, 1, 0), (0, 0))
         self.assertEqual(placement(scheduled, 2, 0), (0, 1))
 
@@ -2474,6 +2492,70 @@ class TestCrossLoopScheduler(TestCase):
         with _forbid_schedule_enumeration():
             self.assertTrue(_validate_worker_schedule_tasks(schedule, (reference,)))
 
+    def test_reflected_woven_worker_schedule_has_traversal_certificate(self) -> None:
+        (target,) = _identify_root_domains((_domain((20, 1, 1), (21, 1536, 1)),))
+        schedule_domain = CoordinateDomain(
+            axis_order=(-3, -2, -1),
+            axis_counts_items=((-3, 2), (-2, 1184), (-1, 14)),
+            kind="worker",
+        )
+        worker = coordinate_axis_symbol(-2)
+        wave = coordinate_axis_symbol(-1)
+        logical_n = (
+            592 * wave
+            + sympy.Mod(worker, 8)
+            + 8 * sympy.floor(worker / 16)
+            - 768 * sympy.floor(sympy.Mod(worker, 16) / 8)
+            - 6336
+        )
+        targets = (
+            (20, sympy.Integer(0), sympy.Integer(1), 1),
+            (21, logical_n, logical_n + 1, 1),
+        )
+        placement = CoordinateRelation(
+            schedule_domain,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    ((-3, 1, 2, 1), (-2, 0, 1184, 1), (-1, 12, 13, 1)),
+                    targets,
+                ),
+                _CoordinateRelationPiece(
+                    ((-3, 1, 2, 1), (-2, 0, 352, 1), (-1, 13, 14, 1)),
+                    targets,
+                ),
+            ),
+        )
+        schedule = WorkerSchedule(
+            1184,
+            (
+                WorkerScheduleSegment(
+                    0,
+                    placement,
+                    0,
+                    1184,
+                    12 * 1184,
+                ),
+            ),
+        )
+        reference = pid_task_order(target, target.axis_order)
+
+        with _forbid_schedule_enumeration():
+            traversal = _root_schedule_traversal(schedule.segments, reference)
+            self.assertIsNotNone(traversal)
+            assert traversal is not None
+            self.assertIsNotNone(traversal.scheduled_ordinal_to_logical_task)
+            self.assertIsNotNone(traversal.logical_task_to_scheduled_ordinal)
+            assert traversal.scheduled_ordinal_to_logical_task is not None
+            assert traversal.logical_task_to_scheduled_ordinal is not None
+            self.assertTrue(
+                traversal.scheduled_ordinal_to_logical_task.is_total_function()
+            )
+            self.assertTrue(
+                traversal.logical_task_to_scheduled_ordinal.is_total_function()
+            )
+            self.assertTrue(_validate_worker_schedule_tasks(schedule, (reference,)))
+
     def test_segmented_traversal_proves_exact_once_without_materializing(self) -> None:
         target = _domain((20, 2, 1), (21, 11, 1), identity=19)
         reference = pid_task_order(target, target.axis_order)
@@ -2619,6 +2701,130 @@ class TestCrossLoopScheduler(TestCase):
             ((0, ((2, 4),)), (2, ((0, 2),))),
         )
 
+    def test_root_publication_plan_owns_continuation_arrival_count(self) -> None:
+        producer_domain, continuation_domain = _identify_root_domains(
+            (_domain((10, 4, 1)), _domain((20, 3, 1)))
+        )
+        readiness_key_domain = _domain((0, 3), kind="event", identity=0)
+        counter = ReadinessCounterPlan(
+            producers=(
+                ReadinessProducer(
+                    producer_root=0,
+                    producers_by_key=_full_point_map(
+                        readiness_key_domain,
+                        producer_domain,
+                        sympy.Integer(0),
+                    ),
+                ),
+            ),
+            consumers=(
+                ReadinessConsumer(
+                    consumer_root=1,
+                    keys_by_consumer=_full_point_map(
+                        continuation_domain,
+                        readiness_key_domain,
+                        coordinate_axis_symbol(20),
+                    ),
+                ),
+            ),
+            continuation_consumer_index=0,
+        )
+        schedule = _schedule(
+            4,
+            _segment(
+                0,
+                pid_task_order(producer_domain, producer_domain.axis_order),
+                workers=(0, 4),
+                dispatch_offset=0,
+            ),
+        )
+
+        with _forbid_schedule_enumeration():
+            publication = cross_loop_scheduler.root_barrier_publication_plan(
+                schedule,
+                1,
+                (counter,),
+            )
+
+        self.assertEqual(publication.participant_intervals, ())
+        self.assertIsNone(publication.participant_order)
+        self.assertEqual(publication.publications, ())
+        self.assertEqual(publication.resident_arrival_count, 0)
+        self.assertEqual(publication.continuation_arrival_count, 3)
+        self.assertEqual(publication.source_stage_arrival_count, 0)
+        self.assertEqual(publication.real_arrival_count, 3)
+        self.assertEqual(publication.effective_arrival_count, 3)
+        self.assertEqual(publication.maximum_arrival_count, 3)
+
+    def test_parameterized_continuation_only_publication_declines_without_bound(
+        self,
+    ) -> None:
+        task_count = sympy.Symbol("task_count", integer=True, nonnegative=True)
+        producer_domain, continuation_domain = _identify_root_domains(
+            (
+                CoordinateDomain((10,), ((10, task_count),), ((10, 16),)),
+                CoordinateDomain((20,), ((20, task_count),), ((20, 16),)),
+            )
+        )
+        readiness_key_domain = CoordinateDomain(
+            (0,),
+            ((0, task_count),),
+            ((0, 16),),
+            kind="event",
+            identity=0,
+        )
+        counter = ReadinessCounterPlan(
+            producers=(
+                ReadinessProducer(
+                    producer_root=0,
+                    producers_by_key=CoordinateRelation.point_map(
+                        readiness_key_domain,
+                        producer_domain,
+                        (
+                            (
+                                ((0, 0, task_count, 1),),
+                                (coordinate_axis_symbol(0),),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            consumers=(
+                ReadinessConsumer(
+                    consumer_root=1,
+                    keys_by_consumer=CoordinateRelation.point_map(
+                        continuation_domain,
+                        readiness_key_domain,
+                        (
+                            (
+                                ((20, 0, task_count, 1),),
+                                (coordinate_axis_symbol(20),),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            continuation_consumer_index=0,
+        )
+        schedule = cross_loop_scheduler._build_parametric_root_major_worker_schedule(
+            (producer_domain,),
+            (pid_task_order(producer_domain, producer_domain.axis_order),),
+            4,
+        )
+
+        with (
+            _forbid_schedule_enumeration(),
+            self.assertRaisesRegex(
+                ValueError,
+                "positive bounded owner set",
+            ),
+        ):
+            cross_loop_scheduler.root_barrier_publication_plan(
+                schedule,
+                1,
+                (counter,),
+            )
+
     def test_parametric_root_major_schedule_is_exact_after_substitution(self) -> None:
         first_count = sympy.Symbol("first_count", integer=True, nonnegative=True)
         second_count = sympy.Symbol("second_count", integer=True, nonnegative=True)
@@ -2654,12 +2860,34 @@ class TestCrossLoopScheduler(TestCase):
         )
         self.assertEqual(
             tuple(plan.participant_intervals for plan in publications),
-            (((0, 4),), ((0, 4),)),
+            ((), ()),
         )
         self.assertEqual(
             tuple(plan.resident_arrival_count for plan in publications),
+            (SymbolicMin(4, first_count), SymbolicMin(4, second_count)),
+        )
+        self.assertEqual(
+            tuple(plan.effective_arrival_count for plan in publications),
+            (
+                SymbolicMax(1, SymbolicMin(4, first_count)),
+                SymbolicMax(1, SymbolicMin(4, second_count)),
+            ),
+        )
+        self.assertEqual(
+            tuple(plan.maximum_arrival_count for plan in publications),
             (4, 4),
         )
+        self.assertTrue(all(plan.unit_contribution == 1 for plan in publications))
+        self.assertTrue(
+            all(plan.participant_order is not None for plan in publications)
+        )
+        with self.assertRaisesRegex(ValueError, "must be max\\(real, 1\\)"):
+            dataclasses.replace(
+                publications[0],
+                effective_arrival_count=publications[0].real_arrival_count,
+            )
+        with self.assertRaisesRegex(ValueError, "exceeds its epoch bound"):
+            dataclasses.replace(publications[0], maximum_arrival_count=3)
         self.assertTrue(
             cross_loop_scheduler._parameterized_prerequisites_follow_root_order(
                 (),
@@ -2674,7 +2902,14 @@ class TestCrossLoopScheduler(TestCase):
         )
 
         launch_stage_axis, worker_axis, wave_axis = schedule.placement_domain.axis_order
-        for concrete_counts in ((0, 0), (1, 3), (4, 5), (5, 8), (9, 1)):
+        for concrete_counts in (
+            (0, 0),
+            (1, 3),
+            (3, 3),
+            (4, 5),
+            (5, 8),
+            (9, 1),
+        ):
             substitutions = dict(
                 zip((first_count, second_count), concrete_counts, strict=True)
             )
@@ -2682,6 +2917,48 @@ class TestCrossLoopScheduler(TestCase):
             for root, (segment, _symbolic_first_slot, _task_count) in enumerate(
                 geometry
             ):
+                publication = publications[root]
+                participant_order = publication.participant_order
+                assert participant_order is not None
+                concrete_participants = participant_order.substitute_parameters(
+                    {
+                        symbol: substitutions[symbol]
+                        for symbol in participant_order.parameter_symbols
+                    }
+                )
+                actual_participants = {
+                    worker: next(iter(targets))
+                    for worker in range(4)
+                    if (
+                        targets := concrete_participants.target_coordinates(
+                            {worker_axis: worker}
+                        )
+                    )
+                }
+                effective_count = max(min(concrete_counts[root], 4), 1)
+                self.assertEqual(
+                    actual_participants,
+                    {
+                        (first_slot + ordinal) % 4: (ordinal,)
+                        for ordinal in range(effective_count)
+                    },
+                )
+                self.assertEqual(
+                    int(
+                        sympy.sympify(publication.real_arrival_count).xreplace(
+                            substitutions
+                        )
+                    ),
+                    min(concrete_counts[root], 4),
+                )
+                self.assertEqual(
+                    int(
+                        sympy.sympify(publication.effective_arrival_count).xreplace(
+                            substitutions
+                        )
+                    ),
+                    effective_count,
+                )
                 relation = segment.task_order.substitute_parameters(substitutions)
                 actual_owners: dict[int, tuple[int, int]] = {}
                 wave_count = relation.source_domain.axis_counts[wave_axis]
@@ -2720,6 +2997,37 @@ class TestCrossLoopScheduler(TestCase):
                     },
                 )
                 first_slot += expected_count
+
+        segment, first_slot, task_count = geometry[0]
+        first_piece, *remaining_pieces = segment.task_order.pieces
+        first_target = first_piece.target_ranges[0]
+        bad_piece = dataclasses.replace(
+            first_piece,
+            target_ranges=(
+                (
+                    first_target[0],
+                    first_target[1] + 1,
+                    first_target[2] + 1,
+                    first_target[3],
+                ),
+                *first_piece.target_ranges[1:],
+            ),
+        )
+        bad_segment = dataclasses.replace(
+            segment,
+            task_order=dataclasses.replace(
+                segment.task_order,
+                pieces=(bad_piece, *remaining_pieces),
+            ),
+        )
+        self.assertIsNone(
+            cross_loop_scheduler._root_major_participant_order(
+                bad_segment,
+                first_slot,
+                task_count,
+                4,
+            )
+        )
 
     def test_parametric_packed_root_major_handles_empty_and_excluded_roots(
         self,
@@ -2932,6 +3240,14 @@ class TestCrossLoopScheduler(TestCase):
             ),
             ((0, 0), (1, 1)),
         )
+        with self.assertRaisesRegex(
+            ValueError,
+            "event-frontier schedules do not prove exact",
+        ):
+            cross_loop_scheduler.root_barrier_publication_plan(
+                plan.worker_schedule,
+                0,
+            )
 
         for concrete_count in (0, 1, 3, 4, 5, 11):
             publication = counter.producers[0].keys_by_producer

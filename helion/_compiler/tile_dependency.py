@@ -1606,12 +1606,12 @@ class CoordinateRelation:
         if self.parameter_symbols:
             return self.derive_converse_and_target_counts()[0]
         converse = self._cached_converse
-        if converse is not None:
+        if converse is not None and converse.is_single_valued():
             return converse
         target_counts = self.target_count_by_source()
         if target_counts is None:
-            return None
-        return _derived_converse(self, target_counts)
+            return converse
+        return _derived_converse(self, target_counts) or converse
 
     def derive_converse_and_target_counts(
         self,
@@ -1751,11 +1751,11 @@ class CoordinateRelation:
             return None, None
         target_counts = self.target_count_by_source()
         converse = self._cached_converse
-        if converse is not None:
+        if converse is not None and converse.is_single_valued():
             return converse, target_counts
         if target_counts is None:
-            return None, None
-        return _derived_converse(self, target_counts), target_counts
+            return converse, None
+        return _derived_converse(self, target_counts) or converse, target_counts
 
     def _separable_fixed_width_partition(
         self,
@@ -4320,6 +4320,63 @@ def _simplify_logical_expression(
         )
     if rebuilt.func == sympy.Add:
         terms = list(rebuilt.args)
+        # Reassociate two adjacent quotient digits without expanding their
+        # domain.  For integer ``x`` and positive static ``d`` dividing ``m``:
+        #
+        #   c * (m / d) * floor(x / m) + c * floor(Mod(x, m) / d)
+        #       == c * floor(x / d)
+        #
+        # Flattening a worker/wave schedule naturally produces the left-hand
+        # spelling.  Keeping it canonical lets the existing mixed-radix proof
+        # see one digit instead of an artificial wave boundary.
+        for inner_index, term in enumerate(tuple(terms)):
+            coefficient, atom = term.as_coeff_Mul()  # pyrefly: ignore[missing-attribute]
+            if atom.func != sympy.floor or len(atom.args) != 1:
+                continue
+            numerator, denominator = sympy.fraction(sympy.together(atom.args[0]))
+            if not isinstance(numerator, sympy.Mod) or len(numerator.args) != 2:
+                continue
+            dividend, modulus = numerator.args
+            if (
+                coefficient.is_integer is not True
+                or dividend.is_integer is not True
+                or denominator.free_symbols
+                or denominator.is_integer is not True
+                or modulus.free_symbols
+                or modulus.is_integer is not True
+            ):
+                continue
+            divisor = int(denominator)
+            period = int(modulus)
+            if divisor <= 0 or period <= 0 or period % divisor:
+                continue
+            outer_term = (
+                coefficient * (period // divisor) * sympy.floor(dividend / period)
+            )
+            matching_index = next(
+                (
+                    index
+                    for index, other in enumerate(terms)
+                    if index != inner_index and sympy.simplify(other - outer_term) == 0  # pyrefly: ignore[unsupported-operation]
+                ),
+                None,
+            )
+            if matching_index is None:
+                continue
+            remaining = [
+                other
+                for index, other in enumerate(terms)
+                if index not in (inner_index, matching_index)
+            ]
+            rebuilt = sympy.Add(
+                *remaining,
+                coefficient * sympy.floor(dividend / divisor),
+            )
+            return _simplify_logical_expression(
+                cast("sympy.Expr", rebuilt),
+                domain=domain,
+                source_bounds=source_bounds,
+            )
         for modulo_index, term in enumerate(tuple(terms)):
             modulo_coefficient, modulo_term = term.as_coeff_Mul()  # pyrefly: ignore[missing-attribute]
             if modulo_term.func != sympy.Mod or len(modulo_term.args) != 2:
@@ -5364,8 +5421,8 @@ def _piecewise_woven_mixed_radix_converse(
         local_bounds = ((source_axis, 0, source_count, 1),)
         substitutions = {source_symbol: source_symbol + source_begin}
         target_box: list[tuple[int, int, int, int]] = []
-        # (input stride, radix, target axis, packed-output stride)
-        source_digits: list[tuple[int, int, int, int]] = []
+        # (input stride, radix, target axis, packed-output stride, reflected)
+        source_digits: list[tuple[int, int, int, int, bool]] = []
         for target_axis, begin, end, target_step in piece.target_ranges:
             begin = _simplify_logical_expression(
                 cast("sympy.Expr", begin.xreplace(substitutions)),
@@ -5403,11 +5460,17 @@ def _piecewise_woven_mixed_radix_converse(
                 domain=relation.source_domain,
                 source_bounds=local_bounds,
             )
-            packed_digits: list[tuple[int, int, int]] = []
+            packed_digits: list[tuple[int, int, int, bool]] = []
+            constant = 0
             if local_expression != 0:
                 for term in sympy.Add.make_args(sympy.expand(local_expression)):
+                    if not term.free_symbols:
+                        if term.is_integer is not True:
+                            return None
+                        constant += int(term)
+                        continue
                     coefficient, atom = term.as_coeff_Mul()
-                    if coefficient.is_integer is not True or int(coefficient) <= 0:
+                    if coefficient.is_integer is not True or int(coefficient) == 0:
                         return None
                     digit = _single_ordinal_digit(
                         cast("sympy.Expr", atom),
@@ -5417,18 +5480,47 @@ def _piecewise_woven_mixed_radix_converse(
                     if digit is None:
                         return None
                     input_stride, radix = digit
-                    packed_digits.append((int(coefficient), input_stride, radix))
+                    signed_stride = int(coefficient)
+                    packed_digits.append(
+                        (
+                            abs(signed_stride),
+                            input_stride,
+                            radix,
+                            signed_stride < 0,
+                        )
+                    )
+            reflected_constant = sum(
+                output_stride * (radix - 1)
+                for output_stride, _input_stride, radix, reflected in packed_digits
+                if reflected
+            )
+            if constant != reflected_constant:
+                return None
             expected_output_stride = 1
-            for output_stride, input_stride, radix in sorted(packed_digits):
+            for output_stride, input_stride, radix, reflected in sorted(packed_digits):
                 if output_stride != expected_output_stride:
                     return None
                 expected_output_stride *= radix
-                source_digits.append((input_stride, radix, target_axis, output_stride))
+                source_digits.append(
+                    (
+                        input_stride,
+                        radix,
+                        target_axis,
+                        output_stride,
+                        reflected,
+                    )
+                )
             if expected_output_stride != support_end - support_begin:
                 return None
 
         expected_input_stride = 1
-        for input_stride, radix, _target_axis, _output_stride in sorted(source_digits):
+        for (
+            input_stride,
+            radix,
+            _target_axis,
+            _output_stride,
+            _reflected,
+        ) in sorted(source_digits):
             if input_stride != expected_input_stride:
                 return None
             expected_input_stride *= radix
@@ -5445,14 +5537,26 @@ def _piecewise_woven_mixed_radix_converse(
             axis: begin for axis, begin, _end, _step in target_box_tuple
         }
         inverse_source: sympy.Expr = sympy.Integer(source_begin)
-        for input_stride, radix, target_axis, output_stride in source_digits:
+        for (
+            input_stride,
+            radix,
+            target_axis,
+            output_stride,
+            reflected,
+        ) in source_digits:
             local_target = (
                 coordinate_axis_symbol(target_axis) - support_begin_by_axis[target_axis]
             )
-            inverse_source += input_stride * sympy.Mod(  # pyrefly: ignore[unsupported-operation]
+            target_digit = sympy.Mod(  # pyrefly: ignore[bad-argument-type]
                 sympy.floor(local_target / output_stride),  # pyrefly: ignore[bad-argument-type, unsupported-operation]
                 radix,
             )
+            source_digit = (
+                radix - 1 - target_digit  # pyrefly: ignore[unsupported-operation]
+                if reflected
+                else target_digit
+            )
+            inverse_source += input_stride * source_digit  # pyrefly: ignore[unsupported-operation]
         converse_pieces.append(
             _CoordinateRelationPiece(
                 source_bounds_items=target_box_tuple,

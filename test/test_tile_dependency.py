@@ -635,6 +635,61 @@ class TestTileDependency(TestCase):
             tuple(frozenset(indices) for indices in expected),
         )
 
+    def test_reflected_woven_mixed_radix_converse_is_exact(self) -> None:
+        ordinal = coordinate_axis_symbol(10)
+        source = CoordinateDomain((10,), ((10, 1536),), kind="task_order")
+        target = CoordinateDomain((20,), ((20, 1536),), kind="site")
+        reflected_bit = sympy.floor(sympy.Mod(ordinal, 16) / 8)
+        relation = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (
+                    ((10, 0, 1536, 1),),
+                    (
+                        sympy.Mod(ordinal, 8)
+                        + 8 * sympy.floor(ordinal / 16)
+                        + 768 * (1 - reflected_bit),
+                    ),
+                ),
+            ),
+        )
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("converse proof must remain symbolic"),
+        ):
+            converse = relation.converse()
+        self.assertIsNotNone(converse)
+        assert converse is not None
+        self.assertTrue(converse.is_total_function())
+
+        expected: list[set[int]] = [set() for _ in range(target.size)]
+        for source_index, target_indices in enumerate(relation.materialize()):
+            for target_index in target_indices:
+                expected[target_index].add(source_index)
+        self.assertEqual(
+            converse.materialize(),
+            tuple(frozenset(indices) for indices in expected),
+        )
+
+        malformed = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (
+                    ((10, 0, 1536, 1),),
+                    (
+                        sympy.Mod(ordinal, 8)
+                        + 8 * sympy.floor(ordinal / 16)
+                        + 767 * (1 - reflected_bit),
+                    ),
+                ),
+            ),
+        )
+        self.assertIsNone(malformed.converse())
+
     def test_woven_mixed_radix_converse_rejects_reused_input_digit(self) -> None:
         ordinal = coordinate_axis_symbol(10)
         source = CoordinateDomain((10,), ((10, 8),), kind="task_order")
@@ -2330,6 +2385,43 @@ class TestTileDependency(TestCase):
                 source_bounds=((20, 0, 2, 1),),
             ),
             coordinate + 510,
+        )
+
+    def test_logical_simplification_reassociates_integer_quotient_digits(
+        self,
+    ) -> None:
+        source = CoordinateDomain((20,), ((20, 1536),), kind="task_order")
+        coordinate = coordinate_axis_symbol(20)
+        bounds = ((20, 0, 1536, 1),)
+
+        for coefficient, constant in ((3, 11), (-5, 7)):
+            expression = (
+                coefficient * 4 * sympy.floor(coordinate / 12)
+                + coefficient * sympy.floor(sympy.Mod(coordinate, 12) / 3)
+                + constant
+            )
+            self.assertEqual(
+                _simplify_logical_expression(
+                    expression,
+                    domain=source,
+                    source_bounds=bounds,
+                ),
+                coefficient * sympy.floor(coordinate / 3) + constant,
+            )
+
+        # The quotient identity is valid only for an integer dividend.  A
+        # foreign real-valued expression must remain untouched.
+        real_value = sympy.Symbol("real_value", real=True)
+        noninteger_expression = 4 * sympy.floor(real_value / 12) + sympy.floor(
+            sympy.Mod(real_value, 12) / 3
+        )
+        self.assertEqual(
+            _simplify_logical_expression(
+                noninteger_expression,
+                domain=source,
+                source_bounds=bounds,
+            ),
+            noninteger_expression,
         )
 
     def test_logical_simplification_uses_symbolic_mixed_radix_bounds(self) -> None:

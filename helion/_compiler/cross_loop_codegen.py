@@ -7,6 +7,8 @@ from typing import cast
 import sympy
 import torch
 from torch.utils._sympy.functions import CeilDiv
+from torch.utils._sympy.functions import Max as SymbolicMax
+from torch.utils._sympy.functions import Min as SymbolicMin
 
 from .. import exc
 from .ast_extension import ExtendedAST
@@ -18,6 +20,7 @@ from .cross_loop_scheduler import _SOURCE_LAUNCH_STAGE
 from .cross_loop_scheduler import ReadinessConsumer
 from .cross_loop_scheduler import ReadinessCounterPlan
 from .cross_loop_scheduler import ReadinessProducer
+from .cross_loop_scheduler import RootBarrierPublication
 from .cross_loop_scheduler import WorkerInterval
 from .cross_loop_scheduler import WorkerScheduleSegment
 from .cross_loop_scheduler import _normalize_intervals
@@ -439,6 +442,7 @@ def _wait_for_dependencies(
     device_function: DeviceFunction,
     dependencies: tuple[tuple[str, str], ...],
     prefix: str,
+    dtype: torch.dtype = _CROSS_LOOP_COUNTER_DTYPE,
 ) -> list[ast.stmt]:
     """Emit every acquire wait in one graph-derived dependency set."""
     return [
@@ -449,6 +453,7 @@ def _wait_for_dependencies(
             counter=counter,
             target=target,
             prefix=prefix,
+            dtype=dtype,
         )
     ]
 
@@ -851,44 +856,33 @@ def emit_cross_loop_schedule(
     root_barrier_producer_roots = sorted(
         {producer for producer, _consumer in root_barrier_edges}
     )
-    root_publication_plans = {
-        root: root_barrier_publication_plan(
-            static_pipeline_plan.worker_schedule,
-            root,
-        )
-        for root in root_barrier_producer_roots
-        if root != transient_source_root
+    scheduled_roots = {
+        segment.root for segment in static_pipeline_plan.worker_schedule.segments
     }
-    continuation_task_count_by_root: dict[int, int | sympy.Expr] = {}
-    for plan in readiness_counter_plans:
-        readiness_consumer = plan.continuation_consumer
-        if readiness_consumer is None:
-            continue
-        if not readiness_consumer.keys_by_consumer.is_total_function():
-            raise AssertionError(
-                "a final-arrival continuation must cover its complete root"
+    # Derive execution support and every barrier count once from the selected
+    # schedule.  Plans for non-producers supply the same exact active-owner
+    # predicate to incoming waits; only producer roots receive counter state.
+    publication_plan_roots = set(root_barrier_producer_roots)
+    if parameterized_event_frontier_geometry is None:
+        publication_plan_roots.update(scheduled_roots)
+    try:
+        root_publication_plans = {
+            root: root_barrier_publication_plan(
+                static_pipeline_plan.worker_schedule,
+                root,
+                readiness_counter_plans,
             )
-        continuation_task_count_by_root[readiness_consumer.consumer_root] = (
-            readiness_consumer.keys_by_consumer.source_domain.size_expr
-            if readiness_consumer.keys_by_consumer.source_domain.parameter_symbols
-            else readiness_consumer.keys_by_consumer.source_domain.size
-        )
-
-    def root_barrier_arrival_count(root: int) -> int | sympy.Expr:
-        scheduled_arrivals = (
-            transient_source_task_count
-            if root == transient_source_root
-            else root_publication_plans[root].resident_arrival_count
-        )
-        continuation_arrivals = continuation_task_count_by_root.get(root, 0)
-        if isinstance(continuation_arrivals, int):
-            return scheduled_arrivals + continuation_arrivals
-        return sympy.simplify(
-            sympy.Add(
-                sympy.Integer(scheduled_arrivals),
-                continuation_arrivals,
-            )
-        )
+            for root in publication_plan_roots
+        }
+    except ValueError as error:
+        raise exc.InvalidConfig(
+            "cross_loop_schedule='static_pipeline' cannot prove exact "
+            "root-barrier publication ownership"
+        ) from error
+    parameterized_root_barriers = any(
+        root_publication_plans[root].parameter_symbols
+        for root in root_barrier_producer_roots
+    )
 
     # Reject grids that cannot residently fit when the device is otherwise
     # idle. Concurrent-stream residency remains an explicit unresolved
@@ -942,48 +936,68 @@ def emit_cross_loop_schedule(
     root_barrier_indices = {
         root: index for index, root in enumerate(root_barrier_producer_roots)
     }
-    state_count: int | sympy.Expr = 0
+    # A single uint64 epoch-framed allocation owns all dynamic state.  Static
+    # root barriers may retain the cumulative uint32 lowering only when no
+    # parameterized state exists; that is the constant-A specialization of the
+    # same publication plan, not a separate scheduling decision.
+    uses_epoch_framed_root_barriers = bool(root_barrier_producer_roots) and (
+        parameterized_root_barriers or uses_epoch_framed_readiness
+    )
+    uses_epoch_framed_state = (
+        uses_epoch_framed_readiness or uses_epoch_framed_root_barriers
+    )
+    static_state_count: int | sympy.Expr = 0
 
-    def reserve_state(count: int | sympy.Expr) -> int | sympy.Expr | None:
-        nonlocal state_count
+    def reserve_static_state(count: int | sympy.Expr) -> int | sympy.Expr | None:
+        nonlocal static_state_count
         if sympy.simplify(count) == 0:
             return None
-        if isinstance(state_count, int):
-            state_count = (
-                (state_count + _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS - 1)
+        if isinstance(static_state_count, int):
+            static_state_count = (
+                (static_state_count + _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS - 1)
                 // _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
                 * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
             )
         else:
-            state_count = sympy.simplify(
+            static_state_count = sympy.simplify(
                 sympy.Mul(
-                    CeilDiv(state_count, _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS),
+                    CeilDiv(
+                        static_state_count,
+                        _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS,
+                    ),
                     _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS,
                 )
             )
-        offset = state_count
-        state_count = sympy.simplify(
-            sympy.Add(sympy.sympify(state_count), sympy.sympify(count))
+        offset = static_state_count
+        static_state_count = sympy.simplify(
+            sympy.Add(sympy.sympify(static_state_count), sympy.sympify(count))
         )
         return offset
 
-    root_barrier_count = (
-        len(root_barrier_producer_roots) * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
+    root_barrier_counter_dtype = (
+        _PARAMETRIC_READINESS_COUNTER_DTYPE
+        if uses_epoch_framed_root_barriers
+        else _CROSS_LOOP_COUNTER_DTYPE
     )
-    if not has_parameterized_schedule:
-        readiness_counter_state_offset = reserve_state(readiness_counter_count)
-        root_barrier_state_offset = reserve_state(root_barrier_count)
-    elif uses_epoch_framed_readiness:
-        root_barrier_state_offset = reserve_state(root_barrier_count)
-        readiness_counter_state_offset = None
-    else:
-        # Parameterized schedules without exact counters retain only the
-        # shape-stable cumulative root-barrier prefix.
-        root_barrier_state_offset = reserve_state(root_barrier_count)
-        readiness_counter_state_offset = reserve_state(readiness_counter_count)
+    root_barrier_counter_stride = (
+        _PARAMETRIC_READINESS_COUNTER_ALIGNMENT_WORDS
+        if uses_epoch_framed_root_barriers
+        else _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
+    )
+    root_barrier_count = len(root_barrier_producer_roots) * root_barrier_counter_stride
+    readiness_counter_state_offset = (
+        None
+        if uses_epoch_framed_readiness
+        else reserve_static_state(readiness_counter_count)
+    )
+    root_barrier_state_offset = (
+        None
+        if uses_epoch_framed_root_barriers
+        else reserve_static_state(root_barrier_count)
+    )
     epoch_state_count = (
         launch_program_count
-        if transient_source_root is None and not uses_epoch_framed_readiness
+        if transient_source_root is None and not uses_epoch_framed_state
         else 0
     )
     static_state_base = str(
@@ -997,19 +1011,38 @@ def emit_cross_loop_schedule(
             name_hint="tile_dependency_state",
             numel=(
                 f"{static_state_base} + "
-                f"{HostFunction.current().sympy_expr(sympy.sympify(state_count))}"
+                f"{HostFunction.current().sympy_expr(sympy.sympify(static_state_count))}"
             ),
             dtype=_CROSS_LOOP_COUNTER_DTYPE,
         )
-        if not uses_epoch_framed_readiness or root_barrier_count
+        if epoch_state_count or sympy.simplify(static_state_count) != 0
         else None
     )
     parameterized_epoch_state_count = (
         (launch_worker_count + _PARAMETRIC_READINESS_COUNTER_ALIGNMENT_WORDS - 1)
         // _PARAMETRIC_READINESS_COUNTER_ALIGNMENT_WORDS
         * _PARAMETRIC_READINESS_COUNTER_ALIGNMENT_WORDS
-        if uses_epoch_framed_readiness
+        if uses_epoch_framed_state
         else 0
+    )
+    # Root barriers have a fixed per-plan location before runtime-sized
+    # readiness sections.  This prevents a shape change from aliasing a root
+    # counter with a differently framed event counter from the prior replay.
+    parameterized_root_barrier_state_offset = (
+        0 if uses_epoch_framed_root_barriers and root_barrier_count else None
+    )
+    parameterized_readiness_state_offset = (
+        root_barrier_count
+        if uses_epoch_framed_readiness and uses_epoch_framed_root_barriers
+        else 0
+        if uses_epoch_framed_readiness
+        else None
+    )
+    parameterized_state_count = sympy.simplify(
+        sympy.Add(
+            root_barrier_count if uses_epoch_framed_root_barriers else 0,
+            readiness_counter_count if uses_epoch_framed_readiness else 0,
+        )
     )
     parameterized_readiness_state_arg = (
         _register_cross_loop_state(
@@ -1017,11 +1050,11 @@ def emit_cross_loop_schedule(
             name_hint="tile_dependency_parameterized_state",
             numel=(
                 f"{parameterized_epoch_state_count} + "
-                f"{HostFunction.current().sympy_expr(sympy.sympify(readiness_counter_count))}"
+                f"{HostFunction.current().sympy_expr(parameterized_state_count)}"
             ),
             dtype=_PARAMETRIC_READINESS_COUNTER_DTYPE,
         )
-        if uses_epoch_framed_readiness
+        if uses_epoch_framed_state
         else None
     )
     dispatch_ticket_arg = (
@@ -1048,16 +1081,22 @@ def emit_cross_loop_schedule(
         return f"{state_arg} + ({static_state_base}) + {offset_text}"
 
     epoch_arg = (
-        parameterized_readiness_state_arg if uses_epoch_framed_readiness else state_arg
+        parameterized_readiness_state_arg if uses_epoch_framed_state else state_arg
     )
     if epoch_arg is None:
         raise AssertionError("cross-loop epoch state was not allocated")
     readiness_counter_arg = (
         f"{parameterized_readiness_state_arg} + {parameterized_epoch_state_count}"
+        f" + {parameterized_readiness_state_offset}"
         if uses_epoch_framed_readiness
         else state_section(readiness_counter_state_offset)
     )
-    root_barrier_counter_arg = state_section(root_barrier_state_offset)
+    root_barrier_counter_arg = (
+        f"{parameterized_readiness_state_arg} + {parameterized_epoch_state_count}"
+        f" + {parameterized_root_barrier_state_offset}"
+        if uses_epoch_framed_root_barriers
+        else state_section(root_barrier_state_offset)
+    )
 
     dispatch_ticket: str | None = None
     if transient_source_root is None:
@@ -1106,14 +1145,33 @@ def emit_cross_loop_schedule(
         assert root_barrier_counter_arg is not None
         return (
             f"{root_barrier_counter_arg} + "
-            f"{root_barrier_indices[root] * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}"
+            f"{root_barrier_indices[root] * root_barrier_counter_stride}"
+        )
+
+    def root_barrier_epoch_base(root: int) -> str:
+        publication_plan = root_publication_plans[root]
+        maximum_arrivals = publication_plan.maximum_arrival_count
+        return (
+            f"tl.cast({epoch_var}, tl.uint64) * tl.cast({maximum_arrivals}, tl.uint64)"
         )
 
     def root_barrier_dependency(root: int) -> tuple[str, str]:
-        arrivals = root_barrier_arrival_count(root)
+        publication_plan = root_publication_plans[root]
+        arrivals = publication_plan.effective_arrival_count
+        arrivals_text = relation_expression(sympy.sympify(arrivals), {})
+        if uses_epoch_framed_root_barriers:
+            target = (
+                f"{root_barrier_epoch_base(root)} + "
+                f"tl.cast(({arrivals_text}), tl.uint64)"
+            )
+        else:
+            target = (
+                f"tl.cast({epoch_var}, tl.uint32) * "
+                f"tl.cast(({arrivals_text}), tl.uint32)"
+            )
         return (
             root_barrier_counter(root),
-            f"tl.cast({epoch_var}, tl.uint32) * tl.cast({arrivals}, tl.uint32)",
+            target,
         )
 
     def root_barrier_input_dependencies(
@@ -1126,9 +1184,25 @@ def emit_cross_loop_schedule(
         if root not in root_barrier_indices:
             return []
         barrier_counter = root_barrier_counter(root)
-        arrivals = root_barrier_arrival_count(root)
+        publication_plan = root_publication_plans[root]
+        arrivals = publication_plan.effective_arrival_count
         result = [_publication_sync(device_function)]
-        if arrivals == 1:
+        if uses_epoch_framed_root_barriers:
+            result.extend(
+                (
+                    statement_from_string(
+                        f"tl.atomic_max({barrier_counter}, "
+                        f"{root_barrier_epoch_base(root)}, "
+                        "sem='relaxed', scope='gpu')"
+                    ),
+                    statement_from_string(
+                        f"tl.atomic_add({barrier_counter}, "
+                        f"{publication_plan.unit_contribution}, "
+                        "sem='release', scope='gpu')"
+                    ),
+                )
+            )
+        elif arrivals == 1:
             result.append(
                 statement_from_string(
                     f"tl.atomic_xchg({barrier_counter}, {epoch_var}, "
@@ -1138,7 +1212,9 @@ def emit_cross_loop_schedule(
         else:
             result.append(
                 statement_from_string(
-                    f"tl.atomic_add({barrier_counter}, 1, sem='release', scope='gpu')"
+                    f"tl.atomic_add({barrier_counter}, "
+                    f"{publication_plan.unit_contribution}, "
+                    "sem='release', scope='gpu')"
                 )
             )
         return result
@@ -1287,6 +1363,21 @@ def emit_cross_loop_schedule(
         """Render the restricted coordinate-relation expression grammar."""
         if isinstance(expression, sympy.Integer):
             return str(int(expression))
+        if expression.func in (sympy.Min, sympy.Max, SymbolicMin, SymbolicMax):
+            function = (
+                "tl.minimum"
+                if expression.func in (sympy.Min, SymbolicMin)
+                else "tl.maximum"
+            )
+            rendered = relation_expression(
+                cast("sympy.Expr", expression.args[0]), coordinates
+            )
+            for argument in expression.args[1:]:
+                rendered = (
+                    f"{function}(({rendered}), "
+                    f"({relation_expression(cast('sympy.Expr', argument), coordinates)}))"
+                )
+            return rendered
         coordinate_symbols = frozenset(
             coordinate_axis_symbol(axis) for axis in coordinates
         )
@@ -1326,27 +1417,24 @@ def emit_cross_loop_schedule(
             if expression.func == sympy.floor:
                 return f"(({numerator_expr}) // {int(denominator)})"
             return f"(-((-({numerator_expr})) // {int(denominator)}))"
-        if expression.func in (sympy.Min, sympy.Max):
-            function = "tl.minimum" if expression.func == sympy.Min else "tl.maximum"
-            rendered = relation_expression(
-                cast("sympy.Expr", expression.args[0]), coordinates
-            )
-            for argument in expression.args[1:]:
-                rendered = (
-                    f"{function}(({rendered}), "
-                    f"({relation_expression(cast('sympy.Expr', argument), coordinates)}))"
-                )
-            return rendered
         if isinstance(expression, sympy.Mod):
             numerator, denominator = expression.args
             if not isinstance(denominator, sympy.Integer) or denominator <= 0:
                 raise AssertionError(
                     "logical modulo requires a positive static divisor"
                 )
-            return (
-                f"(({relation_expression(cast('sympy.Expr', numerator), coordinates)}) % "
-                f"{int(denominator)})"
+            numerator_text = relation_expression(
+                cast("sympy.Expr", numerator), coordinates
             )
+            signed_remainder = f"(({numerator_text}) % {int(denominator)})"
+            if numerator.is_nonnegative is True:
+                return signed_remainder
+            # SymPy's Mod is Euclidean for a positive divisor, whereas Triton
+            # lowers ``%`` on signed integers as a signed remainder.  Preserve
+            # the relation's semantics when affine simplification has removed
+            # a positive multiple of the divisor from a potentially negative
+            # numerator (for example, a wrapped worker cohort).
+            return f"((({signed_remainder}) + {int(denominator)}) % {int(denominator)})"
         if isinstance(expression, sympy.Rational):
             if expression.q == 1:
                 return str(expression.p)
@@ -2223,7 +2311,7 @@ def emit_cross_loop_schedule(
         segment: WorkerScheduleSegment,
         *,
         task_order_begin: int | None,
-        publish_root_barrier_workers: tuple[WorkerInterval, ...],
+        root_barrier_publication_site: RootBarrierPublication | None,
     ) -> list[ast.stmt]:
         """Lower one run at its authoritative position in the segment stream."""
         root = segment.root
@@ -2232,11 +2320,19 @@ def emit_cross_loop_schedule(
         if segment not in static_segments_by_root.get(root, ()):
             raise AssertionError("static segment is not owned by its root")
         task_dispatch: list[ast.stmt]
-        segment_workers = (
-            ((0, launch_worker_count),)
-            if has_parameterized_schedule
-            else segment.worker_intervals()
-        )
+        execution_plan = root_publication_plans[root]
+        participant_order = execution_plan.participant_order
+        if participant_order is None:
+            segment_workers = segment.worker_intervals()
+            segment_membership = worker_membership_condition(segment_workers)
+        else:
+            if len(participant_order.source_domain.axis_order) != 1:
+                raise AssertionError("participant order must have one worker axis")
+            (participant_worker_axis,) = participant_order.source_domain.axis_order
+            _participant_coordinates, segment_membership = relation_point_coordinates(
+                participant_order,
+                {participant_worker_axis: worker},
+            )
         if parameterized_root_major_geometry is not None:
             geometry_segment, first_slot, task_count = (
                 parameterized_segment_geometry_by_root[root]
@@ -2307,9 +2403,10 @@ def emit_cross_loop_schedule(
             ]
         incoming_roots = root_barrier_incoming.get(root, ())
         if (
-            segment_workers == ((0, launch_worker_count),)
+            participant_order is None
+            and segment_workers == ((0, launch_worker_count),)
             and not incoming_roots
-            and not publish_root_barrier_workers
+            and root_barrier_publication_site is None
         ):
             return task_dispatch
 
@@ -2317,18 +2414,26 @@ def emit_cross_loop_schedule(
             device_function=device_function,
             dependencies=root_barrier_input_dependencies(root),
             prefix="tile_dependency_root_barrier_wait",
+            dtype=root_barrier_counter_dtype,
         )
         active_body.extend(task_dispatch)
-        if publish_root_barrier_workers:
+        if root_barrier_publication_site is not None:
             publications = root_barrier_publication(root)
-            if publish_root_barrier_workers == segment_workers:
+            publication_workers = root_barrier_publication_site.worker_intervals
+            if participant_order is not None:
+                if publication_workers:
+                    raise AssertionError(
+                        "symbolic publication support must use participant_order"
+                    )
+                active_body.extend(publications)
+            elif publication_workers == segment_workers:
                 active_body.extend(publications)
             else:
                 active_body.append(
                     create(
                         ast.If,
                         test=expr_from_string(
-                            worker_membership_condition(publish_root_barrier_workers)
+                            worker_membership_condition(publication_workers)
                         ),
                         body=publications,
                         orelse=[],
@@ -2337,22 +2442,23 @@ def emit_cross_loop_schedule(
         return [
             create(
                 ast.If,
-                test=expr_from_string(worker_membership_condition(segment_workers)),
+                test=expr_from_string(segment_membership),
                 body=active_body,
                 orelse=[],
             )
         ]
 
-    publication_workers_by_segment = {
-        publication.segment_index: publication.worker_intervals
-        for publication_plan in root_publication_plans.values()
+    publication_by_segment = {
+        publication.segment_index: publication
+        for root, publication_plan in root_publication_plans.items()
+        if root in root_barrier_indices
         for publication in publication_plan.publications
     }
 
     resident_body: list[ast.stmt] = []
     next_segment_range_by_root: dict[int, int] = {}
     if parameterized_event_frontier_geometry is not None:
-        if publication_workers_by_segment:
+        if publication_by_segment:
             raise AssertionError(
                 "event-frontier recurrence cannot contain a root barrier"
             )
@@ -2402,8 +2508,8 @@ def emit_cross_loop_schedule(
                     static_segment_body(
                         segment,
                         task_order_begin=None,
-                        publish_root_barrier_workers=(
-                            publication_workers_by_segment.get(segment_index, ())
+                        root_barrier_publication_site=publication_by_segment.get(
+                            segment_index
                         ),
                     )
                 )
@@ -2425,8 +2531,8 @@ def emit_cross_loop_schedule(
                 static_segment_body(
                     segment,
                     task_order_begin=task_order_begin,
-                    publish_root_barrier_workers=publication_workers_by_segment.get(
-                        segment_index, ()
+                    root_barrier_publication_site=publication_by_segment.get(
+                        segment_index
                     ),
                 )
             )
