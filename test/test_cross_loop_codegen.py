@@ -10,6 +10,7 @@ from unittest import mock
 import torch
 
 import helion
+from helion import exc
 from helion._compiler import cross_loop_codegen
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cross_loop_codegen import _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
@@ -23,8 +24,12 @@ from helion._compiler.cross_loop_codegen import _triton_root_requires_kernel_sco
 from helion._compiler.cross_loop_scheduler import WorkerSchedule
 from helion._compiler.cross_loop_scheduler import WorkerScheduleSegment
 from helion._compiler.cross_loop_scheduler import _task_order_slice
+from helion._compiler.cross_loop_scheduler import (
+    _with_transient_source_schedule_segment,
+)
 from helion._compiler.device_function import DeviceFunction
 from helion._compiler.tile_dependency import TILE_DEPENDENCY_SITE_ID_ATTR
+from helion._compiler.tile_dependency import pid_task_order
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -1501,12 +1506,19 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                         dispatch_offset=0,
                     )
                 )
+            resident_schedule = WorkerSchedule(
+                worker_count=plan.worker_schedule.worker_count,
+                segments=tuple(resident_segments),
+            )
+            staged_schedule = _with_transient_source_schedule_segment(
+                resident_schedule,
+                kwargs["root_task_orders"],
+                0,
+            )
+            assert staged_schedule is not None
             return dataclasses.replace(
                 plan,
-                worker_schedule=WorkerSchedule(
-                    worker_count=plan.worker_schedule.worker_count,
-                    segments=tuple(resident_segments),
-                ),
+                worker_schedule=staged_schedule,
                 transient_source_root=0,
             )
 
@@ -1535,6 +1547,106 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             ),
             1,
         )
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_codegen_rejects_transient_source_cache_drift(self) -> None:
+        x = torch.arange(128, device=DEVICE, dtype=torch.float32)
+        original_build = cross_loop_codegen.build_static_pipeline_plan
+
+        for extra_source in (False, True):
+            with self.subTest(extra_source=extra_source):
+
+                def build_with_cache_drift(
+                    *, extra_source: bool = extra_source, **kwargs: Any
+                ):
+                    kwargs["allow_transient_source"] = False
+                    plan = original_build(**kwargs)
+                    staged = _with_transient_source_schedule_segment(
+                        plan.worker_schedule,
+                        kwargs["root_task_orders"],
+                        0,
+                    )
+                    assert staged is not None
+                    if extra_source:
+                        staged = _with_transient_source_schedule_segment(
+                            staged,
+                            kwargs["root_task_orders"],
+                            1,
+                        )
+                        assert staged is not None
+                    return dataclasses.replace(
+                        plan,
+                        worker_schedule=staged,
+                        transient_source_root=0 if extra_source else None,
+                    )
+
+                with (
+                    mock.patch.object(
+                        cross_loop_codegen,
+                        "build_static_pipeline_plan",
+                        side_effect=build_with_cache_drift,
+                    ),
+                    self.assertRaisesRegex(
+                        exc.InternalError,
+                        "launch-stage-zero|transient source",
+                    ),
+                ):
+                    code_and_output(
+                        offset_affine_chain,
+                        (x,),
+                        block_sizes=[16, 16],
+                        pid_type="persistent_blocked",
+                        cross_loop_schedule="static_pipeline",
+                        num_sm_multiplier=1,
+                        num_warps=1,
+                    )
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_transient_source_lowers_its_authoritative_permutation(self) -> None:
+        x = torch.arange(128, device=DEVICE, dtype=torch.float32).reshape(2, 64)
+        original_build = cross_loop_codegen.build_static_pipeline_plan
+
+        def build_with_permuted_source(**kwargs: Any):
+            kwargs["allow_transient_source"] = False
+            plan = original_build(**kwargs)
+            root_task_orders = kwargs["root_task_orders"]
+            source_domain = root_task_orders[0].target_domain
+            permuted_source = pid_task_order(
+                source_domain,
+                tuple(reversed(source_domain.axis_order)),
+            )
+            staged = _with_transient_source_schedule_segment(
+                plan.worker_schedule,
+                (permuted_source, *root_task_orders[1:]),
+                0,
+            )
+            assert staged is not None
+            return dataclasses.replace(
+                plan,
+                worker_schedule=staged,
+                transient_source_root=0,
+            )
+
+        with mock.patch.object(
+            cross_loop_codegen,
+            "build_static_pipeline_plan",
+            side_effect=build_with_permuted_source,
+        ):
+            code, out = code_and_output(
+                cartesian_affine_join,
+                (x,),
+                block_sizes=[1, 16, 1, 16, 1, 32],
+                pid_type="persistent_blocked",
+                cross_loop_schedule="static_pipeline",
+                num_sm_multiplier=1,
+                num_warps=1,
+            )
+
+        torch.testing.assert_close(out, x * 2)
+        self.assertIn("tile_dependency_dispatch_ticket", code)
+        self.assertIn("tile_dependency_scheduled_logical_task", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")

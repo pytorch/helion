@@ -14,6 +14,7 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .cross_loop_scheduler import _SOURCE_LAUNCH_STAGE
 from .cross_loop_scheduler import ReadinessConsumer
 from .cross_loop_scheduler import ReadinessCounterPlan
 from .cross_loop_scheduler import ReadinessProducer
@@ -25,6 +26,7 @@ from .cross_loop_scheduler import _parametric_event_frontier_schedule_geometry
 from .cross_loop_scheduler import _parametric_root_major_schedule_geometry
 from .cross_loop_scheduler import _root_schedule_traversal
 from .cross_loop_scheduler import _supports_parameterized_fan_in_one_counter
+from .cross_loop_scheduler import _transient_source_schedule_segment
 from .cross_loop_scheduler import build_static_pipeline_plan
 from .cross_loop_scheduler import root_barrier_publication_plan
 from .device_function import TensorArg
@@ -770,20 +772,38 @@ def emit_cross_loop_schedule(
     )
     launch_worker_count = static_pipeline_plan.worker_schedule.worker_count
     transient_source_root = static_pipeline_plan.transient_source_root
+    transient_source_segment = (
+        None
+        if transient_source_root is None
+        else _transient_source_schedule_segment(
+            static_pipeline_plan.worker_schedule,
+            transient_source_root,
+        )
+    )
+    launch_stage_zero_segments = tuple(
+        segment
+        for segment in static_pipeline_plan.worker_schedule.segments
+        if segment.launch_stage == _SOURCE_LAUNCH_STAGE
+    )
+    if transient_source_root is None and launch_stage_zero_segments:
+        raise AssertionError(
+            "a launch-stage-zero segment requires a transient source role"
+        )
+    if transient_source_root is not None and (
+        transient_source_segment is None
+        or launch_stage_zero_segments != (transient_source_segment,)
+    ):
+        raise AssertionError(
+            "a transient source must have one exact launch-stage-zero segment"
+        )
     transient_source_task_count = (
-        root_domains[transient_source_root].size
-        if transient_source_root is not None
+        transient_source_segment.task_count
+        if transient_source_segment is not None
         else 0
     )
     launch_program_count = launch_worker_count + transient_source_task_count
     resident_grid_size_expr = strategy.grid_size_expr
     if transient_source_root is not None:
-        if static_pipeline_plan.worker_schedule.segments_for_root(
-            transient_source_root
-        ):
-            raise AssertionError(
-                "a transient source must not appear in the resident schedule"
-            )
         worker = device_function.new_var("tile_dependency_resident_worker", dce=True)
 
     root_barrier_producer_roots = sorted(
@@ -795,6 +815,7 @@ def emit_cross_loop_schedule(
             root,
         )
         for root in root_barrier_producer_roots
+        if root != transient_source_root
     }
     continuation_task_count_by_root: dict[int, int] = {}
     for plan in readiness_counter_plans:
@@ -811,7 +832,7 @@ def emit_cross_loop_schedule(
 
     def root_barrier_arrival_count(root: int) -> int:
         scheduled_arrivals = (
-            root_domains[root].size
+            transient_source_task_count
             if root == transient_source_root
             else root_publication_plans[root].resident_arrival_count
         )
@@ -2172,8 +2193,8 @@ def emit_cross_loop_schedule(
 
     publication_workers_by_segment = {
         publication.segment_index: publication.worker_intervals
-        for root in root_barrier_indices
-        for publication in root_publication_plans[root].publications
+        for publication_plan in root_publication_plans.values()
+        for publication in publication_plan.publications
     }
 
     resident_body: list[ast.stmt] = []
@@ -2222,6 +2243,8 @@ def emit_cross_loop_schedule(
             static_pipeline_plan.worker_schedule.segments
         ):
             root = segment.root
+            if root == transient_source_root:
+                continue
             if parameterized_root_major_geometry is not None:
                 resident_body.extend(
                     static_segment_body(
@@ -2256,7 +2279,9 @@ def emit_cross_loop_schedule(
                 )
             )
     if any(
-        next_segment_range_by_root.get(root, 0) != len(traversal.segment_ordinal_ranges)
+        root != transient_source_root
+        and next_segment_range_by_root.get(root, 0)
+        != len(traversal.segment_ordinal_ranges)
         for root, traversal in root_schedule_traversals.items()
     ):
         raise AssertionError("proved root traversal has unconsumed segments")

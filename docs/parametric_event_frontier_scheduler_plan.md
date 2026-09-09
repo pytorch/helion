@@ -14,8 +14,10 @@ Implementation checkpoint (2026-09-08):
   implemented without a production CTA DAG.
 - Independent schedules bypass proposal, and a same-coverage resident
   proposal is retained only when its unit-task final wave does not regress.
-- The generic source-ticket frontier participates in resident priority, while
-  the proven transient-source execution mechanism is retained for now.
+- Transient source work is represented by an ordinary
+  `WorkerScheduleSegment` at launch stage zero. Its relation is now the sole
+  authority for source ticket order, task count, external readiness frontiers,
+  and codegen mapping; resident work occupies launch stage one.
 - The first parameterized-extents vertical slice is implemented for canonical
   rank-one roots: symbolic domains lower through the same `WorkerSchedule`,
   conservative root barriers, and runtime-bounded loops, with one cubin reused
@@ -313,26 +315,23 @@ normalization and implication checking form the proof.
 
 ## Schedule coordinates and lowering
 
-### Resident schedule domain
+### Schedule domain
 
-For resident work, use existing coordinate-domain machinery to describe:
+Use existing coordinate-domain machinery to describe:
 
 ```text
+launch_stage in {source, resident}
 0 <= worker < worker_count
 0 <= wave < wave_count(runtime_parameters)
 ```
 
-For each `(worker, wave)`, at most one resident segment relation is defined.
-Its target is the logical task executed in that slot. An undefined slot is
-idle.
-
-At the current concrete checkpoint, normalized relations occupy only the
-resident value of the launch-stage axis; source execution still uses the
-existing transient ticket lowering. The otherwise-redundant axis is retained
-deliberately for Phase 5, where that same `WorkerSchedule` relation must own
-the source prefix. It must be removed if source ownership is not migrated;
-the current implementation does not yet claim unified source/resident
-execution.
+For each `(launch_stage, worker, wave)`, at most one segment relation is
+defined. Its target is the logical task executed in that slot. An undefined
+slot is idle. Launch stage zero represents source tickets in dense ticket
+order; launch stage one represents persistent resident worker chronology.
+Both are owned by the same `WorkerSchedule`. The source-first global ticket
+allocator remains the execution mechanism that gives the launch-stage order
+its runtime meaning.
 
 `worker_count` remains a selected configuration/hardware value. `wave_count`
 is derived symbolically from the union of segment support; it is not stored in
@@ -1192,6 +1191,16 @@ claim the wider fan-in or source-ticket structure needed by FlashMLA.
 
 Exit gate: FlashMLA B4/B9 retain their gains without an MLA matcher or an
 admission-width knob.
+
+Implementation checkpoint (2026-09-09): the existing transient source is now
+an exact launch-stage-zero `WorkerScheduleSegment`; there is no parallel source
+task-order mapping. Ticket order, count, external source frontiers, source-body
+mapping, and root-barrier arrival targets are derived from that relation.
+`transient_source_root` remains only a cached role identity, and codegen rejects
+any disagreement between it and the unique stage-zero segment. The resident
+stage is unchanged. This checkpoint covers the proved static source-first
+behavior; parameterized wider fan-in and ragged source extents remain outside
+the accepted subset.
 
 ### Phase 6: cross-workload rollout
 

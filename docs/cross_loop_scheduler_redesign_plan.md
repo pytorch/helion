@@ -11,6 +11,10 @@ MoE rollout now includes positive Nemotron and DeepSeek-V3 results plus
 pretuned Qwen3 and Gemma A4B no-regression controls. Final-arrival
 continuations are contracted into their resident producers for proposal and
 proof, and the bounded proposer now covers the 5,170-CTA Qwen graph.
+The subsequent parametric redesign checkpoint also moved the transient source
+into an authoritative launch-stage-zero `WorkerScheduleSegment`; historical
+references below to an "external" source mean external to resident execution,
+not external to `WorkerSchedule`.
 
 The plan intentionally does **not** introduce a new hierarchy of persistent
 schedule IRs. It extends the existing `WorkerSchedule` contract so that the
@@ -57,11 +61,11 @@ There are three progressively narrower generic decisions:
    relations retain the conservative schedule.
 3. **Transient-source execution** applies only when the graph has one
    oversubscribed wait-free source, a safe ticket order, and exactly one
-   requested resident strand per physical visible SM. Source tickets execute
-   outside the resident `WorkerSchedule`; exact counters decide when resident
-   work becomes useful. There is no modeled admission width or source-tail
-   placement. FlashMLA is the first known positive case, not a compiler
-   special case.
+   requested resident strand per physical visible SM. Source tickets occupy
+   launch stage zero of the same `WorkerSchedule`; resident work occupies
+   launch stage one, and exact counters decide when it becomes useful. There
+   is no modeled admission width or source-tail placement. FlashMLA is the
+   first known positive case, not a compiler special case.
 
 Final-arrival continuations are zero-worker semantic nodes: proposal and proof
 recursively contract their outgoing dependencies to the resident tasks that
@@ -295,8 +299,8 @@ then stable source root/task order
 At each abstract worker step it selects up to `W` ready tasks across all roots.
 Selected adjacent tasks from the same source segment are compressed into a
 `WorkerScheduleSegment`; compatible runs are merged. For transient-source
-candidates, source tasks are external producers and are not placed in the
-resident program. Resident tasks whose only unsatisfied producer is that
+candidates, source tasks occupy one stage-zero segment and are not placed in
+the resident stage. Resident tasks whose only unsatisfied producer is that
 source enter the proposal queue immediately; their emitted runtime waits still
 guard actual execution.
 
@@ -316,7 +320,8 @@ ordered tuple and symbolic relations:
 
 1. Every segment task order is a total function into its root domain.
 2. Segment cardinalities sum to the exact root-domain cardinality for every
-   resident root. A transient source has no resident segment.
+   root. A transient source has one stage-zero segment and no resident-stage
+   segment.
 3. The union of segment converses is a total logical-CTA-to-scheduled-ordinal
    function. Together with equal cardinality, this proves that every CTA is
    executed exactly once: no duplicate and no omitted computation.
@@ -326,8 +331,9 @@ ordered tuple and symbolic relations:
    is checked independently on its exact partial support.
 6. Resident semantic edges strictly increase worker-step rank. In a mixed
    producer join, every resident arm is checked independently.
-7. A transient source has a symbolic bijection from logical tasks to tickets
-   `[0, P)`, has no incoming prerequisite, and has no resident segments.
+7. A transient source's stage-zero segment has a symbolic bijection from
+   logical tasks to tickets `[0, P)`, has no incoming prerequisite, and has no
+   resident-stage support.
    Source-to-resident arms alone use earlier ticket-role order for progress;
    their emitted counters or barriers still prove completion and visibility.
 
@@ -556,12 +562,13 @@ Transient plans derive epochs from the monotonic `P + W` ticket sequence. One
 synchronization-state allocation may not be shared by concurrently overlapping
 invocations.
 
-#### Two ticket roles, one executable resident program
+#### Two ticket roles, one executable schedule
 
-The source is not a `WorkerSchedule` segment. Its execution is defined solely
-by `transient_source_root`, the configured PID task order, and source tickets
-`[0, P)`. The resident list scheduler sees only non-source tasks and assigns
-them local steps beginning at zero.
+The source is a launch-stage-zero `WorkerScheduleSegment`. Its relation is the
+sole executable mapping from source tickets `[0, P)` to logical source tasks;
+`transient_source_root` only caches that segment's role. The resident list
+scheduler sees only stage-one tasks and assigns them local steps beginning at
+zero.
 
 This distinction matches the lowering. A physical CTA atomically obtains one
 ticket. Source tickets execute one source task and retire; resident tickets
@@ -572,8 +579,8 @@ width, determine when an already-admitted resident task may proceed.
 
 The proof boundary therefore establishes:
 
-- the configured source PID order is a total bijection with `[0, P)`;
-- the source owns no resident segment and has no incoming prerequisite;
+- the source segment is a total bijection with `[0, P)`;
+- the source owns no resident-stage support and has no incoming prerequisite;
 - resident segments exactly and exclusively cover every non-source task;
 - source-to-resident prerequisites are emitted launch-stage edges;
 - every resident-to-resident prerequisite strictly increases resident rank;
@@ -852,7 +859,8 @@ resident CTAs retain their baseline placement.
 - Port only the proven source inference and monotonic ticket mechanism.
 - Gate on one strand per physical visible SM, an oversubscribed source, and a
   symbolically proved strict-partial source signal.
-- Keep source tasks entirely outside the resident segment program.
+- Encode source tasks in one launch-stage-zero segment, disjoint from the
+  resident segment program.
 - Validate replay and resident-cohort progress.
 
 The current generic B4 schedule is correct, byte-identical to the best
@@ -969,7 +977,7 @@ parallel test-only schedule representation to production code.
 - `P > W` with only a root barrier declines;
 - an exact counter requiring the complete source declines;
 - individually partial source arms are unioned before strict-subset proof;
-- the source has no resident segments;
+- the source has one exact stage-zero segment and no resident-stage support;
 - mixed source/resident joins exempt only the source arm from resident rank;
 - all source tickets precede every resident ticket;
 - all source tasks publish before retirement;
@@ -1057,8 +1065,8 @@ The redesign is complete when:
 4. Split roots have correct completion accounting.
 5. Every dependency remains covered by at least one proved mechanism.
 6. Failure rebuilds the entire current-main plan.
-7. Transient execution uses disjoint source-ticket and resident roles, with no
-   source segments or admission-width policy.
+7. Transient execution uses disjoint source-ticket and resident launch stages,
+   with one authoritative source segment and no admission-width policy.
 8. Transient selection requires only one oversubscribed wait-free source and a
    strict-partial source signal derived from emitted prerequisites.
 9. Generated code remains affine-compressed.
@@ -1069,7 +1077,7 @@ The redesign is complete when:
 
 The central invariant is:
 
-> `WorkerSchedule.segments` is the resident program. The sole external role is
-> the explicitly identified transient source, whose canonical task order is
+> `WorkerSchedule.segments` is the complete source/resident program. The
+> explicitly identified transient source is an earlier launch-stage relation
 > executed exactly once by source tickets. Root order is syntax and readiness
 > is legality; neither may silently replace these executable orders.

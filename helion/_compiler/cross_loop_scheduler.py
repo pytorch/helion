@@ -30,6 +30,7 @@ WorkerInterval = tuple[int, int]
 
 _MAX_TASK_ORDER_SLICE_PIECES = 4096
 
+_SOURCE_LAUNCH_STAGE = 0
 _RESIDENT_LAUNCH_STAGE = 1
 
 
@@ -152,6 +153,33 @@ class WorkerScheduleSegment:
         return self.task_order.source_domain.kind == "worker"
 
     @cached_property
+    def launch_stage(self) -> int | None:
+        """Return the sole launch stage occupied by this relation, if proved."""
+        if not self.is_normalized:
+            return None
+        canonical = self.task_order.canonical_single_valued()
+        if canonical is None:
+            return None
+        launch_stage_axis = canonical.source_domain.axis_order[0]
+        bounds = {
+            (begin, end, step)
+            for piece in canonical.pieces
+            for axis, begin, end, step in piece.source_bounds_items
+            if axis == launch_stage_axis
+        }
+        if len(bounds) != 1:
+            return None
+        (launch_stage_bound,) = bounds
+        begin, end, step = launch_stage_bound
+        if (
+            step != 1
+            or end != begin + 1  # pyrefly: ignore[unsupported-operation]
+            or begin not in (_SOURCE_LAUNCH_STAGE, _RESIDENT_LAUNCH_STAGE)
+        ):
+            return None
+        return int(begin)
+
+    @cached_property
     def logical_task_order(self) -> CoordinateRelation | None:
         """Derive the dense logical traversal represented by this run.
 
@@ -183,6 +211,10 @@ class WorkerScheduleSegment:
         canonical = self.task_order.canonical_single_valued()
         if canonical is None:
             return None
+        launch_stage = self.launch_stage
+        if launch_stage is None:
+            return None
+        launch_stage_bound = (launch_stage, launch_stage + 1, 1)
         schedule_ordinal = (
             coordinate_axis_symbol(wave_axis) * self.worker_count  # pyrefly: ignore[unsupported-operation]
             + coordinate_axis_symbol(worker_axis)
@@ -207,8 +239,7 @@ class WorkerScheduleSegment:
                 source_bounds=piece.source_bounds_items,
             )
             if (
-                bounds[launch_stage_axis]
-                != (_RESIDENT_LAUNCH_STAGE, _RESIDENT_LAUNCH_STAGE + 1, 1)
+                bounds[launch_stage_axis] != launch_stage_bound
                 or worker_begin < self.worker_begin
                 or worker_end > self.worker_begin + self.worker_count
                 or ordinal_bounds is None
@@ -217,9 +248,7 @@ class WorkerScheduleSegment:
             ):
                 return None
         substitutions = {
-            coordinate_axis_symbol(launch_stage_axis): sympy.Integer(
-                _RESIDENT_LAUNCH_STAGE
-            ),
+            coordinate_axis_symbol(launch_stage_axis): sympy.Integer(launch_stage),
             coordinate_axis_symbol(worker_axis): self.worker_begin  # pyrefly: ignore[unsupported-operation]
             + sympy.Mod(dispatch_index, self.worker_count),  # pyrefly: ignore[unsupported-operation]
             coordinate_axis_symbol(wave_axis): sympy.floor(
@@ -235,11 +264,7 @@ class WorkerScheduleSegment:
                 axis: (begin, end, step)
                 for axis, begin, end, step in piece.source_bounds_items
             }
-            if source_bounds[launch_stage_axis] != (
-                _RESIDENT_LAUNCH_STAGE,
-                _RESIDENT_LAUNCH_STAGE + 1,
-                1,
-            ):
+            if source_bounds[launch_stage_axis] != launch_stage_bound:
                 continue
             worker_begin, worker_end, worker_step = source_bounds[worker_axis]
             wave_begin, wave_end, wave_step = source_bounds[wave_axis]
@@ -323,7 +348,12 @@ class WorkerScheduleSegment:
             ordinal_domain,
             self.task_order.target_domain,
             tuple(pieces),
-        ).coalesce_adjacent_source_boxes()
+        )
+        compact = result.coalesce_adjacent_source_boxes()
+        if compact.is_total_function():
+            result = compact
+        elif launch_stage != _SOURCE_LAUNCH_STAGE:
+            return None
         if not result.is_total_function():
             return None
         return result
@@ -366,7 +396,7 @@ class WorkerScheduleSegment:
         return self.dispatch_offset + task_order_index
 
     def occupies(self, worker: int, worker_step: int) -> bool:
-        """Return whether this segment occupies one step on a worker."""
+        """Return whether this segment occupies one resident worker step."""
         if self.is_normalized:
             launch_stage_axis, worker_axis, wave_axis = (
                 self.task_order.source_domain.axis_order
@@ -389,7 +419,9 @@ class WorkerScheduleSegment:
         return 0 <= task_order_index < self.task_count
 
     def worker_step_bounds(self, worker: int) -> tuple[int, int] | None:
-        """Return this segment's first and last occupied step on one worker."""
+        """Return this segment's first and last resident step on one worker."""
+        if self.is_normalized and self.launch_stage != _RESIDENT_LAUNCH_STAGE:
+            return None
         worker_offset = worker - self.worker_begin
         if not 0 <= worker_offset < self.worker_count:
             return None
@@ -402,7 +434,7 @@ class WorkerScheduleSegment:
         return first // self.worker_count, last // self.worker_count
 
     def workers(self) -> frozenset[int]:
-        """Materialize active workers for diagnostics and small-domain tests."""
+        """Materialize active resident workers for diagnostics and tests."""
         return frozenset(
             worker
             for begin, end in self.worker_intervals()
@@ -410,7 +442,7 @@ class WorkerScheduleSegment:
         )
 
     def worker_step_runs(self) -> tuple[tuple[int, int, int, int], ...]:
-        """Return symbolic ``(worker begin, end, first step, last step)`` runs.
+        """Return resident ``(worker begin, end, first step, last step)`` runs.
 
         A dense dispatch has only constant-many changes: at the first-dispatch
         wrap and the final-dispatch wrap.  Partitioning at those endpoints
@@ -531,7 +563,7 @@ def _worker_schedule_domain(
     wave_count: int | sympy.Expr,
     axes: tuple[int, int, int],
 ) -> CoordinateDomain:
-    """Return the shared source domain for resident schedule relations."""
+    """Return the shared launch-stage, worker, and wave schedule domain."""
     if worker_count <= 0:
         raise ValueError("worker count must be positive")
     wave_count_expr = sympy.sympify(wave_count)
@@ -555,8 +587,12 @@ def _worker_schedule_domain(
 def _normalize_dense_schedule_segment(
     segment: WorkerScheduleSegment,
     schedule_domain: CoordinateDomain,
+    *,
+    launch_stage: int = _RESIDENT_LAUNCH_STAGE,
 ) -> WorkerScheduleSegment:
     """Convert one legacy dense run to its exact schedule ownership relation."""
+    if launch_stage not in (_SOURCE_LAUNCH_STAGE, _RESIDENT_LAUNCH_STAGE):
+        raise ValueError(f"invalid launch stage {launch_stage}")
     launch_stage_axis, worker_axis, wave_axis = schedule_domain.axis_order
     if segment.is_normalized:
         source = segment.task_order.source_domain
@@ -627,8 +663,8 @@ def _normalize_dense_schedule_segment(
                     (
                         (
                             launch_stage_axis,
-                            _RESIDENT_LAUNCH_STAGE,
-                            _RESIDENT_LAUNCH_STAGE + 1,
+                            launch_stage,
+                            launch_stage + 1,
                             1,
                         ),
                         (
@@ -645,8 +681,8 @@ def _normalize_dense_schedule_segment(
                     (
                         (
                             launch_stage_axis,
-                            _RESIDENT_LAUNCH_STAGE,
-                            _RESIDENT_LAUNCH_STAGE + 1,
+                            launch_stage,
+                            launch_stage + 1,
                             1,
                         ),
                         (
@@ -679,8 +715,8 @@ def _normalize_dense_schedule_segment(
                 (
                     (
                         launch_stage_axis,
-                        _RESIDENT_LAUNCH_STAGE,
-                        _RESIDENT_LAUNCH_STAGE + 1,
+                        launch_stage,
+                        launch_stage + 1,
                         1,
                     ),
                     (
@@ -1516,7 +1552,7 @@ class WorkerSchedule:
                 prior_runs.append((begin, end, last_step))
 
     def root_at(self, worker: int, worker_step: int) -> int | None:
-        """Return the task family occupying one step on a worker."""
+        """Return the task family occupying one resident worker step."""
         roots = tuple(
             segment.root
             for segment in self.segments
@@ -1533,7 +1569,7 @@ class WorkerSchedule:
         return tuple(segment for segment in self.segments if segment.root == root)
 
     def workers_for_root(self, root: int) -> frozenset[int]:
-        """Materialize one root's worker support for diagnostics/tests."""
+        """Materialize one root's resident worker support for diagnostics."""
         return frozenset(
             worker
             for begin, end in self.worker_intervals_for_root(root)
@@ -1541,11 +1577,11 @@ class WorkerSchedule:
         )
 
     def worker_intervals_for_root(self, root: int) -> tuple[WorkerInterval, ...]:
-        """Return one root's exact active-worker support symbolically."""
+        """Return one root's exact resident-worker support symbolically."""
         return root_barrier_publication_plan(self, root).participant_intervals
 
     def active_worker_count_for_root(self, root: int) -> int:
-        """Return one root's exact active-worker count from interval lengths."""
+        """Return one root's exact resident-worker count from interval lengths."""
         return root_barrier_publication_plan(self, root).resident_arrival_count
 
     @cached_property
@@ -1571,7 +1607,7 @@ class WorkerSchedule:
         )
 
     def last_worker_steps_for_root(self, root: int) -> dict[int, int]:
-        """Return each participating worker's final occupied step."""
+        """Return each participating resident worker's final occupied step."""
         result: dict[int, int] = {}
         for segment in self.segments_for_root(root):
             for (
@@ -1585,7 +1621,7 @@ class WorkerSchedule:
         return result
 
     def worker_step_bounds_for_root(self, root: int) -> tuple[int, int] | None:
-        """Return the first and last occupied worker steps for one root."""
+        """Return the first and last occupied resident steps for one root."""
         segments = self.segments_for_root(root)
         if not segments:
             return None
@@ -1596,6 +1632,8 @@ class WorkerSchedule:
                 segment.worker_step_runs()
             )
         )
+        if not worker_steps:
+            return None
         return (
             min(begin for begin, _end in worker_steps),
             max(end for _begin, end in worker_steps),
@@ -4326,7 +4364,7 @@ def _validate_worker_schedule_tasks(
     *,
     excluded_roots: frozenset[int] = frozenset(),
 ) -> bool:
-    """Prove exact ownership for every root represented by resident segments."""
+    """Prove exact ownership, with explicitly excluded roots absent."""
     if any(root < 0 or root >= len(root_task_orders) for root in excluded_roots):
         return False
     for root, reference_task_order in enumerate(root_task_orders):
@@ -4625,10 +4663,7 @@ def _task_step_relations(
     """Return logical-task-to-wave functions from schedule converses."""
     result: list[CoordinateRelation | None] = []
     for root in range(len(readiness_graph.root_task_orders)):
-        segments = worker_schedule.segments_for_root(root)
         if root in excluded_roots:
-            if segments:
-                return None
             result.append(None)
             continue
         task_steps = _root_task_wave_relation(worker_schedule, root)
@@ -4652,6 +4687,7 @@ def _keys_by_consumer_root_task(
 @cache
 def _external_source_frontiers(
     readiness_graph: ReadinessGraph,
+    worker_schedule: WorkerSchedule,
     readiness_counters: tuple[ReadinessCounterPlan, ...],
     root_barrier_edges: frozenset[tuple[int, int]],
     source_root: int,
@@ -4662,13 +4698,21 @@ def _external_source_frontiers(
     before resident tickets, which proves progress, but only runtime counters
     establish that the corresponding source work has completed.
     """
-    source_ticket_order = _source_ticket_order(readiness_graph, source_root)
+    source_segment = _transient_source_schedule_segment(
+        worker_schedule,
+        source_root,
+    )
+    ticket_to_logical = (
+        None if source_segment is None else source_segment.logical_task_order
+    )
     continuations = _emitted_final_arrival_continuations(
         readiness_graph,
         readiness_counters,
     )
-    if source_ticket_order is None or continuations is None:
+    if ticket_to_logical is None or continuations is None:
         return None
+    ticket_domain = ticket_to_logical.source_domain
+    ticket_identity = CoordinateRelation.identity(ticket_domain, ticket_domain)
     continuation_by_root = _continuations_by_consumer_root(
         readiness_graph,
         continuations,
@@ -4700,7 +4744,7 @@ def _external_source_frontiers(
                 parts_by_consumer.setdefault(consumer_root, []).append(
                     CoordinateRelation.point_map(
                         consumer_domain,
-                        source_ticket_order.target_domain,
+                        ticket_domain,
                         (
                             (
                                 tuple(
@@ -4712,11 +4756,7 @@ def _external_source_frontiers(
                                     )
                                     for axis in consumer_domain.axis_order
                                 ),
-                                (
-                                    sympy.Integer(
-                                        source_ticket_order.target_domain.size - 1
-                                    ),
-                                ),
+                                (sympy.Integer(ticket_domain.size - 1),),
                             ),
                         ),
                     )
@@ -4745,9 +4785,20 @@ def _external_source_frontiers(
             if union is None:
                 return None
             source_keys = union
-        frontier_by_key = _maximum_value_by_key(
-            source_keys,
-            source_ticket_order,
+        keys_by_ticket = ticket_to_logical.then(source_keys)
+        if keys_by_ticket is not None:
+            compact_keys_by_ticket = keys_by_ticket.coalesce_adjacent_source_boxes(
+                fold_static_offsets=True
+            )
+            if compact_keys_by_ticket.is_total_function():
+                keys_by_ticket = compact_keys_by_ticket
+        frontier_by_key = (
+            None
+            if keys_by_ticket is None
+            else _maximum_value_by_key(
+                keys_by_ticket,
+                ticket_identity,
+            )
         )
         frontier = (
             None
@@ -4762,10 +4813,6 @@ def _external_source_frontiers(
         parts_by_consumer.setdefault(consumer_root, []).append(frontier)
 
     result: list[tuple[int, CoordinateRelation]] = []
-    ticket_identity = CoordinateRelation.identity(
-        source_ticket_order.target_domain,
-        source_ticket_order.target_domain,
-    )
     for consumer_root, parts in sorted(parts_by_consumer.items()):
         combined = parts[0]
         for part in parts[1:]:
@@ -4776,6 +4823,33 @@ def _external_source_frontiers(
         frontier = combined.max_target_value_by_source(ticket_identity)
         if frontier is None or not frontier.is_total_function():
             return None
+        canonical_frontier = frontier.canonical_single_valued()
+        if canonical_frontier is None or any(
+            step != 1 or sympy.simplify(end - begin) != 1  # pyrefly: ignore[unsupported-operation]
+            for piece in canonical_frontier.pieces
+            for _axis, begin, end, step in piece.target_ranges
+        ):
+            return None
+        simplified_frontier = CoordinateRelation.point_map(
+            canonical_frontier.source_domain,
+            canonical_frontier.target_domain,
+            tuple(
+                (
+                    piece.source_bounds_items,
+                    tuple(
+                        _simplify_logical_expression(
+                            begin,
+                            domain=canonical_frontier.source_domain,
+                            source_bounds=piece.source_bounds_items,
+                        )
+                        for _axis, begin, _end, _step in piece.target_ranges
+                    ),
+                )
+                for piece in canonical_frontier.pieces
+            ),
+        )
+        if simplified_frontier.is_total_function():
+            frontier = simplified_frontier
         result.append((consumer_root, frontier))
     return tuple(result)
 
@@ -5490,7 +5564,11 @@ def _schedule_is_progress_safe(
     if (
         (
             transient_source_root is not None
-            and worker_schedule.segments_for_root(transient_source_root)
+            and _transient_source_schedule_segment(
+                worker_schedule,
+                transient_source_root,
+            )
+            is None
         )
         or any(worker_schedule.segments_for_root(root) for root in continuation_roots)
         or not _has_symbolic_worker_rank(worker_schedule)
@@ -5579,8 +5657,8 @@ def _schedule_is_progress_safe(
         strictly_ranked = True
         for producer_root, keys_by_producer in static_relations:
             if producer_root == transient_source_root:
-                # This arm is external to the resident WorkerSchedule.  In a
-                # mixed join, every other resident arm is still proved below.
+                # This arm occupies the earlier launch stage.  In a mixed
+                # join, every resident arm is still proved below.
                 continue
             producers_by_key = keys_by_producer.converse()
             if producers_by_key is None:
@@ -5795,6 +5873,7 @@ def _event_frontier_list_schedule(
         if transient_source_root is None
         else _external_source_frontiers(
             readiness_graph,
+            worker_schedule,
             readiness_counters,
             root_barrier_edges,
             transient_source_root,
@@ -6210,7 +6289,11 @@ def _event_frontier_list_schedule(
     if len(merged_runs) > _MAX_GLOBAL_LIST_SEGMENTS:
         return None
 
-    segments: list[WorkerScheduleSegment] = []
+    segments: list[WorkerScheduleSegment] = (
+        []
+        if transient_source_root is None
+        else list(ordered_schedule.segments_for_root(transient_source_root))
+    )
     for run in merged_runs:
         task_order = _task_order_slice(
             root_orders[run.root],
@@ -6235,7 +6318,7 @@ def _event_frontier_list_schedule(
     if not _validate_worker_schedule_tasks(
         result,
         readiness_graph.root_task_orders,
-        excluded_roots=excluded_roots,
+        excluded_roots=frozenset(continuation_by_root),
     ):
         return None
     if not _schedule_is_progress_safe(
@@ -6264,6 +6347,14 @@ def _global_unit_list_schedule(
         root_barrier_edges,
     ):
         return worker_schedule
+    if transient_source_root is not None:
+        worker_schedule = _with_transient_source_schedule_segment(
+            worker_schedule,
+            readiness_graph.root_task_orders,
+            transient_source_root,
+        )
+        if worker_schedule is None:
+            return None
     candidate = _event_frontier_list_schedule(
         readiness_graph,
         worker_schedule,
@@ -6347,47 +6438,139 @@ def _transient_source_candidate(
     return source_root
 
 
-def _source_ticket_order(
-    readiness_graph: ReadinessGraph,
-    source_root: int,
+@cache
+def _source_segment_ticket_order(
+    segment: WorkerScheduleSegment,
 ) -> CoordinateRelation | None:
-    """Return the exact logical-task-to-ticket map for a transient source."""
-    task_order = readiness_graph.root_task_orders[source_root]
-    ticket_axis = (
-        max(
-            (
-                *task_order.source_domain.axis_order,
-                *task_order.target_domain.axis_order,
-            ),
-            default=0,
-        )
-        + 1
-    )
-    ticket_domain = CoordinateDomain(
-        axis_order=(ticket_axis,),
-        axis_counts_items=((ticket_axis, task_order.target_domain.size),),
-        kind="task_order",
-    )
-    logical_to_ticket = _logical_task_to_reference_ordinal(
-        task_order,
-        ticket_domain,
-    )
-    ticket_to_logical = (
-        None if logical_to_ticket is None else logical_to_ticket.converse()
-    )
-    ticket_to_logical = (
+    """Derive the logical-task-to-ticket bijection from one dense segment."""
+    ticket_to_logical = segment.logical_task_order
+    logical_to_ticket = (
         None
         if ticket_to_logical is None
-        else ticket_to_logical.canonical_single_valued()
+        else _logical_task_to_order_ordinal(
+            ticket_to_logical,
+            ticket_to_logical.source_domain,
+        )
     )
     if (
-        logical_to_ticket is None
-        or not logical_to_ticket.is_total_function()
-        or ticket_to_logical is None
+        ticket_to_logical is None
         or not ticket_to_logical.is_total_function()
+        or logical_to_ticket is None
+        or not logical_to_ticket.is_total_function()
     ):
         return None
     return logical_to_ticket
+
+
+def _transient_source_schedule_segment(
+    worker_schedule: WorkerSchedule,
+    source_root: int,
+) -> WorkerScheduleSegment | None:
+    """Recognize one exact dense launch-stage-zero source-ticket relation."""
+    if source_root < 0:
+        return None
+    segments = worker_schedule.segments_for_root(source_root)
+    if len(segments) != 1:
+        return None
+    (segment,) = segments
+    if (
+        segment.launch_stage != _SOURCE_LAUNCH_STAGE
+        or segment.worker_begin != 0
+        or segment.worker_count != worker_schedule.worker_count
+        or segment.dispatch_offset != 0
+        or _source_segment_ticket_order(segment) is None
+    ):
+        return None
+    return segment
+
+
+def _with_transient_source_schedule_segment(
+    worker_schedule: WorkerSchedule,
+    root_task_orders: tuple[CoordinateRelation, ...],
+    source_root: int,
+) -> WorkerSchedule | None:
+    """Move one concrete root into the schedule's source-ticket stage."""
+    if not 0 <= source_root < len(root_task_orders):
+        return None
+    if (
+        _transient_source_schedule_segment(
+            worker_schedule,
+            source_root,
+        )
+        is not None
+        and worker_schedule.segments_for_root(source_root)[0].task_order.target_domain
+        == root_task_orders[source_root].target_domain
+    ):
+        return worker_schedule
+
+    resident_schedule = worker_schedule.without_roots(frozenset((source_root,)))
+    placement_domain = resident_schedule.placement_domain
+    launch_stage_axis, worker_axis, wave_axis = placement_domain.axis_order
+    source_task_order = root_task_orders[source_root]
+    source_task_count = source_task_order.source_domain.size
+    source_wave_count = (
+        source_task_count + worker_schedule.worker_count - 1
+    ) // worker_schedule.worker_count
+    wave_count = max(
+        placement_domain.axis_counts[wave_axis],
+        source_wave_count,
+    )
+    combined_domain = _worker_schedule_domain(
+        worker_schedule.worker_count,
+        wave_count,
+        (launch_stage_axis, worker_axis, wave_axis),
+    )
+    resident_segments = tuple(
+        dataclasses.replace(
+            segment,
+            task_order=dataclasses.replace(
+                segment.task_order,
+                source_domain=combined_domain,
+            ),
+        )
+        for segment in resident_schedule.segments
+    )
+    try:
+        source_segment = _normalize_dense_schedule_segment(
+            WorkerScheduleSegment(
+                root=source_root,
+                task_order=source_task_order,
+                worker_begin=0,
+                worker_count=worker_schedule.worker_count,
+                dispatch_offset=0,
+            ),
+            combined_domain,
+            launch_stage=_SOURCE_LAUNCH_STAGE,
+        )
+        result = WorkerSchedule(
+            worker_count=worker_schedule.worker_count,
+            segments=(source_segment, *resident_segments),
+        )
+    except ValueError:
+        return None
+    return (
+        result
+        if _transient_source_schedule_segment(
+            result,
+            source_root,
+        )
+        is not None
+        else None
+    )
+
+
+def _source_ticket_order(
+    worker_schedule: WorkerSchedule,
+    source_root: int,
+) -> CoordinateRelation | None:
+    """Derive the logical-task-to-ticket map from the source segment."""
+    source_segment = _transient_source_schedule_segment(
+        worker_schedule,
+        source_root,
+    )
+    if source_segment is None:
+        return None
+    return _source_segment_ticket_order(source_segment)
 
 
 def _has_strict_partial_source_signal(
@@ -6449,12 +6632,20 @@ def _has_valid_transient_source_schedule(
     readiness_counters: tuple[ReadinessCounterPlan, ...],
     root_barrier_edges: frozenset[tuple[int, int]],
 ) -> bool:
-    """Check source-ticket invariants on an already-validated resident schedule."""
+    """Check source-ticket invariants after exact schedule ownership is proved."""
     if not 0 <= source_root < len(readiness_graph.root_task_orders):
         return False
-    if worker_schedule.segments_for_root(source_root):
+    if _source_ticket_order(worker_schedule, source_root) is None:
         return False
-    if _source_ticket_order(readiness_graph, source_root) is None:
+    if any(
+        segment.launch_stage
+        != (
+            _SOURCE_LAUNCH_STAGE
+            if segment.root == source_root
+            else _RESIDENT_LAUNCH_STAGE
+        )
+        for segment in worker_schedule.segments
+    ):
         return False
     prerequisites = _emitted_prerequisites(
         readiness_counters,
