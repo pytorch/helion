@@ -108,6 +108,24 @@ def dynamic_exact_then_barrier_chain(x: torch.Tensor) -> torch.Tensor:
     autotune_effort="none",
     triton_do_not_specialize=True,
 )
+def dynamic_exact_three_stage_chain(x: torch.Tensor) -> torch.Tensor:
+    first_tmp = torch.empty((8192,), dtype=x.dtype, device=x.device)
+    second_tmp = torch.empty((8192,), dtype=x.dtype, device=x.device)
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        first_tmp[tile] = x[tile] + 1
+    for tile in hl.tile(x.size(0)):
+        second_tmp[tile] = first_tmp[tile] * 2
+    for tile in hl.tile(x.size(0)):
+        out[tile] = second_tmp[tile] - 3
+    return out
+
+
+@helion.kernel(
+    static_shapes=False,
+    autotune_effort="none",
+    triton_do_not_specialize=True,
+)
 def two_dynamic_exact_chains(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -523,6 +541,10 @@ class TestTritonTileDependencyLowering(TestCase):
         self.assertNotIn("triton_helpers.x_grid_barrier(", code)
         self.assertNotIn("tile_dependency_dispatch_ticket", code)
         self.assertIn("32 * ((15 + x.size(0)) // 16)", code)
+        self.assertEqual(
+            code.count("for tile_dependency_event_frontier_task in tl.range"),
+            1,
+        )
 
         def compiled_cubin_hashes() -> set[str]:
             triton_kernel = compiled.__globals__.get(f"_helion_{bound.kernel.name}")
@@ -574,6 +596,31 @@ class TestTritonTileDependencyLowering(TestCase):
             torch.cuda.synchronize()
             torch.testing.assert_close(captured_output, (captured_input + 1) * 2)
 
+    def test_dynamic_exact_three_stage_chain_uses_one_frontier_loop(self) -> None:
+        x = torch.arange(2049, device=DEVICE, dtype=torch.float32)
+        code, output = code_and_output(
+            dynamic_exact_three_stage_chain,
+            (x,),
+            block_sizes=[16, 16, 16],
+            pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
+            num_warps=1,
+        )
+
+        torch.testing.assert_close(output, (x + 1) * 2 - 3)
+        self.assertEqual(code.count("tl.atomic_xchg"), 2)
+        self.assertGreaterEqual(code.count("tile_dependency_readiness_wait"), 2)
+        self.assertEqual(
+            code.count("for tile_dependency_event_frontier_task in tl.range"),
+            1,
+        )
+        loop = code.index("for tile_dependency_event_frontier_task in tl.range")
+        root_0 = code.index("tile_dependency_root_0_scheduled_task(", loop)
+        root_1 = code.index("tile_dependency_root_1_scheduled_task(", loop)
+        root_2 = code.index("tile_dependency_root_2_scheduled_task(", loop)
+        self.assertLess(root_0, root_1)
+        self.assertLess(root_1, root_2)
+
     def test_dynamic_counter_tail_does_not_relocate_root_barrier(self) -> None:
         exemplar = torch.arange(65, device=DEVICE, dtype=torch.float32)
         bound = dynamic_exact_then_barrier_chain.bind((exemplar,))
@@ -623,6 +670,7 @@ class TestTritonTileDependencyLowering(TestCase):
         self.assertGreaterEqual(code.count("tile_dependency_readiness_wait"), 2)
         self.assertNotIn("tl.atomic_add", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
+        self.assertNotIn("tile_dependency_event_frontier_task", code)
 
         # The first two shapes have the same total key count but move the
         # boundary between the two event sections.  Absolute epoch xchg makes

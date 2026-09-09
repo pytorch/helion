@@ -2683,7 +2683,7 @@ class TestCrossLoopScheduler(TestCase):
                 )
                 first_wave += (expected_count + 3) // 4
 
-    def test_parametric_root_major_schedule_uses_exact_fan_in_one_counter(
+    def test_parametric_event_frontier_schedule_uses_exact_fan_in_one_counter(
         self,
     ) -> None:
         task_count = sympy.Symbol("task_count", integer=True, nonnegative=True)
@@ -2726,10 +2726,18 @@ class TestCrossLoopScheduler(TestCase):
         self.assertTrue(
             cross_loop_scheduler._supports_parameterized_fan_in_one_counter(counter)
         )
-        self.assertIsNotNone(
-            cross_loop_scheduler._parametric_root_major_schedule_geometry(
+        schedule_geometry = (
+            cross_loop_scheduler._parametric_event_frontier_schedule_geometry(
                 plan.worker_schedule
             )
+        )
+        self.assertIsNotNone(schedule_geometry)
+        assert schedule_geometry is not None
+        self.assertEqual(
+            tuple(
+                (segment.root, phase) for segment, phase, _count in schedule_geometry
+            ),
+            ((0, 0), (1, 1)),
         )
 
         for concrete_count in (0, 1, 3, 4, 5, 11):
@@ -2745,6 +2753,223 @@ class TestCrossLoopScheduler(TestCase):
             expected = tuple(frozenset((index,)) for index in range(concrete_count))
             self.assertEqual(concrete_publication.materialize(), expected)
             self.assertEqual(concrete_waits.materialize(), expected)
+            for segment, phase, _count in schedule_geometry:
+                relation = segment.task_order.substitute_parameters(
+                    {task_count: concrete_count}
+                )
+                launch_axis, worker_axis, wave_axis = relation.source_domain.axis_order
+                actual: dict[int, tuple[int, int]] = {}
+                for wave in range(relation.source_domain.axis_counts[wave_axis]):
+                    for worker in range(4):
+                        targets = relation.target_coordinates(
+                            {
+                                launch_axis: 1,
+                                worker_axis: worker,
+                                wave_axis: wave,
+                            }
+                        )
+                        for (task,) in targets:
+                            self.assertNotIn(task, actual)
+                            actual[task] = (worker, wave)
+                self.assertEqual(
+                    actual,
+                    {
+                        task: (task % 4, 2 * (task // 4) + phase)
+                        for task in range(concrete_count)
+                    },
+                )
+
+    def test_parametric_event_frontier_declines_ambiguous_fork(self) -> None:
+        task_count = sympy.Symbol("task_count", integer=True, nonnegative=True)
+        dependency_graph = _dependency_graph(
+            [[10], [20], [30]],
+            _access(
+                root=0,
+                allocation_id=0,
+                kind="store",
+                shape=(8192,),
+                block_ids=(10,),
+                tensor_name="first_tmp",
+            ),
+            _access(
+                root=0,
+                allocation_id=1,
+                kind="store",
+                shape=(8192,),
+                block_ids=(10,),
+                tensor_name="second_tmp",
+            ),
+            _access(
+                root=1,
+                allocation_id=0,
+                kind="load",
+                shape=(8192,),
+                block_ids=(20,),
+                tensor_name="first_tmp",
+            ),
+            _access(
+                root=2,
+                allocation_id=1,
+                kind="load",
+                shape=(8192,),
+                block_ids=(30,),
+                tensor_name="second_tmp",
+            ),
+        )
+        root_domains = tuple(
+            CoordinateDomain((axis,), ((axis, task_count),), ((axis, 16),))
+            for axis in (10, 20, 30)
+        )
+
+        with _forbid_schedule_enumeration():
+            plan = _configured_static_pipeline_plan(
+                dependency_graph=dependency_graph,
+                root_domains=root_domains,
+                axis_geometry=dict.fromkeys((10, 20, 30), (task_count, 16)),
+                worker_count=4,
+            )
+
+        self.assertEqual(len(plan.readiness_counters), 1)
+        self.assertEqual(
+            tuple(
+                consumer.consumer_root
+                for consumer in plan.readiness_counters[0].consumers
+            ),
+            (1, 2),
+        )
+        self.assertEqual(plan.root_barrier_edges, frozenset())
+        self.assertIsNone(
+            cross_loop_scheduler._parametric_event_frontier_schedule_geometry(
+                plan.worker_schedule
+            )
+        )
+        self.assertIsNotNone(
+            cross_loop_scheduler._parametric_root_major_schedule_geometry(
+                plan.worker_schedule
+            )
+        )
+
+    def test_parametric_event_frontier_matches_concrete_list_scheduler(self) -> None:
+        task_count = sympy.Symbol("task_count", integer=True, nonnegative=True)
+        dependency_graph = _dependency_graph(
+            [[10], [20], [30]],
+            _access(
+                root=0,
+                allocation_id=0,
+                kind="store",
+                shape=(8192,),
+                block_ids=(10,),
+                tensor_name="first_tmp",
+            ),
+            _access(
+                root=1,
+                allocation_id=0,
+                kind="load",
+                shape=(8192,),
+                block_ids=(20,),
+                tensor_name="first_tmp",
+            ),
+            _access(
+                root=1,
+                allocation_id=1,
+                kind="store",
+                shape=(8192,),
+                block_ids=(20,),
+                tensor_name="second_tmp",
+            ),
+            _access(
+                root=2,
+                allocation_id=1,
+                kind="load",
+                shape=(8192,),
+                block_ids=(30,),
+                tensor_name="second_tmp",
+            ),
+        )
+        symbolic_domains = tuple(
+            CoordinateDomain((axis,), ((axis, task_count),), ((axis, 16),))
+            for axis in (10, 20, 30)
+        )
+
+        with _forbid_schedule_enumeration():
+            symbolic_plan = _configured_static_pipeline_plan(
+                dependency_graph=dependency_graph,
+                root_domains=symbolic_domains,
+                axis_geometry=dict.fromkeys((10, 20, 30), (task_count, 16)),
+                worker_count=4,
+            )
+        symbolic_geometry = (
+            cross_loop_scheduler._parametric_event_frontier_schedule_geometry(
+                symbolic_plan.worker_schedule
+            )
+        )
+        self.assertIsNotNone(symbolic_geometry)
+        assert symbolic_geometry is not None
+
+        for concrete_count in (1, 3, 4, 5, 8, 9):
+            concrete_domains = tuple(
+                _domain((axis, concrete_count, 16)) for axis in (10, 20, 30)
+            )
+            readiness_graph = _configured_readiness_graph(
+                dependency_graph,
+                concrete_domains,
+                axis_geometry=dict.fromkeys((10, 20, 30), (concrete_count, 16)),
+            )
+            initial_schedule = _baseline_worker_schedule(
+                concrete_domains,
+                4,
+                root_task_orders=readiness_graph.root_task_orders,
+            )
+            readiness_counters, root_barrier_edges = (
+                cross_loop_scheduler._finalize_emitted_synchronization(
+                    dependency_graph=dependency_graph,
+                    readiness_counters=choose_readiness_counters(
+                        readiness_graph,
+                        (),
+                    ),
+                )
+            )
+            concrete_schedule = cross_loop_scheduler._event_frontier_list_schedule(
+                readiness_graph,
+                initial_schedule,
+                readiness_counters,
+                root_barrier_edges,
+            )
+            self.assertIsNotNone(concrete_schedule)
+            assert concrete_schedule is not None
+
+            concrete_relations = tuple(
+                (
+                    segment.root,
+                    segment.task_order.substitute_parameters(
+                        {task_count: concrete_count}
+                    ),
+                )
+                for segment, _phase, _count in symbolic_geometry
+            )
+            wave_count = 3 * ((concrete_count + 3) // 4)
+            for wave in range(wave_count):
+                for worker in range(4):
+                    symbolic_tasks: list[tuple[int, int]] = []
+                    for root, relation in concrete_relations:
+                        launch_axis, worker_axis, wave_axis = (
+                            relation.source_domain.axis_order
+                        )
+                        symbolic_tasks.extend(
+                            (root, task)
+                            for (task,) in relation.target_coordinates(
+                                {
+                                    launch_axis: 1,
+                                    worker_axis: worker,
+                                    wave_axis: wave,
+                                }
+                            )
+                        )
+                    self.assertLessEqual(len(symbolic_tasks), 1)
+                    self.assertEqual(
+                        symbolic_tasks[0] if symbolic_tasks else None,
+                        task_at(concrete_schedule, worker, wave),
+                    )
 
     def test_parametric_counter_declines_unproved_dynamic_layout(self) -> None:
         task_count = sympy.Symbol("task_count", integer=True, nonnegative=True)
@@ -2783,6 +3008,16 @@ class TestCrossLoopScheduler(TestCase):
 
         self.assertEqual(plan.readiness_counters, ())
         self.assertEqual(plan.root_barrier_edges, frozenset(((0, 1),)))
+        self.assertIsNone(
+            cross_loop_scheduler._parametric_event_frontier_schedule_geometry(
+                plan.worker_schedule
+            )
+        )
+        self.assertIsNotNone(
+            cross_loop_scheduler._parametric_root_major_schedule_geometry(
+                plan.worker_schedule
+            )
+        )
 
     def test_parametric_counter_declines_fan_in_greater_than_one(self) -> None:
         key_count = sympy.Symbol("key_count", integer=True, nonnegative=True)

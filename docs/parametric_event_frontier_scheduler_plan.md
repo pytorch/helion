@@ -23,9 +23,12 @@ Implementation checkpoint (2026-09-08):
 - Exact parameterized root-entry readiness is implemented for the first
   replay-safe subset: rank-one positional producer/key and consumer/key
   bijections with fan-in one use the existing epoch-valued counter lowering.
-- Parametric event-frontier recurrence, wider fan-in, cross-workload rollout,
-  and final source/local-path consolidation remain to be implemented and
-  measured.
+- The first parametric event-frontier recurrence is implemented for a unique
+  topological chain of equal-size canonical rank-one roots joined by those
+  exact fan-in-one events. The existing segment relations are the certificate,
+  and codegen only strength-reduces a recognized certificate.
+- Wider fan-in, unequal and ragged extents, cross-workload rollout, and final
+  source/local-path consolidation remain to be implemented and measured.
 
 The hard architectural constraint is:
 
@@ -1126,10 +1129,12 @@ root (full waves plus a partial tail), and codegen strength-reduces that proved
 relation into runtime-bounded cyclic loops. Dynamic memory layouts are not
 specialized from hints: dependencies coarsen to root barriers, and every
 resident worker publishes once per producer root so epoch targets stay fixed
-while shapes vary between graph replays. Exact parameterized readiness events
-and recurrence extraction remain later Phase 4 work; parameterized roots with
-rank greater than one, L2-permuted orders, continuations, and transient-source
-admission still decline rather than relying on a shape hint.
+while shapes vary between graph replays. At this checkpoint, exact
+parameterized readiness events and recurrence extraction remained later Phase
+4 work; subsequent checkpoints below implement the first exact-event and
+recurrence slices. Parameterized roots with rank greater than one, L2-permuted
+orders, continuations, and transient-source admission still decline rather
+than relying on a shape hint.
 The binary-reuse regression explicitly opts its runtime extent out of Triton
 specialization; parameterizing the schedule does not override backend
 specialization policy for ordinary scalar arguments.
@@ -1144,8 +1149,38 @@ root barriers. Fixed cumulative root-barrier sections precede parameter-sized
 epoch-counter sections, so changing exact-event sizes cannot relocate barrier
 state across replay. Tests cover zero, shrink/grow, worker-count boundaries,
 two moving symbolic counter sections with equal aggregate storage, and one
-compiled cubin. This establishes parameterized exact synchronization, not yet
-the cross-root repeating wave relation needed for immediate per-key overlap.
+compiled cubin. This established parameterized exact synchronization; the next
+checkpoint adds the first cross-root repeating wave relation for immediate
+per-key overlap.
+
+Implementation checkpoint (2026-09-09): a unique topological chain of two or
+more equal-size canonical rank-one roots now closes into an exact parametric
+event-frontier recurrence when every emitted prerequisite is one of the
+positional fan-in-one counters above. For `L` roots, `W` workers, and runtime
+task count `N`, phase `p` owns:
+
+```text
+task = (wave // L) * W + worker
+wave % L = p
+```
+
+with `L * ceildiv(N, W)` symbolic waves and target-domain clipping for the
+tail. This is the closed form produced by the concrete event-frontier policy:
+after one producer cohort closes an event, the newly admissible downstream
+cohort wins before another upstream cohort. The compiler derives the root
+order from the existing emitted-prerequisite view and stores the result only
+in `WorkerScheduleSegment.task_order`; no runtime-task DAG or second schedule
+representation is built. Codegen re-recognizes that exact relation and
+strength-reduces it to one worker-strided runtime key loop containing the root
+calls in phase order. Existing counters remain the synchronization authority.
+
+Symbolic tests cover empty domains, tails, multiple waves, ambiguous forks,
+and coexistence with root barriers. A differential test compares the relation
+against the concrete event-frontier list scheduler for a three-stage chain at
+six boundary sizes. Forks, barriers, unequal extents, rank greater than one,
+and non-positional relations conservatively retain the parametric root-major
+schedule. This is a representation and correctness milestone; it does not yet
+claim the wider fan-in or source-ticket structure needed by FlashMLA.
 
 ### Phase 5: source-ticket generalization
 

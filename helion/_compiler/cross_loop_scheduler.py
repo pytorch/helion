@@ -1231,6 +1231,127 @@ def _parametric_root_major_relation(
     )
 
 
+def _parametric_event_frontier_relation(
+    schedule_domain: CoordinateDomain,
+    target_domain: CoordinateDomain,
+    phase: int,
+    period: int,
+    worker_count: int,
+) -> CoordinateRelation:
+    """Return one phase of an exact repeated event-frontier schedule."""
+    if not 0 <= phase < period:
+        raise ValueError("event-frontier phase must lie within its period")
+    launch_stage_axis, worker_axis, wave_axis = schedule_domain.axis_order
+    worker = coordinate_axis_symbol(worker_axis)
+    wave = coordinate_axis_symbol(wave_axis)
+    logical_task = sympy.simplify(
+        sympy.Add(
+            sympy.Mul(
+                sympy.floor(  # pyrefly: ignore[bad-argument-type]
+                    wave / period  # pyrefly: ignore[unsupported-operation]
+                ),
+                worker_count,
+            ),
+            worker,
+        )
+    )
+    return CoordinateRelation.point_map(
+        schedule_domain,
+        target_domain,
+        (
+            (
+                (
+                    (
+                        launch_stage_axis,
+                        _RESIDENT_LAUNCH_STAGE,
+                        _RESIDENT_LAUNCH_STAGE + 1,
+                        1,
+                    ),
+                    (worker_axis, 0, worker_count, 1),
+                    (
+                        wave_axis,
+                        phase,
+                        schedule_domain.axis_count_expressions[wave_axis],
+                        period,
+                    ),
+                ),
+                (logical_task,),
+            ),
+        ),
+    )
+
+
+def _parametric_event_frontier_schedule_geometry_from_parts(
+    worker_count: int,
+    segments: tuple[WorkerScheduleSegment, ...],
+) -> tuple[tuple[WorkerScheduleSegment, int, sympy.Expr], ...] | None:
+    """Recognize the exact repeated positional frontier relation."""
+    if len(segments) < 2 or not any(
+        segment.task_order.parameter_symbols for segment in segments
+    ):
+        return None
+    if not all(segment.is_normalized for segment in segments):
+        return None
+    schedule_domain = segments[0].task_order.source_domain
+    if any(segment.task_order.source_domain != schedule_domain for segment in segments):
+        return None
+    if schedule_domain.kind != "worker" or len(schedule_domain.axis_order) != 3:
+        return None
+    launch_stage_axis, worker_axis, wave_axis = schedule_domain.axis_order
+    schedule_counts = schedule_domain.axis_count_expressions
+    if not _equal_integer_expressions(
+        schedule_counts[launch_stage_axis], 2
+    ) or not _equal_integer_expressions(schedule_counts[worker_axis], worker_count):
+        return None
+
+    period = len(segments)
+    task_count = segments[0].task_order.target_domain.size_expr
+    if (
+        any(
+            segment.root < 0
+            or segment.worker_begin != 0
+            or segment.worker_count != worker_count
+            or len(segment.task_order.target_domain.axis_order) != 1
+            or not _equal_integer_expressions(
+                segment.task_order.target_domain.size_expr,
+                task_count,
+            )
+            for segment in segments
+        )
+        or len({segment.root for segment in segments}) != period
+    ):
+        return None
+    wave_count = sympy.simplify(
+        sympy.Mul(
+            period,
+            _ceildiv_nonnegative_expression(task_count, worker_count),
+        )
+    )
+    if not _equal_integer_expressions(schedule_counts[wave_axis], wave_count):
+        return None
+
+    result: list[tuple[WorkerScheduleSegment, int, sympy.Expr]] = []
+    for segment in segments:
+        matching_phases = tuple(
+            phase
+            for phase in range(period)
+            if segment.task_order
+            == _parametric_event_frontier_relation(
+                schedule_domain,
+                segment.task_order.target_domain,
+                phase,
+                period,
+                worker_count,
+            )
+        )
+        if len(matching_phases) != 1:
+            return None
+        result.append((segment, matching_phases[0], task_count))
+    if {phase for _segment, phase, _count in result} != set(range(period)):
+        return None
+    return tuple(sorted(result, key=operator.itemgetter(1)))
+
+
 def _parametric_root_major_schedule_geometry_from_parts(
     worker_count: int,
     segments: tuple[WorkerScheduleSegment, ...],
@@ -1315,10 +1436,14 @@ class WorkerSchedule:
                     self.segments,
                 )
                 is None
+                and _parametric_event_frontier_schedule_geometry_from_parts(
+                    self.worker_count,
+                    self.segments,
+                )
+                is None
             ):
                 raise ValueError(
-                    "parameterized worker schedule is not the supported exact "
-                    "root-major relation"
+                    "parameterized worker schedule is not a supported exact relation"
                 )
             return
         normalized_axes = {
@@ -1554,6 +1679,16 @@ def _parametric_root_major_schedule_geometry(
 ) -> tuple[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr], ...] | None:
     """Return the proved parameterized schedule geometry, when supported."""
     return _parametric_root_major_schedule_geometry_from_parts(
+        worker_schedule.worker_count,
+        worker_schedule.segments,
+    )
+
+
+def _parametric_event_frontier_schedule_geometry(
+    worker_schedule: WorkerSchedule,
+) -> tuple[tuple[WorkerScheduleSegment, int, sympy.Expr], ...] | None:
+    """Return the proved repeated event-frontier geometry, when supported."""
+    return _parametric_event_frontier_schedule_geometry_from_parts(
         worker_schedule.worker_count,
         worker_schedule.segments,
     )
@@ -1809,6 +1944,32 @@ def root_barrier_publication_plan(
             root=root,
             participant_intervals=participant_intervals,
             publications=(RootBarrierPublication(matching[0], participant_intervals),),
+        )
+    if (
+        parameterized_geometry := _parametric_event_frontier_schedule_geometry(
+            worker_schedule
+        )
+    ) is not None:
+        matching_segment = next(
+            (
+                segment
+                for segment, _phase, _task_count in parameterized_geometry
+                if segment.root == root
+            ),
+            None,
+        )
+        if matching_segment is None:
+            raise ValueError(
+                f"parameterized event-frontier schedule has no root {root}"
+            )
+        segment_index = worker_schedule.segments.index(matching_segment)
+        participant_intervals = ((0, worker_schedule.worker_count),)
+        return RootBarrierPublicationPlan(
+            root=root,
+            participant_intervals=participant_intervals,
+            publications=(
+                RootBarrierPublication(segment_index, participant_intervals),
+            ),
         )
 
     later_workers: tuple[WorkerInterval, ...] = ()
@@ -6320,6 +6481,7 @@ def _supports_parameterized_fan_in_one_counter(
         plan.continuation_consumer_index is not None
         or len(plan.readiness_key_domain.axis_order) != 1
         or len(plan.producers) != 1
+        or not plan.consumers
         or plan.uniform_arrival_count() != 1
     ):
         return False
@@ -6340,6 +6502,134 @@ def _supports_parameterized_fan_in_one_counter(
         and converse.is_positional_bijection()
         for consumer in plan.consumers
     )
+
+
+def _parametric_event_frontier_root_order(
+    root_task_orders: tuple[CoordinateRelation, ...],
+    readiness_counters: tuple[ReadinessCounterPlan, ...],
+    root_barrier_edges: frozenset[tuple[int, int]],
+) -> tuple[int, ...] | None:
+    """Derive the unique repeated positional frontier order, if one exists."""
+    root_count = len(root_task_orders)
+    if root_count < 2 or root_barrier_edges or not readiness_counters:
+        return None
+    task_count = root_task_orders[0].target_domain.size_expr
+    if any(
+        not _is_rank_one_canonical_task_order(
+            task_order,
+            task_order.target_domain,
+        )
+        or not _equal_integer_expressions(
+            task_order.target_domain.size_expr,
+            task_count,
+        )
+        for task_order in root_task_orders
+    ):
+        return None
+
+    edges: set[tuple[int, int]] = set()
+    for prerequisite in _emitted_prerequisites(
+        readiness_counters,
+        root_barrier_edges,
+    ):
+        plan = prerequisite.counter_plan
+        consumer = prerequisite.counter_consumer
+        if (
+            plan is None
+            or consumer is None
+            or not _supports_parameterized_fan_in_one_counter(plan)
+        ):
+            return None
+        (producer,) = plan.producers
+        edge = (producer.producer_root, consumer.consumer_root)
+        if (
+            not 0 <= edge[0] < root_count
+            or not 0 <= edge[1] < root_count
+            or edge[0] == edge[1]
+        ):
+            return None
+        edges.add(edge)
+
+    successors: list[set[int]] = [set() for _ in range(root_count)]
+    indegree = [0] * root_count
+    for producer_root, consumer_root in edges:
+        if consumer_root not in successors[producer_root]:
+            successors[producer_root].add(consumer_root)
+            indegree[consumer_root] += 1
+
+    order: list[int] = []
+    remaining = set(range(root_count))
+    while remaining:
+        ready = sorted(root for root in remaining if indegree[root] == 0)
+        if len(ready) != 1:
+            return None
+        (root,) = ready
+        order.append(root)
+        remaining.remove(root)
+        for successor in successors[root]:
+            indegree[successor] -= 1
+    return tuple(order)
+
+
+def _build_parametric_event_frontier_worker_schedule(
+    root_task_orders: tuple[CoordinateRelation, ...],
+    readiness_counters: tuple[ReadinessCounterPlan, ...],
+    root_barrier_edges: frozenset[tuple[int, int]],
+    worker_count: int,
+) -> WorkerSchedule | None:
+    """Close the exact list-scheduling recurrence into schedule relations."""
+    root_order = _parametric_event_frontier_root_order(
+        root_task_orders,
+        readiness_counters,
+        root_barrier_edges,
+    )
+    if root_order is None:
+        return None
+    task_count = root_task_orders[0].target_domain.size_expr
+    period = len(root_order)
+    minimum_axis = min(
+        (
+            axis
+            for task_order in root_task_orders
+            for axis in task_order.target_domain.axis_order
+        ),
+        default=0,
+    )
+    schedule_domain = _worker_schedule_domain(
+        worker_count,
+        sympy.simplify(
+            sympy.Mul(
+                period,
+                _ceildiv_nonnegative_expression(task_count, worker_count),
+            )
+        ),
+        (minimum_axis - 3, minimum_axis - 2, minimum_axis - 1),
+    )
+    schedule = WorkerSchedule(
+        worker_count=worker_count,
+        segments=tuple(
+            WorkerScheduleSegment(
+                root=root,
+                task_order=_parametric_event_frontier_relation(
+                    schedule_domain,
+                    root_task_orders[root].target_domain,
+                    phase,
+                    period,
+                    worker_count,
+                ),
+                worker_begin=0,
+                worker_count=worker_count,
+                dispatch_offset=0,
+            )
+            for phase, root in enumerate(root_order)
+        ),
+    )
+    geometry = _parametric_event_frontier_schedule_geometry(schedule)
+    if geometry is None or tuple(
+        segment.root for segment, _phase, _count in geometry
+    ) != (root_order):
+        raise AssertionError("event-frontier recurrence failed its shared certificate")
+    return schedule
 
 
 def _finalize_emitted_synchronization(
@@ -6443,6 +6733,14 @@ def build_static_pipeline_plan(
                 if _supports_parameterized_fan_in_one_counter(plan)
             ),
         )
+        event_frontier_schedule = _build_parametric_event_frontier_worker_schedule(
+            root_task_orders,
+            readiness_counters,
+            root_barrier_edges,
+            worker_count,
+        )
+        if event_frontier_schedule is not None:
+            worker_schedule = event_frontier_schedule
         return StaticPipelinePlan(
             worker_schedule=worker_schedule,
             readiness_counters=readiness_counters,

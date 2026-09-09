@@ -20,6 +20,8 @@ from .cross_loop_scheduler import ReadinessProducer
 from .cross_loop_scheduler import WorkerInterval
 from .cross_loop_scheduler import WorkerScheduleSegment
 from .cross_loop_scheduler import _normalize_intervals
+from .cross_loop_scheduler import _parametric_event_frontier_root_order
+from .cross_loop_scheduler import _parametric_event_frontier_schedule_geometry
 from .cross_loop_scheduler import _parametric_root_major_schedule_geometry
 from .cross_loop_scheduler import _root_schedule_traversal
 from .cross_loop_scheduler import _supports_parameterized_fan_in_one_counter
@@ -707,26 +709,49 @@ def emit_cross_loop_schedule(
             and device_function.config.get("num_sm_multiplier", 1) == 1
         ),
     )
-    parameterized_schedule_geometry = _parametric_root_major_schedule_geometry(
+    parameterized_root_major_geometry = _parametric_root_major_schedule_geometry(
         static_pipeline_plan.worker_schedule
     )
-    if parameterized_root_domains and parameterized_schedule_geometry is None:
+    parameterized_event_frontier_geometry = (
+        _parametric_event_frontier_schedule_geometry(
+            static_pipeline_plan.worker_schedule
+        )
+    )
+    has_parameterized_schedule = (
+        parameterized_root_major_geometry is not None
+        or parameterized_event_frontier_geometry is not None
+    )
+    if parameterized_root_domains and (
+        parameterized_root_major_geometry is None
+        and parameterized_event_frontier_geometry is None
+    ):
         raise exc.InvalidConfig(
             "cross_loop_schedule='static_pipeline' cannot lower this "
             "parameterized worker schedule"
         )
-    if parameterized_schedule_geometry is not None and (
+    if parameterized_root_domains and (
         static_pipeline_plan.transient_source_root is not None
         or any(
             not _supports_parameterized_fan_in_one_counter(plan)
             for plan in static_pipeline_plan.readiness_counters
         )
     ):
-        raise AssertionError(
-            "parameterized root-major lowering received an unproved counter plan"
-        )
+        raise AssertionError("parameterized lowering received an unproved counter plan")
     root_barrier_edges = static_pipeline_plan.root_barrier_edges
     all_readiness_counter_plans = static_pipeline_plan.readiness_counters
+    if parameterized_event_frontier_geometry is not None:
+        expected_root_order = _parametric_event_frontier_root_order(
+            root_task_orders,
+            all_readiness_counter_plans,
+            root_barrier_edges,
+        )
+        if expected_root_order != tuple(
+            segment.root
+            for segment, _phase, _task_count in parameterized_event_frontier_geometry
+        ):
+            raise AssertionError(
+                "parameterized event-frontier schedule violates its prerequisites"
+            )
     nested_loop_counter_plans = tuple(
         plan
         for plan in all_readiness_counter_plans
@@ -761,12 +786,15 @@ def emit_cross_loop_schedule(
             )
         worker = device_function.new_var("tile_dependency_resident_worker", dce=True)
 
+    root_barrier_producer_roots = sorted(
+        {producer for producer, _consumer in root_barrier_edges}
+    )
     root_publication_plans = {
         root: root_barrier_publication_plan(
             static_pipeline_plan.worker_schedule,
             root,
         )
-        for root in range(len(root_domains))
+        for root in root_barrier_producer_roots
     }
     continuation_task_count_by_root: dict[int, int] = {}
     for plan in readiness_counter_plans:
@@ -812,9 +840,6 @@ def emit_cross_loop_schedule(
                 ),
             )
         )
-    root_barrier_producer_roots = sorted(
-        {producer for producer, _consumer in root_barrier_edges}
-    )
     root_barrier_indices = {
         root: index for index, root in enumerate(root_barrier_producer_roots)
     }
@@ -846,7 +871,7 @@ def emit_cross_loop_schedule(
     root_barrier_count = (
         len(root_barrier_producer_roots) * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
     )
-    if parameterized_schedule_geometry is None:
+    if not has_parameterized_schedule:
         readiness_counter_state_offset = reserve_state(readiness_counter_count)
         root_barrier_state_offset = reserve_state(root_barrier_count)
     else:
@@ -1022,7 +1047,7 @@ def emit_cross_loop_schedule(
     }
     root_schedule_traversals = {}
     scheduled_task_roots: set[int] = set()
-    if parameterized_schedule_geometry is None:
+    if not has_parameterized_schedule:
         for root, task_order in enumerate(root_task_orders):
             segments = static_pipeline_plan.worker_schedule.segments_for_root(root)
             if not segments:
@@ -1934,7 +1959,7 @@ def emit_cross_loop_schedule(
         # coupling across schedule occurrences.
         root_segments = static_pipeline_plan.worker_schedule.segments_for_root(root)
         is_single_trip_occurrence = (
-            parameterized_schedule_geometry is None
+            not has_parameterized_schedule
             and len(root_segments) == 1
             and root_segments[0].task_count <= root_segments[0].worker_count
         )
@@ -1954,6 +1979,11 @@ def emit_cross_loop_schedule(
         ]
 
     static_segments_by_root: dict[int, tuple[WorkerScheduleSegment, ...]] = {}
+    parameterized_schedule_geometry = (
+        parameterized_root_major_geometry
+        if parameterized_root_major_geometry is not None
+        else parameterized_event_frontier_geometry
+    )
     parameterized_segment_geometry_by_root = (
         {
             segment.root: (segment, first_wave, task_count)
@@ -2037,10 +2067,10 @@ def emit_cross_loop_schedule(
         task_dispatch: list[ast.stmt]
         segment_workers = (
             ((0, launch_worker_count),)
-            if parameterized_schedule_geometry is not None
+            if has_parameterized_schedule
             else segment.worker_intervals()
         )
-        if parameterized_schedule_geometry is not None:
+        if parameterized_root_major_geometry is not None:
             geometry_segment, _first_wave, task_count = (
                 parameterized_segment_geometry_by_root[root]
             )
@@ -2148,41 +2178,83 @@ def emit_cross_loop_schedule(
 
     resident_body: list[ast.stmt] = []
     next_segment_range_by_root: dict[int, int] = {}
-    for segment_index, segment in enumerate(
-        static_pipeline_plan.worker_schedule.segments
-    ):
-        root = segment.root
-        if parameterized_schedule_geometry is not None:
+    if parameterized_event_frontier_geometry is not None:
+        if publication_workers_by_segment:
+            raise AssertionError(
+                "event-frontier recurrence cannot contain a root barrier"
+            )
+        task_count = parameterized_event_frontier_geometry[0][2]
+        task_count_text = device_function.sympy_expr(task_count)
+        frontier_task = device_function.new_var(
+            "tile_dependency_event_frontier_task",
+            dce=True,
+        )
+        frontier_body: list[ast.stmt] = []
+        for segment, _phase, _task_count in parameterized_event_frontier_geometry:
+            root = segment.root
+            frontier_body.extend(
+                scheduled_root_task_body(
+                    root,
+                    frontier_task,
+                    f"{case_offset_strings[root]} + {frontier_task}",
+                    (frontier_task,),
+                    force_noinline=True,
+                )
+            )
+        resident_body.append(
+            create(
+                ast.For,
+                target=create(
+                    ast.Name,
+                    id=frontier_task,
+                    ctx=ast.Store(),
+                ),
+                iter=expr_from_string(
+                    f"tl.range({worker}, {task_count_text}, {launch_worker_count})"
+                ),
+                body=frontier_body,
+                orelse=[],
+                type_comment=None,
+            )
+        )
+    else:
+        for segment_index, segment in enumerate(
+            static_pipeline_plan.worker_schedule.segments
+        ):
+            root = segment.root
+            if parameterized_root_major_geometry is not None:
+                resident_body.extend(
+                    static_segment_body(
+                        segment,
+                        task_order_begin=None,
+                        publish_root_barrier_workers=(
+                            publication_workers_by_segment.get(segment_index, ())
+                        ),
+                    )
+                )
+                continue
+            range_index = next_segment_range_by_root.get(root, 0)
+            ranges = root_schedule_traversals[root].segment_ordinal_ranges
+            if range_index >= len(ranges):
+                raise AssertionError("segment stream exceeds its proved root traversal")
+            certified_segment, task_order_begin, task_order_end = ranges[range_index]
+            if (
+                certified_segment != segment
+                or task_order_end - task_order_begin != segment.task_count
+            ):
+                raise AssertionError(
+                    "segment stream disagrees with its proved traversal"
+                )
+            next_segment_range_by_root[root] = range_index + 1
             resident_body.extend(
                 static_segment_body(
                     segment,
-                    task_order_begin=None,
+                    task_order_begin=task_order_begin,
                     publish_root_barrier_workers=publication_workers_by_segment.get(
                         segment_index, ()
                     ),
                 )
             )
-            continue
-        range_index = next_segment_range_by_root.get(root, 0)
-        ranges = root_schedule_traversals[root].segment_ordinal_ranges
-        if range_index >= len(ranges):
-            raise AssertionError("segment stream exceeds its proved root traversal")
-        certified_segment, task_order_begin, task_order_end = ranges[range_index]
-        if (
-            certified_segment != segment
-            or task_order_end - task_order_begin != segment.task_count
-        ):
-            raise AssertionError("segment stream disagrees with its proved traversal")
-        next_segment_range_by_root[root] = range_index + 1
-        resident_body.extend(
-            static_segment_body(
-                segment,
-                task_order_begin=task_order_begin,
-                publish_root_barrier_workers=publication_workers_by_segment.get(
-                    segment_index, ()
-                ),
-            )
-        )
     if any(
         next_segment_range_by_root.get(root, 0) != len(traversal.segment_ordinal_ranges)
         for root, traversal in root_schedule_traversals.items()
