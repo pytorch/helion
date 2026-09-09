@@ -125,7 +125,16 @@ jobs:
             # Default to nightly
             # On OSDC, route nightly through the pypi-cache /whl proxy (deps stay reachable behind the egress firewall) and clear the cache index vars so it wins over the cache default; off OSDC PYPI_CACHE_WHL_URL is unset so we hit download.pytorch.org.
             PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
-            UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U --pre torch --index-url "${PYTORCH_INDEX%/whl/*}/whl/nightly/${{ matrix.runtime-version }}"
+            NIGHTLY_INDEX="${PYTORCH_INDEX%/whl/*}/whl/nightly/${{ matrix.runtime-version }}"
+            if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
+              # The system NVSHMEM install is outside the venv, but PyTorch's Triton
+              # integration searches the active site-packages for its device bitcode.
+              UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U --pre nvidia-nvshmem-cu13 --index-url "$NIGHTLY_INDEX"
+            fi
+            UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U --pre torch --index-url "$NIGHTLY_INDEX"
+            if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
+              python -c "from torch.distributed._symmetric_memory._nvshmem_triton import NvshmemLibFinder; print(f'NVSHMEM device library: {NvshmemLibFinder.find_device_library()}')"
+            fi
           fi
 
       - name: Install PyTorch (CPU nightly, pinned for TorchTPU)
