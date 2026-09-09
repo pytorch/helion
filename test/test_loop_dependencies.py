@@ -142,6 +142,51 @@ def dynamic_fixed_fan_in_chain(x: torch.Tensor) -> torch.Tensor:
     autotune_effort="none",
     triton_do_not_specialize=True,
 )
+def dynamic_nested_fixed_fan_in_chain(x: torch.Tensor) -> torch.Tensor:
+    """Reduce each fixed-width producer fiber through a nested split loop."""
+    torch._check(x.size(0) <= 16)
+    partial = torch.empty((32,), dtype=x.dtype, device=x.device)
+    partial_by_key = partial.view(16, 2)
+    out = torch.empty_like(x)
+    for producer in hl.tile(x.size(0) * 2, block_size=1):
+        partial[producer] = x[producer.index // 2] + producer.index % 2
+    for consumer in hl.tile(x.size(0), block_size=1):
+        accumulator = hl.zeros([consumer], dtype=torch.float32)
+        for split in hl.tile(2, block_size=1):
+            values = partial_by_key[consumer.id, split]
+            accumulator = accumulator + torch.sum(values)
+        out[consumer] = accumulator
+    return out
+
+
+@helion.kernel(
+    static_shapes=False,
+    autotune_effort="none",
+    triton_do_not_specialize=True,
+)
+def unchecked_dynamic_nested_fixed_fan_in_chain(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    """Negative twin: fixed scratch has no dominating extent guard."""
+    partial = torch.empty((32,), dtype=x.dtype, device=x.device)
+    partial_by_key = partial.view(16, 2)
+    out = torch.empty_like(x)
+    for producer in hl.tile(x.size(0) * 2, block_size=1):
+        partial[producer] = x[producer.index // 2] + producer.index % 2
+    for consumer in hl.tile(x.size(0), block_size=1):
+        accumulator = hl.zeros([consumer], dtype=torch.float32)
+        for split in hl.tile(2, block_size=1):
+            values = partial_by_key[consumer.id, split]
+            accumulator = accumulator + torch.sum(values)
+        out[consumer] = accumulator
+    return out
+
+
+@helion.kernel(
+    static_shapes=False,
+    autotune_effort="none",
+    triton_do_not_specialize=True,
+)
 def two_dynamic_exact_chains(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -756,6 +801,72 @@ class TestTritonTileDependencyLowering(TestCase):
                 (captured_input * 2, (captured_input + 1) * 2), dim=1
             ).flatten()
             torch.testing.assert_close(captured_output, expected)
+
+    def test_dynamic_nested_fixed_fan_in_uses_root_continuation(self) -> None:
+        exemplar = torch.arange(5, device=DEVICE, dtype=torch.float32)
+        bound = dynamic_nested_fixed_fan_in_chain.bind((exemplar,))
+        config = helion.Config(
+            block_sizes=[],
+            pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
+            num_warps=1,
+        )
+        code = bound.to_code(config)
+        compiled = bound.compile_config(config)
+
+        bounded_symbols = tuple(
+            symbol
+            for symbol, value_range in bound._env.shape_env.var_to_range.items()
+            if value_range.lower == 0 and value_range.upper == 16
+        )
+        self.assertEqual(len(bounded_symbols), 1)
+        (batch_size,) = bounded_symbols
+        guards_before = tuple(bound._env.shape_env.guards)
+        self.assertTrue(bound._env.known_nonnegative(32 - 2 * batch_size))
+        self.assertFalse(bound._env.known_nonnegative(31 - 2 * batch_size))
+        self.assertEqual(tuple(bound._env.shape_env.guards), guards_before)
+
+        self.assertIn("tile_dependency_continuation_previous", code)
+        self.assertIn("tl.atomic_max", code)
+        self.assertIn("tl.atomic_add", code)
+        self.assertIn("% (2 * x_size_0) // 2", code)
+        self.assertNotIn("tile_dependency_nested_loop_wait", code)
+        self.assertNotIn("tile_dependency_root_barrier", code)
+
+        expected_hashes: set[str] | None = None
+        for length in (5, 0, 1, 16, 5):
+            x = torch.arange(length, device=DEVICE, dtype=torch.float32)
+            torch.testing.assert_close(compiled(x), x * 2 + 1)
+            triton_kernel = compiled.__globals__.get(f"_helion_{bound.kernel.name}")
+            self.assertIsNotNone(triton_kernel)
+            device_caches = getattr(triton_kernel, "device_caches", None)
+            self.assertIsInstance(device_caches, dict)
+            assert isinstance(device_caches, dict)
+            hashes = {
+                compiled_kernel.hash
+                for cache_tuple in device_caches.values()
+                for compiled_kernel in cache_tuple[0].values()
+                if getattr(compiled_kernel, "hash", None) is not None
+            }
+            self.assertEqual(len(hashes), 1)
+            if expected_hashes is None:
+                expected_hashes = hashes
+            else:
+                self.assertEqual(hashes, expected_hashes)
+
+        def unexpected_launcher(*_args, **_kwargs):
+            self.fail("shape guard must fail before launching the kernel")
+
+        with self.assertRaises((AssertionError, RuntimeError)):
+            compiled(
+                torch.arange(17, device=DEVICE, dtype=torch.float32),
+                _launcher=unexpected_launcher,
+            )
+
+        unchecked = unchecked_dynamic_nested_fixed_fan_in_chain.bind((exemplar,))
+        unchecked_code = unchecked.to_code(config)
+        self.assertNotIn("tile_dependency_continuation_previous", unchecked_code)
+        self.assertIn("tile_dependency_root_barrier", unchecked_code)
 
     def test_dynamic_counter_tail_does_not_relocate_root_barrier(self) -> None:
         exemplar = torch.arange(65, device=DEVICE, dtype=torch.float32)

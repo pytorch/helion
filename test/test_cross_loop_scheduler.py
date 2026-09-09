@@ -667,6 +667,7 @@ def _access(
     tensor_name: str = "tmp",
     storage_offset: int = 0,
     layout_is_static: bool = True,
+    affine_subscript_ranges=None,
 ) -> TileAccess:
     if strides is None:
         stride = 1
@@ -699,6 +700,7 @@ def _access(
         subscript_is_full_slice=full_slice or tuple(False for _ in block_ids),
         subscript_static_extents=static_extents or (),
         layout_is_static=layout_is_static,
+        affine_subscript_ranges=affine_subscript_ranges,
     )
 
 
@@ -4613,6 +4615,219 @@ class TestCrossLoopScheduler(TestCase):
             derive_final_arrival_continuations(readiness_graph, baseline), ()
         )
         self.assertEqual(choose_readiness_counters(readiness_graph, ()), ())
+
+    def test_final_arrival_root_event_must_cover_nested_obligations(self) -> None:
+        producer_domain = _domain((10, 4), identity=0)
+        consumer_domain = _domain((20, 2), identity=1)
+        nested_domain = _domain((20, 2), (21, 1), identity=2)
+        readiness_key_domain = _domain((0, 2), kind="event", identity=0)
+        nested_key_domain = dataclasses.replace(readiness_key_domain, identity=1)
+
+        def producer(key_domain: CoordinateDomain) -> ReadinessProducer:
+            return _readiness_producer_from_publication(
+                producer_root=0,
+                producer_site_id=None,
+                publication=_full_point_map(
+                    producer_domain,
+                    key_domain,
+                    sympy.floor(coordinate_axis_symbol(10) / 2),
+                ),
+            )
+
+        root_obligation = (0, None, None)
+        nested_obligation = (1, None, 2)
+
+        def graph(root_coverage: frozenset[tuple[int, int | None, int | None]]):
+            return _readiness_graph(
+                (producer_domain, consumer_domain),
+                ReadinessEvent(
+                    producers=(producer(readiness_key_domain),),
+                    consumers=(
+                        ReadinessConsumer(
+                            consumer_root=1,
+                            consumer_site_id=None,
+                            keys_by_consumer=_full_point_map(
+                                consumer_domain,
+                                readiness_key_domain,
+                                coordinate_axis_symbol(20),
+                            ),
+                            covered_obligations=root_coverage,
+                        ),
+                    ),
+                ),
+                ReadinessEvent(
+                    producers=(producer(nested_key_domain),),
+                    consumers=(
+                        ReadinessConsumer(
+                            consumer_root=1,
+                            consumer_site_id=2,
+                            keys_by_consumer=_full_point_map(
+                                nested_domain,
+                                nested_key_domain,
+                                coordinate_axis_symbol(20),
+                            ),
+                            covered_obligations=frozenset((nested_obligation,)),
+                        ),
+                    ),
+                ),
+            )
+
+        incomplete = graph(frozenset((root_obligation,)))
+        baseline = _build_baseline_worker_schedule(
+            incomplete.root_domains,
+            incomplete.root_task_orders,
+            worker_count=4,
+        )
+        self.assertEqual(derive_final_arrival_continuations(incomplete, baseline), ())
+
+        complete = graph(frozenset((root_obligation, nested_obligation)))
+        continuations = derive_final_arrival_continuations(complete, baseline)
+        self.assertEqual(
+            continuations,
+            (FinalArrivalContinuation(event_id=0, consumer_index=0),),
+        )
+        (counter,) = choose_readiness_counters(complete, continuations)
+        self.assertEqual(counter.continuation_consumer_index, 0)
+        self.assertEqual(len(counter.consumers), 1)
+        self.assertIsNone(counter.consumers[0].consumer_site_id)
+
+    def test_root_projection_unions_all_nested_sites_or_keeps_barrier(self) -> None:
+        def dependency_graph(
+            *, second_outer_stride: int = 16, second_inner_stride: int = 4
+        ):
+            graph = _dependency_graph(
+                [[10], [20]],
+                _access(root=0, kind="store", shape=(64,), block_ids=(10,)),
+                _access(
+                    root=1,
+                    kind="load",
+                    shape=(64,),
+                    block_ids=(None,),
+                    offsets=(None,),
+                    affine_subscript_ranges=((((20, 16), (21, 4)), 0, 4, 1),),
+                ),
+                _access(
+                    root=1,
+                    kind="load",
+                    shape=(64,),
+                    block_ids=(None,),
+                    offsets=(None,),
+                    affine_subscript_ranges=(
+                        (
+                            ((20, second_outer_stride), (22, second_inner_stride)),
+                            0,
+                            4,
+                            1,
+                        ),
+                    ),
+                ),
+            )
+            return dataclasses.replace(
+                graph,
+                execution_sites=(
+                    ExecutionSite(0, 0, 0, (), None, "root", (10,), (10,), True, False),
+                    ExecutionSite(1, 1, 1, (), None, "root", (20,), (20,), True, False),
+                    ExecutionSite(
+                        2,
+                        1,
+                        2,
+                        ((0, 0),),
+                        1,
+                        "loop",
+                        (21,),
+                        (20, 21),
+                        True,
+                        False,
+                    ),
+                    ExecutionSite(
+                        3,
+                        1,
+                        3,
+                        ((1, 0),),
+                        1,
+                        "loop",
+                        (22,),
+                        (20, 22),
+                        True,
+                        False,
+                    ),
+                ),
+                site_ids_by_access=((0,), (2,), (3,)),
+            )
+
+        root_domains = (_domain((10, 64, 1)), _domain((20, 3, 1)))
+        axis_geometry = {10: (64, 1), 20: (3, 1), 21: (4, 1), 22: (4, 1)}
+        complete_graph = dependency_graph()
+        complete = _configured_readiness_graph(
+            complete_graph,
+            root_domains,
+            axis_geometry=axis_geometry,
+        )
+        self.assertEqual(len(complete.events), 1)
+        root_event = next(
+            event
+            for event in complete.events
+            if any(consumer.consumer_site_id is None for consumer in event.consumers)
+        )
+        root_consumer = next(
+            consumer
+            for consumer in root_event.consumers
+            if consumer.consumer_site_id is None
+        )
+        self.assertEqual(len(root_event.consumers), 1)
+        all_obligations = frozenset(
+            obligation
+            for edge in complete_graph.edges
+            for dependency in edge.access_dependencies
+            for obligation in complete_graph.dependency_obligations(dependency)
+        )
+        self.assertEqual(root_consumer.covered_obligations, all_obligations)
+        self.assertEqual(
+            _expected_arrivals(
+                root_event.readiness_key_domain,
+                root_event.producers,
+            ),
+            (16, 16, 16),
+        )
+        baseline = _build_baseline_worker_schedule(
+            complete.root_domains,
+            complete.root_task_orders,
+            worker_count=8,
+        )
+        self.assertEqual(
+            len(derive_final_arrival_continuations(complete, baseline)),
+            1,
+        )
+
+        # Width four with a stride-five nested axis is valid at each nested
+        # site, but its root projection is gapped and cannot join the event.
+        incomplete_graph = dependency_graph(
+            second_outer_stride=19,
+            second_inner_stride=5,
+        )
+        incomplete = _configured_readiness_graph(
+            incomplete_graph,
+            root_domains,
+            axis_geometry=axis_geometry,
+        )
+        incomplete_root = next(
+            event
+            for event in incomplete.events
+            if event.root_barrier_producer_root is None
+        )
+        fallback = next(
+            event
+            for event in incomplete.events
+            if event.root_barrier_producer_root is not None
+        )
+        incomplete_root_consumer = incomplete_root.consumers[0]
+        self.assertEqual(len(incomplete_root_consumer.covered_obligations), 1)
+        self.assertEqual(fallback.root_barrier_producer_root, 0)
+        self.assertEqual(len(fallback.consumers), 1)
+        self.assertEqual(
+            fallback.consumers[0].covered_obligations,
+            all_obligations - incomplete_root_consumer.covered_obligations,
+        )
 
     def test_large_final_arrival_continuation_ignores_downstream_event_granularity(
         self,

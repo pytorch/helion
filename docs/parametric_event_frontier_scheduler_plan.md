@@ -27,6 +27,14 @@ Implementation checkpoint (2026-09-08):
   per key executes as the existing final-arrival continuation. Parameterized
   counters use one 64-bit epoch-framed state allocation across changing
   extents and counter-section offsets.
+- A root-level fixed-width readiness event may now subsume equivalent accesses
+  inside fixed-trip nested loops. The proof projects only statically bounded
+  inner axes, retains runtime outer axes symbolically, and requires the root
+  event to cover every nested memory obligation before removing nested waits.
+  Fixed-capacity scratch is accepted only when the existing shape environment
+  proves its dominating source guard; unknown bounds conservatively decline.
+  A dynamic-batch Q1/H16 MLA probe reuses one cubin across B=1,2,4,9 and lowers
+  its nested C4 reducer as an exact fan-in-16 final-arrival continuation.
 - The first parametric event-frontier recurrence is implemented for a unique
   topological chain of equal-size canonical rank-one roots joined by those
   exact fan-in-one events. The existing segment relations are the certificate,

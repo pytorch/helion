@@ -1434,6 +1434,16 @@ class CompileEnvironment:
             return bool(res)
         return a == b
 
+    def known_nonnegative(self, expression: sympy.Expr) -> bool:
+        """Prove ``expression >= 0`` without adding a specialization guard."""
+        expression = self.shape_env.simplify(sympy.simplify(expression))
+        if expression.is_nonnegative is True:
+            return True
+        if not expression.free_symbols.issubset(self.shape_env.var_to_range):
+            return False
+        result = self.shape_env._maybe_evaluate_static(sympy.Ge(expression, 0))
+        return result is sympy.true
+
     def known_multiple(self, a: sympy.Expr, b: int | torch.SymInt) -> bool:
         if isinstance(a, (int, sympy.Integer)) and isinstance(b, int):
             return (int(a) % b) == 0

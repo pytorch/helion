@@ -7,6 +7,7 @@ import heapq
 import itertools
 import math
 import operator
+from typing import TYPE_CHECKING
 from typing import cast
 
 import sympy
@@ -25,6 +26,9 @@ from .tile_dependency import coordinate_axis_symbol
 from .tile_dependency import instantiate_symbolic_dependencies
 from .tile_dependency import nested_logical_axes
 from .tile_dependency import pid_task_order
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 WorkerInterval = tuple[int, int]
 
@@ -3637,6 +3641,7 @@ def build_readiness_events(
     root_domains: tuple[CoordinateDomain, ...],
     site_domains: tuple[CoordinateDomain | None, ...],
     publishable_site_ids: frozenset[int] | None = None,
+    prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
 ) -> tuple[ReadinessEvent, ...]:
     """Build canonical symbolic readiness events from memory dependencies.
 
@@ -3648,6 +3653,7 @@ def build_readiness_events(
         dependency_graph,
         root_domains=root_domains,
         site_domains=site_domains,
+        prove_nonnegative=prove_nonnegative,
     )
     site_by_id = {site.site_id: site for site in dependency_graph.execution_sites}
     exact_dependencies = tuple(
@@ -4130,6 +4136,7 @@ def build_readiness_graph(
     root_task_orders: tuple[CoordinateRelation, ...],
     site_domains: tuple[CoordinateDomain | None, ...],
     publishable_site_ids: frozenset[int] | None = None,
+    prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
 ) -> ReadinessGraph:
     """Bind the symbolic readiness DAG for one selected configuration."""
     root_domains = tuple(task_order.target_domain for task_order in root_task_orders)
@@ -4138,6 +4145,7 @@ def build_readiness_graph(
         root_domains=root_domains,
         site_domains=site_domains,
         publishable_site_ids=publishable_site_ids,
+        prove_nonnegative=prove_nonnegative,
     )
     return ReadinessGraph(
         root_task_orders=root_task_orders,
@@ -4153,10 +4161,9 @@ def derive_final_arrival_continuations(
     required_obligations_by_root: dict[int, set[DependencyObligation]] = {}
     for event in readiness_graph.events:
         for readiness_consumer in event.consumers:
-            if readiness_consumer.consumer_site_id is None:
-                required_obligations_by_root.setdefault(
-                    readiness_consumer.consumer_root, set()
-                ).update(readiness_consumer.covered_obligations)
+            required_obligations_by_root.setdefault(
+                readiness_consumer.consumer_root, set()
+            ).update(readiness_consumer.covered_obligations)
 
     candidates: list[
         tuple[
@@ -6938,6 +6945,7 @@ def build_static_pipeline_plan(
     worker_count: int,
     publishable_site_ids: frozenset[int] | None = None,
     allow_transient_source: bool = False,
+    prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
 ) -> StaticPipelinePlan:
     """Derive all generic readiness strategies without inspecting root bodies."""
     root_domains = tuple(task_order.target_domain for task_order in root_task_orders)
@@ -6958,17 +6966,11 @@ def build_static_pipeline_plan(
             root_task_orders=root_task_orders,
             site_domains=site_domains,
             publishable_site_ids=publishable_site_ids,
-        )
-        nested_wait_roots = frozenset(
-            readiness_consumer.consumer_root
-            for event in readiness_graph.events
-            for readiness_consumer in event.consumers
-            if readiness_consumer.consumer_site_id is not None
+            prove_nonnegative=prove_nonnegative,
         )
         continuation_candidates = choose_final_arrival_continuations(
             readiness_graph,
             worker_schedule,
-            excluded_roots=nested_wait_roots,
         )
         sink_roots = frozenset(range(len(root_domains))) - frozenset(
             edge.producer_root for edge in dependency_graph.edges
@@ -7043,6 +7045,7 @@ def build_static_pipeline_plan(
         root_task_orders=root_task_orders,
         site_domains=site_domains,
         publishable_site_ids=publishable_site_ids,
+        prove_nonnegative=prove_nonnegative,
     )
     try:
         (

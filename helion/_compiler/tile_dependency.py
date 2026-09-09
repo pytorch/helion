@@ -16,6 +16,7 @@ from .. import exc
 
 if TYPE_CHECKING:
     import ast
+    from collections.abc import Callable
     from collections.abc import Mapping
 
     from .device_ir import DeviceIR
@@ -34,6 +35,16 @@ AffineSubscriptRange = tuple[tuple[tuple[int, int], ...], int, int, int]
 # integers. Runtime validation in ``_integer_expression`` keeps this alias
 # narrow while avoiding a false type-error fanout through concrete-only code.
 IntegerExpression = Any
+
+
+def _is_provably_nonnegative(
+    expression: sympy.Expr,
+    prove_nonnegative: Callable[[sympy.Expr], bool] | None,
+) -> bool:
+    """Use intrinsic SymPy facts, then an optional enclosing shape proof."""
+    return expression.is_nonnegative is True or (  # pyrefly: ignore[missing-attribute]
+        prove_nonnegative is not None and prove_nonnegative(expression)
+    )
 
 
 def _integer_expression(value: IntegerExpression, *, description: str) -> sympy.Expr:
@@ -839,9 +850,10 @@ class CoordinateRelation:
         source_domain: CoordinateDomain,
     ) -> CoordinateRelation | None:
         """Union dropped source axes when their images remain rectilinear."""
-        current_counts = self.source_domain.axis_counts
+        current_counts = self.source_domain.axis_count_expressions
         if any(
-            axis not in current_counts or current_counts[axis] != count
+            axis not in current_counts
+            or sympy.simplify(current_counts[axis] - count) != 0
             for axis, count in source_domain.axis_counts_items
         ):
             return None
@@ -877,7 +889,7 @@ class CoordinateRelation:
                 if not eliminated_axes:
                     target_ranges.append((target_axis, begin, end, target_step))
                     continue
-                if len(eliminated_axes) != 1 or expression_axes & retained_axes:
+                if len(eliminated_axes) != 1:
                     return None
                 (eliminated_axis,) = eliminated_axes
                 if eliminated_axis in eliminated_uses:
@@ -885,23 +897,54 @@ class CoordinateRelation:
                     # creates a diagonal rather than a Cartesian product.
                     return None
                 eliminated_uses.add(eliminated_axis)
-                interval = _single_axis_interval(
-                    begin,
-                    end,
-                    domain=self.source_domain,
+                eliminated_symbol = coordinate_axis_symbol(eliminated_axis)
+                expanded_begin = sympy.expand(begin)
+                stride_expression = expanded_begin.coeff(eliminated_symbol)
+                base_expression = sympy.simplify(
+                    expanded_begin - stride_expression * eliminated_symbol
                 )
-                if interval is None or target_step != 1:
+                width_expression = sympy.simplify(end - begin)  # pyrefly: ignore[unsupported-operation]
+                if (
+                    target_step != 1
+                    or stride_expression.free_symbols
+                    or width_expression.free_symbols
+                    or stride_expression.is_integer is not True
+                    or width_expression.is_integer is not True
+                    or eliminated_symbol in base_expression.free_symbols
+                ):
                     return None
-                interval_axis, stride, offset, width = interval
-                if interval_axis != eliminated_axis:
+                stride = int(stride_expression)
+                width = int(width_expression)
+                if stride <= 0 or width <= 0:
                     return None
                 source_begin, source_end, source_step = source_bounds[eliminated_axis]
+                try:
+                    concrete_source_begin = _concrete_integer(
+                        source_begin,
+                        description="projected source begin",
+                    )
+                    concrete_source_end = _concrete_integer(
+                        source_end,
+                        description="projected source end",
+                    )
+                except ValueError:
+                    # Retained axes may be parameterized, but eliminating a
+                    # runtime-sized axis would require a non-static union.
+                    return None
+                if concrete_source_end <= concrete_source_begin:
+                    return None
                 final_source = (
-                    source_begin
-                    + (source_end - source_begin - 1) // source_step * source_step
+                    concrete_source_begin
+                    + (concrete_source_end - concrete_source_begin - 1)
+                    // source_step
+                    * source_step
                 )
-                projected_begin = sympy.Integer(offset + source_begin * stride)
-                projected_end = sympy.Integer(offset + final_source * stride + width)
+                projected_begin = sympy.simplify(
+                    base_expression + concrete_source_begin * stride
+                )
+                projected_end = sympy.simplify(
+                    base_expression + final_source * stride + width
+                )
                 if width == stride * source_step:
                     projected_step = 1
                 elif width == 1:
@@ -3241,7 +3284,7 @@ def _logical_expression_bounds(
     expression: sympy.Expr,
     *,
     domain: CoordinateDomain,
-    source_bounds: tuple[tuple[int, int, int, int], ...],
+    source_bounds: tuple[tuple[int, IntegerExpression, IntegerExpression, int], ...],
     symbol_substitutions: dict[sympy.Basic, sympy.Expr] | None = None,
 ) -> tuple[sympy.Expr, sympy.Expr] | None:
     """Return conservative inclusive bounds for the restricted expression IR."""
@@ -3271,7 +3314,7 @@ def _logical_expression_bounds(
             if bound_axis == axis
         )
         final = begin + (end - begin - 1) // step * step
-        return sympy.Integer(begin), sympy.Integer(final)
+        return sympy.sympify(begin), sympy.sympify(final)
     if isinstance(expression, sympy.Add):
         child_bounds = tuple(
             _logical_expression_bounds(
@@ -3901,6 +3944,8 @@ def _static_affine_coefficients(
 def _dense_linear_overlap_relation(
     producer_relation: CoordinateRelation,
     consumer_relation: CoordinateRelation,
+    *,
+    prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
 ) -> CoordinateRelation | None:
     """Map exact linear-view accesses back to a dense producer task grid.
 
@@ -3917,12 +3962,12 @@ def _dense_linear_overlap_relation(
     ):
         return None
     producer_domain = producer_relation.source_domain
+    producer_counts = producer_domain.axis_count_expressions
     producer_piece = producer_relation.pieces[0]
     if (
         producer_piece.source_bounds_items
         != tuple(
-            (axis, 0, producer_domain.axis_counts[axis], 1)
-            for axis in producer_domain.axis_order
+            (axis, 0, producer_counts[axis], 1) for axis in producer_domain.axis_order
         )
         or len(producer_piece.target_ranges) != 1
     ):
@@ -3945,28 +3990,41 @@ def _dense_linear_overlap_relation(
             (
                 axis
                 for axis in producer_domain.axis_order
-                if producer_domain.axis_counts[axis] != 1
+                if sympy.simplify(producer_counts[axis] - 1) != 0
             ),
             key=coefficients.__getitem__,
         )
     )
-    dense_span = producer_width
+    dense_span: sympy.Expr = sympy.Integer(producer_width)
     tile_strides: dict[int, int] = {}
     for axis in active_axes:
-        if coefficients[axis] != dense_span:
+        if (
+            sympy.simplify(
+                coefficients[axis] - dense_span  # pyrefly: ignore[unsupported-operation]
+            )
+            != 0
+        ):
             return None
-        tile_strides[axis] = dense_span // producer_width
-        dense_span *= producer_domain.axis_counts[axis]
+        tile_stride = sympy.simplify(dense_span / producer_width)  # pyrefly: ignore[unsupported-operation]
+        if not isinstance(tile_stride, sympy.Integer):
+            return None
+        tile_strides[axis] = int(tile_stride)
+        dense_span = sympy.simplify(dense_span * producer_counts[axis])
     if any(
         coefficients[axis] != 0
         for axis in producer_domain.axis_order
-        if producer_domain.axis_counts[axis] == 1
+        if sympy.simplify(producer_counts[axis] - 1) == 0
     ):
         return None
-    allocation_count = producer_relation.target_domain.axis_counts[
+    allocation_count = producer_relation.target_domain.axis_count_expressions[
         _ALLOCATION_ADDRESS_AXIS
     ]
-    if producer_offset < 0 or producer_offset + dense_span > allocation_count:
+    remaining_allocation = sympy.simplify(
+        allocation_count - producer_offset - dense_span
+    )
+    if producer_offset < 0 or not _is_provably_nonnegative(
+        remaining_allocation, prove_nonnegative
+    ):
         return None
 
     pieces: list[_CoordinateRelationPiece] = []
@@ -3993,9 +4051,13 @@ def _dense_linear_overlap_relation(
         if (
             begin_bounds is None
             or last_bounds is None
-            or begin_bounds[0].is_nonnegative is not True
-            or sympy.simplify(dense_span - 1 - last_bounds[1]).is_nonnegative
-            is not True
+            or not _is_provably_nonnegative(begin_bounds[0], prove_nonnegative)
+            or not _is_provably_nonnegative(
+                sympy.simplify(
+                    dense_span - 1 - last_bounds[1]  # pyrefly: ignore[unsupported-operation]
+                ),
+                prove_nonnegative,
+            )
             or not isinstance(width_expr, sympy.Integer)
         ):
             return None
@@ -4033,13 +4095,17 @@ def _dense_linear_overlap_relation(
 
         target_ranges: dict[int, tuple[sympy.Expr, sympy.Expr, int]] = {}
         for axis in producer_domain.axis_order:
-            if producer_domain.axis_counts[axis] == 1:
-                coordinate = sympy.Integer(0)
+            producer_count = producer_counts[axis]
+            if sympy.simplify(producer_count - 1) == 0:
+                coordinate: sympy.Expr = sympy.Integer(0)
             else:
                 tile_stride = tile_strides[axis]
-                coordinate = sympy.Mod(
-                    sympy.floor(first_ordinal / tile_stride),
-                    producer_domain.axis_counts[axis],
+                coordinate = cast(
+                    "sympy.Expr",
+                    sympy.Mod(
+                        sympy.floor(first_ordinal / tile_stride),
+                        producer_count,
+                    ),
                 )
                 for _ in range(2):
                     coordinate = _simplify_logical_expression(
@@ -4055,11 +4121,11 @@ def _dense_linear_overlap_relation(
             )
             if (
                 coordinate_bounds is None
-                or coordinate_bounds[0].is_nonnegative is not True
-                or sympy.simplify(
-                    producer_domain.axis_counts[axis] - count - coordinate_bounds[1]
-                ).is_nonnegative
-                is not True
+                or not _is_provably_nonnegative(coordinate_bounds[0], prove_nonnegative)
+                or not _is_provably_nonnegative(
+                    sympy.simplify(producer_count - count - coordinate_bounds[1]),
+                    prove_nonnegative,
+                )
             ):
                 return None
             target_ranges[axis] = (
@@ -4099,7 +4165,10 @@ def _dense_linear_overlap_relation(
                         axis != right_axis
                         or left_step != 1
                         or right_step != 1
-                        or sympy.simplify(left_end - right_begin) != 0
+                        or sympy.simplify(
+                            left_end - right_begin  # pyrefly: ignore[unsupported-operation]
+                        )
+                        != 0
                     ):
                         differing_axes.append(axis)
                         continue
@@ -6334,6 +6403,7 @@ def _symbolic_linear_access_relation(
     *,
     source_domain: CoordinateDomain,
     allocation_domain: CoordinateDomain,
+    prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
 ) -> CoordinateRelation | None:
     """Map a provably contiguous view tile to linear allocation addresses."""
     if (
@@ -6356,7 +6426,7 @@ def _symbolic_linear_access_relation(
         (stride,) = access.tensor_strides
         if stride <= 0:
             return None
-        source_counts = source_domain.axis_counts
+        source_counts = source_domain.axis_count_expressions
         source_bounds = tuple(
             (axis, 0, source_counts[axis], 1) for axis in source_domain.axis_order
         )
@@ -6381,11 +6451,16 @@ def _symbolic_linear_access_relation(
             for axis, coefficient in coefficients:
                 if coefficient < 0:
                     return None
-                index_begin += coefficient * coordinate_axis_symbol(axis)
-                maximum_index += coefficient * (source_counts[axis] - 1)
-            if offset_begin < 0 or maximum_index >= access.tensor_shape[0]:
+                index_begin += coefficient * coordinate_axis_symbol(axis)  # pyrefly: ignore[unsupported-operation]
+                maximum_index += coefficient * (source_counts[axis] - 1)  # pyrefly: ignore[unsupported-operation]
+            remaining = sympy.simplify(  # pyrefly: ignore[unsupported-operation]
+                access.tensor_shape[0] - 1 - maximum_index
+            )
+            if offset_begin < 0 or not _is_provably_nonnegative(
+                remaining, prove_nonnegative
+            ):
                 return None
-            address_begin = access.storage_offset + index_begin * stride
+            address_begin = access.storage_offset + index_begin * stride  # pyrefly: ignore[unsupported-operation]
             pieces.append(
                 _CoordinateRelationPiece(
                     source_bounds_items=source_bounds,
@@ -6435,12 +6510,15 @@ def _symbolic_linear_access_relation(
                 if offset is None:
                     return None
                 final_end = (
-                    (source_domain.axis_counts[axis] - 1)
+                    (source_domain.axis_count_expressions[axis] - 1)
                     * (1 if access.subscript_is_scalar[position] else width)
                     + offset
                     + width
                 )
-                if offset < 0 or final_end > size:
+                remaining = sympy.simplify(size - final_end)
+                if offset < 0 or not _is_provably_nonnegative(
+                    remaining, prove_nonnegative
+                ):
                     return None
         intervals.append(interval)
         widths.append(width)
@@ -6470,7 +6548,7 @@ def _symbolic_linear_access_relation(
         pieces=(
             _CoordinateRelationPiece(
                 source_bounds_items=tuple(
-                    (axis, 0, source_domain.axis_counts[axis], 1)
+                    (axis, 0, source_domain.axis_count_expressions[axis], 1)
                     for axis in source_domain.axis_order
                 ),
                 target_ranges=(
@@ -6492,6 +6570,7 @@ def _symbolic_producers_by_consumer(
     producer_domain: CoordinateDomain,
     consumer_access: TileAccess,
     consumer_domain: CoordinateDomain,
+    prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
 ) -> CoordinateRelation | None:
     """Compose two site-to-allocation maps into exact producer dependencies."""
     if not producer_access.layout_is_static or not consumer_access.layout_is_static:
@@ -6531,13 +6610,6 @@ def _symbolic_producers_by_consumer(
             if relation is not None:
                 return relation
 
-    if producer_domain.parameter_symbols or consumer_domain.parameter_symbols:
-        # The legacy linear-address fallback relies on concrete allocation
-        # bounds.  A parameterized access that the coordinate proof above
-        # cannot represent must conservatively retain its root barrier rather
-        # than specializing or sampling a runtime shape.
-        return None
-
     producer_storage_size = _allocation_storage_size(producer_access)
     consumer_storage_size = _allocation_storage_size(consumer_access)
     if producer_storage_size is None or consumer_storage_size is None:
@@ -6557,18 +6629,24 @@ def _symbolic_producers_by_consumer(
         producer_access,
         source_domain=producer_domain,
         allocation_domain=linear_domain,
+        prove_nonnegative=prove_nonnegative,
     )
     consumer_relation = _symbolic_linear_access_relation(
         consumer_access,
         source_domain=consumer_domain,
         allocation_domain=linear_domain,
+        prove_nonnegative=prove_nonnegative,
     )
     if producer_relation is None or consumer_relation is None:
         return None
     relation = producer_relation.overlapping_sources(consumer_relation)
     if relation is not None:
         return relation
-    return _dense_linear_overlap_relation(producer_relation, consumer_relation)
+    return _dense_linear_overlap_relation(
+        producer_relation,
+        consumer_relation,
+        prove_nonnegative=prove_nonnegative,
+    )
 
 
 def _coordinate_domain_for_axes(
@@ -6659,6 +6737,7 @@ def instantiate_symbolic_dependencies(
     *,
     root_domains: tuple[CoordinateDomain | None, ...],
     site_domains: tuple[CoordinateDomain | None, ...],
+    prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
 ) -> tuple[TileDependencyRelation, ...]:
     """Instantiate site dependencies without enumerating task instances.
 
@@ -6736,6 +6815,7 @@ def instantiate_symbolic_dependencies(
                                     producer_domain=producer_domain,
                                     consumer_access=consumer_access,
                                     consumer_domain=consumer_domain,
+                                    prove_nonnegative=prove_nonnegative,
                                 )
                                 if axes_have_canonical_origins
                                 else None
@@ -6771,6 +6851,8 @@ def consumer_to_preceding_site_relation(
         preceding_site.root != consumer_site.root
         or preceding_domain is None
         or consumer_domain is None
+        or preceding_domain.parameter_symbols
+        or consumer_domain.parameter_symbols
     ):
         return None
     try:

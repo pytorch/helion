@@ -11,6 +11,7 @@ import torch
 
 import helion
 from helion import exc
+from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.device_ir_analysis import DeviceIRAnalysis
 from helion._compiler.tile_dependency import AllocationRegion
 from helion._compiler.tile_dependency import CoordinateDomain
@@ -196,12 +197,15 @@ def _root_producers_by_consumer(
 def _symbolic_root_relation(
     plan,
     axis_geometry: dict[int, tuple[int, int]],
+    *,
+    prove_nonnegative=None,
 ):
     root_domains, site_domains = _configured_domains(plan, axis_geometry)
     dependencies = instantiate_symbolic_dependencies(
         plan,
         root_domains=root_domains,
         site_domains=site_domains,
+        prove_nonnegative=prove_nonnegative,
     )
     self_relations = tuple(
         dependency.producers_by_consumer
@@ -1319,6 +1323,230 @@ class TestTileDependency(TestCase):
             (frozenset((0,)), frozenset((1,))),
         )
         self.assertIsNone(large.project_source(retained))
+
+    def test_project_source_keeps_symbolic_outer_axis_and_unions_static_inner(
+        self,
+    ) -> None:
+        key_count = sympy.Symbol("key_count", integer=True, nonnegative=True)
+        source = CoordinateDomain(
+            (10, 11),
+            ((10, key_count), (11, 4)),
+            kind="site",
+        )
+        retained = CoordinateDomain(
+            (10,),
+            ((10, key_count),),
+            kind="site",
+        )
+        producer = CoordinateDomain(
+            (20,),
+            ((20, 4 * key_count),),
+            kind="site",
+        )
+        outer = coordinate_axis_symbol(10)
+        inner = coordinate_axis_symbol(11)
+        relation = CoordinateRelation.point_map(
+            source,
+            producer,
+            (
+                (
+                    ((10, 0, key_count, 1), (11, 0, 4, 1)),
+                    (4 * outer + inner,),
+                ),
+            ),
+        )
+
+        projected = relation.project_source(retained)
+
+        self.assertIsNotNone(projected)
+        assert projected is not None
+        self.assertEqual(
+            projected.pieces,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 0, key_count, 1),),
+                    ((20, 4 * outer, 4 * outer + 4, 1),),
+                ),
+            ),
+        )
+        for concrete_count in (0, 1, 5):
+            concrete = projected.substitute_parameters({key_count: concrete_count})
+            self.assertEqual(
+                concrete.materialize(),
+                tuple(
+                    frozenset(range(4 * key, 4 * key + 4))
+                    for key in range(concrete_count)
+                ),
+            )
+
+    def test_project_source_exact_nested_c4_and_rejects_nonrectangular_union(
+        self,
+    ) -> None:
+        key_count = sympy.Symbol("key_count", integer=True, nonnegative=True)
+        source = CoordinateDomain(
+            (10, 11),
+            ((10, key_count), (11, 4)),
+            kind="site",
+        )
+        retained = CoordinateDomain((10,), ((10, key_count),), kind="site")
+        producer = CoordinateDomain(
+            (20,),
+            ((20, 16 * key_count),),
+            kind="site",
+        )
+        key = coordinate_axis_symbol(10)
+        split = coordinate_axis_symbol(11)
+        begin = 16 * key + 4 * split
+        relation = CoordinateRelation(
+            source,
+            producer,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 0, key_count, 1), (11, 0, 4, 1)),
+                    ((20, begin, begin + 4, 1),),
+                ),
+            ),
+        )
+
+        projected = relation.project_source(retained)
+
+        self.assertIsNotNone(projected)
+        assert projected is not None
+        self.assertEqual(
+            projected.pieces,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 0, key_count, 1),),
+                    ((20, 16 * key, 16 * key + 16, 1),),
+                ),
+            ),
+        )
+
+        gapped = dataclasses.replace(
+            relation,
+            pieces=(
+                _CoordinateRelationPiece(
+                    ((10, 0, key_count, 1), (11, 0, 4, 1)),
+                    ((20, begin, begin + 2, 1),),
+                ),
+            ),
+        )
+        self.assertIsNone(gapped.project_source(retained))
+
+        diagonal_target = CoordinateDomain(
+            (20, 21),
+            ((20, 16 * key_count), (21, 16 * key_count)),
+            kind="site",
+        )
+        diagonal = CoordinateRelation(
+            source,
+            diagonal_target,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 0, key_count, 1), (11, 0, 4, 1)),
+                    (
+                        (20, begin, begin + 4, 1),
+                        (21, begin, begin + 4, 1),
+                    ),
+                ),
+            ),
+        )
+        self.assertIsNone(diagonal.project_source(retained))
+
+        dynamic_inner = sympy.Symbol("dynamic_inner", integer=True, nonnegative=True)
+        dynamic_source = CoordinateDomain(
+            (10, 11),
+            ((10, key_count), (11, dynamic_inner)),
+            kind="site",
+        )
+        dynamic_relation = dataclasses.replace(
+            relation,
+            source_domain=dynamic_source,
+            pieces=(
+                _CoordinateRelationPiece(
+                    ((10, 0, key_count, 1), (11, 0, dynamic_inner, 1)),
+                    ((20, begin, begin + 4, 1),),
+                ),
+            ),
+        )
+        self.assertIsNone(dynamic_relation.project_source(retained))
+
+    def test_symbolic_fixed_capacity_requires_explicit_bound_proof(self) -> None:
+        key_count = sympy.Symbol("key_count", integer=True, nonnegative=True)
+        plan = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    shape=(32,),
+                    strides=(1,),
+                    block_ids=(10,),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    shape=(16, 2),
+                    strides=(2, 1),
+                    block_ids=(20, None),
+                    offsets=(0, None),
+                    full_slice=(False, True),
+                ),
+            ),
+            [[10], [20]],
+        )
+        geometry = {10: (2 * key_count, 1), 20: (key_count, 1)}
+
+        self.assertIsNone(_symbolic_root_relation(plan, geometry))
+
+        proved_expressions: list[sympy.Expr] = []
+
+        def prove_under_key_bound(expression: sympy.Expr) -> bool:
+            proved_expressions.append(expression)
+            polynomial = sympy.Poly(expression, key_count)
+            return polynomial.degree() <= 1 and all(
+                sympy.sympify(expression.subs(key_count, value)).is_nonnegative is True
+                for value in (0, 16)
+            )
+
+        relation = _symbolic_root_relation(
+            plan,
+            geometry,
+            prove_nonnegative=prove_under_key_bound,
+        )
+
+        self.assertIsNotNone(relation)
+        assert relation is not None
+        self.assertIn(32 - 2 * key_count, proved_expressions)
+        self.assertEqual(
+            relation.substitute_parameters({key_count: 1}).materialize(),
+            (frozenset((0, 1)),),
+        )
+        self.assertIsNone(
+            _symbolic_root_relation(
+                plan,
+                geometry,
+                prove_nonnegative=lambda _expression: False,
+            )
+        )
+
+    def test_compile_environment_nonnegative_proof_uses_shape_ranges(self) -> None:
+        env = CompileEnvironment(torch.device("cpu"), helion.Settings(backend="triton"))
+        with env:
+            batch_size = env.create_unbacked_symint(hint=8)
+            batch = batch_size._sympy_()
+            env.shape_env.constrain_symbol_range(batch, 0, 16)
+            guards_before = tuple(env.shape_env.guards)
+
+            self.assertTrue(env.known_nonnegative(256 - 16 * batch))
+            self.assertFalse(env.known_nonnegative(255 - 16 * batch))
+            self.assertFalse(
+                env.known_nonnegative(
+                    1 - sympy.Symbol("foreign", integer=True, nonnegative=True)
+                )
+            )
+            self.assertEqual(tuple(env.shape_env.guards), guards_before)
 
     def test_factor_through_folds_only_small_bounded_constants(self) -> None:
         small = _bounded_coordinate_relation(64)
