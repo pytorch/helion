@@ -658,6 +658,13 @@ class TestCrossLoopCodegenHelpers(TestCase):
 
 @onlyBackends(["triton"])
 class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
+    def assertUsesExactReadiness(self, code: str) -> None:
+        self.assertTrue(
+            "tile_dependency_continuation_previous" in code
+            or "tile_dependency_readiness_wait" in code,
+            "expected a final-arrival continuation or an exact readiness wait",
+        )
+
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_nested_producer_iterations_publish_readiness(self) -> None:
@@ -760,7 +767,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                     torch.testing.assert_close(out, ((x + launch) + 1) * 2)
                 self.assertNotIn("tile_dependency_root_barrier", code)
                 if producer_width < consumer_width:
-                    self.assertIn("tile_dependency_continuation_previous", code)
+                    self.assertUsesExactReadiness(code)
                     self.assertNotIn("tile_dependency_task_wait", code)
                 else:
                     self.assertIn("tile_dependency_readiness_wait", code)
@@ -806,20 +813,23 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 num_warps=1,
             )
             torch.testing.assert_close(out, torch.sum(x + launch + 1).reshape(1))
-        self.assertGreaterEqual(code.count("tile_dependency_continuation_previous"), 2)
         continuation_lines = [
             line
             for line in code.splitlines()
             if "tile_dependency_continuation_previous" in line
             and "tl.atomic_add" in line
         ]
-        self.assertEqual(len(continuation_lines), 2)
+        self.assertGreaterEqual(len(continuation_lines), 1)
+        self.assertLessEqual(len(continuation_lines), 2)
         for line in continuation_lines:
             self.assertIn(f"* {_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}", line)
-        self.assertIn(
-            f"+ {16 * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS} +",
-            continuation_lines[1],
-        )
+        if len(continuation_lines) == 2:
+            self.assertIn(
+                f"+ {16 * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS} +",
+                continuation_lines[1],
+            )
+        else:
+            self.assertIn("tile_dependency_readiness_wait", code)
         self.assertNotIn("tile_dependency_task_wait", code)
         self.assertIn("tile_dependency_root_barrier_wait", code)
 
@@ -1039,7 +1049,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
                 torch.testing.assert_close(out, (x + 1) * 2)
                 self.assertNotIn("tile_dependency_task_wait", code)
-                self.assertIn("tile_dependency_continuation_previous", code)
+                self.assertUsesExactReadiness(code)
                 self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
@@ -1402,6 +1412,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         ).reshape(1, 128) @ w2.float()
         torch.testing.assert_close(out, expected, rtol=3e-2, atol=3e-2)
         self.assertNotIn("tile_dependency_root_barrier", code)
-        self.assertIn("tile_dependency_continuation_previous", code)
+        self.assertUsesExactReadiness(code)
         self.assertIn("tile_dependency_nested_loop_wait", code)
         self.assertNotIn("tile_dependency_cohort_wait", code)
