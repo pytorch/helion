@@ -839,6 +839,7 @@ class TestTritonTileDependencyLowering(TestCase):
         self.assertIn("tl.atomic_max", code)
         self.assertIn("tl.atomic_add", code)
         self.assertIn("tile_dependency_readiness_wait", code)
+        self.assertIn("2 * x_size_0 %", code)
         self.assertNotIn("tile_dependency_continuation", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
         self.assertNotIn("triton_helpers.x_grid_barrier(", code)

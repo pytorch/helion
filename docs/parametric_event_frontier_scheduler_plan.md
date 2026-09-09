@@ -1142,9 +1142,10 @@ static pipeline passes and reuses one binary across its declared shape guard.
 Implementation checkpoint (2026-09-08): the exit gate is satisfied for the
 minimal conservative slice. `CoordinateDomain` and `CoordinateRelation`
 preserve symbolic integer bounds while concrete enumeration remains explicit.
-Canonical rank-one roots are represented by two exact relation pieces per
-root (full waves plus a partial tail), and codegen strength-reduces that proved
-relation into runtime-bounded cyclic loops. Dynamic memory layouts are not
+Canonical rank-one roots are represented by exact relation pieces for an
+initial partial wave, full waves, and a final partial wave, and codegen
+strength-reduces that proved relation into runtime-bounded cyclic loops.
+Dynamic memory layouts are not
 specialized from hints: dependencies coarsen to root barriers, and every
 resident worker publishes once per producer root so epoch targets stay fixed
 while shapes vary between graph replays. At this checkpoint, exact
@@ -1255,9 +1256,37 @@ standalone arithmetic. On physical GPU 6, cold-L2 medians for B=1,2,4,9 were
 67.36/69.38/112.42/200.50 us persistent versus
 96.03/98.08/136.99/227.04 us matched two-launch Helion. All outputs were
 bit-exact and all four shapes reused one cubin. This validates the generic
-fan-out synchronization slice; its worker schedule is still the conservative
-parameterized root-major relation, not yet the full symbolic event-frontier
+fan-out synchronization slice. At that checkpoint its worker schedule was the
+wave-aligned parameterized root-major relation, not a symbolic event-frontier
 recurrence for unequal root extents.
+
+Implementation checkpoint (2026-09-09): parameterized root-major ownership
+is now globally slot-packed instead of rounding every root to a fresh worker
+wave. For root `r`, task `t` owns the single global slot
+
+```text
+slot(r, t) = sum(task_count(i), i < r) + t
+worker = slot % W
+wave = slot // W
+```
+
+This keeps every task of an earlier root before every task of a later root,
+so a waiting consumer cannot strand later producer work on its own resident
+worker. It only fills workers that would otherwise be idle in the preceding
+root's final partial wave. The existing `WorkerScheduleSegment.task_order`
+relation is still the sole ownership truth; codegen recognizes that exact
+three-piece relation and strength-reduces it to a rotated worker-strided loop.
+An explicit forward-root prerequisite check plus the existing full-residency
+launch contract supplies the progress certificate. There is no new schedule
+object, model gate, admission width, latency estimate, or host schedule.
+
+A more aggressive key-major ablation was rejected despite greater overlap: it
+measured 120.54/266.02 us at B4/B9 because reducers displaced later producer
+work and stretched the producer. Slot-packed root-major instead measured
+57.12/61.22/98.08/171.81 us at B1/B2/B4/B9 on physical GPU 6 versus
+95.84/98.05/136.96/225.41 us for matched standalone. GPU-7 Gantt traces show
+38.78 us of B4 overlap and 39.46 us of B9 overlap while preserving producer
+throughput; outputs are bit-exact and all shapes reuse one cubin.
 
 ### Phase 5: source-ticket generalization
 

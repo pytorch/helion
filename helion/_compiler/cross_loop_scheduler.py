@@ -1210,28 +1210,26 @@ def _is_rank_one_canonical_task_order(
 def _parametric_root_major_relation(
     schedule_domain: CoordinateDomain,
     target_domain: CoordinateDomain,
-    first_wave: sympy.Expr,
+    first_slot: sympy.Expr,
     worker_count: int,
 ) -> CoordinateRelation:
-    """Return one root's exact cyclic ownership relation."""
+    """Return one root's exact placement in a packed root-major stream."""
     launch_stage_axis, worker_axis, wave_axis = schedule_domain.axis_order
     worker = coordinate_axis_symbol(worker_axis)
     wave = coordinate_axis_symbol(wave_axis)
     task_count = target_domain.size_expr
-    full_waves = cast("sympy.Expr", FloorDiv(task_count, worker_count))
-    wave_count = _ceildiv_nonnegative_expression(task_count, worker_count)
-    logical_task = cast(
-        "sympy.Expr",
-        sympy.Add(
-            sympy.Mul(
-                sympy.Add(wave, sympy.Mul(-1, first_wave)),
-                worker_count,
-            ),
-            worker,
-        ),
+    first_wave = cast("sympy.Expr", FloorDiv(first_slot, worker_count))
+    first_worker = sympy.Mod(first_slot, worker_count)
+    first_count = sympy.Min(task_count, worker_count - first_worker)
+    remaining = sympy.simplify(task_count - first_count)
+    full_waves = cast("sympy.Expr", FloorDiv(remaining, worker_count))
+    tail_count = sympy.Mod(remaining, worker_count)
+    middle_wave_begin = sympy.simplify(first_wave + 1)
+    middle_wave_end = sympy.simplify(middle_wave_begin + full_waves)
+    final_wave_end = sympy.simplify(
+        middle_wave_end + _ceildiv_nonnegative_expression(tail_count, worker_count)
     )
-    full_wave_end = cast("sympy.Expr", sympy.Add(first_wave, full_waves))
-    root_wave_end = cast("sympy.Expr", sympy.Add(first_wave, wave_count))
+    logical_task = sympy.simplify(wave * worker_count + worker - first_slot)
     return CoordinateRelation.point_map(
         schedule_domain,
         target_domain,
@@ -1244,8 +1242,13 @@ def _parametric_root_major_relation(
                         _RESIDENT_LAUNCH_STAGE + 1,
                         1,
                     ),
-                    (worker_axis, 0, worker_count, 1),
-                    (wave_axis, first_wave, full_wave_end, 1),
+                    (
+                        worker_axis,
+                        first_worker,
+                        first_worker + first_count,
+                        1,
+                    ),
+                    (wave_axis, first_wave, first_wave + 1, 1),
                 ),
                 (logical_task,),
             ),
@@ -1257,13 +1260,21 @@ def _parametric_root_major_relation(
                         _RESIDENT_LAUNCH_STAGE + 1,
                         1,
                     ),
-                    (worker_axis, 0, sympy.Mod(task_count, worker_count), 1),
+                    (worker_axis, 0, worker_count, 1),
+                    (wave_axis, middle_wave_begin, middle_wave_end, 1),
+                ),
+                (logical_task,),
+            ),
+            (
+                (
                     (
-                        wave_axis,
-                        full_wave_end,
-                        root_wave_end,
+                        launch_stage_axis,
+                        _RESIDENT_LAUNCH_STAGE,
+                        _RESIDENT_LAUNCH_STAGE + 1,
                         1,
                     ),
+                    (worker_axis, 0, tail_count, 1),
+                    (wave_axis, middle_wave_end, final_wave_end, 1),
                 ),
                 (logical_task,),
             ),
@@ -1398,7 +1409,7 @@ def _parametric_root_major_schedule_geometry_from_parts(
 ) -> tuple[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr], ...] | None:
     """Recognize and prove the compiler's exact parametric root-major relation.
 
-    Each result item is ``(segment, first_wave, task_count)``. This structural
+    Each result item is ``(segment, first_slot, task_count)``. This structural
     proof is shared by schedule validation, barrier ownership, and codegen, so
     none of those consumers reconstructs a schedule from runtime shape hints.
     """
@@ -1420,7 +1431,7 @@ def _parametric_root_major_schedule_geometry_from_parts(
     ) or not _equal_integer_expressions(schedule_counts[worker_axis], worker_count):
         return None
 
-    first_wave: sympy.Expr = sympy.Integer(0)
+    first_slot: sympy.Expr = sympy.Integer(0)
     result: list[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr]] = []
     previous_root = -1
     for segment in segments:
@@ -1435,18 +1446,20 @@ def _parametric_root_major_schedule_geometry_from_parts(
             return None
         previous_root = segment.root
         task_count = target_domain.size_expr
-        wave_count = _ceildiv_nonnegative_expression(task_count, worker_count)
         if relation != _parametric_root_major_relation(
             schedule_domain,
             target_domain,
-            first_wave,
+            first_slot,
             worker_count,
         ):
             return None
-        result.append((segment, first_wave, task_count))
-        first_wave = sympy.simplify(sympy.Add(first_wave, wave_count))
+        result.append((segment, first_slot, task_count))
+        first_slot = sympy.simplify(sympy.Add(first_slot, task_count))
 
-    if not _equal_integer_expressions(schedule_counts[wave_axis], first_wave):
+    if not _equal_integer_expressions(
+        schedule_counts[wave_axis],
+        _ceildiv_nonnegative_expression(first_slot, worker_count),
+    ):
         return None
     return tuple(result)
 
@@ -2056,7 +2069,15 @@ def _build_parametric_root_major_worker_schedule(
     *,
     excluded_roots: frozenset[int] = frozenset(),
 ) -> WorkerSchedule:
-    """Build an exact O(roots) schedule over runtime root task counts."""
+    """Build an exact O(roots) packed schedule over runtime task counts.
+
+    Roots retain source order, but each starts at the immediately following
+    global slot rather than at a rounded wave boundary.  Consequently every
+    prerequisite edge still points from a smaller slot to a larger slot, while
+    otherwise idle workers may begin the next root during the preceding root's
+    final partial wave.  Full resident-worker admission makes that slot rank a
+    progress proof; runtime counters remain the readiness authority.
+    """
     if worker_count <= 0:
         raise ValueError(f"worker_count must be positive, got {worker_count}")
     if len(root_domains) != len(root_task_orders):
@@ -2085,28 +2106,27 @@ def _build_parametric_root_major_worker_schedule(
         default=0,
     )
     schedule_axes = (minimum_axis - 3, minimum_axis - 2, minimum_axis - 1)
-    first_wave: sympy.Expr = sympy.Integer(0)
-    root_first_waves: list[sympy.Expr] = []
+    first_slot: sympy.Expr = sympy.Integer(0)
+    root_first_slots: list[sympy.Expr] = []
     for _root, domain in scheduled_roots:
         task_count = domain.size_expr
-        wave_count = _ceildiv_nonnegative_expression(task_count, worker_count)
-        root_first_waves.append(first_wave)
-        first_wave = sympy.simplify(sympy.Add(first_wave, wave_count))
+        root_first_slots.append(first_slot)
+        first_slot = sympy.simplify(sympy.Add(first_slot, task_count))
     schedule_domain = _worker_schedule_domain(
         worker_count,
-        first_wave,
+        _ceildiv_nonnegative_expression(first_slot, worker_count),
         schedule_axes,
     )
     segments: list[WorkerScheduleSegment] = []
-    for (root, domain), root_first_wave in zip(
+    for (root, domain), root_first_slot in zip(
         scheduled_roots,
-        root_first_waves,
+        root_first_slots,
         strict=True,
     ):
         relation = _parametric_root_major_relation(
             schedule_domain,
             domain,
-            root_first_wave,
+            root_first_slot,
             worker_count,
         )
         segments.append(
@@ -2870,6 +2890,36 @@ def _emitted_prerequisites(
                 )
             )
     return tuple(result)
+
+
+def _parameterized_prerequisites_follow_root_order(
+    readiness_counters: tuple[ReadinessCounterPlan, ...],
+    root_barrier_edges: frozenset[tuple[int, int]],
+) -> bool:
+    """Prove every emitted wait points forward in packed root order.
+
+    Together with full resident-worker admission, this is the progress
+    certificate for sharing a physical wave at root boundaries: a waiting
+    task cannot precede any task that may release it on the same strand.
+    """
+    for prerequisite in _emitted_prerequisites(
+        readiness_counters,
+        root_barrier_edges,
+    ):
+        if prerequisite.barrier_producer_root is not None:
+            producer_roots = (prerequisite.barrier_producer_root,)
+        else:
+            assert prerequisite.counter_plan is not None
+            producer_roots = tuple(
+                producer.producer_root
+                for producer in prerequisite.counter_plan.producers
+            )
+        if any(
+            producer_root >= prerequisite.consumer_root
+            for producer_root in producer_roots
+        ):
+            return False
+    return True
 
 
 @cache
@@ -7028,6 +7078,13 @@ def build_static_pipeline_plan(
             dependency_graph=dependency_graph,
             readiness_counters=readiness_counters,
         )
+        if not _parameterized_prerequisites_follow_root_order(
+            readiness_counters,
+            root_barrier_edges,
+        ):
+            raise AssertionError(
+                "parameterized schedule has a backward root prerequisite"
+            )
         continuation_roots = frozenset(
             readiness_consumer.consumer_root
             for plan in readiness_counters

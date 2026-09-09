@@ -2650,7 +2650,7 @@ class TestCrossLoopScheduler(TestCase):
         assert geometry is not None
         self.assertEqual(len(schedule.segments), 2)
         self.assertTrue(
-            all(len(segment.task_order.pieces) == 2 for segment in schedule.segments)
+            all(len(segment.task_order.pieces) == 3 for segment in schedule.segments)
         )
         self.assertEqual(
             tuple(plan.participant_intervals for plan in publications),
@@ -2660,14 +2660,26 @@ class TestCrossLoopScheduler(TestCase):
             tuple(plan.resident_arrival_count for plan in publications),
             (4, 4),
         )
+        self.assertTrue(
+            cross_loop_scheduler._parameterized_prerequisites_follow_root_order(
+                (),
+                frozenset(((0, 1),)),
+            )
+        )
+        self.assertFalse(
+            cross_loop_scheduler._parameterized_prerequisites_follow_root_order(
+                (),
+                frozenset(((1, 0),)),
+            )
+        )
 
         launch_stage_axis, worker_axis, wave_axis = schedule.placement_domain.axis_order
         for concrete_counts in ((0, 0), (1, 3), (4, 5), (5, 8), (9, 1)):
             substitutions = dict(
                 zip((first_count, second_count), concrete_counts, strict=True)
             )
-            first_wave = 0
-            for root, (segment, _symbolic_first_wave, _task_count) in enumerate(
+            first_slot = 0
+            for root, (segment, _symbolic_first_slot, _task_count) in enumerate(
                 geometry
             ):
                 relation = segment.task_order.substitute_parameters(substitutions)
@@ -2700,11 +2712,94 @@ class TestCrossLoopScheduler(TestCase):
                 self.assertEqual(
                     actual_owners,
                     {
-                        task: (task % 4, first_wave + task // 4)
+                        task: (
+                            (first_slot + task) % 4,
+                            (first_slot + task) // 4,
+                        )
                         for task in range(expected_count)
                     },
                 )
-                first_wave += (expected_count + 3) // 4
+                first_slot += expected_count
+
+    def test_parametric_packed_root_major_handles_empty_and_excluded_roots(
+        self,
+    ) -> None:
+        counts = tuple(
+            sympy.Symbol(f"count_{root}", integer=True, nonnegative=True)
+            for root in range(4)
+        )
+        root_domains = _identify_root_domains(
+            tuple(
+                CoordinateDomain(
+                    (10 + root,),
+                    ((10 + root, count),),
+                    ((10 + root, 1),),
+                )
+                for root, count in enumerate(counts)
+            )
+        )
+        with _forbid_schedule_enumeration():
+            schedule = (
+                cross_loop_scheduler._build_parametric_root_major_worker_schedule(
+                    root_domains,
+                    _default_root_task_orders(root_domains),
+                    7,
+                    excluded_roots=frozenset((1,)),
+                )
+            )
+            geometry = cross_loop_scheduler._parametric_root_major_schedule_geometry(
+                schedule
+            )
+        self.assertIsNotNone(geometry)
+        assert geometry is not None
+        self.assertEqual(tuple(item[0].root for item in geometry), (0, 2, 3))
+
+        launch_axis, worker_axis, wave_axis = schedule.placement_domain.axis_order
+        for concrete_counts in (
+            (0, 0, 0, 0),
+            (1, 2, 3, 4),
+            (7, 0, 7, 1),
+            (8, 13, 2, 20),
+        ):
+            substitutions = dict(zip(counts, concrete_counts, strict=True))
+            expected_first_slot = 0
+            expected_wave_count = (
+                sum(concrete_counts[root] for root in (0, 2, 3)) + 6
+            ) // 7
+            for segment, symbolic_first_slot, _task_count in geometry:
+                self.assertEqual(
+                    int(sympy.simplify(symbolic_first_slot.xreplace(substitutions))),
+                    expected_first_slot,
+                )
+                relation = segment.task_order.substitute_parameters(substitutions)
+                self.assertEqual(
+                    relation.source_domain.axis_counts[wave_axis],
+                    expected_wave_count,
+                )
+                owners: dict[int, tuple[int, int]] = {}
+                for wave in range(expected_wave_count):
+                    for worker in range(7):
+                        for (task,) in relation.target_coordinates(
+                            {
+                                launch_axis: 1,
+                                worker_axis: worker,
+                                wave_axis: wave,
+                            }
+                        ):
+                            self.assertNotIn(task, owners)
+                            owners[task] = (worker, wave)
+                task_count = concrete_counts[segment.root]
+                self.assertEqual(
+                    owners,
+                    {
+                        task: (
+                            (expected_first_slot + task) % 7,
+                            (expected_first_slot + task) // 7,
+                        )
+                        for task in range(task_count)
+                    },
+                )
+                expected_first_slot += task_count
 
     def test_parametric_event_frontier_schedule_uses_exact_fan_in_one_counter(
         self,

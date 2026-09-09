@@ -2145,8 +2145,8 @@ def emit_cross_loop_schedule(
     )
     parameterized_segment_geometry_by_root = (
         {
-            segment.root: (segment, first_wave, task_count)
-            for segment, first_wave, task_count in parameterized_schedule_geometry
+            segment.root: (segment, first_position, task_count)
+            for segment, first_position, task_count in parameterized_schedule_geometry
         }
         if parameterized_schedule_geometry is not None
         else {}
@@ -2230,7 +2230,7 @@ def emit_cross_loop_schedule(
             else segment.worker_intervals()
         )
         if parameterized_root_major_geometry is not None:
-            geometry_segment, _first_wave, task_count = (
+            geometry_segment, first_slot, task_count = (
                 parameterized_segment_geometry_by_root[root]
             )
             if segment != geometry_segment or task_order_begin is not None:
@@ -2238,7 +2238,13 @@ def emit_cross_loop_schedule(
                     "parameterized segment disagrees with its proved relation"
                 )
             task_count_text = device_function.sympy_expr(task_count)
+            first_slot_text = device_function.sympy_expr(first_slot)
             case_offset_text = case_offset_strings[root]
+            local_task_begin = (
+                f"(({worker}) + {segment.worker_count} - "
+                f"(({first_slot_text}) % {segment.worker_count})) % "
+                f"{segment.worker_count}"
+            )
             task_dispatch = [
                 create(
                     ast.For,
@@ -2248,7 +2254,7 @@ def emit_cross_loop_schedule(
                         ctx=ast.Store(),
                     ),
                     iter=expr_from_string(
-                        f"tl.range(({case_offset_text}) + ({worker}), "
+                        f"tl.range(({case_offset_text}) + ({local_task_begin}), "
                         f"({case_offset_text}) + ({task_count_text}), "
                         f"{segment.worker_count})"
                     ),
