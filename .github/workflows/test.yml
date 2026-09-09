@@ -275,6 +275,9 @@ jobs:
           if [[ "${{ matrix.backend }}" == "tileir" ]]; then export ENABLE_TILE=1; fi
           if [[ "${{ matrix.alias }}" == "pallas-interpret" ]]; then export HELION_PALLAS_INTERPRET=1; fi
           export HELION_BACKEND=${{ matrix.backend }}
+          # Enable numerical reproducibility in MKL. Otherwise results from the
+          # reference implementation can be non-deterministic.
+          export MKL_CBWR=AVX2
           # Disable TorchTPU build cache to prevent running out of disk space.
           export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=disabled
           # -rf: print failed tests
