@@ -444,10 +444,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1, 128, 128, 256],
         )
 
-    @skipIfFn(
-        lambda: _get_backend() == "cute",
-        "CuTe FP8 attention destabilizes later cute tests when it fails in-process",
-    )
     @onlyBackends(["triton", "pallas"])
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_fp8_gemm(self):
