@@ -3040,7 +3040,7 @@ class TestCrossLoopScheduler(TestCase):
             )
         )
 
-    def test_parametric_counter_declines_fan_in_greater_than_one(self) -> None:
+    def test_parametric_fixed_fan_in_uses_final_arrival_continuation(self) -> None:
         key_count = sympy.Symbol("key_count", integer=True, nonnegative=True)
         dependency_graph = _dependency_graph(
             [[10], [20]],
@@ -3073,8 +3073,110 @@ class TestCrossLoopScheduler(TestCase):
                 worker_count=4,
             )
 
-        self.assertEqual(plan.readiness_counters, ())
+        self.assertEqual(plan.root_barrier_edges, frozenset())
+        self.assertEqual(len(plan.readiness_counters), 1)
+        (counter,) = plan.readiness_counters
+        self.assertEqual(counter.readiness_key_count_expr, key_count)
+        self.assertEqual(counter.uniform_arrival_count(), 2)
+        self.assertEqual(counter.continuation_consumer_index, 0)
+        self.assertTrue(cross_loop_scheduler._supports_parameterized_counter(counter))
+        self.assertFalse(
+            cross_loop_scheduler._supports_parameterized_fan_in_one_counter(counter)
+        )
+        self.assertEqual(
+            tuple(segment.root for segment in plan.worker_schedule.segments),
+            (0,),
+        )
+        schedule_geometry = (
+            cross_loop_scheduler._parametric_root_major_schedule_geometry(
+                plan.worker_schedule
+            )
+        )
+        self.assertIsNotNone(schedule_geometry)
+
+        publication = counter.producers[0].keys_by_producer
+        self.assertIsNotNone(publication)
+        assert publication is not None
+        for concrete_count in (0, 1, 3, 5):
+            concrete_publication = publication.substitute_parameters(
+                {key_count: concrete_count}
+            )
+            self.assertEqual(
+                concrete_publication.materialize(),
+                tuple(
+                    frozenset((producer_index // 2,))
+                    for producer_index in range(2 * concrete_count)
+                ),
+            )
+
+    def test_parametric_fixed_fan_in_non_sink_retains_root_barrier(self) -> None:
+        key_count = sympy.Symbol("key_count", integer=True, nonnegative=True)
+        dependency_graph = _dependency_graph(
+            [[10], [20], [30]],
+            _access(
+                root=0,
+                allocation_id=0,
+                kind="store",
+                shape=(8192,),
+                block_ids=(10,),
+            ),
+            _access(
+                root=1,
+                allocation_id=0,
+                kind="load",
+                shape=(8192,),
+                block_ids=(20,),
+            ),
+            _access(
+                root=1,
+                allocation_id=1,
+                kind="store",
+                shape=(8192,),
+                block_ids=(20,),
+            ),
+            _access(
+                root=2,
+                allocation_id=1,
+                kind="load",
+                shape=(8192,),
+                block_ids=(30,),
+            ),
+        )
+        root_domains = (
+            CoordinateDomain((10,), ((10, 2 * key_count),), ((10, 16),)),
+            CoordinateDomain((20,), ((20, key_count),), ((20, 32),)),
+            CoordinateDomain((30,), ((30, key_count),), ((30, 32),)),
+        )
+
+        with _forbid_schedule_enumeration():
+            plan = _configured_static_pipeline_plan(
+                dependency_graph=dependency_graph,
+                root_domains=root_domains,
+                axis_geometry={
+                    10: (2 * key_count, 16),
+                    20: (key_count, 32),
+                    30: (key_count, 32),
+                },
+                worker_count=4,
+            )
+
+        self.assertEqual(
+            tuple(segment.root for segment in plan.worker_schedule.segments),
+            (0, 1, 2),
+        )
+        self.assertFalse(
+            any(
+                counter.continuation_consumer_index is not None
+                for counter in plan.readiness_counters
+            )
+        )
         self.assertEqual(plan.root_barrier_edges, frozenset(((0, 1),)))
+        self.assertEqual(
+            tuple(
+                counter.uniform_arrival_count() for counter in plan.readiness_counters
+            ),
+            (1,),
+        )
 
     def test_parametric_counter_declines_unsupported_access_scale(self) -> None:
         task_count = sympy.Symbol("task_count", integer=True, nonnegative=True)

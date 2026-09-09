@@ -1322,7 +1322,7 @@ class CoordinateRelation:
         if self.is_positional_bijection():
             return self.derive_converse_and_target_counts()[0]
         if self.parameter_symbols:
-            return None
+            return self.derive_converse_and_target_counts()[0]
         converse = self._cached_converse
         if converse is not None:
             return converse
@@ -1382,6 +1382,57 @@ class CoordinateRelation:
                 ),
             )
             return converse, target_counts
+        fixed_width_partition = (
+            self._fixed_width_partition() if self.parameter_symbols else None
+        )
+        if fixed_width_partition is not None:
+            source_axis, target_axis, width = fixed_width_partition
+            target_coordinate = coordinate_axis_symbol(target_axis)
+            converse = CoordinateRelation.point_map(
+                self.target_domain,
+                self.source_domain,
+                (
+                    (
+                        (
+                            (
+                                target_axis,
+                                0,
+                                self.target_domain.axis_count_expressions[target_axis],
+                                1,
+                            ),
+                        ),
+                        (
+                            sympy.floor(  # pyrefly: ignore[bad-argument-type]
+                                target_coordinate / width  # pyrefly: ignore[unsupported-operation]
+                            ),
+                        ),
+                    ),
+                ),
+            )
+            value_axis = 0
+            value_domain = CoordinateDomain(
+                axis_order=(value_axis,),
+                axis_counts_items=((value_axis, width + 1),),
+                kind="value",
+            )
+            target_counts = CoordinateRelation.point_map(
+                self.source_domain,
+                value_domain,
+                (
+                    (
+                        (
+                            (
+                                source_axis,
+                                0,
+                                self.source_domain.axis_count_expressions[source_axis],
+                                1,
+                            ),
+                        ),
+                        (sympy.Integer(width),),
+                    ),
+                ),
+            )
+            return converse, target_counts
         if self.parameter_symbols:
             return None, None
         target_counts = self.target_count_by_source()
@@ -1391,6 +1442,50 @@ class CoordinateRelation:
         if target_counts is None:
             return None, None
         return _derived_converse(self, target_counts), target_counts
+
+    def _fixed_width_partition(self) -> tuple[int, int, int] | None:
+        """Prove ``key -> [F * key, F * key + F)`` for static ``F``.
+
+        This is the one symbolic certificate used to derive both producer
+        publication and the exact arrival count.  Requiring a complete dense
+        partition keeps parameterized lowering independent of sampled shapes.
+        """
+        if (
+            len(self.source_domain.axis_order) != 1
+            or len(self.target_domain.axis_order) != 1
+            or len(self.pieces) != 1
+        ):
+            return None
+        source_axis = self.source_domain.axis_order[0]
+        target_axis = self.target_domain.axis_order[0]
+        (piece,) = self.pieces
+        if piece.source_bounds_items != (
+            (
+                source_axis,
+                0,
+                self.source_domain.axis_count_expressions[source_axis],
+                1,
+            ),
+        ):
+            return None
+        (_target_axis, begin, end, step) = piece.target_ranges[0]
+        interval = _single_axis_interval(begin, end, domain=self.source_domain)
+        if step != 1 or interval is None:
+            return None
+        interval_axis, stride, offset, width = interval
+        if (
+            interval_axis != source_axis
+            or offset != 0
+            or width != stride
+            or width <= 0
+            or sympy.simplify(
+                self.target_domain.axis_count_expressions[target_axis]
+                - width * self.source_domain.axis_count_expressions[source_axis]
+            )
+            != 0
+        ):
+            return None
+        return source_axis, target_axis, width
 
     @cached_property
     def _cached_converse(self) -> CoordinateRelation | None:

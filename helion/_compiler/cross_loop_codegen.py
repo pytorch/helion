@@ -25,7 +25,7 @@ from .cross_loop_scheduler import _parametric_event_frontier_root_order
 from .cross_loop_scheduler import _parametric_event_frontier_schedule_geometry
 from .cross_loop_scheduler import _parametric_root_major_schedule_geometry
 from .cross_loop_scheduler import _root_schedule_traversal
-from .cross_loop_scheduler import _supports_parameterized_fan_in_one_counter
+from .cross_loop_scheduler import _supports_parameterized_counter
 from .cross_loop_scheduler import _transient_source_schedule_segment
 from .cross_loop_scheduler import build_static_pipeline_plan
 from .cross_loop_scheduler import root_barrier_publication_plan
@@ -64,6 +64,10 @@ _CROSS_LOOP_COUNTER_ALIGNMENT_BYTES = 128
 _CROSS_LOOP_COUNTER_DTYPE = torch.uint32
 _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS = (
     _CROSS_LOOP_COUNTER_ALIGNMENT_BYTES // _CROSS_LOOP_COUNTER_DTYPE.itemsize
+)
+_PARAMETRIC_READINESS_COUNTER_DTYPE = torch.uint64
+_PARAMETRIC_READINESS_COUNTER_ALIGNMENT_WORDS = (
+    _CROSS_LOOP_COUNTER_ALIGNMENT_BYTES // _PARAMETRIC_READINESS_COUNTER_DTYPE.itemsize
 )
 
 
@@ -390,14 +394,25 @@ def _wait_for_counter(
     counter: str,
     target: str,
     prefix: str,
+    dtype: torch.dtype = _CROSS_LOOP_COUNTER_DTYPE,
 ) -> list[ast.stmt]:
+    if dtype == torch.uint32:
+        ptx_type = "u32"
+        output_constraint = "r"
+        triton_dtype = "tl.uint32"
+    elif dtype == torch.uint64:
+        ptx_type = "u64"
+        output_constraint = "l"
+        triton_dtype = "tl.uint64"
+    else:
+        raise AssertionError(f"unsupported cross-loop counter dtype {dtype}")
     value = device_function.new_var(prefix, dce=False)
     sync = device_function.new_var(f"{prefix}_sync", dce=False)
     load = (
         "tl.inline_asm_elementwise("
-        "asm='ld.acquire.gpu.global.u32 $0, [$1];', "
-        "constraints='=r,l', "
-        f"args=[{counter}], dtype=tl.uint32, is_pure=False, pack=1)"
+        f"asm='ld.acquire.gpu.global.{ptx_type} $0, [$1];', "
+        f"constraints='={output_constraint},l', "
+        f"args=[{counter}], dtype={triton_dtype}, is_pure=False, pack=1)"
     )
     return [
         statement_from_string(f"{value} = {load}"),
@@ -438,22 +453,29 @@ def _wait_for_dependencies(
 def _emit_final_arrival_continuation(
     *,
     counter: str,
-    epoch: str,
-    expected_arrivals: int,
+    target: str,
     previous: str,
     continuation_body: list[ast.stmt],
+    epoch_base: str | None = None,
 ) -> list[ast.stmt]:
     """Publish one arrival and run the continuation on the final arrival."""
+    initialization = (
+        []
+        if epoch_base is None
+        else [
+            statement_from_string(
+                f"tl.atomic_max({counter}, {epoch_base}, sem='relaxed', scope='gpu')"
+            )
+        ]
+    )
     return [
+        *initialization,
         statement_from_string(
             f"{previous} = tl.atomic_add({counter}, 1, sem='acq_rel', scope='gpu')"
         ),
         create(
             ast.If,
-            test=expr_from_string(
-                f"{previous} == tl.cast({epoch}, tl.uint32) * "
-                f"tl.cast({expected_arrivals}, tl.uint32) - 1"
-            ),
+            test=expr_from_string(f"{previous} == {target} - 1"),
             body=continuation_body,
             orelse=[],
         ),
@@ -734,7 +756,7 @@ def emit_cross_loop_schedule(
     if parameterized_root_domains and (
         static_pipeline_plan.transient_source_root is not None
         or any(
-            not _supports_parameterized_fan_in_one_counter(plan)
+            not _supports_parameterized_counter(plan)
             for plan in static_pipeline_plan.readiness_counters
         )
     ):
@@ -770,6 +792,19 @@ def emit_cross_loop_schedule(
             for readiness_consumer in plan.consumers
         )
     )
+    continuation_roots = {
+        continuation_consumer.consumer_root
+        for plan in readiness_counter_plans
+        if (continuation_consumer := plan.continuation_consumer) is not None
+    }
+    if (
+        parameterized_root_domains
+        and {segment.root for segment in static_pipeline_plan.worker_schedule.segments}
+        != set(range(len(root_domains))) - continuation_roots
+    ):
+        raise AssertionError(
+            "parameterized worker schedule does not exactly exclude continuations"
+        )
     launch_worker_count = static_pipeline_plan.worker_schedule.worker_count
     transient_source_root = static_pipeline_plan.transient_source_root
     transient_source_segment = (
@@ -817,7 +852,7 @@ def emit_cross_loop_schedule(
         for root in root_barrier_producer_roots
         if root != transient_source_root
     }
-    continuation_task_count_by_root: dict[int, int] = {}
+    continuation_task_count_by_root: dict[int, int | sympy.Expr] = {}
     for plan in readiness_counter_plans:
         readiness_consumer = plan.continuation_consumer
         if readiness_consumer is None:
@@ -827,16 +862,26 @@ def emit_cross_loop_schedule(
                 "a final-arrival continuation must cover its complete root"
             )
         continuation_task_count_by_root[readiness_consumer.consumer_root] = (
-            readiness_consumer.keys_by_consumer.source_domain.size
+            readiness_consumer.keys_by_consumer.source_domain.size_expr
+            if readiness_consumer.keys_by_consumer.source_domain.parameter_symbols
+            else readiness_consumer.keys_by_consumer.source_domain.size
         )
 
-    def root_barrier_arrival_count(root: int) -> int:
+    def root_barrier_arrival_count(root: int) -> int | sympy.Expr:
         scheduled_arrivals = (
             transient_source_task_count
             if root == transient_source_root
             else root_publication_plans[root].resident_arrival_count
         )
-        return scheduled_arrivals + continuation_task_count_by_root.get(root, 0)
+        continuation_arrivals = continuation_task_count_by_root.get(root, 0)
+        if isinstance(continuation_arrivals, int):
+            return scheduled_arrivals + continuation_arrivals
+        return sympy.simplify(
+            sympy.Add(
+                sympy.Integer(scheduled_arrivals),
+                continuation_arrivals,
+            )
+        )
 
     # Reject grids that cannot residently fit when the device is otherwise
     # idle. Concurrent-stream residency remains an explicit unresolved
@@ -849,7 +894,31 @@ def emit_cross_loop_schedule(
         )
     readiness_counter_offsets: dict[ReadinessCounterPlan, int | sympy.Expr] = {}
     readiness_counter_count: int | sympy.Expr = 0
-    readiness_counter_stride = _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
+    parameterized_uniform_fan_ins = tuple(
+        plan.uniform_arrival_count() for plan in all_readiness_counter_plans
+    )
+    uses_epoch_framed_readiness = parameterized_root_domains and bool(
+        parameterized_uniform_fan_ins
+    )
+    if uses_epoch_framed_readiness and any(
+        fan_in is None for fan_in in parameterized_uniform_fan_ins
+    ):
+        raise AssertionError("parameterized readiness requires uniform fan-in")
+    parameterized_readiness_epoch_stride = (
+        max(cast("int", fan_in) for fan_in in parameterized_uniform_fan_ins)
+        if uses_epoch_framed_readiness
+        else 0
+    )
+    readiness_counter_dtype = (
+        _PARAMETRIC_READINESS_COUNTER_DTYPE
+        if uses_epoch_framed_readiness
+        else _CROSS_LOOP_COUNTER_DTYPE
+    )
+    readiness_counter_stride = (
+        _PARAMETRIC_READINESS_COUNTER_ALIGNMENT_WORDS
+        if uses_epoch_framed_readiness
+        else _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
+    )
     for plan in all_readiness_counter_plans:
         readiness_counter_offsets[plan] = readiness_counter_count
         readiness_counter_count = sympy.simplify(
@@ -895,26 +964,56 @@ def emit_cross_loop_schedule(
     if not has_parameterized_schedule:
         readiness_counter_state_offset = reserve_state(readiness_counter_count)
         root_barrier_state_offset = reserve_state(root_barrier_count)
+    elif uses_epoch_framed_readiness:
+        root_barrier_state_offset = reserve_state(root_barrier_count)
+        readiness_counter_state_offset = None
     else:
-        # Cumulative root barriers need shape-stable addresses across graph
-        # replay.  Parameter-sized fan-in-one counters contain absolute epoch
-        # values, so they may safely occupy the variable tail.
+        # Parameterized schedules without exact counters retain only the
+        # shape-stable cumulative root-barrier prefix.
         root_barrier_state_offset = reserve_state(root_barrier_count)
         readiness_counter_state_offset = reserve_state(readiness_counter_count)
-    epoch_state_count = launch_program_count if transient_source_root is None else 0
+    epoch_state_count = (
+        launch_program_count
+        if transient_source_root is None and not uses_epoch_framed_readiness
+        else 0
+    )
     static_state_base = str(
         (epoch_state_count + _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS - 1)
         // _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
         * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
     )
-    state_arg = _register_cross_loop_state(
-        device_function,
-        name_hint="tile_dependency_state",
-        numel=(
-            f"{static_state_base} + "
-            f"{HostFunction.current().sympy_expr(sympy.sympify(state_count))}"
-        ),
-        dtype=_CROSS_LOOP_COUNTER_DTYPE,
+    state_arg = (
+        _register_cross_loop_state(
+            device_function,
+            name_hint="tile_dependency_state",
+            numel=(
+                f"{static_state_base} + "
+                f"{HostFunction.current().sympy_expr(sympy.sympify(state_count))}"
+            ),
+            dtype=_CROSS_LOOP_COUNTER_DTYPE,
+        )
+        if not uses_epoch_framed_readiness or root_barrier_count
+        else None
+    )
+    parameterized_epoch_state_count = (
+        (launch_worker_count + _PARAMETRIC_READINESS_COUNTER_ALIGNMENT_WORDS - 1)
+        // _PARAMETRIC_READINESS_COUNTER_ALIGNMENT_WORDS
+        * _PARAMETRIC_READINESS_COUNTER_ALIGNMENT_WORDS
+        if uses_epoch_framed_readiness
+        else 0
+    )
+    parameterized_readiness_state_arg = (
+        _register_cross_loop_state(
+            device_function,
+            name_hint="tile_dependency_parameterized_state",
+            numel=(
+                f"{parameterized_epoch_state_count} + "
+                f"{HostFunction.current().sympy_expr(sympy.sympify(readiness_counter_count))}"
+            ),
+            dtype=_PARAMETRIC_READINESS_COUNTER_DTYPE,
+        )
+        if uses_epoch_framed_readiness
+        else None
     )
     dispatch_ticket_arg = (
         _register_cross_loop_state(
@@ -930,6 +1029,8 @@ def emit_cross_loop_schedule(
     def state_section(offset: int | sympy.Expr | None) -> str | None:
         if offset is None:
             return None
+        if state_arg is None:
+            raise AssertionError("uint32 cross-loop state was not allocated")
         offset_text = (
             str(offset)
             if isinstance(offset, int)
@@ -937,8 +1038,16 @@ def emit_cross_loop_schedule(
         )
         return f"{state_arg} + ({static_state_base}) + {offset_text}"
 
-    epoch_arg = state_arg
-    readiness_counter_arg = state_section(readiness_counter_state_offset)
+    epoch_arg = (
+        parameterized_readiness_state_arg if uses_epoch_framed_readiness else state_arg
+    )
+    if epoch_arg is None:
+        raise AssertionError("cross-loop epoch state was not allocated")
+    readiness_counter_arg = (
+        f"{parameterized_readiness_state_arg} + {parameterized_epoch_state_count}"
+        if uses_epoch_framed_readiness
+        else state_section(readiness_counter_state_offset)
+    )
     root_barrier_counter_arg = state_section(root_barrier_state_offset)
 
     dispatch_ticket: str | None = None
@@ -973,12 +1082,6 @@ def emit_cross_loop_schedule(
                 f"{worker} = {dispatch_ticket} - {transient_source_task_count}"
             ),
         ]
-    continuation_roots = {
-        continuation_consumer.consumer_root
-        for plan in readiness_counter_plans
-        if (continuation_consumer := plan.continuation_consumer) is not None
-    }
-
     root_barrier_incoming: dict[int, tuple[int, ...]] = {
         consumer: tuple(
             sorted(
@@ -1473,11 +1576,9 @@ def emit_cross_loop_schedule(
                     _wait_for_counter(
                         device_function=device_function,
                         counter=readiness_counter(plan, readiness_key),
-                        target=(
-                            f"tl.cast({epoch_var}, tl.uint32) * "
-                            f"tl.cast({readiness_expected_arrivals(plan, readiness_key)}, tl.uint32)"
-                        ),
+                        target=readiness_target(plan, readiness_key),
                         prefix="tile_dependency_nested_loop_wait",
+                        dtype=readiness_counter_dtype,
                     )
                 )
             )
@@ -1528,6 +1629,23 @@ def emit_cross_loop_schedule(
             expressions.append(values[cardinality.target_domain.axis_order[0]])
         return " + ".join(f"({expression})" for expression in expressions)
 
+    def readiness_epoch_base() -> str:
+        if not uses_epoch_framed_readiness:
+            raise AssertionError("epoch framing requires uint64 readiness state")
+        return (
+            f"tl.cast({epoch_var}, tl.uint64) * "
+            f"tl.cast({parameterized_readiness_epoch_stride}, tl.uint64)"
+        )
+
+    def readiness_target(
+        plan: ReadinessCounterPlan,
+        readiness_key: str,
+    ) -> str:
+        arrivals = readiness_expected_arrivals(plan, readiness_key)
+        if uses_epoch_framed_readiness:
+            return f"{readiness_epoch_base()} + tl.cast({arrivals}, tl.uint64)"
+        return f"tl.cast({epoch_var}, tl.uint32) * tl.cast({arrivals}, tl.uint32)"
+
     def emit_readiness_arrival_for_key(
         plan: ReadinessCounterPlan,
         readiness_key: str,
@@ -1536,16 +1654,32 @@ def emit_cross_loop_schedule(
         if continuation_consumer is None:
             counter = readiness_counter(plan, readiness_key)
             if plan.uniform_arrival_count() == 1:
+                publication_value = (
+                    readiness_target(plan, readiness_key)
+                    if uses_epoch_framed_readiness
+                    else epoch_var
+                )
                 return [
                     statement_from_string(
-                        f"tl.atomic_xchg({counter}, {epoch_var}, "
+                        f"tl.atomic_xchg({counter}, {publication_value}, "
                         "sem='release', scope='gpu')"
                     )
                 ]
+            initialization = (
+                [
+                    statement_from_string(
+                        f"tl.atomic_max({counter}, {readiness_epoch_base()}, "
+                        "sem='relaxed', scope='gpu')"
+                    )
+                ]
+                if uses_epoch_framed_readiness
+                else []
+            )
             return [
+                *initialization,
                 statement_from_string(
                     f"tl.atomic_add({counter}, 1, sem='release', scope='gpu')"
-                )
+                ),
             ]
 
         converse_consumer = continuation_consumer.keys_by_consumer.converse()
@@ -1582,7 +1716,7 @@ def emit_cross_loop_schedule(
             root_axis_counts[continuation_root],
         )
         consumer_logical_pid = (
-            f"{case_offsets[continuation_root]} + "
+            f"{case_offset_strings[continuation_root]} + "
             f"{pid_task_for_logical_coordinates(continuation_root, consumer_coordinates)}"
         )
         consumer_extra_arguments = (consumer_task,)
@@ -1630,10 +1764,12 @@ def emit_cross_loop_schedule(
             *assignments,
             *_emit_final_arrival_continuation(
                 counter=arrival_counter,
-                epoch=epoch_var,
-                expected_arrivals=expected_arrivals,
+                target=readiness_target(plan, readiness_key),
                 previous=previous,
                 continuation_body=last_arrival_body,
+                epoch_base=(
+                    readiness_epoch_base() if uses_epoch_framed_readiness else None
+                ),
             ),
         ]
 
@@ -1885,11 +2021,12 @@ def emit_cross_loop_schedule(
                     incoming_readiness_counter,
                     readiness_key,
                 ),
-                target=(
-                    f"tl.cast({epoch_var}, tl.uint32) * "
-                    f"tl.cast({readiness_expected_arrivals(incoming_readiness_counter, readiness_key)}, tl.uint32)"
+                target=readiness_target(
+                    incoming_readiness_counter,
+                    readiness_key,
                 ),
                 prefix="tile_dependency_readiness_wait",
+                dtype=readiness_counter_dtype,
             )
             if not incoming_consumer.keys_by_consumer.is_total_function():
                 body.append(

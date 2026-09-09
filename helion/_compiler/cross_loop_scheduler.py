@@ -1418,16 +1418,18 @@ def _parametric_root_major_schedule_geometry_from_parts(
 
     first_wave: sympy.Expr = sympy.Integer(0)
     result: list[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr]] = []
-    for expected_root, segment in enumerate(segments):
+    previous_root = -1
+    for segment in segments:
         relation = segment.task_order
         target_domain = relation.target_domain
         if (
-            segment.root != expected_root
+            segment.root <= previous_root
             or segment.worker_begin != 0
             or segment.worker_count != worker_count
             or len(target_domain.axis_order) != 1
         ):
             return None
+        previous_root = segment.root
         task_count = target_domain.size_expr
         wave_count = _ceildiv_nonnegative_expression(task_count, worker_count)
         if relation != _parametric_root_major_relation(
@@ -2047,12 +2049,16 @@ def _build_parametric_root_major_worker_schedule(
     root_domains: tuple[CoordinateDomain, ...],
     root_task_orders: tuple[CoordinateRelation, ...],
     worker_count: int,
+    *,
+    excluded_roots: frozenset[int] = frozenset(),
 ) -> WorkerSchedule:
     """Build an exact O(roots) schedule over runtime root task counts."""
     if worker_count <= 0:
         raise ValueError(f"worker_count must be positive, got {worker_count}")
     if len(root_domains) != len(root_task_orders):
         raise ValueError("root domains and task orders must have equal length")
+    if any(root < 0 or root >= len(root_domains) for root in excluded_roots):
+        raise ValueError("excluded parameterized root is out of range")
     if not root_domains or not any(domain.parameter_symbols for domain in root_domains):
         raise ValueError("parameterized schedule requires a runtime root extent")
     if any(
@@ -2062,6 +2068,13 @@ def _build_parametric_root_major_worker_schedule(
         raise ValueError(
             "parameterized scheduling currently requires canonical rank-one roots"
         )
+    scheduled_roots = tuple(
+        (root, domain)
+        for root, domain in enumerate(root_domains)
+        if root not in excluded_roots
+    )
+    if not scheduled_roots:
+        raise ValueError("parameterized schedule cannot exclude every root")
 
     minimum_axis = min(
         (axis for domain in root_domains for axis in domain.axis_order),
@@ -2070,7 +2083,7 @@ def _build_parametric_root_major_worker_schedule(
     schedule_axes = (minimum_axis - 3, minimum_axis - 2, minimum_axis - 1)
     first_wave: sympy.Expr = sympy.Integer(0)
     root_first_waves: list[sympy.Expr] = []
-    for domain in root_domains:
+    for _root, domain in scheduled_roots:
         task_count = domain.size_expr
         wave_count = _ceildiv_nonnegative_expression(task_count, worker_count)
         root_first_waves.append(first_wave)
@@ -2081,8 +2094,10 @@ def _build_parametric_root_major_worker_schedule(
         schedule_axes,
     )
     segments: list[WorkerScheduleSegment] = []
-    for root, (domain, root_first_wave) in enumerate(
-        zip(root_domains, root_first_waves, strict=True)
+    for (root, domain), root_first_wave in zip(
+        scheduled_roots,
+        root_first_waves,
+        strict=True,
     ):
         relation = _parametric_root_major_relation(
             schedule_domain,
@@ -3509,23 +3524,30 @@ def choose_final_arrival_continuations(
 ) -> tuple[FinalArrivalContinuation, ...]:
     """Choose final-arrival execution from complete exact task readiness.
 
-    A one-task family has no task-level parallelism to expose, so it remains in
-    the static schedule. Downstream event granularity does not change whether
-    an otherwise exact-ready family is eligible for a continuation.
+    A statically one-task family has no task-level parallelism to expose, so it
+    remains in the static schedule.  A parameterized family may be empty, one
+    task, or many tasks at runtime; final-arrival ownership is exact in every
+    case and must not be selected from one sampled extent.
     """
-    return tuple(
-        continuation
-        for continuation in derive_final_arrival_continuations(
-            readiness_graph, worker_schedule
+    result: list[FinalArrivalContinuation] = []
+    for continuation in derive_final_arrival_continuations(
+        readiness_graph, worker_schedule
+    ):
+        readiness_consumer = readiness_graph.event(continuation.event_id).consumers[
+            continuation.consumer_index
+        ]
+        consumer_root = readiness_consumer.consumer_root
+        if consumer_root in excluded_roots:
+            continue
+        domain = readiness_graph.root_domains[consumer_root]
+        has_multiple_tasks = (
+            not _equal_integer_expressions(domain.size_expr, 1)
+            if domain.parameter_symbols
+            else domain.size > 1
         )
-        if (
-            readiness_consumer := readiness_graph.event(
-                continuation.event_id
-            ).consumers[continuation.consumer_index]
-        ).consumer_root
-        not in excluded_roots
-        and readiness_graph.root_domains[readiness_consumer.consumer_root].size > 1
-    )
+        if has_multiple_tasks:
+            result.append(continuation)
+    return tuple(result)
 
 
 def choose_readiness_counters(
@@ -4231,8 +4253,8 @@ def derive_final_arrival_continuations(
                     )
                 )
 
-    possible_workers_by_root = {
-        root: worker_schedule.workers_for_root(root)
+    has_possible_worker_by_root = {
+        root: bool(worker_schedule.segments_for_root(root))
         for root in range(len(readiness_graph.root_domains))
     }
 
@@ -4247,14 +4269,13 @@ def derive_final_arrival_continuations(
     ) in sorted(candidates, key=operator.itemgetter(slice(3))):
         if (event_id, consumer_index) in conflicting_candidates:
             continue
-        possible_workers = frozenset(
-            worker
+        has_possible_worker = any(
+            has_possible_worker_by_root[readiness_producer.producer_root]
             for readiness_producer in event.producers
-            for worker in possible_workers_by_root[readiness_producer.producer_root]
         )
-        if not possible_workers:
+        if not has_possible_worker:
             continue
-        possible_workers_by_root[readiness_consumer.consumer_root] = possible_workers
+        has_possible_worker_by_root[readiness_consumer.consumer_root] = True
         result.append(
             FinalArrivalContinuation(
                 event_id=event_id,
@@ -6656,43 +6677,65 @@ def _has_valid_transient_source_schedule(
     )
 
 
-def _supports_parameterized_fan_in_one_counter(
+def _parameterized_uniform_counter_fan_in(
     plan: ReadinessCounterPlan,
-) -> bool:
-    """Prove the replay-safe exact-event subset used by parametric schedules.
+) -> int | None:
+    """Return the proved static fan-in accepted by parametric schedules.
 
-    This initial subset deliberately requires positional bijections on both
-    sides of one root-entry event.  Every active readiness key therefore has
-    exactly one producer and one task in each retained consumer family for
-    every legal parameter value.
-    The existing epoch-valued ``atomic_xchg`` lowering is consequently safe
-    when a later launch shrinks, becomes empty, or grows again.
+    Fan-in one retains the positional event-frontier subset. Wider fan-in is
+    accepted only when the existing relation proof derives one exact producer
+    partition and one final-arrival consumer per key. The returned cardinality
+    is the sole distinction needed by scheduling and replay-safe lowering.
     """
+    fan_in = plan.uniform_arrival_count()
     if (
-        plan.continuation_consumer_index is not None
-        or len(plan.readiness_key_domain.axis_order) != 1
+        len(plan.readiness_key_domain.axis_order) != 1
         or len(plan.producers) != 1
         or not plan.consumers
-        or plan.uniform_arrival_count() != 1
+        or fan_in is None
+        or not 0 < fan_in < 2**32
     ):
-        return False
+        return None
     (producer,) = plan.producers
     publication = producer.keys_by_producer
     if (
         producer.producer_site_id is not None
         or publication is None
-        or not producer.producers_by_key.is_positional_bijection()
-        or not publication.is_positional_bijection()
+        or publication.canonical_single_valued() is None
     ):
-        return False
-    return all(
+        return None
+    if not all(
         consumer.consumer_site_id is None
         and producer.producer_root < consumer.consumer_root
         and consumer.keys_by_consumer.is_positional_bijection()
         and (converse := consumer.keys_by_consumer.converse()) is not None
         and converse.is_positional_bijection()
         for consumer in plan.consumers
-    )
+    ):
+        return None
+    if fan_in == 1:
+        if (
+            plan.continuation_consumer_index is not None
+            or not producer.producers_by_key.is_positional_bijection()
+            or not publication.is_positional_bijection()
+        ):
+            return None
+        return fan_in
+    if plan.continuation_consumer_index is None or len(plan.consumers) != 1:
+        return None
+    return fan_in
+
+
+def _supports_parameterized_counter(plan: ReadinessCounterPlan) -> bool:
+    """Return whether one counter has the complete parametric certificate."""
+    return _parameterized_uniform_counter_fan_in(plan) is not None
+
+
+def _supports_parameterized_fan_in_one_counter(
+    plan: ReadinessCounterPlan,
+) -> bool:
+    """Return whether one counter belongs to the positional recurrence."""
+    return _parameterized_uniform_counter_fan_in(plan) == 1
 
 
 def _parametric_event_frontier_root_order(
@@ -6916,14 +6959,70 @@ def build_static_pipeline_plan(
             site_domains=site_domains,
             publishable_site_ids=publishable_site_ids,
         )
-        readiness_counters, root_barrier_edges = _finalize_emitted_synchronization(
-            dependency_graph=dependency_graph,
-            readiness_counters=tuple(
+        nested_wait_roots = frozenset(
+            readiness_consumer.consumer_root
+            for event in readiness_graph.events
+            for readiness_consumer in event.consumers
+            if readiness_consumer.consumer_site_id is not None
+        )
+        continuation_candidates = choose_final_arrival_continuations(
+            readiness_graph,
+            worker_schedule,
+            excluded_roots=nested_wait_roots,
+        )
+        sink_roots = frozenset(range(len(root_domains))) - frozenset(
+            edge.producer_root for edge in dependency_graph.edges
+        )
+        selected_continuations: list[FinalArrivalContinuation] = []
+        for continuation in continuation_candidates:
+            event = readiness_graph.event(continuation.event_id)
+            readiness_consumer = event.consumers[continuation.consumer_index]
+            provisional_plan = ReadinessCounterPlan(
+                producers=event.producers,
+                consumers=(readiness_consumer,),
+                continuation_consumer_index=0,
+            )
+            fan_in = _parameterized_uniform_counter_fan_in(provisional_plan)
+            if readiness_consumer.consumer_root in sink_roots and (
+                fan_in is not None and fan_in > 1
+            ):
+                selected_continuations.append(continuation)
+        continuations = tuple(selected_continuations)
+        selected_counters = choose_readiness_counters(
+            readiness_graph,
+            continuations,
+        )
+        readiness_counters = tuple(
+            plan for plan in selected_counters if _supports_parameterized_counter(plan)
+        )
+        if sum(
+            plan.continuation_consumer_index is not None for plan in readiness_counters
+        ) != len(continuations):
+            # Continuation ownership is atomic: if any selected sink cannot be
+            # represented by the emitted counter subset, retain every root in
+            # the conservative schedule.
+            continuations = ()
+            readiness_counters = tuple(
                 plan
                 for plan in choose_readiness_counters(readiness_graph, ())
-                if _supports_parameterized_fan_in_one_counter(plan)
-            ),
+                if _supports_parameterized_counter(plan)
+            )
+        readiness_counters, root_barrier_edges = _finalize_emitted_synchronization(
+            dependency_graph=dependency_graph,
+            readiness_counters=readiness_counters,
         )
+        continuation_roots = frozenset(
+            readiness_consumer.consumer_root
+            for plan in readiness_counters
+            if (readiness_consumer := plan.continuation_consumer) is not None
+        )
+        if continuation_roots:
+            worker_schedule = _build_parametric_root_major_worker_schedule(
+                root_domains,
+                root_task_orders,
+                worker_count,
+                excluded_roots=continuation_roots,
+            )
         event_frontier_schedule = _build_parametric_event_frontier_worker_schedule(
             root_task_orders,
             readiness_counters,

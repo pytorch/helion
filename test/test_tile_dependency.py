@@ -809,6 +809,156 @@ class TestTileDependency(TestCase):
             self.assertEqual(concrete.materialize(), expected)
             self.assertEqual(concrete_converse.materialize(), expected)
 
+    def test_symbolic_fixed_width_partition_derives_inverse_and_fan_in(
+        self,
+    ) -> None:
+        key_count = sympy.Symbol("key_count", integer=True, nonnegative=True)
+        key_domain = CoordinateDomain(
+            (0,),
+            ((0, key_count),),
+            kind="event",
+            identity=0,
+        )
+        producer_domain = CoordinateDomain(
+            (10,),
+            ((10, 2 * key_count),),
+            ((10, 16),),
+            kind="site",
+            identity=0,
+        )
+        key = coordinate_axis_symbol(0)
+        relation = CoordinateRelation(
+            source_domain=key_domain,
+            target_domain=producer_domain,
+            pieces=(
+                _CoordinateRelationPiece(
+                    source_bounds_items=((0, 0, key_count, 1),),
+                    target_ranges=((10, 2 * key, 2 * key + 2, 1),),
+                ),
+            ),
+        )
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("symbolic proof must not enumerate"),
+        ):
+            converse, target_counts = relation.derive_converse_and_target_counts()
+            self.assertIsNotNone(converse)
+            self.assertIsNotNone(target_counts)
+            assert converse is not None and target_counts is not None
+            self.assertEqual(converse, relation.converse())
+            self.assertEqual(target_counts.constant_value(), 2)
+
+        for concrete_count in (0, 1, 3, 5):
+            concrete = relation.substitute_parameters({key_count: concrete_count})
+            concrete_converse = converse.substitute_parameters(
+                {key_count: concrete_count}
+            )
+            self.assertEqual(
+                concrete.materialize(),
+                tuple(
+                    frozenset((2 * key_index, 2 * key_index + 1))
+                    for key_index in range(concrete_count)
+                ),
+            )
+            self.assertEqual(
+                concrete_converse.materialize(),
+                tuple(
+                    frozenset((producer_index // 2,))
+                    for producer_index in range(2 * concrete_count)
+                ),
+            )
+
+    def test_symbolic_nonpartition_relations_do_not_derive_fixed_fan_in(
+        self,
+    ) -> None:
+        key_count = sympy.Symbol("key_count", integer=True, nonnegative=True)
+        key_domain = CoordinateDomain((0,), ((0, key_count),), kind="event")
+        key = coordinate_axis_symbol(0)
+        cases = (
+            (2 * key_count + 1, 2 * key, 2 * key + 2, 1),
+            (2 * key_count, 2 * key + 1, 2 * key + 3, 1),
+            (2 * key_count, 2 * key, 2 * key + 2, 2),
+        )
+        for target_count, begin, end, step in cases:
+            with self.subTest(
+                target_count=target_count,
+                begin=begin,
+                end=end,
+                step=step,
+            ):
+                producer_domain = CoordinateDomain(
+                    (10,),
+                    ((10, target_count),),
+                    kind="site",
+                )
+                relation = CoordinateRelation(
+                    source_domain=key_domain,
+                    target_domain=producer_domain,
+                    pieces=(
+                        _CoordinateRelationPiece(
+                            source_bounds_items=((0, 0, key_count, 1),),
+                            target_ranges=((10, begin, end, step),),
+                        ),
+                    ),
+                )
+                converse, target_counts = relation.derive_converse_and_target_counts()
+                self.assertIsNone(converse)
+                self.assertIsNone(target_counts)
+
+        symbolic_fan_in = sympy.Symbol("fan_in", integer=True, positive=True)
+        symbolic_producer_domain = CoordinateDomain(
+            (10,),
+            ((10, symbolic_fan_in * key_count),),
+            kind="site",
+        )
+        symbolic_width = CoordinateRelation(
+            source_domain=key_domain,
+            target_domain=symbolic_producer_domain,
+            pieces=(
+                _CoordinateRelationPiece(
+                    source_bounds_items=((0, 0, key_count, 1),),
+                    target_ranges=(
+                        (
+                            10,
+                            symbolic_fan_in * key,
+                            symbolic_fan_in * (key + 1),
+                            1,
+                        ),
+                    ),
+                ),
+            ),
+        )
+        self.assertEqual(
+            symbolic_width.derive_converse_and_target_counts(),
+            (None, None),
+        )
+
+        producer_domain = CoordinateDomain(
+            (10,),
+            ((10, 2 * key_count),),
+            kind="site",
+        )
+        duplicate_pieces = CoordinateRelation(
+            source_domain=key_domain,
+            target_domain=producer_domain,
+            pieces=(
+                _CoordinateRelationPiece(
+                    source_bounds_items=((0, 0, key_count, 1),),
+                    target_ranges=((10, 2 * key, 2 * key + 2, 1),),
+                ),
+                _CoordinateRelationPiece(
+                    source_bounds_items=((0, 0, key_count, 1),),
+                    target_ranges=((10, 2 * key, 2 * key + 2, 1),),
+                ),
+            ),
+        )
+        self.assertEqual(
+            duplicate_pieces.derive_converse_and_target_counts(),
+            (None, None),
+        )
+
     def test_unproved_symbolic_point_maps_decline_totality(self) -> None:
         task_count = sympy.Symbol("task_count", integer=True, nonnegative=True)
         source = CoordinateDomain((10,), ((10, task_count),), kind="site")

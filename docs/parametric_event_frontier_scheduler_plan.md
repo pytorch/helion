@@ -22,15 +22,18 @@ Implementation checkpoint (2026-09-08):
   rank-one roots: symbolic domains lower through the same `WorkerSchedule`,
   conservative root barriers, and runtime-bounded loops, with one cubin reused
   across changing extents.
-- Exact parameterized root-entry readiness is implemented for the first
-  replay-safe subset: rank-one positional producer/key and consumer/key
-  bijections with fan-in one use the existing epoch-valued counter lowering.
+- Exact parameterized root-entry readiness supports rank-one positional
+  fan-in one and a proved fixed-width producer partition whose one consumer
+  per key executes as the existing final-arrival continuation. Parameterized
+  counters use one 64-bit epoch-framed state allocation across changing
+  extents and counter-section offsets.
 - The first parametric event-frontier recurrence is implemented for a unique
   topological chain of equal-size canonical rank-one roots joined by those
   exact fan-in-one events. The existing segment relations are the certificate,
   and codegen only strength-reduces a recognized certificate.
-- Wider fan-in, unequal and ragged extents, cross-workload rollout, and final
-  source/local-path consolidation remain to be implemented and measured.
+- Ragged or runtime-varying fan-in, unequal non-continuation recurrences,
+  cross-workload rollout, and final source/local-path consolidation remain to
+  be implemented and measured.
 
 The hard architectural constraint is:
 
@@ -1180,6 +1183,36 @@ six boundary sizes. Forks, barriers, unequal extents, rank greater than one,
 and non-positional relations conservatively retain the parametric root-major
 schedule. This is a representation and correctness milestone; it does not yet
 claim the wider fan-in or source-ticket structure needed by FlashMLA.
+
+Implementation checkpoint (2026-09-09): parameterized readiness also accepts
+the exact rank-one partition
+
+```text
+key k -> producer tasks [F*k, F*k + F)
+```
+
+when `F` is a positive compile-time integer and the producer extent is proved
+to be exactly `F*K`. The same relation derivation produces both the converse
+publication `producer p -> floor(p/F)` and constant arrival count `F`; the
+scheduler does not re-match the affine formula. For `F > 1`, one positional
+sink task per key is removed from resident placement and executed through the
+existing `FinalArrivalContinuation` by the producer observing the final
+arrival. The unequal `F*K -> K` topology deliberately remains root-major and
+does not broaden the equal-size event-frontier recurrence.
+
+All parameterized exact counters share a 64-bit state allocation containing
+fixed per-worker epochs followed by aligned readiness sections. If `M` is the
+maximum compiler-proved static fan-in in the plan, launch epoch `e` uses base
+`e*M` and event target `e*M + F`. Fan-in one publishes the target directly;
+wider fan-in first raises a possibly stale or relocated word to the epoch base
+and then adds one arrival. This is replay-safe across empty, shrink/grow, and
+moving counter sections with different fan-ins without a reset kernel or a
+host-generated schedule. Root barriers remain in their existing separate
+32-bit state. As with any monotonic epoch protocol, correctness assumes the
+64-bit `epoch*M` value does not overflow; that horizon is effectively
+unreachable for practical fan-ins. Tests cover `K=0/1`, worker-count
+boundaries, alternating CUDA graphs, multiple moving sections, different
+fan-ins, and one-cubin reuse.
 
 ### Phase 5: source-ticket generalization
 
