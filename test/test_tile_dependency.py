@@ -73,26 +73,20 @@ def flattened_qwen_attention_stages(x: torch.Tensor) -> torch.Tensor:
     chunk = torch.empty((16, 8, 128), device=x.device, dtype=x.dtype)
     chunk_storage = chunk.view(-1)
     out = torch.empty((8, 128), device=x.device, dtype=x.dtype)
-    for tile_split, tile_group, tile_head in hl.tile(
-        [128, 2, 4], block_size=[1, 1, 4]
-    ):
-        partial[tile_split, tile_group, tile_head, :] = x[
-            tile_group, tile_head
-        ][None, :, :, None]
+    for tile_split, tile_group, tile_head in hl.tile([128, 2, 4], block_size=[1, 1, 4]):
+        partial[tile_split, tile_group, tile_head, :] = x[tile_group, tile_head][
+            None, :, :, None
+        ]
     for tile_chunk, tile_head in hl.tile([16, 8], block_size=[1, 1]):
         split = tile_chunk.index[:, None] * 8 + hl.arange(8)[None, :]
         base = split[:, :, None] * 8 + tile_head.index[None, None, :]
         offsets = base[:, :, :, None] * 128 + hl.arange(128)[None, None, None, :]
-        chunk[tile_chunk, tile_head, :] = torch.sum(
-            partial_storage[offsets], dim=1
-        )
+        chunk[tile_chunk, tile_head, :] = torch.sum(partial_storage[offsets], dim=1)
     for tile_head in hl.tile(8, block_size=1):
         chunk_index = hl.arange(16)
-        offsets = (
-            (chunk_index[:, None] * 8 + tile_head.index[None, :])[:, :, None]
-            * 128
-            + hl.arange(128)[None, None, :]
-        )
+        offsets = (chunk_index[:, None] * 8 + tile_head.index[None, :])[
+            :, :, None
+        ] * 128 + hl.arange(128)[None, None, :]
         out[tile_head, :] = torch.sum(chunk_storage[offsets], dim=0)
     return out
 
@@ -344,6 +338,90 @@ class TestTileDependency(TestCase):
         self.assertIsNotNone(target_counts)
         assert derived is not None
         self.assertEqual(derived.materialize(), converse.materialize())
+
+    def test_adjacent_static_offset_point_maps_fold_exactly(self) -> None:
+        inner = coordinate_axis_symbol(10)
+        outer = coordinate_axis_symbol(11)
+        source = CoordinateDomain(
+            (10, 11),
+            ((10, 16), (11, 3)),
+            kind="task_order",
+        )
+        target = CoordinateDomain((20,), ((20, 48),), kind="site")
+        relation = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (
+                    ((10, 0, 8, 1), (11, 0, 3, 1)),
+                    (8 * outer + inner,),
+                ),
+                (
+                    ((10, 8, 16, 1), (11, 0, 3, 1)),
+                    (8 * outer + inner + 16,),
+                ),
+            ),
+        )
+
+        self.assertEqual(len(relation.coalesce_adjacent_source_boxes().pieces), 2)
+        compact = relation.coalesce_adjacent_source_boxes(fold_static_offsets=True)
+
+        self.assertEqual(len(compact.pieces), 1)
+        self.assertTrue(compact.is_total_function())
+        self.assertTrue(compact.is_pointwise_equal_to(relation))
+        self.assertEqual(compact.materialize(), relation.materialize())
+
+        many_source = CoordinateDomain(
+            (10, 11),
+            ((10, 8), (11, 2)),
+            kind="task_order",
+        )
+        many_target = CoordinateDomain((20,), ((20, 16),), kind="site")
+        ordered_pieces = tuple(
+            _CoordinateRelationPiece(
+                ((10, 2 * part, 2 * part + 2, 1), (11, 0, 2, 1)),
+                (
+                    (
+                        20,
+                        2 * outer + inner + 2 * part,
+                        2 * outer + inner + 2 * part + 1,
+                        1,
+                    ),
+                ),
+            )
+            for part in range(4)
+        )
+        for permutation in (
+            tuple(reversed(ordered_pieces)),
+            tuple(ordered_pieces[index] for index in (2, 0, 3, 1)),
+        ):
+            shuffled = CoordinateRelation(many_source, many_target, permutation)
+            shuffled_compact = shuffled.coalesce_adjacent_source_boxes(
+                fold_static_offsets=True
+            )
+            self.assertEqual(len(shuffled_compact.pieces), 1)
+            self.assertTrue(shuffled_compact.is_pointwise_equal_to(shuffled))
+
+        unequal = CoordinateRelation.point_map(
+            CoordinateDomain((10, 11), ((10, 15), (11, 3)), kind="task_order"),
+            target,
+            (
+                (
+                    ((10, 0, 8, 1), (11, 0, 3, 1)),
+                    (8 * outer + inner,),
+                ),
+                (
+                    ((10, 8, 15, 1), (11, 0, 3, 1)),
+                    (8 * outer + inner + 16,),
+                ),
+            ),
+        )
+        self.assertEqual(
+            len(
+                unequal.coalesce_adjacent_source_boxes(fold_static_offsets=True).pieces
+            ),
+            2,
+        )
 
     def test_piecewise_point_converse_declines_non_dense_layout(self) -> None:
         inner = coordinate_axis_symbol(10)
@@ -832,7 +910,12 @@ class TestTileDependency(TestCase):
             (
                 (
                     ((10, 0, 6, 1), (11, 0, 3, 1)),
-                    (outer, sympy.Integer(0), sympy.Mod(inner, 3), sympy.floor(inner / 3)),
+                    (
+                        outer,
+                        sympy.Integer(0),
+                        sympy.Mod(inner, 3),
+                        sympy.floor(inner / 3),
+                    ),
                 ),
                 (
                     ((10, 6, 12, 1), (11, 0, 3, 1)),
@@ -1339,6 +1422,122 @@ class TestTileDependency(TestCase):
             ),
         )
 
+    def test_symbolic_max_target_value_handles_strided_symbolic_begin(self) -> None:
+        consumer_axis = 57
+        producer_axis = 29
+        consumers = CoordinateDomain(
+            (consumer_axis,),
+            ((consumer_axis, 64),),
+            kind="task_order",
+        )
+        producers = CoordinateDomain(
+            (producer_axis,),
+            ((producer_axis, 8),),
+            kind="task_order",
+        )
+        required_producers = CoordinateRelation(
+            source_domain=consumers,
+            target_domain=producers,
+            pieces=(
+                _CoordinateRelationPiece(
+                    source_bounds_items=((consumer_axis, 0, 64, 1),),
+                    target_ranges=(
+                        (
+                            producer_axis,
+                            sympy.Mod(
+                                coordinate_axis_symbol(consumer_axis),
+                                4,
+                            ),
+                            sympy.Integer(8),
+                            4,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        maximum = required_producers.max_target_value_by_source(
+            CoordinateRelation.identity(producers, producers)
+        )
+
+        self.assertIsNotNone(maximum)
+        assert maximum is not None
+        self.assertEqual(
+            maximum.materialize(),
+            tuple(frozenset((4 + consumer % 4,)) for consumer in range(64)),
+        )
+
+    def test_symbolic_max_target_value_respects_stride_alignment(self) -> None:
+        consumer_axis = 57
+        producer_axis = 29
+        value_axis = -1
+        consumers = CoordinateDomain(
+            (consumer_axis,),
+            ((consumer_axis, 1),),
+            kind="task_order",
+        )
+        producers = CoordinateDomain(
+            (producer_axis,),
+            ((producer_axis, 8),),
+            kind="task_order",
+        )
+        values = CoordinateDomain(
+            (value_axis,),
+            ((value_axis, 108),),
+            kind="value",
+        )
+        required_producers = CoordinateRelation(
+            source_domain=consumers,
+            target_domain=producers,
+            pieces=(
+                _CoordinateRelationPiece(
+                    source_bounds_items=((consumer_axis, 0, 1, 1),),
+                    target_ranges=(
+                        (
+                            producer_axis,
+                            sympy.Integer(1),
+                            sympy.Integer(8),
+                            2,
+                        ),
+                    ),
+                ),
+            ),
+        )
+        producer_values = CoordinateRelation(
+            source_domain=producers,
+            target_domain=values,
+            pieces=(
+                _CoordinateRelationPiece(
+                    source_bounds_items=((producer_axis, 0, 8, 2),),
+                    target_ranges=(
+                        (
+                            value_axis,
+                            coordinate_axis_symbol(producer_axis) + 100,
+                            coordinate_axis_symbol(producer_axis) + 101,
+                            1,
+                        ),
+                    ),
+                ),
+                _CoordinateRelationPiece(
+                    source_bounds_items=((producer_axis, 1, 8, 2),),
+                    target_ranges=(
+                        (
+                            value_axis,
+                            coordinate_axis_symbol(producer_axis),
+                            coordinate_axis_symbol(producer_axis) + 1,
+                            1,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        maximum = required_producers.max_target_value_by_source(producer_values)
+
+        self.assertIsNotNone(maximum)
+        assert maximum is not None
+        self.assertEqual(maximum.materialize(), (frozenset((7,)),))
+
     def test_out_of_domain_point_map_is_not_total(self) -> None:
         source = CoordinateDomain((10,), ((10, 6),), identity=0)
         target = CoordinateDomain((0,), ((0, 2),), kind="event", identity=0)
@@ -1356,6 +1555,42 @@ class TestTileDependency(TestCase):
         self.assertFalse(relation.has_total_source())
         self.assertFalse(relation.is_total_function())
         self.assertEqual(relation.materialize()[-2:], (frozenset(), frozenset()))
+
+    def test_out_of_domain_source_support_is_not_counted_as_total(self) -> None:
+        source = CoordinateDomain((10,), ((10, 2),), identity=0)
+        target = CoordinateDomain((20,), ((20, 1),), identity=1)
+        relation = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (
+                    ((10, -1, 1, 1),),
+                    (sympy.Integer(0),),
+                ),
+            ),
+        )
+
+        self.assertIsNone(relation.source_support_cardinality())
+        self.assertFalse(relation.is_total_function())
+
+    def test_empty_target_is_not_counted_as_source_support(self) -> None:
+        source = CoordinateDomain((10,), ((10, 2),), identity=0)
+        target = CoordinateDomain((20,), ((20, 1),), identity=1)
+        coordinate = coordinate_axis_symbol(10)
+        relation = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (
+                    ((10, 0, 2, 1),),
+                    (coordinate + 1,),
+                ),
+            ),
+        )
+
+        self.assertEqual(relation.materialize(), (frozenset(), frozenset()))
+        self.assertIsNone(relation.source_support_cardinality())
+        self.assertFalse(relation.is_total_function())
 
     def test_pointwise_strict_order_is_proved_on_common_affine_partition(
         self,
@@ -1732,7 +1967,9 @@ class TestTileDependency(TestCase):
             ((131072,), (16384,)),
         )
         self.assertEqual(
-            tuple(len(access.affine_subscript_ranges or ()) for access in flattened_loads),
+            tuple(
+                len(access.affine_subscript_ranges or ()) for access in flattened_loads
+            ),
             (8, 16),
         )
         self.assertEqual(

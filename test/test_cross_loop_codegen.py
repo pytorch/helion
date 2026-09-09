@@ -730,6 +730,62 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_single_trip_root_barrier_publisher_can_inline(self) -> None:
+        x = torch.arange(4096, device=DEVICE, dtype=torch.float32).reshape(1, 4096)
+        original_build = cross_loop_codegen.build_static_pipeline_plan
+
+        def build_with_middle_root_barrier(**kwargs: Any):
+            plan = original_build(**kwargs)
+            return dataclasses.replace(
+                plan,
+                readiness_counters=tuple(
+                    counter
+                    for counter in plan.readiness_counters
+                    if all(
+                        producer.producer_root != 1 for producer in counter.producers
+                    )
+                ),
+                root_barrier_edges=plan.root_barrier_edges | frozenset(((1, 2),)),
+            )
+
+        with mock.patch.object(
+            cross_loop_codegen,
+            "build_static_pipeline_plan",
+            side_effect=build_with_middle_root_barrier,
+        ):
+            code, out = code_and_output(
+                nested_load_store_chain,
+                (x,),
+                block_sizes=[1, 16],
+                pid_type="persistent_blocked",
+                cross_loop_schedule="static_pipeline",
+                num_sm_multiplier=1,
+                num_warps=1,
+            )
+
+        torch.testing.assert_close(out, (x + 1) * 2 + 3)
+        self.assertIn("tile_dependency_root_barrier_wait", code)
+        self.assertIn(
+            "@triton.jit\ndef tile_dependency_root_1_scheduled_task",
+            code,
+        )
+        self.assertNotIn(
+            "@triton.jit(noinline=True)\ndef tile_dependency_root_1_scheduled_task",
+            code,
+        )
+        wrapper_begin = code.index("def tile_dependency_root_1_scheduled_task")
+        wrapper_end = code.index("\n@triton.jit", wrapper_begin)
+        wrapper = code[wrapper_begin:wrapper_end]
+        self.assertNotIn("tile_dependency_root_barrier", wrapper)
+        resident_begin = code.index("def tile_dependency_resident_worker")
+        dispatch = code.index("tile_dependency_root_1_scheduled_task(", resident_begin)
+        publication = code.index("sem='release', scope='gpu'", dispatch)
+        wait = code.index("tile_dependency_root_barrier_wait", publication)
+        self.assertLess(dispatch, publication)
+        self.assertLess(publication, wait)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_two_axis_nested_loop_falls_back_to_root_barrier(self) -> None:
         x = torch.arange(32 * 32, device=DEVICE, dtype=torch.float32).reshape(32, 32)
         code, out = code_and_output(
@@ -859,6 +915,14 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         self.assertIn("tile_dependency_readiness_wait", code)
         self.assertNotIn("tile_dependency_task_wait", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
+        self.assertIn(
+            "@triton.jit\ndef tile_dependency_root_1_scheduled_task",
+            code,
+        )
+        self.assertIn(
+            "@triton.jit(noinline=True)\ndef tile_dependency_root_0_scheduled_task",
+            code,
+        )
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -1183,9 +1247,15 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             worker_step = 0
             normalized = []
             for segment in reordered:
+                logical_order = segment.logical_task_order
+                self.assertIsNotNone(logical_order)
+                assert logical_order is not None
                 normalized.append(
-                    dataclasses.replace(
-                        segment,
+                    WorkerScheduleSegment(
+                        root=segment.root,
+                        task_order=logical_order,
+                        worker_begin=segment.worker_begin,
+                        worker_count=segment.worker_count,
                         dispatch_offset=worker_step * segment.worker_count,
                     )
                 )
@@ -1234,8 +1304,11 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             }
             first = segments[0]
             second = segments[1]
-            prefix = _task_order_slice(first.task_order, 0, 4)
-            suffix = _task_order_slice(first.task_order, 4, first.task_count - 4)
+            first_order = first.logical_task_order
+            second_order = second.logical_task_order
+            assert first_order is not None and second_order is not None
+            prefix = _task_order_slice(first_order, 0, 4)
+            suffix = _task_order_slice(first_order, 4, first.task_count - 4)
             assert prefix is not None and suffix is not None
             interleaved = (
                 WorkerScheduleSegment(
@@ -1247,7 +1320,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 ),
                 WorkerScheduleSegment(
                     root=1,
-                    task_order=second.task_order,
+                    task_order=second_order,
                     worker_begin=4,
                     worker_count=second.worker_count,
                     dispatch_offset=0,
@@ -1310,9 +1383,12 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             producer = segments[0]
             consumer = segments[1]
             prefix_count = producer.task_count // 2
-            prefix = _task_order_slice(producer.task_order, 0, prefix_count)
+            producer_order = producer.logical_task_order
+            consumer_order = consumer.logical_task_order
+            assert producer_order is not None and consumer_order is not None
+            prefix = _task_order_slice(producer_order, 0, prefix_count)
             suffix = _task_order_slice(
-                producer.task_order,
+                producer_order,
                 prefix_count,
                 producer.task_count - prefix_count,
             )
@@ -1340,7 +1416,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 ),
                 WorkerScheduleSegment(
                     root=1,
-                    task_order=consumer.task_order,
+                    task_order=consumer_order,
                     worker_begin=0,
                     worker_count=consumer.worker_count,
                     dispatch_offset=consumer_step * consumer.worker_count,
@@ -1410,16 +1486,26 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         def build_with_transient_source(**kwargs: Any):
             kwargs["allow_transient_source"] = False
             plan = original_build(**kwargs)
-            resident_segments = tuple(
-                dataclasses.replace(segment, dispatch_offset=0)
-                for segment in plan.worker_schedule.segments
-                if segment.root != 0
-            )
+            resident_segments = []
+            for segment in plan.worker_schedule.segments:
+                if segment.root == 0:
+                    continue
+                logical_order = segment.logical_task_order
+                assert logical_order is not None
+                resident_segments.append(
+                    WorkerScheduleSegment(
+                        root=segment.root,
+                        task_order=logical_order,
+                        worker_begin=segment.worker_begin,
+                        worker_count=segment.worker_count,
+                        dispatch_offset=0,
+                    )
+                )
             return dataclasses.replace(
                 plan,
                 worker_schedule=WorkerSchedule(
                     worker_count=plan.worker_schedule.worker_count,
-                    segments=resident_segments,
+                    segments=tuple(resident_segments),
                 ),
                 transient_source_root=0,
             )

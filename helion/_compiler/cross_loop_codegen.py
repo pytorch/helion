@@ -1610,6 +1610,9 @@ def emit_cross_loop_schedule(
         for segment, ordinal_begin, ordinal_end in reversed(
             traversal.segment_ordinal_ranges
         ):
+            logical_order = segment.logical_task_order
+            if logical_order is None:
+                raise AssertionError("segment has no dense rendering order")
             task_order_delta = f"(({task_order_index}) - {ordinal_begin})"
             membership = (
                 f"({task_order_delta}) >= 0 and "
@@ -1617,11 +1620,11 @@ def emit_cross_loop_schedule(
             )
             task_order_coordinates = flat_task_coordinates(
                 task_order_delta,
-                segment.task_order.source_domain.axis_order,
-                segment.task_order.source_domain.axis_counts,
+                logical_order.source_domain.axis_order,
+                logical_order.source_domain.axis_counts,
             )
             task_coordinates, relation_membership = relation_point_coordinates(
-                segment.task_order,
+                logical_order,
                 task_order_coordinates,
             )
             if relation_membership != "True":
@@ -1787,13 +1790,31 @@ def emit_cross_loop_schedule(
             )
         if not has_task_scheduling or root in kernel_scope_roots:
             return body
+        # A root used at one schedule occurrence with entry-only bookkeeping
+        # has no duplicated call site to protect.  Let Triton inline that thin
+        # wrapper just as it does for a root-barrier wait surrounding the same
+        # body.  A root-barrier publication is emitted by the caller after the
+        # task dispatch, so it does not require an outlining boundary.  Repeated
+        # roots and roots that publish per-task counters or splice nested work
+        # retain the noinline boundary that limits code growth and live-range
+        # coupling across schedule occurrences.
+        root_segments = static_pipeline_plan.worker_schedule.segments_for_root(root)
+        is_single_trip_occurrence = (
+            len(root_segments) == 1
+            and root_segments[0].task_count <= root_segments[0].worker_count
+        )
+        scheduled_wrapper_noinline = (
+            not is_single_trip_occurrence
+            or bool(producer_counters)
+            or root in nested_producer_roots
+        )
         return [
             _outline_cross_loop_region(
                 device_function,
                 name_hint=f"tile_dependency_root_{root}_scheduled_task",
                 body=body,
                 extra_argument_names=extra_argument_names,
-                noinline=True,
+                noinline=scheduled_wrapper_noinline,
             )
         ]
 

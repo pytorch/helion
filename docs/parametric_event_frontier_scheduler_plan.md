@@ -2,9 +2,23 @@
 
 ## Status
 
-This is the proposed end-state plan for Helion's cross-loop scheduler. It is a
-design document only. It incorporates the experiments from FlashMLA, Qwen3
-decode, Gemma 4 A4B MoE, DeepSeek-V3 MoE, Nemotron MoE, and Muse/Glimmer FFN.
+This is the end-state plan and implementation ledger for Helion's cross-loop
+scheduler. It incorporates the experiments from FlashMLA, Qwen3 decode, Gemma
+4 A4B MoE, DeepSeek-V3 MoE, Nemotron MoE, and Muse/Glimmer FFN.
+
+Implementation checkpoint (2026-09-08):
+
+- Concrete schedule ownership is normalized into the existing
+  `WorkerScheduleSegment.task_order` relation.
+- Concrete event-frontier proposal and symbolic ownership/progress proofs are
+  implemented without a production CTA DAG.
+- Independent schedules bypass proposal, and a same-coverage resident
+  proposal is retained only when its unit-task final wave does not regress.
+- The generic source-ticket frontier participates in resident priority, while
+  the proven transient-source execution mechanism is retained for now.
+- Runtime-parameterized domain extents, recurrence extraction, cubin reuse,
+  cross-workload rollout, and final source/local-path consolidation remain to
+  be implemented and measured.
 
 The hard architectural constraint is:
 
@@ -302,9 +316,22 @@ For each `(worker, wave)`, at most one resident segment relation is defined.
 Its target is the logical task executed in that slot. An undefined slot is
 idle.
 
+At the current concrete checkpoint, normalized relations occupy only the
+resident value of the launch-stage axis; source execution still uses the
+existing transient ticket lowering. The otherwise-redundant axis is retained
+deliberately for Phase 5, where that same `WorkerSchedule` relation must own
+the source prefix. It must be removed if source ownership is not migrated;
+the current implementation does not yet claim unified source/resident
+execution.
+
 `worker_count` remains a selected configuration/hardware value. `wave_count`
 is derived symbolically from the union of segment support; it is not stored in
 a second schedule object.
+
+The current concrete migration still propagates the largest enclosing wave
+domain from normalized inputs, so that envelope may conservatively exceed
+actual support after a rewrite. Exact support-derived sizing is part of the
+parameterized-domain work, not a property claimed by the present checkpoint.
 
 ### Repetition without Run/Repeat
 
@@ -370,6 +397,15 @@ not cause repeated inlining or alter range-level resource configuration.
 For concrete schedules, codegen may retain today's segment-ordered fast form
 when a proof shows it is the same relation. This is a lowering optimization,
 not a second scheduling path.
+
+A scheduled-task wrapper with one segment and at most one task per
+participating worker may remain inline when it only consumes readiness. There
+is no duplicated call site or loop-carried scheduled state to isolate.
+Wrappers used by repeated segments or by per-task readiness-counter or nested
+loop publications remain outlined. Caller-owned root-barrier publication does
+not affect wrapper inlining: codegen emits it after the task dispatch. This
+changes neither the schedule relation nor the selected counter; it only avoids
+an artificial device-call boundary around a one-trip wait and body.
 
 Any concrete flattening is migration and diagnostic machinery only. Production
 dynamic lowering must never expand runtime waves into a compile-time segment
@@ -522,14 +558,16 @@ unlocks without confusing claims with physical completion.
 Choose candidate intervals lexicographically by:
 
 ```text
-1. effective schema criticality class
-2. already-admissible work at that class before merely prospective release
-3. closes a readiness event at that class
-4. fewest remaining claims within the same event class
-5. canonical root, key, and task order
+1. effective structural slack
+2. immediate inlet from an exact earlier launch stage
+3. effective downstream depth
+4. already-admissible work at that class before merely prospective release
+5. closes a readiness event at that class
+6. earliest fixed launch-stage producer frontier
+7. canonical root, key, and task order
 ```
 
-The second field is computed mechanically:
+The fourth field is computed mechanically:
 
 ```text
 prospective = 0 if effective_class == base(candidate root) else 1
@@ -541,9 +579,20 @@ When no such downstream candidate is yet admissible, the event-closing
 producer inherits its consumer's better class and wins over ordinary ancestor
 work.
 
-The fourth field is deliberately weak. One heavy remaining CTA is not known to
-be faster than two light CTAs. It is only a structural tie-break after class
-and downstream progress agree.
+The second and sixth fields apply only when an earlier launch stage has an
+exact ticket order. At equal slack, immediate consumers of that stage precede
+deeper resident work. Otherwise a statically admissible downstream wait can
+occupy a fixed worker strand while an independent inlet task that could make
+progress is placed behind it. This is a launch-stage property, not a named
+root or model rule; when there is no earlier stage, every candidate has the
+same inlet class and ordinary downstream pipelining is unchanged.
+
+Within those inlet tasks, the sixth field is the maximum source ticket
+required by the candidate cohort, derived through the emitted readiness
+relations. It is a structural release order, not a completion-time estimate:
+it affects priority only, while runtime counters remain the sole permission to
+execute a consumer body. Candidate intervals end whenever this frontier
+changes.
 
 Highest bottom-level is not the primary rule. It can keep issuing FlashMLA
 partials because every partial contains the reduction in its suffix, delaying
@@ -555,6 +604,14 @@ Select intervals until every worker slot in the abstract wave is filled or no
 admissible work remains. Preferring a ready downstream root does not create a
 barrier: after assigning its available tasks, remaining workers receive other
 admissible roots.
+
+For schedules with identical resident task coverage, selection rejects a
+proposal whose final occupied unit-task wave is later than the input
+schedule's. This is a symbolic no-regression certificate, not a latency cost
+model. A source-ticket proposal is compared separately because moving a source
+root out of resident ownership intentionally changes the compared task set.
+With no emitted prerequisite there is no scheduling opportunity, so the input
+schedule is returned without stepping through its waves.
 
 ### Symbolic recurrence extraction
 
@@ -650,6 +707,12 @@ The model-independent eligibility conjunction is:
 CUDA does not guarantee increasing CTA admission from PID order alone.
 Therefore correctness requires the existing global source-first ticket
 allocator; disjoint PID ranges are insufficient. Replay epochs must not alias.
+
+Excluding the source root from resident ownership and admissibility does not
+exclude it from scheduling priority.  Its exact ticket relation induces a
+priority-only external frontier for each dependent resident cohort.  This
+preserves source-release order without pretending that ticket issue proves
+physical completion.
 
 Once B4/B9 parity is established, rename or reshape the existing field if
 needed, but do not add a separate launch-prefix plan object.

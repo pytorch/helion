@@ -5,6 +5,7 @@ from functools import cache
 from functools import cached_property
 import heapq
 import itertools
+import math
 import operator
 from typing import cast
 
@@ -15,6 +16,8 @@ from .tile_dependency import CoordinateDomain
 from .tile_dependency import CoordinateRelation
 from .tile_dependency import DependencyObligation
 from .tile_dependency import TileDependencyGraph
+from .tile_dependency import _logical_expression_bounds
+from .tile_dependency import _simplify_logical_expression
 from .tile_dependency import consumer_to_preceding_site_relation
 from .tile_dependency import coordinate_axis_symbol
 from .tile_dependency import instantiate_symbolic_dependencies
@@ -23,6 +26,8 @@ from .tile_dependency import nested_logical_axes
 WorkerInterval = tuple[int, int]
 
 _MAX_TASK_ORDER_SLICE_PIECES = 4096
+
+_RESIDENT_LAUNCH_STAGE = 1
 
 
 def _normalize_intervals(
@@ -71,18 +76,25 @@ def _interval_cardinality(intervals: tuple[WorkerInterval, ...]) -> int:
 
 @dataclasses.dataclass(frozen=True)
 class WorkerScheduleSegment:
-    """One symbolic task-family run in a static persistent-worker schedule.
+    """One root's ownership relation in a static persistent-worker schedule.
 
-    ``task_order`` maps dense task-order indices to logical tasks.
-    ``dispatch_offset`` places those indices in a linearized range over
-    ``worker_count`` workers::
+    In a normalized :class:`WorkerSchedule`, ``task_order`` maps global
+    ``(launch stage, worker, wave)`` coordinates directly to logical tasks.
+    Its source support is allowed to be partial.  The three integer placement
+    fields remain only as the migration-compatible spelling of a dense run;
+    :class:`WorkerSchedule` immediately normalizes that spelling into the
+    relation and all semantic queries consume the relation.
+
+    Before normalization, constructors may still pass a dense logical task
+    order plus ``dispatch_offset``::
 
         dispatch_index = dispatch_offset + task_order_index
         worker = worker_begin + dispatch_index % worker_count
         worker_step = dispatch_index // worker_count
 
-    Several segments can describe arbitrary numbers of waves without
-    materializing one schedule entry per runtime task.
+    This compatibility form is never a second accepted schedule: construction
+    succeeds only when it can be converted exactly to the authoritative
+    relation.
     """
 
     root: int
@@ -104,19 +116,245 @@ class WorkerScheduleSegment:
             raise ValueError(
                 f"dispatch_offset must be nonnegative, got {self.dispatch_offset}"
             )
-        if (
-            self.task_order.source_domain.kind != "task_order"
-            or self.task_order.target_domain.kind != "site"
-            or not self.task_order.pieces
-        ):
+        if self.task_order.target_domain.kind != "site" or not self.task_order.pieces:
             raise ValueError(
                 "symbolic worker schedule relation has incompatible domains"
             )
+        if self.task_order.source_domain.kind not in ("task_order", "worker"):
+            raise ValueError(
+                "worker schedule source must be a task order or schedule domain"
+            )
+        if self.task_order.source_domain.kind == "worker" and (
+            len(self.task_order.source_domain.axis_order) != 3
+            or self.task_order.source_domain.axis_counts[
+                self.task_order.source_domain.axis_order[0]
+            ]
+            != 2
+        ):
+            raise ValueError("normalized worker schedule has incompatible axes")
+
+    @cached_property
+    def task_count(self) -> int:
+        """Number of schedule slots owned by this segment's relation."""
+        if self.task_order.source_domain.kind == "task_order":
+            return self.task_order.source_domain.size
+        cardinality = self.task_order.source_support_cardinality()
+        if cardinality is None:
+            raise ValueError("worker schedule support cardinality is not exact")
+        return cardinality
 
     @property
-    def task_count(self) -> int:
-        """Number of dense task-order indices represented by this segment."""
-        return self.task_order.source_domain.size
+    def is_normalized(self) -> bool:
+        """Return whether ``task_order`` is the authoritative schedule map."""
+        return self.task_order.source_domain.kind == "worker"
+
+    @cached_property
+    def logical_task_order(self) -> CoordinateRelation | None:
+        """Derive the dense logical traversal represented by this run.
+
+        This is compatibility and code-rendering machinery.  Placement and
+        correctness use ``task_order`` itself after normalization.
+        """
+        if not self.is_normalized:
+            return self.task_order
+        ordinal_axis = (
+            max(
+                (
+                    *self.task_order.source_domain.axis_order,
+                    *self.task_order.target_domain.axis_order,
+                ),
+                default=0,
+            )
+            + 1
+        )
+        ordinal_domain = CoordinateDomain(
+            axis_order=(ordinal_axis,),
+            axis_counts_items=((ordinal_axis, self.task_count),),
+            kind="task_order",
+        )
+        ordinal = coordinate_axis_symbol(ordinal_axis)
+        dispatch_index = self.dispatch_offset + ordinal  # pyrefly: ignore[unsupported-operation]
+        launch_stage_axis, worker_axis, wave_axis = (
+            self.task_order.source_domain.axis_order
+        )
+        canonical = self.task_order.canonical_single_valued()
+        if canonical is None:
+            return None
+        schedule_ordinal = (
+            coordinate_axis_symbol(wave_axis) * self.worker_count  # pyrefly: ignore[unsupported-operation]
+            + coordinate_axis_symbol(worker_axis)
+            - self.worker_begin
+            - self.dispatch_offset
+        )
+        # The scalar fields are only a lowering certificate.  Prove that the
+        # authoritative relation's support is contained in their dense slot
+        # interval; equal cardinality and injectivity of (wave, worker) ->
+        # ordinal then prove exact support equality.  Stale compatibility
+        # fields therefore disable the dense rendering path rather than
+        # overriding relation semantics.
+        for piece in canonical.pieces:
+            bounds = {
+                axis: (begin, end, step)
+                for axis, begin, end, step in piece.source_bounds_items
+            }
+            worker_begin, worker_end, _worker_step = bounds[worker_axis]
+            ordinal_bounds = _logical_expression_bounds(
+                schedule_ordinal,
+                domain=canonical.source_domain,
+                source_bounds=piece.source_bounds_items,
+            )
+            if (
+                bounds[launch_stage_axis]
+                != (_RESIDENT_LAUNCH_STAGE, _RESIDENT_LAUNCH_STAGE + 1, 1)
+                or worker_begin < self.worker_begin
+                or worker_end > self.worker_begin + self.worker_count
+                or ordinal_bounds is None
+                or ordinal_bounds[0] < 0  # pyrefly: ignore[unsupported-operation]
+                or ordinal_bounds[1] >= self.task_count  # pyrefly: ignore[unsupported-operation]
+            ):
+                return None
+        substitutions = {
+            coordinate_axis_symbol(launch_stage_axis): sympy.Integer(
+                _RESIDENT_LAUNCH_STAGE
+            ),
+            coordinate_axis_symbol(worker_axis): self.worker_begin  # pyrefly: ignore[unsupported-operation]
+            + sympy.Mod(dispatch_index, self.worker_count),  # pyrefly: ignore[unsupported-operation]
+            coordinate_axis_symbol(wave_axis): sympy.floor(
+                dispatch_index / self.worker_count
+            ),
+        }
+        full_ordinal_bounds = ((ordinal_axis, 0, self.task_count, 1),)
+        pieces: list[
+            tuple[tuple[tuple[int, int, int, int], ...], tuple[sympy.Expr, ...]]
+        ] = []
+        for piece in self.task_order.pieces:
+            source_bounds = {
+                axis: (begin, end, step)
+                for axis, begin, end, step in piece.source_bounds_items
+            }
+            if source_bounds[launch_stage_axis] != (
+                _RESIDENT_LAUNCH_STAGE,
+                _RESIDENT_LAUNCH_STAGE + 1,
+                1,
+            ):
+                continue
+            worker_begin, worker_end, worker_step = source_bounds[worker_axis]
+            wave_begin, wave_end, wave_step = source_bounds[wave_axis]
+            if wave_end == wave_begin + 1:
+                ordinal_begin = (
+                    wave_begin * self.worker_count
+                    + worker_begin
+                    - self.worker_begin
+                    - self.dispatch_offset
+                )
+                ordinal_end = ordinal_begin + worker_end - worker_begin
+                ordinal_step = worker_step
+            elif (
+                worker_begin == self.worker_begin
+                and worker_end == self.worker_begin + self.worker_count
+                and worker_step == 1
+            ):
+                ordinal_begin = wave_begin * self.worker_count - self.dispatch_offset
+                ordinal_end = (
+                    (wave_end - 1) * self.worker_count
+                    - self.dispatch_offset
+                    + self.worker_count
+                )
+                ordinal_step = wave_step
+                if wave_step != 1:
+                    return None
+            elif worker_end == worker_begin + 1 and worker_step == 1:
+                ordinal_begin = (
+                    wave_begin * self.worker_count
+                    + worker_begin
+                    - self.worker_begin
+                    - self.dispatch_offset
+                )
+                ordinal_end = (
+                    (wave_end - 1) * self.worker_count
+                    + worker_begin
+                    - self.worker_begin
+                    - self.dispatch_offset
+                    + 1
+                )
+                ordinal_step = wave_step * self.worker_count
+            else:
+                return None
+            ordinal_begin = max(0, ordinal_begin)
+            ordinal_end = min(self.task_count, ordinal_end)
+            if ordinal_begin >= ordinal_end:
+                continue
+            ordinal_bounds = ((ordinal_axis, ordinal_begin, ordinal_end, ordinal_step),)
+            target_expressions: list[sympy.Expr] = []
+            for _axis, begin, end, step in piece.target_ranges:
+                if step != 1 or sympy.simplify(end - begin) != 1:  # pyrefly: ignore[unsupported-operation]
+                    return None
+                expression = (
+                    ordinal
+                    if sympy.simplify(
+                        begin
+                        - (  # pyrefly: ignore[unsupported-operation]
+                            coordinate_axis_symbol(worker_axis)  # pyrefly: ignore[unsupported-operation]
+                            - self.worker_begin  # pyrefly: ignore[unsupported-operation]
+                            + coordinate_axis_symbol(wave_axis) * self.worker_count  # pyrefly: ignore[unsupported-operation]
+                            - self.dispatch_offset
+                        )
+                    )
+                    == 0
+                    else cast("sympy.Expr", begin.xreplace(substitutions))
+                )
+                target_expressions.append(
+                    _simplify_logical_expression(
+                        expression,
+                        domain=ordinal_domain,
+                        source_bounds=full_ordinal_bounds,
+                    )
+                )
+            pieces.append(
+                (
+                    ordinal_bounds,
+                    tuple(target_expressions),
+                )
+            )
+        result = CoordinateRelation.point_map(
+            ordinal_domain,
+            self.task_order.target_domain,
+            tuple(pieces),
+        ).coalesce_adjacent_source_boxes()
+        if not result.is_total_function():
+            return None
+        return result
+
+    def logical_task_wave_relation(
+        self,
+        wave_domain: CoordinateDomain,
+    ) -> CoordinateRelation | None:
+        """Derive this dense rendering run's task-order-to-wave map."""
+        logical_order = self.logical_task_order
+        if logical_order is None:
+            return None
+        local_ordinal = _flat_domain_index_expression(logical_order.source_domain)
+        wave = sympy.floor(  # pyrefly: ignore[bad-argument-type]
+            (self.dispatch_offset + local_ordinal) / self.worker_count  # pyrefly: ignore[unsupported-operation]
+        )
+        return CoordinateRelation.point_map(
+            logical_order.source_domain,
+            wave_domain,
+            (
+                (
+                    tuple(
+                        (
+                            axis,
+                            0,
+                            logical_order.source_domain.axis_counts[axis],
+                            1,
+                        )
+                        for axis in logical_order.source_domain.axis_order
+                    ),
+                    (wave,),
+                ),
+            ),
+        )
 
     def dispatch_index(self, task_order_index: int) -> int:
         """Return the linearized dispatch index for one ordered task."""
@@ -126,6 +364,20 @@ class WorkerScheduleSegment:
 
     def occupies(self, worker: int, worker_step: int) -> bool:
         """Return whether this segment occupies one step on a worker."""
+        if self.is_normalized:
+            launch_stage_axis, worker_axis, wave_axis = (
+                self.task_order.source_domain.axis_order
+            )
+            targets = self.task_order.target_coordinates(
+                {
+                    launch_stage_axis: _RESIDENT_LAUNCH_STAGE,
+                    worker_axis: worker,
+                    wave_axis: worker_step,
+                }
+            )
+            if len(targets) > 1:
+                raise AssertionError("one schedule slot maps to multiple tasks")
+            return bool(targets)
         worker_offset = worker - self.worker_begin
         if not 0 <= worker_offset < self.worker_count or worker_step < 0:
             return False
@@ -163,6 +415,62 @@ class WorkerScheduleSegment:
         iterating either domain.  Production optimized schedules impose the
         narrower wave-aligned form when constructing their rank certificate.
         """
+        if self.is_normalized:
+            canonical = self.task_order.canonical_single_valued()
+            if canonical is None and self.task_order.is_single_valued():
+                canonical = self.task_order
+            if canonical is None:
+                raise ValueError("worker schedule relation is not single-valued")
+            launch_stage_axis, worker_axis, wave_axis = (
+                canonical.source_domain.axis_order
+            )
+            support_by_waves: dict[
+                tuple[int, int, int], list[tuple[int, int, int]]
+            ] = {}
+            for piece in canonical.pieces:
+                bounds = {
+                    axis: (begin, end, step)
+                    for axis, begin, end, step in piece.source_bounds_items
+                }
+                if bounds[launch_stage_axis] != (
+                    _RESIDENT_LAUNCH_STAGE,
+                    _RESIDENT_LAUNCH_STAGE + 1,
+                    1,
+                ):
+                    continue
+                worker_begin, worker_end, worker_step = bounds[worker_axis]
+                wave_begin, wave_end, wave_step = bounds[wave_axis]
+                support_by_waves.setdefault(
+                    (wave_begin, wave_end, wave_step), []
+                ).append((worker_begin, worker_end, worker_step))
+            runs: list[tuple[int, int, int, int]] = []
+            for (
+                wave_begin,
+                wave_end,
+                wave_step,
+            ), worker_support in support_by_waves.items():
+                if wave_step != 1:
+                    raise ValueError("worker schedule wave support must be contiguous")
+                support_begin = min(begin for begin, _end, _step in worker_support)
+                support_end = max(end for _begin, end, _step in worker_support)
+                support_count = sum(
+                    len(range(begin, end, step)) for begin, end, step in worker_support
+                )
+                if support_count != support_end - support_begin:
+                    raise ValueError("worker schedule has noncontiguous worker support")
+                for index, (begin, end, step) in enumerate(worker_support):
+                    for other_begin, other_end, other_step in worker_support[
+                        index + 1 :
+                    ]:
+                        overlap_begin = max(begin, other_begin)
+                        overlap_end = min(end, other_end)
+                        if overlap_begin >= overlap_end:
+                            continue
+                        if (other_begin - begin) % math.gcd(step, other_step) == 0:
+                            raise ValueError("worker schedule support overlaps")
+                runs.append((support_begin, support_end, wave_begin, wave_end - 1))
+            return tuple(sorted(dict.fromkeys(runs), key=operator.itemgetter(2, 0)))
+
         worker_count = self.worker_count
         first_residue = self.dispatch_offset % worker_count
         active_count = min(self.task_count, worker_count)
@@ -215,6 +523,222 @@ def _flat_domain_index_expression(domain: CoordinateDomain) -> sympy.Expr:
     return sympy.simplify(result)
 
 
+def _worker_schedule_domain(
+    worker_count: int,
+    wave_count: int,
+    axes: tuple[int, int, int],
+) -> CoordinateDomain:
+    """Return the shared source domain for resident schedule relations."""
+    if worker_count <= 0 or wave_count <= 0:
+        raise ValueError("worker and wave counts must be positive")
+    launch_stage_axis, worker_axis, wave_axis = axes
+    return CoordinateDomain(
+        axis_order=axes,
+        axis_counts_items=(
+            (launch_stage_axis, 2),
+            (worker_axis, worker_count),
+            (wave_axis, wave_count),
+        ),
+        kind="worker",
+    )
+
+
+def _normalize_dense_schedule_segment(
+    segment: WorkerScheduleSegment,
+    schedule_domain: CoordinateDomain,
+) -> WorkerScheduleSegment:
+    """Convert one legacy dense run to its exact schedule ownership relation."""
+    launch_stage_axis, worker_axis, wave_axis = schedule_domain.axis_order
+    if segment.is_normalized:
+        source = segment.task_order.source_domain
+        if (
+            source.axis_order != schedule_domain.axis_order
+            or source.axis_counts[launch_stage_axis]
+            != schedule_domain.axis_counts[launch_stage_axis]
+            or source.axis_counts[worker_axis]
+            != schedule_domain.axis_counts[worker_axis]
+            or source.axis_counts[wave_axis] > schedule_domain.axis_counts[wave_axis]
+        ):
+            raise ValueError("worker schedule segments do not share one domain")
+        if source == schedule_domain:
+            return segment
+        return dataclasses.replace(
+            segment,
+            task_order=dataclasses.replace(
+                segment.task_order,
+                source_domain=schedule_domain,
+            ),
+        )
+
+    logical_order = segment.task_order
+    worker = coordinate_axis_symbol(worker_axis)
+    wave = coordinate_axis_symbol(wave_axis)
+    local_ordinal = (
+        wave * segment.worker_count  # pyrefly: ignore[unsupported-operation]
+        + worker
+        - segment.worker_begin
+        - segment.dispatch_offset
+    )
+    ordinal_axis = (
+        max(
+            (
+                *schedule_domain.axis_order,
+                *logical_order.source_domain.axis_order,
+                *logical_order.target_domain.axis_order,
+            ),
+            default=0,
+        )
+        + 1
+    )
+    ordinal_domain = CoordinateDomain(
+        axis_order=(ordinal_axis,),
+        axis_counts_items=((ordinal_axis, logical_order.source_domain.size),),
+        kind="task_order",
+    )
+    flat_logical_order = _flat_task_order_relation(logical_order, ordinal_domain)
+    if flat_logical_order is None or not flat_logical_order.is_total_function():
+        raise ValueError("logical task order cannot be flattened exactly")
+
+    def dispatch_boxes(
+        ordinal_begin: int,
+        ordinal_end: int,
+        ordinal_step: int,
+    ) -> tuple[tuple[tuple[int, int, int, int], ...], ...]:
+        """Map one dense ordinal interval to constant-many schedule boxes."""
+        if ordinal_step != 1:
+            ordinal_values = range(ordinal_begin, ordinal_end, ordinal_step)
+            if not ordinal_values:
+                return ()
+            dispatch_begin = segment.dispatch_offset + ordinal_values[0]
+            dispatch_last = segment.dispatch_offset + ordinal_values[-1]
+            first_wave, first_worker = divmod(dispatch_begin, segment.worker_count)
+            last_wave, last_worker = divmod(dispatch_last, segment.worker_count)
+            if first_wave == last_wave:
+                return (
+                    (
+                        (
+                            launch_stage_axis,
+                            _RESIDENT_LAUNCH_STAGE,
+                            _RESIDENT_LAUNCH_STAGE + 1,
+                            1,
+                        ),
+                        (
+                            worker_axis,
+                            segment.worker_begin + first_worker,
+                            segment.worker_begin + last_worker + 1,
+                            ordinal_step,
+                        ),
+                        (wave_axis, first_wave, first_wave + 1, 1),
+                    ),
+                )
+            if ordinal_step % segment.worker_count == 0 and first_worker == last_worker:
+                return (
+                    (
+                        (
+                            launch_stage_axis,
+                            _RESIDENT_LAUNCH_STAGE,
+                            _RESIDENT_LAUNCH_STAGE + 1,
+                            1,
+                        ),
+                        (
+                            worker_axis,
+                            segment.worker_begin + first_worker,
+                            segment.worker_begin + first_worker + 1,
+                            1,
+                        ),
+                        (
+                            wave_axis,
+                            first_wave,
+                            last_wave + 1,
+                            ordinal_step // segment.worker_count,
+                        ),
+                    ),
+                )
+            raise ValueError("strided task order crosses worker-wave boundaries")
+        dispatch_begin = segment.dispatch_offset + ordinal_begin
+        dispatch_end = segment.dispatch_offset + ordinal_end
+        first_wave, first_worker = divmod(dispatch_begin, segment.worker_count)
+        final_wave, final_worker = divmod(dispatch_end, segment.worker_count)
+        boxes: list[tuple[tuple[int, int, int, int], ...]] = []
+
+        def add(
+            worker_offset_begin: int, worker_offset_end: int, begin: int, end: int
+        ) -> None:
+            if worker_offset_begin >= worker_offset_end or begin >= end:
+                return
+            boxes.append(
+                (
+                    (
+                        launch_stage_axis,
+                        _RESIDENT_LAUNCH_STAGE,
+                        _RESIDENT_LAUNCH_STAGE + 1,
+                        1,
+                    ),
+                    (
+                        worker_axis,
+                        segment.worker_begin + worker_offset_begin,
+                        segment.worker_begin + worker_offset_end,
+                        1,
+                    ),
+                    (wave_axis, begin, end, 1),
+                )
+            )
+
+        if first_wave == final_wave:
+            add(first_worker, final_worker, first_wave, first_wave + 1)
+            return tuple(boxes)
+        add(first_worker, segment.worker_count, first_wave, first_wave + 1)
+        middle_begin = first_wave + 1
+        middle_end = final_wave
+        add(0, segment.worker_count, middle_begin, middle_end)
+        add(0, final_worker, final_wave, final_wave + 1)
+        return tuple(boxes)
+
+    schedule_pieces: list[
+        tuple[tuple[tuple[int, int, int, int], ...], tuple[sympy.Expr, ...]]
+    ] = []
+    (ordinal_axis,) = ordinal_domain.axis_order
+    ordinal_symbol = coordinate_axis_symbol(ordinal_axis)
+    for piece in flat_logical_order.pieces:
+        ((piece_axis, piece_begin, piece_end, piece_step),) = piece.source_bounds_items
+        if piece_axis != ordinal_axis:
+            raise ValueError("dense worker schedule has the wrong ordinal axis")
+        if any(
+            step != 1 or sympy.simplify(end - begin) != 1  # pyrefly: ignore[unsupported-operation]
+            for _axis, begin, end, step in piece.target_ranges
+        ):
+            raise ValueError("dense worker schedule requires a logical point map")
+        for source_bounds in dispatch_boxes(
+            piece_begin,
+            piece_end,
+            piece_step,
+        ):
+            # Keep the point-map expression independent of the support-box
+            # partition.  Specializing it separately for first/middle/final
+            # waves creates several syntactically different spellings of the
+            # same mixed-radix map and prevents exact coalescing downstream.
+            target_expressions = tuple(
+                cast(
+                    "sympy.Expr",
+                    begin.xreplace({ordinal_symbol: local_ordinal}),
+                )
+                for _axis, begin, _end, _step in piece.target_ranges
+            )
+            schedule_pieces.append((source_bounds, target_expressions))
+    schedule_relation = CoordinateRelation.point_map(
+        schedule_domain,
+        logical_order.target_domain,
+        tuple(schedule_pieces),
+    )
+    if (
+        not schedule_relation.is_single_valued()
+        or schedule_relation.source_support_cardinality()
+        != logical_order.source_domain.size
+    ):
+        raise ValueError("dense worker run does not have exact schedule support")
+    return dataclasses.replace(segment, task_order=schedule_relation)
+
+
 def _task_order_ordinal_domain(
     task_order: CoordinateRelation,
 ) -> CoordinateDomain:
@@ -249,6 +773,14 @@ def _flat_task_order_relation(
         or ordinal_begin + task_order.source_domain.size > ordinal_domain.size
     ):
         return None
+    if (
+        ordinal_begin == 0
+        and len(task_order.source_domain.axis_order) == 1
+        and task_order.source_domain.size == ordinal_domain.size
+    ):
+        renamed = task_order.rename_source_axes(ordinal_domain)
+        if renamed is not None:
+            return renamed
     (ordinal_axis,) = ordinal_domain.axis_order
     local_flat_index = coordinate_axis_symbol(ordinal_axis) - ordinal_begin  # pyrefly: ignore[unsupported-operation]
     local_coordinates: list[sympy.Expr] = []
@@ -282,7 +814,110 @@ def _flat_task_order_relation(
             ),
         ),
     )
-    return ordinal_to_local.then(task_order)
+    composed = ordinal_to_local.then(task_order)
+    if composed is not None:
+        return composed
+
+    # A compact multidimensional PID order can partition its fastest digit
+    # into equal adjacent ranges with a static target offset.  Scalar
+    # flattening turns that guard into a periodic set that the ordinary point
+    # composition cannot express.  Fold it only as a rescue after the native
+    # forms fail, and accept the rewrite only when its total point map remains
+    # symbolically proved.
+    compact_task_order = task_order.coalesce_adjacent_source_boxes(
+        fold_static_offsets=True
+    )
+    if (
+        compact_task_order != task_order
+        and compact_task_order.is_total_function()
+        and (composed := ordinal_to_local.then(compact_task_order)) is not None
+    ):
+        return composed
+
+    # A piecewise PID order can constrain a fast source digit while leaving
+    # slower digits free.  Its flattened support is then a bounded union of
+    # arithmetic progressions.  Derive those progressions from relation boxes;
+    # never enumerate logical tasks.
+    source_strides: dict[int, int] = {}
+    stride = 1
+    for axis in task_order.source_domain.axis_order:
+        source_strides[axis] = stride
+        stride *= task_order.source_domain.axis_counts[axis]
+    flattened_pieces: list[
+        tuple[tuple[tuple[int, int, int, int], ...], tuple[sympy.Expr, ...]]
+    ] = []
+    ordinal_symbol = coordinate_axis_symbol(ordinal_axis)
+    for piece in task_order.pieces:
+        bounds = {
+            axis: (begin, end, step)
+            for axis, begin, end, step in piece.source_bounds_items
+        }
+        varying_axis = max(
+            task_order.source_domain.axis_order,
+            key=lambda axis: len(range(*bounds[axis])),
+        )
+        fixed_axes = tuple(
+            axis for axis in task_order.source_domain.axis_order if axis != varying_axis
+        )
+        fixed_count = math.prod(len(range(*bounds[axis])) for axis in fixed_axes)
+        if fixed_count > _MAX_TASK_ORDER_SLICE_PIECES - len(flattened_pieces):
+            return None
+        varying_begin, varying_end, varying_step = bounds[varying_axis]
+        varying_values = range(varying_begin, varying_end, varying_step)
+        if not varying_values:
+            continue
+        for fixed_values in itertools.product(
+            *(range(*bounds[axis]) for axis in fixed_axes)
+        ):
+            fixed_coordinates = dict(zip(fixed_axes, fixed_values, strict=True))
+            flat_begin = (
+                sum(
+                    fixed_coordinates[axis] * source_strides[axis]
+                    for axis in fixed_axes
+                )
+                + varying_begin * source_strides[varying_axis]
+            )
+            flat_step = varying_step * source_strides[varying_axis]
+            flat_end = flat_begin + (len(varying_values) - 1) * flat_step + 1
+            substitutions = {
+                coordinate_axis_symbol(axis): sympy.Integer(value)
+                for axis, value in fixed_coordinates.items()
+            }
+            substitutions[coordinate_axis_symbol(varying_axis)] = (
+                varying_begin  # pyrefly: ignore[unsupported-operation]
+                + sympy.floor(  # pyrefly: ignore[bad-argument-type]
+                    (ordinal_symbol - ordinal_begin - flat_begin)  # pyrefly: ignore[unsupported-operation]
+                    / source_strides[varying_axis]
+                )
+            )
+            target_expressions: list[sympy.Expr] = []
+            for _axis, begin, end, target_step in piece.target_ranges:
+                if (
+                    target_step != 1 or sympy.simplify(end - begin) != 1  # pyrefly: ignore[unsupported-operation]
+                ):
+                    return None
+                target_expressions.append(
+                    cast("sympy.Expr", begin.xreplace(substitutions))
+                )
+            flattened_pieces.append(
+                (
+                    (
+                        (
+                            ordinal_axis,
+                            ordinal_begin + flat_begin,
+                            ordinal_begin + flat_end,
+                            flat_step,
+                        ),
+                    ),
+                    tuple(target_expressions),
+                )
+            )
+    result = CoordinateRelation.point_map(
+        ordinal_domain,
+        task_order.target_domain,
+        tuple(flattened_pieces),
+    )
+    return result if result.is_total_function() else None
 
 
 def _task_order_slice(
@@ -498,11 +1133,12 @@ class _WorkerScheduleChronologyError(ValueError):
 
 @dataclasses.dataclass(frozen=True)
 class WorkerSchedule:
-    """Compressed, globally ordered execution stream for persistent workers.
+    """The authoritative ownership and chronology of persistent work.
 
-    Tuple order is executable program order.  Worker ``w`` executes exactly
-    the subsequence of segments that assign it at least one task.  The modeled
-    worker steps must therefore increase along every such worker strand.
+    Every normalized segment maps the same global schedule coordinate space
+    directly to logical tasks.  Tuple order is retained only as a stable
+    rendering order for the concrete compatibility lowering; the ``wave``
+    coordinate is semantic chronology.
     """
 
     worker_count: int
@@ -511,6 +1147,55 @@ class WorkerSchedule:
     def __post_init__(self) -> None:
         if self.worker_count <= 0:
             raise ValueError(f"worker_count must be positive, got {self.worker_count}")
+        normalized_axes = {
+            segment.task_order.source_domain.axis_order
+            for segment in self.segments
+            if segment.is_normalized
+        }
+        if len(normalized_axes) > 1:
+            raise ValueError("worker schedule segments use different schedule axes")
+        if normalized_axes:
+            (schedule_axes,) = normalized_axes
+        else:
+            minimum_axis = min(
+                (
+                    axis
+                    for segment in self.segments
+                    for domain in (
+                        segment.task_order.source_domain,
+                        segment.task_order.target_domain,
+                    )
+                    for axis in domain.axis_order
+                ),
+                default=0,
+            )
+            schedule_axes = (
+                minimum_axis - 3,
+                minimum_axis - 2,
+                minimum_axis - 1,
+            )
+        _launch_stage_axis, _worker_axis, wave_axis = schedule_axes
+        maximum_wave = max(
+            (
+                (segment.dispatch_index(segment.task_count - 1) // segment.worker_count)
+                if not segment.is_normalized
+                else segment.task_order.source_domain.axis_counts[wave_axis] - 1
+                for segment in self.segments
+            ),
+            default=0,
+        )
+        schedule_domain = _worker_schedule_domain(
+            self.worker_count,
+            maximum_wave + 1,
+            (_launch_stage_axis, _worker_axis, wave_axis),
+        )
+        input_segments = self.segments
+        normalized_segments = tuple(
+            _normalize_dense_schedule_segment(segment, schedule_domain)
+            for segment in input_segments
+        )
+        object.__setattr__(self, "segments", normalized_segments)
+
         prior_runs: list[tuple[int, int, int]] = []
         for segment in self.segments:
             if segment.worker_begin + segment.worker_count > self.worker_count:
@@ -564,106 +1249,40 @@ class WorkerSchedule:
         """Return one root's exact active-worker count from interval lengths."""
         return root_barrier_publication_plan(self, root).resident_arrival_count
 
-    def _placement_axes(self) -> tuple[int, int]:
-        maximum = max(
-            (
-                axis
-                for segment in self.segments
-                for domain in (
-                    segment.task_order.source_domain,
-                    segment.task_order.target_domain,
-                )
-                for axis in domain.axis_order
-            ),
-            default=0,
-        )
-        worker_axis = maximum + 1
-        return worker_axis, worker_axis + 1
-
     @cached_property
     def placement_domain(self) -> CoordinateDomain:
-        """The worker and worker-step coordinates of static execution."""
-        worker_axis, worker_step_axis = self._placement_axes()
-        maximum_worker_step = max(
-            (
-                segment.dispatch_index(segment.task_count - 1) // segment.worker_count
-                for segment in self.segments
-            ),
-            default=0,
-        )
-        return CoordinateDomain(
-            axis_order=(worker_axis, worker_step_axis),
-            axis_counts_items=(
-                (worker_axis, self.worker_count),
-                (worker_step_axis, maximum_worker_step + 1),
-            ),
-            kind="worker",
-        )
+        """The common launch-stage, worker, and wave schedule domain."""
+        if self.segments:
+            return self.segments[0].task_order.source_domain
+        return _worker_schedule_domain(self.worker_count, 1, (-3, -2, -1))
 
     @cached_property
     def worker_step_domain(self) -> CoordinateDomain:
         """The projected worker-step coordinate used for readiness math."""
-        worker_step_axis = self.placement_domain.axis_order[1]
+        wave_axis = self.placement_domain.axis_order[2]
         return CoordinateDomain(
-            axis_order=(worker_step_axis,),
+            axis_order=(wave_axis,),
             axis_counts_items=(
-                (worker_step_axis, self.placement_domain.axis_counts[worker_step_axis]),
+                (
+                    wave_axis,
+                    self.placement_domain.axis_counts[wave_axis],
+                ),
             ),
             kind="value",
         )
-
-    def placement_relation(
-        self,
-        segment: WorkerScheduleSegment,
-    ) -> CoordinateRelation:
-        """Map one segment's task order to workers and worker steps."""
-        relation = segment.task_order
-        task_order_index = _flat_domain_index_expression(relation.source_domain)
-        dispatch_index = segment.dispatch_offset + task_order_index  # pyrefly: ignore[unsupported-operation]
-        worker = segment.worker_begin + sympy.Mod(  # pyrefly: ignore[unsupported-operation]
-            dispatch_index,
-            segment.worker_count,
-        )
-        worker_step = sympy.floor(dispatch_index / segment.worker_count)
-        return CoordinateRelation.point_map(
-            relation.source_domain,
-            self.placement_domain,
-            (  # pyrefly: ignore[bad-argument-type]
-                (
-                    tuple(
-                        (axis, 0, relation.source_domain.axis_counts[axis], 1)
-                        for axis in relation.source_domain.axis_order
-                    ),
-                    (worker, worker_step),
-                ),
-            ),
-        )
-
-    def worker_step_relation(
-        self,
-        segment: WorkerScheduleSegment,
-    ) -> CoordinateRelation | None:
-        """Project one symbolic placement relation to worker step."""
-        return self.placement_relation(segment).project_target(self.worker_step_domain)
 
     def last_worker_steps_for_root(self, root: int) -> dict[int, int]:
         """Return each participating worker's final occupied step."""
         result: dict[int, int] = {}
         for segment in self.segments_for_root(root):
-            begin = segment.dispatch_offset
-            end = begin + segment.task_count
-            for local_worker in range(segment.worker_count):
-                first = begin + (local_worker - begin) % segment.worker_count
-                if first >= end:
-                    continue
-                last = first + (end - 1 - first) // segment.worker_count * (
-                    segment.worker_count
-                )
-                worker = segment.worker_begin + local_worker
-                result[worker] = max(
-                    result.get(worker, -1),
-                    last // segment.worker_count,
-                )
+            for (
+                worker_begin,
+                worker_end,
+                _first_wave,
+                last_wave,
+            ) in segment.worker_step_runs():
+                for worker in range(worker_begin, worker_end):
+                    result[worker] = max(result.get(worker, -1), last_wave)
         return result
 
     def worker_step_bounds_for_root(self, root: int) -> tuple[int, int] | None:
@@ -672,11 +1291,11 @@ class WorkerSchedule:
         if not segments:
             return None
         worker_steps = tuple(
-            (
-                segment.dispatch_index(0) // segment.worker_count,
-                segment.dispatch_index(segment.task_count - 1) // segment.worker_count,
-            )
+            (first_wave, last_wave)
             for segment in segments
+            for _worker_begin, _worker_end, first_wave, last_wave in (
+                segment.worker_step_runs()
+            )
         )
         return (
             min(begin for begin, _end in worker_steps),
@@ -702,7 +1321,8 @@ class WorkerSchedule:
         schedule_end = dispatch_offset
         for segment in segments:
             if (
-                segment.worker_begin != worker_begin
+                segment.logical_task_order is None
+                or segment.worker_begin != worker_begin
                 or segment.worker_count != worker_count
                 or segment.dispatch_offset != schedule_end
             ):
@@ -753,6 +1373,199 @@ class WorkerSchedule:
         if not inserted:
             result.extend(segments)
         return WorkerSchedule(worker_count=self.worker_count, segments=tuple(result))
+
+
+@cache
+def _root_task_placement_relation(
+    worker_schedule: WorkerSchedule,
+    root: int,
+) -> CoordinateRelation | None:
+    """Map every logical task of one root to its unique schedule slot.
+
+    Segment relations are authoritative.  Their exact converses are combined
+    directly rather than rebuilding task order from dispatch arithmetic.
+    """
+    segments = worker_schedule.segments_for_root(root)
+    if not segments:
+        return None
+    pieces = []
+    root_domain = segments[0].task_order.target_domain
+    for segment in segments:
+        if segment.task_order.target_domain != root_domain:
+            return None
+        converse = segment.task_order.converse()
+        if (
+            converse is None
+            or converse.source_domain != root_domain
+            or converse.target_domain != worker_schedule.placement_domain
+            or not converse.is_single_valued()
+        ):
+            return None
+        pieces.extend(converse.pieces)
+    result = CoordinateRelation(
+        source_domain=root_domain,
+        target_domain=worker_schedule.placement_domain,
+        pieces=tuple(pieces),
+    )
+    return result if result.is_total_function() else None
+
+
+@cache
+def _root_task_wave_relation(
+    worker_schedule: WorkerSchedule,
+    root: int,
+) -> CoordinateRelation | None:
+    """Map every logical task of one root to its authoritative wave."""
+    # Prefer the compact dense rendering certificate when every segment has
+    # one.  This preserves formulas such as ``floor(task / worker_count)``;
+    # taking the converse of worker/wave support first would split the same
+    # function into one constant piece per wave and can obscure later event
+    # frontier calculations.  ``logical_task_order`` has already proved that
+    # each certificate exactly matches its authoritative segment support.
+    dense_waves: CoordinateRelation | None = None
+    dense_supported = True
+    for segment in worker_schedule.segments_for_root(root):
+        logical_order = segment.logical_task_order
+        waves_by_ordinal = segment.logical_task_wave_relation(
+            worker_schedule.worker_step_domain
+        )
+        logical_to_ordinal = None if logical_order is None else logical_order.converse()
+        segment_waves = (
+            None
+            if logical_to_ordinal is None or waves_by_ordinal is None
+            else logical_to_ordinal.then(waves_by_ordinal)
+        )
+        if segment_waves is None:
+            dense_supported = False
+            break
+        dense_waves = (
+            segment_waves if dense_waves is None else dense_waves.union(segment_waves)
+        )
+        if dense_waves is None:
+            dense_supported = False
+            break
+    if dense_supported and dense_waves is not None and dense_waves.is_total_function():
+        return dense_waves
+
+    placement = _root_task_placement_relation(worker_schedule, root)
+    if placement is None:
+        return None
+    waves = placement.project_target(worker_schedule.worker_step_domain)
+    if waves is None or not waves.is_total_function():
+        return None
+    full_source_bounds = tuple(
+        (axis, 0, waves.source_domain.axis_counts[axis], 1)
+        for axis in waves.source_domain.axis_order
+    )
+    for piece in waves.pieces:
+        (_target_axis, begin, end, step) = piece.target_ranges[0]
+        if step != 1 or sympy.simplify(end - begin) != 1:  # pyrefly: ignore[unsupported-operation]
+            continue
+        candidate = CoordinateRelation.point_map(
+            waves.source_domain,
+            waves.target_domain,
+            ((full_source_bounds, (begin,)),),
+        )
+        if candidate.is_total_function() and candidate.is_pointwise_equal_to(waves):
+            return candidate
+    return waves
+
+
+@cache
+def _maximum_value_by_key(
+    keys_by_item: CoordinateRelation,
+    values_by_item: CoordinateRelation,
+) -> CoordinateRelation | None:
+    """Map each key to the maximum scalar value of its contributing items."""
+    if (
+        keys_by_item.source_domain != values_by_item.source_domain
+        or len(values_by_item.target_domain.axis_order) != 1
+    ):
+        return None
+    items_by_key = keys_by_item.converse()
+    maximum = (
+        None
+        if items_by_key is None
+        else items_by_key.max_target_value_by_source(values_by_item)
+    )
+    return (
+        maximum
+        if maximum is not None and maximum.canonical_single_valued() is not None
+        else None
+    )
+
+
+@cache
+def _maximum_required_value_by_consumer(
+    keys_by_consumer: CoordinateRelation,
+    value_by_key: CoordinateRelation,
+) -> CoordinateRelation | None:
+    """Map each consumer item to its maximum required scalar key value."""
+    values_by_consumer = keys_by_consumer.then(value_by_key)
+    if values_by_consumer is None:
+        # Set-valued key requirements need not compose into another relation,
+        # but their extrema can still be derived directly from the same two
+        # relations.
+        maximum = keys_by_consumer.max_target_value_by_source(value_by_key)
+    else:
+        identity = CoordinateRelation.identity(
+            value_by_key.target_domain,
+            value_by_key.target_domain,
+        )
+        maximum = values_by_consumer.max_target_value_by_source(identity)
+    return (
+        maximum
+        if maximum is not None and maximum.canonical_single_valued() is not None
+        else None
+    )
+
+
+@cache
+def _maximum_root_wave_by_key(
+    worker_schedule: WorkerSchedule,
+    root: int,
+    keys_by_task: CoordinateRelation,
+) -> CoordinateRelation | None:
+    """Map each emitted key to its latest producer wave from schedule support."""
+    segments = worker_schedule.segments_for_root(root)
+    if not segments or any(
+        segment.task_order.target_domain != keys_by_task.source_domain
+        for segment in segments
+    ):
+        return None
+    task_waves = _root_task_wave_relation(worker_schedule, root)
+    direct = (
+        None if task_waves is None else _maximum_value_by_key(keys_by_task, task_waves)
+    )
+    if direct is not None:
+        return direct
+    identity = CoordinateRelation.identity(
+        worker_schedule.worker_step_domain,
+        worker_schedule.worker_step_domain,
+    )
+    maxima: list[CoordinateRelation] = []
+    for segment in segments:
+        keys_by_slot = segment.task_order.then(keys_by_task)
+        slots_by_key = None if keys_by_slot is None else keys_by_slot.converse()
+        waves_by_key = (
+            None
+            if slots_by_key is None
+            else slots_by_key.project_target(worker_schedule.worker_step_domain)
+        )
+        maximum = (
+            None
+            if waves_by_key is None
+            else waves_by_key.max_target_value_by_source(identity)
+        )
+        if maximum is None:
+            return None
+        maxima.append(maximum)
+    combined = maxima[0]
+    for maximum in maxima[1:]:
+        combined = combined.union(maximum)
+        if combined is None:
+            return None
+    return combined.max_target_value_by_source(identity)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1561,6 +2374,7 @@ def _emitted_prerequisites(
     return tuple(result)
 
 
+@cache
 def _emitted_final_arrival_continuations(
     readiness_graph: ReadinessGraph,
     readiness_counters: tuple[ReadinessCounterPlan, ...],
@@ -1767,23 +2581,14 @@ def _event_ready_after_worker_steps(
         root_domain = readiness_graph.root_domains[root]
         if keys_by_task.source_domain != root_domain:
             return None
-        for segment in worker_schedule.segments_for_root(root):
-            task_order = segment.task_order
-            if task_order.target_domain != root_domain:
-                return None
-            keys_by_task_order = task_order.then(keys_by_task)
-            converse = (
-                None if keys_by_task_order is None else keys_by_task_order.converse()
-            )
-            worker_steps = worker_schedule.worker_step_relation(segment)
-            maximum = (
-                None
-                if converse is None or worker_steps is None
-                else converse.max_target_value_by_source(worker_steps)
-            )
-            if maximum is None:
-                return None
-            maxima.append(maximum)
+        maximum = _maximum_root_wave_by_key(
+            worker_schedule,
+            root,
+            keys_by_task,
+        )
+        if maximum is None:
+            return None
+        maxima.append(maximum)
     if not maxima:
         return None
     combined = maxima[0]
@@ -3049,38 +3854,8 @@ def order_continuation_producers_by_readiness_key(
     return WorkerSchedule(worker_schedule.worker_count, tuple(segments))
 
 
-# The proposer materializes only its bounded semantic DAG.  This is a memory
-# safety limit, not an eligibility threshold for ordinary decode workloads.
-_MAX_GLOBAL_LIST_NODES = 16_384
 _MAX_GLOBAL_LIST_EDGES = 2_000_000
-_MAX_GLOBAL_LIST_RELATION_ITEMS = 2_000_000
 _MAX_GLOBAL_LIST_SEGMENTS = 4096
-
-
-def _ordered_root_tasks(
-    worker_schedule: WorkerSchedule,
-    root: int,
-) -> tuple[tuple[int, WorkerScheduleSegment, int], ...] | None:
-    """Materialize one bounded root order with its originating segment index."""
-    result: list[tuple[int, WorkerScheduleSegment, int]] = []
-    seen: set[int] = set()
-    for segment in worker_schedule.segments_for_root(root):
-        for local_index, logical_tasks in enumerate(segment.task_order.materialize()):
-            if len(logical_tasks) != 1:
-                return None
-            (logical_task,) = logical_tasks
-            if logical_task in seen:
-                return None
-            seen.add(logical_task)
-            result.append((logical_task, segment, local_index))
-    domain = (
-        worker_schedule.segments_for_root(root)[0].task_order.target_domain
-        if result
-        else None
-    )
-    if domain is None or seen != set(range(domain.size)):
-        return None
-    return tuple(result)
 
 
 def _combined_producer_tasks_by_key(
@@ -3104,311 +3879,6 @@ def _combined_producer_tasks_by_key(
     return result if found else None
 
 
-def _producer_tasks_by_key(
-    readiness_graph: ReadinessGraph,
-    plan: ReadinessCounterPlan,
-    materialization_budget: list[int],
-    *,
-    continuation_by_root: dict[int, FinalArrivalContinuation] | None = None,
-    excluded_producer_roots: frozenset[int] = frozenset(),
-) -> tuple[frozenset[tuple[int, int]], ...] | None:
-    """Project one emitted counter onto its resident producer CTAs.
-
-    Final-arrival continuations consume no resident slot.  Their publications
-    are therefore contracted recursively to the resident tasks that can make
-    the triggering arrival, using the same symbolic relations as continuation
-    lowering.
-    """
-    if plan.readiness_key_count > materialization_budget[0]:
-        return None
-    materialization_budget[0] -= plan.readiness_key_count
-    result: list[set[tuple[int, int]]] = [
-        set() for _ in range(plan.readiness_key_count)
-    ]
-    static_relations = _readiness_static_producers(
-        readiness_graph,
-        plan.producers,
-        continuation_by_root or {},
-    )
-    if static_relations is None:
-        return None
-    for producer_root, keys_by_producer in static_relations:
-        if producer_root in excluded_producer_roots:
-            continue
-        producers_by_key = keys_by_producer.converse()
-        if producers_by_key is None:
-            return None
-        materialized = _materialize_relation_bounded(
-            producers_by_key,
-            materialization_budget,
-        )
-        if materialized is None:
-            return None
-        for readiness_key, logical_tasks in enumerate(materialized):
-            result[readiness_key].update(
-                (producer_root, logical_task) for logical_task in logical_tasks
-            )
-    return tuple(frozenset(tasks) for tasks in result)
-
-
-def _materialize_relation_bounded(
-    relation: CoordinateRelation,
-    materialization_budget: list[int],
-) -> tuple[frozenset[int], ...] | None:
-    """Materialize a relation without exceeding a shared item budget."""
-    source_size = relation.source_domain.size
-    if (
-        source_size > materialization_budget[0]
-        or relation.target_domain.size > _MAX_GLOBAL_LIST_RELATION_ITEMS
-    ):
-        return None
-    materialization_budget[0] -= source_size
-    result: list[frozenset[int]] = []
-    for source_index in range(source_size):
-        targets = relation.targets(source_index)
-        if len(targets) > materialization_budget[0]:
-            return None
-        materialization_budget[0] -= len(targets)
-        result.append(targets)
-    return tuple(result)
-
-
-def _consumer_keys_by_root_task(
-    readiness_graph: ReadinessGraph,
-    consumer: ReadinessConsumer,
-    *,
-    entry_only: bool,
-    materialization_budget: list[int],
-) -> tuple[frozenset[int], ...] | None:
-    """Materialize exact readiness keys at CTA entry or over the whole CTA."""
-    root_domain = readiness_graph.root_domains[consumer.consumer_root]
-    relation = consumer.keys_by_consumer
-    if consumer.consumer_site_id is None:
-        if relation.source_domain != root_domain:
-            return None
-        return _materialize_relation_bounded(relation, materialization_budget)
-    if not entry_only:
-        projected = relation.project_source(root_domain)
-        return (
-            None
-            if projected is None
-            else _materialize_relation_bounded(projected, materialization_budget)
-        )
-
-    nested_axes = nested_logical_axes(root_domain, relation.source_domain)
-    if len(nested_axes) != 1 or any(
-        axis not in relation.source_domain.axis_counts
-        for axis in root_domain.axis_order
-    ):
-        return None
-    (nested_axis,) = nested_axes
-    if (
-        root_domain.size > materialization_budget[0]
-        or relation.target_domain.size > _MAX_GLOBAL_LIST_RELATION_ITEMS
-    ):
-        return None
-    materialization_budget[0] -= root_domain.size
-    result: list[frozenset[int]] = []
-    for logical_task in range(root_domain.size):
-        coordinates = root_domain.coordinates(logical_task)
-        coordinates[nested_axis] = 0
-        targets = frozenset(
-            relation.target_domain.index(
-                dict(
-                    zip(
-                        relation.target_domain.axis_order,
-                        target_coordinates,
-                        strict=True,
-                    )
-                )
-            )
-            for target_coordinates in relation.target_coordinates(coordinates)
-        )
-        if len(targets) > materialization_budget[0]:
-            return None
-        materialization_budget[0] -= len(targets)
-        result.append(targets)
-    return tuple(result)
-
-
-def _semantic_task_successors(
-    readiness_graph: ReadinessGraph,
-    readiness_counters: tuple[ReadinessCounterPlan, ...],
-    root_barrier_edges: frozenset[tuple[int, int]],
-    tasks: tuple[tuple[int, int], ...],
-    *,
-    nested_entry_only: bool,
-    continuations: tuple[FinalArrivalContinuation, ...] = (),
-    external_producer_roots: frozenset[int] = frozenset(),
-) -> tuple[tuple[int, ...], ...] | None:
-    """Build a bounded task/event DAG from emitted synchronization.
-
-    Task nodes come first.  Trailing zero-cost event nodes factor readiness
-    fan-in/fan-out, avoiding a quadratic producer-to-consumer expansion for a
-    barrier or counter key.
-    """
-    index_by_task = {task: index for index, task in enumerate(tasks)}
-    successors: list[set[int]] = [set() for _ in tasks]
-    edge_attempt_count = 0
-    materialization_budget = [_MAX_GLOBAL_LIST_RELATION_ITEMS]
-    continuation_by_root = _continuations_by_consumer_root(
-        readiness_graph,
-        continuations,
-    )
-    producers_by_key_by_plan: dict[
-        ReadinessCounterPlan,
-        tuple[frozenset[tuple[int, int]], ...],
-    ] = {}
-    readiness_nodes_by_plan: dict[ReadinessCounterPlan, tuple[int, ...]] = {}
-
-    def add_event_node() -> int | None:
-        if len(successors) >= _MAX_GLOBAL_LIST_NODES:
-            return None
-        successors.append(set())
-        return len(successors) - 1
-
-    def add_index_edge(producer_index: int, consumer_index: int) -> bool:
-        nonlocal edge_attempt_count
-        edge_attempt_count += 1
-        if edge_attempt_count > _MAX_GLOBAL_LIST_EDGES:
-            return False
-        if (
-            producer_index == consumer_index
-            or consumer_index in successors[producer_index]
-        ):
-            return True
-        successors[producer_index].add(consumer_index)
-        return True
-
-    for prerequisite in _emitted_prerequisites(
-        readiness_counters,
-        root_barrier_edges,
-    ):
-        if prerequisite.barrier_producer_root is not None:
-            producer_root = prerequisite.barrier_producer_root
-            consumer_root = prerequisite.consumer_root
-            producer_domain = readiness_graph.root_domains[producer_root]
-            static_relations = _static_producer_relations(
-                readiness_graph,
-                root=producer_root,
-                site_id=None,
-                readiness_keys=CoordinateRelation.identity(
-                    producer_domain,
-                    producer_domain,
-                ),
-                continuation_by_root=continuation_by_root,
-            )
-            if static_relations is None:
-                return None
-            event_node = add_event_node()
-            if event_node is None:
-                return None
-            for static_root, _relation in static_relations:
-                if static_root in external_producer_roots:
-                    continue
-                for producer_task in range(
-                    readiness_graph.root_domains[static_root].size
-                ):
-                    producer_index = index_by_task.get((static_root, producer_task))
-                    if producer_index is None or not add_index_edge(
-                        producer_index,
-                        event_node,
-                    ):
-                        return None
-            for consumer_task in range(
-                readiness_graph.root_domains[consumer_root].size
-            ):
-                consumer_index = index_by_task.get((consumer_root, consumer_task))
-                if consumer_index is None or not add_index_edge(
-                    event_node,
-                    consumer_index,
-                ):
-                    return None
-            continue
-
-        plan = prerequisite.counter_plan
-        consumer = prerequisite.counter_consumer
-        assert plan is not None and consumer is not None
-        producers_by_key = producers_by_key_by_plan.get(plan)
-        if producers_by_key is None:
-            producers_by_key = _producer_tasks_by_key(
-                readiness_graph,
-                plan,
-                materialization_budget,
-                continuation_by_root=continuation_by_root,
-                excluded_producer_roots=external_producer_roots,
-            )
-            if producers_by_key is None:
-                return None
-            producers_by_key_by_plan[plan] = producers_by_key
-        readiness_nodes = readiness_nodes_by_plan.get(plan)
-        if readiness_nodes is None:
-            new_readiness_nodes: list[int] = []
-            for producer_tasks in producers_by_key:
-                readiness_node = add_event_node()
-                if readiness_node is None:
-                    return None
-                new_readiness_nodes.append(readiness_node)
-                for producer_task in producer_tasks:
-                    producer_index = index_by_task.get(producer_task)
-                    if producer_index is None:
-                        if producer_task[0] in external_producer_roots:
-                            continue
-                        return None
-                    if not add_index_edge(producer_index, readiness_node):
-                        return None
-            readiness_nodes = tuple(new_readiness_nodes)
-            readiness_nodes_by_plan[plan] = readiness_nodes
-        required_keys = _consumer_keys_by_root_task(
-            readiness_graph,
-            consumer,
-            entry_only=nested_entry_only,
-            materialization_budget=materialization_budget,
-        )
-        if required_keys is None:
-            if nested_entry_only:
-                return None
-            required_keys_by_task = (
-                range(len(readiness_nodes))
-                for _ in range(
-                    readiness_graph.root_domains[consumer.consumer_root].size
-                )
-            )
-        else:
-            required_keys_by_task = required_keys
-        for consumer_task, required_keys_for_task in enumerate(required_keys_by_task):
-            consumer_index = index_by_task.get((consumer.consumer_root, consumer_task))
-            if consumer_index is None:
-                return None
-            for readiness_key in required_keys_for_task:
-                if not add_index_edge(
-                    readiness_nodes[readiness_key],
-                    consumer_index,
-                ):
-                    return None
-    return tuple(tuple(sorted(items)) for items in successors)
-
-
-def _topological_order(
-    successors: tuple[tuple[int, ...], ...],
-) -> tuple[int, ...] | None:
-    indegree = [0] * len(successors)
-    for task_successors in successors:
-        for successor in task_successors:
-            indegree[successor] += 1
-    ready = [task for task, degree in enumerate(indegree) if degree == 0]
-    heapq.heapify(ready)
-    result: list[int] = []
-    while ready:
-        task = heapq.heappop(ready)
-        result.append(task)
-        for successor in successors[task]:
-            indegree[successor] -= 1
-            if indegree[successor] == 0:
-                heapq.heappush(ready, successor)
-    return tuple(result) if len(result) == len(successors) else None
-
-
 def _validate_worker_schedule_tasks(
     worker_schedule: WorkerSchedule,
     root_task_orders: tuple[CoordinateRelation, ...],
@@ -3427,11 +3897,17 @@ def _validate_worker_schedule_tasks(
             continue
         if not segments:
             return False
-        if sum(segment.task_count for segment in segments) != root_domain.size:
+        if sum(segment.task_count for segment in segments) != root_domain.size or any(
+            segment.task_order.source_domain != worker_schedule.placement_domain
+            or segment.task_order.target_domain != root_domain
+            for segment in segments
+        ):
             return False
-        traversal = _root_schedule_traversal(segments, reference_task_order)
-        if traversal is None or traversal.logical_task_to_scheduled_ordinal is None:
-            return False
+        placement = _root_task_placement_relation(worker_schedule, root)
+        if placement is None:
+            traversal = _root_schedule_traversal(segments, reference_task_order)
+            if traversal is None or traversal.logical_task_to_scheduled_ordinal is None:
+                return False
     return True
 
 
@@ -3497,16 +3973,36 @@ def _logical_task_to_order_ordinal(
         ),
     )
     logical_to_local = task_order.converse()
-    logical_to_local = (
-        None
-        if logical_to_local is None
-        else logical_to_local.canonical_single_valued()
-    )
-    result = (
-        None
-        if logical_to_local is None
-        else logical_to_local.then(local_to_ordinal)
-    )
+    if logical_to_local is not None and not logical_to_local.is_single_valued():
+        logical_to_local = None
+    result: CoordinateRelation | None
+    if logical_to_local is None:
+        result = None
+    elif len(task_order.source_domain.axis_order) == 1:
+        (local_axis,) = task_order.source_domain.axis_order
+        (ordinal_axis,) = ordinal_domain.axis_order
+        result = CoordinateRelation(
+            source_domain=logical_to_local.source_domain,
+            target_domain=ordinal_domain,
+            pieces=tuple(
+                dataclasses.replace(
+                    piece,
+                    target_ranges=tuple(
+                        (
+                            ordinal_axis,
+                            begin + ordinal_begin,  # pyrefly: ignore[unsupported-operation]
+                            end + ordinal_begin,  # pyrefly: ignore[unsupported-operation]
+                            step,
+                        )
+                        for axis, begin, end, step in piece.target_ranges
+                        if axis == local_axis
+                    ),
+                )
+                for piece in logical_to_local.pieces
+            ),
+        )
+    else:
+        result = logical_to_local.then(local_to_ordinal)
     if result is None:
         # A woven PID traversal may not have a representable multidimensional
         # inverse even though the inverse of its actual emitted order is exact.
@@ -3516,7 +4012,7 @@ def _logical_task_to_order_ordinal(
             ordinal_begin=ordinal_begin,
         )
         result = None if forward is None else forward.converse()
-    return None if result is None else result.canonical_single_valued()
+    return result if result is not None and result.is_single_valued() else None
 
 
 def _logical_task_to_reference_ordinal(
@@ -3580,18 +4076,20 @@ def _root_schedule_traversal(
     segment_ordinal_ranges: list[tuple[WorkerScheduleSegment, int, int]] = []
     ordinal_begin = 0
     for segment in segments:
+        logical_order = segment.logical_task_order
         if (
-            segment.task_order.target_domain != root_domain
-            or not segment.task_order.is_total_function()
+            logical_order is None
+            or logical_order.target_domain != root_domain
+            or not logical_order.is_total_function()
         ):
             return None
         forward_piece = _flat_task_order_relation(
-            segment.task_order,
+            logical_order,
             ordinal_domain,
             ordinal_begin=ordinal_begin,
         )
         inverse_piece = _logical_task_to_order_ordinal(
-            segment.task_order,
+            logical_order,
             ordinal_domain,
             ordinal_begin=ordinal_begin,
         )
@@ -3629,13 +4127,28 @@ def _root_schedule_traversal(
     if root_to_scheduled is not None and not root_to_scheduled.is_total_function():
         root_to_scheduled = None
 
-    scheduled_to_root = (
-        None
-        if scheduled_to_root is None
-        else scheduled_to_root.canonical_single_valued()
-    )
+    if scheduled_to_root is not None and not scheduled_to_root.is_single_valued():
+        scheduled_to_root = None
     if scheduled_to_root is not None and not scheduled_to_root.is_total_function():
         scheduled_to_root = None
+    if scheduled_to_root is not None:
+        # Segment boundaries are placement details, not logical traversal
+        # discontinuities.  Joining identical adjacent point maps can expose a
+        # single mixed-radix bijection whose inverse is provable only over the
+        # complete root domain (for example, complementary prefix/suffix
+        # slices).  The joined forward relation remains derived directly from
+        # the authoritative schedule relation.
+        joined_forward = scheduled_to_root.coalesce_adjacent_source_boxes()
+        if joined_forward.is_total_function():
+            scheduled_to_root = joined_forward
+        if root_to_scheduled is None:
+            converse = scheduled_to_root.converse()
+            if (
+                converse is not None
+                and converse.is_single_valued()
+                and converse.is_total_function()
+            ):
+                root_to_scheduled = converse
     reference_ordinal = _logical_task_to_reference_ordinal(
         reference_task_order,
         ordinal_domain,
@@ -3662,144 +4175,22 @@ def root_schedule_matches_reference(
     return traversal is not None and traversal.matches_reference
 
 
-def _root_task_step_relation(
-    segments: tuple[WorkerScheduleSegment, ...],
-    reference_task_order: CoordinateRelation,
-    rank_domain: CoordinateDomain,
-    *,
-    ticket_worker_count: int | None = None,
-) -> CoordinateRelation | None:
-    """Map logical CTAs to steps through the sole scheduled traversal."""
-    traversal = _root_schedule_traversal(
-        segments,
-        reference_task_order,
-    )
-    if traversal is None:
-        return None
-    task_to_scheduled = traversal.logical_task_to_scheduled_ordinal
-    if task_to_scheduled is None:
-        return None
-    scheduled_ordinal_domain = task_to_scheduled.target_domain
-    if ticket_worker_count is not None and traversal.matches_reference:
-        reference_ordinal = _logical_task_to_reference_ordinal(
-            reference_task_order, scheduled_ordinal_domain
-        )
-        if reference_ordinal is not None:
-            # Preserve the actual traversal as the authority; equality merely
-            # permits its compact canonical form to avoid carrying slice
-            # boundaries into subsequent frontier algebra.
-            task_to_scheduled = reference_ordinal
-    (scheduled_axis,) = scheduled_ordinal_domain.axis_order
-    scheduled_ordinal = coordinate_axis_symbol(scheduled_axis)
-    step_pieces: list[
-        tuple[tuple[tuple[int, int, int, int], ...], tuple[sympy.Expr, ...]]
-    ] = []
-    if ticket_worker_count is not None:
-        step_pieces.append(
-            (
-                (
-                    (
-                        scheduled_axis,
-                        0,
-                        scheduled_ordinal_domain.size,
-                        1,
-                    ),
-                ),
-                (
-                    cast(
-                        "sympy.Expr",
-                        sympy.floor(  # pyrefly: ignore[bad-argument-type]
-                            scheduled_ordinal / ticket_worker_count  # pyrefly: ignore[unsupported-operation]
-                        ),
-                    ),
-                ),
-            )
-        )
-    else:
-        for segment, ordinal_begin, ordinal_end in traversal.segment_ordinal_ranges:
-            step_expression = cast(
-                "sympy.Expr",
-                sympy.floor(  # pyrefly: ignore[bad-argument-type]
-                    (segment.dispatch_offset + scheduled_ordinal - ordinal_begin)  # pyrefly: ignore[unsupported-operation]
-                    / segment.worker_count
-                ),
-            )
-            step_pieces.append(
-                (
-                    (
-                        (
-                            scheduled_axis,
-                            ordinal_begin,
-                            ordinal_end,
-                            1,
-                        ),
-                    ),
-                    (step_expression,),
-                )
-            )
-    steps_by_scheduled_order = CoordinateRelation.point_map(
-        scheduled_ordinal_domain,
-        rank_domain,
-        tuple(step_pieces),
-    )
-    task_steps = task_to_scheduled.then(steps_by_scheduled_order)
-    return (
-        task_steps
-        if task_steps is not None and task_steps.is_total_function()
-        else None
-    )
-
-
 def _task_step_relations(
     worker_schedule: WorkerSchedule,
     readiness_graph: ReadinessGraph,
     *,
     excluded_roots: frozenset[int] = frozenset(),
 ) -> tuple[CoordinateRelation | None, ...] | None:
-    """Return symbolic logical-task-to-rank functions for resident roots."""
-    maximum_step = max(
-        (
-            last_step
-            for segment in worker_schedule.segments
-            for _begin, _end, _first_step, last_step in segment.worker_step_runs()
-        ),
-        default=0,
-    )
-    rank_axis = (
-        max(
-            (
-                axis
-                for task_order in (
-                    *readiness_graph.root_task_orders,
-                    *(segment.task_order for segment in worker_schedule.segments),
-                )
-                for domain in (task_order.source_domain, task_order.target_domain)
-                for axis in domain.axis_order
-            ),
-            default=0,
-        )
-        + 1
-    )
-    rank_domain = CoordinateDomain(
-        axis_order=(rank_axis,),
-        axis_counts_items=((rank_axis, maximum_step + 1),),
-        kind="value",
-    )
+    """Return logical-task-to-wave functions from schedule converses."""
     result: list[CoordinateRelation | None] = []
-    for root, reference_task_order in enumerate(readiness_graph.root_task_orders):
+    for root in range(len(readiness_graph.root_task_orders)):
         segments = worker_schedule.segments_for_root(root)
         if root in excluded_roots:
             if segments:
                 return None
             result.append(None)
             continue
-        if any(segment.dispatch_offset % segment.worker_count for segment in segments):
-            return None
-        task_steps = _root_task_step_relation(
-            segments,
-            reference_task_order,
-            rank_domain,
-        )
+        task_steps = _root_task_wave_relation(worker_schedule, root)
         if task_steps is None:
             return None
         result.append(task_steps)
@@ -3817,6 +4208,243 @@ def _keys_by_consumer_root_task(
     return consumer.keys_by_consumer.project_source(root_domain)
 
 
+@cache
+def _external_source_frontiers(
+    readiness_graph: ReadinessGraph,
+    readiness_counters: tuple[ReadinessCounterPlan, ...],
+    root_barrier_edges: frozenset[tuple[int, int]],
+    source_root: int,
+) -> tuple[tuple[int, CoordinateRelation], ...] | None:
+    """Map resident tasks to their latest required source ticket.
+
+    This frontier is a scheduling priority only.  Source tickets are issued
+    before resident tickets, which proves progress, but only runtime counters
+    establish that the corresponding source work has completed.
+    """
+    source_ticket_order = _source_ticket_order(readiness_graph, source_root)
+    continuations = _emitted_final_arrival_continuations(
+        readiness_graph,
+        readiness_counters,
+    )
+    if source_ticket_order is None or continuations is None:
+        return None
+    continuation_by_root = _continuations_by_consumer_root(
+        readiness_graph,
+        continuations,
+    )
+    parts_by_consumer: dict[int, list[CoordinateRelation]] = {}
+    for prerequisite in _emitted_prerequisites(
+        readiness_counters,
+        root_barrier_edges,
+    ):
+        consumer_root = prerequisite.consumer_root
+        if prerequisite.barrier_producer_root is not None:
+            producer_domain = readiness_graph.root_domains[
+                prerequisite.barrier_producer_root
+            ]
+            static_relations = _static_producer_relations(
+                readiness_graph,
+                root=prerequisite.barrier_producer_root,
+                site_id=None,
+                readiness_keys=CoordinateRelation.identity(
+                    producer_domain,
+                    producer_domain,
+                ),
+                continuation_by_root=continuation_by_root,
+            )
+            if static_relations is None:
+                return None
+            if any(root == source_root for root, _relation in static_relations):
+                consumer_domain = readiness_graph.root_domains[consumer_root]
+                parts_by_consumer.setdefault(consumer_root, []).append(
+                    CoordinateRelation.point_map(
+                        consumer_domain,
+                        source_ticket_order.target_domain,
+                        (
+                            (
+                                tuple(
+                                    (
+                                        axis,
+                                        0,
+                                        consumer_domain.axis_counts[axis],
+                                        1,
+                                    )
+                                    for axis in consumer_domain.axis_order
+                                ),
+                                (
+                                    sympy.Integer(
+                                        source_ticket_order.target_domain.size - 1
+                                    ),
+                                ),
+                            ),
+                        ),
+                    )
+                )
+            continue
+
+        plan = prerequisite.counter_plan
+        consumer = prerequisite.counter_consumer
+        assert plan is not None and consumer is not None
+        consumer_keys = _keys_by_consumer_root_task(readiness_graph, consumer)
+        static_relations = _readiness_static_producers(
+            readiness_graph,
+            plan.producers,
+            continuation_by_root,
+        )
+        if consumer_keys is None or static_relations is None:
+            return None
+        source_relations = tuple(
+            relation for root, relation in static_relations if root == source_root
+        )
+        if not source_relations:
+            continue
+        source_keys = source_relations[0]
+        for relation in source_relations[1:]:
+            union = source_keys.union(relation)
+            if union is None:
+                return None
+            source_keys = union
+        frontier_by_key = _maximum_value_by_key(
+            source_keys,
+            source_ticket_order,
+        )
+        frontier = (
+            None
+            if frontier_by_key is None
+            else _maximum_required_value_by_consumer(
+                consumer_keys,
+                frontier_by_key,
+            )
+        )
+        if frontier is None:
+            return None
+        parts_by_consumer.setdefault(consumer_root, []).append(frontier)
+
+    result: list[tuple[int, CoordinateRelation]] = []
+    ticket_identity = CoordinateRelation.identity(
+        source_ticket_order.target_domain,
+        source_ticket_order.target_domain,
+    )
+    for consumer_root, parts in sorted(parts_by_consumer.items()):
+        combined = parts[0]
+        for part in parts[1:]:
+            union = combined.union(part)
+            if union is None:
+                return None
+            combined = union
+        frontier = combined.max_target_value_by_source(ticket_identity)
+        if frontier is None or not frontier.is_total_function():
+            return None
+        result.append((consumer_root, frontier))
+    return tuple(result)
+
+
+def _expression_is_nondecreasing_in(
+    expression: sympy.Expr,
+    source_symbol: sympy.Symbol,
+) -> bool:
+    """Conservatively prove monotonicity in one integer coordinate.
+
+    This recognizes only order-preserving operations in the logical relation
+    IR.  In particular, ``floor`` and ``ceiling`` preserve the order of their
+    argument, whereas ``Mod`` is deliberately unsupported because it wraps.
+    The proof is structural and therefore does not inspect concrete source
+    points.
+    """
+    expression = sympy.simplify(expression)
+    if source_symbol not in expression.free_symbols:
+        return not expression.free_symbols
+    if expression.free_symbols != {source_symbol}:
+        return False
+    if expression == source_symbol:
+        return True
+    if isinstance(expression, sympy.Add):
+        return all(
+            _expression_is_nondecreasing_in(term, source_symbol)
+            for term in expression.args
+        )
+    if isinstance(expression, sympy.Mul):
+        coefficient = sympy.Integer(1)
+        varying_terms: list[sympy.Expr] = []
+        for factor in expression.args:
+            if factor.free_symbols:
+                varying_terms.append(cast("sympy.Expr", factor))
+            else:
+                coefficient *= factor  # pyrefly: ignore[unsupported-operation]
+        return (
+            len(varying_terms) == 1
+            and coefficient.is_real is True
+            and coefficient >= 0
+            and _expression_is_nondecreasing_in(
+                varying_terms[0],
+                source_symbol,
+            )
+        )
+    if expression.func in (sympy.floor, sympy.ceiling):
+        return _expression_is_nondecreasing_in(
+            cast("sympy.Expr", expression.args[0]),
+            source_symbol,
+        )
+    if expression.func in (sympy.Min, sympy.Max):
+        return all(
+            _expression_is_nondecreasing_in(cast("sympy.Expr", argument), source_symbol)
+            for argument in expression.args
+        )
+    return False
+
+
+def _scalar_relation_is_nondecreasing(relation: CoordinateRelation) -> bool:
+    """Prove a total scalar relation is nondecreasing in source order."""
+    canonical = relation.canonical_single_valued()
+    if canonical is None:
+        return False
+    canonical = canonical.coalesce_adjacent_source_boxes()
+    if (
+        not canonical.is_total_function()
+        or len(canonical.source_domain.axis_order) != 1
+        or len(canonical.target_domain.axis_order) != 1
+    ):
+        return False
+    (source_axis,) = canonical.source_domain.axis_order
+    source_symbol = coordinate_axis_symbol(source_axis)
+    cursor = 0
+    previous_last: sympy.Expr | None = None
+    for piece in sorted(
+        canonical.pieces,
+        key=lambda item: item.source_bounds_items[0][1],
+    ):
+        if len(piece.source_bounds_items) != 1 or len(piece.target_ranges) != 1:
+            return False
+        piece_axis, begin, end, source_step = piece.source_bounds_items[0]
+        _target_axis, value, value_end, target_step = piece.target_ranges[0]
+        if (
+            piece_axis != source_axis
+            or begin != cursor
+            or source_step != 1
+            or target_step != 1
+            or sympy.simplify(value_end - value) != 1  # pyrefly: ignore[unsupported-operation]
+        ):
+            return False
+        first = sympy.simplify(value.xreplace({source_symbol: sympy.Integer(begin)}))
+        last = sympy.simplify(value.xreplace({source_symbol: sympy.Integer(end - 1)}))
+        if (
+            first.free_symbols
+            or last.free_symbols
+            or first.is_integer is not True
+            or last.is_integer is not True
+            or (previous_last is not None and first < previous_last)
+        ):
+            return False
+        if end - begin > 1 and not _expression_is_nondecreasing_in(
+            value,
+            source_symbol,
+        ):
+            return False
+        previous_last = last
+        cursor = end
+    return cursor == canonical.source_domain.size
+
+
 def _consumer_major_producer_order(
     readiness_graph: ReadinessGraph,
     worker_schedule: WorkerSchedule,
@@ -3824,6 +4452,7 @@ def _consumer_major_producer_order(
     root_barrier_edges: frozenset[tuple[int, int]],
     *,
     excluded_roots: frozenset[int],
+    external_source_frontiers: tuple[tuple[int, CoordinateRelation], ...] = (),
 ) -> WorkerSchedule:
     """Normalize readiness cohorts for the global-list proposal.
 
@@ -3872,15 +4501,15 @@ def _consumer_major_producer_order(
             axis_counts_items=((ordinal_axis, task_domain.size),),
             kind="task_order",
         )
-        ordinal = (
-            None
-            if task_order is None
+        if (
+            task_order is None
             or task_order.target_domain != task_domain
             or task_order.source_domain.size != task_domain.size
             or not task_order.is_total_function()
             or len(task_order.pieces) > _MAX_TASK_ORDER_SLICE_PIECES
-            else _logical_task_to_order_ordinal(task_order, ordinal_domain)
-        )
+        ):
+            return None
+        ordinal = _logical_task_to_order_ordinal(task_order, ordinal_domain)
         if ordinal is None or not ordinal.is_total_function():
             return None
         return task_order, ordinal
@@ -3936,10 +4565,18 @@ def _consumer_major_producer_order(
             elif segment.root not in inserted_roots:
                 segments.append(replacement)
                 inserted_roots.add(segment.root)
-        return WorkerSchedule(schedule.worker_count, tuple(segments))
+        try:
+            return WorkerSchedule(schedule.worker_count, tuple(segments))
+        except ValueError:
+            # Reordering is a speculative optimization.  If the proposed
+            # dense orders cannot be normalized into one exact ownership
+            # relation, retain the complete input schedule atomically.
+            return schedule
 
-    # Admission order takes precedence: a newly released subset of this root
-    # must remain compact before downstream completion can be optimized.
+    # First derive counter-admission cohorts.  An exact earlier-stage source
+    # frontier may replace that order below when source release is the tighter
+    # constraint; otherwise a newly released subset remains compact before
+    # downstream completion is optimized.
     incoming_counter_roots: set[int] = set()
     admission_candidates: dict[
         int,
@@ -3970,7 +4607,56 @@ def _consumer_major_producer_order(
         admission_candidates,
         unsupported_admission_roots,
     )
-    normalized_schedule = replace_dense_orders(worker_schedule, admission_orders)
+    source_orders: dict[int, CoordinateRelation] = {}
+    for root, source_frontier in external_source_frontiers:
+        canonical_frontier = source_frontier.canonical_single_valued()
+        canonical_frontier = (
+            None
+            if canonical_frontier is None
+            else canonical_frontier.coalesce_adjacent_source_boxes()
+        )
+        affecting_axes = (
+            None
+            if canonical_frontier is None
+            else canonical_frontier.source_axes_affecting_targets()
+        )
+        if affecting_axes is None or len(affecting_axes) != 1:
+            continue
+        (frontier_axis,) = affecting_axes
+        root_domain = readiness_graph.root_domains[root]
+        source_axis_order = (
+            *(axis for axis in root_domain.axis_order if axis != frontier_axis),
+            frontier_axis,
+        )
+        grouped_tasks = CoordinateRelation.identity(
+            root_domain,
+            root_domain,
+        ).reorder_source_axes(source_axis_order)
+        candidate = exact_task_order(grouped_tasks, root_domain)
+        if candidate is None:
+            continue
+        task_order, logical_to_ordinal = candidate
+        ordinal_to_logical = logical_to_ordinal.converse()
+        ordered_frontier = (
+            None
+            if ordinal_to_logical is None
+            else ordinal_to_logical.then(source_frontier)
+        )
+        if ordered_frontier is not None and _scalar_relation_is_nondecreasing(
+            ordered_frontier
+        ):
+            source_orders[root] = task_order
+    # A source-major order is accepted only with its own monotonicity and
+    # exact-bijection certificates.  The final all-prerequisite rank proof
+    # remains authoritative for resident dependencies.
+    selected_admission_orders = {
+        **admission_orders,
+        **source_orders,
+    }
+    normalized_schedule = replace_dense_orders(
+        worker_schedule,
+        selected_admission_orders,
+    )
 
     completion_candidates: dict[
         int,
@@ -4076,28 +4762,9 @@ def _producer_frontier_by_consumer_task(
     worker_schedule: WorkerSchedule,
     consumer_keys: CoordinateRelation,
     producer: ReadinessProducer,
-    producer_steps: CoordinateRelation,
 ) -> CoordinateRelation | None:
-    """Map each consumer CTA to the latest required producer rank."""
+    """Map each consumer CTA to the latest required producer wave."""
     producer_domain = readiness_graph.root_domains[producer.producer_root]
-    tasks_by_key = producer.producers_by_key.project_target(producer_domain)
-    if tasks_by_key is None:
-        return None
-    required_tasks = consumer_keys.then(tasks_by_key)
-    direct_frontier = (
-        None
-        if required_tasks is None
-        else required_tasks.max_target_value_by_source(producer_steps)
-    )
-    if (
-        direct_frontier is not None
-        and direct_frontier.canonical_single_valued() is not None
-    ):
-        return direct_frontier
-
-    # Keep keys explicit when direct consumer-to-task composition is outside
-    # the supported affine subset.  Each segment still obtains its rank from
-    # ``producer_steps``; no second schedule or rank formula is constructed.
     keys_by_task = producer.keys_by_producer
     if keys_by_task is None:
         return None
@@ -4105,61 +4772,18 @@ def _producer_frontier_by_consumer_task(
         keys_by_task = keys_by_task.project_source(producer_domain)
     if keys_by_task is None:
         return None
-    maxima: list[CoordinateRelation] = []
-    for segment in worker_schedule.segments_for_root(producer.producer_root):
-        flat_order = _flat_task_order_relation(
-            segment.task_order,
-            _task_order_ordinal_domain(segment.task_order),
-        )
-        root_to_order = None if flat_order is None else flat_order.converse()
-        root_to_order = (
-            None if root_to_order is None else root_to_order.canonical_single_valued()
-        )
-        direct_order_by_key = (
-            None if root_to_order is None else tasks_by_key.then(root_to_order)
-        )
-        order_by_key = direct_order_by_key
-        if direct_order_by_key is None:
-            keys_by_order = (
-                None if flat_order is None else flat_order.then(keys_by_task)
-            )
-            order_by_key = None if keys_by_order is None else keys_by_order.converse()
-        steps_by_order = (
-            None if flat_order is None else flat_order.then(producer_steps)
-        )
-        maximum = (
-            None
-            if order_by_key is None or steps_by_order is None
-            else order_by_key.max_target_value_by_source(steps_by_order)
-        )
-        if maximum is None:
-            return None
-        maxima.append(maximum)
-    if not maxima:
-        return None
-    key_frontier = maxima[0]
-    for maximum in maxima[1:]:
-        key_frontier = key_frontier.union(maximum)
-        if key_frontier is None:
-            return None
-    identity = CoordinateRelation.identity(
-        producer_steps.target_domain,
-        producer_steps.target_domain,
+    key_frontier = _maximum_root_wave_by_key(
+        worker_schedule,
+        producer.producer_root,
+        keys_by_task,
     )
-    key_frontier = key_frontier.max_target_value_by_source(identity)
-    if key_frontier is None or key_frontier.canonical_single_valued() is None:
+    if key_frontier is None:
         return None
-    frontier = (
-        consumer_keys.then(key_frontier)
-        if consumer_keys.is_single_valued()
-        else consumer_keys.max_target_value_by_source(key_frontier)
-    )
     # Each producer arm is proved separately.  A union of partial frontiers
     # must never masquerade as a total combined prerequisite.
-    return (
-        frontier
-        if frontier is not None and frontier.canonical_single_valued() is not None
-        else None
+    return _maximum_required_value_by_consumer(
+        consumer_keys,
+        key_frontier,
     )
 
 
@@ -4195,8 +4819,6 @@ def _has_symbolic_worker_rank(
     """Prove every resident strand edge strictly increases worker step."""
     prior_runs: list[tuple[int, int, int]] = []
     for segment in worker_schedule.segments:
-        if segment.dispatch_offset % segment.worker_count:
-            return False
         for begin, end, first_step, last_step in segment.worker_step_runs():
             if any(
                 max(begin, prior_begin) < min(end, prior_end)
@@ -4235,7 +4857,11 @@ def _segment_dependency_support_overlaps(
     relation declines the candidate instead of guessing from materialized
     points.
     """
-    consumer_segment_keys = consumer_segment.task_order.then(keys_by_consumer)
+    consumer_order = consumer_segment.logical_task_order
+    producer_order = producer_segment.logical_task_order
+    if consumer_order is None or producer_order is None:
+        return None
+    consumer_segment_keys = consumer_order.then(keys_by_consumer)
     consumers_by_key = (
         None if consumer_segment_keys is None else consumer_segment_keys.converse()
     )
@@ -4245,8 +4871,8 @@ def _segment_dependency_support_overlaps(
     # Restrict by the same exact traversal certificate used for global
     # exact-once validation; only its logical source support matters here.
     producer_support = _logical_task_to_order_ordinal(
-        producer_segment.task_order,
-        _task_order_ordinal_domain(producer_segment.task_order),
+        producer_order,
+        _task_order_ordinal_domain(producer_order),
     )
     if producers_reaching_consumer is None or producer_support is None:
         return None
@@ -4393,6 +5019,7 @@ def _schedule_is_progress_safe(
     root_barrier_edges: frozenset[tuple[int, int]],
     *,
     transient_source_root: int | None = None,
+    require_strict_rank: bool = False,
 ) -> bool:
     """Prove progress symbolically, without constructing a CTA DAG.
 
@@ -4485,6 +5112,8 @@ def _schedule_is_progress_safe(
                     or (not frontier.is_pointwise_strictly_less_than(consumer_steps))
                 ):
                     strictly_ranked = False
+            if not strictly_ranked and require_strict_rank:
+                return False
             if not strictly_ranked:
                 needs_segment_precedence_proof = True
             continue
@@ -4493,9 +5122,9 @@ def _schedule_is_progress_safe(
         consumer = prerequisite.counter_consumer
         assert plan is not None and consumer is not None
         consumer_keys = (
-            _keys_at_first_consumer_checkpoint(readiness_graph, consumer)
-            if consumer.consumer_site_id is not None
-            else _keys_by_consumer_root_task(readiness_graph, consumer)
+            _keys_by_consumer_root_task(readiness_graph, consumer)
+            if require_strict_rank or consumer.consumer_site_id is None
+            else _keys_at_first_consumer_checkpoint(readiness_graph, consumer)
         )
         if consumer_keys is None:
             return False
@@ -4527,7 +5156,6 @@ def _schedule_is_progress_safe(
                     producer_root=producer_root,
                     producers_by_key=producers_by_key,
                 ),
-                producer_steps=producer_steps,
             )
             if frontier is None:
                 strictly_ranked = False
@@ -4535,7 +5163,11 @@ def _schedule_is_progress_safe(
             if frontier.is_pointwise_strictly_less_than_where_defined(consumer_steps):
                 continue
             strictly_ranked = False
-        if consumer.consumer_site_id is not None or not strictly_ranked:
+        if not strictly_ranked and require_strict_rank:
+            return False
+        if not require_strict_rank and (
+            consumer.consumer_site_id is not None or not strictly_ranked
+        ):
             # A nested consumer can wait again after admission.  The global
             # segment graph includes all checkpoints, whereas the scalar fast
             # path above intentionally checks only entry readiness.
@@ -4555,7 +5187,6 @@ def _schedule_is_progress_safe(
 @dataclasses.dataclass(frozen=True)
 class _PlacedRun:
     root: int
-    source_segment: WorkerScheduleSegment
     source_begin: int
     task_count: int
     worker_begin: int
@@ -4563,7 +5194,138 @@ class _PlacedRun:
     worker_step: int
 
 
-def _global_unit_list_schedule(
+def _root_schema_criticality(
+    root_count: int,
+    edges: frozenset[tuple[int, int]],
+) -> tuple[tuple[int, int], ...] | None:
+    """Return shape-independent ``(slack, -top)`` classes for root DAGs."""
+    successors = [set() for _ in range(root_count)]
+    indegree = [0] * root_count
+    for producer, consumer in edges:
+        if producer == consumer:
+            continue
+        if consumer not in successors[producer]:
+            successors[producer].add(consumer)
+            indegree[consumer] += 1
+    ready = [root for root, degree in enumerate(indegree) if degree == 0]
+    heapq.heapify(ready)
+    order: list[int] = []
+    while ready:
+        root = heapq.heappop(ready)
+        order.append(root)
+        for consumer in sorted(successors[root]):
+            indegree[consumer] -= 1
+            if indegree[consumer] == 0:
+                heapq.heappush(ready, consumer)
+    if len(order) != root_count:
+        # A cyclic quotient needs the affine SCC-rank proof from Phase 4.
+        return None
+
+    predecessors = [set() for _ in range(root_count)]
+    for producer, root_successors in enumerate(successors):
+        for consumer in root_successors:
+            predecessors[consumer].add(producer)
+    top = [1] * root_count
+    for root in order:
+        top[root] = 1 + max(
+            (top[producer] for producer in predecessors[root]),
+            default=0,
+        )
+    bottom = [1] * root_count
+    for root in reversed(order):
+        bottom[root] = 1 + max(
+            (bottom[consumer] for consumer in successors[root]),
+            default=0,
+        )
+    horizon = max(
+        (top[root] + bottom[root] - 1 for root in range(root_count)),
+        default=0,
+    )
+    return tuple(
+        (horizon - top[root] - bottom[root] + 1, -top[root])
+        for root in range(root_count)
+    )
+
+
+def _scalar_relation_maximum_on_interval(
+    relation: CoordinateRelation,
+    begin: int,
+    end: int,
+) -> tuple[bool, int] | None:
+    """Bound a partial scalar function over one concrete ordinal interval.
+
+    The boolean distinguishes an interval outside the relation's support from
+    a represented value.  Every returned maximum is proved from relation
+    bounds; no source point is sampled.
+    """
+    if begin < 0 or end < begin or len(relation.source_domain.axis_order) != 1:
+        return None
+    if len(relation.target_domain.axis_order) != 1:
+        return None
+    canonical = relation.canonical_single_valued()
+    if canonical is None:
+        return None
+    (source_axis,) = canonical.source_domain.axis_order
+    maxima: list[int] = []
+    for piece in canonical.pieces:
+        ((piece_axis, piece_begin, piece_end, piece_step),) = piece.source_bounds_items
+        if piece_axis != source_axis or piece_step != 1:
+            return None
+        overlap_begin = max(begin, piece_begin)
+        overlap_end = min(end, piece_end)
+        if overlap_begin >= overlap_end:
+            continue
+        if len(piece.target_ranges) != 1:
+            return None
+        _target_axis, value, value_end, value_step = piece.target_ranges[0]
+        if value_step != 1 or sympy.simplify(value_end - value) != 1:  # pyrefly: ignore[unsupported-operation]
+            return None
+        bounds = _logical_expression_bounds(
+            value,
+            domain=canonical.source_domain,
+            source_bounds=((source_axis, overlap_begin, overlap_end, 1),),
+        )
+        if (
+            bounds is None or bounds[1].free_symbols or bounds[1].is_integer is not True  # pyrefly: ignore[missing-attribute]
+        ):
+            return None
+        maxima.append(int(bounds[1]))
+    return (False, -1) if not maxima else (True, max(maxima))
+
+
+def _scalar_relation_constant_prefix_end(
+    relation: CoordinateRelation,
+    begin: int,
+    end: int,
+) -> int | None:
+    """Return the maximal constant prefix of a proved nondecreasing relation."""
+    if begin >= end:
+        return begin
+    first = _scalar_relation_maximum_on_interval(relation, begin, begin + 1)
+    whole = _scalar_relation_maximum_on_interval(relation, begin, end)
+    if first is None or whole is None or not first[0] or not whole[0]:
+        return None
+    if whole[1] == first[1]:
+        return end
+    low = begin + 1
+    high = end
+    while low + 1 < high:
+        middle = (low + high) // 2
+        prefix = _scalar_relation_maximum_on_interval(
+            relation,
+            begin,
+            middle,
+        )
+        if prefix is None or not prefix[0]:
+            return None
+        if prefix[1] == first[1]:
+            low = middle
+        else:
+            high = middle
+    return low
+
+
+def _event_frontier_list_schedule(
     readiness_graph: ReadinessGraph,
     worker_schedule: WorkerSchedule,
     readiness_counters: tuple[ReadinessCounterPlan, ...],
@@ -4571,379 +5333,398 @@ def _global_unit_list_schedule(
     *,
     transient_source_root: int | None = None,
 ) -> WorkerSchedule | None:
-    """Apply deterministic unit-weight list scheduling to a bounded CTA DAG.
-
-    This is a topology-only Graham list scheduler.  It has no latency or
-    resource cost model: structural slack, bottom level, and source/task order
-    are the only priorities.  Large or unrepresentable graphs retain their
-    existing schedule.
-    """
+    """List-schedule concrete root/event frontiers without a per-CTA DAG."""
     continuations = _emitted_final_arrival_continuations(
         readiness_graph,
         readiness_counters,
     )
     if continuations is None:
         return None
-    continuation_roots = frozenset(
-        readiness_graph.event(continuation.event_id)
-        .consumers[continuation.consumer_index]
-        .consumer_root
-        for continuation in continuations
+    continuation_by_root = _continuations_by_consumer_root(
+        readiness_graph,
+        continuations,
     )
-    excluded_roots = continuation_roots | (
+    excluded_roots = frozenset(continuation_by_root) | (
         frozenset()
         if transient_source_root is None
         else frozenset((transient_source_root,))
     )
-    worker_schedule = _consumer_major_producer_order(
+    external_source_frontiers = (
+        ()
+        if transient_source_root is None
+        else _external_source_frontiers(
+            readiness_graph,
+            readiness_counters,
+            root_barrier_edges,
+            transient_source_root,
+        )
+    )
+    if external_source_frontiers is None:
+        return None
+    ordered_schedule = _consumer_major_producer_order(
         readiness_graph,
         worker_schedule,
         readiness_counters,
         root_barrier_edges,
         excluded_roots=excluded_roots,
+        external_source_frontiers=external_source_frontiers,
     )
     scheduled_roots = tuple(
         root
         for root in range(len(readiness_graph.root_domains))
         if root not in excluded_roots
     )
-    total_tasks = sum(
-        readiness_graph.root_domains[root].size for root in scheduled_roots
-    )
-    if total_tasks > _MAX_GLOBAL_LIST_NODES:
-        return None
-    tasks = tuple(
-        (root, logical_task)
-        for root in scheduled_roots
-        for logical_task in range(readiness_graph.root_domains[root].size)
-    )
-    if len(tasks) != total_tasks:
-        raise AssertionError("task enumeration disagrees with root domains")
-
-    root_position: dict[tuple[int, int], int] = {}
-    origin_by_task: dict[tuple[int, int], tuple[WorkerScheduleSegment, int]] = {}
-    preferred_worker_by_task: dict[tuple[int, int], int] = {}
+    root_orders: dict[int, CoordinateRelation] = {}
     for root in scheduled_roots:
-        ordered = _ordered_root_tasks(worker_schedule, root)
-        if ordered is None:
+        traversal = _root_schedule_traversal(
+            ordered_schedule.segments_for_root(root),
+            readiness_graph.root_task_orders[root],
+        )
+        if traversal is None or traversal.scheduled_ordinal_to_logical_task is None:
             return None
-        for position, (logical_task, source_segment, source_index) in enumerate(
-            ordered
-        ):
-            root_position[(root, logical_task)] = position
-            origin_by_task[(root, logical_task)] = (source_segment, source_index)
-            preferred_worker_by_task[(root, logical_task)] = (
-                source_segment.worker_begin
-                + (source_segment.dispatch_offset + source_index)
-                % source_segment.worker_count
-            )
+        order = traversal.scheduled_ordinal_to_logical_task
+        if len(order.source_domain.axis_order) != 1 or not order.is_total_function():
+            return None
+        root_orders[root] = order
 
-    successors = _semantic_task_successors(
-        readiness_graph,
+    external_frontiers: dict[int, CoordinateRelation] = {}
+    for root, logical_frontier in external_source_frontiers:
+        order = root_orders.get(root)
+        ordered_frontier = None if order is None else order.then(logical_frontier)
+        if ordered_frontier is None or not _scalar_relation_is_nondecreasing(
+            ordered_frontier
+        ):
+            return None
+        external_frontiers[root] = ordered_frontier
+
+    incoming_frontiers: dict[int, list[tuple[int, CoordinateRelation]]] = {
+        root: [] for root in scheduled_roots
+    }
+    schema_edges: set[tuple[int, int]] = set()
+    for prerequisite in _emitted_prerequisites(
         readiness_counters,
         root_barrier_edges,
-        tasks,
-        nested_entry_only=False,
-        continuations=continuations,
-        external_producer_roots=(
-            frozenset()
-            if transient_source_root is None
-            else frozenset((transient_source_root,))
-        ),
-    )
-    if successors is None:
-        return None
-    topological_order = _topological_order(successors)
-    if topological_order is None:
-        return None
-    task_node_count = len(tasks)
-    node_weight = tuple(
-        1 if node < task_node_count else 0 for node in range(len(successors))
-    )
-    indegree = [0] * len(successors)
-    for task_successors in successors:
-        for successor in task_successors:
-            indegree[successor] += 1
-
-    bottom_level = [0] * len(successors)
-    earliest_start = [0] * len(successors)
-    for node in reversed(topological_order):
-        bottom_level[node] = node_weight[node] + max(
-            (bottom_level[successor] for successor in successors[node]),
-            default=0,
-        )
-    for node in topological_order:
-        finish = earliest_start[node] + node_weight[node]
-        for successor in successors[node]:
-            earliest_start[successor] = max(earliest_start[successor], finish)
-    source_order_makespan = sum(
-        (readiness_graph.root_domains[root].size + worker_schedule.worker_count - 1)
-        // worker_schedule.worker_count
-        for root in scheduled_roots
-    )
-
-    node_predecessors: list[list[int]] = [[] for _ in successors]
-    for producer_index, task_successors in enumerate(successors):
-        for successor in task_successors:
-            node_predecessors[successor].append(producer_index)
-    remaining_predecessors = indegree.copy()
-    selected_tasks = [False] * task_node_count
-    ready_tasks = [False] * task_node_count
-    ready_task_count = 0
-
-    def static_priority(task_index: int) -> tuple[int, int, int, int, int]:
-        root, logical_task = tasks[task_index]
-        slack = (
-            source_order_makespan
-            - earliest_start[task_index]
-            - bottom_level[task_index]
-        )
-        return (
-            slack,
-            -bottom_level[task_index],
-            root,
-            root_position[(root, logical_task)],
-            task_index,
-        )
-
-    event_successors_by_task = tuple(
-        tuple(successor for successor in successors[task] if successor >= task_node_count)
-        for task in range(task_node_count)
-    )
-    event_ready_tasks: list[list[tuple[int, int, int, int, int]]] = [
-        [] for _ in successors
-    ]
-    event_generation = [0] * len(successors)
-    event_candidates: list[
-        tuple[int, int, int, int, int, int, int, int, int]
-    ] = []
-    terminal_ready: list[tuple[int, int, int, int, int]] = []
-
-    def event_priority(
-        event: int,
-    ) -> tuple[int, int, int, int, int, int, int, int] | None:
-        ready_producers = event_ready_tasks[event]
-        while ready_producers and not ready_tasks[ready_producers[0][-1]]:
-            heapq.heappop(ready_producers)
-        if not ready_producers or remaining_predecessors[event] <= 0:
+    ):
+        consumer_root = prerequisite.consumer_root
+        if consumer_root in excluded_roots:
+            continue
+        consumer_order = root_orders.get(consumer_root)
+        if consumer_order is None:
             return None
-        producer_priority = ready_producers[0]
-        consumer_remaining = min(
-            (
-                remaining_predecessors[consumer]
-                for consumer in successors[event]
-                if consumer < task_node_count
-            ),
-            default=task_node_count + 1,
-        )
-        return (
-            producer_priority[0],
-            consumer_remaining,
-            *producer_priority[1:-1],
-            remaining_predecessors[event],
-            producer_priority[-1],
-            event,
-        )
-
-    zero_cost_ready: list[int] = []
-
-    def refresh_event(event: int) -> None:
-        event_generation[event] += 1
-        candidate = event_priority(event)
-        if candidate is not None:
-            heapq.heappush(
-                event_candidates,
-                (*candidate, event_generation[event]),
+        if prerequisite.barrier_producer_root is not None:
+            producer_root = prerequisite.barrier_producer_root
+            producer_domain = readiness_graph.root_domains[producer_root]
+            static_relations = _static_producer_relations(
+                readiness_graph,
+                root=producer_root,
+                site_id=None,
+                readiness_keys=CoordinateRelation.identity(
+                    producer_domain,
+                    producer_domain,
+                ),
+                continuation_by_root=continuation_by_root,
             )
-
-    def push_ready_task(task_index: int) -> None:
-        events = event_successors_by_task[task_index]
-        if not events:
-            heapq.heappush(terminal_ready, static_priority(task_index))
-            return
-        task_priority = static_priority(task_index)
-        for event in events:
-            heapq.heappush(event_ready_tasks[event], task_priority)
-            refresh_event(event)
-
-    def admit_ready(node: int) -> None:
-        nonlocal ready_task_count
-        if node < task_node_count:
-            if selected_tasks[node] or ready_tasks[node]:
-                raise AssertionError("task admitted to the ready queue twice")
-            ready_tasks[node] = True
-            ready_task_count += 1
-            push_ready_task(node)
-        else:
-            zero_cost_ready.append(node)
-
-    def next_event_candidate(
-        *, pop: bool
-    ) -> tuple[int, int, int, int, int, int, int, int] | None:
-        while event_candidates:
-            *candidate, generation = event_candidates[0]
-            event = candidate[-1]
-            if generation != event_generation[event]:
-                heapq.heappop(event_candidates)
-                continue
-            current = event_priority(event)
-            if current is None or tuple(candidate) != current:
-                heapq.heappop(event_candidates)
-                refresh_event(event)
-                continue
-            if pop:
-                heapq.heappop(event_candidates)
-            return current
-        return None
-
-    def next_terminal_candidate(*, pop: bool) -> tuple[int, ...] | None:
-        while terminal_ready and not ready_tasks[terminal_ready[0][-1]]:
-            heapq.heappop(terminal_ready)
-        if not terminal_ready:
-            return None
-        task_priority = terminal_ready[0]
-        if pop:
-            heapq.heappop(terminal_ready)
-        # Completing a terminal task is immediately useful to the makespan.
-        return (task_priority[0], 0, *task_priority[1:-1], 0, task_priority[-1], -1)
-
-    def pop_ready_task() -> int | None:
-        nonlocal ready_task_count
-        while ready_task_count:
-            event_candidate = next_event_candidate(pop=False)
-            terminal_candidate = next_terminal_candidate(pop=False)
-            if event_candidate is None and terminal_candidate is None:
+            if static_relations is None:
                 return None
-            if terminal_candidate is not None and (
-                event_candidate is None or terminal_candidate < event_candidate
-            ):
-                candidate = next_terminal_candidate(pop=True)
-                assert candidate is not None
-                task_index = candidate[-2]
-            else:
-                candidate = next_event_candidate(pop=True)
-                assert candidate is not None
-                task_index = candidate[-2]
-            if not ready_tasks[task_index]:
-                continue
-            ready_tasks[task_index] = False
-            ready_task_count -= 1
-            return task_index
-        return None
+            for static_root, _relation in static_relations:
+                schema_edges.add((static_root, consumer_root))
+                if static_root in excluded_roots:
+                    continue
+                producer_order = root_orders.get(static_root)
+                if producer_order is None:
+                    return None
+                frontier = CoordinateRelation.point_map(
+                    consumer_order.source_domain,
+                    producer_order.source_domain,
+                    (
+                        (
+                            tuple(
+                                (
+                                    axis,
+                                    0,
+                                    consumer_order.source_domain.axis_counts[axis],
+                                    1,
+                                )
+                                for axis in consumer_order.source_domain.axis_order
+                            ),
+                            (sympy.Integer(producer_order.source_domain.size - 1),),
+                        ),
+                    ),
+                )
+                incoming_frontiers[consumer_root].append((static_root, frontier))
+            continue
 
-    def record_event_progress(task_index: int) -> None:
-        """Update shadow readiness and refresh newly urgent producers."""
-        for event in successors[task_index]:
-            if event < task_node_count:
-                continue
-            remaining_predecessors[event] -= 1
-            remaining = remaining_predecessors[event]
-            if remaining < 0:
-                raise AssertionError("readiness event producer count underflow")
-            refresh_event(event)
-            if remaining != 0:
-                continue
-            for consumer in successors[event]:
-                remaining_predecessors[consumer] -= 1
-                consumer_remaining = remaining_predecessors[consumer]
-                if consumer_remaining < 0:
-                    raise AssertionError("consumer readiness count underflow")
-                for predecessor in node_predecessors[consumer]:
-                    if predecessor >= task_node_count:
-                        refresh_event(predecessor)
-
-    def drain_zero_cost_nodes() -> None:
-        while zero_cost_ready:
-            node = zero_cost_ready.pop()
-            for successor in successors[node]:
-                indegree[successor] -= 1
-                if indegree[successor] == 0:
-                    admit_ready(successor)
-
-    for node, degree in enumerate(indegree):
-        if degree == 0:
-            admit_ready(node)
-    drain_zero_cost_nodes()
-    placed_runs: list[_PlacedRun] = []
-    scheduled_count = 0
-    worker_step = 0
-    while scheduled_count < len(tasks):
-        initially_ready = min(ready_task_count, worker_schedule.worker_count)
-        selected: list[int] = []
-        for _ in range(initially_ready):
-            task_index = pop_ready_task()
-            if task_index is None:
-                return None
-            selected_tasks[task_index] = True
-            selected.append(task_index)
-            record_event_progress(task_index)
-
-        def admit_successors(task_index: int) -> None:
-            for successor in successors[task_index]:
-                indegree[successor] -= 1
-                if indegree[successor] == 0:
-                    admit_ready(successor)
-
-        for task_index in selected:
-            admit_successors(task_index)
-        drain_zero_cost_nodes()
-        if not selected:
-            return None
-
-        assignments: dict[int, int] = {}
-        displaced: list[int] = []
-        for task_index in selected:
-            preferred_worker = preferred_worker_by_task[tasks[task_index]]
-            if preferred_worker not in assignments:
-                assignments[preferred_worker] = task_index
-            else:
-                displaced.append(task_index)
-        free_workers = iter(
-            worker
-            for worker in range(worker_schedule.worker_count)
-            if worker not in assignments
+        plan = prerequisite.counter_plan
+        consumer = prerequisite.counter_consumer
+        assert plan is not None and consumer is not None
+        consumer_keys = _keys_by_consumer_root_task(readiness_graph, consumer)
+        ordered_consumer_keys = (
+            None if consumer_keys is None else consumer_order.then(consumer_keys)
         )
-        for task_index in displaced:
-            assignments[next(free_workers)] = task_index
+        static_relations = _readiness_static_producers(
+            readiness_graph,
+            plan.producers,
+            continuation_by_root,
+        )
+        if ordered_consumer_keys is None or static_relations is None:
+            return None
+        for producer_root, keys_by_producer in static_relations:
+            schema_edges.add((producer_root, consumer_root))
+            if producer_root in excluded_roots:
+                continue
+            producer_order = root_orders.get(producer_root)
+            if producer_order is None:
+                return None
+            keys_by_producer_order = producer_order.then(keys_by_producer)
+            ordinal_identity = CoordinateRelation.identity(
+                producer_order.source_domain,
+                producer_order.source_domain,
+            )
+            producer_frontier_by_key = (
+                None
+                if keys_by_producer_order is None
+                else _maximum_value_by_key(keys_by_producer_order, ordinal_identity)
+            )
+            frontier = (
+                None
+                if producer_frontier_by_key is None
+                else _maximum_required_value_by_consumer(
+                    ordered_consumer_keys,
+                    producer_frontier_by_key,
+                )
+            )
+            if frontier is None or frontier.canonical_single_valued() is None:
+                return None
+            incoming_frontiers[consumer_root].append((producer_root, frontier))
 
-        ordered_assignments = sorted(assignments.items())
-        run_begin = 0
-        while run_begin < len(ordered_assignments):
-            first_worker, first_index = ordered_assignments[run_begin]
-            first_task = tasks[first_index]
-            root = first_task[0]
-            source_segment, source_begin = origin_by_task[first_task]
-            run_end = run_begin + 1
-            while run_end < len(ordered_assignments):
-                previous_worker, previous_index = ordered_assignments[run_end - 1]
-                current_worker, current_index = ordered_assignments[run_end]
-                previous_task = tasks[previous_index]
-                current_task = tasks[current_index]
-                current_segment, current_source_index = origin_by_task[current_task]
-                if (
-                    current_worker != previous_worker + 1
-                    or current_task[0] != root
-                    or root_position[current_task] != root_position[previous_task] + 1
-                    or current_segment != source_segment
-                    or current_source_index != source_begin + run_end - run_begin
-                ):
-                    break
-                run_end += 1
-            run_count = run_end - run_begin
+    criticality = _root_schema_criticality(
+        len(readiness_graph.root_domains),
+        frozenset(schema_edges),
+    )
+    if criticality is None:
+        return None
+
+    order_piece_ends: dict[int, tuple[int, ...]] = {}
+    for root, order in root_orders.items():
+        canonical = order.canonical_single_valued()
+        if canonical is None:
+            return None
+        (ordinal_axis,) = canonical.source_domain.axis_order
+        if any(
+            axis != ordinal_axis or step != 1
+            for piece in canonical.pieces
+            for axis, _begin, _end, step in piece.source_bounds_items
+        ):
+            return None
+        order_piece_ends[root] = tuple(
+            sorted(
+                {
+                    end
+                    for piece in canonical.pieces
+                    for _axis, _begin, end, _step in piece.source_bounds_items
+                }
+            )
+        )
+
+    cursors = dict.fromkeys(scheduled_roots, 0)
+    root_ends = {root: root_orders[root].source_domain.size for root in scheduled_roots}
+
+    def interval_is_admissible(
+        root: int,
+        begin: int,
+        end: int,
+        producer_cursors: dict[int, int],
+    ) -> bool | None:
+        for producer_root, frontier in incoming_frontiers[root]:
+            maximum = _scalar_relation_maximum_on_interval(frontier, begin, end)
+            if maximum is None:
+                return None
+            has_value, value = maximum
+            if has_value and value >= producer_cursors[producer_root]:
+                return False
+        return True
+
+    def admissible_prefix_end(
+        root: int,
+        begin: int,
+        limit: int,
+        producer_cursors: dict[int, int],
+    ) -> int | None:
+        if begin >= limit:
+            return begin
+        whole = interval_is_admissible(root, begin, limit, producer_cursors)
+        if whole is None:
+            return None
+        if whole:
+            return limit
+        first = interval_is_admissible(root, begin, begin + 1, producer_cursors)
+        if first is None or not first:
+            return begin if first is False else None
+        low = begin + 1
+        high = limit
+        while low + 1 < high:
+            middle = (low + high) // 2
+            prefix = interval_is_admissible(
+                root,
+                begin,
+                middle,
+                producer_cursors,
+            )
+            if prefix is None:
+                return None
+            if prefix:
+                low = middle
+            else:
+                high = middle
+        return low
+
+    def next_piece_end(root: int, cursor: int) -> int | None:
+        return next(
+            (end for end in order_piece_ends[root] if cursor < end),
+            None,
+        )
+
+    placed_runs: list[_PlacedRun] = []
+    worker_step = 0
+    while any(cursors[root] < root_ends[root] for root in scheduled_roots):
+        wave_start_cursors = dict(cursors)
+        next_worker = 0
+        while next_worker < worker_schedule.worker_count:
+            candidates: list[
+                tuple[
+                    tuple[int, int, int, int, int, int, int, int],
+                    int,
+                    int,
+                ]
+            ] = []
+            for root in scheduled_roots:
+                cursor = cursors[root]
+                if cursor >= root_ends[root]:
+                    continue
+                piece_end = next_piece_end(root, cursor)
+                if piece_end is None:
+                    return None
+                limit = min(
+                    root_ends[root],
+                    piece_end,
+                    cursor + worker_schedule.worker_count - next_worker,
+                )
+                if external_frontier := external_frontiers.get(root):
+                    external_end = _scalar_relation_constant_prefix_end(
+                        external_frontier,
+                        cursor,
+                        limit,
+                    )
+                    if external_end is None:
+                        return None
+                    limit = min(limit, external_end)
+                # Stop at the next producer frontier needed by any current
+                # consumer cohort.  This is the exact event boundary that
+                # lets another arm close a join in the remaining wave slots;
+                # it is derived from the emitted prerequisite relation rather
+                # than from a configurable chunk size.
+                for consumer_root in scheduled_roots:
+                    consumer_cursor = cursors[consumer_root]
+                    if consumer_cursor >= root_ends[consumer_root]:
+                        continue
+                    for producer_root, frontier in incoming_frontiers[consumer_root]:
+                        if producer_root != root:
+                            continue
+                        required = _scalar_relation_maximum_on_interval(
+                            frontier,
+                            consumer_cursor,
+                            consumer_cursor + 1,
+                        )
+                        if required is None:
+                            return None
+                        has_value, value = required
+                        if has_value and cursor <= value:
+                            limit = min(limit, value + 1)
+                candidate_end = admissible_prefix_end(
+                    root,
+                    cursor,
+                    limit,
+                    wave_start_cursors,
+                )
+                if candidate_end is None:
+                    return None
+                if candidate_end == cursor:
+                    continue
+
+                hypothetical_cursors = dict(cursors)
+                hypothetical_cursors[root] = candidate_end
+                released_roots: list[int] = []
+                for consumer_root in scheduled_roots:
+                    consumer_cursor = cursors[consumer_root]
+                    if consumer_cursor >= root_ends[consumer_root]:
+                        continue
+                    before = interval_is_admissible(
+                        consumer_root,
+                        consumer_cursor,
+                        consumer_cursor + 1,
+                        cursors,
+                    )
+                    after = interval_is_admissible(
+                        consumer_root,
+                        consumer_cursor,
+                        consumer_cursor + 1,
+                        hypothetical_cursors,
+                    )
+                    if before is None or after is None:
+                        return None
+                    if not before and after:
+                        released_roots.append(consumer_root)
+                base = criticality[root]
+                release_class = min(
+                    (criticality[consumer_root] for consumer_root in released_roots),
+                    default=base,
+                )
+                effective = min(base, release_class)
+                closes_effective_event = any(
+                    criticality[consumer_root] == effective
+                    for consumer_root in released_roots
+                )
+                external_release = -1
+                if external_frontier := external_frontiers.get(root):
+                    external_maximum = _scalar_relation_maximum_on_interval(
+                        external_frontier,
+                        cursor,
+                        candidate_end,
+                    )
+                    if external_maximum is None or not external_maximum[0]:
+                        return None
+                    external_release = external_maximum[1]
+                priority = (
+                    effective[0],
+                    0 if root in external_frontiers else 1,
+                    effective[1],
+                    0 if effective == base else 1,
+                    0 if closes_effective_event else 1,
+                    external_release,
+                    root,
+                    cursor,
+                )
+                candidates.append((priority, root, candidate_end))
+
+            if not candidates:
+                break
+            _priority, root, candidate_end = min(candidates)
+            cursor = cursors[root]
+            count = candidate_end - cursor
             placed_runs.append(
                 _PlacedRun(
                     root=root,
-                    source_segment=source_segment,
-                    source_begin=source_begin,
-                    task_count=run_count,
-                    worker_begin=first_worker,
-                    worker_count=run_count,
+                    source_begin=cursor,
+                    task_count=count,
+                    worker_begin=next_worker,
+                    worker_count=count,
                     worker_step=worker_step,
                 )
             )
-            run_begin = run_end
-
-        scheduled_count += len(selected)
+            cursors[root] = candidate_end
+            next_worker += count
+        if next_worker == 0:
+            return None
         worker_step += 1
 
     merged_runs: list[_PlacedRun] = []
@@ -4956,29 +5737,32 @@ def _global_unit_list_schedule(
                 and previous.task_count % previous.worker_count == 0
                 and run.worker_begin == 0
                 and run.worker_count <= worker_schedule.worker_count
-                and previous.worker_step
-                + (previous.task_count + previous.worker_count - 1)
-                // previous.worker_count
+                and previous.worker_step + previous.task_count // previous.worker_count
                 == run.worker_step
             )
             if (
                 previous.root == run.root
-                and previous.source_segment == run.source_segment
                 and previous.source_begin + previous.task_count == run.source_begin
-                and (
-                    extends_full_width_run
-                    or (
-                        previous.worker_begin == run.worker_begin
-                        and previous.worker_count == run.worker_count
-                        and previous.worker_step
-                        + previous.task_count // previous.worker_count
-                        == run.worker_step
-                    )
-                )
+                and extends_full_width_run
             ):
                 merged_runs[-1] = dataclasses.replace(
                     previous,
                     task_count=previous.task_count + run.task_count,
+                )
+                continue
+            extends_same_wave = (
+                previous.worker_step == run.worker_step
+                and previous.worker_begin + previous.worker_count == run.worker_begin
+            )
+            if (
+                previous.root == run.root
+                and previous.source_begin + previous.task_count == run.source_begin
+                and extends_same_wave
+            ):
+                merged_runs[-1] = dataclasses.replace(
+                    previous,
+                    task_count=previous.task_count + run.task_count,
+                    worker_count=previous.worker_count + run.worker_count,
                 )
                 continue
         merged_runs.append(run)
@@ -4988,7 +5772,7 @@ def _global_unit_list_schedule(
     segments: list[WorkerScheduleSegment] = []
     for run in merged_runs:
         task_order = _task_order_slice(
-            run.source_segment.task_order,
+            root_orders[run.root],
             run.source_begin,
             run.task_count,
         )
@@ -5019,9 +5803,69 @@ def _global_unit_list_schedule(
         readiness_counters,
         root_barrier_edges,
         transient_source_root=transient_source_root,
+        require_strict_rank=True,
     ):
         return None
     return result
+
+
+def _global_unit_list_schedule(
+    readiness_graph: ReadinessGraph,
+    worker_schedule: WorkerSchedule,
+    readiness_counters: tuple[ReadinessCounterPlan, ...],
+    root_barrier_edges: frozenset[tuple[int, int]],
+    *,
+    transient_source_root: int | None = None,
+) -> WorkerSchedule | None:
+    """Apply event-frontier list scheduling without materializing CTA nodes."""
+    if transient_source_root is None and not _emitted_prerequisites(
+        readiness_counters,
+        root_barrier_edges,
+    ):
+        return worker_schedule
+    candidate = _event_frontier_list_schedule(
+        readiness_graph,
+        worker_schedule,
+        readiness_counters,
+        root_barrier_edges,
+        transient_source_root=transient_source_root,
+    )
+    if candidate is None or transient_source_root is not None:
+        return candidate
+
+    # Unit-task list scheduling must not lengthen an otherwise equivalent
+    # resident schedule.  This is a structural makespan certificate, not a
+    # latency model: candidates with the same exact root coverage may replace
+    # the input only when their final occupied wave is no later.
+    root_count = len(readiness_graph.root_domains)
+    input_task_counts = tuple(
+        sum(segment.task_count for segment in worker_schedule.segments_for_root(root))
+        for root in range(root_count)
+    )
+    candidate_task_counts = tuple(
+        sum(segment.task_count for segment in candidate.segments_for_root(root))
+        for root in range(root_count)
+    )
+    if input_task_counts == candidate_task_counts:
+        input_final_wave = max(
+            (
+                final_wave
+                for segment in worker_schedule.segments
+                for _begin, _end, _first_wave, final_wave in segment.worker_step_runs()
+            ),
+            default=-1,
+        )
+        candidate_final_wave = max(
+            (
+                final_wave
+                for segment in candidate.segments
+                for _begin, _end, _first_wave, final_wave in segment.worker_step_runs()
+            ),
+            default=-1,
+        )
+        if candidate_final_wave > input_final_wave:
+            return worker_schedule
+    return candidate
 
 
 def _transient_source_candidate(
@@ -5164,7 +6008,7 @@ def _has_valid_transient_source_schedule(
     readiness_counters: tuple[ReadinessCounterPlan, ...],
     root_barrier_edges: frozenset[tuple[int, int]],
 ) -> bool:
-    """Prove the disjoint source-ticket and resident-schedule roles."""
+    """Check source-ticket invariants on an already-validated resident schedule."""
     if not 0 <= source_root < len(readiness_graph.root_task_orders):
         return False
     if worker_schedule.segments_for_root(source_root):
@@ -5175,18 +6019,8 @@ def _has_valid_transient_source_schedule(
         readiness_counters,
         root_barrier_edges,
     )
-    if any(prerequisite.consumer_root == source_root for prerequisite in prerequisites):
-        return False
-    return _validate_worker_schedule_tasks(
-        worker_schedule,
-        readiness_graph.root_task_orders,
-        excluded_roots=frozenset((source_root,)),
-    ) and _schedule_is_progress_safe(
-        worker_schedule,
-        readiness_graph,
-        readiness_counters,
-        root_barrier_edges,
-        transient_source_root=source_root,
+    return not any(
+        prerequisite.consumer_root == source_root for prerequisite in prerequisites
     )
 
 
