@@ -142,6 +142,24 @@ def dynamic_fixed_fan_in_chain(x: torch.Tensor) -> torch.Tensor:
     autotune_effort="none",
     triton_do_not_specialize=True,
 )
+def dynamic_fixed_fan_in_fanout_chain(x: torch.Tensor) -> torch.Tensor:
+    """Let three consumer tasks wait on each two-producer readiness key."""
+    torch._check(x.size(0) <= 4096)
+    partial = torch.empty((8192,), dtype=x.dtype, device=x.device)
+    out = torch.empty((x.size(0) * 3,), dtype=x.dtype, device=x.device)
+    for producer in hl.tile(x.size(0) * 2, block_size=1):
+        partial[producer] = x[producer.index // 2] + producer.index % 2
+    for consumer in hl.tile(x.size(0) * 3, block_size=1):
+        split = 2 * (consumer.id // 3) + hl.arange(2)
+        out[consumer] = torch.sum(partial[split])
+    return out
+
+
+@helion.kernel(
+    static_shapes=False,
+    autotune_effort="none",
+    triton_do_not_specialize=True,
+)
 def dynamic_nested_fixed_fan_in_chain(x: torch.Tensor) -> torch.Tensor:
     """Reduce each fixed-width producer fiber through a nested split loop."""
     torch._check(x.size(0) <= 16)
@@ -801,6 +819,61 @@ class TestTritonTileDependencyLowering(TestCase):
                 (captured_input * 2, (captured_input + 1) * 2), dim=1
             ).flatten()
             torch.testing.assert_close(captured_output, expected)
+
+    def test_dynamic_fixed_fan_in_fanout_reuses_compiled_binary(self) -> None:
+        exemplar = torch.arange(5, device=DEVICE, dtype=torch.float32)
+        bound = dynamic_fixed_fan_in_fanout_chain.bind((exemplar,))
+        config = helion.Config(
+            block_sizes=[],
+            pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+        code = bound.to_code(config)
+        compiled = bound.compile_config(config)
+        worker_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+
+        self.assertIn("tile_dependency_parameterized_state", code)
+        self.assertIn("torch.uint64", code)
+        self.assertIn("tl.atomic_max", code)
+        self.assertIn("tl.atomic_add", code)
+        self.assertIn("tile_dependency_readiness_wait", code)
+        self.assertNotIn("tile_dependency_continuation", code)
+        self.assertNotIn("tile_dependency_root_barrier", code)
+        self.assertNotIn("triton_helpers.x_grid_barrier(", code)
+        self.assertNotIn("launch_cooperative_grid=True", code)
+
+        def compiled_cubin_hashes() -> set[str]:
+            triton_kernel = compiled.__globals__.get(f"_helion_{bound.kernel.name}")
+            self.assertIsNotNone(triton_kernel)
+            device_caches = getattr(triton_kernel, "device_caches", None)
+            self.assertIsInstance(device_caches, dict)
+            assert isinstance(device_caches, dict)
+            return {
+                compiled_kernel.hash
+                for cache_tuple in device_caches.values()
+                for compiled_kernel in cache_tuple[0].values()
+                if getattr(compiled_kernel, "hash", None) is not None
+            }
+
+        expected_hashes: set[str] | None = None
+        for launch, key_count in enumerate(
+            (5, 0, 1, worker_count - 1, worker_count, worker_count + 1, 5)
+        ):
+            x = (
+                torch.arange(key_count, device=DEVICE, dtype=torch.float32)
+                + launch * 10000
+            )
+            output = compiled(x)
+            expected = torch.repeat_interleave(x * 2 + 1, 3)
+            torch.testing.assert_close(output, expected)
+            hashes = compiled_cubin_hashes()
+            self.assertEqual(len(hashes), 1)
+            if expected_hashes is None:
+                expected_hashes = hashes
+            else:
+                self.assertEqual(hashes, expected_hashes)
 
     def test_dynamic_nested_fixed_fan_in_uses_root_continuation(self) -> None:
         exemplar = torch.arange(5, device=DEVICE, dtype=torch.float32)

@@ -6689,10 +6689,10 @@ def _parameterized_uniform_counter_fan_in(
 ) -> int | None:
     """Return the proved static fan-in accepted by parametric schedules.
 
-    Fan-in one retains the positional event-frontier subset. Wider fan-in is
-    accepted only when the existing relation proof derives one exact producer
-    partition and one final-arrival consumer per key. The returned cardinality
-    is the sole distinction needed by scheduling and replay-safe lowering.
+    Ordinary resident waits may fan out from one key to multiple consumer
+    tasks. Final-arrival continuations retain their stricter one-task-per-key
+    bijection. The returned cardinality is the sole distinction needed by
+    scheduling and replay-safe lowering.
     """
     fan_in = plan.uniform_arrival_count()
     if (
@@ -6714,22 +6714,22 @@ def _parameterized_uniform_counter_fan_in(
     if not all(
         consumer.consumer_site_id is None
         and producer.producer_root < consumer.consumer_root
-        and consumer.keys_by_consumer.is_positional_bijection()
-        and (converse := consumer.keys_by_consumer.converse()) is not None
-        and converse.is_positional_bijection()
+        and consumer.keys_by_consumer.canonical_single_valued() is not None
+        and consumer.keys_by_consumer.is_total_function()
         for consumer in plan.consumers
     ):
         return None
-    if fan_in == 1:
+    if plan.continuation_consumer_index is not None:
+        if fan_in == 1 or len(plan.consumers) != 1:
+            return None
+        (consumer,) = plan.consumers
+        converse = consumer.keys_by_consumer.converse()
         if (
-            plan.continuation_consumer_index is not None
-            or not producer.producers_by_key.is_positional_bijection()
-            or not publication.is_positional_bijection()
+            not consumer.keys_by_consumer.is_positional_bijection()
+            or converse is None
+            or not converse.is_positional_bijection()
         ):
             return None
-        return fan_in
-    if plan.continuation_consumer_index is None or len(plan.consumers) != 1:
-        return None
     return fan_in
 
 
@@ -6742,7 +6742,22 @@ def _supports_parameterized_fan_in_one_counter(
     plan: ReadinessCounterPlan,
 ) -> bool:
     """Return whether one counter belongs to the positional recurrence."""
-    return _parameterized_uniform_counter_fan_in(plan) == 1
+    if _parameterized_uniform_counter_fan_in(plan) != 1:
+        return False
+    (producer,) = plan.producers
+    publication = producer.keys_by_producer
+    return (
+        plan.continuation_consumer_index is None
+        and publication is not None
+        and producer.producers_by_key.is_positional_bijection()
+        and publication.is_positional_bijection()
+        and all(
+            consumer.keys_by_consumer.is_positional_bijection()
+            and (converse := consumer.keys_by_consumer.converse()) is not None
+            and converse.is_positional_bijection()
+            for consumer in plan.consumers
+        )
+    )
 
 
 def _parametric_event_frontier_root_order(

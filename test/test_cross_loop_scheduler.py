@@ -3111,7 +3111,118 @@ class TestCrossLoopScheduler(TestCase):
                 ),
             )
 
-    def test_parametric_fixed_fan_in_non_sink_retains_root_barrier(self) -> None:
+    def test_parametric_counter_allows_multiple_consumers_per_key(self) -> None:
+        key_count = sympy.Symbol("key_count", integer=True, nonnegative=True)
+        consumers_per_key = 16
+        producers_per_key = 4
+        producer_domain = CoordinateDomain(
+            (10,),
+            ((10, producers_per_key * key_count),),
+            kind="site",
+            identity=0,
+        )
+        consumer_domain = CoordinateDomain(
+            (20,),
+            ((20, consumers_per_key * key_count),),
+            kind="site",
+            identity=1,
+        )
+        readiness_key_domain = CoordinateDomain(
+            (0,),
+            ((0, key_count),),
+            kind="event",
+            identity=0,
+        )
+        key = coordinate_axis_symbol(0)
+        consumer = coordinate_axis_symbol(20)
+        counter = ReadinessCounterPlan(
+            producers=(
+                ReadinessProducer(
+                    producer_root=0,
+                    producers_by_key=CoordinateRelation(
+                        source_domain=readiness_key_domain,
+                        target_domain=producer_domain,
+                        pieces=(
+                            _CoordinateRelationPiece(
+                                source_bounds_items=((0, 0, key_count, 1),),
+                                target_ranges=(
+                                    (
+                                        10,
+                                        producers_per_key * key,
+                                        producers_per_key * (key + 1),
+                                        1,
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            consumers=(
+                ReadinessConsumer(
+                    consumer_root=1,
+                    keys_by_consumer=CoordinateRelation.point_map(
+                        consumer_domain,
+                        readiness_key_domain,
+                        (
+                            (
+                                ((20, 0, consumers_per_key * key_count, 1),),
+                                (sympy.floor(consumer / consumers_per_key),),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        with _forbid_schedule_enumeration():
+            self.assertEqual(counter.uniform_arrival_count(), producers_per_key)
+            self.assertIsNone(counter.continuation_consumer_index)
+            self.assertTrue(
+                cross_loop_scheduler._supports_parameterized_counter(counter)
+            )
+            self.assertFalse(
+                cross_loop_scheduler._supports_parameterized_fan_in_one_counter(counter)
+            )
+
+        one_producer_domain = CoordinateDomain(
+            (10,),
+            ((10, key_count),),
+            kind="site",
+            identity=0,
+        )
+        one_producer_counter = dataclasses.replace(
+            counter,
+            producers=(
+                ReadinessProducer(
+                    producer_root=0,
+                    producers_by_key=CoordinateRelation.point_map(
+                        readiness_key_domain,
+                        one_producer_domain,
+                        (
+                            (
+                                ((0, 0, key_count, 1),),
+                                (key,),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        with _forbid_schedule_enumeration():
+            self.assertEqual(one_producer_counter.uniform_arrival_count(), 1)
+            self.assertTrue(
+                cross_loop_scheduler._supports_parameterized_counter(
+                    one_producer_counter
+                )
+            )
+            self.assertFalse(
+                cross_loop_scheduler._supports_parameterized_fan_in_one_counter(
+                    one_producer_counter
+                )
+            )
+
+    def test_parametric_fixed_fan_in_non_sink_uses_ordinary_counter(self) -> None:
         key_count = sympy.Symbol("key_count", integer=True, nonnegative=True)
         dependency_graph = _dependency_graph(
             [[10], [20], [30]],
@@ -3172,12 +3283,18 @@ class TestCrossLoopScheduler(TestCase):
                 for counter in plan.readiness_counters
             )
         )
-        self.assertEqual(plan.root_barrier_edges, frozenset(((0, 1),)))
+        self.assertEqual(plan.root_barrier_edges, frozenset())
         self.assertEqual(
             tuple(
                 counter.uniform_arrival_count() for counter in plan.readiness_counters
             ),
-            (1,),
+            (2, 1),
+        )
+        self.assertTrue(
+            all(
+                cross_loop_scheduler._supports_parameterized_counter(counter)
+                for counter in plan.readiness_counters
+            )
         )
 
     def test_parametric_counter_declines_unsupported_access_scale(self) -> None:
@@ -4704,7 +4821,7 @@ class TestCrossLoopScheduler(TestCase):
                     shape=(64,),
                     block_ids=(None,),
                     offsets=(None,),
-                    affine_subscript_ranges=((((20, 16), (21, 4)), 0, 4, 1),),
+                    affine_subscript_ranges=((((20, 16, 1), (21, 4, 1)), 0, 4, 1),),
                 ),
                 _access(
                     root=1,
@@ -4714,7 +4831,10 @@ class TestCrossLoopScheduler(TestCase):
                     offsets=(None,),
                     affine_subscript_ranges=(
                         (
-                            ((20, second_outer_stride), (22, second_inner_stride)),
+                            (
+                                (20, second_outer_stride, 1),
+                                (22, second_inner_stride, 1),
+                            ),
                             0,
                             4,
                             1,

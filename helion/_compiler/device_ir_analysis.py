@@ -327,26 +327,40 @@ _MAX_AFFINE_SUBSCRIPT_ELEMENTS = 4096
 
 @dataclasses.dataclass(frozen=True)
 class _AffineIndexScalar:
-    """One scalar index as an affine function of root-task coordinates."""
+    """One scalar index in the bounded quasi-affine access subset.
 
-    coefficients: tuple[tuple[int, int], ...]
+    Each term is ``(root axis, coefficient, static divisor)``.  Divisor one is
+    the ordinary affine case; larger divisors are admitted only for a direct,
+    unshifted scalar ``tile.id // divisor``.
+    """
+
+    coefficients: tuple[tuple[int, int, int], ...]
     offset: int
 
     def scaled(self, factor: int) -> _AffineIndexScalar:
         return _AffineIndexScalar(
             tuple(
-                (axis, coefficient * factor) for axis, coefficient in self.coefficients
+                (axis, coefficient * factor, divisor)
+                for axis, coefficient, divisor in self.coefficients
             ),
             self.offset * factor,
         )
 
     def plus(self, other: _AffineIndexScalar) -> _AffineIndexScalar:
-        coefficients = dict(self.coefficients)
-        for axis, coefficient in other.coefficients:
-            coefficients[axis] = coefficients.get(axis, 0) + coefficient
+        coefficients = {
+            (axis, divisor): coefficient
+            for axis, coefficient, divisor in self.coefficients
+        }
+        for axis, coefficient, divisor in other.coefficients:
+            key = axis, divisor
+            coefficients[key] = coefficients.get(key, 0) + coefficient
         return _AffineIndexScalar(
             tuple(
-                sorted((axis, value) for axis, value in coefficients.items() if value)
+                sorted(
+                    (axis, value, divisor)
+                    for (axis, divisor), value in coefficients.items()
+                    if value
+                )
             ),
             self.offset + other.offset,
         )
@@ -354,7 +368,7 @@ class _AffineIndexScalar:
 
 @dataclasses.dataclass(frozen=True)
 class _AffineIndexTensor:
-    """A small, statically shaped tensor of affine scalar indices."""
+    """A small, statically shaped tensor of quasi-affine scalar indices."""
 
     shape: tuple[int, ...]
     values: tuple[_AffineIndexScalar, ...]
@@ -470,13 +484,14 @@ def _affine_shape_matches_fake(
 def _affine_subscript_ranges(
     env: CompileEnvironment,
     subscript: object,
-) -> tuple[tuple[tuple[tuple[int, int], ...], int, int, int], ...] | None:
-    """Recover an exact bounded affine set for a flattened tensor index.
+) -> tuple[tuple[tuple[tuple[int, int, int], ...], int, int, int], ...] | None:
+    """Recover an exact bounded quasi-affine set for a flattened tensor index.
 
     This handles the common source idiom ``view(-1)[affine_offsets]`` without
     changing the emitted memory operation.  Only fixed-width tile indices,
-    static iotas, broadcasting, integer scaling, and addition are accepted.
-    Unsupported expressions decline to the existing root-barrier fallback.
+    direct scalar ``tile.id // constant``, static iotas, broadcasting, integer
+    scaling, and addition are accepted. Unsupported expressions decline to the
+    existing root-barrier fallback.
     """
     from ..language import memory_ops
     from ..language import view_ops
@@ -531,11 +546,18 @@ def _affine_subscript_ranges(
                     (extent,),
                     tuple(
                         _AffineIndexScalar(
-                            ((info.block_id, extent),),
+                            ((info.block_id, extent, 1),),
                             info.offset + lane,
                         )
                         for lane in range(extent)
                     ),
+                )
+        elif target is hl.tile_id and args and isinstance(args[0], torch.fx.Node):
+            info = subscript_tile_info(env, args[0])
+            if info is not None and env.known_equal(info.offset, 0):
+                result = _AffineIndexTensor(
+                    (),
+                    (_AffineIndexScalar(((info.block_id, 1, 1),), 0),),
                 )
         elif target is view_ops.subscript and args:
             index = args[1] if len(args) >= 2 else None
@@ -550,8 +572,12 @@ def _affine_subscript_ranges(
         elif target is memory_ops.load and args:
             index = args[1] if len(args) >= 2 else None
             extra_mask = args[2] if len(args) >= 3 else value.kwargs.get("extra_mask")
-            if extra_mask is None and isinstance(index, (list, tuple)) and all(
-                item is None or _subscript_is_full_slice(item) for item in index
+            if (
+                extra_mask is None
+                and isinstance(index, (list, tuple))
+                and all(
+                    item is None or _subscript_is_full_slice(item) for item in index
+                )
             ):
                 base = evaluate(args[0])
                 if base is not None:
@@ -586,11 +612,47 @@ def _affine_subscript_ranges(
                     base.shape,
                     tuple(item.scaled(factor) for item in base.values),
                 )
+        elif (
+            target
+            in (
+                operator.floordiv,
+                torch.ops.aten.floor_divide.default,
+                torch.ops.aten.floor_divide.Scalar,
+            )
+            and len(args) == 2
+        ):
+            dividend, divisor = args
+            if (
+                isinstance(dividend, torch.fx.Node)
+                and dividend.target is hl.tile_id
+                and isinstance(divisor, int)
+                and divisor > 0
+            ):
+                base = evaluate(dividend)
+                if (
+                    base is not None
+                    and base.shape == ()
+                    and len(base.values) == 1
+                    and base.values[0].offset == 0
+                    and len(base.values[0].coefficients) == 1
+                ):
+                    axis, coefficient, previous_divisor = base.values[0].coefficients[0]
+                    if coefficient == 1 and previous_divisor == 1:
+                        result = _AffineIndexTensor(
+                            (),
+                            (_AffineIndexScalar(((axis, 1, divisor),), 0),),
+                        )
         if result is not None:
             fake = value.meta.get("val")
             if (
-                not isinstance(fake, torch.Tensor)
-                or not _affine_shape_matches_fake(env, result.shape, fake)
+                (
+                    result.shape
+                    and (
+                        not isinstance(fake, torch.Tensor)
+                        or not _affine_shape_matches_fake(env, result.shape, fake)
+                    )
+                )
+                or (not result.shape and isinstance(fake, torch.Tensor) and fake.ndim)
                 or len(result.values) != math.prod(result.shape)
             ):
                 result = None
@@ -600,13 +662,16 @@ def _affine_subscript_ranges(
     affine = evaluate(subscript)
     if affine is None or not affine.values:
         return None
-    offsets_by_coefficients: dict[tuple[tuple[int, int], ...], set[int]] = {}
+    offsets_by_coefficients: dict[tuple[tuple[int, int, int], ...], set[int]] = {}
     for value in affine.values:
-        if any(coefficient < 0 for _axis, coefficient in value.coefficients):
+        if any(
+            coefficient < 0 or divisor <= 0
+            for _axis, coefficient, divisor in value.coefficients
+        ):
             return None
         offsets_by_coefficients.setdefault(value.coefficients, set()).add(value.offset)
 
-    ranges: list[tuple[tuple[tuple[int, int], ...], int, int, int]] = []
+    ranges: list[tuple[tuple[tuple[int, int, int], ...], int, int, int]] = []
     for coefficients, offset_set in sorted(offsets_by_coefficients.items()):
         offsets = sorted(offset_set)
         begin = previous = offsets[0]

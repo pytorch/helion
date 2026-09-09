@@ -22,8 +22,11 @@ from helion._compiler.tile_dependency import TaskFamily
 from helion._compiler.tile_dependency import TileAccess
 from helion._compiler.tile_dependency import TileDependency
 from helion._compiler.tile_dependency import TileDependencyKind
+from helion._compiler.tile_dependency import _coalesce_adjacent_target_boxes
 from helion._compiler.tile_dependency import _CoordinateRelationPiece
+from helion._compiler.tile_dependency import _dense_linear_overlap_relation
 from helion._compiler.tile_dependency import _dense_mixed_radix_converse
+from helion._compiler.tile_dependency import _simplify_logical_expression
 from helion._compiler.tile_dependency import allocation_regions_may_overlap
 from helion._compiler.tile_dependency import build_tile_dependency_graph
 from helion._compiler.tile_dependency import coordinate_axis_symbol
@@ -874,6 +877,136 @@ class TestTileDependency(TestCase):
                 ),
             )
 
+    def test_symbolic_repeated_fiber_producer_set_quotient(self) -> None:
+        key_count = sympy.Symbol("key_count", integer=True, nonnegative=True)
+        consumers_per_key = 16
+        producers_per_key = 4
+        consumer_domain = CoordinateDomain(
+            (20,),
+            ((20, consumers_per_key * key_count),),
+            kind="site",
+        )
+        producer_domain = CoordinateDomain(
+            (10,),
+            ((10, producers_per_key * key_count),),
+            kind="site",
+        )
+        consumer = coordinate_axis_symbol(20)
+        producer_begin = producers_per_key * sympy.floor(consumer / consumers_per_key)
+        relation = CoordinateRelation(
+            source_domain=consumer_domain,
+            target_domain=producer_domain,
+            pieces=(
+                _CoordinateRelationPiece(
+                    source_bounds_items=((20, 0, consumers_per_key * key_count, 1),),
+                    target_ranges=(
+                        (
+                            10,
+                            producer_begin,
+                            producer_begin + producers_per_key,
+                            1,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        with (
+            mock.patch.object(
+                CoordinateRelation,
+                "materialize",
+                side_effect=AssertionError("symbolic proof must not enumerate"),
+            ),
+            mock.patch.object(
+                CoordinateRelation,
+                "targets",
+                side_effect=AssertionError("symbolic proof must not enumerate"),
+            ),
+        ):
+            quotient = relation.producer_set_quotient()
+            self.assertIsNotNone(quotient)
+            assert quotient is not None
+            keys_by_consumer, producers_by_key = quotient
+            self.assertEqual(keys_by_consumer.target_domain.size_expr, key_count)
+            self.assertTrue(keys_by_consumer.is_total_function())
+            _publication, producer_count = (
+                producers_by_key.derive_converse_and_target_counts()
+            )
+            self.assertIsNotNone(producer_count)
+            assert producer_count is not None
+            self.assertEqual(producer_count.constant_value(), producers_per_key)
+
+        for concrete_count in (0, 1, 3):
+            concrete_keys = keys_by_consumer.substitute_parameters(
+                {key_count: concrete_count}
+            )
+            concrete_producers = producers_by_key.substitute_parameters(
+                {key_count: concrete_count}
+            )
+            self.assertEqual(
+                concrete_keys.materialize(),
+                tuple(
+                    frozenset((consumer_index // consumers_per_key,))
+                    for consumer_index in range(consumers_per_key * concrete_count)
+                ),
+            )
+            self.assertEqual(
+                concrete_producers.materialize(),
+                tuple(
+                    frozenset(
+                        range(
+                            producers_per_key * key_index,
+                            producers_per_key * (key_index + 1),
+                        )
+                    )
+                    for key_index in range(concrete_count)
+                ),
+            )
+
+    def test_symbolic_repeated_fiber_quotient_rejects_inexact_forms(self) -> None:
+        key_count = sympy.Symbol("key_count", integer=True, nonnegative=True)
+        consumer = coordinate_axis_symbol(20)
+        cases = (
+            (16 * key_count + 1, 4 * key_count, 4 * sympy.floor(consumer / 16), 1),
+            (16 * key_count, 4 * key_count + 1, 4 * sympy.floor(consumer / 16), 1),
+            (16 * key_count, 4 * key_count, 4 * sympy.floor(consumer / 16) + 1, 1),
+            (16 * key_count, 4 * key_count, 4 * sympy.floor(consumer / 16), 2),
+        )
+        for source_count, target_count, begin, step in cases:
+            with self.subTest(
+                source_count=source_count,
+                target_count=target_count,
+                begin=begin,
+                step=step,
+            ):
+                relation = CoordinateRelation(
+                    source_domain=CoordinateDomain(
+                        (20,), ((20, source_count),), kind="site"
+                    ),
+                    target_domain=CoordinateDomain(
+                        (10,), ((10, target_count),), kind="site"
+                    ),
+                    pieces=(
+                        _CoordinateRelationPiece(
+                            source_bounds_items=((20, 0, source_count, 1),),
+                            target_ranges=((10, begin, begin + 4, step),),
+                        ),
+                    ),
+                )
+                self.assertIsNone(relation.producer_set_quotient())
+
+        fractional_key = CoordinateRelation(
+            source_domain=CoordinateDomain((20,), ((20, 16 * key_count),), kind="site"),
+            target_domain=CoordinateDomain((10,), ((10, 8),), kind="site"),
+            pieces=(
+                _CoordinateRelationPiece(
+                    source_bounds_items=((20, 0, 16 * key_count, 1),),
+                    target_ranges=((10, sympy.Integer(1), sympy.Integer(5), 1),),
+                ),
+            ),
+        )
+        self.assertIsNone(fractional_key.producer_set_quotient())
+
     def test_symbolic_nonpartition_relations_do_not_derive_fixed_fan_in(
         self,
     ) -> None:
@@ -1529,6 +1662,198 @@ class TestTileDependency(TestCase):
                 geometry,
                 prove_nonnegative=lambda _expression: False,
             )
+        )
+
+    def test_dynamic_strided_overlap_eliminates_bounded_modulo(self) -> None:
+        key_count = sympy.Symbol("key_count", integer=True, positive=True)
+        producer = CoordinateDomain((10,), ((10, 64 * key_count),), kind="site")
+        consumer = CoordinateDomain(
+            (20, 21), ((20, 16 * key_count), (21, 8)), kind="site"
+        )
+        allocation = CoordinateDomain(
+            (-1,), ((-1, 16384),), kind="allocation", identity=0
+        )
+        producer_id = coordinate_axis_symbol(10)
+        consumer_id = coordinate_axis_symbol(20)
+        group = coordinate_axis_symbol(21)
+        producer_access = CoordinateRelation(
+            producer,
+            allocation,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 0, 64 * key_count, 1),),
+                    ((-1, 16 * producer_id, 16 * producer_id + 16, 1),),
+                ),
+            ),
+        )
+        consumer_begin = (
+            consumer_id + 128 * group + 1008 * sympy.floor(consumer_id / 16)
+        )
+        consumer_access = CoordinateRelation(
+            consumer,
+            allocation,
+            (
+                _CoordinateRelationPiece(
+                    ((20, 0, 16 * key_count, 1), (21, 0, 8, 1)),
+                    ((-1, consumer_begin, consumer_begin + 128, 16),),
+                ),
+            ),
+        )
+
+        def prove_under_capacity(expression: sympy.Expr) -> bool:
+            expression = sympy.simplify(expression)
+            if expression.is_nonnegative is True:
+                return True
+            polynomial = sympy.Poly(expression, key_count)
+            return polynomial.degree() <= 1 and all(
+                sympy.sympify(expression.subs(key_count, value)).is_nonnegative is True
+                for value in (1, 16)
+            )
+
+        relation = _dense_linear_overlap_relation(
+            producer_access,
+            consumer_access,
+            prove_nonnegative=prove_under_capacity,
+        )
+
+        self.assertIsNotNone(relation)
+        assert relation is not None
+        expected_begin = 8 * group + 64 * sympy.floor(consumer_id / 16)
+        self.assertEqual(
+            relation.pieces,
+            (
+                _CoordinateRelationPiece(
+                    ((20, 0, 16 * key_count, 1), (21, 0, 8, 1)),
+                    ((10, expected_begin, expected_begin + 8, 1),),
+                ),
+            ),
+        )
+        projected = relation.project_source(
+            CoordinateDomain((20,), ((20, 16 * key_count),), kind="site")
+        )
+        self.assertIsNotNone(projected)
+        assert projected is not None
+        expected_root_begin = 64 * sympy.floor(consumer_id / 16)
+        self.assertEqual(
+            projected.pieces,
+            (
+                _CoordinateRelationPiece(
+                    ((20, 0, 16 * key_count, 1),),
+                    ((10, expected_root_begin, expected_root_begin + 64, 1),),
+                ),
+            ),
+        )
+
+    def test_dynamic_overlap_coalesces_and_prunes_disjoint_chunks(self) -> None:
+        key_count = sympy.Symbol("key_count", integer=True, positive=True)
+        producer = CoordinateDomain((10,), ((10, 64 * key_count),), kind="site")
+        consumer = CoordinateDomain(
+            (20, 21), ((20, 16 * key_count), (21, 8)), kind="site"
+        )
+        allocation = CoordinateDomain(
+            (-1,), ((-1, 8 * 1024 * 1024),), kind="allocation", identity=0
+        )
+        producer_id = coordinate_axis_symbol(10)
+        consumer_id = coordinate_axis_symbol(20)
+        group = coordinate_axis_symbol(21)
+        producer_access = CoordinateRelation(
+            producer,
+            allocation,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 0, 64 * key_count, 1),),
+                    ((-1, 2048 * producer_id, 2048 * producer_id + 2048, 1),),
+                ),
+            ),
+        )
+
+        def prove_under_capacity(expression: sympy.Expr) -> bool:
+            expression = sympy.simplify(expression)
+            if expression.is_nonnegative is True:
+                return True
+            polynomial = sympy.Poly(expression, key_count)
+            return polynomial.degree() <= 1 and all(
+                sympy.sympify(expression.subs(key_count, value)).is_nonnegative is True
+                for value in (1, 16)
+            )
+
+        def consumer_access(chunk_offset: int) -> CoordinateRelation:
+            base = (
+                chunk_offset
+                + 128 * consumer_id
+                + 129024 * sympy.floor(consumer_id / 16)
+                + 16384 * group
+            )
+            return CoordinateRelation(
+                consumer,
+                allocation,
+                tuple(
+                    _CoordinateRelationPiece(
+                        ((20, 0, 16 * key_count, 1), (21, 0, 8, 1)),
+                        ((-1, base + 2048 * lane, base + 2048 * lane + 128, 1),),
+                    )
+                    for lane in range(8)
+                ),
+            )
+
+        matching = producer_access.overlapping_sources(
+            consumer_access(0),
+            prove_nonnegative=prove_under_capacity,
+        )
+        disjoint = producer_access.overlapping_sources(
+            consumer_access(2_097_152),
+            prove_nonnegative=prove_under_capacity,
+        )
+
+        self.assertIsNotNone(matching)
+        assert matching is not None
+        expected_begin = 8 * group + 64 * sympy.floor(consumer_id / 16)
+        self.assertEqual(
+            matching.pieces,
+            (
+                _CoordinateRelationPiece(
+                    ((20, 0, 16 * key_count, 1), (21, 0, 8, 1)),
+                    ((10, expected_begin, expected_begin + 8, 1),),
+                ),
+            ),
+        )
+        self.assertIsNotNone(disjoint)
+        assert disjoint is not None
+        self.assertEqual(disjoint.pieces, ())
+
+    def test_target_coalescing_rejects_conditionally_empty_piece(self) -> None:
+        source = CoordinateDomain((20,), ((20, 3),), kind="site")
+        coordinate = coordinate_axis_symbol(20)
+        pieces = (
+            _CoordinateRelationPiece(
+                ((20, 0, 3, 1),),
+                ((10, coordinate, sympy.Integer(1), 1),),
+            ),
+            _CoordinateRelationPiece(
+                ((20, 0, 3, 1),),
+                ((10, sympy.Integer(1), sympy.Integer(2), 1),),
+            ),
+        )
+
+        self.assertEqual(
+            _coalesce_adjacent_target_boxes(pieces, source_domain=source),
+            pieces,
+        )
+
+    def test_logical_simplification_preserves_bounded_floor_correlation(self) -> None:
+        source = CoordinateDomain((20,), ((20, 2),), kind="task_order")
+        coordinate = coordinate_axis_symbol(20)
+        expression = coordinate + 2 * sympy.floor(
+            sympy.Rational(511, 2) - coordinate / 2
+        )
+
+        self.assertEqual(
+            _simplify_logical_expression(
+                expression,
+                domain=source,
+                source_bounds=((20, 0, 2, 1),),
+            ),
+            coordinate + 510,
         )
 
     def test_compile_environment_nonnegative_proof_uses_shape_ranges(self) -> None:
@@ -2380,13 +2705,13 @@ class TestTileDependency(TestCase):
                     strides=(1,),
                     block_ids=(None,),
                     offsets=(None,),
-                    affine_subscript_ranges=((((20, 512), (21, 1)), 0, 512, 64),),
+                    affine_subscript_ranges=((((20, 512, 1), (21, 1, 1)), 0, 512, 64),),
                 ),
             ),
             [[15, 16, 17], [20, 21]],
         )
         output_ranges = tuple(
-            (((20, 65536), (21, 128)), offset, offset + 128, 1)
+            (((20, 65536, 1), (21, 128, 1)), offset, offset + 128, 1)
             for offset in range(0, 65536, 8192)
         )
         output_plan = build_tile_dependency_graph(
@@ -2464,7 +2789,38 @@ class TestTileDependency(TestCase):
                     strides=(1,),
                     block_ids=(None,),
                     offsets=(None,),
-                    affine_subscript_ranges=((((20, 0),), 0, 16, 2),),
+                    affine_subscript_ranges=((((20, 0, 1),), 0, 16, 2),),
+                ),
+            ),
+            [[10], [20]],
+        )
+        domains = (
+            CoordinateDomain((10,), ((10, 16),), ((10, 1),)),
+            CoordinateDomain((20,), ((20, 1),), ((20, 1),)),
+        )
+
+        self.assertIsNone(_root_producers_by_consumer(plan, domains))
+
+    def test_flattened_affine_range_rejects_negative_first_lane(self) -> None:
+        plan = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    shape=(16,),
+                    strides=(1,),
+                    block_ids=(10,),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    shape=(16,),
+                    strides=(1,),
+                    block_ids=(None,),
+                    offsets=(None,),
+                    affine_subscript_ranges=((((20, 1, 1),), -1, 2, 1),),
                 ),
             ),
             [[10], [20]],
@@ -2515,7 +2871,7 @@ class TestTileDependency(TestCase):
                 for coefficients, _begin, _end, _step in (
                     flattened_load.affine_subscript_ranges
                 )
-                for _axis, coefficient in coefficients
+                for _axis, coefficient, _divisor in coefficients
             ),
             (32, 1),
         )

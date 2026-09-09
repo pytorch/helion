@@ -35,6 +35,14 @@ Implementation checkpoint (2026-09-08):
   proves its dominating source guard; unknown bounds conservatively decline.
   A dynamic-batch Q1/H16 MLA probe reuses one cubin across B=1,2,4,9 and lowers
   its nested C4 reducer as an exact fan-in-16 final-arrival continuation.
+- Parameterized root-entry counters now also support an exact repeated-fiber
+  fan-out: `F*K` producer tasks publish to `K` keys and `C*K` ordinary
+  consumers acquire `floor(c/C)`. Direct unshifted `tile.id // C` flattened
+  accesses remain in the existing relation algebra; integer rounding,
+  bounded modulo elimination, adjacent target coalescing, and proved
+  out-of-domain pruning keep the dependency compact. A production-shaped
+  F64/C16 MLA probe lowers with no root barrier or continuation and reuses one
+  cubin across B=1,2,4,9.
 - The first parametric event-frontier recurrence is implemented for a unique
   topological chain of equal-size canonical rank-one roots joined by those
   exact fan-in-one events. The existing segment relations are the certificate,
@@ -1221,6 +1229,35 @@ host-generated schedule. Root barriers remain in their existing separate
 unreachable for practical fan-ins. Tests cover `K=0/1`, worker-count
 boundaries, alternating CUDA graphs, multiple moving sections, different
 fan-ins, and one-cubin reuse.
+
+Implementation checkpoint (2026-09-09): the same parameterized counter path
+now accepts multiple ordinary consumers per readiness key. The exact symbolic
+shape is `F*K` producers, `C*K` consumers, producer partition
+`k -> [F*k,F*k+F)`, and consumer quotient `c -> floor(c/C)`, with static
+positive `F` and `C` and exact extent identities. Final-arrival continuation
+admission remains one-consumer-per-key, and the equal-size event-frontier
+recurrence remains fan-in-one only. Thus this broadens synchronization without
+silently broadening either execution-ownership optimization.
+
+Flattened scratch analysis was extended in place to carry a static divisor on
+an otherwise existing affine term. Only direct, unshifted scalar
+`tile.id // constant` is admitted. The resulting `CoordinateRelation` remains
+the sole dependency truth. Existing relation simplification now canonicalizes
+integer floor/ceiling endpoints, removes a modulo only when symbolic bounds
+prove its dividend lies in range, coalesces adjacent target boxes through one
+shared helper, and discards only pieces proved wholly outside the target
+domain. These operations reduce the dynamic F64/C16 MLA dependency to one
+root relation without enumerating B or introducing another graph.
+
+The self-contained Q1/H16/D512 probe preserves F64 H16xN128 partials, the
+H1xD512 two-pass C8 reducer, FP32 scratch, BF16 output, and identical
+standalone arithmetic. On physical GPU 6, cold-L2 medians for B=1,2,4,9 were
+67.36/69.38/112.42/200.50 us persistent versus
+96.03/98.08/136.99/227.04 us matched two-launch Helion. All outputs were
+bit-exact and all four shapes reused one cubin. This validates the generic
+fan-out synchronization slice; its worker schedule is still the conservative
+parameterized root-major relation, not yet the full symbolic event-frontier
+recurrence for unequal root extents.
 
 ### Phase 5: source-ticket generalization
 
