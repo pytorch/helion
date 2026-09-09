@@ -3455,6 +3455,7 @@ class _ScheduledRootTraversal:
     matches_reference: bool
 
 
+@cache
 def _logical_task_to_order_ordinal(
     task_order: CoordinateRelation,
     ordinal_domain: CoordinateDomain,
@@ -3816,6 +3817,225 @@ def _keys_by_consumer_root_task(
     return consumer.keys_by_consumer.project_source(root_domain)
 
 
+def _consumer_major_producer_order(
+    readiness_graph: ReadinessGraph,
+    worker_schedule: WorkerSchedule,
+    readiness_counters: tuple[ReadinessCounterPlan, ...],
+    root_barrier_edges: frozenset[tuple[int, int]],
+    *,
+    excluded_roots: frozenset[int],
+) -> WorkerSchedule:
+    """Normalize readiness cohorts for the global-list proposal.
+
+    A partially ready root is ordered first by the event that admits each of
+    its CTAs.  A root without such an incoming counter may instead be ordered
+    by the downstream consumer whose fan-in it completes.  Both orders come
+    exclusively from emitted readiness relations and are accepted only as
+    symbolic exact-once permutations of a complete root.  This normalization
+    is ephemeral: a rejected global proposal leaves the input schedule intact.
+    """
+    continuations = _emitted_final_arrival_continuations(
+        readiness_graph,
+        readiness_counters,
+    )
+    if continuations is None:
+        return worker_schedule
+    continuation_by_root = _continuations_by_consumer_root(
+        readiness_graph,
+        continuations,
+    )
+    ordinal_axis = (
+        max(
+            axis
+            for task_order in readiness_graph.root_task_orders
+            for domain in (task_order.source_domain, task_order.target_domain)
+            for axis in domain.axis_order
+        )
+        + 1
+    )
+    prerequisites = _emitted_prerequisites(
+        readiness_counters,
+        root_barrier_edges,
+    )
+
+    def exact_task_order(
+        grouped_tasks: CoordinateRelation | None,
+        task_domain: CoordinateDomain,
+    ) -> tuple[CoordinateRelation, CoordinateRelation] | None:
+        task_order = (
+            None
+            if grouped_tasks is None
+            else grouped_tasks.enumerate_targets_by_source()
+        )
+        ordinal_domain = CoordinateDomain(
+            axis_order=(ordinal_axis,),
+            axis_counts_items=((ordinal_axis, task_domain.size),),
+            kind="task_order",
+        )
+        ordinal = (
+            None
+            if task_order is None
+            or task_order.target_domain != task_domain
+            or task_order.source_domain.size != task_domain.size
+            or not task_order.is_total_function()
+            or len(task_order.pieces) > _MAX_TASK_ORDER_SLICE_PIECES
+            else _logical_task_to_order_ordinal(task_order, ordinal_domain)
+        )
+        if ordinal is None or not ordinal.is_total_function():
+            return None
+        return task_order, ordinal
+
+    def unique_orders(
+        candidates: dict[
+            int,
+            list[tuple[CoordinateRelation, CoordinateRelation]],
+        ],
+        unsupported: set[int],
+    ) -> dict[int, CoordinateRelation]:
+        result: dict[int, CoordinateRelation] = {}
+        for root, root_candidates in candidates.items():
+            if root in unsupported:
+                continue
+            reference_ordinal = root_candidates[0][1]
+            if any(
+                not candidate_ordinal.is_pointwise_equal_to(reference_ordinal)
+                for _task_order, candidate_ordinal in root_candidates[1:]
+            ):
+                continue
+            result[root] = root_candidates[0][0]
+        return result
+
+    def replace_dense_orders(
+        schedule: WorkerSchedule,
+        task_orders: dict[int, CoordinateRelation],
+    ) -> WorkerSchedule:
+        replacements: dict[int, WorkerScheduleSegment] = {}
+        for root, task_order in task_orders.items():
+            schedule_interval = schedule.contiguous_global_interval(root)
+            if (
+                schedule_interval is None
+                or schedule_interval[1] - schedule_interval[0]
+                != readiness_graph.root_domains[root].size
+            ):
+                continue
+            replacements[root] = WorkerScheduleSegment(
+                root=root,
+                task_order=task_order,
+                worker_begin=0,
+                worker_count=schedule.worker_count,
+                dispatch_offset=schedule_interval[0],
+            )
+        if not replacements:
+            return schedule
+        segments: list[WorkerScheduleSegment] = []
+        inserted_roots: set[int] = set()
+        for segment in schedule.segments:
+            replacement = replacements.get(segment.root)
+            if replacement is None:
+                segments.append(segment)
+            elif segment.root not in inserted_roots:
+                segments.append(replacement)
+                inserted_roots.add(segment.root)
+        return WorkerSchedule(schedule.worker_count, tuple(segments))
+
+    # Admission order takes precedence: a newly released subset of this root
+    # must remain compact before downstream completion can be optimized.
+    incoming_counter_roots: set[int] = set()
+    admission_candidates: dict[
+        int,
+        list[tuple[CoordinateRelation, CoordinateRelation]],
+    ] = {}
+    unsupported_admission_roots: set[int] = set()
+    for prerequisite in prerequisites:
+        plan = prerequisite.counter_plan
+        consumer = prerequisite.counter_consumer
+        if plan is None or consumer is None:
+            continue
+        consumer_root = consumer.consumer_root
+        if consumer_root in excluded_roots:
+            continue
+        incoming_counter_roots.add(consumer_root)
+        consumer_keys = _keys_by_consumer_root_task(readiness_graph, consumer)
+        tasks_by_key = None if consumer_keys is None else consumer_keys.converse()
+        candidate = exact_task_order(
+            tasks_by_key,
+            readiness_graph.root_domains[consumer_root],
+        )
+        if candidate is None:
+            unsupported_admission_roots.add(consumer_root)
+        else:
+            admission_candidates.setdefault(consumer_root, []).append(candidate)
+
+    admission_orders = unique_orders(
+        admission_candidates,
+        unsupported_admission_roots,
+    )
+    normalized_schedule = replace_dense_orders(worker_schedule, admission_orders)
+
+    completion_candidates: dict[
+        int,
+        list[tuple[CoordinateRelation, CoordinateRelation]],
+    ] = {}
+    unsupported_completion_roots: set[int] = set()
+    for prerequisite in prerequisites:
+        plan = prerequisite.counter_plan
+        consumer = prerequisite.counter_consumer
+        if plan is None or consumer is None:
+            # A whole-root barrier carries no useful cohort order.
+            continue
+        static_relations = _readiness_static_producers(
+            readiness_graph,
+            plan.producers,
+            continuation_by_root,
+        )
+        if static_relations is None:
+            continue
+        consumer_segments = normalized_schedule.segments_for_root(
+            consumer.consumer_root
+        )
+        consumer_traversal = _root_schedule_traversal(
+            consumer_segments,
+            readiness_graph.root_task_orders[consumer.consumer_root],
+        )
+        consumer_order = (
+            None
+            if consumer_traversal is None
+            else consumer_traversal.scheduled_ordinal_to_logical_task
+        )
+        consumer_keys = _keys_by_consumer_root_task(readiness_graph, consumer)
+        ordered_consumer_keys = (
+            None
+            if consumer_order is None or consumer_keys is None
+            else consumer_order.then(consumer_keys)
+        )
+        for producer_root, keys_by_producer in static_relations:
+            if (
+                producer_root in excluded_roots
+                or producer_root in incoming_counter_roots
+            ):
+                continue
+            producers_by_key = keys_by_producer.converse()
+            producers_by_consumer = (
+                None
+                if ordered_consumer_keys is None or producers_by_key is None
+                else ordered_consumer_keys.then(producers_by_key)
+            )
+            candidate = exact_task_order(
+                producers_by_consumer,
+                readiness_graph.root_domains[producer_root],
+            )
+            if candidate is None:
+                unsupported_completion_roots.add(producer_root)
+                continue
+            completion_candidates.setdefault(producer_root, []).append(candidate)
+
+    completion_orders = unique_orders(
+        completion_candidates,
+        unsupported_completion_roots,
+    )
+    return replace_dense_orders(normalized_schedule, completion_orders)
+
+
 def _keys_at_first_consumer_checkpoint(
     readiness_graph: ReadinessGraph,
     consumer: ReadinessConsumer,
@@ -4000,6 +4220,7 @@ def _segments_share_worker(
     )
 
 
+@cache
 def _segment_dependency_support_overlaps(
     producer_segment: WorkerScheduleSegment,
     keys_by_producer: CoordinateRelation,
@@ -4374,6 +4595,13 @@ def _global_unit_list_schedule(
         if transient_source_root is None
         else frozenset((transient_source_root,))
     )
+    worker_schedule = _consumer_major_producer_order(
+        readiness_graph,
+        worker_schedule,
+        readiness_counters,
+        root_barrier_edges,
+        excluded_roots=excluded_roots,
+    )
     scheduled_roots = tuple(
         root
         for root in range(len(readiness_graph.root_domains))
@@ -4415,7 +4643,7 @@ def _global_unit_list_schedule(
         readiness_counters,
         root_barrier_edges,
         tasks,
-        nested_entry_only=True,
+        nested_entry_only=False,
         continuations=continuations,
         external_producer_roots=(
             frozenset()
@@ -4454,7 +4682,16 @@ def _global_unit_list_schedule(
         for root in scheduled_roots
     )
 
-    def priority(task_index: int) -> tuple[int, int, int, int, int]:
+    node_predecessors: list[list[int]] = [[] for _ in successors]
+    for producer_index, task_successors in enumerate(successors):
+        for successor in task_successors:
+            node_predecessors[successor].append(producer_index)
+    remaining_predecessors = indegree.copy()
+    selected_tasks = [False] * task_node_count
+    ready_tasks = [False] * task_node_count
+    ready_task_count = 0
+
+    def static_priority(task_index: int) -> tuple[int, int, int, int, int]:
         root, logical_task = tasks[task_index]
         slack = (
             source_order_makespan
@@ -4469,14 +4706,151 @@ def _global_unit_list_schedule(
             task_index,
         )
 
-    ready: list[tuple[int, int, int, int, int, int]] = []
+    event_successors_by_task = tuple(
+        tuple(successor for successor in successors[task] if successor >= task_node_count)
+        for task in range(task_node_count)
+    )
+    event_ready_tasks: list[list[tuple[int, int, int, int, int]]] = [
+        [] for _ in successors
+    ]
+    event_generation = [0] * len(successors)
+    event_candidates: list[
+        tuple[int, int, int, int, int, int, int, int, int]
+    ] = []
+    terminal_ready: list[tuple[int, int, int, int, int]] = []
+
+    def event_priority(
+        event: int,
+    ) -> tuple[int, int, int, int, int, int, int, int] | None:
+        ready_producers = event_ready_tasks[event]
+        while ready_producers and not ready_tasks[ready_producers[0][-1]]:
+            heapq.heappop(ready_producers)
+        if not ready_producers or remaining_predecessors[event] <= 0:
+            return None
+        producer_priority = ready_producers[0]
+        consumer_remaining = min(
+            (
+                remaining_predecessors[consumer]
+                for consumer in successors[event]
+                if consumer < task_node_count
+            ),
+            default=task_node_count + 1,
+        )
+        return (
+            producer_priority[0],
+            consumer_remaining,
+            *producer_priority[1:-1],
+            remaining_predecessors[event],
+            producer_priority[-1],
+            event,
+        )
+
     zero_cost_ready: list[int] = []
 
+    def refresh_event(event: int) -> None:
+        event_generation[event] += 1
+        candidate = event_priority(event)
+        if candidate is not None:
+            heapq.heappush(
+                event_candidates,
+                (*candidate, event_generation[event]),
+            )
+
+    def push_ready_task(task_index: int) -> None:
+        events = event_successors_by_task[task_index]
+        if not events:
+            heapq.heappush(terminal_ready, static_priority(task_index))
+            return
+        task_priority = static_priority(task_index)
+        for event in events:
+            heapq.heappush(event_ready_tasks[event], task_priority)
+            refresh_event(event)
+
     def admit_ready(node: int) -> None:
+        nonlocal ready_task_count
         if node < task_node_count:
-            heapq.heappush(ready, (*priority(node), node))
+            if selected_tasks[node] or ready_tasks[node]:
+                raise AssertionError("task admitted to the ready queue twice")
+            ready_tasks[node] = True
+            ready_task_count += 1
+            push_ready_task(node)
         else:
             zero_cost_ready.append(node)
+
+    def next_event_candidate(
+        *, pop: bool
+    ) -> tuple[int, int, int, int, int, int, int, int] | None:
+        while event_candidates:
+            *candidate, generation = event_candidates[0]
+            event = candidate[-1]
+            if generation != event_generation[event]:
+                heapq.heappop(event_candidates)
+                continue
+            current = event_priority(event)
+            if current is None or tuple(candidate) != current:
+                heapq.heappop(event_candidates)
+                refresh_event(event)
+                continue
+            if pop:
+                heapq.heappop(event_candidates)
+            return current
+        return None
+
+    def next_terminal_candidate(*, pop: bool) -> tuple[int, ...] | None:
+        while terminal_ready and not ready_tasks[terminal_ready[0][-1]]:
+            heapq.heappop(terminal_ready)
+        if not terminal_ready:
+            return None
+        task_priority = terminal_ready[0]
+        if pop:
+            heapq.heappop(terminal_ready)
+        # Completing a terminal task is immediately useful to the makespan.
+        return (task_priority[0], 0, *task_priority[1:-1], 0, task_priority[-1], -1)
+
+    def pop_ready_task() -> int | None:
+        nonlocal ready_task_count
+        while ready_task_count:
+            event_candidate = next_event_candidate(pop=False)
+            terminal_candidate = next_terminal_candidate(pop=False)
+            if event_candidate is None and terminal_candidate is None:
+                return None
+            if terminal_candidate is not None and (
+                event_candidate is None or terminal_candidate < event_candidate
+            ):
+                candidate = next_terminal_candidate(pop=True)
+                assert candidate is not None
+                task_index = candidate[-2]
+            else:
+                candidate = next_event_candidate(pop=True)
+                assert candidate is not None
+                task_index = candidate[-2]
+            if not ready_tasks[task_index]:
+                continue
+            ready_tasks[task_index] = False
+            ready_task_count -= 1
+            return task_index
+        return None
+
+    def record_event_progress(task_index: int) -> None:
+        """Update shadow readiness and refresh newly urgent producers."""
+        for event in successors[task_index]:
+            if event < task_node_count:
+                continue
+            remaining_predecessors[event] -= 1
+            remaining = remaining_predecessors[event]
+            if remaining < 0:
+                raise AssertionError("readiness event producer count underflow")
+            refresh_event(event)
+            if remaining != 0:
+                continue
+            for consumer in successors[event]:
+                remaining_predecessors[consumer] -= 1
+                consumer_remaining = remaining_predecessors[consumer]
+                if consumer_remaining < 0:
+                    raise AssertionError("consumer readiness count underflow")
+                for predecessor in node_predecessors[consumer]:
+                    if predecessor >= task_node_count:
+                        refresh_event(predecessor)
 
     def drain_zero_cost_nodes() -> None:
         while zero_cost_ready:
@@ -4494,8 +4868,15 @@ def _global_unit_list_schedule(
     scheduled_count = 0
     worker_step = 0
     while scheduled_count < len(tasks):
-        initially_ready = min(len(ready), worker_schedule.worker_count)
-        selected = [heapq.heappop(ready)[-1] for _ in range(initially_ready)]
+        initially_ready = min(ready_task_count, worker_schedule.worker_count)
+        selected: list[int] = []
+        for _ in range(initially_ready):
+            task_index = pop_ready_task()
+            if task_index is None:
+                return None
+            selected_tasks[task_index] = True
+            selected.append(task_index)
+            record_event_progress(task_index)
 
         def admit_successors(task_index: int) -> None:
             for successor in successors[task_index]:

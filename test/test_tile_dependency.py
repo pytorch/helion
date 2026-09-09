@@ -813,6 +813,66 @@ class TestTileDependency(TestCase):
             tuple(frozenset(indices) for indices in expected),
         )
 
+    def test_converse_of_grouped_mixed_radix_task_order_is_exact(self) -> None:
+        order = CoordinateDomain(
+            (10, 11),
+            ((10, 16), (11, 3)),
+            kind="task_order",
+        )
+        tasks = CoordinateDomain(
+            (20, 21, 22, 23),
+            ((20, 3), (21, 2), (22, 4), (23, 2)),
+            kind="site",
+        )
+        inner = coordinate_axis_symbol(10)
+        outer = coordinate_axis_symbol(11)
+        task_order = CoordinateRelation.point_map(
+            order,
+            tasks,
+            (
+                (
+                    ((10, 0, 6, 1), (11, 0, 3, 1)),
+                    (outer, sympy.Integer(0), sympy.Mod(inner, 3), sympy.floor(inner / 3)),
+                ),
+                (
+                    ((10, 6, 12, 1), (11, 0, 3, 1)),
+                    (
+                        outer,
+                        sympy.Integer(1),
+                        sympy.Mod(inner, 3),
+                        sympy.Mod(sympy.floor(inner / 3), 2),
+                    ),
+                ),
+                (
+                    ((10, 12, 14, 1), (11, 0, 3, 1)),
+                    (outer, sympy.Integer(0), sympy.Integer(3), inner - 12),
+                ),
+                (
+                    ((10, 14, 16, 1), (11, 0, 3, 1)),
+                    (outer, sympy.Integer(1), sympy.Integer(3), inner - 14),
+                ),
+            ),
+        )
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("converse proof must remain symbolic"),
+        ):
+            tasks_to_order = task_order.converse()
+
+        self.assertIsNotNone(tasks_to_order)
+        assert tasks_to_order is not None
+        self.assertTrue(tasks_to_order.is_total_function())
+        expected: list[set[int]] = [set() for _ in range(tasks.size)]
+        for order_index, task_indices in enumerate(task_order.materialize()):
+            for task_index in task_indices:
+                expected[task_index].add(order_index)
+        self.assertEqual(
+            tasks_to_order.materialize(),
+            tuple(frozenset(indices) for indices in expected),
+        )
+
     def test_project_source_folds_only_small_bounded_constants(self) -> None:
         small = _bounded_coordinate_relation(64)
         large = _bounded_coordinate_relation(65)

@@ -1603,6 +1603,69 @@ class TestCrossLoopScheduler(TestCase):
             )
         validate_worker_schedule(readiness_graph, scheduled)
 
+    def test_global_list_schedule_finishes_nearly_ready_event(self) -> None:
+        producer_domain, consumer_domain = _identify_root_domains(
+            (
+                _domain((10, 2, 1), (11, 2, 1)),
+                _domain((20, 2, 1)),
+            )
+        )
+        key_domain = _domain((0, 2), kind="event", identity=0)
+        event = ReadinessEvent(
+            producers=(
+                ReadinessProducer(
+                    producer_root=0,
+                    producers_by_key=CoordinateRelation(
+                        key_domain,
+                        producer_domain,
+                        (
+                            _CoordinateRelationPiece(
+                                ((0, 0, 2, 1),),
+                                (
+                                    (
+                                        10,
+                                        coordinate_axis_symbol(0),
+                                        coordinate_axis_symbol(0) + 1,
+                                        1,
+                                    ),
+                                    (11, sympy.Integer(0), sympy.Integer(2), 1),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            consumers=(
+                ReadinessConsumer(
+                    consumer_root=1,
+                    keys_by_consumer=_full_point_map(
+                        consumer_domain,
+                        key_domain,
+                        coordinate_axis_symbol(20),
+                    ),
+                ),
+            ),
+        )
+        graph = _readiness_graph((producer_domain, consumer_domain), event)
+        plan = ReadinessCounterPlan(event.producers, event.consumers)
+
+        scheduled = _global_unit_list_schedule(
+            graph,
+            _baseline_worker_schedule(graph.root_domains, worker_count=2),
+            (plan,),
+            frozenset(),
+        )
+
+        self.assertIsNotNone(scheduled)
+        assert scheduled is not None
+        # Source order alternates keys: 0, 1, 0, 1.  Once task 0 is selected,
+        # task 2 becomes the final producer of key 0 and takes the second slot.
+        self.assertEqual(placement(scheduled, 0, 0)[1], 0)
+        self.assertEqual(placement(scheduled, 0, 2)[1], 0)
+        self.assertGreater(placement(scheduled, 0, 1)[1], 0)
+        self.assertGreater(placement(scheduled, 1, 0)[1], 0)
+        validate_worker_schedule(graph, scheduled)
+
     def test_global_list_schedule_contracts_final_arrival_continuation(self) -> None:
         producer_domain, continuation_domain, independent_domain, sink_domain = (
             _identify_root_domains(

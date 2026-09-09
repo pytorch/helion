@@ -7,8 +7,10 @@ This is the living design and implementation record for
 `f28a94dc`. The ordered-segment lowering, bounded list-schedule proposer,
 symbolic acceptance proofs, per-worker publication plan, and transient-source
 lowering are implemented. The B4 and B9 FlashMLA gates pass; broader Qwen and
-MoE rollout now includes a positive Nemotron result plus Qwen3, Gemma A4B, and
-DeepSeek-V3 no-regression controls.
+MoE rollout now includes positive Nemotron and DeepSeek-V3 results plus
+pretuned Qwen3 and Gemma A4B no-regression controls. Final-arrival
+continuations are contracted into their resident producers for proposal and
+proof, and the bounded proposer now covers the 5,170-CTA Qwen graph.
 
 The plan intentionally does **not** introduce a new hierarchy of persistent
 schedule IRs. It extends the existing `WorkerSchedule` contract so that the
@@ -61,13 +63,17 @@ There are three progressively narrower generic decisions:
    placement. FlashMLA is the first known positive case, not a compiler
    special case.
 
-Plans with final-arrival continuations currently retain their existing
-placement instead of entering global list scheduling. Graphs above the current
-4,096-CTA proposal bound, including the roughly 5,000-CTA Qwen3 decode probe,
-also retain the conservative plan. These are explicit fallbacks, not model
-gates. The tested Nemotron routed/shared graph and Gemma A4B unfused graph use
-the generic path; DeepSeek-V3 and full Qwen3 retain their existing continuation
-plans.
+Final-arrival continuations are zero-worker semantic nodes: proposal and proof
+recursively contract their outgoing dependencies to the resident tasks that
+can execute the continuation. The materialized proposer has a 16,384-node
+safety bound, with separate edge, relation-item, and output-segment limits.
+Qwen's 5,106 resident tasks therefore enter the proposer. The proposer uses
+strict unit-time waves: completing one abstract wave makes its successors
+eligible for the next, while the emitted exact counters still permit immediate
+hardware progress when an individual producer frontier completes. A candidate
+supersedes the local plan only after exact-ownership and global progress proofs
+succeed. Profitability admission for chain-only tail overlap remains follow-up;
+legality must not be confused with a latency or contention prediction.
 
 ## Non-negotiable constraints
 
@@ -276,9 +282,9 @@ dependency set differently.
 ### 5. Generate a bounded topology-only candidate
 
 There is no cost model. Every logical CTA has unit structural weight. For
-graphs with at most 4,096 CTAs, the current proposer materializes the emitted
-prerequisite DAG, computes unit-depth bottom levels and earliest starts, and
-uses this deterministic priority:
+graphs with at most 16,384 resident CTAs, the current proposer materializes the
+emitted prerequisite DAG, computes unit-depth bottom levels and earliest
+starts, and uses this deterministic priority:
 
 ```text
 least structural slack
@@ -294,9 +300,11 @@ resident program. Resident tasks whose only unsatisfied producer is that
 source enter the proposal queue immediately; their emitted runtime waits still
 guard actual execution.
 
-This CTA enumeration is only a proposal mechanism. Graphs above the bound,
-relations outside the materializer, continuation-bearing plans, and candidates
-that exceed the segment limit retain the conservative schedule. There is no
+Continuation-owned tasks are excluded from the resident node set, and outgoing
+dependencies are contracted recursively to their statically scheduled
+producers. This CTA enumeration is only a proposal mechanism. Graphs above the
+bound, relations outside the materializer, and candidates that exceed the
+segment limit retain the conservative schedule. There is no
 `_ReadySlice`, affine-front generator, or post-hoc segment-DAG linearizer in
 the current implementation.
 
@@ -648,18 +656,22 @@ B4 ticket role merely because a source exists.
 
 ### Qwen3 decode
 
-Qwen3 is chain-dominated, and exact tile-level handoffs can expose useful
-upstream/downstream overlap. The representative full decode layer has roughly
-5,000 CTAs, however, so it exceeds the current 4,096-CTA bounded proposer and
-falls back unchanged. A future scalable proposer could use the same segment
-contract and symbolic acceptance proof; the present implementation must not
-claim this benefit.
+Qwen3 is chain-dominated, and exact tile-level handoffs already expose useful
+upstream/downstream overlap. The representative full decode layer has 5,170
+logical CTAs, of which 5,106 are resident after two final-arrival continuation
+roots are removed. It now enters the bounded list proposer and passes the
+continuation-contraction and symbolic legality machinery. The proposed
+13-wave plan measured about 98.2 us versus about 94.1 us for the existing
+14-wave local plan: fewer unit waves did not predict better hardware time.
+Because the candidate only repacked dependent roots rather than independent
+branches, the generic independent-overlap gate retains the local plan.
 
-Gate: no regression against a fresh current-main tuned static result. The
-historical approximately 96-us persistent and 108.5-us standalone
-measurements are directional only. Fresh matched lowering produced the same
-plan and both versions measured 155.680 us cold-L2 with this probe's current
-high-spill configuration.
+Gate: no regression against the checked-in pretuned kernel. A direct cold-L2
+replay measured 94.048 us with the redesigned compiler and 94.144 us on clean
+main. This is consistent with the historical approximately 96-us persistent
+result. An earlier 155.680-us measurement came from a separate compatibility
+probe that compiled a high-spill diagnostic configuration; it is not a Qwen
+performance baseline.
 
 ### Qwen3 FFN
 
@@ -675,14 +687,18 @@ invent useful choices where the readiness graph has none.
 
 ### Gemma 4 26B-A4B MoE
 
-Gemma provides statically known fork/join branches. Ready tasks from an
-underfilled branch can be followed immediately by ready work from another
-branch on the same strands. The chosen order no longer collapses back to root
-order in codegen.
+Gemma's pretuned B1 graph is effectively a narrow chain after continuation
+selection. It enters the continuation-aware proposer, but has no independent
+resident roots to co-schedule, so the generic gate retains its tuned local
+plan. A diagnostic that disabled its final-arrival reduction measured about
+47.0 us, but selecting that ownership policy would require a separate generic
+rule; it is not attributed to list scheduling.
 
-Gate: no regression against fresh current-main static and standalone controls.
-Historical approximately 49.0-us persistent and 55.3-us standalone results are
-directional targets.
+Gate: no regression against the checked-in pretuned fused hierarchical kernel.
+A direct cold-L2 replay measured 49.056 us with the redesigned compiler and
+49.120 us on clean main, matching the historical approximately 49.0-us
+persistent result. The unfused m2 configuration below remains useful only as a
+structural scheduling probe.
 
 ### DeepSeek-V3 MoE
 
@@ -700,12 +716,12 @@ kind of task interleaving statically:
 4. join work starts after its real prerequisites; and
 5. no device claim/cancellation loop is needed.
 
-The historical 149--151-us CLC result versus approximately 157.6 us standalone
-is a hypothesis-generating target, not proof that static strands will match it.
-Fresh current-main and redesigned results are equivalent after normalization
-by their paired standalone controls (1.188x and 1.189x respectively). The
-continuation-bearing graph conservatively retains its established placement.
-Runtime-varying routing remains outside this initial static design.
+The continuation-aware global list plan now passes the symbolic proof and
+reduces fresh cold-L2 latency from 182.176 us with the same compiler's global
+proposal disabled to 171.808 us, a 5.7% scheduling win. Standalone Helion is
+still faster at 153.984 us, and the older dynamic CLC path remains faster at
+149.312 us; those are separate remaining gaps. Runtime-varying routing remains
+outside this initial static design.
 
 ### Nemotron-3 Nano MoE
 
@@ -752,9 +768,9 @@ scheduling policy.
 | FlashMLA B4 | 61.312 us | 67.424 us standalone | positive transient-source case |
 | FlashMLA B9 | 90.016 us | 100.128 us standalone radix tree | positive head-of-line case |
 | Nemotron routed-first MoE, iterative top-k, m4 | **98.304 us** | 118.816 us clean main; 120.864 us same compiler with only the global proposal disabled | **17.3% faster than main and 18.7% faster than the targeted ablation** |
-| Gemma A4B, hierarchical top-k, unfused GeGLU, m2 | 57.376 us | 57.328 us clean main | parity within timer quantization |
-| Qwen3 full decode, m8 | 155.680 us | 155.680 us clean main | exact latency parity; conservative continuation/size fallback |
-| DeepSeek-V3 MoE, m4 | 180.256 us | 182.304 us clean main | parity after normalizing by the paired standalone controls (1.189x versus 1.188x) |
+| Gemma A4B checked-in pretuned B1 kernel | 49.056 us | 49.120 us clean main | parity on the original B1 configuration |
+| Qwen3 full-decode checked-in pretuned kernel | 94.048 us | 94.144 us clean main | parity; 5,106 resident tasks enter the proposer and retain the local chain plan |
+| DeepSeek-V3 MoE, m4 | **171.808 us** | 182.176 us same compiler with global proposal disabled | **5.7% faster from continuation-aware independent-branch packing** |
 
 The Nemotron plan is the non-MLA positive case. Its executable root order is
 `norm, router, shared-up, top-k, shared-activation, routed-up[0],
@@ -764,12 +780,28 @@ wave of the 928-task routed-up family. This is precisely the generic fork/tail
 opportunity the list scheduler was intended to expose; there is no Nemotron or
 MoE matcher.
 
-Gemma's accepted non-root-major proposal does not measurably change makespan
-at the tested geometry. Qwen3 exceeds the bounded proposal size and retains
-its continuation plan. DeepSeek-V3 also retains continuations; a speculative
-legacy ready-family placement initially violated the now-authoritative tuple
-chronology. Such a proposal is now rejected locally while the valid
-conservative plan is retained, rather than rejecting the entire configuration.
+Qwen's established continuation plan remains an important negative control.
+DeepSeek's ten-segment plan overlaps its independent shared branch with the
+routed path and is the second non-MLA positive case after Nemotron. For context,
+a fresh rerun of the older CLC branch reproduced 149.312 us versus 153.984 us
+standalone. That result is real but is not a current-main static control.
+
+The later batched Gemma probe exposed a missing symbolic capability rather
+than a model-specific scheduling case. Its configured down-projection order
+weaves one flat ordinal's mixed-radix digits across a `B x 8 x 44` logical
+domain. The relation layer now proves the inverse flat ordinal directly by
+checking complete, unique digit coverage and disjoint target boxes. Every
+consumer of task order--exact ownership, worker rank, producer frontier, and
+segment support--derives from that same flat relation. No task or worker is
+materialized by the acceptance proof.
+
+With that repair, the normal B2 compiler path accepts a seven-to-eight-segment
+list plan. Lowered Triton splits the 22-task reduction into 13- and 9-task
+runs, whereas the forced-local control emits one 22-task run. At the tuned
+`m3/W4/R128` configuration with down-K unroll four, cold-L2 medians are
+67.520 us list, 67.552 us local, and 67.488 us standalone. Numerics pass at the
+same production tolerances. This verifies that list lowering actually executes;
+it does not rely on a proof bypass, model name, root number, or shape constant.
 
 ## Implementation sequence
 
@@ -811,9 +843,9 @@ have focused tests.
 - Reject the proposal unless exact-once, rank, and progress proofs succeed
   without enumeration.
 
-There is no `_ReadySlice` layer or segment-DAG linearizer. Plans with
-continuations and graphs above 4,096 CTAs currently retain their baseline
-placement.
+There is no `_ReadySlice` layer or segment-DAG linearizer. Continuations are
+contracted through the canonical readiness relations, and graphs above 16,384
+resident CTAs retain their baseline placement.
 
 ### Phase 4: transient-source lowering — implemented
 
