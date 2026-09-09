@@ -790,7 +790,6 @@ def test_grouped_device_offsets_root_axis_order_is_semantic(
     _device_offsets_axis_order_kernel.reset()
     with (
         patch_cute_mma_support(),
-        patch("torch.cuda.get_device_capability", return_value=(10, 0)),
         patch(
             "helion.runtime.kernel.target_device_capability",
             return_value=(10, 0),
@@ -799,6 +798,9 @@ def test_grouped_device_offsets_root_axis_order_is_semantic(
             "helion._compiler.compile_environment.target_device_capability",
             return_value=(10, 0),
         ),
+        patch("helion.language.loops.use_tileir_tunables", return_value=False),
+        patch("helion.language.loops._supports_warp_specialize", return_value=True),
+        patch("helion._compat._supports_tensor_descriptor", return_value=True),
         patch(
             "helion._hardware.get_hardware_info",
             return_value=HardwareInfo(
