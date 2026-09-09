@@ -64,6 +64,7 @@ def independent_loops(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 dynamic_implicit_tile_dependency_chain = helion.kernel(
     static_shapes=False,
     autotune_effort="none",
+    triton_do_not_specialize=True,
 )(implicit_tile_dependency_chain.fn)
 
 
@@ -370,20 +371,77 @@ class TestTritonTileDependencyLowering(TestCase):
         self.assertNotIn("triton_helpers.x_grid_barrier(", code)
         self.assertNotIn("launch_cooperative_grid=True", code)
 
-    def test_dynamic_shape_rejects_static_pipeline(self) -> None:
-        x = torch.arange(65, device=DEVICE, dtype=torch.float32)
-        with self.assertRaisesRegex(
-            exc.InvalidConfig,
-            "requires concrete top-level task counts",
-        ):
-            code_and_output(
-                dynamic_implicit_tile_dependency_chain,
-                (x,),
-                block_sizes=[16, 32],
-                pid_type="persistent_blocked",
-                cross_loop_schedule="static_pipeline",
-                num_warps=1,
-            )
+    def test_dynamic_shape_static_pipeline_reuses_compiled_binary(self) -> None:
+        exemplar = torch.arange(65, device=DEVICE, dtype=torch.float32)
+        bound = dynamic_implicit_tile_dependency_chain.bind((exemplar,))
+        config = helion.Config(
+            block_sizes=[16, 32],
+            pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
+            num_warps=1,
+        )
+        code = bound.to_code(config)
+        compiled = bound.compile_config(config)
+        worker_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+
+        self.assertIn("tile_dependency_root_barrier_wait", code)
+        self.assertNotIn("triton_helpers.x_grid_barrier(", code)
+        self.assertNotIn("launch_cooperative_grid=True", code)
+        self.assertNotIn("tile_dependency_dispatch_ticket", code)
+        self.assertIn(
+            f"* tl.cast({worker_count}, tl.uint32)",
+            code,
+        )
+        self.assertTrue(
+            any(
+                "tl.range(" in line and "x_size_0" in line for line in code.splitlines()
+            ),
+            "the scheduled task range must use the runtime extent",
+        )
+
+        def compiled_cubin_hashes() -> set[str]:
+            triton_kernel = compiled.__globals__.get(f"_helion_{bound.kernel.name}")
+            self.assertIsNotNone(triton_kernel)
+            device_caches = getattr(triton_kernel, "device_caches", None)
+            self.assertIsInstance(device_caches, dict)
+            assert isinstance(device_caches, dict)
+            return {
+                compiled_kernel.hash
+                for cache_tuple in device_caches.values()
+                for compiled_kernel in cache_tuple[0].values()
+                if getattr(compiled_kernel, "hash", None) is not None
+            }
+
+        expected_hashes: set[str] | None = None
+        lengths = (
+            65,
+            0,
+            15,
+            16,
+            17,
+            31,
+            32,
+            33,
+            97,
+            16 * (worker_count - 1),
+            16 * worker_count,
+            16 * (worker_count + 1),
+            32 * (worker_count - 1),
+            32 * worker_count,
+            32 * (worker_count + 1),
+            65,
+            17,
+        )
+        for length in lengths:
+            x = torch.arange(length, device=DEVICE, dtype=torch.float32)
+            output = compiled(x)
+            torch.testing.assert_close(output, (x + 1) * 2)
+            hashes = compiled_cubin_hashes()
+            self.assertEqual(len(hashes), 1)
+            if expected_hashes is None:
+                expected_hashes = hashes
+            else:
+                self.assertEqual(hashes, expected_hashes)
 
     def test_matmul_chain_allows_reused_accumulator_name(self) -> None:
         a = torch.arange(256, device=DEVICE, dtype=torch.float32).reshape(16, 16)

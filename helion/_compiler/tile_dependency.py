@@ -6,6 +6,7 @@ from functools import cached_property
 import itertools
 import math
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import Literal
 from typing import cast
 
@@ -15,6 +16,7 @@ from .. import exc
 
 if TYPE_CHECKING:
     import ast
+    from collections.abc import Mapping
 
     from .device_ir import DeviceIR
 
@@ -28,6 +30,44 @@ DependencyObligation = tuple[int, int | None, int | None]
 # field is ``(root_axis, coefficient)`` in logical-task coordinates; the
 # remaining fields describe the constant offsets as ``range(begin, end, step)``.
 AffineSubscriptRange = tuple[tuple[tuple[int, int], ...], int, int, int]
+# SymPy's stubs do not expose a common arithmetic protocol shared with Python
+# integers. Runtime validation in ``_integer_expression`` keeps this alias
+# narrow while avoiding a false type-error fanout through concrete-only code.
+IntegerExpression = Any
+
+
+def _integer_expression(value: IntegerExpression, *, description: str) -> sympy.Expr:
+    """Return an integer-valued SymPy expression without specializing it."""
+    if isinstance(value, int):
+        return sympy.Integer(value)
+    if not isinstance(value, sympy.Expr) or value.is_integer is not True:  # pyrefly: ignore[missing-attribute]
+        raise ValueError(f"{description} must be an integer expression")
+    return value
+
+
+def _concrete_integer(value: IntegerExpression, *, description: str) -> int:
+    """Require an integer expression to have no remaining parameters."""
+    expression = sympy.simplify(_integer_expression(value, description=description))
+    if expression.free_symbols:
+        raise ValueError(
+            f"{description} is symbolic; substitute parameters before enumeration"
+        )
+    if not isinstance(expression, sympy.Integer):
+        raise ValueError(f"{description} did not evaluate to an integer: {expression}")
+    return int(expression)
+
+
+def _parameter_substitutions(
+    substitutions: Mapping[sympy.Symbol, int],
+) -> dict[sympy.Symbol, sympy.Integer]:
+    """Validate the deliberately narrow Symbol-to-concrete-integer API."""
+    result: dict[sympy.Symbol, sympy.Integer] = {}
+    for parameter, value in substitutions.items():
+        if not isinstance(parameter, sympy.Symbol):
+            raise TypeError("parameter substitutions require SymPy Symbol keys")
+        concrete = _concrete_integer(value, description=f"value for {parameter}")
+        result[parameter] = sympy.Integer(concrete)
+    return result
 
 
 class TileDependencyKind(enum.Enum):
@@ -91,12 +131,13 @@ class CoordinateDomain:
     """
 
     axis_order: tuple[int, ...]
-    axis_counts_items: tuple[tuple[int, int], ...]
+    axis_counts_items: tuple[tuple[int, IntegerExpression], ...]
     block_sizes_items: tuple[tuple[int, int], ...] = ()
     kind: Literal["site", "allocation", "event", "task_order", "worker", "value"] = (
         "site"
     )
     identity: int | None = None
+    _allow_empty: bool = dataclasses.field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if len(set(self.axis_order)) != len(self.axis_order):
@@ -108,13 +149,21 @@ class CoordinateDomain:
             and tuple(axis for axis, _size in self.block_sizes_items) != self.axis_order
         ):
             raise ValueError("coordinate-domain block sizes must follow axis order")
-        if any(count <= 0 for _axis, count in self.axis_counts_items):
-            raise ValueError("coordinate-domain axis counts must be positive")
+        for _axis, count in self.axis_counts_items:
+            expression = _integer_expression(
+                count,
+                description="coordinate-domain axis count",
+            )
+            if expression.is_nonnegative is not True or (  # pyrefly: ignore[missing-attribute]
+                expression.is_zero is True and not self._allow_empty
+            ):
+                raise ValueError("coordinate-domain axis counts must be positive")
         if any(size <= 0 for _axis, size in self.block_sizes_items):
             raise ValueError("coordinate-domain block sizes must be positive")
 
     @property
-    def axis_counts(self) -> dict[int, int]:
+    def axis_count_expressions(self) -> dict[int, IntegerExpression]:
+        """Return axis counts without requiring parameter substitution."""
         return dict(self.axis_counts_items)
 
     @property
@@ -122,12 +171,97 @@ class CoordinateDomain:
         return dict(self.block_sizes_items)
 
     @property
-    def shape(self) -> tuple[int, ...]:
+    def shape_expr(self) -> tuple[IntegerExpression, ...]:
+        """Return the possibly parameterized Cartesian shape."""
         return tuple(count for _axis, count in self.axis_counts_items)
 
     @property
+    def axis_counts(self) -> dict[int, int]:
+        """Return concrete axis counts for legacy finite-domain operations."""
+        return self._concrete_axis_counts()
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        """Return the concrete Cartesian shape."""
+        counts = self._concrete_axis_counts()
+        return tuple(counts[axis] for axis in self.axis_order)
+
+    @property
+    def size_expr(self) -> sympy.Expr:
+        """Return the possibly parameterized number of domain points."""
+        return sympy.prod(
+            _integer_expression(count, description="coordinate-domain axis count")
+            for count in self.shape_expr
+        )
+
+    @property
+    def concrete_size(self) -> int:
+        """Return the domain size, rejecting unresolved symbolic parameters."""
+        return _concrete_integer(
+            self.size_expr,
+            description="coordinate-domain size",
+        )
+
+    @property
     def size(self) -> int:
-        return math.prod(self.shape)
+        """Compatibility spelling for the explicitly concrete domain size."""
+        return self.concrete_size
+
+    @property
+    def parameter_symbols(self) -> frozenset[sympy.Symbol]:
+        """Return parameters used by this domain's axis counts."""
+        return cast(
+            "frozenset[sympy.Symbol]",
+            frozenset(
+                symbol
+                for count in self.shape_expr
+                for symbol in _integer_expression(
+                    count,
+                    description="coordinate-domain axis count",
+                ).free_symbols
+            ),
+        )
+
+    def substitute_parameters(
+        self,
+        substitutions: Mapping[sympy.Symbol, int],
+    ) -> CoordinateDomain:
+        """Return a concrete domain after a complete Symbol-to-int substitution."""
+        concrete_substitutions = _parameter_substitutions(substitutions)
+        missing = self.parameter_symbols - concrete_substitutions.keys()
+        if missing:
+            names = ", ".join(sorted(symbol.name for symbol in missing))
+            raise ValueError(f"missing coordinate-domain parameters: {names}")
+        counts = tuple(
+            (
+                axis,
+                _concrete_integer(
+                    _integer_expression(
+                        count,
+                        description="coordinate-domain axis count",
+                    ).xreplace(concrete_substitutions),
+                    description="substituted coordinate-domain axis count",
+                ),
+            )
+            for axis, count in self.axis_counts_items
+        )
+        return CoordinateDomain(
+            axis_order=self.axis_order,
+            axis_counts_items=counts,
+            block_sizes_items=self.block_sizes_items,
+            kind=self.kind,
+            identity=self.identity,
+            _allow_empty=any(count == 0 for _axis, count in counts),
+        )
+
+    def _concrete_axis_counts(self) -> dict[int, int]:
+        return {
+            axis: _concrete_integer(
+                count,
+                description="coordinate-domain axis count",
+            )
+            for axis, count in self.axis_counts_items
+        }
 
     def _validate_linearization_order(
         self,
@@ -151,7 +285,7 @@ class CoordinateDomain:
             self.axis_order if linearization_order is None else linearization_order
         )
         self._validate_linearization_order(linearization_order)
-        counts = self.axis_counts
+        counts = self._concrete_axis_counts()
         coordinates: dict[int, int] = {}
         remainder = index
         for axis in linearization_order:
@@ -173,7 +307,7 @@ class CoordinateDomain:
             self.axis_order if linearization_order is None else linearization_order
         )
         self._validate_linearization_order(linearization_order)
-        counts = self.axis_counts
+        counts = self._concrete_axis_counts()
         result = 0
         multiplier = 1
         for axis in linearization_order:
@@ -233,13 +367,24 @@ def nested_logical_axes(
 class _CoordinateRelationPiece:
     """One guarded source box mapped to a Cartesian target range."""
 
-    source_bounds_items: tuple[tuple[int, int, int, int], ...]
+    source_bounds_items: tuple[
+        tuple[int, IntegerExpression, IntegerExpression, int], ...
+    ]
     target_ranges: tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...]
 
     def contains(self, coordinates: dict[int, int]) -> bool:
         return all(
-            begin <= coordinates[axis] < end and (coordinates[axis] - begin) % step == 0
+            (
+                concrete_begin <= coordinates[axis] < concrete_end
+                and (coordinates[axis] - concrete_begin) % step == 0
+            )
             for axis, begin, end, step in self.source_bounds_items
+            for concrete_begin, concrete_end in (
+                (
+                    _concrete_integer(begin, description="relation source bound"),
+                    _concrete_integer(end, description="relation source bound"),
+                ),
+            )
         )
 
 
@@ -270,12 +415,125 @@ class CoordinateRelation:
                 != self.target_domain.axis_order
             ):
                 raise ValueError("relation target ranges must follow domain order")
+            for _axis, begin, end, _step in piece.source_bounds_items:
+                _integer_expression(begin, description="relation source bound")
+                _integer_expression(end, description="relation source bound")
             if any(
-                step <= 0 for _axis, _begin, _end, step in piece.source_bounds_items
+                _concrete_integer(step, description="relation source stride") <= 0
+                for _axis, _begin, _end, step in piece.source_bounds_items
             ):
                 raise ValueError("relation source strides must be positive")
-            if any(step <= 0 for _axis, _begin, _end, step in piece.target_ranges):
+            if any(
+                _concrete_integer(step, description="relation target stride") <= 0
+                for _axis, _begin, _end, step in piece.target_ranges
+            ):
                 raise ValueError("relation target strides must be positive")
+
+    @property
+    def parameter_symbols(self) -> frozenset[sympy.Symbol]:
+        """Return non-coordinate parameters used by this relation."""
+        coordinate_symbols = frozenset(
+            coordinate_axis_symbol(axis)
+            for axis in (
+                *self.source_domain.axis_order,
+                *self.target_domain.axis_order,
+            )
+        )
+        symbols: set[sympy.Symbol] = set(self.source_domain.parameter_symbols)
+        symbols.update(self.target_domain.parameter_symbols)
+        for piece in self.pieces:
+            for _axis, begin, end, _step in piece.source_bounds_items:
+                symbols.update(
+                    cast(
+                        "set[sympy.Symbol]",
+                        _integer_expression(
+                            begin,
+                            description="relation source bound",
+                        ).free_symbols,
+                    )
+                )
+                symbols.update(
+                    cast(
+                        "set[sympy.Symbol]",
+                        _integer_expression(
+                            end,
+                            description="relation source bound",
+                        ).free_symbols,
+                    )
+                )
+            for _axis, begin, end, _step in piece.target_ranges:
+                symbols.update(
+                    cast("set[sympy.Symbol]", sympy.sympify(begin).free_symbols)
+                )
+                symbols.update(
+                    cast("set[sympy.Symbol]", sympy.sympify(end).free_symbols)
+                )
+        return frozenset(symbols) - coordinate_symbols
+
+    def substitute_parameters(
+        self,
+        substitutions: Mapping[sympy.Symbol, int],
+    ) -> CoordinateRelation:
+        """Concretize parameter bounds while retaining coordinate variables."""
+        concrete_substitutions = _parameter_substitutions(substitutions)
+        coordinate_symbols = frozenset(
+            coordinate_axis_symbol(axis)
+            for axis in (
+                *self.source_domain.axis_order,
+                *self.target_domain.axis_order,
+            )
+        )
+        replaced_coordinates = coordinate_symbols & concrete_substitutions.keys()
+        if replaced_coordinates:
+            names = ", ".join(sorted(symbol.name for symbol in replaced_coordinates))
+            raise ValueError(f"coordinate symbols are not parameters: {names}")
+        missing = self.parameter_symbols - concrete_substitutions.keys()
+        if missing:
+            names = ", ".join(sorted(symbol.name for symbol in missing))
+            raise ValueError(f"missing coordinate-relation parameters: {names}")
+
+        def substitute_expression(expression: IntegerExpression) -> sympy.Expr:
+            return sympy.simplify(
+                _integer_expression(
+                    expression,
+                    description="relation expression",
+                ).xreplace(concrete_substitutions)
+            )
+
+        pieces = tuple(
+            _CoordinateRelationPiece(
+                source_bounds_items=tuple(
+                    (
+                        axis,
+                        _concrete_integer(
+                            substitute_expression(begin),
+                            description="substituted relation source bound",
+                        ),
+                        _concrete_integer(
+                            substitute_expression(end),
+                            description="substituted relation source bound",
+                        ),
+                        step,
+                    )
+                    for axis, begin, end, step in piece.source_bounds_items
+                ),
+                target_ranges=tuple(
+                    (
+                        axis,
+                        substitute_expression(begin),
+                        substitute_expression(end),
+                        step,
+                    )
+                    for axis, begin, end, step in piece.target_ranges
+                ),
+            )
+            for piece in self.pieces
+        )
+        return CoordinateRelation(
+            source_domain=self.source_domain.substitute_parameters(substitutions),
+            target_domain=self.target_domain.substitute_parameters(substitutions),
+            pieces=pieces,
+        )
 
     @classmethod
     def identity(
@@ -295,7 +553,7 @@ class CoordinateRelation:
             pieces=(
                 _CoordinateRelationPiece(
                     source_bounds_items=tuple(
-                        (axis, 0, source_domain.axis_counts[axis], 1)
+                        (axis, 0, source_domain.axis_count_expressions[axis], 1)
                         for axis in source_domain.axis_order
                     ),
                     target_ranges=tuple(
@@ -318,7 +576,7 @@ class CoordinateRelation:
         target_domain: CoordinateDomain,
         pieces: tuple[
             tuple[
-                tuple[tuple[int, int, int, int], ...],
+                tuple[tuple[int, IntegerExpression, IntegerExpression, int], ...],
                 tuple[sympy.Expr, ...],
             ],
             ...,
@@ -362,14 +620,17 @@ class CoordinateRelation:
             pieces=(
                 _CoordinateRelationPiece(
                     source_bounds_items=tuple(
-                        (axis, 0, source_domain.axis_counts[axis], 1)
+                        (axis, 0, source_domain.axis_count_expressions[axis], 1)
                         for axis in source_domain.axis_order
                     ),
                     target_ranges=tuple(
                         (
                             axis,
                             sympy.Integer(0),
-                            sympy.Integer(target_domain.axis_counts[axis]),
+                            _integer_expression(
+                                target_domain.axis_count_expressions[axis],
+                                description="coordinate-domain axis count",
+                            ),
                             1,
                         )
                         for axis in target_domain.axis_order
@@ -385,7 +646,7 @@ class CoordinateRelation:
         target_domain: CoordinateDomain,
     ) -> CoordinateRelation | None:
         """Project a domain onto a coordinate-compatible subdomain."""
-        source_counts = source_domain.axis_counts
+        source_counts = source_domain.axis_count_expressions
         if any(
             axis not in source_counts or source_counts[axis] != count
             for axis, count in target_domain.axis_counts_items
@@ -5147,7 +5408,7 @@ def pid_task_order(
     """Map configured PID task-order coordinates to logical tasks."""
     if set(logical_domain.axis_order) != set(pid_axis_order):
         raise ValueError("PID axis order must permute the logical task axes")
-    counts = logical_domain.axis_counts
+    counts = logical_domain.axis_count_expressions
     if l2_group_size is None or len(pid_axis_order) < 2:
         source_domain = CoordinateDomain(
             axis_order=pid_axis_order,
@@ -6067,15 +6328,22 @@ def _symbolic_producers_by_consumer(
 def _coordinate_domain_for_axes(
     axis_order: tuple[int, ...],
     *,
-    axis_geometry: dict[int, tuple[int, int]],
+    axis_geometry: dict[int, tuple[IntegerExpression, int]],
     identity: int,
 ) -> CoordinateDomain | None:
     geometry = tuple(axis_geometry.get(axis) for axis in axis_order)
     if any(item is None for item in geometry):
         return None
     concrete_geometry = tuple(item for item in geometry if item is not None)
-    if any(count <= 0 or block_size <= 0 for count, block_size in concrete_geometry):
-        return None
+    for count, block_size in concrete_geometry:
+        count_expression = _integer_expression(
+            count,
+            description="coordinate-domain axis count",
+        )
+        if count_expression.is_nonnegative is not True or block_size <= 0:
+            return None
+        if count_expression.is_zero is True:
+            return None
     return CoordinateDomain(
         axis_order=axis_order,
         axis_counts_items=tuple(
@@ -6092,7 +6360,7 @@ def _coordinate_domain_for_axes(
 def instantiate_coordinate_domains(
     dependency_graph: TileDependencyGraph,
     *,
-    axis_geometry: dict[int, tuple[int, int]],
+    axis_geometry: dict[int, tuple[IntegerExpression, int]],
 ) -> tuple[
     tuple[CoordinateDomain | None, ...],
     tuple[CoordinateDomain | None, ...],

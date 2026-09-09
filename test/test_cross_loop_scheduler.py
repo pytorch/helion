@@ -2596,6 +2596,93 @@ class TestCrossLoopScheduler(TestCase):
             ((0, ((2, 4),)), (2, ((0, 2),))),
         )
 
+    def test_parametric_root_major_schedule_is_exact_after_substitution(self) -> None:
+        first_count = sympy.Symbol("first_count", integer=True, nonnegative=True)
+        second_count = sympy.Symbol("second_count", integer=True, nonnegative=True)
+        root_domains = _identify_root_domains(
+            (
+                CoordinateDomain((10,), ((10, first_count),), ((10, 16),)),
+                CoordinateDomain((20,), ((20, second_count),), ((20, 32),)),
+            )
+        )
+        root_task_orders = _default_root_task_orders(root_domains)
+
+        with _forbid_schedule_enumeration():
+            schedule = (
+                cross_loop_scheduler._build_parametric_root_major_worker_schedule(
+                    root_domains,
+                    root_task_orders,
+                    4,
+                )
+            )
+            geometry = cross_loop_scheduler._parametric_root_major_schedule_geometry(
+                schedule
+            )
+            publications = tuple(
+                cross_loop_scheduler.root_barrier_publication_plan(schedule, root)
+                for root in range(2)
+            )
+
+        self.assertIsNotNone(geometry)
+        assert geometry is not None
+        self.assertEqual(len(schedule.segments), 2)
+        self.assertTrue(
+            all(len(segment.task_order.pieces) == 2 for segment in schedule.segments)
+        )
+        self.assertEqual(
+            tuple(plan.participant_intervals for plan in publications),
+            (((0, 4),), ((0, 4),)),
+        )
+        self.assertEqual(
+            tuple(plan.resident_arrival_count for plan in publications),
+            (4, 4),
+        )
+
+        launch_stage_axis, worker_axis, wave_axis = schedule.placement_domain.axis_order
+        for concrete_counts in ((0, 0), (1, 3), (4, 5), (5, 8), (9, 1)):
+            substitutions = dict(
+                zip((first_count, second_count), concrete_counts, strict=True)
+            )
+            first_wave = 0
+            for root, (segment, _symbolic_first_wave, _task_count) in enumerate(
+                geometry
+            ):
+                relation = segment.task_order.substitute_parameters(substitutions)
+                actual_owners: dict[int, tuple[int, int]] = {}
+                wave_count = relation.source_domain.axis_counts[wave_axis]
+                assert isinstance(wave_count, int)
+                for wave in range(wave_count):
+                    self.assertFalse(
+                        relation.target_coordinates(
+                            {
+                                launch_stage_axis: 0,
+                                worker_axis: 0,
+                                wave_axis: wave,
+                            }
+                        )
+                    )
+                    for worker in range(4):
+                        targets = relation.target_coordinates(
+                            {
+                                launch_stage_axis: 1,
+                                worker_axis: worker,
+                                wave_axis: wave,
+                            }
+                        )
+                        self.assertLessEqual(len(targets), 1)
+                        for (task,) in targets:
+                            self.assertNotIn(task, actual_owners)
+                            actual_owners[task] = (worker, wave)
+                expected_count = concrete_counts[root]
+                self.assertEqual(
+                    actual_owners,
+                    {
+                        task: (task % 4, first_wave + task // 4)
+                        for task in range(expected_count)
+                    },
+                )
+                first_wave += (expected_count + 3) // 4
+
     def test_worker_schedule_task_coverage_rejects_duplicate_and_missing(self) -> None:
         (domain,) = _identify_root_domains((_domain((10, 2, 1)),))
         task_order = pid_task_order(domain, domain.axis_order)

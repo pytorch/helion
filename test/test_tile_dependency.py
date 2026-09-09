@@ -297,6 +297,91 @@ class TestTileDependency(TestCase):
             domain.index({10: 1, 20: 0}, linearization_order=(20, 10)),
             3,
         )
+        self.assertEqual(domain.size_expr, 6)
+        self.assertEqual(domain.concrete_size, 6)
+        with self.assertRaisesRegex(ValueError, "axis counts must be positive"):
+            CoordinateDomain((10,), ((10, 0),))
+        unknown_sign = sympy.Symbol("unknown_sign", integer=True)
+        with self.assertRaisesRegex(ValueError, "axis counts must be positive"):
+            CoordinateDomain((10,), ((10, unknown_sign),))
+        noninteger = sympy.Symbol("noninteger", nonnegative=True)
+        with self.assertRaisesRegex(ValueError, "must be an integer expression"):
+            CoordinateDomain((10,), ((10, noninteger),))
+
+    def test_symbolic_coordinate_domain_substitution(self) -> None:
+        width = 8
+        extent = sympy.Symbol("extent", integer=True, nonnegative=True)
+        task_count = sympy.floor((extent + width - 1) / width)
+        domain = CoordinateDomain(
+            (10, 20),
+            ((10, task_count), (20, 2)),
+            ((10, width), (20, 1)),
+        )
+
+        self.assertEqual(domain.size_expr, 2 * task_count)
+        self.assertEqual(domain.parameter_symbols, frozenset((extent,)))
+        with self.assertRaisesRegex(ValueError, "coordinate-domain size is symbolic"):
+            _ = domain.concrete_size
+        with self.assertRaisesRegex(ValueError, "coordinate-domain size is symbolic"):
+            domain.coordinates(0)
+        with self.assertRaisesRegex(
+            ValueError,
+            "coordinate-domain axis count is symbolic",
+        ):
+            domain.index({10: 0, 20: 0})
+
+        for value in (0, 1, width - 1, width, width + 1):
+            expected_count = (value + width - 1) // width
+            concrete = domain.substitute_parameters({extent: value})
+            self.assertEqual(concrete.axis_counts, {10: expected_count, 20: 2})
+            self.assertEqual(concrete.size, 2 * expected_count)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "missing coordinate-domain parameters: extent",
+        ):
+            domain.substitute_parameters({})
+
+    def test_symbolic_coordinate_relation_substitution(self) -> None:
+        width = 8
+        extent = sympy.Symbol("extent", integer=True, nonnegative=True)
+        task_count = sympy.floor((extent + width - 1) / width)
+        source = CoordinateDomain((10,), ((10, task_count),), kind="task_order")
+        target = CoordinateDomain((20,), ((20, task_count),), kind="site")
+        source_coordinate = coordinate_axis_symbol(10)
+        relation = CoordinateRelation(
+            source_domain=source,
+            target_domain=target,
+            pieces=(
+                _CoordinateRelationPiece(
+                    source_bounds_items=((10, 0, task_count, 1),),
+                    target_ranges=((20, source_coordinate, source_coordinate + 1, 1),),
+                ),
+            ),
+        )
+
+        self.assertEqual(relation.parameter_symbols, frozenset((extent,)))
+        with self.assertRaisesRegex(ValueError, "coordinate-domain size is symbolic"):
+            relation.materialize()
+        with self.assertRaisesRegex(ValueError, "relation source bound is symbolic"):
+            relation.target_coordinates({10: 0})
+        with self.assertRaisesRegex(
+            ValueError,
+            "coordinate symbols are not parameters",
+        ):
+            relation.substitute_parameters({source_coordinate: 0, extent: width})
+
+        for value in (0, 1, width - 1, width, width + 1):
+            expected_count = (value + width - 1) // width
+            concrete = relation.substitute_parameters({extent: value})
+            self.assertEqual(
+                concrete.pieces[0].source_bounds_items,
+                ((10, 0, expected_count, 1),),
+            )
+            self.assertEqual(
+                concrete.materialize(),
+                tuple(frozenset((index,)) for index in range(expected_count)),
+            )
 
     def test_piecewise_dense_point_converse_is_exact_transpose(self) -> None:
         inner = coordinate_axis_symbol(10)
@@ -634,6 +719,43 @@ class TestTileDependency(TestCase):
         self.assertEqual(len(root_sites), 2)
         for site in root_sites:
             self.assertIs(root_domains[site.root], site_domains[site.site_id])
+
+    def test_symbolic_geometry_instantiates_coordinate_domains(self) -> None:
+        graph = build_tile_dependency_graph(
+            (
+                _access(0, root=0, kind="store", block_ids=(10,)),
+                _access(1, root=1, kind="load", block_ids=(20,)),
+            ),
+            [[10], [20]],
+        )
+        graph = dataclasses.replace(
+            graph,
+            execution_sites=(
+                ExecutionSite(0, 0, 0, (), None, "root", (), (10,), True, False),
+                ExecutionSite(1, 1, 1, (), None, "root", (), (20,), True, False),
+            ),
+            site_ids_by_access=((0,), (1,)),
+        )
+        task_count = sympy.Symbol("task_count", integer=True, nonnegative=True)
+
+        root_domains, site_domains = instantiate_coordinate_domains(
+            graph,
+            axis_geometry={10: (task_count, 16), 20: (task_count + 1, 32)},
+        )
+
+        self.assertEqual(root_domains[0].size_expr, task_count)
+        self.assertEqual(root_domains[1].size_expr, task_count + 1)
+        self.assertIs(root_domains[0], site_domains[0])
+        self.assertIs(root_domains[1], site_domains[1])
+        self.assertEqual(
+            root_domains[0].substitute_parameters({task_count: 0}).size,
+            0,
+        )
+        zero_roots, _zero_sites = instantiate_coordinate_domains(
+            graph,
+            axis_geometry={10: (0, 16), 20: (1, 32)},
+        )
+        self.assertIsNone(zero_roots[0])
 
     def test_symbolic_pid_task_order_preserves_l2_tail_group(self) -> None:
         domain = CoordinateDomain(

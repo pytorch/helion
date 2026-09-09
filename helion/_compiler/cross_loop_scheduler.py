@@ -10,6 +10,8 @@ import operator
 from typing import cast
 
 import sympy
+from torch.utils._sympy.functions import CeilDiv
+from torch.utils._sympy.functions import FloorDiv
 
 from .. import exc
 from .tile_dependency import CoordinateDomain
@@ -22,6 +24,7 @@ from .tile_dependency import consumer_to_preceding_site_relation
 from .tile_dependency import coordinate_axis_symbol
 from .tile_dependency import instantiate_symbolic_dependencies
 from .tile_dependency import nested_logical_axes
+from .tile_dependency import pid_task_order
 
 WorkerInterval = tuple[int, int]
 
@@ -126,7 +129,7 @@ class WorkerScheduleSegment:
             )
         if self.task_order.source_domain.kind == "worker" and (
             len(self.task_order.source_domain.axis_order) != 3
-            or self.task_order.source_domain.axis_counts[
+            or self.task_order.source_domain.axis_count_expressions[
                 self.task_order.source_domain.axis_order[0]
             ]
             != 2
@@ -525,19 +528,25 @@ def _flat_domain_index_expression(domain: CoordinateDomain) -> sympy.Expr:
 
 def _worker_schedule_domain(
     worker_count: int,
-    wave_count: int,
+    wave_count: int | sympy.Expr,
     axes: tuple[int, int, int],
 ) -> CoordinateDomain:
     """Return the shared source domain for resident schedule relations."""
-    if worker_count <= 0 or wave_count <= 0:
-        raise ValueError("worker and wave counts must be positive")
+    if worker_count <= 0:
+        raise ValueError("worker count must be positive")
+    wave_count_expr = sympy.sympify(wave_count)
+    if (
+        wave_count_expr.is_integer is not True
+        or wave_count_expr.is_nonnegative is not True
+    ):
+        raise ValueError("wave count must be a nonnegative integer expression")
     launch_stage_axis, worker_axis, wave_axis = axes
     return CoordinateDomain(
         axis_order=axes,
         axis_counts_items=(
             (launch_stage_axis, 2),
             (worker_axis, worker_count),
-            (wave_axis, wave_count),
+            (wave_axis, wave_count_expr),
         ),
         kind="worker",
     )
@@ -1127,6 +1136,158 @@ def _task_order_slice(
     )
 
 
+def _equal_integer_expressions(
+    left: int | sympy.Expr,
+    right: int | sympy.Expr,
+) -> bool:
+    """Compare two integer expressions without choosing parameter values."""
+    difference = sympy.Add(
+        sympy.sympify(left),
+        sympy.Mul(-1, sympy.sympify(right)),
+    )
+    return sympy.simplify(difference) == 0
+
+
+def _ceildiv_nonnegative_expression(
+    numerator: int | sympy.Expr,
+    denominator: int,
+) -> sympy.Expr:
+    """Return exact integer ceildiv for a nonnegative parameter expression."""
+    return cast("sympy.Expr", CeilDiv(sympy.sympify(numerator), denominator))
+
+
+def _is_rank_one_canonical_task_order(
+    task_order: CoordinateRelation,
+    domain: CoordinateDomain,
+) -> bool:
+    """Prove that one PID order is the identity on a rank-one root domain."""
+    return len(domain.axis_order) == 1 and task_order == pid_task_order(
+        domain,
+        domain.axis_order,
+    )
+
+
+def _parametric_root_major_relation(
+    schedule_domain: CoordinateDomain,
+    target_domain: CoordinateDomain,
+    first_wave: sympy.Expr,
+    worker_count: int,
+) -> CoordinateRelation:
+    """Return one root's exact cyclic ownership relation."""
+    launch_stage_axis, worker_axis, wave_axis = schedule_domain.axis_order
+    worker = coordinate_axis_symbol(worker_axis)
+    wave = coordinate_axis_symbol(wave_axis)
+    task_count = target_domain.size_expr
+    full_waves = cast("sympy.Expr", FloorDiv(task_count, worker_count))
+    wave_count = _ceildiv_nonnegative_expression(task_count, worker_count)
+    logical_task = cast(
+        "sympy.Expr",
+        sympy.Add(
+            sympy.Mul(
+                sympy.Add(wave, sympy.Mul(-1, first_wave)),
+                worker_count,
+            ),
+            worker,
+        ),
+    )
+    full_wave_end = cast("sympy.Expr", sympy.Add(first_wave, full_waves))
+    root_wave_end = cast("sympy.Expr", sympy.Add(first_wave, wave_count))
+    return CoordinateRelation.point_map(
+        schedule_domain,
+        target_domain,
+        (
+            (
+                (
+                    (
+                        launch_stage_axis,
+                        _RESIDENT_LAUNCH_STAGE,
+                        _RESIDENT_LAUNCH_STAGE + 1,
+                        1,
+                    ),
+                    (worker_axis, 0, worker_count, 1),
+                    (wave_axis, first_wave, full_wave_end, 1),
+                ),
+                (logical_task,),
+            ),
+            (
+                (
+                    (
+                        launch_stage_axis,
+                        _RESIDENT_LAUNCH_STAGE,
+                        _RESIDENT_LAUNCH_STAGE + 1,
+                        1,
+                    ),
+                    (worker_axis, 0, sympy.Mod(task_count, worker_count), 1),
+                    (
+                        wave_axis,
+                        full_wave_end,
+                        root_wave_end,
+                        1,
+                    ),
+                ),
+                (logical_task,),
+            ),
+        ),
+    )
+
+
+def _parametric_root_major_schedule_geometry_from_parts(
+    worker_count: int,
+    segments: tuple[WorkerScheduleSegment, ...],
+) -> tuple[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr], ...] | None:
+    """Recognize and prove the compiler's exact parametric root-major relation.
+
+    Each result item is ``(segment, first_wave, task_count)``. This structural
+    proof is shared by schedule validation, barrier ownership, and codegen, so
+    none of those consumers reconstructs a schedule from runtime shape hints.
+    """
+    if not segments or not any(
+        segment.task_order.parameter_symbols for segment in segments
+    ):
+        return None
+    if not all(segment.is_normalized for segment in segments):
+        return None
+    schedule_domain = segments[0].task_order.source_domain
+    if any(segment.task_order.source_domain != schedule_domain for segment in segments):
+        return None
+    if schedule_domain.kind != "worker" or len(schedule_domain.axis_order) != 3:
+        return None
+    launch_stage_axis, worker_axis, wave_axis = schedule_domain.axis_order
+    schedule_counts = schedule_domain.axis_count_expressions
+    if not _equal_integer_expressions(
+        schedule_counts[launch_stage_axis], 2
+    ) or not _equal_integer_expressions(schedule_counts[worker_axis], worker_count):
+        return None
+
+    first_wave: sympy.Expr = sympy.Integer(0)
+    result: list[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr]] = []
+    for expected_root, segment in enumerate(segments):
+        relation = segment.task_order
+        target_domain = relation.target_domain
+        if (
+            segment.root != expected_root
+            or segment.worker_begin != 0
+            or segment.worker_count != worker_count
+            or len(target_domain.axis_order) != 1
+        ):
+            return None
+        task_count = target_domain.size_expr
+        wave_count = _ceildiv_nonnegative_expression(task_count, worker_count)
+        if relation != _parametric_root_major_relation(
+            schedule_domain,
+            target_domain,
+            first_wave,
+            worker_count,
+        ):
+            return None
+        result.append((segment, first_wave, task_count))
+        first_wave = sympy.simplify(sympy.Add(first_wave, wave_count))
+
+    if not _equal_integer_expressions(schedule_counts[wave_axis], first_wave):
+        return None
+    return tuple(result)
+
+
 class _WorkerScheduleChronologyError(ValueError):
     """Raised when segment tuple order disagrees with a resident strand."""
 
@@ -1147,6 +1308,19 @@ class WorkerSchedule:
     def __post_init__(self) -> None:
         if self.worker_count <= 0:
             raise ValueError(f"worker_count must be positive, got {self.worker_count}")
+        if any(segment.task_order.parameter_symbols for segment in self.segments):
+            if (
+                _parametric_root_major_schedule_geometry_from_parts(
+                    self.worker_count,
+                    self.segments,
+                )
+                is None
+            ):
+                raise ValueError(
+                    "parameterized worker schedule is not the supported exact "
+                    "root-major relation"
+                )
+            return
         normalized_axes = {
             segment.task_order.source_domain.axis_order
             for segment in self.segments
@@ -1373,6 +1547,16 @@ class WorkerSchedule:
         if not inserted:
             result.extend(segments)
         return WorkerSchedule(worker_count=self.worker_count, segments=tuple(result))
+
+
+def _parametric_root_major_schedule_geometry(
+    worker_schedule: WorkerSchedule,
+) -> tuple[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr], ...] | None:
+    """Return the proved parameterized schedule geometry, when supported."""
+    return _parametric_root_major_schedule_geometry_from_parts(
+        worker_schedule.worker_count,
+        worker_schedule.segments,
+    )
 
 
 @cache
@@ -1604,6 +1788,29 @@ def root_barrier_publication_plan(
     used for both the barrier arrival count and the codegen emission sites.
     No worker or task is enumerated.
     """
+    if (
+        parameterized_geometry := _parametric_root_major_schedule_geometry(
+            worker_schedule
+        )
+    ) is not None:
+        matching = tuple(
+            segment_index
+            for segment_index, (segment, _first_wave, _task_count) in enumerate(
+                parameterized_geometry
+            )
+            if segment.root == root
+        )
+        if len(matching) != 1:
+            raise ValueError(
+                f"parameterized root-major schedule has no unique root {root}"
+            )
+        participant_intervals = ((0, worker_schedule.worker_count),)
+        return RootBarrierPublicationPlan(
+            root=root,
+            participant_intervals=participant_intervals,
+            publications=(RootBarrierPublication(matching[0], participant_intervals),),
+        )
+
     later_workers: tuple[WorkerInterval, ...] = ()
     reverse_publications: list[RootBarrierPublication] = []
     for segment_index in reversed(range(len(worker_schedule.segments))):
@@ -1635,6 +1842,65 @@ def root_barrier_publication_plan(
     ):
         raise AssertionError("root publication ownership is not an exact partition")
     return RootBarrierPublicationPlan(root, later_workers, publications)
+
+
+def _build_parametric_root_major_worker_schedule(
+    root_domains: tuple[CoordinateDomain, ...],
+    root_task_orders: tuple[CoordinateRelation, ...],
+    worker_count: int,
+) -> WorkerSchedule:
+    """Build an exact O(roots) schedule over runtime root task counts."""
+    if worker_count <= 0:
+        raise ValueError(f"worker_count must be positive, got {worker_count}")
+    if len(root_domains) != len(root_task_orders):
+        raise ValueError("root domains and task orders must have equal length")
+    if not root_domains or not any(domain.parameter_symbols for domain in root_domains):
+        raise ValueError("parameterized schedule requires a runtime root extent")
+    if any(
+        not _is_rank_one_canonical_task_order(task_order, domain)
+        for domain, task_order in zip(root_domains, root_task_orders, strict=True)
+    ):
+        raise ValueError(
+            "parameterized scheduling currently requires canonical rank-one roots"
+        )
+
+    minimum_axis = min(
+        (axis for domain in root_domains for axis in domain.axis_order),
+        default=0,
+    )
+    schedule_axes = (minimum_axis - 3, minimum_axis - 2, minimum_axis - 1)
+    first_wave: sympy.Expr = sympy.Integer(0)
+    root_first_waves: list[sympy.Expr] = []
+    for domain in root_domains:
+        task_count = domain.size_expr
+        wave_count = _ceildiv_nonnegative_expression(task_count, worker_count)
+        root_first_waves.append(first_wave)
+        first_wave = sympy.simplify(sympy.Add(first_wave, wave_count))
+    schedule_domain = _worker_schedule_domain(
+        worker_count,
+        first_wave,
+        schedule_axes,
+    )
+    segments: list[WorkerScheduleSegment] = []
+    for root, (domain, root_first_wave) in enumerate(
+        zip(root_domains, root_first_waves, strict=True)
+    ):
+        relation = _parametric_root_major_relation(
+            schedule_domain,
+            domain,
+            root_first_wave,
+            worker_count,
+        )
+        segments.append(
+            WorkerScheduleSegment(
+                root=root,
+                task_order=relation,
+                worker_begin=0,
+                worker_count=worker_count,
+                dispatch_offset=0,
+            )
+        )
+    return WorkerSchedule(worker_count=worker_count, segments=tuple(segments))
 
 
 def build_baseline_worker_schedule(
@@ -6034,6 +6300,38 @@ def build_static_pipeline_plan(
     allow_transient_source: bool = False,
 ) -> StaticPipelinePlan:
     """Derive all generic readiness strategies without inspecting root bodies."""
+    root_domains = tuple(task_order.target_domain for task_order in root_task_orders)
+    if any(domain.parameter_symbols for domain in root_domains):
+        try:
+            worker_schedule = _build_parametric_root_major_worker_schedule(
+                root_domains,
+                root_task_orders,
+                worker_count,
+            )
+        except ValueError as error:
+            raise exc.InvalidConfig(
+                "cross_loop_schedule='static_pipeline' cannot represent this "
+                "parameterized root schedule"
+            ) from error
+        # Dynamic access geometry is intentionally not specialized from hints.
+        # Until an exact parametric event proof exists, every dependence falls
+        # back monotonically to the existing whole-root synchronization.
+        root_barrier_edges = _select_root_barrier_edges(
+            dependency_graph=dependency_graph,
+            covered_obligations=frozenset(),
+        )
+        _validate_schedule_coverage(
+            dependency_graph=dependency_graph,
+            covered_obligations=frozenset(),
+            root_barrier_edges=root_barrier_edges,
+        )
+        return StaticPipelinePlan(
+            worker_schedule=worker_schedule,
+            readiness_counters=(),
+            root_barrier_edges=root_barrier_edges,
+            transient_source_root=None,
+        )
+
     readiness_graph = build_readiness_graph(
         dependency_graph,
         root_task_orders=root_task_orders,

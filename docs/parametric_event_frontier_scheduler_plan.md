@@ -16,9 +16,12 @@ Implementation checkpoint (2026-09-08):
   proposal is retained only when its unit-task final wave does not regress.
 - The generic source-ticket frontier participates in resident priority, while
   the proven transient-source execution mechanism is retained for now.
-- Runtime-parameterized domain extents, recurrence extraction, cubin reuse,
-  cross-workload rollout, and final source/local-path consolidation remain to
-  be implemented and measured.
+- The first parameterized-extents vertical slice is implemented for canonical
+  rank-one roots: symbolic domains lower through the same `WorkerSchedule`,
+  conservative root barriers, and runtime-bounded loops, with one cubin reused
+  across changing extents.
+- Parametric exact-event recurrence, cross-workload rollout, and final
+  source/local-path consolidation remain to be implemented and measured.
 
 The hard architectural constraint is:
 
@@ -1110,6 +1113,22 @@ compiles within the agreed budget.
 
 Exit gate: the dynamic implicit-dependency test that currently rejects the
 static pipeline passes and reuses one binary across its declared shape guard.
+
+Implementation checkpoint (2026-09-08): the exit gate is satisfied for the
+minimal conservative slice. `CoordinateDomain` and `CoordinateRelation`
+preserve symbolic integer bounds while concrete enumeration remains explicit.
+Canonical rank-one roots are represented by two exact relation pieces per
+root (full waves plus a partial tail), and codegen strength-reduces that proved
+relation into runtime-bounded cyclic loops. Dynamic memory layouts are not
+specialized from hints: dependencies coarsen to root barriers, and every
+resident worker publishes once per producer root so epoch targets stay fixed
+while shapes vary between graph replays. Exact parameterized readiness events
+and recurrence extraction remain later Phase 4 work; parameterized roots with
+rank greater than one, L2-permuted orders, continuations, and transient-source
+admission still decline rather than relying on a shape hint.
+The binary-reuse regression explicitly opts its runtime extent out of Triton
+specialization; parameterizing the schedule does not override backend
+specialization policy for ordinary scalar arguments.
 
 ### Phase 5: source-ticket generalization
 
