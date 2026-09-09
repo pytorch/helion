@@ -6,11 +6,36 @@ import typing
 from typing import TYPE_CHECKING
 from typing import TypeVar
 
+from .ast_extension import ExtendedAST
+
 if TYPE_CHECKING:
     _A = TypeVar("_A", bound=ast.AST)
 
 
 HELION_LANE_LOOP_VAR_ATTR = "_helion_lane_loop_var"
+
+# Accessing these tensor attributes only reads host-side metadata, not tensor
+# storage.  Keep counting them as ordinary reads for liveness, but identify them
+# separately for analyses that specifically care about memory dependencies.
+# Keep this list conservative: unknown tensor attributes remain storage reads.
+_TENSOR_METADATA_ATTRIBUTES = frozenset(
+    {"device", "dim", "dtype", "ndim", "ndimension", "shape", "size", "stride"}
+)
+
+
+def _is_tensor_metadata_read(node: ast.Attribute) -> bool:
+    if (
+        not isinstance(node.ctx, ast.Load)
+        or node.attr not in _TENSOR_METADATA_ATTRIBUTES
+        or not isinstance(node.value, ExtendedAST)
+    ):
+        return False
+
+    # Import lazily: type_info imports CompileEnvironment, whose finalization
+    # imports this module after type propagation has annotated the AST.
+    from .type_info import TensorType
+
+    return isinstance(node.value._type_info, TensorType)
 
 
 # TODO(oulgen): This visitor is extremely primitive, does not consider alpha renaming or scopes
@@ -18,6 +43,7 @@ class _ReadWriteVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         super().__init__()
         self.rw = ReadWrites(
+            collections.Counter(),
             collections.Counter(),
             collections.Counter(),
             collections.Counter(),
@@ -33,6 +59,11 @@ class _ReadWriteVisitor(ast.NodeVisitor):
 
     def visit_Name(self, node: ast.Name) -> None:
         self._update(node.id, node.ctx)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if _is_tensor_metadata_read(node) and isinstance(node.value, ast.Name):
+            self.rw.tensor_metadata_reads[node.value.id] += 1
+        self.generic_visit(node)
 
     def visit_Subscript(self, node: ast.Subscript) -> None:
         if isinstance(node.value, ast.Name):
@@ -86,6 +117,9 @@ class ReadWrites(typing.NamedTuple):
     # methods inside kernels (e.g. x.copy_(), x.fill_()), the visitor should
     # be updated to detect those as well.
     inplace_writes: dict[str, int]
+    # Reads of tensor shape/type/device metadata do not access tensor storage.
+    # They remain present in ``reads`` for general dependency tracking.
+    tensor_metadata_reads: dict[str, int]
     # AugAssign targets are reads semantically, but branch argument ordering
     # historically placed them with writes. Keep that ordering stable while
     # exposing the read to analyses that consume ``reads`` directly.
