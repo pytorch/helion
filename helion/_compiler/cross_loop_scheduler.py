@@ -1196,14 +1196,28 @@ def _ceildiv_nonnegative_expression(
     return cast("sympy.Expr", CeilDiv(sympy.sympify(numerator), denominator))
 
 
+def _parametric_task_axis_order(
+    task_order: CoordinateRelation,
+    domain: CoordinateDomain,
+) -> tuple[int, ...] | None:
+    """Return the exact ungrouped PID-axis order of one symbolic root."""
+    axis_order = task_order.source_domain.axis_order
+    if set(axis_order) != set(domain.axis_order) or task_order != pid_task_order(
+        domain,
+        axis_order,
+    ):
+        return None
+    return axis_order
+
+
 def _is_rank_one_canonical_task_order(
     task_order: CoordinateRelation,
     domain: CoordinateDomain,
 ) -> bool:
-    """Prove that one PID order is the identity on a rank-one root domain."""
-    return len(domain.axis_order) == 1 and task_order == pid_task_order(
-        domain,
-        domain.axis_order,
+    """Prove canonical PID order for a rank-one root recurrence."""
+    return (
+        len(domain.axis_order) == 1
+        and _parametric_task_axis_order(task_order, domain) is not None
     )
 
 
@@ -1212,6 +1226,7 @@ def _parametric_root_major_relation(
     target_domain: CoordinateDomain,
     first_slot: sympy.Expr,
     worker_count: int,
+    task_axis_order: tuple[int, ...] | None = None,
 ) -> CoordinateRelation:
     """Return one root's exact placement in a packed root-major stream."""
     launch_stage_axis, worker_axis, wave_axis = schedule_domain.axis_order
@@ -1230,6 +1245,31 @@ def _parametric_root_major_relation(
         middle_wave_end + _ceildiv_nonnegative_expression(tail_count, worker_count)
     )
     logical_task = sympy.simplify(wave * worker_count + worker - first_slot)
+    task_axis_order = (
+        target_domain.axis_order if task_axis_order is None else task_axis_order
+    )
+    if set(task_axis_order) != set(target_domain.axis_order):
+        raise ValueError("task axis order must permute the target axes")
+    logical_coordinates: dict[int, sympy.Expr] = {}
+    stride: sympy.Expr = sympy.Integer(1)
+    for index, axis in enumerate(task_axis_order):
+        count = sympy.sympify(target_domain.axis_count_expressions[axis])
+        quotient = (
+            logical_task
+            if stride == 1
+            else cast("sympy.Expr", FloorDiv(logical_task, stride))
+        )
+        logical_coordinates[axis] = (
+            quotient
+            if index == len(task_axis_order) - 1
+            else sympy.simplify(
+                quotient - cast("sympy.Expr", FloorDiv(quotient, count)) * count
+            )
+        )
+        stride = sympy.simplify(stride * count)
+    target_coordinates = tuple(
+        logical_coordinates[axis] for axis in target_domain.axis_order
+    )
     return CoordinateRelation.point_map(
         schedule_domain,
         target_domain,
@@ -1250,7 +1290,7 @@ def _parametric_root_major_relation(
                     ),
                     (wave_axis, first_wave, first_wave + 1, 1),
                 ),
-                (logical_task,),
+                target_coordinates,
             ),
             (
                 (
@@ -1263,7 +1303,7 @@ def _parametric_root_major_relation(
                     (worker_axis, 0, worker_count, 1),
                     (wave_axis, middle_wave_begin, middle_wave_end, 1),
                 ),
-                (logical_task,),
+                target_coordinates,
             ),
             (
                 (
@@ -1276,10 +1316,72 @@ def _parametric_root_major_relation(
                     (worker_axis, 0, tail_count, 1),
                     (wave_axis, middle_wave_end, final_wave_end, 1),
                 ),
-                (logical_task,),
+                target_coordinates,
             ),
         ),
     )
+
+
+def _parametric_root_major_axis_order(
+    relation: CoordinateRelation,
+    first_slot: sympy.Expr,
+    worker_count: int,
+) -> tuple[int, ...] | None:
+    """Recover the mixed-radix PID order encoded by one packed relation."""
+    if not relation.pieces:
+        return None
+    target_expressions: dict[int, sympy.Expr] = {}
+    for piece_index, piece in enumerate(relation.pieces):
+        for axis, begin, end, step in piece.target_ranges:
+            if step != 1 or not _equal_integer_expressions(end, begin + 1):
+                return None
+            if piece_index == 0:
+                target_expressions[axis] = begin
+            elif not _equal_integer_expressions(target_expressions[axis], begin):
+                return None
+
+    _launch_stage_axis, worker_axis, wave_axis = relation.source_domain.axis_order
+    logical_task = sympy.simplify(
+        coordinate_axis_symbol(wave_axis) * worker_count
+        + coordinate_axis_symbol(worker_axis)
+        - first_slot
+    )
+    remaining = list(relation.target_domain.axis_order)
+    result: list[int] = []
+    stride: sympy.Expr = sympy.Integer(1)
+    while len(remaining) > 1:
+        quotient = (
+            logical_task
+            if stride == 1
+            else cast("sympy.Expr", FloorDiv(logical_task, stride))
+        )
+        matching = []
+        for axis in remaining:
+            count = sympy.sympify(relation.target_domain.axis_count_expressions[axis])
+            expected = sympy.simplify(
+                quotient - cast("sympy.Expr", FloorDiv(quotient, count)) * count
+            )
+            if _equal_integer_expressions(target_expressions[axis], expected):
+                matching.append(axis)
+        if not matching:
+            return None
+        axis = matching[0]
+        result.append(axis)
+        remaining.remove(axis)
+        stride = sympy.simplify(
+            stride * relation.target_domain.axis_count_expressions[axis]
+        )
+    if remaining:
+        (axis,) = remaining
+        quotient = (
+            logical_task
+            if stride == 1
+            else cast("sympy.Expr", FloorDiv(logical_task, stride))
+        )
+        if not _equal_integer_expressions(target_expressions[axis], quotient):
+            return None
+        result.append(axis)
+    return tuple(result)
 
 
 def _parametric_event_frontier_relation(
@@ -1441,16 +1543,23 @@ def _parametric_root_major_schedule_geometry_from_parts(
             segment.root <= previous_root
             or segment.worker_begin != 0
             or segment.worker_count != worker_count
-            or len(target_domain.axis_order) != 1
         ):
             return None
         previous_root = segment.root
         task_count = target_domain.size_expr
+        task_axis_order = _parametric_root_major_axis_order(
+            relation,
+            first_slot,
+            worker_count,
+        )
+        if task_axis_order is None:
+            return None
         if relation != _parametric_root_major_relation(
             schedule_domain,
             target_domain,
             first_slot,
             worker_count,
+            task_axis_order,
         ):
             return None
         result.append((segment, first_slot, task_count))
@@ -2087,12 +2196,10 @@ def _build_parametric_root_major_worker_schedule(
     if not root_domains or not any(domain.parameter_symbols for domain in root_domains):
         raise ValueError("parameterized schedule requires a runtime root extent")
     if any(
-        not _is_rank_one_canonical_task_order(task_order, domain)
+        _parametric_task_axis_order(task_order, domain) is None
         for domain, task_order in zip(root_domains, root_task_orders, strict=True)
     ):
-        raise ValueError(
-            "parameterized scheduling currently requires canonical rank-one roots"
-        )
+        raise ValueError("parameterized scheduling requires an ungrouped PID order")
     scheduled_roots = tuple(
         (root, domain)
         for root, domain in enumerate(root_domains)
@@ -2123,11 +2230,15 @@ def _build_parametric_root_major_worker_schedule(
         root_first_slots,
         strict=True,
     ):
+        task_axis_order = _parametric_task_axis_order(root_task_orders[root], domain)
+        if task_axis_order is None:
+            raise AssertionError("parameterized PID order changed after validation")
         relation = _parametric_root_major_relation(
             schedule_domain,
             domain,
             root_first_slot,
             worker_count,
+            task_axis_order,
         )
         segments.append(
             WorkerScheduleSegment(
@@ -2471,14 +2582,36 @@ def _uniform_arrival_count(
     producers: tuple[ReadinessProducer, ...],
 ) -> int | None:
     """Return one constant arrival count for an event, when it has one."""
-    total = 0
+    bounds = _arrival_count_bounds(producers)
+    if bounds is None or bounds[0] != bounds[1]:
+        return None
+    return bounds[0]
+
+
+def _arrival_count_bounds(
+    producers: tuple[ReadinessProducer, ...],
+) -> tuple[int, int] | None:
+    """Return proved minimum and maximum arrivals over all readiness keys."""
+    minimum = 0
+    maximum = 0
+    cardinalities: list[CoordinateRelation] = []
     for readiness_producer in producers:
         cardinality = readiness_producer.arrival_count_by_key
-        count = None if cardinality is None else cardinality.constant_value()
-        if count is None:
+        if cardinality is None or not cardinality.is_total_function():
             return None
-        total += count
-    return total
+        bounds = cardinality.value_bounds()
+        if bounds is None:
+            return None
+        cardinalities.append(cardinality)
+        minimum += bounds[0]
+        maximum += bounds[1]
+    if minimum != maximum and any(
+        cardinality.canonical_single_valued() is None for cardinality in cardinalities
+    ):
+        # Nonuniform codegen evaluates the exact count at each key.  A bounds
+        # proof alone cannot supply that value.
+        return None
+    return minimum, maximum
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2811,9 +2944,23 @@ class ReadinessCounterPlan:
         """Return the complete readiness-key count."""
         return self.readiness_key_domain.size
 
+    @property
+    def parameter_symbols(self) -> frozenset[sympy.Symbol]:
+        """Return every host-backed parameter used by this counter plan."""
+        symbols: set[sympy.Symbol] = set()
+        for producer in self.producers:
+            symbols.update(producer.producers_by_key.parameter_symbols)
+        for consumer in self.consumers:
+            symbols.update(consumer.keys_by_consumer.parameter_symbols)
+        return frozenset(symbols)
+
     def uniform_arrival_count(self) -> int | None:
         """Return constant fan-in without enumerating readiness keys."""
         return _uniform_arrival_count(self.producers)
+
+    def arrival_count_bounds(self) -> tuple[int, int] | None:
+        """Return proved fan-in bounds without enumerating readiness keys."""
+        return _arrival_count_bounds(self.producers)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4008,6 +4155,7 @@ def build_readiness_events(
                 obligations.add(obligation)
             if not quotient_is_supported:
                 break
+            relation = relation.coalesce_adjacent_target_boxes()
             used_axes = relation.source_axes_affecting_targets()
             if used_axes is None:
                 quotient_is_supported = False
@@ -6426,13 +6574,14 @@ def _global_unit_list_schedule(
     ):
         return worker_schedule
     if transient_source_root is not None:
-        worker_schedule = _with_transient_source_schedule_segment(
+        source_schedule = _with_transient_source_schedule_segment(
             worker_schedule,
             readiness_graph.root_task_orders,
             transient_source_root,
         )
-        if worker_schedule is None:
+        if source_schedule is None:
             return None
+        worker_schedule = source_schedule
     candidate = _event_frontier_list_schedule(
         readiness_graph,
         worker_schedule,
@@ -6734,23 +6883,21 @@ def _has_valid_transient_source_schedule(
     )
 
 
-def _parameterized_uniform_counter_fan_in(
+def _parameterized_counter_fan_in_bounds(
     plan: ReadinessCounterPlan,
-) -> int | None:
-    """Return the proved static fan-in accepted by parametric schedules.
+) -> tuple[int, int] | None:
+    """Return the proved static fan-in bounds accepted by parametric schedules.
 
     Ordinary resident waits may fan out from one key to multiple consumer
-    tasks. Final-arrival continuations retain their stricter one-task-per-key
-    bijection. The returned cardinality is the sole distinction needed by
-    scheduling and replay-safe lowering.
+    tasks and may have different exact arrival counts by key. Final-arrival
+    continuations retain their stricter uniform one-task-per-key contract.
     """
-    fan_in = plan.uniform_arrival_count()
+    fan_in_bounds = plan.arrival_count_bounds()
     if (
-        len(plan.readiness_key_domain.axis_order) != 1
-        or len(plan.producers) != 1
+        len(plan.producers) != 1
         or not plan.consumers
-        or fan_in is None
-        or not 0 < fan_in < 2**32
+        or fan_in_bounds is None
+        or not 0 < fan_in_bounds[0] <= fan_in_bounds[1] < 2**32
     ):
         return None
     (producer,) = plan.producers
@@ -6765,12 +6912,15 @@ def _parameterized_uniform_counter_fan_in(
         consumer.consumer_site_id is None
         and producer.producer_root < consumer.consumer_root
         and consumer.keys_by_consumer.canonical_single_valued() is not None
-        and consumer.keys_by_consumer.is_total_function()
         for consumer in plan.consumers
     ):
         return None
     if plan.continuation_consumer_index is not None:
-        if fan_in == 1 or len(plan.consumers) != 1:
+        if (
+            fan_in_bounds[0] != fan_in_bounds[1]
+            or fan_in_bounds[0] == 1
+            or len(plan.consumers) != 1
+        ):
             return None
         (consumer,) = plan.consumers
         converse = consumer.keys_by_consumer.converse()
@@ -6780,12 +6930,30 @@ def _parameterized_uniform_counter_fan_in(
             or not converse.is_positional_bijection()
         ):
             return None
-    return fan_in
+    return fan_in_bounds
+
+
+def _parameterized_uniform_counter_fan_in(
+    plan: ReadinessCounterPlan,
+) -> int | None:
+    """Return a parameterized counter's uniform fan-in, when it has one."""
+    bounds = _parameterized_counter_fan_in_bounds(plan)
+    if bounds is None or bounds[0] != bounds[1]:
+        return None
+    return bounds[0]
+
+
+def _has_replay_safe_counter_state(plan: ReadinessCounterPlan) -> bool:
+    """Require bounded epoch framing whenever a counter layout can move."""
+    if not plan.parameter_symbols:
+        return True
+    bounds = plan.arrival_count_bounds()
+    return bounds is not None and 0 < bounds[0] <= bounds[1] < 2**32
 
 
 def _supports_parameterized_counter(plan: ReadinessCounterPlan) -> bool:
     """Return whether one counter has the complete parametric certificate."""
-    return _parameterized_uniform_counter_fan_in(plan) is not None
+    return _parameterized_counter_fan_in_bounds(plan) is not None
 
 
 def _supports_parameterized_fan_in_one_counter(
@@ -6944,6 +7112,16 @@ def _finalize_emitted_synchronization(
     readiness_counters: tuple[ReadinessCounterPlan, ...],
 ) -> tuple[tuple[ReadinessCounterPlan, ...], frozenset[tuple[int, int]]]:
     """Select fallback barriers and remove counter consumers they subsume."""
+    lowerable_counters: list[ReadinessCounterPlan] = []
+    for counter_plan in readiness_counters:
+        if not _has_replay_safe_counter_state(counter_plan):
+            # Dynamic counter state is replay-safe only when its exact
+            # per-key target is renderable and has a static epoch stride.
+            # Dropping the plan here lets coverage select the ordinary
+            # root-barrier fallback from the same obligations.
+            continue
+        lowerable_counters.append(counter_plan)
+    readiness_counters = tuple(lowerable_counters)
     covered_obligations = frozenset(
         obligation
         for counter_plan in readiness_counters
@@ -7119,6 +7297,7 @@ def build_static_pipeline_plan(
         publishable_site_ids=publishable_site_ids,
         prove_nonnegative=prove_nonnegative,
     )
+    original_readiness_graph = readiness_graph
     try:
         (
             worker_schedule,
@@ -7141,13 +7320,17 @@ def build_static_pipeline_plan(
         for readiness_consumer in plan.consumers
         for obligation in readiness_consumer.covered_obligations
     )
-    readiness_counters = (
+    candidate_readiness_counters = (
         *choose_readiness_counters(
             readiness_graph,
             continuations,
             excluded_obligations=nested_loop_obligations,
         ),
         *nested_loop_counters,
+    )
+    dropped_replay_unsafe_counter = any(
+        not _has_replay_safe_counter_state(plan)
+        for plan in candidate_readiness_counters
     )
     # Recompute coverage from the mechanisms that will actually be emitted.
     # Dependency analysis may prove a finer relation than the selected emitter
@@ -7156,8 +7339,24 @@ def build_static_pipeline_plan(
     # would remove the dependency entirely.
     readiness_counters, root_barrier_edges = _finalize_emitted_synchronization(
         dependency_graph=dependency_graph,
-        readiness_counters=readiness_counters,
+        readiness_counters=candidate_readiness_counters,
     )
+    if dropped_replay_unsafe_counter:
+        # Local placement may have used the finer event before finalization.
+        # Once that event falls back to a stronger whole-root barrier, restart
+        # from the conservative root-major schedule so the replacement cannot
+        # introduce a same-worker cycle.
+        worker_schedule = build_baseline_worker_schedule(
+            root_domains,
+            root_task_orders,
+            worker_count,
+        )
+        continuations = ()
+        readiness_graph = original_readiness_graph
+        readiness_counters, root_barrier_edges = _finalize_emitted_synchronization(
+            dependency_graph=dependency_graph,
+            readiness_counters=choose_readiness_counters(readiness_graph, ()),
+        )
     transient_source_root: int | None = None
     globally_scheduled = None
     if not continuations:
@@ -7197,6 +7396,16 @@ def build_static_pipeline_plan(
         )
     if globally_scheduled is not None:
         worker_schedule = globally_scheduled
+    if dropped_replay_unsafe_counter and not _schedule_is_progress_safe(
+        worker_schedule,
+        readiness_graph,
+        readiness_counters,
+        root_barrier_edges,
+        transient_source_root=transient_source_root,
+    ):
+        raise AssertionError(
+            "replay-unsafe counter fallback did not preserve schedule progress"
+        )
     return StaticPipelinePlan(
         worker_schedule=worker_schedule,
         readiness_counters=readiness_counters,

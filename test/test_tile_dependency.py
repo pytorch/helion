@@ -26,7 +26,11 @@ from helion._compiler.tile_dependency import _coalesce_adjacent_target_boxes
 from helion._compiler.tile_dependency import _CoordinateRelationPiece
 from helion._compiler.tile_dependency import _dense_linear_overlap_relation
 from helion._compiler.tile_dependency import _dense_mixed_radix_converse
+from helion._compiler.tile_dependency import _layout_is_injective
+from helion._compiler.tile_dependency import _logical_expression_bounds
 from helion._compiler.tile_dependency import _simplify_logical_expression
+from helion._compiler.tile_dependency import _symbolic_linear_access_relation
+from helion._compiler.tile_dependency import _symbolic_producers_by_consumer
 from helion._compiler.tile_dependency import allocation_regions_may_overlap
 from helion._compiler.tile_dependency import build_tile_dependency_graph
 from helion._compiler.tile_dependency import coordinate_axis_symbol
@@ -126,8 +130,8 @@ def _access(
     root: int,
     allocation_id: int = 0,
     kind: Literal["load", "store"],
-    shape: tuple[int, ...] = (128,),
-    strides: tuple[int, ...] = (1,),
+    shape: tuple[int | sympy.Expr, ...] = (128,),
+    strides: tuple[int | sympy.Expr, ...] = (1,),
     block_ids: tuple[int | None, ...] = (0,),
     scales: tuple[int, ...] = (1,),
     offsets: tuple[int | None, ...] = (0,),
@@ -136,8 +140,8 @@ def _access(
     static_extents: tuple[int | None, ...] | None = None,
     masked: bool = False,
     tensor_name: str = "tmp",
-    storage_offset: int = 0,
-    layout_is_static: bool = True,
+    storage_offset: int | sympy.Expr = 0,
+    layout_is_symbolically_exact: bool = True,
     affine_subscript_ranges=None,
 ) -> TileAccess:
     return TileAccess(
@@ -159,7 +163,7 @@ def _access(
         has_explicit_mask=masked,
         subscript_is_full_slice=full_slice or tuple(False for _ in block_ids),
         subscript_static_extents=static_extents or (),
-        layout_is_static=layout_is_static,
+        layout_is_symbolically_exact=layout_is_symbolically_exact,
         affine_subscript_ranges=affine_subscript_ranges,
     )
 
@@ -963,6 +967,419 @@ class TestTileDependency(TestCase):
                 ),
             )
 
+    def test_symbolic_multi_axis_producer_set_quotient(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        consumer_domain = CoordinateDomain(
+            (20, 21, 22),
+            ((20, batch), (21, 6), (22, 5)),
+            kind="site",
+        )
+        producer_domain = CoordinateDomain(
+            (10, 11, 12),
+            ((10, batch), (11, 4), (12, 3)),
+            kind="site",
+        )
+        consumer_batch = coordinate_axis_symbol(20)
+        consumer_group = coordinate_axis_symbol(21)
+        producer_group = 2 * sympy.floor(consumer_group / 3)
+        relation = CoordinateRelation(
+            source_domain=consumer_domain,
+            target_domain=producer_domain,
+            pieces=(
+                _CoordinateRelationPiece(
+                    source_bounds_items=(
+                        (20, 0, batch, 1),
+                        (21, 0, 6, 1),
+                        (22, 0, 5, 1),
+                    ),
+                    target_ranges=(
+                        (10, consumer_batch, consumer_batch + 1, 1),
+                        (11, producer_group, producer_group + 2, 1),
+                        (12, sympy.Integer(0), sympy.Integer(3), 1),
+                    ),
+                ),
+            ),
+        )
+
+        with (
+            mock.patch.object(
+                CoordinateRelation,
+                "materialize",
+                side_effect=AssertionError("symbolic proof must not enumerate"),
+            ),
+            mock.patch.object(
+                CoordinateRelation,
+                "targets",
+                side_effect=AssertionError("symbolic proof must not enumerate"),
+            ),
+        ):
+            quotient = relation.producer_set_quotient()
+            self.assertIsNotNone(quotient)
+            assert quotient is not None
+            keys_by_consumer, producers_by_key = quotient
+            self.assertEqual(keys_by_consumer.target_domain.shape_expr, (batch, 2))
+            self.assertTrue(keys_by_consumer.is_total_function())
+            publication, producer_count = (
+                producers_by_key.derive_converse_and_target_counts()
+            )
+            self.assertIsNotNone(publication)
+            self.assertIsNotNone(producer_count)
+            assert publication is not None and producer_count is not None
+            self.assertTrue(publication.is_total_function())
+            self.assertEqual(producer_count.constant_value(), 6)
+
+        for concrete_batch in (1, 2, 9):
+            concrete_keys = keys_by_consumer.substitute_parameters(
+                {batch: concrete_batch}
+            )
+            concrete_producers = producers_by_key.substitute_parameters(
+                {batch: concrete_batch}
+            )
+            expected_keys: list[frozenset[int]] = []
+            for consumer_index in range(
+                consumer_domain.size_expr.subs(batch, concrete_batch)
+            ):
+                consumer_coordinates = consumer_domain.substitute_parameters(
+                    {batch: concrete_batch}
+                ).coordinates(consumer_index)
+                expected_keys.append(
+                    frozenset(
+                        (
+                            consumer_coordinates[20]
+                            + concrete_batch * (consumer_coordinates[21] // 3),
+                        )
+                    )
+                )
+            self.assertEqual(concrete_keys.materialize(), tuple(expected_keys))
+
+            concrete_producer_domain = producer_domain.substitute_parameters(
+                {batch: concrete_batch}
+            )
+            expected_producers: list[frozenset[int]] = []
+            for key_index in range(2 * concrete_batch):
+                batch_index = key_index % concrete_batch
+                group_index = key_index // concrete_batch
+                expected_producers.append(
+                    frozenset(
+                        concrete_producer_domain.index(
+                            {10: batch_index, 11: producer_group_index, 12: tail}
+                        )
+                        for producer_group_index in range(
+                            2 * group_index, 2 * group_index + 2
+                        )
+                        for tail in range(3)
+                    )
+                )
+            self.assertEqual(
+                concrete_producers.materialize(), tuple(expected_producers)
+            )
+
+    def test_symbolic_contiguous_layout_derives_multi_axis_dependencies(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        producer_domain = CoordinateDomain(
+            (10, 11),
+            ((10, batch), (11, 4)),
+            ((10, 1), (11, 16)),
+            kind="site",
+        )
+        consumer_domain = CoordinateDomain(
+            (20, 21),
+            ((20, batch), (21, 2)),
+            ((20, 1), (21, 32)),
+            kind="site",
+        )
+        producer = _access(
+            0,
+            root=0,
+            kind="store",
+            shape=(batch, 64),
+            strides=(64, 1),
+            block_ids=(10, 11),
+            scales=(1, 1),
+            offsets=(0, 0),
+        )
+        consumer = _access(
+            1,
+            root=1,
+            kind="load",
+            shape=(batch, 64),
+            strides=(64, 1),
+            block_ids=(20, 21),
+            scales=(1, 1),
+            offsets=(0, 0),
+        )
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("symbolic proof must not enumerate"),
+        ):
+            relation = _symbolic_producers_by_consumer(
+                producer_access=producer,
+                producer_domain=producer_domain,
+                consumer_access=consumer,
+                consumer_domain=consumer_domain,
+            )
+            self.assertIsNotNone(relation)
+            assert relation is not None
+            quotient = relation.producer_set_quotient()
+            self.assertIsNotNone(quotient)
+            assert quotient is not None
+            keys_by_consumer, producers_by_key = quotient
+            self.assertTrue(keys_by_consumer.is_total_function())
+            publication, target_counts = (
+                producers_by_key.derive_converse_and_target_counts()
+            )
+            self.assertIsNotNone(publication)
+            self.assertIsNotNone(target_counts)
+            assert target_counts is not None
+            self.assertEqual(target_counts.constant_value(), 2)
+
+        self.assertTrue(_layout_is_injective(((batch, 64), (64, 1), 0)))
+        self.assertFalse(_layout_is_injective(((batch, 64), (32, 1), 0)))
+        for concrete_batch in (1, 2, 9):
+            concrete = relation.substitute_parameters({batch: concrete_batch})
+            self.assertEqual(
+                concrete.materialize(),
+                tuple(
+                    frozenset(
+                        batch_index + concrete_batch * (2 * column + inner_column)
+                        for inner_column in range(2)
+                    )
+                    for column in range(2)
+                    for batch_index in range(concrete_batch)
+                ),
+            )
+
+    def test_tile_access_canonicalizes_layout_expressions(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        access = _access(
+            0,
+            root=0,
+            kind="store",
+            shape=(batch, 64),
+            strides=(64, 1),
+            storage_offset=0,
+            masked=True,
+        )
+
+        self.assertEqual(access.tensor_shape, (batch, sympy.Integer(64)))
+        self.assertTrue(
+            all(isinstance(value, sympy.Expr) for value in access.tensor_shape)
+        )
+        self.assertTrue(
+            all(isinstance(value, sympy.Expr) for value in access.tensor_strides)
+        )
+        self.assertIsInstance(access.storage_offset, sympy.Integer)
+        # A mask makes the access relation unsupported, not its tensor layout.
+        self.assertTrue(access.layout_is_symbolically_exact)
+
+    def test_symbolic_flat_view_matches_multidimensional_layout(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        producer_domain = CoordinateDomain(
+            (10, 11),
+            ((10, batch), (11, 2)),
+            ((10, 1), (11, 4)),
+            kind="site",
+        )
+        consumer_domain = CoordinateDomain(
+            (20, 21),
+            ((20, batch), (21, 2)),
+            ((20, 1), (21, 1)),
+            kind="site",
+        )
+        producer = _access(
+            0,
+            root=0,
+            kind="store",
+            shape=(batch, 8),
+            strides=(8, 1),
+            block_ids=(10, 11),
+            scales=(1, 1),
+            offsets=(0, 0),
+        )
+        consumer = _access(
+            1,
+            root=1,
+            kind="load",
+            shape=(8 * batch,),
+            strides=(1,),
+            block_ids=(None,),
+            affine_subscript_ranges=((((20, 8, 1), (21, 4, 1)), 0, 4, 1),),
+        )
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("symbolic proof must not enumerate"),
+        ):
+            relation = _symbolic_producers_by_consumer(
+                producer_access=producer,
+                producer_domain=producer_domain,
+                consumer_access=consumer,
+                consumer_domain=consumer_domain,
+            )
+            self.assertIsNotNone(relation)
+
+        assert relation is not None
+        for concrete_batch in (1, 2, 9):
+            concrete = relation.substitute_parameters({batch: concrete_batch})
+            self.assertEqual(
+                concrete.materialize(),
+                tuple(frozenset((task,)) for task in range(2 * concrete_batch)),
+            )
+
+    def test_symbolic_affine_access_declines_symbolic_target_stride(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        stride = sympy.Symbol("stride", integer=True, positive=True)
+        source_domain = CoordinateDomain(
+            (10,),
+            ((10, batch),),
+            kind="site",
+            identity=0,
+        )
+        allocation_domain = CoordinateDomain(
+            (-1,),
+            ((-1, batch * stride),),
+            kind="allocation",
+            identity=0,
+        )
+        access = _access(
+            0,
+            root=0,
+            kind="load",
+            shape=(batch,),
+            strides=(stride,),
+            block_ids=(None,),
+            affine_subscript_ranges=(((((10, 1, 1),), 0, 1, 1)),),
+        )
+
+        self.assertIsNone(
+            _symbolic_linear_access_relation(
+                access,
+                source_domain=source_domain,
+                allocation_domain=allocation_domain,
+            )
+        )
+
+    def test_symbolic_positional_product_lifts_static_tail_proof(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        key_domain = CoordinateDomain(
+            (0, 1),
+            ((0, batch), (1, 2)),
+            kind="event",
+        )
+        producer_domain = CoordinateDomain(
+            (10, 11),
+            ((10, batch), (11, 3)),
+            kind="site",
+        )
+        key_batch = coordinate_axis_symbol(0)
+        relation = CoordinateRelation(
+            source_domain=key_domain,
+            target_domain=producer_domain,
+            pieces=(
+                _CoordinateRelationPiece(
+                    ((0, 0, batch, 1), (1, 0, 1, 1)),
+                    (
+                        (10, key_batch, key_batch + 1, 1),
+                        (11, sympy.Integer(0), sympy.Integer(2), 1),
+                    ),
+                ),
+                _CoordinateRelationPiece(
+                    ((0, 0, batch, 1), (1, 1, 2, 1)),
+                    (
+                        (10, key_batch, key_batch + 1, 1),
+                        (11, sympy.Integer(2), sympy.Integer(3), 1),
+                    ),
+                ),
+            ),
+        )
+
+        with (
+            mock.patch.object(
+                CoordinateRelation,
+                "materialize",
+                side_effect=AssertionError("symbolic proof must not enumerate"),
+            ),
+            mock.patch.object(
+                CoordinateRelation,
+                "targets",
+                side_effect=AssertionError("symbolic proof must not enumerate"),
+            ),
+        ):
+            converse, target_counts = relation.derive_converse_and_target_counts()
+            self.assertIsNotNone(converse)
+            self.assertIsNotNone(target_counts)
+            assert converse is not None and target_counts is not None
+            self.assertTrue(converse.is_total_function())
+            self.assertIsNotNone(converse.canonical_single_valued())
+            self.assertIsNone(target_counts.constant_value())
+            self.assertEqual(target_counts.value_bounds(), (1, 2))
+
+        for concrete_batch in (1, 2, 9):
+            substitutions = {batch: concrete_batch}
+            concrete_relation = relation.substitute_parameters(substitutions)
+            concrete_converse = converse.substitute_parameters(substitutions)
+            concrete_counts = target_counts.substitute_parameters(substitutions)
+            self.assertEqual(
+                concrete_relation.materialize(),
+                tuple(
+                    frozenset(
+                        batch_index + concrete_batch * producer_inner
+                        for producer_inner in (
+                            range(2) if key_inner == 0 else range(2, 3)
+                        )
+                    )
+                    for key_inner in range(2)
+                    for batch_index in range(concrete_batch)
+                ),
+            )
+            self.assertEqual(
+                concrete_converse.materialize(),
+                tuple(
+                    frozenset((batch_index + concrete_batch * (producer_inner // 2),))
+                    for producer_inner in range(3)
+                    for batch_index in range(concrete_batch)
+                ),
+            )
+            self.assertEqual(
+                concrete_counts.materialize(),
+                tuple(
+                    frozenset((2 if key_inner == 0 else 1,))
+                    for key_inner in range(2)
+                    for _batch_index in range(concrete_batch)
+                ),
+            )
+
+    def test_symbolic_value_bounds_preserve_correlated_minimum(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        source = CoordinateDomain(
+            (0, 1),
+            ((0, batch), (1, 20)),
+            kind="event",
+        )
+        value = CoordinateDomain((0,), ((0, 33),), kind="value")
+        column = coordinate_axis_symbol(1)
+        counts = CoordinateRelation.point_map(
+            source,
+            value,
+            (
+                (
+                    ((0, 0, batch, 1), (1, 0, 20, 1)),
+                    (
+                        16
+                        * sympy.Max(
+                            0,
+                            -2 * column + sympy.Min(39, 2 * column + 2),
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        self.assertEqual(counts.value_bounds(), (16, 32))
+
     def test_symbolic_repeated_fiber_quotient_rejects_inexact_forms(self) -> None:
         key_count = sympy.Symbol("key_count", integer=True, nonnegative=True)
         consumer = coordinate_axis_symbol(20)
@@ -1457,6 +1874,60 @@ class TestTileDependency(TestCase):
         )
         self.assertIsNone(large.project_source(retained))
 
+    def test_project_target_preserves_symbolic_axis_counts(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        source = CoordinateDomain(
+            (10, 11),
+            ((10, batch), (11, 4)),
+            kind="site",
+        )
+        target = CoordinateDomain(
+            (20, 21),
+            ((20, batch), (21, 4)),
+            kind="site",
+        )
+        retained = CoordinateDomain(
+            (20,),
+            ((20, batch),),
+            kind="site",
+        )
+        relation = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (
+                    ((10, 0, batch, 1), (11, 0, 4, 1)),
+                    (coordinate_axis_symbol(10), coordinate_axis_symbol(11)),
+                ),
+            ),
+        )
+
+        projected = relation.project_target(retained)
+
+        self.assertIsNotNone(projected)
+        self.assertTrue(CoordinateRelation.total(source, target).covers(relation))
+        assert projected is not None
+        self.assertEqual(
+            projected.then(CoordinateRelation.identity(retained, retained)),
+            projected,
+        )
+        concrete = projected.substitute_parameters({batch: 3})
+        self.assertEqual(
+            concrete.materialize(),
+            tuple(frozenset((index % 3,)) for index in range(12)),
+        )
+
+    def test_symbolic_set_relation_composes_with_identity(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        source = CoordinateDomain((10,), ((10, batch),), kind="site")
+        target = CoordinateDomain((20,), ((20, 4),), kind="event")
+        relation = CoordinateRelation.total(source, target)
+
+        self.assertIs(
+            relation.then(CoordinateRelation.identity(target, target)),
+            relation,
+        )
+
     def test_project_source_keeps_symbolic_outer_axis_and_unions_static_inner(
         self,
     ) -> None:
@@ -1835,9 +2306,14 @@ class TestTileDependency(TestCase):
             ),
         )
 
+        coalesced = _coalesce_adjacent_target_boxes(pieces, source_domain=source)
+        self.assertEqual(frozenset(coalesced), frozenset(pieces))
         self.assertEqual(
-            _coalesce_adjacent_target_boxes(pieces, source_domain=source),
-            pieces,
+            _coalesce_adjacent_target_boxes(
+                tuple(reversed(pieces)),
+                source_domain=source,
+            ),
+            coalesced,
         )
 
     def test_logical_simplification_preserves_bounded_floor_correlation(self) -> None:
@@ -1855,6 +2331,119 @@ class TestTileDependency(TestCase):
             ),
             coordinate + 510,
         )
+
+    def test_logical_simplification_uses_symbolic_mixed_radix_bounds(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        domain = CoordinateDomain(
+            (20, 21),
+            ((20, 2), (21, batch)),
+            kind="site",
+        )
+        chunk = coordinate_axis_symbol(20)
+        batch_index = coordinate_axis_symbol(21)
+        bounds = ((20, 0, 2, 1), (21, 0, batch, 1))
+
+        self.assertEqual(
+            _logical_expression_bounds(
+                2 * batch * chunk + batch_index,
+                domain=domain,
+                source_bounds=bounds,
+            ),
+            (sympy.Integer(0), 3 * batch - 1),
+        )
+        self.assertEqual(
+            _simplify_logical_expression(
+                sympy.Mod(2 * chunk + sympy.floor(batch_index / batch), 4),
+                domain=domain,
+                source_bounds=bounds,
+            ),
+            2 * chunk,
+        )
+
+    def test_logical_bounds_apply_point_substitution_before_classification(
+        self,
+    ) -> None:
+        source = CoordinateDomain((20,), ((20, 2),), kind="site")
+        source_coordinate = coordinate_axis_symbol(20)
+        intermediate_coordinate = coordinate_axis_symbol(10)
+
+        self.assertEqual(
+            _logical_expression_bounds(
+                sympy.floor(intermediate_coordinate / 2),
+                domain=source,
+                source_bounds=((20, 0, 2, 1),),
+                symbol_substitutions={intermediate_coordinate: source_coordinate},
+            ),
+            (sympy.Integer(0), sympy.Integer(0)),
+        )
+
+    def test_logical_simplification_proves_symbolic_dominance_safely(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        domain = CoordinateDomain((20,), ((20, batch),), kind="site")
+        coordinate = coordinate_axis_symbol(20)
+        bounds = ((20, 0, batch, 1),)
+
+        ambiguous_minimum = sympy.Min(coordinate, sympy.floor(batch / 2))
+        ambiguous_maximum = sympy.Max(coordinate, batch - 2)
+        self.assertEqual(
+            _simplify_logical_expression(
+                ambiguous_minimum,
+                domain=domain,
+                source_bounds=bounds,
+            ),
+            ambiguous_minimum,
+        )
+        self.assertEqual(
+            _simplify_logical_expression(
+                ambiguous_maximum,
+                domain=domain,
+                source_bounds=bounds,
+            ),
+            ambiguous_maximum,
+        )
+        self.assertEqual(
+            _simplify_logical_expression(
+                sympy.Min(coordinate, batch),
+                domain=domain,
+                source_bounds=bounds,
+            ),
+            coordinate,
+        )
+        self.assertEqual(
+            _simplify_logical_expression(
+                sympy.Max(0, batch - coordinate - 1),
+                domain=domain,
+                source_bounds=bounds,
+            ),
+            batch - coordinate - 1,
+        )
+
+    def test_symbolic_tail_relation_predicates_decline_without_raising(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        source = CoordinateDomain(
+            (20,),
+            ((20, batch + 1),),
+            kind="site",
+        )
+        target = CoordinateDomain((10,), ((10, 2),), kind="event")
+        relation = CoordinateRelation(
+            source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    ((20, 0, batch, 1),),
+                    ((10, sympy.Integer(0), sympy.Integer(1), 1),),
+                ),
+                _CoordinateRelationPiece(
+                    ((20, batch, batch + 1, 1),),
+                    ((10, sympy.Integer(1), sympy.Integer(2), 1),),
+                ),
+            ),
+        )
+
+        self.assertTrue(relation.is_single_valued())
+        self.assertIsNone(relation.canonical_single_valued())
+        self.assertFalse(relation.is_total_function())
 
     def test_compile_environment_nonnegative_proof_uses_shape_ranges(self) -> None:
         env = CompileEnvironment(torch.device("cpu"), helion.Settings(backend="triton"))
@@ -1906,6 +2495,50 @@ class TestTileDependency(TestCase):
             _bounded_coordinate_relation(65).source_axes_affecting_targets(),
             (10, 11),
         )
+
+    def test_source_axes_ignore_known_domain_parameters(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        foreign = sympy.Symbol("foreign", integer=True, nonnegative=True)
+        source = CoordinateDomain(
+            (10, 11),
+            ((10, batch), (11, 4)),
+            kind="site",
+        )
+        target = CoordinateDomain(
+            (20, 21),
+            ((20, batch), (21, batch)),
+            kind="site",
+        )
+        source_batch = coordinate_axis_symbol(10)
+
+        relation = CoordinateRelation(
+            source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 0, batch, 1), (11, 0, 4, 1)),
+                    (
+                        (20, source_batch, source_batch + 1, 1),
+                        (21, sympy.Integer(0), batch, 1),
+                    ),
+                ),
+            ),
+        )
+        self.assertEqual(relation.source_axes_affecting_targets(), (10,))
+
+        unknown_parameter = dataclasses.replace(
+            relation,
+            pieces=(
+                dataclasses.replace(
+                    relation.pieces[0],
+                    target_ranges=(
+                        relation.pieces[0].target_ranges[0],
+                        (21, sympy.Integer(0), foreign, 1),
+                    ),
+                ),
+            ),
+        )
+        self.assertIsNone(unknown_parameter.source_axes_affecting_targets())
 
     def test_dense_converse_lifts_full_singleton_target_axis(self) -> None:
         source = CoordinateDomain((0,), ((0, 2),), kind="event")
@@ -2264,6 +2897,64 @@ class TestTileDependency(TestCase):
         assert target_union is not None
         self.assertEqual(target_union.materialize(), (frozenset(range(8)),))
 
+    def test_adjacent_target_coalescing_with_symbolic_source(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        source = CoordinateDomain((10,), ((10, batch),), kind="site")
+        target = CoordinateDomain(
+            (20, 21),
+            ((20, batch), (21, 2)),
+            kind="site",
+        )
+        source_batch = coordinate_axis_symbol(10)
+
+        def half(begin: int) -> CoordinateRelation:
+            return CoordinateRelation(
+                source,
+                target,
+                (
+                    _CoordinateRelationPiece(
+                        ((10, 0, batch, 1),),
+                        (
+                            (20, source_batch, source_batch + 1, 1),
+                            (21, sympy.Integer(begin), sympy.Integer(begin + 1), 1),
+                        ),
+                    ),
+                ),
+            )
+
+        raw_union = half(0).union(half(1))
+        self.assertIsNotNone(raw_union)
+        assert raw_union is not None
+        combined = raw_union.coalesce_adjacent_target_boxes()
+        reversed_combined = CoordinateRelation(
+            source_domain=raw_union.source_domain,
+            target_domain=raw_union.target_domain,
+            pieces=tuple(reversed(raw_union.pieces)),
+        ).coalesce_adjacent_target_boxes()
+        self.assertEqual(reversed_combined, combined)
+        with mock.patch(
+            "helion._compiler.tile_dependency._MAX_RELATION_NORMALIZATION_COMPARISONS",
+            0,
+        ):
+            budgeted = raw_union.coalesce_adjacent_target_boxes()
+        self.assertEqual(len(budgeted.pieces), 2)
+        self.assertEqual(len(combined.pieces), 1)
+        self.assertEqual(
+            combined.pieces[0].target_ranges[-1],
+            (21, sympy.Integer(0), sympy.Integer(2), 1),
+        )
+        for concrete_batch in (1, 2, 9):
+            concrete = combined.substitute_parameters({batch: concrete_batch})
+            budgeted_concrete = budgeted.substitute_parameters({batch: concrete_batch})
+            self.assertEqual(
+                concrete.materialize(),
+                tuple(
+                    frozenset((batch_index, batch_index + concrete_batch))
+                    for batch_index in range(concrete_batch)
+                ),
+            )
+            self.assertEqual(budgeted_concrete.materialize(), concrete.materialize())
+
     def test_symbolic_max_target_value_reduces_schedule_positions(self) -> None:
         elements = 128
         plan = build_tile_dependency_graph(
@@ -2474,6 +3165,14 @@ class TestTileDependency(TestCase):
 
         self.assertIsNone(relation.source_support_cardinality())
         self.assertFalse(relation.is_total_function())
+
+    def test_symbolic_source_support_cardinality_declines(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        domain = CoordinateDomain((10,), ((10, batch),), identity=0)
+        relation = CoordinateRelation.identity(domain, domain)
+
+        self.assertIsNone(relation.source_support_cardinality())
+        self.assertTrue(relation.is_total_function())
 
     def test_empty_target_is_not_counted_as_source_support(self) -> None:
         source = CoordinateDomain((10,), ((10, 2),), identity=0)

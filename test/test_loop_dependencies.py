@@ -99,7 +99,12 @@ def dynamic_exact_then_barrier_chain(x: torch.Tensor) -> torch.Tensor:
     for tile in hl.tile(x.size(0)):
         dynamic_tmp[tile] = exact_tmp[tile] * 2
     for tile in hl.tile(x.size(0)):
-        out[tile] = dynamic_tmp[tile] - 3
+        # Keep this edge deliberately outside the affine access proof while
+        # preserving identity semantics. The test exercises coexistence of a
+        # parameterized counter and a conservative root barrier; a dynamic
+        # tensor layout alone is no longer a reason to force that barrier.
+        identity_index = tile.index + tile.index % 1
+        out[tile] = dynamic_tmp[identity_index] - 3
     return out
 
 
@@ -152,6 +157,51 @@ def dynamic_fixed_fan_in_fanout_chain(x: torch.Tensor) -> torch.Tensor:
     for consumer in hl.tile(x.size(0) * 3, block_size=1):
         split = 2 * (consumer.id // 3) + hl.arange(2)
         out[consumer] = torch.sum(partial[split])
+    return out
+
+
+@helion.kernel(
+    static_shapes=False,
+    autotune_effort="none",
+    triton_do_not_specialize=True,
+)
+def dynamic_symbolic_flattened_gather(x: torch.Tensor) -> torch.Tensor:
+    """Gather a fixed split fiber through a flat view with dynamic stride."""
+    batch = x.size(0)
+    partial = torch.empty((4, batch), dtype=x.dtype, device=x.device)
+    partial_storage = partial.view(-1)
+    out = torch.empty((2, batch), dtype=x.dtype, device=x.device)
+    for producer_split, producer_batch in hl.tile([4, batch], block_size=[1, 1]):
+        partial[producer_split, producer_batch] = (
+            x[producer_batch][None, :] + producer_split.index[:, None]
+        )
+    for consumer_chunk, consumer_batch in hl.tile([2, batch], block_size=[1, 1]):
+        split = consumer_chunk.index[:, None] * 2 + hl.arange(2)[None, :]
+        offsets = split[:, :, None] * batch + consumer_batch.index[None, None, :]
+        values = partial_storage[offsets]
+        out[consumer_chunk, consumer_batch] = torch.sum(values, dim=1)
+    return out
+
+
+@helion.kernel(
+    static_shapes=False,
+    autotune_effort="none",
+    triton_do_not_specialize=True,
+)
+def dynamic_nonuniform_tail_reduction(x: torch.Tensor) -> torch.Tensor:
+    """Reduce a static width-three producer with fan-in two and one tails."""
+    batch = x.size(0)
+    partial = torch.empty((batch, 3), dtype=x.dtype, device=x.device)
+    out = torch.empty((batch, 2), dtype=x.dtype, device=x.device)
+    for producer_batch, producer_split in hl.tile([batch, 3], block_size=[1, 1]):
+        partial[producer_batch, producer_split] = (
+            x[producer_batch][:, None] + producer_split.index[None, :]
+        )
+    for consumer_batch, consumer_split in hl.tile([batch, 3], block_size=[1, 2]):
+        out[consumer_batch, consumer_split.id] = torch.sum(
+            partial[consumer_batch, consumer_split],
+            dim=1,
+        )
     return out
 
 
@@ -491,7 +541,10 @@ class TestTritonTileDependencyLowering(TestCase):
         assert dependency_graph is not None
         self.assertTrue(dependency_graph.accesses)
         self.assertTrue(
-            all(not access.layout_is_static for access in dependency_graph.accesses)
+            all(
+                access.layout_is_symbolically_exact
+                for access in dependency_graph.accesses
+            )
         )
         code, output = code_and_output(
             dynamic_implicit_tile_dependency_chain,
@@ -876,6 +929,51 @@ class TestTritonTileDependencyLowering(TestCase):
             else:
                 self.assertEqual(hashes, expected_hashes)
 
+    def test_dynamic_symbolic_flattened_gather_uses_exact_counter(self) -> None:
+        exemplar = torch.arange(5, device=DEVICE, dtype=torch.float32)
+        bound = dynamic_symbolic_flattened_gather.bind((exemplar,))
+        config = helion.Config(
+            block_sizes=[],
+            pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
+            num_warps=1,
+        )
+        code = bound.to_code(config)
+        compiled = bound.compile_config(config)
+
+        self.assertIn("tile_dependency_parameterized_state", code)
+        self.assertIn("tl.atomic_add", code)
+        self.assertNotIn("tile_dependency_root_barrier", code)
+        for batch in (1, 5, 9):
+            x = torch.arange(batch, device=DEVICE, dtype=torch.float32)
+            output = compiled(x)
+            expected = torch.stack((2 * x + 1, 2 * x + 5))
+            torch.testing.assert_close(output, expected)
+
+    def test_dynamic_nonuniform_tail_counter_replays_exact_key_counts(self) -> None:
+        exemplar = torch.arange(5, device=DEVICE, dtype=torch.float32)
+        bound = dynamic_nonuniform_tail_reduction.bind((exemplar,))
+        config = helion.Config(
+            block_sizes=[],
+            pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
+            num_warps=1,
+        )
+        code = bound.to_code(config)
+        compiled = bound.compile_config(config)
+
+        self.assertIn("tile_dependency_parameterized_state", code)
+        self.assertIn("tl.atomic_add", code)
+        self.assertIn("tl.maximum(0", code)
+        self.assertIn("tl.minimum(3", code)
+        self.assertIn("tl.cast(2, tl.uint64)", code)
+        self.assertNotIn("tile_dependency_root_barrier", code)
+        for batch in (1, 0, 2, 0, 5, 1):
+            x = torch.arange(batch, device=DEVICE, dtype=torch.float32)
+            output = compiled(x)
+            expected = torch.stack((2 * x + 1, x + 2), dim=1)
+            torch.testing.assert_close(output, expected)
+
     def test_dynamic_nested_fixed_fan_in_uses_root_continuation(self) -> None:
         exemplar = torch.arange(5, device=DEVICE, dtype=torch.float32)
         bound = dynamic_nested_fixed_fan_in_chain.bind((exemplar,))
@@ -1214,7 +1312,11 @@ class TestTritonTileDependencyLowering(TestCase):
 
         torch.testing.assert_close(output, a, atol=0, rtol=0)
         self.assertIn("b_desc = tl.make_tensor_descriptor", code)
-        self.assertIn("def tile_dependency_root_0(a, tmp, b_desc):", code)
+        if torch.cuda.get_device_capability(DEVICE)[0] >= 10:
+            # Blackwell tensor-memory allocation must remain kernel-scoped.
+            self.assertNotIn("def tile_dependency_root_0(", code)
+        else:
+            self.assertIn("def tile_dependency_root_0(a, tmp, b_desc):", code)
 
 
 if __name__ == "__main__":

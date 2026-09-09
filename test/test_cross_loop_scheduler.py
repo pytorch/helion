@@ -666,7 +666,7 @@ def _access(
     masked: bool = False,
     tensor_name: str = "tmp",
     storage_offset: int = 0,
-    layout_is_static: bool = True,
+    layout_is_symbolically_exact: bool = True,
     affine_subscript_ranges=None,
 ) -> TileAccess:
     if strides is None:
@@ -699,7 +699,7 @@ def _access(
         has_explicit_mask=masked,
         subscript_is_full_slice=full_slice or tuple(False for _ in block_ids),
         subscript_static_extents=static_extents or (),
-        layout_is_static=layout_is_static,
+        layout_is_symbolically_exact=layout_is_symbolically_exact,
         affine_subscript_ranges=affine_subscript_ranges,
     )
 
@@ -2801,6 +2801,81 @@ class TestCrossLoopScheduler(TestCase):
                 )
                 expected_first_slot += task_count
 
+    def test_parametric_root_major_supports_multiaxis_pid_orders(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, positive=True)
+        root_domains = _identify_root_domains(
+            (
+                CoordinateDomain(
+                    (10, 11),
+                    ((10, batch), (11, 3)),
+                    ((10, 1), (11, 16)),
+                ),
+                CoordinateDomain(
+                    (20, 21, 22),
+                    ((20, 2), (21, batch), (22, 2)),
+                    ((20, 8), (21, 1), (22, 32)),
+                ),
+            )
+        )
+        task_axis_orders = ((11, 10), (21, 22, 20))
+        root_task_orders = tuple(
+            itertools.starmap(
+                pid_task_order,
+                zip(root_domains, task_axis_orders, strict=True),
+            )
+        )
+
+        with _forbid_schedule_enumeration():
+            schedule = (
+                cross_loop_scheduler._build_parametric_root_major_worker_schedule(
+                    root_domains,
+                    root_task_orders,
+                    7,
+                )
+            )
+            geometry = cross_loop_scheduler._parametric_root_major_schedule_geometry(
+                schedule
+            )
+
+        self.assertIsNotNone(geometry)
+        launch_axis, worker_axis, wave_axis = schedule.placement_domain.axis_order
+        for concrete_batch in (1, 2, 9):
+            substitutions = {batch: concrete_batch}
+            actual: list[tuple[int, int, tuple[int, ...]]] = []
+            for segment in schedule.segments:
+                relation = segment.task_order.substitute_parameters(substitutions)
+                for wave in range(relation.source_domain.axis_counts[wave_axis]):
+                    for worker in range(7):
+                        for target in relation.target_coordinates(
+                            {
+                                launch_axis: 1,
+                                worker_axis: worker,
+                                wave_axis: wave,
+                            }
+                        ):
+                            actual.append((wave * 7 + worker, segment.root, target))
+
+            expected: list[tuple[int, int, tuple[int, ...]]] = []
+            slot = 0
+            for root, domain in enumerate(root_domains):
+                concrete_domain = domain.substitute_parameters(substitutions)
+                for task in range(concrete_domain.size):
+                    coordinates = concrete_domain.coordinates(
+                        task,
+                        linearization_order=task_axis_orders[root],
+                    )
+                    expected.append(
+                        (
+                            slot,
+                            root,
+                            tuple(
+                                coordinates[axis] for axis in concrete_domain.axis_order
+                            ),
+                        )
+                    )
+                    slot += 1
+            self.assertEqual(sorted(actual), expected)
+
     def test_parametric_event_frontier_schedule_uses_exact_fan_in_one_counter(
         self,
     ) -> None:
@@ -3098,14 +3173,14 @@ class TestCrossLoopScheduler(TestCase):
                 kind="store",
                 shape=(8192,),
                 block_ids=(10,),
-                layout_is_static=False,
+                layout_is_symbolically_exact=False,
             ),
             _access(
                 root=1,
                 kind="load",
                 shape=(8192,),
                 block_ids=(20,),
-                layout_is_static=False,
+                layout_is_symbolically_exact=False,
             ),
         )
         root_domains = (
@@ -3314,6 +3389,296 @@ class TestCrossLoopScheduler(TestCase):
             self.assertFalse(
                 cross_loop_scheduler._supports_parameterized_fan_in_one_counter(
                     one_producer_counter
+                )
+            )
+
+    def test_parametric_counter_allows_partial_consumer_domain(self) -> None:
+        key_count = sympy.Symbol("key_count", integer=True, nonnegative=True)
+        producer_domain = CoordinateDomain(
+            (10,),
+            ((10, key_count),),
+            kind="site",
+            identity=0,
+        )
+        consumer_domain = CoordinateDomain(
+            (20,),
+            ((20, 2 * key_count),),
+            kind="site",
+            identity=1,
+        )
+        readiness_key_domain = CoordinateDomain(
+            (0,),
+            ((0, key_count),),
+            kind="event",
+            identity=0,
+        )
+        key = coordinate_axis_symbol(0)
+        consumer = coordinate_axis_symbol(20)
+        counter = ReadinessCounterPlan(
+            producers=(
+                ReadinessProducer(
+                    producer_root=0,
+                    producers_by_key=CoordinateRelation.point_map(
+                        readiness_key_domain,
+                        producer_domain,
+                        ((((0, 0, key_count, 1),), (key,)),),
+                    ),
+                ),
+            ),
+            consumers=(
+                ReadinessConsumer(
+                    consumer_root=1,
+                    keys_by_consumer=CoordinateRelation.point_map(
+                        consumer_domain,
+                        readiness_key_domain,
+                        ((((20, 0, key_count, 1),), (consumer,)),),
+                    ),
+                ),
+            ),
+        )
+
+        with _forbid_schedule_enumeration():
+            self.assertFalse(counter.consumers[0].keys_by_consumer.is_total_function())
+            self.assertTrue(
+                cross_loop_scheduler._supports_parameterized_counter(counter)
+            )
+            self.assertFalse(
+                cross_loop_scheduler._supports_parameterized_fan_in_one_counter(counter)
+            )
+
+    def test_parametric_counter_allows_multi_axis_keys(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        key_domain = CoordinateDomain(
+            (0, 1),
+            ((0, batch), (1, 2)),
+            kind="event",
+            identity=0,
+        )
+        producer_domain = CoordinateDomain(
+            (10, 11, 12),
+            ((10, batch), (11, 4), (12, 3)),
+            kind="site",
+            identity=0,
+        )
+        consumer_domain = CoordinateDomain(
+            (20, 21, 22),
+            ((20, batch), (21, 6), (22, 5)),
+            kind="site",
+            identity=1,
+        )
+        key_batch = coordinate_axis_symbol(0)
+        key_group = coordinate_axis_symbol(1)
+        consumer_batch = coordinate_axis_symbol(20)
+        consumer_group = coordinate_axis_symbol(21)
+        counter = ReadinessCounterPlan(
+            producers=(
+                ReadinessProducer(
+                    producer_root=0,
+                    producers_by_key=CoordinateRelation(
+                        source_domain=key_domain,
+                        target_domain=producer_domain,
+                        pieces=(
+                            _CoordinateRelationPiece(
+                                source_bounds_items=(
+                                    (0, 0, batch, 1),
+                                    (1, 0, 2, 1),
+                                ),
+                                target_ranges=(
+                                    (10, key_batch, key_batch + 1, 1),
+                                    (11, 2 * key_group, 2 * key_group + 2, 1),
+                                    (12, sympy.Integer(0), sympy.Integer(3), 1),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            consumers=(
+                ReadinessConsumer(
+                    consumer_root=1,
+                    keys_by_consumer=CoordinateRelation.point_map(
+                        consumer_domain,
+                        key_domain,
+                        (
+                            (
+                                (
+                                    (20, 0, batch, 1),
+                                    (21, 0, 6, 1),
+                                    (22, 0, 5, 1),
+                                ),
+                                (
+                                    consumer_batch,
+                                    sympy.floor(consumer_group / 3),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        with _forbid_schedule_enumeration():
+            self.assertEqual(counter.uniform_arrival_count(), 6)
+            self.assertTrue(
+                cross_loop_scheduler._supports_parameterized_counter(counter)
+            )
+            self.assertFalse(
+                cross_loop_scheduler._supports_parameterized_fan_in_one_counter(counter)
+            )
+
+    def test_parametric_counter_allows_bounded_nonuniform_fan_in(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        key_domain = CoordinateDomain(
+            (0, 1),
+            ((0, batch), (1, 2)),
+            kind="event",
+            identity=0,
+        )
+        producer_domain = CoordinateDomain(
+            (10, 11),
+            ((10, batch), (11, 3)),
+            kind="site",
+            identity=0,
+        )
+        consumer_domain = CoordinateDomain(
+            (20, 21),
+            ((20, batch), (21, 2)),
+            kind="site",
+            identity=1,
+        )
+        key_batch = coordinate_axis_symbol(0)
+        producer_relation = CoordinateRelation(
+            source_domain=key_domain,
+            target_domain=producer_domain,
+            pieces=(
+                _CoordinateRelationPiece(
+                    ((0, 0, batch, 1), (1, 0, 1, 1)),
+                    (
+                        (10, key_batch, key_batch + 1, 1),
+                        (11, sympy.Integer(0), sympy.Integer(2), 1),
+                    ),
+                ),
+                _CoordinateRelationPiece(
+                    ((0, 0, batch, 1), (1, 1, 2, 1)),
+                    (
+                        (10, key_batch, key_batch + 1, 1),
+                        (11, sympy.Integer(2), sympy.Integer(3), 1),
+                    ),
+                ),
+            ),
+        )
+        counter = ReadinessCounterPlan(
+            producers=(
+                ReadinessProducer(
+                    producer_root=0,
+                    producers_by_key=producer_relation,
+                ),
+            ),
+            consumers=(
+                ReadinessConsumer(
+                    consumer_root=1,
+                    keys_by_consumer=CoordinateRelation.point_map(
+                        consumer_domain,
+                        key_domain,
+                        (
+                            (
+                                ((20, 0, batch, 1), (21, 0, 2, 1)),
+                                (
+                                    coordinate_axis_symbol(20),
+                                    coordinate_axis_symbol(21),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        with _forbid_schedule_enumeration():
+            arrival_count = counter.producers[0].arrival_count_by_key
+            self.assertIsNotNone(arrival_count)
+            assert arrival_count is not None
+            self.assertTrue(arrival_count.is_total_function())
+            self.assertIs(arrival_count.canonical_single_valued(), arrival_count)
+            self.assertIsNone(counter.uniform_arrival_count())
+            self.assertEqual(counter.arrival_count_bounds(), (1, 2))
+            self.assertTrue(
+                cross_loop_scheduler._supports_parameterized_counter(counter)
+            )
+            self.assertFalse(
+                cross_loop_scheduler._supports_parameterized_fan_in_one_counter(counter)
+            )
+
+    def test_finalization_rejects_unbounded_dynamic_nested_fan_in(self) -> None:
+        dependency_graph = _dependency_graph(
+            [[10], [20]],
+            _access(root=0, kind="store", shape=(1,), block_ids=(10,)),
+            _access(root=1, kind="load", shape=(1,), block_ids=(20,)),
+        )
+        dependency = dependency_graph.edges[0].access_dependencies[0]
+        (obligation,) = dependency_graph.dependency_obligations(dependency)
+        producer_root = _domain((10, 1, 1))
+        consumer_root = _domain((20, 1, 1))
+        key_domain = _domain((0, 1), kind="event", identity=0)
+        key_count = sympy.Symbol("key_count", integer=True, nonnegative=True)
+        producer_site = CoordinateDomain(
+            (10, 11),
+            ((10, 1), (11, key_count)),
+            kind="site",
+            identity=100,
+        )
+        unbounded = ReadinessCounterPlan(
+            producers=(
+                ReadinessProducer(
+                    producer_root=0,
+                    producers_by_key=CoordinateRelation.total(
+                        key_domain,
+                        producer_site,
+                    ),
+                    producer_site_id=100,
+                ),
+            ),
+            consumers=(
+                ReadinessConsumer(
+                    consumer_root=1,
+                    keys_by_consumer=_full_point_map(
+                        consumer_root,
+                        key_domain,
+                        sympy.Integer(0),
+                    ),
+                    covered_obligations=frozenset((obligation,)),
+                ),
+            ),
+        )
+
+        with _forbid_schedule_enumeration():
+            self.assertTrue(unbounded.parameter_symbols)
+            self.assertIsNone(unbounded.arrival_count_bounds())
+            self.assertFalse(
+                cross_loop_scheduler._has_replay_safe_counter_state(unbounded)
+            )
+            counters, barriers = cross_loop_scheduler._finalize_emitted_synchronization(
+                dependency_graph=dependency_graph,
+                readiness_counters=(unbounded,),
+            )
+
+        self.assertEqual(counters, ())
+        self.assertEqual(barriers, frozenset(((0, 1),)))
+        readiness_graph = _readiness_graph(
+            (producer_root, consumer_root),
+            ReadinessEvent(unbounded.producers, unbounded.consumers),
+        )
+        baseline = _baseline_worker_schedule(
+            readiness_graph.root_domains,
+            worker_count=2,
+        )
+        with _forbid_schedule_enumeration():
+            self.assertTrue(
+                cross_loop_scheduler._schedule_is_progress_safe(
+                    baseline,
+                    readiness_graph,
+                    counters,
+                    barriers,
                 )
             )
 
@@ -5056,14 +5421,14 @@ class TestCrossLoopScheduler(TestCase):
                 allocation_id=1,
                 kind="store",
                 block_ids=(20,),
-                layout_is_static=False,
+                layout_is_symbolically_exact=False,
             ),
             _access(
                 root=2,
                 allocation_id=1,
                 kind="load",
                 block_ids=(30,),
-                layout_is_static=False,
+                layout_is_symbolically_exact=False,
             ),
         )
         root_domains = _identify_root_domains(
@@ -5147,9 +5512,19 @@ class TestCrossLoopScheduler(TestCase):
     ) -> None:
         graph = _dependency_graph(
             [[10], [20], [30]],
-            _access(root=0, kind="store", block_ids=(10,), layout_is_static=False),
+            _access(
+                root=0,
+                kind="store",
+                block_ids=(10,),
+                layout_is_symbolically_exact=False,
+            ),
             _access(root=1, allocation_id=1, kind="store", block_ids=(20,)),
-            _access(root=2, kind="load", block_ids=(30,), layout_is_static=False),
+            _access(
+                root=2,
+                kind="load",
+                block_ids=(30,),
+                layout_is_symbolically_exact=False,
+            ),
             _access(root=2, allocation_id=1, kind="load", block_ids=(30,)),
         )
 
@@ -5620,7 +5995,12 @@ class TestCrossLoopScheduler(TestCase):
     def test_nonstatic_layout_falls_back_to_root_readiness(self) -> None:
         plan = _dependency_graph(
             [[10], [20]],
-            _access(root=0, kind="store", block_ids=(10,), layout_is_static=False),
+            _access(
+                root=0,
+                kind="store",
+                block_ids=(10,),
+                layout_is_symbolically_exact=False,
+            ),
             _access(root=1, kind="load", block_ids=(20,)),
         )
 

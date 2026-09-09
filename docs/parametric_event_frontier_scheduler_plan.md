@@ -6,7 +6,7 @@ This is the end-state plan and implementation ledger for Helion's cross-loop
 scheduler. It incorporates the experiments from FlashMLA, Qwen3 decode, Gemma
 4 A4B MoE, DeepSeek-V3 MoE, Nemotron MoE, and Muse/Glimmer FFN.
 
-Implementation checkpoint (2026-09-08):
+Implementation checkpoint (2026-09-09):
 
 - Concrete schedule ownership is normalized into the existing
   `WorkerScheduleSegment.task_order` relation.
@@ -18,10 +18,14 @@ Implementation checkpoint (2026-09-08):
   `WorkerScheduleSegment` at launch stage zero. Its relation is now the sole
   authority for source ticket order, task count, external readiness frontiers,
   and codegen mapping; resident work occupies launch stage one.
-- The first parameterized-extents vertical slice is implemented for canonical
-  rank-one roots: symbolic domains lower through the same `WorkerSchedule`,
+- Parameterized multi-axis roots now lower through the same `WorkerSchedule`,
   conservative root barriers, and runtime-bounded loops, with one cubin reused
-  across changing extents.
+  across changing extents. PID-axis order remains an exact existing
+  `CoordinateRelation`, not a second schedule representation.
+- `TileAccess` now retains canonical symbolic shape, stride, and storage-offset
+  expressions. Backed shape parameters remain exact; unbacked values and
+  unsupported indirect access relations decline independently without using
+  size hints as correctness facts.
 - Exact parameterized root-entry readiness supports rank-one positional
   fan-in one and a proved fixed-width producer partition whose one consumer
   per key executes as the existing final-arrival continuation. Parameterized
@@ -47,9 +51,122 @@ Implementation checkpoint (2026-09-08):
   topological chain of equal-size canonical rank-one roots joined by those
   exact fan-in-one events. The existing segment relations are the certificate,
   and codegen only strength-reduces a recognized certificate.
-- Ragged or runtime-varying fan-in, unequal non-continuation recurrences,
-  cross-workload rollout, and final source/local-path consolidation remain to
-  be implemented and measured.
+- Exact bounded nonuniform fan-in now lowers through per-key arrival-count
+  expressions and a proved maximum epoch stride. Data-dependent ragged fan-in,
+  masked producer publication, unequal non-continuation recurrences, and the
+  remaining cross-workload rollout still require work.
+
+## Active implementation checklist
+
+This is the ordered handoff list after the 2026-09-09 interruption. Complete
+Priority 1 before resuming scheduler-policy or performance work. A checked box
+means the code exists and its focused unit tests pass; it does not replace the
+cross-workload exit gates below.
+
+### Priority 1: finish the symbolic dependency refactor
+
+- [x] Canonicalize every `TileAccess` shape, stride, and storage-offset value
+  once at construction into a SymPy integer expression, including
+  `sympy.Integer` for constants.
+- [x] Remove the concrete size-hint fallback from dependency `TileAccess`
+  construction. Keep size hints available only to existing tuning paths.
+- [x] Give `layout_is_symbolically_exact` its narrow meaning: the stored
+  layout expressions contain only guarded host-backed parameters. Test that
+  indirect indices and explicit masks leave this flag true but separately
+  make access-relation construction decline.
+- [x] Preserve multi-axis symbolic domains in the existing
+  `CoordinateRelation` and factor exact positional products without
+  enumerating runtime extents.
+- [x] Derive fixed-width producer-set quotients, their converse publication
+  relation, and arrival cardinality from one partition certificate.
+- [x] Preserve and bound nonuniform static tails in ordinary readiness
+  counters rather than widening them or replacing them with a root barrier.
+- [x] Finish and audit nonuniform counter lowering end to end: decode keys
+  using symbolic axis counts, evaluate the per-key arrival expression, use
+  its proved static maximum for epoch framing, and keep continuations limited
+  to uniform exact-once cases.
+- [x] Prove that dependency construction, readiness selection, schedule
+  proof, diagnostics, and codegen all consume the same relation/count facts;
+  remove any duplicate hinted layout, fan-in inference, or CTA-DAG truth.
+- [x] After exact symbolic layouts are wired through, audit every helper,
+  field, and fallback added by the earlier parametric work. Delete or fold any
+  mechanism whose only purpose was to recover information lost by size-hint
+  concretization; retain a compatibility fast path only when it is a proved
+  rendering of the same `CoordinateRelation`, never a second truth.
+- [x] Run focused tests, the full tile-dependency and cross-loop-scheduler
+  suites, formatting/lint checks, and `git diff --check`.
+- [x] Obtain final independent reviewer sign-off on the complete compiler
+  diff. Reviewers must explicitly check the single-source-of-truth invariant,
+  absence of unnecessary abstractions and model cases, symbolic proof
+  soundness, nonuniform-counter replay safety, and cleanup completeness.
+
+Priority 1 exit gate: dynamic layout values are never concretized for
+correctness, ordinary nonuniform counters pass replay/tail tests, unsupported
+indirect or conditional accesses decline conservatively, and the compiler has
+one symbolic dependency representation. The refactor is not complete until
+the cleanup audit and final reviewer sign-off are recorded.
+
+### Priority 2: complete the generic relation coverage
+
+- [x] Bridge exact contiguous symbolic multidimensional and flat layouts for
+  direct affine tiles such as `(B, 8) <-> 8*B` without specializing `B`.
+- [x] Preserve exact index provenance for flattened gathers whose `tile.index`
+  lane width is configuration-selected. The same affine representation now
+  recovers the Qwen 5→6, 6→7, and 7→8 relations.
+- [x] Feed that provenance into the existing linear `CoordinateRelation` and
+  complete the mixed-radix 5→6 and 6→7 proofs without a Qwen-specific rule or
+  compile-time enumeration proportional to a runtime extent.
+- [ ] Support exact nested-consumer and multi-producer join obligations using
+  the existing relation union/composition operations and one emitted-
+  prerequisite view.
+- [ ] Define and prove the safe publication rule for masked or conditional
+  producer bodies. Never count an inactive producer unless every scheduled
+  CTA is independently proved to publish.
+- [x] Keep normalization cost bounded by rank and relation-piece count; add a
+  structural piece budget and conservative fallback for pathological unions
+  or compositions.
+
+### Priority 3: resume the paused validation and performance work
+
+- [ ] Revalidate canonical ragged FlashMLA B4 against matched standalone
+  Helion and ThunderKittens, including cold-L2 latency and aligned Gantt
+  charts; retain Q1/Q2 and random B9 coverage.
+- [x] Revalidate one-cubin B1/B2 behavior and exact readiness-event coverage
+  for Qwen3 decode.
+- [ ] Revalidate one-cubin B1/B2 behavior and performance for Gemma 4 A4B MoE.
+- [x] Revalidate Muse/Glimmer FFN, including its nonuniform 32/16 tail, and
+  preserve the current persistent-over-standalone result.
+- [ ] Audit DeepSeek-V3 MoE and Nemotron MoE for remaining static-factor,
+  nested-wait, and multi-producer relation gaps.
+- [ ] Treat Triton specialization/resource-envelope regressions as a separate
+  body-lowering problem; do not encode them as dependency or scheduler
+  heuristics.
+- [x] Commit only compiler, tests, and this plan. Keep benchmark probes and
+  journals out of the compiler commit.
+
+### 2026-09-09 validation and review closure
+
+- The combined tile-dependency, cross-loop-scheduler, and Triton lowering
+  suite passes: 241 tests, 35 subtests, and one expected skip on GPU 6.
+  Checked-in coverage includes zero-sized replay, moving counter-section
+  offsets, exact bounded nonuniform fan-in, symbolic flattened gathers, and
+  conservative decline for unsupported symbolic layouts and relations.
+- Dynamic Qwen reuses one cubin for B1/B2 and retains exact 5→6, 6→7, and 7→8
+  counters. The latest cold-L2 medians are 157.74 us for B1/S8192 and
+  176.06 us for ragged B2/S2048+S8192.
+- Dynamic Muse/Glimmer retains its exact 32/16 tail counter and one cubin.
+  Measured persistent versus matched standalone latency is 1579.10/1649.60 us
+  at B1 and 3110.08/3244.00 us at B2.
+- The cleanup audit removed size-hint-based dependency proofs and retained
+  only semantic machinery: affine access provenance, positional-product and
+  fixed-width relation proofs, exact allocation sizing, and the existing
+  `WorkerSchedule` lowering. Target-box normalization is an order-independent
+  `CoordinateRelation` operation with bounded work and exact unmerged
+  fallback.
+- Three independent reviews approved symbolic correctness, replay safety,
+  single-source-of-truth ownership, and generality. They found no model names,
+  benchmark shapes, duplicate CTA DAG, host-generated schedule, or second
+  scheduling IR in compiler code.
 
 The hard architectural constraint is:
 
@@ -294,6 +411,121 @@ by existing root and relation IDs.
 `CoordinateDomain.axis_counts_items` currently stores positive concrete
 integers. Reusing schedules across shapes requires these existing objects to
 support integer expressions over Helion's current symbolic shape environment.
+
+### Symbolic memory-layout contract
+
+This is a refinement of the existing `TileAccess`; it is not a replacement
+for it and does not introduce a parallel access representation.
+
+`TileAccess.tensor_shape`, `tensor_strides`, and `storage_offset` retain their
+exact integer expressions whenever those expressions contain only guarded,
+host-backed shape symbols. These fields have one canonical internal spelling:
+every value is a SymPy integer expression and constants are `sympy.Integer`,
+not a mixture of Python `int` and SymPy values. Conversion happens once when
+the access fact is built; proof operations do not repeatedly normalize the
+same value.
+
+The flag is named `layout_is_symbolically_exact` and means only:
+
+> Shape, stride, and storage offset are exact expressions over guarded,
+> host-backed shape parameters.
+
+It does not describe the subscript. An indirect expert lookup, explicit mask,
+or conditional access can have a symbolically exact tensor layout while its
+access-to-allocation relation remains unsupported. Those access properties
+independently cause relation construction to decline. In particular,
+ordinary layouts such as these remain exact:
+
+```text
+shape  = (B, 4096)       stride = (4096, 1)
+shape  = (8*B, 1408)     stride = (1408, 1)
+shape  = (B, 8, 2816)    stride = (22528, 2816, 1)
+```
+
+Unbacked/data-dependent layout symbols and layout expressions whose equality
+cannot be proved remain unknown. An unknown layout may conservatively create a
+dependency edge, but it cannot contribute a fine-grained relation. A size hint
+is permitted to choose or tune a configuration; it must never substitute for
+an extent, stride, offset, alias fact, relation bound, or schedule proof. There
+is no concrete hinted mirror of the symbolic layout inside the dependency
+model.
+
+The exact-dataflow pipeline remains the existing one:
+
+```text
+TileAccess(shape/stride/offset expressions)
+    -> access-to-allocation CoordinateRelation
+    -> producers_by_consumer on TileDependencyGraph edges
+    -> readiness quotient in ReadinessGraph
+    -> selected counters/barriers in StaticPipelinePlan
+    -> ordering in WorkerSchedule
+    -> direct cross_loop_codegen lowering
+```
+
+`TileDependencyGraph` remains the only semantic DAG. The scheduler does not
+reconstruct a CTA DAG. Its finite root/event quotient is a temporary view of
+the already-selected `ReadinessGraph` relations and is discarded after
+ordering; correctness and code generation continue to consume the original
+relations and covered dependency obligations.
+
+### Normalization of one dependency relation
+
+For a dependency from consumer tasks to producer tasks, construct exactly one
+`CoordinateRelation` over symbolic domains. Normalize that relation using a
+small set of exact, composable identities:
+
+1. Factor a Cartesian product `Identity(dynamic_axes) × inner_relation`.
+   The dynamic axes may be renamed or permuted, but their extents and point
+   coordinates must be symbolically equal under the current shape guards.
+2. Extend that rule to exact static-factor reshapes, for example
+   `(B, 8) <-> 8*B` and `assignment -> floor(assignment / 8)`. The factor is a
+   compile-time integer and both domain-size equations must hold exactly.
+3. Recognize affine projections and fixed-width producer-set quotients. A
+   consumer-to-key relation and its producer publication relation are derived
+   together from the same partition certificate.
+4. Preserve fixed inner tails as bounded piecewise relations. For example, a
+   39-tile producer dimension consumed in width-two groups has arrival counts
+   32 for the first 19 keys and 16 for the final key; it must not be widened to
+   32 or collapsed into a root barrier.
+5. Coalesce adjacent exact boxes canonically before deriving the converse and
+   cardinality. Coalescing is semantic normalization, not a scheduling
+   heuristic.
+6. Decline masked, indirect, ragged, or otherwise unsupported relations
+   conservatively. Never infer an unconditional producer publication from a
+   conditional memory store unless every scheduled CTA is separately proved
+   to publish the corresponding readiness event.
+
+The normalization result is still a `CoordinateRelation`; there is no new
+normalized-relation class. Converse, per-key arrival count, totality,
+publication, waiting, continuation selection, and diagnostics all consume
+that same relation. In particular, ordinary parameterized counters may use an
+exact nonuniform `arrival_count_by_key`; final-arrival continuations retain
+their stricter uniform/exact-once requirements.
+
+Parameterized nonuniform counter lowering follows that relation exactly:
+
+- decode readiness keys with symbolic `CoordinateDomain` axis counts;
+- evaluate the exact per-key `arrival_count_by_key` expression for each wait;
+- prove a positive static lower bound and a static maximum across all keys;
+- use that maximum as the replay-safe epoch stride;
+- initialize a key for the current epoch with the existing atomic-max step;
+- publish one arrival per proved producer and wait for that key's exact target;
+  and
+- decline if the lower bound, maximum, publication relation, or key decoding
+  cannot be proved without runtime-domain enumeration.
+
+The epoch stride is allocation/replay framing, not the wait target. Thus a
+width-two tail may use stride 32 while ordinary keys wait for 32 and the final
+key waits for 16. A final-arrival continuation remains eligible only when its
+fan-in is uniform and its existing exact-once consumer bijection is proved.
+
+Normalization work is bounded by relation structure. It may inspect and
+coalesce relation pieces and axes, but must never enumerate runtime extents,
+readiness keys, workers, or CTAs. Because union/composition can multiply piece
+counts, every normalization has an explicit structural piece budget and
+declines to a conservative barrier before pathological growth. The intended
+cost is linear or near-linear in the admitted IR size, not in `B`, `Q`, token
+count, or sequence length.
 
 ### Domain changes
 

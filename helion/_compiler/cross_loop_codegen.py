@@ -337,8 +337,12 @@ def _effective_l2_group_size(
     first_axis, second_axis = axis_order[:2]
     first_count = axis_counts[first_axis]
     second_count = axis_counts[second_axis]
-    if not isinstance(first_count, int) or not isinstance(second_count, int):
+    if not isinstance(first_count, int | sympy.Integer) or not isinstance(
+        second_count, int | sympy.Integer
+    ):
         return None
+    first_count = int(first_count)
+    second_count = int(second_count)
     if second_count == 1 or case.group_size >= first_count:
         return None
     return case.group_size
@@ -359,9 +363,8 @@ def _root_task_orders(
         zip(root_domains, case_geometries, strict=True)
     ):
         pid_axis_order, axis_counts, block_sizes = geometry
-        if domain.parameter_symbols and (
-            len(pid_axis_order) != 1
-            or isinstance(owner.cases[root], L2GroupingProgramIDs)
+        if domain.parameter_symbols and isinstance(
+            owner.cases[root], L2GroupingProgramIDs
         ):
             return None
         if (
@@ -734,6 +737,10 @@ def emit_cross_loop_schedule(
             and device_function.config.get("num_sm_multiplier", 1) == 1
         ),
     )
+    all_readiness_counter_plans = static_pipeline_plan.readiness_counters
+    parameterized_readiness_counters = any(
+        plan.parameter_symbols for plan in all_readiness_counter_plans
+    )
     parameterized_root_major_geometry = _parametric_root_major_schedule_geometry(
         static_pipeline_plan.worker_schedule
     )
@@ -763,7 +770,6 @@ def emit_cross_loop_schedule(
     ):
         raise AssertionError("parameterized lowering received an unproved counter plan")
     root_barrier_edges = static_pipeline_plan.root_barrier_edges
-    all_readiness_counter_plans = static_pipeline_plan.readiness_counters
     if parameterized_event_frontier_geometry is not None:
         expected_root_order = _parametric_event_frontier_root_order(
             root_task_orders,
@@ -895,18 +901,20 @@ def emit_cross_loop_schedule(
         )
     readiness_counter_offsets: dict[ReadinessCounterPlan, int | sympy.Expr] = {}
     readiness_counter_count: int | sympy.Expr = 0
-    parameterized_uniform_fan_ins = tuple(
-        plan.uniform_arrival_count() for plan in all_readiness_counter_plans
+    parameterized_fan_in_bounds = tuple(
+        plan.arrival_count_bounds() for plan in all_readiness_counter_plans
     )
-    uses_epoch_framed_readiness = parameterized_root_domains and bool(
-        parameterized_uniform_fan_ins
+    uses_epoch_framed_readiness = bool(parameterized_fan_in_bounds) and (
+        parameterized_root_domains or parameterized_readiness_counters
     )
     if uses_epoch_framed_readiness and any(
-        fan_in is None for fan_in in parameterized_uniform_fan_ins
+        bounds is None for bounds in parameterized_fan_in_bounds
     ):
-        raise AssertionError("parameterized readiness requires uniform fan-in")
+        raise AssertionError("parameterized readiness requires bounded fan-in")
     parameterized_readiness_epoch_stride = (
-        max(cast("int", fan_in) for fan_in in parameterized_uniform_fan_ins)
+        max(
+            cast("tuple[int, int]", bounds)[1] for bounds in parameterized_fan_in_bounds
+        )
         if uses_epoch_framed_readiness
         else 0
     )
@@ -1616,7 +1624,7 @@ def emit_cross_loop_schedule(
         readiness_key_coordinates = flat_task_coordinates(
             readiness_key,
             plan.readiness_key_domain.axis_order,
-            plan.readiness_key_domain.axis_counts,
+            plan.readiness_key_domain.axis_count_expressions,
         )
         expressions: list[str] = []
         for readiness_producer in plan.producers:
@@ -1694,7 +1702,7 @@ def emit_cross_loop_schedule(
             readiness_key_coordinates = flat_task_coordinates(
                 readiness_key,
                 plan.readiness_key_domain.axis_order,
-                plan.readiness_key_domain.axis_counts,
+                plan.readiness_key_domain.axis_count_expressions,
             )
             consumer_coordinates, _membership = relation_point_coordinates(
                 converse_consumer,
