@@ -52,6 +52,8 @@ if TYPE_CHECKING:
     from ..tile_strategy import TileStrategy
     from .attention_plan import AttentionScorePlan
 
+    SymIntLike = torch.SymInt | int
+
     InductorOpOverrides = OpsHandler[Any]
 
 
@@ -2364,6 +2366,7 @@ class CuteBackend(Backend):
         from ..host_function import HostFunction
         from ..tile_strategy import PerThreadFlattenedTileStrategy
         from ..tile_strategy import PerThreadNDTileStrategy
+        from ..variable_origin import GridOrigin
 
         env = CompileEnvironment.current()
         device_ir = HostFunction.current().device_ir
@@ -2382,6 +2385,16 @@ class CuteBackend(Backend):
         )
         has_dynamic_shape = any(env.block_sizes[i].size is None for i in block_ids)
         grid_ids = {bid for ids in device_ir.grid_block_ids for bid in ids}
+        scalar_noncanonical_grid = (
+            len(block_ids) == 1
+            and block_ids in device_ir.grid_block_ids
+            and block_ids[0] in device_ir.noncanonical_task_origin_block_ids
+            and any(
+                type(origin.origin) is GridOrigin
+                and origin.origin.block_id == block_ids[0]
+                for origin in HostFunction.current().expr_to_origin.values()
+            )
+        )
         num_threads_config = [
             int(env.config_spec.num_threads.config_get(config.num_threads, block_id, 0))
             for block_id in block_ids
@@ -2452,7 +2465,8 @@ class CuteBackend(Backend):
                 if num_threads_config[i] == 0 and block_id not in grid_ids:
                     num_threads_config[i] = 1
         if (
-            has_device_loops
+            scalar_noncanonical_grid
+            or has_device_loops
             or has_dynamic_shape
             or len(device_ir.grid_block_ids) != 1
             or (len(block_ids) > 1 and not flattened)
@@ -2467,7 +2481,16 @@ class CuteBackend(Backend):
                     return known_equal(lhs, rhs)
                 return bool(lhs == rhs)
 
-            nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
+            nd_block_size: list[SymIntLike] = [
+                bs.from_config_assert(config) for bs in block_size_infos
+            ]
+            if scalar_noncanonical_grid:
+                # A scalar grid has one logical operation per program.  Its
+                # configured "block size" is the range step, not a tile width;
+                # treating it as a thread extent can create synthetic lanes and
+                # execute the loop body more than once per grid trip.
+                nd_block_size = [1]
+                num_threads_config = [1]
             original_num_threads_config = list(num_threads_config)
             mma_candidate = _is_mma_candidate_loop(
                 fn,
