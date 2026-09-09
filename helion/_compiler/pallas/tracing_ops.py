@@ -4218,6 +4218,184 @@ def _codegen_dynamic_unroll(state: CodegenState) -> object:
     return [expr_from_string(f"{result_var}[{i}]") for i in range(len(carried))]
 
 
+class _AdvanceLoopIndex(ast.NodeTransformer):
+    """Rewrite reads of one loop index to refer to its next iteration."""
+
+    def __init__(self, loop_var: str) -> None:
+        self.loop_var = loop_var
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        if node.id != self.loop_var or not isinstance(node.ctx, ast.Load):
+            return node
+        return ast.copy_location(
+            ast.BinOp(
+                left=ast.Name(id=self.loop_var, ctx=ast.Load()),
+                op=ast.Add(),
+                right=ast.Constant(value=1),
+            ),
+            node,
+        )
+
+
+def _clone_statements(statements: list[ast.stmt]) -> list[ast.stmt]:
+    """Clone generated statements without retaining compiler-only AST metadata."""
+    return [statement_from_string(ast.unparse(statement)) for statement in statements]
+
+
+def _is_view_expression(expression: ast.expr, aliases: set[str]) -> bool:
+    """Whether an expression only derives a view/index from an existing alias."""
+    from ..ast_read_writes import ReadWrites
+
+    reads = set(ReadWrites.from_ast(expression).reads)
+    if not reads.intersection(aliases):
+        return False
+    if isinstance(expression, (ast.Name, ast.Attribute, ast.Subscript)):
+        return True
+    if isinstance(expression, ast.Call) and isinstance(expression.func, ast.Attribute):
+        return expression.func.attr in {"reshape", "transpose", "permute", "squeeze"}
+    return False
+
+
+def _last_buffer_use(inner_body: list[ast.AST], scratch_name: str) -> int | None:
+    """Find the last use of a DMA buffer, following generated view aliases."""
+    from ..ast_read_writes import ReadWrites
+
+    aliases = {scratch_name}
+    last_use: int | None = None
+    for index, statement in enumerate(inner_body):
+        effects = ReadWrites.from_ast(statement)
+        if set(effects.reads).intersection(aliases):
+            last_use = index
+        if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
+            continue
+        target = statement.targets[0]
+        if isinstance(target, ast.Name) and _is_view_expression(
+            statement.value, aliases
+        ):
+            aliases.add(target.id)
+    return last_use
+
+
+def _hoist_nested_fori_prefetch(
+    state: CodegenState,
+    *,
+    prime_statements: list[ast.stmt],
+    load_primes: list[tuple[str, list[ast.stmt]]],
+    inner_loop_vars: list[str],
+    inner_body: list[ast.AST],
+) -> bool:
+    """Carry a double-buffered inner-loop prefetch across outer iterations.
+
+    A nested panel loop normally primes buffer zero at the start of every outer
+    iteration.  When its address is derived only from the enclosing loop index,
+    buffer zero can instead be refilled for outer iteration ``i + 1`` after its
+    last use by iteration ``i``.  This overlaps the next outer tile's first HBM
+    transfer with the current tile's remaining compute.
+    """
+    if not prime_statements or not load_primes or len(inner_loop_vars) != 1:
+        return False
+
+    from ..ast_read_writes import ReadWrites
+    from ..tile_strategy import ForiLoopState
+
+    enclosing_loops = {
+        id(loop): loop
+        for loops in state.codegen.active_device_loops.values()
+        for loop in loops
+        if isinstance(loop, ForiLoopState)
+    }
+    if len(enclosing_loops) != 1:
+        return False
+    (enclosing_loop,) = enclosing_loops.values()
+    if enclosing_loop.iteration_count is None:
+        return False
+
+    outer_body = state.codegen.statements_stack[-1]
+    prime_rw = ReadWrites.from_list(prime_statements)
+    if set(prime_rw.reads).intersection(inner_loop_vars):
+        return False
+
+    # Find the latest statement that defines an address input, then recover the
+    # straight-line assignment slice needed to compute that address for i + 1.
+    insertion_index = 0
+    for index, statement in enumerate(outer_body):
+        effects = ReadWrites.from_ast(statement)
+        if (set(effects.writes) | set(effects.inplace_writes)).intersection(
+            prime_rw.reads
+        ):
+            insertion_index = index + 1
+
+    needed = set(prime_rw.reads) - set(prime_rw.writes)
+    dependencies: list[ast.stmt] = []
+    for statement in reversed(outer_body[:insertion_index]):
+        effects = ReadWrites.from_ast(statement)
+        writes = set(effects.writes) | set(effects.inplace_writes)
+        if not writes.intersection(needed):
+            continue
+        if not isinstance(statement, ast.Assign):
+            return False
+        dependencies.extend(_clone_statements([statement]))
+        needed = (needed - writes) | set(effects.reads)
+    dependencies.reverse()
+    if enclosing_loop.loop_var_name not in needed:
+        return False
+
+    setup, *prime_starts = prime_statements
+    if not isinstance(setup, ast.Assign) or len(setup.targets) != 1:
+        return False
+    iteration_count_target = setup.targets[0]
+    if not isinstance(iteration_count_target, ast.Name):
+        return False
+    inner_iteration_count = iteration_count_target.id
+
+    def guarded(
+        condition: str, name_hint: str, statements: list[ast.stmt]
+    ) -> ast.FunctionDef:
+        fn_name = state.device_function.new_var(name_hint)
+        fn_def = statement_from_string(
+            f"@pl.when({condition})\ndef {fn_name}():\n    pass"
+        )
+        assert isinstance(fn_def, ast.FunctionDef)
+        fn_def.body = statements or [ast.Pass()]
+        return fn_def
+
+    inner_loop_var = inner_loop_vars[0]
+    refill_iteration = f"(({inner_iteration_count} - 1) // 2) * 2"
+    condition = (
+        f"({inner_loop_var} == {refill_iteration}) & "
+        f"(({enclosing_loop.loop_var_name} + 1) < {enclosing_loop.iteration_count})"
+    )
+
+    # Start each next-outer transfer immediately after this iteration's final
+    # read of the buffer it will refill. Group transfers that share a last-use
+    # point so their address calculations are emitted only once.
+    starts_by_last_use: dict[int, list[ast.stmt]] = {}
+    for scratch_name, starts in load_primes:
+        last_use = _last_buffer_use(inner_body, scratch_name)
+        if last_use is None:
+            return False
+        starts_by_last_use.setdefault(last_use, []).extend(starts)
+
+    # Only the first outer iteration needs an explicit prime. Every later prime
+    # is issued by the preceding inner loop after buffer zero's final use.
+    first_prime = guarded(
+        f"{enclosing_loop.loop_var_name} == 0",
+        "_prime_first_outer_loads",
+        prime_starts,
+    )
+    outer_body[insertion_index:insertion_index] = [setup, first_prime]
+
+    advance = _AdvanceLoopIndex(enclosing_loop.loop_var_name)
+    for last_use, starts in sorted(starts_by_last_use.items(), reverse=True):
+        next_starts = _clone_statements([*dependencies, *starts])
+        next_starts = [advance.visit(statement) for statement in next_starts]
+        inner_body.insert(
+            last_use + 1,
+            guarded(condition, "_prefetch_next_outer_loads", next_starts),
+        )
+    return True
+
+
 def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> object:
     """Emit inner device loops using jax.lax.fori_loop.
 
@@ -4575,6 +4753,7 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
         block_id_to_info=block_id_to_info,
         body_fn_name="_fori_body_0",
         loop_var_name=loop_vars[-1],
+        iteration_count=grid_parts[0] if len(grid_parts) == 1 else None,
         static_unroll=static_unroll,
         inner_statements=body_stmts,
         _tensor_to_dma_scratch=tensor_to_dma_scratch,
@@ -4912,6 +5091,7 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
         return _pl_when(state, condition, name_hint, statements)
 
     prime_statements: list[ast.stmt] = []
+    load_primes: list[tuple[str, list[ast.stmt]]] = []
     body_prefetch: ast.FunctionDef | None = None
     body_current_stage_waits: list[ast.stmt] = []
     if prefetched_loads:
@@ -4924,9 +5104,9 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
         prime_indices[-1] = "0"
         prime_starts: list[ast.stmt] = []
         for transfer in prefetched_loads:
-            prime_starts.extend(
-                _dma_transfer_statements(transfer, prime_indices, "0", ("start",))
-            )
+            starts = _dma_transfer_statements(transfer, prime_indices, "0", ("start",))
+            prime_starts.extend(starts)
+            load_primes.append((transfer.resources.scratch, starts))
         prime_statements.append(
             _guarded_statements(
                 f"{num_iterations} > 0", "_prime_fori_loads", prime_starts
@@ -5047,6 +5227,16 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
             return _read_final_loop_state(state, result_vars)
         return None
 
+    primes_hoisted = False
+    if not static_unroll:
+        primes_hoisted = _hoist_nested_fori_prefetch(
+            state,
+            prime_statements=prime_statements,
+            load_primes=load_primes,
+            inner_loop_vars=loop_vars,
+            inner_body=body_stmts,
+        )
+
     for dim in reversed(range(len(loop_vars))):
         fn_name = state.device_function.new_var(f"_fori_body_{dim}")
         fn_def = statement_from_string(f"def {fn_name}({loop_vars[dim]}, _): pass")
@@ -5055,7 +5245,9 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
         fori_call = statement_from_string(
             f"jax.lax.fori_loop(0, {grid_parts[dim]}, {fn_name}, None)"
         )
-        call_prefix = prime_statements if dim == len(loop_vars) - 1 else []
+        call_prefix = (
+            prime_statements if dim == len(loop_vars) - 1 and not primes_hoisted else []
+        )
         if dim == 0:
             # Outermost: emit function def and fori_loop call into the kernel
             state.add_statement(fn_def)
