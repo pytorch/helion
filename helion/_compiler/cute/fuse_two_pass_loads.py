@@ -45,16 +45,39 @@ import ast
 import re
 
 from ..ast_extension import statement_from_string
+from ..ast_read_writes import ReadWrites
+
+_PERSISTENT_BRANCH_VEC_LOAD = "_helion_persistent_branch_vec_load"
+_PERSISTENT_BRANCH_VEC_STORE = "_helion_persistent_branch_vec_store"
+
+
+def _unwrap_persistent_branch_vec_load(node: ast.AST) -> ast.AST:
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == _PERSISTENT_BRANCH_VEC_LOAD
+        and len(node.args) == 6
+    ):
+        return node.args[5]
+    return node
 
 
 def _range_bounds(node: ast.AST) -> tuple[ast.expr, ast.expr, ast.expr] | None:
-    """Extract ``(start, end, step)`` from a Call to ``range(...)``.
+    """Extract ``(start, end, step)`` from a supported range call.
 
-    Returns None if the iter is not a 1-, 2-, or 3-arg ``range`` call.
+    Synthetic lanes can use either Python ``range`` or CuTe's compile-time
+    ``cutlass.range_constexpr``.
     """
     if not isinstance(node, ast.Call):
         return None
-    if not (isinstance(node.func, ast.Name) and node.func.id == "range"):
+    is_range = isinstance(node.func, ast.Name) and node.func.id == "range"
+    is_constexpr_range = (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr == "range_constexpr"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "cutlass"
+    )
+    if not (is_range or is_constexpr_range):
         return None
     args = node.args
     if not args:
@@ -149,6 +172,7 @@ def _load_kind(
 
     Returns None when ``node`` doesn't look like a gmem load we can fuse.
     """
+    node = _unwrap_persistent_branch_vec_load(node)
     if _looks_like_tracked_load(node) is not None:
         return "masked"
     # A cache-hinted SCALAR load also routes through ``cute.arch.load``
@@ -293,6 +317,7 @@ def _scalar_load_ptr_text(node: ast.AST) -> str | None:
 def _normalized_load_text(node: ast.AST) -> str:
     """Unparse with cache hints stripped and the two scalar load forms
     collapsed onto one spelling (see ``_scalar_load_ptr_text``)."""
+    node = _unwrap_persistent_branch_vec_load(node)
     ptr = _scalar_load_ptr_text(node)
     if ptr is not None:
         return f"__scalar_load__({ptr})"
@@ -338,6 +363,180 @@ def _unmasked_load_tensor_dtype(
     return None
 
 
+def _is_store_call(node: ast.Call) -> bool:
+    """Whether this is a generated memory write."""
+    func = node.func
+    is_store = (
+        isinstance(func, ast.Attribute) and func.attr in ("store", "__setitem__")
+    ) or (
+        isinstance(func, ast.Name)
+        and (
+            func.id.startswith("_cute_store_")
+            or func.id == _PERSISTENT_BRANCH_VEC_STORE
+        )
+    )
+    is_atomic = (
+        isinstance(func, ast.Attribute) and func.attr.startswith("atomic_")
+    ) or (isinstance(func, ast.Name) and func.id.startswith("_cute_atomic_"))
+    return is_store or is_atomic
+
+
+def _contains_arch_attribute(node: ast.AST) -> bool:
+    return any(
+        isinstance(child, ast.Attribute) and child.attr == "arch"
+        for child in ast.walk(node)
+    )
+
+
+def _tensor_arg_roots(
+    node: ast.AST,
+    tensor_names: set[str],
+) -> frozenset[str] | None:
+    """Return kernel tensor arguments whose storage an expression addresses.
+
+    ``None`` means the address cannot be resolved to named tensor arguments and
+    must conservatively alias every tracked load.
+    """
+    roots: set[str] = set()
+    unresolved_iterator = False
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Attribute) or child.attr != "iterator":
+            continue
+        if isinstance(child.value, ast.Name) and child.value.id in tensor_names:
+            roots.add(child.value.id)
+        else:
+            unresolved_iterator = True
+    if unresolved_iterator:
+        return None
+    if isinstance(node, ast.Name) and node.id in tensor_names:
+        roots.add(node.id)
+    return frozenset(roots) if roots else None
+
+
+def _store_tensor_roots(
+    node: ast.Call,
+    tensor_names: set[str],
+) -> frozenset[str] | None:
+    """Resolve the destination tensor arguments of a generated write."""
+    func = node.func
+    pointer: ast.AST | None = None
+    if (
+        isinstance(func, ast.Name)
+        and func.id == _PERSISTENT_BRANCH_VEC_STORE
+        and len(node.args) == 6
+    ):
+        pointer = node.args[3]
+    elif isinstance(func, ast.Name) and func.id.startswith(
+        ("_cute_store_", "_cute_atomic_")
+    ):
+        pointer = node.args[0] if node.args else None
+    elif isinstance(func, ast.Attribute):
+        if func.attr.startswith("atomic_"):
+            pointer = node.args[0] if node.args else None
+        elif func.attr == "store":
+            # ``cute.arch.store(ptr, value, ...)`` is a free function, while
+            # ``ptr.store(value)`` carries its destination on ``func.value``.
+            pointer = (
+                node.args[0]
+                if node.args and _contains_arch_attribute(func.value)
+                else func.value
+            )
+        elif func.attr == "__setitem__":
+            pointer = func.value
+    return _tensor_arg_roots(pointer, tensor_names) if pointer is not None else None
+
+
+def _tensor_roots_may_alias(
+    left: frozenset[str] | None,
+    right: frozenset[str] | None,
+    proven_disjoint_tensor_pairs: set[frozenset[str]],
+) -> bool:
+    if left is None or right is None:
+        return True
+    return any(
+        left_name == right_name
+        or frozenset((left_name, right_name)) not in proven_disjoint_tensor_pairs
+        for left_name in left
+        for right_name in right
+    )
+
+
+class _LexicalMemoryOrder(ast.NodeVisitor):
+    """Track assignments and stores in generated source execution order."""
+
+    def __init__(
+        self,
+        body: list[ast.stmt],
+        tensor_names: set[str],
+        proven_disjoint_tensor_pairs: set[frozenset[str]],
+    ) -> None:
+        super().__init__()
+        self._position = 0
+        self._tensor_names = tensor_names
+        self._proven_disjoint_tensor_pairs = proven_disjoint_tensor_pairs
+        self.assignment_positions: dict[int, int] = {}
+        self.stores: list[tuple[int, frozenset[str] | None]] = []
+        for stmt in body:
+            self.visit(stmt)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.assignment_positions[id(node)] = self._position
+        self._position += 1
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if _is_store_call(node):
+            self.stores.append(
+                (
+                    self._position,
+                    _store_tensor_roots(node, self._tensor_names),
+                )
+            )
+            self._position += 1
+        self.generic_visit(node)
+
+    def _may_alias(
+        self,
+        store_roots: frozenset[str] | None,
+        load_roots: frozenset[str] | None,
+    ) -> bool:
+        return _tensor_roots_may_alias(
+            store_roots,
+            load_roots,
+            self._proven_disjoint_tensor_pairs,
+        )
+
+    def has_aliasing_store_between(
+        self,
+        producer: ast.Assign,
+        consumer: ast.Assign,
+        load_roots: frozenset[str] | None,
+    ) -> bool:
+        producer_pos = self.assignment_positions.get(id(producer))
+        consumer_pos = self.assignment_positions.get(id(consumer))
+        if producer_pos is None or consumer_pos is None or consumer_pos <= producer_pos:
+            return True
+        return any(
+            producer_pos < store_pos < consumer_pos
+            and self._may_alias(store_roots, load_roots)
+            for store_pos, store_roots in self.stores
+        )
+
+    def has_aliasing_store_in(
+        self,
+        node: ast.AST,
+        load_roots: frozenset[str] | None,
+    ) -> bool:
+        return any(
+            isinstance(child, ast.Call)
+            and _is_store_call(child)
+            and self._may_alias(
+                _store_tensor_roots(child, self._tensor_names), load_roots
+            )
+            for child in ast.walk(node)
+        )
+
+
 def _rewrite_vec_extract(
     node: ast.AST,
     hoist_var: str,
@@ -380,7 +579,11 @@ def _rewrite_vec_extract(
     ast.fix_missing_locations(node)
 
 
-def _canonical_load_text(node: ast.AST, lane_var_alias: dict[str, str]) -> str:
+def _canonical_load_text(
+    node: ast.AST,
+    lane_var_alias: dict[str, str],
+    definitions: dict[str, ast.expr] | None = None,
+) -> str:
     """Stringify a load node with lane-base / hoist variables canonicalised.
 
     The strategy creates fresh variable names for each sweep
@@ -390,6 +593,30 @@ def _canonical_load_text(node: ast.AST, lane_var_alias: dict[str, str]) -> str:
     textual form modulo the rename — otherwise identical loads compare
     unequal and fusion bails.
     """
+    if definitions:
+
+        class _InlineDefinitions(ast.NodeTransformer):
+            def __init__(self) -> None:
+                super().__init__()
+                self.expanding: set[str] = set()
+
+            def visit_Name(self, node: ast.Name) -> ast.AST:
+                if not isinstance(node.ctx, ast.Load):
+                    return node
+                value = definitions.get(node.id)
+                if value is None or node.id in self.expanding:
+                    return node
+                self.expanding.add(node.id)
+                replacement = self.visit(
+                    ast.parse(ast.unparse(value), mode="eval").body
+                )
+                self.expanding.remove(node.id)
+                return ast.copy_location(replacement, node)
+
+        node = _InlineDefinitions().visit(
+            ast.parse(ast.unparse(node), mode="eval").body
+        )
+
     # Per-load-site eviction hints differ between sweeps and must not
     # defeat matching (see _node_text).
     text = _normalized_load_text(node)
@@ -409,14 +636,21 @@ class _CuteFuseTwoPassLoads:
         thread_block_dims: tuple[int, int, int] = (1, 1, 1),
         tensor_dtypes: dict[str, str] | None = None,
         reload_modes: dict[int, str] | None = None,
+        proven_disjoint_tensor_pairs: set[frozenset[str]] | None = None,
+        proven_tensor_stride_values: dict[tuple[str, int], int] | None = None,
     ) -> None:
         super().__init__()
         self._counter = 0
         self._constexpr_values = constexpr_values or {}
-        # Autotuner-selected reload mode per rolled-reduction block id
-        # ("auto" / "register" / "gmem").  Sweep loops are matched back to
-        # their block id via the ``roffset_<id>`` loop offset variable.
+        # Autotuner-selected reload mode per rolled or persistent reduction
+        # block id ("auto" / "register" / "gmem").  Sweep loops are matched
+        # back to their block id through their generated lane/offset variable.
         self._reload_modes = reload_modes or {}
+        self._proven_disjoint_tensor_pairs = proven_disjoint_tensor_pairs or set()
+        self._proven_tensor_stride_values = proven_tensor_stride_values or {}
+        # Recursive matches append declarations here so allocations can be
+        # emitted once at kernel scope, never inside a dynamic branch.
+        self._root_declarations: list[ast.stmt] = []
         # Kernel tensor-arg name -> backend dtype string (e.g.
         # "cutlass.Float32"); resolves the cache dtype for unmasked
         # scalar loads.
@@ -433,10 +667,147 @@ class _CuteFuseTwoPassLoads:
         self._thread_block_dims = dims
         self._thread_count = dims[0] * dims[1] * dims[2]
 
+    def _canonical_aliases(self, local: dict[str, str]) -> dict[str, str]:
+        """Resolve aliases proved by explicit copy assignments."""
+        aliases = dict(local)
+
+        def resolve(name: str) -> str:
+            seen: set[str] = set()
+            while name in aliases and name not in seen:
+                seen.add(name)
+                replacement = aliases[name]
+                if replacement == name:
+                    break
+                name = replacement
+            return name
+
+        return {name: resolve(name) for name in aliases}
+
+    @staticmethod
+    def _pure_definitions_before(
+        statements: list[ast.stmt],
+        stop: int,
+        inherited: dict[str, ast.expr] | None = None,
+    ) -> dict[str, ast.expr]:
+        """Collect dominating, side-effect-free scalar definitions."""
+        definitions = dict(inherited or {})
+        for stmt in statements[:stop]:
+            for name in ReadWrites.from_ast(stmt).writes:
+                definitions.pop(name, None)
+            if (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+            ):
+                target = stmt.targets[0].id
+                has_memory_access = any(
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in ("load", "store")
+                    for node in ast.walk(stmt.value)
+                )
+                if not has_memory_access:
+                    definitions[target] = stmt.value
+        return definitions
+
+    @staticmethod
+    def _reduction_block_id(loop: ast.For) -> int | None:
+        if not isinstance(loop.target, ast.Name):
+            return None
+        match = re.match(
+            r"(?:roffset|synthetic_lane|reduction_lane)_(\d+)",
+            loop.target.id,
+        )
+        return int(match.group(1)) if match is not None else None
+
     def _new_cache_name(self) -> str:
         name = f"_fuse_cache_{self._counter}"
         self._counter += 1
         return name
+
+    def _consumer_store_preserves_snapshot(
+        self,
+        loop: ast.For,
+        container: list[ast.stmt],
+        load_index: int,
+        load_stmt: ast.Assign,
+        load_roots: frozenset[str] | None,
+    ) -> bool:
+        """Whether a consume sweep may read a pre-populated register cache.
+
+        An in-place consume loop is not automatically a cache barrier. Once
+        the producer sweep has populated every cache slot, a later exact
+        per-lane read/modify/write may safely read that snapshot when each
+        iteration's store is proved unable to affect another iteration's
+        logical load. This is the same injectivity proof used when splitting
+        persistent reductions in the first place.
+        """
+        from .persistent_branch_vec import _definition_snapshots
+        from .persistent_branch_vec import _lane_accesses_are_iteration_independent
+        from .persistent_branch_vec import _memory_load_calls
+
+        if (
+            load_roots is None
+            or not isinstance(loop.target, ast.Name)
+            or container is not loop.body
+        ):
+            return False
+        bounds = _range_bounds(loop.iter)
+        if bounds is None:
+            return False
+        lane_extent = _trip_count_for(*bounds, self._constexpr_values)
+        if lane_extent is None:
+            return False
+        load_calls = _memory_load_calls(load_stmt.value)
+        if len(load_calls) != 1:
+            return False
+        load_call = load_calls[0]
+
+        snapshots = _definition_snapshots(container)
+        definitely_written: set[str] = set()
+        live_in: set[str] = set()
+        may_writes: set[str] = set()
+        for statement in container:
+            effects = ReadWrites.from_ast(statement)
+            live_in.update(set(effects.reads) - definitely_written - {loop.target.id})
+            may_writes.update(effects.writes)
+            if isinstance(statement, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                definitely_written.update(effects.writes)
+        loop_carried_names = live_in & may_writes
+
+        saw_aliasing_store = False
+        tensor_names = set(self._tensor_dtypes)
+        for statement_index, statement in enumerate(container):
+            for store_call in (
+                child
+                for child in ast.walk(statement)
+                if isinstance(child, ast.Call) and _is_store_call(child)
+            ):
+                store_roots = _store_tensor_roots(store_call, tensor_names)
+                if not _tensor_roots_may_alias(
+                    store_roots,
+                    load_roots,
+                    self._proven_disjoint_tensor_pairs,
+                ):
+                    continue
+                saw_aliasing_store = True
+                if statement_index <= load_index:
+                    return False
+                unstable_names = set(loop_carried_names)
+                for crossed in container[load_index + 1 : statement_index + 1]:
+                    unstable_names.update(ReadWrites.from_ast(crossed).writes)
+                if not _lane_accesses_are_iteration_independent(
+                    load_call,
+                    store_call,
+                    lane_var=loop.target.id,
+                    lane_extent=lane_extent,
+                    load_definitions=snapshots[load_index],
+                    store_definitions=snapshots[statement_index],
+                    proven_tensor_stride_values=self._proven_tensor_stride_values,
+                    loop_carried_names=unstable_names,
+                ):
+                    return False
+        return saw_aliasing_store
 
     def _resolve_load_container(
         self,
@@ -581,6 +952,7 @@ class _CuteFuseTwoPassLoads:
         CONST`` branch.  For unmasked / vec loads, derive from the pointer
         or vec-type expression.
         """
+        node = _unwrap_persistent_branch_vec_load(node)
         if kind == "masked":
             assert isinstance(node, ast.IfExp)
             return _dtype_from_default(node.orelse)
@@ -615,37 +987,39 @@ class _CuteFuseTwoPassLoads:
             return None
         return None
 
-    def _try_fuse(self, body: list[ast.stmt]) -> list[ast.stmt] | None:
+    def _try_fuse(
+        self, body: list[ast.stmt], *, allow_smem: bool = True
+    ) -> list[ast.stmt] | None:
         # Find top-level ``for offset in range(...)`` loops with matching
         # target and range signature -- they don't need to be adjacent in
         # the body. Two-pass reduction kernels typically have
         # post-reduction statements between the two loops.
-        loop_indices: list[int] = []
-        for i, stmt in enumerate(body):
-            if isinstance(stmt, ast.For) and not stmt.orelse:
-                loop_indices.append(i)
-        if len(loop_indices) < 2:
+        loops = [stmt for stmt in body if isinstance(stmt, ast.For) and not stmt.orelse]
+        if len(loops) < 2:
             return None
 
         # Group loops by (target, range) signature -- preserve order.
-        groups_by_key: dict[tuple[str, str], list[int]] = {}
-        for li in loop_indices:
-            stmt = body[li]
-            assert isinstance(stmt, ast.For)
-            if not isinstance(stmt.target, ast.Name):
+        groups_by_key: dict[tuple[str, str], list[ast.For]] = {}
+        for loop in loops:
+            if not isinstance(loop.target, ast.Name):
                 continue
-            key = (stmt.target.id, _node_text(stmt.iter))
-            groups_by_key.setdefault(key, []).append(li)
-        groups: list[list[int]] = [g for g in groups_by_key.values() if len(g) >= 2]
+            key = (loop.target.id, _node_text(loop.iter))
+            groups_by_key.setdefault(key, []).append(loop)
+        # Also process every later suffix.  A value may first be loaded in
+        # sweep two and reused in sweep three; after the full group caches
+        # sweep-one loads, its [1:] suffix handles that later-origin value.
+        groups = [
+            group[start:]
+            for group in groups_by_key.values()
+            for start in range(len(group) - 1)
+        ]
 
         any_fused = False
         new_body = list(body)
         for group in groups:
             if len(group) < 2:
                 continue
-            first_idx = group[0]
-            first_loop = new_body[first_idx]
-            assert isinstance(first_loop, ast.For)
+            first_loop = group[0]
             range_args = _range_bounds(first_loop.iter)
             if range_args is None:
                 continue
@@ -668,21 +1042,45 @@ class _CuteFuseTwoPassLoads:
                 continue
             first_container, first_cache_index, first_cache_size = first_ctx
             cache_size = first_cache_size
+            first_loop_index = new_body.index(first_loop)
+            first_scope_definitions = self._pure_definitions_before(
+                new_body, first_loop_index
+            )
 
             # Gather ALL subsequent sweeps in the group that share the
             # first sweep's container shape.  Multi-pass kernels (e.g.
             # 3-pass softmax: max sweep, sum sweep, normalize sweep)
             # re-load the same values in every later sweep, so each one
             # should read the cache instead.
-            sweeps: list[tuple[int, list[ast.stmt], str, dict[str, str]]] = []
-            for body_idx in group[1:]:
-                loop_k = new_body[body_idx]
-                assert isinstance(loop_k, ast.For)
+            sweeps: list[
+                tuple[
+                    int,
+                    ast.For,
+                    list[ast.stmt],
+                    str,
+                    dict[str, str],
+                    dict[str, ast.expr],
+                ]
+            ] = []
+            for loop_k in group[1:]:
                 ctx_k = self._resolve_load_container(loop_k, start, step, trip)
                 if ctx_k is None or ctx_k[2] != cache_size:
                     continue
-                alias_k = self._build_second_alias(first_loop, loop_k)
-                sweeps.append((body_idx, ctx_k[0], ctx_k[1], alias_k))
+                body_idx = new_body.index(loop_k)
+                alias_k = self._canonical_aliases(
+                    self._build_second_alias(first_loop, loop_k)
+                )
+                scope_definitions = self._pure_definitions_before(new_body, body_idx)
+                sweeps.append(
+                    (
+                        body_idx,
+                        loop_k,
+                        ctx_k[0],
+                        ctx_k[1],
+                        alias_k,
+                        scope_definitions,
+                    )
+                )
             if not sweeps:
                 continue
             # Default policy: register-backed cache only when
@@ -716,20 +1114,15 @@ class _CuteFuseTwoPassLoads:
             # raw slot count understates the register cost by V.
             _vec_m = re.search(r"VectorType\.get\(\[(\d+)\]", ast.unparse(first_loop))
             cache_elems = cache_size * (int(_vec_m.group(1)) if _vec_m else 1)
-            # Rolled-reduction sweeps use ``roffset_<block_id>`` offset
-            # vars; tile-loop sweeps use ``tile_offset_<n>``.  Only the
-            # former have a reload-mode knob.
-            _bid_m = (
-                re.match(r"roffset_(\d+)", first_loop.target.id)
-                if isinstance(first_loop.target, ast.Name)
-                else None
-            )
-            is_reduction_sweep = _bid_m is not None
+            # Both rolled and persistent reduction sweeps have a reload-mode
+            # knob; tile loops retain the automatic policy.
+            block_id = self._reduction_block_id(first_loop)
+            is_reduction_sweep = block_id is not None
             _fuser_mode = os.environ.get("HELION_FUSER_MODE")
             if _fuser_mode is None:
                 _fuser_mode = (
-                    self._reload_modes.get(int(_bid_m.group(1)), "auto")
-                    if _bid_m is not None
+                    self._reload_modes.get(block_id, "auto")
+                    if block_id is not None
                     else "auto"
                 )
                 # The config knob spells "never fuse" as ``"gmem"``
@@ -743,6 +1136,8 @@ class _CuteFuseTwoPassLoads:
                 if cache_elems > 1024:
                     continue
             elif _fuser_mode == "smem":
+                if not allow_smem:
+                    continue
                 use_smem = True
                 if cache_elems > 1024:
                     continue
@@ -764,6 +1159,9 @@ class _CuteFuseTwoPassLoads:
             # vec element type.  Scalar (masked / unmasked) loads cache as
             # the existing fast path.
             tracked: dict[str, tuple[int, str, str, str | None, int | None]] = {}
+            tracked_statements: dict[str, ast.Assign] = {}
+            tracked_tensor_roots: dict[str, frozenset[str] | None] = {}
+            first_keys: dict[int, str] = {}
             for j, s in enumerate(first_container):
                 if (
                     isinstance(s, ast.Assign)
@@ -787,20 +1185,59 @@ class _CuteFuseTwoPassLoads:
                     v_width = _vec_width(s.value) if kind == "vec" else 1
                     if kind == "vec" and v_width is None:
                         continue
-                    tracked[_node_text(s.value)] = (
+                    first_definitions = self._pure_definitions_before(
+                        first_container, j, first_scope_definitions
+                    )
+                    key = _canonical_load_text(s.value, {}, first_definitions)
+                    tracked[key] = (
                         j,
                         s.targets[0].id,
                         kind,
                         dtype,
                         v_width,
                     )
+                    tracked_statements[key] = s
+                    first_keys[id(s)] = key
+                    tracked_tensor_roots[key] = _tensor_arg_roots(
+                        s.value, set(self._tensor_dtypes)
+                    )
             if not tracked:
                 continue
 
             # Match loads in each subsequent sweep's container.
+            # ``auto`` is a profitability policy, not an instruction to keep
+            # reduction values live as far as correctness permits.  A disjoint
+            # write is still a useful phase boundary: crossing it can extend
+            # several per-lane fragments through unrelated reductions and put
+            # a high-thread-count CTA on a much longer dependency chain.  Let
+            # explicit register/smem choices opt into that tradeoff.  Preserve
+            # the historical tile-loop policy, whose much shorter live ranges
+            # are not selected through this reduction-reload knob.
+            disjoint_pairs = (
+                self._proven_disjoint_tensor_pairs
+                if not is_reduction_sweep or _fuser_mode in ("register", "smem")
+                else set()
+            )
+            memory_order = _LexicalMemoryOrder(
+                new_body,
+                set(self._tensor_dtypes),
+                disjoint_pairs,
+            )
+            proven_memory_order = _LexicalMemoryOrder(
+                new_body,
+                set(self._tensor_dtypes),
+                self._proven_disjoint_tensor_pairs,
+            )
             per_sweep_matches: list[list[tuple[int, str, str]]] = []
             matched_keys: set[str] = set()
-            for _body_idx, container_k, _cache_index_k, alias_k in sweeps:
+            for (
+                _body_idx,
+                loop_k,
+                container_k,
+                _cache_index_k,
+                alias_k,
+                scope_definitions,
+            ) in sweeps:
                 matches: list[tuple[int, str, str]] = []
                 for j, s in enumerate(container_k):
                     if (
@@ -813,8 +1250,59 @@ class _CuteFuseTwoPassLoads:
                             continue
                         # Canonicalise this sweep's load text against the
                         # first sweep's variable names before keying.
-                        key = _canonical_load_text(s.value, alias_k)
-                        if key in tracked:
+                        definitions_at_load = self._pure_definitions_before(
+                            container_k, j, scope_definitions
+                        )
+                        key = _canonical_load_text(
+                            s.value, alias_k, definitions_at_load
+                        )
+                        producer = tracked_statements.get(key)
+                        load_roots = tracked_tensor_roots.get(key)
+                        consumer_has_aliasing_store = (
+                            memory_order.has_aliasing_store_in(loop_k, load_roots)
+                        )
+                        snapshot_safe = (
+                            _fuser_mode == "register"
+                            and consumer_has_aliasing_store
+                            and self._consumer_store_preserves_snapshot(
+                                loop_k,
+                                container_k,
+                                j,
+                                s,
+                                load_roots,
+                            )
+                        )
+                        crosses_phase_boundary = (
+                            memory_order.has_aliasing_store_between(
+                                producer,
+                                s,
+                                load_roots,
+                            )
+                            if producer is not None
+                            else True
+                        )
+                        # An explicit register policy may retain an exact
+                        # in-place snapshot through the short writeback
+                        # epilogue. Keep ``auto`` conservative: this tradeoff
+                        # saves bandwidth but extends the fragment live range,
+                        # which can regress small launches through pressure.
+                        if snapshot_safe and crosses_phase_boundary:
+                            crosses_phase_boundary = (
+                                producer is None
+                                or proven_memory_order.has_aliasing_store_between(
+                                    producer,
+                                    s,
+                                    load_roots,
+                                )
+                            )
+                        if (
+                            producer is not None
+                            and not memory_order.has_aliasing_store_in(
+                                first_loop, load_roots
+                            )
+                            and (not consumer_has_aliasing_store or snapshot_safe)
+                            and not crosses_phase_boundary
+                        ):
                             matches.append((j, s.targets[0].id, key))
                             matched_keys.add(key)
                 per_sweep_matches.append(matches)
@@ -924,7 +1412,9 @@ class _CuteFuseTwoPassLoads:
                 ):
                     if _load_kind(s.value, self._tensor_dtypes) is None:
                         continue
-                    key = _node_text(s.value)
+                    key = first_keys.get(id(s))
+                    if key is None:
+                        continue
                     entry = cache_names.get(key)
                     if entry is None:
                         continue
@@ -950,16 +1440,22 @@ class _CuteFuseTwoPassLoads:
             # extracts inside the nested constexpr V-loop are rewritten
             # to read from the cache at the appropriate slot expression.
             smem_barrier_positions: list[int] = []
-            for (body_idx, container_k, cache_index_k, alias_k), matches in zip(
-                sweeps, per_sweep_matches, strict=True
-            ):
+            for (
+                body_idx,
+                _loop_k,
+                container_k,
+                cache_index_k,
+                _alias_k,
+                _scope_definitions,
+            ), matches in zip(sweeps, per_sweep_matches, strict=True):
                 if not matches:
                     continue
                 vec_extract_rewrites: list[
                     tuple[str, str, str, int, bool, int, str]
                 ] = []
                 new_sweep_body: list[ast.stmt] = []
-                for s in container_k:
+                matched_by_index = {j: key for j, _name, key in matches}
+                for statement_index, s in enumerate(container_k):
                     if (
                         isinstance(s, ast.Assign)
                         and len(s.targets) == 1
@@ -967,7 +1463,10 @@ class _CuteFuseTwoPassLoads:
                     ):
                         kind = _load_kind(s.value, self._tensor_dtypes)
                         if kind is not None:
-                            key = _canonical_load_text(s.value, alias_k)
+                            key = matched_by_index.get(statement_index)
+                            if key is None:
+                                new_sweep_body.append(s)
+                                continue
                             entry = cache_names.get(key)
                             if entry is not None:
                                 cache, vec_w = entry
@@ -1033,16 +1532,48 @@ class _CuteFuseTwoPassLoads:
                         statement_from_string("cute.arch.sync_threads()"),
                     )
 
-            # Insert cache declarations before the first loop, in
-            # original order (so ``alloc_smem`` precedes
-            # ``make_tensor``).
-            for offset, decl in enumerate(cache_decls):
-                new_body.insert(first_idx + offset, decl)
+            # Declarations are inserted by ``transform`` at kernel scope.
+            # This remains valid when the matching sweeps live below a
+            # dynamic branch, where CuTe forbids local-memory allocation.
+            self._root_declarations.extend(cache_decls)
             any_fused = True
 
         if not any_fused:
             return None
         return new_body
+
+    def _transform_body(
+        self,
+        body: list[ast.stmt],
+        *,
+        under_dynamic_branch: bool,
+    ) -> list[ast.stmt]:
+        """Recursively transform statement-list fields before siblings."""
+        transformed = list(body)
+        for stmt in transformed:
+            child_under_branch = under_dynamic_branch or isinstance(stmt, ast.If)
+            for field in ("body", "orelse", "finalbody"):
+                child = getattr(stmt, field, None)
+                if isinstance(child, list) and all(
+                    isinstance(child_stmt, ast.stmt) for child_stmt in child
+                ):
+                    setattr(
+                        stmt,
+                        field,
+                        self._transform_body(
+                            child,
+                            under_dynamic_branch=child_under_branch,
+                        ),
+                    )
+        fused = self._try_fuse(
+            transformed,
+            allow_smem=not under_dynamic_branch,
+        )
+        return transformed if fused is None else fused
+
+    def transform(self, body: list[ast.stmt]) -> list[ast.stmt]:
+        transformed = self._transform_body(body, under_dynamic_branch=False)
+        return [*self._root_declarations, *transformed]
 
 
 def fuse_two_pass_loads(
@@ -1052,6 +1583,8 @@ def fuse_two_pass_loads(
     thread_block_dims: tuple[int, int, int] = (1, 1, 1),
     tensor_dtypes: dict[str, str] | None = None,
     reload_modes: dict[int, str] | None = None,
+    proven_disjoint_tensor_pairs: set[frozenset[str]] | None = None,
+    proven_tensor_stride_values: dict[tuple[str, int], int] | None = None,
 ) -> list[ast.stmt]:
     """Apply two-pass load fusion to a list of statements (the device kernel
     body). Returns the (possibly modified) body.
@@ -1067,6 +1600,14 @@ def fuse_two_pass_loads(
     path so kernels with 2-D / 3-D thread blocks (layernorm,
     block-pointer softmax) don't have rows clobber each other's slots.
 
+    ``proven_disjoint_tensor_pairs`` contains only argument-name pairs whose
+    allocations cannot overlap.  Distinct argument names are otherwise
+    conservatively treated as aliases across every store or atomic write.
+
+    ``proven_tensor_stride_values`` supplies cache-keyed exact strides for the
+    injectivity proof used by an in-place consume sweep. Without that proof,
+    a store to the loaded tensor remains a hard cache barrier.
+
     Safe to call on any kernel body — only rewrites when a strict pattern
     match succeeds.
     """
@@ -1075,8 +1616,7 @@ def fuse_two_pass_loads(
         thread_block_dims=thread_block_dims,
         tensor_dtypes=tensor_dtypes,
         reload_modes=reload_modes,
+        proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
+        proven_tensor_stride_values=proven_tensor_stride_values,
     )
-    new_body = transformer._try_fuse(body)
-    if new_body is None:
-        return body
-    return new_body
+    return transformer.transform(body)

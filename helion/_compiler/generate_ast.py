@@ -379,6 +379,73 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self._clear_attention_flash_state()
         raise exc.BackendUnsupported("cute", "flash attention failed late validation")
 
+    def _try_codegen_single_token_rank1_root(self) -> bool:
+        plan = self.device_function.cute_state.single_token_rank1_plan
+        if plan is None:
+            return False
+        from .cute.single_token_rank1_recurrence import (
+            codegen_single_token_rank1_recurrence,
+        )
+
+        if codegen_single_token_rank1_recurrence(self):
+            return True
+        self.device_function.cute_state.single_token_rank1_plan = None
+        raise exc.BackendUnsupported(
+            "cute", "single-token rank-1 recurrence failed late validation"
+        )
+
+    def _try_codegen_split_single_token_rank1_root(self) -> bool:
+        plan = self.device_function.cute_state.split_single_token_rank1_plan
+        if plan is None:
+            return False
+        from .cute.split_single_token_rank1_recurrence import (
+            codegen_split_single_token_rank1_recurrence,
+        )
+
+        if codegen_split_single_token_rank1_recurrence(self, plan):
+            return True
+        self.device_function.cute_state.split_single_token_rank1_plan = None
+        raise exc.BackendUnsupported(
+            "cute", "split single-token rank-1 recurrence failed late validation"
+        )
+
+    def _try_codegen_fixed_token_rank1_root(self) -> bool:
+        plan = self.device_function.cute_state.fixed_token_rank1_plan
+        if plan is None:
+            return False
+        from .cute.fixed_token_rank1_recurrence import (
+            codegen_fixed_token_rank1_recurrence,
+        )
+
+        if codegen_fixed_token_rank1_recurrence(self):
+            return True
+        self.device_function.cute_state.fixed_token_rank1_plan = None
+        raise exc.BackendUnsupported(
+            "cute", "fixed-token rank-1 recurrence failed late validation"
+        )
+
+    def _try_codegen_chunk_prepare_root(self) -> bool:
+        plan = self.device_function.cute_state.chunk_prepare_plan
+        if plan is None:
+            return False
+        from .cute.chunk_prepare import codegen_chunk_prepare
+
+        if codegen_chunk_prepare(self):
+            return True
+        self.device_function.cute_state.chunk_prepare_plan = None
+        raise exc.BackendUnsupported("cute", "chunk prepare failed late validation")
+
+    def _try_codegen_chunk_recurrence_root(self) -> bool:
+        plan = self.device_function.cute_state.chunk_recurrence_plan
+        if plan is None:
+            return False
+        from .cute.chunk_recurrence import codegen_chunk_recurrence
+
+        if codegen_chunk_recurrence(self):
+            return True
+        self.device_function.cute_state.chunk_recurrence_plan = None
+        raise exc.BackendUnsupported("cute", "chunk recurrence failed late validation")
+
     def add_statement(self, stmt: ast.AST | str | None) -> None:
         if stmt is None:
             return
@@ -1134,8 +1201,19 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         )
 
                         codegen_fn(state)
+                    if isinstance(self.current_grid_state, DeviceGridState):
+                        self.current_grid_state.hoist_parent_statements = (
+                            self.statements_stack[-1]
+                        )
                     root = root_graph_info.graph
-                    if not self._try_codegen_attention_flash_root():
+                    if (
+                        not self._try_codegen_chunk_prepare_root()
+                        and not self._try_codegen_chunk_recurrence_root()
+                        and not self._try_codegen_single_token_rank1_root()
+                        and not self._try_codegen_split_single_token_rank1_root()
+                        and not self._try_codegen_fixed_token_rank1_root()
+                        and not self._try_codegen_attention_flash_root()
+                    ):
                         grid_state = self.current_grid_state
                         if isinstance(grid_state, DeviceGridState):
                             # Codegen the body first so synthetic free-``hl.arange``
@@ -1232,7 +1310,20 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         )
                     )
                     self.device_function.body = split_lane_loop_reductions(
-                        list(self.device_function.body)
+                        list(self.device_function.body),
+                        uniform_names={
+                            *(
+                                argument.name
+                                for argument in self.device_function.arguments
+                            ),
+                            *self._extra_params,
+                        },
+                        proven_disjoint_tensor_pairs=(
+                            self.device_function.proven_disjoint_tensor_pairs()
+                        ),
+                        proven_tensor_stride_values=(
+                            self.device_function.proven_tensor_stride_values()
+                        ),
                     )
                     # Safety net: revert any lane-reduce marker that neither pass
                     # rewrote so no ``_helion_lane_reduce`` call leaks into the
@@ -1245,7 +1336,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     # lane-invariant rescale / chunk-entry stores / final combine
                     # hoisted to run once per chunk (gdn_fwd_h).
                     self.device_function.body = hoist_lane_invariant_chunk_recurrence(
-                        list(self.device_function.body)
+                        list(self.device_function.body),
+                        rename_groups={
+                            name: aliases[0]
+                            for name, aliases in self.device_function._variable_renames.items()
+                        },
+                        running_sums=self.device_function.cute_matmul_running_sums,
                     )
                 self.device_function.dead_code_elimination()
                 if not self.device_function.preamble and not self.device_function.body:
@@ -1447,17 +1543,7 @@ def generate_ast(
             load_transform=load_transform,
             extra_params=extra_params,
         )
-        fast_math_cm: contextlib.AbstractContextManager[None] = contextlib.nullcontext()
-        if env.backend_name == "cute" and env.settings.fast_math:
-            # Route the global ``fast_math`` setting into the inductor
-            # CuteDSL op overrides: every cute.math call in this codegen
-            # gets ``fastmath=True``.
-            from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import (
-                use_cutedsl_fast_math,
-            )
-
-            fast_math_cm = use_cutedsl_fast_math(True)
-        with codegen.device_function, fast_math_cm:
+        with codegen.device_function:
             CompileEnvironment.current().backend.pre_codegen(
                 graphs=codegen.codegen_graphs,
                 config=config,
@@ -1539,7 +1625,14 @@ def generate_ast(
             )
             final_host_statements = rng_statements + codegen.host_statements
             shape_bake_safe_wrapper_only = codegen.cute_wrapper_plans and all(
-                plan.get("kind") in {"helion_small_biased_attention", "helion_flash"}
+                plan.get("kind")
+                in {
+                    "helion_small_biased_attention",
+                    "helion_flash",
+                    "chunk_prepare_tma",
+                    "chunk_recurrence_sm100",
+                    "chunk_recurrence_warp_dv4",
+                }
                 for plan in codegen.cute_wrapper_plans
             )
             if codegen.cute_uses_matmul and not shape_bake_safe_wrapper_only:
@@ -1585,8 +1678,22 @@ def generate_ast(
                         "d_name",
                         "q_name",
                         "k_name",
+                        "g_name",
+                        "beta_name",
+                        "a_log_name",
+                        "dt_name",
+                        "cu_seqlens_name",
+                        "cu_chunks_name",
+                        "chunk_to_seq_name",
+                        "kd_name",
+                        "qd_name",
+                        "ak_name",
+                        "aq_name",
+                        "gt_name",
                         "v_name",
                         "o_name",
+                        "out_name",
+                        "state_name",
                         "lse_name",
                         "bias_name",
                         "alibi_name",
@@ -1596,6 +1703,7 @@ def generate_ast(
                         "k_sizes_name",
                         "direct_pointers_name",
                         "direct_strides_name",
+                        "scale_name",
                     ):
                         if key in resolved:
                             arg_name = str(resolved.pop(key))

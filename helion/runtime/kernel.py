@@ -356,6 +356,133 @@ class _SpecializationAlias:
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class _PreparedMetadataSpecializationExtractor:
+    """Specialization already implied by ``_make_prepared_arg_guard``."""
+
+    extractor: Callable[[Sequence[object]], Hashable]
+
+    def __call__(self, args: Sequence[object]) -> Hashable:
+        return self.extractor(args)
+
+
+@dataclasses.dataclass(frozen=True)
+class _RuntimeInputSpecializationExtractor:
+    """Runtime classifier together with its source projections."""
+
+    source_extractors: tuple[Callable[[Sequence[object]], Hashable], ...]
+    classifier: Callable[[Sequence[object]], Hashable]
+    reusable_tensor_properties: frozenset[str]
+    specialization_key: str | None = None
+
+    def source_values(self, args: Sequence[object]) -> tuple[object, ...]:
+        return tuple(extract(args) for extract in self.source_extractors)
+
+    def __call__(self, args: Sequence[object]) -> Hashable:
+        return self.classifier(self.source_values(args))
+
+
+def _partition_prepared_extra_guards(
+    args: tuple[object, ...],
+    extra_guards: tuple[tuple[Callable[[Sequence[object]], Hashable], Hashable], ...],
+) -> tuple[
+    Callable[[tuple[object, ...]], bool] | None,
+    tuple[tuple[Callable[[Sequence[object]], Hashable], Hashable], ...],
+    tuple[tuple[Callable[[Sequence[object]], Hashable], Hashable], ...],
+]:
+    """Split guards into always-check and exact-tensor reusable projections.
+
+    Tensor shape/stride/dtype/device facts are already checked by the prepared
+    argument guard.  A runtime classifier may additionally opt in to reuse
+    when its exact source tensors still have the same pointer/storage facts.
+    Classifiers that depend on tensor contents (or arbitrary Python state)
+    remain in the always-check set.
+    """
+    always_check: list[tuple[Callable[[Sequence[object]], Hashable], Hashable]] = []
+    reusable: list[tuple[Callable[[Sequence[object]], Hashable], Hashable]] = []
+    # One source projection is enough for duplicate tensor objects: the
+    # prepared argument guard independently preserves the input alias topology.
+    tensor_entries: dict[
+        int,
+        tuple[
+            Callable[[Sequence[object]], Hashable],
+            torch.Tensor,
+            set[str],
+        ],
+    ] = {}
+    for extractor, expected in extra_guards:
+        if isinstance(extractor, _PreparedMetadataSpecializationExtractor):
+            continue
+        if (
+            not isinstance(extractor, _RuntimeInputSpecializationExtractor)
+            or not extractor.reusable_tensor_properties
+            or not extractor.reusable_tensor_properties <= {"data_ptr", "storage_span"}
+        ):
+            always_check.append((extractor, expected))
+            continue
+        try:
+            source_values = extractor.source_values(args)
+        except Exception:
+            always_check.append((extractor, expected))
+            continue
+        if not source_values or any(
+            type(value) not in (torch.Tensor, torch.nn.Parameter)
+            for value in source_values
+        ):
+            always_check.append((extractor, expected))
+            continue
+        reusable.append((extractor, expected))
+        for source_extractor, value in zip(
+            extractor.source_extractors, source_values, strict=True
+        ):
+            assert isinstance(value, torch.Tensor)
+            entry = tensor_entries.get(id(value))
+            if entry is None:
+                tensor_entries[id(value)] = (
+                    source_extractor,
+                    value,
+                    set(extractor.reusable_tensor_properties),
+                )
+            else:
+                entry[2].update(extractor.reusable_tensor_properties)
+
+    if not reusable:
+        return None, tuple(always_check), ()
+
+    namespace: dict[str, object] = {}
+    checks: list[str] = []
+    try:
+        for index, (extractor, tensor, properties) in enumerate(
+            tensor_entries.values()
+        ):
+            namespace[f"extract_{index}"] = extractor
+            namespace[f"ref_{index}"] = weakref.ref(tensor)
+            value_name = f"value_{index}"
+            item_checks = [
+                f"(({value_name} := extract_{index}(args)) is ref_{index}())"
+            ]
+            if "data_ptr" in properties:
+                namespace[f"data_ptr_{index}"] = int(tensor.data_ptr())
+                item_checks.append(f"{value_name}.data_ptr() == data_ptr_{index}")
+            if "storage_span" in properties:
+                storage = tensor.untyped_storage()
+                namespace[f"storage_ptr_{index}"] = int(storage.data_ptr())
+                namespace[f"storage_nbytes_{index}"] = storage.nbytes()
+                storage_name = f"storage_{index}"
+                item_checks.extend(
+                    (
+                        f"(({storage_name} := {value_name}.untyped_storage()).data_ptr() == storage_ptr_{index})",
+                        f"{storage_name}.nbytes() == storage_nbytes_{index}",
+                    )
+                )
+            checks.append(f"({' and '.join(item_checks)})")
+        reuse_guard = eval(f"lambda args: {' and '.join(checks)}", namespace)
+    except Exception:
+        always_check.extend(reusable)
+        return None, tuple(always_check), ()
+    return reuse_guard, tuple(always_check), tuple(reusable)
+
+
 def _make_prepared_arg_guard(
     kernel: Kernel,
     args: tuple[object, ...],
@@ -483,6 +610,10 @@ class _PreparedCall:
         "_extra_guards",
         "_is_distributed",
         "_matches_args",
+        "_reset_generation",
+        "_reusable_extra_guards",
+        "_specialization_generation",
+        "_tensor_storage_reuse_guard",
         "bound",
     )
 
@@ -500,7 +631,13 @@ class _PreparedCall:
         self._matches_args = _make_prepared_arg_guard(bound.kernel, args)
         self._dist_initialized = dist_initialized
         self._is_distributed = is_distributed
-        self._extra_guards = extra_guards
+        (
+            self._tensor_storage_reuse_guard,
+            self._extra_guards,
+            self._reusable_extra_guards,
+        ) = _partition_prepared_extra_guards(args, extra_guards)
+        self._specialization_generation = bound.kernel._specialization_generation
+        self._reset_generation = bound.kernel._reset_generation
         self.bound = bound
 
     @classmethod
@@ -538,7 +675,11 @@ class _PreparedCall:
 
     def matches(self, kernel: Kernel, args: tuple[object, ...]) -> bool:
         try:
-            if not self._matches_args(args):
+            if (
+                self._reset_generation != kernel._reset_generation
+                or self._specialization_generation != kernel._specialization_generation
+                or not self._matches_args(args)
+            ):
                 return False
             dist_initialized = dist.is_initialized()
             # ``kernel_uses_symm_mem`` and declared distributed intent are both
@@ -555,7 +696,16 @@ class _PreparedCall:
             for extractor, expected in self._extra_guards:
                 if extractor(args) != expected:
                     return False
-            return True
+            if self._tensor_storage_reuse_guard is None or not (
+                self._tensor_storage_reuse_guard(args)
+            ):
+                for extractor, expected in self._reusable_extra_guards:
+                    if extractor(args) != expected:
+                        return False
+            return (
+                self._reset_generation == kernel._reset_generation
+                and self._specialization_generation == kernel._specialization_generation
+            )
         except Exception:
             # Guard evaluation is an optional fast path. Falling through lets
             # the normal dispatch machinery preserve its own error semantics.
@@ -862,6 +1012,7 @@ class Kernel(Generic[_R]):
         signature: tuple[Hashable, ...],
         *,
         extra_fns: list[Callable[[Sequence[object]], Hashable]] | None = None,
+        snapshot_runtime_results: bool = False,
     ) -> BoundKernelInMemoryCacheKey:
         from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
 
@@ -928,6 +1079,11 @@ class Kernel(Generic[_R]):
                     and self._compiler_seed_specialize_extra.get(signature)
                     is active_compiler_seed_fns
                 ):
+                    if snapshot_runtime_results:
+                        bound_kernel._record_runtime_input_specialization_results(
+                            active_extra_fns,
+                            extra_results,
+                        )
                     return cache_key
 
     def _extend_bound_kernel_specializations(
@@ -1022,7 +1178,24 @@ class Kernel(Generic[_R]):
                 if cached_bound._base_spec_key == signature:
                     self._dispatch_cache.pop(fast_key)
             self._prepared_call = None
-            self._bound_kernels[updated_cache_key] = bound_kernel
+            if bound_kernel._record_runtime_input_specialization_results(
+                updated_extractors,
+                current_results,
+            ):
+                self._bound_kernels[updated_cache_key] = bound_kernel
+            else:
+                # A BoundKernel's generated programs may already consume its
+                # construction-time storage facts.  If those facts changed
+                # while a late specialization was discovered, do not migrate
+                # the existing programs to the new cache identity.  Retire the
+                # bound through the same generation check used by reset(); a
+                # later call will bind and compile against the extended schema.
+                bound_kernel._reset_generation = self._reset_generation - 1
+                bound_kernel._direct_prepared_call = None
+                bound_kernel._run = None
+                bound_kernel._config = None
+                bound_kernel._compile_cache.clear()
+                bound_kernel._cache_path_map.clear()
             return True
 
     def _compute_is_distributed(
@@ -1325,7 +1498,17 @@ class Kernel(Generic[_R]):
                         args,
                         signature,
                         extra_fns=extra_fns,
+                        snapshot_runtime_results=(
+                            signature == bound_kernel._base_spec_key
+                        ),
                     )
+                elif signature == bound_kernel._base_spec_key:
+                    published_extra_fns = self._specialize_extra.get(signature)
+                    if published_extra_fns is not None:
+                        bound_kernel._record_runtime_input_specialization_results(
+                            published_extra_fns,
+                            cache_key.extra_results,
+                        )
                 self._bound_kernels[cache_key] = bound_kernel
             return bound_kernel
 
@@ -1949,6 +2132,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         self._reset_generation = kernel._reset_generation
         # Extending this bound's schema evicts all of its dispatch mappings.
         self._dispatch_generation: int | None = None
+        # ``Kernel.__call__`` owns a shared prepared fast path, but callers may
+        # also retain and invoke a BoundKernel directly (benchmark harnesses do
+        # this deliberately). Keep the latest validated direct-call guard here.
+        self._direct_prepared_call: _PreparedCall | None = None
         self._cache_managed = cache_managed
         if is_distributed is None:
             dist_initialized = dist.is_initialized()
@@ -2072,6 +2259,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                         self.env,
                         self.host_function.device_ir,
                     )
+                    if not self._cache_managed:
+                        self.env.snapshot_runtime_input_specialization_results(
+                            runtime_args
+                        )
                 self._compiler_seed_specialization_extractors = (
                     _compiler_seed_specialization_extractors(
                         compiler_seed_specialization_facts(
@@ -2793,7 +2984,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         extracted_strides: set[TensorPropertySource] = set()
         for v in sorted(self.env.specialized_vars, key=lambda v: v.name):
             source = self.env.shape_env.var_to_sources[v][0]
-            extractors.append(make_extractor(source))
+            extractor = make_extractor(source)
+            if isinstance(source, TensorPropertySource):
+                extractor = _PreparedMetadataSpecializationExtractor(extractor)
+            extractors.append(extractor)
             if (
                 isinstance(source, TensorPropertySource)
                 and source.prop == TensorProperty.STRIDE
@@ -2803,7 +2997,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         for source in sorted(self.env.specialized_strides, key=repr):
             if source in extracted_strides:
                 continue
-            extractors.append(make_extractor(source))
+            extractors.append(
+                _PreparedMetadataSpecializationExtractor(make_extractor(source))
+            )
         implicit_config = self._fixed_config_for_td_layout_guards()
         for source, guard in sorted(
             self.env.tensor_descriptor_layout_guards.items(),
@@ -2831,30 +3027,53 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     _element_size,
                 )
 
-            extractors.append(td_layout_extractor)
+            extractors.append(
+                _PreparedMetadataSpecializationExtractor(td_layout_extractor)
+            )
 
-        for _key, specialization in sorted(
+        for key, specialization in sorted(
             self.env.runtime_input_specializations.items(),
         ):
             source_extractors = tuple(
                 make_extractor(source) for source in specialization.sources
             )
 
-            def runtime_input_specialization_extractor(
-                args: Sequence[object],
-                _source_extractors: tuple[
-                    Callable[[Sequence[object]], Hashable], ...
-                ] = source_extractors,
-                _classifier: Callable[
-                    [Sequence[object]], Hashable
-                ] = specialization.classifier,
-            ) -> Hashable:
-                return _classifier(
-                    tuple(extract(args) for extract in _source_extractors)
+            extractors.append(
+                _RuntimeInputSpecializationExtractor(
+                    source_extractors,
+                    specialization.classifier,
+                    frozenset(specialization.reusable_tensor_properties),
+                    key,
                 )
-
-            extractors.append(runtime_input_specialization_extractor)
+            )
         return extractors
+
+    def _record_runtime_input_specialization_results(
+        self,
+        extractors: Sequence[Callable[[Sequence[object]], Hashable]],
+        results: Sequence[Hashable],
+    ) -> bool:
+        """Initialize immutable reusable facts from an exact cache-key evaluation."""
+        expected_keys = {
+            key
+            for key, specialization in self.env.runtime_input_specializations.items()
+            if specialization.reusable_tensor_properties
+        }
+        observed = {
+            extractor.specialization_key: result
+            for extractor, result in zip(extractors, results, strict=True)
+            if isinstance(extractor, _RuntimeInputSpecializationExtractor)
+            and extractor.specialization_key is not None
+            and extractor.reusable_tensor_properties
+        }
+        if observed.keys() != expected_keys:
+            return False
+        previous = self.env.bound_runtime_input_specialization_results
+        if previous and previous != observed:
+            return False
+        if not previous:
+            self.env.bound_runtime_input_specialization_results = observed
+        return True
 
     @contextlib.contextmanager
     def _runtime_arg_values_for_codegen(self) -> Generator[None, None, None]:
@@ -3002,6 +3221,22 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             _R: The result of the kernel execution.
         """
+        if (
+            self._cache_managed
+            and self._reset_generation != self.kernel._reset_generation
+        ):
+            return self.kernel.bind(args)(*args)
+        is_compiling = torch.compiler.is_compiling()
+        if (
+            not is_compiling
+            and self._cache_managed
+            and (prepared := self._direct_prepared_call) is not None
+            and prepared.bound is self
+            and prepared.matches(self.kernel, args)
+            and self._run is not None
+        ):
+            return self._run(*args)
+
         if self._cache_managed and self._compiler_seed_specialization_extractors:
             device_results: tuple[Hashable | None, ...] | None = None
             new_compiler_seed_device = False
@@ -3066,7 +3301,39 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     assert self._run is not None
                     self.maybe_log_repro(log.warning, args)
 
-        return self._run(*args)
+        result = self._run(*args)
+        if not is_compiling and self._cache_managed:
+            self._prepare_direct_call(args)
+        return result
+
+    def _prepare_direct_call(self, args: tuple[object, ...]) -> None:
+        """Publish a monomorphic fast path for repeated BoundKernel calls."""
+        run = self._run
+        if (
+            run is None
+            or self.kernel._key_fn is not None
+            or not self.env.backend.supports_eager_prepared_call
+            or not self.kernel._has_specialization_extras
+        ):
+            return
+        try:
+            fast_entry = self.kernel._fast_dispatch_key_and_guards(args)
+            if fast_entry is None:
+                return
+            with self.kernel._bind_lock:
+                if (
+                    self._reset_generation != self.kernel._reset_generation
+                    or self.kernel._bind(args) is not self
+                    or self._run is not run
+                ):
+                    return
+                entry = self.kernel._prepare_dispatch_entry(args, self, fast_entry)
+                if entry is not None and entry[0] is not None:
+                    self._direct_prepared_call = entry[0]
+        except Exception:
+            # Preparation runs after the real kernel call.  It is optional and
+            # must not turn a successful launch into a user-visible failure.
+            return
 
     def backend_cache_key(self, config: ConfigLike | None = None) -> str | None:
         """

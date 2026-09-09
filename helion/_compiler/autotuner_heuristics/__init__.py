@@ -4,8 +4,15 @@ import logging
 from typing import TYPE_CHECKING
 
 from .common import dedupe_configs
+from .cute import CuteAsyncPersistentSubwarpRowsHeuristic
+from .cute import CuteAsyncStateLoadHeuristic
+from .cute import CuteChunkPrepareHeuristic
+from .cute import CuteChunkRecurrenceHeuristic
+from .cute import CuteFixedTokenRank1Heuristic
 from .cute import CuteFlashAttentionHeuristic
 from .cute import CuteFp8GemmSkinnyMHeuristic
+from .cute import CutePackedSingleTokenRank1Heuristic
+from .cute import CutePersistentSubwarpRowsHeuristic
 from .cute import CutePointwiseVecHeuristic
 from .cute import CuteReductionTileHeuristic
 from .cute import CuteReductionWideChunkHeuristic
@@ -48,8 +55,13 @@ if TYPE_CHECKING:
 # All active heuristics by backend
 HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
     "cute": (
+        CuteAsyncStateLoadHeuristic,
         CuteFp8GemmSkinnyMHeuristic,
+        CuteChunkRecurrenceHeuristic,
+        CuteChunkPrepareHeuristic,
         CuteFlashAttentionHeuristic,
+        CutePackedSingleTokenRank1Heuristic,
+        CuteFixedTokenRank1Heuristic,
         CuteTcgen05ClusterM2FfiHeuristic,
         CuteTcgen05ClusterM2Heuristic,
         CuteTcgen05GroupedWorklistHeuristic,
@@ -58,6 +70,8 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteTcgen05ThreadLocalEpilogueHeuristic,
         CuteReductionTileHeuristic,
         CuteReductionWideChunkHeuristic,
+        CutePersistentSubwarpRowsHeuristic,
+        CuteAsyncPersistentSubwarpRowsHeuristic,
         CuteRolledRowLadderHeuristic,
         CuteRolledClusterLadderHeuristic,
         CuteTileVecHeuristic,

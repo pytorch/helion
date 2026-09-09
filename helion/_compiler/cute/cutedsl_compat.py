@@ -22,6 +22,30 @@ CUTE_MIN_CUDA_VERSION = "13"
 CUTE_VALIDATED_VERSION = Version("4.7.0")
 CUTE_MIN_VERSION = CUTE_VALIDATED_VERSION
 CUTE_TCGEN05_RUNTIME_N_PTX_VALIDATED_VERSION = CUTE_VALIDATED_VERSION
+L2_EVICT_LAST_STORE_ABI_VERSION = 1
+
+
+def cp_async_supported(
+    target_device_capability: tuple[int, int] | None,
+) -> bool:
+    """Whether the target can execute PTX ``cp.async`` instructions."""
+
+    return target_device_capability is not None and target_device_capability >= (8, 0)
+
+
+def fixed_l2_evict_last_store_policy_supported(
+    target_device_capability: tuple[int, int] | None,
+    cuda_version: str | None,
+) -> bool:
+    """Whether the validated opaque store-policy descriptor is safe to emit.
+
+    The descriptor was obtained from CUDA 13 for SM103.  Keep this probe free
+    of CuTe imports so config normalization can use it before backend setup.
+    """
+
+    return target_device_capability == (10, 3) and bool(
+        cuda_version and cuda_version.split(".", 1)[0] == "13"
+    )
 
 
 @dataclass(frozen=True)

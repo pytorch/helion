@@ -946,6 +946,7 @@ class ReductionLowering(InductorLowering):
 
             strategy = BlockReductionStrategy(state, self.block_index)
 
+        env.backend.validate_reduction_input(strategy.block_index, repr_input)
         result_ast = strategy.codegen_reduction(
             state,
             output_name,
@@ -1206,11 +1207,11 @@ class GenerateASTFromInductor(DefaultHandler):
     def rsqrt(self, x: object) -> str:  # type: ignore[override]
         backend_name = CompileEnvironment.current().backend_name
         if backend_name == "cute":
-            from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import (
-                _CUTEDSL_FAST_MATH,
+            suffix = (
+                ", fastmath=True"
+                if CompileEnvironment.current().settings.fast_math
+                else ""
             )
-
-            suffix = ", fastmath=True" if _CUTEDSL_FAST_MATH.get() else ""
             return self._lift(
                 expr_from_string(f"cute.math.rsqrt({{x}}{suffix})", x=self._to_ast(x))
             )
