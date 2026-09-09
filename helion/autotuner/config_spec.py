@@ -766,6 +766,26 @@ def shrink_block_sizes_for_numel_constraints(
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
 VALID_CROSS_LOOP_SCHEDULES = ("barrier", "static_pipeline")
+CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY = "cute_chunk_recurrence_dv_partitions"
+CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY = "cute_chunk_recurrence_register_cap"
+VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS = (None, 72, 76, 80)
+CUTE_CHUNK_PREPARE_SCHEDULE_KEY = "cute_chunk_prepare_schedule"
+VALID_CUTE_CHUNK_PREPARE_SCHEDULES = (
+    "split_alias_cpc1",
+    "split_alias_cpc2",
+    "split_alias_cpc3",
+    "split_alias_cpc4",
+    "split_alias_cpc5",
+)
+
+
+def _cute_chunk_recurrence_config_is_safe(
+    dv_partitions: object, register_cap: object
+) -> bool:
+    """Reject register caps on the TMEM schedule's dynamic register protocol."""
+
+    return dv_partitions != 2 or register_cap is None
+
 
 # Upper bound (power of two) that a matmul tile dimension's block size may reach
 # even when the dimension itself is smaller. Applied only to dimensions that
@@ -814,6 +834,9 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     | frozenset(FLASH_CONFIG_KEYS)
     | {
         "cross_loop_schedule",
+        CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
+        CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
+        CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         "num_threads",
         "cute_vector_widths",
         "cute_lane_layouts",
@@ -851,6 +874,9 @@ VALID_KEYS: frozenset[str] = frozenset(
         "range_flattens",
         "static_ranges",
         "cross_loop_schedule",
+        CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
+        CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
+        CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         "num_warps",
         "num_stages",
         "pid_type",
@@ -1125,6 +1151,17 @@ class ConfigSpec:
         # Populated only after DeviceIR proves that this kernel contains an
         # implicit cross-root dependency supported by the CUDA Triton backend.
         self.cross_loop_schedule: EnumFragment | None = None
+        # Enabled only when the exact five-factor BT16 recurrence carrier is
+        # detected. Choice ordering makes the geometry seed the no-autotune
+        # default while leaving both legal schedules in cold/full search.
+        self.cute_chunk_recurrence_dv_partitions: EnumFragment | None = None
+        # Enabled by the same exact recurrence matcher. The backend turns the
+        # selected value into a ptxas max-register constraint; unrelated CuTe
+        # kernels never see this search dimension.
+        self.cute_chunk_recurrence_register_cap: EnumFragment | None = None
+        # Enabled only when the exact five-factor BT16 chunk-prepare carrier is
+        # detected. Choice order defines the default and ranked seed order.
+        self.cute_chunk_prepare_schedule: EnumFragment | None = None
         self._cute_tcgen05_config = CuteTcgen05Config(self)
         # CuTe flash-attention autotune surface gating.
         # Default False so the flash knobs never appear in the search surface
@@ -1864,6 +1901,22 @@ class ConfigSpec:
             spec.autotuner_min = target
             spec.max_size = target
 
+    def enable_cute_chunk_recurrence_search(self, *, preferred_partitions: int) -> None:
+        """Expose the exact BT16 recurrence schedule as CuTe search knobs."""
+
+        if preferred_partitions not in (2, 4):
+            raise ValueError(
+                "unsupported chunk-recurrence DV partition count: "
+                f"{preferred_partitions}"
+            )
+        alternate = 4 if preferred_partitions == 2 else 2
+        self.cute_chunk_recurrence_dv_partitions = EnumFragment(
+            choices=(preferred_partitions, alternate)
+        )
+        self.cute_chunk_recurrence_register_cap = EnumFragment(
+            choices=VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS
+        )
+
     def enable_cute_attention_generic_fallback(
         self, *, block_size_targets: Mapping[int, int] | None = None
     ) -> None:
@@ -1881,6 +1934,31 @@ class ConfigSpec:
         ) in self._cute_attention_generic_fallback_block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
             spec.autotuner_min = max(spec.autotuner_min, target)
+
+    def enable_cute_chunk_prepare_schedule_search(
+        self, *, preferred_schedule: str
+    ) -> None:
+        """Expose the exact BT16 prepare shared-memory schedule knob."""
+
+        if not self.supports_config_key(CUTE_CHUNK_PREPARE_SCHEDULE_KEY):
+            raise InvalidConfig(
+                f"{CUTE_CHUNK_PREPARE_SCHEDULE_KEY} is not supported by backend "
+                f"{self.backend_name!r}"
+            )
+        if preferred_schedule not in VALID_CUTE_CHUNK_PREPARE_SCHEDULES:
+            raise ValueError(
+                f"unsupported chunk-prepare schedule: {preferred_schedule!r}"
+            )
+        self.cute_chunk_prepare_schedule = EnumFragment(
+            choices=(
+                preferred_schedule,
+                *(
+                    schedule
+                    for schedule in VALID_CUTE_CHUNK_PREPARE_SCHEDULES
+                    if schedule != preferred_schedule
+                ),
+            )
+        )
 
     def _pre_normalize_cute_flash_block_sizes(self, config: dict[str, object]) -> None:
         if not self.cute_flash_search_enabled or "block_sizes" not in config:
@@ -2530,6 +2608,45 @@ class ConfigSpec:
                     "with compiler-inferred cross-loop dependencies"
                 )
 
+        if (
+            CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY in config
+            and self.cute_chunk_recurrence_dv_partitions is None
+            and self.supports_config_key(CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY)
+        ):
+            if _fix_invalid:
+                config.pop(CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY)
+            else:
+                raise InvalidConfig(
+                    f"{CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY} is available only "
+                    "for matched BT16 chunk-recurrence kernels"
+                )
+
+        if (
+            CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY in config
+            and self.cute_chunk_recurrence_register_cap is None
+            and self.supports_config_key(CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY)
+        ):
+            if _fix_invalid:
+                config.pop(CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY)
+            else:
+                raise InvalidConfig(
+                    f"{CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY} is available only "
+                    "for matched BT16 chunk-recurrence kernels"
+                )
+
+        if (
+            CUTE_CHUNK_PREPARE_SCHEDULE_KEY in config
+            and self.cute_chunk_prepare_schedule is None
+            and self.supports_config_key(CUTE_CHUNK_PREPARE_SCHEDULE_KEY)
+        ):
+            if _fix_invalid:
+                config.pop(CUTE_CHUNK_PREPARE_SCHEDULE_KEY)
+            else:
+                raise InvalidConfig(
+                    f"{CUTE_CHUNK_PREPARE_SCHEDULE_KEY} is available only for "
+                    "matched BT16 chunk-prepare kernels"
+                )
+
         if unsupported := self.unsupported_config_keys(config):
             # Separate backend-specific keys (e.g. AMD tunables, TileIR tunables)
             # from common keys (e.g. num_warps, num_stages, indexing).
@@ -2888,6 +3005,81 @@ class ConfigSpec:
                         "cross_loop_schedule must be one of "
                         f"{cross_loop_schedule_fragment.choices!r}, got "
                         f"{cross_loop_schedule!r}"
+                    )
+        recurrence_dv_fragment = self.cute_chunk_recurrence_dv_partitions
+        if recurrence_dv_fragment is not None:
+            recurrence_dv_partitions = config.setdefault(
+                CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
+                recurrence_dv_fragment.default(),
+            )
+            if (
+                type(recurrence_dv_partitions) is not int
+                or recurrence_dv_partitions not in recurrence_dv_fragment.choices
+            ):
+                if _fix_invalid:
+                    config[CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY] = (
+                        recurrence_dv_fragment.default()
+                    )
+                else:
+                    raise InvalidConfig(
+                        f"{CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY} must be one of "
+                        f"{recurrence_dv_fragment.choices!r}, got "
+                        f"{recurrence_dv_partitions!r}"
+                    )
+        recurrence_register_cap_fragment = self.cute_chunk_recurrence_register_cap
+        if recurrence_register_cap_fragment is not None:
+            recurrence_register_cap = config.setdefault(
+                CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
+                recurrence_register_cap_fragment.default(),
+            )
+            if (
+                (
+                    recurrence_register_cap is not None
+                    and type(recurrence_register_cap) is not int
+                )
+                or recurrence_register_cap
+                not in recurrence_register_cap_fragment.choices
+            ):
+                if _fix_invalid:
+                    config[CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY] = (
+                        recurrence_register_cap_fragment.default()
+                    )
+                else:
+                    raise InvalidConfig(
+                        f"{CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY} must be one of "
+                        f"{recurrence_register_cap_fragment.choices!r}, got "
+                        f"{recurrence_register_cap!r}"
+                    )
+            if recurrence_dv_fragment is not None and not (
+                _cute_chunk_recurrence_config_is_safe(
+                    config[CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY],
+                    config[CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY],
+                )
+            ):
+                if _fix_invalid:
+                    config[CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY] = None
+                else:
+                    raise InvalidConfig(
+                        f"{CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY} must be None for "
+                        f"{CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY}=2 because the "
+                        "TMEM schedule dynamically reallocates registers"
+                    )
+        prepare_schedule_fragment = self.cute_chunk_prepare_schedule
+        if prepare_schedule_fragment is not None:
+            prepare_schedule = config.setdefault(
+                CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
+                prepare_schedule_fragment.default(),
+            )
+            if prepare_schedule not in prepare_schedule_fragment.choices:
+                if _fix_invalid:
+                    config[CUTE_CHUNK_PREPARE_SCHEDULE_KEY] = (
+                        prepare_schedule_fragment.default()
+                    )
+                else:
+                    raise InvalidConfig(
+                        f"{CUTE_CHUNK_PREPARE_SCHEDULE_KEY} must be one of "
+                        f"{prepare_schedule_fragment.choices!r}, got "
+                        f"{prepare_schedule!r}"
                     )
         if self.backend_name == "cute":
             self._cute_tcgen05_config.normalize_pre_pid_type(
@@ -3659,6 +3851,18 @@ class ConfigSpec:
             ):
                 fields["epilogue_subtile"] = EnumFragment(
                     choices=self.epilogue_subtile_autotune_choices
+                )
+            if self.cute_chunk_recurrence_dv_partitions is not None:
+                fields[CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY] = (
+                    self.cute_chunk_recurrence_dv_partitions
+                )
+            if self.cute_chunk_recurrence_register_cap is not None:
+                fields[CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY] = (
+                    self.cute_chunk_recurrence_register_cap
+                )
+            if self.cute_chunk_prepare_schedule is not None:
+                fields[CUTE_CHUNK_PREPARE_SCHEDULE_KEY] = (
+                    self.cute_chunk_prepare_schedule
                 )
             fields.update(self.user_defined_tunables)
             return fields

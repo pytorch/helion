@@ -424,6 +424,28 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             "cute", "fixed-token rank-1 recurrence failed late validation"
         )
 
+    def _try_codegen_chunk_prepare_root(self) -> bool:
+        plan = self.device_function.cute_state.chunk_prepare_plan
+        if plan is None:
+            return False
+        from .cute.chunk_prepare import codegen_chunk_prepare
+
+        if codegen_chunk_prepare(self):
+            return True
+        self.device_function.cute_state.chunk_prepare_plan = None
+        raise exc.BackendUnsupported("cute", "chunk prepare failed late validation")
+
+    def _try_codegen_chunk_recurrence_root(self) -> bool:
+        plan = self.device_function.cute_state.chunk_recurrence_plan
+        if plan is None:
+            return False
+        from .cute.chunk_recurrence import codegen_chunk_recurrence
+
+        if codegen_chunk_recurrence(self):
+            return True
+        self.device_function.cute_state.chunk_recurrence_plan = None
+        raise exc.BackendUnsupported("cute", "chunk recurrence failed late validation")
+
     def add_statement(self, stmt: ast.AST | str | None) -> None:
         if stmt is None:
             return
@@ -1185,7 +1207,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         )
                     root = root_graph_info.graph
                     if (
-                        not self._try_codegen_single_token_rank1_root()
+                        not self._try_codegen_chunk_prepare_root()
+                        and not self._try_codegen_chunk_recurrence_root()
+                        and not self._try_codegen_single_token_rank1_root()
                         and not self._try_codegen_split_single_token_rank1_root()
                         and not self._try_codegen_fixed_token_rank1_root()
                         and not self._try_codegen_attention_flash_root()
@@ -1601,7 +1625,14 @@ def generate_ast(
             )
             final_host_statements = rng_statements + codegen.host_statements
             shape_bake_safe_wrapper_only = codegen.cute_wrapper_plans and all(
-                plan.get("kind") in {"helion_small_biased_attention", "helion_flash"}
+                plan.get("kind")
+                in {
+                    "helion_small_biased_attention",
+                    "helion_flash",
+                    "chunk_prepare_tma",
+                    "chunk_recurrence_sm100",
+                    "chunk_recurrence_warp_dv4",
+                }
                 for plan in codegen.cute_wrapper_plans
             )
             if codegen.cute_uses_matmul and not shape_bake_safe_wrapper_only:
@@ -1647,8 +1678,22 @@ def generate_ast(
                         "d_name",
                         "q_name",
                         "k_name",
+                        "g_name",
+                        "beta_name",
+                        "a_log_name",
+                        "dt_name",
+                        "cu_seqlens_name",
+                        "cu_chunks_name",
+                        "chunk_to_seq_name",
+                        "kd_name",
+                        "qd_name",
+                        "ak_name",
+                        "aq_name",
+                        "gt_name",
                         "v_name",
                         "o_name",
+                        "out_name",
+                        "state_name",
                         "lse_name",
                         "bias_name",
                         "alibi_name",
@@ -1658,6 +1703,7 @@ def generate_ast(
                         "k_sizes_name",
                         "direct_pointers_name",
                         "direct_strides_name",
+                        "scale_name",
                     ):
                         if key in resolved:
                             arg_name = str(resolved.pop(key))
