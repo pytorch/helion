@@ -6,9 +6,13 @@ from typing import Any
 from typing import cast
 
 import torch
+from torch._inductor.runtime.triton_heuristics import (
+    get_max_y_grid,  # type: ignore[import-untyped]
+)
 
 from ...autotuner.config_spec import get_valid_eviction_policies
 from ...runtime.config import Config
+from ..cute.cutedsl_compat import cp_async_supported
 from ..cute.cutedsl_compat import tcgen05_runtime_n_ptx_compatible
 from ..cute.cutedsl_compat import warn_tcgen05_runtime_n_ptx_fallback
 from ..cute.grouped_worklist_policy import GroupedBMajor
@@ -56,6 +60,7 @@ if TYPE_CHECKING:
     from ...autotuner.config_fragment import BlockSizeFragment
     from ...autotuner.config_spec import ConfigSpec
     from ...autotuner.config_spec import MatmulFact
+    from ...autotuner.config_spec import MemoryOpFact
     from ...autotuner.config_spec import ReductionLoopSpec
     from ..compile_environment import CompileEnvironment
     from ..cute.cute_mma import Tcgen05GroupedWorklistAnalysis
@@ -78,6 +83,379 @@ def _seq_config_list(
         overrides[item.block_id] if item.block_id in overrides else item._fill_missing()
         for item in seq
     ]
+
+
+def _has_async_state_load_candidate(env: CompileEnvironment) -> bool:
+    """Cheap device-IR gate for the stricter generated-AST matcher.
+
+    This intentionally admits an input-layout-independent superset: a 16-bit
+    tensor that is both read and written in one graph. The late AST pass proves
+    the exact vector width, row/thread coverage, address equality, and alias
+    facts from cache-specialized metadata.
+    """
+    by_tensor_graph: dict[tuple[str, int], list[MemoryOpFact]] = {}
+    for fact in env.config_spec.memory_op_facts:
+        if (
+            fact.tensor_name is None
+            or fact.dtype not in (torch.float16, torch.bfloat16)
+            or fact.ndim < 2
+        ):
+            continue
+        by_tensor_graph.setdefault((fact.tensor_name, fact.graph_id), []).append(fact)
+    return any(
+        any(fact.kind == "load" for fact in facts)
+        and any(fact.kind == "store" for fact in facts)
+        for facts in by_tensor_graph.values()
+    )
+
+
+class CutePackedSingleTokenRank1Heuristic(AutotunerHeuristic):
+    """Seed packed one-warp single-token rank-1 recurrences.
+
+    This is deliberately a cheap structural superset of the fail-closed FX
+    matcher.  It never keys on a function or tensor name: the late matcher
+    remains responsible for proving the complete recurrence and its layouts.
+    """
+
+    name = "cute_packed_single_token_rank1"
+    backend = "cute"
+    CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+
+    @classmethod
+    def _value_block_id(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> int | None:
+        spec = env.config_spec
+        grid_fact = spec.kernel_grid_fact
+        if (
+            spec.matmul_facts
+            or len(spec.block_sizes) != 1
+            or grid_fact is None
+            or len(grid_fact.roots) != 1
+        ):
+            return None
+        (root,) = grid_fact.roots
+        if len(root.block_ids) != 3:
+            return None
+        value_spec = cast("Any", spec.block_sizes[0])
+        if value_spec.block_id != root.block_ids[-1] or not any(
+            value_spec.min_size <= tile <= value_spec.max_size for tile in (8, 16)
+        ):
+            return None
+
+        reduction_blocks = [block for block in env.block_sizes if block.reduction]
+        if len(reduction_blocks) != 1:
+            return None
+        try:
+            reduction_size = int(reduction_blocks[0].numel)
+        except (TypeError, ValueError):
+            return None
+        if reduction_size != 128:
+            return None
+
+        facts = [fact for fact in spec.memory_op_facts if fact.tensor_name is not None]
+        root_index_loads = [
+            fact
+            for fact in facts
+            if fact.graph_id == root.root_graph_id
+            and fact.kind == "load"
+            and fact.ndim == 1
+            and fact.dtype in (torch.int32, torch.int64)
+        ]
+        if len(root_index_loads) != 1:
+            return None
+
+        by_tensor_graph: dict[tuple[str, int], list[MemoryOpFact]] = {}
+        by_tensor: dict[str, list[MemoryOpFact]] = {}
+        for fact in facts:
+            assert fact.tensor_name is not None
+            by_tensor_graph.setdefault((fact.tensor_name, fact.graph_id), []).append(
+                fact
+            )
+            by_tensor.setdefault(fact.tensor_name, []).append(fact)
+        state_candidates = [
+            (name, graph_id)
+            for (name, graph_id), tensor_facts in by_tensor_graph.items()
+            if tensor_facts[0].dtype is torch.bfloat16
+            and tensor_facts[0].ndim == 4
+            and sum(fact.kind == "load" for fact in tensor_facts) == 1
+            and sum(fact.kind == "store" for fact in tensor_facts) == 1
+        ]
+        if len(state_candidates) != 1:
+            return None
+        _, recurrence_graph_id = state_candidates[0]
+        has_packed_input = any(
+            tensor_facts[0].dtype is torch.bfloat16
+            and tensor_facts[0].ndim == 2
+            and sum(
+                fact.kind == "load" and fact.graph_id == recurrence_graph_id
+                for fact in tensor_facts
+            )
+            >= 3
+            for tensor_facts in by_tensor.values()
+        )
+        has_branched_output = any(
+            tensor_facts[0].dtype is torch.bfloat16
+            and tensor_facts[0].ndim == 4
+            and all(fact.kind == "store" for fact in tensor_facts)
+            and any(fact.graph_id == recurrence_graph_id for fact in tensor_facts)
+            and any(fact.graph_id != recurrence_graph_id for fact in tensor_facts)
+            for tensor_facts in by_tensor.values()
+        )
+        return value_spec.block_id if has_packed_input and has_branched_output else None
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._value_block_id(env, device_ir) is not None
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        return (
+            cls.CACHE_SPECIALIZATION_FACTS
+            if cls._value_block_id(env, device_ir) is not None
+            else frozenset()
+        )
+
+    @classmethod
+    def _seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        value_block_id = cls._value_block_id(env, device_ir)
+        if value_block_id is None:
+            return []
+        spec = env.config_spec
+        value_spec = cast("Any", spec.block_sizes[0])
+        reduction_blocks = [block for block in env.block_sizes if block.reduction]
+        if len(reduction_blocks) != 1:
+            return []
+        reduction_block_id = reduction_blocks[0].block_id
+        if not {value_block_id, reduction_block_id}.issubset(
+            spec.num_threads.valid_block_ids()
+        ):
+            return []
+
+        def make_seed(tile_rows: int, num_warps: int) -> Config:
+            num_threads = (
+                _seq_config_list(
+                    spec.num_threads,
+                    {
+                        value_block_id: 1,
+                        reduction_block_id: 32,
+                    },
+                )
+                if num_warps == 1
+                else _seq_config_list(spec.num_threads, {})
+            )
+            return Config(
+                block_sizes=cast(
+                    "list[int]",
+                    _seq_config_list(
+                        spec.block_sizes,
+                        {value_block_id: tile_rows},
+                    ),
+                ),
+                # CuTe SIMT autotuning represents launch topology with
+                # per-axis ``num_threads``.  Keep ``num_warps`` as the direct,
+                # pinned-config compatibility signal, but encode one value-row
+                # thread by 32 reduction threads so flatten/unflatten preserves
+                # the one-warp seed.
+                num_threads=cast("list[int]", num_threads),
+                loop_orders=[[2, 1, 0]],
+                num_warps=num_warps,
+                num_stages=1,
+                indexing="pointer",
+                pid_type="flat",
+            )
+
+        seeds = [
+            make_seed(tile_rows, 1)
+            for tile_rows in (16, 8)
+            if value_spec.min_size <= tile_rows <= value_spec.max_size
+        ]
+        if value_spec.min_size <= 16 <= value_spec.max_size:
+            # Preserve an explicit path to the existing 256-thread B1 body.
+            seeds.append(make_seed(16, 8))
+        return seeds
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls._seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        seeds = cls._seed_configs(env, device_ir)
+        return seeds or None
+
+
+class CuteFixedTokenRank1Heuristic(AutotunerHeuristic):
+    """Seed the grouped fixed-token rank-1 recurrence schedule.
+
+    The seed is intentionally selected from device-IR structure rather than a
+    function or benchmark name.  The late fixed-token matcher remains the
+    authority and fails closed unless it proves the complete recurrence.
+    """
+
+    name = "cute_fixed_token_rank1"
+    backend = "cute"
+    CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+
+    @classmethod
+    def _value_block_id(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> int | None:
+        spec = env.config_spec
+        grid_fact = spec.kernel_grid_fact
+        if (
+            spec.matmul_facts
+            or len(spec.block_sizes) != 1
+            or grid_fact is None
+            or len(grid_fact.roots) != 1
+        ):
+            return None
+        (root,) = grid_fact.roots
+        if len(root.block_ids) != 3:
+            return None
+        value_spec = cast("Any", spec.block_sizes[0])
+        if (
+            value_spec.block_id != root.block_ids[-1]
+            or not value_spec.min_size <= 32 <= value_spec.max_size
+        ):
+            return None
+
+        reduction_blocks = [block for block in env.block_sizes if block.reduction]
+        if len(reduction_blocks) != 1:
+            return None
+        try:
+            reduction_size = int(reduction_blocks[0].numel)
+        except (TypeError, ValueError):
+            return None
+        if reduction_size != 128:
+            return None
+
+        by_tensor_graph: dict[tuple[str, int], list[MemoryOpFact]] = {}
+        for fact in spec.memory_op_facts:
+            if (
+                fact.tensor_name is not None
+                and fact.graph_id == root.root_graph_id
+                and fact.dtype is torch.bfloat16
+            ):
+                by_tensor_graph.setdefault(
+                    (fact.tensor_name, fact.graph_id), []
+                ).append(fact)
+        state_store_counts = [
+            sum(fact.kind == "store" for fact in facts)
+            for facts in by_tensor_graph.values()
+            if facts[0].ndim == 4 and sum(fact.kind == "load" for fact in facts) == 1
+        ]
+        if (
+            len(state_store_counts) != 1
+            or not 2 <= state_store_counts[0] <= 6
+            or sum(
+                fact.kind == "store" and fact.ndim == 3
+                for fact in spec.memory_op_facts
+                if fact.graph_id == root.root_graph_id
+            )
+            != state_store_counts[0]
+        ):
+            return None
+        return value_spec.block_id
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._value_block_id(env, device_ir) is not None
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        return (
+            cls.CACHE_SPECIALIZATION_FACTS
+            if cls._value_block_id(env, device_ir) is not None
+            else frozenset()
+        )
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        value_block_id = cls._value_block_id(env, device_ir)
+        if value_block_id is None:
+            return None
+        return Config(
+            block_sizes=cast(
+                "list[int]",
+                _seq_config_list(
+                    env.config_spec.block_sizes,
+                    {value_block_id: 32},
+                ),
+            ),
+            num_warps=4,
+            num_stages=1,
+            indexing="pointer",
+            pid_type="flat",
+        )
+
+
+class CuteAsyncStateLoadHeuristic(AutotunerHeuristic):
+    """Seed the proven shared-memory ring for in-place vector state updates.
+
+    Eligibility is deliberately broader than codegen matching so it can be
+    derived from stable device-IR facts. The AST pass is fail-closed and emits
+    no shared allocation unless one exact disjoint row/vector region matches.
+    """
+
+    name = "cute_async_state_load"
+    backend = "cute"
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        if cp_async_supported(
+            env.config_spec.target_device_capability
+        ) and _has_async_state_load_candidate(env):
+            env.config_spec.enable_cute_async_load_pipeline()
+            env.config_spec.enable_cute_bf16x2_recurrence()
+            env.config_spec.enable_cute_proven_bounds()
+            # Generated scheduling consumes exact tensor extents and strides.
+            # Make those values part of the bound-kernel cache key so a later
+            # dynamic-shape/layout call cannot reuse an incompatible ring.
+            return frozenset({"input_tensor_metadata"})
+        return frozenset()
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return (
+            cp_async_supported(env.config_spec.target_device_capability)
+            and env.config_spec.cute_async_load_pipeline_enabled
+        )
+
+    @staticmethod
+    def _seed_overrides() -> dict[str, object]:
+        return {
+            "cute_async_load_stages": 5,
+            "cute_async_load_lookahead": 4,
+            "cute_async_load_group_rows": 2,
+            "cute_async_load_cache": "cg",
+            "cute_proven_bounds": False,
+        }
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        if not cls.is_eligible(env, device_ir):
+            return None
+        values = dict(env.config_spec.autotune_reference_config().config)
+        values.update(cls._seed_overrides())
+        return Config.from_dict(values)
 
 
 def _cute_seed_vec_width(
@@ -471,6 +849,175 @@ class CutePersistentSubwarpRowsHeuristic(AutotunerHeuristic):
                 )
             )
         return seeds
+
+
+class CuteAsyncPersistentSubwarpRowsHeuristic(AutotunerHeuristic):
+    """Compose the full-row reduction and async state-load schedules.
+
+    The component heuristics deliberately remain useful independently.  This
+    seed joins their measured settings only when the kernel has one 3-D root
+    whose innermost axis is the row tile.  No tensor names or model shapes are
+    part of the match.
+
+    ``xyz`` is included only when exact, metadata-specialized root extents prove
+    that every axis fits the CUDA y/z limit even at a one-element block.  That
+    stronger proof keeps every nearby block-size/loop-order candidate safe; the
+    global conservative ``allowed_pid_types`` restriction remains untouched.
+    """
+
+    name = "cute_async_persistent_subwarp_rows"
+    backend = "cute"
+    CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+
+    @classmethod
+    def _plan(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, int, int] | None:
+        if not CuteAsyncStateLoadHeuristic.is_eligible(env, device_ir):
+            return None
+        persistent_plan = CutePersistentSubwarpRowsHeuristic._plan(env, device_ir)
+        if persistent_plan is None:
+            return None
+        row_block_id, reduction_block_id, reduction_threads = persistent_plan
+        row_spec = cast("Any", env.config_spec.block_sizes[0])
+        full_row_size = CutePersistentSubwarpRowsHeuristic.FULL_ROW_BLOCK_SIZE
+        row_size = env.block_sizes[row_block_id].size
+        if (
+            row_spec.max_size < full_row_size
+            or not isinstance(row_size, (int, torch.SymInt))
+            or not isinstance(
+                row_extent := env.try_concretize_symint(row_size),
+                int,
+            )
+            or not 0 <= row_extent <= full_row_size
+        ):
+            return None
+
+        grid_fact = env.config_spec.kernel_grid_fact
+        if grid_fact is None or len(grid_fact.roots) != 1:
+            return None
+        (root,) = grid_fact.roots
+        if len(root.block_ids) != 3 or root.block_ids[-1] != row_block_id:
+            return None
+        matching_loop_orders = [
+            spec
+            for spec in env.config_spec.loop_orders
+            if tuple(spec.block_ids) == root.block_ids
+        ]
+        if len(matching_loop_orders) != 1:
+            return None
+        return (
+            row_block_id,
+            reduction_block_id,
+            reduction_threads,
+            matching_loop_orders[0].block_id,
+        )
+
+    @staticmethod
+    def _metadata_specialized_xyz_is_safe(env: CompileEnvironment) -> bool:
+        """Prove every searchable 3-D launch stays within y/z limits.
+
+        Each program count is at most its full axis extent because every legal
+        block size is positive.  Requiring all three exact extents below the
+        y/z limit therefore remains valid if the tuner changes either the block
+        size or loop order around this seed.  ``try_concretize_symint`` accepts
+        backed input-shape symbols; ``CACHE_SPECIALIZATION_FACTS`` makes those
+        exact runtime shapes part of the bound-kernel cache key.
+        """
+
+        spec = env.config_spec
+        grid_fact = spec.kernel_grid_fact
+        if (
+            grid_fact is None
+            or len(grid_fact.roots) != 1
+            or "flat" not in spec.allowed_pid_types
+            or "input_tensor_metadata" not in env.compiler_fact_specialization_facts
+        ):
+            return False
+        (root,) = grid_fact.roots
+        if len(root.block_ids) != 3:
+            return False
+        if "xyz" not in spec.allowed_pid_types:
+            reason = spec.disallowed_pid_type_reasons.get("xyz", "")
+            if not reason.startswith("grid does not fit the y/z launch grid"):
+                return False
+
+        limit = get_max_y_grid()
+        for block_id in root.block_ids:
+            if not 0 <= block_id < len(env.block_sizes):
+                return False
+            block = env.block_sizes[block_id]
+            if block.reduction or not isinstance(block.size, (int, torch.SymInt)):
+                return False
+            extent = env.try_concretize_symint(block.size)
+            if not isinstance(extent, int) or not 0 <= extent < limit:
+                return False
+        return True
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        # Async registration runs earlier in the CuTe registry.  Keep the exact
+        # input metadata in the cache key for both the async matcher and the
+        # optional backed-SymInt xyz proof.
+        return (
+            cls.CACHE_SPECIALIZATION_FACTS if cls._plan(env, device_ir) else frozenset()
+        )
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._plan(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return None
+        (
+            row_block_id,
+            reduction_block_id,
+            reduction_threads,
+            loop_order_block_id,
+        ) = plan
+        values = dict(
+            CutePersistentSubwarpRowsHeuristic._seed_config(
+                env,
+                row_block_id,
+                reduction_block_id,
+                reduction_threads,
+                row_block_size=CutePersistentSubwarpRowsHeuristic.FULL_ROW_BLOCK_SIZE,
+            ).config
+        )
+        values.update(
+            {
+                "loop_orders": _seq_config_list(
+                    env.config_spec.loop_orders,
+                    {loop_order_block_id: [1, 0, 2]},
+                ),
+            }
+        )
+        values.update(CuteAsyncStateLoadHeuristic._seed_overrides())
+        from ..cute.cutedsl_compat import fixed_l2_evict_last_store_policy_supported
+
+        values.update(
+            {
+                "cute_async_store_policy": (
+                    "l2_evict_last"
+                    if fixed_l2_evict_last_store_policy_supported(
+                        env.config_spec.target_device_capability,
+                        torch.version.cuda,
+                    )
+                    else "default"
+                ),
+                "cute_bf16x2_recurrence": True,
+            }
+        )
+        if cls._metadata_specialized_xyz_is_safe(env):
+            values["pid_type"] = "xyz"
+        return Config.from_dict(values)
 
 
 class CuteTileVecHeuristic(AutotunerHeuristic):

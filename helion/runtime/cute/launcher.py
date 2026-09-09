@@ -1351,6 +1351,19 @@ def _create_cute_wrapper(
     cluster_shape = _cute_cluster_shape(cute_kernel, wrapper_plans)
     if cluster_shape is not None:
         launch_suffix += f", cluster={list(cluster_shape)!r}"
+    preferred_smem_carveout = getattr(
+        cast("Any", cute_kernel), "_helion_cute_preferred_smem_carveout", None
+    )
+    if preferred_smem_carveout is not None:
+        if (
+            type(preferred_smem_carveout) is not int
+            or not 0 <= preferred_smem_carveout <= 100
+        ):
+            raise ValueError(
+                "invalid _helion_cute_preferred_smem_carveout: "
+                f"{preferred_smem_carveout!r}"
+            )
+        launch_suffix += f", preferred_smem_carveout={preferred_smem_carveout}"
     # G2-H (cute_plan.md, see plan: G2-H CLC): CLC kernels need PDL
     # enabled at the host launch so ``nvvm.clusterlaunchcontrol_try_cancel``
     # returns valid responses. ``use_pdl`` is set on the per-matmul
@@ -1731,9 +1744,9 @@ def _cute_disk_cache_key(
     compiled (so a hit can skip recompilation), so it is derived from the
     inputs that determine the lowered IR rather than from the IR itself:
     generated device-kernel source, full input specialization (dtypes, ranks,
-    baked shapes/strides, constexpr values), launch shape (block/cluster), CuTe
-    compile options, the IR-affecting ``CUTE_DSL_*`` env vars (target SM arch
-    among them), and the cutlass version.
+    baked shapes/strides, constexpr values), launch shape (block/cluster), the
+    preferred shared-memory carveout, CuTe compile options, the IR-affecting
+    ``CUTE_DSL_*`` env vars (target SM arch among them), and the cutlass version.
 
     ``num_sm`` is the device SM count the persistent flash wrapper bakes into
     its grid clamp as a literal (``cute.compile`` lowers that literal into the
@@ -1761,6 +1774,11 @@ def _cute_disk_cache_key(
             block,
             wrapper_plans,
             repr(cluster_shape),
+            getattr(
+                cast("Any", cute_kernel),
+                "_helion_cute_preferred_smem_carveout",
+                None,
+            ),
             compile_options or "",
             _cute_cache_relevant_env(),
             cutlass_version,

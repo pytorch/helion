@@ -63,6 +63,7 @@ from .._compiler.cute.cute_flash import flash_effective_config_values
 from .._compiler.cute.cute_flash import flash_env_fingerprint
 from .._compiler.cute.cute_flash import flash_exp2_packet_is_compound
 from .._compiler.cute.cute_flash import resolve_flash_config
+from .._compiler.cute.cutedsl_compat import fixed_l2_evict_last_store_policy_supported
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_STRATEGY_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_TUNABLE_KEYS
@@ -817,6 +818,13 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_vector_widths",
         "cute_lane_layouts",
         "cute_reduction_reloads",
+        "cute_async_load_stages",
+        "cute_async_load_lookahead",
+        "cute_async_load_group_rows",
+        "cute_async_load_cache",
+        "cute_async_store_policy",
+        "cute_bf16x2_recurrence",
+        "cute_proven_bounds",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
         "load_cache_modifiers",
@@ -860,6 +868,13 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_vector_widths",
         "cute_lane_layouts",
         "cute_reduction_reloads",
+        "cute_async_load_stages",
+        "cute_async_load_lookahead",
+        "cute_async_load_group_rows",
+        "cute_async_load_cache",
+        "cute_async_store_policy",
+        "cute_bf16x2_recurrence",
+        "cute_proven_bounds",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
         *BACKEND_TUNABLE_KEYS,
@@ -911,6 +926,13 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "pid_type",
         "num_sm_multiplier",
         "maxnreg",
+        "cute_async_load_stages",
+        "cute_async_load_lookahead",
+        "cute_async_load_group_rows",
+        "cute_async_load_cache",
+        "cute_async_store_policy",
+        "cute_bf16x2_recurrence",
+        "cute_proven_bounds",
     }
 )
 
@@ -1038,6 +1060,11 @@ class ConfigSpec:
         self.cute_reduction_reloads: BlockIdSequence[CuteReductionReloadSpec] = (
             BlockIdSequence()
         )
+        # Device-IR facts enable this only for plausible in-place 16-bit state
+        # updates. Generated-AST matching is stricter and remains authoritative.
+        self.cute_async_load_pipeline_enabled = False
+        self.cute_bf16x2_recurrence_enabled = False
+        self.cute_proven_bounds_enabled = False
         self.range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = (
             BlockIdSequence()
         )
@@ -2221,6 +2248,150 @@ class ConfigSpec:
             )
         self.cross_loop_schedule = EnumFragment(VALID_CROSS_LOOP_SCHEDULES)
 
+    def enable_cute_async_load_pipeline(self) -> None:
+        """Expose the narrow CuTe async state-load search dimensions."""
+        if self.backend_name != "cute":
+            raise InvalidConfig("async state-load pipelining requires CuTe")
+        self.cute_async_load_pipeline_enabled = True
+
+    @property
+    def cute_l2_evict_last_store_policy_supported(self) -> bool:
+        """Whether the fixed async-store policy is valid for this target."""
+
+        return fixed_l2_evict_last_store_policy_supported(
+            self.target_device_capability,
+            torch.version.cuda,
+        )
+
+    def enable_cute_bf16x2_recurrence(self) -> None:
+        """Expose native packed-BF16 recurrence lowering to the tuner."""
+        if self.backend_name != "cute":
+            raise InvalidConfig("packed BF16 recurrence lowering requires CuTe")
+        self.cute_bf16x2_recurrence_enabled = True
+
+    def enable_cute_proven_bounds(self) -> None:
+        """Expose proof-driven CuTe bounds cleanup to the tuner."""
+        if self.backend_name != "cute":
+            raise InvalidConfig("proven bounds cleanup requires CuTe")
+        self.cute_proven_bounds_enabled = True
+
+    def _normalize_cute_async_load_pipeline(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        keys = (
+            "cute_async_load_stages",
+            "cute_async_load_lookahead",
+            "cute_async_load_group_rows",
+            "cute_async_load_cache",
+            "cute_async_store_policy",
+        )
+        if not self.cute_async_load_pipeline_enabled:
+            supplied = [key for key in keys if key in config]
+            if supplied and not fix_invalid:
+                raise InvalidConfig(
+                    "CuTe async state-load knobs require a compatible in-place "
+                    "vector state update"
+                )
+            for key in supplied:
+                config.pop(key, None)
+            return
+
+        defaults: dict[str, object] = {
+            "cute_async_load_stages": 0,
+            "cute_async_load_lookahead": 4,
+            "cute_async_load_group_rows": 2,
+            "cute_async_load_cache": "cg",
+            "cute_async_store_policy": "default",
+        }
+        choices: dict[str, tuple[object, ...]] = {
+            "cute_async_load_stages": (0, 3, 4, 5),
+            "cute_async_load_lookahead": (2, 3, 4),
+            "cute_async_load_group_rows": (2, 4),
+            "cute_async_load_cache": ("cg", "ca"),
+            "cute_async_store_policy": ("default", "l2_evict_last"),
+        }
+        integer_keys = frozenset(
+            {
+                "cute_async_load_stages",
+                "cute_async_load_lookahead",
+                "cute_async_load_group_rows",
+            }
+        )
+        lookahead_was_supplied = "cute_async_load_lookahead" in config
+        for key in keys:
+            value = config.setdefault(key, defaults[key])
+            if value not in choices[key] or (
+                key in integer_keys and type(value) is not int
+            ):
+                if fix_invalid:
+                    config[key] = defaults[key]
+                else:
+                    raise InvalidConfig(
+                        f"{key} must be one of {choices[key]!r}, got {value!r}"
+                    )
+        if (
+            config["cute_async_store_policy"] == "l2_evict_last"
+            and not self.cute_l2_evict_last_store_policy_supported
+        ):
+            # Old pinned configs remain loadable on other targets/toolchains,
+            # where the transform has always failed closed to the default path.
+            config["cute_async_store_policy"] = "default"
+        stages = cast("int", config["cute_async_load_stages"])
+        if stages > 0 and not lookahead_was_supplied:
+            config["cute_async_load_lookahead"] = min(
+                cast("int", defaults["cute_async_load_lookahead"]), stages - 1
+            )
+        lookahead = cast("int", config["cute_async_load_lookahead"])
+        if stages == 0:
+            for key in keys[1:]:
+                config[key] = defaults[key]
+        elif lookahead >= stages:
+            if fix_invalid:
+                config["cute_async_load_lookahead"] = stages - 1
+            else:
+                raise InvalidConfig(
+                    "cute_async_load_lookahead must be smaller than "
+                    "cute_async_load_stages"
+                )
+
+    def _normalize_cute_bf16x2_recurrence(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_bf16x2_recurrence"
+        if not self.cute_bf16x2_recurrence_enabled:
+            if key in config and not fix_invalid:
+                raise InvalidConfig(
+                    "cute_bf16x2_recurrence requires a compatible BF16 recurrence"
+                )
+            config.pop(key, None)
+            return
+        value = config.setdefault(key, False)
+        if not isinstance(value, bool):
+            if fix_invalid:
+                config[key] = False
+            else:
+                raise InvalidConfig(f"{key} must be a boolean, got {value!r}")
+        elif config.get("cute_async_load_stages", 0) == 0:
+            config[key] = False
+
+    def _normalize_cute_proven_bounds(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_proven_bounds"
+        if not self.cute_proven_bounds_enabled:
+            if key in config and not fix_invalid:
+                raise InvalidConfig(
+                    "cute_proven_bounds requires exact CuTe launch and tensor facts"
+                )
+            config.pop(key, None)
+            return
+        value = config.setdefault(key, False)
+        if not isinstance(value, bool):
+            if fix_invalid:
+                config[key] = False
+            else:
+                raise InvalidConfig(f"{key} must be a boolean, got {value!r}")
+
     def supported_config_keys(self) -> frozenset[str]:
         return frozenset(key for key in VALID_KEYS if self.supports_config_key(key))
 
@@ -2380,6 +2551,9 @@ class ConfigSpec:
             self._cute_tcgen05_config.prepare_normalization(
                 config, fix_invalid=_fix_invalid
             )
+            self._normalize_cute_async_load_pipeline(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_bf16x2_recurrence(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_proven_bounds(config, fix_invalid=_fix_invalid)
         provided_keys = set(config)
         if _fix_invalid:
             self._pre_normalize_cute_flash_block_sizes(config)
@@ -3412,6 +3586,47 @@ class ConfigSpec:
                     and len(self.cute_reduction_reloads) > 0
                 ):
                     fields["cute_reduction_reloads"] = self.cute_reduction_reloads
+                if self.cute_async_load_pipeline_enabled:
+                    fields["cute_async_load_stages"] = EnumFragment(
+                        choices=(0, 3, 4, 5)
+                    )
+                    fields["cute_async_load_lookahead"] = EnumFragment(
+                        choices=(4, 2, 3)
+                    )
+                    fields["cute_async_load_group_rows"] = EnumFragment(choices=(2, 4))
+                    fields["cute_async_load_cache"] = EnumFragment(choices=("cg", "ca"))
+                    fields["cute_async_store_policy"] = EnumFragment(
+                        choices=(
+                            ("default", "l2_evict_last")
+                            if self.cute_l2_evict_last_store_policy_supported
+                            else ("default",)
+                        )
+                    )
+                if self.cute_bf16x2_recurrence_enabled:
+                    fields["cute_bf16x2_recurrence"] = BooleanFragment()
+                if self.cute_proven_bounds_enabled:
+                    fields["cute_proven_bounds"] = BooleanFragment()
+                # CuTe's SIMT search normally has no pid_type coordinate.  A
+                # metadata-specialized compiler seed may nevertheless prove one
+                # exact 3-D ``xyz`` launch safe after the earlier, deliberately
+                # conservative grid-size gate rejected it.  Preserve that seed
+                # through flatten/unflatten while keeping ``xyz`` out of random
+                # search when it is absent from ``allowed_pid_types``.
+                if self.supports_config_key("pid_type") and any(
+                    seed.config.get("pid_type") == "xyz"
+                    for seed in self.compiler_seed_configs
+                ):
+                    searchable_pid_types = tuple(
+                        pid_type
+                        for pid_type in self.allowed_pid_types
+                        if pid_type in ("flat", "xyz")
+                    )
+                    if searchable_pid_types:
+                        choices = tuple(dict.fromkeys((*searchable_pid_types, "xyz")))
+                        fields["pid_type"] = EnumFragment(
+                            choices,
+                            search_choices=searchable_pid_types,
+                        )
                 # Thread-block cluster width for SIMT reduction kernels:
                 # splits a whole-extent lane-looped axis across cluster
                 # CTAs (register-resident slices) with a DSM cluster
