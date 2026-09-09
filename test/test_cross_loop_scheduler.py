@@ -2683,6 +2683,180 @@ class TestCrossLoopScheduler(TestCase):
                 )
                 first_wave += (expected_count + 3) // 4
 
+    def test_parametric_root_major_schedule_uses_exact_fan_in_one_counter(
+        self,
+    ) -> None:
+        task_count = sympy.Symbol("task_count", integer=True, nonnegative=True)
+        dependency_graph = _dependency_graph(
+            [[10], [20]],
+            _access(
+                root=0,
+                kind="store",
+                shape=(8192,),
+                block_ids=(10,),
+            ),
+            _access(
+                root=1,
+                kind="load",
+                shape=(8192,),
+                block_ids=(20,),
+            ),
+        )
+        root_domains = (
+            CoordinateDomain((10,), ((10, task_count),), ((10, 16),)),
+            CoordinateDomain((20,), ((20, task_count),), ((20, 16),)),
+        )
+
+        with _forbid_schedule_enumeration():
+            plan = _configured_static_pipeline_plan(
+                dependency_graph=dependency_graph,
+                root_domains=root_domains,
+                axis_geometry={
+                    10: (task_count, 16),
+                    20: (task_count, 16),
+                },
+                worker_count=4,
+            )
+
+        self.assertEqual(plan.root_barrier_edges, frozenset())
+        self.assertEqual(len(plan.readiness_counters), 1)
+        (counter,) = plan.readiness_counters
+        self.assertEqual(counter.readiness_key_count_expr, task_count)
+        self.assertEqual(counter.uniform_arrival_count(), 1)
+        self.assertTrue(
+            cross_loop_scheduler._supports_parameterized_fan_in_one_counter(counter)
+        )
+        self.assertIsNotNone(
+            cross_loop_scheduler._parametric_root_major_schedule_geometry(
+                plan.worker_schedule
+            )
+        )
+
+        for concrete_count in (0, 1, 3, 4, 5, 11):
+            publication = counter.producers[0].keys_by_producer
+            self.assertIsNotNone(publication)
+            assert publication is not None
+            concrete_publication = publication.substitute_parameters(
+                {task_count: concrete_count}
+            )
+            concrete_waits = counter.consumers[
+                0
+            ].keys_by_consumer.substitute_parameters({task_count: concrete_count})
+            expected = tuple(frozenset((index,)) for index in range(concrete_count))
+            self.assertEqual(concrete_publication.materialize(), expected)
+            self.assertEqual(concrete_waits.materialize(), expected)
+
+    def test_parametric_counter_declines_unproved_dynamic_layout(self) -> None:
+        task_count = sympy.Symbol("task_count", integer=True, nonnegative=True)
+        dependency_graph = _dependency_graph(
+            [[10], [20]],
+            _access(
+                root=0,
+                kind="store",
+                shape=(8192,),
+                block_ids=(10,),
+                layout_is_static=False,
+            ),
+            _access(
+                root=1,
+                kind="load",
+                shape=(8192,),
+                block_ids=(20,),
+                layout_is_static=False,
+            ),
+        )
+        root_domains = (
+            CoordinateDomain((10,), ((10, task_count),), ((10, 16),)),
+            CoordinateDomain((20,), ((20, task_count),), ((20, 16),)),
+        )
+
+        with _forbid_schedule_enumeration():
+            plan = _configured_static_pipeline_plan(
+                dependency_graph=dependency_graph,
+                root_domains=root_domains,
+                axis_geometry={
+                    10: (task_count, 16),
+                    20: (task_count, 16),
+                },
+                worker_count=4,
+            )
+
+        self.assertEqual(plan.readiness_counters, ())
+        self.assertEqual(plan.root_barrier_edges, frozenset(((0, 1),)))
+
+    def test_parametric_counter_declines_fan_in_greater_than_one(self) -> None:
+        key_count = sympy.Symbol("key_count", integer=True, nonnegative=True)
+        dependency_graph = _dependency_graph(
+            [[10], [20]],
+            _access(
+                root=0,
+                kind="store",
+                shape=(8192,),
+                block_ids=(10,),
+            ),
+            _access(
+                root=1,
+                kind="load",
+                shape=(8192,),
+                block_ids=(20,),
+            ),
+        )
+        root_domains = (
+            CoordinateDomain((10,), ((10, 2 * key_count),), ((10, 16),)),
+            CoordinateDomain((20,), ((20, key_count),), ((20, 32),)),
+        )
+
+        with _forbid_schedule_enumeration():
+            plan = _configured_static_pipeline_plan(
+                dependency_graph=dependency_graph,
+                root_domains=root_domains,
+                axis_geometry={
+                    10: (2 * key_count, 16),
+                    20: (key_count, 32),
+                },
+                worker_count=4,
+            )
+
+        self.assertEqual(plan.readiness_counters, ())
+        self.assertEqual(plan.root_barrier_edges, frozenset(((0, 1),)))
+
+    def test_parametric_counter_declines_unsupported_access_scale(self) -> None:
+        task_count = sympy.Symbol("task_count", integer=True, nonnegative=True)
+        dependency_graph = _dependency_graph(
+            [[10], [20]],
+            _access(
+                root=0,
+                kind="store",
+                shape=(8192,),
+                block_ids=(10,),
+                scales=(2,),
+            ),
+            _access(
+                root=1,
+                kind="load",
+                shape=(8192,),
+                block_ids=(20,),
+            ),
+        )
+        root_domains = (
+            CoordinateDomain((10,), ((10, task_count),), ((10, 16),)),
+            CoordinateDomain((20,), ((20, task_count),), ((20, 16),)),
+        )
+
+        with _forbid_schedule_enumeration():
+            plan = _configured_static_pipeline_plan(
+                dependency_graph=dependency_graph,
+                root_domains=root_domains,
+                axis_geometry={
+                    10: (task_count, 16),
+                    20: (task_count, 16),
+                },
+                worker_count=4,
+            )
+
+        self.assertEqual(plan.readiness_counters, ())
+        self.assertEqual(plan.root_barrier_edges, frozenset(((0, 1),)))
+
     def test_worker_schedule_task_coverage_rejects_duplicate_and_missing(self) -> None:
         (domain,) = _identify_root_domains((_domain((10, 2, 1)),))
         task_order = pid_task_order(domain, domain.axis_order)

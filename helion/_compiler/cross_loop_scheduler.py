@@ -2305,13 +2305,19 @@ class ReadinessEvent:
         return identity
 
     @property
+    def readiness_key_count_expr(self) -> sympy.Expr:
+        """Return the possibly parameterized readiness-key count."""
+        return self.readiness_key_domain.size_expr
+
+    @property
     def readiness_key_count(self) -> int:
+        """Return the concrete readiness-key count."""
         return self.readiness_key_domain.size
 
     @property
     def root_barrier_producer_root(self) -> int | None:
         if (
-            self.readiness_key_count == 1
+            _equal_integer_expressions(self.readiness_key_count_expr, 1)
             and len(self.producers) == 1
             and self.producers[0].producer_site_id is None
             and self.producers[0].producers_by_key.is_total()
@@ -2330,7 +2336,10 @@ class ReadinessGraph:
     def __post_init__(self) -> None:
         for task_order in self.root_task_orders:
             if (
-                task_order.source_domain.size != task_order.target_domain.size
+                not _equal_integer_expressions(
+                    task_order.source_domain.size_expr,
+                    task_order.target_domain.size_expr,
+                )
                 or task_order.source_domain.kind != "task_order"
                 or task_order.target_domain.kind != "site"
                 or not task_order.pieces
@@ -2553,6 +2562,11 @@ class ReadinessCounterPlan:
         if self.continuation_consumer_index is None:
             return None
         return self.consumers[self.continuation_consumer_index]
+
+    @property
+    def readiness_key_count_expr(self) -> sympy.Expr:
+        """Return the possibly parameterized readiness-key count."""
+        return self.readiness_key_domain.size_expr
 
     @property
     def readiness_key_count(self) -> int:
@@ -3766,7 +3780,7 @@ def build_readiness_events(
             for axis in consumer_domain.axis_order
             if axis in readiness_key_axis_set
         )
-        consumer_counts = consumer_domain.axis_counts
+        consumer_counts = consumer_domain.axis_count_expressions
         consumer_blocks = consumer_domain.block_sizes
         readiness_key_domain = CoordinateDomain(
             axis_order=readiness_key_axes,
@@ -6290,6 +6304,108 @@ def _has_valid_transient_source_schedule(
     )
 
 
+def _supports_parameterized_fan_in_one_counter(
+    plan: ReadinessCounterPlan,
+) -> bool:
+    """Prove the replay-safe exact-event subset used by parametric schedules.
+
+    This initial subset deliberately requires positional bijections on both
+    sides of one root-entry event.  Every active readiness key therefore has
+    exactly one producer and one task in each retained consumer family for
+    every legal parameter value.
+    The existing epoch-valued ``atomic_xchg`` lowering is consequently safe
+    when a later launch shrinks, becomes empty, or grows again.
+    """
+    if (
+        plan.continuation_consumer_index is not None
+        or len(plan.readiness_key_domain.axis_order) != 1
+        or len(plan.producers) != 1
+        or plan.uniform_arrival_count() != 1
+    ):
+        return False
+    (producer,) = plan.producers
+    publication = producer.keys_by_producer
+    if (
+        producer.producer_site_id is not None
+        or publication is None
+        or not producer.producers_by_key.is_positional_bijection()
+        or not publication.is_positional_bijection()
+    ):
+        return False
+    return all(
+        consumer.consumer_site_id is None
+        and producer.producer_root < consumer.consumer_root
+        and consumer.keys_by_consumer.is_positional_bijection()
+        and (converse := consumer.keys_by_consumer.converse()) is not None
+        and converse.is_positional_bijection()
+        for consumer in plan.consumers
+    )
+
+
+def _finalize_emitted_synchronization(
+    *,
+    dependency_graph: TileDependencyGraph,
+    readiness_counters: tuple[ReadinessCounterPlan, ...],
+) -> tuple[tuple[ReadinessCounterPlan, ...], frozenset[tuple[int, int]]]:
+    """Select fallback barriers and remove counter consumers they subsume."""
+    covered_obligations = frozenset(
+        obligation
+        for counter_plan in readiness_counters
+        for readiness_consumer in counter_plan.consumers
+        for obligation in readiness_consumer.covered_obligations
+    )
+    root_barrier_edges = _select_root_barrier_edges(
+        dependency_graph=dependency_graph,
+        covered_obligations=covered_obligations,
+    )
+    root_order_edges = set(root_barrier_edges)
+    retained_readiness_counters: list[ReadinessCounterPlan] = []
+    for counter_plan in readiness_counters:
+        retained_consumer_indices = tuple(
+            consumer_index
+            for consumer_index, readiness_consumer in enumerate(counter_plan.consumers)
+            if consumer_index == counter_plan.continuation_consumer_index
+            or not all(
+                _is_ordered_by_root_barrier(
+                    readiness_producer.producer_root,
+                    readiness_consumer.consumer_root,
+                    root_order_edges,
+                )
+                for readiness_producer in counter_plan.producers
+            )
+        )
+        if not retained_consumer_indices:
+            continue
+        retained_readiness_counters.append(
+            dataclasses.replace(
+                counter_plan,
+                consumers=tuple(
+                    counter_plan.consumers[index] for index in retained_consumer_indices
+                ),
+                continuation_consumer_index=(
+                    retained_consumer_indices.index(
+                        counter_plan.continuation_consumer_index
+                    )
+                    if counter_plan.continuation_consumer_index is not None
+                    else None
+                ),
+            )
+        )
+    retained = tuple(retained_readiness_counters)
+    covered_obligations = frozenset(
+        obligation
+        for counter_plan in retained
+        for readiness_consumer in counter_plan.consumers
+        for obligation in readiness_consumer.covered_obligations
+    )
+    _validate_schedule_coverage(
+        dependency_graph=dependency_graph,
+        covered_obligations=covered_obligations,
+        root_barrier_edges=root_barrier_edges,
+    )
+    return retained, root_barrier_edges
+
+
 def build_static_pipeline_plan(
     *,
     dependency_graph: TileDependencyGraph,
@@ -6313,21 +6429,23 @@ def build_static_pipeline_plan(
                 "cross_loop_schedule='static_pipeline' cannot represent this "
                 "parameterized root schedule"
             ) from error
-        # Dynamic access geometry is intentionally not specialized from hints.
-        # Until an exact parametric event proof exists, every dependence falls
-        # back monotonically to the existing whole-root synchronization.
-        root_barrier_edges = _select_root_barrier_edges(
+        readiness_graph = build_readiness_graph(
             dependency_graph=dependency_graph,
-            covered_obligations=frozenset(),
+            root_task_orders=root_task_orders,
+            site_domains=site_domains,
+            publishable_site_ids=publishable_site_ids,
         )
-        _validate_schedule_coverage(
+        readiness_counters, root_barrier_edges = _finalize_emitted_synchronization(
             dependency_graph=dependency_graph,
-            covered_obligations=frozenset(),
-            root_barrier_edges=root_barrier_edges,
+            readiness_counters=tuple(
+                plan
+                for plan in choose_readiness_counters(readiness_graph, ())
+                if _supports_parameterized_fan_in_one_counter(plan)
+            ),
         )
         return StaticPipelinePlan(
             worker_schedule=worker_schedule,
-            readiness_counters=(),
+            readiness_counters=readiness_counters,
             root_barrier_edges=root_barrier_edges,
             transient_source_root=None,
         )
@@ -6368,65 +6486,14 @@ def build_static_pipeline_plan(
         ),
         *nested_loop_counters,
     )
-    covered_obligations = frozenset(
-        obligation
-        for counter_plan in readiness_counters
-        for readiness_consumer in counter_plan.consumers
-        for obligation in readiness_consumer.covered_obligations
-    )
     # Recompute coverage from the mechanisms that will actually be emitted.
     # Dependency analysis may prove a finer relation than the selected emitter
     # can materialize. Such a relation must monotonically coarsen to root
     # barrier; retaining a task-ready classification without an emitter
     # would remove the dependency entirely.
-    root_barrier_edges = _select_root_barrier_edges(
+    readiness_counters, root_barrier_edges = _finalize_emitted_synchronization(
         dependency_graph=dependency_graph,
-        covered_obligations=covered_obligations,
-    )
-    root_order_edges = set(root_barrier_edges)
-    retained_readiness_counters: list[ReadinessCounterPlan] = []
-    for counter_plan in readiness_counters:
-        retained_consumer_indices = tuple(
-            consumer_index
-            for consumer_index, readiness_consumer in enumerate(counter_plan.consumers)
-            if consumer_index == counter_plan.continuation_consumer_index
-            or not all(
-                _is_ordered_by_root_barrier(
-                    readiness_producer.producer_root,
-                    readiness_consumer.consumer_root,
-                    root_order_edges,
-                )
-                for readiness_producer in counter_plan.producers
-            )
-        )
-        if not retained_consumer_indices:
-            continue
-        retained_readiness_counters.append(
-            dataclasses.replace(
-                counter_plan,
-                consumers=tuple(
-                    counter_plan.consumers[index] for index in retained_consumer_indices
-                ),
-                continuation_consumer_index=(
-                    retained_consumer_indices.index(
-                        counter_plan.continuation_consumer_index
-                    )
-                    if counter_plan.continuation_consumer_index is not None
-                    else None
-                ),
-            )
-        )
-    readiness_counters = tuple(retained_readiness_counters)
-    covered_obligations = frozenset(
-        obligation
-        for counter_plan in readiness_counters
-        for readiness_consumer in counter_plan.consumers
-        for obligation in readiness_consumer.covered_obligations
-    )
-    _validate_schedule_coverage(
-        dependency_graph=dependency_graph,
-        covered_obligations=covered_obligations,
-        root_barrier_edges=root_barrier_edges,
+        readiness_counters=readiness_counters,
     )
     transient_source_root: int | None = None
     globally_scheduled = None

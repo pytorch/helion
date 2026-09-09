@@ -68,6 +68,66 @@ dynamic_implicit_tile_dependency_chain = helion.kernel(
 )(implicit_tile_dependency_chain.fn)
 
 
+@helion.kernel(
+    static_shapes=False,
+    autotune_effort="none",
+    triton_do_not_specialize=True,
+)
+def dynamic_exact_tile_dependency_chain(x: torch.Tensor) -> torch.Tensor:
+    """Keep scratch layout static while the scheduled task domain varies."""
+    tmp = torch.empty((8192,), dtype=x.dtype, device=x.device)
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        tmp[tile] = x[tile] + 1
+    for tile in hl.tile(x.size(0)):
+        out[tile] = tmp[tile] * 2
+    return out
+
+
+@helion.kernel(
+    static_shapes=False,
+    autotune_effort="none",
+    triton_do_not_specialize=True,
+)
+def dynamic_exact_then_barrier_chain(x: torch.Tensor) -> torch.Tensor:
+    """Mix a parameter-sized exact counter with a cumulative root barrier."""
+    exact_tmp = torch.empty((8192,), dtype=x.dtype, device=x.device)
+    dynamic_tmp = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        exact_tmp[tile] = x[tile] + 1
+    for tile in hl.tile(x.size(0)):
+        dynamic_tmp[tile] = exact_tmp[tile] * 2
+    for tile in hl.tile(x.size(0)):
+        out[tile] = dynamic_tmp[tile] - 3
+    return out
+
+
+@helion.kernel(
+    static_shapes=False,
+    autotune_effort="none",
+    triton_do_not_specialize=True,
+)
+def two_dynamic_exact_chains(
+    x: torch.Tensor,
+    y: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exercise two symbolic counter sections whose aggregate size can match."""
+    x_tmp = torch.empty((4096,), dtype=x.dtype, device=x.device)
+    x_out = torch.empty_like(x)
+    y_tmp = torch.empty((4096,), dtype=y.dtype, device=y.device)
+    y_out = torch.empty_like(y)
+    for tile in hl.tile(x.size(0)):
+        x_tmp[tile] = x[tile] + 1
+    for tile in hl.tile(x.size(0)):
+        x_out[tile] = x_tmp[tile] * 2
+    for tile in hl.tile(y.size(0)):
+        y_tmp[tile] = y[tile] - 3
+    for tile in hl.tile(y.size(0)):
+        y_out[tile] = y_tmp[tile] * 4
+    return x_out, y_out
+
+
 @helion.kernel(autotune_effort="none")
 def implicit_atomic_dependency(x: torch.Tensor) -> torch.Tensor:
     tmp = torch.empty_like(x)
@@ -442,6 +502,178 @@ class TestTritonTileDependencyLowering(TestCase):
                 expected_hashes = hashes
             else:
                 self.assertEqual(hashes, expected_hashes)
+
+    def test_dynamic_exact_readiness_reuses_epoch_counter_across_shapes(self) -> None:
+        exemplar = torch.arange(65, device=DEVICE, dtype=torch.float32)
+        bound = dynamic_exact_tile_dependency_chain.bind((exemplar,))
+        config = helion.Config(
+            block_sizes=[16, 16],
+            pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
+            num_warps=1,
+        )
+        code = bound.to_code(config)
+        compiled = bound.compile_config(config)
+        worker_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+
+        self.assertIn("tile_dependency_readiness_wait", code)
+        self.assertIn("tl.atomic_xchg", code)
+        self.assertNotIn("tl.atomic_add", code)
+        self.assertNotIn("tile_dependency_root_barrier", code)
+        self.assertNotIn("triton_helpers.x_grid_barrier(", code)
+        self.assertNotIn("tile_dependency_dispatch_ticket", code)
+        self.assertIn("32 * ((15 + x.size(0)) // 16)", code)
+
+        def compiled_cubin_hashes() -> set[str]:
+            triton_kernel = compiled.__globals__.get(f"_helion_{bound.kernel.name}")
+            self.assertIsNotNone(triton_kernel)
+            device_caches = getattr(triton_kernel, "device_caches", None)
+            self.assertIsInstance(device_caches, dict)
+            assert isinstance(device_caches, dict)
+            return {
+                compiled_kernel.hash
+                for cache_tuple in device_caches.values()
+                for compiled_kernel in cache_tuple[0].values()
+                if getattr(compiled_kernel, "hash", None) is not None
+            }
+
+        task_counts = (
+            5,
+            1,
+            0,
+            worker_count + 1,
+            worker_count - 1,
+            2 * worker_count + 3,
+            5,
+        )
+        expected_hashes: set[str] | None = None
+        for launch, task_count in enumerate(task_counts):
+            length = 0 if task_count == 0 else task_count * 16 - launch % 7
+            x = (
+                torch.arange(length, device=DEVICE, dtype=torch.float32)
+                + launch * 10000
+            )
+            output = compiled(x)
+            torch.testing.assert_close(output, (x + 1) * 2)
+            hashes = compiled_cubin_hashes()
+            self.assertEqual(len(hashes), 1)
+            if expected_hashes is None:
+                expected_hashes = hashes
+            else:
+                self.assertEqual(hashes, expected_hashes)
+
+        captured_input = torch.empty(65, device=DEVICE, dtype=torch.float32)
+        compiled(captured_input)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured_output = compiled(captured_input)
+        for value in (3.0, 7.0, -2.0):
+            captured_input.fill_(value)
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(captured_output, (captured_input + 1) * 2)
+
+    def test_dynamic_counter_tail_does_not_relocate_root_barrier(self) -> None:
+        exemplar = torch.arange(65, device=DEVICE, dtype=torch.float32)
+        bound = dynamic_exact_then_barrier_chain.bind((exemplar,))
+        config = helion.Config(
+            block_sizes=[16, 16, 16],
+            pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
+            num_warps=1,
+        )
+        code = bound.to_code(config)
+        compiled = bound.compile_config(config)
+        worker_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+        epoch_words = (worker_count + 31) // 32 * 32
+
+        fixed_barrier = f"tile_dependency_state + {epoch_words} + 0 + 0"
+        dynamic_counter = f"tile_dependency_state + {epoch_words} + 32 + 0"
+        self.assertIn(f"tl.atomic_add({fixed_barrier}", code)
+        self.assertIn("tile_dependency_root_barrier_wait", code)
+        self.assertIn(f"tl.atomic_xchg({dynamic_counter}", code)
+        self.assertIn("tile_dependency_readiness_wait", code)
+        self.assertIn("32 * ((15 + x.size(0)) // 16)", code)
+
+        for launch, length in enumerate((65, 17, 0, 97, 65)):
+            x = (
+                torch.arange(length, device=DEVICE, dtype=torch.float32)
+                + launch * 10000
+            )
+            output = compiled(x)
+            torch.testing.assert_close(output, (x + 1) * 2 - 3)
+
+    def test_dynamic_counter_sections_are_replay_safe_when_offsets_move(self) -> None:
+        exemplar = (
+            torch.arange(65, device=DEVICE, dtype=torch.float32),
+            torch.arange(49, device=DEVICE, dtype=torch.float32),
+        )
+        bound = two_dynamic_exact_chains.bind(exemplar)
+        config = helion.Config(
+            block_sizes=[16, 16, 16, 16],
+            pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
+            num_warps=1,
+        )
+        code = bound.to_code(config)
+        compiled = bound.compile_config(config)
+
+        self.assertEqual(code.count("tl.atomic_xchg"), 2)
+        self.assertGreaterEqual(code.count("tile_dependency_readiness_wait"), 2)
+        self.assertNotIn("tl.atomic_add", code)
+        self.assertNotIn("tile_dependency_root_barrier", code)
+
+        # The first two shapes have the same total key count but move the
+        # boundary between the two event sections.  Absolute epoch xchg makes
+        # stale values harmless even when the launcher reuses one state pad.
+        shapes = ((16, 144), (0, 145), (16, 144))
+        for launch, (x_length, y_length) in enumerate(shapes):
+            x = (
+                torch.arange(x_length, device=DEVICE, dtype=torch.float32)
+                + launch * 10000
+            )
+            y = (
+                torch.arange(y_length, device=DEVICE, dtype=torch.float32)
+                + launch * 20000
+            )
+            x_out, y_out = compiled(x, y)
+            torch.testing.assert_close(x_out, (x + 1) * 2)
+            torch.testing.assert_close(y_out, (y - 3) * 4)
+
+        graph_inputs = tuple(
+            (
+                torch.empty(x_length, device=DEVICE, dtype=torch.float32),
+                torch.empty(y_length, device=DEVICE, dtype=torch.float32),
+            )
+            for x_length, y_length in shapes[:2]
+        )
+        capture_stream = torch.cuda.Stream(device=DEVICE)
+        with torch.cuda.stream(capture_stream):
+            for x, y in graph_inputs:
+                compiled(x, y)
+        capture_stream.synchronize()
+
+        graphs: list[
+            tuple[torch.cuda.CUDAGraph, tuple[torch.Tensor, torch.Tensor]]
+        ] = []
+        captured_outputs: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for inputs in graph_inputs:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=capture_stream):
+                outputs = compiled(*inputs)
+            graphs.append((graph, inputs))
+            captured_outputs.append(outputs)
+
+        for launch, graph_index in enumerate((0, 1, 0, 1, 0)):
+            graph, (x, y) = graphs[graph_index]
+            x.fill_(launch * 10000 + 1)
+            y.fill_(launch * 20000 + 2)
+            graph.replay()
+            torch.cuda.synchronize()
+            x_out, y_out = captured_outputs[graph_index]
+            torch.testing.assert_close(x_out, (x + 1) * 2)
+            torch.testing.assert_close(y_out, (y - 3) * 4)
 
     def test_matmul_chain_allows_reused_accumulator_name(self) -> None:
         a = torch.arange(256, device=DEVICE, dtype=torch.float32).reshape(16, 16)

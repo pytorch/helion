@@ -22,6 +22,7 @@ from .cross_loop_scheduler import WorkerScheduleSegment
 from .cross_loop_scheduler import _normalize_intervals
 from .cross_loop_scheduler import _parametric_root_major_schedule_geometry
 from .cross_loop_scheduler import _root_schedule_traversal
+from .cross_loop_scheduler import _supports_parameterized_fan_in_one_counter
 from .cross_loop_scheduler import build_static_pipeline_plan
 from .cross_loop_scheduler import root_barrier_publication_plan
 from .device_function import TensorArg
@@ -715,11 +716,14 @@ def emit_cross_loop_schedule(
             "parameterized worker schedule"
         )
     if parameterized_schedule_geometry is not None and (
-        static_pipeline_plan.readiness_counters
-        or static_pipeline_plan.transient_source_root is not None
+        static_pipeline_plan.transient_source_root is not None
+        or any(
+            not _supports_parameterized_fan_in_one_counter(plan)
+            for plan in static_pipeline_plan.readiness_counters
+        )
     ):
         raise AssertionError(
-            "parameterized root-major lowering only supports root barriers"
+            "parameterized root-major lowering received an unproved counter plan"
         )
     root_barrier_edges = static_pipeline_plan.root_barrier_edges
     all_readiness_counter_plans = static_pipeline_plan.readiness_counters
@@ -794,37 +798,63 @@ def emit_cross_loop_schedule(
         strategy.grid_size_expr = (
             f"({resident_grid_size_expr} + {transient_source_task_count})"
         )
-    readiness_counter_offsets: dict[ReadinessCounterPlan, int] = {}
-    readiness_counter_count = 0
+    readiness_counter_offsets: dict[ReadinessCounterPlan, int | sympy.Expr] = {}
+    readiness_counter_count: int | sympy.Expr = 0
     readiness_counter_stride = _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
     for plan in all_readiness_counter_plans:
         readiness_counter_offsets[plan] = readiness_counter_count
-        readiness_counter_count += plan.readiness_key_count * readiness_counter_stride
+        readiness_counter_count = sympy.simplify(
+            sympy.Add(
+                sympy.sympify(readiness_counter_count),
+                sympy.Mul(
+                    plan.readiness_key_count_expr,
+                    readiness_counter_stride,
+                ),
+            )
+        )
     root_barrier_producer_roots = sorted(
         {producer for producer, _consumer in root_barrier_edges}
     )
     root_barrier_indices = {
         root: index for index, root in enumerate(root_barrier_producer_roots)
     }
-    state_count = 0
+    state_count: int | sympy.Expr = 0
 
-    def reserve_state(count: int) -> int | None:
+    def reserve_state(count: int | sympy.Expr) -> int | sympy.Expr | None:
         nonlocal state_count
-        if not count:
+        if sympy.simplify(count) == 0:
             return None
-        state_count = (
-            (state_count + _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS - 1)
-            // _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
-            * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
-        )
+        if isinstance(state_count, int):
+            state_count = (
+                (state_count + _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS - 1)
+                // _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
+                * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
+            )
+        else:
+            state_count = sympy.simplify(
+                sympy.Mul(
+                    CeilDiv(state_count, _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS),
+                    _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS,
+                )
+            )
         offset = state_count
-        state_count += count
+        state_count = sympy.simplify(
+            sympy.Add(sympy.sympify(state_count), sympy.sympify(count))
+        )
         return offset
 
-    readiness_counter_state_offset = reserve_state(readiness_counter_count)
-    root_barrier_state_offset = reserve_state(
+    root_barrier_count = (
         len(root_barrier_producer_roots) * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
     )
+    if parameterized_schedule_geometry is None:
+        readiness_counter_state_offset = reserve_state(readiness_counter_count)
+        root_barrier_state_offset = reserve_state(root_barrier_count)
+    else:
+        # Cumulative root barriers need shape-stable addresses across graph
+        # replay.  Parameter-sized fan-in-one counters contain absolute epoch
+        # values, so they may safely occupy the variable tail.
+        root_barrier_state_offset = reserve_state(root_barrier_count)
+        readiness_counter_state_offset = reserve_state(readiness_counter_count)
     epoch_state_count = launch_program_count if transient_source_root is None else 0
     static_state_base = str(
         (epoch_state_count + _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS - 1)
@@ -834,7 +864,10 @@ def emit_cross_loop_schedule(
     state_arg = _register_cross_loop_state(
         device_function,
         name_hint="tile_dependency_state",
-        numel=f"{static_state_base} + {state_count}",
+        numel=(
+            f"{static_state_base} + "
+            f"{HostFunction.current().sympy_expr(sympy.sympify(state_count))}"
+        ),
         dtype=_CROSS_LOOP_COUNTER_DTYPE,
     )
     dispatch_ticket_arg = (
@@ -848,10 +881,15 @@ def emit_cross_loop_schedule(
         else None
     )
 
-    def state_section(offset: int | None) -> str | None:
+    def state_section(offset: int | sympy.Expr | None) -> str | None:
         if offset is None:
             return None
-        return f"{state_arg} + ({static_state_base}) + {offset}"
+        offset_text = (
+            str(offset)
+            if isinstance(offset, int)
+            else device_function.sympy_expr(offset)
+        )
+        return f"{state_arg} + ({static_state_base}) + {offset_text}"
 
     epoch_arg = state_arg
     readiness_counter_arg = state_section(readiness_counter_state_offset)
@@ -1409,8 +1447,14 @@ def emit_cross_loop_schedule(
         readiness_key: str,
     ) -> str:
         assert readiness_counter_arg is not None
+        offset = readiness_counter_offsets[plan]
+        offset_text = (
+            str(offset)
+            if isinstance(offset, int)
+            else device_function.sympy_expr(offset)
+        )
         return (
-            f"{readiness_counter_arg} + {readiness_counter_offsets[plan]} + "
+            f"{readiness_counter_arg} + {offset_text} + "
             f"({readiness_key}) * {readiness_counter_stride}"
         )
 
@@ -1890,7 +1934,8 @@ def emit_cross_loop_schedule(
         # coupling across schedule occurrences.
         root_segments = static_pipeline_plan.worker_schedule.segments_for_root(root)
         is_single_trip_occurrence = (
-            len(root_segments) == 1
+            parameterized_schedule_geometry is None
+            and len(root_segments) == 1
             and root_segments[0].task_count <= root_segments[0].worker_count
         )
         scheduled_wrapper_noinline = (

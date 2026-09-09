@@ -20,8 +20,12 @@ Implementation checkpoint (2026-09-08):
   rank-one roots: symbolic domains lower through the same `WorkerSchedule`,
   conservative root barriers, and runtime-bounded loops, with one cubin reused
   across changing extents.
-- Parametric exact-event recurrence, cross-workload rollout, and final
-  source/local-path consolidation remain to be implemented and measured.
+- Exact parameterized root-entry readiness is implemented for the first
+  replay-safe subset: rank-one positional producer/key and consumer/key
+  bijections with fan-in one use the existing epoch-valued counter lowering.
+- Parametric event-frontier recurrence, wider fan-in, cross-workload rollout,
+  and final source/local-path consolidation remain to be implemented and
+  measured.
 
 The hard architectural constraint is:
 
@@ -1129,6 +1133,19 @@ admission still decline rather than relying on a shape hint.
 The binary-reuse regression explicitly opts its runtime extent out of Triton
 specialization; parameterizing the schedule does not override backend
 specialization policy for ordinary scalar arguments.
+
+Implementation checkpoint (2026-09-09): the same parameterized root-major
+schedule now consumes ordinary `ReadinessGraph` events when the existing
+relations prove a rank-one positional bijection on both sides and constant
+fan-in one. Those events lower through the existing `ReadinessCounterPlan`,
+release `atomic_xchg(counter[key], epoch)`, and acquire wait for that epoch;
+unsupported layouts, partial relations, nested waits, and wider fan-in retain
+root barriers. Fixed cumulative root-barrier sections precede parameter-sized
+epoch-counter sections, so changing exact-event sizes cannot relocate barrier
+state across replay. Tests cover zero, shrink/grow, worker-count boundaries,
+two moving symbolic counter sections with equal aggregate storage, and one
+compiled cubin. This establishes parameterized exact synchronization, not yet
+the cross-root repeating wave relation needed for immediate per-key overlap.
 
 ### Phase 5: source-ticket generalization
 

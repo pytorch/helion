@@ -757,6 +757,83 @@ class TestTileDependency(TestCase):
         )
         self.assertIsNone(zero_roots[0])
 
+    def test_symbolic_positional_bijection_derives_inverse_and_unit_fan_in(
+        self,
+    ) -> None:
+        task_count = sympy.Symbol("task_count", integer=True, nonnegative=True)
+        key_domain = CoordinateDomain(
+            (0,),
+            ((0, task_count),),
+            kind="event",
+            identity=0,
+        )
+        producer_domain = CoordinateDomain(
+            (10,),
+            ((10, task_count),),
+            ((10, 16),),
+            kind="site",
+            identity=0,
+        )
+        relation = CoordinateRelation.point_map(
+            key_domain,
+            producer_domain,
+            (
+                (
+                    ((0, 0, task_count, 1),),
+                    (coordinate_axis_symbol(0),),
+                ),
+            ),
+        )
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("symbolic proof must not enumerate"),
+        ):
+            converse, target_counts = relation.derive_converse_and_target_counts()
+            self.assertTrue(relation.is_positional_bijection())
+            self.assertTrue(relation.is_total_function())
+            self.assertIs(relation.canonical_single_valued(), relation)
+            self.assertIsNotNone(converse)
+            self.assertIsNotNone(target_counts)
+            assert converse is not None and target_counts is not None
+            self.assertTrue(converse.is_positional_bijection())
+            self.assertEqual(target_counts.constant_value(), 1)
+
+        for concrete_count in (0, 1, 3, 4, 5):
+            concrete = relation.substitute_parameters({task_count: concrete_count})
+            concrete_converse = converse.substitute_parameters(
+                {task_count: concrete_count}
+            )
+            expected = tuple(frozenset((index,)) for index in range(concrete_count))
+            self.assertEqual(concrete.materialize(), expected)
+            self.assertEqual(concrete_converse.materialize(), expected)
+
+    def test_unproved_symbolic_point_maps_decline_totality(self) -> None:
+        task_count = sympy.Symbol("task_count", integer=True, nonnegative=True)
+        source = CoordinateDomain((10,), ((10, task_count),), kind="site")
+        target = CoordinateDomain((20,), ((20, task_count),), kind="event")
+        coordinate = coordinate_axis_symbol(10)
+
+        for expression in (
+            coordinate + 1,
+            sympy.Integer(0),
+            sympy.Mod(coordinate, 2),
+        ):
+            with self.subTest(expression=expression):
+                relation = CoordinateRelation.point_map(
+                    source,
+                    target,
+                    (
+                        (
+                            ((10, 0, task_count, 1),),
+                            (expression,),
+                        ),
+                    ),
+                )
+                self.assertFalse(relation.is_total_function())
+                self.assertIsNone(relation.converse())
+
     def test_symbolic_pid_task_order_preserves_l2_tail_group(self) -> None:
         domain = CoordinateDomain(
             (10, 20, 30),

@@ -328,7 +328,10 @@ def coordinate_axis_symbol(axis: int) -> sympy.Symbol:
 
 def _simplify_bounded_coordinate_constants(
     expression: sympy.Expr,
-    source_bounds: dict[int, tuple[int, int, int]],
+    source_bounds: dict[
+        int,
+        tuple[IntegerExpression, IntegerExpression, int],
+    ],
     *,
     axes: frozenset[int] | None = None,
 ) -> sympy.Expr:
@@ -340,7 +343,20 @@ def _simplify_bounded_coordinate_constants(
         symbol = coordinate_axis_symbol(axis)
         if symbol not in result.free_symbols:
             continue
-        values = range(begin, end, step)
+        try:
+            concrete_begin = _concrete_integer(
+                begin,
+                description="relation source bound",
+            )
+            concrete_end = _concrete_integer(
+                end,
+                description="relation source bound",
+            )
+        except ValueError:
+            # Sampling parameter values would turn a regression oracle into a
+            # proof.  Keeping the coordinate term is conservative.
+            continue
+        values = range(concrete_begin, concrete_end, step)
         if len(values) > 64:
             continue
         evaluated = tuple(
@@ -648,7 +664,8 @@ class CoordinateRelation:
         """Project a domain onto a coordinate-compatible subdomain."""
         source_counts = source_domain.axis_count_expressions
         if any(
-            axis not in source_counts or source_counts[axis] != count
+            axis not in source_counts
+            or sympy.simplify(source_counts[axis] - count) != 0
             for axis, count in target_domain.axis_counts_items
         ):
             return None
@@ -680,7 +697,14 @@ class CoordinateRelation:
         """Rename target axes positionally without changing coordinates."""
         old_axes = self.target_domain.axis_order
         new_axes = target_domain.axis_order
-        if self.target_domain.shape != target_domain.shape:
+        if len(old_axes) != len(new_axes) or any(
+            sympy.simplify(left - right) != 0
+            for left, right in zip(
+                self.target_domain.shape_expr,
+                target_domain.shape_expr,
+                strict=True,
+            )
+        ):
             return None
         renamed_axes = dict(zip(old_axes, new_axes, strict=True))
         return CoordinateRelation(
@@ -704,7 +728,14 @@ class CoordinateRelation:
         """Rename source axes positionally without changing coordinates."""
         old_axes = self.source_domain.axis_order
         new_axes = source_domain.axis_order
-        if self.source_domain.shape != source_domain.shape:
+        if len(old_axes) != len(new_axes) or any(
+            sympy.simplify(left - right) != 0
+            for left, right in zip(
+                self.source_domain.shape_expr,
+                source_domain.shape_expr,
+                strict=True,
+            )
+        ):
             return None
         renamed_axes = dict(zip(old_axes, new_axes, strict=True))
         substitutions = {
@@ -1006,7 +1037,7 @@ class CoordinateRelation:
             return None
         (quotient_piece,) = quotient.pieces
         if quotient_piece.source_bounds_items != tuple(
-            (axis, 0, self.source_domain.axis_counts[axis], 1)
+            (axis, 0, self.source_domain.axis_count_expressions[axis], 1)
             for axis in self.source_domain.axis_order
         ):
             return None
@@ -1026,8 +1057,11 @@ class CoordinateRelation:
             if source_axis in source_axis_by_key_axis.values():
                 return None
             if (
-                self.source_domain.axis_counts[source_axis]
-                != quotient.target_domain.axis_counts[key_axis]
+                sympy.simplify(
+                    self.source_domain.axis_count_expressions[source_axis]
+                    - quotient.target_domain.axis_count_expressions[key_axis]
+                )
+                != 0
             ):
                 return None
             source_axis_by_key_axis[key_axis] = source_axis
@@ -1052,7 +1086,8 @@ class CoordinateRelation:
                 for axis, begin, end, step in piece.source_bounds_items
             }
             if any(
-                source_bounds[axis] != (0, self.source_domain.axis_counts[axis], 1)
+                source_bounds[axis]
+                != (0, self.source_domain.axis_count_expressions[axis], 1)
                 for axis in dropped_axes
             ):
                 return None
@@ -1128,7 +1163,7 @@ class CoordinateRelation:
         }
         used: set[int] = set()
         full_source_bounds = {
-            axis: (0, self.source_domain.axis_counts[axis], 1)
+            axis: (0, self.source_domain.axis_count_expressions[axis], 1)
             for axis in self.source_domain.axis_order
         }
         for piece in self.pieces:
@@ -1160,6 +1195,11 @@ class CoordinateRelation:
         as four adjacent consumer heads sharing the same producer set, while
         rejecting diagonal, partial, masked, or otherwise nonseparable maps.
         """
+        if self.parameter_symbols:
+            # The current exact parametric subset is positional fan-in one.
+            # Wider fibers need symbolic divisibility/cardinality lemmas and
+            # must decline rather than sampling a runtime extent.
+            return None
         if len(self.pieces) != 1:
             return None
         (piece,) = self.pieces
@@ -1279,6 +1319,10 @@ class CoordinateRelation:
 
     def converse(self) -> CoordinateRelation | None:
         """Return the exact converse when representable without enumeration."""
+        if self.is_positional_bijection():
+            return self.derive_converse_and_target_counts()[0]
+        if self.parameter_symbols:
+            return None
         converse = self._cached_converse
         if converse is not None:
             return converse
@@ -1291,6 +1335,55 @@ class CoordinateRelation:
         self,
     ) -> tuple[CoordinateRelation | None, CoordinateRelation | None]:
         """Derive the converse and per-source target counts from one proof."""
+        if self.is_positional_bijection():
+            converse = CoordinateRelation.point_map(
+                self.target_domain,
+                self.source_domain,
+                (
+                    (
+                        tuple(
+                            (
+                                axis,
+                                0,
+                                self.target_domain.axis_count_expressions[axis],
+                                1,
+                            )
+                            for axis in self.target_domain.axis_order
+                        ),
+                        tuple(
+                            coordinate_axis_symbol(axis)
+                            for axis in self.target_domain.axis_order
+                        ),
+                    ),
+                ),
+            )
+            value_axis = 0
+            value_domain = CoordinateDomain(
+                axis_order=(value_axis,),
+                axis_counts_items=((value_axis, 2),),
+                kind="value",
+            )
+            target_counts = CoordinateRelation.point_map(
+                self.source_domain,
+                value_domain,
+                (
+                    (
+                        tuple(
+                            (
+                                axis,
+                                0,
+                                self.source_domain.axis_count_expressions[axis],
+                                1,
+                            )
+                            for axis in self.source_domain.axis_order
+                        ),
+                        (sympy.Integer(1),),
+                    ),
+                ),
+            )
+            return converse, target_counts
+        if self.parameter_symbols:
+            return None, None
         target_counts = self.target_count_by_source()
         converse = self._cached_converse
         if converse is not None:
@@ -1878,13 +1971,16 @@ class CoordinateRelation:
             return False
         (piece,) = self.pieces
         return piece.source_bounds_items == tuple(
-            (axis, 0, self.source_domain.axis_counts[axis], 1)
+            (axis, 0, self.source_domain.axis_count_expressions[axis], 1)
             for axis in self.source_domain.axis_order
         ) and piece.target_ranges == tuple(
             (
                 axis,
                 sympy.Integer(0),
-                sympy.Integer(self.target_domain.axis_counts[axis]),
+                _integer_expression(
+                    self.target_domain.axis_count_expressions[axis],
+                    description="coordinate-domain axis count",
+                ),
                 1,
             )
             for axis in self.target_domain.axis_order
@@ -1963,6 +2059,16 @@ class CoordinateRelation:
 
     @cached_property
     def _cached_canonical_single_valued(self) -> CoordinateRelation | None:
+        if len(self.pieces) == 1:
+            (piece,) = self.pieces
+            if piece.source_bounds_items == tuple(
+                (axis, 0, self.source_domain.axis_count_expressions[axis], 1)
+                for axis in self.source_domain.axis_order
+            ) and all(
+                step == 1 and sympy.simplify(end - begin) == 1  # pyrefly: ignore[unsupported-operation]
+                for _axis, begin, end, step in piece.target_ranges
+            ):
+                return self
         cells = _relation_source_cells(self)
         if cells is None:
             return None
@@ -2015,6 +2121,31 @@ class CoordinateRelation:
 
     def is_total_function(self) -> bool:
         """Return whether every source instance maps to exactly one target."""
+        if self.is_positional_bijection():
+            return True
+        if len(self.pieces) == 1:
+            (piece,) = self.pieces
+            if (
+                piece.source_bounds_items
+                == tuple(
+                    (axis, 0, self.source_domain.axis_count_expressions[axis], 1)
+                    for axis in self.source_domain.axis_order
+                )
+                and not self.target_domain.parameter_symbols
+                and all(
+                    not begin.free_symbols and not end.free_symbols
+                    for _axis, begin, end, _step in piece.target_ranges
+                )
+                and _target_point_is_in_domain(
+                    piece.target_ranges,
+                    source_domain=self.source_domain,
+                    source_bounds=piece.source_bounds_items,
+                    target_domain=self.target_domain,
+                )
+            ):
+                return True
+        if self.parameter_symbols:
+            return False
         source_boxes = tuple(piece.source_bounds_items for piece in self.pieces)
         if _source_boxes_partition_domain(source_boxes, self.source_domain) and all(
             _target_point_is_in_domain(
@@ -2216,13 +2347,20 @@ class CoordinateRelation:
         """Return whether coordinates are renamed position-for-position."""
         if (
             len(self.source_domain.axis_order) != len(self.target_domain.axis_order)
-            or self.source_domain.shape != self.target_domain.shape
+            or any(
+                sympy.simplify(left - right) != 0
+                for left, right in zip(
+                    self.source_domain.shape_expr,
+                    self.target_domain.shape_expr,
+                    strict=True,
+                )
+            )
             or len(self.pieces) != 1
         ):
             return False
         (piece,) = self.pieces
         if piece.source_bounds_items != tuple(
-            (axis, 0, self.source_domain.axis_counts[axis], 1)
+            (axis, 0, self.source_domain.axis_count_expressions[axis], 1)
             for axis in self.source_domain.axis_order
         ):
             return False
@@ -2690,11 +2828,11 @@ class CoordinateRelation:
         """
         if self.target_domain != other.target_domain:
             return None
-        target_counts = self.source_domain.axis_counts
+        target_counts = self.source_domain.axis_count_expressions
         pieces: list[_CoordinateRelationPiece] = []
         for producer_piece in self.pieces:
             full_producer_bounds = tuple(
-                (axis, 0, self.source_domain.axis_counts[axis], 1)
+                (axis, 0, self.source_domain.axis_count_expressions[axis], 1)
                 for axis in self.source_domain.axis_order
             )
             if producer_piece.source_bounds_items != full_producer_bounds:
@@ -2791,7 +2929,10 @@ class CoordinateRelation:
                                 (
                                     sympy.Min(*upper_bounds[axis])
                                     if upper_bounds[axis]
-                                    else sympy.Integer(target_counts[axis])
+                                    else _integer_expression(
+                                        target_counts[axis],
+                                        description="coordinate-domain axis count",
+                                    )
                                 ),
                                 1,
                             )
@@ -2922,6 +3063,8 @@ def _relation_source_cells(
     include_domain: bool = False,
 ) -> tuple[tuple[tuple[int, int, int, int], ...], ...] | None:
     """Partition source space at relation-piece boundaries without enumeration."""
+    if relation.parameter_symbols:
+        return None
     if any(
         step != 1
         for piece in relation.pieces
@@ -5971,14 +6114,15 @@ def _access_interval_expression(
             return None
         begin = sympy.Integer(normalized_offset)
         return begin, begin + static_extent
-    if axis is None or offset is None or axis not in domain.axis_counts:
+    counts = domain.axis_count_expressions
+    if axis is None or offset is None or axis not in counts:
         return None
     scale = access.subscript_index_scales[position]
     if scale != 1:
         return None
     coordinate: sympy.Expr = (
         sympy.Integer(0)
-        if domain.axis_counts[axis] == 1
+        if sympy.simplify(counts[axis] - 1) == 0
         else coordinate_axis_symbol(axis)
     )
     if access.subscript_is_scalar[position]:
@@ -6043,7 +6187,7 @@ def _symbolic_coordinate_access_relation(
         pieces=(
             _CoordinateRelationPiece(
                 source_bounds_items=tuple(
-                    (axis, 0, source_domain.axis_counts[axis], 1)
+                    (axis, 0, source_domain.axis_count_expressions[axis], 1)
                     for axis in source_domain.axis_order
                 ),
                 target_ranges=tuple(target_ranges),
@@ -6291,6 +6435,13 @@ def _symbolic_producers_by_consumer(
             relation = producer_relation.overlapping_sources(consumer_relation)
             if relation is not None:
                 return relation
+
+    if producer_domain.parameter_symbols or consumer_domain.parameter_symbols:
+        # The legacy linear-address fallback relies on concrete allocation
+        # bounds.  A parameterized access that the coordinate proof above
+        # cannot represent must conservatively retain its root barrier rather
+        # than specializing or sampling a runtime shape.
+        return None
 
     producer_storage_size = _allocation_storage_size(producer_access)
     consumer_storage_size = _allocation_storage_size(consumer_access)
