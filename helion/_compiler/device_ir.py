@@ -369,6 +369,10 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         # Make the active graph reachable by the strategy so it can pick
         # different lane-loop shapes for the reduce vs consume sweeps.
         # pyrefly: ignore [missing-attribute]
+        previous_active_graph_info = getattr(
+            state.codegen, "_cute_active_graph_info", None
+        )
+        # pyrefly: ignore [missing-attribute]
         state.codegen._cute_active_graph_info = self
         try:
             device_loop = state.device_function.tile_strategy.codegen_device_loop(
@@ -394,7 +398,7 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
                 )
         finally:
             # pyrefly: ignore [missing-attribute]
-            state.codegen._cute_active_graph_info = None
+            state.codegen._cute_active_graph_info = previous_active_graph_info
 
 
 def control_flow_parent_entries(
@@ -982,6 +986,7 @@ class DeviceIR:
             for graph_info in self.graphs:
                 mark_ftz_safe_exp_nodes(graph_info.graph)
         rdims = [bs for bs in env.block_sizes if bs.reduction]
+        env.config_spec.reduction_block_ids.update(rdim.block_id for rdim in rdims)
         # Eager tile-slot registration (see _register_cute_tile_vec_slots).
         # A present reduction must keep its slot at index 0, so reduction
         # kernels register their tile slots after the reduction-loop pass below.
@@ -1045,6 +1050,69 @@ class DeviceIR:
 
         # Second pass: register reduction loop specs, ensuring that each
         # original graph is only rolled for one reduction dim at a time.
+        #
+        # CuTe's persistent reduction strategy can also split a static
+        # reduction over fewer live threads plus synthetic per-thread lanes.
+        # Those layout choices are independent of whether ReductionRoller can
+        # turn the reduction into an outer ``reduction_loop``.  In particular,
+        # an ``hl.arange``-indexed reduction is deliberately non-rollable but
+        # is still a profitable persistent subwarp reduction.  Register the
+        # orthogonal CuTe knobs for every static reduction block; only the
+        # ``ReductionLoopSpec`` below remains conditional on rollability.
+        if env.backend_name == "cute":
+            from .cute.memory_ops import register_cute_tensor_alias_specializations
+            from .cute.memory_ops import (
+                register_persistent_vec_alignment_specializations,
+            )
+
+            register_persistent_vec_alignment_specializations(env)
+            register_cute_tensor_alias_specializations(env)
+            num_thread_blocks = set(env.config_spec.num_threads.valid_block_ids())
+            vector_blocks = set(env.config_spec.cute_vector_widths.valid_block_ids())
+            lane_layout_blocks = set(
+                env.config_spec.cute_lane_layouts.valid_block_ids()
+            )
+            reload_blocks = set(
+                env.config_spec.cute_reduction_reloads.valid_block_ids()
+            )
+            for rdim, _allow_loop, _used_graphs in rdim_results:
+                # Reduction lowering materializes output-range blocks even
+                # when the range is exactly an already-active tile symbol.
+                # CuTe reuses that tile's execution strategy, so separate
+                # reduction tuning slots would be dead dimensions in the
+                # search space.
+                if env.canonical_block_id(rdim.block_id) != rdim.block_id:
+                    continue
+                if not isinstance(rdim.size, (int, torch.SymInt)):
+                    continue
+                size_hint = rdim.size_hint()
+                if rdim.block_id not in num_thread_blocks:
+                    env.config_spec.num_threads.append(
+                        NumThreadsSpec(
+                            block_id=rdim.block_id,
+                            size_hint=size_hint,
+                        )
+                    )
+                    num_thread_blocks.add(rdim.block_id)
+                if rdim.block_id not in vector_blocks:
+                    env.config_spec.cute_vector_widths.append(
+                        CuteVectorWidthSpec(
+                            block_id=rdim.block_id,
+                            size_hint=size_hint,
+                        )
+                    )
+                    vector_blocks.add(rdim.block_id)
+                if rdim.block_id not in lane_layout_blocks:
+                    env.config_spec.cute_lane_layouts.append(
+                        CuteLaneLayoutSpec(block_id=rdim.block_id)
+                    )
+                    lane_layout_blocks.add(rdim.block_id)
+                if rdim.block_id not in reload_blocks:
+                    env.config_spec.cute_reduction_reloads.append(
+                        CuteReductionReloadSpec(block_id=rdim.block_id)
+                    )
+                    reload_blocks.add(rdim.block_id)
+
         graphs_with_rolled_rdim: set[int] = set()
         for rdim, allow_loop, used_graphs in rdim_results:
             if not allow_loop:
@@ -1058,29 +1126,6 @@ class DeviceIR:
                         size_hint=rdim.size_hint(),
                     )
                 )
-                if env.backend_name == "cute":
-                    env.config_spec.cute_vector_widths.append(
-                        CuteVectorWidthSpec(
-                            block_id=rdim.block_id,
-                            size_hint=rdim.size_hint(),
-                        )
-                    )
-                    env.config_spec.cute_lane_layouts.append(
-                        CuteLaneLayoutSpec(block_id=rdim.block_id)
-                    )
-                    env.config_spec.cute_reduction_reloads.append(
-                        CuteReductionReloadSpec(block_id=rdim.block_id)
-                    )
-                    # Rolled reduction dims get a thread-count knob: fewer
-                    # threads per row (with more elements per thread) is
-                    # often faster for memory-bound row reductions. 0 = auto
-                    # (derive from the loop chunk, the legacy behavior).
-                    env.config_spec.num_threads.append(
-                        NumThreadsSpec(
-                            block_id=rdim.block_id,
-                            size_hint=rdim.size_hint(),
-                        )
-                    )
             graphs_with_rolled_rdim |= used_graphs
 
         # Track which rdims appear as the reduction axis of an indexed
@@ -3071,6 +3116,14 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
 
         for graph in device_ir.graphs:
             rewrite_implicit_random_ops(graph.graph)
+        if (
+            CompileEnvironment.current().backend.name == "cute"
+            and CompileEnvironment.current().settings.fast_math
+        ):
+            from .cute.factor_affine_reductions import factor_affine_reductions
+
+            for graph_info in device_ir.graphs:
+                factor_affine_reductions(graph_info.graph, fast_math=True)
         if CompileEnvironment.current().backend.name == "cute":
             promotions = collect_cute_half_atomic_output_promotions(device_ir.graphs)
             if promotions:

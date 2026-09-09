@@ -74,7 +74,10 @@ def _seq_config_list(
     slot order varies (e.g. ``num_threads`` registers tile slots first
     while ``cute_vector_widths`` keeps the rdim slot at index 0), so build
     by block id instead of by position."""
-    return [overrides.get(item.block_id, item._fill_missing()) for item in seq]
+    return [
+        overrides[item.block_id] if item.block_id in overrides else item._fill_missing()
+        for item in seq
+    ]
 
 
 def _cute_seed_vec_width(
@@ -208,6 +211,266 @@ def _cute_tile_inner_block_dtype(
                 if isinstance(last, int) and last == block_numel_int:
                     return val.dtype
     return None
+
+
+class CutePersistentSubwarpRowsHeuristic(AutotunerHeuristic):
+    """Seed a row-tiled, one-vector persistent reduction.
+
+    This targets the general shape of a small row tile sharing a short static
+    reduction: eight row threads, one 16-byte reduction fragment per thread,
+    and register reloads across repeated reduction sweeps.  It is deliberately
+    an autotuning seed only; no architecture has promoted it to the default.
+    """
+
+    name = "cute_persistent_subwarp_rows"
+    backend = "cute"
+    CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+    FULL_ROW_BLOCK_SIZE = 128
+    RECURRENT_STYLE_REDUCTION_SIZE = 128
+    RECURRENT_STYLE_REDUCTION_THREADS = 32
+    RECURRENT_STYLE_ROW_THREADS = 1
+    RECURRENT_STYLE_VECTOR_WIDTH = 4
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        # The lane-splitting legality proof consumes exact runtime strides.
+        # Register this independently of seed generation so explicitly pinned
+        # configs and autotuner-disabled compilation remain cache-safe.
+        return (
+            cls.CACHE_SPECIALIZATION_FACTS if cls._plan(env, device_ir) else frozenset()
+        )
+
+    @staticmethod
+    def _reduction_dtype(
+        device_ir: DeviceIR, reduction_size: int
+    ) -> torch.dtype | None:
+        # Ignore the integer FakeTensor produced by ``hl.arange`` itself and
+        # find a vector-loadable tensor value using that trailing dimension.
+        best_dtype: torch.dtype | None = None
+        best_width = 1
+        for graph_info in device_ir.graphs:
+            for node in graph_info.graph.nodes:
+                value = node.meta.get("val")
+                target_name = getattr(node.target, "__name__", "")
+                if (
+                    isinstance(value, torch.Tensor)
+                    and value.ndim >= 1
+                    and isinstance(value.shape[-1], int)
+                    and value.shape[-1] == reduction_size
+                    and target_name in ("_host_tensor", "load")
+                ):
+                    width = _cute_tile_seed_vec_width_for_dtype(value.dtype)
+                    if width > best_width:
+                        best_dtype = value.dtype
+                        best_width = width
+        return best_dtype
+
+    @classmethod
+    def _plan(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, int] | None:
+        spec = env.config_spec
+        if spec.matmul_facts or spec.reduction_loops or len(spec.block_sizes) != 1:
+            return None
+        reduction_blocks = [block for block in env.block_sizes if block.reduction]
+        if len(reduction_blocks) != 1:
+            return None
+        reduction_block = reduction_blocks[0]
+        try:
+            reduction_size = int(reduction_block.numel)
+        except (TypeError, ValueError):
+            return None
+        vec = _cute_tile_seed_vec_width_for_dtype(
+            cls._reduction_dtype(device_ir, reduction_size)
+        )
+        if vec <= 1 or not 128 <= reduction_size <= 256:
+            return None
+        if reduction_size % vec:
+            return None
+        reduction_threads = reduction_size // vec
+        if reduction_threads not in (16, 32):
+            return None
+
+        row_spec = cast("Any", spec.block_sizes[0])
+        if len(row_spec.block_ids) != 1:
+            return None
+        if not row_spec.min_size <= 16 <= row_spec.max_size:
+            return None
+        row_block_id = row_spec.block_id
+        required = (
+            (spec.num_threads, row_block_id),
+            (spec.num_threads, reduction_block.block_id),
+            (spec.cute_vector_widths, reduction_block.block_id),
+            (spec.cute_lane_layouts, reduction_block.block_id),
+            (spec.cute_reduction_reloads, reduction_block.block_id),
+        )
+        if any(
+            block_id not in sequence.valid_block_ids()
+            for sequence, block_id in required
+        ):
+            return None
+        return row_block_id, reduction_block.block_id, reduction_threads
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._plan(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return None
+        row_block_id, reduction_block_id, reduction_threads = plan
+        return cls._seed_config(
+            env,
+            row_block_id,
+            reduction_block_id,
+            reduction_threads,
+            row_block_size=16,
+        )
+
+    @classmethod
+    def _seed_config(
+        cls,
+        env: CompileEnvironment,
+        row_block_id: int,
+        reduction_block_id: int,
+        reduction_threads: int,
+        *,
+        row_block_size: int,
+        row_threads: int = 8,
+    ) -> Config:
+        reduction_size = int(env.block_sizes[reduction_block_id].numel)
+        vec = reduction_size // reduction_threads
+        seed: dict[str, Any] = {
+            "block_sizes": _seq_config_list(
+                env.config_spec.block_sizes, {row_block_id: row_block_size}
+            ),
+            "num_threads": _seq_config_list(
+                env.config_spec.num_threads,
+                {row_block_id: row_threads, reduction_block_id: reduction_threads},
+            ),
+            "cute_vector_widths": _seq_config_list(
+                env.config_spec.cute_vector_widths, {reduction_block_id: vec}
+            ),
+            "cute_lane_layouts": _seq_config_list(
+                env.config_spec.cute_lane_layouts, {reduction_block_id: "blocked"}
+            ),
+            "cute_reduction_reloads": _seq_config_list(
+                env.config_spec.cute_reduction_reloads,
+                {reduction_block_id: "register"},
+            ),
+            "num_warps": max(1, row_threads * reduction_threads // 32),
+            "num_stages": 1,
+            "pid_type": "flat",
+        }
+        return Config(**seed)
+
+    @classmethod
+    def _recurrent_style_seed_config(
+        cls,
+        env: CompileEnvironment,
+        device_ir: DeviceIR,
+        row_block_id: int,
+        reduction_block_id: int,
+    ) -> Config | None:
+        reduction_size = int(env.block_sizes[reduction_block_id].numel)
+        if reduction_size != cls.RECURRENT_STYLE_REDUCTION_SIZE:
+            return None
+        dtype_vec = _cute_tile_seed_vec_width_for_dtype(
+            cls._reduction_dtype(device_ir, reduction_size)
+        )
+        if dtype_vec < cls.RECURRENT_STYLE_VECTOR_WIDTH:
+            return None
+        if reduction_size % cls.RECURRENT_STYLE_VECTOR_WIDTH:
+            return None
+        reduction_threads = reduction_size // cls.RECURRENT_STYLE_VECTOR_WIDTH
+        if reduction_threads != cls.RECURRENT_STYLE_REDUCTION_THREADS:
+            return None
+        return cls._seed_config(
+            env,
+            row_block_id,
+            reduction_block_id,
+            reduction_threads,
+            row_block_size=16,
+            row_threads=cls.RECURRENT_STYLE_ROW_THREADS,
+        )
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        """Add recurrent-style, row-one, one-warp, and full-row schedules.
+
+        The recurrent-style sibling maps one row thread and 32 reduction
+        threads into a single-warp CTA with V=4 for K=128 updates.  The row-one
+        sibling maps all 16 rows onto independent 16-thread groups in an
+        eight-warp CTA.  This exposes enough resident warps to hide the
+        state-load latency of short recurrent updates.  A 128-row tile instead
+        maps eight groups across a short row loop, which amortizes invariant
+        setup, while a 32-row one-warp sibling targets latency-sensitive
+        workloads.  The existing 16-row seed stays rank zero and therefore
+        preserves the no-autotune/default behavior.
+        """
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return None
+        row_block_id, reduction_block_id, reduction_threads = plan
+        primary = cls._seed_config(
+            env,
+            row_block_id,
+            reduction_block_id,
+            reduction_threads,
+            row_block_size=16,
+        )
+        row_spec = cast("Any", env.config_spec.block_sizes[0])
+        seeds = [primary]
+        recurrent_style = cls._recurrent_style_seed_config(
+            env,
+            device_ir,
+            row_block_id,
+            reduction_block_id,
+        )
+        if recurrent_style is not None:
+            seeds.append(recurrent_style)
+        if reduction_threads == 16:
+            seeds.append(
+                cls._seed_config(
+                    env,
+                    row_block_id,
+                    reduction_block_id,
+                    reduction_threads,
+                    row_block_size=16,
+                    row_threads=16,
+                )
+            )
+        one_warp_row_threads = max(1, 32 // reduction_threads)
+        if row_spec.max_size >= 32:
+            seeds.append(
+                cls._seed_config(
+                    env,
+                    row_block_id,
+                    reduction_block_id,
+                    reduction_threads,
+                    row_block_size=32,
+                    row_threads=one_warp_row_threads,
+                )
+            )
+        if row_spec.max_size >= cls.FULL_ROW_BLOCK_SIZE:
+            seeds.append(
+                cls._seed_config(
+                    env,
+                    row_block_id,
+                    reduction_block_id,
+                    reduction_threads,
+                    row_block_size=cls.FULL_ROW_BLOCK_SIZE,
+                )
+            )
+        return seeds
 
 
 class CuteTileVecHeuristic(AutotunerHeuristic):

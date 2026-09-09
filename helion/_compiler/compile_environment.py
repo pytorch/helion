@@ -1638,19 +1638,46 @@ class CompileEnvironment:
         return None
 
     def canonical_block_id(self, block_id: int) -> int:
-        """Follow fixed block-size aliases back to their canonical symbolic owner."""
+        """Follow block-size aliases back to their canonical symbolic owner.
+
+        Reduction lowering creates a separate output-range block even when
+        that range is exactly an already-active tile block.  In that case
+        ``allocate_reduction_dimension`` deliberately reuses the tile's
+        symbolic variable, so preserve that identity here as well as for the
+        explicit ``FixedBlockSizeSource`` aliases.
+        """
 
         seen: set[int] = set()
         current = block_id
         while current not in seen:
             seen.add(current)
-            source = self.block_sizes[current].block_size_source
-            if not isinstance(source, FixedBlockSizeSource):
+            info = self.block_sizes[current]
+            source = info.block_size_source
+            if isinstance(source, FixedBlockSizeSource):
+                value = source.value
+            elif self.backend_name == "cute" and isinstance(
+                source, ReductionLoopBlockSizeSource
+            ):
+                value = info.size
+            else:
                 break
-            value = source.value
             if not isinstance(value, torch.SymInt):
                 break
-            next_block_id = self.get_block_id(value)
+            value_expr = value._sympy_()
+            # ``get_block_id`` intentionally prefers the newest matching
+            # reduction block.  Canonicalization needs the opposite: locate
+            # the earlier owner whose symbol was reused when this alias was
+            # allocated.  This is also usable after HostFunction teardown.
+            next_block_id = next(
+                (
+                    candidate.block_id
+                    for candidate in self.block_sizes[:current]
+                    if candidate.symbol() == value_expr
+                ),
+                None,
+            )
+            if next_block_id is None:
+                next_block_id = self.get_block_id(value)
             if next_block_id is None or next_block_id == current:
                 break
             current = next_block_id

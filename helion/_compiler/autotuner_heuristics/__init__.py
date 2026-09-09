@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 from .common import dedupe_configs
 from .cute import CuteFlashAttentionHeuristic
 from .cute import CuteFp8GemmSkinnyMHeuristic
+from .cute import CutePersistentSubwarpRowsHeuristic
 from .cute import CutePointwiseVecHeuristic
 from .cute import CuteReductionTileHeuristic
 from .cute import CuteReductionWideChunkHeuristic
@@ -58,6 +59,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteTcgen05ThreadLocalEpilogueHeuristic,
         CuteReductionTileHeuristic,
         CuteReductionWideChunkHeuristic,
+        CutePersistentSubwarpRowsHeuristic,
         CuteRolledRowLadderHeuristic,
         CuteRolledClusterLadderHeuristic,
         CuteTileVecHeuristic,

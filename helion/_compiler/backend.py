@@ -1053,11 +1053,19 @@ class Backend(abc.ABC):
         contraction = cute_matmul_contraction_block_ids()
         if not contraction:
             return set()
-        return {
-            info.block_id
-            for info in env.block_sizes
-            if info.reduction and canonical_block_id(info.block_id) in contraction
-        }
+        result: set[int] = set()
+        for info in env.block_sizes:
+            if not info.reduction:
+                continue
+            block_id = canonical_block_id(info.block_id)
+            # Reduction lowering may materialize an output-range block whose
+            # extent aliases an already-active *tile* block.  Such an alias
+            # reuses the tile strategy and must not reserve a second copy of
+            # the contraction threads.  Canonical reduction aliases, on the
+            # other hand, still need one (deduplicated) reserve.
+            if block_id in contraction and env.block_sizes[block_id].reduction:
+                result.add(block_id)
+        return result
 
     def _cute_matmul_contraction_thread_reserve(
         self, fn: DeviceFunction, tile_block_ids: list[int]

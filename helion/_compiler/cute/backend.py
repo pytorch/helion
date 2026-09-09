@@ -1200,7 +1200,10 @@ class CuteBackend(Backend):
                 # unaffected by flushing denormal exp outputs; skip the
                 # default lowering's denormal fixup (FSETP + 2 predicated
                 # FMULs per element) — see exp2_fastmath.py.
-                if HelionCuteDSLOpOverrides._ftz_safe_current_node():
+                if (
+                    HelionCuteDSLOpOverrides._ftz_safe_current_node()
+                    or HelionCuteDSLOpOverrides._fastmath_on()
+                ):
                     if CuteDSLOpOverrides._get_cse_var(x) is None:
                         x = CuteDSLOpOverrides._cast_expr(str(x), torch.float32)
                     return CuteDSLOpOverrides._apply_unary_op(
@@ -1211,7 +1214,10 @@ class CuteBackend(Backend):
 
             @staticmethod
             def exp2(x: CuteDSLArg) -> CuteDSLArg:
-                if HelionCuteDSLOpOverrides._ftz_safe_current_node():
+                if (
+                    HelionCuteDSLOpOverrides._ftz_safe_current_node()
+                    or HelionCuteDSLOpOverrides._fastmath_on()
+                ):
                     return CuteDSLOpOverrides._apply_unary_op(
                         x, "cute.math.exp2({x}, fastmath=True)"
                     )
@@ -1219,11 +1225,79 @@ class CuteBackend(Backend):
 
             @staticmethod
             def _fastmath_on() -> bool:
-                from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import (
-                    _CUTEDSL_FAST_MATH,
+                from ..compile_environment import CompileEnvironment
+
+                return CompileEnvironment.current().settings.fast_math
+
+            @staticmethod
+            def _unary_math(x: CuteDSLArg, name: str) -> CuteDSLArg:
+                suffix = (
+                    ", fastmath=True" if HelionCuteDSLOpOverrides._fastmath_on() else ""
+                )
+                return CuteDSLOpOverrides._apply_unary_op(
+                    x, f"cute.math.{name}({{x}}{suffix})"
                 )
 
-                return _CUTEDSL_FAST_MATH.get()
+            @staticmethod
+            def sqrt(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "sqrt")
+
+            @staticmethod
+            def rsqrt(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "rsqrt")
+
+            @staticmethod
+            def log(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "log")
+
+            @staticmethod
+            def log2(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "log2")
+
+            @staticmethod
+            def log10(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "log10")
+
+            @staticmethod
+            def cos(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "cos")
+
+            @staticmethod
+            def sin(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "sin")
+
+            @staticmethod
+            def tan(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "tan")
+
+            @staticmethod
+            def acos(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "acos")
+
+            @staticmethod
+            def asin(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "asin")
+
+            @staticmethod
+            def atan(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "atan")
+
+            @staticmethod
+            def atan2(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
+                suffix = (
+                    ", fastmath=True" if HelionCuteDSLOpOverrides._fastmath_on() else ""
+                )
+                return CuteDSLOpOverrides._apply_binary_op(
+                    a, b, f"cute.math.atan2({{a}}, {{b}}{suffix})"
+                )
+
+            @staticmethod
+            def erf(x: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x, "erf")
+
+            @staticmethod
+            def tanh(x0: CuteDSLArg) -> CuteDSLArg:
+                return HelionCuteDSLOpOverrides._unary_math(x0, "tanh")
 
             @staticmethod
             # pyrefly: ignore [bad-override]

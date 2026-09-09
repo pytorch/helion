@@ -1134,6 +1134,10 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         )
 
                         codegen_fn(state)
+                    if isinstance(self.current_grid_state, DeviceGridState):
+                        self.current_grid_state.hoist_parent_statements = (
+                            self.statements_stack[-1]
+                        )
                     root = root_graph_info.graph
                     if not self._try_codegen_attention_flash_root():
                         grid_state = self.current_grid_state
@@ -1232,7 +1236,20 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         )
                     )
                     self.device_function.body = split_lane_loop_reductions(
-                        list(self.device_function.body)
+                        list(self.device_function.body),
+                        uniform_names={
+                            *(
+                                argument.name
+                                for argument in self.device_function.arguments
+                            ),
+                            *self._extra_params,
+                        },
+                        proven_disjoint_tensor_pairs=(
+                            self.device_function.proven_disjoint_tensor_pairs()
+                        ),
+                        proven_tensor_stride_values=(
+                            self.device_function.proven_tensor_stride_values()
+                        ),
                     )
                     # Safety net: revert any lane-reduce marker that neither pass
                     # rewrote so no ``_helion_lane_reduce`` call leaks into the
@@ -1245,7 +1262,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     # lane-invariant rescale / chunk-entry stores / final combine
                     # hoisted to run once per chunk (gdn_fwd_h).
                     self.device_function.body = hoist_lane_invariant_chunk_recurrence(
-                        list(self.device_function.body)
+                        list(self.device_function.body),
+                        rename_groups={
+                            name: aliases[0]
+                            for name, aliases in self.device_function._variable_renames.items()
+                        },
+                        running_sums=self.device_function.cute_matmul_running_sums,
                     )
                 self.device_function.dead_code_elimination()
                 if not self.device_function.preamble and not self.device_function.body:
@@ -1447,17 +1469,7 @@ def generate_ast(
             load_transform=load_transform,
             extra_params=extra_params,
         )
-        fast_math_cm: contextlib.AbstractContextManager[None] = contextlib.nullcontext()
-        if env.backend_name == "cute" and env.settings.fast_math:
-            # Route the global ``fast_math`` setting into the inductor
-            # CuteDSL op overrides: every cute.math call in this codegen
-            # gets ``fastmath=True``.
-            from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import (
-                use_cutedsl_fast_math,
-            )
-
-            fast_math_cm = use_cutedsl_fast_math(True)
-        with codegen.device_function, fast_math_cm:
+        with codegen.device_function:
             CompileEnvironment.current().backend.pre_codegen(
                 graphs=codegen.codegen_graphs,
                 config=config,

@@ -14886,6 +14886,7 @@ class TestCuteLowerings(unittest.TestCase):
             _thread_count=256,
             _synthetic_cute_lane_var="synthetic_lane_0",
             _synthetic_cute_lane_extent=4,
+            _cute_reduction_vec_width=1,
             block_size_var=lambda block_idx: "_RDIM_SIZE_0",
             index_var=lambda block_idx: "indices_0",
             _get_thread_axis=lambda: 0,

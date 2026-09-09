@@ -18,7 +18,10 @@ import sympy
 import torch
 from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
+from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.graph import _Namespace
+from torch.utils._sympy.symbol import SymT
+from torch.utils._sympy.symbol import symbol_is_type
 
 from .. import exc
 from .._compat import get_tensor_descriptor_fn_name
@@ -52,6 +55,7 @@ if TYPE_CHECKING:
     from .generate_ast import GenerateAST
     from .indexing_strategy import IndexingStrategy
     from .program_id import ProgramIDs
+    from .tile_dispatch import TileStrategyDispatch
     from helion._compiler.pallas.dma import DmaResources
     from helion._compiler.pallas.ordered_carry import CarryBoundaryTile
     from helion._compiler.pallas.ordered_carry import CarryScratchKey
@@ -64,6 +68,23 @@ if TYPE_CHECKING:
 
 
 tls: _TLS = cast("_TLS", threading.local())
+
+
+def _exact_thread_block_dims(
+    tile_strategy: TileStrategyDispatch,
+) -> tuple[int, int, int] | None:
+    """Return a proven-static launch shape, or ``None`` when inference fails."""
+
+    try:
+        thread_dims = tile_strategy.thread_block_dims()
+        if len(thread_dims) != 3 or any(
+            not isinstance(dim, (int, sympy.Integer)) for dim in thread_dims
+        ):
+            return None
+        result = int(thread_dims[0]), int(thread_dims[1]), int(thread_dims[2])
+        return result if all(dim > 0 for dim in result) else None
+    except Exception:
+        return None
 
 
 class VarInfo(NamedTuple):
@@ -1069,15 +1090,7 @@ class DeviceFunction:
             # linear slot index when ``cache_size`` exceeds the
             # register-fragment threshold (opt-in via
             # ``HELION_FUSER_MODE=smem``).
-            try:
-                thread_dims = self.tile_strategy.thread_block_dims()
-                thread_block_dims: tuple[int, int, int] = (
-                    int(thread_dims[0]),
-                    int(thread_dims[1]),
-                    int(thread_dims[2]),
-                )
-            except Exception:
-                thread_block_dims = (1, 1, 1)
+            exact_thread_block_dims = _exact_thread_block_dims(self.tile_strategy)
             # Best-effort map for the fuser's cache-dtype resolution;
             # ``dtype_str`` raises for dtypes the cute backend has no
             # canonical spelling for (e.g. uint32 barrier flags, which
@@ -1092,10 +1105,9 @@ class DeviceFunction:
                         )
                     except ValueError:
                         continue
-            # Autotuner-selected reload mode per rolled reduction dim
-            # ("auto" / "register" / "gmem"); the fuser keys the sweep
-            # loops back to their block id via the ``roffset_<id>`` /
-            # ``tile_offset_<id>`` loop offset variable.
+            proven_disjoint_tensor_pairs = self.proven_disjoint_tensor_pairs()
+            # Autotuner-selected reload mode per rolled or persistent
+            # reduction dim ("auto" / "register" / "gmem").
             env = CompileEnvironment.current()
             reload_cfg = cast(
                 "list[str]",
@@ -1107,12 +1119,30 @@ class DeviceFunction:
                 )
                 for block_id in env.config_spec.cute_reduction_reloads.valid_block_ids()
             }
-            kernel_body = fuse_two_pass_loads(
+            if exact_thread_block_dims is not None:
+                kernel_body = fuse_two_pass_loads(
+                    kernel_body,
+                    constexpr_values,
+                    thread_block_dims=exact_thread_block_dims,
+                    tensor_dtypes=tensor_dtypes,
+                    reload_modes=reload_modes,
+                    proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
+                    proven_tensor_stride_values=self.proven_tensor_stride_values(),
+                )
+            # Some exact persistent fragments have addresses defined only
+            # inside a runtime branch (for example a loaded state-slot index),
+            # so the normal root-wrapper hoist cannot legally reference them.
+            # Their lowering markers survive the reduction split and load
+            # fuser; place one vector transaction beside the earliest surviving
+            # constexpr sweep and erase every unhandled marker here.
+            from .cute.persistent_branch_vec import (
+                vectorize_branch_local_persistent_fragments,
+            )
+
+            kernel_body = vectorize_branch_local_persistent_fragments(
                 kernel_body,
-                constexpr_values,
-                thread_block_dims=thread_block_dims,
-                tensor_dtypes=tensor_dtypes,
-                reload_modes=reload_modes,
+                proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
+                proven_tensor_stride_values=self.proven_tensor_stride_values(),
             )
             # Hoist warp reductions out of constexpr V-loops to collapse
             # 4 per-V-lane warp reductions into 1 V-fold + 1 warp reduce.
@@ -1136,6 +1166,50 @@ class DeviceFunction:
             from .cute.merge_sibling_v_loops import merge_sibling_v_loops
 
             kernel_body = merge_sibling_v_loops(kernel_body)
+            # A persistent row tile may repeat a row-invariant Q/K norm (and
+            # its warp reduction) once for every compile-time row lane.  Wide
+            # row tiles are useful only if that setup is shared.  Unswitch a
+            # proven-uniform terminal guard and move complete, pure invariant
+            # reduction slices before the row loop.  Runtime storage facts are
+            # required before a load may cross any loop write.
+            from .cute.hoist_lane_invariant_reductions import (
+                hoist_lane_invariant_reductions,
+            )
+
+            float_scalar_names = {
+                argument.name
+                for expression, argument in self._expr_args.items()
+                if isinstance(expression, sympy.Symbol)
+                and (
+                    symbol_is_type(expression, SymT.FLOAT)
+                    or symbol_is_type(expression, SymT.UNBACKED_FLOAT)
+                )
+            } | {
+                argument.name
+                for argument in self.arguments
+                if isinstance(argument, NumericArgument)
+                and isinstance(
+                    HostFunction.current().params.arguments.get(argument.host_str()),
+                    (float, torch.SymFloat),
+                )
+            }
+            kernel_body = hoist_lane_invariant_reductions(
+                kernel_body,
+                tensor_names=set(tensor_dtypes),
+                tensor_dtypes=tensor_dtypes,
+                proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
+                rename_groups=rename_groups,
+                uniform_names={arg.arg for arg in args},
+                float_scalar_names=float_scalar_names,
+                thread_block_dims=exact_thread_block_dims,
+            )
+            if CompileEnvironment.current().settings.fast_math:
+                from .cute.factor_affine_reductions import hoist_factored_reductions
+
+                kernel_body = hoist_factored_reductions(
+                    kernel_body,
+                    fast_math=True,
+                )
             # Fuse adjacent per-lane fp8 decodes in the SIMT matmul V-loop
             # into one ``cvt.rn.f16x2.e4m3x2`` (decode 2 e4m3 bytes per
             # instruction) — halves the decode instruction count on the
@@ -1269,6 +1343,96 @@ class DeviceFunction:
                     f"{self.name}._helion_cute_min_blocks_per_mp = {min_blocks}"
                 )
             )
+        return result
+
+    def proven_disjoint_tensor_pairs(self) -> set[frozenset[str]]:
+        """Return tensor argument pairs with a cache-safe non-aliasing proof.
+
+        Different user/global tensor arguments are not a non-aliasing proof:
+        callers may pass the same tensor, or overlapping views, under multiple
+        names.  A tensor backed by storage absent from the original function
+        inputs cannot overlap an external input or a separately allocated
+        output.  Two external inputs are disjoint only when the current runtime
+        storage spans do not overlap and that predicate is part of the bound
+        kernel cache key.  Origin type alone is insufficient: host-local
+        ``torch.empty``-family outputs commonly carry ``NameOrigin`` too.
+        """
+        from .cute.memory_ops import runtime_tensors_are_proven_disjoint
+
+        env = CompileEnvironment.current()
+        host_function = HostFunction.current()
+        input_storages = {id(tensor.untyped_storage()) for tensor in env.input_sources}
+        origins: dict[str, tuple[str, int, bool, torch.Tensor]] = {}
+        for arg in self.arguments:
+            if not isinstance(arg, TensorArg):
+                continue
+            origin = host_function.tensor_to_origin.get(arg.fake_value)
+            root = origin.root_rw_name() if origin is not None else None
+            if root is not None:
+                storage = id(arg.fake_value.untyped_storage())
+                origins[arg.name] = (
+                    root,
+                    storage,
+                    storage not in input_storages,
+                    arg.fake_value,
+                )
+        return {
+            frozenset((left_name, right_name))
+            for left_name, (
+                left_root,
+                left_storage,
+                left_is_fresh,
+                left_tensor,
+            ) in origins.items()
+            for right_name, (
+                right_root,
+                right_storage,
+                right_is_fresh,
+                right_tensor,
+            ) in origins.items()
+            if left_name < right_name
+            and left_root != right_root
+            and left_storage != right_storage
+            and (
+                left_is_fresh
+                or right_is_fresh
+                or runtime_tensors_are_proven_disjoint(
+                    env,
+                    left_tensor,
+                    right_tensor,
+                )
+            )
+        }
+
+    def proven_tensor_stride_values(self) -> dict[tuple[str, int], int]:
+        """Return tensor strides whose exact value is cache-safe."""
+        env = CompileEnvironment.current()
+        input_metadata_specialized = (
+            "input_tensor_metadata" in env.compiler_fact_specialization_facts
+        )
+        result: dict[tuple[str, int], int] = {}
+        for arg in self.arguments:
+            if not isinstance(arg, TensorArg):
+                continue
+            source = env.tensor_input_source(arg.fake_value)
+            runtime = env.runtime_value_for_tensor(arg.fake_value)
+            if not isinstance(runtime, torch.Tensor) or isinstance(runtime, FakeTensor):
+                continue
+            for dim, fake_stride in enumerate(arg.fake_value.stride()):
+                cache_safe = source is not None and (
+                    input_metadata_specialized
+                    or TensorPropertySource(source, TensorProperty.STRIDE, dim)
+                    in env.specialized_strides
+                )
+                if not cache_safe:
+                    continue
+                try:
+                    traced_stride = env.size_hint(fake_stride)
+                except (RuntimeError, TypeError, ValueError):
+                    continue
+                runtime_stride = runtime.stride(dim)
+                if runtime_stride == traced_stride:
+                    result[arg.name, dim] = traced_stride
         return result
 
     def codegen_function_call(self) -> ast.AST:

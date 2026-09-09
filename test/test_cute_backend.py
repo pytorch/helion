@@ -6974,6 +6974,7 @@ class TestCuteBackend(TestCase):
             args,
             block_sizes=[1],
             reduction_loop=8192,
+            cute_reduction_reloads=["register"],
         )
         (x,) = args
         expected = x / x.sum(-1, keepdim=True)
@@ -6994,6 +6995,7 @@ class TestCuteBackend(TestCase):
             block_sizes=[1],
             reduction_loop=8192,
             cute_vector_widths=[4],
+            cute_reduction_reloads=["register"],
         )
         (x,) = args
         expected = (x.float() / x.float().sum(-1, keepdim=True)).to(x.dtype)

@@ -265,7 +265,10 @@ class TestBarrier(RefEagerTestBase, TestCase):
 
         fake_env = SimpleNamespace(
             block_sizes=[_FakeRDim()],
-            config_spec=SimpleNamespace(reduction_loops=[]),
+            config_spec=SimpleNamespace(
+                reduction_block_ids=set(),
+                reduction_loops=[],
+            ),
             backend_name="triton",
         )
 
