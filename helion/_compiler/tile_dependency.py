@@ -4894,20 +4894,36 @@ class CoordinateRelation:
 
         This is the dependency composition used by memory accesses: ``self``
         maps producer instances to allocation coordinates and ``other`` maps
-        consumer instances to the same allocation coordinates.  Unsupported
-        relation shapes decline instead of expanding either source domain.
+        consumer instances to the same allocation coordinates.  Partial and
+        statically strided producer support is retained in the resulting
+        target ranges.  Unsupported relation shapes decline instead of
+        expanding either source domain.
         """
-        if self.target_domain != other.target_domain:
+        if (
+            self.target_domain != other.target_domain
+            or len(self.pieces) > _MAX_RELATION_PIECES
+            or len(other.pieces) > _MAX_RELATION_PIECES
+            or not _relation_product_is_within_budget(
+                len(self.pieces),
+                len(other.pieces),
+            )
+        ):
             return None
         target_counts = self.source_domain.axis_count_expressions
         pieces: list[_CoordinateRelationPiece] = []
+        has_partial_producer_source = False
         for producer_piece in self.pieces:
-            full_producer_bounds = tuple(
+            producer_source_bounds = {
+                axis: (sympy.sympify(begin), sympy.sympify(end), step)
+                for axis, begin, end, step in producer_piece.source_bounds_items
+            }
+            if tuple(producer_source_bounds) != self.source_domain.axis_order:
+                return None
+            has_full_producer_source = producer_piece.source_bounds_items == tuple(
                 (axis, 0, self.source_domain.axis_count_expressions[axis], 1)
                 for axis in self.source_domain.axis_order
             )
-            if producer_piece.source_bounds_items != full_producer_bounds:
-                return None
+            has_partial_producer_source |= not has_full_producer_source
             producer_ranges = {
                 axis: (begin, end, step)
                 for axis, begin, end, step in producer_piece.target_ranges
@@ -4918,10 +4934,20 @@ class CoordinateRelation:
                     for axis, begin, end, step in consumer_piece.target_ranges
                 }
                 lower_bounds: dict[int, list[sympy.Expr]] = {
-                    axis: [] for axis in self.source_domain.axis_order
+                    axis: (
+                        []
+                        if has_full_producer_source
+                        else [producer_source_bounds[axis][0]]
+                    )
+                    for axis in self.source_domain.axis_order
                 }
                 upper_bounds: dict[int, list[sympy.Expr]] = {
-                    axis: [] for axis in self.source_domain.axis_order
+                    axis: (
+                        []
+                        if has_full_producer_source
+                        else [producer_source_bounds[axis][1]]
+                    )
+                    for axis in self.source_domain.axis_order
                 }
                 for allocation_axis in self.target_domain.axis_order:
                     producer_range = producer_ranges[allocation_axis]
@@ -4988,34 +5014,71 @@ class CoordinateRelation:
                             ),
                         )
                     )
-                target_ranges = tuple(
-                    (
-                        axis,
-                        _simplify_logical_expression(
-                            (
-                                sympy.Max(*lower_bounds[axis])
-                                if lower_bounds[axis]
-                                else sympy.Integer(0)
-                            ),
-                            domain=other.source_domain,
-                            source_bounds=consumer_piece.source_bounds_items,
-                        ),
-                        _simplify_logical_expression(
-                            (
-                                sympy.Min(*upper_bounds[axis])
-                                if upper_bounds[axis]
-                                else _integer_expression(
-                                    target_counts[axis],
-                                    description="coordinate-domain axis count",
-                                )
-                            ),
-                            domain=other.source_domain,
-                            source_bounds=consumer_piece.source_bounds_items,
-                        ),
-                        1,
+                target_ranges_list: list[
+                    tuple[int, sympy.Expr, sympy.Expr, int]
+                ] = []
+                for axis in self.source_domain.axis_order:
+                    producer_begin, _producer_end, producer_step = (
+                        producer_source_bounds[axis]
                     )
-                    for axis in self.source_domain.axis_order
-                )
+                    raw_begin = (
+                        sympy.Max(*lower_bounds[axis])
+                        if lower_bounds[axis]
+                        else sympy.Integer(0)
+                    )
+                    raw_end = (
+                        sympy.Min(*upper_bounds[axis])
+                        if upper_bounds[axis]
+                        else _integer_expression(
+                            target_counts[axis],
+                            description="coordinate-domain axis count",
+                        )
+                    )
+                    if has_full_producer_source:
+                        target_begin = _simplify_logical_expression(
+                            raw_begin,
+                            domain=other.source_domain,
+                            source_bounds=consumer_piece.source_bounds_items,
+                        )
+                        target_end = _simplify_logical_expression(
+                            raw_end,
+                            domain=other.source_domain,
+                            source_bounds=consumer_piece.source_bounds_items,
+                        )
+                    else:
+                        target_count = _integer_expression(
+                            target_counts[axis],
+                            description="coordinate-domain axis count",
+                        )
+                        clamped_begin = sympy.Max(sympy.Integer(0), raw_begin)
+                        clamped_end = sympy.Min(target_count, raw_end)
+                        aligned_begin = (
+                            clamped_begin
+                            if producer_step == 1
+                            else (
+                                producer_begin
+                                + producer_step
+                                * sympy.ceiling(  # pyrefly: ignore[bad-argument-type]
+                                    (clamped_begin - producer_begin) / producer_step
+                                )
+                            )
+                        )
+                        target_begin = sympy.Min(clamped_end, aligned_begin)
+                        target_end = clamped_end
+                    target_ranges_list.append(
+                        (axis, target_begin, target_end, producer_step)
+                    )
+                target_ranges = tuple(target_ranges_list)
+                if not has_full_producer_source:
+                    pieces.append(
+                        _CoordinateRelationPiece(
+                            source_bounds_items=consumer_piece.source_bounds_items,
+                            target_ranges=target_ranges,
+                        )
+                    )
+                    if len(pieces) > _MAX_RELATION_PIECES:
+                        return None
+                    continue
                 outside_target_domain = False
                 for axis, begin, end, _step in target_ranges:
                     begin_bounds = _logical_expression_bounds(
@@ -5070,11 +5133,20 @@ class CoordinateRelation:
                         target_ranges=target_ranges,
                     )
                 )
-        return CoordinateRelation(
+                if len(pieces) > _MAX_RELATION_PIECES:
+                    return None
+        result = CoordinateRelation(
             source_domain=other.source_domain,
             target_domain=self.source_domain,
-            pieces=tuple(pieces),
-        ).coalesce_adjacent_target_boxes(prove_nonnegative=prove_nonnegative)
+            pieces=tuple(dict.fromkeys(pieces)),
+        )
+        return (
+            result
+            if has_partial_producer_source
+            else result.coalesce_adjacent_target_boxes(
+                prove_nonnegative=prove_nonnegative
+            )
+        )
 
 
 def _source_boxes_are_disjoint(
@@ -5499,6 +5571,44 @@ def _integer_partition_expressions_equal(
         sympy.simplify(sympy.sympify(left) - sympy.sympify(right))
     )
     return sympy.simplify(difference) == 0
+
+
+def _is_identity_on_source_support(relation: CoordinateRelation) -> bool:
+    """Prove a possibly partial relation maps each source point to itself."""
+    if relation.source_domain.axis_order != relation.target_domain.axis_order or any(
+        not _integer_partition_expressions_equal(source_count, target_count)
+        for source_count, target_count in zip(
+            relation.source_domain.shape_expr,
+            relation.target_domain.shape_expr,
+            strict=True,
+        )
+    ):
+        return False
+    return all(
+        all(
+            target_axis == source_axis
+            and target_step == 1
+            and _integer_partition_expressions_equal(
+                target_begin,
+                coordinate_axis_symbol(source_axis),
+            )
+            and _integer_partition_expressions_equal(
+                target_end,
+                coordinate_axis_symbol(source_axis) + 1,
+            )
+            for source_axis, (
+                target_axis,
+                target_begin,
+                target_end,
+                target_step,
+            ) in zip(
+                relation.source_domain.axis_order,
+                piece.target_ranges,
+                strict=True,
+            )
+        )
+        for piece in relation.pieces
+    )
 
 
 def _coordinate_permutation_axes(
@@ -10988,7 +11098,10 @@ def _compose_point_relations(
                 1,
             )
             for axis in following.source_domain.axis_order
-        ) and _has_unclipped_point_source_support(first):
+        ) and (
+            _is_identity_on_source_support(first)
+            or _has_unclipped_point_source_support(first)
+        ):
             # Full following support cannot clip the first map.  Direct
             # substitution avoids re-solving nested quotient bounds.
             pieces: list[_CoordinateRelationPiece] = []

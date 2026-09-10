@@ -297,6 +297,102 @@ def placement(
     return placements[0] if placements else None
 
 
+def _placed_tasks_by_slot(
+    schedule: WorkerSchedule,
+) -> dict[tuple[int, ...], tuple[int, int]]:
+    """Materialize the authoritative occupied-slot bijection for small tests."""
+    result: dict[tuple[int, ...], tuple[int, int]] = {}
+    for segment in schedule.segments:
+        relation = segment.task_order
+        for source_index in range(relation.source_domain.size):
+            source_coordinates = relation.source_domain.coordinates(source_index)
+            targets = relation.target_coordinates(source_coordinates)
+            if not targets:
+                continue
+            if len(targets) != 1:
+                raise AssertionError("one occupied slot maps to multiple tasks")
+            slot = tuple(
+                source_coordinates[axis] for axis in relation.source_domain.axis_order
+            )
+            task = relation.target_domain.index(
+                dict(
+                    zip(
+                        relation.target_domain.axis_order,
+                        next(iter(targets)),
+                        strict=True,
+                    )
+                )
+            )
+            if slot in result:
+                raise AssertionError("multiple tasks occupy one schedule slot")
+            result[slot] = (segment.root, task)
+    return result
+
+
+def _expected_same_strand_edges(
+    schedule: WorkerSchedule,
+) -> frozenset[tuple[int, int, int, int]]:
+    """Return the exhaustive logical-task oracle for a small schedule."""
+    placements = _placed_tasks_by_slot(schedule)
+    return frozenset(
+        (predecessor_root, predecessor_task, successor_root, successor_task)
+        for (
+            predecessor_stage,
+            predecessor_worker,
+            predecessor_wave,
+        ), (predecessor_root, predecessor_task) in placements.items()
+        for (
+            successor_stage,
+            successor_worker,
+            successor_wave,
+        ), (successor_root, successor_task) in placements.items()
+        if predecessor_stage == successor_stage
+        and predecessor_worker == successor_worker
+        and predecessor_wave < successor_wave
+    )
+
+
+def _materialized_same_strand_edges(
+    schedule: WorkerSchedule,
+    precedence: CoordinateRelation,
+) -> frozenset[tuple[int, int, int, int]]:
+    """Decode the occupied slot relation and reject duplicate raw edges."""
+    placements = _placed_tasks_by_slot(schedule)
+    placement_domain = schedule.placement_domain
+    represented_edges: list[tuple[int, int, int, int]] = []
+    if (
+        precedence.source_domain != placement_domain
+        or precedence.target_domain != placement_domain
+    ):
+        raise AssertionError("same-strand relation left the placement domain")
+    for piece in precedence.pieces:
+        piece_relation = dataclasses.replace(precedence, pieces=(piece,))
+        for source_index in range(placement_domain.size):
+            source_coordinates = placement_domain.coordinates(source_index)
+            source_slot = tuple(
+                source_coordinates[axis] for axis in placement_domain.axis_order
+            )
+            for target_coordinates in piece_relation.target_coordinates(
+                source_coordinates
+            ):
+                target_slot = tuple(target_coordinates)
+                successor = placements.get(source_slot)
+                predecessor = placements.get(target_slot)
+                if successor is None or predecessor is None:
+                    raise AssertionError("same-strand edge names an empty slot")
+                represented_edges.append(
+                    (
+                        predecessor[0],
+                        predecessor[1],
+                        successor[0],
+                        successor[1],
+                    )
+                )
+    if len(represented_edges) != len(set(represented_edges)):
+        raise AssertionError("same-strand relation represents a duplicate edge")
+    return frozenset(represented_edges)
+
+
 def task_at(
     schedule: WorkerSchedule,
     worker: int,
@@ -2696,6 +2792,227 @@ class TestCrossLoopScheduler(TestCase):
             tuple(next(iter(values)) for values in slots.materialize()),
             (3, 5, 6),
         )
+
+    def test_occupied_same_strand_precedence_matches_small_oracle(self) -> None:
+        for worker_count, task_counts in itertools.product(
+            range(1, 4),
+            itertools.product(range(4), repeat=2),
+        ):
+            with self.subTest(
+                worker_count=worker_count,
+                task_counts=task_counts,
+            ):
+                domains = tuple(
+                    CoordinateDomain(
+                        (axis,),
+                        ((axis, task_count),),
+                        ((axis, 1),),
+                        kind="site",
+                        identity=root,
+                        _allow_empty=True,
+                    )
+                    for root, (axis, task_count) in enumerate(
+                        zip((10, 20), task_counts, strict=True)
+                    )
+                )
+                first_slot = 0
+                segments: list[WorkerScheduleSegment] = []
+                for root, (domain, task_count) in enumerate(
+                    zip(domains, task_counts, strict=True)
+                ):
+                    if task_count:
+                        segments.append(
+                            _segment(
+                                root,
+                                pid_task_order(domain, domain.axis_order),
+                                workers=(0, worker_count),
+                                dispatch_offset=first_slot,
+                            )
+                        )
+                    first_slot += task_count
+                schedule = _schedule(worker_count, *segments)
+
+                with _forbid_schedule_enumeration():
+                    precedence = (
+                        cross_loop_scheduler._occupied_same_strand_precedence(
+                            schedule
+                        )
+                    )
+
+                self.assertIsNotNone(precedence)
+                assert precedence is not None
+                self.assertEqual(
+                    _materialized_same_strand_edges(schedule, precedence),
+                    _expected_same_strand_edges(schedule),
+                )
+
+    def test_occupied_same_strand_precedence_substitution_parity(self) -> None:
+        task_count = sympy.Symbol(
+            "task_count",
+            integer=True,
+            nonnegative=True,
+        )
+        worker_count = 4
+        symbolic_domains = (
+            CoordinateDomain(
+                (10,),
+                ((10, 3),),
+                ((10, 1),),
+                kind="site",
+                identity=0,
+            ),
+            CoordinateDomain(
+                (20,),
+                ((20, task_count),),
+                ((20, 1),),
+                kind="site",
+                identity=1,
+                _allow_empty=True,
+            ),
+            CoordinateDomain(
+                (30,),
+                ((30, 2),),
+                ((30, 1),),
+                kind="site",
+                identity=2,
+            ),
+        )
+        symbolic_schedule = cross_loop_scheduler._build_root_major_worker_schedule(
+            symbolic_domains,
+            _default_root_task_orders(symbolic_domains),
+            worker_count,
+        )
+        with _forbid_schedule_enumeration():
+            symbolic_precedence = (
+                cross_loop_scheduler._occupied_same_strand_precedence(
+                    symbolic_schedule
+                )
+            )
+        self.assertIsNotNone(symbolic_precedence)
+        assert symbolic_precedence is not None
+
+        for concrete_count in (0, 1, worker_count - 1, worker_count, worker_count + 1):
+            with self.subTest(task_count=concrete_count):
+                substitutions = {task_count: concrete_count}
+                concrete_domains = tuple(
+                    domain.substitute_parameters(substitutions)
+                    for domain in symbolic_domains
+                )
+                concrete_schedule = (
+                    cross_loop_scheduler._build_root_major_worker_schedule(
+                        concrete_domains,
+                        _default_root_task_orders(concrete_domains),
+                        worker_count,
+                    )
+                )
+                specialized_precedence = symbolic_precedence.substitute_parameters(
+                    substitutions
+                )
+                with _forbid_schedule_enumeration():
+                    concrete_precedence = (
+                        cross_loop_scheduler._occupied_same_strand_precedence(
+                            concrete_schedule
+                        )
+                    )
+                self.assertIsNotNone(concrete_precedence)
+                assert concrete_precedence is not None
+                expected = _expected_same_strand_edges(concrete_schedule)
+                self.assertEqual(
+                    _materialized_same_strand_edges(
+                        concrete_schedule,
+                        specialized_precedence,
+                    ),
+                    expected,
+                )
+                self.assertEqual(
+                    _materialized_same_strand_edges(
+                        concrete_schedule,
+                        concrete_precedence,
+                    ),
+                    expected,
+                )
+
+    def test_occupied_same_strand_precedence_spans_split_root_segments(
+        self,
+    ) -> None:
+        first_domain, second_domain = _identify_root_domains(
+            (_domain((10, 6, 1)), _domain((20, 4, 1)))
+        )
+        first_order = pid_task_order(first_domain, first_domain.axis_order)
+        first_prefix = _task_order_slice(first_order, 0, 4)
+        first_suffix = _task_order_slice(first_order, 4, 2)
+        self.assertIsNotNone(first_prefix)
+        self.assertIsNotNone(first_suffix)
+        assert first_prefix is not None and first_suffix is not None
+        schedule = _schedule(
+            4,
+            _segment(0, first_prefix, workers=(0, 4), dispatch_offset=0),
+            _segment(
+                1,
+                pid_task_order(second_domain, second_domain.axis_order),
+                workers=(0, 4),
+                dispatch_offset=4,
+            ),
+            _segment(0, first_suffix, workers=(0, 2), dispatch_offset=4),
+        )
+
+        with _forbid_schedule_enumeration():
+            precedence = cross_loop_scheduler._occupied_same_strand_precedence(
+                schedule
+            )
+
+        self.assertIsNotNone(precedence)
+        assert precedence is not None
+        expected = {
+            (0, 0, 0, 4),
+            (0, 1, 0, 5),
+            (1, 0, 0, 4),
+            (1, 1, 0, 5),
+        }
+        expected.update((0, task, 1, task) for task in range(4))
+        self.assertEqual(
+            _materialized_same_strand_edges(schedule, precedence),
+            frozenset(expected),
+        )
+
+    def test_occupied_same_strand_precedence_respects_launch_stage_and_budget(
+        self,
+    ) -> None:
+        domains = _identify_root_domains(
+            (_domain((10, 5, 1)), _domain((20, 3, 1)))
+        )
+        task_orders = _default_root_task_orders(domains)
+        resident = _schedule(
+            4,
+            _segment(0, task_orders[0], workers=(0, 4), dispatch_offset=0),
+            _segment(1, task_orders[1], workers=(0, 4), dispatch_offset=5),
+        )
+        schedule = cross_loop_scheduler._with_transient_source_schedule_segment(
+            resident,
+            task_orders,
+            source_root=0,
+        )
+        self.assertIsNotNone(schedule)
+        assert schedule is not None
+
+        with _forbid_schedule_enumeration():
+            precedence = cross_loop_scheduler._occupied_same_strand_precedence(
+                schedule
+            )
+        self.assertIsNotNone(precedence)
+        assert precedence is not None
+        self.assertEqual(
+            _materialized_same_strand_edges(schedule, precedence),
+            frozenset(((0, 0, 0, 4),)),
+        )
+        with mock.patch.object(
+            tile_dependency,
+            "_relation_product_is_within_budget",
+            return_value=False,
+        ):
+            self.assertIsNone(
+                cross_loop_scheduler._occupied_same_strand_precedence(schedule)
+            )
 
     def test_strict_root_slot_progress_accepts_only_earlier_slots(self) -> None:
         producer_domain, consumer_domain = _identify_root_domains(

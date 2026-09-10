@@ -2424,6 +2424,120 @@ def _parametric_root_major_schedule_geometry(
     return geometry
 
 
+def _occupied_slot_identity(
+    segment: WorkerScheduleSegment,
+) -> CoordinateRelation | None:
+    """Return identity restricted to one segment's authoritative placements."""
+    task_order = segment.task_order
+    if len(task_order.pieces) > tile_dependency._MAX_RELATION_PIECES:
+        return None
+    schedule_domain = task_order.source_domain
+    if tile_dependency._has_unclipped_point_source_support(task_order):
+        occupied = task_order
+    else:
+        converse = task_order.converse()
+        occupied = None if converse is None else task_order.then(converse)
+        if (
+            occupied is None
+            or occupied.source_domain != schedule_domain
+            or occupied.target_domain != schedule_domain
+            or len(occupied.pieces) > tile_dependency._MAX_RELATION_PIECES
+        ):
+            return None
+    identity = CoordinateRelation.point_map(
+        schedule_domain,
+        schedule_domain,
+        tuple(
+            (
+                piece.source_bounds_items,
+                tuple(
+                    coordinate_axis_symbol(axis)
+                    for axis in schedule_domain.axis_order
+                ),
+            )
+            for piece in occupied.pieces
+        ),
+    )
+    if occupied is task_order:
+        return identity
+    return (
+        identity
+        if occupied.is_pointwise_equal_on_same_support(identity)
+        else None
+    )
+
+
+def _occupied_same_strand_precedence(
+    worker_schedule: WorkerSchedule,
+) -> CoordinateRelation | None:
+    """Map each occupied slot to all occupied earlier same-strand slots.
+
+    The result remains entirely in the placement domain.  Callers recover
+    roots and logical tasks only through the authoritative segment
+    ``task_order`` relations.
+
+    Work is bounded by roots and relation pieces.  Unsupported relation
+    composition or a common relation-budget overflow declines the whole view.
+    """
+    placement_domain = worker_schedule.placement_domain
+    if placement_domain.kind != "worker" or len(placement_domain.axis_order) != 3:
+        return None
+    launch_stage_axis, worker_axis, wave_axis = placement_domain.axis_order
+    occupied_pieces: dict[_CoordinateRelationPiece, None] = {}
+    for segment in worker_schedule.segments:
+        occupied = _occupied_slot_identity(segment)
+        if occupied is None or occupied.source_domain != placement_domain:
+            return None
+        for piece in occupied.pieces:
+            occupied_pieces.setdefault(piece, None)
+            if len(occupied_pieces) > tile_dependency._MAX_RELATION_PIECES:
+                return None
+
+    total_piece_count = len(occupied_pieces)
+    if (
+        not tile_dependency._relation_product_is_within_budget(
+            total_piece_count,
+            total_piece_count,
+        )
+    ):
+        return None
+
+    launch_stage = coordinate_axis_symbol(launch_stage_axis)
+    worker = coordinate_axis_symbol(worker_axis)
+    wave = coordinate_axis_symbol(wave_axis)
+    strict_predecessors = CoordinateRelation(
+        source_domain=placement_domain,
+        target_domain=placement_domain,
+        pieces=(
+            _CoordinateRelationPiece(
+                source_bounds_items=tuple(
+                    (
+                        axis,
+                        0,
+                        placement_domain.axis_count_expressions[axis],
+                        1,
+                    )
+                    for axis in placement_domain.axis_order
+                ),
+                target_ranges=(
+                    (launch_stage_axis, launch_stage, launch_stage + 1, 1),
+                    (worker_axis, worker, worker + 1, 1),
+                    (wave_axis, sympy.Integer(0), wave, 1),
+                ),
+            ),
+        ),
+    )
+    occupied_identity = CoordinateRelation(
+        source_domain=placement_domain,
+        target_domain=placement_domain,
+        pieces=tuple(occupied_pieces),
+    )
+    predecessors_by_successor = occupied_identity.then(strict_predecessors)
+    if predecessors_by_successor is None:
+        return None
+    return occupied_identity.overlapping_sources(predecessors_by_successor)
+
+
 @cache
 def _root_task_placement_relation(
     worker_schedule: WorkerSchedule,

@@ -1879,6 +1879,73 @@ class TestTileDependency(TestCase):
         )
         self.assertIsNone(clipped.then(following))
 
+    def test_partial_identity_composes_with_full_set_relation(self) -> None:
+        extent = sympy.Symbol("extent", integer=True, nonnegative=True)
+
+        def relations(
+            count: int | sympy.Expr,
+        ) -> tuple[CoordinateRelation, CoordinateRelation]:
+            source = CoordinateDomain(
+                (10,),
+                ((10, count),),
+                kind="site",
+                _allow_empty=True,
+            )
+            intermediate = CoordinateDomain(
+                (10,),
+                ((10, count),),
+                kind="worker",
+                _allow_empty=True,
+            )
+            target = CoordinateDomain(
+                (30,),
+                ((30, count),),
+                kind="value",
+                _allow_empty=True,
+            )
+            coordinate = coordinate_axis_symbol(10)
+            return (
+                CoordinateRelation.point_map(
+                    source,
+                    intermediate,
+                    ((((10, -3, count + 4, 2),), (coordinate,)),),
+                ),
+                CoordinateRelation(
+                    intermediate,
+                    target,
+                    (
+                        _CoordinateRelationPiece(
+                            ((10, 0, count, 1),),
+                            ((30, sympy.Integer(0), coordinate + 1, 1),),
+                        ),
+                    ),
+                ),
+            )
+
+        first, following = relations(extent)
+        composed = first.then(following)
+        self.assertIsNotNone(composed)
+        assert composed is not None
+        for concrete_extent in (0, 1, 2, 5, 8):
+            with self.subTest(extent=concrete_extent):
+                direct_first, direct_following = relations(concrete_extent)
+                direct = direct_first.then(direct_following)
+                self.assertIsNotNone(direct)
+                assert direct is not None
+                expected = tuple(
+                    frozenset(range(source_index + 1))
+                    if source_index % 2 == 1
+                    else frozenset()
+                    for source_index in range(concrete_extent)
+                )
+                self.assertEqual(
+                    composed.substitute_parameters(
+                        {extent: concrete_extent}
+                    ).materialize(),
+                    expected,
+                )
+                self.assertEqual(direct.materialize(), expected)
+
     def test_symbolic_pid_task_order_preserves_axis_permutation(self) -> None:
         domain = CoordinateDomain(
             (10, 20, 30),
@@ -2743,6 +2810,182 @@ class TestTileDependency(TestCase):
         self.assertIsNotNone(disjoint)
         assert disjoint is not None
         self.assertEqual(disjoint.pieces, ())
+
+    def test_overlap_respects_partial_strided_producer_support(self) -> None:
+        producer = CoordinateDomain((10,), ((10, 8),), kind="site")
+        consumer = CoordinateDomain((20,), ((20, 6),), kind="site")
+        allocation = CoordinateDomain(
+            (-1,),
+            ((-1, 10),),
+            kind="allocation",
+            identity=0,
+        )
+        producer_coordinate = coordinate_axis_symbol(10)
+        consumer_coordinate = coordinate_axis_symbol(20)
+        consumer_access = CoordinateRelation(
+            consumer,
+            allocation,
+            (
+                _CoordinateRelationPiece(
+                    ((20, 0, 6, 1),),
+                    ((-1, consumer_coordinate - 1, consumer_coordinate + 2, 1),),
+                ),
+            ),
+        )
+
+        for producer_bounds, supported_producers in (
+            ((10, 1, 8, 2), (1, 3, 5, 7)),
+            # Source membership remains anchored at the raw negative begin.
+            # Clipping must not shift this odd lattice onto even coordinates.
+            ((10, -3, 12, 2), (1, 3, 5, 7)),
+            ((10, -4, 13, 3), (2, 5)),
+        ):
+            with self.subTest(producer_bounds=producer_bounds):
+                producer_access = CoordinateRelation(
+                    producer,
+                    allocation,
+                    (
+                        _CoordinateRelationPiece(
+                            (producer_bounds,),
+                            (
+                                (
+                                    -1,
+                                    producer_coordinate,
+                                    producer_coordinate + 1,
+                                    1,
+                                ),
+                            ),
+                        ),
+                    ),
+                )
+                overlap = producer_access.overlapping_sources(consumer_access)
+
+                self.assertIsNotNone(overlap)
+                assert overlap is not None
+                self.assertEqual(
+                    overlap.materialize(),
+                    tuple(
+                        frozenset(
+                            producer_index
+                            for producer_index in supported_producers
+                            if consumer_index - 1
+                            <= producer_index
+                            < consumer_index + 2
+                        )
+                        for consumer_index in range(consumer.size)
+                    ),
+                )
+
+                disjoint_consumer = CoordinateRelation(
+                    consumer,
+                    allocation,
+                    (
+                        _CoordinateRelationPiece(
+                            ((20, 0, 6, 1),),
+                            ((-1, sympy.Integer(8), sympy.Integer(9), 1),),
+                        ),
+                    ),
+                )
+                disjoint = producer_access.overlapping_sources(disjoint_consumer)
+                self.assertIsNotNone(disjoint)
+                assert disjoint is not None
+                self.assertEqual(
+                    disjoint.materialize(),
+                    (frozenset(),) * consumer.size,
+                )
+
+        empty = CoordinateRelation(producer, allocation, ())
+        empty_overlap = empty.overlapping_sources(consumer_access)
+        self.assertIsNotNone(empty_overlap)
+        assert empty_overlap is not None
+        self.assertEqual(
+            empty_overlap.materialize(),
+            (frozenset(),) * consumer.size,
+        )
+
+    def test_partial_strided_overlap_has_symbolic_substitution_parity(self) -> None:
+        extent = sympy.Symbol("extent", integer=True, nonnegative=True)
+
+        def relations(
+            count: int | sympy.Expr,
+        ) -> tuple[CoordinateRelation, CoordinateRelation]:
+            producer = CoordinateDomain(
+                (10,),
+                ((10, count),),
+                kind="site",
+                _allow_empty=True,
+            )
+            consumer = CoordinateDomain(
+                (20,),
+                ((20, count),),
+                kind="site",
+                _allow_empty=True,
+            )
+            allocation = CoordinateDomain(
+                (-1,),
+                ((-1, count),),
+                kind="allocation",
+                identity=0,
+                _allow_empty=True,
+            )
+            producer_coordinate = coordinate_axis_symbol(10)
+            consumer_coordinate = coordinate_axis_symbol(20)
+            return (
+                CoordinateRelation(
+                    producer,
+                    allocation,
+                    (
+                        _CoordinateRelationPiece(
+                            ((10, 0, count, 2),),
+                            (
+                                (
+                                    -1,
+                                    producer_coordinate,
+                                    producer_coordinate + 1,
+                                    1,
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+                CoordinateRelation(
+                    consumer,
+                    allocation,
+                    (
+                        _CoordinateRelationPiece(
+                            ((20, 0, count, 1),),
+                            ((-1, sympy.Integer(0), consumer_coordinate + 1, 1),),
+                        ),
+                    ),
+                ),
+            )
+
+        producer_access, consumer_access = relations(extent)
+        overlap = producer_access.overlapping_sources(consumer_access)
+        self.assertIsNotNone(overlap)
+        assert overlap is not None
+
+        for concrete_extent in (0, 1, 2, 5, 8):
+            with self.subTest(extent=concrete_extent):
+                direct_producer, direct_consumer = relations(concrete_extent)
+                direct = direct_producer.overlapping_sources(direct_consumer)
+                self.assertIsNotNone(direct)
+                assert direct is not None
+                specialized = overlap.substitute_parameters(
+                    {extent: concrete_extent}
+                )
+                expected = tuple(
+                    frozenset(range(0, consumer_index + 1, 2))
+                    for consumer_index in range(concrete_extent)
+                )
+                self.assertEqual(specialized.materialize(), expected)
+                self.assertEqual(direct.materialize(), expected)
+
+        with mock.patch(
+            "helion._compiler.tile_dependency._relation_product_is_within_budget",
+            return_value=False,
+        ):
+            self.assertIsNone(producer_access.overlapping_sources(consumer_access))
 
     def test_target_coalescing_rejects_conditionally_empty_piece(self) -> None:
         source = CoordinateDomain((20,), ((20, 3),), kind="site")
