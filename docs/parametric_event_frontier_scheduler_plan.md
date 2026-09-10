@@ -2886,7 +2886,7 @@ ownership a production decision. They are derived views over the existing
   scalar acyclic prefix evaluator and cyclic affine recurrence proof are still
   outstanding.
 
-- [ ] Let the existing extrema implementation consume a partial scalar-value
+- [x] Let the existing extrema implementation consume a partial scalar-value
   relation when, and only when, its value support provably covers every target
   reachable by the relation being reduced. Keep the public extrema API and its
   candidate/winner/attainer machinery unchanged: normalize the value support
@@ -2897,7 +2897,7 @@ ownership a production decision. They are derived views over the existing
   because schedule scores are defined exactly on occupied slots; filling the
   rectangular placement domain or rebuilding `q` from wave arithmetic would
   introduce a second source of truth.
-- [ ] Add one private exact-or-decline partition of a resident slot-to-slot
+- [x] Add one private exact-or-decline partition of a resident slot-to-slot
   dependency relation into same-owner and cross-owner edges. Ownership is the
   existing `(launch_stage, worker)` projection of the two endpoints. Preserve
   symbolic guards and strides, require the two outputs to be disjoint and to
@@ -2905,6 +2905,20 @@ ownership a production decision. They are derived views over the existing
   common relation budgets. This pair-dependent partition is the only extra
   operation needed for the handoff component; separable source/target scalar
   potentials cannot represent endpoint inequality.
+
+  Implementation checkpoint (2026-09-10): extrema now canonicalize a partial
+  scalar map once and accept it only after the disjoint intersections with
+  each clipped reachable target box have exactly the same cardinality as that
+  box. Scalar values are validated against their carrier even when the partial
+  map is already canonical. Independent review covered 6,000 randomized
+  max/min calls plus symbolic zero and tail substitutions. The private
+  resident-handoff partition proves both endpoints are in the resident stage,
+  classifies uniform owner relations, and splits only the exact dense full-
+  worker mixed form into `{w}`, `[0,w)`, and `(w,W)`. It does not enumerate
+  workers or CTAs; unsupported modular or conditional partitions decline.
+  Independent review covered 5,000 concrete relations and symbolic tails with
+  no partition, coverage, or owner mismatches.
+
 - [ ] Evaluate the lexicographic objective `(completion, handoffs)` with that
   prefix proof over same-strand precedence and semantic readiness edges. For
   each body `s`, let `R(s)` be the greatest readiness-predecessor score,
