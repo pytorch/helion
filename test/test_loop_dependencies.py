@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 import pytest
 import torch
 
 import helion
 from helion import exc
+from helion._compiler import cross_loop_codegen
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import _get_backend
@@ -692,7 +694,13 @@ class TestTritonTileDependencyLowering(TestCase):
             cross_loop_schedule="static_pipeline",
             num_warps=1,
         )
-        code = bound.to_code(config)
+        with mock.patch.object(
+            cross_loop_codegen,
+            "_current_renderer_lowerable_counters",
+            side_effect=AssertionError("codegen revalidated a finalized plan"),
+            create=True,
+        ):
+            code = bound.to_code(config)
         compiled = bound.compile_config(config)
         worker_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
 

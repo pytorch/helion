@@ -2427,6 +2427,52 @@ class TestCrossLoopScheduler(TestCase):
                 root_barrier_edges=frozenset(),
             )
 
+    def test_static_pipeline_plan_rejects_resident_continuation_owner(self) -> None:
+        producer_domain, consumer_domain = _identify_root_domains(
+            (_domain((10, 2, 1)), _domain((20, 2, 1)))
+        )
+        root_task_orders = _default_root_task_orders((producer_domain, consumer_domain))
+        worker_schedule = cross_loop_scheduler._build_root_major_worker_schedule(
+            (producer_domain, consumer_domain),
+            root_task_orders,
+            2,
+        )
+        readiness_key_domain = _domain((0, 2), kind="event", identity=0)
+        continuation = ReadinessCounterPlan(
+            producers=(
+                ReadinessProducer(
+                    producer_root=0,
+                    producers_by_key=_full_point_map(
+                        readiness_key_domain,
+                        producer_domain,
+                        coordinate_axis_symbol(0),
+                    ),
+                ),
+            ),
+            consumers=(
+                ReadinessConsumer(
+                    consumer_root=1,
+                    keys_by_consumer=_full_point_map(
+                        consumer_domain,
+                        readiness_key_domain,
+                        coordinate_axis_symbol(20),
+                    ),
+                ),
+            ),
+            continuation_consumer_index=0,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "continuation roots must not retain resident ownership",
+        ):
+            cross_loop_scheduler.StaticPipelinePlan(
+                worker_schedule=worker_schedule,
+                root_task_orders=root_task_orders,
+                readiness_counters=(continuation,),
+                root_barrier_edges=frozenset(),
+            )
+
     def test_counter_lowering_rejects_mixed_and_continuation_nested_plans(
         self,
     ) -> None:

@@ -23,7 +23,6 @@ from .cross_loop_scheduler import ReadinessProducer
 from .cross_loop_scheduler import RootBarrierPublication
 from .cross_loop_scheduler import WorkerInterval
 from .cross_loop_scheduler import WorkerScheduleSegment
-from .cross_loop_scheduler import _current_renderer_lowerable_counters
 from .cross_loop_scheduler import _normalize_intervals
 from .cross_loop_scheduler import _parametric_event_frontier_root_order
 from .cross_loop_scheduler import _parametric_event_frontier_schedule_geometry
@@ -768,14 +767,9 @@ def emit_cross_loop_schedule(
             "cross_loop_schedule='static_pipeline' cannot lower this "
             "parameterized worker schedule"
         )
-    if (parameterized_root_domains or parameterized_readiness_counters) and (
-        static_pipeline_plan.transient_source_root is not None
-        or _current_renderer_lowerable_counters(
-            static_pipeline_plan.readiness_counters,
-            root_domains,
-        )
-        != static_pipeline_plan.readiness_counters
-    ):
+    if (
+        parameterized_root_domains or parameterized_readiness_counters
+    ) and static_pipeline_plan.transient_source_root is not None:
         raise AssertionError("parameterized lowering received an unsupported plan")
     root_barrier_edges = static_pipeline_plan.root_barrier_edges
     if parameterized_event_frontier_geometry is not None:
@@ -812,14 +806,6 @@ def emit_cross_loop_schedule(
         for plan in readiness_counter_plans
         if (continuation_consumer := plan.continuation_consumer) is not None
     }
-    if (
-        parameterized_root_domains
-        and {segment.root for segment in static_pipeline_plan.worker_schedule.segments}
-        != set(range(len(root_domains))) - continuation_roots
-    ):
-        raise AssertionError(
-            "parameterized worker schedule does not exactly exclude continuations"
-        )
     launch_worker_count = static_pipeline_plan.worker_schedule.worker_count
     transient_source_root = static_pipeline_plan.transient_source_root
     transient_source_segment = (
