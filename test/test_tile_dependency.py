@@ -4683,6 +4683,395 @@ class TestTileDependency(TestCase):
                 ((), ()),
             )
 
+    def test_target_value_extreme_accepts_exact_partial_value_support(self) -> None:
+        source_axis = 10
+        target_axis = 20
+        value_axis = 30
+        source = CoordinateDomain(
+            (source_axis,),
+            ((source_axis, 2),),
+            kind="event",
+        )
+        target = CoordinateDomain(
+            (target_axis,),
+            ((target_axis, 3),),
+            kind="site",
+        )
+        values = CoordinateDomain(
+            (value_axis,),
+            ((value_axis, 3),),
+            kind="value",
+        )
+
+        checked = 0
+        for required_bits in range(1 << (source.size * target.size)):
+            required = CoordinateRelation(
+                source,
+                target,
+                tuple(
+                    _CoordinateRelationPiece(
+                        (
+                            (
+                                source_axis,
+                                source_index,
+                                source_index + 1,
+                                1,
+                            ),
+                        ),
+                        (
+                            (
+                                target_axis,
+                                target_index,
+                                target_index + 1,
+                                1,
+                            ),
+                        ),
+                    )
+                    for source_index in range(source.size)
+                    for target_index in range(target.size)
+                    if required_bits
+                    & (1 << (source_index * target.size + target_index))
+                ),
+            )
+            for support_bits in range(1 << target.size):
+                value_by_target = CoordinateRelation.point_map(
+                    target,
+                    values,
+                    tuple(
+                        (
+                            ((target_axis, target_index, target_index + 1, 1),),
+                            (target_index % 2,),
+                        )
+                        for target_index in range(target.size)
+                        if support_bits & (1 << target_index)
+                    ),
+                )
+                reachable = {
+                    target_index
+                    for source_index in range(source.size)
+                    for target_index in range(target.size)
+                    if required_bits
+                    & (1 << (source_index * target.size + target_index))
+                }
+                support = {
+                    target_index
+                    for target_index in range(target.size)
+                    if support_bits & (1 << target_index)
+                }
+                with mock.patch.object(
+                    CoordinateRelation,
+                    "materialize",
+                    side_effect=AssertionError("partial extrema must not enumerate"),
+                ):
+                    maximum = required.max_target_value_by_source(value_by_target)
+                    joint = required.extreme_target_value_and_attainers_by_source(
+                        value_by_target,
+                        maximize=True,
+                    )
+                if not reachable <= support:
+                    self.assertIsNone(maximum)
+                    self.assertIsNone(joint)
+                    continue
+
+                self.assertIsNotNone(maximum)
+                self.assertIsNotNone(joint)
+                assert maximum is not None and joint is not None
+                joint_maximum, attainers = joint
+                for source_index in range(source.size):
+                    targets = tuple(
+                        target_index
+                        for target_index in range(target.size)
+                        if required_bits
+                        & (1 << (source_index * target.size + target_index))
+                    )
+                    expected_value = (
+                        frozenset((max(target % 2 for target in targets),))
+                        if targets
+                        else frozenset()
+                    )
+                    expected_attainers = frozenset(
+                        target_index
+                        for target_index in targets
+                        if target_index % 2 in expected_value
+                    )
+                    self.assertEqual(maximum.targets(source_index), expected_value)
+                    self.assertEqual(
+                        joint_maximum.targets(source_index),
+                        expected_value,
+                    )
+                    self.assertEqual(
+                        attainers.targets(source_index),
+                        expected_attainers,
+                    )
+                checked += 1
+        self.assertEqual(checked, 125)
+
+    def test_partial_value_support_handles_overlap_extra_and_weighting(self) -> None:
+        source = CoordinateDomain((), (), kind="event")
+        target_axis = 20
+        target = CoordinateDomain(
+            (target_axis,),
+            ((target_axis, 5),),
+            kind="site",
+        )
+        value_domain = CoordinateDomain(
+            (30,),
+            ((30, 16),),
+            kind="value",
+        )
+        potential_domain = CoordinateDomain(
+            (31,),
+            ((31, 8),),
+            kind="value",
+        )
+        target_coordinate = coordinate_axis_symbol(target_axis)
+        required = CoordinateRelation(
+            source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    (),
+                    ((target_axis, 1, 4, 1),),
+                ),
+            ),
+        )
+        overlapping_equal_values = CoordinateRelation.point_map(
+            target,
+            value_domain,
+            (
+                (((target_axis, 0, 3, 1),), (target_coordinate + 1,)),
+                (((target_axis, 2, 4, 1),), (target_coordinate + 1,)),
+                (((target_axis, 2, 4, 1),), (target_coordinate + 1,)),
+            ),
+        )
+
+        result = required.extreme_target_value_and_attainers_by_source(
+            overlapping_equal_values,
+            maximize=True,
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result[0].materialize(), (frozenset((4,)),))
+        self.assertEqual(result[1].materialize(), (frozenset((3,)),))
+
+        partial_values = CoordinateRelation.point_map(
+            target,
+            value_domain,
+            (
+                (
+                    ((target_axis, 0, 4, 1),),
+                    (target_coordinate,),
+                ),
+            ),
+        )
+        target_potential = CoordinateRelation.point_map(
+            target,
+            potential_domain,
+            (
+                (
+                    ((target_axis, 0, 5, 1),),
+                    (4 - target_coordinate,),
+                ),
+            ),
+        )
+        source_potential = CoordinateRelation.point_map(
+            source,
+            potential_domain,
+            (((), (sympy.Integer(2),)),),
+        )
+        weighted = required.weighted_max_target_value_and_attainers_by_source(
+            partial_values,
+            target_potential=target_potential,
+            source_potential=source_potential,
+            offset=1,
+        )
+        self.assertIsNotNone(weighted)
+        assert weighted is not None
+        self.assertEqual(weighted[0].materialize(), (frozenset((7,)),))
+        self.assertEqual(weighted[1].materialize(), (frozenset((1, 2, 3)),))
+
+        missing_one = CoordinateRelation.point_map(
+            target,
+            value_domain,
+            (
+                (((target_axis, 0, 2, 1),), (target_coordinate,)),
+                (((target_axis, 3, 4, 1),), (target_coordinate,)),
+            ),
+        )
+        self.assertIsNone(required.max_target_value_by_source(missing_one))
+        self.assertIsNone(
+            required.extreme_target_value_and_attainers_by_source(
+                missing_one,
+                maximize=True,
+            )
+        )
+        self.assertIsNone(
+            required.weighted_max_target_value_and_attainers_by_source(
+                missing_one,
+                target_potential=target_potential,
+            )
+        )
+
+        conflicting_overlap = CoordinateRelation.point_map(
+            target,
+            value_domain,
+            (
+                (((target_axis, 0, 3, 1),), (target_coordinate,)),
+                (((target_axis, 2, 4, 1),), (target_coordinate + 1,)),
+            ),
+        )
+        self.assertIsNone(
+            required.extreme_target_value_and_attainers_by_source(
+                conflicting_overlap,
+                maximize=True,
+            )
+        )
+
+    def test_partial_value_support_substitutes_symbolic_boundaries(self) -> None:
+        extent = sympy.Symbol("partial_value_extent", integer=True, positive=True)
+        source_axis = 10
+        target_axis = 20
+        source = CoordinateDomain(
+            (source_axis,),
+            ((source_axis, 2),),
+            kind="event",
+        )
+        target = CoordinateDomain(
+            (target_axis,),
+            ((target_axis, extent + 6),),
+            kind="site",
+        )
+        value_domain = CoordinateDomain(
+            (30,),
+            ((30, extent + 7),),
+            kind="value",
+        )
+        target_coordinate = coordinate_axis_symbol(target_axis)
+        required = CoordinateRelation(
+            source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    ((source_axis, 0, 1, 1),),
+                    ((target_axis, -2, extent + 3, 1),),
+                ),
+                _CoordinateRelationPiece(
+                    ((source_axis, 1, 2, 1),),
+                    ((target_axis, 1, extent + 4, 1),),
+                ),
+            ),
+        )
+        value_by_target = CoordinateRelation.point_map(
+            target,
+            value_domain,
+            (
+                (((target_axis, 0, 2, 1),), (target_coordinate + 1,)),
+                (
+                    ((target_axis, 2, extent + 4, 1),),
+                    (target_coordinate + 1,),
+                ),
+            ),
+        )
+
+        symbolic = required.extreme_target_value_and_attainers_by_source(
+            value_by_target,
+            maximize=True,
+        )
+
+        self.assertIsNotNone(symbolic)
+        assert symbolic is not None
+        for concrete_extent in (1, 2, 5):
+            substitutions = {extent: concrete_extent}
+            concrete = tuple(
+                relation.substitute_parameters(substitutions) for relation in symbolic
+            )
+            self.assertEqual(
+                concrete[0].materialize(),
+                (
+                    frozenset((concrete_extent + 3,)),
+                    frozenset((concrete_extent + 4,)),
+                ),
+            )
+            self.assertEqual(
+                concrete[1].materialize(),
+                (
+                    frozenset((concrete_extent + 2,)),
+                    frozenset((concrete_extent + 3,)),
+                ),
+            )
+
+        maybe_empty_extent = sympy.Symbol(
+            "partial_value_maybe_empty",
+            integer=True,
+            nonnegative=True,
+        )
+        maybe_empty_target = CoordinateDomain(
+            (target_axis,),
+            ((target_axis, maybe_empty_extent + 1),),
+            kind="site",
+        )
+        conditionally_nonempty = CoordinateRelation(
+            source,
+            maybe_empty_target,
+            (
+                _CoordinateRelationPiece(
+                    ((source_axis, 0, 1, 1),),
+                    ((target_axis, 0, maybe_empty_extent, 1),),
+                ),
+            ),
+        )
+        conditional_values = CoordinateRelation.point_map(
+            maybe_empty_target,
+            CoordinateDomain(
+                (30,),
+                ((30, maybe_empty_extent + 2),),
+                kind="value",
+            ),
+            (
+                (
+                    ((target_axis, 0, maybe_empty_extent, 1),),
+                    (target_coordinate + 1,),
+                ),
+            ),
+        )
+        self.assertIsNone(
+            conditionally_nonempty.extreme_target_value_and_attainers_by_source(
+                conditional_values,
+                maximize=True,
+            )
+        )
+
+    def test_partial_value_support_respects_relation_budget(self) -> None:
+        source = CoordinateDomain((), (), kind="event")
+        target_axis = 20
+        target = CoordinateDomain(
+            (target_axis,),
+            ((target_axis, 4),),
+            kind="site",
+        )
+        values = CoordinateDomain((30,), ((30, 4),), kind="value")
+        target_coordinate = coordinate_axis_symbol(target_axis)
+        required = CoordinateRelation(
+            source,
+            target,
+            (_CoordinateRelationPiece((), ((target_axis, 0, 3, 1),)),),
+        )
+        partial = CoordinateRelation.point_map(
+            target,
+            values,
+            (
+                (((target_axis, 0, 1, 1),), (target_coordinate,)),
+                (((target_axis, 1, 3, 1),), (target_coordinate,)),
+            ),
+        )
+        self.assertIsNotNone(required.max_target_value_by_source(partial))
+        with mock.patch(
+            "helion._compiler.tile_dependency._MAX_RELATION_PRODUCT_STATES",
+            3,
+        ):
+            self.assertIsNone(required.max_target_value_by_source(partial))
+
     def test_target_value_extreme_retains_tied_boxes_and_affine_face(self) -> None:
         source = CoordinateDomain((), (), kind="event")
         target = CoordinateDomain(

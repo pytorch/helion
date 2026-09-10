@@ -4435,8 +4435,9 @@ class CoordinateRelation:
         ``self`` maps source coordinates to a set of target coordinates and
         ``values`` maps those target coordinates to one scalar value.  The
         result maps every source with targets to its maximum value without
-        enumerating either domain.  Unsupported intersections decline rather
-        than approximating the dependency.
+        enumerating either domain.  ``values`` may be partial when its exact
+        support covers every reachable target.  Unsupported intersections or
+        coverage proofs decline rather than approximating the dependency.
         """
         result = self._target_value_extreme_by_source(
             values,
@@ -4459,8 +4460,10 @@ class CoordinateRelation:
         are constructed from the same candidate proofs so ties cannot lose
         their value/target correlation.
 
-        Unrepresentable level sets and winner partitions decline rather than
-        selecting one witness or enumerating a runtime extent.
+        A partial ``values`` map is accepted only when its canonical support
+        exactly covers each reachable target box.  Unrepresentable coverage,
+        level sets, and winner partitions decline rather than selecting one
+        witness or enumerating a runtime extent.
         """
         result = self._target_value_extreme_by_source(
             values,
@@ -4533,9 +4536,44 @@ class CoordinateRelation:
                 len(self.pieces),
                 len(values.pieces),
             )
-            or not values.is_total_function()
         ):
             return None
+        values_are_total = values.is_total_function()
+        if not values_are_total:
+            # Extrema need values only for targets that are actually reachable.
+            # Canonicalize a partial point map once so coverage cardinalities
+            # below cannot double-count overlapping equal-valued pieces.
+            values = dataclasses.replace(
+                values,
+                pieces=tuple(dict.fromkeys(values.pieces)),
+            )
+            canonical_values = values.canonical_single_valued()
+            if canonical_values is None:
+                if not values.is_single_valued() or any(
+                    not _target_point_is_in_domain(
+                        piece.target_ranges,
+                        source_domain=values.source_domain,
+                        source_bounds=piece.source_bounds_items,
+                        target_domain=values.target_domain,
+                    )
+                    for piece in values.pieces
+                ):
+                    return None
+                # A symbolic support may not admit one global source-cell
+                # partition.  Keep its deduplicated point pieces here; each
+                # reachable target box below must still induce a disjoint,
+                # exact cover before any value is used.
+                canonical_values = values
+            values = canonical_values
+            value_piece_count = len(values.pieces)
+            coverage_is_within_budget = _relation_product_is_within_budget(
+                len(self.pieces), value_piece_count, value_piece_count
+            )
+            if (
+                value_piece_count > _MAX_RELATION_PIECES
+                or not coverage_is_within_budget
+            ):
+                return None
         if not self.pieces:
             return (
                 CoordinateRelation(self.source_domain, values.target_domain, ()),
@@ -4597,6 +4635,7 @@ class CoordinateRelation:
                     target_domain=self.target_domain,
                 ):
                     continue
+                covered_target_ranges: dict[_TargetBoxRanges, None] = {}
                 for value_piece in values.pieces:
                     intersection = _intersect_target_with_source_box(
                         semantic_target_ranges,
@@ -4626,6 +4665,8 @@ class CoordinateRelation:
                         target_domain=self.target_domain,
                     ):
                         return None
+                    if not values_are_total:
+                        covered_target_ranges.setdefault(intersected_ranges, None)
                     if len(value_piece.target_ranges) != 1:
                         return None
                     _axis, begin, end, step = value_piece.target_ranges[0]
@@ -4666,6 +4707,50 @@ class CoordinateRelation:
                     )
                     candidates.setdefault((candidate_value, target_ranges), None)
                     if include_attainers and len(candidates) > _MAX_RELATION_PIECES:
+                        return None
+                if not values_are_total:
+                    covered_ranges = tuple(covered_target_ranges)
+                    if (
+                        not covered_ranges
+                        or not _relation_product_is_within_budget(
+                            len(covered_ranges),
+                            len(covered_ranges),
+                        )
+                        or any(
+                            not _target_boxes_are_disjoint(
+                                left,
+                                right,
+                                source_domain=self.source_domain,
+                                source_bounds=source_bounds,
+                            )
+                            for index, left in enumerate(covered_ranges)
+                            for right in covered_ranges[index + 1 :]
+                        )
+                    ):
+                        return None
+                    reachable_cardinality = _target_box_cardinality(
+                        semantic_target_ranges,
+                        target_domain=self.target_domain,
+                        source_domain=self.source_domain,
+                        source_bounds=source_bounds,
+                    )
+                    covered_cardinality = sympy.simplify(
+                        sympy.Add(
+                            *(
+                                _target_box_cardinality(
+                                    target_ranges,
+                                    target_domain=self.target_domain,
+                                    source_domain=self.source_domain,
+                                    source_bounds=source_bounds,
+                                )
+                                for target_ranges in covered_ranges
+                            )
+                        )
+                    )
+                    if not _integer_partition_expressions_equal(
+                        covered_cardinality,
+                        reachable_cardinality,
+                    ):
                         return None
             if not candidates:
                 continue
@@ -7693,72 +7778,29 @@ def _intersect_target_with_source_box(
         tuple[int, IntegerExpression, IntegerExpression, int], ...
     ],
 ) -> tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...] | bool | None:
-    """Return a contained target box, ``False`` if disjoint, else unknown."""
-    bounds_by_axis = {
-        axis: (begin, end, step) for axis, begin, end, step in value_source_bounds
-    }
-    for axis, begin, end, step in target_ranges:
-        source_begin, source_end, source_step = bounds_by_axis[axis]
-        # A dense value piece contains every positive-stride subset of the
-        # same interval.  For a strided value piece, the target stride must
-        # preserve its lattice and the target begin must have the same
-        # residue.  Equal strides alone are insufficient: even and odd
-        # lattices have equal strides but are disjoint.
-        if source_step != 1:
-            if step % source_step:
-                return None
-            residue = sympy.simplify(
-                sympy.Mod(  # pyrefly: ignore[bad-argument-type]
-                    begin - source_begin,  # pyrefly: ignore[unsupported-operation]
-                    source_step,
-                )
-            )
-            if residue != 0:
-                if residue.is_number:
-                    return False
-                residue_bounds = _logical_expression_bounds(
-                    residue,
-                    domain=source_domain,
-                    source_bounds=relation_source_bounds,
-                )
-                if residue_bounds is None:
-                    return None
-                if residue_bounds[0] == residue_bounds[1] != 0:
-                    return False
-                if residue_bounds != (sympy.Integer(0), sympy.Integer(0)):
-                    return None
-        before = _logical_expression_bounds(
-            end - source_begin,  # pyrefly: ignore[unsupported-operation]
-            domain=source_domain,
-            source_bounds=relation_source_bounds,
+    """Intersect one reachable target box with a value-map source box."""
+    if _source_bounds_are_disjoint(target_ranges, value_source_bounds):
+        return False
+    intersection = _intersect_source_boxes(target_ranges, value_source_bounds)
+    if intersection is None or intersection is False:
+        return intersection
+    return tuple(
+        (
+            axis,
+            _simplify_logical_expression(
+                sympy.sympify(begin),
+                domain=source_domain,
+                source_bounds=relation_source_bounds,
+            ),
+            _simplify_logical_expression(
+                sympy.sympify(end),
+                domain=source_domain,
+                source_bounds=relation_source_bounds,
+            ),
+            step,
         )
-        after = _logical_expression_bounds(
-            begin - source_end,  # pyrefly: ignore[unsupported-operation]
-            domain=source_domain,
-            source_bounds=relation_source_bounds,
-        )
-        if (before is not None and _is_provably_nonnegative(-before[1], None)) or (
-            after is not None and _is_provably_nonnegative(after[0], None)
-        ):
-            return False
-        lower = _logical_expression_bounds(
-            begin - source_begin,  # pyrefly: ignore[unsupported-operation]
-            domain=source_domain,
-            source_bounds=relation_source_bounds,
-        )
-        upper = _logical_expression_bounds(
-            source_end - end,  # pyrefly: ignore[unsupported-operation]
-            domain=source_domain,
-            source_bounds=relation_source_bounds,
-        )
-        if (
-            lower is None
-            or not _is_provably_nonnegative(lower[0], None)
-            or upper is None
-            or not _is_provably_nonnegative(upper[0], None)
-        ):
-            return None
-    return target_ranges
+        for axis, begin, end, step in intersection
+    )
 
 
 _TargetBoxEndpointChoices = tuple[tuple[int, sympy.Expr], ...]
