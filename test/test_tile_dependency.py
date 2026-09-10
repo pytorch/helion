@@ -3913,11 +3913,11 @@ class TestTileDependency(TestCase):
                     (
                         _CoordinateRelationPiece(
                             (),
-                            ((20, point, point, 1),),  # pyrefly: ignore[bad-argument-type]
+                            ((20, begin, end, 1),),  # pyrefly: ignore[bad-argument-type]
                         ),
                     ),
                 )
-                for point in (0, 2, 4)
+                for begin, end in ((0, 0), (2, 2), (4, 4), (3, 2))
             ),
         )
         for empty in empty_relations:
@@ -3988,55 +3988,90 @@ class TestTileDependency(TestCase):
 
     def test_target_value_extreme_partitions_affine_source_crossing(self) -> None:
         source_axis = 10
+        outer_axis = 11
         target_axis = 20
-        source = CoordinateDomain((source_axis,), ((source_axis, 4),), kind="event")
+        scale = sympy.Symbol("scale", integer=True, positive=True)
+        source = CoordinateDomain(
+            (source_axis, outer_axis),
+            ((source_axis, 4), (outer_axis, 2)),
+            kind="event",
+        )
         target = CoordinateDomain((target_axis,), ((target_axis, 4),), kind="site")
-        values = CoordinateDomain((30,), ((30, 4),), kind="value")
+        values = CoordinateDomain(
+            (30,),
+            ((30, 4 * scale),),  # pyrefly: ignore[unsupported-operation]
+            kind="value",
+        )
         source_coordinate = coordinate_axis_symbol(source_axis)
+        outer_coordinate = coordinate_axis_symbol(outer_axis)
         target_coordinate = coordinate_axis_symbol(target_axis)
+        source_bounds = ((source_axis, 0, 4, 1), (outer_axis, 0, 2, 1))
         pieces = (
             _CoordinateRelationPiece(
-                ((source_axis, 0, 4, 1),),
+                source_bounds,
                 ((target_axis, source_coordinate, source_coordinate + 1, 1),),  # pyrefly: ignore[unsupported-operation]
             ),
             _CoordinateRelationPiece(
-                ((source_axis, 0, 4, 1),),
+                source_bounds,
                 ((target_axis, 3 - source_coordinate, 4 - source_coordinate, 1),),  # pyrefly: ignore[unsupported-operation]
             ),
         )
         value_by_target = CoordinateRelation.point_map(
             target,
             values,
-            ((((target_axis, 0, 4, 1),), (target_coordinate,)),),
+            ((((target_axis, 0, 4, 1),), (scale * target_coordinate,)),),  # pyrefly: ignore[unsupported-operation]
         )
 
         results = []
         for ordered_pieces in (pieces, tuple(reversed(pieces))):
             required = CoordinateRelation(source, target, ordered_pieces)
-            maximum = required.extreme_target_value_and_attainers_by_source(
+            result = required.extreme_target_value_and_attainers_by_source(
                 value_by_target,
                 maximize=True,
             )
-            minimum = required.extreme_target_value_and_attainers_by_source(
-                value_by_target,
-                maximize=False,
-            )
-            self.assertIsNotNone(maximum)
-            self.assertIsNotNone(minimum)
-            assert maximum is not None
-            assert minimum is not None
-            self.assertEqual(
-                maximum[0].materialize(),
-                tuple(frozenset((value,)) for value in (3, 2, 2, 3)),
-            )
-            self.assertEqual(maximum[1].materialize(), maximum[0].materialize())
-            self.assertEqual(
-                minimum[0].materialize(),
-                tuple(frozenset((value,)) for value in (0, 1, 1, 0)),
-            )
-            self.assertEqual(minimum[1].materialize(), minimum[0].materialize())
-            results.append((maximum, minimum))
+            self.assertIsNotNone(result)
+            assert result is not None
+            results.append(result)
         self.assertEqual(results[0], results[1])
+        for scale_value in (1, 3):
+            value_relation, attainer_relation = (
+                relation.substitute_parameters({scale: scale_value})
+                for relation in results[0]
+            )
+            for source_coordinate_value in range(4):
+                for outer_coordinate_value in range(2):
+                    coordinates = {
+                        source_axis: source_coordinate_value,
+                        outer_axis: outer_coordinate_value,
+                    }
+                    expected = max(
+                        source_coordinate_value,
+                        3 - source_coordinate_value,
+                    )
+                    self.assertEqual(
+                        value_relation.target_coordinates(coordinates),
+                        frozenset(((scale_value * expected,),)),
+                    )
+                    self.assertEqual(
+                        attainer_relation.target_coordinates(coordinates),
+                        frozenset(((expected,),)),
+                    )
+
+        multi_axis_pieces = (
+            pieces[0],
+            _CoordinateRelationPiece(
+                source_bounds,
+                ((target_axis, outer_coordinate, outer_coordinate + 1, 1),),  # pyrefly: ignore[unsupported-operation]
+            ),
+        )
+        self.assertIsNone(
+            CoordinateRelation(
+                source, target, multi_axis_pieces
+            ).extreme_target_value_and_attainers_by_source(
+                value_by_target,
+                maximize=True,
+            )
+        )
 
         with mock.patch(
             "helion._compiler.tile_dependency._MAX_RELATION_PRODUCT_STATES",

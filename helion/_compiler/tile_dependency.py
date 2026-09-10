@@ -4281,9 +4281,11 @@ class CoordinateRelation:
                         "tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...]",
                         intersection,
                     )
-                    if any(
-                        _integer_partition_expressions_equal(begin, end)
-                        for _axis, begin, end, _step in intersected_ranges
+                    if _target_box_is_empty_for_all_sources(
+                        intersected_ranges,
+                        source_domain=self.source_domain,
+                        source_bounds=source_bounds,
+                        target_domain=self.target_domain,
                     ):
                         continue
                     if not _target_box_is_nonempty_for_all_sources(
@@ -7588,6 +7590,40 @@ def _target_box_expression_extreme_proof_uncached(
     return None
 
 
+def _extreme_candidate_comparison(
+    difference: sympy.Expr,
+    *,
+    source_domain: CoordinateDomain,
+    source_bounds: _SourceBounds,
+    parameter_symbols: frozenset[sympy.Symbol],
+) -> int | None:
+    """Return the fixed sign of an integer difference over a source box."""
+    bounds = _logical_expression_bounds(
+        difference,
+        domain=source_domain,
+        source_bounds=source_bounds,
+        parameter_symbols=parameter_symbols,
+    )
+    if bounds is None:
+        return None
+    lower, upper = bounds
+    if _is_provably_nonnegative(
+        sympy.simplify(lower - 1),  # pyrefly: ignore[unsupported-operation]
+        None,
+    ):
+        return 1
+    if _is_provably_nonnegative(
+        sympy.simplify(-upper - 1),  # pyrefly: ignore[unsupported-operation]
+        None,
+    ):
+        return -1
+    if _integer_partition_expressions_equal(lower, 0) and (
+        _integer_partition_expressions_equal(upper, 0)
+    ):
+        return 0
+    return None
+
+
 def _extreme_candidate_source_cells(
     candidate_values: tuple[sympy.Expr, ...],
     *,
@@ -7606,11 +7642,59 @@ def _extreme_candidate_source_cells(
     )
     if winners is not None:
         return ((source_bounds, winners),)
-    if len(source_bounds) != 1 or not _relation_product_is_within_budget(
+    if not _relation_product_is_within_budget(
         len(candidate_values), len(candidate_values)
     ):
         return None
-    axis, begin_expression, end_expression, step = source_bounds[0]
+    source_axes = {
+        coordinate_axis_symbol(axis): axis for axis in source_domain.axis_order
+    }
+    crossing_axis: int | None = None
+    roots: list[sympy.Rational] = []
+    for left in range(len(candidate_values)):
+        for right in range(left + 1, len(candidate_values)):
+            difference = sympy.simplify(
+                candidate_values[left] - candidate_values[right]  # pyrefly: ignore[unsupported-operation]
+            )
+            if (
+                _extreme_candidate_comparison(
+                    difference,
+                    source_domain=source_domain,
+                    source_bounds=source_bounds,
+                    parameter_symbols=parameter_symbols,
+                )
+                is not None
+            ):
+                continue
+            varying = difference.free_symbols & source_axes.keys()
+            if len(varying) != 1:
+                return None
+            (coordinate,) = varying
+            axis = source_axes[coordinate]
+            if crossing_axis is not None and crossing_axis != axis:
+                return None
+            crossing_axis = axis
+            difference = sympy.expand(difference)
+            coefficient = sympy.simplify(difference.coeff(coordinate))
+            offset = sympy.simplify(difference - coefficient * coordinate)  # pyrefly: ignore[unsupported-operation]
+            if (
+                (coefficient.free_symbols | offset.free_symbols) - parameter_symbols
+                or coefficient.is_zero is not False  # pyrefly: ignore[missing-attribute]
+                or not (
+                    coefficient.is_positive is True  # pyrefly: ignore[missing-attribute]
+                    or coefficient.is_negative is True  # pyrefly: ignore[missing-attribute]
+                )
+            ):
+                return None
+            root = sympy.simplify(-offset / coefficient)  # pyrefly: ignore[unsupported-operation]
+            if not isinstance(root, sympy.Rational):
+                return None
+            roots.append(root)
+    if crossing_axis is None:
+        return None
+    axis, begin_expression, end_expression, step = next(
+        bound for bound in source_bounds if bound[0] == crossing_axis
+    )
     begin = sympy.simplify(begin_expression)
     end = sympy.simplify(end_expression)
     if (
@@ -7619,37 +7703,19 @@ def _extreme_candidate_source_cells(
         or not isinstance(end, sympy.Integer)
     ):
         return None
-    coordinate = coordinate_axis_symbol(axis)
     cuts = {int(begin), int(end)}
-    for left in range(len(candidate_values)):
-        for right in range(left + 1, len(candidate_values)):
-            difference = sympy.expand(
-                candidate_values[left] - candidate_values[right]  # pyrefly: ignore[unsupported-operation]
-            )
-            coefficient = sympy.simplify(difference.coeff(coordinate))
-            offset = sympy.simplify(difference - coefficient * coordinate)  # pyrefly: ignore[unsupported-operation]
-            if (
-                coefficient.free_symbols
-                or offset.free_symbols
-                or coefficient.is_rational is not True  # pyrefly: ignore[missing-attribute]
-                or offset.is_rational is not True  # pyrefly: ignore[missing-attribute]
-            ):
-                return None
-            if coefficient == 0:
-                continue
-            root = sympy.simplify(-offset / coefficient)  # pyrefly: ignore[unsupported-operation]
-            floor_root = sympy.floor(root)
-            if not isinstance(floor_root, sympy.Integer):
-                return None
-            floor_value = int(floor_root)
-            new_cuts = (
-                (floor_value, floor_value + 1)
-                if _integer_partition_expressions_equal(root, floor_root)
-                else (floor_value + 1,)
-            )
-            cuts.update(cut for cut in new_cuts if int(begin) < cut < int(end))
-            if len(cuts) - 1 > _MAX_RELATION_PIECES:
-                return None
+    for root in roots:
+        floor_root = sympy.floor(root)
+        assert isinstance(floor_root, sympy.Integer)
+        floor_value = int(floor_root)
+        new_cuts = (
+            (floor_value, floor_value + 1)
+            if _integer_partition_expressions_equal(root, floor_root)
+            else (floor_value + 1,)
+        )
+        cuts.update(cut for cut in new_cuts if int(begin) < cut < int(end))
+        if len(cuts) - 1 > _MAX_RELATION_PIECES:
+            return None
     ordered_cuts = sorted(cuts)
     if not _relation_product_is_within_budget(
         len(ordered_cuts),
@@ -7659,7 +7725,12 @@ def _extreme_candidate_source_cells(
         return None
     result: list[tuple[_SourceBounds, tuple[int, ...]]] = []
     for cell_begin, cell_end in itertools.pairwise(ordered_cuts):
-        cell = ((axis, cell_begin, cell_end, 1),)
+        cell = tuple(
+            (bound_axis, cell_begin, cell_end, 1)
+            if bound_axis == crossing_axis
+            else (bound_axis, bound_begin, bound_end, bound_step)
+            for bound_axis, bound_begin, bound_end, bound_step in source_bounds
+        )
         winners = _extreme_candidate_indices(
             candidate_values,
             source_domain=source_domain,
@@ -7691,30 +7762,13 @@ def _extreme_candidate_indices(
     winners = set(range(len(candidate_values)))
     for left in range(len(candidate_values)):
         for right in range(left + 1, len(candidate_values)):
-            bounds = _logical_expression_bounds(
+            sign = _extreme_candidate_comparison(
                 sympy.simplify(candidate_values[left] - candidate_values[right]),  # pyrefly: ignore[unsupported-operation]
-                domain=source_domain,
+                source_domain=source_domain,
                 source_bounds=source_bounds,
                 parameter_symbols=parameter_symbols,
             )
-            if bounds is None:
-                return None
-            lower, upper = bounds
-            if _is_provably_nonnegative(
-                sympy.simplify(lower - 1),  # pyrefly: ignore[unsupported-operation]
-                None,
-            ):
-                sign = 1
-            elif _is_provably_nonnegative(
-                sympy.simplify(-upper - 1),  # pyrefly: ignore[unsupported-operation]
-                None,
-            ):
-                sign = -1
-            elif _integer_partition_expressions_equal(lower, 0) and (
-                _integer_partition_expressions_equal(upper, 0)
-            ):
-                sign = 0
-            else:
+            if sign is None:
                 return None
             if maximize:
                 if sign < 0:
@@ -8060,6 +8114,32 @@ def _target_box_cardinality(
         )
         cardinality *= extent  # pyrefly: ignore[unsupported-operation]
     return sympy.simplify(cardinality)
+
+
+def _target_box_is_empty_for_all_sources(
+    target_ranges: _TargetBoxRanges,
+    *,
+    source_domain: CoordinateDomain,
+    source_bounds: _SourceBounds,
+    target_domain: CoordinateDomain,
+) -> bool:
+    """Prove that at least one target axis is empty for every source point."""
+    parameter_symbols = (
+        source_domain.parameter_symbols | target_domain.parameter_symbols
+    )
+    for _axis, begin, end, _step in target_ranges:
+        width_bounds = _logical_expression_bounds(
+            end - begin,  # pyrefly: ignore[unsupported-operation]
+            domain=source_domain,
+            source_bounds=source_bounds,
+            parameter_symbols=parameter_symbols,
+        )
+        if width_bounds is not None and _is_provably_nonnegative(
+            -width_bounds[1],  # pyrefly: ignore[unsupported-operation]
+            None,
+        ):
+            return True
+    return False
 
 
 def _target_box_is_nonempty_for_all_sources(
