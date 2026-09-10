@@ -2906,7 +2906,7 @@ ownership a production decision. They are derived views over the existing
   because schedule scores are defined exactly on occupied slots; filling the
   rectangular placement domain or rebuilding `q` from wave arithmetic would
   introduce a second source of truth.
-- [ ] Reuse that same exact support-cover proof in
+- [x] Reuse that same exact support-cover proof in
   `CoordinateRelation.pointwise_add_scalar`: a partial right operand is legal
   exactly when its canonical single-valued support covers the left operand's
   support; extra right-hand support is irrelevant. Preserve the left support,
@@ -2915,6 +2915,16 @@ ownership a production decision. They are derived views over the existing
   shifted `q` arithmetic directly on occupied slots, rather than adding more
   symbolic `task -> slot -> q` preimage cases or filling holes with fabricated
   values.
+
+  Implementation checkpoint (2026-09-10): scalar addition and extrema now
+  share one bounded exact-support-cover proof. The pre-existing total-map path
+  remains unchanged; only a relation proved partial enters canonical partial
+  support handling, where proved-empty pieces are discarded before value
+  validation. The canonical symbolic `(3, N, 2)` occupied-ordinal addition
+  stays symbolic, produces three pieces, and takes about five seconds cold
+  after ordinal construction. Independent review covered 220,181 exhaustive
+  strided support combinations and 2,500 randomized additions without an
+  unsound acceptance.
 - [x] Add one private exact-or-decline partition of a resident slot-to-slot
   dependency relation into same-owner and cross-owner edges. Ownership is the
   existing `(launch_stage, worker)` projection of the two endpoints. Preserve
