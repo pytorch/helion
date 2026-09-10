@@ -243,7 +243,8 @@ pullback are also complete. Same-strand chronology is derived only from the
 authoritative `WorkerScheduleSegment.task_order` relations; a review-found
 partial/strided clipping bug and a second mixed full/partial-piece clipping bug
 were fixed before integration. The combined tile-dependency and scheduler
-suites now pass 326 tests with 304 subtests. Occupied strand ordinal `q(s)` is
+suites now pass 335 tests with 342 subtests; the separate max-plus oracle adds
+12 tests with 4 subtests. Occupied strand ordinal `q(s)` is
 also complete for concrete, holed, and ordinary symbolic packed schedules.
 The acyclic resident root quotient and the first test-only concrete max-plus
 oracle are now complete. The oracle is independently differential-tested and
