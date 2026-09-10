@@ -337,8 +337,11 @@ therefore cannot be coarsened or finalized before placement. Qwen's useful
 - [ ] Let the one event-frontier scheduler compare an eligible continuation
   with the earliest legal resident placement when the event closes. Charge
   each inline body, including a chain, as one unit after its final producer on
-  that strand; compare the complete structural completion rank/horizon, and
-  prefer resident ownership on an exact or unproved tie. The decision is
+  every possible final-producer strand. Compare the guard-wide lexicographic
+  objective `(unit completion makespan, critical-path resident handoff depth)`.
+  Inline may win a proved primary tie only by strictly reducing the maximum
+  handoff depth among primary-critical terminal paths; prefer resident on an
+  unproved comparison or a full objective tie. The decision is
   atomic for the whole event family and compiled guard. Never run a separate
   continuation-selection pass before or after scheduling. The selected
   candidate remains the existing ephemeral `FinalArrivalContinuation` until
@@ -770,7 +773,9 @@ This principle has three ordered parts:
 2. **Priority:** unit-weight `top`/`bottom`/slack protect structurally critical
    chains. Event-closing lookahead and remaining-producer count break ties so a
    nearly complete fan-in is finished instead of spreading equal-priority work
-   across many keys.
+   across many keys. For ownership choices with equal proved completion
+   makespan, minimize cross-owner readiness handoff depth on the
+   primary-critical terminal paths.
 3. **Work conservation:** every worker slot receives admissible work when any
    exists; newly released consumers enter the same ready frontier immediately.
 
@@ -1504,11 +1509,15 @@ For schedules with identical resident task coverage, reject a proposal whose
 final occupied unit-task wave is later than the conservative schedule's. For a
 continuation candidate, compare complete logical completion ranks after adding
 one unit for every inline body on the final-producer strand against the
-earliest admissible resident completion. Include the whole continuation chain,
-not only its first consumer, and prefer resident ownership on an exact or
-unproved tie. This is the same explicit unit-weight model, not a measured
-makespan estimate. A source-ticket proposal is compared separately because it
-intentionally changes resident coverage. With no provably lowerable
+earliest admissible resident completion. Include the whole continuation chain
+and every possible final-arrival winner, not only its first consumer or one
+chosen strand. On a proved primary tie, compare the maximum number of resident
+readiness handoffs along primary-critical terminal paths; continuation may win
+only by strictly reducing that depth. Prefer resident ownership when either
+comparison is unproved or the full pair ties. This remains a structural
+topology objective, not a measured makespan or latency estimate. A source-ticket
+proposal is compared separately because it intentionally changes resident
+coverage. With no provably lowerable
 fine-grained prerequisite there is no early-admission opportunity, so the
 canonical compact order is returned without stepping through its frontiers.
 
@@ -1662,17 +1671,30 @@ parameterized extents and requires:
   producer chain.
 
 When an event closes, compare each eligible continuation action with the
-earliest legal resident placement using the same unit-weight criticality and
-complete logical completion horizon. An inline consumer costs one unit after
-the final producer on that producer's strand; an inline chain costs one unit
-per body. The candidate accounts for every possible final producer and all
-later work on those strands. Prefer resident ownership on an exact or unproved
-tie. At most one consumer may own a final arrival, and one choice must hold for
-the whole event family and compiled guard. If continuation wins, omit the
-consumer from resident placement and contract downstream readiness in that
-same atomic scheduling action. Otherwise it remains ordinary resident work. A
-parameter symbol, sink status, sampled task count, or `fan_in > 1` is not an
-eligibility or priority rule.
+earliest legal resident placement using the lexicographic pair of complete
+unit-weight completion makespan and critical-path resident handoff depth. An
+inline consumer costs one unit after the final producer on every possible
+winner's strand; an inline chain costs one unit per body, including all later
+work on those strands. A resident cross-owner readiness wait adds one handoff
+at its point on a primary-critical terminal path. Inline may win only when its
+primary makespan is proved no worse and, on a primary tie, its maximum handoff
+depth is strictly lower. Prefer resident ownership on an unproved comparison
+or a full pair tie. At most one consumer may own a final arrival, and one
+choice must hold for the whole event family and compiled guard. If continuation
+wins, omit the consumer from resident placement and contract downstream
+readiness in that same atomic scheduling action. Otherwise it remains ordinary
+resident work. A parameter symbol, sink status, sampled task count, or
+`fan_in > 1` is not an eligibility or priority rule.
+
+The secondary handoff objective is necessary rather than optional decoration:
+under unit body weights, inline execution is a resident placement constrained
+to a final-producer strand, so an optimal resident placement weakly dominates
+it on makespan alone. A rule that gave resident ownership every exact
+makespan tie could therefore never select any continuation. Handoff depth is
+derived solely from readiness topology and ownership, contains no measured
+latency, and distinguishes intermediate work that would delay a producer
+strand from terminal work that removes a synchronization edge at equal
+makespan.
 
 The selected identity is copied exactly once into the final counter plan after
 the schedule is accepted. Proposal, proof, and diagnostics consume that same
@@ -2693,9 +2715,10 @@ cannot accept an action whose eventual publication is unproved.
   proved.
 - At event-family closure, compare the earliest legal resident placement with
   the continuation alternative after charging one unit per inline body on
-  every possible final-producer strand. Compare complete completion horizon,
-  prefer resident on exact/unproved ties, and require one choice for the whole
-  compiled guard.
+  every possible final-producer strand. Compare complete completion horizon
+  first and critical-path resident handoff depth second; prefer resident on an
+  unproved comparison or a full objective tie, and require one choice for the
+  whole compiled guard.
 - Commit at most one continuation consumer, remove its resident coverage, and
   contract downstream readiness atomically. No other pass reselects it.
 - Preserve the configured intra-root order unless an exact readiness-major
@@ -2949,7 +2972,8 @@ The redesign is complete when:
 10. every dependency remains covered and every wait has a progress proof;
 11. continuation ownership and resident placement are selected atomically by
     the same structural rule for constant and symbolic domains; inline bodies
-    are charged on producer strands and resident wins exact/unproved ties;
+    are charged on every possible producer strand, handoff depth breaks only a
+    proved makespan tie, and resident wins unproved or full-objective ties;
 12. nested counter partitions are exact quotients of the accepted schedule and
     are never derived from a schedule that a later pass mutates;
 13. source tickets use a source-first allocator and capacity certificate;
