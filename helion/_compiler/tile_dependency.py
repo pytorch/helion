@@ -2186,7 +2186,7 @@ class CoordinateRelation:
         selector_partition = _static_binary_floor_selector_partition(self)
         if selector_partition is not None:
             converse = selector_partition.converse()
-            if converse is not None:
+            if converse is not None and converse.is_total_function():
                 return _remember_exact_converse(self, converse)
         if self.parameter_symbols and (
             converse := _flat_static_inner_dynamic_outer_converse(self)
@@ -3239,20 +3239,7 @@ class CoordinateRelation:
         if (
             converse is not None
             and self.is_single_valued()
-            and converse.is_single_valued()
-            and _source_boxes_partition_domain(
-                tuple(piece.source_bounds_items for piece in converse.pieces),
-                converse.source_domain,
-            )
-            and all(
-                _target_point_is_in_domain(
-                    piece.target_ranges,
-                    source_domain=converse.source_domain,
-                    source_bounds=piece.source_bounds_items,
-                    target_domain=converse.target_domain,
-                )
-                for piece in converse.pieces
-            )
+            and converse.is_total_function()
         ):
             target_size = sympy.simplify(self.target_domain.size_expr)
             return (
@@ -3260,7 +3247,40 @@ class CoordinateRelation:
                 if isinstance(target_size, sympy.Integer)
                 else target_size
             )
+        positional_product = self._positional_product
+        if positional_product is not None:
+            positional_axes, residual = positional_product
+            residual_cardinality = residual.source_support_cardinality()
+            if residual_cardinality is not None:
+                cardinality = sympy.simplify(
+                    residual_cardinality
+                    * sympy.prod(
+                        self.source_domain.axis_count_expressions[source_axis]
+                        for source_axis, _target_axis in positional_axes
+                    )
+                )
+                return (
+                    int(cardinality)
+                    if isinstance(cardinality, sympy.Integer)
+                    else cardinality
+                )
+        selector_partition = _static_binary_floor_selector_partition(self)
+        if selector_partition is not None:
+            return selector_partition.source_support_cardinality()
         if self.parameter_symbols:
+            converse = self._factored_source_support_converse
+            if (
+                converse is not None
+                and self.is_single_valued()
+                and converse.is_total_function()
+            ):
+                _remember_exact_converse(self, converse)
+                target_size = sympy.simplify(self.target_domain.size_expr)
+                return (
+                    int(target_size)
+                    if isinstance(target_size, sympy.Integer)
+                    else target_size
+                )
             # Symbolic overlap normalization requires an ordering proof for
             # every source cut.  Decline instead of sampling a runtime size.
             return None
