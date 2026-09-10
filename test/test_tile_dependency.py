@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import math
+import random
 from typing import Literal
 from unittest import mock
 
@@ -2902,6 +2903,175 @@ class TestTileDependency(TestCase):
             empty_overlap.materialize(),
             (frozenset(),) * consumer.size,
         )
+
+    def test_partial_stride_overlap_preserves_endpoint_crossing(self) -> None:
+        producer = CoordinateDomain((10,), ((10, 5),), kind="site")
+        consumer = CoordinateDomain((20,), ((20, 7),), kind="site")
+        allocation = CoordinateDomain(
+            (-1,),
+            ((-1, 128),),
+            kind="allocation",
+            identity=0,
+        )
+        producer_coordinate = coordinate_axis_symbol(10)
+        consumer_coordinate = coordinate_axis_symbol(20)
+        producer_access = CoordinateRelation(
+            producer,
+            allocation,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 1, 4, 3),),
+                    (
+                        (
+                            -1,
+                            producer_coordinate + 110,
+                            producer_coordinate + 114,
+                            1,
+                        ),
+                    ),
+                ),
+            ),
+        )
+        consumer_access = CoordinateRelation(
+            consumer,
+            allocation,
+            (
+                _CoordinateRelationPiece(
+                    ((20, 0, 7, 1),),
+                    (
+                        (
+                            -1,
+                            4 * consumer_coordinate + 102,
+                            4 * consumer_coordinate + 107,
+                            1,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        overlap = producer_access.overlapping_sources(consumer_access)
+
+        self.assertIsNotNone(overlap)
+        assert overlap is not None
+        self.assertEqual(
+            overlap.materialize(),
+            (
+                frozenset(),
+                frozenset(),
+                frozenset((1,)),
+                frozenset((1,)),
+                frozenset(),
+                frozenset(),
+                frozenset(),
+            ),
+        )
+
+    def test_partial_strided_overlap_randomized_differential(self) -> None:
+        generator = random.Random(0)
+        accepted = 0
+        for case in range(256):
+            producer_count = generator.randrange(1, 9)
+            consumer_count = generator.randrange(1, 9)
+            allocation_count = generator.randrange(8, 33)
+            producer_begin = generator.randrange(-5, producer_count + 4)
+            producer_end = generator.randrange(
+                producer_begin,
+                producer_count + 6,
+            )
+            producer_step = generator.randrange(2, 5)
+            producer_scale = generator.randrange(1, 5)
+            producer_offset = generator.randrange(-10, allocation_count + 8)
+            producer_width = generator.randrange(1, 7)
+            consumer_scale = generator.randrange(1, 6)
+            consumer_offset = generator.randrange(-10, allocation_count + 8)
+            consumer_width = generator.randrange(1, 7)
+            producer = CoordinateDomain(
+                (10,),
+                ((10, producer_count),),
+                kind="site",
+            )
+            consumer = CoordinateDomain(
+                (20,),
+                ((20, consumer_count),),
+                kind="site",
+            )
+            allocation = CoordinateDomain(
+                (-1,),
+                ((-1, allocation_count),),
+                kind="allocation",
+                identity=case,
+            )
+            producer_coordinate = coordinate_axis_symbol(10)
+            consumer_coordinate = coordinate_axis_symbol(20)
+            producer_access = CoordinateRelation(
+                producer,
+                allocation,
+                (
+                    _CoordinateRelationPiece(
+                        (
+                            (
+                                10,
+                                producer_begin,
+                                producer_end,
+                                producer_step,
+                            ),
+                        ),
+                        (
+                            (
+                                -1,
+                                producer_scale * producer_coordinate
+                                + producer_offset,
+                                producer_scale * producer_coordinate
+                                + producer_offset
+                                + producer_width,
+                                1,
+                            ),
+                        ),
+                    ),
+                ),
+            )
+            consumer_access = CoordinateRelation(
+                consumer,
+                allocation,
+                (
+                    _CoordinateRelationPiece(
+                        ((20, 0, consumer_count, 1),),
+                        (
+                            (
+                                -1,
+                                consumer_scale * consumer_coordinate
+                                + consumer_offset,
+                                consumer_scale * consumer_coordinate
+                                + consumer_offset
+                                + consumer_width,
+                                1,
+                            ),
+                        ),
+                    ),
+                ),
+            )
+
+            overlap = producer_access.overlapping_sources(consumer_access)
+            if overlap is None:
+                continue
+            accepted += 1
+            producer_points = producer_access.materialize()
+            consumer_points = consumer_access.materialize()
+            expected = tuple(
+                frozenset(
+                    producer_index
+                    for producer_index, points in enumerate(producer_points)
+                    if points & consumer_points[consumer_index]
+                )
+                for consumer_index in range(consumer_count)
+            )
+            self.assertEqual(
+                overlap.materialize(),
+                expected,
+                msg=f"random differential case {case}",
+            )
+        self.assertGreaterEqual(accepted, 32)
 
     def test_partial_strided_overlap_has_symbolic_substitution_parity(self) -> None:
         extent = sympy.Symbol("extent", integer=True, nonnegative=True)

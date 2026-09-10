@@ -4912,6 +4912,7 @@ class CoordinateRelation:
         target_counts = self.source_domain.axis_count_expressions
         pieces: list[_CoordinateRelationPiece] = []
         has_partial_producer_source = False
+        source_targets_are_unclipped = _has_unclipped_coordinate_point_targets(self)
         for producer_piece in self.pieces:
             producer_source_bounds = {
                 axis: (sympy.sympify(begin), sympy.sympify(end), step)
@@ -4924,6 +4925,80 @@ class CoordinateRelation:
                 for axis in self.source_domain.axis_order
             )
             has_partial_producer_source |= not has_full_producer_source
+            if not has_full_producer_source and not source_targets_are_unclipped:
+                # The overlap algebra below uses raw allocation intervals.  A
+                # producer interval clipped by the allocation domain could
+                # otherwise create an overlap that exists only out of bounds.
+                # Prove the interval is unclipped on the exact in-domain
+                # source lattice; conditionally empty cells decline here.
+                effective_source_bounds: list[
+                    tuple[int, sympy.Expr, sympy.Expr, int]
+                ] = []
+                for axis in self.source_domain.axis_order:
+                    source_begin, source_end, source_step = producer_source_bounds[
+                        axis
+                    ]
+                    source_count = _integer_expression(
+                        target_counts[axis],
+                        description="coordinate-domain axis count",
+                    )
+                    clamped_begin = sympy.Max(sympy.Integer(0), source_begin)
+                    aligned_begin = (
+                        clamped_begin
+                        if source_step == 1
+                        else source_begin
+                        + source_step
+                        * sympy.ceiling(  # pyrefly: ignore[bad-argument-type]
+                            (clamped_begin - source_begin) / source_step
+                        )
+                    )
+                    effective_source_bounds.append(
+                        (
+                            axis,
+                            aligned_begin,
+                            sympy.Min(source_count, source_end),
+                            source_step,
+                        )
+                    )
+                effective_bounds = tuple(effective_source_bounds)
+                if _source_box_cardinality(
+                    effective_bounds,
+                    domain=self.source_domain,
+                ) is None:
+                    return None
+                relation_parameters = (
+                    self.source_domain.parameter_symbols
+                    | self.target_domain.parameter_symbols
+                )
+                for target_axis, begin, end, _step in producer_piece.target_ranges:
+                    begin_bounds = _logical_expression_bounds(
+                        begin,
+                        domain=self.source_domain,
+                        source_bounds=effective_bounds,
+                        parameter_symbols=relation_parameters,
+                    )
+                    end_bounds = _logical_expression_bounds(
+                        end,
+                        domain=self.source_domain,
+                        source_bounds=effective_bounds,
+                        parameter_symbols=relation_parameters,
+                    )
+                    if (
+                        begin_bounds is None
+                        or end_bounds is None
+                        or not _is_provably_nonnegative(
+                            begin_bounds[0],
+                            prove_nonnegative,
+                        )
+                        or not _is_provably_nonnegative(
+                            sympy.simplify(
+                                self.target_domain.axis_count_expressions[target_axis]
+                                - end_bounds[1]
+                            ),
+                            prove_nonnegative,
+                        )
+                    ):
+                        return None
             producer_ranges = {
                 axis: (begin, end, step)
                 for axis, begin, end, step in producer_piece.target_ranges
@@ -5063,8 +5138,12 @@ class CoordinateRelation:
                                 )
                             )
                         )
-                        target_begin = sympy.Min(clamped_end, aligned_begin)
+                        target_begin = aligned_begin
                         target_end = clamped_end
+                        # ``begin >= end`` already denotes an empty range.  Do
+                        # not replace begin with Min(end, begin): SymPy may
+                        # simplify that Min across a source-dependent crossing
+                        # and shift a strided lattice onto the wrong residue.
                     target_ranges_list.append(
                         (axis, target_begin, target_end, producer_step)
                     )
@@ -5609,6 +5688,31 @@ def _is_identity_on_source_support(relation: CoordinateRelation) -> bool:
         )
         for piece in relation.pieces
     )
+
+
+def _has_unclipped_coordinate_point_targets(
+    relation: CoordinateRelation,
+) -> bool:
+    """Prove every target is an in-domain source coordinate."""
+    source_axis_by_symbol = {
+        coordinate_axis_symbol(axis): axis for axis in relation.source_domain.axis_order
+    }
+    source_counts = relation.source_domain.axis_count_expressions
+    target_counts = relation.target_domain.axis_count_expressions
+    for piece in relation.pieces:
+        for target_axis, begin, end, step in piece.target_ranges:
+            source_axis = source_axis_by_symbol.get(begin)
+            if (
+                source_axis is None
+                or step != 1
+                or not _integer_partition_expressions_equal(end - begin, 1)
+                or not _integer_partition_expressions_equal(
+                    source_counts[source_axis],
+                    target_counts[target_axis],
+                )
+            ):
+                return False
+    return True
 
 
 def _coordinate_permutation_axes(
