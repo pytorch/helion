@@ -2738,7 +2738,7 @@ def _root_task_wave_relation(
     if waves is None or not waves.is_total_function():
         return None
     full_source_bounds = tuple(
-        (axis, 0, waves.source_domain.axis_counts[axis], 1)
+        (axis, 0, waves.source_domain.axis_count_expressions[axis], 1)
         for axis in waves.source_domain.axis_order
     )
     for piece in waves.pieces:
@@ -7862,6 +7862,110 @@ def _event_frontier_list_schedule(
     return result
 
 
+def _resident_task_counts_by_root(
+    worker_schedule: WorkerSchedule,
+    root_count: int,
+) -> tuple[sympy.Expr, ...] | None:
+    """Return exact resident task mass from authoritative schedule support."""
+    counts = [sympy.Integer(0) for _ in range(root_count)]
+    for segment in worker_schedule.segments:
+        if not 0 <= segment.root < root_count:
+            return None
+        count = segment.task_order.source_support_cardinality()
+        if count is None or (
+            not sympy.sympify(count).is_zero
+            and segment.launch_stage != _RESIDENT_LAUNCH_STAGE
+        ):
+            return None
+        counts[segment.root] = sympy.simplify(
+            counts[segment.root] + sympy.sympify(count)
+        )
+    return tuple(counts)
+
+
+def _singleton_scalar_relation_value(
+    relation: CoordinateRelation,
+) -> sympy.Expr | None:
+    """Extract one proved scalar value from a total singleton relation."""
+    canonical = relation.canonical_single_valued()
+    if (
+        canonical is None
+        or canonical.source_domain.axis_order
+        or not canonical.is_total_function()
+        or len(canonical.pieces) != 1
+    ):
+        return None
+    (piece,) = canonical.pieces
+    if piece.source_bounds_items or len(piece.target_ranges) != 1:
+        return None
+    _axis, begin, end, step = piece.target_ranges[0]
+    if step != 1 or not _equal_integer_expressions(end - begin, 1):
+        return None
+    return sympy.simplify(begin)
+
+
+def _resident_schedule_occupied_wave_count(
+    worker_schedule: WorkerSchedule,
+) -> sympy.Expr | None:
+    """Return the exact number of occupied resident waves, including zero.
+
+    Schedule relations live in a bounded worker/wave domain, so that domain's
+    wave extent is always an upper bound.  When the exact source-support mass
+    fills the minimum possible number of waves, the bound is attained by the
+    pigeonhole principle.  This also proves the runtime-empty case: zero tasks
+    have a zero-wave minimum without asking an extremum operation to represent
+    a conditionally empty fiber.
+
+    Non-minimal schedules use the ordinary relation projection and extremum
+    operations.  If a symbolic root may be empty and its maximum therefore has
+    no total representation, decline rather than sampling a nonempty extent.
+    """
+    if not worker_schedule.segments:
+        return sympy.Integer(0)
+
+    task_counts = _resident_task_counts_by_root(
+        worker_schedule,
+        max(segment.root for segment in worker_schedule.segments) + 1,
+    )
+    if task_counts is None:
+        return None
+    task_count = sympy.simplify(sympy.Add(*task_counts))
+    wave_count = sympy.sympify(worker_schedule.worker_step_domain.size_expr)
+    minimum_wave_count = _ceildiv_nonnegative_expression(
+        task_count,
+        worker_schedule.worker_count,
+    )
+    if _equal_integer_expressions(wave_count, minimum_wave_count):
+        return sympy.simplify(wave_count)
+
+    singleton_domain = CoordinateDomain((), (), kind="event")
+    maximum_waves: list[sympy.Expr] = []
+    for root in sorted({segment.root for segment in worker_schedule.segments}):
+        segments = worker_schedule.segments_for_root(root)
+        root_domain = segments[0].task_order.target_domain
+        if root_domain.size_expr.is_zero is True:
+            continue
+        maximum = _maximum_root_wave_by_key(
+            worker_schedule,
+            root,
+            CoordinateRelation.total(root_domain, singleton_domain),
+        )
+        value = None if maximum is None else _singleton_scalar_relation_value(maximum)
+        if value is None:
+            return None
+        maximum_waves.append(value)
+
+    if not maximum_waves:
+        return sympy.Integer(0) if task_count.is_zero is True else None
+    result = sympy.simplify(sympy.Max(*maximum_waves) + 1)
+    if not tile_dependency._is_provably_nonnegative(
+        sympy.simplify(wave_count - result),
+        None,
+    ):
+        return None
+    return result
+
+
 def _global_unit_list_schedule(
     readiness_graph: ReadinessGraph,
     worker_schedule: WorkerSchedule,
@@ -7900,33 +8004,33 @@ def _global_unit_list_schedule(
     # latency model: candidates with the same exact root coverage may replace
     # the input only when their final occupied wave is no later.
     root_count = len(readiness_graph.root_domains)
-    input_task_counts = tuple(
-        sum(segment.task_count for segment in worker_schedule.segments_for_root(root))
-        for root in range(root_count)
-    )
-    candidate_task_counts = tuple(
-        sum(segment.task_count for segment in candidate.segments_for_root(root))
-        for root in range(root_count)
-    )
-    if input_task_counts == candidate_task_counts:
-        input_final_wave = max(
-            (
-                final_wave
-                for segment in worker_schedule.segments
-                for _begin, _end, _first_wave, final_wave in segment.worker_step_runs()
-            ),
-            default=-1,
+    input_task_counts = _resident_task_counts_by_root(worker_schedule, root_count)
+    candidate_task_counts = _resident_task_counts_by_root(candidate, root_count)
+    if (
+        input_task_counts is None
+        or candidate_task_counts is None
+        or any(
+            not _equal_integer_expressions(input_count, candidate_count)
+            for input_count, candidate_count in zip(
+                input_task_counts,
+                candidate_task_counts,
+                strict=True,
+            )
         )
-        candidate_final_wave = max(
-            (
-                final_wave
-                for segment in candidate.segments
-                for _begin, _end, _first_wave, final_wave in segment.worker_step_runs()
-            ),
-            default=-1,
+    ):
+        return worker_schedule
+
+    input_horizon = _resident_schedule_occupied_wave_count(worker_schedule)
+    candidate_horizon = _resident_schedule_occupied_wave_count(candidate)
+    if (
+        input_horizon is None
+        or candidate_horizon is None
+        or not tile_dependency._is_provably_nonnegative(
+            sympy.simplify(input_horizon - candidate_horizon),
+            None,
         )
-        if candidate_final_wave > input_final_wave:
-            return worker_schedule
+    ):
+        return worker_schedule
     return candidate
 
 

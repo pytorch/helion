@@ -861,6 +861,53 @@ def _baseline_worker_schedule(
     )
 
 
+def _repeated_phase_worker_schedule(
+    root_domains: tuple[CoordinateDomain, ...],
+    worker_count: int,
+) -> WorkerSchedule:
+    """Build the old repeated-frontier relation as a scheduler test input."""
+    root_domains = _identify_root_domains(root_domains)
+    task_count = root_domains[0].size_expr
+    assert all(
+        sympy.simplify(domain.size_expr - task_count) == 0
+        for domain in root_domains
+    )
+    minimum_axis = min(
+        axis for domain in root_domains for axis in domain.axis_order
+    )
+    period = len(root_domains)
+    schedule_domain = cross_loop_scheduler._worker_schedule_domain(
+        worker_count,
+        sympy.simplify(
+            period
+            * cross_loop_scheduler._ceildiv_nonnegative_expression(
+                task_count,
+                worker_count,
+            )
+        ),
+        (minimum_axis - 3, minimum_axis - 2, minimum_axis - 1),
+    )
+    return WorkerSchedule(
+        worker_count,
+        tuple(
+            WorkerScheduleSegment(
+                root=root,
+                task_order=cross_loop_scheduler._parametric_event_frontier_relation(
+                    schedule_domain,
+                    domain,
+                    root,
+                    period,
+                    worker_count,
+                ),
+                worker_begin=0,
+                worker_count=worker_count,
+                dispatch_offset=0,
+            )
+            for root, domain in enumerate(root_domains)
+        ),
+    )
+
+
 def _configured_static_pipeline_plan(
     *,
     dependency_graph,
@@ -1908,6 +1955,315 @@ class TestCrossLoopScheduler(TestCase):
         )
         self.assertIs(scheduled, baseline)
         self.assertEqual(baseline.worker_step_domain.size, 3)
+
+    def test_schedule_horizon_matches_concrete_worker_step_runs(self) -> None:
+        (domain,) = _identify_root_domains((_domain((10, 3, 1)),))
+        task_order = pid_task_order(domain, domain.axis_order)
+        schedules = (
+            _baseline_worker_schedule((domain,), worker_count=2),
+            _schedule(
+                2,
+                _segment(
+                    0,
+                    task_order,
+                    workers=(0, 2),
+                    dispatch_offset=4,
+                ),
+            ),
+        )
+
+        for schedule in schedules:
+            old_horizon = (
+                max(
+                    (
+                        final_wave
+                        for segment in schedule.segments
+                        for _begin, _end, _first_wave, final_wave in (
+                            segment.worker_step_runs()
+                        )
+                    ),
+                    default=-1,
+                )
+                + 1
+            )
+            with _forbid_schedule_enumeration():
+                horizon = (
+                    cross_loop_scheduler._resident_schedule_occupied_wave_count(
+                        schedule
+                    )
+                )
+            self.assertEqual(horizon, old_horizon)
+
+    def test_symbolic_schedule_horizon_is_zero_safe_under_substitution(self) -> None:
+        task_count = sympy.Symbol("task_count", integer=True, nonnegative=True)
+        domains = tuple(
+            CoordinateDomain(
+                (axis,),
+                ((axis, task_count),),
+                ((axis, 16),),
+                kind="site",
+                identity=root,
+                _allow_empty=True,
+            )
+            for root, axis in enumerate((10, 20, 30))
+        )
+        schedule = cross_loop_scheduler._build_root_major_worker_schedule(
+            domains,
+            _default_root_task_orders(domains),
+            worker_count=4,
+        )
+
+        with _forbid_schedule_enumeration():
+            symbolic_horizon = (
+                cross_loop_scheduler._resident_schedule_occupied_wave_count(schedule)
+            )
+        self.assertIsNotNone(symbolic_horizon)
+        assert symbolic_horizon is not None
+
+        for concrete_count in (0, 1, 4, 5, 9):
+            concrete_schedule = WorkerSchedule(
+                schedule.worker_count,
+                tuple(
+                    dataclasses.replace(
+                        segment,
+                        task_order=segment.task_order.substitute_parameters(
+                            {task_count: concrete_count}
+                        ),
+                    )
+                    for segment in schedule.segments
+                ),
+            )
+            old_horizon = (
+                max(
+                    (
+                        final_wave
+                        for segment in concrete_schedule.segments
+                        for _begin, _end, _first_wave, final_wave in (
+                            segment.worker_step_runs()
+                        )
+                    ),
+                    default=-1,
+                )
+                + 1
+            )
+            self.assertEqual(
+                int(symbolic_horizon.subs(task_count, concrete_count)),
+                old_horizon,
+            )
+
+    def test_symbolic_horizon_comparison_matches_concrete_and_keeps_ties(
+        self,
+    ) -> None:
+        def old_horizon(schedule: WorkerSchedule) -> int:
+            return (
+                max(
+                    (
+                        final_wave
+                        for segment in schedule.segments
+                        for _begin, _end, _first_wave, final_wave in (
+                            segment.worker_step_runs()
+                        )
+                    ),
+                    default=-1,
+                )
+                + 1
+            )
+
+        for task_count in (1, 3, 4, 5, 8, 9):
+            with self.subTest(task_count=task_count):
+                domains = _identify_root_domains(
+                    tuple(_domain((axis, task_count, 16)) for axis in (10, 20, 30))
+                )
+                events: list[ReadinessEvent] = []
+                for event_id, (producer_root, consumer_root) in enumerate(
+                    ((0, 1), (1, 2))
+                ):
+                    key_domain = _domain(
+                        (0, task_count),
+                        kind="event",
+                        identity=event_id,
+                    )
+                    events.append(
+                        ReadinessEvent(
+                            producers=(
+                                ReadinessProducer(
+                                    producer_root=producer_root,
+                                    producers_by_key=_full_point_map(
+                                        key_domain,
+                                        domains[producer_root],
+                                        coordinate_axis_symbol(0),
+                                    ),
+                                ),
+                            ),
+                            consumers=(
+                                ReadinessConsumer(
+                                    consumer_root=consumer_root,
+                                    keys_by_consumer=_full_point_map(
+                                        domains[consumer_root],
+                                        key_domain,
+                                        coordinate_axis_symbol(
+                                            domains[consumer_root].axis_order[0]
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        )
+                    )
+                graph = _readiness_graph(domains, *events)
+                plans = tuple(
+                    ReadinessCounterPlan(event.producers, event.consumers)
+                    for event in events
+                )
+                baseline = _baseline_worker_schedule(domains, worker_count=4)
+                candidate = cross_loop_scheduler._event_frontier_list_schedule(
+                    graph,
+                    baseline,
+                    plans,
+                    frozenset(),
+                )
+                self.assertIsNotNone(candidate)
+                assert candidate is not None
+                expected = (
+                    candidate
+                    if old_horizon(candidate) <= old_horizon(baseline)
+                    else baseline
+                )
+                with (
+                    _forbid_schedule_enumeration(),
+                    mock.patch.object(
+                        cross_loop_scheduler,
+                        "_event_frontier_list_schedule",
+                        return_value=candidate,
+                    ),
+                ):
+                    actual = _global_unit_list_schedule(
+                        graph,
+                        baseline,
+                        plans,
+                        frozenset(),
+                    )
+                self.assertIs(actual, expected)
+
+        delayed_domains = _identify_root_domains(
+            (_domain((10, 3, 1)), _domain((20, 3, 1)))
+        )
+        delayed_orders = _default_root_task_orders(delayed_domains)
+        delayed_graph = _readiness_graph(delayed_domains)
+        delayed_baseline = _baseline_worker_schedule(
+            delayed_domains,
+            worker_count=2,
+        )
+        delayed_candidate = _schedule(
+            2,
+            _segment(
+                0,
+                delayed_orders[0],
+                workers=(0, 2),
+                dispatch_offset=0,
+            ),
+            _segment(
+                1,
+                delayed_orders[1],
+                workers=(0, 2),
+                dispatch_offset=6,
+            ),
+        )
+        self.assertGreater(
+            old_horizon(delayed_candidate),
+            old_horizon(delayed_baseline),
+        )
+        with mock.patch.object(
+            cross_loop_scheduler,
+            "_event_frontier_list_schedule",
+            return_value=delayed_candidate,
+        ):
+            selected = _global_unit_list_schedule(
+                delayed_graph,
+                delayed_baseline,
+                (),
+                frozenset(((0, 1),)),
+            )
+        self.assertIs(selected, delayed_baseline)
+
+        dynamic_count = sympy.Symbol(
+            "dynamic_count",
+            integer=True,
+            nonnegative=True,
+        )
+        dynamic_domains = tuple(
+            CoordinateDomain(
+                (axis,),
+                ((axis, dynamic_count),),
+                ((axis, 16),),
+                kind="site",
+                identity=root,
+                _allow_empty=True,
+            )
+            for root, axis in enumerate((10, 20, 30))
+        )
+        dynamic_graph = _readiness_graph(dynamic_domains)
+        dynamic_baseline = cross_loop_scheduler._build_root_major_worker_schedule(
+            dynamic_domains,
+            _default_root_task_orders(dynamic_domains),
+            worker_count=4,
+        )
+        dynamic_candidate = _repeated_phase_worker_schedule(
+            dynamic_domains,
+            worker_count=4,
+        )
+        with (
+            _forbid_schedule_enumeration(),
+            mock.patch.object(
+                cross_loop_scheduler,
+                "_event_frontier_list_schedule",
+                return_value=dynamic_candidate,
+            ),
+        ):
+            selected = _global_unit_list_schedule(
+                dynamic_graph,
+                dynamic_baseline,
+                (),
+                frozenset(((0, 1), (1, 2))),
+            )
+        self.assertIs(selected, dynamic_baseline)
+
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        tied_domains = tuple(
+            CoordinateDomain(
+                (axis,),
+                ((axis, 4 * batch),),
+                ((axis, 16),),
+                kind="site",
+                identity=root,
+                _allow_empty=True,
+            )
+            for root, axis in enumerate((10, 20, 30))
+        )
+        tied_graph = _readiness_graph(tied_domains)
+        tied_baseline = cross_loop_scheduler._build_root_major_worker_schedule(
+            tied_domains,
+            _default_root_task_orders(tied_domains),
+            worker_count=4,
+        )
+        tied_candidate = _repeated_phase_worker_schedule(
+            tied_domains,
+            worker_count=4,
+        )
+        with (
+            _forbid_schedule_enumeration(),
+            mock.patch.object(
+                cross_loop_scheduler,
+                "_event_frontier_list_schedule",
+                return_value=tied_candidate,
+            ),
+        ):
+            selected = _global_unit_list_schedule(
+                tied_graph,
+                tied_baseline,
+                (),
+                frozenset(((0, 1), (1, 2))),
+            )
+        self.assertIs(selected, tied_candidate)
 
     def test_event_frontier_waits_for_every_join_arm(self) -> None:
         first_domain, second_domain, consumer_domain = _identify_root_domains(
