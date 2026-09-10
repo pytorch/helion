@@ -119,7 +119,11 @@ derived later only as a counter-lowering strength reduction, and the compiler
 retains one `ReadinessGraph`. A reviewed correction removed raw nested-
 obligation exclusions from readiness traversal because an uncommitted counter
 must not erase a semantic prerequisite. Continuation candidates are derived
-once from the graph; ownership selection remains deliberately unchanged.
+once from the graph; ownership selection remains deliberately unchanged. One
+parameter-independent, root-domain-aware predicate now validates exact counter
+publication, consumer shape, and continuation shape. Temporary parameterized
+renderer limits and plan-wide epoch bounds remain explicitly separate from
+semantic legality and are applied before a plan is frozen.
 
 Symbolic traversal helpers now consume `size_expr` and
 `axis_count_expressions`, support exact empty traversals, and validate legacy
