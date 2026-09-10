@@ -223,29 +223,31 @@ comparison merely because its relation has a compact rendering. The review
 also showed that schedule geometry alone can falsely classify independent or
 root-barrier roots as a recurrence. Any retained recurrence rendering must be
 certified from both the final schedule relation and its actual readiness plans.
-The symbolic, relation-based no-regression comparison is now complete. The
-current implementation marker is the tail-packed symbolic event-frontier
-proposal—not another parameter-specific recurrence entry point—followed by
-removal of the remaining parameter-only action filters.
+The symbolic, relation-based no-regression comparison is now complete.
 
-The latest architecture review narrows that first proposal deliberately. It
-may preserve full translated fan-in-one producer/consumer cohorts and pack
-only their incomplete tails when the `ReadinessGraph` proves one common
-positional key relation. It must run for constants and parameters, validate
-same-wave progress, and decline barriers, nested waits, forks/joins, and wider
-fan-in. In particular, it must not turn the F64/C16 MLA relation into the
-known-slow key-major stream; equal unit-wave horizon is not evidence that two
-dense schedules have equal body performance. This slice is a prerequisite,
-not policy unification. Before accepting it, derive the reusable symbolic
-logical-task-to-global-slot relation and use strict slot order only as a
-topological progress certificate. It is not a completion-time objective:
-different workers in one wave are concurrent, while a readiness wait within
-that wave can still add another unit of logical completion time. The merge
-order is: symbolic slot/progress proof, tail packing, relation-level max-plus
-completion prerequisites, joint continuation/resident choice,
-post-placement nested quotient, source-ticket action, single
-finalization/validation, and only then deletion of the top-level
-constant/parameterized branch.
+A subsequent tail-packing prototype was also rejected. It preserved translated
+fan-in-one producer/consumer cohorts and packed only incomplete tails, but it
+had the same four-wave horizon as the existing packed root-major relation for
+the representative `L=3`, `N=5`, `W=4` case. It changed only locality, supplied
+no measured runtime win, and raised representative schedule-build time from
+about 10 seconds to 28.5 seconds. The prototype also exposed avoidable nested
+`Mod` proof hazards. Keep it out of production: locality transformations must
+instead be proposed by the one event-frontier policy, pass the common progress
+proof, and demonstrate a runtime benefit.
+
+The immediate implementation marker is therefore deliberately smaller:
+remove production selection and rendering of the old six-wave recurrence and
+retain the existing packed root-major relation as the sole conservative
+fallback. This is deletion, not a new scheduling path. The reviewed symbolic
+logical-task-to-global-slot relation remains the reusable topological progress
+certificate; it is not a completion-time objective because different workers
+in one wave are concurrent while a readiness wait within that wave can add a
+unit of logical completion time. The merge order is now: remove the obsolete
+recurrence, finish exact extrema with all attainers, derive same-strand
+precedence, implement the relation-level max-plus objective and joint
+continuation/resident choice, derive post-placement nested quotients, admit
+source-ticket actions through that same policy, finalize/validate once, and
+only then delete the top-level constant/parameterized branch.
 
 Then continue Phase 4A.2 by replacing the remaining parameter-only admission
 filters with one exact action-legality decision, followed by the single joint
