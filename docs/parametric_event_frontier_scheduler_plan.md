@@ -2754,7 +2754,7 @@ ownership a production decision. They are derived views over the existing
   predecessors; immediate-predecessor selection is only a later strength
   reduction. Iterate over roots and relation pieces, never workers, waves, or
   logical CTAs.
-- [ ] Extend the existing exact extremum machinery to return both the extremal
+- [x] Extend the existing exact extremum machinery to return both the extremal
   value and the exact relation containing every target coordinate that attains
   it. Preserve value/witness correlation across ties, empty domains, dominance
   proofs, and parameter-dependent crossings for the whole compiled guard. A
@@ -2770,6 +2770,17 @@ ownership a production decision. They are derived views over the existing
   grammar, decline for the whole guard rather than sampling or dropping tied
   witnesses. Charge candidate comparison and partition products to the common
   relation budgets.
+
+  Implementation checkpoint (2026-09-10):
+  `CoordinateRelation.extreme_target_value_and_attainers_by_source` now shares
+  candidate collection with the existing scalar maximum and returns the exact
+  extremal value plus every attaining target. It handles constant plateaus,
+  affine faces, bounded common-axis winner partitions, and static quotient
+  plateaus while declining unrepresentable crossings. Candidate boxes are
+  clipped with exactly the same clamp-then-stride semantics as relation
+  materialization before either legacy or joint extrema are evaluated.
+  Independent differential review covered oversized and negative bounds,
+  strides, symbolic substitutions, empty intersections, and proof budgets.
 - [ ] Evaluate the lexicographic objective `(completion, handoffs)` with one
   ephemeral max-plus propagation over same-strand precedence and semantic
   readiness edges. Every body contributes `(1, 0)`; a resident cross-owner
