@@ -7053,7 +7053,7 @@ def _clip_target_box_to_domain(
     source_domain: CoordinateDomain,
     source_bounds: _SourceBounds,
 ) -> _TargetBoxRanges:
-    """Intersect a target box with its declared domain without enumeration."""
+    """Apply the domain clamps used by target-coordinate materialization."""
     axis_counts = target_domain.axis_count_expressions
     parameter_symbols = (
         source_domain.parameter_symbols | target_domain.parameter_symbols
@@ -7070,15 +7070,8 @@ def _clip_target_box_to_domain(
             begin_bounds[0],
             None,
         )
-        lower = begin if begin_is_in_domain else sympy.Max(sympy.Integer(0), begin)
         clipped_begin = (
-            begin
-            if begin_is_in_domain
-            else lower
-            if step == 1
-            else _normalize_integer_rounding(
-                begin + sympy.ceiling((lower - begin) / step) * step  # pyrefly: ignore[unsupported-operation]
-            )
+            begin if begin_is_in_domain else sympy.Max(sympy.Integer(0), begin)
         )
         end_bounds = _logical_expression_bounds(
             end,

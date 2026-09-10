@@ -4188,24 +4188,40 @@ class TestTileDependency(TestCase):
                 ),
             ),
         )
-        symbolic_result = strided_required.extreme_target_value_and_attainers_by_source(
-            symbolic_value_by_target,
-            maximize=True,
+        symbolic_maximum = (
+            strided_required.extreme_target_value_and_attainers_by_source(
+                symbolic_value_by_target,
+                maximize=True,
+            )
         )
-        self.assertIsNotNone(symbolic_result)
-        assert symbolic_result is not None
+        symbolic_minimum = (
+            strided_required.extreme_target_value_and_attainers_by_source(
+                symbolic_value_by_target,
+                maximize=False,
+            )
+        )
+        self.assertIsNotNone(symbolic_maximum)
+        self.assertIsNotNone(symbolic_minimum)
+        assert symbolic_maximum is not None
+        assert symbolic_minimum is not None
         for concrete_extent in range(1, 6):
             substitutions = {extent: concrete_extent}
-            expected_target = max(
-                set(range(-3, concrete_extent + 9, 2)) & set(range(concrete_extent + 2))
+            semantic_targets = tuple(range(0, concrete_extent + 2, 2))
+            self.assertEqual(
+                symbolic_maximum[0].substitute_parameters(substitutions).materialize(),
+                (frozenset((max(semantic_targets) + 10,)),),
             )
             self.assertEqual(
-                symbolic_result[0].substitute_parameters(substitutions).materialize(),
-                (frozenset((expected_target + 10,)),),
+                symbolic_maximum[1].substitute_parameters(substitutions).materialize(),
+                (frozenset((max(semantic_targets),)),),
             )
             self.assertEqual(
-                symbolic_result[1].substitute_parameters(substitutions).materialize(),
-                (frozenset((expected_target,)),),
+                symbolic_minimum[0].substitute_parameters(substitutions).materialize(),
+                (frozenset((min(semantic_targets) + 10,)),),
+            )
+            self.assertEqual(
+                symbolic_minimum[1].substitute_parameters(substitutions).materialize(),
+                (frozenset((min(semantic_targets),)),),
             )
 
     def test_target_value_extreme_declines_unrepresentable_guards_and_levels(
