@@ -6730,6 +6730,267 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(lowered.uniform_arrival_count(), 2)
         self.assertEqual(lowered.continuation_consumer_index, 0)
 
+    def test_semantic_event_identity_does_not_depend_on_counter_lowering(
+        self,
+    ) -> None:
+        dependency_graph = _dependency_graph(
+            [[10], [20]],
+            _access(root=0, kind="store", shape=(64,), block_ids=(10,)),
+            _access(root=1, kind="load", shape=(64,), block_ids=(20,)),
+        )
+        root_domains = (
+            _domain((10, 4, 16)),
+            _domain((20, 2, 32)),
+        )
+        with mock.patch.object(
+            cross_loop_scheduler,
+            "_supports_readiness_counter_lowering",
+            side_effect=AssertionError("semantic graph consulted lowering policy"),
+        ):
+            readiness_graph = _configured_readiness_graph(
+                dependency_graph,
+                root_domains,
+            )
+
+        (event,) = readiness_graph.events
+        self.assertEqual(event.readiness_key_count, 2)
+        self.assertIsNone(event.root_barrier_producer_root)
+        with mock.patch.object(
+            cross_loop_scheduler,
+            "_supports_readiness_counter_lowering",
+            return_value=False,
+        ):
+            selected = choose_readiness_counters(readiness_graph, ())
+        self.assertEqual(selected, ())
+        counters, barriers = cross_loop_scheduler._finalize_emitted_synchronization(
+            dependency_graph=dependency_graph,
+            readiness_counters=selected,
+        )
+        self.assertEqual(counters, ())
+        self.assertEqual(barriers, frozenset(((0, 1),)))
+
+    def test_producer_set_quotient_is_lowering_only(self) -> None:
+        dependency_graph = _dependency_graph(
+            [[10], [20]],
+            _access(root=0, kind="store", shape=(64,), block_ids=(10,)),
+            _access(root=1, kind="load", shape=(64,), block_ids=(20,)),
+        )
+        root_domains = (
+            _domain((10, 4, 16)),
+            _domain((20, 64, 1)),
+        )
+        readiness_graph = _configured_readiness_graph(
+            dependency_graph,
+            root_domains,
+        )
+
+        (event,) = readiness_graph.events
+        self.assertEqual(event.readiness_key_count, 64)
+        self.assertFalse(
+            cross_loop_scheduler._supports_readiness_counter_lowering(
+                event.producers[0]
+            )
+        )
+        plan = _configured_static_pipeline_plan(
+            dependency_graph=dependency_graph,
+            root_domains=root_domains,
+            axis_geometry={10: (4, 16), 20: (64, 1)},
+            worker_count=4,
+        )
+
+        self.assertEqual(plan.root_barrier_edges, frozenset())
+        (counter,) = plan.readiness_counters
+        self.assertEqual(counter.readiness_key_count, 4)
+        self.assertEqual(counter.uniform_arrival_count(), 1)
+
+    def test_counter_quotient_is_invariant_to_adjacent_source_pieces(self) -> None:
+        producer_domain, consumer_domain = _identify_root_domains(
+            (_domain((10, 4, 1)), _domain((20, 64, 1)))
+        )
+        readiness_key_domain = _domain((0, 64), kind="event", identity=0)
+        readiness_key = coordinate_axis_symbol(0)
+        obligation = (0, None, None)
+
+        def graph(source_intervals: tuple[tuple[int, int], ...]) -> ReadinessGraph:
+            producer = ReadinessProducer(
+                producer_root=0,
+                producers_by_key=CoordinateRelation(
+                    readiness_key_domain,
+                    producer_domain,
+                    tuple(
+                        _CoordinateRelationPiece(
+                            ((0, begin, end, 1),),
+                            (
+                                (
+                                    10,
+                                    sympy.floor(readiness_key / 16),
+                                    sympy.floor(readiness_key / 16) + 1,
+                                    1,
+                                ),
+                            ),
+                        )
+                        for begin, end in source_intervals
+                    ),
+                ),
+            )
+            consumer = ReadinessConsumer(
+                consumer_root=1,
+                keys_by_consumer=_full_point_map(
+                    consumer_domain,
+                    readiness_key_domain,
+                    coordinate_axis_symbol(20),
+                ),
+                covered_obligations=frozenset((obligation,)),
+            )
+            return _readiness_graph(
+                (producer_domain, consumer_domain),
+                ReadinessEvent((producer,), (consumer,)),
+            )
+
+        canonical = choose_readiness_counters(graph(((0, 64),)), ())
+        split = choose_readiness_counters(graph(((0, 32), (32, 64))), ())
+
+        self.assertEqual(split, canonical)
+        self.assertEqual(len(canonical), 1)
+        self.assertEqual(canonical[0].readiness_key_count, 4)
+
+    def test_dynamic_counter_quotient_matches_specialized_controls(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+
+        def configured_plan(batch_size: int | sympy.Expr):
+            dependency_graph = _dependency_graph(
+                [[10], [20]],
+                _access(
+                    root=0,
+                    kind="store",
+                    shape=(64 * batch_size,),
+                    block_ids=(10,),
+                ),
+                _access(
+                    root=1,
+                    kind="load",
+                    shape=(64 * batch_size,),
+                    block_ids=(20,),
+                ),
+            )
+            return _configured_static_pipeline_plan(
+                dependency_graph=dependency_graph,
+                root_domains=(
+                    _domain((10, 4 * batch_size, 16)),
+                    _domain((20, 64 * batch_size, 1)),
+                ),
+                axis_geometry={
+                    10: (4 * batch_size, 16),
+                    20: (64 * batch_size, 1),
+                },
+                worker_count=4,
+            )
+
+        with _forbid_schedule_enumeration():
+            dynamic_plan = configured_plan(batch)
+        self.assertEqual(dynamic_plan.root_barrier_edges, frozenset())
+        (dynamic_counter,) = dynamic_plan.readiness_counters
+        self.assertEqual(dynamic_counter.readiness_key_count_expr, 4 * batch)
+        self.assertEqual(dynamic_counter.uniform_arrival_count(), 1)
+
+        for batch_size in (0, 1, 3):
+            substitutions = {batch: batch_size}
+            dynamic_producer = dynamic_counter.producers[
+                0
+            ].producers_by_key.substitute_parameters(substitutions)
+            dynamic_consumer = dynamic_counter.consumers[
+                0
+            ].keys_by_consumer.substitute_parameters(substitutions)
+            self.assertEqual(dynamic_producer.source_domain.size, 4 * batch_size)
+            self.assertEqual(dynamic_consumer.source_domain.size, 64 * batch_size)
+            if batch_size == 0:
+                self.assertEqual(dynamic_producer.pieces, ())
+                self.assertEqual(dynamic_consumer.pieces, ())
+                continue
+
+            static_plan = configured_plan(batch_size)
+            self.assertEqual(static_plan.root_barrier_edges, frozenset())
+            (static_counter,) = static_plan.readiness_counters
+            self.assertEqual(
+                dynamic_producer.materialize(),
+                static_counter.producers[0].producers_by_key.materialize(),
+            )
+            self.assertEqual(
+                dynamic_consumer.materialize(),
+                static_counter.consumers[0].keys_by_consumer.materialize(),
+            )
+
+    def test_nested_obligation_exclusion_keeps_authoritative_graph(self) -> None:
+        root_domains = tuple(
+            _domain((axis, 2, 1), identity=root)
+            for root, axis in enumerate((10, 20, 30))
+        )
+        first_key_domain = _domain((0, 2), kind="event", identity=0)
+        second_key_domain = _domain((0, 2), kind="event", identity=1)
+        first_obligation = (0, None, None)
+
+        def event(
+            producer_root: int,
+            consumer_root: int,
+            key_domain: CoordinateDomain,
+            obligation: tuple[int, int | None, int | None],
+        ) -> ReadinessEvent:
+            producer_axis = root_domains[producer_root].axis_order[0]
+            consumer_axis = root_domains[consumer_root].axis_order[0]
+            return ReadinessEvent(
+                producers=(
+                    _readiness_producer_from_publication(
+                        producer_root,
+                        _full_point_map(
+                            root_domains[producer_root],
+                            key_domain,
+                            coordinate_axis_symbol(producer_axis),
+                        ),
+                    ),
+                ),
+                consumers=(
+                    ReadinessConsumer(
+                        consumer_root,
+                        _full_point_map(
+                            root_domains[consumer_root],
+                            key_domain,
+                            coordinate_axis_symbol(consumer_axis),
+                        ),
+                        covered_obligations=frozenset((obligation,)),
+                    ),
+                ),
+            )
+
+        first_event = event(0, 1, first_key_domain, first_obligation)
+        second_event = event(1, 2, second_key_domain, (1, None, None))
+        readiness_graph = _readiness_graph(
+            root_domains,
+            first_event,
+            second_event,
+        )
+        baseline = _baseline_worker_schedule(root_domains, worker_count=2)
+
+        unfiltered = _event_ready_after_worker_steps(
+            readiness_graph,
+            second_event,
+            worker_schedule=baseline,
+            continuation_by_root={},
+        )
+        locally_excluded = _event_ready_after_worker_steps(
+            readiness_graph,
+            second_event,
+            worker_schedule=baseline,
+            continuation_by_root={},
+            excluded_obligations=frozenset((first_obligation,)),
+        )
+
+        self.assertIsNotNone(unfiltered)
+        self.assertIsNotNone(locally_excluded)
+        assert unfiltered is not None and locally_excluded is not None
+        self.assertEqual(unfiltered[1], frozenset((0, 1)))
+        self.assertEqual(locally_excluded[1], frozenset((1,)))
+        self.assertIs(readiness_graph.events[0], first_event)
+
     def test_nonstatic_layout_falls_back_to_root_readiness(self) -> None:
         plan = _dependency_graph(
             [[10], [20]],

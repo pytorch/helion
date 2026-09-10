@@ -3194,6 +3194,8 @@ def place_ready_families(
     original_schedule: WorkerSchedule,
     worker_schedule: WorkerSchedule,
     continuations: tuple[FinalArrivalContinuation, ...],
+    *,
+    excluded_obligations: frozenset[DependencyObligation] = frozenset(),
 ) -> tuple[WorkerSchedule, tuple[FinalArrivalContinuation, ...]]:
     """Move complete ready families into idle capacity during a producer tail.
 
@@ -3240,6 +3242,7 @@ def place_ready_families(
             continuation_event,
             worker_schedule=result,
             continuation_by_root=continuation_by_root,
+            excluded_obligations=excluded_obligations,
         )
         if ready_after is None:
             continue
@@ -3309,7 +3312,6 @@ def build_worker_schedule(
     WorkerSchedule,
     tuple[FinalArrivalContinuation, ...],
     tuple[ReadinessCounterPlan, ...],
-    ReadinessGraph,
 ]:
     """Derive local and static task placement for one worker count."""
     baseline = build_baseline_worker_schedule(
@@ -3359,16 +3361,14 @@ def build_worker_schedule(
         for readiness_consumer in counter.consumers
         for obligation in readiness_consumer.covered_obligations
     )
-    scheduled_readiness_graph = _without_root_consumers_for_obligations(
-        readiness_graph, nested_obligations
-    )
     schedule, continuations = place_ready_families(
-        scheduled_readiness_graph,
+        readiness_graph,
         ordered,
         schedule,
         continuations,
+        excluded_obligations=nested_obligations,
     )
-    return schedule, continuations, nested_loop_counters, scheduled_readiness_graph
+    return schedule, continuations, nested_loop_counters
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3629,12 +3629,12 @@ def _record_readiness_event(
     readiness_key_domain: CoordinateDomain,
     producers: tuple[ReadinessProducer, ...],
     consumers: tuple[ReadinessConsumer, ...],
-    require_counter_lowering: bool = False,
-) -> bool:
+) -> None:
     """Canonicalize and group one semantic event by producer partition.
 
-    Counter-lowering admission runs only after the final event identity is
-    assigned, so later scheduling phases reuse the same relation proofs.
+    Lowering eligibility is intentionally not part of event identity. Later
+    scheduling phases either lower this exact semantic event or conservatively
+    cover its obligations with root barriers.
     """
     if _readiness_key_domain(producers, consumers) != readiness_key_domain:
         raise AssertionError("event relations do not share their quotient domain")
@@ -3694,12 +3694,6 @@ def _record_readiness_event(
         event_producers = previous_event.producers
         previous_consumers = previous_event.consumers
 
-    if require_counter_lowering and any(
-        not _supports_readiness_counter_lowering(readiness_producer)
-        for readiness_producer in event_producers
-    ):
-        return False
-
     grouped_consumers = list(previous_consumers)
     for canonical_consumer in canonical_consumers:
         keys_by_consumer = canonical_consumer.keys_by_consumer.rename_target_axes(
@@ -3737,33 +3731,6 @@ def _record_readiness_event(
         producers=event_producers,
         consumers=tuple(grouped_consumers),
     )
-    return True
-
-
-def _without_root_consumers_for_obligations(
-    readiness_graph: ReadinessGraph,
-    covered_obligations: frozenset[DependencyObligation],
-) -> ReadinessGraph:
-    """Remove root-entry consumers covered by selected nested-loop waits."""
-    if not covered_obligations:
-        return readiness_graph
-    events: list[ReadinessEvent] = []
-    for event in readiness_graph.events:
-        consumers: list[ReadinessConsumer] = []
-        for readiness_consumer in event.consumers:
-            if readiness_consumer.consumer_site_id is not None:
-                consumers.append(readiness_consumer)
-                continue
-            remaining = readiness_consumer.covered_obligations - covered_obligations
-            if remaining:
-                consumers.append(
-                    dataclasses.replace(
-                        readiness_consumer,
-                        covered_obligations=remaining,
-                    )
-                )
-        events.append(dataclasses.replace(event, consumers=tuple(consumers)))
-    return dataclasses.replace(readiness_graph, events=tuple(events))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4083,6 +4050,7 @@ def _transitive_static_prerequisite_roots(
     readiness_graph: ReadinessGraph,
     static_relations: tuple[tuple[int, CoordinateRelation], ...],
     continuation_by_root: dict[int, FinalArrivalContinuation],
+    excluded_obligations: frozenset[DependencyObligation] = frozenset(),
 ) -> frozenset[int] | None:
     """Close static producers through waits earlier in task-local program order."""
     roots = {root for root, _relation in static_relations}
@@ -4092,6 +4060,13 @@ def _transitive_static_prerequisite_roots(
         for event in readiness_graph.events:
             if not any(
                 readiness_consumer.consumer_root == consumer_root
+                and (
+                    readiness_consumer.consumer_site_id is not None
+                    or not excluded_obligations
+                    or bool(
+                        readiness_consumer.covered_obligations - excluded_obligations
+                    )
+                )
                 for readiness_consumer in event.consumers
             ):
                 continue
@@ -4117,6 +4092,7 @@ def _event_ready_after_worker_steps(
     *,
     worker_schedule: WorkerSchedule,
     continuation_by_root: dict[int, FinalArrivalContinuation],
+    excluded_obligations: frozenset[DependencyObligation] = frozenset(),
 ) -> tuple[CoordinateRelation, frozenset[int]] | None:
     """Return when each readiness key becomes ready and its static producers."""
     static_relations = _event_static_producers(
@@ -4130,6 +4106,7 @@ def _event_ready_after_worker_steps(
         readiness_graph,
         static_relations,
         continuation_by_root,
+        excluded_obligations,
     )
     if prerequisite_roots is None:
         return None
@@ -4712,6 +4689,61 @@ def choose_final_arrival_continuations(
     return tuple(result)
 
 
+def _counter_lowering_relations(
+    event: ReadinessEvent,
+) -> tuple[tuple[ReadinessProducer, ...], tuple[ReadinessConsumer, ...]] | None:
+    """Return an exact lowerable representation of one semantic event.
+
+    The readiness graph retains its finest exact key space.  A single producer
+    whose publication is not a function may still admit the established
+    producer-set quotient as a counter-rendering strength reduction.  Derive
+    that quotient from the event's authoritative relation rather than replacing
+    the event in the graph.
+    """
+    if all(
+        _supports_readiness_counter_lowering(readiness_producer)
+        for readiness_producer in event.producers
+    ):
+        return event.producers, event.consumers
+    if len(event.producers) != 1:
+        return None
+    (semantic_producer,) = event.producers
+    normalized_producers_by_key = (
+        semantic_producer.producers_by_key.coalesce_adjacent_source_boxes()
+    )
+    quotient = normalized_producers_by_key.producer_set_quotient()
+    if quotient is None:
+        return None
+    quotient_keys_by_semantic_key, quotient_producers_by_key = quotient
+    quotient_key_domain = dataclasses.replace(
+        _canonical_readiness_key_domain(quotient_keys_by_semantic_key.target_domain),
+        identity=event.event_id,
+    )
+    quotient_keys_by_semantic_key = quotient_keys_by_semantic_key.rename_target_axes(
+        quotient_key_domain
+    )
+    quotient_producers_by_key = quotient_producers_by_key.rename_source_axes(
+        quotient_key_domain
+    )
+    if quotient_keys_by_semantic_key is None or quotient_producers_by_key is None:
+        return None
+    lowered_producer = dataclasses.replace(
+        semantic_producer,
+        producers_by_key=quotient_producers_by_key,
+    )
+    if not _supports_readiness_counter_lowering(lowered_producer):
+        return None
+    lowered_consumers: list[ReadinessConsumer] = []
+    for consumer in event.consumers:
+        keys_by_consumer = consumer.keys_by_consumer.then(quotient_keys_by_semantic_key)
+        if keys_by_consumer is None:
+            return None
+        lowered_consumers.append(
+            dataclasses.replace(consumer, keys_by_consumer=keys_by_consumer)
+        )
+    return (lowered_producer,), tuple(lowered_consumers)
+
+
 def choose_readiness_counters(
     readiness_graph: ReadinessGraph,
     continuations: tuple[FinalArrivalContinuation, ...],
@@ -4733,14 +4765,15 @@ def choose_readiness_counters(
     }
     selected: list[ReadinessCounterPlan] = []
     for event in readiness_graph.events:
-        if event.root_barrier_producer_root is not None or any(
-            not _supports_readiness_counter_lowering(readiness_producer)
-            for readiness_producer in event.producers
-        ):
+        if event.root_barrier_producer_root is not None:
             continue
+        lowering_relations = _counter_lowering_relations(event)
+        if lowering_relations is None:
+            continue
+        lowered_producers, lowered_consumers = lowering_relations
         retained_consumers: list[ReadinessConsumer] = []
         continuation_consumer_indices: list[int] = []
-        for consumer_index, readiness_consumer in enumerate(event.consumers):
+        for consumer_index, readiness_consumer in enumerate(lowered_consumers):
             if (
                 readiness_consumer.consumer_site_id is not None
                 or readiness_consumer.keys_by_consumer.canonical_single_valued() is None
@@ -4777,7 +4810,7 @@ def choose_readiness_counters(
             continue
         selected.append(
             ReadinessCounterPlan(
-                producers=event.producers,
+                producers=lowered_producers,
                 consumers=tuple(retained_consumers),
                 continuation_consumer_index=continuation_consumer_index,
             )
@@ -4981,19 +5014,15 @@ def build_readiness_events(
         readiness_key_domain: CoordinateDomain,
         producers: tuple[ReadinessProducer, ...],
         consumers: tuple[ReadinessConsumer, ...],
-        require_counter_lowering: bool = False,
-    ) -> bool:
-        if not _record_readiness_event(
+    ) -> None:
+        _record_readiness_event(
             pending_events,
             readiness_key_domain=readiness_key_domain,
             producers=producers,
             consumers=consumers,
-            require_counter_lowering=require_counter_lowering,
-        ):
-            return False
+        )
         for readiness_consumer in consumers:
             represented_obligations.update(readiness_consumer.covered_obligations)
-        return True
 
     def add_producer_key_events(
         *,
@@ -5039,47 +5068,6 @@ def build_readiness_events(
                     ),
                 ),
             )
-
-    def add_producer_set_quotient_event(
-        *,
-        consumer_root: int,
-        consumer_site_id: int | None,
-        relations: list[
-            tuple[
-                tuple[int, int | None, CoordinateDomain],
-                CoordinateRelation,
-                frozenset[DependencyObligation],
-            ]
-        ],
-    ) -> bool:
-        """Use exact producer-set equivalence classes as readiness keys."""
-        if len(relations) != 1:
-            return False
-        (producer, relation, obligations) = relations[0]
-        quotient = relation.producer_set_quotient()
-        if quotient is None:
-            return False
-        keys_by_consumer, producers_by_key = quotient
-        producer_root, producer_site_id, _producer_domain = producer
-        return record_readiness_event(
-            readiness_key_domain=keys_by_consumer.target_domain,
-            producers=(
-                ReadinessProducer(
-                    producer_root=producer_root,
-                    producer_site_id=producer_site_id,
-                    producers_by_key=producers_by_key,
-                ),
-            ),
-            consumers=(
-                ReadinessConsumer(
-                    consumer_root=consumer_root,
-                    consumer_site_id=consumer_site_id,
-                    keys_by_consumer=keys_by_consumer,
-                    covered_obligations=obligations,
-                ),
-            ),
-            require_counter_lowering=True,
-        )
 
     for consumer, producers in sorted(
         exact_relations.items(),
@@ -5206,7 +5194,7 @@ def build_readiness_events(
             )
             covered_obligations.update(relation_points)
         else:
-            if not record_readiness_event(
+            record_readiness_event(
                 readiness_key_domain=readiness_key_domain,
                 producers=tuple(event_producers),
                 consumers=(
@@ -5217,17 +5205,7 @@ def build_readiness_events(
                         covered_obligations=frozenset(covered_obligations),
                     ),
                 ),
-                require_counter_lowering=True,
-            ) and not add_producer_set_quotient_event(
-                consumer_root=consumer_root,
-                consumer_site_id=consumer_site_id,
-                relations=merged_relations,
-            ):
-                add_producer_key_events(
-                    consumer_root=consumer_root,
-                    consumer_site_id=consumer_site_id,
-                    relations=merged_relations,
-                )
+            )
             continue
 
         if len(event_producers) != len(merged_relations):
@@ -8178,7 +8156,6 @@ def build_static_pipeline_plan(
         publishable_site_ids=publishable_site_ids,
         prove_nonnegative=prove_nonnegative,
     )
-    original_readiness_graph = readiness_graph
     if any(domain.parameter_symbols for domain in root_domains):
         try:
             worker_schedule = _build_root_major_worker_schedule(
@@ -8276,7 +8253,6 @@ def build_static_pipeline_plan(
             worker_schedule,
             continuations,
             nested_loop_counters,
-            readiness_graph,
         ) = build_worker_schedule(
             readiness_graph,
             worker_count=worker_count,
@@ -8325,7 +8301,6 @@ def build_static_pipeline_plan(
             worker_count,
         )
         continuations = ()
-        readiness_graph = original_readiness_graph
         readiness_counters, root_barrier_edges = _finalize_emitted_synchronization(
             dependency_graph=dependency_graph,
             readiness_counters=choose_readiness_counters(readiness_graph, ()),
