@@ -128,9 +128,13 @@ jobs:
             NIGHTLY_INDEX="${PYTORCH_INDEX%/whl/*}/whl/nightly/${{ matrix.runtime-version }}"
             UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U --pre torch --index-url "$NIGHTLY_INDEX"
             if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
-              # Match the system install and retain libnvshmem_device.bc, which is
-              # absent from newer NVSHMEM wheels but required by PyTorch's Triton API.
-              UV_DEFAULT_INDEX= UV_INDEX= uv pip install --python .venv/bin/python --reinstall nvidia-nvshmem-cu13==3.4.5 --index-url "$NIGHTLY_INDEX"
+              # Current NVSHMEM wheels no longer contain libnvshmem_device.bc, which
+              # PyTorch's Triton API still requires. Keep Torch's ABI-matched host
+              # library and install only the older wheel's device bitcode separately.
+              NVSHMEM_DEVICE_ROOT="$RUNNER_TEMP/nvshmem-device"
+              UV_DEFAULT_INDEX= UV_INDEX= uv pip install --target "$NVSHMEM_DEVICE_ROOT" --no-deps nvidia-nvshmem-cu13==3.4.5 --index-url "$NIGHTLY_INDEX"
+              export NVSHMEM_LIB_DIR="$NVSHMEM_DEVICE_ROOT/nvidia/nvshmem/lib"
+              echo "NVSHMEM_LIB_DIR=$NVSHMEM_LIB_DIR" >> "$GITHUB_ENV"
               python -c "from torch.distributed._symmetric_memory._nvshmem_triton import NvshmemLibFinder; print(f'NVSHMEM device library: {NvshmemLibFinder.find_device_library()}')"
             fi
           fi
