@@ -368,11 +368,13 @@ therefore cannot be coarsened or finalized before placement. Qwen's useful
   filtered graph, capability object, or alternate policy. A schedule-dependent
   nested mechanism is attempted transactionally: if its final quotient cannot
   lower, reject the entire optimized proposal once.
-- [ ] Let the one event-frontier scheduler compare an eligible continuation
-  with the earliest legal resident placement when the event closes. Charge
-  each inline body, including a chain, as one unit after its final producer on
-  every possible final-producer strand. Compare the guard-wide lexicographic
-  objective `(unit completion makespan, critical-path resident handoff depth)`.
+- [ ] From one complete provisional all-resident schedule, let the one
+  event-frontier scheduler compare each eligible continuation with resident
+  ownership. Charge each inline body, including a chain, as one unit after its
+  final producer on every possible final-producer strand. Compare the
+  guard-wide lexicographic objective `(unit completion makespan,
+  critical-path resident handoff depth)` and commit at most one continuation
+  globally.
   Inline may win a proved primary tie only by strictly reducing the maximum
   handoff depth among primary-critical terminal paths; prefer resident on an
   unproved comparison or a full objective tie. The decision is
@@ -750,7 +752,7 @@ The single production pipeline is:
 3. Event-frontier scheduling and ownership
       every early-admission action proves its existing synchronization lowering;
       atomically compare resident placement with charged inline execution;
-      produce one WorkerSchedule plus selected continuation candidates
+      produce one WorkerSchedule plus at most one selected continuation
 4. Schedule-frontier quotient
       coarsen nested waits against the final schedule, when exact
 5. Synchronization finalization
@@ -768,12 +770,12 @@ The single production pipeline is:
 There is no capability graph or preliminary synchronization plan. The
 scheduler reads the one `ReadinessGraph`; when considering early admission or
 inline ownership, it proves that the event's existing relations can lower the
-required counter/publication. It then makes ownership and placement one atomic
-event-closing decision: inline execution is charged on the final-producer
-strand and resident execution is placed in its earliest admissible slot. Final
-synchronization is constructed only after placement supplies the information
-needed to quotient nested waits. No provisional counter plan is a source of
-truth.
+required counter/publication. From a complete provisional resident placement,
+it then makes ownership and placement one atomic decision: inline execution is
+charged on every causally possible final-publisher strand and resident
+execution retains its proved slot. Final synchronization is constructed only
+after placement supplies the information needed to quotient nested waits. No
+provisional counter plan is a source of truth.
 
 There is one bounded fallback, not a second policy. If the optimized schedule,
 schedule-frontier quotient, or progress proof declines, discard that proposal
