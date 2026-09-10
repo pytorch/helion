@@ -95,32 +95,36 @@ Priority 1 before resuming scheduler-policy or performance work. A checked box
 means the code exists and its focused unit tests pass; it does not replace the
 cross-workload exit gates below.
 
-### Paused implementation marker: exact-converse proof placement
+### Current implementation marker: exact-converse proof placement
 
-Commit `8c32b09d` is the current compiler checkpoint. It contains the
-symbolic schedule-relation work and its semantic tests, but no benchmark probe
-or journal changes. Work paused inside Phase 4A.1 after adding exact full/tail
-event support, common `FloorDiv` recognition, bounded source-support
-ordinalization, common normalized `WorkerSchedule` validation, and the first
-symbolic scalar mixed-radix proofs.
+Commit `6cdf49fc` is the current compiler checkpoint. It retains derived exact
+converses on the existing immutable `CoordinateRelation`, constructs packed
+ownership and its inverse together, propagates those proofs through ordinary
+composition/union/slicing/renaming/coalescing/source-domain rebasing, and uses
+the same relation-level ownership and disjointness validation for constant and
+symbolic schedules. The memo is excluded from equality, hashing, and
+serialization; deepcopy/pickle therefore exercise the bounded semantic
+fallback rather than relying on provenance.
 
-The checkpoint is not an exit point. In the focused dynamic multi-axis root
-test, relation construction is subsecond but late schedule validation still
-reconstructs the packed factorization from expanded floor/mod expressions.
-The most recent focused run built the schedule in about 24.35 seconds and then
-timed out at 45 seconds during downstream geometry validation. The complete
-tile-dependency and scheduler suites have not been rerun after the last proof
-changes. The current source-support factorization and factorial symbolic
-mixed-radix search are therefore an experiment to simplify or remove, not a
-design to extend to more cases.
+The full dependency/relation suite passes with 144 tests and 40 subtests; the
+full scheduler suite passes with 117 tests and 27 subtests. The independent
+architecture review approved the exact-converse placement, source-domain
+rebase, shared-coordinate support proof, and removal of the root-major
+validation shortcut. Ordinary packed construction no longer enters late
+source-support ordinalization or factored-converse reconstruction.
 
-Resume exactly here: prove and retain exact converses earlier on the existing
-`CoordinateRelation`, while the factors are structurally simple. Prove the
-configured task order `Q` once in its natural representation, construct packed
-ownership `P` with its exact converse, and derive the converse of `P.then(Q)`
-as `Q_converse.then(P_converse)`. Do not start wider woven/L2 coverage,
-scheduler-policy work, or performance tuning until the reviewed Phase 4A.1
-TODO below replaces the late reconstruction on the ordinary compiler path.
+Phase 4A.1 still has one deliberate gate before scheduler-policy work resumes:
+ragged grouped L2 order `[5, 3, B]`, group size 2, after a non-wave-aligned
+packed prefix still declines in `P.then(Q)` for `B > 1`. `Q` itself is already
+an exact nine-piece bijection. The missing operation is a generic bounded
+affine-lattice preimage for a static modulo interval; it must live in ordinary
+relation composition, honor the 4,096-piece/65,536-state budgets, preserve
+zero extents and Euclidean modulo, and decline unsupported symbolic moduli or
+non-affine maps. It must not mention L2, worker schedules, or model names.
+
+Resume exactly there. After the ragged-L2 substitution/copy/negative tests and
+compile-time gate pass, close Phase 4A.1 and proceed to building one readiness
+graph and one event-frontier policy in Phase 4A.2.
 
 ### Priority 1: finish the symbolic dependency refactor
 
@@ -2463,25 +2467,25 @@ The actual proof boundaries are:
 
 Implement the earlier proof without changing those boundaries:
 
-- [ ] Add private derived exact-converse memoization to the existing
+- [x] Add private derived exact-converse memoization to the existing
   `CoordinateRelation`. Exclude it from constructor arguments, equality,
   hashing, serialization, and codegen truth. Only proof-producing relation
   operations may seed a forward/converse pair, with reversed-domain assertions.
-- [ ] Make `converse()`, cardinality, and
+- [x] Make `converse()`, cardinality, and
   `is_bijection_from_source_support()` consume an already-derived converse and
   cheap structural lemmas before attempting source-support factorization.
   A cached converse is still accepted as a bijection only when the forward map
   is point-valued and the converse is a total function over the target.
   Likewise, target cardinality may be inferred from a support bijection only
   after those two facts are proved; an exact converse alone is insufficient.
-- [ ] Construct packed `P` and `P_converse` together, prove/cache configured
+- [x] Construct packed `P` and `P_converse` together, prove/cache configured
   `Q_converse` once before scheduling, and let existing relation composition
   retain `(P;Q)_converse = Q_converse;P_converse`. Do this for both the direct
   packed path and the existing piece-aligned/sliced fallback. Prevent converse
   propagation from recursively invoking itself while building the reverse
   composition or reverse union; propagation may inspect only already-memoized
   converses and must not force a new converse derivation.
-- [ ] Make existing `then()` and `union()` retain exact converses when both
+- [x] Make existing `then()` and `union()` retain exact converses when both
   operands have proved converses. For union, use
   `(A union B)_converse = A_converse union B_converse`; individual segments
   may be partial. Missing tasks must make the combined converse non-total,
@@ -2492,7 +2496,7 @@ Implement the earlier proof without changing those boundaries:
   the transformed exact converse or drop the memo and use the bounded generic
   proof. No result may inherit a converse merely because its Python object was
   copied.
-- [ ] Keep an extensional, bounded generic fallback for manually constructed
+- [x] Keep an extensional, bounded generic fallback for manually constructed
   relations and extensionally equal copies with no memo. Run it only after the
   memo and cheap structural rules, never implicitly from ordinary support-
   cardinality calculation. Construction provenance must affect compile time,
@@ -2505,10 +2509,10 @@ Implement the earlier proof without changing those boundaries:
   axes. Symbolic grouped axes and fully symbolic woven/reflected radices may
   decline until a deterministic bounded lemma exists; remove the factorial
   production search rather than treating permutations as a schedule space.
-- [ ] Preserve runtime-empty roots. Proofs require nonnegative extents, not
+- [x] Preserve runtime-empty roots. Proofs require nonnegative extents, not
   strictly positive symbolic extents, and must validate the synthetic one-slot
   root-barrier participant order without sampling a nonzero shape.
-- [ ] Update the exact-converse consumers and true-bijection validators to
+- [x] Update the exact-converse consumers and true-bijection validators to
   reuse the one proof: `_validate_root_task_orders`, per-root `WorkerSchedule`
   validation, per-segment partial ordinal lookup, complete-root
   placement/traversal/ticket lookup, continuation selection/finalization, and
