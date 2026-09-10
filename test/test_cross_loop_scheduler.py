@@ -862,11 +862,13 @@ def _baseline_worker_schedule(
     )
 
 
-def _repeated_phase_worker_schedule(
+def _padded_root_major_worker_schedule(
     root_domains: tuple[CoordinateDomain, ...],
     worker_count: int,
+    *,
+    padding_waves: int,
 ) -> WorkerSchedule:
-    """Build the old repeated-frontier relation as a scheduler test input."""
+    """Build a symbolic root-major test schedule with gaps between roots."""
     root_domains = _identify_root_domains(root_domains)
     task_count = root_domains[0].size_expr
     assert all(
@@ -876,15 +878,15 @@ def _repeated_phase_worker_schedule(
     minimum_axis = min(
         axis for domain in root_domains for axis in domain.axis_order
     )
-    period = len(root_domains)
+    root_count = len(root_domains)
+    waves_per_root = cross_loop_scheduler._ceildiv_nonnegative_expression(
+        task_count,
+        worker_count,
+    )
     schedule_domain = cross_loop_scheduler._worker_schedule_domain(
         worker_count,
         sympy.simplify(
-            period
-            * cross_loop_scheduler._ceildiv_nonnegative_expression(
-                task_count,
-                worker_count,
-            )
+            root_count * waves_per_root + (root_count - 1) * padding_waves
         ),
         (minimum_axis - 3, minimum_axis - 2, minimum_axis - 1),
     )
@@ -893,12 +895,16 @@ def _repeated_phase_worker_schedule(
         tuple(
             WorkerScheduleSegment(
                 root=root,
-                task_order=cross_loop_scheduler._parametric_event_frontier_relation(
+                task_order=cross_loop_scheduler._parametric_root_major_relation(
                     schedule_domain,
                     domain,
-                    root,
-                    period,
+                    sympy.simplify(
+                        root
+                        * (waves_per_root + padding_waves)
+                        * worker_count
+                    ),
                     worker_count,
+                    domain.axis_order,
                 ),
                 worker_begin=0,
                 worker_count=worker_count,
@@ -2186,48 +2192,6 @@ class TestCrossLoopScheduler(TestCase):
             )
         self.assertIs(selected, delayed_baseline)
 
-        dynamic_count = sympy.Symbol(
-            "dynamic_count",
-            integer=True,
-            nonnegative=True,
-        )
-        dynamic_domains = tuple(
-            CoordinateDomain(
-                (axis,),
-                ((axis, dynamic_count),),
-                ((axis, 16),),
-                kind="site",
-                identity=root,
-                _allow_empty=True,
-            )
-            for root, axis in enumerate((10, 20, 30))
-        )
-        dynamic_graph = _readiness_graph(dynamic_domains)
-        dynamic_baseline = cross_loop_scheduler._build_root_major_worker_schedule(
-            dynamic_domains,
-            _default_root_task_orders(dynamic_domains),
-            worker_count=4,
-        )
-        dynamic_candidate = _repeated_phase_worker_schedule(
-            dynamic_domains,
-            worker_count=4,
-        )
-        with (
-            _forbid_schedule_enumeration(),
-            mock.patch.object(
-                cross_loop_scheduler,
-                "_event_frontier_list_schedule",
-                return_value=dynamic_candidate,
-            ),
-        ):
-            selected = _global_unit_list_schedule(
-                dynamic_graph,
-                dynamic_baseline,
-                (),
-                frozenset(((0, 1), (1, 2))),
-            )
-        self.assertIs(selected, dynamic_baseline)
-
         batch = sympy.Symbol("batch", integer=True, nonnegative=True)
         tied_domains = tuple(
             CoordinateDomain(
@@ -2246,9 +2210,31 @@ class TestCrossLoopScheduler(TestCase):
             _default_root_task_orders(tied_domains),
             worker_count=4,
         )
-        tied_candidate = _repeated_phase_worker_schedule(
+        delayed_dynamic_candidate = _padded_root_major_worker_schedule(
             tied_domains,
             worker_count=4,
+            padding_waves=1,
+        )
+        with (
+            _forbid_schedule_enumeration(),
+            mock.patch.object(
+                cross_loop_scheduler,
+                "_event_frontier_list_schedule",
+                return_value=delayed_dynamic_candidate,
+            ),
+        ):
+            selected = _global_unit_list_schedule(
+                tied_graph,
+                tied_baseline,
+                (),
+                frozenset(((0, 1), (1, 2))),
+            )
+        self.assertIs(selected, tied_baseline)
+
+        tied_candidate = _padded_root_major_worker_schedule(
+            tied_domains,
+            worker_count=4,
+            padding_waves=0,
         )
         with (
             _forbid_schedule_enumeration(),
@@ -4924,7 +4910,7 @@ class TestCrossLoopScheduler(TestCase):
                         concrete.segments[0].task_order.materialize(),
                     )
 
-    def test_parametric_event_frontier_schedule_uses_exact_fan_in_one_counter(
+    def test_parametric_root_major_schedule_uses_exact_fan_in_one_counter(
         self,
     ) -> None:
         task_count = sympy.Symbol("task_count", integer=True, nonnegative=True)
@@ -4967,27 +4953,17 @@ class TestCrossLoopScheduler(TestCase):
         self.assertTrue(
             cross_loop_scheduler._supports_parameterized_fan_in_one_counter(counter)
         )
-        schedule_geometry = (
-            cross_loop_scheduler._parametric_event_frontier_schedule_geometry(
-                plan.worker_schedule
-            )
+        schedule_geometry = cross_loop_scheduler._parametric_root_major_schedule_geometry(
+            plan.worker_schedule
         )
         self.assertIsNotNone(schedule_geometry)
         assert schedule_geometry is not None
         self.assertEqual(
             tuple(
-                (segment.root, phase) for segment, phase, _count in schedule_geometry
+                segment.root for segment, _first_slot, _count in schedule_geometry
             ),
-            ((0, 0), (1, 1)),
+            (0, 1),
         )
-        with self.assertRaisesRegex(
-            ValueError,
-            "event-frontier schedules do not prove exact",
-        ):
-            cross_loop_scheduler.root_barrier_publication_plan(
-                plan.worker_schedule,
-                0,
-            )
 
         for concrete_count in (0, 1, 3, 4, 5, 11):
             publication = counter.producers[0].keys_by_producer
@@ -5002,9 +4978,12 @@ class TestCrossLoopScheduler(TestCase):
             expected = tuple(frozenset((index,)) for index in range(concrete_count))
             self.assertEqual(concrete_publication.materialize(), expected)
             self.assertEqual(concrete_waits.materialize(), expected)
-            for segment, phase, _count in schedule_geometry:
+            for segment, first_slot, _count in schedule_geometry:
                 relation = segment.task_order.substitute_parameters(
                     {task_count: concrete_count}
+                )
+                concrete_first_slot = int(
+                    first_slot.xreplace({task_count: concrete_count})
                 )
                 launch_axis, worker_axis, wave_axis = relation.source_domain.axis_order
                 actual: dict[int, tuple[int, int]] = {}
@@ -5023,12 +5002,15 @@ class TestCrossLoopScheduler(TestCase):
                 self.assertEqual(
                     actual,
                     {
-                        task: (task % 4, 2 * (task // 4) + phase)
+                        task: (
+                            (concrete_first_slot + task) % 4,
+                            (concrete_first_slot + task) // 4,
+                        )
                         for task in range(concrete_count)
                     },
                 )
 
-    def test_parametric_event_frontier_declines_ambiguous_fork(self) -> None:
+    def test_parametric_root_major_supports_ambiguous_fork(self) -> None:
         task_count = sympy.Symbol("task_count", integer=True, nonnegative=True)
         dependency_graph = _dependency_graph(
             [[10], [20], [30]],
@@ -5087,18 +5069,13 @@ class TestCrossLoopScheduler(TestCase):
             (1, 2),
         )
         self.assertEqual(plan.root_barrier_edges, frozenset())
-        self.assertIsNone(
-            cross_loop_scheduler._parametric_event_frontier_schedule_geometry(
-                plan.worker_schedule
-            )
-        )
         self.assertIsNotNone(
             cross_loop_scheduler._parametric_root_major_schedule_geometry(
                 plan.worker_schedule
             )
         )
 
-    def test_parametric_event_frontier_matches_concrete_list_scheduler(self) -> None:
+    def test_parametric_root_major_packs_three_stage_chain(self) -> None:
         task_count = sympy.Symbol("task_count", integer=True, nonnegative=True)
         dependency_graph = _dependency_graph(
             [[10], [20], [30]],
@@ -5147,47 +5124,31 @@ class TestCrossLoopScheduler(TestCase):
                 axis_geometry=dict.fromkeys((10, 20, 30), (task_count, 16)),
                 worker_count=4,
             )
-        symbolic_geometry = (
-            cross_loop_scheduler._parametric_event_frontier_schedule_geometry(
-                symbolic_plan.worker_schedule
-            )
+        symbolic_geometry = cross_loop_scheduler._parametric_root_major_schedule_geometry(
+            symbolic_plan.worker_schedule
         )
         self.assertIsNotNone(symbolic_geometry)
         assert symbolic_geometry is not None
+        self.assertEqual(
+            tuple(segment.root for segment, _first_slot, _count in symbolic_geometry),
+            (0, 1, 2),
+        )
+        _launch_axis, _worker_axis, wave_axis = (
+            symbolic_plan.worker_schedule.placement_domain.axis_order
+        )
+        self.assertTrue(
+            cross_loop_scheduler._equal_integer_expressions(
+                symbolic_plan.worker_schedule.placement_domain.axis_count_expressions[
+                    wave_axis
+                ],
+                cross_loop_scheduler._ceildiv_nonnegative_expression(
+                    3 * task_count,
+                    4,
+                ),
+            )
+        )
 
-        for concrete_count in (1, 3, 4, 5, 8, 9):
-            concrete_domains = tuple(
-                _domain((axis, concrete_count, 16)) for axis in (10, 20, 30)
-            )
-            readiness_graph = _configured_readiness_graph(
-                dependency_graph,
-                concrete_domains,
-                axis_geometry=dict.fromkeys((10, 20, 30), (concrete_count, 16)),
-            )
-            initial_schedule = _baseline_worker_schedule(
-                concrete_domains,
-                4,
-                root_task_orders=readiness_graph.root_task_orders,
-            )
-            readiness_counters, root_barrier_edges = (
-                cross_loop_scheduler._finalize_emitted_synchronization(
-                    dependency_graph=dependency_graph,
-                    root_domains=readiness_graph.root_domains,
-                    readiness_counters=choose_readiness_counters(
-                        readiness_graph,
-                        (),
-                    ),
-                )
-            )
-            concrete_schedule = cross_loop_scheduler._event_frontier_list_schedule(
-                readiness_graph,
-                initial_schedule,
-                readiness_counters,
-                root_barrier_edges,
-            )
-            self.assertIsNotNone(concrete_schedule)
-            assert concrete_schedule is not None
-
+        for concrete_count in (0, 1, 3, 4, 5, 7, 8, 9):
             concrete_relations = tuple(
                 (
                     segment.root,
@@ -5195,17 +5156,22 @@ class TestCrossLoopScheduler(TestCase):
                         {task_count: concrete_count}
                     ),
                 )
-                for segment, _phase, _count in symbolic_geometry
+                for segment, _first_slot, _count in symbolic_geometry
             )
-            wave_count = 3 * ((concrete_count + 3) // 4)
+            wave_count = (3 * concrete_count + 3) // 4
+            stream = tuple(
+                (root, task)
+                for root in range(3)
+                for task in range(concrete_count)
+            )
             for wave in range(wave_count):
                 for worker in range(4):
-                    symbolic_tasks: list[tuple[int, int]] = []
+                    actual: list[tuple[int, int]] = []
                     for root, relation in concrete_relations:
                         launch_axis, worker_axis, wave_axis = (
                             relation.source_domain.axis_order
                         )
-                        symbolic_tasks.extend(
+                        actual.extend(
                             (root, task)
                             for (task,) in relation.target_coordinates(
                                 {
@@ -5215,11 +5181,16 @@ class TestCrossLoopScheduler(TestCase):
                                 }
                             )
                         )
-                    self.assertLessEqual(len(symbolic_tasks), 1)
+                    self.assertLessEqual(len(actual), 1)
+                    slot = wave * 4 + worker
                     self.assertEqual(
-                        symbolic_tasks[0] if symbolic_tasks else None,
-                        task_at(concrete_schedule, worker, wave),
+                        actual[0] if actual else None,
+                        stream[slot] if slot < len(stream) else None,
                     )
+
+        # Three five-task stages occupy fifteen slots: four packed waves,
+        # rather than the six waves of the removed per-stage recurrence.
+        self.assertEqual((3 * 5 + 3) // 4, 4)
 
     def test_parametric_counter_declines_unproved_dynamic_layout(self) -> None:
         task_count = sympy.Symbol("task_count", integer=True, nonnegative=True)
@@ -5258,11 +5229,6 @@ class TestCrossLoopScheduler(TestCase):
 
         self.assertEqual(plan.readiness_counters, ())
         self.assertEqual(plan.root_barrier_edges, frozenset(((0, 1),)))
-        self.assertIsNone(
-            cross_loop_scheduler._parametric_event_frontier_schedule_geometry(
-                plan.worker_schedule
-            )
-        )
         self.assertIsNotNone(
             cross_loop_scheduler._parametric_root_major_schedule_geometry(
                 plan.worker_schedule

@@ -788,10 +788,8 @@ class TestTritonTileDependencyLowering(TestCase):
         self.assertNotIn("tile_dependency_dispatch_ticket", code)
         self.assertIn("16 * ((15 + x.size(0)) // 16)", code)
         self.assertIn("torch.uint64", code)
-        self.assertEqual(
-            code.count("for tile_dependency_event_frontier_task in tl.range"),
-            1,
-        )
+        self.assertNotIn("tile_dependency_event_frontier_task", code)
+        self.assertEqual(code.count("for virtual_pid in tl.range"), 2)
 
         def compiled_cubin_hashes() -> set[str]:
             triton_kernel = compiled.__globals__.get(f"_helion_{bound.kernel.name}")
@@ -843,7 +841,7 @@ class TestTritonTileDependencyLowering(TestCase):
             torch.cuda.synchronize()
             torch.testing.assert_close(captured_output, (captured_input + 1) * 2)
 
-    def test_dynamic_exact_three_stage_chain_uses_one_frontier_loop(self) -> None:
+    def test_dynamic_exact_three_stage_chain_uses_packed_root_major_loops(self) -> None:
         x = torch.arange(2049, device=DEVICE, dtype=torch.float32)
         code, output = code_and_output(
             dynamic_exact_three_stage_chain,
@@ -857,14 +855,12 @@ class TestTritonTileDependencyLowering(TestCase):
         torch.testing.assert_close(output, (x + 1) * 2 - 3)
         self.assertEqual(code.count("tl.atomic_xchg"), 2)
         self.assertGreaterEqual(code.count("tile_dependency_readiness_wait"), 2)
-        self.assertEqual(
-            code.count("for tile_dependency_event_frontier_task in tl.range"),
-            1,
-        )
-        loop = code.index("for tile_dependency_event_frontier_task in tl.range")
+        self.assertNotIn("tile_dependency_event_frontier_task", code)
+        self.assertEqual(code.count("for virtual_pid in tl.range"), 3)
+        loop = code.index("for virtual_pid in tl.range")
         root_0 = code.index("tile_dependency_root_0_scheduled_task(", loop)
-        root_1 = code.index("tile_dependency_root_1_scheduled_task(", loop)
-        root_2 = code.index("tile_dependency_root_2_scheduled_task(", loop)
+        root_1 = code.index("tile_dependency_root_1_scheduled_task(", root_0 + 1)
+        root_2 = code.index("tile_dependency_root_2_scheduled_task(", root_1 + 1)
         self.assertLess(root_0, root_1)
         self.assertLess(root_1, root_2)
 
