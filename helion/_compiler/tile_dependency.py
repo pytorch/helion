@@ -4266,9 +4266,22 @@ class CoordinateRelation:
         for source_bounds, active_pieces in active_pieces_by_cell:
             candidates: dict[tuple[sympy.Expr, _TargetBoxRanges | None], None] = {}
             for relation_piece in active_pieces:
+                semantic_target_ranges = _clip_target_box_to_domain(
+                    relation_piece.target_ranges,
+                    target_domain=self.target_domain,
+                    source_domain=self.source_domain,
+                    source_bounds=source_bounds,
+                )
+                if _target_box_is_empty_for_all_sources(
+                    semantic_target_ranges,
+                    source_domain=self.source_domain,
+                    source_bounds=source_bounds,
+                    target_domain=self.target_domain,
+                ):
+                    continue
                 for value_piece in values.pieces:
                     intersection = _intersect_target_with_source_box(
-                        relation_piece.target_ranges,
+                        semantic_target_ranges,
                         value_piece.source_bounds_items,
                         source_domain=self.source_domain,
                         relation_source_bounds=source_bounds,
@@ -7031,6 +7044,62 @@ def _logical_expression_bounds(
                 )
         return sympy.Integer(0), modulus - 1
     return None
+
+
+def _clip_target_box_to_domain(
+    target_ranges: _TargetBoxRanges,
+    *,
+    target_domain: CoordinateDomain,
+    source_domain: CoordinateDomain,
+    source_bounds: _SourceBounds,
+) -> _TargetBoxRanges:
+    """Intersect a target box with its declared domain without enumeration."""
+    axis_counts = target_domain.axis_count_expressions
+    parameter_symbols = (
+        source_domain.parameter_symbols | target_domain.parameter_symbols
+    )
+    result: list[tuple[int, sympy.Expr, sympy.Expr, int]] = []
+    for axis, begin, end, step in target_ranges:
+        begin_bounds = _logical_expression_bounds(
+            begin,
+            domain=source_domain,
+            source_bounds=source_bounds,
+            parameter_symbols=parameter_symbols,
+        )
+        begin_is_in_domain = begin_bounds is not None and _is_provably_nonnegative(
+            begin_bounds[0],
+            None,
+        )
+        lower = begin if begin_is_in_domain else sympy.Max(sympy.Integer(0), begin)
+        clipped_begin = (
+            begin
+            if begin_is_in_domain
+            else lower
+            if step == 1
+            else _normalize_integer_rounding(
+                begin + sympy.ceiling((lower - begin) / step) * step  # pyrefly: ignore[unsupported-operation]
+            )
+        )
+        end_bounds = _logical_expression_bounds(
+            end,
+            domain=source_domain,
+            source_bounds=source_bounds,
+            parameter_symbols=parameter_symbols,
+        )
+        target_count = axis_counts[axis]
+        end_is_in_domain = end_bounds is not None and _is_provably_nonnegative(
+            sympy.simplify(target_count - end_bounds[1]),
+            None,
+        )
+        result.append(
+            (
+                axis,
+                clipped_begin,
+                end if end_is_in_domain else sympy.Min(end, target_count),
+                step,
+            )
+        )
+    return tuple(result)
 
 
 def _intersect_target_with_source_box(

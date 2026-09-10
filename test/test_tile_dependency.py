@@ -4109,6 +4109,105 @@ class TestTileDependency(TestCase):
         self.assertEqual(result[0].materialize(), expected)
         self.assertEqual(result[1].materialize(), expected)
 
+    def test_target_value_extreme_clips_to_semantic_target_domain(self) -> None:
+        source = CoordinateDomain((), (), kind="event")
+        target = CoordinateDomain((20,), ((20, 3),), kind="site")
+        values = CoordinateDomain((30,), ((30, 21),), kind="value")
+        target_coordinate = coordinate_axis_symbol(20)
+        required = CoordinateRelation(
+            source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    (),
+                    ((20, 0, 10, 1),),  # pyrefly: ignore[bad-argument-type]
+                ),
+            ),
+        )
+        value_by_target = CoordinateRelation.point_map(
+            target,
+            values,
+            (
+                (
+                    ((20, -10, 10, 1),),
+                    (target_coordinate + 10,),  # pyrefly: ignore[unsupported-operation]
+                ),
+            ),
+        )
+
+        maximum = required.extreme_target_value_and_attainers_by_source(
+            value_by_target,
+            maximize=True,
+        )
+        minimum = required.extreme_target_value_and_attainers_by_source(
+            value_by_target,
+            maximize=False,
+        )
+        legacy_maximum = required.max_target_value_by_source(value_by_target)
+
+        self.assertIsNotNone(maximum)
+        self.assertIsNotNone(minimum)
+        self.assertIsNotNone(legacy_maximum)
+        assert maximum is not None
+        assert minimum is not None
+        assert legacy_maximum is not None
+        self.assertEqual(maximum[0].materialize(), (frozenset((12,)),))
+        self.assertEqual(maximum[1].materialize(), (frozenset((2,)),))
+        self.assertEqual(minimum[0].materialize(), (frozenset((10,)),))
+        self.assertEqual(minimum[1].materialize(), (frozenset((0,)),))
+        self.assertEqual(legacy_maximum.materialize(), maximum[0].materialize())
+
+        extent = sympy.Symbol("extent", integer=True, positive=True)
+        symbolic_target = CoordinateDomain(
+            (20,),
+            ((20, extent + 2),),  # pyrefly: ignore[unsupported-operation]
+            kind="site",
+        )
+        symbolic_values = CoordinateDomain(
+            (30,),
+            ((30, extent + 12),),  # pyrefly: ignore[unsupported-operation]
+            kind="value",
+        )
+        strided_required = CoordinateRelation(
+            source,
+            symbolic_target,
+            (
+                _CoordinateRelationPiece(
+                    (),
+                    ((20, -3, extent + 9, 2),),  # pyrefly: ignore[bad-argument-type, unsupported-operation]
+                ),
+            ),
+        )
+        symbolic_value_by_target = CoordinateRelation.point_map(
+            symbolic_target,
+            symbolic_values,
+            (
+                (
+                    ((20, 0, extent + 2, 1),),  # pyrefly: ignore[unsupported-operation]
+                    (target_coordinate + 10,),  # pyrefly: ignore[unsupported-operation]
+                ),
+            ),
+        )
+        symbolic_result = strided_required.extreme_target_value_and_attainers_by_source(
+            symbolic_value_by_target,
+            maximize=True,
+        )
+        self.assertIsNotNone(symbolic_result)
+        assert symbolic_result is not None
+        for concrete_extent in range(1, 6):
+            substitutions = {extent: concrete_extent}
+            expected_target = max(
+                set(range(-3, concrete_extent + 9, 2)) & set(range(concrete_extent + 2))
+            )
+            self.assertEqual(
+                symbolic_result[0].substitute_parameters(substitutions).materialize(),
+                (frozenset((expected_target + 10,)),),
+            )
+            self.assertEqual(
+                symbolic_result[1].substitute_parameters(substitutions).materialize(),
+                (frozenset((expected_target,)),),
+            )
+
     def test_target_value_extreme_declines_unrepresentable_guards_and_levels(
         self,
     ) -> None:
