@@ -2898,6 +2898,15 @@ ownership a production decision. They are derived views over the existing
   because schedule scores are defined exactly on occupied slots; filling the
   rectangular placement domain or rebuilding `q` from wave arithmetic would
   introduce a second source of truth.
+- [ ] Reuse that same exact support-cover proof in
+  `CoordinateRelation.pointwise_add_scalar`: a partial right operand is legal
+  exactly when its canonical single-valued support covers the left operand's
+  support; extra right-hand support is irrelevant. Preserve the left support,
+  validate both values and the sum on every intersection, and retain the
+  existing total-right-operand fast path. This lets the Bellman evaluator do
+  shifted `q` arithmetic directly on occupied slots, rather than adding more
+  symbolic `task -> slot -> q` preimage cases or filling holes with fabricated
+  values.
 - [x] Add one private exact-or-decline partition of a resident slot-to-slot
   dependency relation into same-owner and cross-owner edges. Ownership is the
   existing `(launch_stage, worker)` projection of the two endpoints. Preserve
