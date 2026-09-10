@@ -2603,28 +2603,6 @@ def _partition_resident_readiness_handoffs(
             for axis, begin, end, step in target_ranges
         )
 
-    def ranges_equal(
-        left: tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...],
-        right: tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...],
-    ) -> bool:
-        return len(left) == len(right) and all(
-            left_axis == right_axis
-            and left_step == right_step
-            and _equal_integer_expressions(left_begin, right_begin)
-            and _equal_integer_expressions(left_end, right_end)
-            for (
-                left_axis,
-                left_begin,
-                left_end,
-                left_step,
-            ), (
-                right_axis,
-                right_begin,
-                right_end,
-                right_step,
-            ) in zip(left, right, strict=True)
-        )
-
     def replace_target_range(
         target_ranges: tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...],
         target_axis: int,
@@ -2672,7 +2650,14 @@ def _partition_resident_readiness_handoffs(
         ):
             return False
         simplified_intersection = simplify_target_ranges(intersection, source_bounds)
-        return True if ranges_equal(simplified_intersection, (target_range,)) else None
+        return (
+            True
+            if tile_dependency._source_bounds_equal(
+                simplified_intersection,
+                (target_range,),
+            )
+            else None
+        )
 
     for piece in relation.pieces:
         source_bounds = tile_dependency._intersect_source_boxes(
@@ -2686,7 +2671,7 @@ def _partition_resident_readiness_handoffs(
         if not isinstance(source_bounds, tuple):
             return None
         sources = {source_bound[0]: source_bound for source_bound in source_bounds}
-        if not ranges_equal(
+        if not tile_dependency._source_bounds_equal(
             (sources[launch_stage_axis],),
             (resident_stage_range,),
         ):
@@ -2708,7 +2693,7 @@ def _partition_resident_readiness_handoffs(
         ):
             continue
         targets = {target_range[0]: target_range for target_range in target_ranges}
-        if not ranges_equal(
+        if not tile_dependency._source_bounds_equal(
             (targets[launch_stage_axis],),
             (resident_stage_range,),
         ):
