@@ -42,6 +42,7 @@ from helion._compiler.tile_dependency import _simplify_logical_expression
 from helion._compiler.tile_dependency import _symbolic_linear_access_relation
 from helion._compiler.tile_dependency import _symbolic_producers_by_consumer
 from helion._compiler.tile_dependency import _target_box_expression_extreme
+from helion._compiler.tile_dependency import _target_box_expression_extreme_proof_uncached
 from helion._compiler.tile_dependency import allocation_regions_may_overlap
 from helion._compiler.tile_dependency import build_tile_dependency_graph
 from helion._compiler.tile_dependency import coordinate_axis_symbol
@@ -3781,6 +3782,86 @@ class TestTileDependency(TestCase):
             ),
         )
         self.assertIsNone(required.max_target_value_by_source(fixed_width_value))
+
+    def test_target_box_extrema_memoizes_nested_modulo_dag(self) -> None:
+        target_axis = 20
+        target = CoordinateDomain(
+            (target_axis,),
+            ((target_axis, 4),),
+            kind="site",
+        )
+        source = CoordinateDomain((), (), kind="event")
+        coordinate = coordinate_axis_symbol(target_axis)
+        target_ranges = ((target_axis, sympy.Integer(0), sympy.Integer(4), 1),)
+        depth = 12
+        expression = coordinate
+        for modulus in range(16, 16 + depth):
+            expression = sympy.Mod(expression, modulus, evaluate=False)
+
+        with mock.patch(
+            "helion._compiler.tile_dependency._target_box_expression_extreme_proof_uncached",
+            wraps=_target_box_expression_extreme_proof_uncached,
+        ) as uncached:
+            maximum = _target_box_expression_extreme(
+                expression,
+                target_domain=target,
+                target_ranges=target_ranges,
+                source_domain=source,
+                source_bounds=(),
+                maximize=True,
+            )
+
+        self.assertEqual(maximum, 3)
+        self.assertLessEqual(uncached.call_count, 2 * depth + 1)
+
+    def test_symbolic_max_target_value_declines_possibly_empty_fiber(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        key_axis = 10
+        task_axis = 20
+        value_axis = 30
+        keys = CoordinateDomain((key_axis,), ((key_axis, 1),), kind="event")
+        tasks = CoordinateDomain(
+            (task_axis,),
+            ((task_axis, batch),),
+            kind="site",
+            _allow_empty=True,
+        )
+        values = CoordinateDomain((value_axis,), ((value_axis, 1),), kind="worker")
+        required = CoordinateRelation(
+            keys,
+            tasks,
+            (
+                _CoordinateRelationPiece(
+                    ((key_axis, 0, 1, 1),),
+                    ((task_axis, sympy.Integer(0), batch, 1),),
+                ),
+            ),
+        )
+        value_by_task = CoordinateRelation.point_map(
+            tasks,
+            values,
+            (
+                (
+                    ((task_axis, 0, batch, 1),),
+                    (sympy.Integer(0),),
+                ),
+            ),
+        )
+
+        self.assertEqual(
+            required.substitute_parameters({batch: 0}).materialize(),
+            (frozenset(),),
+        )
+        self.assertIsNone(required.max_target_value_by_source(value_by_task))
+
+        concrete_required = required.substitute_parameters({batch: 4})
+        concrete_values = value_by_task.substitute_parameters({batch: 4})
+        concrete_maximum = concrete_required.max_target_value_by_source(
+            concrete_values
+        )
+        self.assertIsNotNone(concrete_maximum)
+        assert concrete_maximum is not None
+        self.assertEqual(concrete_maximum.materialize(), (frozenset((0,)),))
 
     def test_symbolic_max_target_value_reduces_schedule_positions(self) -> None:
         elements = 128

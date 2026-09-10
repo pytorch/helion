@@ -4142,6 +4142,17 @@ class CoordinateRelation:
                         return None
                     if intersection is False:
                         continue
+                    intersected_ranges = cast(
+                        "tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...]",
+                        intersection,
+                    )
+                    if not _target_box_is_nonempty_for_all_sources(
+                        intersected_ranges,
+                        source_domain=self.source_domain,
+                        source_bounds=source_bounds,
+                        target_domain=self.target_domain,
+                    ):
+                        return None
                     if len(value_piece.target_ranges) != 1:
                         return None
                     _axis, begin, end, step = value_piece.target_ranges[0]
@@ -4154,10 +4165,7 @@ class CoordinateRelation:
                     maximum = _target_box_expression_extreme(
                         begin,
                         target_domain=self.target_domain,
-                        target_ranges=cast(
-                            "tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...]",
-                            intersection,
-                        ),
+                        target_ranges=intersected_ranges,
                         source_domain=self.source_domain,
                         source_bounds=source_bounds,
                         maximize=True,
@@ -6895,6 +6903,11 @@ def _intersect_target_with_source_box(
 
 _TargetBoxEndpointChoices = tuple[tuple[int, sympy.Expr], ...]
 _TargetBoxExtremeProof = tuple[sympy.Expr, _TargetBoxEndpointChoices]
+_TargetBoxExtremeCacheKey = tuple[
+    sympy.Expr,
+    tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...],
+    bool,
+]
 
 
 def _merge_target_box_endpoint_choices(
@@ -6933,6 +6946,7 @@ def _target_box_expression_extreme(
         source_domain=source_domain,
         source_bounds=source_bounds,
         maximize=maximize,
+        memo={},
     )
     return None if proof is None else proof[0]
 
@@ -6947,6 +6961,34 @@ def _target_box_expression_extreme_proof(
         tuple[int, IntegerExpression, IntegerExpression, int], ...
     ],
     maximize: bool,
+    memo: dict[_TargetBoxExtremeCacheKey, _TargetBoxExtremeProof | None],
+) -> _TargetBoxExtremeProof | None:
+    """Memoize one bounded proof over its expression DAG and residual box."""
+    key = (expression, target_ranges, maximize)
+    if key not in memo:
+        memo[key] = _target_box_expression_extreme_proof_uncached(
+            expression,
+            target_domain=target_domain,
+            target_ranges=target_ranges,
+            source_domain=source_domain,
+            source_bounds=source_bounds,
+            maximize=maximize,
+            memo=memo,
+        )
+    return memo[key]
+
+
+def _target_box_expression_extreme_proof_uncached(
+    expression: sympy.Expr,
+    *,
+    target_domain: CoordinateDomain,
+    target_ranges: tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...],
+    source_domain: CoordinateDomain,
+    source_bounds: tuple[
+        tuple[int, IntegerExpression, IntegerExpression, int], ...
+    ],
+    maximize: bool,
+    memo: dict[_TargetBoxExtremeCacheKey, _TargetBoxExtremeProof | None],
 ) -> _TargetBoxExtremeProof | None:
     """Return an exact extremum for the supported target-box expression IR.
 
@@ -6982,6 +7024,7 @@ def _target_box_expression_extreme_proof(
                 source_domain=source_domain,
                 source_bounds=source_bounds,
                 maximize=maximize,
+                memo=memo,
             )
     ranges = {
         coordinate_axis_symbol(axis): (begin, end, step)
@@ -7020,6 +7063,7 @@ def _target_box_expression_extreme_proof(
                 source_domain=source_domain,
                 source_bounds=source_bounds,
                 maximize=maximize,
+                memo=memo,
             )
             for child in expression.args
         )
@@ -7060,6 +7104,7 @@ def _target_box_expression_extreme_proof(
             source_domain=source_domain,
             source_bounds=source_bounds,
             maximize=(maximize if coefficient_is_nonnegative else not maximize),
+            memo=memo,
         )
         if child is None:
             return None
@@ -7077,6 +7122,7 @@ def _target_box_expression_extreme_proof(
             source_domain=source_domain,
             source_bounds=source_bounds,
             maximize=maximize,
+            memo=memo,
         )
         if child is None:
             return None
@@ -7104,6 +7150,7 @@ def _target_box_expression_extreme_proof(
             source_domain=source_domain,
             source_bounds=source_bounds,
             maximize=False,
+            memo=memo,
         )
         maximum = _target_box_expression_extreme_proof(
             dividend,
@@ -7112,6 +7159,7 @@ def _target_box_expression_extreme_proof(
             source_domain=source_domain,
             source_bounds=source_bounds,
             maximize=True,
+            memo=memo,
         )
         if minimum is None or maximum is None:
             return None
@@ -7175,6 +7223,7 @@ def _target_box_expression_extreme_proof(
             source_domain=source_domain,
             source_bounds=source_bounds,
             maximize=maximize,
+            memo=memo,
         )
         if child is None:
             return None
@@ -7188,6 +7237,7 @@ def _target_box_expression_extreme_proof(
                 source_domain=source_domain,
                 source_bounds=source_bounds,
                 maximize=maximize,
+                memo=memo,
             )
             for child in expression.args
         )
@@ -7544,13 +7594,16 @@ def _target_box_is_nonempty_for_all_sources(
     source_bounds: tuple[tuple[int, IntegerExpression, IntegerExpression, int], ...],
     target_domain: CoordinateDomain,
 ) -> bool:
-    """Prove that a clipped target box is nonempty for every source point."""
+    """Prove that a clipped target box is nonempty for every source point.
+
+    ``CoordinateRelation`` already requires every target step to be positive.
+    Once the clipped begin is strictly below the clipped end, that begin is a
+    member regardless of the step, so strided boxes use the same proof.
+    """
     relation_parameters = (
         source_domain.parameter_symbols | target_domain.parameter_symbols
     )
-    for axis, begin, end, step in target_ranges:
-        if step != 1:
-            return False
+    for axis, begin, end, _step in target_ranges:
         begin_bounds = _logical_expression_bounds(
             begin,
             domain=source_domain,
