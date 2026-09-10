@@ -86,8 +86,9 @@ Implementation checkpoint (2026-09-09):
   from the accepted segment relations and readiness plans.
 - Exact bounded nonuniform fan-in now lowers through per-key arrival-count
   expressions and a proved maximum epoch stride. Data-dependent ragged fan-in,
-  masked producer publication, unequal non-continuation recurrences, and the
-  remaining cross-workload rollout still require work.
+  masked producer publication, and the remaining cross-workload rollout still
+  require work. Cyclic dependency scheduling is outside the current milestone;
+  those cases retain the conservative fallback.
 
 ## Active implementation checklist
 
@@ -255,10 +256,9 @@ substitution gates below remain mandatory before production ownership changes.
 The active implementation point is therefore the acyclic relation-level
 max-plus evaluator, compared exhaustively against the concrete oracle without
 yet changing scheduling policy. Then continue with the real-model gate, joint
-continuation/resident choice, translated recurrence closure, post-placement
-nested quotients, source-ticket actions through that same policy, one final
-validation/lowering pass, and deletion of the top-level constant/parameterized
-branch.
+continuation/resident choice, post-placement nested quotients, source-ticket
+actions through that same policy, one final validation/lowering pass, and
+deletion of the top-level constant/parameterized branch.
 
 Then continue Phase 4A.2 by replacing the remaining parameter-only admission
 filters with one exact action-legality decision, followed by the single joint
@@ -399,9 +399,9 @@ therefore cannot be coarsened or finalized before placement. Qwen's useful
 - [ ] Run one symbolic event-frontier proposal implementation for constants and
   parameters alike. It consumes the exact `ReadinessGraph`, not a prematurely
   coarsened counter plan, and produces the authoritative schedule relation.
-  Only afterward may codegen choose a concrete loop or compact recurrence as a
-  certified rendering. Concrete task-list placement remains a test oracle, not
-  an alternate production decision procedure.
+  Only afterward may codegen choose an equivalent concrete or runtime-bounded
+  loop rendering. Concrete task-list placement remains a test oracle, not an
+  alternate production decision procedure.
 - [ ] After the final `WorkerSchedule` is selected, derive each nested
   consumer's maximal schedule-frontier quotient. For a fixed owning task, group
   adjacent nested iterations exactly when their latest required producer wave
@@ -473,7 +473,7 @@ predicate, sampled shape, or benchmark-specific exception.
 
 The equality required here is semantic rather than syntactic: constant codegen
 may strength-reduce a bounded epoch counter, a participant relation, or a
-symbolic recurrence. Such rendering differences are allowed only after their
+runtime-bounded loop. Such rendering differences are allowed only after their
 equivalence to the same finalized plan is proved.
 
 Implementation checkpoint (commit `a9df42d1`): the first correctness slice is
@@ -546,6 +546,17 @@ dependency overlap, critical-path completion, ownership, and handoff logic; it
 does not predict register pressure, shared resource contention, instruction
 mix, or constituent body speed. Those remain the later cold-L2 performance
 gate rather than inputs to scheduling policy.
+
+### Acyclic go/no-go gate
+
+Cyclic event-graph optimization is not on the immediate roadmap. Finish the
+single acyclic evaluator and use it to select schedules for the real FlashMLA,
+Qwen, Gemma, and Muse graphs. Then run the existing correctness checks,
+cubin-reuse checks, cold-L2 benchmarks, and standalone comparisons. Proceed to
+the remaining lowering cleanup only if this acyclic path preserves the known
+FlashMLA result and demonstrates at least one reproducible end-to-end win; if
+it does not, remove or quarantine the unused experimental scheduler rather
+than extending it with cyclic/SCC machinery.
 
 ### Priority 3: resume the paused validation and performance work
 
@@ -697,8 +708,8 @@ cross_loop_codegen              renderer of finalized relations and plans
 There is one semantic policy for both constant and parameterized extents.
 Code may branch on a proved relation form only after synchronization and
 scheduling decisions are complete, in order to emit a compact concrete loop
-or symbolic recurrence. Such a branch is a rendering choice, never a second
-continuation, barrier, source-admission, or ordering policy.
+or runtime-bounded symbolic loop. Such a branch is a rendering choice, never a
+second continuation, barrier, source-admission, or ordering policy.
 
 ## Current implementation diagnosis
 
@@ -784,7 +795,7 @@ The following distinctions are normative:
 | Resident scheduling | Which worker/wave owns each remaining task? | `WorkerScheduleSegment.task_order` | overlap and makespan |
 | Nested frontier quotient | Which adjacent loop iterations share one emitted wait for this schedule? | finalized `ReadinessCounterPlan` derived from the exact event and `WorkerSchedule` | synchronization overhead without weakening readiness |
 | Root completion | Which owners publish, and what target is replay-safe? | `RootBarrierPublicationPlan` | barrier correctness and overhead |
-| Rendering | Which proved loop/recurrence/constant form emits the plan? | `cross_loop_codegen` | instruction count only |
+| Rendering | Which proved runtime-bounded or constant loop form emits the plan? | `cross_loop_codegen` | instruction count only |
 | Body/resource tuning | How are individual root bodies tiled and pipelined? | existing block/range/warp/register configuration | constituent-kernel speed and occupancy |
 
 A final-arrival continuation and list scheduling are intentionally separate.
@@ -1437,11 +1448,10 @@ Constants and guarded symbolic expressions enter this same algorithm. When a
 comparison between symbolic frontiers cannot be proved, the algorithm uses the
 canonical conservative order; it does not invoke a different scheduler.
 
-If repeated source structure induces an apparent cycle between root and event
-relations, prove an affine progress rank directly from those relations. If no
-rank is proved, retain the proved sequential order for the affected frontiers.
-Never widen a valid recurrence such as `A_i -> B_i -> A_(i+1)` into mutually
-dependent whole-root barriers merely because its runtime extent is symbolic.
+If root/event relations induce a cyclic quotient, this milestone declines the
+optimized proposal and retains the proved conservative schedule and barriers.
+Do not add an affine recurrence proof merely to broaden coverage: first require
+the acyclic scheduler to demonstrate end-to-end performance value.
 
 ### Unit-weight structural criticality
 
@@ -1595,7 +1605,7 @@ changes.
 
 This is the single policy for concrete and symbolic inputs. A newly completed
 event releases its consumer immediately into the same ready set; no separate
-parameterized recurrence policy decides whether that consumer deserves to run.
+parameterized policy decides whether that consumer deserves to run.
 
 ### Work conservation
 
@@ -1620,17 +1630,18 @@ coverage. With no provably lowerable
 fine-grained prerequisite there is no early-admission opportunity, so the
 canonical compact order is returned without stepping through its frontiers.
 
-### Symbolic recurrence extraction
+### Deferred: cyclic recurrence extraction
 
-Advance the temporary root/event frontiers symbolically. When the complete
-frontier state changes by the same affine delta under an invariant priority
-decision, summarize the recurrence directly in the affected
-`WorkerScheduleSegment.task_order` relation using wave `floor`/modulo pieces.
+Cyclic event-graph support is deliberately not part of the immediate roadmap.
+The acyclic scheduler must first pass its correctness and performance gates; if
+it does not produce worthwhile wins, abandon the redesign rather than adding
+recurrence machinery. Until a separate future decision revisits this scope, a
+cyclic quotient retains the conservative schedule and synchronization.
 
-If a finite guarded comparison changes the winner, split relation pieces at
-the proved crossing. If neither recurrence nor a bounded piecewise form can be
-proved, retain canonical compact ordering with a conservative admissible
-frontier. Do not unroll the runtime extent.
+If cyclic support is reconsidered later, it must still be expressed through the
+existing `WorkerScheduleSegment.task_order` relation and proved from the same
+readiness graph; this note is not an implementation task or an exit criterion
+for the current work.
 
 There is one scheduler. "Local order" is simply the conservative result when
 only one root frontier is movable or a finer frontier cannot be proved.
@@ -2488,9 +2499,10 @@ compiles within the numeric budget above.
 
 - Generalize existing CoordinateDomain/CoordinateRelation bounds.
 - Derive symbolic event counts, fan-in, and schedule wave counts.
-- Detect translation-equivalent frontier recurrence and express it with
-  floor/modulo relation pieces.
 - Lower runtime-bounded wave loops.
+- Let cyclic event quotients retain the conservative schedule; cyclic
+  event-frontier optimization is explicitly deferred until after the acyclic
+  performance decision.
 - Permit host launch/scratch sizing from known scalar shapes without schedule
   generation.
 - Verify cubin identity, not merely Python kernel/cache identity, while varying
@@ -2504,14 +2516,14 @@ minimal conservative slice. `CoordinateDomain` and `CoordinateRelation`
 preserve symbolic integer bounds while concrete enumeration remains explicit.
 Canonical rank-one roots are represented by exact relation pieces for an
 initial partial wave, full waves, and a final partial wave, and codegen
-strength-reduces that proved relation into runtime-bounded cyclic loops.
+strength-reduces that proved relation into runtime-bounded wave loops.
 Dynamic memory layouts are not
 specialized from hints: dependencies coarsen to root barriers, and every
 resident worker publishes once per producer root so epoch targets stay fixed
 while shapes vary between graph replays. At this checkpoint, exact
-parameterized readiness events and recurrence extraction remained later Phase
-4 work; subsequent checkpoints below implement the first exact-event and
-recurrence slices. Parameterized roots with rank greater than one, L2-permuted
+parameterized readiness events remained later Phase 4 work; subsequent
+checkpoints below implement the first exact-event slices. Parameterized roots
+with rank greater than one, L2-permuted
 orders, continuations, and transient-source admission still decline rather
 than relying on a shape hint.
 The binary-reuse regression explicitly opts its runtime extent out of Triton
@@ -2589,9 +2601,10 @@ now accepts multiple ordinary consumers per readiness key. The exact symbolic
 shape is `F*K` producers, `C*K` consumers, producer partition
 `k -> [F*k,F*k+F)`, and consumer quotient `c -> floor(c/C)`, with static
 positive `F` and `C` and exact extent identities. Final-arrival continuation
-admission remains one-consumer-per-key, and the equal-size event-frontier
-recurrence remains fan-in-one only. Thus this broadens synchronization without
-silently broadening either execution-ownership optimization.
+admission remains one-consumer-per-key. At that historical checkpoint, the
+subsequently removed equal-size event-frontier recurrence remained fan-in-one.
+Thus the counter change broadened synchronization without silently broadening
+either execution-ownership optimization.
 
 Flattened scratch analysis was extended in place to carry a static divisor on
 an otherwise existing affine term. Only direct, unshifted scalar
@@ -2861,17 +2874,12 @@ ownership a production decision. They are derived views over the existing
   Symbolic `N`, `4*N+1`, and `(3,N,2)` schedules produce three-piece ordinal
   relations, and boundary substitutions plus randomized packed, holed, split,
   and staged schedules agree with exhaustive materialization.
-- [ ] Add one bounded exact-or-decline ranked prefix/recurrence proof to the
-  existing relation algebra. A finite number of ordinary compositions is not
-  sufficient: even the affine pipeline `A_i -> B_i -> A_(i+1)` has a cyclic
-  root quotient and completion growing with runtime `i`. First support an
-  acyclic relation-piece quotient. Then support a cyclic quotient only when a
-  common well-founded rank, a static translation period, base coverage, tail
-  coverage, and the complete Bellman equality are all proved. Encode the
-  resulting scalar maps with existing affine/floor/modulo relation pieces;
-  do not add a recurrence, state, or schedule IR. Decline parameter-dependent
-  periods, unbounded state, nonrectangular partitions, or proof-budget
-  overflow.
+- [ ] Add one bounded exact-or-decline acyclic ranked-prefix proof to the
+  existing relation algebra. Process the finite root quotient in topological
+  order and encode the resulting scalar maps with existing affine/floor/modulo
+  relation pieces; do not add recurrence state or schedule IR. Any cyclic
+  quotient, nonrectangular partition, or proof-budget overflow declines to the
+  conservative schedule in this milestone.
 
   Implementation checkpoint (2026-09-10): the acyclic all-resident root
   quotient is complete. It includes every possibly nonempty root-level
@@ -2884,8 +2892,8 @@ ownership a production decision. They are derived views over the existing
   edges. Independent randomized review found no unsound accepts; the packed
   strength reduction is intentionally conservative and may decline a reverse
   readiness edge between roots that occupy disjoint workers in one wave. The
-  scalar acyclic prefix evaluator and cyclic affine recurrence proof are still
-  outstanding.
+  scalar acyclic prefix evaluator is still outstanding. Cyclic affine
+  recurrence support is explicitly deferred and is not an exit criterion.
 
 - [x] Let the existing extrema implementation consume a partial scalar-value
   relation when, and only when, its value support provably covers every target
@@ -2943,9 +2951,7 @@ ownership a production decision. They are derived views over the existing
   For an acyclic piece quotient, the pair may be encoded as the scalar
   `K*completion + handoffs`, with static `K = quotient_node_count + 1`, only
   after proving a path cannot revisit a charged node and therefore
-  `handoffs < K`. A cyclic translation proof keeps two scalar relations and
-  performs completion extrema before handoff extrema unless a larger symbolic
-  radix is itself proved to stay within the supported expression grammar.
+  `handoffs < K`.
 - [ ] Before this evaluator changes production ownership, run the Priority 2B
   concrete oracle on the real FlashMLA, Qwen, Gemma, and Muse graphs. Require
   the objective to reproduce the known positive and negative scheduling
@@ -3051,7 +3057,7 @@ relation pieces.
 - After backend compilation, verify actual cubin occupancy against the promised
   resident capacity before accepting the artifact into the executable cache or
   launching it. This gate validates the selected plan; it does not reschedule.
-- Permit concrete loops, compact recurrences, interval publishers, and fixed-
+- Permit concrete loops, runtime-bounded loops, interval publishers, and fixed-
   count uint32 barriers only as proved strength reductions of the final plan.
 - Lower every accepted `WorkerScheduleSegment.task_order` relation through the
   generic relation renderer. Root-major and event-frontier recognizers may
