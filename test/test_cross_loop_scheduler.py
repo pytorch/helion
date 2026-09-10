@@ -2805,6 +2805,10 @@ class TestCrossLoopScheduler(TestCase):
         )
         with _forbid_schedule_enumeration():
             self.assertTrue(_validate_worker_schedule_tasks(valid, (reference,)))
+            traversal = _root_schedule_traversal(valid.segments, reference)
+            self.assertIsNotNone(traversal)
+            assert traversal is not None
+            self.assertTrue(traversal.matches_reference)
         with (
             _forbid_schedule_enumeration(),
             self.assertRaisesRegex(

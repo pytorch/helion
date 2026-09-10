@@ -5940,8 +5940,11 @@ def _root_schedule_traversal(
         matches_reference=(
             root_to_scheduled is not None
             and reference_ordinal is not None
-            and root_to_scheduled.is_pointwise_equal_on_same_support(
-                reference_ordinal
+            and (
+                root_to_scheduled.is_pointwise_equal_to(reference_ordinal)
+                or root_to_scheduled.is_pointwise_equal_on_same_support(
+                    reference_ordinal
+                )
             )
         ),
     )
