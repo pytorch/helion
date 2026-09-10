@@ -4153,6 +4153,165 @@ class CoordinateRelation:
             pieces=tuple(pieces),
         )
 
+    def pointwise_add_scalar(
+        self,
+        other: CoordinateRelation | None = None,
+        *,
+        offset: IntegerExpression = 0,
+    ) -> CoordinateRelation | None:
+        """Add scalar point maps exactly on this relation's support.
+
+        ``self`` may be partial, while ``other`` (when present) must be a
+        total scalar function over the same source domain.  The result keeps
+        ``self``'s scalar target domain and exact source support.  This makes
+        the operation useful both before an aggregation, when ``self`` is
+        total, and after one, when empty fibers make ``self`` partial.
+
+        Source guards are intersected symbolically and no source extent is
+        enumerated.  A sum that cannot be represented as an in-domain scalar
+        point map, or whose source intersections exceed the common relation
+        budgets, declines.
+        """
+        offset_expression = _integer_expression(
+            offset,
+            description="pointwise scalar offset",
+        )
+        source_symbols = frozenset(
+            coordinate_axis_symbol(axis) for axis in self.source_domain.axis_order
+        )
+        if (
+            len(self.target_domain.axis_order) != 1
+            or len(self.pieces) > _MAX_RELATION_PIECES
+            or offset_expression.free_symbols & source_symbols
+            or not self.is_single_valued()
+        ):
+            return None
+        relations = (self,) if other is None else (self, other)
+        if other is not None and (
+            self.source_domain != other.source_domain
+            or len(other.target_domain.axis_order) != 1
+            or len(other.pieces) > _MAX_RELATION_PIECES
+            or not _relation_product_is_within_budget(
+                len(self.pieces),
+                len(other.pieces),
+            )
+            or not other.is_total_function()
+        ):
+            return None
+
+        # Parameters that occur only in the addend or offset must still be
+        # carried by the result's source/value domains.  Otherwise the
+        # resulting point would contain an unbound symbol and could not be
+        # proved to remain inside its finite scalar carrier.
+        result_parameters = frozenset(offset_expression.free_symbols).union(
+            *(relation.parameter_symbols for relation in relations)
+        )
+        result_domain_parameters = (
+            self.source_domain.parameter_symbols | self.target_domain.parameter_symbols
+        )
+        if not result_parameters <= result_domain_parameters:
+            return None
+
+        domain_bounds = tuple(
+            (
+                axis,
+                sympy.Integer(0),
+                _integer_expression(
+                    self.source_domain.axis_count_expressions[axis],
+                    description="coordinate-domain axis count",
+                ),
+                1,
+            )
+            for axis in self.source_domain.axis_order
+        )
+        right_pieces: tuple[_CoordinateRelationPiece | None, ...] = (
+            (None,) if other is None else other.pieces
+        )
+        value_axis = self.target_domain.axis_order[0]
+        pieces: dict[_CoordinateRelationPiece, None] = {}
+        for left_piece in self.pieces:
+            if len(left_piece.target_ranges) != 1:
+                return None
+            _left_axis, left_begin, left_end, left_step = left_piece.target_ranges[0]
+            if left_step != 1 or sympy.simplify(left_end - left_begin) != 1:  # pyrefly: ignore[unsupported-operation]
+                return None
+            for right_piece in right_pieces:
+                source_bounds = left_piece.source_bounds_items
+                right_begin = sympy.Integer(0)
+                if right_piece is not None:
+                    source_intersection = _intersect_source_boxes(
+                        source_bounds,
+                        right_piece.source_bounds_items,
+                    )
+                    if source_intersection is None:
+                        return None
+                    if source_intersection is False:
+                        continue
+                    source_bounds = source_intersection
+                    if len(right_piece.target_ranges) != 1:
+                        return None
+                    (
+                        _right_axis,
+                        right_begin,
+                        right_end,
+                        right_step,
+                    ) = right_piece.target_ranges[0]
+                    if right_step != 1 or sympy.simplify(  # pyrefly: ignore[unsupported-operation]
+                        right_end - right_begin
+                    ) != 1:
+                        return None
+                domain_intersection = _intersect_source_boxes(
+                    source_bounds,
+                    domain_bounds,
+                )
+                if domain_intersection is None:
+                    return None
+                if domain_intersection is False:
+                    continue
+                source_bounds = domain_intersection
+                left_range = ((value_axis, left_begin, left_end, left_step),)
+                if not _target_point_is_in_domain(
+                    left_range,
+                    source_domain=self.source_domain,
+                    source_bounds=source_bounds,
+                    target_domain=self.target_domain,
+                ):
+                    return None
+                if right_piece is not None and not _target_point_is_in_domain(
+                    right_piece.target_ranges,
+                    source_domain=self.source_domain,
+                    source_bounds=source_bounds,
+                    target_domain=other.target_domain,
+                ):
+                    return None
+                value = _simplify_logical_expression(
+                    sympy.simplify(left_begin + right_begin + offset_expression),  # pyrefly: ignore[unsupported-operation]
+                    domain=self.source_domain,
+                    source_bounds=source_bounds,
+                )
+                target_ranges = ((value_axis, value, value + 1, 1),)  # pyrefly: ignore[unsupported-operation]
+                if not _target_point_is_in_domain(
+                    target_ranges,
+                    source_domain=self.source_domain,
+                    source_bounds=source_bounds,
+                    target_domain=self.target_domain,
+                ):
+                    return None
+                pieces.setdefault(
+                    _CoordinateRelationPiece(
+                        source_bounds_items=source_bounds,
+                        target_ranges=target_ranges,
+                    ),
+                    None,
+                )
+                if len(pieces) > _MAX_RELATION_PIECES:
+                    return None
+        return CoordinateRelation(
+            source_domain=self.source_domain,
+            target_domain=self.target_domain,
+            pieces=tuple(pieces),
+        )
+
     def max_target_value_by_source(
         self,
         values: CoordinateRelation,
@@ -4197,6 +4356,51 @@ class CoordinateRelation:
         if result is None or result[1] is None:
             return None
         return result[0], result[1]
+
+    def weighted_max_target_value_and_attainers_by_source(
+        self,
+        values: CoordinateRelation,
+        *,
+        target_potential: CoordinateRelation | None = None,
+        source_potential: CoordinateRelation | None = None,
+        offset: IntegerExpression = 0,
+    ) -> tuple[CoordinateRelation, CoordinateRelation] | None:
+        """Pull back an exact weighted maximum and every original attainer.
+
+        For every nonempty source fiber this computes
+
+        ``max_t(values(t) + target_potential(t) + offset + source_potential(s))``
+
+        and returns that scalar map together with the relation from ``s`` to
+        every original ``t`` attaining it.  Potentials are optional total
+        scalar maps.  Pointwise scalar addition performs the only new
+        combination; candidate collection, winner partitioning, clipping,
+        and tie preservation remain in the shared extrema implementation.
+        """
+        offset_expression = _integer_expression(
+            offset,
+            description="weighted maximum offset",
+        )
+        weighted_values = values
+        if target_potential is not None or offset_expression.is_zero is not True:
+            weighted_values = values.pointwise_add_scalar(
+                target_potential,
+                offset=offset_expression,
+            )
+            if weighted_values is None:
+                return None
+        result = self.extreme_target_value_and_attainers_by_source(
+            weighted_values,
+            maximize=True,
+        )
+        if result is None:
+            return None
+        maximum, attainers = result
+        if source_potential is not None:
+            maximum = maximum.pointwise_add_scalar(source_potential)
+            if maximum is None:
+                return None
+        return maximum, attainers
 
     def _target_value_extreme_by_source(
         self,
@@ -6385,6 +6589,57 @@ def _source_boxes_partition_domain(
             return False
         active.append(box)
     return True
+
+
+def _intersect_source_boxes(
+    left: tuple[tuple[int, IntegerExpression, IntegerExpression, int], ...],
+    right: tuple[tuple[int, IntegerExpression, IntegerExpression, int], ...],
+) -> tuple[tuple[int, IntegerExpression, IntegerExpression, int], ...] | bool | None:
+    """Return an exact source-box intersection without enumerating it.
+
+    ``False`` denotes a proved-empty intersection and ``None`` an unsupported
+    lattice intersection.  Dense symbolic endpoints remain symbolic so a
+    later parameter substitution sees the exact guard.
+    """
+    if len(left) != len(right):
+        return None
+    result: list[tuple[int, IntegerExpression, IntegerExpression, int]] = []
+    for left_bound, right_bound in zip(left, right, strict=True):
+        left_axis, left_begin, left_end, left_step = left_bound
+        right_axis, right_begin, right_end, right_step = right_bound
+        if left_axis != right_axis:
+            return None
+        if _is_provably_nonnegative(
+            sympy.simplify(right_begin - left_end),  # pyrefly: ignore[unsupported-operation]
+            None,
+        ) or _is_provably_nonnegative(
+            sympy.simplify(left_begin - right_end),  # pyrefly: ignore[unsupported-operation]
+            None,
+        ):
+            return False
+        lower = sympy.Max(left_begin, right_begin)
+        if left_step == right_step and _integer_partition_expressions_equal(
+            sympy.Mod(left_begin - right_begin, left_step),  # pyrefly: ignore[unsupported-operation]
+            0,
+        ):
+            begin = lower
+            step = left_step
+        elif left_step == 1 or right_step == 1:
+            strided_begin, step = (
+                (right_begin, right_step) if left_step == 1 else (left_begin, left_step)
+            )
+            begin = _normalize_integer_rounding(
+                strided_begin + step * sympy.ceiling(  # pyrefly: ignore[unsupported-operation]
+                    (lower - strided_begin) / step
+                )
+            )
+        else:
+            return None
+        end = sympy.Min(left_end, right_end)
+        if sympy.simplify(end - begin).is_nonpositive is True:  # pyrefly: ignore[unsupported-operation]
+            return False
+        result.append((left_axis, begin, end, step))
+    return tuple(result)
 
 
 def _source_box_covers(

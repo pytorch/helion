@@ -4453,6 +4453,499 @@ class TestTileDependency(TestCase):
                 )
             )
 
+    def test_weighted_max_pullback_matches_exhaustive_small_oracle(self) -> None:
+        source_axis = 10
+        target_axis = 20
+        source = CoordinateDomain(
+            (source_axis,),
+            ((source_axis, 2),),
+            kind="event",
+        )
+        target = CoordinateDomain(
+            (target_axis,),
+            ((target_axis, 2),),
+            kind="site",
+        )
+        values = CoordinateDomain((30,), ((30, 32),), kind="value")
+        potentials = CoordinateDomain((31,), ((31, 4),), kind="value")
+
+        def scalar_map(
+            domain: CoordinateDomain,
+            value_domain: CoordinateDomain,
+            scalars: tuple[int, ...],
+        ) -> CoordinateRelation:
+            (axis,) = domain.axis_order
+            return CoordinateRelation.point_map(
+                domain,
+                value_domain,
+                tuple(
+                    (((axis, coordinate, coordinate + 1, 1),), (scalar,))
+                    for coordinate, scalar in enumerate(scalars)
+                ),
+            )
+
+        checked = 0
+        for relation_bits in range(1 << (source.size * target.size)):
+            required = CoordinateRelation(
+                source,
+                target,
+                tuple(
+                    _CoordinateRelationPiece(
+                        ((source_axis, source_index, source_index + 1, 1),),
+                        ((target_axis, target_index, target_index + 1, 1),),
+                    )
+                    for source_index in range(source.size)
+                    for target_index in range(target.size)
+                    if relation_bits
+                    & (1 << (source_index * target.size + target_index))
+                ),
+            )
+            for value_scalars in itertools.product(range(3), repeat=target.size):
+                value_by_target = scalar_map(target, values, value_scalars)
+                for target_scalars in itertools.product(range(2), repeat=target.size):
+                    target_potential = scalar_map(
+                        target,
+                        potentials,
+                        target_scalars,
+                    )
+                    for source_scalars in itertools.product(
+                        range(2), repeat=source.size
+                    ):
+                        source_potential = scalar_map(
+                            source,
+                            potentials,
+                            source_scalars,
+                        )
+                        for offset in (0, 1):
+                            result = required.weighted_max_target_value_and_attainers_by_source(
+                                value_by_target,
+                                target_potential=target_potential,
+                                source_potential=source_potential,
+                                offset=offset,
+                            )
+                            self.assertIsNotNone(
+                                result,
+                                (
+                                    relation_bits,
+                                    value_scalars,
+                                    target_scalars,
+                                    source_scalars,
+                                    offset,
+                                ),
+                            )
+                            assert result is not None
+                            maximum, attainers = result
+                            for source_index in range(source.size):
+                                related_targets = tuple(
+                                    target_index
+                                    for target_index in range(target.size)
+                                    if relation_bits
+                                    & (1 << (source_index * target.size + target_index))
+                                )
+                                weighted = {
+                                    target_index: (
+                                        value_scalars[target_index]
+                                        + target_scalars[target_index]
+                                        + offset
+                                        + source_scalars[source_index]
+                                    )
+                                    for target_index in related_targets
+                                }
+                                expected_value = (
+                                    frozenset((max(weighted.values()),))
+                                    if weighted
+                                    else frozenset()
+                                )
+                                expected_attainers = frozenset(
+                                    target_index
+                                    for target_index, value in weighted.items()
+                                    if value in expected_value
+                                )
+                                self.assertEqual(
+                                    maximum.targets(source_index),
+                                    expected_value,
+                                )
+                                self.assertEqual(
+                                    attainers.targets(source_index),
+                                    expected_attainers,
+                                )
+                            checked += 1
+        self.assertEqual(checked, 4_608)
+
+    def test_weighted_max_pullback_preserves_clipping_ties_and_empty_fibers(
+        self,
+    ) -> None:
+        source_axis = 10
+        target_axis = 20
+        source = CoordinateDomain(
+            (source_axis,),
+            ((source_axis, 2),),
+            kind="event",
+        )
+        target = CoordinateDomain(
+            (target_axis,),
+            ((target_axis, 5),),
+            kind="site",
+        )
+        values = CoordinateDomain((30,), ((30, 32),), kind="value")
+        target_potentials = CoordinateDomain((31,), ((31, 5),), kind="value")
+        source_potentials = CoordinateDomain((32,), ((32, 3),), kind="value")
+        target_coordinate = coordinate_axis_symbol(target_axis)
+        source_coordinate = coordinate_axis_symbol(source_axis)
+        required = CoordinateRelation(
+            source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    ((source_axis, 0, 1, 1),),
+                    ((target_axis, -3, 9, 2),),
+                ),
+                _CoordinateRelationPiece(
+                    ((source_axis, 1, 2, 1),),
+                    ((target_axis, 7, 11, 1),),
+                ),
+            ),
+        )
+        value_by_target = CoordinateRelation.point_map(
+            target,
+            values,
+            (
+                (
+                    ((target_axis, 0, 5, 1),),
+                    (target_coordinate,),
+                ),
+            ),
+        )
+        target_potential = CoordinateRelation.point_map(
+            target,
+            target_potentials,
+            (
+                (
+                    ((target_axis, 0, 5, 1),),
+                    (4 - target_coordinate,),
+                ),
+            ),
+        )
+        source_potential = CoordinateRelation.point_map(
+            source,
+            source_potentials,
+            (
+                (
+                    ((source_axis, 0, 2, 1),),
+                    (source_coordinate + 1,),
+                ),
+            ),
+        )
+
+        result = required.weighted_max_target_value_and_attainers_by_source(
+            value_by_target,
+            target_potential=target_potential,
+            source_potential=source_potential,
+            offset=2,
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        maximum, attainers = result
+        self.assertEqual(maximum.materialize(), (frozenset((7,)), frozenset()))
+        self.assertEqual(
+            attainers.materialize(),
+            (frozenset((0, 2, 4)), frozenset()),
+        )
+
+    def test_pointwise_scalar_add_handles_strided_partial_symbolic_support(
+        self,
+    ) -> None:
+        extent = sympy.Symbol("extent", integer=True, nonnegative=True)
+        source_axis = 10
+        source = CoordinateDomain(
+            (source_axis,),
+            ((source_axis, extent),),
+            kind="event",
+            _allow_empty=True,
+        )
+        values = CoordinateDomain(
+            (30,),
+            ((30, extent + 10),),  # pyrefly: ignore[unsupported-operation]
+            kind="value",
+        )
+        potentials = CoordinateDomain((31,), ((31, 2),), kind="value")
+        source_coordinate = coordinate_axis_symbol(source_axis)
+        partial = CoordinateRelation.point_map(
+            source,
+            values,
+            (
+                (
+                    ((source_axis, -2, extent - 1, 2),),  # pyrefly: ignore[unsupported-operation]
+                    (source_coordinate + 2,),
+                ),
+            ),
+        )
+        total = CoordinateRelation.point_map(
+            source,
+            potentials,
+            (
+                (
+                    ((source_axis, 0, extent, 1),),
+                    (sympy.Integer(1),),
+                ),
+            ),
+        )
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("pointwise addition must not enumerate"),
+        ):
+            combined = partial.pointwise_add_scalar(total, offset=2)
+
+        self.assertIsNotNone(combined)
+        assert combined is not None
+        for concrete_extent in range(6):
+            concrete = combined.substitute_parameters({extent: concrete_extent})
+            self.assertEqual(
+                concrete.materialize(),
+                tuple(
+                    frozenset((coordinate + 5,))
+                    if coordinate % 2 == 0 and coordinate < concrete_extent - 1
+                    else frozenset()
+                    for coordinate in range(concrete_extent)
+                ),
+            )
+
+    def test_weighted_max_pullback_partitions_symbolically_and_substitutes(
+        self,
+    ) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        scale = sympy.Symbol("scale", integer=True, positive=True)
+        bias = sympy.Symbol("bias", integer=True, nonnegative=True)
+        source_axis = 10
+        outer_axis = 11
+        target_axis = 20
+        source = CoordinateDomain(
+            (source_axis, outer_axis),
+            ((source_axis, 4), (outer_axis, batch)),
+            kind="event",
+            _allow_empty=True,
+        )
+        target = CoordinateDomain(
+            (target_axis,),
+            ((target_axis, 4),),
+            kind="site",
+        )
+        values = CoordinateDomain(
+            (30,),
+            ((30, 3 * scale + bias + batch + 10),),  # pyrefly: ignore[unsupported-operation]
+            kind="value",
+        )
+        target_potentials = CoordinateDomain(
+            (31,),
+            ((31, 3 * scale + 1),),  # pyrefly: ignore[unsupported-operation]
+            kind="value",
+        )
+        source_potentials = CoordinateDomain(
+            (32,),
+            ((32, batch + 4),),  # pyrefly: ignore[unsupported-operation]
+            kind="value",
+        )
+        source_coordinate = coordinate_axis_symbol(source_axis)
+        outer_coordinate = coordinate_axis_symbol(outer_axis)
+        target_coordinate = coordinate_axis_symbol(target_axis)
+        source_bounds = (
+            (source_axis, 0, 4, 1),
+            (outer_axis, 0, batch, 1),
+        )
+        required = CoordinateRelation(
+            source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    source_bounds,
+                    (
+                        (
+                            target_axis,
+                            source_coordinate,
+                            source_coordinate + 1,
+                            1,
+                        ),
+                    ),
+                ),
+                _CoordinateRelationPiece(
+                    source_bounds,
+                    (
+                        (
+                            target_axis,
+                            3 - source_coordinate,
+                            4 - source_coordinate,
+                            1,
+                        ),
+                    ),
+                ),
+            ),
+        )
+        value_by_target = CoordinateRelation.point_map(
+            target,
+            values,
+            ((((target_axis, 0, 4, 1),), (target_coordinate,)),),
+        )
+        target_potential = CoordinateRelation.point_map(
+            target,
+            target_potentials,
+            (
+                (
+                    ((target_axis, 0, 4, 1),),
+                    (scale * target_coordinate,),
+                ),
+            ),
+        )
+        source_potential = CoordinateRelation.point_map(
+            source,
+            source_potentials,
+            (
+                (
+                    source_bounds,
+                    (source_coordinate + outer_coordinate,),
+                ),
+            ),
+        )
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("symbolic pullback must not enumerate"),
+        ):
+            result = required.weighted_max_target_value_and_attainers_by_source(
+                value_by_target,
+                target_potential=target_potential,
+                source_potential=source_potential,
+                offset=bias,
+            )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        maximum, attainers = result
+        for concrete_batch, concrete_scale, concrete_bias in itertools.product(
+            range(4),
+            (1, 3),
+            (0, 2),
+        ):
+            substitutions = {
+                batch: concrete_batch,
+                scale: concrete_scale,
+                bias: concrete_bias,
+            }
+            concrete_maximum = maximum.substitute_parameters(substitutions)
+            concrete_attainers = attainers.substitute_parameters(substitutions)
+            expected_values: list[frozenset[int]] = []
+            expected_attainers: list[frozenset[int]] = []
+            for outer in range(concrete_batch):
+                for source_index in range(4):
+                    winner = max(source_index, 3 - source_index)
+                    expected_values.append(
+                        frozenset(
+                            (
+                                (concrete_scale + 1) * winner
+                                + concrete_bias
+                                + source_index
+                                + outer,
+                            )
+                        )
+                    )
+                    expected_attainers.append(frozenset((winner,)))
+            self.assertEqual(concrete_maximum.materialize(), tuple(expected_values))
+            self.assertEqual(
+                concrete_attainers.materialize(),
+                tuple(expected_attainers),
+            )
+
+    def test_weighted_max_pullback_declines_unsupported_combinations(self) -> None:
+        source = CoordinateDomain((), (), kind="event")
+        target_axis = 20
+        target = CoordinateDomain(
+            (target_axis,),
+            ((target_axis, 2),),
+            kind="site",
+        )
+        small_values = CoordinateDomain((30,), ((30, 5),), kind="value")
+        potentials = CoordinateDomain((31,), ((31, 5),), kind="value")
+        target_coordinate = coordinate_axis_symbol(target_axis)
+        required = CoordinateRelation.total(source, target)
+        value_by_target = CoordinateRelation.point_map(
+            target,
+            small_values,
+            ((((target_axis, 0, 2, 1),), (target_coordinate + 3,)),),
+        )
+        oversized_sum = CoordinateRelation.point_map(
+            target,
+            potentials,
+            ((((target_axis, 0, 2, 1),), (sympy.Integer(2),)),),
+        )
+
+        # Scalar arithmetic retains the left carrier.  It must decline when
+        # that finite carrier cannot represent the mathematical sum.
+        self.assertIsNone(value_by_target.pointwise_add_scalar(oversized_sum))
+        self.assertIsNone(
+            required.weighted_max_target_value_and_attainers_by_source(
+                value_by_target,
+                target_potential=oversized_sum,
+            )
+        )
+
+        parameter = sympy.Symbol("parameter", integer=True, positive=True)
+        symbolic_values = CoordinateDomain(
+            (30,),
+            ((30, parameter + 10),),  # pyrefly: ignore[unsupported-operation]
+            kind="value",
+        )
+        symbolic_potentials = CoordinateDomain(
+            (31,),
+            ((31, parameter + 1),),  # pyrefly: ignore[unsupported-operation]
+            kind="value",
+        )
+        crossing_values = CoordinateRelation.point_map(
+            target,
+            symbolic_values,
+            (
+                (((target_axis, 0, 1, 1),), (sympy.Integer(0),)),
+                (((target_axis, 1, 2, 1),), (sympy.Integer(4),)),
+            ),
+        )
+        crossing_potential = CoordinateRelation.point_map(
+            target,
+            symbolic_potentials,
+            (
+                (((target_axis, 0, 1, 1),), (parameter,)),
+                (((target_axis, 1, 2, 1),), (sympy.Integer(0),)),
+            ),
+        )
+        self.assertIsNone(
+            required.weighted_max_target_value_and_attainers_by_source(
+                crossing_values,
+                target_potential=crossing_potential,
+            )
+        )
+
+        with mock.patch(
+            "helion._compiler.tile_dependency._MAX_RELATION_PRODUCT_STATES",
+            3,
+        ):
+            self.assertIsNone(
+                required.weighted_max_target_value_and_attainers_by_source(
+                    crossing_values,
+                    target_potential=crossing_potential,
+                )
+            )
+        with mock.patch(
+            "helion._compiler.tile_dependency._MAX_RELATION_PIECES",
+            1,
+        ):
+            self.assertIsNone(
+                required.weighted_max_target_value_and_attainers_by_source(
+                    crossing_values,
+                    target_potential=crossing_potential,
+                )
+            )
+
     def test_symbolic_max_target_value_respects_stride_alignment(self) -> None:
         consumer_axis = 57
         producer_axis = 29
