@@ -2561,6 +2561,8 @@ class RootBarrierPublicationPlan:
             self.effective_arrival_count,
         ):
             raise ValueError("participant order does not cover effective arrivals")
+        if not self.participant_order.is_bijection_from_source_support():
+            raise ValueError("participant order is not an exact support bijection")
 
     @property
     def parameter_symbols(self) -> frozenset[sympy.Symbol]:
@@ -2663,8 +2665,9 @@ def _root_major_participant_order(
         kind="value",
     )
     worker = coordinate_axis_symbol(worker_axis)
+    first_worker = sympy.Mod(first_slot, worker_count)
     local_ordinal = sympy.Mod(
-        worker + worker_count - sympy.Mod(first_slot, worker_count),  # pyrefly: ignore[unsupported-operation]
+        worker + worker_count - first_worker,  # pyrefly: ignore[unsupported-operation]
         worker_count,
     )
     participant_order = CoordinateRelation.point_map(
@@ -2679,6 +2682,30 @@ def _root_major_participant_order(
     )
     if not participant_order.is_single_valued():
         raise AssertionError("root-major participant order is not single-valued")
+    participant = coordinate_axis_symbol(participant_axis)
+    workers_by_participant = CoordinateRelation.point_map(
+        participant_domain,
+        worker_domain,
+        (
+            (
+                (
+                    (
+                        participant_axis,
+                        0,
+                        effective_arrival_count,
+                        1,
+                    ),
+                ),
+                (sympy.Mod(participant + first_worker, worker_count),),
+            ),
+        ),
+    )
+    if not workers_by_participant.is_total_function():
+        raise AssertionError("root-major participant converse is not total")
+    tile_dependency._remember_exact_converse(
+        participant_order,
+        workers_by_participant,
+    )
     return participant_order, real_arrival_count, effective_arrival_count
 
 

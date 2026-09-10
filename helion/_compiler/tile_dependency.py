@@ -695,11 +695,23 @@ class CoordinateRelation:
             )
             for piece in self.pieces
         )
-        return CoordinateRelation(
+        result = CoordinateRelation(
             source_domain=self.source_domain.substitute_parameters(substitutions),
             target_domain=self.target_domain.substitute_parameters(substitutions),
             pieces=pieces,
         )
+        converse = _memoized_exact_converse(self)
+        if converse is not None:
+            unmemoized_converse = CoordinateRelation(
+                source_domain=converse.source_domain,
+                target_domain=converse.target_domain,
+                pieces=converse.pieces,
+            )
+            _remember_exact_converse(
+                result,
+                unmemoized_converse.substitute_parameters(substitutions),
+            )
+        return result
 
     @classmethod
     def identity(
@@ -2802,6 +2814,31 @@ class CoordinateRelation:
                     if isinstance(cardinality, sympy.Integer)
                     else cardinality
                 )
+        converse = _memoized_exact_converse(self)
+        if (
+            converse is not None
+            and self.is_single_valued()
+            and converse.is_single_valued()
+            and _source_boxes_partition_domain(
+                tuple(piece.source_bounds_items for piece in converse.pieces),
+                converse.source_domain,
+            )
+            and all(
+                _target_point_is_in_domain(
+                    piece.target_ranges,
+                    source_domain=converse.source_domain,
+                    source_bounds=piece.source_bounds_items,
+                    target_domain=converse.target_domain,
+                )
+                for piece in converse.pieces
+            )
+        ):
+            target_size = sympy.simplify(self.target_domain.size_expr)
+            return (
+                int(target_size)
+                if isinstance(target_size, sympy.Integer)
+                else target_size
+            )
         if self._factored_source_support_converse is not None:
             target_size = sympy.simplify(self.target_domain.size_expr)
             return (
