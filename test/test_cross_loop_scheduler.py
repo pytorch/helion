@@ -4496,6 +4496,51 @@ class TestCrossLoopScheduler(TestCase):
             )
         )
 
+    def test_pipeline_derives_continuation_candidates_once(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+
+        for task_count in (4, batch):
+            dependency_graph = _dependency_graph(
+                [[10], [20]],
+                _access(
+                    root=0,
+                    kind="store",
+                    shape=(32 * task_count,),
+                    block_ids=(10,),
+                ),
+                _access(
+                    root=1,
+                    kind="load",
+                    shape=(32 * task_count,),
+                    block_ids=(20,),
+                ),
+            )
+            with (
+                self.subTest(task_count=task_count),
+                mock.patch.object(
+                    cross_loop_scheduler,
+                    "derive_final_arrival_continuations",
+                    wraps=derive_final_arrival_continuations,
+                ) as derive_candidates,
+            ):
+                plan = _configured_static_pipeline_plan(
+                    dependency_graph=dependency_graph,
+                    root_domains=(
+                        _domain((10, 2 * task_count, 16)),
+                        _domain((20, task_count, 32)),
+                    ),
+                    axis_geometry={
+                        10: (2 * task_count, 16),
+                        20: (task_count, 32),
+                    },
+                    worker_count=4,
+                )
+
+            self.assertEqual(derive_candidates.call_count, 1)
+            (counter,) = plan.readiness_counters
+            self.assertEqual(counter.continuation_consumer_index, 0)
+            self.assertEqual(counter.uniform_arrival_count(), 2)
+
     def test_parametric_counter_declines_unsupported_access_scale(self) -> None:
         task_count = sympy.Symbol("task_count", integer=True, nonnegative=True)
         dependency_graph = _dependency_graph(
@@ -5755,7 +5800,7 @@ class TestCrossLoopScheduler(TestCase):
             configured.root_task_orders,
             worker_count=4,
         )
-        continuations = derive_final_arrival_continuations(configured, baseline)
+        continuations = derive_final_arrival_continuations(configured)
         self.assertEqual(
             tuple(
                 configured.event(continuation.event_id)
@@ -5833,13 +5878,7 @@ class TestCrossLoopScheduler(TestCase):
                 ),
             ),
         )
-        baseline = _build_baseline_worker_schedule(
-            domains,
-            readiness_graph.root_task_orders,
-            worker_count=4,
-        )
-
-        continuations = derive_final_arrival_continuations(readiness_graph, baseline)
+        continuations = derive_final_arrival_continuations(readiness_graph)
 
         self.assertEqual(
             tuple(
@@ -5867,7 +5906,7 @@ class TestCrossLoopScheduler(TestCase):
                 ),
             ),
         )
-        self.assertEqual(derive_final_arrival_continuations(overlapping, baseline), ())
+        self.assertEqual(derive_final_arrival_continuations(overlapping), ())
 
     def test_final_arrival_continuation_requires_counter_lowerability(
         self,
@@ -5916,18 +5955,12 @@ class TestCrossLoopScheduler(TestCase):
                 ),
             ),
         )
-        baseline = _build_baseline_worker_schedule(
-            readiness_graph.root_domains,
-            readiness_graph.root_task_orders,
-            worker_count=4,
-        )
-
         publication = readiness_producer.keys_by_producer
         self.assertIsNotNone(publication)
         assert publication is not None
         self.assertIsNone(publication.canonical_single_valued())
         self.assertEqual(
-            derive_final_arrival_continuations(readiness_graph, baseline), ()
+            derive_final_arrival_continuations(readiness_graph), ()
         )
         self.assertEqual(choose_readiness_counters(readiness_graph, ()), ())
 
@@ -5988,15 +6021,10 @@ class TestCrossLoopScheduler(TestCase):
             )
 
         incomplete = graph(frozenset((root_obligation,)))
-        baseline = _build_baseline_worker_schedule(
-            incomplete.root_domains,
-            incomplete.root_task_orders,
-            worker_count=4,
-        )
-        self.assertEqual(derive_final_arrival_continuations(incomplete, baseline), ())
+        self.assertEqual(derive_final_arrival_continuations(incomplete), ())
 
         complete = graph(frozenset((root_obligation, nested_obligation)))
-        continuations = derive_final_arrival_continuations(complete, baseline)
+        continuations = derive_final_arrival_continuations(complete)
         self.assertEqual(
             continuations,
             (FinalArrivalContinuation(event_id=0, consumer_index=0),),
@@ -6107,13 +6135,8 @@ class TestCrossLoopScheduler(TestCase):
             ),
             (16, 16, 16),
         )
-        baseline = _build_baseline_worker_schedule(
-            complete.root_domains,
-            complete.root_task_orders,
-            worker_count=8,
-        )
         self.assertEqual(
-            len(derive_final_arrival_continuations(complete, baseline)),
+            len(derive_final_arrival_continuations(complete)),
             1,
         )
 
@@ -6183,7 +6206,11 @@ class TestCrossLoopScheduler(TestCase):
             worker_count=4,
         )
 
-        continuations = choose_final_arrival_continuations(readiness_graph, baseline)
+        continuations = choose_final_arrival_continuations(
+            readiness_graph,
+            derive_final_arrival_continuations(readiness_graph),
+            baseline,
+        )
 
         self.assertGreater(root_domains[1].size, baseline.worker_count)
         self.assertEqual(readiness_graph.events[1].root_barrier_producer_root, 1)
@@ -6227,14 +6254,7 @@ class TestCrossLoopScheduler(TestCase):
             },
             {1, 2},
         )
-        continuations = derive_final_arrival_continuations(
-            configured,
-            _build_baseline_worker_schedule(
-                configured.root_domains,
-                configured.root_task_orders,
-                worker_count=4,
-            ),
-        )
+        continuations = derive_final_arrival_continuations(configured)
         self.assertEqual(
             {
                 configured.event(continuation.event_id)
@@ -6289,12 +6309,7 @@ class TestCrossLoopScheduler(TestCase):
             ),
             (4,),
         )
-        baseline = _build_baseline_worker_schedule(
-            configured.root_domains,
-            configured.root_task_orders,
-            worker_count=4,
-        )
-        self.assertEqual(derive_final_arrival_continuations(configured, baseline), ())
+        self.assertEqual(derive_final_arrival_continuations(configured), ())
 
     def test_dependency_coverage_distinguishes_producer_callsites(self) -> None:
         graph = _dependency_graph(
@@ -6377,13 +6392,8 @@ class TestCrossLoopScheduler(TestCase):
             ),
             events=events,
         )
-        baseline = _build_baseline_worker_schedule(
-            root_domains,
-            readiness_graph.root_task_orders,
-            worker_count=4,
-        )
         self.assertEqual(
-            derive_final_arrival_continuations(readiness_graph, baseline), ()
+            derive_final_arrival_continuations(readiness_graph), ()
         )
         readiness_counters = choose_readiness_counters(readiness_graph, ())
         covered_obligations = frozenset(
@@ -6532,7 +6542,7 @@ class TestCrossLoopScheduler(TestCase):
             readiness_graph.root_domains,
             worker_count=2,
         )
-        continuations = derive_final_arrival_continuations(readiness_graph, baseline)
+        continuations = derive_final_arrival_continuations(readiness_graph)
 
         schedule = order_continuation_producers_by_readiness_key(
             readiness_graph,
@@ -6706,11 +6716,7 @@ class TestCrossLoopScheduler(TestCase):
                 ),
             ),
         )
-        baseline = _baseline_worker_schedule(
-            root_domains,
-            worker_count=4,
-        )
-        continuations = derive_final_arrival_continuations(readiness_graph, baseline)
+        continuations = derive_final_arrival_continuations(readiness_graph)
 
         (lowered,) = choose_readiness_counters(readiness_graph, continuations)
 

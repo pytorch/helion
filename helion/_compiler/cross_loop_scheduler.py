@@ -3303,6 +3303,7 @@ def place_ready_families(
 
 def build_worker_schedule(
     readiness_graph: ReadinessGraph,
+    continuation_candidates: tuple[FinalArrivalContinuation, ...],
     *,
     worker_count: int,
 ) -> tuple[
@@ -3324,6 +3325,7 @@ def build_worker_schedule(
     )
     continuations = choose_final_arrival_continuations(
         readiness_graph,
+        continuation_candidates,
         baseline,
         excluded_roots=nested_wait_roots,
     )
@@ -3331,11 +3333,6 @@ def build_worker_schedule(
         readiness_graph,
         baseline,
         continuations,
-    )
-    continuations = choose_final_arrival_continuations(
-        readiness_graph,
-        ordered,
-        excluded_roots=nested_wait_roots,
     )
     continuation_roots = frozenset(
         readiness_consumer.consumer_root
@@ -4642,6 +4639,7 @@ class StaticPipelinePlan:
 
 def choose_final_arrival_continuations(
     readiness_graph: ReadinessGraph,
+    candidates: tuple[FinalArrivalContinuation, ...],
     worker_schedule: WorkerSchedule,
     *,
     excluded_roots: frozenset[int] = frozenset(),
@@ -4653,10 +4651,24 @@ def choose_final_arrival_continuations(
     task, or many tasks at runtime; final-arrival ownership is exact in every
     case and must not be selected from one sampled extent.
     """
+    has_possible_worker_by_root = {
+        root: bool(worker_schedule.segments_for_root(root))
+        for root in range(len(readiness_graph.root_domains))
+    }
+    reachable_candidates: list[FinalArrivalContinuation] = []
+    for continuation in candidates:
+        event = readiness_graph.event(continuation.event_id)
+        readiness_consumer = event.consumers[continuation.consumer_index]
+        if not any(
+            has_possible_worker_by_root[readiness_producer.producer_root]
+            for readiness_producer in event.producers
+        ):
+            continue
+        has_possible_worker_by_root[readiness_consumer.consumer_root] = True
+        reachable_candidates.append(continuation)
+
     result: list[FinalArrivalContinuation] = []
-    for continuation in derive_final_arrival_continuations(
-        readiness_graph, worker_schedule
-    ):
+    for continuation in reachable_candidates:
         readiness_consumer = readiness_graph.event(continuation.event_id).consumers[
             continuation.consumer_index
         ]
@@ -5272,9 +5284,8 @@ def build_readiness_graph(
 
 def derive_final_arrival_continuations(
     readiness_graph: ReadinessGraph,
-    worker_schedule: WorkerSchedule,
 ) -> tuple[FinalArrivalContinuation, ...]:
-    """Select complete one-task-per-readiness-key continuations."""
+    """Derive complete one-task-per-readiness-key continuation candidates."""
     required_obligations_by_root: dict[int, set[DependencyObligation]] = {}
     for event in readiness_graph.events:
         for readiness_consumer in event.consumers:
@@ -5287,8 +5298,6 @@ def derive_final_arrival_continuations(
             int,
             int,
             int,
-            ReadinessEvent,
-            ReadinessConsumer,
             tuple[tuple[int, CoordinateRelation], ...],
         ]
     ] = []
@@ -5341,8 +5350,6 @@ def derive_final_arrival_continuations(
                 readiness_consumer.consumer_root,
                 event.event_id,
                 consumer_index,
-                event,
-                readiness_consumer,
                 producer_relations,
             )
         )
@@ -5377,29 +5384,15 @@ def derive_final_arrival_continuations(
                     )
                 )
 
-    has_possible_worker_by_root = {
-        root: bool(worker_schedule.segments_for_root(root))
-        for root in range(len(readiness_graph.root_domains))
-    }
-
     result: list[FinalArrivalContinuation] = []
     for (
         _consumer_root,
         event_id,
         consumer_index,
-        event,
-        readiness_consumer,
         _producer_relations,
     ) in sorted(candidates, key=operator.itemgetter(slice(3))):
         if (event_id, consumer_index) in conflicting_candidates:
             continue
-        has_possible_worker = any(
-            has_possible_worker_by_root[readiness_producer.producer_root]
-            for readiness_producer in event.producers
-        )
-        if not has_possible_worker:
-            continue
-        has_possible_worker_by_root[readiness_consumer.consumer_root] = True
         result.append(
             FinalArrivalContinuation(
                 event_id=event_id,
@@ -8136,6 +8129,7 @@ def build_static_pipeline_plan(
         publishable_site_ids=publishable_site_ids,
         prove_nonnegative=prove_nonnegative,
     )
+    continuation_candidates = derive_final_arrival_continuations(readiness_graph)
     if any(domain.parameter_symbols for domain in root_domains):
         try:
             worker_schedule = _build_root_major_worker_schedule(
@@ -8150,6 +8144,7 @@ def build_static_pipeline_plan(
             ) from error
         continuation_candidates = choose_final_arrival_continuations(
             readiness_graph,
+            continuation_candidates,
             worker_schedule,
         )
         sink_roots = frozenset(range(len(root_domains))) - frozenset(
@@ -8235,6 +8230,7 @@ def build_static_pipeline_plan(
             nested_loop_counters,
         ) = build_worker_schedule(
             readiness_graph,
+            continuation_candidates,
             worker_count=worker_count,
         )
     except ValueError as error:
