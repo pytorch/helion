@@ -6436,6 +6436,180 @@ class TestCrossLoopScheduler(TestCase):
                 static_plan.consumers[0].keys_by_consumer.materialize(),
             )
 
+    def test_nested_counter_falls_back_per_producer_arm(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        query = sympy.Symbol("query", integer=True, nonnegative=True)
+        first_producer, second_producer, consumer_root = _identify_root_domains(
+            (
+                CoordinateDomain(
+                    (10, 11, 12),
+                    ((10, batch), (11, query), (12, 8)),
+                    ((10, 1), (11, 1), (12, 1)),
+                    _allow_empty=True,
+                ),
+                CoordinateDomain(
+                    (30, 31, 32),
+                    ((30, batch), (31, query), (32, 8)),
+                    ((30, 1), (31, 1), (32, 1)),
+                    _allow_empty=True,
+                ),
+                CoordinateDomain(
+                    (20, 21),
+                    ((20, batch), (21, query)),
+                    ((20, 1), (21, 1)),
+                    _allow_empty=True,
+                ),
+            )
+        )
+        semantic_key_domain = CoordinateDomain(
+            (0, 1, 2),
+            ((0, batch), (1, query), (2, 8)),
+            kind="event",
+            identity=0,
+            _allow_empty=True,
+        )
+        producers = tuple(
+            _readiness_producer_from_publication(
+                producer_root=root,
+                publication=_full_point_map(
+                    domain,
+                    semantic_key_domain,
+                    *(coordinate_axis_symbol(axis) for axis in domain.axis_order),
+                ),
+            )
+            for root, domain in enumerate((first_producer, second_producer))
+        )
+        consumer_site = CoordinateDomain(
+            (20, 21, 22),
+            ((20, batch), (21, query), (22, 8)),
+            ((20, 1), (21, 1), (22, 1)),
+            identity=7,
+            _allow_empty=True,
+        )
+        consumer = ReadinessConsumer(
+            consumer_root=2,
+            consumer_site_id=7,
+            keys_by_consumer=_full_point_map(
+                consumer_site,
+                semantic_key_domain,
+                coordinate_axis_symbol(20),
+                coordinate_axis_symbol(21),
+                coordinate_axis_symbol(22),
+            ),
+            covered_obligations=frozenset(((0, None, 7), (1, None, 7))),
+        )
+        event = ReadinessEvent(producers, (consumer,))
+        graph = _readiness_graph(
+            (first_producer, second_producer, consumer_root),
+            event,
+        )
+
+        original_converse = CoordinateRelation.converse
+        original_axis_counts = CoordinateDomain._concrete_axis_counts
+        declined_publications = 0
+
+        def decline_second_publication(
+            relation: CoordinateRelation,
+        ) -> CoordinateRelation | None:
+            nonlocal declined_publications
+            if (
+                relation.source_domain == second_producer
+                and relation.target_domain.kind == "event"
+                and relation.target_domain.identity is None
+            ):
+                declined_publications += 1
+                return None
+            return original_converse(relation)
+
+        def reject_runtime_axis_counts(domain: CoordinateDomain) -> dict[int, int]:
+            if domain.parameter_symbols:
+                raise AssertionError(
+                    "symbolic nested counters must not concretize runtime axes"
+                )
+            return original_axis_counts(domain)
+
+        with (
+            mock.patch.object(
+                CoordinateRelation,
+                "converse",
+                decline_second_publication,
+            ),
+            mock.patch.object(
+                CoordinateDomain,
+                "_concrete_axis_counts",
+                reject_runtime_axis_counts,
+            ),
+            mock.patch.object(
+                CoordinateRelation,
+                "materialize",
+                side_effect=AssertionError(
+                    "symbolic nested counters must not enumerate relations"
+                ),
+            ),
+        ):
+            plan = _segmented_nested_loop_counter(
+                graph,
+                event,
+                consumer,
+                (0, 4, 8),
+            )
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(declined_publications, 1)
+        self.assertEqual(len(plan.producers), 2)
+        self.assertTrue(
+            cross_loop_scheduler._supports_exact_counter_plan_lowering(
+                plan,
+                graph.root_domains,
+            )
+        )
+
+        for concrete_batch, concrete_query in ((0, 3), (2, 0), (2, 3)):
+            substitutions = {batch: concrete_batch, query: concrete_query}
+            concrete_relations = tuple(
+                producer.producers_by_key.substitute_parameters(substitutions)
+                for producer in plan.producers
+            )
+            concrete_consumer = plan.consumers[
+                0
+            ].keys_by_consumer.substitute_parameters(substitutions)
+            if not concrete_batch or not concrete_query:
+                self.assertTrue(
+                    all(not relation.pieces for relation in concrete_relations)
+                )
+                self.assertFalse(concrete_consumer.pieces)
+                continue
+
+            for relation in concrete_relations:
+                target_axes = relation.target_domain.axis_order
+                for key_index, actual in enumerate(relation.materialize()):
+                    key = relation.source_domain.coordinates(key_index)
+                    expected = frozenset(
+                        relation.target_domain.index(
+                            {
+                                target_axes[0]: key[1],
+                                target_axes[1]: key[2],
+                                target_axes[2]: nested_iteration,
+                            }
+                        )
+                        for nested_iteration in range(4 * key[0], 4 * key[0] + 4)
+                    )
+                    self.assertEqual(actual, expected)
+
+            for consumer_index, actual in enumerate(concrete_consumer.materialize()):
+                coordinates = concrete_consumer.source_domain.coordinates(
+                    consumer_index
+                )
+                expected_key = concrete_consumer.target_domain.index(
+                    {
+                        0: coordinates[22] // 4,
+                        1: coordinates[20],
+                        2: coordinates[21],
+                    }
+                )
+                self.assertEqual(actual, frozenset((expected_key,)))
+
     def test_nested_loop_entry_counter_accepts_positive_symbolic_extent(
         self,
     ) -> None:
