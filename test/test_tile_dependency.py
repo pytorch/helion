@@ -8,6 +8,7 @@ from unittest import mock
 
 import sympy
 import torch
+from torch.utils._sympy.functions import FloorDiv
 
 import helion
 from helion import exc
@@ -28,6 +29,7 @@ from helion._compiler.tile_dependency import _dense_linear_overlap_relation
 from helion._compiler.tile_dependency import _dense_mixed_radix_converse
 from helion._compiler.tile_dependency import _layout_is_injective
 from helion._compiler.tile_dependency import _logical_expression_bounds
+from helion._compiler.tile_dependency import _relation_source_cells
 from helion._compiler.tile_dependency import _simplify_logical_expression
 from helion._compiler.tile_dependency import _symbolic_linear_access_relation
 from helion._compiler.tile_dependency import _symbolic_producers_by_consumer
@@ -2989,6 +2991,103 @@ class TestTileDependency(TestCase):
         assert target_union is not None
         self.assertEqual(target_union.materialize(), (frozenset(range(8)),))
 
+    def test_relation_operations_decline_before_oversized_products(self) -> None:
+        domain = CoordinateDomain((10,), ((10, 4),), identity=0)
+        coordinate = coordinate_axis_symbol(10)
+        first = CoordinateRelation.point_map(
+            domain,
+            domain,
+            (
+                (((10, 0, 2, 1),), (coordinate,)),
+                (((10, 2, 4, 1),), (coordinate,)),
+            ),
+        )
+        following = CoordinateRelation.point_map(
+            domain,
+            domain,
+            (
+                (((10, 0, 1, 1),), (coordinate,)),
+                (((10, 1, 4, 1),), (coordinate,)),
+            ),
+        )
+
+        with (
+            mock.patch(
+                "helion._compiler.tile_dependency._MAX_RELATION_PRODUCT_STATES",
+                3,
+            ),
+            mock.patch(
+                "helion._compiler.tile_dependency._relation_piece_covers",
+                side_effect=AssertionError("union must check its budget first"),
+            ),
+        ):
+            self.assertIsNone(first.union(following))
+        with (
+            mock.patch(
+                "helion._compiler.tile_dependency._MAX_RELATION_PRODUCT_STATES",
+                3,
+            ),
+            mock.patch(
+                "helion._compiler.tile_dependency._substitute_composed_expression",
+                side_effect=AssertionError("composition must check its budget first"),
+            ),
+        ):
+            self.assertIsNone(first.then(following))
+
+        two_dimensional = CoordinateDomain(
+            (10, 11),
+            ((10, 2), (11, 2)),
+            identity=0,
+        )
+        horizontal = CoordinateRelation.point_map(
+            two_dimensional,
+            two_dimensional,
+            (
+                (
+                    ((10, 0, 1, 1), (11, 0, 2, 1)),
+                    (coordinate_axis_symbol(10), coordinate_axis_symbol(11)),
+                ),
+                (
+                    ((10, 1, 2, 1), (11, 0, 1, 1)),
+                    (coordinate_axis_symbol(10), coordinate_axis_symbol(11)),
+                ),
+            ),
+        )
+        with (
+            mock.patch(
+                "helion._compiler.tile_dependency._MAX_RELATION_PRODUCT_STATES",
+                3,
+            ),
+            mock.patch(
+                "helion._compiler.tile_dependency.itertools.product",
+                side_effect=AssertionError(
+                    "source cells must check their budget first"
+                ),
+            ),
+        ):
+            self.assertIsNone(_relation_source_cells(horizontal))
+
+    def test_relation_union_declines_above_retained_piece_budget(self) -> None:
+        source = CoordinateDomain((10,), ((10, 2),), identity=0)
+        target = CoordinateDomain((20,), ((20, 2),), identity=1)
+        coordinate = coordinate_axis_symbol(10)
+        left = CoordinateRelation.point_map(
+            source,
+            target,
+            ((((10, 0, 1, 1),), (coordinate,)),),
+        )
+        right = CoordinateRelation.point_map(
+            source,
+            target,
+            ((((10, 1, 2, 1),), (coordinate,)),),
+        )
+
+        with mock.patch(
+            "helion._compiler.tile_dependency._MAX_RELATION_PIECES",
+            1,
+        ):
+            self.assertIsNone(left.union(right))
+
     def test_adjacent_target_coalescing_with_symbolic_source(self) -> None:
         batch = sympy.Symbol("batch", integer=True, nonnegative=True)
         source = CoordinateDomain((10,), ((10, batch),), kind="site")
@@ -3025,7 +3124,7 @@ class TestTileDependency(TestCase):
         ).coalesce_adjacent_target_boxes()
         self.assertEqual(reversed_combined, combined)
         with mock.patch(
-            "helion._compiler.tile_dependency._MAX_RELATION_NORMALIZATION_COMPARISONS",
+            "helion._compiler.tile_dependency._MAX_RELATION_PRODUCT_STATES",
             0,
         ):
             budgeted = raw_union.coalesce_adjacent_target_boxes()
@@ -3258,13 +3357,116 @@ class TestTileDependency(TestCase):
         self.assertIsNone(relation.source_support_cardinality())
         self.assertFalse(relation.is_total_function())
 
-    def test_symbolic_source_support_cardinality_declines(self) -> None:
+    def test_symbolic_source_support_cardinality_is_exact_without_enumeration(
+        self,
+    ) -> None:
         batch = sympy.Symbol("batch", integer=True, nonnegative=True)
-        domain = CoordinateDomain((10,), ((10, batch),), identity=0)
-        relation = CoordinateRelation.identity(domain, domain)
+        source = CoordinateDomain(
+            (10, 11),
+            ((10, batch), (11, 4)),
+            identity=0,
+        )
+        target = CoordinateDomain(
+            (20, 21),
+            ((20, batch), (21, 4)),
+            identity=1,
+        )
+        outer = coordinate_axis_symbol(10)
+        inner = coordinate_axis_symbol(11)
+        relation = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (((10, 0, batch, 1), (11, 0, 2, 1)), (outer, inner)),
+                (((10, 0, batch, 1), (11, 2, 4, 1)), (outer, inner)),
+            ),
+        )
 
-        self.assertIsNone(relation.source_support_cardinality())
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("symbolic support must not enumerate"),
+        ):
+            cardinality = relation.source_support_cardinality()
+        self.assertEqual(sympy.simplify(cardinality - 4 * batch), 0)
         self.assertTrue(relation.is_total_function())
+        for concrete_batch in (0, 1, 31):
+            concrete = relation.substitute_parameters({batch: concrete_batch})
+            self.assertEqual(
+                concrete.source_support_cardinality(),
+                4 * concrete_batch,
+            )
+
+    def test_symbolic_strided_source_support_cardinality_is_exact(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        source = CoordinateDomain((10,), ((10, 2 * batch),), identity=0)
+        target = CoordinateDomain((20,), ((20, 1),), identity=1)
+        relation = CoordinateRelation(
+            source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 0, 2 * batch, 2),),
+                    ((20, sympy.Integer(0), sympy.Integer(1), 1),),
+                ),
+            ),
+        )
+
+        cardinality = relation.source_support_cardinality()
+
+        self.assertIsNotNone(cardinality)
+        self.assertEqual(sympy.simplify(cardinality - batch), 0)
+
+    def test_point_map_equality_on_reordered_symbolic_support(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        source = CoordinateDomain(
+            (10, 11),
+            ((10, batch), (11, 4)),
+            identity=0,
+        )
+        target = CoordinateDomain(
+            (20, 21),
+            ((20, batch), (21, 4)),
+            identity=1,
+        )
+        outer = coordinate_axis_symbol(10)
+        inner = coordinate_axis_symbol(11)
+        pieces = (
+            (((10, 0, batch, 1), (11, 0, 2, 1)), (outer, inner)),
+            (((10, 0, batch, 1), (11, 2, 4, 1)), (outer, inner)),
+        )
+        reference = CoordinateRelation.point_map(source, target, pieces)
+        equivalent = CoordinateRelation.point_map(
+            source,
+            target,
+            tuple(
+                (
+                    bounds,
+                    (mapped_outer + FloorDiv(inner, 4), mapped_inner),
+                )
+                for bounds, (mapped_outer, mapped_inner) in reversed(pieces)
+            ),
+        )
+        different_map = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                pieces[0],
+                (pieces[1][0], (outer, inner - 1)),
+            ),
+        )
+        different_support = CoordinateRelation.point_map(
+            source,
+            target,
+            (pieces[0],),
+        )
+
+        self.assertTrue(reference.is_pointwise_equal_on_same_support(equivalent))
+        self.assertTrue(equivalent.is_pointwise_equal_on_same_support(reference))
+        self.assertFalse(reference.is_pointwise_equal_on_same_support(different_map))
+        self.assertFalse(
+            reference.is_pointwise_equal_on_same_support(different_support)
+        )
 
     def test_empty_target_is_not_counted_as_source_support(self) -> None:
         source = CoordinateDomain((10,), ((10, 2),), identity=0)
