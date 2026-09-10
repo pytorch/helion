@@ -243,12 +243,17 @@ pullback are also complete. Same-strand chronology is derived only from the
 authoritative `WorkerScheduleSegment.task_order` relations; a review-found
 partial/strided clipping bug and a second mixed full/partial-piece clipping bug
 were fixed before integration. The combined tile-dependency and scheduler
-suites now pass 321 tests with 266 subtests. Occupied strand ordinal `q(s)` is
+suites now pass 326 tests with 304 subtests. Occupied strand ordinal `q(s)` is
 also complete for concrete, holed, and ordinary symbolic packed schedules.
-The active implementation point is the acyclic root quotient and a test-only
-concrete max-plus oracle over the real model-shaped graphs. That oracle is a
-mandatory early gate before production ownership selection. After it validates
-the objective, continue with the relation-level max-plus evaluator and joint
+The acyclic resident root quotient and the first test-only concrete max-plus
+oracle are now complete. The oracle is independently differential-tested and
+already supplies topology-shaped FlashMLA, Qwen, Gemma, and Muse positive and
+negative controls. Those compact fixtures are an early objective check, not a
+substitute for extracting the real model graphs; the real-graph and symbolic-
+substitution gates below remain mandatory before production ownership changes.
+The active implementation point is therefore the acyclic relation-level
+max-plus evaluator, compared exhaustively against the concrete oracle without
+yet changing scheduling policy. Then continue with the real-model gate, joint
 continuation/resident choice, translated recurrence closure, post-placement
 nested quotients, source-ticket actions through that same policy, one final
 validation/lowering pass, and deletion of the top-level constant/parameterized
@@ -496,7 +501,7 @@ concrete max-plus oracle over the actual model-shaped `ReadinessGraph` and
 production scheduling must remain bounded by roots, relation pieces, and
 symbolic expressions.
 
-- [ ] Evaluate the exact task DAG with one unit of completion cost per body and
+- [x] Evaluate the exact task DAG with one unit of completion cost per body and
   a secondary cross-worker handoff count. Check the implementation against
   exhaustive tiny DAGs before using model-shaped cases.
 - [ ] Score the current all-resident schedule, the previously successful
@@ -520,6 +525,20 @@ symbolic expressions.
 - [ ] If the objective fails to rank any already measured win or negative
   control correctly, revise the objective before wiring it into production.
   Do not compensate with a model/root-ID heuristic.
+
+  Implementation checkpoint (2026-09-10): the test-only oracle materializes
+  exact root-level readiness edges and immediate occupied same-strand edges,
+  then evaluates the lexicographic longest path. It rejects missing ownership
+  and cycles, does not impose global slot order, shares production continuation
+  eligibility, retains all causally maximal singleton publishers as mutually
+  exclusive alternatives, and counts the inline body once. Independent checks
+  covered 1,000 randomized resident graphs, 300 multi-key graphs, 500 singleton
+  continuation cases, and a multi-axis domain. Compact topology-shaped motifs
+  rank FlashMLA early release, Qwen ordering/resident join, Gemma's resident
+  reduction, and multiplicity-preserving Muse group completion correctly. A
+  deliberately over-serialized Muse caricature remains as a negative control.
+  Correlated multi-body continuations, extraction of the actual model graphs,
+  and symbolic-substitution parity remain explicit follow-up work.
 
 This is an early scheduling signal, not a GPU performance model. It validates
 dependency overlap, critical-path completion, ownership, and handoff logic; it
@@ -2852,6 +2871,21 @@ ownership a production decision. They are derived views over the existing
   do not add a recurrence, state, or schedule IR. Decline parameter-dependent
   periods, unbounded state, nonrectangular partitions, or proof-budget
   overflow.
+
+  Implementation checkpoint (2026-09-10): the acyclic all-resident root
+  quotient is complete. It includes every possibly nonempty root-level
+  readiness edge and every required cross-root same-strand ordering edge,
+  rejects nested/nonresident/cyclic cases, and uses the same deterministic
+  topological helper as existing acyclicity and criticality checks. The
+  canonical symbolic `(3, N, 2)` packed schedule now proves order `(0, 1, 2)`
+  in about 0.08 seconds rather than declining after about 5 seconds. Source
+  support is clipped to its domain before nonemptiness testing, fixing phantom
+  edges. Independent randomized review found no unsound accepts; the packed
+  strength reduction is intentionally conservative and may decline a reverse
+  readiness edge between roots that occupy disjoint workers in one wave. The
+  scalar acyclic prefix evaluator and cyclic affine recurrence proof are still
+  outstanding.
+
 - [ ] Evaluate the lexicographic objective `(completion, handoffs)` with that
   prefix proof over same-strand precedence and semantic readiness edges. For
   each body `s`, let `R(s)` be the greatest readiness-predecessor score,
