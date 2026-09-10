@@ -41,6 +41,7 @@ from helion._compiler.tile_dependency import _relation_source_cells
 from helion._compiler.tile_dependency import _simplify_logical_expression
 from helion._compiler.tile_dependency import _symbolic_linear_access_relation
 from helion._compiler.tile_dependency import _symbolic_producers_by_consumer
+from helion._compiler.tile_dependency import _target_box_expression_extreme
 from helion._compiler.tile_dependency import allocation_regions_may_overlap
 from helion._compiler.tile_dependency import build_tile_dependency_graph
 from helion._compiler.tile_dependency import coordinate_axis_symbol
@@ -3655,6 +3656,131 @@ class TestTileDependency(TestCase):
                 ),
             )
             self.assertEqual(budgeted_concrete.materialize(), concrete.materialize())
+
+    def test_target_box_extrema_require_one_attainable_corner(self) -> None:
+        target_axis = 20
+        target = CoordinateDomain(
+            (target_axis,),
+            ((target_axis, 4),),
+            kind="site",
+        )
+        source = CoordinateDomain((), (), kind="event")
+        coordinate = coordinate_axis_symbol(target_axis)
+        target_ranges = ((target_axis, sympy.Integer(0), sympy.Integer(4), 1),)
+
+        def extreme(expression: sympy.Expr, *, maximize: bool) -> sympy.Expr | None:
+            return _target_box_expression_extreme(
+                expression,
+                target_domain=target,
+                target_ranges=target_ranges,
+                source_domain=source,
+                source_bounds=(),
+                maximize=maximize,
+            )
+
+        # The separate maxima of ``coordinate`` and ``-floor(coordinate / 2)``
+        # occur at opposite endpoints.  Adding them used to return the
+        # unattainable upper bound 4 even though the exact maximum is 3.
+        anticorrelated = coordinate - sympy.floor(coordinate / 2) + 1
+        self.assertEqual(
+            max(anticorrelated.subs(coordinate, value) for value in range(4)),
+            3,
+        )
+        self.assertIsNone(extreme(anticorrelated, maximize=True))
+        self.assertIsNone(extreme(anticorrelated, maximize=False))
+
+        # Negative coefficients reverse both the requested extremum and its
+        # witnessing endpoint.
+        self.assertEqual(extreme(-coordinate, maximize=True), 0)
+        self.assertEqual(extreme(-coordinate, maximize=False), -3)
+        dead_anticorrelated_term = sympy.Mul(0, -coordinate, evaluate=False)
+        self.assertEqual(
+            extreme(
+                sympy.Add(coordinate, dead_anticorrelated_term, evaluate=False),
+                maximize=True,
+            ),
+            3,
+        )
+
+        # Correlated children remain provable when their extrema share a
+        # corner.  The same rule applies to Min/Max; incompatible child
+        # extrema must decline rather than manufacture an unattainable value.
+        correlated = coordinate + sympy.floor(coordinate / 2)
+        self.assertEqual(extreme(correlated, maximize=True), 4)
+        self.assertEqual(extreme(correlated, maximize=False), 0)
+        self.assertEqual(
+            extreme(
+                sympy.Min(coordinate, sympy.floor(coordinate / 2) + 1),
+                maximize=True,
+            ),
+            2,
+        )
+        self.assertEqual(
+            extreme(
+                sympy.Max(coordinate, sympy.floor(coordinate / 2) + 1),
+                maximize=True,
+            ),
+            3,
+        )
+        self.assertIsNone(extreme(sympy.Min(coordinate, 3 - coordinate), maximize=True))
+        self.assertIsNone(
+            extreme(sympy.Max(coordinate, 3 - coordinate), maximize=False)
+        )
+
+    def test_target_box_extrema_modulo_requires_attainable_dividend_bounds(
+        self,
+    ) -> None:
+        target_axis = 20
+        target = CoordinateDomain(
+            (target_axis,),
+            ((target_axis, 4),),
+            kind="site",
+        )
+        source = CoordinateDomain((), (), kind="event")
+        coordinate = coordinate_axis_symbol(target_axis)
+        target_ranges = ((target_axis, sympy.Integer(0), sympy.Integer(4), 1),)
+
+        def maximum(expression: sympy.Expr) -> sympy.Expr | None:
+            return _target_box_expression_extreme(
+                expression,
+                target_domain=target,
+                target_ranges=target_ranges,
+                source_domain=source,
+                source_bounds=(),
+                maximize=True,
+            )
+
+        anticorrelated = coordinate - sympy.floor(coordinate / 2) + 1
+        self.assertIsNone(maximum(sympy.Mod(anticorrelated, 10)))
+        self.assertIsNone(maximum(sympy.floor(sympy.Mod(anticorrelated, 10) / 2)))
+        self.assertEqual(maximum(sympy.Mod(coordinate, 8)), 3)
+        self.assertIsNone(maximum(sympy.Mod(coordinate + 1, 4)))
+
+        key_axis = 10
+        value_axis = 30
+        keys = CoordinateDomain((key_axis,), ((key_axis, 1),), kind="event")
+        values = CoordinateDomain((value_axis,), ((value_axis, 2),), kind="worker")
+        required = CoordinateRelation(
+            keys,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    ((key_axis, 0, 1, 1),),
+                    ((target_axis, sympy.Integer(0), sympy.Integer(4), 1),),
+                ),
+            ),
+        )
+        fixed_width_value = CoordinateRelation.point_map(
+            target,
+            values,
+            (
+                (
+                    ((target_axis, 0, 4, 1),),
+                    (sympy.floor(sympy.Mod(anticorrelated, 10) / 2),),
+                ),
+            ),
+        )
+        self.assertIsNone(required.max_target_value_by_source(fixed_width_value))
 
     def test_symbolic_max_target_value_reduces_schedule_positions(self) -> None:
         elements = 128

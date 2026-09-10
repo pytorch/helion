@@ -6893,6 +6893,27 @@ def _intersect_target_with_source_box(
     return target_ranges
 
 
+_TargetBoxEndpointChoices = tuple[tuple[int, sympy.Expr], ...]
+_TargetBoxExtremeProof = tuple[sympy.Expr, _TargetBoxEndpointChoices]
+
+
+def _merge_target_box_endpoint_choices(
+    proofs: tuple[_TargetBoxExtremeProof, ...],
+) -> _TargetBoxEndpointChoices | None:
+    """Merge corners that attain child extrema, declining contradictions."""
+    choices: dict[int, sympy.Expr] = {}
+    for _value, child_choices in proofs:
+        for axis, coordinate in child_choices:
+            previous = choices.get(axis)
+            if previous is not None and not _integer_partition_expressions_equal(
+                previous,
+                coordinate,
+            ):
+                return None
+            choices[axis] = coordinate
+    return tuple(sorted(choices.items()))
+
+
 def _target_box_expression_extreme(
     expression: sympy.Expr,
     *,
@@ -6904,6 +6925,29 @@ def _target_box_expression_extreme(
     ],
     maximize: bool,
 ) -> sympy.Expr | None:
+    """Return an attained exact extremum for the supported expression IR."""
+    proof = _target_box_expression_extreme_proof(
+        expression,
+        target_domain=target_domain,
+        target_ranges=target_ranges,
+        source_domain=source_domain,
+        source_bounds=source_bounds,
+        maximize=maximize,
+    )
+    return None if proof is None else proof[0]
+
+
+def _target_box_expression_extreme_proof(
+    expression: sympy.Expr,
+    *,
+    target_domain: CoordinateDomain,
+    target_ranges: tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...],
+    source_domain: CoordinateDomain,
+    source_bounds: tuple[
+        tuple[int, IntegerExpression, IntegerExpression, int], ...
+    ],
+    maximize: bool,
+) -> _TargetBoxExtremeProof | None:
     """Return an exact extremum for the supported target-box expression IR.
 
     Point-valued target axes are substituted before the residual expression is
@@ -6931,7 +6975,7 @@ def _target_box_expression_extreme(
             if coordinate_axis_symbol(target_range[0]) not in point_substitutions
         )
         if substituted != expression or len(residual_ranges) != len(target_ranges):
-            return _target_box_expression_extreme(
+            return _target_box_expression_extreme_proof(
                 substituted,
                 target_domain=target_domain,
                 target_ranges=residual_ranges,
@@ -6944,24 +6988,32 @@ def _target_box_expression_extreme(
         for axis, begin, end, step in target_ranges
     }
     if not (expression.free_symbols & ranges.keys()):
-        return expression
+        return expression, ()
     if isinstance(expression, sympy.Symbol):
         target_range = ranges.get(expression)
         if target_range is None:
             return None
         begin, end, step = target_range
-        if not maximize:
-            return begin
-        return (
+        coordinate = (
             begin
-            + sympy.floor(  # pyrefly: ignore[unsupported-operation]
-                (end - 1 - begin) / step  # pyrefly: ignore[unsupported-operation]
+            if not maximize
+            else (
+                begin
+                + sympy.floor(  # pyrefly: ignore[unsupported-operation]
+                    (end - 1 - begin) / step  # pyrefly: ignore[unsupported-operation]
+                )
+                * step
             )
-            * step
         )
+        axis = next(
+            axis
+            for axis, _begin, _end, _step in target_ranges
+            if coordinate_axis_symbol(axis) == expression
+        )
+        return coordinate, ((axis, coordinate),)
     if isinstance(expression, sympy.Add):
         children = tuple(
-            _target_box_expression_extreme(
+            _target_box_expression_extreme_proof(
                 child,
                 target_domain=target_domain,
                 target_ranges=target_ranges,
@@ -6973,7 +7025,14 @@ def _target_box_expression_extreme(
         )
         if any(child is None for child in children):
             return None
-        return sympy.Add(*(child for child in children if child is not None))
+        proved_children = cast("tuple[_TargetBoxExtremeProof, ...]", children)
+        endpoint_choices = _merge_target_box_endpoint_choices(proved_children)
+        if endpoint_choices is None:
+            return None
+        return (
+            sympy.Add(*(child[0] for child in proved_children)),
+            endpoint_choices,
+        )
     if isinstance(expression, sympy.Mul):
         coefficient: sympy.Expr = sympy.Integer(1)
         varying: list[sympy.Expr] = []
@@ -6992,25 +7051,26 @@ def _target_box_expression_extreme(
         )
         if not coefficient_is_nonnegative and not coefficient_is_nonpositive:
             return None
-        child = _target_box_expression_extreme(
+        if coefficient.is_zero is True:  # pyrefly: ignore[missing-attribute]
+            return sympy.Integer(0), ()
+        child = _target_box_expression_extreme_proof(
             varying[0],
             target_domain=target_domain,
             target_ranges=target_ranges,
             source_domain=source_domain,
             source_bounds=source_bounds,
-            maximize=(
-                maximize
-                if coefficient_is_nonnegative
-                else not maximize
-            ),
+            maximize=(maximize if coefficient_is_nonnegative else not maximize),
         )
         if child is None:
             return None
-        return coefficient * child  # pyrefly: ignore[unsupported-operation]
+        return (
+            coefficient * child[0],  # pyrefly: ignore[unsupported-operation]
+            child[1],
+        )
     quotient = _static_integer_quotient(expression)
     if quotient is not None:
         numerator, denominator = quotient
-        child = _target_box_expression_extreme(
+        child = _target_box_expression_extreme_proof(
             numerator,
             target_domain=target_domain,
             target_ranges=target_ranges,
@@ -7018,9 +7078,14 @@ def _target_box_expression_extreme(
             source_bounds=source_bounds,
             maximize=maximize,
         )
-        return None if child is None else cast(
-            "sympy.Expr",
-            sympy.floor(child / denominator),  # pyrefly: ignore[bad-argument-type, unsupported-operation]
+        if child is None:
+            return None
+        return (
+            cast(
+                "sympy.Expr",
+                sympy.floor(child[0] / denominator),  # pyrefly: ignore[bad-argument-type, unsupported-operation]
+            ),
+            child[1],
         )
     if isinstance(expression, sympy.Mod):
         dividend, modulus = (
@@ -7032,7 +7097,7 @@ def _target_box_expression_extreme(
             or modulus.is_positive is not True  # pyrefly: ignore[missing-attribute]
         ):
             return None
-        minimum = _target_box_expression_extreme(
+        minimum = _target_box_expression_extreme_proof(
             dividend,
             target_domain=target_domain,
             target_ranges=target_ranges,
@@ -7040,7 +7105,7 @@ def _target_box_expression_extreme(
             source_bounds=source_bounds,
             maximize=False,
         )
-        maximum = _target_box_expression_extreme(
+        maximum = _target_box_expression_extreme_proof(
             dividend,
             target_domain=target_domain,
             target_ranges=target_ranges,
@@ -7050,8 +7115,10 @@ def _target_box_expression_extreme(
         )
         if minimum is None or maximum is None:
             return None
-        lower_period = sympy.floor(minimum / modulus)  # pyrefly: ignore[bad-argument-type, unsupported-operation]
-        upper_period = sympy.floor(maximum / modulus)  # pyrefly: ignore[bad-argument-type, unsupported-operation]
+        minimum_value, minimum_choices = minimum
+        maximum_value, maximum_choices = maximum
+        lower_period = sympy.floor(minimum_value / modulus)  # pyrefly: ignore[bad-argument-type, unsupported-operation]
+        upper_period = sympy.floor(maximum_value / modulus)  # pyrefly: ignore[bad-argument-type, unsupported-operation]
         period_delta_bounds = _logical_expression_bounds(
             sympy.simplify(upper_period - lower_period),
             domain=source_domain,
@@ -7061,18 +7128,23 @@ def _target_box_expression_extreme(
             lower_period,
             upper_period,
         ) or period_delta_bounds == (sympy.Integer(0), sympy.Integer(0)):
-            return cast(
-                "sympy.Expr",
-                sympy.Mod(maximum if maximize else minimum, modulus),
+            selected_value, selected_choices = (
+                (maximum_value, maximum_choices)
+                if maximize
+                else (minimum_value, minimum_choices)
             )
-        span = sympy.simplify(maximum - minimum)  # pyrefly: ignore[unsupported-operation]
+            return (
+                cast("sympy.Expr", sympy.Mod(selected_value, modulus)),
+                selected_choices,
+            )
+        span = sympy.simplify(maximum_value - minimum_value)  # pyrefly: ignore[unsupported-operation]
         interval_width = span + 1  # pyrefly: ignore[unsupported-operation]
         if (
             interval_width.is_integer is True  # pyrefly: ignore[missing-attribute]
             and interval_width.is_positive is True  # pyrefly: ignore[missing-attribute]
             and not interval_width.free_symbols
             and sympy.Mod(modulus, interval_width) == 0
-            and sympy.simplify(sympy.Mod(minimum, interval_width)) == 0
+            and sympy.simplify(sympy.Mod(minimum_value, interval_width)) == 0
         ):
             # Let w be ``maximum - minimum + 1`` and m be the modulus.  From
             # ``w | m`` and ``minimum == 0 (mod w)``, ``minimum mod m`` is one
@@ -7083,14 +7155,33 @@ def _target_box_expression_extreme(
             # positional outer digits have been substituted.  The local lemma
             # is sufficient on its own; it need not recover the original
             # relation's ``_positional_product`` provenance.
-            return cast(
-                "sympy.Expr",
-                sympy.Mod(maximum if maximize else minimum, modulus),
+            selected_value, selected_choices = (
+                (maximum_value, maximum_choices)
+                if maximize
+                else (minimum_value, minimum_choices)
+            )
+            return (
+                cast("sympy.Expr", sympy.Mod(selected_value, modulus)),
+                selected_choices,
             )
         return None
-    if expression.func in (sympy.floor, sympy.ceiling, sympy.Min, sympy.Max):
+    if expression.func in (sympy.floor, sympy.ceiling):
+        if len(expression.args) != 1:
+            return None
+        child = _target_box_expression_extreme_proof(
+            cast("sympy.Expr", expression.args[0]),
+            target_domain=target_domain,
+            target_ranges=target_ranges,
+            source_domain=source_domain,
+            source_bounds=source_bounds,
+            maximize=maximize,
+        )
+        if child is None:
+            return None
+        return expression.func(child[0]), child[1]
+    if expression.func in (sympy.Min, sympy.Max):
         children = tuple(
-            _target_box_expression_extreme(
+            _target_box_expression_extreme_proof(
                 cast("sympy.Expr", child),
                 target_domain=target_domain,
                 target_ranges=target_ranges,
@@ -7102,7 +7193,14 @@ def _target_box_expression_extreme(
         )
         if any(child is None for child in children):
             return None
-        return expression.func(*(child for child in children if child is not None))
+        proved_children = cast("tuple[_TargetBoxExtremeProof, ...]", children)
+        endpoint_choices = _merge_target_box_endpoint_choices(proved_children)
+        if endpoint_choices is None:
+            return None
+        return (
+            expression.func(*(child[0] for child in proved_children)),
+            endpoint_choices,
+        )
     return None
 
 
