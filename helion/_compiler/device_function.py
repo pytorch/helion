@@ -407,6 +407,10 @@ class DeviceFunction:
             tuple[str, tuple[str, ...], tuple[ast.stmt, ...], bool]
         ] = []
         self.triton_outlined_helper_constexprs: dict[str, int] = {}
+        # FlyDSL: (tensor_name, is_vec, is_rolled_col) → loop-invariant buffer/
+        # div/copy-atom setup, memoized per generated function so load and store
+        # reuse the same lifted AST vars.
+        self._flydsl_setup: dict[tuple[object, ...], dict[str, int | str]] = {}
         # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`
         self.pallas_tensor_dim_tilings: dict[int, list[DimensionTiling]] = {}
         # Track Pallas remote-copy operands by tensor and storage identity. The
