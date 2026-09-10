@@ -4158,6 +4158,8 @@ class CoordinateRelation:
                             "tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...]",
                             intersection,
                         ),
+                        source_domain=self.source_domain,
+                        source_bounds=source_bounds,
                         maximize=True,
                     )
                     if maximum is None:
@@ -4168,6 +4170,11 @@ class CoordinateRelation:
             maximum = _max_target_value_expression(
                 tuple(maxima),
                 source_domain=self.source_domain,
+                source_bounds=source_bounds,
+            )
+            maximum = _simplify_logical_expression(
+                maximum,
+                domain=self.source_domain,
                 source_bounds=source_bounds,
             )
             pieces.append(
@@ -6891,14 +6898,52 @@ def _target_box_expression_extreme(
     *,
     target_domain: CoordinateDomain,
     target_ranges: tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...],
+    source_domain: CoordinateDomain,
+    source_bounds: tuple[
+        tuple[int, IntegerExpression, IntegerExpression, int], ...
+    ],
     maximize: bool,
 ) -> sympy.Expr | None:
-    """Substitute a box endpoint into a coordinatewise-monotone expression."""
+    """Return an exact extremum for the supported target-box expression IR.
+
+    Point-valued target axes are substituted before the residual expression is
+    classified.  This is the local form of factoring a Cartesian positional
+    product: unlike ``_positional_product``, it also applies after intersection
+    or composition has made an axis a symbolic singleton.
+    """
+    # Factor point-valued coordinates before inspecting the residual
+    # expression.  In particular, a schedule can be
+    # ``Identity(runtime_outer) x finite_inner`` even though flattening the
+    # schedule and taking a fixed-width quotient mixes the outer coordinate
+    # into the scalar expression.  Substitution removes that positional
+    # factor without specializing its runtime extent and leaves only the
+    # finite inner box to maximize.
+    point_substitutions = {
+        coordinate_axis_symbol(axis): begin
+        for axis, begin, end, step in target_ranges
+        if step == 1 and sympy.simplify(end - begin) == 1  # pyrefly: ignore[unsupported-operation]
+    }
+    if point_substitutions:
+        substituted = cast("sympy.Expr", expression.xreplace(point_substitutions))
+        residual_ranges = tuple(
+            target_range
+            for target_range in target_ranges
+            if coordinate_axis_symbol(target_range[0]) not in point_substitutions
+        )
+        if substituted != expression or len(residual_ranges) != len(target_ranges):
+            return _target_box_expression_extreme(
+                substituted,
+                target_domain=target_domain,
+                target_ranges=residual_ranges,
+                source_domain=source_domain,
+                source_bounds=source_bounds,
+                maximize=maximize,
+            )
     ranges = {
         coordinate_axis_symbol(axis): (begin, end, step)
         for axis, begin, end, step in target_ranges
     }
-    if expression.is_number:
+    if not (expression.free_symbols & ranges.keys()):
         return expression
     if isinstance(expression, sympy.Symbol):
         target_range = ranges.get(expression)
@@ -6920,6 +6965,8 @@ def _target_box_expression_extreme(
                 child,
                 target_domain=target_domain,
                 target_ranges=target_ranges,
+                source_domain=source_domain,
+                source_bounds=source_bounds,
                 maximize=maximize,
             )
             for child in expression.args
@@ -6928,29 +6975,44 @@ def _target_box_expression_extreme(
             return None
         return sympy.Add(*(child for child in children if child is not None))
     if isinstance(expression, sympy.Mul):
-        numeric = sympy.Integer(1)
-        symbolic: list[sympy.Expr] = []
+        coefficient = sympy.Integer(1)
+        varying: list[sympy.Expr] = []
         for child in expression.args:
-            if child.is_number:
-                numeric *= child  # pyrefly: ignore[unsupported-operation]
+            if child.free_symbols & ranges.keys():
+                varying.append(child)
             else:
-                symbolic.append(child)
-        if len(symbolic) != 1 or numeric.is_real is not True:
+                coefficient *= child  # pyrefly: ignore[unsupported-operation]
+        if len(varying) != 1 or coefficient.is_real is not True:
             return None
         child = _target_box_expression_extreme(
-            symbolic[0],
+            varying[0],
             target_domain=target_domain,
             target_ranges=target_ranges,
-            maximize=maximize if numeric >= 0 else not maximize,
+            source_domain=source_domain,
+            source_bounds=source_bounds,
+            maximize=(
+                maximize
+                if coefficient.is_nonnegative is True
+                else not maximize
+                if coefficient.is_nonpositive is True
+                else maximize
+            ),
         )
-        return None if child is None else numeric * child  # pyrefly: ignore[unsupported-operation]
+        if child is None or (
+            coefficient.is_nonnegative is not True
+            and coefficient.is_nonpositive is not True
+        ):
+            return None
+        return coefficient * child  # pyrefly: ignore[unsupported-operation]
     quotient = _static_integer_quotient(expression)
-    if quotient is not None and expression.func is FloorDiv:
+    if quotient is not None:
         numerator, denominator = quotient
         child = _target_box_expression_extreme(
             numerator,
             target_domain=target_domain,
             target_ranges=target_ranges,
+            source_domain=source_domain,
+            source_bounds=source_bounds,
             maximize=maximize,
         )
         return (
@@ -6958,12 +7020,72 @@ def _target_box_expression_extreme(
             if child is None
             else sympy.floor(child / denominator)  # pyrefly: ignore[bad-argument-type]
         )
+    if isinstance(expression, sympy.Mod):
+        dividend, modulus = expression.args
+        if (
+            modulus.free_symbols
+            or modulus.is_integer is not True
+            or modulus.is_positive is not True
+        ):
+            return None
+        minimum = _target_box_expression_extreme(
+            cast("sympy.Expr", dividend),
+            target_domain=target_domain,
+            target_ranges=target_ranges,
+            source_domain=source_domain,
+            source_bounds=source_bounds,
+            maximize=False,
+        )
+        maximum = _target_box_expression_extreme(
+            cast("sympy.Expr", dividend),
+            target_domain=target_domain,
+            target_ranges=target_ranges,
+            source_domain=source_domain,
+            source_bounds=source_bounds,
+            maximize=True,
+        )
+        if minimum is None or maximum is None:
+            return None
+        lower_period = sympy.floor(minimum / modulus)  # pyrefly: ignore[bad-argument-type]
+        upper_period = sympy.floor(maximum / modulus)  # pyrefly: ignore[bad-argument-type]
+        period_delta_bounds = _logical_expression_bounds(
+            sympy.simplify(upper_period - lower_period),
+            domain=source_domain,
+            source_bounds=source_bounds,
+        )
+        if _integer_partition_expressions_equal(
+            lower_period,
+            upper_period,
+        ) or period_delta_bounds == (sympy.Integer(0), sympy.Integer(0)):
+            return sympy.Mod(maximum if maximize else minimum, modulus)
+        span = sympy.simplify(maximum - minimum)
+        interval_width = span + 1  # pyrefly: ignore[unsupported-operation]
+        if (
+            interval_width.is_integer is True  # pyrefly: ignore[missing-attribute]
+            and interval_width.is_positive is True  # pyrefly: ignore[missing-attribute]
+            and not interval_width.free_symbols
+            and sympy.Mod(modulus, interval_width) == 0
+            and sympy.simplify(sympy.Mod(minimum, interval_width)) == 0
+        ):
+            # Let w be ``maximum - minimum + 1`` and m be the modulus.  From
+            # ``w | m`` and ``minimum == 0 (mod w)``, ``minimum mod m`` is one
+            # of ``0, w, ..., m - w``.  The complete interval through
+            # ``maximum = minimum + w - 1`` therefore cannot cross an m-period
+            # boundary, so modulo preserves both exact endpoints.  This is the
+            # mixed-radix case where one complete lower digit varies after all
+            # positional outer digits have been substituted.  The local lemma
+            # is sufficient on its own; it need not recover the original
+            # relation's ``_positional_product`` provenance.
+            return sympy.Mod(maximum if maximize else minimum, modulus)
+        return None
     if expression.func in (sympy.floor, sympy.ceiling, sympy.Min, sympy.Max):
         children = tuple(
             _target_box_expression_extreme(
                 cast("sympy.Expr", child),
                 target_domain=target_domain,
                 target_ranges=target_ranges,
+                source_domain=source_domain,
+                source_bounds=source_bounds,
                 maximize=maximize,
             )
             for child in expression.args
@@ -6984,6 +7106,16 @@ def _max_target_value_expression(
     unique = tuple(dict.fromkeys(expressions))
     if len(unique) == 1:
         return unique[0]
+    for candidate in unique:
+        if all(
+            _is_provably_nonnegative(
+                sympy.simplify(candidate - other),  # pyrefly: ignore[unsupported-operation]
+                None,
+            )
+            for other in unique
+            if other != candidate
+        ):
+            return candidate
     bounds = tuple(
         _logical_expression_bounds(
             expression,

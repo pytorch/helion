@@ -3832,6 +3832,345 @@ class TestTileDependency(TestCase):
         assert maximum is not None
         self.assertEqual(maximum.materialize(), (frozenset((7,)),))
 
+    def test_symbolic_max_target_value_composes_qwen_mixed_radix_quotient(
+        self,
+    ) -> None:
+        batch = sympy.Symbol("batch", integer=True, positive=True)
+        order = CoordinateDomain(
+            (10, 11, 12),
+            ((10, batch), (11, 16), (12, 96)),
+            kind="task_order",
+        )
+        tasks = CoordinateDomain(
+            (20, 21),
+            ((20, batch), (21, 1536)),
+            kind="site",
+        )
+        order_batch = coordinate_axis_symbol(10)
+        inner = coordinate_axis_symbol(11)
+        iteration = coordinate_axis_symbol(12)
+        task_order = CoordinateRelation.point_map(
+            order,
+            tasks,
+            (
+                (
+                    ((10, 0, batch, 1), (11, 0, 8, 1), (12, 0, 96, 1)),
+                    (order_batch, 8 * iteration + inner),
+                ),
+                (
+                    ((10, 0, batch, 1), (11, 8, 16, 1), (12, 0, 96, 1)),
+                    (order_batch, 8 * iteration + inner + 760),
+                ),
+            ),
+        )
+        waves = CoordinateDomain((30,), ((30, 2),), kind="worker")
+        wave_by_order = CoordinateRelation.point_map(
+            order,
+            waves,
+            (
+                (
+                    ((10, 0, batch, 1), (11, 0, 16, 1), (12, 0, 96, 1)),
+                    (sympy.floor((16 * iteration + inner) / 1184),),
+                ),
+            ),
+        )
+        keys = CoordinateDomain(
+            (40, 41),
+            ((40, batch), (41, 96)),
+            kind="event",
+        )
+        key_batch = coordinate_axis_symbol(40)
+        key_iteration = coordinate_axis_symbol(41)
+        required_producers = CoordinateRelation(
+            keys,
+            tasks,
+            (
+                _CoordinateRelationPiece(
+                    ((40, 0, batch, 1), (41, 0, 96, 1)),
+                    (
+                        (20, key_batch, key_batch + 1, 1),
+                        (21, 8 * key_iteration, 8 * key_iteration + 8, 1),
+                    ),
+                ),
+                _CoordinateRelationPiece(
+                    ((40, 0, batch, 1), (41, 0, 96, 1)),
+                    (
+                        (20, key_batch, key_batch + 1, 1),
+                        (
+                            21,
+                            8 * key_iteration + 768,
+                            8 * key_iteration + 776,
+                            1,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        positional_product = task_order._positional_product
+        self.assertIsNotNone(positional_product)
+        assert positional_product is not None
+        self.assertEqual(positional_product[0], ((10, 20),))
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("symbolic frontier must not enumerate"),
+        ):
+            tasks_to_order = task_order.converse()
+            self.assertIsNotNone(tasks_to_order)
+            assert tasks_to_order is not None
+            wave_by_task = tasks_to_order.then(wave_by_order)
+            self.assertIsNotNone(wave_by_task)
+            assert wave_by_task is not None
+            maximum = required_producers.max_target_value_by_source(wave_by_task)
+
+        self.assertIsNotNone(maximum)
+        assert maximum is not None
+        self.assertEqual(len(maximum.pieces), 1)
+        (_axis, frontier, _end, _step) = maximum.pieces[0].target_ranges[0]
+        self.assertEqual(
+            frontier,
+            sympy.floor(key_iteration / 74 + sympy.Rational(15, 1184)),
+        )
+        for concrete_batch in (1, 2):
+            substitutions = {batch: concrete_batch}
+            concrete_required = required_producers.substitute_parameters(substitutions)
+            concrete_values = wave_by_task.substitute_parameters(substitutions)
+            concrete_maximum = maximum.substitute_parameters(substitutions)
+            values = concrete_values.materialize()
+            oracle = tuple(
+                frozenset((max(max(values[task]) for task in producer_tasks),))
+                for producer_tasks in concrete_required.materialize()
+            )
+            self.assertEqual(concrete_maximum.materialize(), oracle)
+            self.assertEqual(
+                sum(next(iter(value)) for value in oracle),
+                22 * concrete_batch,
+            )
+
+    def test_symbolic_max_target_value_aligned_modulo_catalog(self) -> None:
+        for modulus in (4, 6, 8, 12):
+            for width in range(1, modulus + 1):
+                if modulus % width:
+                    continue
+                with self.subTest(modulus=modulus, width=width):
+                    group_count = modulus // width
+                    keys = CoordinateDomain((10,), ((10, group_count),), kind="event")
+                    tasks = CoordinateDomain(
+                        (20, 21),
+                        ((20, width), (21, group_count)),
+                        kind="site",
+                    )
+                    key = coordinate_axis_symbol(10)
+                    inner = coordinate_axis_symbol(20)
+                    group = coordinate_axis_symbol(21)
+                    required = CoordinateRelation(
+                        keys,
+                        tasks,
+                        (
+                            _CoordinateRelationPiece(
+                                ((10, 0, group_count, 1),),
+                                (
+                                    (20, sympy.Integer(0), sympy.Integer(width), 1),
+                                    (21, key, key + 1, 1),
+                                ),
+                            ),
+                        ),
+                    )
+                    quotient_width = 2
+                    values = CoordinateDomain(
+                        (30,),
+                        ((30, (modulus + quotient_width - 1) // quotient_width),),
+                        kind="worker",
+                    )
+                    value_by_task = CoordinateRelation.point_map(
+                        tasks,
+                        values,
+                        (
+                            (
+                                ((20, 0, width, 1), (21, 0, group_count, 1)),
+                                (
+                                    sympy.floor(
+                                        sympy.Mod(inner + width * group, modulus)
+                                        / quotient_width
+                                    ),
+                                ),
+                            ),
+                        ),
+                    )
+
+                    maximum = required.max_target_value_by_source(value_by_task)
+
+                    self.assertIsNotNone(maximum)
+                    assert maximum is not None
+                    values_by_task = value_by_task.materialize()
+                    oracle = tuple(
+                        frozenset(
+                            (max(max(values_by_task[task]) for task in tasks_for_key),)
+                        )
+                        for tasks_for_key in required.materialize()
+                    )
+                    self.assertEqual(maximum.materialize(), oracle)
+
+        batch = sympy.Symbol("batch", integer=True, positive=True)
+        keys = CoordinateDomain((40,), ((40, batch),), kind="event")
+        tasks = CoordinateDomain(
+            (50, 51),
+            ((50, batch), (51, 4)),
+            kind="site",
+        )
+        key_batch = coordinate_axis_symbol(40)
+        task_batch = coordinate_axis_symbol(50)
+        inner = coordinate_axis_symbol(51)
+        required = CoordinateRelation(
+            keys,
+            tasks,
+            (
+                _CoordinateRelationPiece(
+                    ((40, 0, batch, 1),),
+                    (
+                        (50, key_batch, key_batch + 1, 1),
+                        (51, sympy.Integer(0), sympy.Integer(4), 1),
+                    ),
+                ),
+            ),
+        )
+        values = CoordinateDomain((60,), ((60, 8),), kind="worker")
+        value_by_task = CoordinateRelation.point_map(
+            tasks,
+            values,
+            (
+                (
+                    ((50, 0, batch, 1), (51, 0, 4, 1)),
+                    (sympy.Mod(inner + 4 * sympy.Mod(task_batch, 2), 8),),
+                ),
+            ),
+        )
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("symbolic outer parity must not enumerate"),
+        ):
+            maximum = required.max_target_value_by_source(value_by_task)
+        self.assertIsNotNone(maximum)
+        assert maximum is not None
+        for concrete_batch in (1, 2, 5):
+            substitutions = {batch: concrete_batch}
+            concrete_required = required.substitute_parameters(substitutions)
+            concrete_values = value_by_task.substitute_parameters(substitutions)
+            concrete_maximum = maximum.substitute_parameters(substitutions)
+            values_by_task = concrete_values.materialize()
+            oracle = tuple(
+                frozenset(
+                    (max(max(values_by_task[task]) for task in tasks_for_key),)
+                )
+                for tasks_for_key in concrete_required.materialize()
+            )
+            self.assertEqual(concrete_maximum.materialize(), oracle)
+
+    def test_symbolic_max_target_value_declines_wrapping_modulo_fiber(
+        self,
+    ) -> None:
+        keys = CoordinateDomain((10,), ((10, 4),), kind="event")
+        tasks = CoordinateDomain(
+            (20, 21),
+            ((20, 8), (21, 4)),
+            kind="site",
+        )
+        key = coordinate_axis_symbol(10)
+        head = coordinate_axis_symbol(20)
+        column = coordinate_axis_symbol(21)
+        required_producers = CoordinateRelation(
+            keys,
+            tasks,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 0, 4, 1),),
+                    (
+                        (20, sympy.Integer(0), sympy.Integer(8), 1),
+                        (21, key, key + 1, 1),
+                    ),
+                ),
+            ),
+        )
+        values = CoordinateDomain((30,), ((30, 4),), kind="worker")
+        cyclic_wave = CoordinateRelation.point_map(
+            tasks,
+            values,
+            (
+                (
+                    ((20, 0, 8, 1), (21, 0, 4, 1)),
+                    (sympy.floor(sympy.Mod(head + 8 * column + 1, 32) / 8),),
+                ),
+            ),
+        )
+
+        # The shifted mixed-radix rank wraps within the final fiber.  Its
+        # maximum would require another source partition, so the bounded
+        # extrema proof must decline instead of selecting an endpoint.
+        self.assertIsNone(
+            required_producers.max_target_value_by_source(cyclic_wave)
+        )
+
+        for modulus in (4, 6, 8, 12):
+            for width in range(2, modulus + 1):
+                if modulus % width:
+                    continue
+                with self.subTest(modulus=modulus, width=width):
+                    group_count = modulus // width
+                    small_keys = CoordinateDomain(
+                        (40,),
+                        ((40, group_count),),
+                        kind="event",
+                    )
+                    small_tasks = CoordinateDomain(
+                        (50, 51),
+                        ((50, width), (51, group_count)),
+                        kind="site",
+                    )
+                    small_key = coordinate_axis_symbol(40)
+                    small_inner = coordinate_axis_symbol(50)
+                    small_group = coordinate_axis_symbol(51)
+                    small_required = CoordinateRelation(
+                        small_keys,
+                        small_tasks,
+                        (
+                            _CoordinateRelationPiece(
+                                ((40, 0, group_count, 1),),
+                                (
+                                    (50, sympy.Integer(0), sympy.Integer(width), 1),
+                                    (51, small_key, small_key + 1, 1),
+                                ),
+                            ),
+                        ),
+                    )
+                    small_values = CoordinateDomain(
+                        (60,),
+                        ((60, modulus),),
+                        kind="worker",
+                    )
+                    wrapping_value = CoordinateRelation.point_map(
+                        small_tasks,
+                        small_values,
+                        (
+                            (
+                                (
+                                    (50, 0, width, 1),
+                                    (51, 0, group_count, 1),
+                                ),
+                                (
+                                    sympy.Mod(
+                                        small_inner + width * small_group + 1,
+                                        modulus,
+                                    ),
+                                ),
+                            ),
+                        ),
+                    )
+                    self.assertIsNone(
+                        small_required.max_target_value_by_source(wrapping_value)
+                    )
+
     def test_out_of_domain_point_map_is_not_total(self) -> None:
         source = CoordinateDomain((10,), ((10, 6),), identity=0)
         target = CoordinateDomain((0,), ((0, 2),), kind="event", identity=0)
