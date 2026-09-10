@@ -98,7 +98,7 @@ cross-workload exit gates below.
 
 ### Current implementation marker: close the symbolic proof layer
 
-Commits through `2ff6d5df` are the current compiler checkpoint. The existing immutable
+Commits through `7e7e44ac` are the current compiler checkpoint. The existing immutable
 `CoordinateRelation` remains the only schedule/dependency truth. It now retains
 derived exact converses through proved construction and transformation,
 represents ragged grouped L2 order with one forward piece and a two-piece
@@ -243,15 +243,16 @@ pullback are also complete. Same-strand chronology is derived only from the
 authoritative `WorkerScheduleSegment.task_order` relations; a review-found
 partial/strided clipping bug and a second mixed full/partial-piece clipping bug
 were fixed before integration. The combined tile-dependency and scheduler
-suites pass 310 tests with 185 subtests. The active implementation point is the
-occupied strand ordinal `q(s)`, followed by the acyclic root quotient and a
-test-only concrete max-plus oracle over the real model-shaped graphs. That
-oracle is now a mandatory early gate before production ownership selection.
-After it validates the objective, continue with the relation-level max-plus
-evaluator and joint continuation/resident choice, translated recurrence
-closure, post-placement nested quotients, source-ticket actions through that
-same policy, one final validation/lowering pass, and deletion of the top-level
-constant/parameterized branch.
+suites now pass 321 tests with 266 subtests. Occupied strand ordinal `q(s)` is
+also complete for concrete, holed, and ordinary symbolic packed schedules.
+The active implementation point is the acyclic root quotient and a test-only
+concrete max-plus oracle over the real model-shaped graphs. That oracle is a
+mandatory early gate before production ownership selection. After it validates
+the objective, continue with the relation-level max-plus evaluator and joint
+continuation/resident choice, translated recurrence closure, post-placement
+nested quotients, source-ticket actions through that same policy, one final
+validation/lowering pass, and deletion of the top-level constant/parameterized
+branch.
 
 Then continue Phase 4A.2 by replacing the remaining parameter-only admission
 filters with one exact action-legality decision, followed by the single joint
@@ -2827,10 +2828,19 @@ ownership a production decision. They are derived views over the existing
   Independent review covered 456,976 concrete lattice intersections, 50,850
   symbolic substitutions, and randomized pointwise-add and end-to-end
   weighted-extrema oracles with no mismatches.
-- [ ] Derive the occupied strand ordinal
+- [x] Derive the occupied strand ordinal
   `q(s) = 1 + |{t: t <strand s}|` from the exact same-strand relation. Holes
   and unoccupied waves contribute nothing. This is an ephemeral scalar
   `CoordinateRelation`, not another schedule field.
+
+  Implementation checkpoint (2026-09-10): arbitrary schedules count the
+  exact occupied-predecessor relation. A schedule already proved to be the
+  canonical dense packed prefix uses the full same-strand predecessor relation
+  as an algebraic strength reduction, but still delegates cardinality to
+  `target_count_by_source`; it does not introduce another scheduling policy.
+  Symbolic `N`, `4*N+1`, and `(3,N,2)` schedules produce three-piece ordinal
+  relations, and boundary substitutions plus randomized packed, holed, split,
+  and staged schedules agree with exhaustive materialization.
 - [ ] Add one bounded exact-or-decline ranked prefix/recurrence proof to the
   existing relation algebra. A finite number of ordinary compositions is not
   sufficient: even the affine pipeline `A_i -> B_i -> A_(i+1)` has a cyclic
