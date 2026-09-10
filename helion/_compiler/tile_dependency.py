@@ -4168,6 +4168,12 @@ class CoordinateRelation:
         if (
             self.target_domain != values.source_domain
             or len(values.target_domain.axis_order) != 1
+            or len(self.pieces) > _MAX_RELATION_PIECES
+            or len(values.pieces) > _MAX_RELATION_PIECES
+            or not _relation_product_is_within_budget(
+                len(self.pieces),
+                len(values.pieces),
+            )
             or not values.is_total_function()
         ):
             return None

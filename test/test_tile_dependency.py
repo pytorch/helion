@@ -3968,6 +3968,43 @@ class TestTileDependency(TestCase):
             tuple(frozenset((4 + consumer % 4,)) for consumer in range(64)),
         )
 
+    def test_max_target_value_respects_relation_product_budget(self) -> None:
+        source = CoordinateDomain((10,), ((10, 2),), kind="task_order")
+        target = CoordinateDomain((20,), ((20, 2),), kind="task_order")
+        values = CoordinateDomain((0,), ((0, 2),), kind="value")
+        source_coordinate = coordinate_axis_symbol(10)
+        target_coordinate = coordinate_axis_symbol(20)
+        source_pieces = (
+            ((10, 0, 1, 1),),
+            ((10, 1, 2, 1),),
+        )
+        target_pieces = (
+            ((20, 0, 1, 1),),
+            ((20, 1, 2, 1),),
+        )
+        required = CoordinateRelation.point_map(
+            source,
+            target,
+            tuple((bounds, (source_coordinate,)) for bounds in source_pieces),
+        )
+        value_by_target = CoordinateRelation.point_map(
+            target,
+            values,
+            tuple((bounds, (target_coordinate,)) for bounds in target_pieces),
+        )
+
+        self.assertIsNotNone(required.max_target_value_by_source(value_by_target))
+        with mock.patch(
+            "helion._compiler.tile_dependency._MAX_RELATION_PRODUCT_STATES",
+            1,
+        ):
+            self.assertIsNone(required.max_target_value_by_source(value_by_target))
+        with mock.patch(
+            "helion._compiler.tile_dependency._MAX_RELATION_PIECES",
+            1,
+        ):
+            self.assertIsNone(required.max_target_value_by_source(value_by_target))
+
     def test_symbolic_max_target_value_respects_stride_alignment(self) -> None:
         consumer_axis = 57
         producer_axis = 29
