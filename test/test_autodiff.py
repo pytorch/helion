@@ -6,6 +6,7 @@ import os
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import helion
@@ -1337,6 +1338,8 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             atol=1e-2,
         )
 
+    # XPU native compilation of the backward kernel can exceed the CI 60s limit.
+    @pytest.mark.timeout(180)
     def test_example_attention_non_divisible_seqlen(self):
         # Non-block-divisible sequence length: the scan zero-pads the key dim
         # and must re-apply the forward's OOB mask, else the softmax is
