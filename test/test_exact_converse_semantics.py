@@ -12,6 +12,7 @@ from helion._compiler.cross_loop_scheduler import WorkerSchedule
 from helion._compiler.cross_loop_scheduler import WorkerScheduleSegment
 from helion._compiler.tile_dependency import CoordinateDomain
 from helion._compiler.tile_dependency import CoordinateRelation
+from helion._compiler.tile_dependency import _memoized_exact_converse
 from helion._compiler.tile_dependency import coordinate_axis_symbol
 from helion._compiler.tile_dependency import pid_task_order
 from helion._testing import TestCase
@@ -106,6 +107,83 @@ def _dynamic_task_orders(
 
 
 class TestExactConverseSemantics(TestCase):
+    def test_composition_and_union_retain_only_existing_exact_converses(
+        self,
+    ) -> None:
+        source = CoordinateDomain((10,), ((10, 4),), kind="worker")
+        ordinal = CoordinateDomain((20,), ((20, 4),), kind="task_order")
+        target = CoordinateDomain((30,), ((30, 4),), identity=0)
+        source_coordinate = coordinate_axis_symbol(10)
+        ordinal_coordinate = coordinate_axis_symbol(20)
+        first = CoordinateRelation.point_map(
+            source,
+            ordinal,
+            ((((10, 0, 4, 1),), (source_coordinate,)),),
+        )
+        following = CoordinateRelation.point_map(
+            ordinal,
+            target,
+            ((((20, 0, 4, 1),), (3 - ordinal_coordinate,)),),
+        )
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "converse",
+            side_effect=AssertionError("composition must not initiate a proof"),
+        ):
+            unproved = first.then(following)
+        self.assertIsNotNone(unproved)
+        assert unproved is not None
+        self.assertIsNone(_memoized_exact_converse(unproved))
+
+        self.assertIsNotNone(first.converse())
+        self.assertIsNotNone(following.converse())
+        with mock.patch.object(
+            CoordinateRelation,
+            "converse",
+            side_effect=AssertionError("composition must use retained proofs"),
+        ):
+            composed = first.then(following)
+        self.assertIsNotNone(composed)
+        assert composed is not None
+        composed_converse = _memoized_exact_converse(composed)
+        self.assertIsNotNone(composed_converse)
+        assert composed_converse is not None
+        self.assertEqual(
+            composed_converse.materialize(),
+            (frozenset((3,)), frozenset((2,)), frozenset((1,)), frozenset((0,))),
+        )
+
+        left = CoordinateRelation.point_map(
+            source,
+            target,
+            ((((10, 0, 2, 1),), (source_coordinate,)),),
+        )
+        right = CoordinateRelation.point_map(
+            source,
+            target,
+            ((((10, 2, 4, 1),), (source_coordinate,)),),
+        )
+        self.assertIsNotNone(left.converse())
+        self.assertIsNotNone(right.converse())
+        with mock.patch.object(
+            CoordinateRelation,
+            "converse",
+            side_effect=AssertionError("union must use retained proofs"),
+        ):
+            combined = left.union(right)
+        self.assertIsNotNone(combined)
+        assert combined is not None
+        self.assertIsNotNone(_memoized_exact_converse(combined))
+        self.assertTrue(combined.is_bijection_from_source_support())
+
+        # Derived proof state is not part of equality and is not copied by a
+        # value transformation whose new forward relation has not been proved.
+        transformed = dataclasses.replace(composed)
+        self.assertEqual(transformed, composed)
+        self.assertEqual(hash(transformed), hash(composed))
+        self.assertIsNone(_memoized_exact_converse(transformed))
+
     def test_manual_relation_without_construction_witness_uses_bounded_fallback(
         self,
     ) -> None:

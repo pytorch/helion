@@ -1184,6 +1184,23 @@ class CoordinateRelation:
         )
 
     def then(self, following: CoordinateRelation) -> CoordinateRelation | None:
+        """Compose two relations and retain a proved reverse composition."""
+        result = self._then_without_converse(following)
+        if result is None:
+            return None
+        first_converse = _memoized_exact_converse(self)
+        following_converse = _memoized_exact_converse(following)
+        if first_converse is None or following_converse is None:
+            return result
+        converse = following_converse._then_without_converse(first_converse)
+        if converse is not None:
+            _remember_exact_converse(result, converse)
+        return result
+
+    def _then_without_converse(
+        self,
+        following: CoordinateRelation,
+    ) -> CoordinateRelation | None:
         """Compose a projection/full-target-set relation with another relation.
 
         This is the program-order composition needed for nested checkpoints.
@@ -1810,6 +1827,7 @@ class CoordinateRelation:
         )
         if ordinal_inverse is None:
             return None
+        _remember_exact_converse(ordinalization, ordinal_inverse)
         quotient = _factor_through_source_ordinalization(
             self,
             ordinalization,
@@ -1820,27 +1838,44 @@ class CoordinateRelation:
         quotient_inverse = quotient.converse()
         if quotient_inverse is None or not quotient_inverse.is_total_function():
             return None
-        return quotient_inverse.then(ordinal_inverse)
+        return quotient_inverse._then_without_converse(ordinal_inverse)
 
     def converse(self) -> CoordinateRelation | None:
         """Return the exact converse when representable without enumeration."""
+        if (converse := _memoized_exact_converse(self)) is not None:
+            return converse
         if self.is_positional_bijection():
-            return self.derive_converse_and_target_counts()[0]
+            converse = self.derive_converse_and_target_counts()[0]
+            return (
+                None if converse is None else _remember_exact_converse(self, converse)
+            )
+        cached_converse = self.__dict__.get("_cached_converse")
         if (
-            converse := _symbolic_single_source_mixed_radix_converse(self)
-        ) is not None:
+            isinstance(cached_converse, CoordinateRelation)
+            and cached_converse.is_single_valued()
+        ):
+            return _remember_exact_converse(self, cached_converse)
+        if (converse := _symbolic_single_source_mixed_radix_converse(self)) is not None:
+            return _remember_exact_converse(self, converse)
+        if (converse := _cheap_source_support_converse(self)) is not None:
             return converse
         if (converse := self._factored_source_support_converse) is not None:
-            return converse
+            return _remember_exact_converse(self, converse)
         if self.parameter_symbols:
-            return self.derive_converse_and_target_counts()[0]
+            converse = self.derive_converse_and_target_counts()[0]
+            return (
+                None if converse is None else _remember_exact_converse(self, converse)
+            )
         converse = self._cached_converse
         if converse is not None and converse.is_single_valued():
-            return converse
+            return _remember_exact_converse(self, converse)
         target_counts = self.target_count_by_source()
         if target_counts is None:
-            return converse
-        return _derived_converse(self, target_counts) or converse
+            return (
+                None if converse is None else _remember_exact_converse(self, converse)
+            )
+        converse = _derived_converse(self, target_counts) or converse
+        return None if converse is None else _remember_exact_converse(self, converse)
 
     def derive_converse_and_target_counts(
         self,
@@ -2445,7 +2480,24 @@ class CoordinateRelation:
         )
 
     def union(self, other: CoordinateRelation) -> CoordinateRelation | None:
-        """Return an exact finite union when both relations share typed domains."""
+        """Return an exact union, retaining already-proved exact converses."""
+        result = self._union_without_converse(other)
+        if result is None or result is self or result is other:
+            return result
+        left_converse = _memoized_exact_converse(self)
+        right_converse = _memoized_exact_converse(other)
+        if left_converse is None or right_converse is None:
+            return result
+        converse = left_converse._union_without_converse(right_converse)
+        if converse is not None:
+            _remember_exact_converse(result, converse)
+        return result
+
+    def _union_without_converse(
+        self,
+        other: CoordinateRelation,
+    ) -> CoordinateRelation | None:
+        """Return an exact finite union without recursively propagating proof."""
         if (
             self.source_domain != other.source_domain
             or self.target_domain != other.target_domain
@@ -2697,13 +2749,6 @@ class CoordinateRelation:
         """
         if self.target_domain.size_expr.is_zero is True:
             return 0
-        if self._factored_source_support_converse is not None:
-            target_size = sympy.simplify(self.target_domain.size_expr)
-            return (
-                int(target_size)
-                if isinstance(target_size, sympy.Integer)
-                else target_size
-            )
         if len(
             self.pieces
         ) <= _MAX_RELATION_PIECES and _relation_product_is_within_budget(
@@ -2749,6 +2794,13 @@ class CoordinateRelation:
                     if isinstance(cardinality, sympy.Integer)
                     else cardinality
                 )
+        if self._factored_source_support_converse is not None:
+            target_size = sympy.simplify(self.target_domain.size_expr)
+            return (
+                int(target_size)
+                if isinstance(target_size, sympy.Integer)
+                else target_size
+            )
         if self.parameter_symbols:
             # Symbolic overlap normalization requires an ordering proof for
             # every source cut.  Decline instead of sampling a runtime size.
@@ -2810,6 +2862,20 @@ class CoordinateRelation:
             # Support is a proved subset of the source domain. Equal finite
             # cardinality therefore proves coverage, including symbolic tails.
             return True
+        converse = _memoized_exact_converse(self)
+        if converse is not None and self.is_single_valued():
+            converse_cardinality = converse.source_support_cardinality()
+            if (
+                converse_cardinality is not None
+                and _integer_partition_expressions_equal(
+                    converse_cardinality,
+                    self.source_domain.size_expr,
+                )
+            ):
+                # ``self`` being single-valued makes its exact converse
+                # injective.  Its full-cardinality support therefore maps
+                # onto every point of this finite source domain.
+                return True
         positional_product = self._parameterized_positional_product
         if positional_product is not None:
             _positional_axes, residual = positional_product
@@ -3122,7 +3188,10 @@ class CoordinateRelation:
         are all required, so equal source/target counts alone cannot certify a
         duplicate-target map.
         """
-        if self._factored_source_support_converse is not None:
+        converse = _memoized_exact_converse(self)
+        if converse is None and self._factored_source_support_converse is not None:
+            # The factorization constructs an exact total inverse through the
+            # dense ordinal of this relation's semantic support.
             return True
         source_cardinality = self.source_support_cardinality()
         if (
@@ -3136,7 +3205,8 @@ class CoordinateRelation:
             return False
         if self.target_domain.size_expr.is_zero is True:
             return True
-        converse = self.converse()
+        if converse is None:
+            converse = self.converse()
         return converse is not None and converse.is_total_function()
 
     def _pointwise_difference_bounds(
@@ -4109,6 +4179,64 @@ def _source_box_cardinality(
         extent = width if step == 1 else FloorDiv(width + step - 1, step)
         cardinality *= extent
     return sympy.simplify(cardinality)
+
+
+_DERIVED_EXACT_CONVERSE_ATTRIBUTE = "_derived_exact_converse"
+
+
+def _memoized_exact_converse(
+    relation: CoordinateRelation,
+) -> CoordinateRelation | None:
+    """Read an internally derived converse without initiating another proof."""
+    converse = relation.__dict__.get(_DERIVED_EXACT_CONVERSE_ATTRIBUTE)
+    if converse is None:
+        return None
+    if not isinstance(converse, CoordinateRelation) or (
+        converse.source_domain != relation.target_domain
+        or converse.target_domain != relation.source_domain
+    ):
+        raise AssertionError("invalid derived exact-converse memo")
+    return converse
+
+
+def _remember_exact_converse(
+    relation: CoordinateRelation,
+    converse: CoordinateRelation,
+) -> CoordinateRelation:
+    """Memoize a proved converse pair outside dataclass value semantics."""
+    if (
+        converse.source_domain != relation.target_domain
+        or converse.target_domain != relation.source_domain
+    ):
+        raise AssertionError("exact converse has reversed domains")
+    existing = _memoized_exact_converse(relation)
+    if existing is not None:
+        return existing
+    relation.__dict__[_DERIVED_EXACT_CONVERSE_ATTRIBUTE] = converse
+    if _memoized_exact_converse(converse) is None:
+        converse.__dict__[_DERIVED_EXACT_CONVERSE_ATTRIBUTE] = relation
+    return converse
+
+
+def _cheap_source_support_converse(
+    relation: CoordinateRelation,
+) -> CoordinateRelation | None:
+    """Return a cheap structural converse of an exact support ordinal."""
+    if (converse := _memoized_exact_converse(relation)) is not None:
+        return converse
+    if (
+        len(relation.target_domain.axis_order) == 1
+        and len(relation.source_domain.axis_order) >= 2
+        and (
+            converse := _source_support_ordinalization(
+                relation,
+                reverse=True,
+            )
+        )
+        is not None
+    ):
+        return _remember_exact_converse(relation, converse)
+    return None
 
 
 def _integer_partition_expressions_equal(
