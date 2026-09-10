@@ -2771,17 +2771,48 @@ ownership a production decision. They are derived views over the existing
   materialization before either legacy or joint extrema are evaluated.
   Independent differential review covered oversized and negative bounds,
   strides, symbolic substitutions, empty intersections, and proof budgets.
-- [ ] Evaluate the lexicographic objective `(completion, handoffs)` with one
-  ephemeral max-plus propagation over same-strand precedence and semantic
-  readiness edges. Every body contributes `(1, 0)`; a resident cross-owner
-  readiness handoff contributes `(0, 1)`, but only on paths tied for maximum
-  completion. This evaluator consumes the authoritative relations and adds no
-  serialized schedule representation.
+- [ ] Derive the occupied strand ordinal
+  `q(s) = 1 + |{t: t <strand s}|` from the exact same-strand relation. Holes
+  and unoccupied waves contribute nothing. This is an ephemeral scalar
+  `CoordinateRelation`, not another schedule field.
+- [ ] Add one bounded exact-or-decline ranked prefix/recurrence proof to the
+  existing relation algebra. A finite number of ordinary compositions is not
+  sufficient: even the affine pipeline `A_i -> B_i -> A_(i+1)` has a cyclic
+  root quotient and completion growing with runtime `i`. First support an
+  acyclic relation-piece quotient. Then support a cyclic quotient only when a
+  common well-founded rank, a static translation period, base coverage, tail
+  coverage, and the complete Bellman equality are all proved. Encode the
+  resulting scalar maps with existing affine/floor/modulo relation pieces;
+  do not add a recurrence, state, or schedule IR. Decline parameter-dependent
+  periods, unbounded state, nonrectangular partitions, or proof-budget
+  overflow.
+- [ ] Evaluate the lexicographic objective `(completion, handoffs)` with that
+  prefix proof over same-strand precedence and semantic readiness edges. For
+  each body `s`, let `R(s)` be the greatest readiness-predecessor score,
+  `I(s) = R(s) + (1, 0) - (q(s), 0)`, and
+  `D(s) = max((0, 0), max_{t <=strand s} I(t))`; then the body score is
+  `(q(s), 0) + D(s)`. Every body contributes `(1, 0)`. A resident readiness
+  edge contributes `(0, 1)` exactly when producer and consumer owners differ,
+  and only among predecessors tied for maximum completion. Existing extremum
+  and all-attainer relations perform each Bellman pullback; the new prefix
+  proof supplies only the runtime-length closure they cannot express. The
+  evaluator is ephemeral and adds no serialized schedule representation.
+  For an acyclic piece quotient, the pair may be encoded as the scalar
+  `K*completion + handoffs`, with static `K = quotient_node_count + 1`, only
+  after proving a path cannot revisit a charged node and therefore
+  `handoffs < K`. A cyclic translation proof keeps two scalar relations and
+  performs completion extrema before handoff extrema unless a larger symbolic
+  radix is itself proved to stay within the supported expression grammar.
 - [ ] Represent an inline consumer body exactly once. Its possible
-  final-producer winners are mutually exclusive ownership alternatives, not
-  simultaneous copies of the body on every producer strand. Propagate each
-  alternative through the complete downstream graph and compare the
-  guard-wide worst result with resident placement.
+  final-producer winners are the causally maximal producer on each strand,
+  followed by removal of producers proved to precede another candidate for
+  the same key. They are mutually exclusive ownership alternatives, not
+  simultaneous copies of the body on every producer strand and not simply
+  the producers with maximum wave or completion. Each alternative receives
+  the event maximum over all required producers, executes after its publisher,
+  and contributes the body once. Propagate each alternative through the
+  complete downstream graph and compare the guard-wide worst result with
+  resident placement.
 
 The scalar global-slot relation used by tail-packing is a sufficient acyclic
 progress rank, not this objective. In particular, a producer and waiting
@@ -2792,14 +2823,17 @@ therefore cannot substitute for the max-plus evaluator.
 - Feed the one exact `ReadinessGraph` into one event-frontier policy; reject an
   early-admission candidate unless its required synchronization lowering is
   proved.
-- At event-family closure, compare the earliest legal resident placement with
-  the continuation alternative after charging one unit per inline body on
-  every possible final-producer strand. Compare complete completion horizon
-  first and critical-path resident handoff depth second; prefer resident on an
-  unproved comparison or a full objective tie, and require one choice for the
-  whole compiled guard.
-- Commit at most one continuation consumer, remove its resident coverage, and
-  contract downstream readiness atomically. No other pass reselects it.
+- From one complete provisional all-resident schedule, compare each legal
+  continuation alternative after charging one unit per inline body on every
+  possible final-producer strand. This is not an online decision made before
+  downstream placement exists. Compare complete completion horizon first and
+  critical-path resident handoff depth second; prefer resident on an unproved
+  comparison or a full objective tie, and require one choice for the whole
+  compiled guard.
+- Commit at most one continuation consumer globally, remove its resident
+  coverage, and contract downstream readiness atomically. Score the resident
+  plan once and each single-continuation proposal independently; this avoids
+  an implicit exponential assignment problem. No other pass reselects it.
 - Preserve the configured intra-root order unless an exact readiness-major
   permutation is proved.
 - Emit the result directly as `WorkerScheduleSegment.task_order` relations.
@@ -2809,6 +2843,12 @@ therefore cannot substitute for the max-plus evaluator.
   transient-source selector as a second production policy.
 - Keep the old concrete placement algorithm only as a small differential test
   oracle; remove it from production after parity.
+
+The unit-body objective treats a root body atomically. A nested-site wait is a
+legality/frontier constraint, but it is not a separate timed body phase until
+the compiler has an exact phase model. Any ownership comparison that would
+depend on nested-site timing declines rather than silently assigning it a
+cost.
 
 Exit gate: the policy contains no parameter-presence branch, model/root ID,
 sampled shape, latency estimate, or host-generated runtime schedule. Gemma B2
