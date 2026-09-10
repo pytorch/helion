@@ -97,7 +97,7 @@ cross-workload exit gates below.
 
 ### Current implementation marker: close the symbolic proof layer
 
-Commits through `5c36fed9` are the current compiler checkpoint. The existing immutable
+Commits through `ba26378f` are the current compiler checkpoint. The existing immutable
 `CoordinateRelation` remains the only schedule/dependency truth. It now retains
 derived exact converses through proved construction and transformation,
 represents ragged grouped L2 order with one forward piece and a two-piece
@@ -224,9 +224,15 @@ same-wave progress, and decline barriers, nested waits, forks/joins, and wider
 fan-in. In particular, it must not turn the F64/C16 MLA relation into the
 known-slow key-major stream; equal unit-wave horizon is not evidence that two
 dense schedules have equal body performance. This slice is a prerequisite,
-not policy unification. The merge order is: tail packing, post-placement
-nested quotient, joint continuation/resident choice, source-ticket action,
-single finalization/validation, and only then deletion of the top-level
+not policy unification. Before accepting it, derive the reusable symbolic
+logical-task-to-global-slot relation and use strict slot order only as a
+topological progress certificate. It is not a completion-time objective:
+different workers in one wave are concurrent, while a readiness wait within
+that wave can still add another unit of logical completion time. The merge
+order is: symbolic slot/progress proof, tail packing, relation-level max-plus
+completion prerequisites, joint continuation/resident choice,
+post-placement nested quotient, source-ticket action, single
+finalization/validation, and only then deletion of the top-level
 constant/parameterized branch.
 
 Then continue Phase 4A.2 by replacing the remaining parameter-only admission
@@ -2722,6 +2728,40 @@ normalized relations and guards, no ownership has yet changed, and scheduling
 cannot accept an action whose eventual publication is unproved.
 
 #### Phase 4A.3: jointly schedule resident and inline work once
+
+Complete these relation-level prerequisites before making continuation
+ownership a production decision. They are derived views over the existing
+`WorkerSchedule` and `ReadinessGraph`, not new plan or IR state:
+
+- [ ] Derive occupied same-strand precedence from
+  `WorkerScheduleSegment.task_order`. Construct occupied slot identity from
+  each segment and relate slots with the same `(launch_stage, worker)` and a
+  strictly earlier wave. It is acceptable initially to retain all strict
+  predecessors; immediate-predecessor selection is only a later strength
+  reduction. Iterate over roots and relation pieces, never workers, waves, or
+  logical CTAs.
+- [ ] Extend the existing exact extremum machinery to return both the extremal
+  value and the exact relation containing every target coordinate that attains
+  it. Preserve value/witness correlation across ties, empty domains, dominance
+  proofs, and parameter-dependent crossings for the whole compiled guard. A
+  single attaining corner or a bare `sympy.Max` is insufficient.
+- [ ] Evaluate the lexicographic objective `(completion, handoffs)` with one
+  ephemeral max-plus propagation over same-strand precedence and semantic
+  readiness edges. Every body contributes `(1, 0)`; a resident cross-owner
+  readiness handoff contributes `(0, 1)`, but only on paths tied for maximum
+  completion. This evaluator consumes the authoritative relations and adds no
+  serialized schedule representation.
+- [ ] Represent an inline consumer body exactly once. Its possible
+  final-producer winners are mutually exclusive ownership alternatives, not
+  simultaneous copies of the body on every producer strand. Propagate each
+  alternative through the complete downstream graph and compare the
+  guard-wide worst result with resident placement.
+
+The scalar global-slot relation used by tail-packing is a sufficient acyclic
+progress rank, not this objective. In particular, a producer and waiting
+consumer on different workers in the same wave occupy one resident wave but
+take two unit completion steps. Root-schema depth and occupied-wave horizon
+therefore cannot substitute for the max-plus evaluator.
 
 - Feed the one exact `ReadinessGraph` into one event-frontier policy; reject an
   early-admission candidate unless its required synchronization lowering is
