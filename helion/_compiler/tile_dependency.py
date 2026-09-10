@@ -4549,15 +4549,7 @@ class CoordinateRelation:
             )
             canonical_values = values.canonical_single_valued()
             if canonical_values is None:
-                if not values.is_single_valued() or any(
-                    not _target_point_is_in_domain(
-                        piece.target_ranges,
-                        source_domain=values.source_domain,
-                        source_bounds=piece.source_bounds_items,
-                        target_domain=values.target_domain,
-                    )
-                    for piece in values.pieces
-                ):
+                if not values.is_single_valued():
                     return None
                 # A symbolic support may not admit one global source-cell
                 # partition.  Keep its deduplicated point pieces here; each
@@ -4565,6 +4557,16 @@ class CoordinateRelation:
                 # exact cover before any value is used.
                 canonical_values = values
             values = canonical_values
+            if any(
+                not _target_point_is_in_domain(
+                    piece.target_ranges,
+                    source_domain=values.source_domain,
+                    source_bounds=piece.source_bounds_items,
+                    target_domain=values.target_domain,
+                )
+                for piece in values.pieces
+            ):
+                return None
             value_piece_count = len(values.pieces)
             coverage_is_within_budget = _relation_product_is_within_budget(
                 len(self.pieces), value_piece_count, value_piece_count

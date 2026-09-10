@@ -5072,6 +5072,29 @@ class TestTileDependency(TestCase):
         ):
             self.assertIsNone(required.max_target_value_by_source(partial))
 
+    def test_partial_value_extrema_rejects_out_of_domain_scalar(self) -> None:
+        source = CoordinateDomain((), (), kind="event")
+        target = CoordinateDomain((20,), ((20, 2),), kind="site")
+        scalar = CoordinateDomain((30,), ((30, 1),), kind="value")
+        required = CoordinateRelation(
+            source,
+            target,
+            (_CoordinateRelationPiece((), ((20, 0, 1, 1),)),),
+        )
+        invalid_values = CoordinateRelation.point_map(
+            target,
+            scalar,
+            ((((20, 0, 1, 1),), (sympy.Integer(5),)),),
+        )
+
+        self.assertIsNone(required.max_target_value_by_source(invalid_values))
+        self.assertIsNone(
+            required.extreme_target_value_and_attainers_by_source(
+                invalid_values,
+                maximize=True,
+            )
+        )
+
     def test_target_value_extreme_retains_tied_boxes_and_affine_face(self) -> None:
         source = CoordinateDomain((), (), kind="event")
         target = CoordinateDomain(
