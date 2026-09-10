@@ -78,11 +78,12 @@ Implementation checkpoint (2026-09-09):
   out-of-domain pruning keep the dependency compact. A production-shaped
   F64/C16 MLA probe lowers with no root barrier or continuation and reuses one
   cubin across B=1,2,4,9.
-- The first parametric event-frontier recurrence is implemented for a unique
-  topological chain of equal-size canonical rank-one roots joined by those
-  exact fan-in-one events. The existing segment relations are the certificate.
-  Current codegen still re-recognizes some event order and barrier facts; that
-  duplicate derivation must be removed under Priority 2A.
+- The former equal-size parametric event-frontier recurrence has been removed.
+  It occupied `L*ceil(N/W)` waves, whereas the existing packed root-major
+  relation occupies `ceil(L*N/W)` for the same work; its separate recognizer
+  and renderer therefore added policy surface without a proved benefit.
+  Event-aware locality must now be proposed by the one scheduler and certified
+  from the accepted segment relations and readiness plans.
 - Exact bounded nonuniform fan-in now lowers through per-key arrival-count
   expressions and a proved maximum epoch stride. Data-dependent ragged fan-in,
   masked producer publication, unequal non-continuation recurrences, and the
@@ -656,8 +657,7 @@ The current parameterized-extent path is approximately:
 packed root-major WorkerSchedule
     -> choose only sink continuations with uniform fan-in greater than one
     -> discard counters outside a separate parameterized subset
-    -> recognize one equal-size positional event-frontier recurrence
-    -> otherwise keep root-major order
+    -> keep packed root-major order
     -> finalize its counters and barriers separately
 ```
 
@@ -2462,34 +2462,24 @@ compiled cubin. This established parameterized exact synchronization; the next
 checkpoint adds the first cross-root repeating wave relation for immediate
 per-key overlap.
 
-Implementation checkpoint (2026-09-09): a unique topological chain of two or
-more equal-size canonical rank-one roots now closes into an exact parametric
-event-frontier recurrence when every emitted prerequisite is one of the
-positional fan-in-one counters above. For `L` roots, `W` workers, and runtime
-task count `N`, phase `p` owns:
+Historical checkpoint (2026-09-09, removed 2026-09-10): a unique topological
+chain of two or more equal-size canonical rank-one roots was once closed into
+the following parametric event-frontier recurrence when every emitted
+prerequisite was a positional fan-in-one counter. For `L` roots, `W` workers,
+and runtime task count `N`, phase `p` owned:
 
 ```text
 task = (wave // L) * W + worker
 wave % L = p
 ```
 
-with `L * ceildiv(N, W)` symbolic waves and target-domain clipping for the
-tail. This is the closed form produced by the concrete event-frontier policy:
-after one producer cohort closes an event, the newly admissible downstream
-cohort wins before another upstream cohort. The compiler derives the root
-order from the existing emitted-prerequisite view and stores the result only
-in `WorkerScheduleSegment.task_order`; no runtime-task DAG or second schedule
-representation is built. Codegen re-recognizes that exact relation and
-strength-reduces it to one worker-strided runtime key loop containing the root
-calls in phase order. Existing counters remain the synchronization authority.
-
-Symbolic tests cover empty domains, tails, multiple waves, ambiguous forks,
-and coexistence with root barriers. A differential test compares the relation
-against the concrete event-frontier list scheduler for a three-stage chain at
-six boundary sizes. Forks, barriers, unequal extents, rank greater than one,
-and non-positional relations conservatively retain the parametric root-major
-schedule. This is a representation and correctness milestone; it does not yet
-claim the wider fan-in or source-ticket structure needed by FlashMLA.
+with `L * ceildiv(N, W)` symbolic waves. Review later established that the
+already-supported packed root-major relation holds the same tasks in
+`ceildiv(L*N, W)` waves (six versus four for `L=3`, `N=5`, `W=4`) and compiles
+at the prior baseline cost. No runtime benefit justified the separate
+recognizer or renderer, so production selection, lowering, and their private
+helpers were deleted. This history is retained only to prevent reintroducing
+the same schedule as a special case.
 
 Implementation checkpoint (2026-09-09): parameterized readiness also accepts
 the exact rank-one partition
@@ -2507,7 +2497,7 @@ current candidate-continuation helper by the producer observing the final
 arrival. Priority 2A folds that candidate into
 `ReadinessCounterPlan.continuation_consumer_index`, the sole finalized
 continuation identity. The unequal `F*K -> K` topology deliberately remains
-root-major and does not broaden the equal-size event-frontier recurrence.
+root-major and does not introduce another scheduling or ownership policy.
 
 All parameterized exact counters share a 64-bit state allocation containing
 fixed per-worker epochs followed by aligned readiness sections. If `M` is the
