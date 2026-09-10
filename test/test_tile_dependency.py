@@ -4831,6 +4831,34 @@ class TestTileDependency(TestCase):
         self.assertTrue(left.is_pointwise_strictly_less_than_where_defined(right))
         self.assertFalse(right.is_pointwise_strictly_less_than_where_defined(left))
 
+    def test_pointwise_strict_order_respects_relation_piece_budget(self) -> None:
+        source = CoordinateDomain((10,), ((10, 2),), identity=0)
+        values = CoordinateDomain((0,), ((0, 4),), kind="value")
+        coordinate = coordinate_axis_symbol(10)
+        source_pieces = (
+            ((10, 0, 1, 1),),
+            ((10, 1, 2, 1),),
+        )
+        left = CoordinateRelation.point_map(
+            source,
+            values,
+            tuple((bounds, (coordinate,)) for bounds in source_pieces),
+        )
+        right = CoordinateRelation.point_map(
+            source,
+            values,
+            tuple((bounds, (coordinate + 1,)) for bounds in source_pieces),
+        )
+
+        self.assertTrue(left.is_pointwise_strictly_less_than_where_defined(right))
+        with mock.patch(
+            "helion._compiler.tile_dependency._MAX_RELATION_PIECES",
+            1,
+        ):
+            self.assertFalse(
+                left.is_pointwise_strictly_less_than_where_defined(right)
+            )
+
     def test_partitioned_total_function_avoids_global_canonicalization(self) -> None:
         source = CoordinateDomain((10,), ((10, 128),), identity=0)
         target = CoordinateDomain((20,), ((20, 128),), identity=1)

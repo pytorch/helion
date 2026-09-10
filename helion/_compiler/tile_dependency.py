@@ -3840,6 +3840,11 @@ class CoordinateRelation:
         other: CoordinateRelation,
     ) -> bool:
         """Prove strict order on this scalar function's exact source support."""
+        if (
+            len(self.pieces) > _MAX_RELATION_PIECES
+            or len(other.pieces) > _MAX_RELATION_PIECES
+        ):
+            return False
         left = self.canonical_single_valued()
         right = other.canonical_single_valued()
         if (
