@@ -854,19 +854,31 @@ def _flat_task_order_relation(
     ):
         renamed = task_order.rename_source_axes(ordinal_domain)
         if renamed is not None:
+            if renamed.converse() is None:
+                return None
             return renamed
     (ordinal_axis,) = ordinal_domain.axis_order
     local_flat_index = coordinate_axis_symbol(ordinal_axis) - ordinal_begin  # pyrefly: ignore[unsupported-operation]
     local_coordinates: list[sympy.Expr] = []
     local_stride: sympy.Expr = sympy.Integer(1)
-    for axis in task_order.source_domain.axis_order:
+    source_axis_order = task_order.source_domain.axis_order
+    for index, axis in enumerate(source_axis_order):
         axis_count = task_order.source_domain.axis_count_expressions[axis]
+        quotient = (
+            local_flat_index
+            if local_stride == 1
+            else cast("sympy.Expr", FloorDiv(local_flat_index, local_stride))
+        )
         local_coordinates.append(
             cast(
                 "sympy.Expr",
-                sympy.Mod(
-                    sympy.floor(local_flat_index / local_stride),  # pyrefly: ignore[unsupported-operation]
-                    axis_count,
+                quotient
+                if index == len(source_axis_order) - 1
+                else sympy.Mod(quotient, axis_count)
+                if not axis_count.free_symbols
+                else sympy.simplify(
+                    quotient
+                    - cast("sympy.Expr", FloorDiv(quotient, axis_count)) * axis_count
                 ),
             )
         )
@@ -888,6 +900,34 @@ def _flat_task_order_relation(
             ),
         ),
     )
+    local_ordinal: sympy.Expr = sympy.Integer(ordinal_begin)
+    local_stride: sympy.Expr = sympy.Integer(1)
+    for axis in source_axis_order:
+        local_ordinal = sympy.simplify(
+            local_ordinal + coordinate_axis_symbol(axis) * local_stride
+        )
+        local_stride = sympy.simplify(
+            local_stride * task_order.source_domain.axis_count_expressions[axis]
+        )
+    local_to_ordinal = CoordinateRelation.point_map(
+        task_order.source_domain,
+        ordinal_domain,
+        (
+            (
+                tuple(
+                    (
+                        axis,
+                        0,
+                        task_order.source_domain.axis_count_expressions[axis],
+                        1,
+                    )
+                    for axis in task_order.source_domain.axis_order
+                ),
+                (local_ordinal,),
+            ),
+        ),
+    )
+    tile_dependency._remember_exact_converse(ordinal_to_local, local_to_ordinal)
     composed = ordinal_to_local.then(task_order)
     if composed is not None:
         return composed
@@ -904,6 +944,7 @@ def _flat_task_order_relation(
     if (
         compact_task_order != task_order
         and compact_task_order.is_total_function()
+        and compact_task_order.converse() is not None
         and (composed := ordinal_to_local.then(compact_task_order)) is not None
     ):
         return composed
@@ -996,7 +1037,9 @@ def _flat_task_order_relation(
         task_order.target_domain,
         tuple(flattened_pieces),
     )
-    return result if result.is_total_function() else None
+    if not result.is_total_function() or result.converse() is None:
+        return None
+    return result
 
 
 def _task_order_slice(
@@ -1271,11 +1314,18 @@ def _parametric_root_major_relation(
     wave = coordinate_axis_symbol(wave_axis)
     task_count = target_domain.size_expr
     if task_count.is_zero is True:
-        return CoordinateRelation(
+        relation = CoordinateRelation(
             source_domain=schedule_domain,
             target_domain=target_domain,
             pieces=(),
         )
+        converse = CoordinateRelation(
+            source_domain=target_domain,
+            target_domain=schedule_domain,
+            pieces=(),
+        )
+        tile_dependency._remember_exact_converse(relation, converse)
+        return relation
     first_wave = cast("sympy.Expr", FloorDiv(first_slot, worker_count))
     first_worker = sympy.Mod(first_slot, worker_count)
     first_count = SymbolicMin(task_count, worker_count - first_worker)
@@ -1365,7 +1415,7 @@ def _parametric_root_major_relation(
             ),
         ),
     )
-    return dataclasses.replace(
+    relation = dataclasses.replace(
         relation,
         pieces=tuple(
             piece
@@ -1376,6 +1426,38 @@ def _parametric_root_major_relation(
             )
         ),
     )
+    task_ordinal: sympy.Expr = sympy.Integer(0)
+    stride = sympy.Integer(1)
+    for axis in task_axis_order:
+        task_ordinal = sympy.simplify(
+            task_ordinal + coordinate_axis_symbol(axis) * stride
+        )
+        stride = sympy.simplify(stride * target_domain.axis_count_expressions[axis])
+    global_slot = sympy.simplify(first_slot + task_ordinal)
+    converse = CoordinateRelation.point_map(
+        target_domain,
+        schedule_domain,
+        (
+            (
+                tuple(
+                    (
+                        axis,
+                        0,
+                        target_domain.axis_count_expressions[axis],
+                        1,
+                    )
+                    for axis in target_domain.axis_order
+                ),
+                (
+                    sympy.Integer(_RESIDENT_LAUNCH_STAGE),
+                    sympy.Mod(global_slot, worker_count),
+                    cast("sympy.Expr", FloorDiv(global_slot, worker_count)),
+                ),
+            ),
+        ),
+    )
+    tile_dependency._remember_exact_converse(relation, converse)
+    return relation
 
 
 def _packed_ordinal_slice_relation(
@@ -1404,25 +1486,29 @@ def _packed_ordinal_slice_relation(
         worker_count,
         interval_domain.axis_order,
     )
-    return CoordinateRelation(
-        source_domain=schedule_domain,
-        target_domain=ordinal_domain,
-        pieces=tuple(
-            dataclasses.replace(
-                piece,
-                target_ranges=tuple(
-                    (
-                        axis,
-                        sympy.simplify(begin + ordinal_begin),
-                        sympy.simplify(end + ordinal_begin),
-                        step,
-                    )
-                    for axis, begin, end, step in piece.target_ranges
-                ),
-            )
-            for piece in local.pieces
+    interval_coordinate = coordinate_axis_symbol(ordinal_axis)
+    translation = CoordinateRelation.point_map(
+        interval_domain,
+        ordinal_domain,
+        (
+            (
+                ((ordinal_axis, 0, interval_count, 1),),
+                (interval_coordinate + ordinal_begin,),  # pyrefly: ignore[unsupported-operation]
+            ),
         ),
     )
+    translation_converse = CoordinateRelation.point_map(
+        ordinal_domain,
+        interval_domain,
+        (
+            (
+                ((ordinal_axis, ordinal_begin, ordinal_end, 1),),
+                (interval_coordinate - ordinal_begin,),  # pyrefly: ignore[unsupported-operation]
+            ),
+        ),
+    )
+    tile_dependency._remember_exact_converse(translation, translation_converse)
+    return local.then(translation)
 
 
 def _packed_root_major_task_order_relation(
@@ -1432,6 +1518,8 @@ def _packed_root_major_task_order_relation(
     worker_count: int,
 ) -> CoordinateRelation | None:
     """Compose packed schedule slots with one configured logical traversal."""
+    if task_order.converse() is None:
+        return None
     packed_source = _parametric_root_major_relation(
         schedule_domain,
         task_order.source_domain,
@@ -1441,13 +1529,18 @@ def _packed_root_major_task_order_relation(
     )
     if (composed := packed_source.then(task_order)) is not None:
         return composed
+    if (
+        composed := _compose_packed_with_total_point_map(
+            packed_source,
+            task_order,
+        )
+    ) is not None:
+        return composed
 
     # Piecewise orders such as L2 grouping may guard only an interval of their
     # scalar traversal. Align the packed relation to those existing pieces so
     # point composition can prove each preimage directly. This loop scales
     # with relation complexity, never with tasks, workers, or waves.
-    if len(task_order.source_domain.axis_order) != 1:
-        return None
     ordinal_domain = _task_order_ordinal_domain(task_order)
     flat_task_order = _flat_task_order_relation(task_order, ordinal_domain)
     if flat_task_order is None:
@@ -1458,7 +1551,7 @@ def _packed_root_major_task_order_relation(
     ):
         return None
     (ordinal_axis,) = ordinal_domain.axis_order
-    packed_pieces = []
+    packed_order: CoordinateRelation | None = None
     for piece in flat_task_order.pieces:
         if len(piece.source_bounds_items) != 1:
             return None
@@ -1475,17 +1568,81 @@ def _packed_root_major_task_order_relation(
         )
         if packed_slice is None:
             return None
-        if len(packed_slice.pieces) > tile_dependency._MAX_RELATION_PIECES - len(
-            packed_pieces
+        if (
+            packed_order is not None
+            and not tile_dependency._relation_product_is_within_budget(
+                len(packed_order.pieces),
+                len(packed_slice.pieces),
+            )
         ):
             return None
-        packed_pieces.extend(packed_slice.pieces)
-    packed_order = CoordinateRelation(
-        source_domain=schedule_domain,
-        target_domain=ordinal_domain,
-        pieces=tuple(dict.fromkeys(packed_pieces)),
+        packed_order = (
+            packed_slice if packed_order is None else packed_order.union(packed_slice)
+        )
+        if packed_order is None:
+            return None
+    if packed_order is None:
+        return None
+    if (composed := packed_order.then(flat_task_order)) is not None:
+        return composed
+    return _compose_packed_with_total_point_map(packed_order, flat_task_order)
+
+
+def _compose_packed_with_total_point_map(
+    packed_order: CoordinateRelation,
+    following: CoordinateRelation,
+) -> CoordinateRelation | None:
+    """Compose a proved packed placement with one total configured point map."""
+    if (
+        packed_order.target_domain != following.source_domain
+        or len(following.pieces) != 1
+        or tile_dependency._memoized_exact_converse(packed_order) is None
+        or tile_dependency._memoized_exact_converse(following) is None
+    ):
+        return None
+    (following_piece,) = following.pieces
+    if following_piece.source_bounds_items != tuple(
+        (
+            axis,
+            0,
+            following.source_domain.axis_count_expressions[axis],
+            1,
+        )
+        for axis in following.source_domain.axis_order
+    ) or any(
+        step != 1 or not _equal_integer_expressions(end - begin, 1)
+        for _axis, begin, end, step in following_piece.target_ranges
+    ):
+        return None
+    pieces = []
+    for packed_piece in packed_order.pieces:
+        substitutions = {
+            coordinate_axis_symbol(axis): begin
+            for axis, begin, _end, _step in packed_piece.target_ranges
+        }
+        target_coordinates = tuple(
+            tile_dependency._substitute_composed_expression(
+                begin,
+                substitutions=substitutions,
+                source_domain=packed_order.source_domain,
+                source_bounds=packed_piece.source_bounds_items,
+            )
+            for _axis, begin, _end, _step in following_piece.target_ranges
+        )
+        pieces.append((packed_piece.source_bounds_items, target_coordinates))
+    result = CoordinateRelation.point_map(
+        packed_order.source_domain,
+        following.target_domain,
+        tuple(pieces),
     )
-    return packed_order.then(flat_task_order)
+    packed_converse = tile_dependency._memoized_exact_converse(packed_order)
+    following_converse = tile_dependency._memoized_exact_converse(following)
+    assert packed_converse is not None and following_converse is not None
+    converse = following_converse.then(packed_converse)
+    if converse is None:
+        return None
+    tile_dependency._remember_exact_converse(result, converse)
+    return result
 
 
 def _parametric_root_major_axis_order(

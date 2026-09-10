@@ -1844,6 +1844,13 @@ class CoordinateRelation:
         """Return the exact converse when representable without enumeration."""
         if (converse := _memoized_exact_converse(self)) is not None:
             return converse
+        if self.target_domain.size_expr.is_zero is True or not self.pieces:
+            converse = CoordinateRelation(
+                source_domain=self.target_domain,
+                target_domain=self.source_domain,
+                pieces=(),
+            )
+            return _remember_exact_converse(self, converse)
         if self.is_positional_bijection():
             converse = self.derive_converse_and_target_counts()[0]
             return (
@@ -1993,9 +2000,8 @@ class CoordinateRelation:
         positional_product = self._parameterized_positional_product
         if positional_product is not None:
             positional_axes, residual = positional_product
-            residual_converse, residual_target_counts = (
-                residual.derive_converse_and_target_counts()
-            )
+            residual_converse = residual.converse()
+            residual_target_counts = residual.target_count_by_source()
             if residual_converse is None or residual_target_counts is None:
                 return None, None
             converse = _restore_positional_product(
@@ -3189,6 +3195,12 @@ class CoordinateRelation:
         duplicate-target map.
         """
         converse = _memoized_exact_converse(self)
+        if (
+            converse is not None
+            and self.is_single_valued()
+            and converse.is_total_function()
+        ):
+            return True
         if converse is None and self._factored_source_support_converse is not None:
             # The factorization constructs an exact total inverse through the
             # dense ordinal of this relation's semantic support.

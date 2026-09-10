@@ -280,7 +280,13 @@ class TestExactConverseSemantics(TestCase):
                     self.assertTrue(concrete_converse.is_total_function())
 
                     expected = tuple(
-                        next(iter(targets)) for targets in concrete_order.materialize()
+                        tuple(
+                            concrete_order.target_domain.coordinates(
+                                next(iter(targets))
+                            )[axis]
+                            for axis in concrete_order.target_domain.axis_order
+                        )
+                        for targets in concrete_order.materialize()
                     )
                     launch_axis, worker_axis, wave_axis = (
                         concrete_relation.source_domain.axis_order
