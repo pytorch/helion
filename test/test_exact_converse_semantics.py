@@ -200,6 +200,49 @@ class TestExactConverseSemantics(TestCase):
                 )
         self.assertEqual(task_order.source_domain, old_domain)
 
+    def test_reorder_symbolic_source_axes_retains_exact_converse(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        source = CoordinateDomain(
+            (10, 11),
+            ((10, 3), (11, batch)),
+            kind="task_order",
+            _allow_empty=True,
+        )
+        target = CoordinateDomain(
+            (10, 11),
+            ((10, 3), (11, batch)),
+            identity=0,
+            _allow_empty=True,
+        )
+        relation = CoordinateRelation.identity(source, target)
+        self.assertIsNotNone(relation.converse())
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "_factored_source_support_converse",
+            new_callable=mock.PropertyMock,
+            side_effect=AssertionError("source reorder must retain its converse"),
+        ):
+            reordered = relation.reorder_source_axes((11, 10))
+            self.assertIsNotNone(reordered)
+            assert reordered is not None
+            self.assertEqual(reordered.source_domain.shape_expr, (batch, 3))
+            self.assertTrue(reordered.source_domain._allow_empty)
+            self.assertTrue(reordered.is_bijection_from_source_support())
+            converse = reordered.converse()
+            self.assertIsNotNone(converse)
+            assert converse is not None
+            self.assertEqual(converse.target_domain, reordered.source_domain)
+
+        for concrete_batch in (0, 1, 4):
+            with self.subTest(batch=concrete_batch):
+                concrete = reordered.substitute_parameters({batch: concrete_batch})
+                self.assertTrue(concrete.is_bijection_from_source_support())
+                self.assertEqual(
+                    concrete.materialize(source_axis_order=(10, 11)),
+                    tuple(frozenset((index,)) for index in range(3 * concrete_batch)),
+                )
+
     def test_source_support_ordinalization_retains_constructed_inverse(self) -> None:
         _old_domain, _widened_domain, task_order = self._partial_worker_task_order()
 

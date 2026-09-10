@@ -1212,7 +1212,7 @@ class CoordinateRelation:
             source_axis_order
         ) != set(self.source_domain.axis_order):
             return None
-        counts = self.source_domain.axis_counts
+        counts = self.source_domain.axis_count_expressions
         block_sizes = self.source_domain.block_sizes
         source_domain = CoordinateDomain(
             axis_order=source_axis_order,
@@ -1224,8 +1224,9 @@ class CoordinateRelation:
             else (),
             kind=self.source_domain.kind,
             identity=self.source_domain.identity,
+            _allow_empty=self.source_domain._allow_empty,
         )
-        return CoordinateRelation(
+        result = CoordinateRelation(
             source_domain=source_domain,
             target_domain=self.target_domain,
             pieces=tuple(
@@ -1242,6 +1243,28 @@ class CoordinateRelation:
                 for piece in self.pieces
             ),
         )
+        converse = _memoized_exact_converse(self)
+        if converse is None:
+            return result
+        reordered_converse = CoordinateRelation(
+            source_domain=converse.source_domain,
+            target_domain=source_domain,
+            pieces=tuple(
+                dataclasses.replace(
+                    piece,
+                    target_ranges=tuple(
+                        {
+                            axis: (axis, begin, end, step)
+                            for axis, begin, end, step in piece.target_ranges
+                        }[axis]
+                        for axis in source_axis_order
+                    ),
+                )
+                for piece in converse.pieces
+            ),
+        )
+        _remember_exact_converse(result, reordered_converse)
+        return result
 
     def project_target(
         self,

@@ -3194,8 +3194,6 @@ def place_ready_families(
     original_schedule: WorkerSchedule,
     worker_schedule: WorkerSchedule,
     continuations: tuple[FinalArrivalContinuation, ...],
-    *,
-    excluded_obligations: frozenset[DependencyObligation] = frozenset(),
 ) -> tuple[WorkerSchedule, tuple[FinalArrivalContinuation, ...]]:
     """Move complete ready families into idle capacity during a producer tail.
 
@@ -3242,7 +3240,6 @@ def place_ready_families(
             continuation_event,
             worker_schedule=result,
             continuation_by_root=continuation_by_root,
-            excluded_obligations=excluded_obligations,
         )
         if ready_after is None:
             continue
@@ -3355,18 +3352,11 @@ def build_worker_schedule(
         schedule,
         continuations,
     )
-    nested_obligations = frozenset(
-        obligation
-        for counter in nested_loop_counters
-        for readiness_consumer in counter.consumers
-        for obligation in readiness_consumer.covered_obligations
-    )
     schedule, continuations = place_ready_families(
         readiness_graph,
         ordered,
         schedule,
         continuations,
-        excluded_obligations=nested_obligations,
     )
     return schedule, continuations, nested_loop_counters
 
@@ -4050,7 +4040,6 @@ def _transitive_static_prerequisite_roots(
     readiness_graph: ReadinessGraph,
     static_relations: tuple[tuple[int, CoordinateRelation], ...],
     continuation_by_root: dict[int, FinalArrivalContinuation],
-    excluded_obligations: frozenset[DependencyObligation] = frozenset(),
 ) -> frozenset[int] | None:
     """Close static producers through waits earlier in task-local program order."""
     roots = {root for root, _relation in static_relations}
@@ -4060,13 +4049,6 @@ def _transitive_static_prerequisite_roots(
         for event in readiness_graph.events:
             if not any(
                 readiness_consumer.consumer_root == consumer_root
-                and (
-                    readiness_consumer.consumer_site_id is not None
-                    or not excluded_obligations
-                    or bool(
-                        readiness_consumer.covered_obligations - excluded_obligations
-                    )
-                )
                 for readiness_consumer in event.consumers
             ):
                 continue
@@ -4092,7 +4074,6 @@ def _event_ready_after_worker_steps(
     *,
     worker_schedule: WorkerSchedule,
     continuation_by_root: dict[int, FinalArrivalContinuation],
-    excluded_obligations: frozenset[DependencyObligation] = frozenset(),
 ) -> tuple[CoordinateRelation, frozenset[int]] | None:
     """Return when each readiness key becomes ready and its static producers."""
     static_relations = _event_static_producers(
@@ -4106,7 +4087,6 @@ def _event_ready_after_worker_steps(
         readiness_graph,
         static_relations,
         continuation_by_root,
-        excluded_obligations,
     )
     if prerequisite_roots is None:
         return None

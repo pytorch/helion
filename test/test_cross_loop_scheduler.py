@@ -6920,7 +6920,7 @@ class TestCrossLoopScheduler(TestCase):
                 static_counter.consumers[0].keys_by_consumer.materialize(),
             )
 
-    def test_nested_obligation_exclusion_keeps_authoritative_graph(self) -> None:
+    def test_nested_readiness_traversal_keeps_semantic_prerequisites(self) -> None:
         root_domains = tuple(
             _domain((axis, 2, 1), identity=root)
             for root, axis in enumerate((10, 20, 30))
@@ -6976,19 +6976,9 @@ class TestCrossLoopScheduler(TestCase):
             worker_schedule=baseline,
             continuation_by_root={},
         )
-        locally_excluded = _event_ready_after_worker_steps(
-            readiness_graph,
-            second_event,
-            worker_schedule=baseline,
-            continuation_by_root={},
-            excluded_obligations=frozenset((first_obligation,)),
-        )
-
         self.assertIsNotNone(unfiltered)
-        self.assertIsNotNone(locally_excluded)
-        assert unfiltered is not None and locally_excluded is not None
+        assert unfiltered is not None
         self.assertEqual(unfiltered[1], frozenset((0, 1)))
-        self.assertEqual(locally_excluded[1], frozenset((1,)))
         self.assertIs(readiness_graph.events[0], first_event)
 
     def test_nonstatic_layout_falls_back_to_root_readiness(self) -> None:
