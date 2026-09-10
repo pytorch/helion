@@ -4950,8 +4950,17 @@ class TestCrossLoopScheduler(TestCase):
         (counter,) = plan.readiness_counters
         self.assertEqual(counter.readiness_key_count_expr, task_count)
         self.assertEqual(counter.uniform_arrival_count(), 1)
+        self.assertIsNone(counter.continuation_consumer_index)
+        (producer,) = counter.producers
+        self.assertTrue(producer.producers_by_key.is_positional_bijection())
+        self.assertIsNotNone(producer.keys_by_producer)
+        assert producer.keys_by_producer is not None
+        self.assertTrue(producer.keys_by_producer.is_positional_bijection())
         self.assertTrue(
-            cross_loop_scheduler._supports_parameterized_fan_in_one_counter(counter)
+            all(
+                consumer.keys_by_consumer.is_positional_bijection()
+                for consumer in counter.consumers
+            )
         )
         schedule_geometry = cross_loop_scheduler._parametric_root_major_schedule_geometry(
             plan.worker_schedule
@@ -5283,7 +5292,7 @@ class TestCrossLoopScheduler(TestCase):
             )
         )
         self.assertFalse(
-            cross_loop_scheduler._supports_parameterized_fan_in_one_counter(counter)
+            counter.producers[0].producers_by_key.is_positional_bijection()
         )
         self.assertEqual(
             tuple(segment.root for segment in plan.worker_schedule.segments),
@@ -5385,7 +5394,7 @@ class TestCrossLoopScheduler(TestCase):
                 )
             )
             self.assertFalse(
-                cross_loop_scheduler._supports_parameterized_fan_in_one_counter(counter)
+                counter.producers[0].producers_by_key.is_positional_bijection()
             )
 
         one_producer_domain = CoordinateDomain(
@@ -5421,9 +5430,9 @@ class TestCrossLoopScheduler(TestCase):
                 )
             )
             self.assertFalse(
-                cross_loop_scheduler._supports_parameterized_fan_in_one_counter(
-                    one_producer_counter
-                )
+                one_producer_counter.consumers[
+                    0
+                ].keys_by_consumer.is_positional_bijection()
             )
 
     def test_parametric_counter_allows_partial_consumer_domain(self) -> None:
@@ -5480,7 +5489,7 @@ class TestCrossLoopScheduler(TestCase):
                 )
             )
             self.assertFalse(
-                cross_loop_scheduler._supports_parameterized_fan_in_one_counter(counter)
+                counter.consumers[0].keys_by_consumer.is_positional_bijection()
             )
 
     def test_parametric_counter_allows_multi_axis_keys(self) -> None:
@@ -5562,8 +5571,9 @@ class TestCrossLoopScheduler(TestCase):
                     (producer_domain, consumer_domain),
                 )
             )
-            self.assertFalse(
-                cross_loop_scheduler._supports_parameterized_fan_in_one_counter(counter)
+            self.assertEqual(
+                len(counter.producers[0].producers_by_key.source_domain.axis_order),
+                2,
             )
 
     def test_parametric_counter_allows_bounded_nonuniform_fan_in(self) -> None:
@@ -5648,9 +5658,7 @@ class TestCrossLoopScheduler(TestCase):
                     (producer_domain, consumer_domain),
                 )
             )
-            self.assertFalse(
-                cross_loop_scheduler._supports_parameterized_fan_in_one_counter(counter)
-            )
+            self.assertEqual(len(arrival_count.pieces), 2)
 
     def test_static_root_symbolic_nested_counter_falls_back_before_codegen(
         self,

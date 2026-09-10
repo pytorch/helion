@@ -29,7 +29,6 @@ from .tile_dependency import consumer_to_preceding_site_relation
 from .tile_dependency import coordinate_axis_symbol
 from .tile_dependency import instantiate_symbolic_dependencies
 from .tile_dependency import nested_logical_axes
-from .tile_dependency import pid_task_order
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1630,20 +1629,6 @@ def _ceildiv_nonnegative_expression(
 ) -> sympy.Expr:
     """Return exact integer ceildiv for a nonnegative parameter expression."""
     return cast("sympy.Expr", CeilDiv(sympy.sympify(numerator), denominator))
-
-
-def _parametric_task_axis_order(
-    task_order: CoordinateRelation,
-    domain: CoordinateDomain,
-) -> tuple[int, ...] | None:
-    """Return the exact ungrouped PID-axis order of one symbolic root."""
-    axis_order = task_order.source_domain.axis_order
-    if set(axis_order) != set(domain.axis_order) or task_order != pid_task_order(
-        domain,
-        axis_order,
-    ):
-        return None
-    return axis_order
 
 
 def _parametric_root_major_relation(
@@ -8649,28 +8634,6 @@ def _current_renderer_lowerable_counters(
         for plan in renderable
         if (bounds := plan.arrival_count_bounds()) is not None
         and 0 < bounds[0] <= bounds[1] < 2**32
-    )
-
-
-def _supports_parameterized_fan_in_one_counter(
-    plan: ReadinessCounterPlan,
-) -> bool:
-    """Return whether one counter belongs to the positional recurrence."""
-    if _parameterized_uniform_counter_fan_in(plan) != 1:
-        return False
-    (producer,) = plan.producers
-    publication = producer.keys_by_producer
-    return (
-        plan.continuation_consumer_index is None
-        and publication is not None
-        and producer.producers_by_key.is_positional_bijection()
-        and publication.is_positional_bijection()
-        and all(
-            consumer.keys_by_consumer.is_positional_bijection()
-            and (converse := consumer.keys_by_consumer.converse()) is not None
-            and converse.is_positional_bijection()
-            for consumer in plan.consumers
-        )
     )
 
 
