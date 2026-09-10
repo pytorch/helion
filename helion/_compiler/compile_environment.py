@@ -659,11 +659,34 @@ class CompileEnvironment:
 
         This is intentionally a positive proof.  Absence from ``input_sources``
         is insufficient: input views and aliases also commonly lack a direct
-        source.  Storage identity lets deterministic views of a proven
-        compiler allocation share the proof without separately classifying
-        every view operation.
+        source.  Storage identity lets deterministic views of either a proven
+        compiler allocation or one fully stride-specialized, unaliased input
+        share the proof without separately classifying every view operation.
         """
-        return tensor.untyped_storage() in self._symbolically_exact_layout_storages
+        storage = tensor.untyped_storage()
+        if storage in self._symbolically_exact_layout_storages:
+            return True
+
+        # A view does not have its own replayable input source.  Its layout is
+        # nevertheless fixed when the sole input owning its storage has every
+        # stride explicitly specialized.  Refuse shared input storage: another
+        # input alias has independent metadata (including storage offset), so
+        # blessing the storage from only one tensor would not be a proof.
+        input_aliases = tuple(
+            (input_tensor, source)
+            for input_tensor, source in self.input_sources.items()
+            if input_tensor.untyped_storage() == storage
+        )
+        if len(input_aliases) != 1:
+            return False
+        input_tensor, source = input_aliases[0]
+        if id(input_tensor) in self._ambiguous_tensor_input_source_ids:
+            return False
+        return all(
+            TensorPropertySource(source, TensorProperty.STRIDE, dim)
+            in self.specialized_strides
+            for dim in range(input_tensor.ndim)
+        )
 
     def register_tensor_factory_layout(
         self,

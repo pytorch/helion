@@ -6,6 +6,8 @@ import unittest
 from unittest.mock import patch
 
 import torch
+from torch._dynamo.source import TensorProperty
+from torch._dynamo.source import TensorPropertySource
 
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
@@ -28,6 +30,17 @@ class _StrideHarness:
 
 
 class TestLayoutProvenance(unittest.TestCase):
+    @staticmethod
+    def _specialize_all_input_strides(
+        env: CompileEnvironment,
+        tensor: torch.Tensor,
+    ) -> None:
+        source = env.input_sources[tensor]
+        env.specialized_strides.update(
+            TensorPropertySource(source, TensorProperty.STRIDE, dim)
+            for dim in range(tensor.ndim)
+        )
+
     def test_kernel_trace_does_not_mark_torch_empty_out_as_fresh(self) -> None:
         @helion.kernel(
             autotune_effort="none",
@@ -106,6 +119,65 @@ class TestLayoutProvenance(unittest.TestCase):
             self.assertTrue(
                 env.tensor_layout_is_symbolically_exact(exact_like.fake_value)
             )
+
+    def test_fully_specialized_input_layout_propagates_to_views(self) -> None:
+        env = CompileEnvironment(
+            torch.device("cpu"),
+            helion.Settings(backend="triton", static_shapes=False),
+        )
+        real_input = torch.empty_strided((2, 3, 4), (12, 4, 1))
+
+        with env:
+            fake_input = env.to_fake(real_input, ArgumentOrigin("x"))
+            assert isinstance(fake_input, torch.Tensor)
+            flattened = fake_input.view(6, 4)
+
+            self.assertFalse(env.tensor_layout_is_symbolically_exact(flattened))
+            source = env.input_sources[fake_input]
+            env.specialized_strides.add(
+                TensorPropertySource(source, TensorProperty.STRIDE, 0)
+            )
+            self.assertFalse(env.tensor_layout_is_symbolically_exact(flattened))
+
+            self._specialize_all_input_strides(env, fake_input)
+            self.assertTrue(env.tensor_layout_is_symbolically_exact(fake_input))
+            self.assertTrue(env.tensor_layout_is_symbolically_exact(flattened))
+            literal_view = fake_input.as_strided((6, 4), (4, 1))
+            literal_view_stride = DeviceFunction.tensor_stride(
+                cast("DeviceFunction", _StrideHarness()),
+                literal_view,
+                0,
+            )
+            self.assertIsInstance(literal_view_stride, StaticShape)
+            self.assertEqual(literal_view_stride.name, "4")
+
+            input_type = TensorType(ArgumentOrigin("x"), fake_input)
+            specialized_like = CallableType(
+                NameOrigin("allocation"), torch.empty_like
+            ).propagate_call((input_type,), {}, NameOrigin("allocation"))
+            assert isinstance(specialized_like, TensorType)
+            self.assertTrue(
+                env.tensor_layout_is_symbolically_exact(specialized_like.fake_value)
+            )
+
+    def test_specialized_input_layout_does_not_cross_input_aliases(self) -> None:
+        env = CompileEnvironment(
+            torch.device("cpu"),
+            helion.Settings(backend="triton", static_shapes=False),
+        )
+        real_input = torch.empty_strided((2, 3, 4), (12, 4, 1))
+        real_alias = real_input.transpose(0, 1)
+
+        with env:
+            fake_input = env.to_fake(real_input, ArgumentOrigin("x"))
+            fake_alias = env.to_fake(real_alias, ArgumentOrigin("alias"))
+            assert isinstance(fake_input, torch.Tensor)
+            assert isinstance(fake_alias, torch.Tensor)
+            self.assertEqual(fake_input.untyped_storage(), fake_alias.untyped_storage())
+
+            self._specialize_all_input_strides(env, fake_input)
+            self.assertFalse(env.tensor_layout_is_symbolically_exact(fake_input))
+            self.assertFalse(env.tensor_layout_is_symbolically_exact(fake_alias))
 
     def test_factory_layout_registration_requires_fresh_storage(self) -> None:
         env = CompileEnvironment(
