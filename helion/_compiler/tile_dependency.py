@@ -4911,7 +4911,13 @@ class CoordinateRelation:
             return None
         target_counts = self.source_domain.axis_count_expressions
         pieces: list[_CoordinateRelationPiece] = []
-        has_partial_producer_source = False
+        full_producer_bounds = tuple(
+            (axis, 0, self.source_domain.axis_count_expressions[axis], 1)
+            for axis in self.source_domain.axis_order
+        )
+        has_partial_producer_source = any(
+            piece.source_bounds_items != full_producer_bounds for piece in self.pieces
+        )
         source_targets_are_unclipped = _has_unclipped_coordinate_point_targets(self)
         for producer_piece in self.pieces:
             producer_source_bounds = {
@@ -4920,12 +4926,10 @@ class CoordinateRelation:
             }
             if tuple(producer_source_bounds) != self.source_domain.axis_order:
                 return None
-            has_full_producer_source = producer_piece.source_bounds_items == tuple(
-                (axis, 0, self.source_domain.axis_count_expressions[axis], 1)
-                for axis in self.source_domain.axis_order
+            has_full_producer_source = (
+                producer_piece.source_bounds_items == full_producer_bounds
             )
-            has_partial_producer_source |= not has_full_producer_source
-            if not has_full_producer_source and not source_targets_are_unclipped:
+            if has_partial_producer_source and not source_targets_are_unclipped:
                 # The overlap algebra below uses raw allocation intervals.  A
                 # producer interval clipped by the allocation domain could
                 # otherwise create an overlap that exists only out of bounds.

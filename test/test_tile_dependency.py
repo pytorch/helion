@@ -2967,6 +2967,69 @@ class TestTileDependency(TestCase):
             ),
         )
 
+    def test_partial_overlap_declines_mixed_clipped_target_pieces(self) -> None:
+        producer = CoordinateDomain((10,), ((10, 2),), kind="site")
+        consumer = CoordinateDomain((20,), ((20, 2),), kind="site")
+        allocation = CoordinateDomain(
+            (-1,),
+            ((-1, 4),),
+            kind="allocation",
+            identity=0,
+        )
+        producer_coordinate = coordinate_axis_symbol(10)
+        consumer_coordinate = coordinate_axis_symbol(20)
+        producer_access = CoordinateRelation(
+            producer,
+            allocation,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 0, 2, 1),),
+                    (
+                        (
+                            -1,
+                            producer_coordinate + 4,
+                            producer_coordinate + 5,
+                            1,
+                        ),
+                    ),
+                ),
+                _CoordinateRelationPiece(
+                    ((10, 0, 1, 1),),
+                    (
+                        (
+                            -1,
+                            producer_coordinate,
+                            producer_coordinate + 1,
+                            1,
+                        ),
+                    ),
+                ),
+            ),
+        )
+        consumer_access = CoordinateRelation(
+            consumer,
+            allocation,
+            (
+                _CoordinateRelationPiece(
+                    ((20, 0, 2, 1),),
+                    (
+                        (
+                            -1,
+                            consumer_coordinate + 4,
+                            consumer_coordinate + 5,
+                            1,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        # Once any producer piece has partial source support, the generalized
+        # overlap path must validate target clipping for every producer piece.
+        # Declining is conservative; accepting the raw out-of-domain intervals
+        # would invent an overlap for consumer 0.
+        self.assertIsNone(producer_access.overlapping_sources(consumer_access))
+
     def test_partial_strided_overlap_randomized_differential(self) -> None:
         generator = random.Random(0)
         accepted = 0
