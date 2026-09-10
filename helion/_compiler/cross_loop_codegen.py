@@ -23,12 +23,12 @@ from .cross_loop_scheduler import ReadinessProducer
 from .cross_loop_scheduler import RootBarrierPublication
 from .cross_loop_scheduler import WorkerInterval
 from .cross_loop_scheduler import WorkerScheduleSegment
+from .cross_loop_scheduler import _current_renderer_lowerable_counters
 from .cross_loop_scheduler import _normalize_intervals
 from .cross_loop_scheduler import _parametric_event_frontier_root_order
 from .cross_loop_scheduler import _parametric_event_frontier_schedule_geometry
 from .cross_loop_scheduler import _parametric_root_major_schedule_geometry
 from .cross_loop_scheduler import _root_schedule_traversal
-from .cross_loop_scheduler import _supports_parameterized_counter
 from .cross_loop_scheduler import _transient_source_schedule_segment
 from .cross_loop_scheduler import build_static_pipeline_plan
 from .device_function import TensorArg
@@ -768,14 +768,15 @@ def emit_cross_loop_schedule(
             "cross_loop_schedule='static_pipeline' cannot lower this "
             "parameterized worker schedule"
         )
-    if parameterized_root_domains and (
+    if (parameterized_root_domains or parameterized_readiness_counters) and (
         static_pipeline_plan.transient_source_root is not None
-        or any(
-            not _supports_parameterized_counter(plan)
-            for plan in static_pipeline_plan.readiness_counters
+        or _current_renderer_lowerable_counters(
+            static_pipeline_plan.readiness_counters,
+            root_domains,
         )
+        != static_pipeline_plan.readiness_counters
     ):
-        raise AssertionError("parameterized lowering received an unproved counter plan")
+        raise AssertionError("parameterized lowering received an unsupported plan")
     root_barrier_edges = static_pipeline_plan.root_barrier_edges
     if parameterized_event_frontier_geometry is not None:
         expected_root_order = _parametric_event_frontier_root_order(

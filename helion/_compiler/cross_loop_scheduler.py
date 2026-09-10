@@ -4636,6 +4636,9 @@ class StaticPipelinePlan:
     def __post_init__(self) -> None:
         _validate_root_task_orders(self.root_task_orders)
         root_count = len(self.root_task_orders)
+        root_domains = tuple(
+            task_order.target_domain for task_order in self.root_task_orders
+        )
         for segment in self.worker_schedule.segments:
             if (
                 segment.root >= root_count
@@ -4651,26 +4654,20 @@ class StaticPipelinePlan:
 
         continuation_roots: set[int] = set()
         for counter in self.readiness_counters:
-            for producer in counter.producers:
-                if not 0 <= producer.producer_root < root_count:
-                    raise ValueError("readiness producer references an unknown root")
-                if (
-                    producer.producer_site_id is None
-                    and producer.producers_by_key.target_domain
-                    != self.root_task_orders[producer.producer_root].target_domain
-                ):
-                    raise ValueError("root readiness producer has the wrong domain")
+            if not _supports_exact_counter_plan_lowering(
+                counter,
+                root_domains,
+            ):
+                raise ValueError("readiness counter has no exact lowering")
             for consumer_index, consumer in enumerate(counter.consumers):
-                if not 0 <= consumer.consumer_root < root_count:
-                    raise ValueError("readiness consumer references an unknown root")
-                if (
-                    consumer.consumer_site_id is None
-                    and consumer.keys_by_consumer.source_domain
-                    != self.root_task_orders[consumer.consumer_root].target_domain
-                ):
-                    raise ValueError("root readiness consumer has the wrong domain")
                 if consumer_index == counter.continuation_consumer_index:
                     continuation_roots.add(consumer.consumer_root)
+
+        if _current_renderer_lowerable_counters(
+            self.readiness_counters,
+            root_domains,
+        ) != self.readiness_counters:
+            raise ValueError("readiness counter is unsupported by the current renderer")
 
         scheduled_roots = {segment.root for segment in self.worker_schedule.segments}
         if scheduled_roots & continuation_roots:
@@ -4900,13 +4897,16 @@ def choose_readiness_counters(
         # one-key events were rejected through ``root_barrier_producer_root``.
         if not retained_consumers:
             continue
-        selected.append(
-            ReadinessCounterPlan(
-                producers=lowered_producers,
-                consumers=tuple(retained_consumers),
-                continuation_consumer_index=continuation_consumer_index,
-            )
+        candidate = ReadinessCounterPlan(
+            producers=lowered_producers,
+            consumers=tuple(retained_consumers),
+            continuation_consumer_index=continuation_consumer_index,
         )
+        if _supports_exact_counter_plan_lowering(
+            candidate,
+            readiness_graph.root_domains,
+        ):
+            selected.append(candidate)
     selected_continuation_count = sum(
         counter_plan.continuation_consumer_index is not None
         for counter_plan in selected
@@ -8020,17 +8020,123 @@ def _parameterized_uniform_counter_fan_in(
     return bounds[0]
 
 
-def _has_replay_safe_counter_state(plan: ReadinessCounterPlan) -> bool:
-    """Require bounded epoch framing whenever a counter layout can move."""
-    if not plan.parameter_symbols:
+def _supports_exact_counter_plan_lowering(
+    plan: ReadinessCounterPlan,
+    root_domains: tuple[CoordinateDomain, ...],
+) -> bool:
+    """Return whether the selected counter has one exact supported lowering.
+
+    These are immutable plan facts shared by static and parameterized
+    schedules.  Renderer-specific restrictions do not belong here.
+    """
+    def endpoint_has_supported_domain(
+        root: int,
+        site_id: int | None,
+        domain: CoordinateDomain,
+    ) -> bool:
+        if not 0 <= root < len(root_domains):
+            return False
+        root_domain = root_domains[root]
+        if site_id is None:
+            return domain == root_domain
+        root_counts = root_domain.axis_count_expressions
+        site_counts = domain.axis_count_expressions
+        return (
+            domain.kind == "site"
+            and domain.identity == site_id
+            and len(nested_logical_axes(root_domain, domain)) == 1
+            and all(
+                axis in site_counts
+                and _equal_integer_expressions(site_counts[axis], count)
+                for axis, count in root_counts.items()
+            )
+        )
+
+    continuation_index = plan.continuation_consumer_index
+    if not plan.consumers or (
+        continuation_index is not None
+        and not 0 <= continuation_index < len(plan.consumers)
+    ):
+        return False
+    for producer in plan.producers:
+        if not endpoint_has_supported_domain(
+            producer.producer_root,
+            producer.producer_site_id,
+            producer.producers_by_key.target_domain,
+        ) or not _supports_readiness_counter_lowering(producer):
+            return False
+    for consumer in plan.consumers:
+        if not endpoint_has_supported_domain(
+            consumer.consumer_root,
+            consumer.consumer_site_id,
+            consumer.keys_by_consumer.source_domain,
+        ) or consumer.keys_by_consumer.canonical_single_valued() is None:
+            return False
+
+    nested_consumers = tuple(
+        consumer
+        for consumer in plan.consumers
+        if consumer.consumer_site_id is not None
+    )
+    if nested_consumers and (
+        len(plan.consumers) != 1 or continuation_index is not None
+    ):
+        return False
+
+    if continuation_index is None:
         return True
-    bounds = plan.arrival_count_bounds()
-    return bounds is not None and 0 < bounds[0] <= bounds[1] < 2**32
+
+    continuation_consumer = plan.consumers[continuation_index]
+    converse = continuation_consumer.keys_by_consumer.converse()
+    fan_in = plan.uniform_arrival_count()
+    return (
+        fan_in is not None
+        and fan_in > 0
+        and continuation_consumer.keys_by_consumer.is_total_function()
+        and converse is not None
+        and converse.is_total_function()
+    )
 
 
-def _supports_parameterized_counter(plan: ReadinessCounterPlan) -> bool:
-    """Return whether one counter has the complete parametric certificate."""
-    return _parameterized_counter_fan_in_bounds(plan) is not None
+def _supports_current_parameterized_renderer(
+    plan: ReadinessCounterPlan,
+    root_domains: tuple[CoordinateDomain, ...],
+) -> bool:
+    """Return whether today's parameterized renderer supports this exact plan."""
+    return (
+        _supports_exact_counter_plan_lowering(plan, root_domains)
+        and _parameterized_counter_fan_in_bounds(plan) is not None
+    )
+
+
+def _current_renderer_lowerable_counters(
+    plans: tuple[ReadinessCounterPlan, ...],
+    root_domains: tuple[CoordinateDomain, ...],
+) -> tuple[ReadinessCounterPlan, ...]:
+    """Filter exact plans through today's parameterized/epoch renderer contract."""
+    common = tuple(
+        plan
+        for plan in plans
+        if _supports_exact_counter_plan_lowering(plan, root_domains)
+    )
+    parameterized_roots = any(domain.parameter_symbols for domain in root_domains)
+    renderable = tuple(
+        plan
+        for plan in common
+        if not (parameterized_roots or plan.parameter_symbols)
+        or _supports_current_parameterized_renderer(plan, root_domains)
+    )
+    uses_epoch_framing = parameterized_roots or any(
+        plan.parameter_symbols for plan in renderable
+    )
+    if not uses_epoch_framing:
+        return renderable
+    return tuple(
+        plan
+        for plan in renderable
+        if (bounds := plan.arrival_count_bounds()) is not None
+        and 0 < bounds[0] <= bounds[1] < 2**32
+    )
 
 
 def _supports_parameterized_fan_in_one_counter(
@@ -8193,19 +8299,18 @@ def _build_parametric_event_frontier_worker_schedule(
 def _finalize_emitted_synchronization(
     *,
     dependency_graph: TileDependencyGraph,
+    root_domains: tuple[CoordinateDomain, ...],
     readiness_counters: tuple[ReadinessCounterPlan, ...],
 ) -> tuple[tuple[ReadinessCounterPlan, ...], frozenset[tuple[int, int]]]:
     """Select fallback barriers and remove counter consumers they subsume."""
-    lowerable_counters: list[ReadinessCounterPlan] = []
-    for counter_plan in readiness_counters:
-        if not _has_replay_safe_counter_state(counter_plan):
-            # Dynamic counter state is replay-safe only when its exact
-            # per-key target is renderable and has a static epoch stride.
-            # Dropping the plan here lets coverage select the ordinary
-            # root-barrier fallback from the same obligations.
-            continue
-        lowerable_counters.append(counter_plan)
-    readiness_counters = tuple(lowerable_counters)
+    # Dropping an unsupported plan lets coverage select the ordinary
+    # root-barrier fallback from the same obligations. The two-pass renderer
+    # filter first rejects unsupported parameterized plans, then enforces the
+    # shared epoch bound across every retained sibling.
+    readiness_counters = _current_renderer_lowerable_counters(
+        readiness_counters,
+        root_domains,
+    )
     covered_obligations = frozenset(
         obligation
         for counter_plan in readiness_counters
@@ -8324,7 +8429,9 @@ def build_static_pipeline_plan(
             continuations,
         )
         readiness_counters = tuple(
-            plan for plan in selected_counters if _supports_parameterized_counter(plan)
+            plan
+            for plan in selected_counters
+            if _supports_current_parameterized_renderer(plan, root_domains)
         )
         if sum(
             plan.continuation_consumer_index is not None for plan in readiness_counters
@@ -8336,10 +8443,11 @@ def build_static_pipeline_plan(
             readiness_counters = tuple(
                 plan
                 for plan in choose_readiness_counters(readiness_graph, ())
-                if _supports_parameterized_counter(plan)
+                if _supports_current_parameterized_renderer(plan, root_domains)
             )
         readiness_counters, root_barrier_edges = _finalize_emitted_synchronization(
             dependency_graph=dependency_graph,
+            root_domains=root_domains,
             readiness_counters=readiness_counters,
         )
         if not _parameterized_prerequisites_follow_root_order(
@@ -8407,9 +8515,12 @@ def build_static_pipeline_plan(
         ),
         *nested_loop_counters,
     )
-    dropped_replay_unsafe_counter = any(
-        not _has_replay_safe_counter_state(plan)
-        for plan in candidate_readiness_counters
+    dropped_unlowerable_counter = (
+        _current_renderer_lowerable_counters(
+            candidate_readiness_counters,
+            root_domains,
+        )
+        != candidate_readiness_counters
     )
     # Recompute coverage from the mechanisms that will actually be emitted.
     # Dependency analysis may prove a finer relation than the selected emitter
@@ -8418,9 +8529,10 @@ def build_static_pipeline_plan(
     # would remove the dependency entirely.
     readiness_counters, root_barrier_edges = _finalize_emitted_synchronization(
         dependency_graph=dependency_graph,
+        root_domains=root_domains,
         readiness_counters=candidate_readiness_counters,
     )
-    if dropped_replay_unsafe_counter:
+    if dropped_unlowerable_counter:
         # Local placement may have used the finer event before finalization.
         # Once that event falls back to a stronger whole-root barrier, restart
         # from the conservative root-major schedule so the replacement cannot
@@ -8433,6 +8545,7 @@ def build_static_pipeline_plan(
         continuations = ()
         readiness_counters, root_barrier_edges = _finalize_emitted_synchronization(
             dependency_graph=dependency_graph,
+            root_domains=root_domains,
             readiness_counters=choose_readiness_counters(readiness_graph, ()),
         )
     transient_source_root: int | None = None
@@ -8474,7 +8587,7 @@ def build_static_pipeline_plan(
         )
     if globally_scheduled is not None:
         worker_schedule = globally_scheduled
-    if dropped_replay_unsafe_counter and not _schedule_is_progress_safe(
+    if dropped_unlowerable_counter and not _schedule_is_progress_safe(
         worker_schedule,
         readiness_graph,
         readiness_counters,
