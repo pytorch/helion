@@ -84,8 +84,7 @@ def _infer_autotune_device(args: Sequence[Any]) -> torch.device:
     """Pick the accelerator device to autotune on from the sample args.
 
     Prefers a tensor argument that already lives on the current accelerator;
-    otherwise falls back to the current accelerator itself.  Never assumes
-    CUDA -- an external kernel may be tuned on ROCm, XPU or MPS.
+    otherwise falls back to the current accelerator itself.
     """
     accelerator = torch.accelerator.current_accelerator()
     if accelerator is None:
