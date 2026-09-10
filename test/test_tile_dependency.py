@@ -3835,7 +3835,7 @@ class TestTileDependency(TestCase):
     def test_symbolic_max_target_value_composes_qwen_mixed_radix_quotient(
         self,
     ) -> None:
-        batch = sympy.Symbol("batch", integer=True, positive=True)
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
         order = CoordinateDomain(
             (10, 11, 12),
             ((10, batch), (11, 16), (12, 96)),
@@ -3932,7 +3932,7 @@ class TestTileDependency(TestCase):
             frontier,
             sympy.floor(key_iteration / 74 + sympy.Rational(15, 1184)),
         )
-        for concrete_batch in (1, 2):
+        for concrete_batch in (0, 1, 2):
             substitutions = {batch: concrete_batch}
             concrete_required = required_producers.substitute_parameters(substitutions)
             concrete_values = wave_by_task.substitute_parameters(substitutions)
