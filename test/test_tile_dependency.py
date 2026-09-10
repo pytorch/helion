@@ -9,6 +9,8 @@ from unittest import mock
 import sympy
 import torch
 from torch.utils._sympy.functions import FloorDiv
+from torch.utils._sympy.functions import Max as SymbolicMax
+from torch.utils._sympy.functions import Min as SymbolicMin
 
 import helion
 from helion import exc
@@ -1621,6 +1623,32 @@ class TestTileDependency(TestCase):
             tuple(expected.index(task) for task in range(len(expected))),
         )
 
+    def test_l2_pid_task_order_preflights_relation_budget(self) -> None:
+        domain = CoordinateDomain(
+            (10, 20),
+            ((10, 3), (20, 2)),
+            ((10, 1), (20, 1)),
+        )
+
+        for budget_name in (
+            "_MAX_RELATION_PIECES",
+            "_MAX_RELATION_PRODUCT_STATES",
+        ):
+            with (
+                self.subTest(budget_name=budget_name),
+                mock.patch(
+                    f"helion._compiler.tile_dependency.{budget_name}",
+                    3,
+                ),
+                mock.patch.object(
+                    CoordinateRelation,
+                    "point_map",
+                    side_effect=AssertionError("L2 construction must preflight"),
+                ),
+                self.assertRaisesRegex(ValueError, "relation budget"),
+            ):
+                pid_task_order(domain, domain.axis_order, l2_group_size=2)
+
     def test_symbolic_pid_task_order_preserves_axis_permutation(self) -> None:
         domain = CoordinateDomain(
             (10, 20, 30),
@@ -2037,6 +2065,65 @@ class TestTileDependency(TestCase):
                 tuple(
                     frozenset(range(4 * key, 4 * key + 4))
                     for key in range(concrete_count)
+                ),
+            )
+
+    def test_project_source_unions_runtime_sized_positional_factor(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        source = CoordinateDomain(
+            (10, 11),
+            ((10, batch), (11, 3)),
+            kind="site",
+        )
+        retained = CoordinateDomain((11,), ((11, 3),), kind="site")
+        target = CoordinateDomain(
+            (20, 21),
+            ((20, batch), (21, 3)),
+            kind="site",
+        )
+        inner = coordinate_axis_symbol(11)
+        relation = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (
+                    ((10, 0, batch, 1), (11, 0, 3, 1)),
+                    (coordinate_axis_symbol(10), inner),
+                ),
+            ),
+        )
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("runtime positional factor must stay symbolic"),
+        ):
+            projected = relation.project_source(retained)
+
+        self.assertIsNotNone(projected)
+        assert projected is not None
+        self.assertEqual(
+            projected.pieces,
+            (
+                _CoordinateRelationPiece(
+                    ((11, 0, 3, 1),),
+                    (
+                        (20, sympy.Integer(0), batch, 1),
+                        (21, inner, inner + 1, 1),
+                    ),
+                ),
+            ),
+        )
+        for concrete_batch in (0, 1, 5):
+            concrete = projected.substitute_parameters({batch: concrete_batch})
+            self.assertEqual(
+                concrete.materialize(),
+                tuple(
+                    frozenset(
+                        batch_index + concrete_batch * inner_index
+                        for batch_index in range(concrete_batch)
+                    )
+                    for inner_index in range(3)
                 ),
             )
 
@@ -2512,7 +2599,7 @@ class TestTileDependency(TestCase):
             batch - coordinate - 1,
         )
 
-    def test_symbolic_tail_relation_predicates_decline_without_raising(self) -> None:
+    def test_symbolic_tail_relation_uses_exact_support_cardinality(self) -> None:
         batch = sympy.Symbol("batch", integer=True, nonnegative=True)
         source = CoordinateDomain(
             (20,),
@@ -2537,7 +2624,17 @@ class TestTileDependency(TestCase):
 
         self.assertTrue(relation.is_single_valued())
         self.assertIsNone(relation.canonical_single_valued())
-        self.assertFalse(relation.is_total_function())
+        self.assertTrue(relation.has_total_source())
+        self.assertTrue(relation.is_total_function())
+        self.assertEqual(
+            sympy.simplify(relation.source_support_cardinality() - batch - 1),
+            0,
+        )
+        for concrete_batch in (0, 1, 8):
+            concrete = relation.substitute_parameters({batch: concrete_batch})
+            self.assertTrue(
+                all(len(targets) == 1 for targets in concrete.materialize())
+            )
 
     def test_compile_environment_nonnegative_proof_uses_shape_ranges(self) -> None:
         env = CompileEnvironment(torch.device("cpu"), helion.Settings(backend="triton"))
@@ -2991,6 +3088,55 @@ class TestTileDependency(TestCase):
         assert target_union is not None
         self.assertEqual(target_union.materialize(), (frozenset(range(8)),))
 
+    def test_relation_coverage_factors_runtime_positional_axis(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        source = CoordinateDomain(
+            (10, 11),
+            ((10, batch), (11, 2)),
+            identity=0,
+        )
+        target = CoordinateDomain(
+            (20, 21),
+            ((20, batch), (21, 2)),
+            identity=1,
+        )
+        outer = coordinate_axis_symbol(10)
+        inner = coordinate_axis_symbol(11)
+        available = CoordinateRelation(
+            source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 0, batch, 1), (11, 0, 2, 1)),
+                    (
+                        (20, outer, outer + 1, 1),
+                        (21, sympy.Integer(0), sympy.Integer(2), 1),
+                    ),
+                ),
+            ),
+        )
+        required = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (
+                    ((10, 0, batch, 1), (11, 0, 2, 1)),
+                    (outer, inner),
+                ),
+            ),
+        )
+
+        with mock.patch(
+            "helion._compiler.tile_dependency._relation_piece_covers",
+            side_effect=AssertionError("runtime identity factor should be reused"),
+        ):
+            self.assertTrue(available.covers(required))
+        self.assertTrue(available.has_total_source())
+        self.assertFalse(available.is_single_valued())
+        self.assertTrue(required.has_total_source())
+        self.assertTrue(required.is_single_valued())
+        self.assertFalse(required.covers(available))
+
     def test_relation_operations_decline_before_oversized_products(self) -> None:
         domain = CoordinateDomain((10,), ((10, 4),), identity=0)
         coordinate = coordinate_axis_symbol(10)
@@ -3033,6 +3179,35 @@ class TestTileDependency(TestCase):
             ),
         ):
             self.assertIsNone(first.then(following))
+        with (
+            mock.patch(
+                "helion._compiler.tile_dependency._MAX_RELATION_PRODUCT_STATES",
+                3,
+            ),
+            mock.patch(
+                "helion._compiler.tile_dependency._source_boxes_are_disjoint",
+                side_effect=AssertionError("disjointness must check its budget first"),
+            ),
+        ):
+            self.assertFalse(first.has_disjoint_source_support(following))
+        with (
+            mock.patch(
+                "helion._compiler.tile_dependency._MAX_RELATION_PRODUCT_STATES",
+                3,
+            ),
+            mock.patch(
+                "helion._compiler.tile_dependency._relation_piece_covers",
+                side_effect=AssertionError("coverage must check its budget first"),
+            ),
+        ):
+            self.assertFalse(first.covers(following))
+
+        self.assertEqual(len(first.coalesce_adjacent_source_boxes().pieces), 1)
+        with mock.patch(
+            "helion._compiler.tile_dependency._MAX_RELATION_PRODUCT_STATES",
+            3,
+        ):
+            self.assertIs(first.coalesce_adjacent_source_boxes(), first)
 
         two_dimensional = CoordinateDomain(
             (10, 11),
@@ -3416,6 +3591,183 @@ class TestTileDependency(TestCase):
 
         self.assertIsNotNone(cardinality)
         self.assertEqual(sympy.simplify(cardinality - batch), 0)
+
+    def test_packed_partial_bijections_and_adjacent_support_are_symbolic(
+        self,
+    ) -> None:
+        left_count = sympy.Symbol("left_count", integer=True, nonnegative=True)
+        right_count = sympy.Symbol("right_count", integer=True, nonnegative=True)
+        worker_count = 7
+        worker_axis, wave_axis = 11, 12
+        schedule = CoordinateDomain(
+            (10, worker_axis, wave_axis),
+            (
+                (10, 2),
+                (worker_axis, worker_count),
+                (
+                    wave_axis,
+                    FloorDiv(left_count + right_count + worker_count - 1, worker_count),
+                ),
+            ),
+            kind="worker",
+        )
+
+        def packed(
+            target_axis: int,
+            first_slot: sympy.Expr,
+            count: sympy.Expr,
+        ) -> CoordinateRelation:
+            worker = coordinate_axis_symbol(worker_axis)
+            wave = coordinate_axis_symbol(wave_axis)
+            first_wave = FloorDiv(first_slot, worker_count)
+            first_worker = sympy.Mod(first_slot, worker_count)
+            first_count = SymbolicMin(count, worker_count - first_worker)
+            remaining = SymbolicMax(count - first_count, 0)
+            full_waves = FloorDiv(remaining, worker_count)
+            tail_count = sympy.Mod(remaining, worker_count)
+            middle_begin = first_wave + 1
+            middle_end = middle_begin + full_waves
+            final_end = middle_end + FloorDiv(
+                tail_count + worker_count - 1,
+                worker_count,
+            )
+            target = CoordinateDomain(
+                (target_axis,),
+                ((target_axis, count),),
+                kind="task_order",
+            )
+            logical_task = wave * worker_count + worker - first_slot
+            return CoordinateRelation.point_map(
+                schedule,
+                target,
+                (
+                    (
+                        (
+                            (10, 1, 2, 1),
+                            (worker_axis, first_worker, first_worker + first_count, 1),
+                            (wave_axis, first_wave, first_wave + 1, 1),
+                        ),
+                        (logical_task,),
+                    ),
+                    (
+                        (
+                            (10, 1, 2, 1),
+                            (worker_axis, 0, worker_count, 1),
+                            (wave_axis, middle_begin, middle_end, 1),
+                        ),
+                        (logical_task,),
+                    ),
+                    (
+                        (
+                            (10, 1, 2, 1),
+                            (worker_axis, 0, tail_count, 1),
+                            (wave_axis, middle_end, final_end, 1),
+                        ),
+                        (logical_task,),
+                    ),
+                ),
+            )
+
+        left = packed(20, sympy.Integer(0), left_count)
+        right = packed(21, left_count, right_count)
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("symbolic traversal proof must not enumerate"),
+        ):
+            self.assertEqual(left.source_support_cardinality(), left_count)
+            self.assertEqual(right.source_support_cardinality(), right_count)
+            self.assertTrue(left.is_bijection_from_source_support())
+            self.assertTrue(right.is_bijection_from_source_support())
+            self.assertTrue(left.has_disjoint_source_support(right))
+
+        for concrete_left, concrete_right in ((0, 0), (1, 6), (7, 1), (8, 13)):
+            substitutions = {
+                left_count: concrete_left,
+                right_count: concrete_right,
+            }
+            for relation, expected_count in (
+                (left, concrete_left),
+                (right, concrete_right),
+            ):
+                concrete = relation.substitute_parameters(substitutions)
+                self.assertEqual(concrete.source_support_cardinality(), expected_count)
+                self.assertTrue(concrete.is_bijection_from_source_support())
+
+    def test_event_frontier_partial_bijection_is_symbolic(self) -> None:
+        count = sympy.Symbol("count", integer=True, nonnegative=True)
+        worker_count, period, phase = 7, 3, 2
+        source = CoordinateDomain(
+            (10, 11, 12),
+            (
+                (10, 2),
+                (11, worker_count),
+                (12, period * FloorDiv(count + worker_count - 1, worker_count)),
+            ),
+            kind="worker",
+        )
+        target = CoordinateDomain((20,), ((20, count),), kind="task_order")
+        worker = coordinate_axis_symbol(11)
+        wave = coordinate_axis_symbol(12)
+        full_waves = FloorDiv(count, worker_count)
+        tail_count = sympy.Mod(count, worker_count)
+        tail_wave = phase + period * full_waves
+        relation = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (
+                    (
+                        (10, 1, 2, 1),
+                        (11, 0, worker_count, 1),
+                        (12, phase, tail_wave, period),
+                    ),
+                    (sympy.floor(wave / period) * worker_count + worker,),
+                ),
+                (
+                    (
+                        (10, 1, 2, 1),
+                        (11, 0, tail_count, 1),
+                        (
+                            12,
+                            tail_wave,
+                            tail_wave
+                            + FloorDiv(tail_count + worker_count - 1, worker_count),
+                            1,
+                        ),
+                    ),
+                    (sympy.floor(wave / period) * worker_count + worker,),
+                ),
+            ),
+        )
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("symbolic traversal proof must not enumerate"),
+        ):
+            self.assertEqual(relation.source_support_cardinality(), count)
+            self.assertTrue(relation.is_bijection_from_source_support())
+            self.assertIsNotNone(relation.converse())
+        for concrete_count in (0, 1, 6, 7, 8):
+            concrete = relation.substitute_parameters({count: concrete_count})
+            self.assertEqual(concrete.source_support_cardinality(), concrete_count)
+            self.assertTrue(concrete.is_bijection_from_source_support())
+
+    def test_equal_cardinality_does_not_prove_bijection(self) -> None:
+        source = CoordinateDomain((10,), ((10, 2),), identity=0)
+        target = CoordinateDomain((20,), ((20, 2),), identity=1)
+        relation = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (((10, 0, 1, 1),), (sympy.Integer(0),)),
+                (((10, 1, 2, 1),), (sympy.Integer(0),)),
+            ),
+        )
+
+        self.assertEqual(relation.source_support_cardinality(), 2)
+        self.assertFalse(relation.is_bijection_from_source_support())
 
     def test_point_map_equality_on_reordered_symbolic_support(self) -> None:
         batch = sympy.Symbol("batch", integer=True, nonnegative=True)

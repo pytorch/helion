@@ -13,6 +13,8 @@ from typing import cast
 
 import sympy
 from torch.utils._sympy.functions import FloorDiv
+from torch.utils._sympy.functions import Max as SymbolicMax
+from torch.utils._sympy.functions import Min as SymbolicMin
 
 from .. import exc
 
@@ -68,9 +70,12 @@ def _is_provably_nonnegative(
 ) -> bool:
     """Use intrinsic SymPy facts, then an optional enclosing shape proof."""
     expression = sympy.sympify(expression)
-    return expression.is_nonnegative is True or (  # pyrefly: ignore[missing-attribute]
-        prove_nonnegative is not None and prove_nonnegative(expression)
-    )
+    if expression.is_nonnegative is True:  # pyrefly: ignore[missing-attribute]
+        return True
+    interval = _bounded_parameter_expression_interval(expression)
+    return (
+        interval is not None and interval[0].is_nonnegative is True
+    ) or (prove_nonnegative is not None and prove_nonnegative(expression))
 
 
 def _integer_expression(value: IntegerExpression, *, description: str) -> sympy.Expr:
@@ -92,6 +97,82 @@ def _concrete_integer(value: IntegerExpression, *, description: str) -> int:
     if not isinstance(expression, sympy.Integer):
         raise ValueError(f"{description} did not evaluate to an integer: {expression}")
     return int(expression)
+
+
+def _bounded_parameter_expression_interval(
+    expression: sympy.Expr,
+) -> tuple[sympy.Expr, sympy.Expr] | None:
+    """Bound a finite integer expression independently of runtime parameters."""
+    expression = sympy.sympify(expression)
+    if expression.is_number:
+        return expression, expression
+    if isinstance(expression, sympy.Mod) and len(expression.args) == 2:
+        modulus = expression.args[1]
+        if (
+            not modulus.free_symbols
+            and modulus.is_integer is True
+            and modulus.is_positive is True
+        ):
+            return sympy.Integer(0), modulus - 1
+        return None
+    quotient = _static_integer_quotient(expression)
+    if quotient is not None:
+        numerator, denominator = quotient
+        numerator_interval = _bounded_parameter_expression_interval(numerator)
+        if numerator_interval is None:
+            return None
+        return (
+            sympy.floor(numerator_interval[0] / denominator),
+            sympy.floor(numerator_interval[1] / denominator),
+        )
+    if isinstance(expression, sympy.Add):
+        intervals = tuple(
+            _bounded_parameter_expression_interval(child)
+            for child in expression.args
+        )
+        if any(interval is None for interval in intervals):
+            return None
+        bounded = tuple(interval for interval in intervals if interval is not None)
+        return (
+            sympy.Add(*(interval[0] for interval in bounded)),
+            sympy.Add(*(interval[1] for interval in bounded)),
+        )
+    if isinstance(expression, sympy.Mul):
+        interval: tuple[sympy.Expr, sympy.Expr] = (
+            sympy.Integer(1),
+            sympy.Integer(1),
+        )
+        for child in expression.args:
+            child_interval = _bounded_parameter_expression_interval(child)
+            if child_interval is None:
+                return None
+            products = tuple(
+                sympy.simplify(left * right)
+                for left in interval
+                for right in child_interval
+            )
+            if any(not value.is_number for value in products):
+                return None
+            interval = (min(products), max(products))
+        return interval
+    if expression.func in (sympy.Min, sympy.Max):
+        intervals = tuple(
+            _bounded_parameter_expression_interval(cast("sympy.Expr", child))
+            for child in expression.args
+        )
+        if any(interval is None for interval in intervals):
+            return None
+        bounded = tuple(interval for interval in intervals if interval is not None)
+        if expression.func == sympy.Min:
+            return (
+                min(interval[0] for interval in bounded),
+                min(interval[1] for interval in bounded),
+            )
+        return (
+            max(interval[0] for interval in bounded),
+            max(interval[1] for interval in bounded),
+        )
+    return None
 
 
 def _parameter_substitutions(
@@ -910,10 +991,13 @@ class CoordinateRelation:
     ) -> CoordinateRelation | None:
         """Union dropped source axes when their images remain rectilinear."""
         current_counts = self.source_domain.axis_count_expressions
-        if any(
-            axis not in current_counts
-            or sympy.simplify(current_counts[axis] - count) != 0
-            for axis, count in source_domain.axis_counts_items
+        if (
+            any(
+                axis not in current_counts
+                or sympy.simplify(current_counts[axis] - count) != 0
+                for axis, count in source_domain.axis_counts_items
+            )
+            or len(self.pieces) > _MAX_RELATION_PIECES
         ):
             return None
         retained_axes = frozenset(source_domain.axis_order)
@@ -977,6 +1061,34 @@ class CoordinateRelation:
                 if stride <= 0 or width <= 0:
                     return None
                 source_begin, source_end, source_step = source_bounds[eliminated_axis]
+                source_count = self.source_domain.axis_count_expressions[
+                    eliminated_axis
+                ]
+                target_count = self.target_domain.axis_count_expressions[target_axis]
+                if (
+                    source_step == 1
+                    and stride == 1
+                    and width == 1
+                    and sympy.simplify(source_begin) == 0
+                    and sympy.simplify(source_end - source_count) == 0  # pyrefly: ignore[unsupported-operation]
+                    and sympy.simplify(base_expression) == 0
+                    and sympy.simplify(target_count - source_count) == 0  # pyrefly: ignore[unsupported-operation]
+                ):
+                    # Existentially removing a complete runtime-sized
+                    # positional factor produces the complete corresponding
+                    # target axis.  No runtime extent is enumerated.
+                    target_ranges.append(
+                        (
+                            target_axis,
+                            sympy.Integer(0),
+                            _integer_expression(
+                                target_count,
+                                description="coordinate-domain axis count",
+                            ),
+                            1,
+                        )
+                    )
+                    continue
                 try:
                     concrete_source_begin = _concrete_integer(
                         source_begin,
@@ -1027,10 +1139,13 @@ class CoordinateRelation:
                     target_ranges=tuple(target_ranges),
                 )
             )
+        unique_pieces = tuple(dict.fromkeys(pieces))
+        if len(unique_pieces) > _MAX_RELATION_PIECES:
+            return None
         return CoordinateRelation(
             source_domain=source_domain,
             target_domain=self.target_domain,
-            pieces=tuple(dict.fromkeys(pieces)),
+            pieces=unique_pieces,
         )
 
     def lift_source(self, source_domain: CoordinateDomain) -> CoordinateRelation | None:
@@ -1086,6 +1201,33 @@ class CoordinateRelation:
             )
         ):
             return self
+        if following.is_positional_bijection():
+            renamed = self.rename_target_axes(following.target_domain)
+            if renamed is not None:
+                return renamed
+        coordinate_permutation = _coordinate_permutation_axes(following)
+        if coordinate_permutation is not None:
+            pieces = tuple(
+                _CoordinateRelationPiece(
+                    source_bounds_items=piece.source_bounds_items,
+                    target_ranges=tuple(
+                        (
+                            target_axis,
+                            *{
+                                axis: (begin, end, step)
+                                for axis, begin, end, step in piece.target_ranges
+                            }[coordinate_permutation[target_axis]],
+                        )
+                        for target_axis in following.target_domain.axis_order
+                    ),
+                )
+                for piece in self.pieces
+            )
+            return CoordinateRelation(
+                source_domain=self.source_domain,
+                target_domain=following.target_domain,
+                pieces=pieces,
+            )
         point_composition = _compose_point_relations(self, following)
         if point_composition is not None:
             return point_composition
@@ -1150,7 +1292,22 @@ class CoordinateRelation:
         renaming.  Dropped coordinates must neither restrict source support nor
         occur in a target expression.
         """
-        if quotient.source_domain != self.source_domain or len(quotient.pieces) != 1:
+        if quotient.source_domain != self.source_domain:
+            return None
+        if (
+            ordinal_inverse := _source_support_ordinalization(
+                quotient,
+                reverse=True,
+            )
+        ) is not None:
+            factored = _factor_through_source_ordinalization(
+                self,
+                quotient,
+                ordinal_inverse,
+            )
+            if factored is not None:
+                return factored
+        if len(quotient.pieces) != 1:
             return None
         (quotient_piece,) = quotient.pieces
         if quotient_piece.source_bounds_items != tuple(
@@ -1259,6 +1416,27 @@ class CoordinateRelation:
         if (
             self.source_domain != required.source_domain
             or self.target_domain != required.target_domain
+        ):
+            return False
+        if not required.pieces or self == required or self.is_total():
+            return True
+        if (
+            len(self.pieces) > _MAX_RELATION_PIECES
+            or len(required.pieces) > _MAX_RELATION_PIECES
+        ):
+            return False
+        if self.is_pointwise_equal_on_same_support(required):
+            return True
+        positional_product = self._parameterized_positional_product
+        required_positional_product = required._parameterized_positional_product
+        if (
+            positional_product is not None
+            and required_positional_product is not None
+            and positional_product[0] == required_positional_product[0]
+        ):
+            return positional_product[1].covers(required_positional_product[1])
+        if not _relation_product_is_within_budget(
+            len(self.pieces), len(required.pieces)
         ):
             return False
         return all(
@@ -1615,10 +1793,45 @@ class CoordinateRelation:
             return None
         return keys_by_source, targets_by_key
 
+    @cached_property
+    def _ordinalized_source_support(self) -> CoordinateRelation | None:
+        """Canonical dense ordinal for this relation's represented support."""
+        return _source_support_ordinalization(self)
+
+    @cached_property
+    def _factored_source_support_converse(self) -> CoordinateRelation | None:
+        """Prove and invert this relation through its support ordinalization."""
+        ordinalization = self._ordinalized_source_support
+        if ordinalization is None:
+            return None
+        ordinal_inverse = _source_support_ordinalization(
+            ordinalization,
+            reverse=True,
+        )
+        if ordinal_inverse is None:
+            return None
+        quotient = _factor_through_source_ordinalization(
+            self,
+            ordinalization,
+            ordinal_inverse,
+        )
+        if quotient is None or not quotient.is_total_function():
+            return None
+        quotient_inverse = quotient.converse()
+        if quotient_inverse is None or not quotient_inverse.is_total_function():
+            return None
+        return quotient_inverse.then(ordinal_inverse)
+
     def converse(self) -> CoordinateRelation | None:
         """Return the exact converse when representable without enumeration."""
         if self.is_positional_bijection():
             return self.derive_converse_and_target_counts()[0]
+        if (
+            converse := _symbolic_single_source_mixed_radix_converse(self)
+        ) is not None:
+            return converse
+        if (converse := self._factored_source_support_converse) is not None:
+            return converse
         if self.parameter_symbols:
             return self.derive_converse_and_target_counts()[0]
         converse = self._cached_converse
@@ -2291,10 +2504,23 @@ class CoordinateRelation:
         mixed-radix permutations compact without enumerating their repeated
         residues after flattening.
         """
+        if len(self.pieces) > _MAX_RELATION_PIECES or not (
+            _relation_product_is_within_budget(
+                len(self.pieces),
+                len(self.pieces),
+                max(1, len(self.source_domain.axis_order)),
+            )
+        ):
+            # Returning the original relation is an exact conservative
+            # decline; callers may reject it if compactness is required.
+            return self
 
         def piece_key(piece: _CoordinateRelationPiece) -> tuple[object, ...]:
             return (
-                piece.source_bounds_items,
+                tuple(
+                    (axis, sympy.srepr(begin), sympy.srepr(end), step)
+                    for axis, begin, end, step in piece.source_bounds_items
+                ),
                 tuple(
                     (axis, sympy.srepr(begin), sympy.srepr(end), step)
                     for axis, begin, end, step in piece.target_ranges
@@ -2435,8 +2661,20 @@ class CoordinateRelation:
 
     def has_disjoint_source_support(self, other: CoordinateRelation) -> bool:
         """Prove that no source coordinate participates in both relations."""
-        if self.source_domain != other.source_domain:
+        if (
+            self.source_domain != other.source_domain
+            or len(self.pieces) > _MAX_RELATION_PIECES
+            or len(other.pieces) > _MAX_RELATION_PIECES
+            or not _relation_product_is_within_budget(
+                len(self.pieces), len(other.pieces)
+            )
+        ):
             return False
+        if _ordinalized_source_supports_are_disjoint(
+            self._ordinalized_source_support,
+            other._ordinalized_source_support,
+        ):
+            return True
         return all(
             _source_boxes_are_disjoint(left, right)
             for left in self.pieces
@@ -2457,6 +2695,15 @@ class CoordinateRelation:
         never on the number of source points.  Strided or overlapping support
         that cannot be canonicalized exactly declines instead of enumerating.
         """
+        if self.target_domain.size_expr.is_zero is True:
+            return 0
+        if self._factored_source_support_converse is not None:
+            target_size = sympy.simplify(self.target_domain.size_expr)
+            return (
+                int(target_size)
+                if isinstance(target_size, sympy.Integer)
+                else target_size
+            )
         if len(
             self.pieces
         ) <= _MAX_RELATION_PIECES and _relation_product_is_within_budget(
@@ -2550,6 +2797,23 @@ class CoordinateRelation:
 
     def has_total_source(self) -> bool:
         """Return whether every source coordinate has at least one target."""
+        if self.source_domain.size_expr.is_zero is True:
+            return True
+        cardinality = self.source_support_cardinality()
+        if (
+            cardinality is not None
+            and sympy.simplify(
+                cardinality - self.source_domain.size_expr  # pyrefly: ignore[unsupported-operation]
+            )
+            == 0
+        ):
+            # Support is a proved subset of the source domain. Equal finite
+            # cardinality therefore proves coverage, including symbolic tails.
+            return True
+        positional_product = self._parameterized_positional_product
+        if positional_product is not None:
+            _positional_axes, residual = positional_product
+            return residual.has_total_source()
         cells = _relation_source_cells(self, include_domain=True)
         if cells is None:
             return False
@@ -2569,6 +2833,12 @@ class CoordinateRelation:
 
     def is_single_valued(self) -> bool:
         """Return whether every source instance maps to at most one target."""
+        if len(self.pieces) > _MAX_RELATION_PIECES:
+            return False
+        positional_product = self._parameterized_positional_product
+        if positional_product is not None:
+            _positional_axes, residual = positional_product
+            return residual.is_single_valued()
         normalized_targets = tuple(
             tuple(
                 (
@@ -2596,6 +2866,21 @@ class CoordinateRelation:
             for target_ranges in normalized_targets
             for _axis, begin, end, step in target_ranges
         ):
+            return False
+        if len(self.pieces) <= 1 or (
+            normalized_targets
+            and all(
+                target_ranges == normalized_targets[0]
+                for target_ranges in normalized_targets[1:]
+            )
+        ):
+            return True
+        if _source_boxes_partition_domain(
+            tuple(piece.source_bounds_items for piece in self.pieces),
+            self.source_domain,
+        ):
+            return True
+        if not _relation_product_is_within_budget(len(self.pieces), len(self.pieces)):
             return False
         for left_index, left in enumerate(self.pieces):
             for right_index, right in enumerate(
@@ -2731,6 +3016,12 @@ class CoordinateRelation:
             return True
         if self._separable_fixed_width_point_quotient() is not None:
             return True
+        if (
+            self.parameter_symbols
+            and len(self.source_domain.axis_order) == 1
+            and _symbolic_single_source_mixed_radix_converse(self) is not None
+        ):
+            return True
         positional_product = self._parameterized_positional_product
         if positional_product is not None:
             _positional_axes, residual = positional_product
@@ -2766,6 +3057,8 @@ class CoordinateRelation:
             )
             for piece in self.pieces
         ):
+            return True
+        if self.is_single_valued() and self.has_total_source():
             return True
         if self.parameter_symbols:
             return False
@@ -2820,6 +3113,31 @@ class CoordinateRelation:
             )
             for bounds in cells
         )
+
+    def is_bijection_from_source_support(self) -> bool:
+        """Prove that this relation bijects its support onto its target domain.
+
+        The source relation may be partial: only participating source points
+        are counted.  Exact cardinality, point-valuedness, and a total inverse
+        are all required, so equal source/target counts alone cannot certify a
+        duplicate-target map.
+        """
+        if self._factored_source_support_converse is not None:
+            return True
+        source_cardinality = self.source_support_cardinality()
+        if (
+            source_cardinality is None
+            or not _integer_partition_expressions_equal(
+                source_cardinality,
+                self.target_domain.size_expr,
+            )
+            or not self.is_single_valued()
+        ):
+            return False
+        if self.target_domain.size_expr.is_zero is True:
+            return True
+        converse = self.converse()
+        return converse is not None and converse.is_total_function()
 
     def _pointwise_difference_bounds(
         self,
@@ -3013,8 +3331,8 @@ class CoordinateRelation:
             all(
                 left_axis == right_axis
                 and left_step == right_step
-                and sympy.simplify(left_begin - right_begin) == 0  # pyrefly: ignore[unsupported-operation]
-                and sympy.simplify(left_end - right_end) == 0  # pyrefly: ignore[unsupported-operation]
+                and _integer_partition_expressions_equal(left_begin, right_begin)
+                and _integer_partition_expressions_equal(left_end, right_end)
                 for (
                     left_axis,
                     left_begin,
@@ -3793,6 +4111,889 @@ def _source_box_cardinality(
     return sympy.simplify(cardinality)
 
 
+def _integer_partition_expressions_equal(
+    left: IntegerExpression,
+    right: IntegerExpression,
+) -> bool:
+    """Compare integer expressions after canonical quotient simplification."""
+    difference = _simplify_integer_quotients(
+        sympy.simplify(sympy.sympify(left) - sympy.sympify(right))
+    )
+    return sympy.simplify(difference) == 0
+
+
+def _coordinate_permutation_axes(
+    relation: CoordinateRelation,
+) -> dict[int, int] | None:
+    """Return target-to-source axes for a complete coordinate permutation."""
+    if (
+        len(relation.pieces) != 1
+        or len(relation.source_domain.axis_order)
+        != len(relation.target_domain.axis_order)
+    ):
+        return None
+    (piece,) = relation.pieces
+    if piece.source_bounds_items != tuple(
+        (axis, 0, relation.source_domain.axis_count_expressions[axis], 1)
+        for axis in relation.source_domain.axis_order
+    ):
+        return None
+    source_axis_by_symbol = {
+        coordinate_axis_symbol(axis): axis
+        for axis in relation.source_domain.axis_order
+    }
+    result: dict[int, int] = {}
+    for target_axis, begin, end, step in piece.target_ranges:
+        source_axis = source_axis_by_symbol.get(begin)
+        if (
+            source_axis is None
+            or source_axis in result.values()
+            or step != 1
+            or not _integer_partition_expressions_equal(end - begin, 1)
+            or not _integer_partition_expressions_equal(
+                relation.source_domain.axis_count_expressions[source_axis],
+                relation.target_domain.axis_count_expressions[target_axis],
+            )
+        ):
+            return None
+        result[target_axis] = source_axis
+    return (
+        result
+        if tuple(result) == relation.target_domain.axis_order
+        and len(result) == len(relation.source_domain.axis_order)
+        else None
+    )
+
+
+def _nonempty_relation_pieces(
+    relation: CoordinateRelation,
+) -> tuple[_CoordinateRelationPiece, ...]:
+    """Discard only pieces whose source box is proved empty."""
+    return tuple(
+        piece
+        for piece in relation.pieces
+        if not any(
+            sympy.simplify(sympy.sympify(end) - sympy.sympify(begin)).is_nonpositive
+            is True
+            for _axis, begin, end, _step in piece.source_bounds_items
+        )
+    )
+
+
+def _source_bounds_equal(
+    left: tuple[tuple[int, IntegerExpression, IntegerExpression, int], ...],
+    right: tuple[tuple[int, IntegerExpression, IntegerExpression, int], ...],
+) -> bool:
+    return len(left) == len(right) and all(
+        left_axis == right_axis
+        and left_step == right_step
+        and _integer_partition_expressions_equal(left_begin, right_begin)
+        and _integer_partition_expressions_equal(left_end, right_end)
+        for (
+            left_axis,
+            left_begin,
+            left_end,
+            left_step,
+        ), (
+            right_axis,
+            right_begin,
+            right_end,
+            right_step,
+        ) in zip(left, right, strict=True)
+    )
+
+
+def _flattened_capacity_is_sufficient(
+    outer_count: sympy.Expr,
+    inner_count: int,
+    required_slots: sympy.Expr,
+) -> bool:
+    """Prove a dense two-axis container can hold a required prefix."""
+    if _is_provably_nonnegative(
+        _simplify_integer_quotients(
+            sympy.simplify(outer_count * inner_count - required_slots)
+        ),
+        None,
+    ):
+        return True
+    quotient = _static_integer_quotient(outer_count)
+    if quotient is None:
+        return False
+    numerator, denominator = quotient
+    if denominator != inner_count:
+        return False
+    # ceildiv(available, inner_count) is represented as
+    # FloorDiv(available + inner_count - 1, inner_count).
+    available = sympy.simplify(numerator - inner_count + 1)
+    return _is_provably_nonnegative(
+        _simplify_integer_quotients(
+            sympy.simplify(available - required_slots)
+        ),
+        None,
+    )
+
+
+def _fixed_source_coordinates(
+    relation: CoordinateRelation,
+    piece: _CoordinateRelationPiece,
+    varying_axes: frozenset[int],
+) -> dict[int, sympy.Expr] | None:
+    """Return proved in-domain singleton coordinates on all other axes."""
+    counts = relation.source_domain.axis_count_expressions
+    result: dict[int, sympy.Expr] = {}
+    for axis, begin, end, step in piece.source_bounds_items:
+        if axis in varying_axes:
+            continue
+        begin = sympy.sympify(begin)
+        end = sympy.sympify(end)
+        if (
+            step != 1
+            or not _integer_partition_expressions_equal(end - begin, 1)
+            or not _is_provably_nonnegative(begin, None)
+            or not _is_provably_nonnegative(
+                sympy.simplify(sympy.sympify(counts[axis]) - end),
+                None,
+            )
+        ):
+            return None
+        result[axis] = begin
+    return result
+
+
+def _relations_equal_after_source_coalescing(
+    left: CoordinateRelation,
+    right: CoordinateRelation,
+) -> bool:
+    """Compare point maps after the existing bounded source normalization."""
+    if left == right:
+        return True
+    left = dataclasses.replace(left, pieces=_nonempty_relation_pieces(left))
+    right = dataclasses.replace(right, pieces=_nonempty_relation_pieces(right))
+    left = left.coalesce_adjacent_source_boxes()
+    right = right.coalesce_adjacent_source_boxes()
+    return left.is_pointwise_equal_on_same_support(right)
+
+
+def _source_support_ordinalization(
+    relation: CoordinateRelation,
+    *,
+    reverse: bool = False,
+) -> CoordinateRelation | None:
+    """Derive or invert a dense ordinalization of semantic source support.
+
+    The proof depends only on relation geometry.  It accepts a bounded
+    partition of one dense two-axis interval, or one phased strided traversal
+    whose final row is clipped by the ordinal target domain.
+    """
+    if (
+        not relation.pieces
+        or len(relation.pieces) > _MAX_RELATION_PIECES
+        or len(relation.source_domain.axis_order) < 2
+    ):
+        return None
+    target_count = sympy.sympify(relation.target_domain.size_expr)
+    if target_count.is_nonnegative is not True:
+        return None
+    if len(relation.target_domain.axis_order) == 1:
+        ordinal_domain = relation.target_domain
+    else:
+        used_axes = frozenset(
+            (*relation.source_domain.axis_order, *relation.target_domain.axis_order)
+        )
+        ordinal_axis = min(used_axes, default=0) - 1
+        while ordinal_axis in used_axes:
+            ordinal_axis -= 1
+        ordinal_domain = CoordinateDomain(
+            (ordinal_axis,),
+            ((ordinal_axis, target_count),),
+            kind="task_order",
+            identity=relation.target_domain.identity,
+            _allow_empty=target_count.is_zero is True,
+        )
+    (ordinal_axis,) = ordinal_domain.axis_order
+    ordinal = coordinate_axis_symbol(ordinal_axis)
+    source_counts = relation.source_domain.axis_count_expressions
+    pieces = _nonempty_relation_pieces(relation)
+    if not pieces:
+        return None
+
+    def finish(
+        point_expression: sympy.Expr,
+        inverse: dict[int, sympy.Expr],
+    ) -> CoordinateRelation | None:
+        ordinalization = CoordinateRelation.point_map(
+            relation.source_domain,
+            ordinal_domain,
+            tuple(
+                (piece.source_bounds_items, (point_expression,))
+                for piece in relation.pieces
+            ),
+        )
+        if reverse:
+            if not _relations_equal_after_source_coalescing(
+                ordinalization,
+                relation,
+            ):
+                return None
+            return CoordinateRelation.point_map(
+                ordinal_domain,
+                relation.source_domain,
+                (
+                    (
+                        ((ordinal_axis, 0, target_count, 1),),
+                        tuple(
+                            inverse[axis]
+                            for axis in relation.source_domain.axis_order
+                        ),
+                    ),
+                ),
+            )
+        return ordinalization
+
+    # A bounded partition of one row-major interval.
+    for inner_axis in relation.source_domain.axis_order:
+        try:
+            inner_count = _concrete_integer(
+                source_counts[inner_axis],
+                description="ordinalization inner-axis count",
+            )
+        except ValueError:
+            continue
+        if inner_count <= 0:
+            continue
+        inner = coordinate_axis_symbol(inner_axis)
+        for outer_axis in relation.source_domain.axis_order:
+            if outer_axis == inner_axis:
+                continue
+            outer = coordinate_axis_symbol(outer_axis)
+            for candidate_piece in pieces:
+                candidate_bounds = {
+                    axis: (begin, end, step)
+                    for axis, begin, end, step in candidate_piece.source_bounds_items
+                }
+                first_inner, _inner_end, inner_step = candidate_bounds[inner_axis]
+                first_outer, outer_end, outer_step = candidate_bounds[outer_axis]
+                first_inner = sympy.sympify(first_inner)
+                first_outer = sympy.sympify(first_outer)
+                fixed = _fixed_source_coordinates(
+                    relation,
+                    candidate_piece,
+                    frozenset((inner_axis, outer_axis)),
+                )
+                first_inner_interval = _bounded_parameter_expression_interval(
+                    first_inner
+                )
+                if (
+                    fixed is None
+                    or inner_step != 1
+                    or outer_step != 1
+                    or not _integer_partition_expressions_equal(
+                        outer_end - first_outer,
+                        1,
+                    )
+                    or not _is_provably_nonnegative(first_outer, None)
+                    or first_inner_interval is None
+                    or not _is_provably_nonnegative(first_inner_interval[0], None)
+                    or not _is_provably_nonnegative(
+                        sympy.simplify(inner_count - 1 - first_inner_interval[1]),
+                        None,
+                    )
+                    or not _flattened_capacity_is_sufficient(
+                        sympy.sympify(source_counts[outer_axis]),
+                        inner_count,
+                        sympy.simplify(
+                            first_outer * inner_count
+                            + first_inner
+                            + target_count
+                        ),
+                    )
+                ):
+                    continue
+                point_expression = _simplify_integer_quotients(
+                    sympy.simplify(
+                        (outer - first_outer) * inner_count + inner - first_inner
+                    )
+                )
+                first_count = SymbolicMin(
+                    target_count,
+                    inner_count - first_inner,
+                )
+                remaining = SymbolicMax(
+                    sympy.simplify(target_count - first_count),
+                    sympy.Integer(0),
+                )
+                full_outer = FloorDiv(remaining, inner_count)
+                tail_count = sympy.Mod(remaining, inner_count)
+                middle_begin = sympy.simplify(first_outer + 1)
+                middle_end = sympy.simplify(middle_begin + full_outer)
+                final_end = sympy.simplify(
+                    middle_end
+                    + FloorDiv(tail_count + inner_count - 1, inner_count)
+                )
+
+                def source_box(
+                    inner_begin: IntegerExpression,
+                    inner_end: IntegerExpression,
+                    outer_begin: IntegerExpression,
+                    outer_end: IntegerExpression,
+                ) -> tuple[
+                    tuple[int, IntegerExpression, IntegerExpression, int], ...
+                ]:
+                    bounds = {
+                        **{
+                            axis: (value, value + 1, 1)
+                            for axis, value in fixed.items()
+                        },
+                        inner_axis: (inner_begin, inner_end, 1),
+                        outer_axis: (outer_begin, outer_end, 1),
+                    }
+                    return tuple(
+                        (axis, *bounds[axis])
+                        for axis in relation.source_domain.axis_order
+                    )
+
+                expected_bounds = tuple(
+                    bounds
+                    for bounds in (
+                        source_box(
+                            first_inner,
+                            first_inner + first_count,
+                            first_outer,
+                            first_outer + 1,
+                        ),
+                        source_box(0, inner_count, middle_begin, middle_end),
+                        source_box(0, tail_count, middle_end, final_end),
+                    )
+                    if not any(
+                        sympy.simplify(
+                            sympy.sympify(end) - sympy.sympify(begin)
+                        ).is_nonpositive
+                        is True
+                        for _axis, begin, end, _step in bounds
+                    )
+                )
+                expected = CoordinateRelation.point_map(
+                    relation.source_domain,
+                    ordinal_domain,
+                    tuple((bounds, (point_expression,)) for bounds in expected_bounds),
+                )
+                actual = CoordinateRelation.point_map(
+                    relation.source_domain,
+                    ordinal_domain,
+                    tuple(
+                        (piece.source_bounds_items, (point_expression,))
+                        for piece in relation.pieces
+                    ),
+                )
+                if not _relations_equal_after_source_coalescing(actual, expected):
+                    continue
+                inverse = {
+                    **fixed,
+                    inner_axis: sympy.Mod(ordinal + first_inner, inner_count),
+                    outer_axis: first_outer
+                    + sympy.floor((ordinal + first_inner) / inner_count),
+                }
+                return finish(point_expression, inverse)
+
+    # A phased row-major traversal represented by exact full rows plus one
+    # exact tail row.  Unlike a padded source box, every raw source point maps
+    # inside the ordinal domain, so later composition never has to recover
+    # support that was implicit in target clipping.
+    for inner_axis in relation.source_domain.axis_order:
+        try:
+            inner_count = _concrete_integer(
+                source_counts[inner_axis],
+                description="ordinalization inner-axis count",
+            )
+        except ValueError:
+            continue
+        if inner_count <= 0:
+            continue
+        for outer_axis in relation.source_domain.axis_order:
+            if outer_axis == inner_axis:
+                continue
+            for full_piece in pieces:
+                full_bounds = {
+                    axis: (begin, end, step)
+                    for axis, begin, end, step in full_piece.source_bounds_items
+                }
+                if not _source_bounds_equal(
+                    ((inner_axis, *full_bounds[inner_axis]),),
+                    ((inner_axis, 0, inner_count, 1),),
+                ):
+                    continue
+                phase, _full_end, period = full_bounds[outer_axis]
+                fixed = _fixed_source_coordinates(
+                    relation,
+                    full_piece,
+                    frozenset((inner_axis, outer_axis)),
+                )
+                if (
+                    fixed is None
+                    or period <= 0
+                    or not isinstance(phase, sympy.Integer)
+                    or not 0 <= int(phase) < period
+                    or any(
+                        _fixed_source_coordinates(
+                            relation,
+                            piece,
+                            frozenset((inner_axis, outer_axis)),
+                        )
+                        != fixed
+                        for piece in pieces
+                    )
+                    or not _integer_partition_expressions_equal(
+                        source_counts[outer_axis],
+                        period
+                        * FloorDiv(
+                            target_count + inner_count - 1,
+                            inner_count,
+                        ),
+                    )
+                ):
+                    continue
+                full_rows = FloorDiv(target_count, inner_count)
+                tail_count = sympy.Mod(target_count, inner_count)
+                tail_row = sympy.simplify(phase + period * full_rows)
+                tail_rows = FloorDiv(tail_count + inner_count - 1, inner_count)
+
+                def phased_box(
+                    inner_begin: IntegerExpression,
+                    inner_end: IntegerExpression,
+                    outer_begin: IntegerExpression,
+                    outer_end: IntegerExpression,
+                    outer_step: int,
+                ) -> tuple[
+                    tuple[int, IntegerExpression, IntegerExpression, int], ...
+                ]:
+                    bounds = {
+                        **{
+                            axis: (value, value + 1, 1)
+                            for axis, value in fixed.items()
+                        },
+                        inner_axis: (inner_begin, inner_end, 1),
+                        outer_axis: (outer_begin, outer_end, outer_step),
+                    }
+                    return tuple(
+                        (axis, *bounds[axis])
+                        for axis in relation.source_domain.axis_order
+                    )
+
+                expected_bounds = tuple(
+                    bounds
+                    for bounds in (
+                        phased_box(0, inner_count, phase, tail_row, period),
+                        phased_box(
+                            0,
+                            tail_count,
+                            tail_row,
+                            sympy.simplify(tail_row + tail_rows),
+                            1,
+                        ),
+                    )
+                    if not any(
+                        sympy.simplify(
+                            sympy.sympify(end) - sympy.sympify(begin)
+                        ).is_nonpositive
+                        is True
+                        for _axis, begin, end, _step in bounds
+                    )
+                )
+                point_expression = _simplify_integer_quotients(
+                    sympy.floor(coordinate_axis_symbol(outer_axis) / period)
+                    * inner_count
+                    + coordinate_axis_symbol(inner_axis)
+                )
+                expected = CoordinateRelation.point_map(
+                    relation.source_domain,
+                    ordinal_domain,
+                    tuple((bounds, (point_expression,)) for bounds in expected_bounds),
+                )
+                actual = CoordinateRelation.point_map(
+                    relation.source_domain,
+                    ordinal_domain,
+                    tuple(
+                        (piece.source_bounds_items, (point_expression,))
+                        for piece in relation.pieces
+                    ),
+                )
+                if not _relations_equal_after_source_coalescing(actual, expected):
+                    continue
+                inverse = {
+                    **fixed,
+                    inner_axis: sympy.Mod(ordinal, inner_count),
+                    outer_axis: period * sympy.floor(ordinal / inner_count) + phase,
+                }
+                return finish(point_expression, inverse)
+    return None
+
+
+def _factor_through_source_ordinalization(
+    relation: CoordinateRelation,
+    ordinalization: CoordinateRelation,
+    ordinal_inverse: CoordinateRelation,
+) -> CoordinateRelation | None:
+    """Factor a point map through an exact dense support ordinalization."""
+    if _relations_equal_after_source_coalescing(relation, ordinalization):
+        return CoordinateRelation.identity(
+            ordinalization.target_domain,
+            ordinalization.target_domain,
+        )
+    if (
+        len(ordinalization.target_domain.axis_order) != 1
+        or ordinal_inverse.source_domain != ordinalization.target_domain
+        or ordinal_inverse.target_domain != relation.source_domain
+        or not _relation_product_is_within_budget(
+            len(relation.pieces),
+            len(ordinalization.pieces),
+            len(ordinal_inverse.pieces),
+        )
+    ):
+        return None
+    target_count = ordinalization.target_domain.size_expr
+    (ordinal_axis,) = ordinalization.target_domain.axis_order
+    ordinal = coordinate_axis_symbol(ordinal_axis)
+    if len(ordinal_inverse.pieces) != 1 or not _source_bounds_equal(
+        ordinal_inverse.pieces[0].source_bounds_items,
+        ((ordinal_axis, 0, target_count, 1),),
+    ):
+        return None
+    (inverse_piece,) = ordinal_inverse.pieces
+    inverse_substitutions = {
+        coordinate_axis_symbol(axis): begin
+        for axis, begin, _end, _step in inverse_piece.target_ranges
+    }
+    full_ordinal_bounds = ((ordinal_axis, 0, target_count, 1),)
+
+    def full_candidate_recomposes(candidate: CoordinateRelation) -> bool:
+        """Prove ``relation == ordinalization ; candidate`` piecewise."""
+        if len(candidate.pieces) != 1:
+            return False
+        (candidate_piece,) = candidate.pieces
+        if not _source_bounds_equal(
+            candidate_piece.source_bounds_items,
+            full_ordinal_bounds,
+        ):
+            return False
+        matched_ordinal_pieces: set[int] = set()
+        for relation_piece in relation.pieces:
+            matching = tuple(
+                (index, ordinal_piece)
+                for index, ordinal_piece in enumerate(ordinalization.pieces)
+                if _source_bounds_equal(
+                    ordinal_piece.source_bounds_items,
+                    relation_piece.source_bounds_items,
+                )
+            )
+            if len(matching) != 1:
+                return False
+            ordinal_index, ordinal_piece = matching[0]
+            matched_ordinal_pieces.add(ordinal_index)
+            ordinal_expression = ordinal_piece.target_ranges[0][1]
+            substitutions = {
+                coordinate_axis_symbol(ordinal_axis): ordinal_expression
+            }
+            recomposed_targets = tuple(
+                (
+                    target_axis,
+                    _substitute_composed_expression(
+                        begin,
+                        substitutions=substitutions,
+                        source_domain=relation.source_domain,
+                        source_bounds=relation_piece.source_bounds_items,
+                    ),
+                    _substitute_composed_expression(
+                        end,
+                        substitutions=substitutions,
+                        source_domain=relation.source_domain,
+                        source_bounds=relation_piece.source_bounds_items,
+                    ),
+                    step,
+                )
+                for target_axis, begin, end, step in candidate_piece.target_ranges
+            )
+            if any(
+                actual_axis != expected_axis
+                or actual_step != expected_step
+                or not _integer_partition_expressions_equal(
+                    _simplify_logical_expression(
+                        actual_begin,
+                        domain=relation.source_domain,
+                        source_bounds=relation_piece.source_bounds_items,
+                    ),
+                    _simplify_logical_expression(
+                        expected_begin,
+                        domain=relation.source_domain,
+                        source_bounds=relation_piece.source_bounds_items,
+                    ),
+                )
+                or not _integer_partition_expressions_equal(
+                    _simplify_logical_expression(
+                        actual_end,
+                        domain=relation.source_domain,
+                        source_bounds=relation_piece.source_bounds_items,
+                    ),
+                    _simplify_logical_expression(
+                        expected_end,
+                        domain=relation.source_domain,
+                        source_bounds=relation_piece.source_bounds_items,
+                    ),
+                )
+                for (
+                    actual_axis,
+                    actual_begin,
+                    actual_end,
+                    actual_step,
+                ), (
+                    expected_axis,
+                    expected_begin,
+                    expected_end,
+                    expected_step,
+                ) in zip(
+                    relation_piece.target_ranges,
+                    recomposed_targets,
+                    strict=True,
+                )
+            ):
+                return False
+        return len(matched_ordinal_pieces) == len(ordinalization.pieces)
+
+    # Packed schedule pieces normally share one semantic ordinal expression.
+    # Replace that expression directly before falling back to substitution
+    # through the (necessarily more complicated) mixed-radix inverse.  This
+    # is an exact quotient rewrite: ``full_candidate_recomposes`` remains the
+    # acceptance proof, while avoiding expensive simplification of identities
+    # such as ``W * floor((i + offset) / W) + Mod(i + offset, W)``.
+    ordinal_expressions = tuple(
+        dict.fromkeys(
+            piece.target_ranges[0][1]
+            for piece in ordinalization.pieces
+            if len(piece.target_ranges) == 1
+        )
+    )
+    if len(ordinal_expressions) == 1:
+        ordinal_expression = ordinal_expressions[0]
+        source_symbols = frozenset(
+            coordinate_axis_symbol(axis)
+            for axis in relation.source_domain.axis_order
+        )
+        direct_targets: dict[
+            tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...], None
+        ] = {}
+        for piece in relation.pieces:
+            target_ranges = tuple(
+                (
+                    target_axis,
+                    cast(
+                        "sympy.Expr",
+                        target_begin.subs(
+                            ordinal_expression,
+                            ordinal,
+                            simultaneous=True,
+                        ),
+                    ),
+                    cast(
+                        "sympy.Expr",
+                        target_end.subs(
+                            ordinal_expression,
+                            ordinal,
+                            simultaneous=True,
+                        ),
+                    ),
+                    target_step,
+                )
+                for target_axis, target_begin, target_end, target_step in piece.target_ranges
+            )
+            if any(
+                (begin.free_symbols | end.free_symbols) & source_symbols
+                for _axis, begin, end, _step in target_ranges
+            ):
+                direct_targets.clear()
+                break
+            direct_targets.setdefault(target_ranges, None)
+        for target_ranges in direct_targets:
+            candidate = CoordinateRelation(
+                source_domain=ordinalization.target_domain,
+                target_domain=relation.target_domain,
+                pieces=(
+                    _CoordinateRelationPiece(
+                        source_bounds_items=full_ordinal_bounds,
+                        target_ranges=target_ranges,
+                    ),
+                ),
+            )
+            if candidate.is_total_function() and full_candidate_recomposes(candidate):
+                return candidate
+
+    # Piece boundaries in ``relation`` may be artifacts of the packed source
+    # support rather than changes in the logical task map.  If the direct
+    # quotient rewrite above did not apply, derive candidates by substituting
+    # the proved inverse over the complete ordinal domain.
+    candidate_targets: dict[
+        tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...], None
+    ] = {}
+    for piece in relation.pieces:
+        target_ranges = tuple(
+            (
+                target_axis,
+                _substitute_composed_expression(
+                    target_begin,
+                    substitutions=inverse_substitutions,
+                    source_domain=ordinalization.target_domain,
+                    source_bounds=full_ordinal_bounds,
+                ),
+                _substitute_composed_expression(
+                    target_end,
+                    substitutions=inverse_substitutions,
+                    source_domain=ordinalization.target_domain,
+                    source_bounds=full_ordinal_bounds,
+                ),
+                target_step,
+            )
+            for target_axis, target_begin, target_end, target_step in piece.target_ranges
+        )
+        candidate_targets.setdefault(target_ranges, None)
+
+    for target_ranges in candidate_targets:
+        candidate = CoordinateRelation(
+            source_domain=ordinalization.target_domain,
+            target_domain=relation.target_domain,
+            pieces=(
+                _CoordinateRelationPiece(
+                    source_bounds_items=full_ordinal_bounds,
+                    target_ranges=target_ranges,
+                ),
+            ),
+        )
+        if candidate.is_total_function() and full_candidate_recomposes(candidate):
+            return candidate
+
+    factored_pieces: list[_CoordinateRelationPiece] = []
+    for piece in relation.pieces:
+        matching = tuple(
+            candidate
+            for candidate in ordinalization.pieces
+            if _source_bounds_equal(
+                candidate.source_bounds_items,
+                piece.source_bounds_items,
+            )
+        )
+        if len(matching) != 1 or len(matching[0].target_ranges) != 1:
+            return None
+        axis, begin, end, step = matching[0].target_ranges[0]
+        bounds = _logical_expression_bounds(
+            begin,
+            domain=relation.source_domain,
+            source_bounds=piece.source_bounds_items,
+        )
+        if (
+            axis != ordinal_axis
+            or step != 1
+            or not _integer_partition_expressions_equal(end - begin, 1)
+            or bounds is None
+        ):
+            return None
+        ordinal_begin = SymbolicMax(sympy.Integer(0), bounds[0])
+        ordinal_end = SymbolicMin(target_count, bounds[1] + 1)
+        if sympy.simplify(ordinal_end - ordinal_begin).is_nonpositive is True:
+            continue
+        source_bounds = ((ordinal_axis, ordinal_begin, ordinal_end, 1),)
+        factored_pieces.append(
+            _CoordinateRelationPiece(
+                source_bounds_items=source_bounds,
+                target_ranges=tuple(
+                    (
+                        target_axis,
+                        _substitute_composed_expression(
+                            target_begin,
+                            substitutions=inverse_substitutions,
+                            source_domain=ordinalization.target_domain,
+                            source_bounds=source_bounds,
+                        ),
+                        _substitute_composed_expression(
+                            target_end,
+                            substitutions=inverse_substitutions,
+                            source_domain=ordinalization.target_domain,
+                            source_bounds=source_bounds,
+                        ),
+                        target_step,
+                    )
+                    for target_axis, target_begin, target_end, target_step in piece.target_ranges
+                ),
+            )
+        )
+        if len(factored_pieces) > _MAX_RELATION_PIECES:
+            return None
+    factored = CoordinateRelation(
+        source_domain=ordinalization.target_domain,
+        target_domain=relation.target_domain,
+        pieces=tuple(dict.fromkeys(factored_pieces)),
+    ).coalesce_adjacent_source_boxes()
+    recomposed = ordinalization.then(factored)
+    if recomposed is None or not _relations_equal_after_source_coalescing(
+        recomposed,
+        relation,
+    ):
+        return None
+    return factored
+
+
+def _ordinalized_source_supports_are_disjoint(
+    left: CoordinateRelation | None,
+    right: CoordinateRelation | None,
+) -> bool:
+    """Prove two dense ordinalized supports occupy disjoint source intervals."""
+    if (
+        left is None
+        or right is None
+        or left.source_domain != right.source_domain
+        or len(left.target_domain.axis_order) != 1
+        or len(right.target_domain.axis_order) != 1
+    ):
+        return False
+    left_piece = next(iter(_nonempty_relation_pieces(left)), None)
+    right_piece = next(iter(_nonempty_relation_pieces(right)), None)
+    if left_piece is None or right_piece is None:
+        return True
+    left_expression = left_piece.target_ranges[0][1]
+    right_expression = right_piece.target_ranges[0][1]
+    source_symbols = frozenset(
+        coordinate_axis_symbol(axis) for axis in left.source_domain.axis_order
+    )
+    difference = _simplify_integer_quotients(
+        sympy.simplify(left_expression - right_expression)
+    )
+    if difference.free_symbols & source_symbols:
+        return False
+    left_fixed = _fixed_source_coordinates(
+        left,
+        left_piece,
+        frozenset(
+            axis
+            for axis in left.source_domain.axis_order
+            if coordinate_axis_symbol(axis) in left_expression.free_symbols
+        ),
+    )
+    right_fixed = _fixed_source_coordinates(
+        right,
+        right_piece,
+        frozenset(
+            axis
+            for axis in right.source_domain.axis_order
+            if coordinate_axis_symbol(axis) in right_expression.free_symbols
+        ),
+    )
+    if left_fixed is None or left_fixed != right_fixed:
+        return False
+    return _is_provably_nonnegative(
+        sympy.simplify(difference - left.target_domain.size_expr),
+        None,
+    ) or _is_provably_nonnegative(
+        sympy.simplify(-difference - right.target_domain.size_expr),
+        None,
+    )
+
+
 def _source_bounds_are_disjoint(
     left: tuple[tuple[int, IntegerExpression, IntegerExpression, int], ...],
     right: tuple[tuple[int, IntegerExpression, IntegerExpression, int], ...],
@@ -3812,6 +5013,30 @@ def _source_bounds_are_disjoint(
             None,
         ) or _is_provably_nonnegative(
             sympy.simplify(left_begin - right_end),  # pyrefly: ignore[unsupported-operation]
+            None,
+        ):
+            return True
+        left_last = _simplify_integer_quotients(
+            sympy.simplify(
+                left_begin
+                + FloorDiv(left_end - left_begin - 1, left_step) * left_step  # pyrefly: ignore[unsupported-operation]
+            )
+        )
+        right_last = _simplify_integer_quotients(
+            sympy.simplify(
+                right_begin
+                + FloorDiv(right_end - right_begin - 1, right_step) * right_step  # pyrefly: ignore[unsupported-operation]
+            )
+        )
+        if _is_provably_nonnegative(
+            _simplify_integer_quotients(
+                sympy.simplify(right_begin - left_last - 1)  # pyrefly: ignore[unsupported-operation]
+            ),
+            None,
+        ) or _is_provably_nonnegative(
+            _simplify_integer_quotients(
+                sympy.simplify(left_begin - right_last - 1)  # pyrefly: ignore[unsupported-operation]
+            ),
             None,
         ):
             return True
@@ -4086,6 +5311,82 @@ def _normalize_integer_rounding(expression: sympy.Expr) -> sympy.Expr:
     return sympy.simplify(
         integer_part + sympy.floor(remainder / divisor)  # pyrefly: ignore[bad-argument-type, unsupported-operation]
     )
+
+
+def _static_integer_quotient(
+    expression: sympy.Expr,
+) -> tuple[sympy.Expr, int] | None:
+    """Parse either spelling of floor division by a positive static integer."""
+    expression = sympy.sympify(expression)
+    if expression.func == FloorDiv and len(expression.args) == 2:
+        numerator, denominator = expression.args
+    elif expression.func == sympy.floor and len(expression.args) == 1:
+        numerator, denominator = sympy.fraction(sympy.together(expression.args[0]))
+    else:
+        return None
+    if (
+        numerator.is_integer is not True
+        or denominator.free_symbols
+        or denominator.is_integer is not True
+        or int(denominator) <= 0
+    ):
+        return None
+    return cast("sympy.Expr", numerator), int(denominator)
+
+
+def _simplify_integer_quotients(expression: sympy.Expr) -> sympy.Expr:
+    """Canonicalize exact integer quotient/remainder identities."""
+    replacements = {
+        node: sympy.floor(numerator / denominator)  # pyrefly: ignore[bad-argument-type, unsupported-operation]
+        for node in sympy.preorder_traversal(expression)
+        if (quotient := _static_integer_quotient(cast("sympy.Expr", node)))
+        is not None
+        for numerator, denominator in (quotient,)
+        if node.func == FloorDiv
+    }
+    result = sympy.simplify(expression.xreplace(replacements))
+    while result.func == sympy.Add:
+        terms = list(result.args)
+        replacement: sympy.Expr | None = None
+        for modulo_index, term in enumerate(terms):
+            modulo_coefficient, modulo = term.as_coeff_Mul()
+            if not isinstance(modulo, sympy.Mod) or len(modulo.args) != 2:
+                continue
+            dividend, modulus = modulo.args
+            if (
+                modulo_coefficient.is_number is not True
+                or dividend.is_integer is not True  # pyrefly: ignore[missing-attribute]
+                or modulus.free_symbols
+                or modulus.is_integer is not True  # pyrefly: ignore[missing-attribute]
+                or int(modulus) <= 0  # pyrefly: ignore[bad-argument-type]
+            ):
+                continue
+            quotient_term = (
+                modulo_coefficient * modulus * sympy.floor(dividend / modulus)  # pyrefly: ignore[unsupported-operation]
+            )
+            quotient_index = next(
+                (
+                    index
+                    for index, candidate in enumerate(terms)
+                    if index != modulo_index
+                    and sympy.simplify(candidate - quotient_term) == 0  # pyrefly: ignore[unsupported-operation]
+                ),
+                None,
+            )
+            if quotient_index is not None:
+                replacement = sympy.Add(
+                    *(
+                        candidate
+                        for index, candidate in enumerate(terms)
+                        if index not in (modulo_index, quotient_index)
+                    ),
+                    modulo_coefficient * dividend,
+                )
+                break
+        if replacement is None:
+            break
+        result = sympy.simplify(replacement)
+    return result
 
 
 def _logical_expression_bounds(
@@ -4492,7 +5793,7 @@ def _simplify_logical_expression(
         else child
         for child in expression.args
     )
-    rebuilt = expression.func(*children)
+    rebuilt = _simplify_integer_quotients(expression.func(*children))
     if rebuilt.func == sympy.ceiling:
         rebuilt = _normalize_integer_rounding(rebuilt)
     if rebuilt.func == sympy.floor:
@@ -5363,6 +6664,133 @@ def _dense_linear_overlap_relation(
     ).coalesce_adjacent_target_boxes(prove_nonnegative=prove_nonnegative)
 
 
+def _symbolic_single_source_mixed_radix_converse(
+    relation: CoordinateRelation,
+) -> CoordinateRelation | None:
+    """Invert a full symbolic scalar traversal by a bounded radix search.
+
+    This is the symbolic counterpart of the existing concrete mixed-radix
+    proofs.  It permits one or more target extents to remain parameterized;
+    the candidate inverse is accepted only when substituting the forward map
+    reconstructs the source ordinal identically over its complete domain.
+    Equal finite domain cardinalities then make that injection a bijection.
+    """
+    if (
+        not relation.parameter_symbols
+        or len(relation.source_domain.axis_order) != 1
+        or len(relation.pieces) != 1
+        or len(relation.target_domain.axis_order) > 6
+        or not _integer_partition_expressions_equal(
+            relation.source_domain.size_expr,
+            relation.target_domain.size_expr,
+        )
+    ):
+        return None
+    (piece,) = relation.pieces
+    (source_axis,) = relation.source_domain.axis_order
+    full_source_bounds = (
+        (
+            source_axis,
+            sympy.Integer(0),
+            relation.source_domain.size_expr,
+            1,
+        ),
+    )
+    if piece.source_bounds_items != full_source_bounds or any(
+        step != 1 or not _integer_partition_expressions_equal(end - begin, 1)
+        for _axis, begin, end, step in piece.target_ranges
+    ):
+        return None
+    target_counts = relation.target_domain.axis_count_expressions
+    if any(sympy.sympify(count).is_positive is not True for count in target_counts.values()):
+        return None
+
+    target_axes = relation.target_domain.axis_order
+    target_expression_by_axis = {
+        axis: begin for axis, begin, _end, _step in piece.target_ranges
+    }
+    if any(
+        not _integer_partition_expressions_equal(
+            target_expression_by_axis[axis],
+            0,
+        )
+        for axis in target_axes
+        if _integer_partition_expressions_equal(target_counts[axis], 1)
+    ):
+        return None
+    varying_axes = tuple(
+        axis
+        for axis in target_axes
+        if not _integer_partition_expressions_equal(
+            target_counts[axis],
+            1,
+        )
+    )
+    candidate_count = math.factorial(len(varying_axes)) * (1 << len(varying_axes))
+    if candidate_count > _MAX_RELATION_PRODUCT_STATES:
+        return None
+    source_symbol = coordinate_axis_symbol(source_axis)
+    target_bounds = tuple(
+        (
+            axis,
+            sympy.Integer(0),
+            target_counts[axis],
+            1,
+        )
+        for axis in target_axes
+    )
+    for axis_order in itertools.permutations(varying_axes):
+        for reflected_mask in range(1 << len(axis_order)):
+            inverse: sympy.Expr = sympy.Integer(0)
+            stride: sympy.Expr = sympy.Integer(1)
+            matches = True
+            for index, axis in enumerate(axis_order):
+                count = target_counts[axis]
+                coordinate = coordinate_axis_symbol(axis)
+                quotient = (
+                    source_symbol
+                    if _integer_partition_expressions_equal(stride, 1)
+                    else cast("sympy.Expr", FloorDiv(source_symbol, stride))
+                )
+                ordinary_digit = (
+                    quotient
+                    if index == len(axis_order) - 1
+                    else sympy.Mod(quotient, count)
+                    if not count.free_symbols
+                    else sympy.simplify(
+                        quotient
+                        - cast("sympy.Expr", FloorDiv(quotient, count)) * count
+                    )
+                )
+                expected_digit = (
+                    count - 1 - ordinary_digit  # pyrefly: ignore[unsupported-operation]
+                    if reflected_mask & (1 << index)
+                    else ordinary_digit
+                )
+                if not _integer_partition_expressions_equal(
+                    target_expression_by_axis[axis],
+                    expected_digit,
+                ):
+                    matches = False
+                    break
+                digit = (
+                    count - 1 - coordinate  # pyrefly: ignore[unsupported-operation]
+                    if reflected_mask & (1 << index)
+                    else coordinate
+                )
+                inverse += stride * digit  # pyrefly: ignore[unsupported-operation]
+                stride = sympy.simplify(stride * count)
+            if not matches:
+                continue
+            converse = CoordinateRelation.point_map(
+                relation.target_domain,
+                relation.source_domain,
+                ((target_bounds, (inverse,)),),
+            )
+            return converse
+    return None
+
+
 def _derived_converse(
     relation: CoordinateRelation,
     target_counts: CoordinateRelation,
@@ -5388,17 +6816,13 @@ def _single_ordinal_quotient_stride(
     """Recognize ``floor(source / stride)`` (with stride one implicit)."""
     if sympy.simplify(expression - source_symbol) == 0:  # pyrefly: ignore[unsupported-operation]
         return 1
-    if expression.func != sympy.floor or len(expression.args) != 1:
-        return None
-    numerator, denominator = sympy.fraction(sympy.together(expression.args[0]))
+    quotient = _static_integer_quotient(expression)
     if (
-        sympy.simplify(numerator - source_symbol) != 0  # pyrefly: ignore[unsupported-operation]
-        or denominator.free_symbols
-        or denominator.is_integer is not True
-        or int(denominator) <= 0
+        quotient is None
+        or sympy.simplify(quotient[0] - source_symbol) != 0  # pyrefly: ignore[unsupported-operation]
     ):
         return None
-    return int(denominator)
+    return quotient[1]
 
 
 def _single_ordinal_digit(
@@ -5431,19 +6855,12 @@ def _single_ordinal_digit(
         period = stride * radix
         return (stride, radix) if source_count % period == 0 else None
 
-    if expression.func != sympy.floor or len(expression.args) != 1:
+    quotient = _static_integer_quotient(expression)
+    if quotient is None:
         if sympy.simplify(expression - source_symbol) == 0:  # pyrefly: ignore[unsupported-operation]
             return (1, source_count) if source_count > 1 else None
         return None
-
-    numerator, denominator = sympy.fraction(sympy.together(expression.args[0]))
-    if (
-        denominator.free_symbols
-        or denominator.is_integer is not True
-        or int(denominator) <= 0
-    ):
-        return None
-    stride = int(denominator)
+    numerator, stride = quotient
     if isinstance(numerator, sympy.Mod) and len(numerator.args) == 2:
         dividend, period = numerator.args
         if (
@@ -6673,7 +8090,9 @@ def _single_axis_floor_point(
         return None
 
     floor_terms = tuple(
-        term for term in sympy.Add.make_args(begin) if term.func == sympy.floor
+        term
+        for term in sympy.Add.make_args(begin)
+        if _static_integer_quotient(cast("sympy.Expr", term)) is not None
     )
     if len(floor_terms) != 1:
         return None
@@ -6684,22 +8103,22 @@ def _single_axis_floor_point(
         or output_offset_expression.is_integer is not True
     ):
         return None
-    numerator, denominator = sympy.fraction(sympy.together(floor_term.args[0]))
+    quotient = _static_integer_quotient(cast("sympy.Expr", floor_term))
+    if quotient is None:
+        return None
+    numerator, divisor = quotient
     numerator = sympy.expand(numerator)
     numerator_stride_expression = numerator.coeff(symbol)
     numerator_offset_expression = sympy.simplify(
         numerator - numerator_stride_expression * symbol
     )
     if (
-        denominator.free_symbols
-        or numerator_stride_expression.free_symbols
+        numerator_stride_expression.free_symbols
         or numerator_offset_expression.free_symbols
-        or denominator.is_integer is not True  # pyrefly: ignore[missing-attribute]
         or numerator_stride_expression.is_integer is not True
         or numerator_offset_expression.is_integer is not True
     ):
         return None
-    divisor = int(denominator)
     numerator_stride = int(numerator_stride_expression)
     numerator_offset = int(numerator_offset_expression)
     output_offset = int(output_offset_expression)
@@ -6843,6 +8262,25 @@ def _compose_point_relations(
                     )
                     == 0
                 ):
+                    target_begin = first_targets[axis]
+                    target_bounds = _logical_expression_bounds(
+                        target_begin,
+                        domain=first.source_domain,
+                        source_bounds=first_piece.source_bounds_items,
+                    )
+                    if (
+                        target_bounds is None
+                        or not _is_provably_nonnegative(target_bounds[0], None)
+                        or not _is_provably_nonnegative(
+                            sympy.simplify(
+                                first.target_domain.axis_count_expressions[axis]
+                                - 1
+                                - target_bounds[1]
+                            ),
+                            None,
+                        )
+                    ):
+                        return None
                     continue
                 expression_bounds = _logical_expression_bounds(
                     first_targets[axis],
@@ -6972,6 +8410,22 @@ def pid_task_order(
     first_axis, second_axis, *outer_axes = pid_axis_order
     first_count = counts[first_axis]
     second_count = counts[second_axis]
+    if l2_group_size <= 0:
+        raise ValueError("L2 group size must be positive")
+    concrete_first_count = _concrete_integer(
+        first_count,
+        description="L2 first-axis count",
+    )
+    concrete_second_count = _concrete_integer(
+        second_count,
+        description="L2 second-axis count",
+    )
+    group_count = (concrete_first_count + l2_group_size - 1) // l2_group_size
+    piece_count = group_count * concrete_second_count
+    if piece_count > _MAX_RELATION_PIECES or not (
+        _relation_product_is_within_budget(group_count, concrete_second_count)
+    ):
+        raise ValueError("L2 task order exceeds the symbolic relation budget")
     inner_axis = min(logical_domain.axis_order, default=0) - 1
     while inner_axis in logical_domain.axis_order:
         inner_axis -= 1
@@ -6991,11 +8445,14 @@ def pid_task_order(
             tuple[sympy.Expr, ...],
         ]
     ] = []
-    for first_in_group in range(0, first_count, l2_group_size):
-        actual_group_size = min(first_count - first_in_group, l2_group_size)
+    for first_in_group in range(0, concrete_first_count, l2_group_size):
+        actual_group_size = min(
+            concrete_first_count - first_in_group,
+            l2_group_size,
+        )
         group = first_in_group // l2_group_size
-        group_begin = group * l2_group_size * second_count
-        for second in range(second_count):
+        group_begin = group * l2_group_size * concrete_second_count
+        for second in range(concrete_second_count):
             begin = group_begin + second * actual_group_size
             expressions = {
                 first_axis: inner - begin + first_in_group,  # pyrefly: ignore[unsupported-operation]

@@ -31,7 +31,6 @@ from .cross_loop_scheduler import _root_schedule_traversal
 from .cross_loop_scheduler import _supports_parameterized_counter
 from .cross_loop_scheduler import _transient_source_schedule_segment
 from .cross_loop_scheduler import build_static_pipeline_plan
-from .cross_loop_scheduler import root_barrier_publication_plan
 from .device_function import TensorArg
 from .host_function import HostFunction
 from .program_id import _clone_ast_value
@@ -742,6 +741,9 @@ def emit_cross_loop_schedule(
             and device_function.config.get("num_sm_multiplier", 1) == 1
         ),
     )
+    if static_pipeline_plan.root_task_orders != root_task_orders:
+        raise AssertionError("pipeline plan changed the configured root task orders")
+    root_task_orders = static_pipeline_plan.root_task_orders
     all_readiness_counter_plans = static_pipeline_plan.readiness_counters
     parameterized_readiness_counters = any(
         plan.parameter_symbols for plan in all_readiness_counter_plans
@@ -856,29 +858,15 @@ def emit_cross_loop_schedule(
     root_barrier_producer_roots = sorted(
         {producer for producer, _consumer in root_barrier_edges}
     )
-    scheduled_roots = {
-        segment.root for segment in static_pipeline_plan.worker_schedule.segments
+    # Publication support and arrival counts were derived and validated when
+    # the selected plan was frozen.  Codegen only renders those facts.
+    root_publication_plans = {
+        root: publication_plan
+        for root, publication_plan in enumerate(
+            static_pipeline_plan.root_barrier_publication_plans
+        )
+        if publication_plan is not None
     }
-    # Derive execution support and every barrier count once from the selected
-    # schedule.  Plans for non-producers supply the same exact active-owner
-    # predicate to incoming waits; only producer roots receive counter state.
-    publication_plan_roots = set(root_barrier_producer_roots)
-    if parameterized_event_frontier_geometry is None:
-        publication_plan_roots.update(scheduled_roots)
-    try:
-        root_publication_plans = {
-            root: root_barrier_publication_plan(
-                static_pipeline_plan.worker_schedule,
-                root,
-                readiness_counter_plans,
-            )
-            for root in publication_plan_roots
-        }
-    except ValueError as error:
-        raise exc.InvalidConfig(
-            "cross_loop_schedule='static_pipeline' cannot prove exact "
-            "root-barrier publication ownership"
-        ) from error
     parameterized_root_barriers = any(
         root_publication_plans[root].parameter_symbols
         for root in root_barrier_producer_roots

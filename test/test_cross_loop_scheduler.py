@@ -14,6 +14,7 @@ from torch.utils._sympy.functions import Min as SymbolicMin
 
 import helion
 from helion._compiler import cross_loop_scheduler
+from helion._compiler import tile_dependency
 from helion._compiler.cross_loop_scheduler import FinalArrivalContinuation
 from helion._compiler.cross_loop_scheduler import ReadinessConsumer
 from helion._compiler.cross_loop_scheduler import ReadinessCounterPlan
@@ -2272,6 +2273,114 @@ class TestCrossLoopScheduler(TestCase):
         assert root_placement is not None
         self.assertTrue(root_placement.is_total_function())
 
+    def test_worker_schedule_rejects_equal_cardinality_with_duplicate_tasks(
+        self,
+    ) -> None:
+        target_domain = _identify_root_domains((_domain((10, 2, 1)),))[0]
+        schedule_domain = CoordinateDomain(
+            axis_order=(-3, -2, -1),
+            axis_counts_items=((-3, 2), (-2, 2), (-1, 1)),
+            kind="worker",
+        )
+        duplicate = CoordinateRelation.point_map(
+            schedule_domain,
+            target_domain,
+            (
+                (
+                    ((-3, 1, 2, 1), (-2, 0, 2, 1), (-1, 0, 1, 1)),
+                    (sympy.Integer(0),),
+                ),
+            ),
+        )
+
+        self.assertEqual(duplicate.source_support_cardinality(), 2)
+        with self.assertRaisesRegex(ValueError, "own each logical task once"):
+            WorkerSchedule(
+                2,
+                (WorkerScheduleSegment(0, duplicate, 0, 2, 0),),
+            )
+
+    def test_worker_schedule_rejects_symbolic_overlapping_support(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        first_domain, second_domain = _identify_root_domains(
+            (
+                CoordinateDomain((10,), ((10, batch),), ((10, 1),)),
+                CoordinateDomain((20,), ((20, batch),), ((20, 1),)),
+            )
+        )
+        schedule_domain = CoordinateDomain(
+            axis_order=(-3, -2, -1),
+            axis_counts_items=((-3, 2), (-2, 1), (-1, batch)),
+            kind="worker",
+        )
+        wave = coordinate_axis_symbol(-1)
+
+        def placement(domain: CoordinateDomain) -> CoordinateRelation:
+            return CoordinateRelation.point_map(
+                schedule_domain,
+                domain,
+                (
+                    (
+                        ((-3, 1, 2, 1), (-2, 0, 1, 1), (-1, 0, batch, 1)),
+                        (wave,),
+                    ),
+                ),
+            )
+
+        with self.assertRaisesRegex(ValueError, "support overlaps"):
+            WorkerSchedule(
+                1,
+                (
+                    WorkerScheduleSegment(0, placement(first_domain), 0, 1, 0),
+                    WorkerScheduleSegment(1, placement(second_domain), 0, 1, 0),
+                ),
+            )
+
+    def test_static_pipeline_plan_owns_configured_root_orders(self) -> None:
+        (domain,) = _identify_root_domains((_domain((10, 2, 1)),))
+        order = pid_task_order(domain, domain.axis_order)
+        schedule = cross_loop_scheduler._build_root_major_worker_schedule(
+            (domain,),
+            (order,),
+            2,
+        )
+        plan = cross_loop_scheduler.StaticPipelinePlan(
+            worker_schedule=schedule,
+            root_task_orders=(order,),
+            readiness_counters=(),
+            root_barrier_edges=frozenset(),
+        )
+
+        self.assertEqual(plan.root_task_orders, (order,))
+        self.assertEqual(dataclasses.replace(plan).root_task_orders, (order,))
+        publication = plan.root_barrier_publication_plans[0]
+        self.assertIsNotNone(publication)
+        self.assertIs(
+            publication,
+            plan.root_barrier_publication_plans[0],
+        )
+        self.assertEqual(
+            publication,
+            cross_loop_scheduler.root_barrier_publication_plan(
+                schedule,
+                0,
+            ),
+        )
+
+        order_axis = order.source_domain.axis_order[0]
+        duplicate = CoordinateRelation.point_map(
+            order.source_domain,
+            domain,
+            (
+                (
+                    ((order_axis, 0, 2, 1),),
+                    (sympy.Integer(0),),
+                ),
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "not an exact bijection"):
+            dataclasses.replace(plan, root_task_orders=(duplicate,))
+
     def test_dense_schedule_rejects_logical_order_with_empty_targets(self) -> None:
         target_domain = _identify_root_domains((_domain((10, 1, 1)),))[0]
         order_domain = CoordinateDomain(
@@ -2393,8 +2502,8 @@ class TestCrossLoopScheduler(TestCase):
         self.assertIsNotNone(prefix.converse())
         self.assertIsNotNone(suffix.converse())
         with mock.patch.object(
-            cross_loop_scheduler,
-            "_MAX_TASK_ORDER_SLICE_PIECES",
+            tile_dependency,
+            "_MAX_RELATION_PIECES",
             15,
         ):
             self.assertIsNone(_task_order_slice(task_order, 1, 1184))
@@ -2806,7 +2915,7 @@ class TestCrossLoopScheduler(TestCase):
             ),
             continuation_consumer_index=0,
         )
-        schedule = cross_loop_scheduler._build_parametric_root_major_worker_schedule(
+        schedule = cross_loop_scheduler._build_root_major_worker_schedule(
             (producer_domain,),
             (pid_task_order(producer_domain, producer_domain.axis_order),),
             4,
@@ -2837,12 +2946,10 @@ class TestCrossLoopScheduler(TestCase):
         root_task_orders = _default_root_task_orders(root_domains)
 
         with _forbid_schedule_enumeration():
-            schedule = (
-                cross_loop_scheduler._build_parametric_root_major_worker_schedule(
-                    root_domains,
-                    root_task_orders,
-                    4,
-                )
+            schedule = cross_loop_scheduler._build_root_major_worker_schedule(
+                root_domains,
+                root_task_orders,
+                4,
             )
             geometry = cross_loop_scheduler._parametric_root_major_schedule_geometry(
                 schedule
@@ -3047,13 +3154,11 @@ class TestCrossLoopScheduler(TestCase):
             )
         )
         with _forbid_schedule_enumeration():
-            schedule = (
-                cross_loop_scheduler._build_parametric_root_major_worker_schedule(
-                    root_domains,
-                    _default_root_task_orders(root_domains),
-                    7,
-                    excluded_roots=frozenset((1,)),
-                )
+            schedule = cross_loop_scheduler._build_root_major_worker_schedule(
+                root_domains,
+                _default_root_task_orders(root_domains),
+                7,
+                excluded_roots=frozenset((1,)),
             )
             geometry = cross_loop_scheduler._parametric_root_major_schedule_geometry(
                 schedule
@@ -3134,12 +3239,10 @@ class TestCrossLoopScheduler(TestCase):
         )
 
         with _forbid_schedule_enumeration():
-            schedule = (
-                cross_loop_scheduler._build_parametric_root_major_worker_schedule(
-                    root_domains,
-                    root_task_orders,
-                    7,
-                )
+            schedule = cross_loop_scheduler._build_root_major_worker_schedule(
+                root_domains,
+                root_task_orders,
+                7,
             )
             geometry = cross_loop_scheduler._parametric_root_major_schedule_geometry(
                 schedule
@@ -3183,6 +3286,234 @@ class TestCrossLoopScheduler(TestCase):
                     )
                     slot += 1
             self.assertEqual(sorted(actual), expected)
+
+    def test_root_major_symbolic_and_constant_orders_are_identical(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        symbolic_domain = CoordinateDomain(
+            (10, 11),
+            ((10, batch), (11, 3)),
+            ((10, 1), (11, 16)),
+            identity=0,
+        )
+        symbolic_order = pid_task_order(symbolic_domain, (11, 10))
+
+        with _forbid_schedule_enumeration():
+            symbolic_schedule = cross_loop_scheduler._build_root_major_worker_schedule(
+                (symbolic_domain,),
+                (symbolic_order,),
+                4,
+            )
+            concrete_schedules = tuple(
+                cross_loop_scheduler._build_root_major_worker_schedule(
+                    (concrete_domain,),
+                    (symbolic_order.substitute_parameters({batch: concrete_batch}),),
+                    4,
+                )
+                for concrete_batch in (0, 1, 2, 5)
+                for concrete_domain in (
+                    symbolic_domain.substitute_parameters({batch: concrete_batch}),
+                )
+            )
+
+        for concrete_batch, concrete_schedule in zip(
+            (0, 1, 2, 5), concrete_schedules, strict=True
+        ):
+            self.assertEqual(
+                symbolic_schedule.segments[0]
+                .task_order.substitute_parameters({batch: concrete_batch})
+                .materialize(),
+                concrete_schedule.segments[0].task_order.materialize(),
+            )
+
+    def test_root_major_preserves_piecewise_configured_orders(self) -> None:
+        l2_domain = _domain((10, 4, 1), (11, 3, 1), identity=0)
+        l2_order = pid_task_order(
+            l2_domain,
+            l2_domain.axis_order,
+            l2_group_size=2,
+        )
+
+        reflected_domain = _domain((20, 2, 1), (21, 4, 1), identity=0)
+        reflected_source = dataclasses.replace(
+            reflected_domain,
+            kind="task_order",
+        )
+        reflected_order = CoordinateRelation.point_map(
+            reflected_source,
+            reflected_domain,
+            (
+                (
+                    ((20, 0, 2, 1), (21, 0, 4, 1)),
+                    (
+                        coordinate_axis_symbol(20),
+                        3 - coordinate_axis_symbol(21),
+                    ),
+                ),
+            ),
+        )
+
+        woven_domain = _domain(
+            (30, 2, 1),
+            (31, 2, 1),
+            (32, 4, 1),
+            identity=0,
+        )
+        woven_source = CoordinateDomain(
+            (-1, 0, 1),
+            ((-1, 4), (0, 2), (1, 2)),
+            kind="task_order",
+            identity=0,
+        )
+        inner = coordinate_axis_symbol(-1)
+        woven_order = CoordinateRelation.point_map(
+            woven_source,
+            woven_domain,
+            (
+                (
+                    ((-1, 0, 4, 1), (0, 0, 2, 1), (1, 0, 2, 1)),
+                    (
+                        coordinate_axis_symbol(0),
+                        sympy.Mod(inner, 2),
+                        2 * coordinate_axis_symbol(1) + sympy.floor(inner / 2),
+                    ),
+                ),
+            ),
+        )
+
+        for domain, configured_order in (
+            (l2_domain, l2_order),
+            (reflected_domain, reflected_order),
+            (woven_domain, woven_order),
+        ):
+            with (
+                self.subTest(configured_order=configured_order),
+                _forbid_schedule_enumeration(),
+            ):
+                schedule = cross_loop_scheduler._build_root_major_worker_schedule(
+                    (domain,),
+                    (configured_order,),
+                    4,
+                )
+                self.assertTrue(schedule.segments[0].task_order.is_single_valued())
+            relation = schedule.segments[0].task_order
+            launch_axis, worker_axis, wave_axis = relation.source_domain.axis_order
+            actual: list[int] = []
+            for ordinal in range(domain.size):
+                wave, worker = divmod(ordinal, 4)
+                targets = relation.target_coordinates(
+                    {
+                        launch_axis: 1,
+                        worker_axis: worker,
+                        wave_axis: wave,
+                    }
+                )
+                self.assertEqual(len(targets), 1)
+                target = next(iter(targets))
+                actual.append(
+                    domain.index(dict(zip(domain.axis_order, target, strict=True)))
+                )
+            self.assertEqual(
+                actual,
+                [next(iter(targets)) for targets in configured_order.materialize()],
+            )
+
+    def test_root_major_symbolic_configured_orders_match_substitution(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+
+        reflected_domain = CoordinateDomain(
+            (10, 11),
+            ((10, batch), (11, 4)),
+            ((10, 1), (11, 1)),
+            identity=0,
+        )
+        reflected_source = dataclasses.replace(
+            reflected_domain,
+            kind="task_order",
+        )
+        reflected_order = CoordinateRelation.point_map(
+            reflected_source,
+            reflected_domain,
+            (
+                (
+                    ((10, 0, batch, 1), (11, 0, 4, 1)),
+                    (
+                        coordinate_axis_symbol(10),
+                        3 - coordinate_axis_symbol(11),
+                    ),
+                ),
+            ),
+        )
+
+        woven_domain = CoordinateDomain(
+            (20, 21, 22),
+            ((20, batch), (21, 2), (22, 4)),
+            ((20, 1), (21, 1), (22, 1)),
+            identity=1,
+        )
+        woven_source = CoordinateDomain(
+            (-1, 20, 21),
+            ((-1, 4), (20, batch), (21, 2)),
+            kind="task_order",
+            identity=1,
+        )
+        inner = coordinate_axis_symbol(-1)
+        woven_order = CoordinateRelation.point_map(
+            woven_source,
+            woven_domain,
+            (
+                (
+                    ((-1, 0, 4, 1), (20, 0, batch, 1), (21, 0, 2, 1)),
+                    (
+                        coordinate_axis_symbol(20),
+                        coordinate_axis_symbol(21),
+                        2 * sympy.Mod(inner, 2) + sympy.floor(inner / 2),
+                    ),
+                ),
+            ),
+        )
+
+        l2_domain = CoordinateDomain(
+            (30, 31, 32),
+            ((30, 4), (31, 3), (32, batch)),
+            ((30, 1), (31, 1), (32, 1)),
+            identity=2,
+        )
+        l2_order = pid_task_order(
+            l2_domain,
+            l2_domain.axis_order,
+            l2_group_size=2,
+        )
+
+        for name, domain, configured_order in (
+            ("reflected", reflected_domain, reflected_order),
+            ("woven", woven_domain, woven_order),
+            ("l2", l2_domain, l2_order),
+        ):
+            with self.subTest(order=name), _forbid_schedule_enumeration():
+                symbolic = cross_loop_scheduler._build_root_major_worker_schedule(
+                    (domain,),
+                    (configured_order,),
+                    7,
+                )
+            for concrete_batch in (0, 1, 8):
+                concrete_domain = domain.substitute_parameters(
+                    {batch: concrete_batch}
+                )
+                concrete_order = configured_order.substitute_parameters(
+                    {batch: concrete_batch}
+                )
+                with self.subTest(order=name, batch=concrete_batch):
+                    concrete = cross_loop_scheduler._build_root_major_worker_schedule(
+                        (concrete_domain,),
+                        (concrete_order,),
+                        7,
+                    )
+                    self.assertEqual(
+                        symbolic.segments[0]
+                        .task_order.substitute_parameters({batch: concrete_batch})
+                        .materialize(),
+                        concrete.segments[0].task_order.materialize(),
+                    )
 
     def test_parametric_event_frontier_schedule_uses_exact_fan_in_one_counter(
         self,
