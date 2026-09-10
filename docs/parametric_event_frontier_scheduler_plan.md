@@ -97,7 +97,7 @@ cross-workload exit gates below.
 
 ### Current implementation marker: close the symbolic proof layer
 
-Commits through `fbf8142c` are the current compiler checkpoint. The existing immutable
+Commits through `977adfc8` are the current compiler checkpoint. The existing immutable
 `CoordinateRelation` remains the only schedule/dependency truth. It now retains
 derived exact converses through proved construction and transformation,
 represents ragged grouped L2 order with one forward piece and a two-piece
@@ -138,6 +138,41 @@ seconds and cache-free proof recovery is about 5.5 seconds. The transform audit
 now covers rename, reorder, projection, lift, coalescing, substitution, and
 copying. The integrated Phase 4A.1 suites pass 142 tile/ragged tests with 216
 subtests and 154 exact/scheduler tests with 78 subtests. Phase 4A.1 is closed.
+
+The first Phase 4A.2/4A.4 prerequisites are also complete. Final-arrival
+candidates now validate the canonical lowered event with the same exact
+counter predicate used by plan validation. A quotient-lowered continuation is
+recovered through the event identity already carried by its readiness-key
+domain and accepted only after exact equality with that event's canonical
+lowering; no second candidate identity or filtered graph is retained.
+
+Dense task-order slicing now accepts proved symbolic begin/count expressions by
+composing a translated ordinal relation with the existing flat task-order
+relation. It retains exact converses, remains one piece for the representative
+unaligned `B*Q` prefix, handles substitutions to zero, and leaves the bounded
+concrete/manual implementation as a compatibility fallback. The frontier
+extremum operation now proves the Qwen mixed-radix permutation followed by the
+fixed-width worker quotient without enumerating `B` or its 96 nested
+iterations. Every returned extremum carries a local attaining-corner witness;
+possibly empty symbolic producer fibers decline, and a per-query memo bounds
+nested-expression work by expression-DAG size. The resulting frontier remains
+the derived 74/22 partition with neither value encoded in scheduler policy.
+Independent review signs off on these proof primitives after adversarial
+correlated-expression, runtime-zero, wrapping-modulo, and positive-stride
+checks. The current full tile suite passes 136 tests with 57 subtests.
+
+A proposed shortcut that routed the old equal-width repeated recurrence through
+the common list-scheduler entry was reviewed and rejected; it is not part of
+this branch. For `L=3`, `W=4`, and `N=5`, that recurrence occupies
+`L*ceil(N/W)=6` waves while the valid packed root-major schedule occupies
+`ceil(L*N/W)=4`. It therefore cannot bypass the common same-coverage horizon
+comparison merely because its relation has a compact rendering. The review
+also showed that schedule geometry alone can falsely classify independent or
+root-barrier roots as a recurrence. Any retained recurrence rendering must be
+certified from both the final schedule relation and its actual readiness plans.
+The next scheduler prerequisite is a symbolic, relation-based no-regression
+comparison, followed by a tail-packed event-frontier proposal—not another
+parameter-specific recurrence entry point.
 
 Then continue Phase 4A.2 by replacing the remaining parameter-only admission
 filters with one exact action-legality decision, followed by the single joint
@@ -2581,11 +2616,16 @@ to direct constant construction. Unsupported orders decline before codegen.
 #### Phase 4A.2: build readiness once
 
 - Build `ReadinessGraph` once above any constant/parameterized branch.
-- Derive structural final-arrival candidates without consulting sampled domain
-  size or a provisional worker placement, but do not select or contract them
-  yet. Schedule-dependent progress, final-publication occurrence, and
-  synthetic empty-root ownership are transaction-local action-acceptance
-  proofs in Phase 4A.3, not candidate properties.
+- [x] Derive structural final-arrival candidates without consulting sampled
+  domain size or a provisional worker placement. Validate their canonical
+  counter lowering with the common exact-plan predicate, and recover a
+  quotient-lowered emitted continuation through the readiness-key domain's
+  existing event identity plus exact lowered-relation equality. Do not select
+  or contract candidates yet.
+- [ ] Keep schedule-dependent progress, final-publication occurrence, and
+  synthetic empty-root ownership as transaction-local action-acceptance proofs
+  in Phase 4A.3, not candidate properties. Remove the remaining parameterized
+  sink-only and `fan_in > 1` selection policy there.
 - Reuse the existing relation operations to answer whether a proposed early
   admission has exact publication/cardinality/replay lowering. Do not create a
   capability wrapper or filtered readiness graph. Unsupported events remain
@@ -2635,7 +2675,7 @@ the post-placement 74/22 frontier.
 
 #### Phase 4A.4: derive nested frontiers from the accepted schedule
 
-- Extend existing relation composition/extremum support for a bijective
+- [x] Extend existing relation composition/extremum support for a bijective
   mixed-radix task order followed by a fixed-width quotient.
 - Factor schedule-polymorphic outer axes such as `Identity(B)` and derive the
   finite inner piecewise frontier once.
