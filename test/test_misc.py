@@ -1596,7 +1596,7 @@ class TestLauncher(TestCase):
         finally:
             gdict[name] = original
 
-    def test_correct_result_on_each_device(self) -> None:
+    def test_correct_result_on_each_cuda_device(self) -> None:
         """The same kernel called on device 0 then device 1 must
         yield correct numeric results landing on each device. Whether
         the two calls share a ``BoundKernel`` (cache key collapses on
