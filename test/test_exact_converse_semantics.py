@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import dataclasses
+import pickle
 from unittest import mock
 
 import sympy
@@ -183,6 +185,10 @@ class TestExactConverseSemantics(TestCase):
         self.assertEqual(transformed, composed)
         self.assertEqual(hash(transformed), hash(composed))
         self.assertIsNone(_memoized_exact_converse(transformed))
+        for rebuilt in (copy.deepcopy(composed), pickle.loads(pickle.dumps(composed))):
+            self.assertEqual(rebuilt, composed)
+            self.assertEqual(hash(rebuilt), hash(composed))
+            self.assertIsNone(_memoized_exact_converse(rebuilt))
 
     def test_manual_relation_without_construction_witness_uses_bounded_fallback(
         self,

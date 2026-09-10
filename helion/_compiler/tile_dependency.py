@@ -572,6 +572,18 @@ class CoordinateRelation:
     target_domain: CoordinateDomain
     pieces: tuple[_CoordinateRelationPiece, ...]
 
+    def __getstate__(self) -> dict[str, object]:
+        """Serialize semantic fields only, never cyclic derived proof caches."""
+        return {
+            field.name: getattr(self, field.name)
+            for field in dataclasses.fields(self)
+        }
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        """Restore immutable semantic fields with all derived caches empty."""
+        for field in dataclasses.fields(self):
+            object.__setattr__(self, field.name, state[field.name])
+
     def __post_init__(self) -> None:
         for piece in self.pieces:
             if (
@@ -3260,7 +3272,7 @@ class CoordinateRelation:
             and converse.is_total_function()
         ):
             return True
-        if converse is None and self._factored_source_support_converse is not None:
+        if self._factored_source_support_converse is not None:
             # The factorization constructs an exact total inverse through the
             # dense ordinal of this relation's semantic support.
             return True
