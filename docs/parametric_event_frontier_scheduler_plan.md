@@ -95,45 +95,52 @@ Priority 1 before resuming scheduler-policy or performance work. A checked box
 means the code exists and its focused unit tests pass; it does not replace the
 cross-workload exit gates below.
 
-### Current implementation marker: exact-converse proof placement
+### Current implementation marker: close the symbolic proof layer
 
-Commit `6cdf49fc` is the current compiler checkpoint. It retains derived exact
-converses on the existing immutable `CoordinateRelation`, constructs packed
-ownership and its inverse together, propagates those proofs through ordinary
-composition/union/slicing/renaming/coalescing/source-domain rebasing, and uses
-the same relation-level ownership and disjointness validation for constant and
-symbolic schedules. The memo is excluded from equality, hashing, and
-serialization; deepcopy/pickle therefore exercise the bounded semantic
-fallback rather than relying on provenance.
+Commits through `65bb313d` are the current compiler checkpoint. The existing immutable
+`CoordinateRelation` remains the only schedule/dependency truth. It now retains
+derived exact converses through proved construction and transformation,
+represents ragged grouped L2 order with one forward piece and a two-piece
+full-group/tail inverse, recovers those proofs after deepcopy/pickle, supports
+multiple uniquely ordered symbolic outer radix axes, and validates concrete
+and symbolic `WorkerSchedule`s through the same ownership/disjointness path.
+Ambiguous symbolic radix order declines conservatively.
 
-The full dependency/relation suite passes with 144 tests and 40 subtests; the
-full scheduler suite passes with 117 tests and 27 subtests. The independent
-architecture review approved the exact-converse placement, source-domain
-rebase, shared-coordinate support proof, and removal of the root-major
-validation shortcut. Ordinary packed construction no longer enters late
-source-support ordinalization or factored-converse reconstruction.
+The old factorial mixed-radix inverse search has also been removed. One shared
+structural recognizer infers `(stride, radix)` digits, verifies the unique
+complete chain, and declines malformed or ambiguous chains. A six-digit case
+that exceeded 60 seconds now proves in about 0.12 seconds. The representative
+`[5, 3, B]`, group-size-2 schedule after an unaligned prefix builds in about
+7.1 seconds rather than 15.9 seconds; no runtime extent is enumerated.
 
-Phase 4A.1 still has one deliberate gate before scheduler-policy work resumes:
-ragged grouped L2 order `[5, 3, B]`, group size 2, after a non-wave-aligned
-packed prefix still declines in `P.then(Q)` for `B > 1`. Expanding the modular
-preimage is not the accepted fix: the prototype produced 255 pieces, made
-single-valuedness quadratic, and exceeded the proof-time budget. Instead,
-canonicalize every concrete ragged L2 traversal into one full-support point
-map with a statically proved 0/1 full-group/tail selector. Construct its exact
-two-piece inverse at the same proof-producing boundary as the existing uniform
-L2 inverse. Ordinary full-support point-map composition may substitute this
-map without rediscovering a preimage. After deepcopy or pickle removes the
-derived converse memo, generic bounded relation proof must split a static 0/1
-floor selector at its exact source boundary and reuse the existing piecewise
-converse machinery. This proof-time normalization must not mention L2, worker
-schedules, or model names and must never enumerate a runtime extent.
+Phase 4A.2 has started without waiting for policy redesign: event construction
+now always records the finest exact semantic event, producer-set quotienting is
+derived later only as a counter-lowering strength reduction, and the compiler
+retains one `ReadinessGraph`. A reviewed correction removed raw nested-
+obligation exclusions from readiness traversal because an uncommitted counter
+must not erase a semantic prerequisite. Continuation candidates are derived
+once from the graph; ownership selection remains deliberately unchanged.
 
-Resume exactly there. The gate includes direct and non-wave-aligned packed
-composition, `B={0,1,2,8}` substitution, deepcopy/pickle proof recovery,
-zero/divisible/`G >= M` cases, unsupported-selector decline, and deterministic
-piece/product plus wall-time budgets. Once those pass, close Phase 4A.1 and
-proceed directly to one readiness graph and one event-frontier policy in Phase
-4A.2.
+Symbolic traversal helpers now consume `size_expr` and
+`axis_count_expressions`, support exact empty traversals, and validate legacy
+scalar dispatch metadata against an ordinalization of the authoritative
+schedule relation. Unsupported symbolic offsets decline cleanly rather than
+falling back to concrete counts.
+
+Before declaring Phase 4A.1 closed, finish these bounded proof tasks:
+
+- complete transform invalidation/propagation regressions; and
+- rerun the combined relation/scheduler suites and record separate relation-
+  proof and schedule-construction timing gates.
+
+The flat-converse attempt is now cached once per relation instance and the
+packed `[5, 3, B, Q]` unaligned-prefix regression passes for direct,
+deepcopy/pickle, and either-axis-zero cases. Its schedule build is about 2.6
+seconds and cache-free proof recovery is about 5.5 seconds.
+
+Then continue Phase 4A.2 by replacing the remaining parameter-only admission
+filters with one exact action-legality decision, followed by the single joint
+event-frontier policy in Phase 4A.3.
 
 ### Priority 1: finish the symbolic dependency refactor
 
@@ -235,7 +242,7 @@ partition may depend on the final producer and consumer wave relation. It
 therefore cannot be coarsened or finalized before placement. Qwen's useful
 74/22 frontier is the concrete counterexample to the old ordering.
 
-- [ ] Build `ReadinessGraph` once before any concrete/parameterized rendering
+- [x] Build `ReadinessGraph` once before any concrete/parameterized rendering
   choice.
 - [ ] Derive final-arrival continuation eligibility from the one
   `ReadinessGraph` before comparing scheduling actions.
@@ -2511,7 +2518,7 @@ Implement the earlier proof without changing those boundaries:
   cardinality calculation. Construction provenance must affect compile time,
   not which extensionally equal normalized relation within the supported proof
   grammar is accepted.
-- [ ] Prove canonical/permuted dynamic task orders with coordinate and
+- [x] Prove canonical/permuted dynamic task orders with coordinate and
   positional-product rules. Prove reflected and woven orders on their bounded
   concrete inner relation, then lift exact dynamic positional axes. Construct
   concrete-radix ragged L2 orders as one algebraic point map with its derived
@@ -2574,6 +2581,10 @@ to direct constant construction. Unsupported orders decline before codegen.
   admission has exact publication/cardinality/replay lowering. Do not create a
   capability wrapper or filtered readiness graph. Unsupported events remain
   semantic truth but admit work only through conservative root ordering.
+- Validate the emitted counter shape once: consumers in one counter are all
+  root-level or all part of the supported nested-site form, and a final-arrival
+  continuation is always root-level. Codegen must not repartition a mixed plan
+  and silently lose a consumer arm.
 - Reject external ownership for a possibly empty root with downstream work
   until its exact synthetic occurrence is proved.
 - Delete the parameterized sink-only, `fan_in > 1`, and separate counter-
