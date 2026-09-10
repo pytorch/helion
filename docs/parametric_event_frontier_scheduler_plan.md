@@ -115,16 +115,25 @@ source-support ordinalization or factored-converse reconstruction.
 
 Phase 4A.1 still has one deliberate gate before scheduler-policy work resumes:
 ragged grouped L2 order `[5, 3, B]`, group size 2, after a non-wave-aligned
-packed prefix still declines in `P.then(Q)` for `B > 1`. `Q` itself is already
-an exact nine-piece bijection. The missing operation is a generic bounded
-affine-lattice preimage for a static modulo interval; it must live in ordinary
-relation composition, honor the 4,096-piece/65,536-state budgets, preserve
-zero extents and Euclidean modulo, and decline unsupported symbolic moduli or
-non-affine maps. It must not mention L2, worker schedules, or model names.
+packed prefix still declines in `P.then(Q)` for `B > 1`. Expanding the modular
+preimage is not the accepted fix: the prototype produced 255 pieces, made
+single-valuedness quadratic, and exceeded the proof-time budget. Instead,
+canonicalize every concrete ragged L2 traversal into one full-support point
+map with a statically proved 0/1 full-group/tail selector. Construct its exact
+two-piece inverse at the same proof-producing boundary as the existing uniform
+L2 inverse. Ordinary full-support point-map composition may substitute this
+map without rediscovering a preimage. After deepcopy or pickle removes the
+derived converse memo, generic bounded relation proof must split a static 0/1
+floor selector at its exact source boundary and reuse the existing piecewise
+converse machinery. This proof-time normalization must not mention L2, worker
+schedules, or model names and must never enumerate a runtime extent.
 
-Resume exactly there. After the ragged-L2 substitution/copy/negative tests and
-compile-time gate pass, close Phase 4A.1 and proceed to building one readiness
-graph and one event-frontier policy in Phase 4A.2.
+Resume exactly there. The gate includes direct and non-wave-aligned packed
+composition, `B={0,1,2,8}` substitution, deepcopy/pickle proof recovery,
+zero/divisible/`G >= M` cases, unsupported-selector decline, and deterministic
+piece/product plus wall-time budgets. Once those pass, close Phase 4A.1 and
+proceed directly to one readiness graph and one event-frontier policy in Phase
+4A.2.
 
 ### Priority 1: finish the symbolic dependency refactor
 
@@ -2504,11 +2513,14 @@ Implement the earlier proof without changing those boundaries:
   grammar is accepted.
 - [ ] Prove canonical/permuted dynamic task orders with coordinate and
   positional-product rules. Prove reflected and woven orders on their bounded
-  concrete inner relation, then lift exact dynamic positional axes. Prove L2
-  orders on the bounded concrete grouped partition, then lift dynamic outer
-  axes. Symbolic grouped axes and fully symbolic woven/reflected radices may
-  decline until a deterministic bounded lemma exists; remove the factorial
-  production search rather than treating permutations as a schedule space.
+  concrete inner relation, then lift exact dynamic positional axes. Construct
+  concrete-radix ragged L2 orders as one algebraic point map with its derived
+  two-piece full/tail inverse, then lift dynamic outer axes. Do not retain the
+  old `group_count * second_count` construction limit: it budgets an obsolete
+  proof witness rather than actual work. Symbolic grouped axes and fully
+  symbolic woven/reflected radices may decline until a deterministic bounded
+  lemma exists; remove the factorial production search rather than treating
+  permutations as a schedule space.
 - [x] Preserve runtime-empty roots. Proofs require nonnegative extents, not
   strictly positive symbolic extents, and must validate the synthetic one-slot
   root-barrier participant order without sampling a nonzero shape.
@@ -2552,15 +2564,6 @@ Implement the earlier proof without changing those boundaries:
 Exit gate: for canonical, permuted, reflected, woven, and supported L2 task
 orders, symbolic substitution at `N={0,1,W-1,W,W+1}` is semantically identical
 to direct constant construction. Unsupported orders decline before codegen.
-
-The current uncommitted Stage-1a prototype does not satisfy this gate and must
-not land as written. It retains a parameterized recognizer/early return in
-`WorkerSchedule.__post_init__`, lacks symbolic source-support cardinality,
-accepts configured orders that downstream canonical recognizers reject, and
-uses scheduler-local relation reconstruction/equality that caused a Gemma
-compile to spend more than five minutes in SymPy simplification. Retain the
-general positive-`FloorDiv` bound proof, but replace the duplicated recognition
-with the common relation operations above before continuing.
 
 #### Phase 4A.2: build readiness once
 
