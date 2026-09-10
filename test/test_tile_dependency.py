@@ -3853,6 +3853,12 @@ class TestTileDependency(TestCase):
             (frozenset(),),
         )
         self.assertIsNone(required.max_target_value_by_source(value_by_task))
+        self.assertIsNone(
+            required.extreme_target_value_and_attainers_by_source(
+                value_by_task,
+                maximize=True,
+            )
+        )
 
         concrete_required = required.substitute_parameters({batch: 4})
         concrete_values = value_by_task.substitute_parameters({batch: 4})
@@ -3862,6 +3868,173 @@ class TestTileDependency(TestCase):
         self.assertIsNotNone(concrete_maximum)
         assert concrete_maximum is not None
         self.assertEqual(concrete_maximum.materialize(), (frozenset((0,)),))
+
+    def test_target_value_extreme_retains_complete_plateaus(self) -> None:
+        source = CoordinateDomain((), (), kind="event")
+        target = CoordinateDomain((20,), ((20, 8),), kind="site")
+        values = CoordinateDomain((30,), ((30, 4),), kind="value")
+        target_coordinate = coordinate_axis_symbol(20)
+        required = CoordinateRelation.total(source, target)
+        value_by_target = CoordinateRelation.point_map(
+            target,
+            values,
+            (
+                (
+                    ((20, 0, 8, 1),),
+                    (sympy.floor(target_coordinate / 2),),  # pyrefly: ignore[unsupported-operation]
+                ),
+            ),
+        )
+
+        maximum = required.extreme_target_value_and_attainers_by_source(
+            value_by_target,
+            maximize=True,
+        )
+        minimum = required.extreme_target_value_and_attainers_by_source(
+            value_by_target,
+            maximize=False,
+        )
+
+        self.assertIsNotNone(maximum)
+        self.assertIsNotNone(minimum)
+        assert maximum is not None
+        assert minimum is not None
+        self.assertEqual(maximum[0].materialize(), (frozenset((3,)),))
+        self.assertEqual(maximum[1].materialize(), (frozenset((6, 7)),))
+        self.assertEqual(minimum[0].materialize(), (frozenset((0,)),))
+        self.assertEqual(minimum[1].materialize(), (frozenset((0, 1)),))
+
+        empty = CoordinateRelation(source, target, ())
+        empty_result = empty.extreme_target_value_and_attainers_by_source(
+            value_by_target,
+            maximize=True,
+        )
+        self.assertIsNotNone(empty_result)
+        assert empty_result is not None
+        self.assertEqual((empty_result[0].pieces, empty_result[1].pieces), ((), ()))
+
+    def test_target_value_extreme_retains_tied_boxes_and_affine_face(self) -> None:
+        source = CoordinateDomain((), (), kind="event")
+        target = CoordinateDomain(
+            (20, 21),
+            ((20, 3), (21, 4)),
+            kind="site",
+        )
+        constant_values = CoordinateDomain((30,), ((30, 8),), kind="value")
+        affine_values = CoordinateDomain((31,), ((31, 3),), kind="value")
+        required = CoordinateRelation(
+            source,
+            target,
+            tuple(
+                _CoordinateRelationPiece(
+                    (),
+                    ((20, row, row + 1, 1), (21, 0, 4, 1)),  # pyrefly: ignore[bad-argument-type]
+                )
+                for row in range(3)
+            ),
+        )
+        full_target_bounds = ((20, 0, 3, 1), (21, 0, 4, 1))
+        constant = CoordinateRelation.point_map(
+            target,
+            constant_values,
+            ((full_target_bounds, (sympy.Integer(7),)),),
+        )
+        affine = CoordinateRelation.point_map(
+            target,
+            affine_values,
+            ((full_target_bounds, (coordinate_axis_symbol(20),)),),
+        )
+
+        constant_maximum = required.extreme_target_value_and_attainers_by_source(
+            constant,
+            maximize=True,
+        )
+        affine_maximum = required.extreme_target_value_and_attainers_by_source(
+            affine,
+            maximize=True,
+        )
+
+        self.assertIsNotNone(constant_maximum)
+        self.assertIsNotNone(affine_maximum)
+        assert constant_maximum is not None
+        assert affine_maximum is not None
+        self.assertEqual(
+            constant_maximum[1].target_coordinates({}),
+            frozenset(itertools.product(range(3), range(4))),
+        )
+        self.assertEqual(
+            affine_maximum[1].target_coordinates({}),
+            frozenset((2, column) for column in range(4)),
+        )
+
+    def test_target_value_extreme_declines_unrepresentable_guards_and_levels(
+        self,
+    ) -> None:
+        parameter = sympy.Symbol("parameter", integer=True, positive=True)
+        source = CoordinateDomain((), (), kind="event")
+        target = CoordinateDomain((20,), ((20, 2),), kind="site")
+        values = CoordinateDomain(
+            (30,),
+            ((30, parameter + 5),),  # pyrefly: ignore[unsupported-operation]
+            kind="value",
+        )
+        required = CoordinateRelation(
+            source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    (),
+                    ((20, sympy.Integer(0), sympy.Integer(1), 1),),
+                ),
+                _CoordinateRelationPiece(
+                    (),
+                    ((20, sympy.Integer(1), sympy.Integer(2), 1),),
+                ),
+            ),
+        )
+        parameter_crossing = CoordinateRelation.point_map(
+            target,
+            values,
+            (
+                (((20, 0, 1, 1),), (parameter,)),
+                (((20, 1, 2, 1),), (sympy.Integer(4),)),
+            ),
+        )
+
+        self.assertIsNotNone(required.max_target_value_by_source(parameter_crossing))
+        self.assertIsNone(
+            required.extreme_target_value_and_attainers_by_source(
+                parameter_crossing,
+                maximize=True,
+            )
+        )
+
+        square = CoordinateDomain(
+            (40, 41),
+            ((40, 4), (41, 4)),
+            kind="site",
+        )
+        diagonal_values = CoordinateDomain((50,), ((50, 2),), kind="value")
+        row = coordinate_axis_symbol(40)
+        column = coordinate_axis_symbol(41)
+        nonrectangular = CoordinateRelation.point_map(
+            square,
+            diagonal_values,
+            (
+                (
+                    ((40, 0, 4, 1), (41, 0, 4, 1)),
+                    (sympy.floor((row + column) / 4),),  # pyrefly: ignore[unsupported-operation]
+                ),
+            ),
+        )
+        self.assertIsNone(
+            CoordinateRelation.total(
+                source, square
+            ).extreme_target_value_and_attainers_by_source(
+                nonrectangular,
+                maximize=True,
+            )
+        )
 
     def test_symbolic_max_target_value_reduces_schedule_positions(self) -> None:
         elements = 128
@@ -3994,16 +4167,34 @@ class TestTileDependency(TestCase):
         )
 
         self.assertIsNotNone(required.max_target_value_by_source(value_by_target))
+        self.assertIsNotNone(
+            required.extreme_target_value_and_attainers_by_source(
+                value_by_target,
+                maximize=True,
+            )
+        )
         with mock.patch(
             "helion._compiler.tile_dependency._MAX_RELATION_PRODUCT_STATES",
             1,
         ):
             self.assertIsNone(required.max_target_value_by_source(value_by_target))
+            self.assertIsNone(
+                required.extreme_target_value_and_attainers_by_source(
+                    value_by_target,
+                    maximize=True,
+                )
+            )
         with mock.patch(
             "helion._compiler.tile_dependency._MAX_RELATION_PIECES",
             1,
         ):
             self.assertIsNone(required.max_target_value_by_source(value_by_target))
+            self.assertIsNone(
+                required.extreme_target_value_and_attainers_by_source(
+                    value_by_target,
+                    maximize=True,
+                )
+            )
 
     def test_symbolic_max_target_value_respects_stride_alignment(self) -> None:
         consumer_axis = 57

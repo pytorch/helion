@@ -4165,6 +4165,47 @@ class CoordinateRelation:
         enumerating either domain.  Unsupported intersections decline rather
         than approximating the dependency.
         """
+        result = self._target_value_extreme_by_source(
+            values,
+            maximize=True,
+            include_attainers=False,
+        )
+        return None if result is None else result[0]
+
+    def extreme_target_value_and_attainers_by_source(
+        self,
+        values: CoordinateRelation,
+        *,
+        maximize: bool,
+    ) -> tuple[CoordinateRelation, CoordinateRelation] | None:
+        """Return an exact scalar extremum and all targets attaining it.
+
+        The first relation maps each nonempty source fiber to its extremal
+        scalar value.  The second maps that source to every original target
+        coordinate whose value is equal to the extremum.  The two relations
+        are constructed from the same candidate proofs so ties cannot lose
+        their value/target correlation.
+
+        Unsupported level sets and source-dependent winner partitions decline
+        rather than selecting one witness or enumerating a runtime extent.
+        """
+        result = self._target_value_extreme_by_source(
+            values,
+            maximize=maximize,
+            include_attainers=True,
+        )
+        if result is None or result[1] is None:
+            return None
+        return result[0], result[1]
+
+    def _target_value_extreme_by_source(
+        self,
+        values: CoordinateRelation,
+        *,
+        maximize: bool,
+        include_attainers: bool,
+    ) -> tuple[CoordinateRelation, CoordinateRelation | None] | None:
+        """Shared exact candidate collection for scalar and attaining extrema."""
         if (
             self.target_domain != values.source_domain
             or len(values.target_domain.axis_order) != 1
@@ -4177,6 +4218,13 @@ class CoordinateRelation:
             or not values.is_total_function()
         ):
             return None
+        if not self.pieces:
+            return (
+                CoordinateRelation(self.source_domain, values.target_domain, ()),
+                CoordinateRelation(self.source_domain, self.target_domain, ())
+                if include_attainers
+                else None,
+            )
         pieces_by_source_bounds: dict[
             tuple[tuple[int, int, int, int], ...],
             list[_CoordinateRelationPiece],
@@ -4209,9 +4257,10 @@ class CoordinateRelation:
                 for bounds in cells
             )
         value_axis = values.target_domain.axis_order[0]
-        pieces: list[_CoordinateRelationPiece] = []
+        value_pieces: list[_CoordinateRelationPiece] = []
+        attainer_pieces: dict[_CoordinateRelationPiece, None] = {}
         for source_bounds, active_pieces in active_pieces_by_cell:
-            maxima: list[sympy.Expr] = []
+            candidates: dict[tuple[sympy.Expr, _TargetBoxRanges | None], None] = {}
             for relation_piece in active_pieces:
                 for value_piece in values.pieces:
                     intersection = _intersect_target_with_source_box(
@@ -4244,46 +4293,103 @@ class CoordinateRelation:
                         != 1
                     ):
                         return None
-                    maximum = _target_box_expression_extreme(
-                        begin,
-                        target_domain=self.target_domain,
-                        target_ranges=intersected_ranges,
-                        source_domain=self.source_domain,
+                    if include_attainers:
+                        exact = _target_box_expression_extreme_with_attainers(
+                            begin,
+                            target_domain=self.target_domain,
+                            target_ranges=intersected_ranges,
+                            source_domain=self.source_domain,
+                            source_bounds=source_bounds,
+                            maximize=maximize,
+                        )
+                        if exact is None:
+                            return None
+                        candidate_value, target_ranges = exact
+                    else:
+                        candidate_value = _target_box_expression_extreme(
+                            begin,
+                            target_domain=self.target_domain,
+                            target_ranges=intersected_ranges,
+                            source_domain=self.source_domain,
+                            source_bounds=source_bounds,
+                            maximize=maximize,
+                        )
+                        if candidate_value is None:
+                            return None
+                        target_ranges = None
+                    candidate_value = _simplify_logical_expression(
+                        candidate_value,
+                        domain=self.source_domain,
                         source_bounds=source_bounds,
-                        maximize=True,
                     )
-                    if maximum is None:
+                    candidates.setdefault((candidate_value, target_ranges), None)
+                    if include_attainers and len(candidates) > _MAX_RELATION_PIECES:
                         return None
-                    maxima.append(maximum)
-            if not maxima:
+            if not candidates:
                 continue
-            maximum = _max_target_value_expression(
-                tuple(maxima),
+            ordered_candidates = tuple(candidates)
+            if not include_attainers:
+                extreme = _max_target_value_expression(
+                    tuple(candidate[0] for candidate in ordered_candidates),
+                    source_domain=self.source_domain,
+                    source_bounds=source_bounds,
+                )
+                extreme = _simplify_logical_expression(
+                    extreme,
+                    domain=self.source_domain,
+                    source_bounds=source_bounds,
+                )
+                value_pieces.append(
+                    _CoordinateRelationPiece(
+                        source_bounds_items=source_bounds,
+                        target_ranges=((value_axis, extreme, extreme + 1, 1),),  # pyrefly: ignore[unsupported-operation]
+                    )
+                )
+                continue
+
+            winner_indices = _extreme_candidate_indices(
+                tuple(candidate[0] for candidate in ordered_candidates),
                 source_domain=self.source_domain,
                 source_bounds=source_bounds,
+                parameter_symbols=self.parameter_symbols | values.parameter_symbols,
+                maximize=maximize,
             )
-            maximum = _simplify_logical_expression(
-                maximum,
-                domain=self.source_domain,
-                source_bounds=source_bounds,
-            )
-            pieces.append(
+            if winner_indices is None:
+                return None
+            extreme = ordered_candidates[winner_indices[0]][0]
+            value_pieces.append(
                 _CoordinateRelationPiece(
                     source_bounds_items=source_bounds,
-                    target_ranges=(
-                        (
-                            value_axis,
-                            maximum,
-                            maximum + 1,  # pyrefly: ignore[unsupported-operation]
-                            1,
-                        ),
-                    ),
+                    target_ranges=((value_axis, extreme, extreme + 1, 1),),  # pyrefly: ignore[unsupported-operation]
                 )
             )
-        return CoordinateRelation(
+            for winner_index in winner_indices:
+                target_ranges = ordered_candidates[winner_index][1]
+                assert target_ranges is not None
+                attainer_pieces.setdefault(
+                    _CoordinateRelationPiece(
+                        source_bounds_items=source_bounds,
+                        target_ranges=target_ranges,
+                    ),
+                    None,
+                )
+                if len(attainer_pieces) > _MAX_RELATION_PIECES:
+                    return None
+            if len(value_pieces) > _MAX_RELATION_PIECES:
+                return None
+        value_relation = CoordinateRelation(
             source_domain=self.source_domain,
             target_domain=values.target_domain,
-            pieces=tuple(pieces),
+            pieces=tuple(value_pieces),
+        )
+        return value_relation, (
+            CoordinateRelation(
+                source_domain=self.source_domain,
+                target_domain=self.target_domain,
+                pieces=tuple(attainer_pieces),
+            )
+            if include_attainers
+            else None
         )
 
     def enumerate_targets_by_source(self) -> CoordinateRelation | None:
@@ -6985,6 +7091,8 @@ def _intersect_target_with_source_box(
 
 _TargetBoxEndpointChoices = tuple[tuple[int, sympy.Expr], ...]
 _TargetBoxExtremeProof = tuple[sympy.Expr, _TargetBoxEndpointChoices]
+_SourceBounds = tuple[tuple[int, IntegerExpression, IntegerExpression, int], ...]
+_TargetBoxRanges = tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...]
 _TargetBoxExtremeCacheKey = tuple[
     sympy.Expr,
     tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...],
@@ -7031,6 +7139,114 @@ def _target_box_expression_extreme(
         memo={},
     )
     return None if proof is None else proof[0]
+
+
+def _target_box_expression_extreme_with_attainers(
+    expression: sympy.Expr,
+    *,
+    target_domain: CoordinateDomain,
+    target_ranges: _TargetBoxRanges,
+    source_domain: CoordinateDomain,
+    source_bounds: tuple[tuple[int, IntegerExpression, IntegerExpression, int], ...],
+    maximize: bool,
+) -> tuple[sympy.Expr, _TargetBoxRanges] | None:
+    """Return an exact extremum and its complete box-representable level set."""
+    proof = _target_box_expression_extreme_proof(
+        expression,
+        target_domain=target_domain,
+        target_ranges=target_ranges,
+        source_domain=source_domain,
+        source_bounds=source_bounds,
+        maximize=maximize,
+        memo={},
+    )
+    if proof is None:
+        return None
+    extreme, endpoint_choices = proof
+    point_substitutions = {
+        coordinate_axis_symbol(axis): begin
+        for axis, begin, end, step in target_ranges
+        if step == 1 and sympy.simplify(end - begin) == 1  # pyrefly: ignore[unsupported-operation]
+    }
+    expression = cast("sympy.Expr", expression.xreplace(point_substitutions))
+    target_symbols = {
+        coordinate_axis_symbol(axis) for axis, _begin, _end, _step in target_ranges
+    }
+    if not expression.free_symbols & target_symbols:
+        return extreme, target_ranges
+
+    quotient = _static_integer_quotient(expression)
+    if quotient is not None:
+        numerator, denominator = quotient
+        numerator_target_symbols = numerator.free_symbols & target_symbols
+        if len(numerator_target_symbols) != 1:
+            return None
+        (symbol,) = numerator_target_symbols
+        expanded = sympy.expand(numerator)
+        coefficient = sympy.simplify(expanded.coeff(symbol))
+        offset = sympy.simplify(expanded - coefficient * symbol)
+        if (
+            not isinstance(coefficient, sympy.Integer)
+            or coefficient == 0
+            or offset.free_symbols & target_symbols
+        ):
+            return None
+        axis, begin, end, step = next(
+            item for item in target_ranges if coordinate_axis_symbol(item[0]) == symbol
+        )
+        lower = extreme * denominator  # pyrefly: ignore[unsupported-operation]
+        upper = (extreme + 1) * denominator  # pyrefly: ignore[unsupported-operation]
+        if coefficient > 0:
+            raw_begin = sympy.ceiling((lower - offset) / coefficient)  # pyrefly: ignore[unsupported-operation]
+            raw_end = sympy.ceiling((upper - offset) / coefficient)  # pyrefly: ignore[unsupported-operation]
+        else:
+            coefficient = -coefficient
+            raw_begin = sympy.floor((offset - upper) / coefficient) + 1  # pyrefly: ignore[unsupported-operation]
+            raw_end = sympy.floor((offset - lower) / coefficient) + 1  # pyrefly: ignore[unsupported-operation]
+        clipped_begin = sympy.Max(begin, raw_begin)
+        aligned_begin = _normalize_integer_rounding(
+            begin + sympy.ceiling((clipped_begin - begin) / step) * step  # pyrefly: ignore[unsupported-operation]
+        )
+        clipped_end = sympy.Min(end, raw_end)
+        plateau = tuple(
+            (
+                range_axis,
+                aligned_begin if range_axis == axis else range_begin,
+                clipped_end if range_axis == axis else range_end,
+                range_step,
+            )
+            for range_axis, range_begin, range_end, range_step in target_ranges
+        )
+        if not _target_box_is_nonempty_for_all_sources(
+            plateau,
+            source_domain=source_domain,
+            source_bounds=source_bounds,
+            target_domain=target_domain,
+        ):
+            return None
+        return extreme, plateau
+
+    # Affine extrema are exact faces: nonzero axes select one endpoint, while
+    # zero-coefficient axes retain their complete range.
+    try:
+        if sympy.Poly(expression, *target_symbols).total_degree() > 1:
+            return None
+    except sympy.PolynomialError:
+        return None
+    choices = dict(endpoint_choices)
+    result: list[tuple[int, sympy.Expr, sympy.Expr, int]] = []
+    for axis, begin, end, step in target_ranges:
+        coefficient = sympy.simplify(
+            sympy.diff(expression, coordinate_axis_symbol(axis))
+        )
+        if coefficient.is_zero is True:  # pyrefly: ignore[missing-attribute]
+            result.append((axis, begin, end, step))
+            continue
+        coordinate = choices.get(axis)
+        if coefficient.is_zero is not False or coordinate is None:  # pyrefly: ignore[missing-attribute]
+            return None
+        result.append((axis, coordinate, coordinate + 1, 1))  # pyrefly: ignore[unsupported-operation]
+    return extreme, tuple(result)
 
 
 def _target_box_expression_extreme_proof(
@@ -7334,6 +7550,62 @@ def _target_box_expression_extreme_proof_uncached(
             endpoint_choices,
         )
     return None
+
+
+def _extreme_candidate_indices(
+    candidate_values: tuple[sympy.Expr, ...],
+    *,
+    source_domain: CoordinateDomain,
+    source_bounds: _SourceBounds,
+    parameter_symbols: frozenset[sympy.Symbol],
+    maximize: bool,
+) -> tuple[int, ...] | None:
+    """Return every whole-box winner, declining any unresolved crossing."""
+    if not candidate_values:
+        return ()
+    if not _relation_product_is_within_budget(
+        len(candidate_values), len(candidate_values)
+    ):
+        return None
+    winners = set(range(len(candidate_values)))
+    for left in range(len(candidate_values)):
+        for right in range(left + 1, len(candidate_values)):
+            bounds = _logical_expression_bounds(
+                sympy.simplify(candidate_values[left] - candidate_values[right]),  # pyrefly: ignore[unsupported-operation]
+                domain=source_domain,
+                source_bounds=source_bounds,
+                parameter_symbols=parameter_symbols,
+            )
+            if bounds is None:
+                return None
+            lower, upper = bounds
+            if _is_provably_nonnegative(
+                sympy.simplify(lower - 1),  # pyrefly: ignore[unsupported-operation]
+                None,
+            ):
+                sign = 1
+            elif _is_provably_nonnegative(
+                sympy.simplify(-upper - 1),  # pyrefly: ignore[unsupported-operation]
+                None,
+            ):
+                sign = -1
+            elif _integer_partition_expressions_equal(lower, 0) and (
+                _integer_partition_expressions_equal(upper, 0)
+            ):
+                sign = 0
+            else:
+                return None
+            if maximize:
+                if sign < 0:
+                    winners.discard(left)
+                elif sign > 0:
+                    winners.discard(right)
+            else:
+                if sign > 0:
+                    winners.discard(left)
+                elif sign < 0:
+                    winners.discard(right)
+    return tuple(sorted(winners)) if winners else None
 
 
 def _max_target_value_expression(
