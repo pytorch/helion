@@ -6277,6 +6277,85 @@ class TestCrossLoopScheduler(TestCase):
                 )
             )
 
+    def test_strict_root_slot_progress_handles_exact_counter_fork_join(
+        self,
+    ) -> None:
+        domains = _identify_root_domains(
+            tuple(_domain((axis, 1, 1)) for axis in (10, 20, 30, 40))
+        )
+        key_domain = _domain((0, 1), kind="event", identity=0)
+        zero = sympy.Integer(0)
+        event = ReadinessEvent(
+            producers=tuple(
+                ReadinessProducer(
+                    root,
+                    _full_point_map(key_domain, domains[root], zero),
+                )
+                for root in (0, 1)
+            ),
+            consumers=tuple(
+                ReadinessConsumer(
+                    root,
+                    _full_point_map(domains[root], key_domain, zero),
+                )
+                for root in (2, 3)
+            ),
+        )
+        graph = _readiness_graph(domains, event)
+        plan = ReadinessCounterPlan(event.producers, event.consumers)
+
+        def schedule(root_order: tuple[int, ...]) -> WorkerSchedule:
+            return _schedule(
+                4,
+                *(
+                    _segment(
+                        root,
+                        graph.root_task_orders[root],
+                        workers=(worker, 1),
+                        dispatch_offset=0,
+                    )
+                    for worker, root in enumerate(root_order)
+                ),
+            )
+
+        safe = schedule((0, 1, 2, 3))
+        late_arm = schedule((0, 2, 1, 3))
+        nested_plan = dataclasses.replace(
+            plan,
+            consumers=(dataclasses.replace(plan.consumers[0], consumer_site_id=7),),
+        )
+        with _forbid_schedule_enumeration():
+            self.assertTrue(
+                cross_loop_scheduler._schedule_has_strict_root_slot_progress(
+                    safe,
+                    graph,
+                    (plan,),
+                    frozenset(),
+                )
+            )
+            self.assertFalse(
+                cross_loop_scheduler._schedule_has_strict_root_slot_progress(
+                    late_arm,
+                    graph,
+                    (plan,),
+                    frozenset(),
+                )
+            )
+            for counters, barriers, source_root in (
+                ((plan,), frozenset(((0, 2),)), None),
+                ((nested_plan,), frozenset(), None),
+                ((plan,), frozenset(), 0),
+            ):
+                self.assertFalse(
+                    cross_loop_scheduler._schedule_has_strict_root_slot_progress(
+                        safe,
+                        graph,
+                        counters,
+                        barriers,
+                        transient_source_root=source_root,
+                    )
+                )
+
     def test_strict_root_slot_progress_respects_relation_budget(self) -> None:
         producer_domain, consumer_domain = _identify_root_domains(
             (_domain((10, 2, 1)), _domain((20, 2, 1)))

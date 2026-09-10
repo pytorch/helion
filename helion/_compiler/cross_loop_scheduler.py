@@ -7576,6 +7576,83 @@ def _schedule_is_progress_safe(
     )
 
 
+def _schedule_has_strict_root_slot_progress(
+    worker_schedule: WorkerSchedule,
+    readiness_graph: ReadinessGraph,
+    readiness_counters: tuple[ReadinessCounterPlan, ...],
+    root_barrier_edges: frozenset[tuple[int, int]],
+    *,
+    transient_source_root: int | None = None,
+) -> bool:
+    """Prove exact root-entry counter waits increase resident global slots.
+
+    This intentionally declines root barriers, nested execution sites,
+    final-arrival continuations, and a separate source launch stage.  Those
+    mechanisms need a rank spanning more than resident root-entry slots.
+    """
+    if root_barrier_edges or transient_source_root is not None:
+        return False
+    continuations = _emitted_final_arrival_continuations(
+        readiness_graph,
+        readiness_counters,
+    )
+    if continuations is None or continuations:
+        return False
+    if (
+        any(
+            not _supports_exact_counter_plan_lowering(
+                plan,
+                readiness_graph.root_domains,
+            )
+            for plan in readiness_counters
+        )
+        or any(
+            producer.producer_site_id is not None
+            for plan in readiness_counters
+            for producer in plan.producers
+        )
+        or any(
+            consumer.consumer_site_id is not None
+            for plan in readiness_counters
+            for consumer in plan.consumers
+        )
+    ):
+        return False
+
+    dependencies: list[tuple[int, int, CoordinateRelation]] = []
+    for prerequisite in _emitted_prerequisites(readiness_counters, frozenset()):
+        plan = prerequisite.counter_plan
+        consumer = prerequisite.counter_consumer
+        assert plan is not None and consumer is not None
+        consumer_domain = readiness_graph.root_domains[consumer.consumer_root]
+        if consumer.keys_by_consumer.source_domain != consumer_domain:
+            return False
+        static_relations = _readiness_static_producers(
+            readiness_graph,
+            plan.producers,
+            {},
+        )
+        if static_relations is None:
+            return False
+        for producer_root, keys_by_producer in static_relations:
+            producers_by_key = keys_by_producer.converse()
+            producers_by_consumer = (
+                None
+                if producers_by_key is None
+                else consumer.keys_by_consumer.then(producers_by_key)
+            )
+            if producers_by_consumer is None:
+                return False
+            dependencies.append(
+                (
+                    producer_root,
+                    consumer.consumer_root,
+                    producers_by_consumer,
+                )
+            )
+    return _strict_root_slot_progress(worker_schedule, tuple(dependencies))
+
+
 @dataclasses.dataclass(frozen=True)
 class _PlacedRun:
     root: int
