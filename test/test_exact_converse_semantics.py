@@ -209,12 +209,21 @@ class TestExactConverseSemantics(TestCase):
             _allow_empty=True,
         )
         target = CoordinateDomain(
-            (10, 11),
-            ((10, 3), (11, batch)),
+            (20, 21),
+            ((20, batch), (21, 3)),
             identity=0,
             _allow_empty=True,
         )
-        relation = CoordinateRelation.identity(source, target)
+        relation = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (
+                    ((10, 0, 3, 1), (11, 0, batch, 1)),
+                    (coordinate_axis_symbol(11), coordinate_axis_symbol(10)),
+                ),
+            ),
+        )
         self.assertIsNotNone(relation.converse())
 
         with mock.patch.object(
@@ -237,10 +246,11 @@ class TestExactConverseSemantics(TestCase):
         for concrete_batch in (0, 1, 4):
             with self.subTest(batch=concrete_batch):
                 concrete = reordered.substitute_parameters({batch: concrete_batch})
+                original = relation.substitute_parameters({batch: concrete_batch})
                 self.assertTrue(concrete.is_bijection_from_source_support())
                 self.assertEqual(
                     concrete.materialize(source_axis_order=(10, 11)),
-                    tuple(frozenset((index,)) for index in range(3 * concrete_batch)),
+                    original.materialize(source_axis_order=(10, 11)),
                 )
 
     def test_source_support_ordinalization_retains_constructed_inverse(self) -> None:
