@@ -2744,7 +2744,18 @@ ownership a production decision. They are derived views over the existing
   value and the exact relation containing every target coordinate that attains
   it. Preserve value/witness correlation across ties, empty domains, dominance
   proofs, and parameter-dependent crossings for the whole compiled guard. A
-  single attaining corner or a bare `sympy.Max` is insufficient.
+  single attaining corner or a bare `sympy.Max` is insufficient. Implement
+  this as an exact-or-decline operation on `CoordinateRelation`, returning
+  `(value_by_source, attaining_targets_by_source)` and sharing the candidate
+  collection used by `max_target_value_by_source`; do not add an extrema IR.
+  Constant plateaus retain the whole target box, affine extrema retain the
+  exact extremal face, and floor/static-quotient extrema retain the complete
+  preimage plateau. Cross-piece winners require a bounded exact partition of
+  the existing source domain. If a winner changes only with an unresolved
+  parameter, or its level set is non-rectangular in the current relation
+  grammar, decline for the whole guard rather than sampling or dropping tied
+  witnesses. Charge candidate comparison and partition products to the common
+  relation budgets.
 - [ ] Evaluate the lexicographic objective `(completion, handoffs)` with one
   ephemeral max-plus propagation over same-strand precedence and semantic
   readiness edges. Every body contributes `(1, 0)`; a resident cross-owner
