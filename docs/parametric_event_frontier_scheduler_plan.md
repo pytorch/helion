@@ -2947,6 +2947,17 @@ ownership a production decision. They are derived views over the existing
   Independent review covered 5,000 concrete relations and symbolic tails with
   no partition, coverage, or owner mismatches.
 
+  Implementation checkpoint (2026-09-10): root-level readiness now lifts from
+  the authoritative per-segment `task_order` relations into an exact
+  consumer-slot-to-producer-slot relation. Segment unions preserve their
+  remembered converse proofs; no dispatch geometry or second DAG is rebuilt.
+  The shared `overlapping_sources` operation gained a bounded semantic
+  point-in-domain certificate and now checks consumer nonemptiness before its
+  full-target shortcut. This admits independently partial packed tails while
+  declining clipped or conditional false edges. Symbolic `(3, N, 2)` boundary
+  substitutions, 10,000 randomized overlap cases, and the full relation/oracle
+  suites pass.
+
 - [ ] Evaluate the lexicographic objective `(completion, handoffs)` with that
   prefix proof over same-strand precedence and semantic readiness edges. For
   each body `s`, let `R(s)` be the greatest readiness-predecessor score,
