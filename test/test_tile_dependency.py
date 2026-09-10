@@ -5876,6 +5876,328 @@ class TestTileDependency(TestCase):
                 ),
             )
 
+    def test_pointwise_scalar_add_accepts_exact_partial_cover(self) -> None:
+        source_axis = 10
+        source = CoordinateDomain(
+            (source_axis,),
+            ((source_axis, 3),),
+            kind="event",
+        )
+        values = CoordinateDomain((30,), ((30, 8),), kind="value")
+        addends = CoordinateDomain((31,), ((31, 2),), kind="value")
+        source_coordinate = coordinate_axis_symbol(source_axis)
+
+        def scalar_map(
+            mask: int,
+            target: CoordinateDomain,
+            value: sympy.Expr,
+        ) -> CoordinateRelation:
+            return CoordinateRelation.point_map(
+                source,
+                target,
+                tuple(
+                    (
+                        ((source_axis, index, index + 1, 1),),
+                        (value,),
+                    )
+                    for index in range(3)
+                    if mask & (1 << index)
+                ),
+            )
+
+        checked = 0
+        for left_mask in range(8):
+            left = scalar_map(left_mask, values, source_coordinate + 1)
+            for right_mask in range(8):
+                right = scalar_map(right_mask, addends, sympy.Integer(1))
+                with mock.patch.object(
+                    CoordinateRelation,
+                    "materialize",
+                    side_effect=AssertionError("pointwise addition must not enumerate"),
+                ):
+                    result = left.pointwise_add_scalar(right, offset=1)
+                if left_mask & ~right_mask:
+                    self.assertIsNone(result, (left_mask, right_mask))
+                    continue
+                self.assertIsNotNone(result, (left_mask, right_mask))
+                assert result is not None
+                self.assertEqual(
+                    result.materialize(),
+                    tuple(
+                        frozenset((index + 3,))
+                        if left_mask & (1 << index)
+                        else frozenset()
+                        for index in range(3)
+                    ),
+                )
+                checked += 1
+        self.assertEqual(checked, 27)
+
+    def test_pointwise_scalar_add_partial_cover_edge_cases(self) -> None:
+        source_axis = 10
+        source = CoordinateDomain(
+            (source_axis,),
+            ((source_axis, 5),),
+            kind="event",
+        )
+        values = CoordinateDomain((30,), ((30, 10),), kind="value")
+        addends = CoordinateDomain((31,), ((31, 4),), kind="value")
+        source_coordinate = coordinate_axis_symbol(source_axis)
+        left = CoordinateRelation.point_map(
+            source,
+            values,
+            (
+                (
+                    ((source_axis, -2, 7, 2),),
+                    (source_coordinate + 1,),
+                ),
+            ),
+        )
+        exact = CoordinateRelation.point_map(
+            source,
+            addends,
+            (
+                (((source_axis, -4, 3, 2),), (sympy.Integer(1),)),
+                (((source_axis, 4, 9, 2),), (sympy.Integer(1),)),
+                # An identical overlap must not be counted twice.
+                (((source_axis, 4, 9, 2),), (sympy.Integer(1),)),
+            ),
+        )
+
+        result = left.pointwise_add_scalar(exact)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(
+            result.materialize(),
+            tuple(
+                frozenset((index + 2,)) if index % 2 == 0 else frozenset()
+                for index in range(5)
+            ),
+        )
+
+        missing_one = CoordinateRelation.point_map(
+            source,
+            addends,
+            ((((source_axis, -4, 3, 2),), (sympy.Integer(1),)),),
+        )
+        conflicting = CoordinateRelation.point_map(
+            source,
+            addends,
+            (
+                (((source_axis, -4, 7, 2),), (sympy.Integer(1),)),
+                (((source_axis, 2, 3, 1),), (sympy.Integer(2),)),
+            ),
+        )
+        invalid_addend = CoordinateRelation.point_map(
+            source,
+            CoordinateDomain((31,), ((31, 1),), kind="value"),
+            ((((source_axis, -4, 7, 2),), (sympy.Integer(5),)),),
+        )
+        oversized_addend = CoordinateRelation.point_map(
+            source,
+            values,
+            ((((source_axis, -4, 7, 2),), (sympy.Integer(9),)),),
+        )
+        self.assertIsNone(left.pointwise_add_scalar(missing_one))
+        self.assertIsNone(left.pointwise_add_scalar(conflicting))
+        self.assertIsNone(left.pointwise_add_scalar(invalid_addend))
+        self.assertIsNone(left.pointwise_add_scalar(oversized_addend))
+
+        empty = CoordinateRelation(source, values, ())
+        self.assertEqual(
+            empty.pointwise_add_scalar(conflicting),
+            empty,
+        )
+
+    def test_pointwise_scalar_add_preserves_total_rhs_with_empty_junk(self) -> None:
+        source_axis = 10
+        source = CoordinateDomain(
+            (source_axis,),
+            ((source_axis, 2),),
+            kind="event",
+        )
+        values = CoordinateDomain((30,), ((30, 4),), kind="value")
+        addends = CoordinateDomain((31,), ((31, 2),), kind="value")
+        source_coordinate = coordinate_axis_symbol(source_axis)
+        left = CoordinateRelation.point_map(
+            source,
+            values,
+            (
+                (
+                    ((source_axis, 0, 2, 1),),
+                    (source_coordinate + 1,),
+                ),
+            ),
+        )
+        total_with_empty_junk = CoordinateRelation.point_map(
+            source,
+            addends,
+            (
+                (
+                    ((source_axis, -2, 4, 1),),
+                    (sympy.Mod(source_coordinate, 2),),
+                ),
+                (
+                    ((source_axis, -2, -2, 1),),
+                    (source_coordinate,),
+                ),
+            ),
+        )
+        self.assertTrue(total_with_empty_junk.is_total_function())
+
+        result = left.pointwise_add_scalar(total_with_empty_junk)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(
+            result.materialize(),
+            (frozenset((1,)), frozenset((3,))),
+        )
+
+        query = CoordinateDomain((), (), kind="event")
+        required = CoordinateRelation.total(query, source)
+        maximum = required.max_target_value_by_source(total_with_empty_junk)
+        self.assertIsNotNone(maximum)
+        assert maximum is not None
+        self.assertEqual(maximum.materialize(), (frozenset((1,)),))
+
+        partial_left = CoordinateRelation.point_map(
+            source,
+            values,
+            ((((source_axis, 0, 1, 1),), (sympy.Integer(1),)),),
+        )
+        partial_with_empty_junk = CoordinateRelation.point_map(
+            source,
+            addends,
+            (
+                (((source_axis, 0, 1, 1),), (sympy.Integer(1),)),
+                (((source_axis, -2, -2, 1),), (source_coordinate,)),
+            ),
+        )
+        partial_result = partial_left.pointwise_add_scalar(partial_with_empty_junk)
+        self.assertIsNotNone(partial_result)
+        assert partial_result is not None
+        self.assertEqual(
+            partial_result.materialize(),
+            (frozenset((2,)), frozenset()),
+        )
+        partial_required = CoordinateRelation(
+            query,
+            source,
+            (_CoordinateRelationPiece((), ((source_axis, 0, 1, 1),)),),
+        )
+        partial_maximum = partial_required.max_target_value_by_source(
+            partial_with_empty_junk
+        )
+        self.assertIsNotNone(partial_maximum)
+        assert partial_maximum is not None
+        self.assertEqual(partial_maximum.materialize(), (frozenset((1,)),))
+
+    def test_pointwise_scalar_add_partial_symbolic_cover(self) -> None:
+        extent = sympy.Symbol(
+            "partial_add_extent",
+            integer=True,
+            nonnegative=True,
+        )
+        source_axis = 10
+        source = CoordinateDomain(
+            (source_axis,),
+            ((source_axis, extent),),
+            kind="event",
+            _allow_empty=True,
+        )
+        values = CoordinateDomain(
+            (30,),
+            ((30, extent + 3),),  # pyrefly: ignore[unsupported-operation]
+            kind="value",
+        )
+        addends = CoordinateDomain((31,), ((31, 2),), kind="value")
+        source_coordinate = coordinate_axis_symbol(source_axis)
+        split = sympy.Min(sympy.Integer(2), extent)
+        left = CoordinateRelation.point_map(
+            source,
+            values,
+            (
+                (
+                    ((source_axis, 0, extent, 1),),
+                    (source_coordinate,),
+                ),
+            ),
+        )
+        exact = CoordinateRelation.point_map(
+            source,
+            addends,
+            (
+                (((source_axis, 0, split, 1),), (sympy.Integer(1),)),
+                (((source_axis, split, extent, 1),), (sympy.Integer(1),)),
+            ),
+        )
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("symbolic pointwise addition must not enumerate"),
+        ):
+            result = left.pointwise_add_scalar(exact)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        for concrete_extent in (0, 1, 2, 3, 7):
+            concrete = result.substitute_parameters({extent: concrete_extent})
+            self.assertEqual(
+                concrete.materialize(),
+                tuple(
+                    frozenset((coordinate + 1,))
+                    for coordinate in range(concrete_extent)
+                ),
+            )
+
+        missing_last = CoordinateRelation.point_map(
+            source,
+            addends,
+            (
+                (
+                    ((source_axis, 0, sympy.Max(0, extent - 1), 1),),
+                    (sympy.Integer(1),),
+                ),
+            ),
+        )
+        self.assertIsNone(left.pointwise_add_scalar(missing_last))
+
+    def test_pointwise_scalar_add_partial_cover_respects_budget(self) -> None:
+        source_axis = 10
+        source = CoordinateDomain(
+            (source_axis,),
+            ((source_axis, 5),),
+            kind="event",
+        )
+        values = CoordinateDomain((30,), ((30, 8),), kind="value")
+        addends = CoordinateDomain((31,), ((31, 3),), kind="value")
+        source_coordinate = coordinate_axis_symbol(source_axis)
+        left = CoordinateRelation.point_map(
+            source,
+            values,
+            (
+                (((source_axis, 0, 1, 1),), (source_coordinate,)),
+                (((source_axis, 2, 3, 1),), (source_coordinate,)),
+            ),
+        )
+        exact = CoordinateRelation.point_map(
+            source,
+            addends,
+            (
+                (((source_axis, 0, 2, 1),), (sympy.Integer(1),)),
+                (((source_axis, 2, 4, 1),), (sympy.Integer(2),)),
+            ),
+        )
+        self.assertIsNotNone(left.pointwise_add_scalar(exact))
+        with mock.patch(
+            "helion._compiler.tile_dependency._MAX_RELATION_PRODUCT_STATES",
+            7,
+        ):
+            self.assertIsNone(left.pointwise_add_scalar(exact))
+
     def test_weighted_max_pullback_partitions_symbolically_and_substitutes(
         self,
     ) -> None:

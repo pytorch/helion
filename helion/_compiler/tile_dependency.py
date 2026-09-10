@@ -4275,11 +4275,11 @@ class CoordinateRelation:
     ) -> CoordinateRelation | None:
         """Add scalar point maps exactly on this relation's support.
 
-        ``self`` may be partial, while ``other`` (when present) must be a
-        total scalar function over the same source domain.  The result keeps
+        ``self`` may be partial.  ``other`` may also be partial when its exact
+        support covers every point in ``self``'s support.  The result keeps
         ``self``'s scalar target domain and exact source support.  This makes
         the operation useful both before an aggregation, when ``self`` is
-        total, and after one, when empty fibers make ``self`` partial.
+        total, and after one, when empty fibers make either operand partial.
 
         Source guards are intersected symbolically and no source extent is
         enumerated.  A sum that cannot be represented as an in-domain scalar
@@ -4305,11 +4305,6 @@ class CoordinateRelation:
             self.source_domain != other.source_domain
             or len(other.target_domain.axis_order) != 1
             or len(other.pieces) > _MAX_RELATION_PIECES
-            or not _relation_product_is_within_budget(
-                len(self.pieces),
-                len(other.pieces),
-            )
-            or not other.is_total_function()
         ):
             return None
 
@@ -4326,6 +4321,37 @@ class CoordinateRelation:
         if not result_parameters <= result_domain_parameters:
             return None
 
+        if not self.pieces:
+            return CoordinateRelation(
+                source_domain=self.source_domain,
+                target_domain=self.target_domain,
+                pieces=(),
+            )
+
+        other_is_total = True
+        if other is not None:
+            other_is_total = (
+                not _source_support_is_provably_partial(other)
+                and other.is_total_function()
+            )
+            if not other_is_total:
+                other = _canonical_partial_point_map(other)
+                if (
+                    other is None
+                    or len(other.pieces) > _MAX_RELATION_PIECES
+                    or not _relation_product_is_within_budget(
+                        len(self.pieces),
+                        len(other.pieces),
+                        len(other.pieces),
+                    )
+                ):
+                    return None
+            elif not _relation_product_is_within_budget(
+                len(self.pieces),
+                len(other.pieces),
+            ):
+                return None
+
         domain_bounds = tuple(
             (
                 axis,
@@ -4338,9 +4364,6 @@ class CoordinateRelation:
             )
             for axis in self.source_domain.axis_order
         )
-        right_pieces: tuple[_CoordinateRelationPiece | None, ...] = (
-            (None,) if other is None else other.pieces
-        )
         value_axis = self.target_domain.axis_order[0]
         pieces: dict[_CoordinateRelationPiece, None] = {}
         for left_piece in self.pieces:
@@ -4349,18 +4372,67 @@ class CoordinateRelation:
             _left_axis, left_begin, left_end, left_step = left_piece.target_ranges[0]
             if left_step != 1 or sympy.simplify(left_end - left_begin) != 1:  # pyrefly: ignore[unsupported-operation]
                 return None
-            for right_piece in right_pieces:
-                source_bounds = left_piece.source_bounds_items
+            if other is not None and not other_is_total:
+                left_support = _intersect_source_boxes(
+                    left_piece.source_bounds_items,
+                    domain_bounds,
+                )
+                if left_support is None:
+                    return None
+                if left_support is False:
+                    continue
+                exact_cover = _exact_support_cover_intersections(
+                    left_support,
+                    other.pieces,
+                    support_domain=self.source_domain,
+                    source_domain=self.source_domain,
+                    source_bounds=left_support,
+                    allow_conditionally_empty=True,
+                )
+                if exact_cover is None:
+                    return None
+                right_intersections: tuple[
+                    tuple[_CoordinateRelationPiece | None, _SourceBounds], ...
+                ] = exact_cover
+            else:
+                right_intersections_list: list[
+                    tuple[_CoordinateRelationPiece | None, _SourceBounds]
+                ] = []
+                right_pieces: tuple[_CoordinateRelationPiece | None, ...] = (
+                    (None,) if other is None else other.pieces
+                )
+                for right_piece in right_pieces:
+                    source_bounds = left_piece.source_bounds_items
+                    if right_piece is not None:
+                        source_intersection = _intersect_source_boxes(
+                            source_bounds,
+                            right_piece.source_bounds_items,
+                        )
+                        if source_intersection is None:
+                            return None
+                        if source_intersection is False:
+                            continue
+                        source_bounds = source_intersection
+                    domain_intersection = _intersect_source_boxes(
+                        source_bounds,
+                        domain_bounds,
+                    )
+                    if domain_intersection is None:
+                        return None
+                    if domain_intersection is False:
+                        continue
+                    right_intersections_list.append(
+                        (right_piece, domain_intersection)
+                    )
+                right_intersections = tuple(right_intersections_list)
+            for right_piece, source_bounds in right_intersections:
                 right_begin = sympy.Integer(0)
                 if right_piece is not None:
                     source_intersection = _intersect_source_boxes(
-                        source_bounds,
-                        right_piece.source_bounds_items,
+                        source_bounds, domain_bounds
                     )
-                    if source_intersection is None:
+                    if source_intersection is None or source_intersection is False:
                         return None
-                    if source_intersection is False:
-                        continue
                     source_bounds = source_intersection
                     if len(right_piece.target_ranges) != 1:
                         return None
@@ -4374,15 +4446,6 @@ class CoordinateRelation:
                         right_end - right_begin
                     ) != 1:
                         return None
-                domain_intersection = _intersect_source_boxes(
-                    source_bounds,
-                    domain_bounds,
-                )
-                if domain_intersection is None:
-                    return None
-                if domain_intersection is False:
-                    continue
-                source_bounds = domain_intersection
                 left_range = ((value_axis, left_begin, left_end, left_step),)
                 if not _target_point_is_in_domain(
                     left_range,
@@ -4538,34 +4601,13 @@ class CoordinateRelation:
             )
         ):
             return None
-        values_are_total = values.is_total_function()
+        values_are_total = (
+            not _source_support_is_provably_partial(values)
+            and values.is_total_function()
+        )
         if not values_are_total:
-            # Extrema need values only for targets that are actually reachable.
-            # Canonicalize a partial point map once so coverage cardinalities
-            # below cannot double-count overlapping equal-valued pieces.
-            values = dataclasses.replace(
-                values,
-                pieces=tuple(dict.fromkeys(values.pieces)),
-            )
-            canonical_values = values.canonical_single_valued()
-            if canonical_values is None:
-                if not values.is_single_valued():
-                    return None
-                # A symbolic support may not admit one global source-cell
-                # partition.  Keep its deduplicated point pieces here; each
-                # reachable target box below must still induce a disjoint,
-                # exact cover before any value is used.
-                canonical_values = values
-            values = canonical_values
-            if any(
-                not _target_point_is_in_domain(
-                    piece.target_ranges,
-                    source_domain=values.source_domain,
-                    source_bounds=piece.source_bounds_items,
-                    target_domain=values.target_domain,
-                )
-                for piece in values.pieces
-            ):
+            values = _canonical_partial_point_map(values)
+            if values is None:
                 return None
             value_piece_count = len(values.pieces)
             coverage_is_within_budget = _relation_product_is_within_budget(
@@ -4637,38 +4679,51 @@ class CoordinateRelation:
                     target_domain=self.target_domain,
                 ):
                     continue
-                covered_target_ranges: dict[_TargetBoxRanges, None] = {}
-                for value_piece in values.pieces:
-                    intersection = _intersect_target_with_source_box(
+                if values_are_total:
+                    value_intersections: tuple[
+                        tuple[_CoordinateRelationPiece, _TargetBoxRanges | None], ...
+                    ] = tuple((value_piece, None) for value_piece in values.pieces)
+                else:
+                    exact_cover = _exact_support_cover_intersections(
                         semantic_target_ranges,
-                        value_piece.source_bounds_items,
-                        source_domain=self.source_domain,
-                        relation_source_bounds=source_bounds,
-                    )
-                    if intersection is None:
-                        return None
-                    if intersection is False:
-                        continue
-                    intersected_ranges = cast(
-                        "tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...]",
-                        intersection,
-                    )
-                    if _target_box_is_empty_for_all_sources(
-                        intersected_ranges,
+                        values.pieces,
+                        support_domain=self.target_domain,
                         source_domain=self.source_domain,
                         source_bounds=source_bounds,
-                        target_domain=self.target_domain,
-                    ):
-                        continue
-                    if not _target_box_is_nonempty_for_all_sources(
-                        intersected_ranges,
-                        source_domain=self.source_domain,
-                        source_bounds=source_bounds,
-                        target_domain=self.target_domain,
-                    ):
+                        allow_conditionally_empty=False,
+                    )
+                    if exact_cover is None:
                         return None
-                    if not values_are_total:
-                        covered_target_ranges.setdefault(intersected_ranges, None)
+                    value_intersections = exact_cover
+                for value_piece, known_intersection in value_intersections:
+                    if known_intersection is None:
+                        intersection = _intersect_target_with_source_box(
+                            semantic_target_ranges,
+                            value_piece.source_bounds_items,
+                            source_domain=self.source_domain,
+                            relation_source_bounds=source_bounds,
+                        )
+                        if intersection is None:
+                            return None
+                        if intersection is False:
+                            continue
+                        intersected_ranges = cast("_TargetBoxRanges", intersection)
+                        if _target_box_is_empty_for_all_sources(
+                            intersected_ranges,
+                            source_domain=self.source_domain,
+                            source_bounds=source_bounds,
+                            target_domain=self.target_domain,
+                        ):
+                            continue
+                        if not _target_box_is_nonempty_for_all_sources(
+                            intersected_ranges,
+                            source_domain=self.source_domain,
+                            source_bounds=source_bounds,
+                            target_domain=self.target_domain,
+                        ):
+                            return None
+                    else:
+                        intersected_ranges = known_intersection
                     if len(value_piece.target_ranges) != 1:
                         return None
                     _axis, begin, end, step = value_piece.target_ranges[0]
@@ -4709,50 +4764,6 @@ class CoordinateRelation:
                     )
                     candidates.setdefault((candidate_value, target_ranges), None)
                     if include_attainers and len(candidates) > _MAX_RELATION_PIECES:
-                        return None
-                if not values_are_total:
-                    covered_ranges = tuple(covered_target_ranges)
-                    if (
-                        not covered_ranges
-                        or not _relation_product_is_within_budget(
-                            len(covered_ranges),
-                            len(covered_ranges),
-                        )
-                        or any(
-                            not _target_boxes_are_disjoint(
-                                left,
-                                right,
-                                source_domain=self.source_domain,
-                                source_bounds=source_bounds,
-                            )
-                            for index, left in enumerate(covered_ranges)
-                            for right in covered_ranges[index + 1 :]
-                        )
-                    ):
-                        return None
-                    reachable_cardinality = _target_box_cardinality(
-                        semantic_target_ranges,
-                        target_domain=self.target_domain,
-                        source_domain=self.source_domain,
-                        source_bounds=source_bounds,
-                    )
-                    covered_cardinality = sympy.simplify(
-                        sympy.Add(
-                            *(
-                                _target_box_cardinality(
-                                    target_ranges,
-                                    target_domain=self.target_domain,
-                                    source_domain=self.source_domain,
-                                    source_bounds=source_bounds,
-                                )
-                                for target_ranges in covered_ranges
-                            )
-                        )
-                    )
-                    if not _integer_partition_expressions_equal(
-                        covered_cardinality,
-                        reachable_cardinality,
-                    ):
                         return None
             if not candidates:
                 continue
@@ -7814,6 +7825,200 @@ _TargetBoxExtremeCacheKey = tuple[
     tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...],
     bool,
 ]
+
+
+def _source_support_is_provably_partial(relation: CoordinateRelation) -> bool:
+    """Use the missing domain origin as a bounded partial-support witness."""
+    if any(
+        count.is_zero is True
+        for count in relation.source_domain.axis_count_expressions.values()
+    ):
+        return False
+    for piece in relation.pieces:
+        origin_may_be_supported = True
+        for _axis, begin, end, step in piece.source_bounds_items:
+            if (
+                _is_provably_nonnegative(sympy.simplify(begin - 1), None)  # pyrefly: ignore[unsupported-operation]
+                or _is_provably_nonnegative(sympy.simplify(-end), None)
+                or sympy.Mod(-begin, step).is_zero is False  # pyrefly: ignore[unsupported-operation]
+            ):
+                origin_may_be_supported = False
+                break
+        if origin_may_be_supported:
+            return False
+    return True
+
+
+def _canonical_partial_point_map(
+    relation: CoordinateRelation,
+) -> CoordinateRelation | None:
+    """Canonicalize a bounded partial point map without enumerating support."""
+    relation = dataclasses.replace(
+        relation,
+        pieces=tuple(dict.fromkeys(_nonempty_relation_pieces(relation))),
+    )
+    if len(relation.pieces) > _MAX_RELATION_PIECES:
+        return None
+    points_are_in_domain = all(
+        _target_point_is_in_domain(
+            piece.target_ranges,
+            source_domain=relation.source_domain,
+            source_bounds=piece.source_bounds_items,
+            target_domain=relation.target_domain,
+        )
+        for piece in relation.pieces
+    )
+    if not points_are_in_domain:
+        return None
+    if len(relation.pieces) <= 1 or (
+        _relation_product_is_within_budget(
+            len(relation.pieces),
+            len(relation.pieces),
+        )
+        and all(
+            _source_bounds_are_disjoint(
+                left.source_bounds_items,
+                right.source_bounds_items,
+            )
+            for index, left in enumerate(relation.pieces)
+            for right in relation.pieces[index + 1 :]
+        )
+    ):
+        return relation
+
+    canonical = relation.canonical_single_valued()
+    if canonical is None:
+        if not relation.is_single_valued():
+            return None
+        # Some symbolic equal-valued overlaps have no global source-cell
+        # partition.  The exact-cover proof below still rejects any support
+        # whose union cannot be represented without double counting.
+        canonical = relation
+    if len(canonical.pieces) > _MAX_RELATION_PIECES or any(
+        not _target_point_is_in_domain(
+            piece.target_ranges,
+            source_domain=canonical.source_domain,
+            source_bounds=piece.source_bounds_items,
+            target_domain=canonical.target_domain,
+        )
+        for piece in canonical.pieces
+    ):
+        return None
+    return canonical
+
+
+def _exact_support_cover_intersections(
+    required_ranges: _TargetBoxRanges,
+    support_pieces: tuple[_CoordinateRelationPiece, ...],
+    *,
+    support_domain: CoordinateDomain,
+    source_domain: CoordinateDomain,
+    source_bounds: _SourceBounds,
+    allow_conditionally_empty: bool,
+) -> tuple[tuple[_CoordinateRelationPiece, _TargetBoxRanges], ...] | None:
+    """Prove and return an exact piecewise cover of one required box."""
+    if not support_pieces or not _relation_product_is_within_budget(
+        len(support_pieces),
+        len(support_pieces),
+    ):
+        return None
+    for support_piece in support_pieces:
+        if _source_bounds_equal(
+            support_piece.source_bounds_items,
+            required_ranges,
+        ):
+            if (
+                not allow_conditionally_empty
+                and not _target_box_is_nonempty_for_all_sources(
+                    required_ranges,
+                    source_domain=source_domain,
+                    source_bounds=source_bounds,
+                    target_domain=support_domain,
+                )
+            ):
+                return None
+            return ((support_piece, required_ranges),)
+    intersections: list[tuple[_CoordinateRelationPiece, _TargetBoxRanges]] = []
+    covered_ranges: dict[_TargetBoxRanges, None] = {}
+    for support_piece in support_pieces:
+        intersection = _intersect_target_with_source_box(
+            required_ranges,
+            support_piece.source_bounds_items,
+            source_domain=source_domain,
+            relation_source_bounds=source_bounds,
+        )
+        if intersection is None:
+            return None
+        if intersection is False:
+            continue
+        intersected_ranges = cast("_TargetBoxRanges", intersection)
+        if _target_box_is_empty_for_all_sources(
+            intersected_ranges,
+            source_domain=source_domain,
+            source_bounds=source_bounds,
+            target_domain=support_domain,
+        ):
+            continue
+        if (
+            not allow_conditionally_empty
+            and not _target_box_is_nonempty_for_all_sources(
+                intersected_ranges,
+                source_domain=source_domain,
+                source_bounds=source_bounds,
+                target_domain=support_domain,
+            )
+        ):
+            return None
+        intersections.append((support_piece, intersected_ranges))
+        covered_ranges.setdefault(intersected_ranges, None)
+        if _source_bounds_equal(
+            intersected_ranges,
+            required_ranges,
+        ):
+            # Ignore overlapping extras; the caller separately proves that
+            # the support relation is single-valued.
+            return ((support_piece, intersected_ranges),)
+
+    unique_ranges = tuple(covered_ranges)
+    if not unique_ranges or any(
+        not (
+            _source_bounds_are_disjoint(left, right)
+            or _target_boxes_are_disjoint(
+                left,
+                right,
+                source_domain=source_domain,
+                source_bounds=source_bounds,
+            )
+        )
+        for index, left in enumerate(unique_ranges)
+        for right in unique_ranges[index + 1 :]
+    ):
+        return None
+    required_cardinality = _target_box_cardinality(
+        required_ranges,
+        target_domain=support_domain,
+        source_domain=source_domain,
+        source_bounds=source_bounds,
+    )
+    covered_cardinality = sympy.simplify(
+        sympy.Add(
+            *(
+                _target_box_cardinality(
+                    ranges,
+                    target_domain=support_domain,
+                    source_domain=source_domain,
+                    source_bounds=source_bounds,
+                )
+                for ranges in unique_ranges
+            )
+        )
+    )
+    if not _integer_partition_expressions_equal(
+        covered_cardinality,
+        required_cardinality,
+    ):
+        return None
+    return tuple(intersections)
 
 
 def _merge_target_box_endpoint_choices(
