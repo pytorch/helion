@@ -678,51 +678,49 @@ class CoordinateRelation:
                 ).xreplace(concrete_substitutions)
             )
 
-        pieces = tuple(
-            _CoordinateRelationPiece(
-                source_bounds_items=tuple(
-                    (
-                        axis,
-                        _concrete_integer(
+        def substitute_relation(relation: CoordinateRelation) -> CoordinateRelation:
+            pieces = tuple(
+                _CoordinateRelationPiece(
+                    source_bounds_items=tuple(
+                        (
+                            axis,
+                            _concrete_integer(
+                                substitute_expression(begin),
+                                description="substituted relation source bound",
+                            ),
+                            _concrete_integer(
+                                substitute_expression(end),
+                                description="substituted relation source bound",
+                            ),
+                            step,
+                        )
+                        for axis, begin, end, step in piece.source_bounds_items
+                    ),
+                    target_ranges=tuple(
+                        (
+                            axis,
                             substitute_expression(begin),
-                            description="substituted relation source bound",
-                        ),
-                        _concrete_integer(
                             substitute_expression(end),
-                            description="substituted relation source bound",
-                        ),
-                        step,
-                    )
-                    for axis, begin, end, step in piece.source_bounds_items
+                            step,
+                        )
+                        for axis, begin, end, step in piece.target_ranges
+                    ),
+                )
+                for piece in relation.pieces
+            )
+            return CoordinateRelation(
+                source_domain=relation.source_domain.substitute_parameters(
+                    substitutions
                 ),
-                target_ranges=tuple(
-                    (
-                        axis,
-                        substitute_expression(begin),
-                        substitute_expression(end),
-                        step,
-                    )
-                    for axis, begin, end, step in piece.target_ranges
+                target_domain=relation.target_domain.substitute_parameters(
+                    substitutions
                 ),
+                pieces=pieces,
             )
-            for piece in self.pieces
-        )
-        result = CoordinateRelation(
-            source_domain=self.source_domain.substitute_parameters(substitutions),
-            target_domain=self.target_domain.substitute_parameters(substitutions),
-            pieces=pieces,
-        )
-        converse = _memoized_exact_converse(self)
-        if converse is not None:
-            unmemoized_converse = CoordinateRelation(
-                source_domain=converse.source_domain,
-                target_domain=converse.target_domain,
-                pieces=converse.pieces,
-            )
-            _remember_exact_converse(
-                result,
-                unmemoized_converse.substitute_parameters(substitutions),
-            )
+
+        result = substitute_relation(self)
+        if (converse := _memoized_exact_converse(self)) is not None:
+            _remember_exact_converse(result, substitute_relation(converse))
         return result
 
     @classmethod
@@ -1468,8 +1466,8 @@ class CoordinateRelation:
             return False
         if self.is_pointwise_equal_on_same_support(required):
             return True
-        positional_product = self._parameterized_positional_product
-        required_positional_product = required._parameterized_positional_product
+        positional_product = self._positional_product
+        required_positional_product = required._positional_product
         if (
             positional_product is not None
             and required_positional_product is not None
@@ -1526,34 +1524,24 @@ class CoordinateRelation:
         return tuple(axis for axis in self.source_domain.axis_order if axis in used)
 
     @cached_property
-    def _parameterized_positional_product(
+    def _positional_product(
         self,
     ) -> tuple[tuple[tuple[int, int], ...], CoordinateRelation] | None:
-        """Factor shape-varying positional axes from a static inner relation.
+        """Factor positional axes from a static residual relation.
 
-        A runtime-sized axis is removable only when every relation piece spans
-        that complete source axis and maps it point-for-point onto one equally
-        sized target axis. The residual relation must be fully concrete. This
-        is an exact Cartesian-product proof, not a sampled-shape shortcut.
+        An axis is removable only when every relation piece spans that complete
+        source axis and maps it point-for-point onto one equally sized target
+        axis. The residual relation must be fully concrete. This is an exact
+        Cartesian-product proof, not a sampled-shape shortcut.
         """
-        if not self.parameter_symbols or not self.pieces:
+        if not self.pieces:
             return None
         source_counts = self.source_domain.axis_count_expressions
         target_counts = self.target_domain.axis_count_expressions
-        parameterized_source_axes = tuple(
-            axis
-            for axis in self.source_domain.axis_order
-            if _integer_expression(
-                source_counts[axis],
-                description="coordinate-domain axis count",
-            ).free_symbols
-        )
-        if not parameterized_source_axes:
-            return None
 
         pairs: list[tuple[int, int]] = []
         used_target_axes: set[int] = set()
-        for source_axis in parameterized_source_axes:
+        for source_axis in self.source_domain.axis_order:
             source_count = _integer_expression(
                 source_counts[source_axis],
                 description="coordinate-domain axis count",
@@ -1594,7 +1582,7 @@ class CoordinateRelation:
                 )
             )
             if len(candidates) != 1:
-                return None
+                continue
             target_axis = candidates[0]
             if any(
                 next(
@@ -1605,9 +1593,12 @@ class CoordinateRelation:
                 != (source_axis, 0, source_count, 1)
                 for piece in self.pieces
             ):
-                return None
+                continue
             pairs.append((source_axis, target_axis))
             used_target_axes.add(target_axis)
+
+        if not pairs or len(pairs) == len(self.source_domain.axis_order):
+            return None
 
         removed_source_symbols = frozenset(
             coordinate_axis_symbol(source_axis) for source_axis, _target_axis in pairs
@@ -1639,6 +1630,7 @@ class CoordinateRelation:
             ),
             kind=self.source_domain.kind,
             identity=self.source_domain.identity,
+            _allow_empty=self.source_domain._allow_empty,
         )
         residual_target = CoordinateDomain(
             axis_order=tuple(
@@ -1658,6 +1650,7 @@ class CoordinateRelation:
             ),
             kind=self.target_domain.kind,
             identity=self.target_domain.identity,
+            _allow_empty=self.target_domain._allow_empty,
         )
         residual = CoordinateRelation(
             source_domain=residual_source,
@@ -1890,6 +1883,10 @@ class CoordinateRelation:
             return _remember_exact_converse(self, cached_converse)
         if (converse := _symbolic_single_source_mixed_radix_converse(self)) is not None:
             return _remember_exact_converse(self, converse)
+        if self._positional_product is not None:
+            converse = self.derive_converse_and_target_counts()[0]
+            if converse is not None:
+                return _remember_exact_converse(self, converse)
         if (converse := _cheap_source_support_converse(self)) is not None:
             return converse
         if (converse := self._factored_source_support_converse) is not None:
@@ -2023,7 +2020,7 @@ class CoordinateRelation:
                 ),
             )
             return converse, target_counts
-        positional_product = self._parameterized_positional_product
+        positional_product = self._positional_product
         if positional_product is not None:
             positional_axes, residual = positional_product
             residual_converse = residual.converse()
@@ -2933,7 +2930,7 @@ class CoordinateRelation:
                 # injective.  Its full-cardinality support therefore maps
                 # onto every point of this finite source domain.
                 return True
-        positional_product = self._parameterized_positional_product
+        positional_product = self._positional_product
         if positional_product is not None:
             _positional_axes, residual = positional_product
             return residual.has_total_source()
@@ -2978,7 +2975,7 @@ class CoordinateRelation:
             )
         ):
             return True
-        positional_product = self._parameterized_positional_product
+        positional_product = self._positional_product
         if positional_product is not None:
             _positional_axes, residual = positional_product
             return residual.is_single_valued()
@@ -3078,7 +3075,7 @@ class CoordinateRelation:
                 )
             ):
                 return self
-        positional_product = self._parameterized_positional_product
+        positional_product = self._positional_product
         if positional_product is not None:
             positional_axes, residual = positional_product
             canonical_residual = residual.canonical_single_valued()
@@ -3165,7 +3162,7 @@ class CoordinateRelation:
             and _symbolic_single_source_mixed_radix_converse(self) is not None
         ):
             return True
-        positional_product = self._parameterized_positional_product
+        positional_product = self._positional_product
         if positional_product is not None:
             _positional_axes, residual = positional_product
             return residual.is_total_function()
@@ -3553,7 +3550,7 @@ class CoordinateRelation:
         Source boxes are partitioned only at existing structural boundaries.
         Overlapping target boxes must be identical or provably disjoint.
         """
-        positional_product = self._parameterized_positional_product
+        positional_product = self._positional_product
         if positional_product is not None:
             _positional_axes, residual = positional_product
             residual_counts = residual.target_count_by_source()
@@ -8742,12 +8739,6 @@ def pid_task_order(
         second_count,
         description="L2 second-axis count",
     )
-    group_count = (concrete_first_count + l2_group_size - 1) // l2_group_size
-    piece_count = group_count * concrete_second_count
-    if piece_count > _MAX_RELATION_PIECES or not (
-        _relation_product_is_within_budget(group_count, concrete_second_count)
-    ):
-        raise ValueError("L2 task order exceeds the symbolic relation budget")
     inner_axis = min(logical_domain.axis_order, default=0) - 1
     while inner_axis in logical_domain.axis_order:
         inner_axis -= 1
@@ -8761,6 +8752,84 @@ def pid_task_order(
         identity=logical_domain.identity,
     )
     inner = coordinate_axis_symbol(inner_axis)
+    uniform_group_size = min(l2_group_size, concrete_first_count)
+    if (
+        uniform_group_size > 0
+        and concrete_second_count > 0
+        and concrete_first_count % uniform_group_size == 0
+    ):
+        group_span = uniform_group_size * concrete_second_count
+        expressions = {
+            first_axis: cast(
+                "sympy.Expr",
+                FloorDiv(inner, group_span) * uniform_group_size
+                + sympy.Mod(inner, uniform_group_size),
+            ),
+            second_axis: sympy.Mod(
+                cast("sympy.Expr", FloorDiv(inner, uniform_group_size)),
+                concrete_second_count,
+            ),
+            **{axis: coordinate_axis_symbol(axis) for axis in outer_axes},
+        }
+        relation = CoordinateRelation.point_map(
+            source_domain,
+            logical_domain,
+            (
+                (
+                    tuple(
+                        (
+                            axis,
+                            0,
+                            source_domain.axis_count_expressions[axis],
+                            1,
+                        )
+                        for axis in source_domain.axis_order
+                    ),
+                    tuple(expressions[axis] for axis in logical_domain.axis_order),
+                ),
+            ),
+        )
+        first = coordinate_axis_symbol(first_axis)
+        second = coordinate_axis_symbol(second_axis)
+        inverse_expressions = {
+            inner_axis: cast(
+                "sympy.Expr",
+                FloorDiv(first, uniform_group_size) * group_span
+                + second * uniform_group_size
+                + sympy.Mod(first, uniform_group_size),
+            ),
+            **{axis: coordinate_axis_symbol(axis) for axis in outer_axes},
+        }
+        converse = CoordinateRelation.point_map(
+            logical_domain,
+            source_domain,
+            (
+                (
+                    tuple(
+                        (
+                            axis,
+                            0,
+                            logical_domain.axis_count_expressions[axis],
+                            1,
+                        )
+                        for axis in logical_domain.axis_order
+                    ),
+                    tuple(
+                        inverse_expressions[axis]
+                        for axis in source_domain.axis_order
+                    ),
+                ),
+            ),
+        )
+        _remember_exact_converse(relation, converse)
+        return relation
+
+    group_count = (concrete_first_count + l2_group_size - 1) // l2_group_size
+    piece_count = group_count * concrete_second_count
+    if piece_count > _MAX_RELATION_PIECES or not (
+        _relation_product_is_within_budget(group_count, concrete_second_count)
+    ):
+        raise ValueError("L2 task order exceeds the symbolic relation budget")
     pieces: list[
         tuple[
             tuple[tuple[int, int, int, int], ...],

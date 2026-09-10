@@ -1623,6 +1623,49 @@ class TestTileDependency(TestCase):
             tuple(expected.index(task) for task in range(len(expected))),
         )
 
+    def test_symbolic_pid_task_order_compacts_uniform_l2_groups(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        domain = CoordinateDomain(
+            (10, 20, 30),
+            ((10, 4), (20, 3), (30, batch)),
+            ((10, 1), (20, 1), (30, 1)),
+        )
+        relation = pid_task_order(
+            domain,
+            domain.axis_order,
+            l2_group_size=2,
+        )
+
+        self.assertEqual(len(relation.pieces), 1)
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("symbolic L2 proof must not enumerate"),
+        ):
+            self.assertTrue(relation.is_bijection_from_source_support())
+            converse = relation.converse()
+            self.assertIsNotNone(converse)
+            assert converse is not None
+            self.assertTrue(converse.is_total_function())
+
+        one_outer_slice = (0, 1, 4, 5, 8, 9, 2, 3, 6, 7, 10, 11)
+        for concrete_batch in (0, 1, 3):
+            concrete = relation.substitute_parameters({batch: concrete_batch})
+            expected = tuple(
+                task + outer * 12
+                for outer in range(concrete_batch)
+                for task in one_outer_slice
+            )
+            self.assertEqual(
+                tuple(next(iter(targets)) for targets in concrete.materialize()),
+                expected,
+            )
+            self.assertTrue(concrete.is_bijection_from_source_support())
+            concrete_converse = concrete.converse()
+            self.assertIsNotNone(concrete_converse)
+            assert concrete_converse is not None
+            self.assertTrue(concrete_converse.is_total_function())
+
     def test_l2_pid_task_order_preflights_relation_budget(self) -> None:
         domain = CoordinateDomain(
             (10, 20),

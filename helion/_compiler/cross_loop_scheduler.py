@@ -1406,12 +1406,12 @@ def _parametric_root_major_relation(
                     first_worker + first_count,
                     1,
                 ),
-                    (
-                        wave_axis,
-                        first_wave,
-                        sympy.simplify(first_wave + 1),
-                        1,
-                    ),
+                (
+                    wave_axis,
+                    first_wave,
+                    sympy.simplify(first_wave + 1),
+                    1,
+                ),
             ),
             target_coordinates,
         ),
