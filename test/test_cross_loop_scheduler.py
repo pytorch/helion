@@ -6126,13 +6126,19 @@ class TestCrossLoopScheduler(TestCase):
         query = sympy.Symbol("query", integer=True, nonnegative=True)
         graph, event, consumer = _symbolic_nested_counter_graph(batch, query, 8)
 
+        concrete_axis_counts = CoordinateDomain._concrete_axis_counts
+
+        def reject_runtime_axis_counts(domain: CoordinateDomain) -> dict[int, int]:
+            if domain.parameter_symbols:
+                raise AssertionError(
+                    "symbolic nested counters must not concretize runtime axes"
+                )
+            return concrete_axis_counts(domain)
+
         with mock.patch.object(
             CoordinateDomain,
-            "axis_counts",
-            new_callable=mock.PropertyMock,
-            side_effect=AssertionError(
-                "symbolic nested counters must not request concrete axis counts"
-            ),
+            "_concrete_axis_counts",
+            reject_runtime_axis_counts,
         ):
             plan = _segmented_nested_loop_counter(
                 graph,

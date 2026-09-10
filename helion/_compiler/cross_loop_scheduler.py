@@ -4553,9 +4553,6 @@ def _segmented_nested_loop_counter(
     # authoritative producer sets and the one proved segment quotient.  The
     # generic converse search cannot rediscover runtime-valued segment cuts;
     # retaining the structural inverse here avoids specialization or sampling.
-    semantic_keys_by_segment = key_coarsening.converse()
-    if semantic_keys_by_segment is None:
-        return None
     publication_relations = tuple(
         (
             None
@@ -4564,21 +4561,29 @@ def _segmented_nested_loop_counter(
         )
         for readiness_producer in event.producers
     )
-    producers_by_key_relations = tuple(
-        semantic_keys_by_segment.then(readiness_producer.producers_by_key)
-        for readiness_producer in event.producers
-    )
-    if any(relation is None for relation in publication_relations) or any(
-        relation is None for relation in producers_by_key_relations
-    ):
+    if any(relation is None for relation in publication_relations):
         return None
-    for producers_by_key, publication in zip(
-        producers_by_key_relations,
+    producers_by_key_relations: list[CoordinateRelation] = []
+    semantic_keys_by_segment: CoordinateRelation | None = None
+    for readiness_producer, publication in zip(
+        event.producers,
         publication_relations,
         strict=True,
     ):
-        assert producers_by_key is not None and publication is not None
-        tile_dependency._remember_exact_converse(producers_by_key, publication)
+        assert publication is not None
+        producers_by_key = publication.converse()
+        if producers_by_key is None:
+            if semantic_keys_by_segment is None:
+                semantic_keys_by_segment = key_coarsening.converse()
+            if semantic_keys_by_segment is None:
+                return None
+            producers_by_key = semantic_keys_by_segment.then(
+                readiness_producer.producers_by_key
+            )
+            if producers_by_key is None:
+                return None
+            tile_dependency._remember_exact_converse(producers_by_key, publication)
+        producers_by_key_relations.append(producers_by_key)
     keys_by_consumer = keys_by_reduced_iteration.lift_source(domain)
     if keys_by_consumer is None:
         return None
@@ -4592,7 +4597,7 @@ def _segmented_nested_loop_counter(
             )
             for readiness_producer, relation in zip(
                 event.producers,
-                producers_by_key_relations,
+                tuple(producers_by_key_relations),
                 strict=True,
             )
             if relation is not None
