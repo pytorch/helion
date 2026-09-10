@@ -1527,21 +1527,36 @@ class CoordinateRelation:
     def _positional_product(
         self,
     ) -> tuple[tuple[tuple[int, int], ...], CoordinateRelation] | None:
-        """Factor positional axes from a static residual relation.
+        """Factor positional axes from a nonempty static residual relation.
 
         An axis is removable only when every relation piece spans that complete
         source axis and maps it point-for-point onto one equally sized target
-        axis. The residual relation must be fully concrete. This is an exact
-        Cartesian-product proof, not a sampled-shape shortcut.
+        axis. Runtime-sized positional axes take priority: they are the factors
+        that prevent the residual relation from using bounded concrete proofs.
+        With no runtime axes, positional factors are removed only around an
+        existing non-positional core. The residual relation must be nonempty and
+        fully concrete. This is an exact Cartesian-product proof, not a
+        sampled-shape shortcut.
         """
         if not self.pieces:
             return None
         source_counts = self.source_domain.axis_count_expressions
         target_counts = self.target_domain.axis_count_expressions
+        parameterized_source_axes = tuple(
+            axis
+            for axis in self.source_domain.axis_order
+            if _integer_expression(
+                source_counts[axis],
+                description="coordinate-domain axis count",
+            ).free_symbols
+        )
+        source_axes_to_consider = (
+            parameterized_source_axes or self.source_domain.axis_order
+        )
 
         pairs: list[tuple[int, int]] = []
         used_target_axes: set[int] = set()
-        for source_axis in self.source_domain.axis_order:
+        for source_axis in source_axes_to_consider:
             source_count = _integer_expression(
                 source_counts[source_axis],
                 description="coordinate-domain axis count",
@@ -1612,17 +1627,23 @@ class CoordinateRelation:
             return None
 
         paired_source_axes = frozenset(source_axis for source_axis, _ in pairs)
+        residual_source_counts = tuple(
+            (axis, count)
+            for axis, count in self.source_domain.axis_counts_items
+            if axis not in paired_source_axes
+        )
+        residual_target_counts = tuple(
+            (axis, count)
+            for axis, count in self.target_domain.axis_counts_items
+            if axis not in used_target_axes
+        )
         residual_source = CoordinateDomain(
             axis_order=tuple(
                 axis
                 for axis in self.source_domain.axis_order
                 if axis not in paired_source_axes
             ),
-            axis_counts_items=tuple(
-                (axis, count)
-                for axis, count in self.source_domain.axis_counts_items
-                if axis not in paired_source_axes
-            ),
+            axis_counts_items=residual_source_counts,
             block_sizes_items=tuple(
                 (axis, size)
                 for axis, size in self.source_domain.block_sizes_items
@@ -1630,7 +1651,14 @@ class CoordinateRelation:
             ),
             kind=self.source_domain.kind,
             identity=self.source_domain.identity,
-            _allow_empty=self.source_domain._allow_empty,
+            _allow_empty=any(
+                _integer_expression(
+                    count,
+                    description="coordinate-domain axis count",
+                ).is_zero
+                is True
+                for _axis, count in residual_source_counts
+            ),
         )
         residual_target = CoordinateDomain(
             axis_order=tuple(
@@ -1638,11 +1666,7 @@ class CoordinateRelation:
                 for axis in self.target_domain.axis_order
                 if axis not in used_target_axes
             ),
-            axis_counts_items=tuple(
-                (axis, count)
-                for axis, count in self.target_domain.axis_counts_items
-                if axis not in used_target_axes
-            ),
+            axis_counts_items=residual_target_counts,
             block_sizes_items=tuple(
                 (axis, size)
                 for axis, size in self.target_domain.block_sizes_items
@@ -1650,7 +1674,14 @@ class CoordinateRelation:
             ),
             kind=self.target_domain.kind,
             identity=self.target_domain.identity,
-            _allow_empty=self.target_domain._allow_empty,
+            _allow_empty=any(
+                _integer_expression(
+                    count,
+                    description="coordinate-domain axis count",
+                ).is_zero
+                is True
+                for _axis, count in residual_target_counts
+            ),
         )
         residual = CoordinateRelation(
             source_domain=residual_source,

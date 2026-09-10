@@ -3180,6 +3180,35 @@ class TestTileDependency(TestCase):
         self.assertTrue(required.is_single_valued())
         self.assertFalse(required.covers(available))
 
+    def test_positional_product_does_not_hide_runtime_residual(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        source = CoordinateDomain(
+            (10, 11),
+            ((10, batch), (11, 2)),
+            identity=0,
+        )
+        target = CoordinateDomain(
+            (20, 21),
+            ((20, batch), (21, 2)),
+            identity=1,
+        )
+        outer = coordinate_axis_symbol(10)
+        inner = coordinate_axis_symbol(11)
+        relation = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (
+                    ((10, 0, batch, 1), (11, 0, 2, 1)),
+                    (batch - outer - 1, inner),
+                ),
+            ),
+        )
+
+        # The static identity axis is not a useful Cartesian factor when the
+        # remaining runtime axis is non-positional.
+        self.assertIsNone(relation._positional_product)
+
     def test_relation_operations_decline_before_oversized_products(self) -> None:
         domain = CoordinateDomain((10,), ((10, 4),), identity=0)
         coordinate = coordinate_axis_symbol(10)
