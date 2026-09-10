@@ -3871,8 +3871,8 @@ class TestTileDependency(TestCase):
 
     def test_target_value_extreme_retains_complete_plateaus(self) -> None:
         source = CoordinateDomain((), (), kind="event")
-        target = CoordinateDomain((20,), ((20, 8),), kind="site")
-        values = CoordinateDomain((30,), ((30, 4),), kind="value")
+        target = CoordinateDomain((20,), ((20, 4),), kind="site")
+        values = CoordinateDomain((30,), ((30, 3),), kind="value")
         target_coordinate = coordinate_axis_symbol(20)
         required = CoordinateRelation.total(source, target)
         value_by_target = CoordinateRelation.point_map(
@@ -3880,8 +3880,8 @@ class TestTileDependency(TestCase):
             values,
             (
                 (
-                    ((20, 0, 8, 1),),
-                    (sympy.floor(target_coordinate / 2),),  # pyrefly: ignore[unsupported-operation]
+                    ((20, 0, 4, 1),),
+                    (sympy.floor((target_coordinate + 2) / 2),),  # pyrefly: ignore[unsupported-operation]
                 ),
             ),
         )
@@ -3899,19 +3899,38 @@ class TestTileDependency(TestCase):
         self.assertIsNotNone(minimum)
         assert maximum is not None
         assert minimum is not None
-        self.assertEqual(maximum[0].materialize(), (frozenset((3,)),))
-        self.assertEqual(maximum[1].materialize(), (frozenset((6, 7)),))
-        self.assertEqual(minimum[0].materialize(), (frozenset((0,)),))
+        self.assertEqual(maximum[0].materialize(), (frozenset((2,)),))
+        self.assertEqual(maximum[1].materialize(), (frozenset((2, 3)),))
+        self.assertEqual(minimum[0].materialize(), (frozenset((1,)),))
         self.assertEqual(minimum[1].materialize(), (frozenset((0, 1)),))
 
-        empty = CoordinateRelation(source, target, ())
-        empty_result = empty.extreme_target_value_and_attainers_by_source(
-            value_by_target,
-            maximize=True,
+        empty_relations = (
+            CoordinateRelation(source, target, ()),
+            *(
+                CoordinateRelation(
+                    source,
+                    target,
+                    (
+                        _CoordinateRelationPiece(
+                            (),
+                            ((20, point, point, 1),),  # pyrefly: ignore[bad-argument-type]
+                        ),
+                    ),
+                )
+                for point in (0, 2, 4)
+            ),
         )
-        self.assertIsNotNone(empty_result)
-        assert empty_result is not None
-        self.assertEqual((empty_result[0].pieces, empty_result[1].pieces), ((), ()))
+        for empty in empty_relations:
+            empty_result = empty.extreme_target_value_and_attainers_by_source(
+                value_by_target,
+                maximize=True,
+            )
+            self.assertIsNotNone(empty_result)
+            assert empty_result is not None
+            self.assertEqual(
+                (empty_result[0].pieces, empty_result[1].pieces),
+                ((), ()),
+            )
 
     def test_target_value_extreme_retains_tied_boxes_and_affine_face(self) -> None:
         source = CoordinateDomain((), (), kind="event")
@@ -3966,6 +3985,94 @@ class TestTileDependency(TestCase):
             affine_maximum[1].target_coordinates({}),
             frozenset((2, column) for column in range(4)),
         )
+
+    def test_target_value_extreme_partitions_affine_source_crossing(self) -> None:
+        source_axis = 10
+        target_axis = 20
+        source = CoordinateDomain((source_axis,), ((source_axis, 4),), kind="event")
+        target = CoordinateDomain((target_axis,), ((target_axis, 4),), kind="site")
+        values = CoordinateDomain((30,), ((30, 4),), kind="value")
+        source_coordinate = coordinate_axis_symbol(source_axis)
+        target_coordinate = coordinate_axis_symbol(target_axis)
+        pieces = (
+            _CoordinateRelationPiece(
+                ((source_axis, 0, 4, 1),),
+                ((target_axis, source_coordinate, source_coordinate + 1, 1),),  # pyrefly: ignore[unsupported-operation]
+            ),
+            _CoordinateRelationPiece(
+                ((source_axis, 0, 4, 1),),
+                ((target_axis, 3 - source_coordinate, 4 - source_coordinate, 1),),  # pyrefly: ignore[unsupported-operation]
+            ),
+        )
+        value_by_target = CoordinateRelation.point_map(
+            target,
+            values,
+            ((((target_axis, 0, 4, 1),), (target_coordinate,)),),
+        )
+
+        results = []
+        for ordered_pieces in (pieces, tuple(reversed(pieces))):
+            required = CoordinateRelation(source, target, ordered_pieces)
+            maximum = required.extreme_target_value_and_attainers_by_source(
+                value_by_target,
+                maximize=True,
+            )
+            minimum = required.extreme_target_value_and_attainers_by_source(
+                value_by_target,
+                maximize=False,
+            )
+            self.assertIsNotNone(maximum)
+            self.assertIsNotNone(minimum)
+            assert maximum is not None
+            assert minimum is not None
+            self.assertEqual(
+                maximum[0].materialize(),
+                tuple(frozenset((value,)) for value in (3, 2, 2, 3)),
+            )
+            self.assertEqual(maximum[1].materialize(), maximum[0].materialize())
+            self.assertEqual(
+                minimum[0].materialize(),
+                tuple(frozenset((value,)) for value in (0, 1, 1, 0)),
+            )
+            self.assertEqual(minimum[1].materialize(), minimum[0].materialize())
+            results.append((maximum, minimum))
+        self.assertEqual(results[0], results[1])
+
+        with mock.patch(
+            "helion._compiler.tile_dependency._MAX_RELATION_PRODUCT_STATES",
+            4,
+        ):
+            self.assertIsNone(
+                CoordinateRelation(
+                    source, target, pieces
+                ).extreme_target_value_and_attainers_by_source(
+                    value_by_target,
+                    maximize=True,
+                )
+            )
+
+    def test_target_value_extreme_handles_identity_axis_alias(self) -> None:
+        domain = CoordinateDomain((20,), ((20, 4),), kind="site")
+        values = CoordinateDomain((30,), ((30, 4),), kind="value")
+        value_by_target = CoordinateRelation.point_map(
+            domain,
+            values,
+            ((((20, 0, 4, 1),), (coordinate_axis_symbol(20),)),),
+        )
+
+        result = CoordinateRelation.identity(
+            domain,
+            domain,
+        ).extreme_target_value_and_attainers_by_source(
+            value_by_target,
+            maximize=True,
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        expected = tuple(frozenset((coordinate,)) for coordinate in range(4))
+        self.assertEqual(result[0].materialize(), expected)
+        self.assertEqual(result[1].materialize(), expected)
 
     def test_target_value_extreme_declines_unrepresentable_guards_and_levels(
         self,

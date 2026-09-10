@@ -4186,8 +4186,8 @@ class CoordinateRelation:
         are constructed from the same candidate proofs so ties cannot lose
         their value/target correlation.
 
-        Unsupported level sets and source-dependent winner partitions decline
-        rather than selecting one witness or enumerating a runtime extent.
+        Unrepresentable level sets and winner partitions decline rather than
+        selecting one witness or enumerating a runtime extent.
         """
         result = self._target_value_extreme_by_source(
             values,
@@ -4256,6 +4256,10 @@ class CoordinateRelation:
                 )
                 for bounds in cells
             )
+        if include_attainers:
+            active_pieces_by_cell = tuple(
+                sorted(active_pieces_by_cell, key=lambda item: repr(item[0]))
+            )
         value_axis = values.target_domain.axis_order[0]
         value_pieces: list[_CoordinateRelationPiece] = []
         attainer_pieces: dict[_CoordinateRelationPiece, None] = {}
@@ -4277,6 +4281,11 @@ class CoordinateRelation:
                         "tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...]",
                         intersection,
                     )
+                    if any(
+                        _integer_partition_expressions_equal(begin, end)
+                        for _axis, begin, end, _step in intersected_ranges
+                    ):
+                        continue
                     if not _target_box_is_nonempty_for_all_sources(
                         intersected_ranges,
                         source_domain=self.source_domain,
@@ -4327,7 +4336,17 @@ class CoordinateRelation:
                         return None
             if not candidates:
                 continue
-            ordered_candidates = tuple(candidates)
+            ordered_candidates = tuple(
+                sorted(
+                    candidates,
+                    key=lambda candidate: (
+                        sympy.srepr(candidate[0]),
+                        repr(candidate[1]),
+                    ),
+                )
+                if include_attainers
+                else candidates
+            )
             if not include_attainers:
                 extreme = _max_target_value_expression(
                     tuple(candidate[0] for candidate in ordered_candidates),
@@ -4347,36 +4366,38 @@ class CoordinateRelation:
                 )
                 continue
 
-            winner_indices = _extreme_candidate_indices(
+            winner_cells = _extreme_candidate_source_cells(
                 tuple(candidate[0] for candidate in ordered_candidates),
                 source_domain=self.source_domain,
                 source_bounds=source_bounds,
                 parameter_symbols=self.parameter_symbols | values.parameter_symbols,
                 maximize=maximize,
             )
-            if winner_indices is None:
+            if winner_cells is None:
                 return None
-            extreme = ordered_candidates[winner_indices[0]][0]
-            value_pieces.append(
-                _CoordinateRelationPiece(
-                    source_bounds_items=source_bounds,
-                    target_ranges=((value_axis, extreme, extreme + 1, 1),),  # pyrefly: ignore[unsupported-operation]
-                )
-            )
-            for winner_index in winner_indices:
-                target_ranges = ordered_candidates[winner_index][1]
-                assert target_ranges is not None
-                attainer_pieces.setdefault(
+            for winner_bounds, winner_indices in winner_cells:
+                extreme = ordered_candidates[winner_indices[0]][0]
+                value_pieces.append(
                     _CoordinateRelationPiece(
-                        source_bounds_items=source_bounds,
-                        target_ranges=target_ranges,
-                    ),
-                    None,
+                        source_bounds_items=winner_bounds,
+                        target_ranges=((value_axis, extreme, extreme + 1, 1),),  # pyrefly: ignore[unsupported-operation]
+                    )
                 )
-                if len(attainer_pieces) > _MAX_RELATION_PIECES:
+                for winner_index in winner_indices:
+                    target_ranges = ordered_candidates[winner_index][1]
+                    assert target_ranges is not None
+                    attainer_pieces.setdefault(
+                        _CoordinateRelationPiece(
+                            source_bounds_items=winner_bounds,
+                            target_ranges=target_ranges,
+                        ),
+                        None,
+                    )
+                if (
+                    len(value_pieces) > _MAX_RELATION_PIECES
+                    or len(attainer_pieces) > _MAX_RELATION_PIECES
+                ):
                     return None
-            if len(value_pieces) > _MAX_RELATION_PIECES:
-                return None
         value_relation = CoordinateRelation(
             source_domain=self.source_domain,
             target_domain=values.target_domain,
@@ -7170,14 +7191,27 @@ def _target_box_expression_extreme_with_attainers(
     }
     expression = cast("sympy.Expr", expression.xreplace(point_substitutions))
     target_symbols = {
-        coordinate_axis_symbol(axis) for axis, _begin, _end, _step in target_ranges
+        coordinate_axis_symbol(axis)
+        for axis, _begin, _end, _step in target_ranges
+        if coordinate_axis_symbol(axis) not in point_substitutions
     }
     if not expression.free_symbols & target_symbols:
         return extreme, target_ranges
 
-    quotient = _static_integer_quotient(expression)
+    target_terms = tuple(
+        term
+        for term in sympy.Add.make_args(expression)
+        if term.free_symbols & target_symbols
+    )
+    quotient = (
+        _static_integer_quotient(cast("sympy.Expr", target_terms[0]))
+        if len(target_terms) == 1
+        else None
+    )
     if quotient is not None:
         numerator, denominator = quotient
+        additive_offset = sympy.simplify(expression - target_terms[0])  # pyrefly: ignore[unsupported-operation]
+        quotient_extreme = sympy.simplify(extreme - additive_offset)  # pyrefly: ignore[unsupported-operation]
         numerator_target_symbols = numerator.free_symbols & target_symbols
         if len(numerator_target_symbols) != 1:
             return None
@@ -7194,8 +7228,8 @@ def _target_box_expression_extreme_with_attainers(
         axis, begin, end, step = next(
             item for item in target_ranges if coordinate_axis_symbol(item[0]) == symbol
         )
-        lower = extreme * denominator  # pyrefly: ignore[unsupported-operation]
-        upper = (extreme + 1) * denominator  # pyrefly: ignore[unsupported-operation]
+        lower = quotient_extreme * denominator  # pyrefly: ignore[unsupported-operation]
+        upper = (quotient_extreme + 1) * denominator  # pyrefly: ignore[unsupported-operation]
         if coefficient > 0:
             raw_begin = sympy.ceiling((lower - offset) / coefficient)  # pyrefly: ignore[unsupported-operation]
             raw_end = sympy.ceiling((upper - offset) / coefficient)  # pyrefly: ignore[unsupported-operation]
@@ -7236,9 +7270,11 @@ def _target_box_expression_extreme_with_attainers(
     choices = dict(endpoint_choices)
     result: list[tuple[int, sympy.Expr, sympy.Expr, int]] = []
     for axis, begin, end, step in target_ranges:
-        coefficient = sympy.simplify(
-            sympy.diff(expression, coordinate_axis_symbol(axis))
-        )
+        symbol = coordinate_axis_symbol(axis)
+        if symbol not in target_symbols:
+            result.append((axis, begin, end, step))
+            continue
+        coefficient = sympy.simplify(sympy.diff(expression, symbol))
         if coefficient.is_zero is True:  # pyrefly: ignore[missing-attribute]
             result.append((axis, begin, end, step))
             continue
@@ -7550,6 +7586,91 @@ def _target_box_expression_extreme_proof_uncached(
             endpoint_choices,
         )
     return None
+
+
+def _extreme_candidate_source_cells(
+    candidate_values: tuple[sympy.Expr, ...],
+    *,
+    source_domain: CoordinateDomain,
+    source_bounds: _SourceBounds,
+    parameter_symbols: frozenset[sympy.Symbol],
+    maximize: bool,
+) -> tuple[tuple[_SourceBounds, tuple[int, ...]], ...] | None:
+    """Partition one bounded affine source axis wherever a winner changes."""
+    winners = _extreme_candidate_indices(
+        candidate_values,
+        source_domain=source_domain,
+        source_bounds=source_bounds,
+        parameter_symbols=parameter_symbols,
+        maximize=maximize,
+    )
+    if winners is not None:
+        return ((source_bounds, winners),)
+    if len(source_bounds) != 1 or not _relation_product_is_within_budget(
+        len(candidate_values), len(candidate_values)
+    ):
+        return None
+    axis, begin_expression, end_expression, step = source_bounds[0]
+    begin = sympy.simplify(begin_expression)
+    end = sympy.simplify(end_expression)
+    if (
+        step != 1
+        or not isinstance(begin, sympy.Integer)
+        or not isinstance(end, sympy.Integer)
+    ):
+        return None
+    coordinate = coordinate_axis_symbol(axis)
+    cuts = {int(begin), int(end)}
+    for left in range(len(candidate_values)):
+        for right in range(left + 1, len(candidate_values)):
+            difference = sympy.expand(
+                candidate_values[left] - candidate_values[right]  # pyrefly: ignore[unsupported-operation]
+            )
+            coefficient = sympy.simplify(difference.coeff(coordinate))
+            offset = sympy.simplify(difference - coefficient * coordinate)  # pyrefly: ignore[unsupported-operation]
+            if (
+                coefficient.free_symbols
+                or offset.free_symbols
+                or coefficient.is_rational is not True  # pyrefly: ignore[missing-attribute]
+                or offset.is_rational is not True  # pyrefly: ignore[missing-attribute]
+            ):
+                return None
+            if coefficient == 0:
+                continue
+            root = sympy.simplify(-offset / coefficient)  # pyrefly: ignore[unsupported-operation]
+            floor_root = sympy.floor(root)
+            if not isinstance(floor_root, sympy.Integer):
+                return None
+            floor_value = int(floor_root)
+            new_cuts = (
+                (floor_value, floor_value + 1)
+                if _integer_partition_expressions_equal(root, floor_root)
+                else (floor_value + 1,)
+            )
+            cuts.update(cut for cut in new_cuts if int(begin) < cut < int(end))
+            if len(cuts) - 1 > _MAX_RELATION_PIECES:
+                return None
+    ordered_cuts = sorted(cuts)
+    if not _relation_product_is_within_budget(
+        len(ordered_cuts),
+        len(candidate_values),
+        len(candidate_values),
+    ):
+        return None
+    result: list[tuple[_SourceBounds, tuple[int, ...]]] = []
+    for cell_begin, cell_end in itertools.pairwise(ordered_cuts):
+        cell = ((axis, cell_begin, cell_end, 1),)
+        winners = _extreme_candidate_indices(
+            candidate_values,
+            source_domain=source_domain,
+            source_bounds=cell,
+            parameter_symbols=parameter_symbols,
+            maximize=maximize,
+        )
+        if winners is None:
+            return None
+        result.append((cell, winners))
+    return tuple(result)
 
 
 def _extreme_candidate_indices(
