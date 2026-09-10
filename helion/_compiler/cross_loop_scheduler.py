@@ -1365,55 +1365,87 @@ def _parametric_root_major_relation(
     target_coordinates = tuple(
         logical_coordinates[axis] for axis in target_domain.axis_order
     )
-    relation = CoordinateRelation.point_map(
-        schedule_domain,
-        target_domain,
+    aligned_full_waves = cast("sympy.Expr", FloorDiv(task_count, worker_count))
+    is_wave_aligned = _equal_integer_expressions(first_worker, 0) and (
+        _equal_integer_expressions(
+            aligned_full_waves * worker_count,
+            task_count,
+        )
+    )
+    source_pieces = (
         (
             (
                 (
-                    (
-                        launch_stage_axis,
-                        _RESIDENT_LAUNCH_STAGE,
-                        _RESIDENT_LAUNCH_STAGE + 1,
-                        1,
-                    ),
-                    (
-                        worker_axis,
-                        first_worker,
-                        first_worker + first_count,
-                        1,
-                    ),
-                    (wave_axis, first_wave, first_wave + 1, 1),
+                    launch_stage_axis,
+                    _RESIDENT_LAUNCH_STAGE,
+                    _RESIDENT_LAUNCH_STAGE + 1,
+                    1,
                 ),
-                target_coordinates,
-            ),
-            (
+                (worker_axis, 0, worker_count, 1),
                 (
-                    (
-                        launch_stage_axis,
-                        _RESIDENT_LAUNCH_STAGE,
-                        _RESIDENT_LAUNCH_STAGE + 1,
-                        1,
-                    ),
-                    (worker_axis, 0, worker_count, 1),
-                    (wave_axis, middle_wave_begin, middle_wave_end, 1),
+                    wave_axis,
+                    first_wave,
+                    sympy.simplify(first_wave + aligned_full_waves),
+                    1,
                 ),
-                target_coordinates,
             ),
-            (
-                (
-                    (
-                        launch_stage_axis,
-                        _RESIDENT_LAUNCH_STAGE,
-                        _RESIDENT_LAUNCH_STAGE + 1,
-                        1,
-                    ),
-                    (worker_axis, 0, tail_count, 1),
-                    (wave_axis, middle_wave_end, final_wave_end, 1),
-                ),
-                target_coordinates,
-            ),
+            target_coordinates,
         ),
+    ) if is_wave_aligned else (
+        (
+            (
+                (
+                    launch_stage_axis,
+                    _RESIDENT_LAUNCH_STAGE,
+                    _RESIDENT_LAUNCH_STAGE + 1,
+                    1,
+                ),
+                (
+                    worker_axis,
+                    first_worker,
+                    first_worker + first_count,
+                    1,
+                ),
+                    (
+                        wave_axis,
+                        first_wave,
+                        sympy.simplify(first_wave + 1),
+                        1,
+                    ),
+            ),
+            target_coordinates,
+        ),
+        (
+            (
+                (
+                    launch_stage_axis,
+                    _RESIDENT_LAUNCH_STAGE,
+                    _RESIDENT_LAUNCH_STAGE + 1,
+                    1,
+                ),
+                (worker_axis, 0, worker_count, 1),
+                (wave_axis, middle_wave_begin, middle_wave_end, 1),
+            ),
+            target_coordinates,
+        ),
+        (
+            (
+                (
+                    launch_stage_axis,
+                    _RESIDENT_LAUNCH_STAGE,
+                    _RESIDENT_LAUNCH_STAGE + 1,
+                    1,
+                ),
+                (worker_axis, 0, tail_count, 1),
+                (wave_axis, middle_wave_end, final_wave_end, 1),
+            ),
+            target_coordinates,
+        ),
+    )
+    relation = CoordinateRelation.point_map(
+        schedule_domain,
+        target_domain,
+        source_pieces,
     )
     relation = dataclasses.replace(
         relation,
@@ -1518,7 +1550,10 @@ def _packed_root_major_task_order_relation(
     worker_count: int,
 ) -> CoordinateRelation | None:
     """Compose packed schedule slots with one configured logical traversal."""
-    if task_order.converse() is None:
+    if (
+        not task_order.is_bijection_from_source_support()
+        or task_order.converse() is None
+    ):
         return None
     packed_source = _parametric_root_major_relation(
         schedule_domain,
@@ -1528,13 +1563,6 @@ def _packed_root_major_task_order_relation(
         task_order.source_domain.axis_order,
     )
     if (composed := packed_source.then(task_order)) is not None:
-        return composed
-    if (
-        composed := _compose_packed_with_total_point_map(
-            packed_source,
-            task_order,
-        )
-    ) is not None:
         return composed
 
     # Piecewise orders such as L2 grouping may guard only an interval of their
@@ -1583,66 +1611,7 @@ def _packed_root_major_task_order_relation(
             return None
     if packed_order is None:
         return None
-    if (composed := packed_order.then(flat_task_order)) is not None:
-        return composed
-    return _compose_packed_with_total_point_map(packed_order, flat_task_order)
-
-
-def _compose_packed_with_total_point_map(
-    packed_order: CoordinateRelation,
-    following: CoordinateRelation,
-) -> CoordinateRelation | None:
-    """Compose a proved packed placement with one total configured point map."""
-    if (
-        packed_order.target_domain != following.source_domain
-        or len(following.pieces) != 1
-        or tile_dependency._memoized_exact_converse(packed_order) is None
-        or tile_dependency._memoized_exact_converse(following) is None
-    ):
-        return None
-    (following_piece,) = following.pieces
-    if following_piece.source_bounds_items != tuple(
-        (
-            axis,
-            0,
-            following.source_domain.axis_count_expressions[axis],
-            1,
-        )
-        for axis in following.source_domain.axis_order
-    ) or any(
-        step != 1 or not _equal_integer_expressions(end - begin, 1)
-        for _axis, begin, end, step in following_piece.target_ranges
-    ):
-        return None
-    pieces = []
-    for packed_piece in packed_order.pieces:
-        substitutions = {
-            coordinate_axis_symbol(axis): begin
-            for axis, begin, _end, _step in packed_piece.target_ranges
-        }
-        target_coordinates = tuple(
-            tile_dependency._substitute_composed_expression(
-                begin,
-                substitutions=substitutions,
-                source_domain=packed_order.source_domain,
-                source_bounds=packed_piece.source_bounds_items,
-            )
-            for _axis, begin, _end, _step in following_piece.target_ranges
-        )
-        pieces.append((packed_piece.source_bounds_items, target_coordinates))
-    result = CoordinateRelation.point_map(
-        packed_order.source_domain,
-        following.target_domain,
-        tuple(pieces),
-    )
-    packed_converse = tile_dependency._memoized_exact_converse(packed_order)
-    following_converse = tile_dependency._memoized_exact_converse(following)
-    assert packed_converse is not None and following_converse is not None
-    converse = following_converse.then(packed_converse)
-    if converse is None:
-        return None
-    tile_dependency._remember_exact_converse(result, converse)
-    return result
+    return packed_order.then(flat_task_order)
 
 
 def _parametric_root_major_axis_order(

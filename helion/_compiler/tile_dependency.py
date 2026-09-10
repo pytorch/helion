@@ -1851,6 +1851,8 @@ class CoordinateRelation:
                 pieces=(),
             )
             return _remember_exact_converse(self, converse)
+        if (converse := _coordinate_permutation_converse(self)) is not None:
+            return _remember_exact_converse(self, converse)
         if self.is_positional_bijection():
             converse = self.derive_converse_and_target_counts()[0]
             return (
@@ -2907,6 +2909,26 @@ class CoordinateRelation:
         """Return whether every source instance maps to at most one target."""
         if len(self.pieces) > _MAX_RELATION_PIECES:
             return False
+        if all(
+            step == 1
+            and _integer_partition_expressions_equal(end - begin, 1)
+            for piece in self.pieces
+            for _axis, begin, end, step in piece.target_ranges
+        ) and (
+            len(self.pieces) <= 1
+            or (
+                _relation_product_is_within_budget(
+                    len(self.pieces),
+                    len(self.pieces),
+                )
+                and all(
+                    _source_boxes_are_disjoint(left, right)
+                    for index, left in enumerate(self.pieces)
+                    for right in self.pieces[index + 1 :]
+                )
+            )
+        ):
+            return True
         positional_product = self._parameterized_positional_product
         if positional_product is not None:
             _positional_axes, residual = positional_product
@@ -4193,6 +4215,50 @@ def _source_box_cardinality(
     return sympy.simplify(cardinality)
 
 
+def _has_unclipped_point_source_support(relation: CoordinateRelation) -> bool:
+    """Prove every raw source-box point denotes one in-domain target point.
+
+    An exact converse that is total proves that every target has one source.
+    If the disjoint raw source boxes contain exactly that many points and the
+    forward relation is point-valued, no raw point can have been removed by
+    target-domain clipping.  This is the generic support fact needed to
+    compose through a full intermediate-domain piece without re-solving each
+    mixed-radix range expression.
+    """
+    converse = _memoized_exact_converse(relation)
+    if converse is None or not converse.is_total_function():
+        return False
+    pieces = _nonempty_relation_pieces(relation)
+    if any(
+        not _source_bounds_are_symbolically_within_domain(
+            piece.source_bounds_items,
+            relation.source_domain,
+        )
+        or any(
+            step != 1
+            or not _integer_partition_expressions_equal(end - begin, 1)
+            for _axis, begin, end, step in piece.target_ranges
+        )
+        for piece in pieces
+    ) or any(
+        not _source_boxes_are_disjoint(left, right)
+        for index, left in enumerate(pieces)
+        for right in pieces[index + 1 :]
+    ):
+        return False
+    cardinalities = tuple(
+        _source_box_cardinality(
+            piece.source_bounds_items,
+            domain=relation.source_domain,
+        )
+        for piece in pieces
+    )
+    return None not in cardinalities and _integer_partition_expressions_equal(
+        sympy.Add(*(value for value in cardinalities if value is not None)),
+        relation.target_domain.size_expr,
+    )
+
+
 _DERIVED_EXACT_CONVERSE_ATTRIBUTE = "_derived_exact_converse"
 
 
@@ -4302,6 +4368,40 @@ def _coordinate_permutation_axes(
         if tuple(result) == relation.target_domain.axis_order
         and len(result) == len(relation.source_domain.axis_order)
         else None
+    )
+
+
+def _coordinate_permutation_converse(
+    relation: CoordinateRelation,
+) -> CoordinateRelation | None:
+    """Invert a complete coordinate permutation without radix reconstruction."""
+    target_to_source = _coordinate_permutation_axes(relation)
+    if target_to_source is None:
+        return None
+    source_to_target = {
+        source_axis: target_axis
+        for target_axis, source_axis in target_to_source.items()
+    }
+    return CoordinateRelation.point_map(
+        relation.target_domain,
+        relation.source_domain,
+        (
+            (
+                tuple(
+                    (
+                        axis,
+                        0,
+                        relation.target_domain.axis_count_expressions[axis],
+                        1,
+                    )
+                    for axis in relation.target_domain.axis_order
+                ),
+                tuple(
+                    coordinate_axis_symbol(source_to_target[axis])
+                    for axis in relation.source_domain.axis_order
+                ),
+            ),
+        ),
     )
 
 
@@ -6266,15 +6366,41 @@ def _target_point_is_in_domain(
             domain=source_domain,
             source_bounds=source_bounds,
         )
+        lower_is_in_domain = bounds is not None and _is_provably_nonnegative(
+            bounds[0],
+            None,
+        )
+        upper_is_in_domain = bounds is not None and _is_provably_nonnegative(
+            sympy.simplify(
+                target_domain.axis_count_expressions[axis] - 1 - bounds[1]
+            ),
+            None,
+        )
+        quotient = _static_integer_quotient(begin)
+        if not upper_is_in_domain and quotient is not None:
+            numerator, denominator = quotient
+            numerator_bounds = _logical_expression_bounds(
+                numerator,
+                domain=source_domain,
+                source_bounds=source_bounds,
+            )
+            upper_is_in_domain = (
+                numerator_bounds is not None
+                and _is_provably_nonnegative(numerator_bounds[0], None)
+                and _is_provably_nonnegative(
+                    sympy.simplify(
+                        denominator
+                        * target_domain.axis_count_expressions[axis]
+                        - 1
+                        - numerator_bounds[1]
+                    ),
+                    None,
+                )
+            )
         if (
             bounds is None
-            or not _is_provably_nonnegative(bounds[0], None)
-            or not _is_provably_nonnegative(
-                sympy.simplify(
-                    target_domain.axis_count_expressions[axis] - 1 - bounds[1]
-                ),
-                None,
-            )
+            or not lower_is_in_domain
+            or not upper_is_in_domain
         ):
             return False
     return True
@@ -8378,6 +8504,7 @@ def _compose_point_relations(
     ):
         return None
     pieces: dict[_CoordinateRelationPiece, None] = {}
+    unclipped_point_support: bool | None = None
     for first_piece in first.pieces:
         first_targets = {
             axis: begin for axis, begin, _end, _step in first_piece.target_ranges
@@ -8409,9 +8536,9 @@ def _compose_point_relations(
                         source_bounds=first_piece.source_bounds_items,
                     )
                     if (
-                        target_bounds is None
-                        or not _is_provably_nonnegative(target_bounds[0], None)
-                        or not _is_provably_nonnegative(
+                        target_bounds is not None
+                        and _is_provably_nonnegative(target_bounds[0], None)
+                        and _is_provably_nonnegative(
                             sympy.simplify(
                                 first.target_domain.axis_count_expressions[axis]
                                 - 1
@@ -8420,6 +8547,12 @@ def _compose_point_relations(
                             None,
                         )
                     ):
+                        continue
+                    if unclipped_point_support is None:
+                        unclipped_point_support = (
+                            _has_unclipped_point_source_support(first)
+                        )
+                    if not unclipped_point_support:
                         return None
                     continue
                 expression_bounds = _logical_expression_bounds(
