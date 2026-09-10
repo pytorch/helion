@@ -1388,36 +1388,15 @@ def _ensure_torch_tpu_cpu_export_info() -> None:
     _ensure_cpu_tpu_info(get_tpu_device_name())
 
 
-def _x64_disabled_scope() -> object:
-    """Return a context manager that disables JAX x64 for a Pallas trace."""
-    import jax
-
-    state = getattr(jax, "enable_x64", None)
-    if callable(state):
-        return state(False)
-    try:
-        from jax.experimental import x64_context
-    except ImportError:
-        x64_context = None  # type: ignore[assignment]
-    disable = getattr(x64_context, "_disable_x64", None) or getattr(
-        x64_context, "disable_x64", None
-    )
-    if disable is not None:
-        return disable()
-    raise RuntimeError(
-        "Helion needs to scope jax_enable_x64 around a Pallas kernel, but JAX "
-        f"{getattr(jax, '__version__', '?')} exposes neither jax.enable_x64 nor "
-        "jax.experimental.x64_context"
-    )
-
-
-def _is_64bit_int(x: object) -> bool:
-    dtype = getattr(x, "dtype", None)
+def _is_64bit_int(x: object) -> TypeGuard[_TorchTensorOrJaxArray]:
+    if not _is_torch_tensor_or_jax_array(x):
+        return False
+    dtype = x.dtype
     kind = getattr(dtype, "kind", None)
     return kind in ("i", "u") and getattr(dtype, "itemsize", 0) == 8
 
 
-def _x64_scoped_jit_fn(jit_fn: object) -> object:
+def _x64_scoped_jit_fn(jit_fn: Callable[..., object]) -> Callable[..., object]:
     """Trace a Helion Pallas kernel with JAX x64 disabled.
 
     Pallas grid, DMA-slice, and tiling arithmetic are int32. Python integer
@@ -1427,19 +1406,21 @@ def _x64_scoped_jit_fn(jit_fn: object) -> object:
     unchanged.
     """
 
-    @functools.wraps(jit_fn)  # pyrefly: ignore[bad-argument-type]
+    import jax
+
+    @functools.wraps(jit_fn)
     def wrapper(*args: object, **kwargs: object) -> object:
-        wide = [a for a in args if _is_64bit_int(a)]
+        wide = [a for a in (*args, *kwargs.values()) if _is_64bit_int(a)]
         if wide:
             raise RuntimeError(
                 "Helion cannot launch a Pallas kernel that carries 64-bit "
-                f"integer data ({', '.join(str(a.dtype) for a in wide)}): "  # type: ignore[attr-defined]
+                f"integer data ({', '.join(str(a.dtype) for a in wide)}): "
                 "the kernel is traced with jax_enable_x64 off (so that Pallas's "
                 "int32 index arithmetic stays consistent), which would silently "
                 "truncate those inputs to 32-bit. Narrow them before the kernel."
             )
-        with _x64_disabled_scope():  # type: ignore[attr-defined]
-            return jit_fn(*args, **kwargs)  # type: ignore[operator]
+        with jax.enable_x64(False):
+            return jit_fn(*args, **kwargs)
 
     return wrapper
 
