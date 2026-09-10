@@ -6791,6 +6791,364 @@ class TestCrossLoopScheduler(TestCase):
             )
         )
 
+    def test_nested_frontier_derives_qwen_split_from_worker_schedule(self) -> None:
+        producer_domain, consumer_domain = _identify_root_domains(
+            (
+                _domain((20, 1, 1), (21, 1536, 1)),
+                _domain((30, 1, 1), (31, 16, 1)),
+            )
+        )
+        producer_order_domain = _domain(
+            (10, 1),
+            (11, 16),
+            (12, 96),
+            kind="task_order",
+            identity=0,
+        )
+        order_batch = coordinate_axis_symbol(10)
+        inner = coordinate_axis_symbol(11)
+        iteration = coordinate_axis_symbol(12)
+        producer_order = CoordinateRelation.point_map(
+            producer_order_domain,
+            producer_domain,
+            (
+                (
+                    ((10, 0, 1, 1), (11, 0, 8, 1), (12, 0, 96, 1)),
+                    (order_batch, 8 * iteration + inner),
+                ),
+                (
+                    ((10, 0, 1, 1), (11, 8, 16, 1), (12, 0, 96, 1)),
+                    (order_batch, 8 * iteration + inner + 760),
+                ),
+            ),
+        )
+        key_domain = _domain((0, 1), (1, 96), kind="event", identity=0)
+        key_batch = coordinate_axis_symbol(0)
+        key_iteration = coordinate_axis_symbol(1)
+        producers_by_key = CoordinateRelation(
+            key_domain,
+            producer_domain,
+            (
+                _CoordinateRelationPiece(
+                    ((0, 0, 1, 1), (1, 0, 96, 1)),
+                    (
+                        (20, key_batch, key_batch + 1, 1),
+                        (21, 8 * key_iteration, 8 * key_iteration + 8, 1),
+                    ),
+                ),
+                _CoordinateRelationPiece(
+                    ((0, 0, 1, 1), (1, 0, 96, 1)),
+                    (
+                        (20, key_batch, key_batch + 1, 1),
+                        (
+                            21,
+                            8 * key_iteration + 768,
+                            8 * key_iteration + 776,
+                            1,
+                        ),
+                    ),
+                ),
+            ),
+        )
+        nested_domain = _domain(
+            (30, 1, 1),
+            (31, 16, 1),
+            (32, 96, 1),
+            identity=7,
+        )
+        consumer = ReadinessConsumer(
+            consumer_root=1,
+            consumer_site_id=7,
+            keys_by_consumer=_full_point_map(
+                nested_domain,
+                key_domain,
+                coordinate_axis_symbol(30),
+                coordinate_axis_symbol(32),
+            ),
+        )
+        event = ReadinessEvent(
+            producers=(ReadinessProducer(0, producers_by_key),),
+            consumers=(consumer,),
+        )
+        graph = ReadinessGraph(
+            root_task_orders=(
+                producer_order,
+                pid_task_order(consumer_domain, consumer_domain.axis_order),
+            ),
+            events=(event,),
+        )
+        accepted_schedule = _schedule(
+            1184,
+            _segment(
+                0,
+                producer_order,
+                workers=(0, 1184),
+                dispatch_offset=0,
+            ),
+        )
+        event_frontier = _event_ready_after_worker_steps(
+            graph,
+            event,
+            worker_schedule=accepted_schedule,
+            continuation_by_root={},
+        )
+        self.assertIsNotNone(event_frontier)
+        assert event_frontier is not None
+        ready_after_worker_step = consumer.keys_by_consumer.then(event_frontier[0])
+        self.assertIsNotNone(ready_after_worker_step)
+        assert ready_after_worker_step is not None
+        nested_readiness = cross_loop_scheduler._NestedLoopReadiness(
+            event,
+            consumer,
+            ready_after_worker_step,
+            frozenset(),
+        )
+        frontier = cross_loop_scheduler._uniform_nested_readiness_frontier(
+            ready_after_worker_step,
+            32,
+        )
+        self.assertIsNotNone(frontier)
+        assert frontier is not None
+        self.assertEqual(
+            cross_loop_scheduler._nested_ready_prefix_boundaries(frontier, 1),
+            (0, 74, 96),
+        )
+
+        with (
+            mock.patch.object(
+                CoordinateRelation,
+                "materialize",
+                side_effect=AssertionError("nested frontier must not enumerate"),
+            ),
+            mock.patch.object(
+                CoordinateRelation,
+                "value_bounds",
+                side_effect=AssertionError("exact preimage must precede the oracle"),
+            ),
+        ):
+            plan = cross_loop_scheduler._split_nested_loop_at_readiness(
+                graph,
+                nested_readiness,
+                consumer_worker_step=1,
+            )
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan.readiness_key_domain.shape, (2,))
+        self.assertEqual(
+            sorted(set(_expected_arrivals(plan.readiness_key_domain, plan.producers))),
+            [352, 1184],
+        )
+
+    def test_nested_frontier_factors_runtime_empty_outer_domain(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        query = sympy.Symbol("query", integer=True, nonnegative=True)
+        graph, event, consumer = _symbolic_nested_counter_graph(batch, query, 96)
+        source_domain = consumer.keys_by_consumer.source_domain
+        wave_domain = _domain((40, 2), kind="value")
+        iteration = coordinate_axis_symbol(22)
+        ready_after_worker_step = _full_point_map(
+            source_domain,
+            wave_domain,
+            sympy.floor((16 * iteration + 15) / 1184),
+        )
+        nested_readiness = cross_loop_scheduler._NestedLoopReadiness(
+            event,
+            consumer,
+            ready_after_worker_step,
+            frozenset(),
+        )
+        concrete_axis_counts = CoordinateDomain._concrete_axis_counts
+
+        def reject_runtime_axis_counts(domain: CoordinateDomain) -> dict[int, int]:
+            if domain.parameter_symbols:
+                raise AssertionError("runtime outer axes must remain symbolic")
+            return concrete_axis_counts(domain)
+
+        with (
+            mock.patch.object(
+                CoordinateDomain,
+                "_concrete_axis_counts",
+                reject_runtime_axis_counts,
+            ),
+            mock.patch.object(
+                CoordinateRelation,
+                "materialize",
+                side_effect=AssertionError("runtime outer axes must not enumerate"),
+            ),
+        ):
+            plan = cross_loop_scheduler._split_nested_loop_at_readiness(
+                graph,
+                nested_readiness,
+                consumer_worker_step=1,
+            )
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan.readiness_key_domain.shape_expr, (2, batch, query))
+        for zero in ({batch: 0, query: 3}, {batch: 2, query: 0}):
+            self.assertFalse(
+                plan.producers[0].producers_by_key.substitute_parameters(zero).pieces
+            )
+            self.assertFalse(
+                plan.consumers[0].keys_by_consumer.substitute_parameters(zero).pieces
+            )
+        concrete = {batch: 2, query: 3}
+        concrete_producers = plan.producers[0].producers_by_key.substitute_parameters(
+            concrete
+        )
+        arrivals = tuple(
+            len(producers) for producers in concrete_producers.materialize()
+        )
+        self.assertEqual(arrivals.count(74), 6)
+        self.assertEqual(arrivals.count(22), 6)
+
+    def test_nested_frontier_declines_nonuniform_empty_or_nonprefix_fibers(
+        self,
+    ) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        source_domain = CoordinateDomain(
+            (20, 21),
+            ((20, batch), (21, 4)),
+            kind="site",
+            _allow_empty=True,
+        )
+        wave_domain = CoordinateDomain(
+            (30,),
+            ((30, batch + 4),),
+            kind="value",
+            _allow_empty=True,
+        )
+        outer = coordinate_axis_symbol(20)
+        nested = coordinate_axis_symbol(21)
+        outer_dependent = _full_point_map(
+            source_domain,
+            wave_domain,
+            outer + nested,
+        )
+        self.assertIsNone(
+            cross_loop_scheduler._uniform_nested_readiness_frontier(
+                outer_dependent,
+                21,
+            )
+        )
+
+        concrete_source = _domain((20, 1), (21, 4), kind="site")
+        nonmonotone = CoordinateRelation.point_map(
+            concrete_source,
+            _domain((30, 2), kind="value"),
+            (
+                (((20, 0, 1, 1), (21, 0, 2, 1)), (sympy.Integer(0),)),
+                (((20, 0, 1, 1), (21, 2, 3, 1)), (sympy.Integer(1),)),
+                (((20, 0, 1, 1), (21, 3, 4, 1)), (sympy.Integer(0),)),
+            ),
+        )
+        frontier = cross_loop_scheduler._uniform_nested_readiness_frontier(
+            nonmonotone,
+            21,
+        )
+        self.assertIsNotNone(frontier)
+        assert frontier is not None
+        self.assertIsNone(
+            cross_loop_scheduler._nested_ready_prefix_boundaries(frontier, 1)
+        )
+        self.assertIsNone(
+            cross_loop_scheduler._concrete_nested_ready_prefix_boundaries(
+                frontier,
+                1,
+            )
+        )
+
+    def test_nested_frontier_matches_concrete_prefix_oracle(self) -> None:
+        source_domain = _domain((20, 3), (21, 17), kind="site")
+        wave_domain = _domain((30, 8), kind="value")
+        outer = coordinate_axis_symbol(20)
+        nested = coordinate_axis_symbol(21)
+        ready_after_worker_step = _full_point_map(
+            source_domain,
+            wave_domain,
+            sympy.floor((2 * nested + outer) / 5),
+        )
+        frontier = cross_loop_scheduler._uniform_nested_readiness_frontier(
+            ready_after_worker_step,
+            21,
+        )
+        self.assertIsNotNone(frontier)
+        assert frontier is not None
+        concrete_values = ready_after_worker_step.materialize()
+
+        for consumer_worker_step in range(9):
+            with self.subTest(consumer_worker_step=consumer_worker_step):
+                expected = 0
+                for nested_iteration in range(17):
+                    if all(
+                        next(iter(concrete_values[outer_index + 3 * nested_iteration]))
+                        < consumer_worker_step
+                        for outer_index in range(3)
+                    ):
+                        expected += 1
+                    else:
+                        break
+                expected_boundaries = tuple(sorted({0, expected, 17}))
+                self.assertEqual(
+                    cross_loop_scheduler._nested_ready_prefix_boundaries(
+                        frontier,
+                        consumer_worker_step,
+                    ),
+                    expected_boundaries,
+                )
+
+        monotone_but_not_invertible = _full_point_map(
+            _domain((21, 17), kind="site"),
+            wave_domain,
+            sympy.Max(
+                sympy.floor(nested / 4),
+                sympy.floor(nested / 6),
+            ),
+        )
+        self.assertIsNone(
+            cross_loop_scheduler._nested_ready_prefix_boundaries(
+                monotone_but_not_invertible,
+                3,
+            )
+        )
+        self.assertEqual(
+            cross_loop_scheduler._concrete_nested_ready_prefix_boundaries(
+                monotone_but_not_invertible,
+                3,
+            ),
+            (0, 12, 17),
+        )
+
+        symbolic_split = sympy.Symbol(
+            "symbolic_split",
+            integer=True,
+            positive=True,
+        )
+        symbolic_source = CoordinateDomain(
+            (21,),
+            ((21, symbolic_split + 2),),
+            kind="site",
+        )
+        symbolic_frontier = CoordinateRelation.point_map(
+            symbolic_source,
+            _domain((30, 2), kind="value"),
+            (
+                (((21, 0, symbolic_split, 1),), (sympy.Integer(0),)),
+                (
+                    ((21, symbolic_split, symbolic_split + 2, 1),),
+                    (sympy.Integer(1),),
+                ),
+            ),
+        )
+        self.assertEqual(
+            cross_loop_scheduler._nested_ready_prefix_boundaries(
+                symbolic_frontier,
+                1,
+            ),
+            (0, symbolic_split, symbolic_split + 2),
+        )
+
     def test_partial_source_event_has_a_structural_ready_frontier(self) -> None:
         producer_domain, consumer_domain = _identify_root_domains(
             (_domain((10, 8, 1)), _domain((20, 2, 1)))

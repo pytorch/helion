@@ -4613,49 +4613,230 @@ def _segmented_nested_loop_counter(
     )
 
 
-def _split_nested_loop_at_readiness(
-    readiness_graph: ReadinessGraph,
-    nested_readiness: _NestedLoopReadiness,
-    *,
-    consumer_worker_step: int,
-) -> ReadinessCounterPlan | None:
-    """Split a nested loop at the first iteration not yet ready."""
-    domain = nested_readiness.readiness_consumer.keys_by_consumer.source_domain
-    consumer_site_id = nested_readiness.readiness_consumer.consumer_site_id
-    assert consumer_site_id is not None
-    nested_axes = nested_logical_axes(
-        readiness_graph.root_domains[nested_readiness.readiness_consumer.consumer_root],
-        domain,
-    )
-    if len(nested_axes) != 1:
+def _uniform_nested_readiness_frontier(
+    ready_after_worker_step: CoordinateRelation,
+    nested_axis: int,
+) -> CoordinateRelation | None:
+    """Maximize a nested iteration's producer wave over every owning CTA.
+
+    Outer axes which provably do not affect readiness are factored before the
+    maximum.  Recomposition proves that this is an exact product, rather than
+    inferring independence merely because an axis is absent from the target
+    expression.  This distinction also makes a runtime-empty outer domain
+    safe: the reduced proof is only used after it has been lifted back to the
+    original, conditionally empty source domain.
+
+    The result has one source coordinate, ``nested_axis``, and maps it to the
+    latest producer wave required by any owning CTA.  A retained outer axis
+    is maximized as a complete relation fiber; a fiber which may be empty or
+    whose maximum is not exact declines conservatively.
+    """
+    domain = ready_after_worker_step.source_domain
+    if (
+        nested_axis not in domain.axis_order
+        or len(ready_after_worker_step.target_domain.axis_order) != 1
+        or not ready_after_worker_step.is_total_function()
+    ):
         return None
-    (nested_axis,) = nested_axes
-    nested_iterations_per_task = domain.axis_counts[nested_axis]
+    affecting_axes = ready_after_worker_step.source_axes_affecting_targets()
+    if affecting_axes is None:
+        return None
+    retained_axes = tuple(
+        axis
+        for axis in domain.axis_order
+        if axis == nested_axis or axis in affecting_axes
+    )
+    counts = domain.axis_count_expressions
+    reduced_domain = CoordinateDomain(
+        axis_order=retained_axes,
+        axis_counts_items=tuple((axis, counts[axis]) for axis in retained_axes),
+        block_sizes_items=tuple(
+            (axis, domain.block_sizes[axis])
+            for axis in retained_axes
+            if axis in domain.block_sizes
+        ),
+        kind=domain.kind,
+        identity=domain.identity,
+        _allow_empty=domain._allow_empty,
+    )
+    reduced = ready_after_worker_step.project_source(reduced_domain)
+    recomposed = None if reduced is None else reduced.lift_source(domain)
+    if (
+        reduced is None
+        or recomposed is None
+        or not recomposed.is_pointwise_equal_on_same_support(
+            ready_after_worker_step
+        )
+        or not reduced.is_total_function()
+    ):
+        return None
+
+    nested_domain = CoordinateDomain(
+        axis_order=(nested_axis,),
+        axis_counts_items=((nested_axis, counts[nested_axis]),),
+        block_sizes_items=(
+            ((nested_axis, domain.block_sizes[nested_axis]),)
+            if nested_axis in domain.block_sizes
+            else ()
+        ),
+        kind=domain.kind,
+        identity=domain.identity,
+        _allow_empty=domain._allow_empty,
+    )
+    if reduced_domain == nested_domain:
+        frontier = reduced
+    else:
+        nested_iteration = coordinate_axis_symbol(nested_axis)
+        retained_iterations_by_nested = CoordinateRelation(
+            source_domain=nested_domain,
+            target_domain=reduced_domain,
+            pieces=(
+                _CoordinateRelationPiece(
+                    source_bounds_items=(
+                        (nested_axis, 0, counts[nested_axis], 1),
+                    ),
+                    target_ranges=tuple(
+                        (
+                            (axis, nested_iteration, nested_iteration + 1, 1)
+                            if axis == nested_axis
+                            else (axis, 0, counts[axis], 1)
+                        )
+                        for axis in retained_axes
+                    ),
+                ),
+            ),
+        )
+        frontier = retained_iterations_by_nested.max_target_value_by_source(reduced)
+    canonical = None if frontier is None else frontier.canonical_single_valued()
+    return (
+        canonical
+        if canonical is not None and canonical.is_total_function()
+        else None
+    )
+
+
+def _nested_ready_prefix_boundaries(
+    frontier: CoordinateRelation,
+    consumer_worker_step: int,
+) -> tuple[int | sympy.Expr, ...] | None:
+    """Derive the exact prefix ready strictly before one admission wave.
+
+    Composition with a wave-prefix relation computes the exact preimage of
+    ``producer_wave < consumer_worker_step``.  The result is accepted only
+    when its complete source support is one prefix.  Consequently wrapping or
+    otherwise nonmonotone readiness declines instead of relying on sampled
+    endpoints.
+    """
+    if (
+        consumer_worker_step < 0
+        or len(frontier.source_domain.axis_order) != 1
+        or len(frontier.target_domain.axis_order) != 1
+        or not frontier.is_total_function()
+    ):
+        return None
+    (nested_axis,) = frontier.source_domain.axis_order
+    nested_extent = sympy.sympify(
+        frontier.source_domain.axis_count_expressions[nested_axis]
+    )
+    if not tile_dependency._is_provably_nonnegative(nested_extent - 1, None):
+        return None
+    if consumer_worker_step == 0:
+        return (sympy.Integer(0), nested_extent)
+
+    (wave_axis,) = frontier.target_domain.axis_order
+    wave_count = sympy.sympify(
+        frontier.target_domain.axis_count_expressions[wave_axis]
+    )
+    if tile_dependency._is_provably_nonnegative(
+        wave_count - consumer_worker_step,
+        None,
+    ):
+        ready_wave_end: int | sympy.Expr = sympy.Integer(consumer_worker_step)
+    elif tile_dependency._is_provably_nonnegative(
+        consumer_worker_step - wave_count,
+        None,
+    ):
+        ready_wave_end = wave_count
+    else:
+        return None
+
+    ready_value_domain = CoordinateDomain((), (), kind="value")
+    ready_values = CoordinateRelation(
+        source_domain=frontier.target_domain,
+        target_domain=ready_value_domain,
+        pieces=(
+            _CoordinateRelationPiece(
+                source_bounds_items=((wave_axis, 0, ready_wave_end, 1),),
+                target_ranges=(),
+            ),
+        ),
+    )
+    ready_iterations = frontier.then(ready_values)
+    ready_iterations = (
+        None
+        if ready_iterations is None
+        else ready_iterations.canonical_single_valued()
+    )
+    if ready_iterations is None:
+        return None
+    ready_iterations = ready_iterations.coalesce_adjacent_source_boxes()
+    if not ready_iterations.pieces:
+        split_iteration = sympy.Integer(0)
+    elif len(ready_iterations.pieces) == 1:
+        (piece,) = ready_iterations.pieces
+        if len(piece.source_bounds_items) != 1:
+            return None
+        axis, begin, end, step = piece.source_bounds_items[0]
+        if axis != nested_axis or step != 1 or sympy.simplify(begin) != 0:
+            return None
+        split_iteration = sympy.simplify(end)
+    else:
+        return None
+
+    if sympy.simplify(split_iteration) == 0 or sympy.simplify(
+        split_iteration - nested_extent
+    ) == 0:
+        return (sympy.Integer(0), nested_extent)
+    if not tile_dependency._is_provably_nonnegative(
+        split_iteration - 1,
+        None,
+    ) or not tile_dependency._is_provably_nonnegative(
+        nested_extent - split_iteration - 1,
+        None,
+    ):
+        return None
+    return (sympy.Integer(0), split_iteration, nested_extent)
+
+
+def _concrete_nested_ready_prefix_boundaries(
+    frontier: CoordinateRelation,
+    consumer_worker_step: int,
+) -> tuple[int, ...] | None:
+    """Retain the old binary search as a proved-monotone concrete oracle."""
+    if not _scalar_relation_is_nondecreasing(frontier):
+        return None
+    (nested_axis,) = frontier.source_domain.axis_order
+    nested_extent = frontier.source_domain.axis_counts[nested_axis]
 
     def ready(nested_iteration: int) -> bool | None:
-        value_bounds = nested_readiness.ready_after_worker_step.value_bounds(
-            {nested_axis: nested_iteration}
+        value_bounds = frontier.value_bounds({nested_axis: nested_iteration})
+        return (
+            None
+            if value_bounds is None
+            else value_bounds[1] < consumer_worker_step
         )
-        if value_bounds is None:
-            return None
-        # Producers at the same worker step execute concurrently on other
-        # workers. They permit placement at this step, but are not ready at
-        # admission: their consumer iterations belong after the split.
-        # ``prerequisite_worker_steps`` separately prevents self-deadlock on a
-        # producer's own worker.
-        return value_bounds[1] < consumer_worker_step
 
     first_ready = ready(0)
-    last_ready = ready(nested_iterations_per_task - 1)
+    last_ready = ready(nested_extent - 1)
     if first_ready is None or last_ready is None:
         return None
     if not first_ready:
         split_iteration = 0
     elif last_ready:
-        split_iteration = nested_iterations_per_task
+        split_iteration = nested_extent
     else:
         lower = 0
-        upper = nested_iterations_per_task - 1
+        upper = nested_extent - 1
         while lower + 1 < upper:
             midpoint = (lower + upper) // 2
             midpoint_ready = ready(midpoint)
@@ -4666,7 +4847,40 @@ def _split_nested_loop_at_readiness(
             else:
                 upper = midpoint
         split_iteration = upper
-    boundaries = tuple(sorted({0, split_iteration, nested_iterations_per_task}))
+    return tuple(sorted({0, split_iteration, nested_extent}))
+
+
+def _split_nested_loop_at_readiness(
+    readiness_graph: ReadinessGraph,
+    nested_readiness: _NestedLoopReadiness,
+    *,
+    consumer_worker_step: int,
+) -> ReadinessCounterPlan | None:
+    """Split a nested loop at its exact uniform readiness frontier."""
+    domain = nested_readiness.readiness_consumer.keys_by_consumer.source_domain
+    consumer_site_id = nested_readiness.readiness_consumer.consumer_site_id
+    assert consumer_site_id is not None
+    nested_axes = nested_logical_axes(
+        readiness_graph.root_domains[nested_readiness.readiness_consumer.consumer_root],
+        domain,
+    )
+    if len(nested_axes) != 1:
+        return None
+    (nested_axis,) = nested_axes
+    frontier = _uniform_nested_readiness_frontier(
+        nested_readiness.ready_after_worker_step,
+        nested_axis,
+    )
+    if frontier is None:
+        return None
+    boundaries = _nested_ready_prefix_boundaries(frontier, consumer_worker_step)
+    if boundaries is None and not frontier.parameter_symbols:
+        boundaries = _concrete_nested_ready_prefix_boundaries(
+            frontier,
+            consumer_worker_step,
+        )
+    if boundaries is None:
+        return None
     return _segmented_nested_loop_counter(
         readiness_graph,
         nested_readiness.event,
