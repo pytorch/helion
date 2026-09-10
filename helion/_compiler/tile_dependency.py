@@ -5130,7 +5130,14 @@ class CoordinateRelation:
         has_partial_producer_source = any(
             piece.source_bounds_items != full_producer_bounds for piece in self.pieces
         )
-        source_targets_are_unclipped = _has_unclipped_coordinate_point_targets(self)
+        has_unclipped_coordinate_targets = (
+            _has_unclipped_coordinate_point_targets(self)
+        )
+        has_in_domain_point_targets = _has_proved_in_domain_point_targets(self)
+        source_targets_are_unclipped = (
+            has_unclipped_coordinate_targets or has_in_domain_point_targets
+        )
+        other_has_in_domain_point_targets: bool | None = None
         for producer_piece in self.pieces:
             producer_source_bounds = {
                 axis: (sympy.sympify(begin), sympy.sympify(end), step)
@@ -5224,6 +5231,7 @@ class CoordinateRelation:
                     axis: (begin, end, step)
                     for axis, begin, end, step in consumer_piece.target_ranges
                 }
+                consumer_target_is_empty = False
                 lower_bounds: dict[int, list[sympy.Expr]] = {
                     axis: (
                         []
@@ -5255,6 +5263,33 @@ class CoordinateRelation:
                         and sympy.simplify(producer_end - allocation_count)  # pyrefly: ignore[unsupported-operation]
                         == 0
                     ):
+                        if other_has_in_domain_point_targets is None:
+                            other_has_in_domain_point_targets = (
+                                _has_proved_in_domain_point_targets(other)
+                            )
+                        if other_has_in_domain_point_targets:
+                            continue
+                        semantic_consumer_range = _clip_target_box_to_domain(
+                            ((allocation_axis, *consumer_range),),
+                            target_domain=other.target_domain,
+                            source_domain=other.source_domain,
+                            source_bounds=consumer_piece.source_bounds_items,
+                        )
+                        if _target_box_is_empty_for_all_sources(
+                            semantic_consumer_range,
+                            source_domain=other.source_domain,
+                            source_bounds=consumer_piece.source_bounds_items,
+                            target_domain=other.target_domain,
+                        ):
+                            consumer_target_is_empty = True
+                            break
+                        if not _target_box_is_nonempty_for_all_sources(
+                            semantic_consumer_range,
+                            source_domain=other.source_domain,
+                            source_bounds=consumer_piece.source_bounds_items,
+                            target_domain=other.target_domain,
+                        ):
+                            return None
                         continue
                     producer_interval = _single_axis_interval(
                         producer_begin,
@@ -5305,6 +5340,8 @@ class CoordinateRelation:
                             ),
                         )
                     )
+                if consumer_target_is_empty:
+                    continue
                 target_ranges_list: list[
                     tuple[int, sympy.Expr, sympy.Expr, int]
                 ] = []
@@ -5929,6 +5966,36 @@ def _has_unclipped_coordinate_point_targets(
             ):
                 return False
     return True
+
+
+def _has_proved_in_domain_point_targets(relation: CoordinateRelation) -> bool:
+    """Prove point targets are nonempty on every semantic source point."""
+    if _has_unclipped_point_source_support(relation):
+        return True
+    full_source_bounds = tuple(
+        (axis, 0, relation.source_domain.axis_count_expressions[axis], 1)
+        for axis in relation.source_domain.axis_order
+    )
+    semantic_pieces: list[tuple[_CoordinateRelationPiece, _SourceBounds]] = []
+    for piece in relation.pieces:
+        source_bounds = _intersect_source_boxes(
+            piece.source_bounds_items,
+            full_source_bounds,
+        )
+        if source_bounds is None:
+            return False
+        if source_bounds is False:
+            continue
+        semantic_pieces.append((piece, source_bounds))
+    return all(
+        _target_point_is_in_domain(
+            piece.target_ranges,
+            source_domain=relation.source_domain,
+            source_bounds=source_bounds,
+            target_domain=relation.target_domain,
+        )
+        for piece, source_bounds in semantic_pieces
+    )
 
 
 def _coordinate_permutation_axes(

@@ -2954,6 +2954,125 @@ def _root_task_placement_relation(
     return result if result.is_total_function() else None
 
 
+def _resident_readiness_predecessors_by_slot(
+    worker_schedule: WorkerSchedule,
+    readiness_graph: ReadinessGraph,
+    consumer_root: int,
+) -> CoordinateRelation | None:
+    """Map one root's resident consumer slots to semantic producer slots.
+
+    Segment ``task_order`` relations remain the only slot-to-task ownership
+    source.  Event relations supply the semantic readiness keys; exact target
+    overlap joins consumer and producer slots through those keys.  Nested
+    readiness and any nonresident ownership conservatively decline.
+    """
+    placement_domain = worker_schedule.placement_domain
+    root_count = len(readiness_graph.root_task_orders)
+    if (
+        placement_domain.kind != "worker"
+        or len(placement_domain.axis_order) != 3
+        or consumer_root < 0
+        or consumer_root >= root_count
+        or not _validate_worker_schedule_tasks(
+            worker_schedule,
+            readiness_graph.root_task_orders,
+        )
+    ):
+        return None
+
+    tasks_by_slot: list[CoordinateRelation | None] = [None] * root_count
+    for root in range(root_count):
+        root_domain = readiness_graph.root_domains[root]
+        combined: CoordinateRelation | None = None
+        for segment in worker_schedule.segments_for_root(root):
+            try:
+                is_empty = segment.task_count_expr.is_zero is True
+            except ValueError:
+                return None
+            if not is_empty and segment.launch_stage != _RESIDENT_LAUNCH_STAGE:
+                return None
+            if (
+                segment.task_order.source_domain != placement_domain
+                or segment.task_order.target_domain != root_domain
+            ):
+                return None
+            combined = (
+                segment.task_order
+                if combined is None
+                else combined.union(segment.task_order)
+            )
+            if combined is None:
+                return None
+        if combined is not None:
+            tasks_by_slot[root] = combined
+        elif root_domain.size_expr.is_zero is True:
+            tasks_by_slot[root] = CoordinateRelation(
+                source_domain=placement_domain,
+                target_domain=root_domain,
+                pieces=(),
+            )
+
+    result_pieces: dict[_CoordinateRelationPiece, None] = {}
+    root_domains = readiness_graph.root_domains
+    for event in readiness_graph.events:
+        for producer in event.producers:
+            if (
+                producer.producer_site_id is not None
+                or producer.producer_root < 0
+                or producer.producer_root >= root_count
+                or producer.producers_by_key.target_domain
+                != root_domains[producer.producer_root]
+            ):
+                return None
+        for consumer in event.consumers:
+            if (
+                consumer.consumer_site_id is not None
+                or consumer.consumer_root < 0
+                or consumer.consumer_root >= root_count
+                or consumer.keys_by_consumer.source_domain
+                != root_domains[consumer.consumer_root]
+            ):
+                return None
+            if consumer.consumer_root != consumer_root:
+                continue
+            consumer_tasks = tasks_by_slot[consumer.consumer_root]
+            if consumer_tasks is None:
+                return None
+            consumers_by_key = consumer.keys_by_consumer.converse()
+            keys_by_consumer_slot = (
+                None
+                if consumers_by_key is None
+                else consumers_by_key.overlapping_sources(consumer_tasks)
+            )
+            if keys_by_consumer_slot is None:
+                return None
+            for producer in event.producers:
+                producer_tasks = tasks_by_slot[producer.producer_root]
+                if producer_tasks is None:
+                    return None
+                keys_by_producer_slot = producer.producers_by_key.overlapping_sources(
+                    producer_tasks
+                )
+                predecessors = (
+                    None
+                    if keys_by_producer_slot is None
+                    else keys_by_producer_slot.overlapping_sources(
+                        keys_by_consumer_slot
+                    )
+                )
+                if predecessors is None:
+                    return None
+                for piece in predecessors.pieces:
+                    result_pieces.setdefault(piece, None)
+                    if len(result_pieces) > tile_dependency._MAX_RELATION_PIECES:
+                        return None
+    return CoordinateRelation(
+        source_domain=placement_domain,
+        target_domain=placement_domain,
+        pieces=tuple(result_pieces),
+    )
+
+
 @cache
 def _root_task_slot_relation(
     worker_schedule: WorkerSchedule,

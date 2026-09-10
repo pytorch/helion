@@ -2905,6 +2905,197 @@ class TestTileDependency(TestCase):
             (frozenset(),) * consumer.size,
         )
 
+    def test_partial_overlap_accepts_proved_unclipped_constant_points(self) -> None:
+        extent = sympy.Symbol(
+            "constant_overlap_extent",
+            integer=True,
+            nonnegative=True,
+        )
+        wave_count = FloorDiv(extent + 3, 4)
+        producer = CoordinateDomain(
+            (10, 11),
+            ((10, 4), (11, wave_count)),
+            kind="worker",
+            _allow_empty=True,
+        )
+        consumer = CoordinateDomain((20,), ((20, 3),), kind="worker")
+        key = CoordinateDomain((30,), ((30, 1),), kind="event")
+        producer_keys = CoordinateRelation.point_map(
+            producer,
+            key,
+            (
+                (
+                    (
+                        (10, 0, sympy.Min(4, extent), 1),
+                        (11, 0, sympy.Min(1, wave_count), 1),
+                    ),
+                    (sympy.Integer(0),),
+                ),
+            ),
+        )
+        consumer_keys = CoordinateRelation.point_map(
+            consumer,
+            key,
+            ((((20, 0, 3, 1),), (sympy.Integer(0),)),),
+        )
+
+        overlap = producer_keys.overlapping_sources(consumer_keys)
+
+        self.assertIsNotNone(overlap)
+        assert overlap is not None
+        for concrete_extent in (0, 1, 3, 4, 5, 9):
+            substitutions = {extent: concrete_extent}
+            concrete_producer = producer_keys.substitute_parameters(substitutions)
+            concrete_consumer = consumer_keys.substitute_parameters(substitutions)
+            concrete_overlap = overlap.substitute_parameters(substitutions)
+            expected = tuple(
+                frozenset(
+                    producer_index
+                    for producer_index, producer_targets in enumerate(
+                        concrete_producer.materialize()
+                    )
+                    if producer_targets & consumer_targets
+                )
+                for consumer_targets in concrete_consumer.materialize()
+            )
+            self.assertEqual(concrete_overlap.materialize(), expected)
+
+        consumer_coordinate = coordinate_axis_symbol(20)
+        clipped_consumer_keys = CoordinateRelation.point_map(
+            consumer,
+            key,
+            (
+                (
+                    ((20, 0, 3, 1),),
+                    (consumer_coordinate - 1,),
+                ),
+            ),
+        )
+        self.assertIsNone(
+            producer_keys.overlapping_sources(clipped_consumer_keys)
+        )
+
+        invalid_keys = CoordinateRelation.point_map(
+            producer,
+            key,
+            (
+                (
+                    (
+                        (10, 0, sympy.Min(4, extent), 1),
+                        (11, 0, sympy.Min(1, wave_count), 1),
+                    ),
+                    (sympy.Integer(1),),
+                ),
+            ),
+        )
+        self.assertIsNone(invalid_keys.overlapping_sources(consumer_keys))
+
+    def test_partial_constant_point_overlap_clipped_consumer_differential(
+        self,
+    ) -> None:
+        generator = random.Random(17)
+        accepted = 0
+        clipped_declines = 0
+        for case in range(128):
+            producer_count = generator.randrange(2, 8)
+            consumer_count = generator.randrange(2, 6)
+            key_count = 1
+            producer_begin = generator.randrange(0, producer_count)
+            producer_end = generator.randrange(producer_begin + 1, producer_count + 1)
+            consumer_is_clipped = bool(generator.randrange(2))
+            producer = CoordinateDomain(
+                (10,),
+                ((10, producer_count),),
+                kind="worker",
+            )
+            consumer = CoordinateDomain(
+                (20,),
+                ((20, consumer_count),),
+                kind="worker",
+            )
+            key = CoordinateDomain(
+                (30,),
+                ((30, key_count),),
+                kind="event",
+                identity=case,
+            )
+            consumer_coordinate = coordinate_axis_symbol(20)
+            producer_keys = CoordinateRelation.point_map(
+                producer,
+                key,
+                (
+                    (
+                        ((10, producer_begin, producer_end, 1),),
+                        (sympy.Integer(0),),
+                    ),
+                ),
+            )
+            consumer_keys = CoordinateRelation.point_map(
+                consumer,
+                key,
+                (
+                    (
+                        ((20, 0, consumer_count, 1),),
+                        (
+                            consumer_coordinate - 1
+                            if consumer_is_clipped
+                            else sympy.Integer(0),
+                        ),
+                    ),
+                ),
+            )
+
+            overlap = producer_keys.overlapping_sources(consumer_keys)
+            producer_points = producer_keys.materialize()
+            consumer_points = consumer_keys.materialize()
+            expected = tuple(
+                frozenset(
+                    producer_index
+                    for producer_index, producer_targets in enumerate(producer_points)
+                    if producer_targets & consumer_targets
+                )
+                for consumer_targets in consumer_points
+            )
+            if overlap is None:
+                if consumer_is_clipped:
+                    clipped_declines += 1
+                continue
+            accepted += 1
+            self.assertEqual(overlap.materialize(), expected, msg=f"case {case}")
+        self.assertGreaterEqual(accepted, 16)
+        self.assertGreaterEqual(clipped_declines, 16)
+
+    def test_full_target_overlap_checks_consumer_semantic_nonemptiness(self) -> None:
+        producer = CoordinateDomain((10,), ((10, 1),), kind="worker")
+        consumer = CoordinateDomain((20,), ((20, 3),), kind="worker")
+        key = CoordinateDomain((30,), ((30, 1),), kind="event")
+        consumer_coordinate = coordinate_axis_symbol(20)
+        producer_keys = CoordinateRelation.total(producer, key)
+        conditionally_clipped = CoordinateRelation.point_map(
+            consumer,
+            key,
+            ((((20, 0, 3, 1),), (consumer_coordinate - 1,)),),
+        )
+        always_clipped = CoordinateRelation.point_map(
+            consumer,
+            key,
+            ((((20, 0, 3, 1),), (sympy.Integer(2),)),),
+        )
+        in_domain = CoordinateRelation.point_map(
+            consumer,
+            key,
+            ((((20, 0, 3, 1),), (sympy.Integer(0),)),),
+        )
+
+        self.assertIsNone(producer_keys.overlapping_sources(conditionally_clipped))
+        empty = producer_keys.overlapping_sources(always_clipped)
+        overlap = producer_keys.overlapping_sources(in_domain)
+        self.assertIsNotNone(empty)
+        self.assertIsNotNone(overlap)
+        assert empty is not None and overlap is not None
+        self.assertEqual(empty.materialize(), (frozenset(),) * 3)
+        self.assertEqual(overlap.materialize(), (frozenset((0,)),) * 3)
+
     def test_partial_stride_overlap_preserves_endpoint_crossing(self) -> None:
         producer = CoordinateDomain((10,), ((10, 5),), kind="site")
         consumer = CoordinateDomain((20,), ((20, 7),), kind="site")
