@@ -98,7 +98,7 @@ cross-workload exit gates below.
 
 ### Current implementation marker: close the symbolic proof layer
 
-Commits through `ba26378f` are the current compiler checkpoint. The existing immutable
+Commits through `2ff6d5df` are the current compiler checkpoint. The existing immutable
 `CoordinateRelation` remains the only schedule/dependency truth. It now retains
 derived exact converses through proved construction and transformation,
 represents ragged grouped L2 order with one forward piece and a two-piece
@@ -236,19 +236,19 @@ about 10 seconds to 28.5 seconds. The prototype also exposed avoidable nested
 instead be proposed by the one event-frontier policy, pass the common progress
 proof, and demonstrate a runtime benefit.
 
-The immediate implementation marker is therefore deliberately smaller:
-remove production selection and rendering of the old six-wave recurrence and
-retain the existing packed root-major relation as the sole conservative
-fallback. This is deletion, not a new scheduling path. The reviewed symbolic
-logical-task-to-global-slot relation remains the reusable topological progress
-certificate; it is not a completion-time objective because different workers
-in one wave are concurrent while a readiness wait within that wave can add a
-unit of logical completion time. The merge order is now: remove the obsolete
-recurrence, finish exact extrema with all attainers, derive same-strand
-precedence, implement the relation-level max-plus objective and joint
-continuation/resident choice, derive post-placement nested quotients, admit
-source-ticket actions through that same policy, finalize/validate once, and
-only then delete the top-level constant/parameterized branch.
+The obsolete six-wave recurrence is now gone, and the existing packed
+root-major relation is the sole conservative fallback. Exact extrema with all
+attainers, occupied same-strand precedence, and the generic weighted scalar
+pullback are also complete. Same-strand chronology is derived only from the
+authoritative `WorkerScheduleSegment.task_order` relations; a review-found
+partial/strided clipping bug and a second mixed full/partial-piece clipping bug
+were fixed before integration. The combined tile-dependency and scheduler
+suites pass 310 tests with 185 subtests. The active implementation point is the
+occupied strand ordinal `q(s)`, followed by the acyclic relation-level max-plus
+objective and joint continuation/resident choice, translated recurrence
+closure, post-placement nested quotients, source-ticket actions through that
+same policy, one final validation/lowering pass, and deletion of the top-level
+constant/parameterized branch.
 
 Then continue Phase 4A.2 by replacing the remaining parameter-only admission
 filters with one exact action-legality decision, followed by the single joint
@@ -2743,7 +2743,7 @@ Complete these relation-level prerequisites before making continuation
 ownership a production decision. They are derived views over the existing
 `WorkerSchedule` and `ReadinessGraph`, not new plan or IR state:
 
-- [ ] Derive occupied same-strand precedence from
+- [x] Derive occupied same-strand precedence from
   `WorkerScheduleSegment.task_order`. Construct occupied slot identity from
   each segment and relate slots with the same `(launch_stage, worker)` and a
   strictly earlier wave. It is acceptable initially to retain all strict
@@ -2777,6 +2777,13 @@ ownership a production decision. They are derived views over the existing
   materialization before either legacy or joint extrema are evaluated.
   Independent differential review covered oversized and negative bounds,
   strides, symbolic substitutions, empty intersections, and proof budgets.
+- [x] Add one generic exact weighted scalar pullback to the existing relation
+  algebra. Optional target and source potentials are composed around the
+  shared exact-extrema implementation, so candidate collection, source-cell
+  partitioning, clipping, and all-attainer preservation remain single-source.
+  Independent review covered 456,976 concrete lattice intersections, 50,850
+  symbolic substitutions, and randomized pointwise-add and end-to-end
+  weighted-extrema oracles with no mismatches.
 - [ ] Derive the occupied strand ordinal
   `q(s) = 1 + |{t: t <strand s}|` from the exact same-strand relation. Holes
   and unoccupied waves contribute nothing. This is an ephemeral scalar
