@@ -2886,6 +2886,25 @@ ownership a production decision. They are derived views over the existing
   scalar acyclic prefix evaluator and cyclic affine recurrence proof are still
   outstanding.
 
+- [ ] Let the existing extrema implementation consume a partial scalar-value
+  relation when, and only when, its value support provably covers every target
+  reachable by the relation being reduced. Keep the public extrema API and its
+  candidate/winner/attainer machinery unchanged: normalize the value support
+  once, intersect it with each clipped reachable target box, prove those
+  intersections disjoint, and prove their exact cardinality equals the whole
+  reachable box. Missing coverage, conditional nonemptiness, overlap that
+  cannot be normalized, or budget overflow must decline. This is required
+  because schedule scores are defined exactly on occupied slots; filling the
+  rectangular placement domain or rebuilding `q` from wave arithmetic would
+  introduce a second source of truth.
+- [ ] Add one private exact-or-decline partition of a resident slot-to-slot
+  dependency relation into same-owner and cross-owner edges. Ownership is the
+  existing `(launch_stage, worker)` projection of the two endpoints. Preserve
+  symbolic guards and strides, require the two outputs to be disjoint and to
+  cover the original clipped edge relation, and charge all splits to the
+  common relation budgets. This pair-dependent partition is the only extra
+  operation needed for the handoff component; separable source/target scalar
+  potentials cannot represent endpoint inequality.
 - [ ] Evaluate the lexicographic objective `(completion, handoffs)` with that
   prefix proof over same-strand precedence and semantic readiness edges. For
   each body `s`, let `R(s)` be the greatest readiness-predecessor score,
