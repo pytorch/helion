@@ -1626,6 +1626,49 @@ class TestTileDependency(TestCase):
             tuple(expected.index(task) for task in range(len(expected))),
         )
 
+    def test_ragged_l2_task_order_matches_grouped_traversal(self) -> None:
+        for first_count, second_count, group_size in itertools.product(
+            range(9), range(5), range(1, 6)
+        ):
+            with self.subTest(
+                first_count=first_count,
+                second_count=second_count,
+                group_size=group_size,
+            ):
+                domain = CoordinateDomain(
+                    (10, 20),
+                    ((10, first_count), (20, second_count)),
+                    ((10, 1), (20, 1)),
+                    _allow_empty=first_count == 0 or second_count == 0,
+                )
+                relation = pid_task_order(
+                    domain, domain.axis_order, l2_group_size=group_size
+                )
+                expected = tuple(
+                    domain.index({10: first, 20: second})
+                    for group_begin in range(0, first_count, group_size)
+                    for second in range(second_count)
+                    for first in range(
+                        group_begin,
+                        min(group_begin + group_size, first_count),
+                    )
+                )
+                actual = tuple(
+                    next(iter(targets)) for targets in relation.materialize()
+                )
+                self.assertEqual(actual, expected)
+                self.assertLessEqual(len(relation.pieces), 1)
+                converse = relation.converse()
+                self.assertIsNotNone(converse)
+                assert converse is not None
+                self.assertEqual(
+                    tuple(
+                        next(iter(targets))
+                        for targets in converse.materialize()
+                    ),
+                    tuple(expected.index(task) for task in range(len(expected))),
+                )
+
     def test_symbolic_pid_task_order_compacts_uniform_l2_groups(self) -> None:
         batch = sympy.Symbol("batch", integer=True, nonnegative=True)
         domain = CoordinateDomain(
@@ -1684,7 +1727,7 @@ class TestTileDependency(TestCase):
                 self.subTest(budget_name=budget_name),
                 mock.patch(
                     f"helion._compiler.tile_dependency.{budget_name}",
-                    3,
+                    1,
                 ),
                 mock.patch.object(
                     CoordinateRelation,
@@ -1694,6 +1737,74 @@ class TestTileDependency(TestCase):
                 self.assertRaisesRegex(ValueError, "relation budget"),
             ):
                 pid_task_order(domain, domain.axis_order, l2_group_size=2)
+
+        large_domain = CoordinateDomain(
+            (10, 20),
+            ((10, 4097), (20, 17)),
+            ((10, 1), (20, 1)),
+        )
+        relation = pid_task_order(
+            large_domain,
+            large_domain.axis_order,
+            l2_group_size=2,
+        )
+        self.assertEqual(len(relation.pieces), 1)
+        converse = relation.converse()
+        self.assertIsNotNone(converse)
+        assert converse is not None
+        self.assertEqual(len(converse.pieces), 2)
+
+    def test_binary_floor_selector_does_not_certify_duplicate_targets(self) -> None:
+        source = CoordinateDomain((10,), ((10, 4),), identity=0)
+        target = CoordinateDomain((20,), ((20, 4),), identity=1)
+        coordinate = coordinate_axis_symbol(10)
+        relation = CoordinateRelation.point_map(
+            source,
+            target,
+            ((((10, 0, 4, 1),), (FloorDiv(coordinate, 2),)),),
+        )
+
+        converse = relation.converse()
+        self.assertIsNotNone(converse)
+        assert converse is not None
+        self.assertFalse(converse.is_total_function())
+        self.assertFalse(relation.is_bijection_from_source_support())
+
+    def test_full_source_composition_rejects_a_clipped_first_map(self) -> None:
+        source = CoordinateDomain((10,), ((10, 3),), identity=0)
+        intermediate = CoordinateDomain((20,), ((20, 3),), identity=1)
+        target = CoordinateDomain((30,), ((30, 3),), identity=2)
+        source_coordinate = coordinate_axis_symbol(10)
+        intermediate_coordinate = coordinate_axis_symbol(20)
+        first = CoordinateRelation.point_map(
+            source,
+            intermediate,
+            ((((10, 0, 3, 1),), (source_coordinate,)),),
+        )
+        following = CoordinateRelation.point_map(
+            intermediate,
+            target,
+            ((((20, 0, 3, 1),), (2 - intermediate_coordinate,)),),
+        )
+        self.assertIsNotNone(first.converse())
+        with mock.patch(
+            "helion._compiler.tile_dependency._substitute_composed_expression",
+            side_effect=AssertionError("full support should substitute directly"),
+        ):
+            composed = first.then(following)
+        self.assertIsNotNone(composed)
+        assert composed is not None
+        self.assertEqual(
+            composed.materialize(),
+            (frozenset((2,)), frozenset((1,)), frozenset((0,))),
+        )
+
+        clipped = CoordinateRelation.point_map(
+            source,
+            intermediate,
+            ((((10, 0, 3, 1),), (source_coordinate + 1,)),),
+        )
+        self.assertIsNone(clipped.then(following))
 
     def test_symbolic_pid_task_order_preserves_axis_permutation(self) -> None:
         domain = CoordinateDomain(

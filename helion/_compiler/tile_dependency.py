@@ -2183,6 +2183,15 @@ class CoordinateRelation:
                 return _remember_exact_converse(self, converse)
         if (converse := _cheap_source_support_converse(self)) is not None:
             return converse
+        selector_partition = _static_binary_floor_selector_partition(self)
+        if selector_partition is not None:
+            converse = selector_partition.converse()
+            if converse is not None:
+                return _remember_exact_converse(self, converse)
+        if self.parameter_symbols and (
+            converse := _flat_static_inner_dynamic_outer_converse(self)
+        ) is not None:
+            return _remember_exact_converse(self, converse)
         if (converse := self._factored_source_support_converse) is not None:
             return _remember_exact_converse(self, converse)
         if self.parameter_symbols:
@@ -5586,18 +5595,8 @@ def _factor_through_source_ordinalization(
             recomposed_targets = tuple(
                 (
                     target_axis,
-                    _substitute_composed_expression(
-                        begin,
-                        substitutions=substitutions,
-                        source_domain=relation.source_domain,
-                        source_bounds=relation_piece.source_bounds_items,
-                    ),
-                    _substitute_composed_expression(
-                        end,
-                        substitutions=substitutions,
-                        source_domain=relation.source_domain,
-                        source_bounds=relation_piece.source_bounds_items,
-                    ),
+                    begin.xreplace(substitutions),
+                    end.xreplace(substitutions),
                     step,
                 )
                 for target_axis, begin, end, step in candidate_piece.target_ranges
@@ -5698,7 +5697,16 @@ def _factor_through_source_ordinalization(
                     ),
                 ),
             )
-            if candidate.is_total_function() and full_candidate_recomposes(candidate):
+            if (
+                (
+                    candidate.is_total_function()
+                    or (
+                        candidate.converse() is not None
+                        and candidate.is_total_function()
+                    )
+                )
+                and full_candidate_recomposes(candidate)
+            ):
                 return candidate
 
     # Piece boundaries in ``relation`` may be artifacts of the packed source
@@ -7962,7 +7970,7 @@ def _flat_static_inner_dynamic_outer_converse(
     converse = (
         None
         if expanded_converse is None
-        else expanded_converse.then(product_to_flat)
+        else expanded_converse._then_without_converse(product_to_flat)
     )
     return (
         converse
@@ -9362,6 +9370,105 @@ def _point_expression_preimage(
     )
 
 
+def _static_binary_floor_selector_partition(
+    relation: CoordinateRelation,
+) -> CoordinateRelation | None:
+    """Split one concrete point map at a proved 0/1 floor selector."""
+    if (
+        relation.parameter_symbols
+        or len(relation.pieces) != 1
+        or _MAX_RELATION_PIECES < 2
+        or not _relation_product_is_within_budget(1, 2)
+    ):
+        return None
+    (piece,) = relation.pieces
+    source_counts = relation.source_domain.axis_counts
+    if piece.source_bounds_items != tuple(
+        (axis, 0, source_counts[axis], 1)
+        for axis in relation.source_domain.axis_order
+    ) or any(
+        step != 1
+        or not _integer_partition_expressions_equal(end - begin, 1)
+        for _axis, begin, end, step in piece.target_ranges
+    ):
+        return None
+
+    selectors = tuple(
+        dict.fromkeys(
+            node
+            for _axis, begin, _end, _step in piece.target_ranges
+            for node in sympy.preorder_traversal(begin)
+            if isinstance(node, sympy.Expr)
+            and _static_integer_quotient(node) is not None
+            and _logical_expression_bounds(
+                node,
+                domain=relation.source_domain,
+                source_bounds=piece.source_bounds_items,
+            )
+            == (sympy.Integer(0), sympy.Integer(1))
+        )
+    )
+    for selector in selectors:
+        split_pieces: list[_CoordinateRelationPiece] = []
+        for value in (0, 1):
+            preimage = _point_expression_preimage(
+                selector,
+                lower=value,
+                upper=value + 1,
+                domain=relation.source_domain,
+            )
+            if preimage is None or isinstance(preimage, bool):
+                break
+            source_axis, preimage_begin, preimage_end = preimage
+            begin = max(0, preimage_begin)
+            end = min(source_counts[source_axis], preimage_end)
+            if begin >= end:
+                continue
+            source_bounds = tuple(
+                (
+                    (axis, begin, end, 1)
+                    if axis == source_axis
+                    else (axis, 0, source_counts[axis], 1)
+                )
+                for axis in relation.source_domain.axis_order
+            )
+            substitution = {selector: sympy.Integer(value)}
+            split_pieces.append(
+                _CoordinateRelationPiece(
+                    source_bounds_items=source_bounds,
+                    target_ranges=tuple(
+                        (
+                            axis,
+                            _simplify_logical_expression(
+                                cast("sympy.Expr", target_begin.xreplace(substitution)),
+                                domain=relation.source_domain,
+                                source_bounds=source_bounds,
+                            ),
+                            _simplify_logical_expression(
+                                cast("sympy.Expr", target_end.xreplace(substitution)),
+                                domain=relation.source_domain,
+                                source_bounds=source_bounds,
+                            ),
+                            step,
+                        )
+                        for axis, target_begin, target_end, step in piece.target_ranges
+                    ),
+                )
+            )
+        else:
+            result = CoordinateRelation(
+                relation.source_domain,
+                relation.target_domain,
+                tuple(split_pieces),
+            )
+            if split_pieces and _source_boxes_partition_domain(
+                tuple(item.source_bounds_items for item in split_pieces),
+                relation.source_domain,
+            ):
+                return result
+    return None
+
+
 def _substitute_composed_expression(
     expression: sympy.Expr,
     *,
@@ -9458,6 +9565,44 @@ def _compose_point_relations(
         )
     ):
         return None
+    if len(following.pieces) == 1:
+        (following_piece,) = following.pieces
+        if following_piece.source_bounds_items == tuple(
+            (
+                axis,
+                0,
+                following.source_domain.axis_count_expressions[axis],
+                1,
+            )
+            for axis in following.source_domain.axis_order
+        ) and _has_unclipped_point_source_support(first):
+            # Full following support cannot clip the first map.  Direct
+            # substitution avoids re-solving nested quotient bounds.
+            pieces: list[_CoordinateRelationPiece] = []
+            for piece in first.pieces:
+                substitutions = {
+                    coordinate_axis_symbol(axis): begin
+                    for axis, begin, _end, _step in piece.target_ranges
+                }
+                pieces.append(
+                    _CoordinateRelationPiece(
+                        source_bounds_items=piece.source_bounds_items,
+                        target_ranges=tuple(
+                            (
+                                axis,
+                                begin.xreplace(substitutions),
+                                end.xreplace(substitutions),
+                                step,
+                            )
+                            for axis, begin, end, step in following_piece.target_ranges
+                        ),
+                    )
+                )
+            return CoordinateRelation(
+                source_domain=first.source_domain,
+                target_domain=following.target_domain,
+                pieces=tuple(pieces),
+            )
     pieces: dict[_CoordinateRelationPiece, None] = {}
     unclipped_point_support: bool | None = None
     for first_piece in first.pieces:
@@ -9665,6 +9810,15 @@ def pid_task_order(
     inner = coordinate_axis_symbol(inner_axis)
     uniform_group_size = min(l2_group_size, concrete_first_count)
     if (
+        concrete_first_count == 0
+        or concrete_second_count == 0
+        or logical_domain.size_expr.is_zero is True
+    ):
+        relation = CoordinateRelation(source_domain, logical_domain, ())
+        converse = CoordinateRelation(logical_domain, source_domain, ())
+        _remember_exact_converse(relation, converse)
+        return relation
+    if (
         uniform_group_size > 0
         and concrete_second_count > 0
         and concrete_first_count % uniform_group_size == 0
@@ -9735,42 +9889,101 @@ def pid_task_order(
         _remember_exact_converse(relation, converse)
         return relation
 
-    group_count = (concrete_first_count + l2_group_size - 1) // l2_group_size
-    piece_count = group_count * concrete_second_count
-    if piece_count > _MAX_RELATION_PIECES or not (
-        _relation_product_is_within_budget(group_count, concrete_second_count)
-    ):
+    # A short final L2 group is selected by one exact 0/1 quotient.  Keeping
+    # the forward permutation in one piece avoids multiplying its static
+    # partition by runtime-sized outer axes.
+    if _MAX_RELATION_PIECES < 2 or not _relation_product_is_within_budget(1, 2):
         raise ValueError("L2 task order exceeds the symbolic relation budget")
-    pieces: list[
-        tuple[
-            tuple[tuple[int, int, int, int], ...],
-            tuple[sympy.Expr, ...],
-        ]
-    ] = []
-    for first_in_group in range(0, concrete_first_count, l2_group_size):
-        actual_group_size = min(
-            concrete_first_count - first_in_group,
-            l2_group_size,
-        )
-        group = first_in_group // l2_group_size
-        group_begin = group * l2_group_size * concrete_second_count
-        for second in range(concrete_second_count):
-            begin = group_begin + second * actual_group_size
-            expressions = {
-                first_axis: inner - begin + first_in_group,  # pyrefly: ignore[unsupported-operation]
-                second_axis: sympy.Integer(second),
-                **{axis: coordinate_axis_symbol(axis) for axis in outer_axes},
-            }
-            pieces.append(
-                (
-                    (
-                        (inner_axis, begin, begin + actual_group_size, 1),
-                        *((axis, 0, counts[axis], 1) for axis in outer_axes),
-                    ),
-                    tuple(expressions[axis] for axis in logical_domain.axis_order),
-                )
+    tail_size = concrete_first_count % uniform_group_size
+    full_first_count = concrete_first_count - tail_size
+    tail_begin = full_first_count * concrete_second_count
+    tail = cast("sympy.Expr", FloorDiv(inner, tail_begin))
+    full_first = cast(
+        "sympy.Expr",
+        FloorDiv(inner, uniform_group_size * concrete_second_count)
+        * uniform_group_size
+        + sympy.Mod(inner, uniform_group_size),
+    )
+    tail_first = full_first_count + sympy.Mod(inner - tail_begin, tail_size)
+    full_second = sympy.Mod(
+        cast("sympy.Expr", FloorDiv(inner, uniform_group_size)),
+        concrete_second_count,
+    )
+    tail_second = cast("sympy.Expr", FloorDiv(inner - tail_begin, tail_size))
+    expressions = {
+        first_axis: full_first + tail * (tail_first - full_first),
+        second_axis: full_second + tail * (tail_second - full_second),
+        **{axis: coordinate_axis_symbol(axis) for axis in outer_axes},
+    }
+    relation = CoordinateRelation.point_map(
+        source_domain,
+        logical_domain,
+        (
+            (
+                tuple(
+                    (axis, 0, source_domain.axis_count_expressions[axis], 1)
+                    for axis in source_domain.axis_order
+                ),
+                tuple(expressions[axis] for axis in logical_domain.axis_order),
+            ),
+        ),
+    )
+
+    first = coordinate_axis_symbol(first_axis)
+    second = coordinate_axis_symbol(second_axis)
+    inverse_expressions = {
+        inner_axis: cast(
+            "sympy.Expr",
+            FloorDiv(first, uniform_group_size)
+            * uniform_group_size
+            * concrete_second_count
+            + second * uniform_group_size
+            + sympy.Mod(first, uniform_group_size),
+        ),
+        **{axis: coordinate_axis_symbol(axis) for axis in outer_axes},
+    }
+    tail_inverse_expressions = {
+        **inverse_expressions,
+        inner_axis: tail_begin
+        + second * tail_size
+        + first
+        - full_first_count,
+    }
+
+    def inverse_bounds(begin: int, end: int) -> tuple[
+        tuple[int, IntegerExpression, IntegerExpression, int], ...
+    ]:
+        return tuple(
+            (
+                axis,
+                begin if axis == first_axis else 0,
+                end if axis == first_axis else counts[axis],
+                1,
             )
-    return CoordinateRelation.point_map(source_domain, logical_domain, tuple(pieces))
+            for axis in logical_domain.axis_order
+        )
+
+    converse = CoordinateRelation.point_map(
+        logical_domain,
+        source_domain,
+        (
+            (
+                inverse_bounds(0, full_first_count),
+                tuple(
+                    inverse_expressions[axis] for axis in source_domain.axis_order
+                ),
+            ),
+            (
+                inverse_bounds(full_first_count, concrete_first_count),
+                tuple(
+                    tail_inverse_expressions[axis]
+                    for axis in source_domain.axis_order
+                ),
+            ),
+        ),
+    )
+    _remember_exact_converse(relation, converse)
+    return relation
 
 
 @dataclasses.dataclass(frozen=True)
