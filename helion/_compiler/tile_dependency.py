@@ -2152,12 +2152,20 @@ class CoordinateRelation:
         return _source_support_ordinalization(self)
 
     @cached_property
+    def _flat_static_inner_dynamic_outer_converse_proof(
+        self,
+    ) -> CoordinateRelation | None:
+        """Attempt the bounded parameterized flat-converse proof once."""
+        if not self.parameter_symbols:
+            return None
+        return _flat_static_inner_dynamic_outer_converse(self)
+
+    @cached_property
     def _factored_source_support_converse(self) -> CoordinateRelation | None:
         """Prove and invert this relation through its support ordinalization."""
-        if self.parameter_symbols and (
-            converse := _flat_static_inner_dynamic_outer_converse(self)
-        ) is not None:
-            return converse
+        flat_converse = self._flat_static_inner_dynamic_outer_converse_proof
+        if flat_converse is not None:
+            return flat_converse
         ordinalization = self._ordinalized_source_support
         if ordinalization is None:
             return None
@@ -2369,7 +2377,7 @@ class CoordinateRelation:
                 return None, None
             return converse, target_counts
         if self.parameter_symbols:
-            converse = _flat_static_inner_dynamic_outer_converse(self)
+            converse = self._flat_static_inner_dynamic_outer_converse_proof
             if converse is not None:
                 value_domain = CoordinateDomain(
                     axis_order=(0,),

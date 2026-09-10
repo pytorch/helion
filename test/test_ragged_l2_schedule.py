@@ -360,6 +360,41 @@ class TestRaggedL2Schedule(TestCase):
         # by target-axis order would be an arbitrary and unsound tie-break.
         self.assertIsNone(_flat_static_inner_dynamic_outer_converse(relation))
 
+        # All public proof entry points share one bounded negative result on a
+        # relation instance.  Round trips intentionally retain only semantic
+        # fields, so each rebuilt relation performs its own single attempt.
+        proof_cache = "_flat_static_inner_dynamic_outer_converse_proof"
+        factored_cache = "_factored_source_support_converse"
+        original_derivation = _flat_static_inner_dynamic_outer_converse
+        with mock.patch.object(
+            tile_dependency,
+            "_flat_static_inner_dynamic_outer_converse",
+            wraps=original_derivation,
+        ) as derivation:
+            self.assertIsNone(relation.converse())
+            self.assertIsNone(relation.derive_converse_and_target_counts()[0])
+            self.assertFalse(relation.is_bijection_from_source_support())
+            self.assertEqual(derivation.call_count, 1)
+        self.assertIn(proof_cache, relation.__dict__)
+
+        for name, rebuilt in (
+            ("deepcopy", copy.deepcopy(relation)),
+            ("pickle", pickle.loads(pickle.dumps(relation))),
+        ):
+            with self.subTest(roundtrip=name):
+                self.assertNotIn(proof_cache, rebuilt.__dict__)
+                self.assertNotIn(factored_cache, rebuilt.__dict__)
+                with mock.patch.object(
+                    tile_dependency,
+                    "_flat_static_inner_dynamic_outer_converse",
+                    wraps=original_derivation,
+                ) as derivation:
+                    self.assertIsNone(rebuilt.converse())
+                    self.assertIsNone(
+                        rebuilt.derive_converse_and_target_counts()[0]
+                    )
+                    self.assertEqual(derivation.call_count, 1)
+
     def test_ragged_l2_relation_proof_recovers_after_copy_and_pickle(self) -> None:
         batch = sympy.Symbol("batch", integer=True, nonnegative=True)
         domain = _domain(
@@ -543,6 +578,133 @@ class TestRaggedL2Schedule(TestCase):
                     self.assertTrue(
                         occupied_supports[0].isdisjoint(occupied_supports[1])
                     )
+
+    def test_two_dynamic_axis_l2_survives_unaligned_packed_prefix(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        query = sympy.Symbol("query", integer=True, nonnegative=True)
+        worker_count = 7
+        prefix = _domain((1,), (3,), identity=0)
+        l2_domain = _domain(
+            (_FIRST_AXIS, _SECOND_AXIS, _BATCH_AXIS, _QUERY_AXIS),
+            (5, 3, batch, query),
+            identity=1,
+        )
+        task_orders = (
+            pid_task_order(prefix, prefix.axis_order),
+            pid_task_order(
+                l2_domain,
+                l2_domain.axis_order,
+                l2_group_size=2,
+            ),
+        )
+        schedule = cross_loop_scheduler._build_root_major_worker_schedule(
+            (prefix, l2_domain),
+            task_orders,
+            worker_count,
+        )
+
+        self.assertEqual(len(schedule.segments), 2)
+        self.assertLessEqual(len(schedule.segments[0].task_order.pieces), 3)
+        self.assertLessEqual(len(schedule.segments[1].task_order.pieces), 3)
+        for name, rebuilt in (
+            ("original", schedule),
+            ("deepcopy", copy.deepcopy(schedule)),
+            ("pickle", pickle.loads(pickle.dumps(schedule))),
+        ):
+            with self.subTest(roundtrip=name):
+                cross_loop_scheduler._root_task_placement_relation.cache_clear()
+                cross_loop_scheduler._root_schedule_traversal.cache_clear()
+                cross_loop_scheduler.root_barrier_publication_plan.cache_clear()
+                with mock.patch.object(
+                    CoordinateRelation,
+                    "materialize",
+                    side_effect=AssertionError(
+                        "schedule proof recovery must not enumerate runtime CTAs"
+                    ),
+                ):
+                    self.assertTrue(
+                        cross_loop_scheduler._validate_worker_schedule_tasks(
+                            rebuilt,
+                            task_orders,
+                        )
+                    )
+                    for root in range(2):
+                        placement = (
+                            cross_loop_scheduler._root_task_placement_relation(
+                                rebuilt,
+                                root,
+                            )
+                        )
+                        self.assertIsNotNone(placement)
+                        assert placement is not None
+                        self.assertTrue(placement.is_total_function())
+                        publication = (
+                            cross_loop_scheduler.root_barrier_publication_plan(
+                                rebuilt,
+                                root,
+                            )
+                        )
+                        self.assertIsNotNone(publication.participant_order)
+                        assert publication.participant_order is not None
+                        self.assertTrue(
+                            publication.participant_order
+                            .is_bijection_from_source_support()
+                        )
+
+                for concrete_batch, concrete_query in (
+                    (0, 2),
+                    (2, 0),
+                    (1, 1),
+                    (2, 3),
+                ):
+                    with self.subTest(
+                        batch=concrete_batch,
+                        query=concrete_query,
+                    ):
+                        substitutions = {
+                            batch: concrete_batch,
+                            query: concrete_query,
+                        }
+                        concrete_relations = tuple(
+                            segment.task_order.substitute_parameters(substitutions)
+                            for segment in rebuilt.segments
+                        )
+                        self.assertEqual(
+                            _singleton_targets(concrete_relations[0]),
+                            (0, 1, 2),
+                        )
+                        concrete_l2_domain = l2_domain.substitute_parameters(
+                            substitutions
+                        )
+                        l2_targets = _singleton_targets(concrete_relations[1])
+                        expected_l2_targets = _expected_l2_targets(
+                            concrete_l2_domain,
+                            concrete_l2_domain.axis_order,
+                            2,
+                        )
+                        self.assertEqual(l2_targets, expected_l2_targets)
+                        self.assertEqual(
+                            len(l2_targets),
+                            15 * concrete_batch * concrete_query,
+                        )
+                        _assert_exact_bijection(
+                            self,
+                            concrete_relations[1],
+                            15 * concrete_batch * concrete_query,
+                        )
+                        occupied_supports = tuple(
+                            {
+                                source_index
+                                for source_index, targets in enumerate(
+                                    relation.materialize()
+                                )
+                                if targets
+                            }
+                            for relation in concrete_relations
+                        )
+                        self.assertTrue(
+                            occupied_supports[0].isdisjoint(occupied_supports[1])
+                        )
 
     def test_l2_edge_geometries_have_exact_constant_size_proofs(self) -> None:
         for first_count, second_count, group_size in (
