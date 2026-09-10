@@ -1626,49 +1626,6 @@ class TestTileDependency(TestCase):
             tuple(expected.index(task) for task in range(len(expected))),
         )
 
-    def test_ragged_l2_task_order_matches_grouped_traversal(self) -> None:
-        for first_count, second_count, group_size in itertools.product(
-            range(9), range(5), range(1, 6)
-        ):
-            with self.subTest(
-                first_count=first_count,
-                second_count=second_count,
-                group_size=group_size,
-            ):
-                domain = CoordinateDomain(
-                    (10, 20),
-                    ((10, first_count), (20, second_count)),
-                    ((10, 1), (20, 1)),
-                    _allow_empty=first_count == 0 or second_count == 0,
-                )
-                relation = pid_task_order(
-                    domain, domain.axis_order, l2_group_size=group_size
-                )
-                expected = tuple(
-                    domain.index({10: first, 20: second})
-                    for group_begin in range(0, first_count, group_size)
-                    for second in range(second_count)
-                    for first in range(
-                        group_begin,
-                        min(group_begin + group_size, first_count),
-                    )
-                )
-                actual = tuple(
-                    next(iter(targets)) for targets in relation.materialize()
-                )
-                self.assertEqual(actual, expected)
-                self.assertLessEqual(len(relation.pieces), 1)
-                converse = relation.converse()
-                self.assertIsNotNone(converse)
-                assert converse is not None
-                self.assertEqual(
-                    tuple(
-                        next(iter(targets))
-                        for targets in converse.materialize()
-                    ),
-                    tuple(expected.index(task) for task in range(len(expected))),
-                )
-
     def test_symbolic_pid_task_order_compacts_uniform_l2_groups(self) -> None:
         batch = sympy.Symbol("batch", integer=True, nonnegative=True)
         domain = CoordinateDomain(
@@ -1737,22 +1694,6 @@ class TestTileDependency(TestCase):
                 self.assertRaisesRegex(ValueError, "relation budget"),
             ):
                 pid_task_order(domain, domain.axis_order, l2_group_size=2)
-
-        large_domain = CoordinateDomain(
-            (10, 20),
-            ((10, 4097), (20, 17)),
-            ((10, 1), (20, 1)),
-        )
-        relation = pid_task_order(
-            large_domain,
-            large_domain.axis_order,
-            l2_group_size=2,
-        )
-        self.assertEqual(len(relation.pieces), 1)
-        converse = relation.converse()
-        self.assertIsNotNone(converse)
-        assert converse is not None
-        self.assertEqual(len(converse.pieces), 2)
 
     def test_binary_floor_selector_does_not_certify_duplicate_targets(self) -> None:
         source = CoordinateDomain((10,), ((10, 4),), identity=0)

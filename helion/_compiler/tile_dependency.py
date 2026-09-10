@@ -3185,21 +3185,52 @@ class CoordinateRelation:
         """
         if self.target_domain.size_expr.is_zero is True:
             return 0
+
+        def cardinality_from_exact_converse(
+            converse: CoordinateRelation | None,
+        ) -> int | sympy.Expr | None:
+            if (
+                converse is None
+                or not self.is_single_valued()
+                or not converse.is_single_valued()
+                or not _source_boxes_partition_domain(
+                    tuple(piece.source_bounds_items for piece in converse.pieces),
+                    converse.source_domain,
+                )
+                or any(
+                    not _target_point_is_in_domain(
+                        piece.target_ranges,
+                        source_domain=converse.source_domain,
+                        source_bounds=piece.source_bounds_items,
+                        target_domain=converse.target_domain,
+                    )
+                    for piece in converse.pieces
+                )
+            ):
+                return None
+            target_size = sympy.simplify(self.target_domain.size_expr)
+            return (
+                int(target_size)
+                if isinstance(target_size, sympy.Integer)
+                else target_size
+            )
+
         if len(
             self.pieces
         ) <= _MAX_RELATION_PIECES and _relation_product_is_within_budget(
             len(self.pieces), len(self.pieces)
         ):
-            piece_cardinalities = tuple(
-                _source_box_cardinality(
+            piece_cardinalities: list[int | sympy.Expr] = []
+            for piece in self.pieces:
+                piece_cardinality = _source_box_cardinality(
                     piece.source_bounds_items,
                     domain=self.source_domain,
                 )
-                for piece in self.pieces
-            )
-            if (
-                all(cardinality is not None for cardinality in piece_cardinalities)
-                and all(
+                if piece_cardinality is None:
+                    break
+                piece_cardinalities.append(piece_cardinality)
+            else:
+                if all(
                     cardinality == 0
                     or _target_box_is_nonempty_for_all_sources(
                         piece.target_ranges,
@@ -3212,41 +3243,25 @@ class CoordinateRelation:
                         piece_cardinalities,
                         strict=True,
                     )
-                )
-                and all(
+                ) and all(
                     _source_boxes_are_disjoint(left, right)
                     for index, left in enumerate(self.pieces)
                     for right in self.pieces[index + 1 :]
-                )
-            ):
-                cardinality = sympy.simplify(
-                    sum(
-                        cast("sympy.Expr", piece_cardinality)
-                        for piece_cardinality in piece_cardinalities
+                ):
+                    cardinality = sympy.simplify(sum(piece_cardinalities))
+                    return (
+                        int(cardinality)
+                        if isinstance(cardinality, sympy.Integer)
+                        else cardinality
                     )
-                )
-                return (
-                    int(cardinality)
-                    if isinstance(cardinality, sympy.Integer)
-                    else cardinality
-                )
         # Production relations normally arrive with this memo already attached.
         # The cheap bounded recognizer preserves extensionally equal manually
         # constructed relations without re-entering the factored proof search.
         converse = _memoized_exact_converse(self) or _cheap_source_support_converse(
             self
         )
-        if (
-            converse is not None
-            and self.is_single_valued()
-            and converse.is_total_function()
-        ):
-            target_size = sympy.simplify(self.target_domain.size_expr)
-            return (
-                int(target_size)
-                if isinstance(target_size, sympy.Integer)
-                else target_size
-            )
+        if (cardinality := cardinality_from_exact_converse(converse)) is not None:
+            return cardinality
         positional_product = self._positional_product
         if positional_product is not None:
             positional_axes, residual = positional_product
@@ -3270,17 +3285,11 @@ class CoordinateRelation:
         if self.parameter_symbols:
             converse = self._factored_source_support_converse
             if (
-                converse is not None
-                and self.is_single_valued()
-                and converse.is_total_function()
-            ):
+                cardinality := cardinality_from_exact_converse(converse)
+            ) is not None:
+                assert converse is not None
                 _remember_exact_converse(self, converse)
-                target_size = sympy.simplify(self.target_domain.size_expr)
-                return (
-                    int(target_size)
-                    if isinstance(target_size, sympy.Integer)
-                    else target_size
-                )
+                return cardinality
             # Symbolic overlap normalization requires an ordering proof for
             # every source cut.  Decline instead of sampling a runtime size.
             return None
