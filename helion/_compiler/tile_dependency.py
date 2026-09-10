@@ -2134,10 +2134,12 @@ class CoordinateRelation:
         ordinalization = self._ordinalized_source_support
         if ordinalization is None:
             return None
-        ordinal_inverse = _source_support_ordinalization(
-            ordinalization,
-            reverse=True,
-        )
+        ordinal_inverse = _memoized_exact_converse(ordinalization)
+        if ordinal_inverse is None:
+            ordinal_inverse = _source_support_ordinalization(
+                ordinalization,
+                reverse=True,
+            )
         if ordinal_inverse is None:
             return None
         _remember_exact_converse(ordinalization, ordinal_inverse)
@@ -5228,25 +5230,27 @@ def _source_support_ordinalization(
                 for piece in relation.pieces
             ),
         )
+        inverse_relation = CoordinateRelation.point_map(
+            ordinal_domain,
+            relation.source_domain,
+            (
+                (
+                    ((ordinal_axis, 0, target_count, 1),),
+                    tuple(
+                        inverse[axis] for axis in relation.source_domain.axis_order
+                    ),
+                ),
+            ),
+        )
         if reverse:
             if not _relations_equal_after_source_coalescing(
                 ordinalization,
                 relation,
             ):
                 return None
-            return CoordinateRelation.point_map(
-                ordinal_domain,
-                relation.source_domain,
-                (
-                    (
-                        ((ordinal_axis, 0, target_count, 1),),
-                        tuple(
-                            inverse[axis]
-                            for axis in relation.source_domain.axis_order
-                        ),
-                    ),
-                ),
-            )
+            return inverse_relation
+        if inverse_relation.is_total_function():
+            _remember_exact_converse(ordinalization, inverse_relation)
         return ordinalization
 
     # A bounded partition of one row-major interval.

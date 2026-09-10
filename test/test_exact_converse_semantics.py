@@ -200,6 +200,17 @@ class TestExactConverseSemantics(TestCase):
                 )
         self.assertEqual(task_order.source_domain, old_domain)
 
+    def test_source_support_ordinalization_retains_constructed_inverse(self) -> None:
+        _old_domain, _widened_domain, task_order = self._partial_worker_task_order()
+
+        ordinalization = task_order._ordinalized_source_support
+        self.assertIsNotNone(ordinalization)
+        assert ordinalization is not None
+        inverse = _memoized_exact_converse(ordinalization)
+        self.assertIsNotNone(inverse)
+        assert inverse is not None
+        self.assertTrue(inverse.is_total_function())
+
     def test_normalized_segment_widening_does_not_reconstruct_converse(
         self,
     ) -> None:
