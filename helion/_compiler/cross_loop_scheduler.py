@@ -2695,6 +2695,79 @@ def _root_task_placement_relation(
 
 
 @cache
+def _root_task_slot_relation(
+    worker_schedule: WorkerSchedule,
+    root: int,
+) -> CoordinateRelation | None:
+    """Map every resident logical task to ``wave * workers + worker``.
+
+    The root placement relation is the sole ownership source.  This derived
+    scalar view discards launch stage only after proving that every represented
+    task is resident, and it remains bounded by the ordinary relation budget.
+    """
+    placement = _root_task_placement_relation(worker_schedule, root)
+    if (
+        placement is None
+        or len(placement.pieces) > tile_dependency._MAX_RELATION_PIECES
+    ):
+        return None
+    launch_stage_axis, worker_axis, wave_axis = (
+        worker_schedule.placement_domain.axis_order
+    )
+    wave_count = worker_schedule.placement_domain.axis_count_expressions[wave_axis]
+    slot_count = sympy.simplify(worker_schedule.worker_count * wave_count)
+    slot_domain = CoordinateDomain(
+        axis_order=(wave_axis,),
+        axis_counts_items=((wave_axis, slot_count),),
+        kind="value",
+        _allow_empty=slot_count.is_zero is True,
+    )
+    pieces: list[
+        tuple[
+            tuple[tuple[int, int | sympy.Expr, int | sympy.Expr, int], ...],
+            tuple[sympy.Expr, ...],
+        ]
+    ] = []
+    for piece in placement.pieces:
+        targets = {
+            axis: (begin, end, step) for axis, begin, end, step in piece.target_ranges
+        }
+        if set(targets) != {launch_stage_axis, worker_axis, wave_axis}:
+            return None
+        if any(
+            step != 1 or not _equal_integer_expressions(end - begin, 1)
+            for begin, end, step in targets.values()
+        ):
+            return None
+        launch_stage = targets[launch_stage_axis][0]
+        if not _equal_integer_expressions(
+            launch_stage,
+            _RESIDENT_LAUNCH_STAGE,
+        ):
+            return None
+        worker = targets[worker_axis][0]
+        wave = targets[wave_axis][0]
+        pieces.append(
+            (
+                piece.source_bounds_items,
+                (
+                    _simplify_logical_expression(
+                        sympy.simplify(wave * worker_schedule.worker_count + worker),
+                        domain=placement.source_domain,
+                        source_bounds=piece.source_bounds_items,
+                    ),
+                ),
+            )
+        )
+    result = CoordinateRelation.point_map(
+        placement.source_domain,
+        slot_domain,
+        tuple(pieces),
+    )
+    return result if result.is_total_function() else None
+
+
+@cache
 def _root_task_wave_relation(
     worker_schedule: WorkerSchedule,
     root: int,
@@ -2802,6 +2875,63 @@ def _maximum_required_value_by_consumer(
         if maximum is not None and maximum.canonical_single_valued() is not None
         else None
     )
+
+
+def _strict_root_slot_progress(
+    worker_schedule: WorkerSchedule,
+    dependencies: tuple[tuple[int, int, CoordinateRelation], ...],
+) -> bool:
+    """Prove root-level dependency edges strictly increase global slot rank.
+
+    Each relation maps a consumer root task to all producer root tasks that it
+    waits for.  Empty support is allowed; otherwise the exact maximum producer
+    slot must precede the owning consumer slot.  Worker-strand edges also
+    increase this rank by construction, so the proof is sufficient for
+    same-wave lower-worker admission without enumerating workers or tasks.
+    """
+    slots_by_root: dict[int, CoordinateRelation] = {}
+    for producer_root, consumer_root, producers_by_consumer in dependencies:
+        producer_slots = slots_by_root.get(producer_root)
+        if producer_slots is None:
+            producer_slots = _root_task_slot_relation(
+                worker_schedule,
+                producer_root,
+            )
+            if producer_slots is None:
+                return False
+            slots_by_root[producer_root] = producer_slots
+        consumer_slots = slots_by_root.get(consumer_root)
+        if consumer_slots is None:
+            consumer_slots = _root_task_slot_relation(
+                worker_schedule,
+                consumer_root,
+            )
+            if consumer_slots is None:
+                return False
+            slots_by_root[consumer_root] = consumer_slots
+        if (
+            producers_by_consumer.source_domain != consumer_slots.source_domain
+            or producers_by_consumer.target_domain != producer_slots.source_domain
+        ):
+            return False
+        latest_producer_slot = producers_by_consumer.max_target_value_by_source(
+            producer_slots
+        )
+        if latest_producer_slot is None:
+            return False
+        if not latest_producer_slot.pieces:
+            support_cardinality = producers_by_consumer.source_support_cardinality()
+            if support_cardinality is None or not _equal_integer_expressions(
+                support_cardinality,
+                0,
+            ):
+                return False
+            continue
+        if not latest_producer_slot.is_pointwise_strictly_less_than_where_defined(
+            consumer_slots
+        ):
+            return False
+    return True
 
 
 @cache

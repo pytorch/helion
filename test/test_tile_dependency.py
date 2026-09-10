@@ -4803,6 +4803,34 @@ class TestTileDependency(TestCase):
         )
         self.assertFalse(partial_right.is_pointwise_equal_to(right))
 
+    def test_pointwise_strict_order_uses_symbolic_support_cardinality(self) -> None:
+        count = sympy.Symbol("count", integer=True, nonnegative=True)
+        source = CoordinateDomain(
+            (10,),
+            ((10, count),),
+            identity=0,
+            _allow_empty=True,
+        )
+        values = CoordinateDomain(
+            (0,),
+            ((0, 2 * count + 1),),
+            kind="value",
+        )
+        coordinate = coordinate_axis_symbol(10)
+        left = CoordinateRelation.point_map(
+            source,
+            values,
+            ((((10, 0, count, 1),), (coordinate,)),),
+        )
+        right = CoordinateRelation.point_map(
+            source,
+            values,
+            ((((10, 0, count, 1),), (coordinate + count,)),),
+        )
+
+        self.assertTrue(left.is_pointwise_strictly_less_than_where_defined(right))
+        self.assertFalse(right.is_pointwise_strictly_less_than_where_defined(left))
+
     def test_partitioned_total_function_avoids_global_canonicalization(self) -> None:
         source = CoordinateDomain((10,), ((10, 128),), identity=0)
         target = CoordinateDomain((20,), ((20, 128),), identity=1)

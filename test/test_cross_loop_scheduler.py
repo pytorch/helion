@@ -11,6 +11,7 @@ from unittest import mock
 
 import sympy
 import torch
+from torch.utils._sympy.functions import FloorDiv
 from torch.utils._sympy.functions import Max as SymbolicMax
 from torch.utils._sympy.functions import Min as SymbolicMin
 
@@ -2691,6 +2692,165 @@ class TestCrossLoopScheduler(TestCase):
         self.assertIsNotNone(root_placement)
         assert root_placement is not None
         self.assertTrue(root_placement.is_total_function())
+
+    def test_root_task_slots_derive_from_authoritative_placement(self) -> None:
+        (domain,) = _identify_root_domains((_domain((10, 3, 1)),))
+        order = pid_task_order(domain, domain.axis_order)
+        schedule = _schedule(
+            4,
+            _segment(0, order, workers=(1, 3), dispatch_offset=2),
+        )
+
+        with _forbid_schedule_enumeration():
+            slots = cross_loop_scheduler._root_task_slot_relation(schedule, 0)
+
+        self.assertIsNotNone(slots)
+        assert slots is not None
+        self.assertEqual(
+            tuple(next(iter(values)) for values in slots.materialize()),
+            (3, 5, 6),
+        )
+
+    def test_strict_root_slot_progress_accepts_only_earlier_slots(self) -> None:
+        producer_domain, consumer_domain = _identify_root_domains(
+            (_domain((10, 2, 1)), _domain((20, 1, 1)))
+        )
+        orders = _default_root_task_orders((producer_domain, consumer_domain))
+        producers_by_consumer = CoordinateRelation.total(
+            consumer_domain,
+            producer_domain,
+        )
+        safe = _schedule(
+            4,
+            _segment(0, orders[0], workers=(0, 2), dispatch_offset=0),
+            _segment(1, orders[1], workers=(2, 1), dispatch_offset=0),
+        )
+        late_producer = _schedule(
+            4,
+            _segment(1, orders[1], workers=(1, 1), dispatch_offset=0),
+            _segment(0, orders[0], workers=(2, 2), dispatch_offset=0),
+        )
+        self_dependency = CoordinateRelation.identity(
+            consumer_domain,
+            consumer_domain,
+        )
+
+        with _forbid_schedule_enumeration():
+            self.assertTrue(
+                cross_loop_scheduler._strict_root_slot_progress(
+                    safe,
+                    ((0, 1, producers_by_consumer),),
+                )
+            )
+            self.assertFalse(
+                cross_loop_scheduler._strict_root_slot_progress(
+                    late_producer,
+                    ((0, 1, producers_by_consumer),),
+                )
+            )
+            self.assertFalse(
+                cross_loop_scheduler._strict_root_slot_progress(
+                    safe,
+                    ((1, 1, self_dependency),),
+                )
+            )
+
+    def test_strict_root_slot_progress_is_symbolic_and_empty_safe(self) -> None:
+        task_count = sympy.Symbol("task_count", integer=True, nonnegative=True)
+        root_domains = _identify_root_domains(
+            tuple(
+                CoordinateDomain(
+                    (axis,),
+                    ((axis, task_count),),
+                    ((axis, 1),),
+                    _allow_empty=True,
+                )
+                for axis in (10, 20)
+            )
+        )
+        schedule_domain = cross_loop_scheduler._worker_schedule_domain(
+            4,
+            task_count,
+            (-3, -2, -1),
+        )
+        launch_axis, worker_axis, wave_axis = schedule_domain.axis_order
+        worker = coordinate_axis_symbol(worker_axis)
+        wave = coordinate_axis_symbol(wave_axis)
+        segments: list[WorkerScheduleSegment] = []
+        for root, phase in enumerate((0, 1)):
+            domain = root_domains[root]
+            (task_axis,) = domain.axis_order
+            task = coordinate_axis_symbol(task_axis)
+            schedule_to_task = CoordinateRelation.point_map(
+                schedule_domain,
+                domain,
+                (
+                    (
+                        (
+                            (launch_axis, 1, 2, 1),
+                            (worker_axis, phase, 4, 2),
+                            (wave_axis, 0, task_count, 1),
+                        ),
+                        (2 * wave + sympy.floor(worker / 2),),
+                    ),
+                ),
+            )
+            global_slot = 2 * task + phase
+            task_to_schedule = CoordinateRelation.point_map(
+                domain,
+                schedule_domain,
+                (
+                    (
+                        ((task_axis, 0, task_count, 1),),
+                        (
+                            sympy.Integer(1),
+                            sympy.Mod(global_slot, 4),
+                            FloorDiv(global_slot, 4),
+                        ),
+                    ),
+                ),
+            )
+            tile_dependency._remember_exact_converse(
+                schedule_to_task,
+                task_to_schedule,
+            )
+            segments.append(WorkerScheduleSegment(root, schedule_to_task, 0, 4, 0))
+        schedule = WorkerSchedule(4, tuple(segments))
+        dependency = CoordinateRelation.identity(
+            root_domains[1],
+            root_domains[1],
+        ).rename_target_axes(root_domains[0])
+        self.assertIsNotNone(dependency)
+        assert dependency is not None
+
+        with _forbid_schedule_enumeration():
+            self.assertTrue(
+                cross_loop_scheduler._strict_root_slot_progress(
+                    schedule,
+                    ((0, 1, dependency),),
+                )
+            )
+
+        empty_schedule = WorkerSchedule(
+            4,
+            tuple(
+                dataclasses.replace(
+                    segment,
+                    task_order=segment.task_order.substitute_parameters(
+                        {task_count: 0}
+                    ),
+                )
+                for segment in schedule.segments
+            ),
+        )
+        empty_dependency = dependency.substitute_parameters({task_count: 0})
+        with _forbid_schedule_enumeration():
+            self.assertTrue(
+                cross_loop_scheduler._strict_root_slot_progress(
+                    empty_schedule,
+                    ((0, 1, empty_dependency),),
+                )
+            )
 
     def test_worker_schedule_rejects_equal_cardinality_with_duplicate_tasks(
         self,
@@ -6114,6 +6274,38 @@ class TestCrossLoopScheduler(TestCase):
                     (plan,),
                     frozenset(),
                     transient_source_root=0,
+                )
+            )
+
+    def test_strict_root_slot_progress_respects_relation_budget(self) -> None:
+        producer_domain, consumer_domain = _identify_root_domains(
+            (_domain((10, 2, 1)), _domain((20, 2, 1)))
+        )
+        orders = _default_root_task_orders((producer_domain, consumer_domain))
+        schedule = _schedule(
+            4,
+            _segment(0, orders[0], workers=(0, 2), dispatch_offset=0),
+            _segment(1, orders[1], workers=(2, 2), dispatch_offset=0),
+        )
+        consumer_axis = coordinate_axis_symbol(20)
+        dependency = CoordinateRelation.point_map(
+            consumer_domain,
+            producer_domain,
+            (
+                (((20, 0, 1, 1),), (consumer_axis,)),
+                (((20, 1, 2, 1),), (consumer_axis,)),
+            ),
+        )
+
+        cross_loop_scheduler._root_task_slot_relation.cache_clear()
+        with (
+            _forbid_schedule_enumeration(),
+            mock.patch.object(tile_dependency, "_MAX_RELATION_PIECES", 1),
+        ):
+            self.assertFalse(
+                cross_loop_scheduler._strict_root_slot_progress(
+                    schedule,
+                    ((0, 1, dependency),),
                 )
             )
 

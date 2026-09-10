@@ -3840,6 +3840,77 @@ class CoordinateRelation:
         other: CoordinateRelation,
     ) -> bool:
         """Prove strict order on this scalar function's exact source support."""
+        left = self.canonical_single_valued()
+        right = other.canonical_single_valued()
+        if (
+            left is not None
+            and right is not None
+            and left.source_domain == right.source_domain
+            and left.target_domain == right.target_domain
+            and left.pieces
+            and right.is_total_function()
+            and tuple(piece.source_bounds_items for piece in left.pieces)
+            == tuple(piece.source_bounds_items for piece in right.pieces)
+        ):
+            for left_piece, right_piece in zip(
+                left.pieces,
+                right.pieces,
+                strict=True,
+            ):
+                if (
+                    len(left_piece.target_ranges) != 1
+                    or len(right_piece.target_ranges) != 1
+                ):
+                    break
+                left_axis, left_begin, left_end, left_step = (
+                    left_piece.target_ranges[0]
+                )
+                right_axis, right_begin, right_end, right_step = (
+                    right_piece.target_ranges[0]
+                )
+                if (
+                    left_axis != right_axis
+                    or left_step != 1
+                    or right_step != 1
+                    or not _integer_partition_expressions_equal(
+                        left_end - left_begin,  # pyrefly: ignore[unsupported-operation]
+                        1,
+                    )
+                    or not _integer_partition_expressions_equal(
+                        right_end - right_begin,  # pyrefly: ignore[unsupported-operation]
+                        1,
+                    )
+                ):
+                    break
+                difference = _simplify_integer_quotients(
+                    sympy.simplify(left_begin - right_begin)  # pyrefly: ignore[unsupported-operation]
+                )
+                bounds = _logical_expression_bounds(
+                    difference,
+                    domain=left.source_domain,
+                    source_bounds=left_piece.source_bounds_items,
+                )
+                if bounds is not None and (
+                    not bounds[1].free_symbols
+                    and bounds[1].is_integer is True
+                    and int(bounds[1]) <= -1
+                ):
+                    continue
+                # A symbolic box contains either no points or at least one.
+                # Therefore a gap at least as large as ``cardinality(box)`` is
+                # strictly positive everywhere the partial left relation is
+                # defined, even when its symbolic extent may also be zero.
+                cardinality = _source_box_cardinality(
+                    left_piece.source_bounds_items,
+                    domain=left.source_domain,
+                )
+                if cardinality is None or not _is_provably_nonnegative(
+                    sympy.simplify(-difference - cardinality),
+                    None,
+                ):
+                    break
+            else:
+                return True
         bounds = self._pointwise_difference_bounds(
             other,
             require_total_self=False,
