@@ -6975,7 +6975,7 @@ def _target_box_expression_extreme(
             return None
         return sympy.Add(*(child for child in children if child is not None))
     if isinstance(expression, sympy.Mul):
-        coefficient = sympy.Integer(1)
+        coefficient: sympy.Expr = sympy.Integer(1)
         varying: list[sympy.Expr] = []
         for child in expression.args:
             if child.free_symbols & ranges.keys():
@@ -6983,6 +6983,14 @@ def _target_box_expression_extreme(
             else:
                 coefficient *= child  # pyrefly: ignore[unsupported-operation]
         if len(varying) != 1 or coefficient.is_real is not True:
+            return None
+        coefficient_is_nonnegative = (
+            coefficient.is_nonnegative is True  # pyrefly: ignore[missing-attribute]
+        )
+        coefficient_is_nonpositive = (
+            coefficient.is_nonpositive is True  # pyrefly: ignore[missing-attribute]
+        )
+        if not coefficient_is_nonnegative and not coefficient_is_nonpositive:
             return None
         child = _target_box_expression_extreme(
             varying[0],
@@ -6992,16 +7000,11 @@ def _target_box_expression_extreme(
             source_bounds=source_bounds,
             maximize=(
                 maximize
-                if coefficient.is_nonnegative is True
+                if coefficient_is_nonnegative
                 else not maximize
-                if coefficient.is_nonpositive is True
-                else maximize
             ),
         )
-        if child is None or (
-            coefficient.is_nonnegative is not True
-            and coefficient.is_nonpositive is not True
-        ):
+        if child is None:
             return None
         return coefficient * child  # pyrefly: ignore[unsupported-operation]
     quotient = _static_integer_quotient(expression)
@@ -7015,21 +7018,22 @@ def _target_box_expression_extreme(
             source_bounds=source_bounds,
             maximize=maximize,
         )
-        return (
-            None
-            if child is None
-            else sympy.floor(child / denominator)  # pyrefly: ignore[bad-argument-type]
+        return None if child is None else cast(
+            "sympy.Expr",
+            sympy.floor(child / denominator),  # pyrefly: ignore[bad-argument-type, unsupported-operation]
         )
     if isinstance(expression, sympy.Mod):
-        dividend, modulus = expression.args
+        dividend, modulus = (
+            cast("sympy.Expr", argument) for argument in expression.args
+        )
         if (
             modulus.free_symbols
-            or modulus.is_integer is not True
-            or modulus.is_positive is not True
+            or modulus.is_integer is not True  # pyrefly: ignore[missing-attribute]
+            or modulus.is_positive is not True  # pyrefly: ignore[missing-attribute]
         ):
             return None
         minimum = _target_box_expression_extreme(
-            cast("sympy.Expr", dividend),
+            dividend,
             target_domain=target_domain,
             target_ranges=target_ranges,
             source_domain=source_domain,
@@ -7037,7 +7041,7 @@ def _target_box_expression_extreme(
             maximize=False,
         )
         maximum = _target_box_expression_extreme(
-            cast("sympy.Expr", dividend),
+            dividend,
             target_domain=target_domain,
             target_ranges=target_ranges,
             source_domain=source_domain,
@@ -7046,8 +7050,8 @@ def _target_box_expression_extreme(
         )
         if minimum is None or maximum is None:
             return None
-        lower_period = sympy.floor(minimum / modulus)  # pyrefly: ignore[bad-argument-type]
-        upper_period = sympy.floor(maximum / modulus)  # pyrefly: ignore[bad-argument-type]
+        lower_period = sympy.floor(minimum / modulus)  # pyrefly: ignore[bad-argument-type, unsupported-operation]
+        upper_period = sympy.floor(maximum / modulus)  # pyrefly: ignore[bad-argument-type, unsupported-operation]
         period_delta_bounds = _logical_expression_bounds(
             sympy.simplify(upper_period - lower_period),
             domain=source_domain,
@@ -7057,8 +7061,11 @@ def _target_box_expression_extreme(
             lower_period,
             upper_period,
         ) or period_delta_bounds == (sympy.Integer(0), sympy.Integer(0)):
-            return sympy.Mod(maximum if maximize else minimum, modulus)
-        span = sympy.simplify(maximum - minimum)
+            return cast(
+                "sympy.Expr",
+                sympy.Mod(maximum if maximize else minimum, modulus),
+            )
+        span = sympy.simplify(maximum - minimum)  # pyrefly: ignore[unsupported-operation]
         interval_width = span + 1  # pyrefly: ignore[unsupported-operation]
         if (
             interval_width.is_integer is True  # pyrefly: ignore[missing-attribute]
@@ -7076,7 +7083,10 @@ def _target_box_expression_extreme(
             # positional outer digits have been substituted.  The local lemma
             # is sufficient on its own; it need not recover the original
             # relation's ``_positional_product`` provenance.
-            return sympy.Mod(maximum if maximize else minimum, modulus)
+            return cast(
+                "sympy.Expr",
+                sympy.Mod(maximum if maximize else minimum, modulus),
+            )
         return None
     if expression.func in (sympy.floor, sympy.ceiling, sympy.Min, sympy.Max):
         children = tuple(
