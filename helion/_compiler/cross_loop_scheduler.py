@@ -2522,6 +2522,284 @@ def _strict_same_strand_precedence(
     )
 
 
+def _partition_resident_readiness_handoffs(
+    relation: CoordinateRelation,
+) -> tuple[CoordinateRelation, CoordinateRelation] | None:
+    """Partition slot edges by exact resident-owner equality.
+
+    The first result contains edges whose source and target have equal
+    ``(launch_stage, worker)`` coordinates; the second contains the remaining
+    cross-owner edges.  Both endpoints must be wholly resident.  Input boxes
+    are clipped to their common placement carrier before classification.  A
+    mixed worker box is supported only when its target range is the complete
+    dense worker dimension, which has the exact partition ``[0, w), {w},
+    (w, W)``.  Other mixed or conditionally classifiable boxes decline.
+    """
+    placement_domain = relation.source_domain
+    if (
+        placement_domain != relation.target_domain
+        or placement_domain.kind != "worker"
+        or len(placement_domain.axis_order) != 3
+        or len(relation.pieces) > tile_dependency._MAX_RELATION_PIECES
+        or not tile_dependency._relation_product_is_within_budget(
+            len(relation.pieces),
+            3,
+        )
+    ):
+        return None
+    launch_stage_axis, worker_axis, _wave_axis = placement_domain.axis_order
+    source_counts = placement_domain.axis_count_expressions
+    full_source_bounds = tuple(
+        (axis, sympy.Integer(0), source_counts[axis], 1)
+        for axis in placement_domain.axis_order
+    )
+    resident_stage_range = (
+        launch_stage_axis,
+        sympy.Integer(_RESIDENT_LAUNCH_STAGE),
+        sympy.Integer(_RESIDENT_LAUNCH_STAGE + 1),
+        1,
+    )
+    source_symbols = {
+        axis: coordinate_axis_symbol(axis) for axis in placement_domain.axis_order
+    }
+    same_pieces: dict[_CoordinateRelationPiece, None] = {}
+    cross_pieces: dict[_CoordinateRelationPiece, None] = {}
+
+    def add_piece(
+        destination: dict[_CoordinateRelationPiece, None],
+        source_bounds: tuple[tuple[int, int | sympy.Expr, int | sympy.Expr, int], ...],
+        target_ranges: tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...],
+    ) -> bool:
+        destination.setdefault(
+            _CoordinateRelationPiece(
+                source_bounds_items=source_bounds,
+                target_ranges=target_ranges,
+            ),
+            None,
+        )
+        return (
+            len(same_pieces) + len(cross_pieces) <= tile_dependency._MAX_RELATION_PIECES
+        )
+
+    def simplify_target_ranges(
+        target_ranges: tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...],
+        source_bounds: tuple[tuple[int, int | sympy.Expr, int | sympy.Expr, int], ...],
+    ) -> tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...]:
+        return tuple(
+            (
+                axis,
+                _simplify_logical_expression(
+                    begin,
+                    domain=placement_domain,
+                    source_bounds=source_bounds,
+                ),
+                _simplify_logical_expression(
+                    end,
+                    domain=placement_domain,
+                    source_bounds=source_bounds,
+                ),
+                step,
+            )
+            for axis, begin, end, step in target_ranges
+        )
+
+    def ranges_equal(
+        left: tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...],
+        right: tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...],
+    ) -> bool:
+        return len(left) == len(right) and all(
+            left_axis == right_axis
+            and left_step == right_step
+            and _equal_integer_expressions(left_begin, right_begin)
+            and _equal_integer_expressions(left_end, right_end)
+            for (
+                left_axis,
+                left_begin,
+                left_end,
+                left_step,
+            ), (
+                right_axis,
+                right_begin,
+                right_end,
+                right_step,
+            ) in zip(left, right, strict=True)
+        )
+
+    def replace_target_range(
+        target_ranges: tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...],
+        target_axis: int,
+        begin: int | sympy.Expr,
+        end: int | sympy.Expr,
+    ) -> tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...]:
+        return tuple(
+            (
+                (axis, sympy.sympify(begin), sympy.sympify(end), 1)
+                if axis == target_axis
+                else (axis, range_begin, range_end, step)
+            )
+            for axis, range_begin, range_end, step in target_ranges
+        )
+
+    def owner_axis_classification(
+        target_range: tuple[int, sympy.Expr, sympy.Expr, int],
+        source_bounds: tuple[tuple[int, int | sympy.Expr, int | sympy.Expr, int], ...],
+    ) -> bool | None:
+        """Return equality, inequality, or an unsupported mixed result."""
+        axis = target_range[0]
+        equality_range = (
+            (
+                axis,
+                source_symbols[axis],
+                source_symbols[axis] + 1,
+                1,
+            ),
+        )
+        intersection = tile_dependency._intersect_source_boxes(
+            (target_range,),
+            equality_range,
+        )
+        if intersection is None:
+            return None
+        if intersection is False:
+            return False
+        if not isinstance(intersection, tuple):
+            return None
+        if tile_dependency._target_box_is_empty_for_all_sources(
+            intersection,
+            source_domain=placement_domain,
+            source_bounds=source_bounds,
+            target_domain=placement_domain,
+        ):
+            return False
+        simplified_intersection = simplify_target_ranges(intersection, source_bounds)
+        return True if ranges_equal(simplified_intersection, (target_range,)) else None
+
+    for piece in relation.pieces:
+        source_bounds = tile_dependency._intersect_source_boxes(
+            piece.source_bounds_items,
+            full_source_bounds,
+        )
+        if source_bounds is None:
+            return None
+        if source_bounds is False:
+            continue
+        if not isinstance(source_bounds, tuple):
+            return None
+        sources = {source_bound[0]: source_bound for source_bound in source_bounds}
+        if not ranges_equal(
+            (sources[launch_stage_axis],),
+            (resident_stage_range,),
+        ):
+            return None
+        target_ranges = simplify_target_ranges(
+            tile_dependency._clip_target_box_to_domain(
+                piece.target_ranges,
+                target_domain=placement_domain,
+                source_domain=placement_domain,
+                source_bounds=source_bounds,
+            ),
+            source_bounds,
+        )
+        if tile_dependency._target_box_is_empty_for_all_sources(
+            target_ranges,
+            source_domain=placement_domain,
+            source_bounds=source_bounds,
+            target_domain=placement_domain,
+        ):
+            continue
+        targets = {target_range[0]: target_range for target_range in target_ranges}
+        if not ranges_equal(
+            (targets[launch_stage_axis],),
+            (resident_stage_range,),
+        ):
+            return None
+        worker_class = owner_axis_classification(
+            targets[worker_axis],
+            source_bounds,
+        )
+        if worker_class is False:
+            if not add_piece(cross_pieces, source_bounds, target_ranges):
+                return None
+            continue
+        if worker_class is True:
+            if not add_piece(same_pieces, source_bounds, target_ranges):
+                return None
+            continue
+        worker_range = targets[worker_axis]
+        _axis, worker_begin, worker_end, worker_step = worker_range
+        worker_count = source_counts[worker_axis]
+        if not (
+            worker_step == 1
+            and _equal_integer_expressions(worker_begin, 0)
+            and _equal_integer_expressions(worker_end, worker_count)
+        ):
+            return None
+
+        worker = source_symbols[worker_axis]
+        if not add_piece(
+            same_pieces,
+            source_bounds,
+            replace_target_range(
+                target_ranges,
+                worker_axis,
+                worker,
+                worker + 1,
+            ),
+        ):
+            return None
+        for worker_guard, cross_target_ranges in (
+            (
+                (worker_axis, sympy.Integer(1), worker_count, 1),
+                replace_target_range(target_ranges, worker_axis, 0, worker),
+            ),
+            (
+                (
+                    worker_axis,
+                    sympy.Integer(0),
+                    sympy.simplify(worker_count - 1),
+                    1,
+                ),
+                replace_target_range(
+                    target_ranges,
+                    worker_axis,
+                    worker + 1,
+                    worker_count,
+                ),
+            ),
+        ):
+            guarded_source_bounds = tile_dependency._intersect_source_boxes(
+                source_bounds,
+                tuple(
+                    worker_guard if axis == worker_axis else (axis, begin, end, step)
+                    for axis, begin, end, step in full_source_bounds
+                ),
+            )
+            if guarded_source_bounds is None:
+                return None
+            if guarded_source_bounds is False:
+                continue
+            if not isinstance(guarded_source_bounds, tuple):
+                return None
+            if not add_piece(
+                cross_pieces,
+                guarded_source_bounds,
+                cross_target_ranges,
+            ):
+                return None
+
+    same = CoordinateRelation(
+        source_domain=placement_domain,
+        target_domain=placement_domain,
+        pieces=tuple(same_pieces),
+    )
+    cross = CoordinateRelation(
+        source_domain=placement_domain,
+        target_domain=placement_domain,
+        pieces=tuple(cross_pieces),
+    )
+    return same, cross
+
+
 def _occupied_same_strand_precedence_between(
     successor_occupied_identity: CoordinateRelation,
     predecessor_occupied_identity: CoordinateRelation,

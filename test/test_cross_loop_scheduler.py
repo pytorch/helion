@@ -393,6 +393,50 @@ def _materialized_same_strand_edges(
     return frozenset(represented_edges)
 
 
+def _assert_materialized_handoff_partition(
+    test_case: TestCase,
+    relation: CoordinateRelation,
+    partition: tuple[CoordinateRelation, CoordinateRelation],
+) -> None:
+    """Check exact per-source edge coverage and owner disjointness."""
+    same_owner, cross_owner = partition
+    test_case.assertEqual(same_owner.source_domain, relation.source_domain)
+    test_case.assertEqual(same_owner.target_domain, relation.target_domain)
+    test_case.assertEqual(cross_owner.source_domain, relation.source_domain)
+    test_case.assertEqual(cross_owner.target_domain, relation.target_domain)
+    launch_stage_axis, worker_axis, _wave_axis = relation.source_domain.axis_order
+    for source_index, expected_targets in enumerate(relation.materialize()):
+        source_coordinates = relation.source_domain.coordinates(source_index)
+        same_targets = same_owner.targets(source_index)
+        cross_targets = cross_owner.targets(source_index)
+        test_case.assertFalse(same_targets & cross_targets)
+        test_case.assertEqual(same_targets | cross_targets, expected_targets)
+        for target_index in same_targets:
+            target_coordinates = relation.target_domain.coordinates(target_index)
+            test_case.assertEqual(
+                (
+                    source_coordinates[launch_stage_axis],
+                    source_coordinates[worker_axis],
+                ),
+                (
+                    target_coordinates[launch_stage_axis],
+                    target_coordinates[worker_axis],
+                ),
+            )
+        for target_index in cross_targets:
+            target_coordinates = relation.target_domain.coordinates(target_index)
+            test_case.assertNotEqual(
+                (
+                    source_coordinates[launch_stage_axis],
+                    source_coordinates[worker_axis],
+                ),
+                (
+                    target_coordinates[launch_stage_axis],
+                    target_coordinates[worker_axis],
+                ),
+            )
+
+
 def _expected_occupied_strand_ordinals(
     schedule: WorkerSchedule,
 ) -> dict[tuple[int, ...], int]:
@@ -3205,6 +3249,324 @@ class TestCrossLoopScheduler(TestCase):
         ):
             self.assertIsNone(
                 cross_loop_scheduler._occupied_same_strand_precedence(schedule)
+            )
+
+    def test_resident_readiness_handoffs_match_exhaustive_point_relations(
+        self,
+    ) -> None:
+        for worker_count in range(1, 3):
+            placement_domain = CoordinateDomain(
+                (-3, -2, -1),
+                ((-3, 2), (-2, worker_count), (-1, 1)),
+                kind="worker",
+            )
+            resident_slots = tuple((1, worker, 0) for worker in range(worker_count))
+            possible_edges = tuple(itertools.product(resident_slots, repeat=2))
+            for edge_mask in range(1 << len(possible_edges)):
+                relation = CoordinateRelation(
+                    placement_domain,
+                    placement_domain,
+                    tuple(
+                        _CoordinateRelationPiece(
+                            tuple(
+                                (axis, coordinate, coordinate + 1, 1)
+                                for axis, coordinate in zip(
+                                    placement_domain.axis_order,
+                                    source,
+                                    strict=True,
+                                )
+                            ),
+                            tuple(
+                                (axis, coordinate, coordinate + 1, 1)
+                                for axis, coordinate in zip(
+                                    placement_domain.axis_order,
+                                    target,
+                                    strict=True,
+                                )
+                            ),
+                        )
+                        for edge_index, (source, target) in enumerate(possible_edges)
+                        if edge_mask & (1 << edge_index)
+                    ),
+                )
+                with self.subTest(
+                    worker_count=worker_count,
+                    edge_mask=edge_mask,
+                ):
+                    partition = (
+                        cross_loop_scheduler._partition_resident_readiness_handoffs(
+                            relation
+                        )
+                    )
+                    self.assertIsNotNone(partition)
+                    assert partition is not None
+                    _assert_materialized_handoff_partition(
+                        self,
+                        relation,
+                        partition,
+                    )
+
+    def test_resident_readiness_handoffs_split_dense_worker_boxes(self) -> None:
+        for worker_count, wave_count in itertools.product(range(1, 5), range(1, 4)):
+            placement_domain = CoordinateDomain(
+                (-3, -2, -1),
+                ((-3, 2), (-2, worker_count), (-1, wave_count)),
+                kind="worker",
+            )
+            launch_stage, _worker, wave = (
+                coordinate_axis_symbol(axis) for axis in placement_domain.axis_order
+            )
+            relation = CoordinateRelation(
+                placement_domain,
+                placement_domain,
+                (
+                    _CoordinateRelationPiece(
+                        (
+                            (-3, 1, 2, 1),
+                            (-2, 0, worker_count, 1),
+                            (-1, 0, wave_count, 1),
+                        ),
+                        (
+                            (-3, launch_stage, launch_stage + 1, 1),
+                            (-2, 0, worker_count, 1),
+                            (-1, wave, wave + 1, 1),
+                        ),
+                    ),
+                ),
+            )
+            with self.subTest(
+                worker_count=worker_count,
+                wave_count=wave_count,
+            ):
+                partition = cross_loop_scheduler._partition_resident_readiness_handoffs(
+                    relation
+                )
+                self.assertIsNotNone(partition)
+                assert partition is not None
+                _assert_materialized_handoff_partition(self, relation, partition)
+                same_owner, cross_owner = partition
+                self.assertEqual(
+                    sum(map(len, same_owner.materialize())),
+                    worker_count * wave_count,
+                )
+                self.assertEqual(
+                    sum(map(len, cross_owner.materialize())),
+                    worker_count * wave_count * (worker_count - 1),
+                )
+
+    def test_resident_readiness_handoffs_support_symbolic_tail(self) -> None:
+        task_count = sympy.Symbol(
+            "handoff_tail_task_count",
+            integer=True,
+            nonnegative=True,
+        )
+        worker_count = 4
+        wave_count = FloorDiv(task_count + worker_count - 1, worker_count)
+        placement_domain = CoordinateDomain(
+            (-3, -2, -1),
+            ((-3, 2), (-2, worker_count), (-1, wave_count)),
+            kind="worker",
+            _allow_empty=True,
+        )
+        launch_stage, _worker, wave = (
+            coordinate_axis_symbol(axis) for axis in placement_domain.axis_order
+        )
+        tail_wave = FloorDiv(task_count, worker_count)
+        relation = CoordinateRelation(
+            placement_domain,
+            placement_domain,
+            (
+                _CoordinateRelationPiece(
+                    (
+                        (-3, 1, 2, 1),
+                        (-2, 0, sympy.Mod(task_count, worker_count), 1),
+                        (-1, tail_wave, tail_wave + 1, 1),
+                    ),
+                    (
+                        (-3, launch_stage, launch_stage + 1, 1),
+                        (-2, 0, worker_count, 1),
+                        (-1, wave, wave + 1, 1),
+                    ),
+                ),
+            ),
+        )
+        partition = cross_loop_scheduler._partition_resident_readiness_handoffs(
+            relation
+        )
+        self.assertIsNotNone(partition)
+        assert partition is not None
+        self.assertEqual(tuple(len(item.pieces) for item in partition), (1, 2))
+
+        for concrete_count in (0, 1, 3, 4, 5, 7, 8, 9):
+            with self.subTest(task_count=concrete_count):
+                substitutions = {task_count: concrete_count}
+                concrete_relation = relation.substitute_parameters(substitutions)
+                same_owner, cross_owner = partition
+                concrete_partition = (
+                    same_owner.substitute_parameters(substitutions),
+                    cross_owner.substitute_parameters(substitutions),
+                )
+                _assert_materialized_handoff_partition(
+                    self,
+                    concrete_relation,
+                    concrete_partition,
+                )
+
+    def test_resident_readiness_handoffs_clip_and_decline_unsupported(
+        self,
+    ) -> None:
+        placement_domain = CoordinateDomain(
+            (-3, -2, -1),
+            ((-3, 2), (-2, 3), (-1, 3)),
+            kind="worker",
+        )
+        launch_stage, worker, wave = (
+            coordinate_axis_symbol(axis) for axis in placement_domain.axis_order
+        )
+        oversized = CoordinateRelation(
+            placement_domain,
+            placement_domain,
+            (
+                _CoordinateRelationPiece(
+                    (
+                        (-3, 1, 2, 1),
+                        (-2, -2, 5, 1),
+                        (-1, -1, 4, 1),
+                    ),
+                    (
+                        (-3, launch_stage, launch_stage + 1, 1),
+                        (-2, -4, 7, 1),
+                        (-1, wave, wave + 1, 1),
+                    ),
+                ),
+                _CoordinateRelationPiece(
+                    ((-3, 1, 2, 1), (-2, 8, 9, 1), (-1, 0, 1, 1)),
+                    ((-3, 1, 2, 1), (-2, 0, 3, 1), (-1, 0, 1, 1)),
+                ),
+            ),
+        )
+        oversized_partition = (
+            cross_loop_scheduler._partition_resident_readiness_handoffs(oversized)
+        )
+        self.assertIsNotNone(oversized_partition)
+        assert oversized_partition is not None
+        _assert_materialized_handoff_partition(
+            self,
+            oversized,
+            oversized_partition,
+        )
+
+        strided_same = CoordinateRelation.point_map(
+            placement_domain,
+            placement_domain,
+            (
+                (
+                    ((-3, 1, 2, 1), (-2, 0, 3, 1), (-1, 0, 3, 2)),
+                    (launch_stage, worker, wave),
+                ),
+            ),
+        )
+        strided_partition = cross_loop_scheduler._partition_resident_readiness_handoffs(
+            strided_same
+        )
+        self.assertIsNotNone(strided_partition)
+        assert strided_partition is not None
+        _assert_materialized_handoff_partition(
+            self,
+            strided_same,
+            strided_partition,
+        )
+
+        stage_cross = CoordinateRelation(
+            placement_domain,
+            placement_domain,
+            (
+                _CoordinateRelationPiece(
+                    ((-3, 1, 2, 1), (-2, 0, 3, 1), (-1, 0, 3, 1)),
+                    ((-3, 0, 1, 1), (-2, 0, 3, 1), (-1, wave, wave + 1, 1)),
+                ),
+            ),
+        )
+        self.assertIsNone(
+            cross_loop_scheduler._partition_resident_readiness_handoffs(stage_cross)
+        )
+        source_stage = CoordinateRelation(
+            placement_domain,
+            placement_domain,
+            (
+                _CoordinateRelationPiece(
+                    ((-3, 0, 1, 1), (-2, 0, 3, 1), (-1, 0, 3, 1)),
+                    (
+                        (-3, 1, 2, 1),
+                        (-2, worker, worker + 1, 1),
+                        (-1, wave, wave + 1, 1),
+                    ),
+                ),
+            ),
+        )
+        self.assertIsNone(
+            cross_loop_scheduler._partition_resident_readiness_handoffs(source_stage)
+        )
+
+        unsupported_strided_mixed = CoordinateRelation(
+            placement_domain,
+            placement_domain,
+            (
+                _CoordinateRelationPiece(
+                    ((-3, 1, 2, 1), (-2, 0, 3, 1), (-1, 0, 1, 1)),
+                    ((-3, 1, 2, 1), (-2, 0, 3, 2), (-1, 0, 1, 1)),
+                ),
+            ),
+        )
+        self.assertIsNone(
+            cross_loop_scheduler._partition_resident_readiness_handoffs(
+                unsupported_strided_mixed
+            )
+        )
+
+        parameter = sympy.Symbol(
+            "conditional_handoff",
+            integer=True,
+            nonnegative=True,
+        )
+        conditional_domain = dataclasses.replace(
+            placement_domain,
+            axis_counts_items=((-3, 2), (-2, 3), (-1, parameter + 1)),
+        )
+        conditional = CoordinateRelation.point_map(
+            conditional_domain,
+            conditional_domain,
+            (
+                (
+                    ((-3, 1, 2, 1), (-2, 0, 1, 1), (-1, 0, 1, 1)),
+                    (sympy.Integer(1), sympy.Mod(parameter, 2), sympy.Integer(0)),
+                ),
+            ),
+        )
+        self.assertIsNone(
+            cross_loop_scheduler._partition_resident_readiness_handoffs(conditional)
+        )
+
+        empty = CoordinateRelation(placement_domain, placement_domain, ())
+        empty_partition = cross_loop_scheduler._partition_resident_readiness_handoffs(
+            empty
+        )
+        self.assertEqual(
+            empty_partition,
+            (empty, empty),
+        )
+
+        with mock.patch.object(tile_dependency, "_MAX_RELATION_PIECES", 2):
+            self.assertIsNone(
+                cross_loop_scheduler._partition_resident_readiness_handoffs(oversized)
+            )
+        with mock.patch.object(
+            tile_dependency,
+            "_relation_product_is_within_budget",
+            return_value=False,
+        ):
+            self.assertIsNone(
+                cross_loop_scheduler._partition_resident_readiness_handoffs(oversized)
             )
 
     def test_occupied_strand_ordinal_matches_small_oracle(self) -> None:
