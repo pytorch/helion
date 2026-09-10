@@ -737,6 +737,219 @@ class TestExactConverseSemantics(TestCase):
                 )
             )
 
+    def test_symbolic_traversal_helpers_avoid_concrete_counts_after_roundtrip(
+        self,
+    ) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        worker_count = 7
+        domain = CoordinateDomain(
+            (10, 11),
+            ((10, 2), (11, batch)),
+            identity=0,
+        )
+        reference = pid_task_order(domain, domain.axis_order)
+        schedule = cross_loop_scheduler._build_root_major_worker_schedule(
+            (domain,),
+            (reference,),
+            worker_count,
+        )
+        variants = (
+            ("direct", schedule, reference),
+            ("deepcopy", copy.deepcopy(schedule), copy.deepcopy(reference)),
+            ("pickle", *pickle.loads(pickle.dumps((schedule, reference)))),
+        )
+
+        with (
+            mock.patch.object(
+                WorkerScheduleSegment,
+                "task_count",
+                new_callable=mock.PropertyMock,
+                side_effect=AssertionError(
+                    "symbolic traversal must not request a concrete task count"
+                ),
+            ),
+            mock.patch.object(
+                CoordinateDomain,
+                "size",
+                new_callable=mock.PropertyMock,
+                side_effect=AssertionError(
+                    "symbolic traversal must not request a concrete domain size"
+                ),
+            ),
+            mock.patch.object(
+                CoordinateDomain,
+                "axis_counts",
+                new_callable=mock.PropertyMock,
+                side_effect=AssertionError(
+                    "symbolic traversal must not request concrete axis counts"
+                ),
+            ),
+            mock.patch.object(
+                CoordinateRelation,
+                "materialize",
+                side_effect=AssertionError(
+                    "symbolic traversal must not enumerate runtime tasks"
+                ),
+            ),
+        ):
+            for name, variant_schedule, variant_reference in variants:
+                with self.subTest(roundtrip=name):
+                    cross_loop_scheduler._root_schedule_traversal.cache_clear()
+                    (segment,) = variant_schedule.segments
+                    logical_order = segment.logical_task_order
+                    self.assertIsNotNone(logical_order)
+                    assert logical_order is not None
+                    self.assertTrue(logical_order.is_total_function())
+                    logical_to_order = logical_order.converse()
+                    self.assertIsNotNone(logical_to_order)
+                    assert logical_to_order is not None
+                    self.assertTrue(logical_to_order.is_single_valued())
+
+                    worker_step_domain = variant_schedule.worker_step_domain
+                    task_to_wave = segment.logical_task_wave_relation(
+                        worker_step_domain
+                    )
+                    self.assertIsNotNone(task_to_wave)
+                    assert task_to_wave is not None
+                    self.assertTrue(task_to_wave.is_total_function())
+
+                    ordinal_domain = CoordinateDomain(
+                        (30,),
+                        ((30, 8 * batch),),
+                        kind="task_order",
+                    )
+                    forward = cross_loop_scheduler._flat_task_order_relation(
+                        variant_reference,
+                        ordinal_domain,
+                        ordinal_begin=6 * batch,
+                    )
+                    inverse = cross_loop_scheduler._logical_task_to_order_ordinal(
+                        variant_reference,
+                        ordinal_domain,
+                        ordinal_begin=6 * batch,
+                    )
+                    self.assertIsNotNone(forward)
+                    self.assertIsNotNone(inverse)
+                    assert forward is not None
+                    assert inverse is not None
+                    forward_converse = forward.converse()
+                    self.assertIsNotNone(forward_converse)
+                    assert forward_converse is not None
+                    self.assertTrue(
+                        forward_converse.is_pointwise_equal_on_same_support(inverse)
+                    )
+
+                    # Only one B-sized interval remains after this offset, so
+                    # a 2*B traversal must be rejected symbolically.
+                    self.assertIsNone(
+                        cross_loop_scheduler._flat_task_order_relation(
+                            variant_reference,
+                            ordinal_domain,
+                            ordinal_begin=7 * batch,
+                        )
+                    )
+                    self.assertIsNone(
+                        cross_loop_scheduler._logical_task_to_order_ordinal(
+                            variant_reference,
+                            ordinal_domain,
+                            ordinal_begin=7 * batch,
+                        )
+                    )
+
+                    traversal = cross_loop_scheduler._root_schedule_traversal(
+                        variant_schedule.segments,
+                        variant_reference,
+                    )
+                    self.assertIsNotNone(traversal)
+                    assert traversal is not None
+                    self.assertIsNotNone(
+                        traversal.scheduled_ordinal_to_logical_task
+                    )
+                    self.assertIsNotNone(
+                        traversal.logical_task_to_scheduled_ordinal
+                    )
+                    self.assertTrue(traversal.matches_reference)
+
+        logical_order = schedule.segments[0].logical_task_order
+        assert logical_order is not None
+        for concrete_batch in (0, 1, 8):
+            substitutions = {batch: concrete_batch}
+            self.assertEqual(
+                logical_order.substitute_parameters(substitutions).materialize(),
+                reference.substitute_parameters(substitutions).materialize(),
+            )
+
+    def test_static_empty_traversal_helpers_are_exact_after_roundtrip(self) -> None:
+        domain = CoordinateDomain(
+            (10,),
+            ((10, 0),),
+            identity=0,
+            _allow_empty=True,
+        )
+        reference = pid_task_order(domain, domain.axis_order)
+        ordinal_domain = cross_loop_scheduler._task_order_ordinal_domain(reference)
+        schedule = cross_loop_scheduler._build_root_major_worker_schedule(
+            (domain,),
+            (reference,),
+            4,
+        )
+        variants = (
+            ("direct", schedule, reference, ordinal_domain),
+            (
+                "deepcopy",
+                copy.deepcopy(schedule),
+                copy.deepcopy(reference),
+                copy.deepcopy(ordinal_domain),
+            ),
+            (
+                "pickle",
+                *pickle.loads(
+                    pickle.dumps((schedule, reference, ordinal_domain))
+                ),
+            ),
+        )
+
+        for name, variant_schedule, variant_reference, variant_ordinal in variants:
+            with self.subTest(roundtrip=name):
+                forward = cross_loop_scheduler._flat_task_order_relation(
+                    variant_reference,
+                    variant_ordinal,
+                )
+                inverse = cross_loop_scheduler._logical_task_to_order_ordinal(
+                    variant_reference,
+                    variant_ordinal,
+                )
+                self.assertIsNotNone(forward)
+                self.assertIsNotNone(inverse)
+                assert forward is not None
+                assert inverse is not None
+                self.assertFalse(forward.pieces)
+                self.assertFalse(inverse.pieces)
+                self.assertTrue(forward.is_total_function())
+                self.assertTrue(inverse.is_total_function())
+                self.assertEqual(forward.converse(), inverse)
+
+                (segment,) = variant_schedule.segments
+                logical_order = segment.logical_task_order
+                self.assertIsNotNone(logical_order)
+                assert logical_order is not None
+                self.assertFalse(logical_order.pieces)
+                worker_steps = variant_schedule.worker_step_domain
+                self.assertTrue(worker_steps.size_expr.is_zero)
+                task_to_wave = segment.logical_task_wave_relation(worker_steps)
+                self.assertIsNotNone(task_to_wave)
+                assert task_to_wave is not None
+                self.assertFalse(task_to_wave.pieces)
+
+                cross_loop_scheduler._root_schedule_traversal.cache_clear()
+                traversal = cross_loop_scheduler._root_schedule_traversal(
+                    variant_schedule.segments,
+                    variant_reference,
+                )
+                self.assertIsNotNone(traversal)
+                assert traversal is not None
+                self.assertTrue(traversal.matches_reference)
+
     def test_runtime_empty_middle_root_preserves_adjacent_packed_support(
         self,
     ) -> None:

@@ -2409,7 +2409,7 @@ class TestCrossLoopScheduler(TestCase):
         target_domain = _identify_root_domains((_domain((10, 4, 1)),))[0]
         schedule_domain = CoordinateDomain(
             axis_order=(-3, -2, -1),
-            axis_counts_items=((-3, 2), (-2, 4), (-1, 1)),
+            axis_counts_items=((-3, 2), (-2, 4), (-1, 2)),
             kind="worker",
         )
         worker = coordinate_axis_symbol(-2)
@@ -2427,9 +2427,10 @@ class TestCrossLoopScheduler(TestCase):
         schedule = WorkerSchedule(
             4,
             (
-                # The relation owns four workers, while these stale fields
-                # describe two workers and would duplicate tasks 0/1 if they
-                # were incorrectly treated as authoritative.
+                # The relation owns four workers in wave zero. These stale
+                # fields describe a different in-domain four-slot bijection:
+                # workers 0/1 across waves zero and one. Bijection alone must
+                # not make that incompatible dispatch certificate valid.
                 WorkerScheduleSegment(0, relation, 0, 2, 0),
             ),
         )

@@ -1992,7 +1992,7 @@ def emit_cross_loop_schedule(
             task_order_coordinates = flat_task_coordinates(
                 task_order_index,
                 forward.source_domain.axis_order,
-                forward.source_domain.axis_counts,
+                forward.source_domain.axis_count_expressions,
             )
             task_coordinates, membership = relation_point_coordinates(
                 forward,
@@ -2022,7 +2022,7 @@ def emit_cross_loop_schedule(
             task_order_coordinates = flat_task_coordinates(
                 task_order_delta,
                 logical_order.source_domain.axis_order,
-                logical_order.source_domain.axis_counts,
+                logical_order.source_domain.axis_count_expressions,
             )
             task_coordinates, relation_membership = relation_point_coordinates(
                 logical_order,

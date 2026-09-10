@@ -204,6 +204,10 @@ class WorkerScheduleSegment:
         """
         if not self.is_normalized:
             return self.task_order
+        try:
+            task_count = self.task_count_expr
+        except ValueError:
+            return None
         ordinal_axis = (
             max(
                 (
@@ -216,33 +220,101 @@ class WorkerScheduleSegment:
         )
         ordinal_domain = CoordinateDomain(
             axis_order=(ordinal_axis,),
-            axis_counts_items=((ordinal_axis, self.task_count),),
+            axis_counts_items=((ordinal_axis, task_count),),
             kind="task_order",
+            _allow_empty=task_count.is_zero is True,
         )
+        if task_count.is_zero is True:
+            result = CoordinateRelation(
+                source_domain=ordinal_domain,
+                target_domain=self.task_order.target_domain,
+                pieces=(),
+            )
+            converse = CoordinateRelation(
+                source_domain=self.task_order.target_domain,
+                target_domain=ordinal_domain,
+                pieces=(),
+            )
+            tile_dependency._remember_exact_converse(result, converse)
+            return result
         ordinal = coordinate_axis_symbol(ordinal_axis)
         dispatch_index = self.dispatch_offset + ordinal  # pyrefly: ignore[unsupported-operation]
         launch_stage_axis, worker_axis, wave_axis = (
             self.task_order.source_domain.axis_order
         )
-        canonical = self.task_order.canonical_single_valued()
-        if canonical is None:
-            return None
         launch_stage = self.launch_stage
         if launch_stage is None:
             return None
         launch_stage_bound = (launch_stage, launch_stage + 1, 1)
+
+        if task_count.free_symbols:
+            # Prove the compatibility fields directly against an exact dense
+            # ordinalization of the authoritative placement support.  This is
+            # bounded by relation pieces and never samples runtime task counts.
+            support_relation = CoordinateRelation.point_map(
+                self.task_order.source_domain,
+                ordinal_domain,
+                tuple(
+                    (piece.source_bounds_items, (sympy.Integer(0),))
+                    for piece in self.task_order.pieces
+                ),
+            ).coalesce_adjacent_source_boxes()
+            support_ordinal = support_relation._ordinalized_source_support
+            authoritative_dispatch = (
+                None if support_ordinal is None else support_ordinal.converse()
+            )
+            compatibility_dispatch = CoordinateRelation.point_map(
+                ordinal_domain,
+                self.task_order.source_domain,
+                (
+                    (
+                        ((ordinal_axis, 0, task_count, 1),),
+                        (
+                            sympy.Integer(launch_stage),
+                            self.worker_begin
+                            + sympy.Mod(dispatch_index, self.worker_count),
+                            sympy.floor(dispatch_index / self.worker_count),
+                        ),
+                    ),
+                ),
+            )
+            if (
+                support_ordinal is not None
+                and authoritative_dispatch is not None
+                and authoritative_dispatch.is_total_function()
+                and authoritative_dispatch.is_pointwise_equal_on_same_support(
+                    compatibility_dispatch
+                )
+            ):
+                logical_order = tile_dependency._factor_through_source_ordinalization(
+                    self.task_order,
+                    support_ordinal,
+                    authoritative_dispatch,
+                )
+                logical_to_ordinal = (
+                    None if logical_order is None else logical_order.converse()
+                )
+                if (
+                    logical_order is not None
+                    and logical_order.is_total_function()
+                    and logical_to_ordinal is not None
+                    and logical_to_ordinal.is_single_valued()
+                ):
+                    return logical_order
+            return None
+
+        # Retain the bounded concrete compatibility proof for older segmented
+        # schedules whose source support has no compact ordinalization.
+        task_count_int = int(task_count)
+        canonical = self.task_order.canonical_single_valued()
+        if canonical is None:
+            return None
         schedule_ordinal = (
             coordinate_axis_symbol(wave_axis) * self.worker_count  # pyrefly: ignore[unsupported-operation]
             + coordinate_axis_symbol(worker_axis)
             - self.worker_begin
             - self.dispatch_offset
         )
-        # The scalar fields are only a lowering certificate.  Prove that the
-        # authoritative relation's support is contained in their dense slot
-        # interval; equal cardinality and injectivity of (wave, worker) ->
-        # ordinal then prove exact support equality.  Stale compatibility
-        # fields therefore disable the dense rendering path rather than
-        # overriding relation semantics.
         for piece in canonical.pieces:
             bounds = {
                 axis: (begin, end, step)
@@ -260,7 +332,7 @@ class WorkerScheduleSegment:
                 or worker_end > self.worker_begin + self.worker_count
                 or ordinal_bounds is None
                 or ordinal_bounds[0] < 0  # pyrefly: ignore[unsupported-operation]
-                or ordinal_bounds[1] >= self.task_count  # pyrefly: ignore[unsupported-operation]
+                or ordinal_bounds[1] >= task_count_int  # pyrefly: ignore[unsupported-operation]
             ):
                 return None
         substitutions = {
@@ -271,7 +343,7 @@ class WorkerScheduleSegment:
                 dispatch_index / self.worker_count
             ),
         }
-        full_ordinal_bounds = ((ordinal_axis, 0, self.task_count, 1),)
+        full_ordinal_bounds = ((ordinal_axis, 0, task_count_int, 1),)
         pieces: list[
             tuple[tuple[tuple[int, int, int, int], ...], tuple[sympy.Expr, ...]]
         ] = []
@@ -325,7 +397,7 @@ class WorkerScheduleSegment:
             else:
                 return None
             ordinal_begin = max(0, ordinal_begin)
-            ordinal_end = min(self.task_count, ordinal_end)
+            ordinal_end = min(task_count_int, ordinal_end)
             if ordinal_begin >= ordinal_end:
                 continue
             ordinal_bounds = ((ordinal_axis, ordinal_begin, ordinal_end, ordinal_step),)
@@ -409,6 +481,12 @@ class WorkerScheduleSegment:
         logical_order = self.logical_task_order
         if logical_order is None:
             return None
+        if logical_order.source_domain.size_expr.is_zero is True:
+            return CoordinateRelation(
+                source_domain=logical_order.source_domain,
+                target_domain=wave_domain,
+                pieces=(),
+            )
         local_ordinal = _flat_domain_index_expression(logical_order.source_domain)
         wave = sympy.floor(  # pyrefly: ignore[bad-argument-type]
             (self.dispatch_offset + local_ordinal) / self.worker_count  # pyrefly: ignore[unsupported-operation]
@@ -422,7 +500,7 @@ class WorkerScheduleSegment:
                         (
                             axis,
                             0,
-                            logical_order.source_domain.axis_counts[axis],
+                            logical_order.source_domain.axis_count_expressions[axis],
                             1,
                         )
                         for axis in logical_order.source_domain.axis_order
@@ -594,10 +672,11 @@ class WorkerScheduleSegment:
 def _flat_domain_index_expression(domain: CoordinateDomain) -> sympy.Expr:
     """Return the canonical flattened index of a logical coordinate."""
     result: sympy.Expr = sympy.Integer(0)
-    multiplier = 1
+    multiplier: sympy.Expr = sympy.Integer(1)
+    counts = domain.axis_count_expressions
     for axis in domain.axis_order:
         result += coordinate_axis_symbol(axis) * multiplier  # pyrefly: ignore[unsupported-operation]
-        multiplier *= domain.axis_counts[axis]
+        multiplier = sympy.simplify(multiplier * counts[axis])
     return sympy.simplify(result)
 
 
@@ -902,6 +981,7 @@ def _task_order_ordinal_domain(
         axis_order=(ordinal_axis,),
         axis_counts_items=((ordinal_axis, task_order.source_domain.size_expr),),
         kind="task_order",
+        _allow_empty=task_order.source_domain.size_expr.is_zero is True,
     )
 
 
@@ -909,18 +989,36 @@ def _flat_task_order_relation(
     task_order: CoordinateRelation,
     ordinal_domain: CoordinateDomain,
     *,
-    ordinal_begin: int = 0,
+    ordinal_begin: int | sympy.Expr = 0,
 ) -> CoordinateRelation | None:
     """Map a flat emitted ordinal interval directly to logical tasks."""
     task_count = task_order.source_domain.size_expr
     ordinal_count = ordinal_domain.size_expr
+    ordinal_begin = sympy.sympify(ordinal_begin)
     if (
         len(ordinal_domain.axis_order) != 1
-        or ordinal_begin < 0
-        or sympy.simplify(ordinal_count - ordinal_begin - task_count).is_nonnegative
-        is not True
+        or not tile_dependency._is_provably_nonnegative(ordinal_begin, None)
+        or not tile_dependency._is_provably_nonnegative(
+            sympy.simplify(ordinal_count - ordinal_begin - task_count),
+            None,
+        )
     ):
         return None
+    if task_count.is_zero is True:
+        if task_order.target_domain.size_expr.is_zero is not True:
+            return None
+        result = CoordinateRelation(
+            source_domain=ordinal_domain,
+            target_domain=task_order.target_domain,
+            pieces=(),
+        )
+        converse = CoordinateRelation(
+            source_domain=task_order.target_domain,
+            target_domain=ordinal_domain,
+            pieces=(),
+        )
+        tile_dependency._remember_exact_converse(result, converse)
+        return result
     task_order_converse = tile_dependency._memoized_exact_converse(task_order)
     if task_order_converse is None:
         task_order_converse = task_order.derive_converse_and_target_counts()[0]
@@ -932,7 +1030,7 @@ def _flat_task_order_relation(
     if task_order_converse is None:
         return None
     if (
-        ordinal_begin == 0
+        _equal_integer_expressions(ordinal_begin, 0)
         and len(task_order.source_domain.axis_order) == 1
         and _equal_integer_expressions(task_count, ordinal_count)
     ):
@@ -984,7 +1082,7 @@ def _flat_task_order_relation(
             ),
         ),
     )
-    local_ordinal: sympy.Expr = sympy.Integer(ordinal_begin)
+    local_ordinal: sympy.Expr = sympy.sympify(ordinal_begin)
     local_stride: sympy.Expr = sympy.Integer(1)
     for axis in source_axis_order:
         local_ordinal = sympy.simplify(
@@ -2243,15 +2341,17 @@ class WorkerSchedule:
     def worker_step_domain(self) -> CoordinateDomain:
         """The projected worker-step coordinate used for readiness math."""
         wave_axis = self.placement_domain.axis_order[2]
+        wave_count = self.placement_domain.axis_count_expressions[wave_axis]
         return CoordinateDomain(
             axis_order=(wave_axis,),
             axis_counts_items=(
                 (
                     wave_axis,
-                    self.placement_domain.axis_counts[wave_axis],
+                    wave_count,
                 ),
             ),
             kind="value",
+            _allow_empty=wave_count.is_zero is True,
         )
 
     def last_worker_steps_for_root(self, root: int) -> dict[int, int]:
@@ -5552,7 +5652,9 @@ class _ScheduledRootTraversal:
     traversal.
     """
 
-    segment_ordinal_ranges: tuple[tuple[WorkerScheduleSegment, int, int], ...]
+    segment_ordinal_ranges: tuple[
+        tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr], ...
+    ]
     scheduled_ordinal_to_logical_task: CoordinateRelation | None
     logical_task_to_scheduled_ordinal: CoordinateRelation | None
     matches_reference: bool
@@ -5563,7 +5665,7 @@ def _logical_task_to_order_ordinal(
     task_order: CoordinateRelation,
     ordinal_domain: CoordinateDomain,
     *,
-    ordinal_begin: int = 0,
+    ordinal_begin: int | sympy.Expr = 0,
 ) -> CoordinateRelation | None:
     """Invert one emitted traversal into its scalar ordinal coordinates.
 
@@ -5572,12 +5674,33 @@ def _logical_task_to_order_ordinal(
     one of those forms invertible, so this is the single certificate used by
     both exact-once validation and progress-support checks.
     """
+    task_count = task_order.source_domain.size_expr
+    ordinal_count = ordinal_domain.size_expr
+    ordinal_begin = sympy.sympify(ordinal_begin)
     if (
         len(ordinal_domain.axis_order) != 1
-        or ordinal_begin < 0
-        or ordinal_begin + task_order.source_domain.size > ordinal_domain.size
+        or not tile_dependency._is_provably_nonnegative(ordinal_begin, None)
+        or not tile_dependency._is_provably_nonnegative(
+            sympy.simplify(ordinal_count - ordinal_begin - task_count),
+            None,
+        )
     ):
         return None
+    if task_count.is_zero is True:
+        if task_order.target_domain.size_expr.is_zero is not True:
+            return None
+        result = CoordinateRelation(
+            source_domain=task_order.target_domain,
+            target_domain=ordinal_domain,
+            pieces=(),
+        )
+        converse = CoordinateRelation(
+            source_domain=ordinal_domain,
+            target_domain=task_order.target_domain,
+            pieces=(),
+        )
+        tile_dependency._remember_exact_converse(result, converse)
+        return result
     local_to_ordinal = CoordinateRelation.point_map(
         task_order.source_domain,
         ordinal_domain,
@@ -5587,7 +5710,7 @@ def _logical_task_to_order_ordinal(
                     (
                         axis,
                         0,
-                        task_order.source_domain.axis_counts[axis],
+                        task_order.source_domain.axis_count_expressions[axis],
                         1,
                     )
                     for axis in task_order.source_domain.axis_order
@@ -5608,7 +5731,10 @@ def _logical_task_to_order_ordinal(
     elif len(task_order.source_domain.axis_order) == 1:
         (local_axis,) = task_order.source_domain.axis_order
         (ordinal_axis,) = ordinal_domain.axis_order
-        if ordinal_begin == 0 and logical_to_local.target_domain == ordinal_domain:
+        if _equal_integer_expressions(
+            ordinal_begin,
+            0,
+        ) and logical_to_local.target_domain == ordinal_domain:
             result = logical_to_local
         else:
             result = CoordinateRelation(
@@ -5650,7 +5776,10 @@ def _logical_task_to_reference_ordinal(
     ordinal_domain: CoordinateDomain,
 ) -> CoordinateRelation | None:
     """Map a logical CTA to its canonical PID ordinal symbolically."""
-    if reference_task_order.source_domain.size != ordinal_domain.size:
+    if not _equal_integer_expressions(
+        reference_task_order.source_domain.size_expr,
+        ordinal_domain.size_expr,
+    ):
         return None
     result = _logical_task_to_order_ordinal(
         reference_task_order,
@@ -5675,9 +5804,15 @@ def _root_schedule_traversal(
     PID permutations may retain only the segment ranges used by codegen.
     """
     root_domain = reference_task_order.target_domain
-    if (
-        not segments
-        or sum(segment.task_count for segment in segments) != root_domain.size
+    if not segments:
+        return None
+    try:
+        segment_task_counts = tuple(segment.task_count_expr for segment in segments)
+    except ValueError:
+        return None
+    if not _equal_integer_expressions(
+        sympy.Add(*segment_task_counts),
+        root_domain.size_expr,
     ):
         return None
     ordinal_axis = (
@@ -5696,16 +5831,23 @@ def _root_schedule_traversal(
     )
     ordinal_domain = CoordinateDomain(
         axis_order=(ordinal_axis,),
-        axis_counts_items=((ordinal_axis, root_domain.size),),
+        axis_counts_items=((ordinal_axis, root_domain.size_expr),),
         kind="task_order",
+        _allow_empty=root_domain.size_expr.is_zero is True,
     )
     root_to_scheduled: CoordinateRelation | None = None
     scheduled_to_root: CoordinateRelation | None = None
     inverse_relation_supported = True
     forward_relation_supported = True
-    segment_ordinal_ranges: list[tuple[WorkerScheduleSegment, int, int]] = []
-    ordinal_begin = 0
-    for segment in segments:
+    segment_ordinal_ranges: list[
+        tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr]
+    ] = []
+    ordinal_begin: sympy.Expr = sympy.Integer(0)
+    for segment, segment_task_count in zip(
+        segments,
+        segment_task_counts,
+        strict=True,
+    ):
         logical_order = segment.logical_task_order
         if (
             logical_order is None
@@ -5746,11 +5888,18 @@ def _root_schedule_traversal(
             if scheduled_to_root is None:
                 forward_relation_supported = False
         segment_ordinal_ranges.append(
-            (segment, ordinal_begin, ordinal_begin + segment.task_count)
+            (
+                segment,
+                ordinal_begin,
+                sympy.simplify(ordinal_begin + segment_task_count),
+            )
         )
-        ordinal_begin += segment.task_count
+        ordinal_begin = sympy.simplify(ordinal_begin + segment_task_count)
     if (
-        reference_task_order.source_domain.size != root_domain.size
+        not _equal_integer_expressions(
+            reference_task_order.source_domain.size_expr,
+            root_domain.size_expr,
+        )
         or not reference_task_order.is_total_function()
     ):
         return None
@@ -5791,7 +5940,9 @@ def _root_schedule_traversal(
         matches_reference=(
             root_to_scheduled is not None
             and reference_ordinal is not None
-            and root_to_scheduled.is_pointwise_equal_to(reference_ordinal)
+            and root_to_scheduled.is_pointwise_equal_on_same_support(
+                reference_ordinal
+            )
         ),
     )
 
