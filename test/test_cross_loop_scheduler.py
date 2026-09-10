@@ -6822,14 +6822,25 @@ class TestCrossLoopScheduler(TestCase):
                     ),
                     expected_candidate,
                 )
-                self.assertEqual(
-                    derive_final_arrival_continuations(readiness_graph),
-                    (
-                        (FinalArrivalContinuation(event_id=0, consumer_index=0),)
-                        if expected_candidate
-                        else ()
-                    ),
+                candidates = derive_final_arrival_continuations(readiness_graph)
+                expected_candidates = (
+                    (FinalArrivalContinuation(event_id=0, consumer_index=0),)
+                    if expected_candidate
+                    else ()
                 )
+                self.assertEqual(candidates, expected_candidates)
+                if expected_candidate:
+                    selected = choose_readiness_counters(
+                        readiness_graph,
+                        candidates,
+                    )
+                    self.assertEqual(
+                        cross_loop_scheduler._emitted_final_arrival_continuations(
+                            readiness_graph,
+                            selected,
+                        ),
+                        candidates,
+                    )
 
     def test_final_arrival_root_event_must_cover_nested_obligations(self) -> None:
         producer_domain = _domain((10, 4), identity=0)

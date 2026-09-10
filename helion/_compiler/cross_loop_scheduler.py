@@ -4108,8 +4108,9 @@ def _emitted_final_arrival_continuations(
     """Recover continuation identities from the plans consumed by codegen.
 
     ``ReadinessCounterPlan.continuation_consumer_index`` is the emitted source
-    of truth.  Matching it back to the canonical readiness event gives the
-    event identity needed for recursive producer contraction without carrying
+    of truth.  The readiness-key domain retains the semantic event identity;
+    matching the plan against that event's canonical lowering gives the
+    consumer index needed for recursive producer contraction without carrying
     a second independently-derived continuation list into proposal or proof.
     """
     result: list[FinalArrivalContinuation] = []
@@ -4118,11 +4119,19 @@ def _emitted_final_arrival_continuations(
         continuation_consumer = plan.continuation_consumer
         if continuation_consumer is None:
             continue
+        event_id = plan.readiness_key_domain.identity
+        if event_id is None or not 0 <= event_id < len(readiness_graph.events):
+            return None
+        event = readiness_graph.event(event_id)
+        lowering_relations = _counter_lowering_relations(event)
+        if lowering_relations is None:
+            return None
+        lowered_producers, lowered_consumers = lowering_relations
+        if lowered_producers != plan.producers:
+            return None
         matches = tuple(
-            FinalArrivalContinuation(event.event_id, consumer_index)
-            for event in readiness_graph.events
-            if event.producers == plan.producers
-            for consumer_index, consumer in enumerate(event.consumers)
+            FinalArrivalContinuation(event_id, consumer_index)
+            for consumer_index, consumer in enumerate(lowered_consumers)
             if consumer == continuation_consumer
         )
         if len(matches) != 1:
