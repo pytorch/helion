@@ -1594,7 +1594,7 @@ def _pallas_pl_kernel_jit_fn(
     input_output_aliases: dict[int, int],
     interpret: bool,
     collective_id: int | None,
-) -> object:
+) -> Callable[..., object]:
     """Build the ``pl.kernel`` jit_fn that drives the Helion device kernel.
 
     The kernel body receives ANY-space refs ``[inputs..., outputs...,
@@ -1668,12 +1668,15 @@ def _pallas_pl_kernel_jit_fn(
                 out_specs=pipe_out_specs,
             )(*pipe_any)
 
-        return pl.kernel(  # type: ignore[union-attr]
-            interpret_kernel_body,
-            out_shape_arg,
-            mesh=mesh,
-            interpret=True,
-            **{scratch_kw: scratch_shapes},
+        return cast(
+            "Callable[..., object]",
+            pl.kernel(  # type: ignore[union-attr]
+                interpret_kernel_body,
+                out_shape_arg,
+                mesh=mesh,
+                interpret=True,
+                **{scratch_kw: scratch_shapes},
+            ),
         )
 
     kernel_out_shapes = [out_shape_seq[pos] for pos in kernel_output_positions]
@@ -1685,7 +1688,7 @@ def _pallas_pl_kernel_jit_fn(
     else:
         kernel_out_shape = tuple(kernel_out_shapes)
 
-    def make_kernel(alias_refs: Mapping[int, object]) -> object:
+    def make_kernel(alias_refs: Mapping[int, object]) -> Callable[..., object]:
         def kernel_body(*refs: object) -> None:
             input_refs = iter(refs[: len(kernel_input_positions)])
             output_start = len(kernel_input_positions)
@@ -1734,12 +1737,15 @@ def _pallas_pl_kernel_jit_fn(
         kernel_kwargs["compiler_params"] = pltpu.CompilerParams(  # type: ignore[union-attr]
             **compiler_params
         )
-        return pl.kernel(  # type: ignore[union-attr]
-            kernel_body,
-            kernel_out_shape,
-            mesh=mesh,
-            interpret=interpret,
-            **kernel_kwargs,
+        return cast(
+            "Callable[..., object]",
+            pl.kernel(  # type: ignore[union-attr]
+                kernel_body,
+                kernel_out_shape,
+                mesh=mesh,
+                interpret=interpret,
+                **kernel_kwargs,
+            ),
         )
 
     if not hbm_alias_input_positions:
@@ -1753,7 +1759,7 @@ def _pallas_pl_kernel_jit_fn(
             for position in hbm_alias_input_positions
         }
         kernel_inputs = [inputs[position] for position in kernel_input_positions]
-        kernel = cast("Callable[..., object]", make_kernel(alias_refs))
+        kernel = make_kernel(alias_refs)
         kernel_results = kernel(*kernel_inputs)
         if not kernel_output_positions:
             kernel_results_seq: list[object] = []
