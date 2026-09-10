@@ -2452,7 +2452,9 @@ The actual proof boundaries are:
 | configured root task order `Q` in `_validate_root_task_orders` | true bijection from configured task coordinates to every logical CTA |
 | one `WorkerScheduleSegment` | point-valued exact partial placement with an exact converse; it need not cover the whole root |
 | union of all segments for one root in `_validate_normalized_worker_schedule` | true bijection from represented schedule support to every logical CTA, plus separately disjoint schedule support across segments/roots |
-| `_root_task_placement_relation`, `_logical_task_to_order_ordinal`, `_root_schedule_traversal`, and `_source_segment_ticket_order` | unique total logical-task-to-slot/ordinal/ticket lookup inherited from the proved root ownership bijection |
+| `_logical_task_to_order_ordinal` for one segment | an exact single-valued partial logical-task-to-segment-ordinal converse; totality is not required until segments are combined |
+| `_root_task_placement_relation` and `_root_schedule_traversal` | unique total logical-task-to-slot/ordinal lookup after the complete per-root union |
+| `_source_segment_ticket_order` | true bijection for the complete source-ticket relation |
 | selected final-arrival continuation | true bijection between consumer tasks and readiness keys; producer fan-in may still be many-to-one |
 | `RootBarrierPublicationPlan.participant_order` | true bijection from participating worker support to every effective arrival slot, including the synthetic single slot for an empty root |
 | readiness publication/count derivation, `_maximum_value_by_key`, producer-frontier calculation, and nested-counter coarsening | exact relational converse and cardinality, which may be set-valued; no bijection requirement |
@@ -2470,12 +2472,15 @@ Implement the earlier proof without changing those boundaries:
   cheap structural lemmas before attempting source-support factorization.
   A cached converse is still accepted as a bijection only when the forward map
   is point-valued and the converse is a total function over the target.
+  Likewise, target cardinality may be inferred from a support bijection only
+  after those two facts are proved; an exact converse alone is insufficient.
 - [ ] Construct packed `P` and `P_converse` together, prove/cache configured
   `Q_converse` once before scheduling, and let existing relation composition
   retain `(P;Q)_converse = Q_converse;P_converse`. Do this for both the direct
   packed path and the existing piece-aligned/sliced fallback. Prevent converse
   propagation from recursively invoking itself while building the reverse
-  composition.
+  composition or reverse union; propagation may inspect only already-memoized
+  converses and must not force a new converse derivation.
 - [ ] Make existing `then()` and `union()` retain exact converses when both
   operands have proved converses. For union, use
   `(A union B)_converse = A_converse union B_converse`; individual segments
@@ -2491,7 +2496,8 @@ Implement the earlier proof without changing those boundaries:
   relations and extensionally equal copies with no memo. Run it only after the
   memo and cheap structural rules, never implicitly from ordinary support-
   cardinality calculation. Construction provenance must affect compile time,
-  not which valid relation is accepted.
+  not which extensionally equal normalized relation within the supported proof
+  grammar is accepted.
 - [ ] Prove canonical/permuted dynamic task orders with coordinate and
   positional-product rules. Prove reflected and woven orders on their bounded
   concrete inner relation, then lift exact dynamic positional axes. Prove L2
@@ -2502,8 +2508,9 @@ Implement the earlier proof without changing those boundaries:
 - [ ] Preserve runtime-empty roots. Proofs require nonnegative extents, not
   strictly positive symbolic extents, and must validate the synthetic one-slot
   root-barrier participant order without sampling a nonzero shape.
-- [ ] Update the true-bijection consumers to reuse the one proof:
-  `_validate_root_task_orders`, per-root `WorkerSchedule` validation, root
+- [ ] Update the exact-converse consumers and true-bijection validators to
+  reuse the one proof: `_validate_root_task_orders`, per-root `WorkerSchedule`
+  validation, per-segment partial ordinal lookup, complete-root
   placement/traversal/ticket lookup, continuation selection/finalization, and
   root-barrier participant validation. Codegen consumes the finalized relation
   and plan and performs no duplicate bijection discovery.
