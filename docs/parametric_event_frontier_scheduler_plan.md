@@ -244,8 +244,11 @@ authoritative `WorkerScheduleSegment.task_order` relations; a review-found
 partial/strided clipping bug and a second mixed full/partial-piece clipping bug
 were fixed before integration. The combined tile-dependency and scheduler
 suites pass 310 tests with 185 subtests. The active implementation point is the
-occupied strand ordinal `q(s)`, followed by the acyclic relation-level max-plus
-objective and joint continuation/resident choice, translated recurrence
+occupied strand ordinal `q(s)`, followed by the acyclic root quotient and a
+test-only concrete max-plus oracle over the real model-shaped graphs. That
+oracle is now a mandatory early gate before production ownership selection.
+After it validates the objective, continue with the relation-level max-plus
+evaluator and joint continuation/resident choice, translated recurrence
 closure, post-placement nested quotients, source-ticket actions through that
 same policy, one final validation/lowering pass, and deletion of the top-level
 constant/parameterized branch.
@@ -482,6 +485,46 @@ input”) with positive storage provenance for exact wrapper allocations.
 Input aliases, views, and `torch.empty(..., out=input)` therefore cannot make
 runtime strides look static. This is a prerequisite for comparing symbolic and
 exact-shape schedules without silently changing the generated kernel body.
+
+### Priority 2B: validate the scheduling objective before policy wiring
+
+Do not wait for the complete symbolic continuation lowering to discover
+whether the unit-work objective makes the right decisions. Add a test-only
+concrete max-plus oracle over the actual model-shaped `ReadinessGraph` and
+`WorkerSchedule` relations. Materialization is allowed only inside this oracle;
+production scheduling must remain bounded by roots, relation pieces, and
+symbolic expressions.
+
+- [ ] Evaluate the exact task DAG with one unit of completion cost per body and
+  a secondary cross-worker handoff count. Check the implementation against
+  exhaustive tiny DAGs before using model-shaped cases.
+- [ ] Score the current all-resident schedule, the previously successful
+  FlashMLA event-aware schedule, and each single continuation alternative over
+  the complete downstream horizon. The oracle must count an inline body once,
+  use the maximum over all event producers, and retain all possible final-
+  publisher alternatives.
+- [ ] Run the oracle on the checked-in source structures for ragged FlashMLA
+  B4, both Qwen forms, both Gemma 4 A4B forms, and Muse/Glimmer FFN. It must
+  predict the known qualitative decisions: immediate FlashMLA reduction
+  release improves the topology; Qwen retains its good attention ordering and
+  resident root 13; Gemma keeps the expert reduction resident when inlining
+  lengthens the critical path; and Muse completes a fan-in group and releases
+  its consumer instead of spreading equal-priority producers across every
+  group. Add DeepSeek and Nemotron once their exact graphs are available.
+- [ ] For every symbolic case accepted by the production evaluator, substitute
+  `0`, `1`, boundary-minus-one, boundary, boundary-plus-one, and representative
+  larger extents and require exact agreement with this oracle. Constants and
+  runtime shapes must not select different policies merely because one path
+  uses Python integers and the other uses SymPy expressions.
+- [ ] If the objective fails to rank any already measured win or negative
+  control correctly, revise the objective before wiring it into production.
+  Do not compensate with a model/root-ID heuristic.
+
+This is an early scheduling signal, not a GPU performance model. It validates
+dependency overlap, critical-path completion, ownership, and handoff logic; it
+does not predict register pressure, shared resource contention, instruction
+mix, or constituent body speed. Those remain the later cold-L2 performance
+gate rather than inputs to scheduling policy.
 
 ### Priority 3: resume the paused validation and performance work
 
@@ -2816,6 +2859,10 @@ ownership a production decision. They are derived views over the existing
   `handoffs < K`. A cyclic translation proof keeps two scalar relations and
   performs completion extrema before handoff extrema unless a larger symbolic
   radix is itself proved to stay within the supported expression grammar.
+- [ ] Before this evaluator changes production ownership, run the Priority 2B
+  concrete oracle on the real FlashMLA, Qwen, Gemma, and Muse graphs. Require
+  the objective to reproduce the known positive and negative scheduling
+  choices, then require symbolic-substitution parity on every accepted case.
 - [ ] Represent an inline consumer body exactly once. Its possible
   final-producer winners are the causally maximal producer on each strand,
   followed by removal of producers proved to precede another candidate for
