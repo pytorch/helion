@@ -2507,7 +2507,7 @@ Implement the earlier proof without changing those boundaries:
   may be partial. Missing tasks must make the combined converse non-total,
   duplicate ownership must make it non-functional, and overlapping schedule
   support remains an independent rejection.
-- [ ] Audit every existing transform (`rename`, projection, lift, slice,
+- [x] Audit every existing transform (`rename`, projection, lift, slice,
   substitution, coalescing, and `dataclasses.replace`). It must either derive
   the transformed exact converse or drop the memo and use the bounded generic
   proof. No result may inherit a converse merely because its Python object was

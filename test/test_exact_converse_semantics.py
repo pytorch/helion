@@ -17,6 +17,7 @@ from helion._compiler.cross_loop_scheduler import WorkerScheduleSegment
 from helion._compiler.tile_dependency import CoordinateDomain
 from helion._compiler.tile_dependency import CoordinateRelation
 from helion._compiler.tile_dependency import _bounded_parameter_expression_interval
+from helion._compiler.tile_dependency import _CoordinateRelationPiece
 from helion._compiler.tile_dependency import _is_provably_nonnegative
 from helion._compiler.tile_dependency import _memoized_exact_converse
 from helion._compiler.tile_dependency import _remember_exact_converse
@@ -252,6 +253,183 @@ class TestExactConverseSemantics(TestCase):
                     concrete.materialize(source_axis_order=(10, 11)),
                     original.materialize(source_axis_order=(10, 11)),
                 )
+
+    def test_relation_transform_exact_converse_provenance(self) -> None:
+        extent = sympy.Symbol("extent", integer=True, nonnegative=True)
+        source = CoordinateDomain(
+            (10, 11),
+            ((10, 2), (11, extent)),
+            kind="task_order",
+            _allow_empty=True,
+        )
+        target = CoordinateDomain(
+            (20, 21),
+            ((20, extent), (21, 2)),
+            identity=0,
+            _allow_empty=True,
+        )
+        relation = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (
+                    ((10, 0, 2, 1), (11, 0, extent, 1)),
+                    (coordinate_axis_symbol(11), coordinate_axis_symbol(10)),
+                ),
+            ),
+        )
+        self.assertIsNotNone(relation.converse())
+
+        renamed_target = CoordinateDomain(
+            (30, 31),
+            ((30, extent), (31, 2)),
+            identity=1,
+            _allow_empty=True,
+        )
+        renamed = relation.rename_target_axes(renamed_target)
+        reordered = relation.reorder_source_axes((11, 10))
+        self.assertIsNotNone(renamed)
+        self.assertIsNotNone(reordered)
+        assert renamed is not None and reordered is not None
+        self.assertIsNotNone(_memoized_exact_converse(renamed))
+        self.assertIsNotNone(_memoized_exact_converse(reordered))
+
+        def assert_cached_converse_is_exact(
+            transformed: CoordinateRelation,
+            concrete_extent: int,
+        ) -> None:
+            concrete = transformed.substitute_parameters({extent: concrete_extent})
+            converse = _memoized_exact_converse(concrete)
+            self.assertIsNotNone(converse)
+            assert converse is not None
+            forward = concrete.materialize()
+            expected = tuple(
+                frozenset(
+                    source_index
+                    for source_index, targets in enumerate(forward)
+                    if target_index in targets
+                )
+                for target_index in range(concrete.target_domain.size)
+            )
+            self.assertEqual(converse.materialize(), expected)
+
+        for concrete_extent in (0, 1, 4):
+            with self.subTest(transform="rename_target", extent=concrete_extent):
+                assert_cached_converse_is_exact(renamed, concrete_extent)
+            with self.subTest(transform="reorder_source", extent=concrete_extent):
+                assert_cached_converse_is_exact(reordered, concrete_extent)
+            with self.subTest(transform="substitute", extent=concrete_extent):
+                assert_cached_converse_is_exact(relation, concrete_extent)
+
+        projected_target = relation.project_target(
+            CoordinateDomain(
+                (20,),
+                ((20, extent),),
+                identity=0,
+                _allow_empty=True,
+            )
+        )
+        projected_source = relation.project_source(
+            CoordinateDomain(
+                (11,),
+                ((11, extent),),
+                kind="task_order",
+                _allow_empty=True,
+            )
+        )
+        narrow_source = CoordinateDomain(
+            (11,),
+            ((11, extent),),
+            kind="task_order",
+            _allow_empty=True,
+        )
+        narrow_target = CoordinateDomain(
+            (20,),
+            ((20, extent),),
+            identity=0,
+            _allow_empty=True,
+        )
+        narrow = CoordinateRelation.point_map(
+            narrow_source,
+            narrow_target,
+            (
+                (
+                    ((11, 0, extent, 1),),
+                    (coordinate_axis_symbol(11),),
+                ),
+            ),
+        )
+        self.assertIsNotNone(narrow.converse())
+        lifted_source = narrow.lift_source(source)
+        replaced = dataclasses.replace(relation)
+        for name, transformed in (
+            ("project_target", projected_target),
+            ("project_source", projected_source),
+            ("lift_source", lifted_source),
+            ("dataclasses.replace", replaced),
+        ):
+            with self.subTest(transform=name):
+                self.assertIsNotNone(transformed)
+                assert transformed is not None
+                self.assertIsNone(_memoized_exact_converse(transformed))
+
+    def test_source_and_target_coalescing_retain_exact_converse(self) -> None:
+        source = CoordinateDomain((10,), ((10, 4),), kind="task_order")
+        target = CoordinateDomain((20,), ((20, 4),), identity=0)
+        source_coordinate = coordinate_axis_symbol(10)
+        source_partitioned = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (((10, 0, 2, 1),), (source_coordinate,)),
+                (((10, 2, 4, 1),), (source_coordinate,)),
+            ),
+        )
+        self.assertIsNotNone(source_partitioned.converse())
+        source_coalesced = source_partitioned.coalesce_adjacent_source_boxes()
+        self.assertEqual(len(source_coalesced.pieces), 1)
+
+        singleton_source = CoordinateDomain(
+            (30,),
+            ((30, 1),),
+            kind="task_order",
+        )
+        target_partitioned = CoordinateRelation(
+            singleton_source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    ((30, 0, 1, 1),),
+                    ((20, sympy.Integer(0), sympy.Integer(2), 1),),
+                ),
+                _CoordinateRelationPiece(
+                    ((30, 0, 1, 1),),
+                    ((20, sympy.Integer(2), sympy.Integer(4), 1),),
+                ),
+            ),
+        )
+        self.assertIsNotNone(target_partitioned.converse())
+        target_coalesced = target_partitioned.coalesce_adjacent_target_boxes()
+        self.assertEqual(len(target_coalesced.pieces), 1)
+
+        for name, transformed in (
+            ("source", source_coalesced),
+            ("target", target_coalesced),
+        ):
+            with self.subTest(coalescing=name):
+                converse = _memoized_exact_converse(transformed)
+                self.assertIsNotNone(converse)
+                assert converse is not None
+                forward = transformed.materialize()
+                expected = tuple(
+                    frozenset(
+                        source_index
+                        for source_index, targets in enumerate(forward)
+                        if target_index in targets
+                    )
+                    for target_index in range(transformed.target_domain.size)
+                )
+                self.assertEqual(converse.materialize(), expected)
 
     def test_source_support_ordinalization_retains_constructed_inverse(self) -> None:
         _old_domain, _widened_domain, task_order = self._partial_worker_task_order()

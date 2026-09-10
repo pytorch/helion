@@ -1072,7 +1072,7 @@ class CoordinateRelation:
         ):
             return None
         renamed_axes = dict(zip(old_axes, new_axes, strict=True))
-        return CoordinateRelation(
+        result = CoordinateRelation(
             source_domain=self.source_domain,
             target_domain=target_domain,
             pieces=tuple(
@@ -1086,6 +1086,17 @@ class CoordinateRelation:
                 for piece in self.pieces
             ),
         )
+        if (converse := _memoized_exact_converse(self)) is not None:
+            # Renaming the forward target is the same coordinate isomorphism
+            # as renaming the converse source.  Strip the converse's reverse
+            # memo before applying the public transform so propagation cannot
+            # recurse back through ``self``.
+            renamed_converse = dataclasses.replace(converse).rename_source_axes(
+                target_domain
+            )
+            if renamed_converse is not None:
+                _remember_exact_converse(result, renamed_converse)
+        return result
 
     def rename_source_axes(
         self, source_domain: CoordinateDomain
@@ -1131,7 +1142,12 @@ class CoordinateRelation:
             ),
         )
         if (converse := _memoized_exact_converse(self)) is not None:
-            renamed_converse = converse.rename_target_axes(source_domain)
+            # Apply only the semantic transform to the reverse relation.  Its
+            # existing back-reference would otherwise start reciprocal proof
+            # propagation through ``rename_target_axes``.
+            renamed_converse = dataclasses.replace(converse).rename_target_axes(
+                source_domain
+            )
             if renamed_converse is not None:
                 _remember_exact_converse(result, renamed_converse)
         return result
@@ -2927,11 +2943,16 @@ class CoordinateRelation:
         )
         if pieces == self.pieces:
             return self
-        return CoordinateRelation(
+        result = CoordinateRelation(
             source_domain=self.source_domain,
             target_domain=self.target_domain,
             pieces=pieces,
         )
+        if (converse := _memoized_exact_converse(self)) is not None:
+            # Target-box coalescing is an extensional representation change;
+            # the already-derived inverse remains exact.
+            _remember_exact_converse(result, converse)
+        return result
 
     def coalesce_adjacent_source_boxes(
         self,
