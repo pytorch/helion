@@ -29,6 +29,7 @@ from helion._compiler.cross_loop_scheduler import _event_ready_after_worker_step
 from helion._compiler.cross_loop_scheduler import _flat_task_order_relation
 from helion._compiler.cross_loop_scheduler import _global_unit_list_schedule
 from helion._compiler.cross_loop_scheduler import _has_valid_transient_source_schedule
+from helion._compiler.cross_loop_scheduler import _nested_loop_entry_counter
 from helion._compiler.cross_loop_scheduler import _root_schedule_traversal
 from helion._compiler.cross_loop_scheduler import _segmented_nested_loop_counter
 from helion._compiler.cross_loop_scheduler import _select_root_barrier_edges
@@ -566,12 +567,75 @@ def _full_point_map(
         (
             (
                 tuple(
-                    (axis, 0, source.axis_counts[axis], 1) for axis in source.axis_order
+                    (axis, 0, source.axis_count_expressions[axis], 1)
+                    for axis in source.axis_order
                 ),
                 target_coordinates,
             ),
         ),
     )
+
+
+def _symbolic_nested_counter_graph(
+    batch_size: int | sympy.Expr,
+    query_size: int | sympy.Expr,
+    nested_extent: int | sympy.Expr,
+) -> tuple[ReadinessGraph, ReadinessEvent, ReadinessConsumer]:
+    """Build one exact B x Q x nested readiness relation for counter tests."""
+    producer_domain, consumer_domain = _identify_root_domains(
+        (
+            CoordinateDomain(
+                (10, 11, 12),
+                ((10, batch_size), (11, query_size), (12, nested_extent)),
+                ((10, 1), (11, 1), (12, 1)),
+                _allow_empty=True,
+            ),
+            CoordinateDomain(
+                (20, 21),
+                ((20, batch_size), (21, query_size)),
+                ((20, 1), (21, 1)),
+                _allow_empty=True,
+            ),
+        )
+    )
+    consumer_site_domain = CoordinateDomain(
+        (20, 21, 22),
+        ((20, batch_size), (21, query_size), (22, nested_extent)),
+        ((20, 1), (21, 1), (22, 1)),
+        identity=7,
+        _allow_empty=True,
+    )
+    readiness_key_domain = CoordinateDomain(
+        (0, 1, 2),
+        ((0, batch_size), (1, query_size), (2, nested_extent)),
+        kind="event",
+        identity=0,
+        _allow_empty=True,
+    )
+    producer = _readiness_producer_from_publication(
+        producer_root=0,
+        publication=_full_point_map(
+            producer_domain,
+            readiness_key_domain,
+            coordinate_axis_symbol(10),
+            coordinate_axis_symbol(11),
+            coordinate_axis_symbol(12),
+        ),
+    )
+    consumer = ReadinessConsumer(
+        consumer_root=1,
+        consumer_site_id=7,
+        keys_by_consumer=_full_point_map(
+            consumer_site_domain,
+            readiness_key_domain,
+            coordinate_axis_symbol(20),
+            coordinate_axis_symbol(21),
+            coordinate_axis_symbol(22),
+        ),
+        covered_obligations=frozenset(((0, None, 7),)),
+    )
+    event = ReadinessEvent((producer,), (consumer,))
+    return _readiness_graph((producer_domain, consumer_domain), event), event, consumer
 
 
 def _axis_geometry(
@@ -5926,6 +5990,218 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(
             plan.consumers[0].covered_obligations,
             readiness_consumer.covered_obligations,
+        )
+
+    def test_nested_counter_supports_symbolic_bq_and_boundaries(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        query = sympy.Symbol("query", integer=True, nonnegative=True)
+        half = sympy.Symbol("half", integer=True, positive=True)
+        graph, event, consumer = _symbolic_nested_counter_graph(
+            batch,
+            query,
+            2 * half,
+        )
+
+        with (
+            mock.patch.object(
+                CoordinateDomain,
+                "axis_counts",
+                new_callable=mock.PropertyMock,
+                side_effect=AssertionError(
+                    "symbolic nested counters must not request concrete axis counts"
+                ),
+            ),
+            mock.patch.object(
+                CoordinateRelation,
+                "materialize",
+                side_effect=AssertionError(
+                    "symbolic nested counters must not enumerate relations"
+                ),
+            ),
+        ):
+            plan = _segmented_nested_loop_counter(
+                graph,
+                event,
+                consumer,
+                (0, half, 2 * half),
+            )
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan.readiness_key_domain.shape_expr, (2, batch, query))
+        self.assertEqual(plan.parameter_symbols, frozenset((batch, query, half)))
+
+        for concrete_batch, concrete_query, concrete_half in (
+            (0, 3, 2),
+            (2, 0, 3),
+            (2, 2, 1),
+            (2, 3, 2),
+            (3, 2, 3),
+        ):
+            substitutions = {
+                batch: concrete_batch,
+                query: concrete_query,
+                half: concrete_half,
+            }
+            dynamic_producer = plan.producers[0].producers_by_key.substitute_parameters(
+                substitutions
+            )
+            dynamic_consumer = plan.consumers[0].keys_by_consumer.substitute_parameters(
+                substitutions
+            )
+            if not concrete_batch or not concrete_query:
+                self.assertFalse(dynamic_producer.pieces)
+                self.assertFalse(dynamic_consumer.pieces)
+                self.assertEqual(dynamic_producer.source_domain.size, 0)
+                self.assertEqual(dynamic_consumer.source_domain.size, 0)
+                continue
+
+            static_graph, static_event, static_consumer = (
+                _symbolic_nested_counter_graph(
+                    concrete_batch,
+                    concrete_query,
+                    2 * concrete_half,
+                )
+            )
+            static_plan = _segmented_nested_loop_counter(
+                static_graph,
+                static_event,
+                static_consumer,
+                (0, concrete_half, 2 * concrete_half),
+            )
+            self.assertIsNotNone(static_plan)
+            assert static_plan is not None
+            self.assertEqual(
+                dynamic_producer.materialize(),
+                static_plan.producers[0].producers_by_key.materialize(),
+            )
+            self.assertEqual(
+                dynamic_consumer.materialize(),
+                static_plan.consumers[0].keys_by_consumer.materialize(),
+            )
+
+    def test_nested_loop_entry_counter_accepts_positive_symbolic_extent(
+        self,
+    ) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        query = sympy.Symbol("query", integer=True, nonnegative=True)
+        nested_extent = sympy.Symbol("nested_extent", integer=True, positive=True)
+        graph, event, consumer = _symbolic_nested_counter_graph(
+            batch,
+            query,
+            nested_extent,
+        )
+
+        with mock.patch.object(
+            CoordinateDomain,
+            "axis_counts",
+            new_callable=mock.PropertyMock,
+            side_effect=AssertionError(
+                "symbolic nested counters must not request concrete axis counts"
+            ),
+        ):
+            plan = _nested_loop_entry_counter(graph, event, consumer)
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan.readiness_key_domain.shape_expr, (1, batch, query))
+        zero_batch = {
+            batch: 0,
+            query: 3,
+            nested_extent: 5,
+        }
+        self.assertFalse(
+            plan.producers[0]
+            .producers_by_key.substitute_parameters(zero_batch)
+            .pieces
+        )
+        self.assertFalse(
+            plan.consumers[0]
+            .keys_by_consumer.substitute_parameters(zero_batch)
+            .pieces
+        )
+
+    def test_nested_counter_preserves_static_nonuniform_segments(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        query = sympy.Symbol("query", integer=True, nonnegative=True)
+        graph, event, consumer = _symbolic_nested_counter_graph(batch, query, 8)
+
+        with mock.patch.object(
+            CoordinateDomain,
+            "axis_counts",
+            new_callable=mock.PropertyMock,
+            side_effect=AssertionError(
+                "symbolic nested counters must not request concrete axis counts"
+            ),
+        ):
+            plan = _segmented_nested_loop_counter(
+                graph,
+                event,
+                consumer,
+                (0, 1, 5, 8),
+            )
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan.readiness_key_domain.shape_expr, (3, batch, query))
+        self.assertTrue(
+            cross_loop_scheduler._supports_exact_counter_plan_lowering(
+                plan,
+                graph.root_domains,
+            )
+        )
+        concrete_producers = plan.producers[0].producers_by_key.substitute_parameters(
+            {batch: 2, query: 2}
+        )
+        self.assertEqual(
+            sorted(
+                len(producers)
+                for producers in concrete_producers.materialize()
+            ),
+            [1, 1, 1, 1, 3, 3, 3, 3, 4, 4, 4, 4],
+        )
+        self.assertEqual(plan.arrival_count_bounds(), (1, 4))
+
+    def test_nested_counter_declines_unproved_or_empty_inner_segments(self) -> None:
+        maybe_empty = sympy.Symbol(
+            "maybe_empty",
+            integer=True,
+            nonnegative=True,
+        )
+        graph, event, consumer = _symbolic_nested_counter_graph(
+            2,
+            3,
+            maybe_empty + 2,
+        )
+
+        with mock.patch.object(
+            CoordinateDomain,
+            "axis_counts",
+            new_callable=mock.PropertyMock,
+            side_effect=AssertionError(
+                "symbolic nested counters must not request concrete axis counts"
+            ),
+        ):
+            self.assertIsNone(
+                _segmented_nested_loop_counter(
+                    graph,
+                    event,
+                    consumer,
+                    (0, maybe_empty, maybe_empty + 2),
+                )
+            )
+
+        empty_graph, empty_event, empty_consumer = _symbolic_nested_counter_graph(
+            2,
+            3,
+            maybe_empty,
+        )
+        self.assertIsNone(
+            _nested_loop_entry_counter(
+                empty_graph,
+                empty_event,
+                empty_consumer,
+            )
         )
 
     def test_nested_counter_declines_diagonal_owning_task_axis(self) -> None:

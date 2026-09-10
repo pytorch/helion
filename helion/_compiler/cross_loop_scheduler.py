@@ -22,6 +22,7 @@ from .tile_dependency import CoordinateDomain
 from .tile_dependency import CoordinateRelation
 from .tile_dependency import DependencyObligation
 from .tile_dependency import TileDependencyGraph
+from .tile_dependency import _CoordinateRelationPiece
 from .tile_dependency import _logical_expression_bounds
 from .tile_dependency import _simplify_logical_expression
 from .tile_dependency import consumer_to_preceding_site_relation
@@ -4390,7 +4391,7 @@ def _segmented_nested_loop_counter(
     readiness_graph: ReadinessGraph,
     event: ReadinessEvent,
     readiness_consumer: ReadinessConsumer,
-    boundaries: tuple[int, ...],
+    boundaries: tuple[int | sympy.Expr, ...],
 ) -> ReadinessCounterPlan | None:
     """Coarsen one exact nested dependency into contiguous loop segments."""
     consumer_site_id = readiness_consumer.consumer_site_id
@@ -4402,15 +4403,41 @@ def _segmented_nested_loop_counter(
     if len(nested_axes) != 1:
         return None
     (nested_axis,) = nested_axes
-    segments = tuple(itertools.pairwise(boundaries))
-    if not segments or any(begin >= end for begin, end in segments):
+    nested_extent = sympy.sympify(domain.axis_count_expressions[nested_axis])
+    normalized_boundaries = tuple(
+        sympy.simplify(sympy.sympify(boundary)) for boundary in boundaries
+    )
+    segments = tuple(itertools.pairwise(normalized_boundaries))
+    if (
+        not segments
+        or any(boundary.is_integer is not True for boundary in normalized_boundaries)
+        or any(
+            not boundary.free_symbols <= domain.parameter_symbols
+            for boundary in normalized_boundaries
+        )
+        or sympy.simplify(normalized_boundaries[0]) != 0
+        or sympy.simplify(normalized_boundaries[-1] - nested_extent) != 0
+        or any(
+            not tile_dependency._is_provably_nonnegative(begin, None)
+            or not tile_dependency._is_provably_nonnegative(
+                sympy.simplify(end - begin - 1),
+                None,
+            )
+            or not tile_dependency._is_provably_nonnegative(
+                sympy.simplify(nested_extent - end),
+                None,
+            )
+            for begin, end in segments
+        )
+    ):
         return None
     used_axes = readiness_consumer.keys_by_consumer.source_axes_affecting_targets()
     if used_axes is None or nested_axis not in used_axes:
         return None
+    domain_counts = domain.axis_count_expressions
     reduced_domain = CoordinateDomain(
         axis_order=used_axes,
-        axis_counts_items=tuple((axis, domain.axis_counts[axis]) for axis in used_axes),
+        axis_counts_items=tuple((axis, domain_counts[axis]) for axis in used_axes),
         block_sizes_items=tuple(
             (axis, domain.block_sizes[axis])
             for axis in used_axes
@@ -4418,18 +4445,21 @@ def _segmented_nested_loop_counter(
         ),
         kind="site",
         identity=domain.identity,
+        _allow_empty=domain._allow_empty,
     )
     outer_axes = tuple(axis for axis in used_axes if axis != nested_axis)
+    reduced_counts = reduced_domain.axis_count_expressions
     readiness_key_domain = CoordinateDomain(
         axis_order=tuple(range(len(outer_axes) + 1)),
         axis_counts_items=(
             (0, len(segments)),
             *(
-                (event_axis, reduced_domain.axis_counts[source_axis])
+                (event_axis, reduced_counts[source_axis])
                 for event_axis, source_axis in enumerate(outer_axes, start=1)
             ),
         ),
         kind="event",
+        _allow_empty=reduced_domain._allow_empty,
     )
     keys_by_reduced_iteration = CoordinateRelation.point_map(
         reduced_domain,
@@ -4440,7 +4470,7 @@ def _segmented_nested_loop_counter(
                     (
                         (axis, segment_begin, segment_end, 1)
                         if axis == nested_axis
-                        else (axis, 0, reduced_domain.axis_counts[axis], 1)
+                        else (axis, 0, reduced_counts[axis], 1)
                     )
                     for axis in reduced_domain.axis_order
                 ),
@@ -4451,6 +4481,58 @@ def _segmented_nested_loop_counter(
             )
             for stage, (segment_begin, segment_end) in enumerate(segments)
         ),
+    )
+    outer_event_axis_by_source = dict(
+        zip(outer_axes, range(1, len(outer_axes) + 1), strict=True)
+    )
+    reduced_iterations_by_key = CoordinateRelation(
+        source_domain=readiness_key_domain,
+        target_domain=reduced_domain,
+        pieces=tuple(
+            _CoordinateRelationPiece(
+                source_bounds_items=(
+                    (0, stage, stage + 1, 1),
+                    *(
+                        (
+                            event_axis,
+                            0,
+                            reduced_counts[source_axis],
+                            1,
+                        )
+                        for source_axis, event_axis in (
+                            outer_event_axis_by_source.items()
+                        )
+                    ),
+                ),
+                target_ranges=tuple(
+                    (
+                        (axis, segment_begin, segment_end, 1)
+                        if axis == nested_axis
+                        else (
+                            axis,
+                            coordinate_axis_symbol(
+                                outer_event_axis_by_source[axis]
+                            ),
+                            coordinate_axis_symbol(
+                                outer_event_axis_by_source[axis]
+                            )
+                            + 1,
+                            1,
+                        )
+                    )
+                    for axis in reduced_domain.axis_order
+                ),
+            )
+            for stage, (segment_begin, segment_end) in enumerate(segments)
+        ),
+    )
+    # Boundary validation above proves that these pieces are an exact
+    # partition, including their symbolic endpoints.  Retain that structural
+    # proof instead of asking the generic converse search to rediscover the
+    # same segmentation by specializing or enumerating the nested extent.
+    tile_dependency._remember_exact_converse(
+        keys_by_reduced_iteration,
+        reduced_iterations_by_key,
     )
     # Remove task-local coordinates that provably do not affect the producer
     # set before taking the converse. The unreduced relation may be many-to-one
@@ -4467,9 +4549,13 @@ def _segmented_nested_loop_counter(
     if key_coarsening is None:
         return None
     # This is a scheduling-derived coarsening of an already lowerable event,
-    # not a second dependency fact. Derive producer publication from the
-    # authoritative producer sets, compose it with the segment map, then
-    # take the exact converse back into the representation owned by the plan.
+    # not a second dependency fact. Derive both directions from the
+    # authoritative producer sets and the one proved segment quotient.  The
+    # generic converse search cannot rediscover runtime-valued segment cuts;
+    # retaining the structural inverse here avoids specialization or sampling.
+    semantic_keys_by_segment = key_coarsening.converse()
+    if semantic_keys_by_segment is None:
+        return None
     publication_relations = tuple(
         (
             None
@@ -4478,14 +4564,21 @@ def _segmented_nested_loop_counter(
         )
         for readiness_producer in event.producers
     )
-    if any(relation is None for relation in publication_relations):
-        return None
     producers_by_key_relations = tuple(
-        None if relation is None else relation.converse()
-        for relation in publication_relations
+        semantic_keys_by_segment.then(readiness_producer.producers_by_key)
+        for readiness_producer in event.producers
     )
-    if any(relation is None for relation in producers_by_key_relations):
+    if any(relation is None for relation in publication_relations) or any(
+        relation is None for relation in producers_by_key_relations
+    ):
         return None
+    for producers_by_key, publication in zip(
+        producers_by_key_relations,
+        publication_relations,
+        strict=True,
+    ):
+        assert producers_by_key is not None and publication is not None
+        tile_dependency._remember_exact_converse(producers_by_key, publication)
     keys_by_consumer = keys_by_reduced_iteration.lift_source(domain)
     if keys_by_consumer is None:
         return None
@@ -4591,7 +4684,7 @@ def _nested_loop_entry_counter(
     )
     if len(nested_axes) != 1:
         return None
-    nested_iterations_per_task = domain.axis_counts[nested_axes[0]]
+    nested_iterations_per_task = domain.axis_count_expressions[nested_axes[0]]
     return _segmented_nested_loop_counter(
         readiness_graph,
         event,
