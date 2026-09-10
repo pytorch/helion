@@ -3477,6 +3477,489 @@ class TestCrossLoopScheduler(TestCase):
                 cross_loop_scheduler._occupied_strand_ordinal(schedule)
             )
 
+    def test_all_resident_root_topological_order_matches_exhaustive_oracle(
+        self,
+    ) -> None:
+        slots = ((0, 0), (1, 0), (0, 1))
+        root_pairs = tuple(itertools.permutations(range(2), 2))
+        for root_slots in itertools.permutations(slots, 2):
+            cases = []
+            for edge_mask in range(1 << len(root_pairs)):
+                readiness_edges = frozenset(
+                    edge
+                    for edge_index, edge in enumerate(root_pairs)
+                    if edge_mask & (1 << edge_index)
+                )
+                readiness_graph, schedule = _singleton_root_problem(
+                    root_slots,
+                    readiness_edges,
+                )
+                if (
+                    cross_loop_scheduler._parametric_root_major_schedule_geometry(
+                        schedule
+                    )
+                    is not None
+                ):
+                    continue
+                cases.append(
+                    (
+                        readiness_edges,
+                        readiness_graph,
+                        schedule,
+                        _materialized_root_quotient_order(
+                            schedule,
+                            readiness_graph,
+                        ),
+                    )
+                )
+            with _forbid_schedule_enumeration():
+                for (
+                    readiness_edges,
+                    readiness_graph,
+                    schedule,
+                    expected,
+                ) in cases:
+                    with self.subTest(
+                        root_slots=root_slots,
+                        readiness_edges=readiness_edges,
+                    ):
+                        self.assertEqual(
+                            cross_loop_scheduler._all_resident_root_topological_order(
+                                schedule,
+                                readiness_graph,
+                            ),
+                            expected,
+                        )
+
+        base_graph, schedule = _singleton_root_problem(
+            ((3, 0), (2, 0), (1, 0), (0, 0)),
+            frozenset(),
+            worker_count=4,
+        )
+        first = _pointwise_root_readiness_event(
+            base_graph.root_domains,
+            2,
+            0,
+            0,
+        )
+        second = _pointwise_root_readiness_event(
+            base_graph.root_domains,
+            3,
+            1,
+            0,
+        )
+        readiness_graph = _readiness_graph(
+            base_graph.root_domains,
+            ReadinessEvent(
+                first.producers + second.producers,
+                first.consumers + second.consumers,
+            ),
+        )
+        expected = _materialized_root_quotient_order(schedule, readiness_graph)
+        with _forbid_schedule_enumeration():
+            actual = cross_loop_scheduler._all_resident_root_topological_order(
+                schedule,
+                readiness_graph,
+            )
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual, (2, 3, 0, 1))
+
+    def test_all_resident_root_topological_order_supports_symbolic_empty_roots(
+        self,
+    ) -> None:
+        task_count = sympy.Symbol(
+            "root_quotient_task_count",
+            integer=True,
+            nonnegative=True,
+        )
+        symbolic_domains = _identify_root_domains(
+            tuple(
+                CoordinateDomain(
+                    axis_order=(10 + 10 * root,),
+                    axis_counts_items=((10 + 10 * root, task_count),),
+                    kind="site",
+                    _allow_empty=True,
+                )
+                for root in range(2)
+            )
+        )
+        symbolic_graph = _readiness_graph(
+            symbolic_domains,
+            _pointwise_root_readiness_event(symbolic_domains, 0, 1, 0),
+        )
+
+        def disjoint_worker_schedule(
+            root_domains: tuple[CoordinateDomain, ...],
+            count: int | sympy.Expr,
+        ) -> WorkerSchedule:
+            placement_domain = CoordinateDomain(
+                axis_order=(-3, -2, -1),
+                axis_counts_items=((-3, 2), (-2, 2), (-1, count)),
+                kind="worker",
+                _allow_empty=True,
+            )
+            wave = coordinate_axis_symbol(-1)
+            segments = []
+            for root, root_domain in enumerate(root_domains):
+                relation = CoordinateRelation(
+                    placement_domain,
+                    root_domain,
+                    (),
+                )
+                if sympy.sympify(count).is_zero is not True:
+                    relation = CoordinateRelation.point_map(
+                        placement_domain,
+                        root_domain,
+                        (
+                            (
+                                (
+                                    (-3, 1, 2, 1),
+                                    (-2, root, root + 1, 1),
+                                    (-1, 0, count, 1),
+                                ),
+                                (wave,),
+                            ),
+                        ),
+                    )
+                segments.append(
+                    WorkerScheduleSegment(
+                        root=root,
+                        task_order=relation,
+                        worker_begin=0,
+                        worker_count=2,
+                        dispatch_offset=0,
+                    )
+                )
+            return WorkerSchedule(2, tuple(segments))
+
+        symbolic_schedule = disjoint_worker_schedule(
+            symbolic_domains,
+            task_count,
+        )
+        with _forbid_schedule_enumeration():
+            symbolic_order = cross_loop_scheduler._all_resident_root_topological_order(
+                symbolic_schedule,
+                symbolic_graph,
+            )
+        self.assertEqual(symbolic_order, (0, 1))
+
+        for concrete_count in (0, 1, 2, 3, 5):
+            with self.subTest(task_count=concrete_count):
+                substitutions = {task_count: concrete_count}
+                concrete_domains = tuple(
+                    domain.substitute_parameters(substitutions)
+                    for domain in symbolic_domains
+                )
+                concrete_graph = _readiness_graph(
+                    concrete_domains,
+                    _pointwise_root_readiness_event(concrete_domains, 0, 1, 0),
+                )
+                concrete_schedule = disjoint_worker_schedule(
+                    concrete_domains,
+                    concrete_count,
+                )
+                expected = _materialized_root_quotient_order(
+                    concrete_schedule,
+                    concrete_graph,
+                )
+                with _forbid_schedule_enumeration():
+                    actual = (
+                        cross_loop_scheduler._all_resident_root_topological_order(
+                            concrete_schedule,
+                            concrete_graph,
+                        )
+                    )
+                self.assertEqual(actual, expected)
+                self.assertEqual(actual, symbolic_order)
+
+        conditional_self_domains = symbolic_domains[:1]
+        conditional_self_graph = _readiness_graph(
+            conditional_self_domains,
+            _pointwise_root_readiness_event(
+                conditional_self_domains,
+                0,
+                0,
+                0,
+            ),
+        )
+        conditional_self_schedule = disjoint_worker_schedule(
+            conditional_self_domains,
+            task_count,
+        )
+        with _forbid_schedule_enumeration():
+            self.assertIsNone(
+                cross_loop_scheduler._all_resident_root_topological_order(
+                    conditional_self_schedule,
+                    conditional_self_graph,
+                )
+            )
+
+        empty_domains = tuple(
+            domain.substitute_parameters({task_count: 0})
+            for domain in conditional_self_domains
+        )
+        empty_self_graph = _readiness_graph(
+            empty_domains,
+            _pointwise_root_readiness_event(empty_domains, 0, 0, 0),
+        )
+        empty_self_schedule = disjoint_worker_schedule(empty_domains, 0)
+        with _forbid_schedule_enumeration():
+            self.assertEqual(
+                cross_loop_scheduler._all_resident_root_topological_order(
+                    empty_self_schedule,
+                    empty_self_graph,
+                ),
+                (0,),
+            )
+
+    def test_all_resident_root_topological_order_root_major_symbolic_tail(
+        self,
+    ) -> None:
+        task_count = sympy.Symbol(
+            "root_quotient_packed_tail",
+            integer=True,
+            nonnegative=True,
+        )
+        worker_count = 4
+        shape = (sympy.Integer(3), task_count, sympy.Integer(2))
+        symbolic_domains = _identify_root_domains(
+            tuple(
+                CoordinateDomain(
+                    (10 + root,),
+                    ((10 + root, count),),
+                    ((10 + root, 1),),
+                    kind="site",
+                    identity=root,
+                    _allow_empty=True,
+                )
+                for root, count in enumerate(shape)
+            )
+        )
+        symbolic_graph = _readiness_graph(symbolic_domains)
+        symbolic_schedule = cross_loop_scheduler._build_root_major_worker_schedule(
+            symbolic_domains,
+            symbolic_graph.root_task_orders,
+            worker_count,
+        )
+        with _forbid_schedule_enumeration():
+            symbolic_order = cross_loop_scheduler._all_resident_root_topological_order(
+                symbolic_schedule,
+                symbolic_graph,
+            )
+        self.assertEqual(symbolic_order, (0, 1, 2))
+
+        for concrete_count in (0, 1, 3, 4, 5, 7, 8, 9):
+            with self.subTest(task_count=concrete_count):
+                substitutions = {task_count: concrete_count}
+                concrete_domains = tuple(
+                    domain.substitute_parameters(substitutions)
+                    for domain in symbolic_domains
+                )
+                concrete_graph = _readiness_graph(concrete_domains)
+                concrete_schedule = (
+                    cross_loop_scheduler._build_root_major_worker_schedule(
+                        concrete_domains,
+                        concrete_graph.root_task_orders,
+                        worker_count,
+                    )
+                )
+                expected = _materialized_root_quotient_order(
+                    concrete_schedule,
+                    concrete_graph,
+                )
+                with _forbid_schedule_enumeration():
+                    actual = (
+                        cross_loop_scheduler._all_resident_root_topological_order(
+                            concrete_schedule,
+                            concrete_graph,
+                        )
+                    )
+                self.assertEqual(actual, expected)
+                self.assertEqual(actual, symbolic_order)
+
+    def test_all_resident_root_topological_order_clips_source_support(self) -> None:
+        readiness_graph, schedule = _singleton_root_problem(
+            ((0, 0), (0, 1)),
+            frozenset(),
+        )
+        root_domains = readiness_graph.root_domains
+        event = _pointwise_root_readiness_event(root_domains, 1, 0, 0)
+        consumer = event.consumers[0]
+        (consumer_axis,) = consumer.keys_by_consumer.source_domain.axis_order
+        (event_axis,) = consumer.keys_by_consumer.target_domain.axis_order
+        clipped_empty_keys = CoordinateRelation(
+            source_domain=consumer.keys_by_consumer.source_domain,
+            target_domain=consumer.keys_by_consumer.target_domain,
+            pieces=(
+                _CoordinateRelationPiece(
+                    ((consumer_axis, -2, -1, 1),),
+                    ((event_axis, 0, 1, 1),),
+                ),
+                _CoordinateRelationPiece(
+                    ((consumer_axis, 2, 3, 1),),
+                    ((event_axis, 0, 1, 1),),
+                ),
+            ),
+        )
+        readiness_graph = _readiness_graph(
+            root_domains,
+            dataclasses.replace(
+                event,
+                consumers=(
+                    dataclasses.replace(
+                        consumer,
+                        keys_by_consumer=clipped_empty_keys,
+                    ),
+                ),
+            ),
+        )
+        self.assertEqual(
+            _materialized_root_quotient_order(schedule, readiness_graph),
+            (0, 1),
+        )
+        with _forbid_schedule_enumeration():
+            self.assertEqual(
+                cross_loop_scheduler._all_resident_root_topological_order(
+                    schedule,
+                    readiness_graph,
+                ),
+                (0, 1),
+            )
+
+    def test_all_resident_root_topological_order_declines_unsupported_cases(
+        self,
+    ) -> None:
+        cyclic_graph, cyclic_schedule = _singleton_root_problem(
+            ((0, 0), (0, 1)),
+            frozenset(((1, 0),)),
+        )
+        self_graph, self_schedule = _singleton_root_problem(
+            ((0, 0),),
+            frozenset(((0, 0),)),
+        )
+        nested_graph, nested_schedule = _singleton_root_problem(
+            ((0, 0), (1, 0)),
+            frozenset(((0, 1),)),
+        )
+        nested_event = nested_graph.events[0]
+        nested_producer_graph = dataclasses.replace(
+            nested_graph,
+            events=(
+                dataclasses.replace(
+                    nested_event,
+                    producers=(
+                        dataclasses.replace(
+                            nested_event.producers[0],
+                            producer_site_id=7,
+                        ),
+                    ),
+                ),
+            ),
+        )
+        nested_consumer_graph = dataclasses.replace(
+            nested_graph,
+            events=(
+                dataclasses.replace(
+                    nested_event,
+                    consumers=(
+                        dataclasses.replace(
+                            nested_event.consumers[0],
+                            consumer_site_id=7,
+                        ),
+                    ),
+                ),
+            ),
+        )
+        source_graph, source_schedule = _singleton_root_problem(
+            ((0, 0),),
+            frozenset(),
+            launch_stage=0,
+        )
+
+        for name, readiness_graph, schedule in (
+            ("cyclic quotient", cyclic_graph, cyclic_schedule),
+            ("self readiness", self_graph, self_schedule),
+            ("nested producer", nested_producer_graph, nested_schedule),
+            ("nested consumer", nested_consumer_graph, nested_schedule),
+            ("source stage", source_graph, source_schedule),
+        ):
+            with self.subTest(name=name), _forbid_schedule_enumeration():
+                self.assertIsNone(
+                    cross_loop_scheduler._all_resident_root_topological_order(
+                        schedule,
+                        readiness_graph,
+                    )
+                )
+
+        def decline_readiness_composition(
+            relation: CoordinateRelation,
+            following: CoordinateRelation,
+        ) -> CoordinateRelation | None:
+            if (
+                relation.source_domain.kind == "site"
+                and relation.target_domain.kind == "event"
+            ):
+                return None
+            return original_then(relation, following)
+
+        original_then = CoordinateRelation.then
+        with (
+            _forbid_schedule_enumeration(),
+            mock.patch.object(
+                CoordinateRelation,
+                "then",
+                new=decline_readiness_composition,
+            ),
+        ):
+            self.assertIsNone(
+                cross_loop_scheduler._all_resident_root_topological_order(
+                    nested_schedule,
+                    nested_graph,
+                )
+            )
+        budget_graph, budget_schedule = _singleton_root_problem(
+            ((0, 0), (0, 1)),
+            frozenset(),
+        )
+        with (
+            _forbid_schedule_enumeration(),
+            mock.patch.object(
+                cross_loop_scheduler,
+                "_MAX_GLOBAL_LIST_EDGES",
+                0,
+            ),
+        ):
+            self.assertIsNone(
+                cross_loop_scheduler._all_resident_root_topological_order(
+                    budget_schedule,
+                    budget_graph,
+                )
+            )
+        with (
+            _forbid_schedule_enumeration(),
+            mock.patch.object(tile_dependency, "_MAX_RELATION_PIECES", 0),
+        ):
+            self.assertIsNone(
+                cross_loop_scheduler._all_resident_root_topological_order(
+                    budget_schedule,
+                    budget_graph,
+                )
+            )
+        with (
+            _forbid_schedule_enumeration(),
+            mock.patch.object(
+                tile_dependency,
+                "_relation_product_is_within_budget",
+                return_value=False,
+            ),
+        ):
+            self.assertIsNone(
+                cross_loop_scheduler._all_resident_root_topological_order(
+                    budget_schedule,
+                    budget_graph,
+                )
+            )
+
     def test_strict_root_slot_progress_accepts_only_earlier_slots(self) -> None:
         producer_domain, consumer_domain = _identify_root_domains(
             (_domain((10, 2, 1)), _domain((20, 1, 1)))

@@ -7295,9 +7295,26 @@ def _all_resident_root_topological_order(
     def may_be_nonempty(relation: CoordinateRelation) -> bool | None:
         if len(relation.pieces) > tile_dependency._MAX_RELATION_PIECES:
             return None
+        domain_bounds = tuple(
+            (
+                axis,
+                sympy.Integer(0),
+                relation.source_domain.axis_count_expressions[axis],
+                1,
+            )
+            for axis in relation.source_domain.axis_order
+        )
         for piece in relation.pieces:
-            source_cardinality = tile_dependency._source_box_cardinality(
+            source_bounds = tile_dependency._intersect_source_boxes(
                 piece.source_bounds_items,
+                domain_bounds,
+            )
+            if source_bounds is None:
+                return None
+            if source_bounds is False:
+                continue
+            source_cardinality = tile_dependency._source_box_cardinality(
+                source_bounds,
                 domain=relation.source_domain,
             )
             if source_cardinality is not None and source_cardinality.is_zero is True:
@@ -7306,31 +7323,33 @@ def _all_resident_root_topological_order(
                 piece.target_ranges,
                 target_domain=relation.target_domain,
                 source_domain=relation.source_domain,
-                source_bounds=piece.source_bounds_items,
+                source_bounds=source_bounds,
             )
             if not tile_dependency._target_box_is_empty_for_all_sources(
                 target_ranges,
                 source_domain=relation.source_domain,
-                source_bounds=piece.source_bounds_items,
+                source_bounds=source_bounds,
                 target_domain=relation.target_domain,
             ):
                 return True
         return False
 
-    occupied_by_root: list[list[CoordinateRelation]] = [
-        [] for _ in range(root_count)
-    ]
-    for segment in worker_schedule.segments:
-        occupied = _occupied_slot_identity(segment)
-        if occupied is None:
-            return None
-        occupied_may_be_nonempty = may_be_nonempty(occupied)
-        if occupied_may_be_nonempty is None or (
-            occupied_may_be_nonempty and segment.launch_stage != _RESIDENT_LAUNCH_STAGE
-        ):
-            return None
-        if occupied_may_be_nonempty:
-            occupied_by_root[segment.root].append(occupied)
+    root_major_geometry = _parametric_root_major_schedule_geometry(worker_schedule)
+    occupied_by_root: list[list[CoordinateRelation]] | None = None
+    if root_major_geometry is None:
+        occupied_by_root = [[] for _ in range(root_count)]
+        for segment in worker_schedule.segments:
+            occupied = _occupied_slot_identity(segment)
+            if occupied is None:
+                return None
+            occupied_may_be_nonempty = may_be_nonempty(occupied)
+            if occupied_may_be_nonempty is None or (
+                occupied_may_be_nonempty
+                and segment.launch_stage != _RESIDENT_LAUNCH_STAGE
+            ):
+                return None
+            if occupied_may_be_nonempty:
+                occupied_by_root[segment.root].append(occupied)
     successors: list[set[int]] = [set() for _ in range(root_count)]
     edge_attempt_count = 0
 
@@ -7382,33 +7401,46 @@ def _all_resident_root_topological_order(
                     return None
                 successors[producer.producer_root].add(consumer.consumer_root)
 
-    occupied_roots = tuple(
-        (root, segments)
-        for root, segments in enumerate(occupied_by_root)
-        if segments
-    )
-    for producer_root, producer_segments in occupied_roots:
-        for consumer_root, consumer_segments in occupied_roots:
-            if consumer_root == producer_root:
-                continue
-            if not account_edge_attempt():
-                return None
-            for successor_occupied in consumer_segments:
-                for predecessor_occupied in producer_segments:
-                    precedence = _occupied_same_strand_precedence_between(
-                        successor_occupied,
-                        predecessor_occupied,
-                    )
-                    if precedence is None:
-                        return None
-                    edge_may_be_nonempty = may_be_nonempty(precedence)
-                    if edge_may_be_nonempty is None:
-                        return None
-                    if edge_may_be_nonempty:
-                        successors[producer_root].add(consumer_root)
+    if root_major_geometry is not None:
+        possibly_nonempty_roots = tuple(
+            segment.root
+            for segment, _first_slot, task_count in root_major_geometry
+            if task_count.is_zero is not True
+        )
+        for earlier_index, producer_root in enumerate(possibly_nonempty_roots):
+            for consumer_root in possibly_nonempty_roots[earlier_index + 1 :]:
+                if not account_edge_attempt():
+                    return None
+                successors[producer_root].add(consumer_root)
+    else:
+        assert occupied_by_root is not None
+        occupied_roots = tuple(
+            (root, segments)
+            for root, segments in enumerate(occupied_by_root)
+            if segments
+        )
+        for producer_root, producer_segments in occupied_roots:
+            for consumer_root, consumer_segments in occupied_roots:
+                if consumer_root == producer_root:
+                    continue
+                if not account_edge_attempt():
+                    return None
+                for successor_occupied in consumer_segments:
+                    for predecessor_occupied in producer_segments:
+                        precedence = _occupied_same_strand_precedence_between(
+                            successor_occupied,
+                            predecessor_occupied,
+                        )
+                        if precedence is None:
+                            return None
+                        edge_may_be_nonempty = may_be_nonempty(precedence)
+                        if edge_may_be_nonempty is None:
+                            return None
+                        if edge_may_be_nonempty:
+                            successors[producer_root].add(consumer_root)
+                            break
+                    if consumer_root in successors[producer_root]:
                         break
-                if consumer_root in successors[producer_root]:
-                    break
 
     return _deterministic_topological_order(successors)
 
