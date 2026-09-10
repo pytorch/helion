@@ -194,13 +194,25 @@ Independent review confirmed that candidate coverage validation precedes this
 cardinality comparison and that sparse/trailing-wave cases match the concrete
 oracle.
 
+A reviewed relation-derived progress certificate now maps each resident
+logical task to its scalar global slot `wave * worker_count + worker` from the
+authoritative `WorkerScheduleSegment.task_order`. It composes exact root-entry
+counter dependencies into consumer-task-to-producer-task relations, takes the
+producer-slot maximum, and accepts only strict slot increase. It handles
+symbolic empty domains and multi-arm fork/join events without enumerating
+workers or tasks, while conservatively declining barriers, nested sites,
+continuations, source-stage work, and proof-budget exhaustion. This rank is a
+topological/deadlock certificate for admitted same-wave work; it is explicitly
+not the completion-time objective used to choose continuations. Independent
+review found and fixed missing per-relation and Cartesian-product budget gates.
+
 Code generation also no longer reruns counter legality or continuation
 ownership checks after `StaticPipelinePlan` construction. The plan validates
 those facts once and codegen renders them. Independent review found one
 production construction path and no serialization path that could bypass this
 validation; any future plan serialization must add validated restoration.
 The integrated tile-dependency and scheduler suites at this checkpoint pass
-281 tests with 119 subtests.
+289 tests with 119 subtests.
 
 A proposed shortcut that routed the old equal-width repeated recurrence through
 the common list-scheduler entry was reviewed and rejected; it is not part of
