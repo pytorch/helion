@@ -39,6 +39,7 @@ from helion._compiler.tile_dependency import (
     _piecewise_source_grouped_mixed_radix_converse,
 )
 from helion._compiler.tile_dependency import _relation_source_cells
+from helion._compiler.tile_dependency import _remember_exact_converse
 from helion._compiler.tile_dependency import _simplify_logical_expression
 from helion._compiler.tile_dependency import _symbolic_linear_access_relation
 from helion._compiler.tile_dependency import _symbolic_producers_by_consumer
@@ -3808,6 +3809,103 @@ class TestTileDependency(TestCase):
                     concrete.materialize(),
                     tuple(frozenset((index,)) for index in range(concrete_count)),
                 )
+
+    def test_target_count_accepts_exact_symbolic_support_carrier(self) -> None:
+        count = sympy.Symbol("count", integer=True, nonnegative=True)
+        source = CoordinateDomain(
+            (10,),
+            ((10, count),),
+            kind="site",
+            _allow_empty=True,
+        )
+        target = CoordinateDomain(
+            (20,),
+            ((20, count),),
+            kind="site",
+            _allow_empty=True,
+        )
+        carrier_target = CoordinateDomain(
+            (30,),
+            ((30, count),),
+            kind="task_order",
+            _allow_empty=True,
+        )
+        source_index = coordinate_axis_symbol(10)
+        carrier_index = coordinate_axis_symbol(30)
+        relation = CoordinateRelation(
+            source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 0, count, 1),),
+                    ((20, sympy.Integer(0), source_index, 1),),
+                ),
+            ),
+        )
+        carrier = CoordinateRelation.point_map(
+            source,
+            carrier_target,
+            (
+                (((10, 0, sympy.Min(1, count), 1),), (source_index,)),
+                (((10, 1, count, 1),), (source_index,)),
+            ),
+        )
+        carrier_converse = CoordinateRelation.point_map(
+            carrier_target,
+            source,
+            (
+                (((30, 0, count, 1),), (carrier_index,)),
+            ),
+        )
+        _remember_exact_converse(carrier, carrier_converse)
+
+        counts = relation.target_count_by_source(source_support=carrier)
+
+        self.assertIsNotNone(counts)
+        assert counts is not None
+        for concrete_count in (0, 1, 4):
+            with self.subTest(count=concrete_count):
+                concrete = counts.substitute_parameters({count: concrete_count})
+                self.assertEqual(
+                    concrete.materialize(),
+                    tuple(frozenset((index,)) for index in range(concrete_count)),
+                )
+
+    def test_target_count_carrier_declines_crossing_relation_boundary(self) -> None:
+        source = CoordinateDomain((10,), ((10, 4),), kind="site")
+        target = CoordinateDomain((20,), ((20, 4),), kind="site")
+        carrier_target = CoordinateDomain((30,), ((30, 2),), kind="task_order")
+        source_index = coordinate_axis_symbol(10)
+        carrier_index = coordinate_axis_symbol(30)
+        relation = CoordinateRelation(
+            source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 0, 2, 1),),
+                    ((20, sympy.Integer(0), sympy.Integer(1), 1),),
+                ),
+                _CoordinateRelationPiece(
+                    ((10, 2, 4, 1),),
+                    ((20, sympy.Integer(0), sympy.Integer(2), 1),),
+                ),
+            ),
+        )
+        carrier = CoordinateRelation.point_map(
+            source,
+            carrier_target,
+            ((((10, 1, 3, 1),), (source_index - 1,)),),
+        )
+        carrier_converse = CoordinateRelation.point_map(
+            carrier_target,
+            source,
+            ((((30, 0, 2, 1),), (carrier_index + 1,)),),
+        )
+        _remember_exact_converse(carrier, carrier_converse)
+
+        self.assertIsNone(
+            relation.target_count_by_source(source_support=carrier)
+        )
 
     def test_target_count_with_support_rejects_overlapping_targets(self) -> None:
         source = CoordinateDomain((10,), ((10, 3),), kind="site")

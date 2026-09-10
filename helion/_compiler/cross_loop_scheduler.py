@@ -2501,9 +2501,6 @@ def _occupied_same_strand_precedence(
     composition or a common relation-budget overflow declines the whole view.
     """
     placement_domain = worker_schedule.placement_domain
-    if placement_domain.kind != "worker" or len(placement_domain.axis_order) != 3:
-        return None
-    launch_stage_axis, worker_axis, wave_axis = placement_domain.axis_order
     occupied_identity = _occupied_schedule_identity(worker_schedule)
     if occupied_identity is None:
         return None
@@ -2516,10 +2513,26 @@ def _occupied_same_strand_precedence(
     ):
         return None
 
+    strict_predecessors = _strict_same_strand_precedence(placement_domain)
+    if strict_predecessors is None:
+        return None
+    predecessors_by_successor = occupied_identity.then(strict_predecessors)
+    if predecessors_by_successor is None:
+        return None
+    return occupied_identity.overlapping_sources(predecessors_by_successor)
+
+
+def _strict_same_strand_precedence(
+    placement_domain: CoordinateDomain,
+) -> CoordinateRelation | None:
+    """Map every placement slot to all earlier slots on the same strand."""
+    if placement_domain.kind != "worker" or len(placement_domain.axis_order) != 3:
+        return None
+    launch_stage_axis, worker_axis, wave_axis = placement_domain.axis_order
     launch_stage = coordinate_axis_symbol(launch_stage_axis)
     worker = coordinate_axis_symbol(worker_axis)
     wave = coordinate_axis_symbol(wave_axis)
-    strict_predecessors = CoordinateRelation(
+    return CoordinateRelation(
         source_domain=placement_domain,
         target_domain=placement_domain,
         pieces=(
@@ -2541,10 +2554,46 @@ def _occupied_same_strand_precedence(
             ),
         ),
     )
-    predecessors_by_successor = occupied_identity.then(strict_predecessors)
-    if predecessors_by_successor is None:
+
+
+def _dense_prefix_strand_predecessor_count(
+    worker_schedule: WorkerSchedule,
+) -> CoordinateRelation | None:
+    """Strength-reduce predecessor count for a proved dense packed prefix."""
+    geometry = _parametric_root_major_schedule_geometry(worker_schedule)
+    if geometry is None:
         return None
-    return occupied_identity.overlapping_sources(predecessors_by_successor)
+    placement_domain = worker_schedule.placement_domain
+    if placement_domain.kind != "worker" or len(placement_domain.axis_order) != 3:
+        return None
+    total_task_count = sympy.Add(*(task_count for _, _, task_count in geometry))
+    used_axes = frozenset(placement_domain.axis_order)
+    ordinal_axis = min(used_axes, default=0) - 1
+    while ordinal_axis in used_axes:
+        ordinal_axis -= 1
+    ordinal_domain = CoordinateDomain(
+        (ordinal_axis,),
+        ((ordinal_axis, total_task_count),),
+        kind="task_order",
+        _allow_empty=total_task_count.is_zero is True,
+    )
+    packed_support = _parametric_root_major_relation(
+        placement_domain,
+        ordinal_domain,
+        sympy.Integer(0),
+        worker_schedule.worker_count,
+        ordinal_domain.axis_order,
+    )
+    if packed_support is None:
+        return None
+    strict_predecessors = _strict_same_strand_precedence(placement_domain)
+    if strict_predecessors is None:
+        return None
+    result = strict_predecessors.target_count_by_source(source_support=packed_support)
+    # The geometry proof established that the authoritative segment supports
+    # concatenate to exactly this packed prefix.  Cardinality and the scalar
+    # single-valued proof remain owned by the generic relation operation.
+    return result if result is not None and result.is_single_valued() else None
 
 
 def _occupied_strand_ordinal(
@@ -2556,20 +2605,37 @@ def _occupied_strand_ordinal(
     predecessor accounting is delegated to ``target_count_by_source`` before
     its scalar result is shifted by one.
     """
-    predecessors = _occupied_same_strand_precedence(worker_schedule)
-    if predecessors is None:
-        return None
-    occupied_identity = _occupied_schedule_identity(worker_schedule)
-    if occupied_identity is None:
-        return None
-    predecessor_counts = predecessors.target_count_by_source(
-        source_support=occupied_identity,
+    predecessor_counts = _dense_prefix_strand_predecessor_count(worker_schedule)
+    if predecessor_counts is None:
+        predecessors = _occupied_same_strand_precedence(worker_schedule)
+        occupied_identity = _occupied_schedule_identity(worker_schedule)
+        if predecessors is None or occupied_identity is None:
+            return None
+        predecessor_counts = predecessors.target_count_by_source(
+            source_support=occupied_identity,
+        )
+        if predecessor_counts is None:
+            return None
+
+    # Leave room for the one-based shift even when the authoritative support
+    # is conditionally empty at the scalar carrier's smallest parameter value.
+    (value_axis,) = predecessor_counts.target_domain.axis_order
+    widened_value_domain = dataclasses.replace(
+        predecessor_counts.target_domain,
+        axis_counts_items=(
+            (
+                value_axis,
+                sympy.simplify(
+                    predecessor_counts.target_domain.axis_count_expressions[value_axis]
+                    + 1
+                ),
+            ),
+        ),
     )
-    return (
-        None
-        if predecessor_counts is None
-        else predecessor_counts.pointwise_add_scalar(offset=1)
-    )
+    return dataclasses.replace(
+        predecessor_counts,
+        target_domain=widened_value_domain,
+    ).pointwise_add_scalar(offset=1)
 
 
 @cache

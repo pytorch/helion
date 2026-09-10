@@ -3212,6 +3212,80 @@ class TestCrossLoopScheduler(TestCase):
                     expected,
                 )
 
+    def test_occupied_strand_ordinal_symbolic_packed_tails(self) -> None:
+        task_count = sympy.Symbol(
+            "task_count",
+            integer=True,
+            nonnegative=True,
+        )
+        worker_count = 4
+        symbolic_shapes = (
+            (task_count,),
+            (worker_count * task_count + 1,),
+            (sympy.Integer(3), task_count, sympy.Integer(2)),
+        )
+        substitutions = (
+            0,
+            1,
+            worker_count - 1,
+            worker_count,
+            worker_count + 1,
+            2 * worker_count - 1,
+            2 * worker_count + 1,
+        )
+        for shape in symbolic_shapes:
+            with self.subTest(shape=shape):
+                symbolic_domains = tuple(
+                    CoordinateDomain(
+                        (10 + root,),
+                        ((10 + root, count),),
+                        ((10 + root, 1),),
+                        kind="site",
+                        identity=root,
+                        _allow_empty=True,
+                    )
+                    for root, count in enumerate(shape)
+                )
+                symbolic_schedule = (
+                    cross_loop_scheduler._build_root_major_worker_schedule(
+                        symbolic_domains,
+                        _default_root_task_orders(symbolic_domains),
+                        worker_count,
+                    )
+                )
+                with _forbid_schedule_enumeration():
+                    symbolic_ordinals = cross_loop_scheduler._occupied_strand_ordinal(
+                        symbolic_schedule
+                    )
+                self.assertIsNotNone(symbolic_ordinals)
+                assert symbolic_ordinals is not None
+                self.assertLessEqual(len(symbolic_ordinals.pieces), 3)
+
+                for concrete_count in substitutions:
+                    with self.subTest(task_count=concrete_count):
+                        parameters = {task_count: concrete_count}
+                        concrete_domains = tuple(
+                            domain.substitute_parameters(parameters)
+                            for domain in symbolic_domains
+                        )
+                        concrete_schedule = (
+                            cross_loop_scheduler._build_root_major_worker_schedule(
+                                concrete_domains,
+                                _default_root_task_orders(concrete_domains),
+                                worker_count,
+                            )
+                        )
+                        concrete_ordinals = symbolic_ordinals.substitute_parameters(
+                            parameters
+                        )
+                        self.assertEqual(
+                            _materialized_occupied_strand_ordinals(
+                                concrete_schedule,
+                                concrete_ordinals,
+                            ),
+                            _expected_occupied_strand_ordinals(concrete_schedule),
+                        )
+
     def test_occupied_strand_ordinal_empty_and_budget_decline(self) -> None:
         empty_schedule = _schedule(3)
         with _forbid_schedule_enumeration():

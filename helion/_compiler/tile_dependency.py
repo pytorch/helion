@@ -4089,10 +4089,13 @@ class CoordinateRelation:
         Overlapping target boxes must be identical or provably disjoint.
 
         By default the result covers every source, including zero-target
-        fibers.  ``source_support`` may instead provide an exact partial
-        identity selecting the source coordinates whose counts are needed.
-        Its boxes must form a bounded partition on which this relation's
-        active pieces are fixed; unsupported symbolic intersections decline.
+        fibers.  ``source_support`` may instead select the source coordinates
+        whose counts are needed.  It must either be an exact partial identity
+        or an exact bijection from its source support onto its target domain;
+        the latter retains authoritative support proofs whose target values
+        are otherwise irrelevant.  Its boxes must form a bounded partition on
+        which this relation's active pieces are fixed; unsupported symbolic
+        intersections decline.
         """
         positional_product = self._positional_product
         if positional_product is not None and source_support is None:
@@ -4103,6 +4106,7 @@ class CoordinateRelation:
                 if residual_counts is None
                 else residual_counts.lift_source(self.source_domain)
             )
+        support_is_exact_carrier = False
         if source_support is None:
             cells = _relation_source_cells(self, include_domain=True)
             if cells is None:
@@ -4119,16 +4123,20 @@ class CoordinateRelation:
                 for bounds in cells
             )
         else:
+            support_is_identity = _is_identity_on_source_support(source_support)
+            support_is_exact_carrier = (
+                not support_is_identity
+                and source_support.is_bijection_from_source_support()
+            )
             if (
                 source_support.source_domain != self.source_domain
-                or source_support.target_domain != self.source_domain
                 or len(self.pieces) > _MAX_RELATION_PIECES
                 or len(source_support.pieces) > _MAX_RELATION_PIECES
                 or not _relation_product_is_within_budget(
                     len(self.pieces),
                     len(source_support.pieces),
                 )
-                or not _is_identity_on_source_support(source_support)
+                or not (support_is_identity or support_is_exact_carrier)
             ):
                 return None
             support_cells = tuple(
@@ -4137,24 +4145,27 @@ class CoordinateRelation:
                     for piece in _nonempty_relation_pieces(source_support)
                 )
             )
-            if (
-                not _relation_product_is_within_budget(
-                    len(support_cells),
-                    len(support_cells),
-                )
-                or not _relation_product_is_within_budget(
-                    len(support_cells),
-                    len(self.pieces),
-                    len(self.pieces),
-                )
-                or any(
-                    _source_box_cardinality(bounds, domain=self.source_domain) is None
-                    for bounds in support_cells
-                )
-                or any(
-                    not _source_bounds_are_disjoint(left, right)
-                    for left_index, left in enumerate(support_cells)
-                    for right in support_cells[left_index + 1 :]
+            if not _relation_product_is_within_budget(
+                len(support_cells),
+                len(self.pieces),
+                len(self.pieces),
+            ) or (
+                not support_is_exact_carrier
+                and (
+                    not _relation_product_is_within_budget(
+                        len(support_cells),
+                        len(support_cells),
+                    )
+                    or any(
+                        _source_box_cardinality(bounds, domain=self.source_domain)
+                        is None
+                        for bounds in support_cells
+                    )
+                    or any(
+                        not _source_bounds_are_disjoint(left, right)
+                        for left_index, left in enumerate(support_cells)
+                        for right in support_cells[left_index + 1 :]
+                    )
                 )
             ):
                 return None
@@ -4166,10 +4177,22 @@ class CoordinateRelation:
                     tuple[_CoordinateRelationPiece, ...],
                 ]
             ] = []
+            full_source_bounds = tuple(
+                (
+                    axis,
+                    0,
+                    self.source_domain.axis_count_expressions[axis],
+                    1,
+                )
+                for axis in self.source_domain.axis_order
+            )
             for bounds in support_cells:
                 selected_pieces: list[_CoordinateRelationPiece] = []
                 for piece in self.pieces:
-                    if _source_bounds_equal(piece.source_bounds_items, bounds) or (
+                    if (
+                        support_is_exact_carrier
+                        and piece.source_bounds_items == full_source_bounds
+                    ) or _source_bounds_equal(piece.source_bounds_items, bounds) or (
                         _source_box_covers(piece.source_bounds_items, bounds)
                     ):
                         selected_pieces.append(piece)
@@ -4231,10 +4254,17 @@ class CoordinateRelation:
                     ),
                 )
             )
-        return CoordinateRelation(
+        result = CoordinateRelation(
             source_domain=self.source_domain,
             target_domain=value_domain,
             pieces=tuple(pieces),
+        )
+        return (
+            result
+            if source_support is None
+            or not support_is_exact_carrier
+            or result.is_single_valued()
+            else None
         )
 
     def pointwise_add_scalar(
