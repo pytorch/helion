@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import dataclasses
 import itertools
+import pickle
 from typing import TYPE_CHECKING
 from typing import Literal
 from unittest import mock
@@ -2907,6 +2909,225 @@ class TestCrossLoopScheduler(TestCase):
         self.assertIsNone(_task_order_slice(task_order, 0, 0))
         self.assertIsNone(_task_order_slice(task_order, 4, 3))
 
+    def test_task_order_slice_accepts_symbolic_begin_and_count(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        query = sympy.Symbol("query", integer=True, nonnegative=True)
+        domain = CoordinateDomain(
+            (10,),
+            ((10, batch + query),),
+            identity=0,
+        )
+        task_order = pid_task_order(domain, domain.axis_order)
+        variants = (
+            ("direct", task_order),
+            ("deepcopy", copy.deepcopy(task_order)),
+            ("pickle", pickle.loads(pickle.dumps(task_order))),
+        )
+
+        with (
+            mock.patch.object(
+                CoordinateDomain,
+                "size",
+                new_callable=mock.PropertyMock,
+                side_effect=AssertionError("symbolic slice must not request size"),
+            ),
+            mock.patch.object(
+                CoordinateDomain,
+                "axis_counts",
+                new_callable=mock.PropertyMock,
+                side_effect=AssertionError(
+                    "symbolic slice must not request concrete axis counts"
+                ),
+            ),
+            mock.patch.object(
+                CoordinateRelation,
+                "materialize",
+                side_effect=AssertionError("symbolic slice must not enumerate"),
+            ),
+            mock.patch.object(
+                CoordinateRelation,
+                "_factored_source_support_converse",
+                new_callable=mock.PropertyMock,
+                side_effect=AssertionError(
+                    "slice composition must retain its exact converse"
+                ),
+            ),
+        ):
+            slices = []
+            for name, variant in variants:
+                with self.subTest(roundtrip=name):
+                    sliced = _task_order_slice(variant, batch, query)
+                    self.assertIsNotNone(sliced)
+                    assert sliced is not None
+                    self.assertEqual(sliced.source_domain.size_expr, query)
+                    self.assertLessEqual(len(sliced.pieces), len(variant.pieces))
+                    self.assertIsNotNone(
+                        tile_dependency._memoized_exact_converse(sliced)
+                    )
+                    converse = sliced.converse()
+                    self.assertIsNotNone(converse)
+                    assert converse is not None
+                    self.assertTrue(converse.is_single_valued())
+                    slices.append(sliced)
+
+        for concrete_batch, concrete_query in ((0, 0), (0, 3), (2, 0), (2, 3)):
+            substitutions = {batch: concrete_batch, query: concrete_query}
+            expected = task_order.substitute_parameters(substitutions).materialize()[
+                concrete_batch : concrete_batch + concrete_query
+            ]
+            for sliced in slices:
+                concrete = sliced.substitute_parameters(substitutions)
+                self.assertEqual(concrete.materialize(), expected)
+                self.assertIsNotNone(concrete.converse())
+                if concrete_query == 0:
+                    self.assertTrue(concrete.source_domain.size_expr.is_zero)
+                    self.assertFalse(concrete.pieces)
+                    self.assertIsNotNone(
+                        tile_dependency._memoized_exact_converse(concrete)
+                    )
+
+    def test_task_order_slice_handles_unaligned_symbolic_bq_prefix(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        query = sympy.Symbol("query", integer=True, nonnegative=True)
+        domain = CoordinateDomain(
+            (10, 11, 12, 13),
+            ((10, 5), (11, 3), (12, batch), (13, query)),
+            identity=0,
+        )
+        task_order = pid_task_order(domain, (11, 10, 12, 13))
+        ordinal_begin = batch * query
+        task_count = 14 * batch * query
+        variants = (
+            ("direct", task_order),
+            ("deepcopy", copy.deepcopy(task_order)),
+            ("pickle", pickle.loads(pickle.dumps(task_order))),
+        )
+
+        with (
+            mock.patch.object(
+                CoordinateDomain,
+                "size",
+                new_callable=mock.PropertyMock,
+                side_effect=AssertionError("symbolic slice must not request size"),
+            ),
+            mock.patch.object(
+                CoordinateDomain,
+                "axis_counts",
+                new_callable=mock.PropertyMock,
+                side_effect=AssertionError(
+                    "symbolic slice must not request concrete axis counts"
+                ),
+            ),
+            mock.patch.object(
+                CoordinateRelation,
+                "materialize",
+                side_effect=AssertionError("symbolic slice must not enumerate"),
+            ),
+            mock.patch.object(
+                CoordinateRelation,
+                "_factored_source_support_converse",
+                new_callable=mock.PropertyMock,
+                side_effect=AssertionError(
+                    "slice composition must retain its exact converse"
+                ),
+            ),
+        ):
+            slices = []
+            for name, variant in variants:
+                with self.subTest(roundtrip=name):
+                    sliced = _task_order_slice(
+                        variant,
+                        ordinal_begin,
+                        task_count,
+                    )
+                    self.assertIsNotNone(sliced)
+                    assert sliced is not None
+                    self.assertEqual(sliced.source_domain.size_expr, task_count)
+                    self.assertEqual(len(sliced.pieces), 1)
+                    self.assertIsNotNone(
+                        tile_dependency._memoized_exact_converse(sliced)
+                    )
+                    self.assertIsNotNone(sliced.converse())
+                    slices.append(sliced)
+
+        for concrete_batch, concrete_query in ((0, 3), (2, 0), (1, 1), (2, 3)):
+            substitutions = {batch: concrete_batch, query: concrete_query}
+            concrete_order = task_order.substitute_parameters(substitutions)
+            concrete_begin = concrete_batch * concrete_query
+            concrete_count = 14 * concrete_begin
+            expected = concrete_order.materialize()[
+                concrete_begin : concrete_begin + concrete_count
+            ]
+            for sliced in slices:
+                concrete_slice = sliced.substitute_parameters(substitutions)
+                self.assertEqual(concrete_slice.materialize(), expected)
+                self.assertIsNotNone(concrete_slice.converse())
+                if not concrete_count:
+                    self.assertFalse(concrete_slice.pieces)
+            if concrete_count:
+                direct = _task_order_slice(
+                    concrete_order,
+                    concrete_begin,
+                    concrete_count,
+                )
+                self.assertIsNotNone(direct)
+                assert direct is not None
+                self.assertEqual(expected, direct.materialize())
+
+    def test_task_order_slice_declines_unproved_symbolic_interval(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        query = sympy.Symbol("query", integer=True, nonnegative=True)
+        domain = CoordinateDomain(
+            (10,),
+            ((10, batch * query),),
+            identity=0,
+        )
+        task_order = pid_task_order(domain, domain.axis_order)
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("unsupported slice must decline symbolically"),
+        ):
+            self.assertIsNone(_task_order_slice(task_order, batch, query))
+
+        positive_batch = sympy.Symbol("positive_batch", integer=True, positive=True)
+        positive_query = sympy.Symbol("positive_query", integer=True, positive=True)
+        dynamic_count = positive_batch + positive_query
+        manual_source = CoordinateDomain(
+            (20,),
+            ((20, dynamic_count),),
+            kind="task_order",
+        )
+        manual_target = CoordinateDomain(
+            (10,),
+            ((10, dynamic_count),),
+            identity=0,
+        )
+        source_ordinal = coordinate_axis_symbol(20)
+        unsupported_order = CoordinateRelation.point_map(
+            manual_source,
+            manual_target,
+            (
+                (
+                    ((20, 0, dynamic_count, 1),),
+                    (sympy.Mod(source_ordinal + 1, dynamic_count),),
+                ),
+            ),
+        )
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("unsupported order must not be enumerated"),
+        ):
+            self.assertIsNone(
+                _task_order_slice(
+                    unsupported_order,
+                    positive_batch,
+                    positive_query,
+                )
+            )
+
     def test_task_order_slice_retains_exact_converse_before_worker_normalization(
         self,
     ) -> None:
@@ -3014,11 +3235,22 @@ class TestCrossLoopScheduler(TestCase):
         assert task_order_converse is not None
         tile_dependency._remember_exact_converse(task_order, task_order_converse)
 
-        with mock.patch.object(
-            CoordinateRelation,
-            "_factored_source_support_converse",
-            new_callable=mock.PropertyMock,
-            side_effect=AssertionError("aligned slice proof must be retained early"),
+        with (
+            mock.patch.object(
+                CoordinateRelation,
+                "_factored_source_support_converse",
+                new_callable=mock.PropertyMock,
+                side_effect=AssertionError(
+                    "aligned slice proof must be retained early"
+                ),
+            ),
+            mock.patch.object(
+                cross_loop_scheduler,
+                "_flat_task_order_relation",
+                side_effect=AssertionError(
+                    "concrete manual slice must use its fallback"
+                ),
+            ),
         ):
             sliced = _task_order_slice(task_order, 1, 4)
             self.assertIsNotNone(sliced)

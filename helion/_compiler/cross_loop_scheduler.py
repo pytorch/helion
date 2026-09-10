@@ -1232,12 +1232,12 @@ def _flat_task_order_relation(
     return result
 
 
-def _task_order_slice(
+def _concrete_task_order_slice(
     task_order: CoordinateRelation,
     begin: int,
     count: int,
 ) -> CoordinateRelation | None:
-    """Return one dense slice of a symbolic task traversal."""
+    """Retain the bounded concrete slice fallback for manual relations."""
 
     def retain_exact_converse(
         relation: CoordinateRelation,
@@ -1493,6 +1493,121 @@ def _task_order_slice(
         if result_converse is None:
             return None
     tile_dependency._remember_exact_converse(result, result_converse)
+    return result
+
+
+def _task_order_slice(
+    task_order: CoordinateRelation,
+    ordinal_begin: int | sympy.Expr,
+    task_count: int | sympy.Expr,
+) -> CoordinateRelation | None:
+    """Return one exact dense ordinal slice of a task traversal."""
+    ordinal_begin = sympy.simplify(sympy.sympify(ordinal_begin))
+    task_count = sympy.simplify(sympy.sympify(task_count))
+    if ordinal_begin.is_integer is not True or task_count.is_integer is not True:
+        return None
+
+    # Preserve the established bounded construction for wholly concrete
+    # relations.  In particular, manually assembled piecewise orders can use
+    # its relation-box fallback without changing their representation.
+    if (
+        not task_order.parameter_symbols
+        and not ordinal_begin.free_symbols
+        and not task_count.free_symbols
+    ):
+        if not isinstance(ordinal_begin, sympy.Integer) or not isinstance(
+            task_count, sympy.Integer
+        ):
+            return None
+        return _concrete_task_order_slice(
+            task_order,
+            int(ordinal_begin),
+            int(task_count),
+        )
+
+    ordinal_count = task_order.source_domain.size_expr
+    if (
+        not tile_dependency._is_provably_nonnegative(ordinal_begin, None)
+        or not tile_dependency._is_provably_nonnegative(task_count, None)
+        or not tile_dependency._is_provably_nonnegative(
+            sympy.simplify(ordinal_count - ordinal_begin - task_count),
+            None,
+        )
+    ):
+        return None
+
+    if _equal_integer_expressions(ordinal_begin, 0) and _equal_integer_expressions(
+        task_count,
+        ordinal_count,
+    ):
+        return task_order if task_order.converse() is not None else None
+
+    slice_axis = (
+        max(
+            (
+                *task_order.source_domain.axis_order,
+                *task_order.target_domain.axis_order,
+            ),
+            default=0,
+        )
+        + 2
+    )
+    slice_domain = CoordinateDomain(
+        axis_order=(slice_axis,),
+        axis_counts_items=((slice_axis, task_count),),
+        kind="task_order",
+        _allow_empty=task_count.is_zero is True,
+    )
+    if task_count.is_zero is True:
+        result = CoordinateRelation(
+            source_domain=slice_domain,
+            target_domain=task_order.target_domain,
+            pieces=(),
+        )
+        converse = CoordinateRelation(
+            source_domain=task_order.target_domain,
+            target_domain=slice_domain,
+            pieces=(),
+        )
+        tile_dependency._remember_exact_converse(result, converse)
+        return result
+
+    ordinal_domain = _task_order_ordinal_domain(task_order)
+    flat_task_order = _flat_task_order_relation(task_order, ordinal_domain)
+    if flat_task_order is None:
+        return None
+    (ordinal_axis,) = ordinal_domain.axis_order
+    slice_ordinal = coordinate_axis_symbol(slice_axis)
+    ordinal = coordinate_axis_symbol(ordinal_axis)
+    slice_to_ordinal = CoordinateRelation.point_map(
+        slice_domain,
+        ordinal_domain,
+        (
+            (
+                ((slice_axis, 0, task_count, 1),),
+                (slice_ordinal + ordinal_begin,),  # pyrefly: ignore[unsupported-operation]
+            ),
+        ),
+    )
+    # Keep the inverse's source box rectangular and let the slice target
+    # domain clip ordinals outside the selected interval.  This is the exact
+    # converse of the translation above, and lets ordinary point composition
+    # restrict mixed-radix logical coordinates without expanding a symbolic
+    # prefix into runtime-many Cartesian boxes.
+    ordinal_to_slice = CoordinateRelation.point_map(
+        ordinal_domain,
+        slice_domain,
+        (
+            (
+                ((ordinal_axis, 0, ordinal_count, 1),),
+                (ordinal - ordinal_begin,),  # pyrefly: ignore[unsupported-operation]
+            ),
+        ),
+    )
+    tile_dependency._remember_exact_converse(slice_to_ordinal, ordinal_to_slice)
+    result = slice_to_ordinal.then(flat_task_order)
+    if result is None or tile_dependency._memoized_exact_converse(result) is None:
+        return None
     return result
 
 
