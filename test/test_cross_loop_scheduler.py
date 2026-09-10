@@ -1058,28 +1058,25 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(placement(scheduled, 1, 0), (0, 0))
         self.assertEqual(placement(scheduled, 2, 0), (0, 1))
 
-        invalid = WorkerSchedule(
-            scheduled.worker_count,
-            (
-                *scheduled.segments,
-                WorkerScheduleSegment(
-                    root=0,
-                    task_order=readiness_graph.root_task_orders[0],
-                    worker_begin=0,
-                    worker_count=2,
-                    dispatch_offset=4,
-                ),
+        with (
+            _forbid_schedule_enumeration(),
+            self.assertRaisesRegex(
+                ValueError,
+                "worker schedule does not own each logical task once",
             ),
-        )
-        with _forbid_schedule_enumeration():
-            self.assertFalse(
-                _has_valid_transient_source_schedule(
-                    invalid,
-                    readiness_graph,
-                    0,
-                    readiness_counters,
-                    frozenset(),
-                )
+        ):
+            WorkerSchedule(
+                scheduled.worker_count,
+                (
+                    *scheduled.segments,
+                    WorkerScheduleSegment(
+                        root=0,
+                        task_order=readiness_graph.root_task_orders[0],
+                        worker_begin=0,
+                        worker_count=2,
+                        dispatch_offset=4,
+                    ),
+                ),
             )
 
     def test_transient_source_inlets_precede_downstream_waits(self) -> None:
@@ -2455,6 +2452,129 @@ class TestCrossLoopScheduler(TestCase):
         self.assertIsNone(_task_order_slice(task_order, 0, 0))
         self.assertIsNone(_task_order_slice(task_order, 4, 3))
 
+    def test_task_order_slice_retains_exact_converse_before_worker_normalization(
+        self,
+    ) -> None:
+        domain = CoordinateDomain(
+            (10, 11),
+            ((10, 2), (11, 3)),
+            identity=0,
+        )
+        task_order = pid_task_order(domain, domain.axis_order)
+        task_order_converse = task_order.derive_converse_and_target_counts()[0]
+        self.assertIsNotNone(task_order_converse)
+        assert task_order_converse is not None
+        tile_dependency._remember_exact_converse(task_order, task_order_converse)
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "_factored_source_support_converse",
+            new_callable=mock.PropertyMock,
+            side_effect=AssertionError("slice proof must be retained early"),
+        ):
+            prefix = _task_order_slice(task_order, 0, 4)
+            suffix = _task_order_slice(task_order, 4, 2)
+            leading = _task_order_slice(task_order, 0, 1)
+            middle = _task_order_slice(task_order, 1, 4)
+            trailing = _task_order_slice(task_order, 5, 1)
+            self.assertTrue(
+                all(
+                    relation is not None
+                    and tile_dependency._memoized_exact_converse(relation) is not None
+                    for relation in (prefix, suffix, leading, middle, trailing)
+                )
+            )
+            assert prefix is not None and suffix is not None
+            assert leading is not None and middle is not None and trailing is not None
+            WorkerSchedule(
+                4,
+                (
+                    WorkerScheduleSegment(0, prefix, 0, 4, 0),
+                    WorkerScheduleSegment(0, suffix, 0, 4, 4),
+                ),
+            )
+            WorkerSchedule(
+                4,
+                (
+                    WorkerScheduleSegment(0, leading, 0, 4, 0),
+                    WorkerScheduleSegment(0, middle, 0, 4, 1),
+                    WorkerScheduleSegment(0, trailing, 0, 4, 5),
+                ),
+            )
+
+        renamed_domain = CoordinateDomain(
+            (20,),
+            ((20, middle.source_domain.size),),
+            kind="task_order",
+        )
+        proved_renamed = middle.rename_source_axes(renamed_domain)
+        self.assertIsNotNone(proved_renamed)
+        assert proved_renamed is not None
+        self.assertIsNotNone(tile_dependency._memoized_exact_converse(proved_renamed))
+        proved_coalesced = middle.coalesce_adjacent_source_boxes(
+            fold_static_offsets=True
+        )
+        self.assertIsNotNone(tile_dependency._memoized_exact_converse(proved_coalesced))
+
+        unproved = dataclasses.replace(middle)
+        renamed = unproved.rename_source_axes(renamed_domain)
+        self.assertIsNotNone(renamed)
+        assert renamed is not None
+        self.assertIsNone(tile_dependency._memoized_exact_converse(renamed))
+
+        split = CoordinateRelation(
+            source_domain=middle.source_domain,
+            target_domain=middle.target_domain,
+            pieces=middle.pieces,
+        )
+        coalesced = split.coalesce_adjacent_source_boxes(fold_static_offsets=True)
+        self.assertIsNone(tile_dependency._memoized_exact_converse(coalesced))
+
+    def test_piece_aligned_task_order_slice_retains_exact_converse(self) -> None:
+        source = CoordinateDomain(
+            (-1, 0),
+            ((-1, 4), (0, 3)),
+            kind="task_order",
+            identity=0,
+        )
+        target = CoordinateDomain((10,), ((10, 12),), identity=0)
+        inner = coordinate_axis_symbol(-1)
+        outer = coordinate_axis_symbol(0)
+        task_order = CoordinateRelation(
+            source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    ((-1, 0, 2, 1), (0, 0, 3, 1)),
+                    ((10, 2 * outer + inner, 2 * outer + inner + 1, 1),),
+                ),
+                _CoordinateRelationPiece(
+                    ((-1, 2, 4, 1), (0, 0, 3, 1)),
+                    ((10, 2 * outer + inner + 4, 2 * outer + inner + 5, 1),),
+                ),
+            ),
+        )
+        task_order_converse = task_order.derive_converse_and_target_counts()[0]
+        self.assertIsNotNone(task_order_converse)
+        assert task_order_converse is not None
+        tile_dependency._remember_exact_converse(task_order, task_order_converse)
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "_factored_source_support_converse",
+            new_callable=mock.PropertyMock,
+            side_effect=AssertionError("aligned slice proof must be retained early"),
+        ):
+            sliced = _task_order_slice(task_order, 1, 4)
+            self.assertIsNotNone(sliced)
+            assert sliced is not None
+            self.assertIsNotNone(tile_dependency._memoized_exact_converse(sliced))
+            self.assertIsNotNone(sliced.converse())
+        self.assertEqual(
+            sliced.materialize(),
+            task_order.materialize()[1:5],
+        )
+
     def test_task_order_slice_preserves_piecewise_dense_bijection(self) -> None:
         target_domain = _domain((10, 1, 1), (11, 1536, 1), identity=17)
         source_domain = _domain((-1, 16), (0, 96), kind="task_order")
@@ -2682,18 +2802,21 @@ class TestCrossLoopScheduler(TestCase):
                 WorkerScheduleSegment(0, suffix, 19, 3, 0),
             ),
         )
-        overlapping_with_gap = WorkerSchedule(
-            22,
-            (
-                WorkerScheduleSegment(0, prefix, 0, 19, 0),
-                WorkerScheduleSegment(0, duplicate, 19, 3, 0),
-            ),
-        )
-
         with _forbid_schedule_enumeration():
             self.assertTrue(_validate_worker_schedule_tasks(valid, (reference,)))
-            self.assertFalse(
-                _validate_worker_schedule_tasks(overlapping_with_gap, (reference,))
+        with (
+            _forbid_schedule_enumeration(),
+            self.assertRaisesRegex(
+                ValueError,
+                "worker schedule does not own each logical task once",
+            ),
+        ):
+            WorkerSchedule(
+                22,
+                (
+                    WorkerScheduleSegment(0, prefix, 0, 19, 0),
+                    WorkerScheduleSegment(0, duplicate, 19, 3, 0),
+                ),
             )
 
     def test_worker_schedule_tuple_order_must_match_each_worker_strand(self) -> None:
@@ -3104,37 +3227,6 @@ class TestCrossLoopScheduler(TestCase):
                     },
                 )
                 first_slot += expected_count
-
-        segment, first_slot, task_count = geometry[0]
-        first_piece, *remaining_pieces = segment.task_order.pieces
-        first_target = first_piece.target_ranges[0]
-        bad_piece = dataclasses.replace(
-            first_piece,
-            target_ranges=(
-                (
-                    first_target[0],
-                    first_target[1] + 1,
-                    first_target[2] + 1,
-                    first_target[3],
-                ),
-                *first_piece.target_ranges[1:],
-            ),
-        )
-        bad_segment = dataclasses.replace(
-            segment,
-            task_order=dataclasses.replace(
-                segment.task_order,
-                pieces=(bad_piece, *remaining_pieces),
-            ),
-        )
-        self.assertIsNone(
-            cross_loop_scheduler._root_major_participant_order(
-                bad_segment,
-                first_slot,
-                task_count,
-                4,
-            )
-        )
 
     def test_parametric_packed_root_major_handles_empty_and_excluded_roots(
         self,
@@ -4446,18 +4538,17 @@ class TestCrossLoopScheduler(TestCase):
         task_order = pid_task_order(domain, domain.axis_order)
         first = _task_order_slice(task_order, 0, 1)
         assert first is not None
-        schedule = _schedule(
-            1,
-            _segment(0, first, workers=(0, 1), dispatch_offset=0),
-            _segment(0, first, workers=(0, 1), dispatch_offset=1),
-        )
-
-        with _forbid_schedule_enumeration():
-            self.assertFalse(
-                _validate_worker_schedule_tasks(
-                    schedule,
-                    (task_order,),
-                )
+        with (
+            _forbid_schedule_enumeration(),
+            self.assertRaisesRegex(
+                ValueError,
+                "worker schedule does not own each logical task once",
+            ),
+        ):
+            _schedule(
+                1,
+                _segment(0, first, workers=(0, 1), dispatch_offset=0),
+                _segment(0, first, workers=(0, 1), dispatch_offset=1),
             )
 
     def test_worker_schedule_accepts_symbolic_permuted_traversal(self) -> None:

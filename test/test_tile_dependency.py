@@ -389,10 +389,13 @@ class TestTileDependency(TestCase):
         for value in (0, 1, width - 1, width, width + 1):
             expected_count = (value + width - 1) // width
             concrete = relation.substitute_parameters({extent: value})
-            self.assertEqual(
-                concrete.pieces[0].source_bounds_items,
-                ((10, 0, expected_count, 1),),
-            )
+            if expected_count:
+                self.assertEqual(
+                    concrete.pieces[0].source_bounds_items,
+                    ((10, 0, expected_count, 1),),
+                )
+            else:
+                self.assertFalse(concrete.pieces)
             self.assertEqual(
                 concrete.materialize(),
                 tuple(frozenset((index,)) for index in range(expected_count)),
@@ -2056,6 +2059,84 @@ class TestTileDependency(TestCase):
             relation,
         )
 
+    def test_point_composition_uses_piece_bounds_for_modulo(self) -> None:
+        order = CoordinateDomain((10,), ((10, 8),), kind="task_order")
+        logical = CoordinateDomain(
+            (20, 21),
+            ((20, 1), (21, 8)),
+            kind="site",
+        )
+        key = CoordinateDomain((30,), ((30, 2),), kind="event")
+        ordinal = coordinate_axis_symbol(10)
+        task_order = CoordinateRelation.point_map(
+            order,
+            logical,
+            (
+                (
+                    ((10, 0, 6, 1),),
+                    (sympy.Integer(0), sympy.Mod(ordinal, 6)),
+                ),
+                (
+                    ((10, 6, 8, 1),),
+                    (sympy.Integer(0), sympy.Mod(ordinal, 6) + 6),
+                ),
+            ),
+        )
+        keys_by_task = CoordinateRelation.point_map(
+            logical,
+            key,
+            (
+                (((20, 0, 1, 1), (21, 0, 6, 1)), (sympy.Integer(0),)),
+                (((20, 0, 1, 1), (21, 6, 8, 1)), (sympy.Integer(1),)),
+            ),
+        )
+
+        composed = task_order.then(keys_by_task)
+
+        self.assertIsNotNone(composed)
+        assert composed is not None
+        self.assertEqual(
+            composed.materialize(),
+            (
+                frozenset((0,)),
+                frozenset((0,)),
+                frozenset((0,)),
+                frozenset((0,)),
+                frozenset((0,)),
+                frozenset((0,)),
+                frozenset((1,)),
+                frozenset((1,)),
+            ),
+        )
+
+    def test_source_support_comparison_preserves_target_clipping(self) -> None:
+        source = CoordinateDomain((10,), ((10, 2),), kind="worker")
+        target = CoordinateDomain((20,), ((20, 1),), kind="site")
+        coordinate = coordinate_axis_symbol(10)
+        clipped = CoordinateRelation.point_map(
+            source,
+            target,
+            ((((10, 0, 2, 1),), (coordinate,)),),
+        )
+        full = CoordinateRelation.point_map(
+            source,
+            target,
+            ((((10, 0, 2, 1),), (sympy.Integer(0),)),),
+        )
+
+        self.assertFalse(clipped.has_same_source_support(full))
+        self.assertNotEqual(clipped.materialize(), full.materialize())
+
+        larger_target = CoordinateDomain((30,), ((30, 2),), kind="site")
+        unclipped = CoordinateRelation.point_map(
+            source,
+            larger_target,
+            ((((10, 0, 2, 1),), (coordinate,)),),
+        )
+        self.assertIsNotNone(clipped.converse())
+        self.assertIsNotNone(unclipped.converse())
+        self.assertFalse(clipped.has_same_source_support(unclipped))
+
     def test_project_source_keeps_symbolic_outer_axis_and_unions_static_inner(
         self,
     ) -> None:
@@ -3586,6 +3667,44 @@ class TestTileDependency(TestCase):
         self.assertFalse(relation.has_total_source())
         self.assertFalse(relation.is_total_function())
         self.assertEqual(relation.materialize()[-2:], (frozenset(), frozenset()))
+
+    def test_symbolic_quotient_point_map_respects_ceildiv_domain(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        source = CoordinateDomain(
+            (10, 11),
+            ((10, batch), (11, 3)),
+            identity=0,
+        )
+        outer = coordinate_axis_symbol(10)
+        inner = coordinate_axis_symbol(11)
+        numerator = 3 * outer + inner
+
+        def relation(target_count: sympy.Expr) -> CoordinateRelation:
+            target = CoordinateDomain(
+                (20,),
+                ((20, target_count),),
+                kind="worker",
+            )
+            return CoordinateRelation.point_map(
+                source,
+                target,
+                (
+                    (
+                        ((10, 0, batch, 1), (11, 0, 3, 1)),
+                        (FloorDiv(numerator, 4),),
+                    ),
+                ),
+            )
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("symbolic bound proof must not enumerate"),
+        ):
+            self.assertTrue(relation(FloorDiv(3 * batch + 3, 4)).is_total_function())
+            self.assertFalse(
+                relation(FloorDiv(3 * batch + 2, 4)).is_total_function()
+            )
 
     def test_out_of_domain_source_support_is_not_counted_as_total(self) -> None:
         source = CoordinateDomain((10,), ((10, 2),), identity=0)

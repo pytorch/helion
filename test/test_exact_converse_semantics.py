@@ -6,6 +6,8 @@ import pickle
 from unittest import mock
 
 import sympy
+from torch.utils._sympy.functions import Max as SymbolicMax
+from torch.utils._sympy.functions import Min as SymbolicMin
 
 from helion._compiler import cross_loop_scheduler
 from helion._compiler.cross_loop_scheduler import RootBarrierPublication
@@ -14,7 +16,10 @@ from helion._compiler.cross_loop_scheduler import WorkerSchedule
 from helion._compiler.cross_loop_scheduler import WorkerScheduleSegment
 from helion._compiler.tile_dependency import CoordinateDomain
 from helion._compiler.tile_dependency import CoordinateRelation
+from helion._compiler.tile_dependency import _bounded_parameter_expression_interval
+from helion._compiler.tile_dependency import _is_provably_nonnegative
 from helion._compiler.tile_dependency import _memoized_exact_converse
+from helion._compiler.tile_dependency import _remember_exact_converse
 from helion._compiler.tile_dependency import coordinate_axis_symbol
 from helion._compiler.tile_dependency import pid_task_order
 from helion._testing import TestCase
@@ -109,6 +114,244 @@ def _dynamic_task_orders(
 
 
 class TestExactConverseSemantics(TestCase):
+    @staticmethod
+    def _partial_worker_task_order(
+        *,
+        target_identity: int = 0,
+    ) -> tuple[
+        CoordinateDomain,
+        CoordinateDomain,
+        CoordinateRelation,
+    ]:
+        schedule_domain = CoordinateDomain(
+            (-3, -2, -1),
+            ((-3, 2), (-2, 4), (-1, 2)),
+            kind="worker",
+        )
+        widened_domain = CoordinateDomain(
+            (-3, -2, -1),
+            ((-3, 2), (-2, 4), (-1, 3)),
+            kind="worker",
+        )
+        target_domain = CoordinateDomain(
+            (10,),
+            ((10, 3),),
+            identity=target_identity,
+        )
+        worker = coordinate_axis_symbol(-2)
+        task = coordinate_axis_symbol(10)
+        task_order = CoordinateRelation.point_map(
+            schedule_domain,
+            target_domain,
+            (
+                (
+                    ((-3, 1, 2, 1), (-2, 0, 3, 1), (-1, 0, 1, 1)),
+                    (worker,),
+                ),
+            ),
+        )
+        exact_converse = CoordinateRelation.point_map(
+            target_domain,
+            schedule_domain,
+            (
+                (
+                    ((10, 0, 3, 1),),
+                    (sympy.Integer(1), task, sympy.Integer(0)),
+                ),
+            ),
+        )
+        _remember_exact_converse(task_order, exact_converse)
+        return schedule_domain, widened_domain, task_order
+
+    def test_source_domain_rebase_retains_exact_converse_without_reproof(
+        self,
+    ) -> None:
+        old_domain, widened_domain, task_order = self._partial_worker_task_order()
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "_factored_source_support_converse",
+            new_callable=mock.PropertyMock,
+            side_effect=AssertionError("source rebasing must retain its converse"),
+        ):
+            rebased = task_order.rebase_source_domain(widened_domain)
+            self.assertIsNotNone(rebased)
+            assert rebased is not None
+            self.assertEqual(rebased.pieces, task_order.pieces)
+            self.assertTrue(rebased.is_bijection_from_source_support())
+            converse = rebased.converse()
+            self.assertIsNotNone(converse)
+            assert converse is not None
+            self.assertEqual(converse.target_domain, widened_domain)
+            self.assertTrue(converse.is_total_function())
+
+        launch_axis, worker_axis, wave_axis = widened_domain.axis_order
+        for launch_stage in range(2):
+            for worker in range(4):
+                self.assertEqual(
+                    rebased.target_coordinates(
+                        {
+                            launch_axis: launch_stage,
+                            worker_axis: worker,
+                            wave_axis: 2,
+                        }
+                    ),
+                    frozenset(),
+                )
+        self.assertEqual(task_order.source_domain, old_domain)
+
+    def test_normalized_segment_widening_does_not_reconstruct_converse(
+        self,
+    ) -> None:
+        _old_domain, widened_domain, task_order = self._partial_worker_task_order()
+        segment = WorkerScheduleSegment(
+            root=0,
+            task_order=task_order,
+            worker_begin=0,
+            worker_count=4,
+            dispatch_offset=0,
+        )
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "_factored_source_support_converse",
+            new_callable=mock.PropertyMock,
+            side_effect=AssertionError("normalization must retain its converse"),
+        ):
+            normalized = cross_loop_scheduler._normalize_dense_schedule_segment(
+                segment,
+                widened_domain,
+            )
+            self.assertIsNotNone(_memoized_exact_converse(normalized.task_order))
+            WorkerSchedule(4, (normalized,))
+
+    def test_transient_source_widening_retains_resident_converse(self) -> None:
+        _old_domain, widened_domain, resident_order = self._partial_worker_task_order(
+            target_identity=1
+        )
+        resident_target = resident_order.target_domain
+        resident_schedule = WorkerSchedule(
+            4,
+            (WorkerScheduleSegment(1, resident_order, 0, 4, 0),),
+        )
+
+        source_domain = CoordinateDomain((20,), ((20, 9),), identity=0)
+        source_order = pid_task_order(source_domain, source_domain.axis_order)
+        resident_reference = pid_task_order(
+            resident_target,
+            resident_target.axis_order,
+        )
+        source_segment = cross_loop_scheduler._normalize_dense_schedule_segment(
+            WorkerScheduleSegment(0, source_order, 0, 4, 0),
+            widened_domain,
+            launch_stage=0,
+        )
+        self.assertIsNotNone(source_segment.task_order.converse())
+        normalize = cross_loop_scheduler._normalize_dense_schedule_segment
+
+        def use_prepared_source_segment(
+            segment: WorkerScheduleSegment,
+            schedule_domain: CoordinateDomain,
+            *,
+            launch_stage: int = 1,
+        ) -> WorkerScheduleSegment:
+            if not segment.is_normalized and segment.root == 0 and launch_stage == 0:
+                self.assertEqual(schedule_domain, widened_domain)
+                return source_segment
+            return normalize(
+                segment,
+                schedule_domain,
+                launch_stage=launch_stage,
+            )
+
+        with (
+            mock.patch.object(
+                cross_loop_scheduler,
+                "_normalize_dense_schedule_segment",
+                side_effect=use_prepared_source_segment,
+            ),
+            mock.patch.object(
+                CoordinateRelation,
+                "_factored_source_support_converse",
+                new_callable=mock.PropertyMock,
+                side_effect=AssertionError(
+                    "transient widening must retain resident converses"
+                ),
+            ),
+        ):
+            result = cross_loop_scheduler._with_transient_source_schedule_segment(
+                resident_schedule,
+                (source_order, resident_reference),
+                0,
+            )
+            self.assertIsNotNone(result)
+            assert result is not None
+            widened_resident = result.segments_for_root(1)[0].task_order
+            self.assertEqual(widened_resident.source_domain, widened_domain)
+            self.assertIsNotNone(_memoized_exact_converse(widened_resident))
+            self.assertTrue(widened_resident.is_bijection_from_source_support())
+
+    def test_static_quotient_bounds_are_valid_for_signed_integer_base(self) -> None:
+        value = sympy.Symbol("value", integer=True)
+
+        def quotient(numerator: sympy.Expr, divisor: int) -> sympy.Expr:
+            return sympy.floor(numerator / divisor)  # pyrefly: ignore[bad-return]
+
+        bounded = 1 + quotient(value, 4) - quotient(value + 2, 4)
+        remainder_complement = 5 + 4 * quotient(value, 4) - value
+        negative = quotient(value - 1, 4) - quotient(value, 4)
+        oversized_offset = 1 + quotient(value, 4) - quotient(value + 5, 4)
+        mismatched_divisor = 1 + quotient(value, 4) - quotient(value + 2, 5)
+
+        self.assertEqual(
+            _bounded_parameter_expression_interval(bounded),
+            (0, 1),
+        )
+        self.assertEqual(
+            _bounded_parameter_expression_interval(remainder_complement),
+            (2, 5),
+        )
+        self.assertTrue(_is_provably_nonnegative(bounded, None))
+        self.assertTrue(_is_provably_nonnegative(remainder_complement, None))
+        self.assertFalse(_is_provably_nonnegative(negative, None))
+        self.assertFalse(_is_provably_nonnegative(oversized_offset, None))
+        self.assertFalse(_is_provably_nonnegative(mismatched_divisor, None))
+
+    def test_full_source_composition_does_not_restore_clipped_points(self) -> None:
+        source = CoordinateDomain((10,), ((10, 2),), kind="worker")
+        middle = CoordinateDomain((20,), ((20, 1),), kind="task_order")
+        target = CoordinateDomain((30,), ((30, 1),), kind="site")
+        source_coordinate = coordinate_axis_symbol(10)
+        middle_coordinate = coordinate_axis_symbol(20)
+        first = CoordinateRelation.point_map(
+            source,
+            middle,
+            ((((10, 0, 2, 1),), (source_coordinate,)),),
+        )
+        first_inverse = CoordinateRelation.point_map(
+            middle,
+            source,
+            ((((20, 0, 1, 1),), (middle_coordinate,)),),
+        )
+        _remember_exact_converse(first, first_inverse)
+        following = CoordinateRelation.point_map(
+            middle,
+            target,
+            ((((20, 0, 1, 1),), (sympy.Integer(0),)),),
+        )
+        following_inverse = CoordinateRelation.point_map(
+            target,
+            middle,
+            ((((30, 0, 1, 1),), (sympy.Integer(0),)),),
+        )
+        _remember_exact_converse(following, following_inverse)
+
+        self.assertEqual(
+            first.materialize(),
+            (frozenset((0,)), frozenset()),
+        )
+        self.assertIsNone(first.then(following))
+
     def test_composition_and_union_retain_only_existing_exact_converses(
         self,
     ) -> None:
@@ -310,6 +553,287 @@ class TestExactConverseSemantics(TestCase):
                         actual.append(next(iter(targets)))
                     self.assertEqual(tuple(actual), expected)
 
+    def test_unaligned_packed_interval_preserves_symbolic_support(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        worker_count = 7
+        domains = (
+            CoordinateDomain((10,), ((10, 3 * batch),), identity=0),
+            CoordinateDomain((20,), ((20, 4 * batch),), identity=1),
+        )
+        task_orders = tuple(
+            pid_task_order(domain, domain.axis_order) for domain in domains
+        )
+
+        with (
+            mock.patch.object(
+                CoordinateRelation,
+                "materialize",
+                side_effect=AssertionError(
+                    "symbolic support proof must not enumerate"
+                ),
+            ),
+            mock.patch.object(
+                CoordinateRelation,
+                "_factored_source_support_converse",
+                new_callable=mock.PropertyMock,
+                side_effect=AssertionError(
+                    "ordinary packed construction must retain its converse"
+                ),
+            ),
+            mock.patch.object(
+                CoordinateRelation,
+                "_ordinalized_source_support",
+                new_callable=mock.PropertyMock,
+                side_effect=AssertionError(
+                    "ordinary packed disjointness must use source geometry"
+                ),
+            ),
+        ):
+            schedule = cross_loop_scheduler._build_root_major_worker_schedule(
+                domains,
+                task_orders,
+                worker_count,
+            )
+            relation = schedule.segments[1].task_order
+            self.assertTrue(relation.is_bijection_from_source_support())
+            converse = relation.converse()
+            self.assertIsNotNone(converse)
+            assert converse is not None
+            self.assertTrue(converse.is_total_function())
+
+        for concrete_batch in (0, 1, 8):
+            concrete = relation.substitute_parameters({batch: concrete_batch})
+            launch_axis, worker_axis, wave_axis = concrete.source_domain.axis_order
+            occupied_slots: list[int] = []
+            targets: list[int] = []
+            for wave in range(concrete_batch):
+                for worker in range(worker_count):
+                    mapped = concrete.target_coordinates(
+                        {
+                            launch_axis: 1,
+                            worker_axis: worker,
+                            wave_axis: wave,
+                        }
+                    )
+                    if mapped:
+                        occupied_slots.append(wave * worker_count + worker)
+                        targets.append(next(iter(mapped))[0])
+            self.assertEqual(
+                occupied_slots,
+                list(range(3 * concrete_batch, 7 * concrete_batch)),
+            )
+            self.assertEqual(targets, list(range(4 * concrete_batch)))
+
+    def test_runtime_empty_middle_root_preserves_adjacent_packed_support(
+        self,
+    ) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        worker_count = 4
+        symbolic_domains = (
+            CoordinateDomain((10,), ((10, 3),), identity=0),
+            CoordinateDomain((20,), ((20, batch),), identity=1),
+            CoordinateDomain((30,), ((30, 2),), identity=2),
+        )
+        symbolic = cross_loop_scheduler._build_root_major_worker_schedule(
+            symbolic_domains,
+            tuple(
+                pid_task_order(domain, domain.axis_order) for domain in symbolic_domains
+            ),
+            worker_count,
+        )
+
+        for left_index, left in enumerate(symbolic.segments):
+            self.assertTrue(left.task_order.is_bijection_from_source_support())
+            for right in symbolic.segments[left_index + 1 :]:
+                self.assertTrue(
+                    left.task_order.has_disjoint_source_support(right.task_order)
+                )
+
+        for concrete_batch in (0, 1, worker_count - 1, worker_count, worker_count + 1):
+            substitutions = {batch: concrete_batch}
+            concrete_domains = tuple(
+                domain.substitute_parameters(substitutions)
+                for domain in symbolic_domains
+            )
+            concrete = cross_loop_scheduler._build_root_major_worker_schedule(
+                concrete_domains,
+                tuple(
+                    pid_task_order(domain, domain.axis_order)
+                    for domain in concrete_domains
+                ),
+                worker_count,
+            )
+            self.assertEqual(
+                tuple(
+                    segment.task_order.substitute_parameters(
+                        substitutions
+                    ).materialize()
+                    for segment in symbolic.segments
+                ),
+                tuple(
+                    segment.task_order.materialize() for segment in concrete.segments
+                ),
+            )
+
+    def test_root_major_builder_retains_geometry_for_all_consumers(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, positive=True)
+        worker_count = 7
+        domains = (
+            CoordinateDomain((10, 11), ((10, batch), (11, 3)), identity=0),
+            CoordinateDomain(
+                (20, 21, 22),
+                ((20, 2), (21, batch), (22, 2)),
+                identity=1,
+            ),
+        )
+        task_orders = (
+            pid_task_order(domains[0], (11, 10)),
+            pid_task_order(domains[1], (21, 22, 20)),
+        )
+        schedule = cross_loop_scheduler._build_root_major_worker_schedule(
+            domains,
+            task_orders,
+            worker_count,
+        )
+        cross_loop_scheduler.root_barrier_publication_plan.cache_clear()
+
+        with (
+            mock.patch.object(
+                cross_loop_scheduler,
+                "_parametric_root_major_schedule_geometry_from_parts",
+                side_effect=AssertionError("builder geometry must be retained"),
+            ),
+            mock.patch.object(
+                CoordinateRelation,
+                "has_same_source_support",
+                side_effect=AssertionError("participant lowering must not re-prove"),
+            ),
+            mock.patch.object(
+                CoordinateRelation,
+                "is_pointwise_equal_on_same_support",
+                side_effect=AssertionError("participant lowering must not re-prove"),
+            ),
+        ):
+            geometry = cross_loop_scheduler._parametric_root_major_schedule_geometry(
+                schedule
+            )
+            self.assertIsNotNone(geometry)
+            for root in range(len(domains)):
+                for _ in range(2):
+                    publication = (
+                        cross_loop_scheduler.root_barrier_publication_plan(
+                            schedule,
+                            root,
+                        )
+                    )
+                    self.assertIsNotNone(publication.participant_order)
+                    assert publication.participant_order is not None
+                    self.assertTrue(
+                        publication.participant_order.is_bijection_from_source_support()
+                    )
+
+    def test_root_major_geometry_survives_copy_without_proof_provenance(self) -> None:
+        extent = sympy.Symbol("extent", integer=True, nonnegative=True)
+        worker_count = 2
+        for name, domain, task_order in _dynamic_task_orders(extent):
+            with self.subTest(order=name):
+                schedule = cross_loop_scheduler._build_root_major_worker_schedule(
+                    (domain,),
+                    (task_order,),
+                    worker_count,
+                )
+                for rebuilt in (
+                    copy.deepcopy(schedule),
+                    pickle.loads(pickle.dumps(schedule)),
+                ):
+                    self.assertEqual(rebuilt, schedule)
+                    cross_loop_scheduler._root_task_placement_relation.cache_clear()
+                    rebuilt_placement = (
+                        cross_loop_scheduler._root_task_placement_relation(rebuilt, 0)
+                    )
+                    original_placement = (
+                        cross_loop_scheduler._root_task_placement_relation(schedule, 0)
+                    )
+                    self.assertIsNotNone(rebuilt_placement)
+                    self.assertEqual(rebuilt_placement, original_placement)
+                    geometry = (
+                        cross_loop_scheduler._parametric_root_major_schedule_geometry(
+                            rebuilt
+                        )
+                    )
+                    self.assertIsNotNone(geometry)
+                    cross_loop_scheduler.root_barrier_publication_plan.cache_clear()
+                    publication = (
+                        cross_loop_scheduler.root_barrier_publication_plan(rebuilt, 0)
+                    )
+                    self.assertIsNotNone(publication.participant_order)
+                    self.assertEqual(
+                        publication.resident_arrival_count,
+                        SymbolicMin(worker_count, domain.size_expr),
+                    )
+                    self.assertEqual(
+                        publication.effective_arrival_count,
+                        SymbolicMax(
+                            1,
+                            SymbolicMin(worker_count, domain.size_expr),
+                        ),
+                    )
+
+    def test_unaligned_root_major_copy_recovers_conditional_support(self) -> None:
+        extent = sympy.Symbol("extent", integer=True, nonnegative=True)
+        worker_count = 7
+        prefix = CoordinateDomain(
+            (10,),
+            ((10, 3 * extent),),
+            identity=0,
+        )
+        _name, reflected_domain, reflected_order = next(
+            item for item in _dynamic_task_orders(extent) if item[0] == "reflected"
+        )
+        reflected_domain = dataclasses.replace(reflected_domain, identity=1)
+        reflected_order = dataclasses.replace(
+            reflected_order,
+            source_domain=dataclasses.replace(
+                reflected_order.source_domain,
+                identity=1,
+            ),
+            target_domain=reflected_domain,
+        )
+        schedule = cross_loop_scheduler._build_root_major_worker_schedule(
+            (prefix, reflected_domain),
+            (pid_task_order(prefix, prefix.axis_order), reflected_order),
+            worker_count,
+        )
+
+        for rebuilt in (
+            copy.deepcopy(schedule),
+            pickle.loads(pickle.dumps(schedule)),
+        ):
+            geometry = cross_loop_scheduler._parametric_root_major_schedule_geometry(
+                rebuilt
+            )
+            self.assertIsNotNone(geometry)
+            assert geometry is not None
+            self.assertEqual(
+                tuple((first_slot, task_count) for _, first_slot, task_count in geometry),
+                ((0, 3 * extent), (3 * extent, 4 * extent)),
+            )
+            for root, task_count in enumerate((3 * extent, 4 * extent)):
+                cross_loop_scheduler.root_barrier_publication_plan.cache_clear()
+                publication = cross_loop_scheduler.root_barrier_publication_plan(
+                    rebuilt,
+                    root,
+                )
+                self.assertIsNotNone(publication.participant_order)
+                self.assertEqual(
+                    publication.resident_arrival_count,
+                    SymbolicMin(worker_count, task_count),
+                )
+                self.assertEqual(
+                    publication.effective_arrival_count,
+                    SymbolicMax(1, SymbolicMin(worker_count, task_count)),
+                )
+
     def test_multisegment_root_requires_exact_union_ownership(self) -> None:
         target = CoordinateDomain((10,), ((10, 6),), identity=0)
         task_order = pid_task_order(target, target.axis_order)
@@ -384,6 +908,36 @@ class TestExactConverseSemantics(TestCase):
         overlap = placement(right_target, 3, 5)
         self.assertTrue(left.has_disjoint_source_support(adjacent))
         self.assertFalse(left.has_disjoint_source_support(overlap))
+
+        # Dense-support intervals are comparable only after both relations
+        # use the same source-axis basis.  Dropping each relation's own fixed
+        # axis would incorrectly make these overlapping supports look like
+        # adjacent scalar intervals.
+        crossed_domain = CoordinateDomain((0, 1), ((0, 2), (1, 4)))
+        crossed_left = CoordinateRelation.point_map(
+            crossed_domain,
+            CoordinateDomain((10,), ((10, 2),)),
+            (
+                (
+                    ((0, 1, 2, 1), (1, 2, 4, 1)),
+                    (coordinate_axis_symbol(1) - 2,),
+                ),
+            ),
+        )
+        crossed_right = CoordinateRelation.point_map(
+            crossed_domain,
+            CoordinateDomain((20,), ((20, 2),)),
+            (
+                (
+                    ((0, 0, 2, 1), (1, 2, 3, 1)),
+                    (coordinate_axis_symbol(0),),
+                ),
+            ),
+        )
+        self.assertIsNotNone(crossed_left.converse())
+        self.assertIsNotNone(crossed_right.converse())
+        self.assertFalse(crossed_left.has_disjoint_source_support(crossed_right))
+
         WorkerSchedule(
             6,
             (
@@ -543,3 +1097,70 @@ class TestExactConverseSemantics(TestCase):
             self.assertIsNotNone(converse)
             assert converse is not None
             self.assertTrue(converse.is_total_function())
+
+        concrete_root = root.substitute_parameters({extent: 0})
+        concrete_order = pid_task_order(concrete_root, concrete_root.axis_order)
+        concrete_schedule = cross_loop_scheduler._build_root_major_worker_schedule(
+            (concrete_root,),
+            (concrete_order,),
+            worker_count,
+        )
+        concrete_publication = cross_loop_scheduler.root_barrier_publication_plan(
+            concrete_schedule,
+            0,
+        )
+        self.assertEqual(concrete_publication.real_arrival_count, 0)
+        self.assertEqual(concrete_publication.effective_arrival_count, 1)
+        self.assertIsNotNone(concrete_publication.participant_order)
+        assert concrete_publication.participant_order is not None
+        self.assertTrue(
+            concrete_publication.participant_order.is_bijection_from_source_support()
+        )
+
+    def test_empty_root_preserves_its_packed_synthetic_occurrence(self) -> None:
+        extent = sympy.Symbol("extent", integer=True, nonnegative=True)
+        worker_count = 4
+        prefix = CoordinateDomain((10,), ((10, 3),), identity=0)
+        dynamic_empty = CoordinateDomain((20,), ((20, extent),), identity=1)
+        symbolic_schedule = cross_loop_scheduler._build_root_major_worker_schedule(
+            (prefix, dynamic_empty),
+            (
+                pid_task_order(prefix, prefix.axis_order),
+                pid_task_order(dynamic_empty, dynamic_empty.axis_order),
+            ),
+            worker_count,
+        )
+        symbolic_publication = cross_loop_scheduler.root_barrier_publication_plan(
+            symbolic_schedule,
+            1,
+        )
+        self.assertIsNotNone(symbolic_publication.participant_order)
+        assert symbolic_publication.participant_order is not None
+
+        concrete_empty = dynamic_empty.substitute_parameters({extent: 0})
+        concrete_schedule = cross_loop_scheduler._build_root_major_worker_schedule(
+            (prefix, concrete_empty),
+            (
+                pid_task_order(prefix, prefix.axis_order),
+                pid_task_order(concrete_empty, concrete_empty.axis_order),
+            ),
+            worker_count,
+        )
+        concrete_publication = cross_loop_scheduler.root_barrier_publication_plan(
+            concrete_schedule,
+            1,
+        )
+        self.assertIsNotNone(concrete_publication.participant_order)
+        assert concrete_publication.participant_order is not None
+
+        specialized = symbolic_publication.participant_order.substitute_parameters(
+            {extent: 0}
+        )
+        self.assertEqual(
+            concrete_publication.participant_order.materialize(),
+            specialized.materialize(),
+        )
+        self.assertEqual(
+            specialized.materialize(),
+            (frozenset(), frozenset(), frozenset(), frozenset((0,))),
+        )
