@@ -12,14 +12,15 @@ from helion._compiler import cross_loop_scheduler
 from helion._compiler import tile_dependency
 from helion._compiler.tile_dependency import CoordinateDomain
 from helion._compiler.tile_dependency import CoordinateRelation
+from helion._compiler.tile_dependency import _flat_static_inner_dynamic_outer_converse
 from helion._compiler.tile_dependency import coordinate_axis_symbol
 from helion._compiler.tile_dependency import pid_task_order
 from helion._testing import TestCase
 
-
 _FIRST_AXIS = 10
 _SECOND_AXIS = 20
 _BATCH_AXIS = 30
+_QUERY_AXIS = 40
 
 
 def _domain(
@@ -196,6 +197,168 @@ class TestRaggedL2Schedule(TestCase):
                 self.assertEqual(len(set(expected)), len(expected))
                 self.assertEqual(sorted(expected), list(range(15 * concrete_batch)))
                 _assert_exact_bijection(self, concrete, 15 * concrete_batch)
+
+    def test_ragged_l2_multiple_dynamic_outer_axes_recover_after_roundtrip(
+        self,
+    ) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        query = sympy.Symbol("query", integer=True, nonnegative=True)
+        domain = _domain(
+            (_FIRST_AXIS, _SECOND_AXIS, _BATCH_AXIS, _QUERY_AXIS),
+            (5, 3, batch, query),
+            identity=1,
+        )
+        task_order = pid_task_order(
+            domain,
+            domain.axis_order,
+            l2_group_size=2,
+        )
+        ordinal_domain = CoordinateDomain(
+            (50,),
+            ((50, 15 * batch * query),),
+            kind="task_order",
+        )
+        flat_order = cross_loop_scheduler._flat_task_order_relation(
+            task_order,
+            ordinal_domain,
+        )
+        self.assertIsNotNone(flat_order)
+        assert flat_order is not None
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("symbolic L2 proofs must not enumerate"),
+        ):
+            for name, relation in (
+                ("direct", task_order),
+                ("direct_deepcopy", copy.deepcopy(task_order)),
+                ("direct_pickle", pickle.loads(pickle.dumps(task_order))),
+                ("flat", flat_order),
+                ("flat_deepcopy", copy.deepcopy(flat_order)),
+                ("flat_pickle", pickle.loads(pickle.dumps(flat_order))),
+            ):
+                with self.subTest(roundtrip=name):
+                    converse = _assert_exact_bijection(
+                        self,
+                        relation,
+                        15 * batch * query,
+                    )
+                    self.assertLessEqual(len(converse.pieces), 2)
+
+        for concrete_batch, concrete_query in ((0, 2), (1, 1), (2, 3)):
+            with self.subTest(batch=concrete_batch, query=concrete_query):
+                substitutions = {
+                    batch: concrete_batch,
+                    query: concrete_query,
+                }
+                concrete_domain = domain.substitute_parameters(substitutions)
+                expected = _expected_l2_targets(
+                    concrete_domain,
+                    concrete_domain.axis_order,
+                    2,
+                )
+                self.assertEqual(
+                    _singleton_targets(
+                        task_order.substitute_parameters(substitutions)
+                    ),
+                    expected,
+                )
+                self.assertEqual(
+                    _singleton_targets(
+                        flat_order.substitute_parameters(substitutions)
+                    ),
+                    expected,
+                )
+
+    def test_flat_ragged_l2_infers_permuted_dynamic_axis_order(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        query = sympy.Symbol("query", integer=True, nonnegative=True)
+        domain = _domain(
+            (_BATCH_AXIS, _FIRST_AXIS, _QUERY_AXIS, _SECOND_AXIS),
+            (batch, 5, query, 3),
+            identity=1,
+        )
+        pid_axis_order = (
+            _FIRST_AXIS,
+            _SECOND_AXIS,
+            _QUERY_AXIS,
+            _BATCH_AXIS,
+        )
+        task_order = pid_task_order(
+            domain,
+            pid_axis_order,
+            l2_group_size=2,
+        )
+        ordinal_domain = CoordinateDomain(
+            (50,),
+            ((50, 15 * query * batch),),
+            kind="task_order",
+        )
+        flat_order = cross_loop_scheduler._flat_task_order_relation(
+            task_order,
+            ordinal_domain,
+        )
+        self.assertIsNotNone(flat_order)
+        assert flat_order is not None
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("axis-order proof must not enumerate"),
+        ):
+            for name, relation in (
+                ("deepcopy", copy.deepcopy(flat_order)),
+                ("pickle", pickle.loads(pickle.dumps(flat_order))),
+            ):
+                with self.subTest(roundtrip=name):
+                    _assert_exact_bijection(
+                        self,
+                        relation,
+                        15 * query * batch,
+                    )
+
+        substitutions = {batch: 2, query: 3}
+        concrete_domain = domain.substitute_parameters(substitutions)
+        expected = _expected_l2_targets(
+            concrete_domain,
+            pid_axis_order,
+            2,
+        )
+        self.assertEqual(
+            _singleton_targets(flat_order.substitute_parameters(substitutions)),
+            expected,
+        )
+
+    def test_flat_dynamic_outer_axis_order_declines_when_ambiguous(self) -> None:
+        extent = sympy.Symbol("extent", integer=True, nonnegative=True)
+        source_axis = 10
+        source = CoordinateDomain(
+            (source_axis,),
+            ((source_axis, extent * extent),),
+            kind="task_order",
+        )
+        target = CoordinateDomain(
+            (20, 30),
+            ((20, extent), (30, extent)),
+            identity=1,
+        )
+        ordinal = coordinate_axis_symbol(source_axis)
+        repeated_digit = ordinal - FloorDiv(ordinal, extent) * extent
+        relation = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (
+                    ((source_axis, 0, extent * extent, 1),),
+                    (repeated_digit, repeated_digit),
+                ),
+            ),
+        )
+
+        # Both target axes match the first mixed-radix digit.  Picking either
+        # by target-axis order would be an arbitrary and unsound tie-break.
+        self.assertIsNone(_flat_static_inner_dynamic_outer_converse(relation))
 
     def test_ragged_l2_relation_proof_recovers_after_copy_and_pickle(self) -> None:
         batch = sympy.Symbol("batch", integer=True, nonnegative=True)

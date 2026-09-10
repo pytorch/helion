@@ -2131,6 +2131,10 @@ class CoordinateRelation:
     @cached_property
     def _factored_source_support_converse(self) -> CoordinateRelation | None:
         """Prove and invert this relation through its support ordinalization."""
+        if self.parameter_symbols and (
+            converse := _flat_static_inner_dynamic_outer_converse(self)
+        ) is not None:
+            return converse
         ordinalization = self._ordinalized_source_support
         if ordinalization is None:
             return None
@@ -2190,10 +2194,6 @@ class CoordinateRelation:
             converse = selector_partition.converse()
             if converse is not None and converse.is_total_function():
                 return _remember_exact_converse(self, converse)
-        if self.parameter_symbols and (
-            converse := _flat_static_inner_dynamic_outer_converse(self)
-        ) is not None:
-            return _remember_exact_converse(self, converse)
         if (converse := self._factored_source_support_converse) is not None:
             return _remember_exact_converse(self, converse)
         if self.parameter_symbols:
@@ -7919,13 +7919,14 @@ def _dense_linear_overlap_relation(
 def _flat_static_inner_dynamic_outer_converse(
     relation: CoordinateRelation,
 ) -> CoordinateRelation | None:
-    """Invert a flat static-inner product with one symbolic outer axis.
+    """Invert a flat static-inner product with symbolic positional outer axes.
 
-    A flattened task order often has the form ``inner + K * outer`` where
-    ``K`` is a bounded compile-time product and ``outer`` is a runtime shape
-    axis.  Expand that ordinal into the corresponding two-axis product, let
-    the existing positional-product proof remove ``outer``, and invert only
-    the finite inner permutation.  No runtime extent is enumerated.
+    A flattened task order often has a bounded compile-time inner permutation
+    followed by one or more runtime-sized mixed-radix digits.  Recover their
+    unique radix order from the target expressions, expand the ordinal into
+    that product, let the existing positional-product proof remove the runtime
+    axes, and invert only the finite inner permutation.  The greedy recognition
+    is quadratic in relation rank and never enumerates a runtime extent.
     """
     if (
         len(relation.source_domain.axis_order) != 1
@@ -7948,13 +7949,12 @@ def _flat_static_inner_dynamic_outer_converse(
         for axis in relation.target_domain.axis_order
         if target_counts[axis].free_symbols
     )
-    if len(dynamic_target_axes) != 1:
+    if not dynamic_target_axes:
         return None
-    (outer_target_axis,) = dynamic_target_axes
     static_target_axes = tuple(
         axis
         for axis in relation.target_domain.axis_order
-        if axis != outer_target_axis
+        if axis not in dynamic_target_axes
     )
     try:
         inner_count = math.prod(
@@ -7971,29 +7971,88 @@ def _flat_static_inner_dynamic_outer_converse(
         or inner_count > _MAX_RELATION_PRODUCT_STATES
         or not _integer_partition_expressions_equal(
             source_count,
-            inner_count * target_counts[outer_target_axis],
+            inner_count
+            * sympy.prod(target_counts[axis] for axis in dynamic_target_axes),
         )
     ):
+        return None
+
+    target_expressions = {
+        axis: _simplify_logical_expression(
+            begin,
+            domain=relation.source_domain,
+            source_bounds=piece.source_bounds_items,
+        )
+        for axis, begin, _end, _step in piece.target_ranges
+    }
+    ordinal = coordinate_axis_symbol(source_axis)
+    remaining_axes = list(dynamic_target_axes)
+    ordered_target_axes: list[int] = []
+    stride: sympy.Expr = sympy.Integer(inner_count)
+    while remaining_axes:
+        candidates: list[int] = []
+        for axis in remaining_axes:
+            count = target_counts[axis]
+            quotient = cast("sympy.Expr", FloorDiv(ordinal, stride))
+            expected = (
+                quotient
+                if len(remaining_axes) == 1
+                and _integer_partition_expressions_equal(
+                    source_count,
+                    stride * count,
+                )
+                else quotient
+                - cast("sympy.Expr", FloorDiv(quotient, count)) * count
+            )
+            if _integer_partition_expressions_equal(
+                target_expressions[axis],
+                expected,
+            ):
+                candidates.append(axis)
+        if len(candidates) != 1:
+            return None
+        (axis,) = candidates
+        ordered_target_axes.append(axis)
+        remaining_axes.remove(axis)
+        stride = sympy.simplify(stride * target_counts[axis])
+    if not _integer_partition_expressions_equal(stride, source_count):
         return None
 
     used_axes = frozenset(
         (*relation.source_domain.axis_order, *relation.target_domain.axis_order)
     )
-    inner_axis = min(used_axes, default=0) - 2
-    outer_axis = inner_axis + 1
+    first_product_axis = min(used_axes, default=0) - len(ordered_target_axes) - 1
+    product_axes = tuple(
+        range(first_product_axis, min(used_axes, default=0))
+    )
+    inner_axis, *outer_axes = product_axes
     product_domain = CoordinateDomain(
-        axis_order=(inner_axis, outer_axis),
+        axis_order=product_axes,
         axis_counts_items=(
             (inner_axis, inner_count),
-            (outer_axis, target_counts[outer_target_axis]),
+            *(
+                (outer_axis, target_counts[target_axis])
+                for outer_axis, target_axis in zip(
+                    outer_axes,
+                    ordered_target_axes,
+                    strict=True,
+                )
+            ),
         ),
         kind="task_order",
         identity=relation.source_domain.identity,
         _allow_empty=relation.source_domain._allow_empty,
     )
     inner = coordinate_axis_symbol(inner_axis)
-    outer = coordinate_axis_symbol(outer_axis)
-    ordinal = coordinate_axis_symbol(source_axis)
+    product_ordinal = inner
+    stride = sympy.Integer(inner_count)
+    for outer_axis, target_axis in zip(
+        outer_axes,
+        ordered_target_axes,
+        strict=True,
+    ):
+        product_ordinal += coordinate_axis_symbol(outer_axis) * stride
+        stride = sympy.simplify(stride * target_counts[target_axis])
     product_bounds = tuple(
         (axis, 0, product_domain.axis_count_expressions[axis], 1)
         for axis in product_domain.axis_order
@@ -8001,7 +8060,7 @@ def _flat_static_inner_dynamic_outer_converse(
     product_to_flat = CoordinateRelation.point_map(
         product_domain,
         relation.source_domain,
-        ((product_bounds, (inner + inner_count * outer,)),),
+        ((product_bounds, (product_ordinal,)),),
     )
     flat_to_product = CoordinateRelation.point_map(
         relation.source_domain,
@@ -8011,7 +8070,10 @@ def _flat_static_inner_dynamic_outer_converse(
                 piece.source_bounds_items,
                 (
                     sympy.Mod(ordinal, inner_count),
-                    sympy.floor(ordinal / inner_count),
+                    *(
+                        target_expressions[target_axis]
+                        for target_axis in ordered_target_axes
+                    ),
                 ),
             ),
         ),
@@ -8021,6 +8083,13 @@ def _flat_static_inner_dynamic_outer_converse(
     expanded = product_to_flat._then_without_converse(relation)
     if expanded is None:
         return None
+    outer_axis_by_target = dict(
+        zip(ordered_target_axes, outer_axes, strict=True)
+    )
+    # Each matched target is the corresponding mixed-radix digit of the flat
+    # ordinal.  Substituting the canonical product ordinal therefore makes it
+    # exactly the associated product coordinate.  Record that proved identity
+    # directly; general simplification cannot cancel symbolic radix products.
     expanded = dataclasses.replace(
         expanded,
         pieces=tuple(
@@ -8029,15 +8098,23 @@ def _flat_static_inner_dynamic_outer_converse(
                 target_ranges=tuple(
                     (
                         axis,
-                        _simplify_logical_expression(
-                            begin,
-                            domain=expanded.source_domain,
-                            source_bounds=expanded_piece.source_bounds_items,
+                        (
+                            coordinate_axis_symbol(outer_axis_by_target[axis])
+                            if axis in outer_axis_by_target
+                            else _simplify_logical_expression(
+                                begin,
+                                domain=expanded.source_domain,
+                                source_bounds=expanded_piece.source_bounds_items,
+                            )
                         ),
-                        _simplify_logical_expression(
-                            end,
-                            domain=expanded.source_domain,
-                            source_bounds=expanded_piece.source_bounds_items,
+                        (
+                            coordinate_axis_symbol(outer_axis_by_target[axis]) + 1
+                            if axis in outer_axis_by_target
+                            else _simplify_logical_expression(
+                                end,
+                                domain=expanded.source_domain,
+                                source_bounds=expanded_piece.source_bounds_items,
+                            )
                         ),
                         step,
                     )
