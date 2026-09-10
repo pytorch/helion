@@ -97,7 +97,7 @@ cross-workload exit gates below.
 
 ### Current implementation marker: close the symbolic proof layer
 
-Commits through `65bb313d` are the current compiler checkpoint. The existing immutable
+Commits through `fbf8142c` are the current compiler checkpoint. The existing immutable
 `CoordinateRelation` remains the only schedule/dependency truth. It now retains
 derived exact converses through proved construction and transformation,
 represents ragged grouped L2 order with one forward piece and a two-piece
@@ -127,16 +127,13 @@ scalar dispatch metadata against an ordinalization of the authoritative
 schedule relation. Unsupported symbolic offsets decline cleanly rather than
 falling back to concrete counts.
 
-Before declaring Phase 4A.1 closed, finish these bounded proof tasks:
-
-- complete transform invalidation/propagation regressions; and
-- rerun the combined relation/scheduler suites and record separate relation-
-  proof and schedule-construction timing gates.
-
 The flat-converse attempt is now cached once per relation instance and the
 packed `[5, 3, B, Q]` unaligned-prefix regression passes for direct,
 deepcopy/pickle, and either-axis-zero cases. Its schedule build is about 2.6
-seconds and cache-free proof recovery is about 5.5 seconds.
+seconds and cache-free proof recovery is about 5.5 seconds. The transform audit
+now covers rename, reorder, projection, lift, coalescing, substitution, and
+copying. The integrated Phase 4A.1 suites pass 142 tile/ragged tests with 216
+subtests and 154 exact/scheduler tests with 78 subtests. Phase 4A.1 is closed.
 
 Then continue Phase 4A.2 by replacing the remaining parameter-only admission
 filters with one exact action-legality decision, followed by the single joint
@@ -2537,19 +2534,24 @@ Implement the earlier proof without changing those boundaries:
   placement/traversal/ticket lookup, continuation selection/finalization, and
   root-barrier participant validation. Codegen consumes the finalized relation
   and plan and performs no duplicate bijection discovery.
-- [ ] Add negative tests for omitted tasks, duplicate targets, overlapping
+- [x] Add negative tests for omitted tasks, duplicate targets, overlapping
   segment support, out-of-domain maps, padded tails, stale converse memos after
   transforms, and non-bijective participant order. Add positive tests for zero
   roots, multi-segment roots, canonical/permuted/reflected/woven orders, and
   supported L2 with dynamic positional outer axes.
-- [ ] Once the ordinary packed path uses retained converses, inventory callers
+- [x] Once the ordinary packed path uses retained converses, inventory callers
   of `_factored_source_support_converse`, source-support ordinalization, and the
   symbolic mixed-radix search. Demote them to the bounded manual-relation
   fallback or delete them when no independent semantic caller remains.
-- [ ] Rerun focused semantic tests, both full suites, `git diff --check`, and
+  `_factored_source_support_converse` remains only as the bounded fallback for
+  extensionally constructed parameterized relations and support cardinality;
+  `_source_support_ordinalization` remains the shared support/factorization
+  primitive; the factorial mixed-radix search has been deleted.
+- [x] Rerun focused semantic tests, both full suites, `git diff --check`, and
   the compile-time gate before resuming Phase 4A.2. Record relation/scheduling
-  proof time separately; the current 24-second validation and 45-second focused
-  timeout do not pass.
+  proof time separately. The representative ragged schedule build is 7.1
+  seconds, B×Q is 2.6 seconds, and cache-free B×Q proof recovery is 5.5
+  seconds; the old six-digit factorial case is 0.12 seconds.
 
 - Move exact symbolic support cardinality, support projection, disjointness,
   coverage, and semantic equality into the existing `CoordinateRelation`.
@@ -2575,8 +2577,11 @@ to direct constant construction. Unsupported orders decline before codegen.
 #### Phase 4A.2: build readiness once
 
 - Build `ReadinessGraph` once above any constant/parameterized branch.
-- Derive final-arrival candidates without consulting sampled domain size or a
-  provisional worker placement, but do not select or contract them yet.
+- Derive structural final-arrival candidates without consulting sampled domain
+  size or a provisional worker placement, but do not select or contract them
+  yet. Schedule-dependent progress, final-publication occurrence, and
+  synthetic empty-root ownership are transaction-local action-acceptance
+  proofs in Phase 4A.3, not candidate properties.
 - Reuse the existing relation operations to answer whether a proposed early
   admission has exact publication/cardinality/replay lowering. Do not create a
   capability wrapper or filtered readiness graph. Unsupported events remain
@@ -2611,6 +2616,9 @@ cannot accept an action whose eventual publication is unproved.
   permutation is proved.
 - Emit the result directly as `WorkerScheduleSegment.task_order` relations.
 - Use root-major ordering as the sole conservative fallback.
+- Treat source-ticket admission as another action of this same policy, derived
+  from the launch-stage-zero schedule relation. Do not retain a concrete-only
+  transient-source selector as a second production policy.
 - Keep the old concrete placement algorithm only as a small differential test
   oracle; remove it from production after parity.
 
@@ -2656,8 +2664,10 @@ producer/consumer placement and the derived 74/22 frontier, with no literal
   that cannot pass it. Never repair a plan by silently dropping an obligation
   or repeatedly changing ownership and placement.
 
-Exit gate: one finalization and validation path serves constant and symbolic
-domains; production proof cost is bounded by graph rank and relation pieces.
+Exit gate: one finalization and validation implementation serves constant and
+symbolic domains and is invoked at most once for each of the optimized and
+fallback proposals; production proof cost is bounded by graph rank and
+relation pieces.
 
 #### Phase 4A.6: make codegen a renderer and delete migration paths
 
@@ -2668,6 +2678,9 @@ domains; production proof cost is bounded by graph rank and relation pieces.
   launching it. This gate validates the selected plan; it does not reschedule.
 - Permit concrete loops, compact recurrences, interval publishers, and fixed-
   count uint32 barriers only as proved strength reductions of the final plan.
+- Lower every accepted `WorkerScheduleSegment.task_order` relation through the
+  generic relation renderer. Root-major and event-frontier recognizers may
+  remain only as equivalent fast renderings, never as admission requirements.
 - Derive source-stage identity from the launch-stage-zero schedule relation and
   delete `transient_source_root`.
 - Delete the production constant/parameterized and local/global policy split,
@@ -2692,9 +2705,10 @@ by finalized relation rendering or unavoidable body specialization, and both
 original pretuned and symbolic probe forms of Qwen and Gemma meet their
 performance gates.
 
-### Phase 5: source-ticket generalization
+### Phase 5: source-ticket generalization after policy unification
 
-- Port only the proved source-first ticket behavior.
+- Extend the relation-based source-ticket action already admitted by the Phase
+  4A scheduler; do not introduce it here as a separate scheduling path.
 - Replace shape/root assumptions with exact source relation predicates.
 - Preserve the existing plan and counter abstractions.
 - Prove source/resident/continuation disjoint coverage and capacity.
