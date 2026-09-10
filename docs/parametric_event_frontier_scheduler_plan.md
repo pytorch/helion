@@ -1705,31 +1705,35 @@ parameterized extents and requires:
 - exact downstream publication after contracting this consumer into its
   producer chain.
 
-When an event closes, compare each eligible continuation action with the
-earliest legal resident placement using the lexicographic pair of complete
-unit-weight completion makespan and critical-path resident handoff depth. An
-inline consumer costs one unit after the final producer on every possible
-winner's strand; an inline chain costs one unit per body, including all later
-work on those strands. A resident cross-owner readiness wait adds one handoff
-at its point on a primary-critical terminal path. Inline may win only when its
+After constructing a complete provisional all-resident schedule, compare each
+eligible continuation action against that placement using the lexicographic
+pair of complete unit-weight completion makespan and critical-path resident
+handoff depth. A possible final publisher is a causal maximum of the event's
+producer tasks, not merely the producer with greatest wave or completion.
+Every inline alternative receives the event maximum over all required
+producers and then charges one unit for the consumer body on that publisher's
+strand; an inline chain costs one unit per body, including all later work on
+the affected strand. A resident cross-owner readiness wait adds one handoff at
+its point on a primary-critical terminal path. Inline may win only when its
 primary makespan is proved no worse and, on a primary tie, its maximum handoff
 depth is strictly lower. Prefer resident ownership on an unproved comparison
-or a full pair tie. At most one consumer may own a final arrival, and one
-choice must hold for the whole event family and compiled guard. If continuation
-wins, omit the consumer from resident placement and contract downstream
-readiness in that same atomic scheduling action. Otherwise it remains ordinary
-resident work. A parameter symbol, sink status, sampled task count, or
-`fan_in > 1` is not an eligibility or priority rule.
+or a full pair tie. At most one consumer globally may own a final arrival, and
+one choice must hold for the whole event family and compiled guard. If a
+continuation wins, omit the consumer from resident placement and contract
+downstream readiness in that same atomic scheduling action. Otherwise it
+remains ordinary resident work. A parameter symbol, sink status, sampled task
+count, or `fan_in > 1` is not an eligibility or priority rule.
 
 The secondary handoff objective is necessary rather than optional decoration:
-under unit body weights, inline execution is a resident placement constrained
-to a final-producer strand, so an optimal resident placement weakly dominates
-it on makespan alone. A rule that gave resident ownership every exact
-makespan tie could therefore never select any continuation. Handoff depth is
-derived solely from readiness topology and ownership, contains no measured
-latency, and distinguishes intermediate work that would delay a producer
-strand from terminal work that removes a synchronization edge at equal
-makespan.
+for a fixed provisional placement, resident and inline ownership can have the
+same unit-weight makespan even though inline execution removes a cross-owner
+synchronization boundary. A rule that gave resident ownership every such tie
+could therefore miss a structural benefit. Handoff depth is derived solely
+from readiness topology and ownership, contains no measured latency, and
+distinguishes intermediate work that would delay a producer strand from
+terminal work that removes a synchronization edge at equal makespan. This is
+not a claim that arbitrary or greedily constructed resident placement always
+dominates inline execution.
 
 The selected identity is copied exactly once into the final counter plan after
 the schedule is accepted. Proposal, proof, and diagnostics consume that same
