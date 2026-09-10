@@ -624,6 +624,55 @@ class TestExactConverseSemantics(TestCase):
             )
             self.assertEqual(targets, list(range(4 * concrete_batch)))
 
+    def test_worker_schedule_validation_uses_symbolic_relation_counts(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        worker_count = 7
+        domains = (
+            CoordinateDomain((10,), ((10, 3 * batch),), identity=0),
+            CoordinateDomain((20,), ((20, 4 * batch),), identity=1),
+        )
+        task_orders = tuple(
+            pid_task_order(domain, domain.axis_order) for domain in domains
+        )
+        schedule = cross_loop_scheduler._build_root_major_worker_schedule(
+            domains,
+            task_orders,
+            worker_count,
+        )
+        cross_loop_scheduler._root_task_placement_relation.cache_clear()
+
+        with (
+            mock.patch.object(
+                WorkerScheduleSegment,
+                "task_count",
+                new_callable=mock.PropertyMock,
+                side_effect=AssertionError(
+                    "symbolic validation must not request a concrete task count"
+                ),
+            ),
+            mock.patch.object(
+                CoordinateDomain,
+                "size",
+                new_callable=mock.PropertyMock,
+                side_effect=AssertionError(
+                    "symbolic validation must not request a concrete domain size"
+                ),
+            ),
+            mock.patch.object(
+                CoordinateRelation,
+                "materialize",
+                side_effect=AssertionError(
+                    "symbolic validation must not enumerate runtime tasks"
+                ),
+            ),
+        ):
+            self.assertTrue(
+                cross_loop_scheduler._validate_worker_schedule_tasks(
+                    schedule,
+                    task_orders,
+                )
+            )
+
     def test_runtime_empty_middle_root_preserves_adjacent_packed_support(
         self,
     ) -> None:

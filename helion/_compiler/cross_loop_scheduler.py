@@ -5554,7 +5554,13 @@ def _validate_worker_schedule_tasks(
             continue
         if not segments:
             return False
-        if sum(segment.task_count for segment in segments) != root_domain.size or any(
+        task_count = sympy.Add(
+            *(sympy.sympify(segment.task_count_expr) for segment in segments)
+        )
+        if not _equal_integer_expressions(
+            task_count,
+            root_domain.size_expr,
+        ) or any(
             segment.task_order.source_domain != worker_schedule.placement_domain
             or segment.task_order.target_domain != root_domain
             for segment in segments
@@ -5562,6 +5568,13 @@ def _validate_worker_schedule_tasks(
             return False
         placement = _root_task_placement_relation(worker_schedule, root)
         if placement is None:
+            # The traversal compatibility path uses concrete ordinal domains.
+            # A parameterized schedule is valid only when its authoritative
+            # placement relation itself proves exact ownership.
+            if root_domain.parameter_symbols or any(
+                segment.task_order.parameter_symbols for segment in segments
+            ):
+                return False
             traversal = _root_schedule_traversal(segments, reference_task_order)
             if traversal is None or traversal.logical_task_to_scheduled_ordinal is None:
                 return False
