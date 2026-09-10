@@ -3725,6 +3725,183 @@ class TestTileDependency(TestCase):
             tuple(frozenset((len(targets),)) for targets in relation.materialize()),
         )
 
+    def test_target_count_accepts_exact_partial_strided_source_support(self) -> None:
+        source = CoordinateDomain((10,), ((10, 6),), kind="site")
+        target = CoordinateDomain((20,), ((20, 6),), kind="site")
+        source_index = coordinate_axis_symbol(10)
+        source_bounds = ((10, 0, 6, 2),)
+        relation = CoordinateRelation(
+            source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    source_bounds,
+                    ((20, sympy.Integer(0), source_index, 1),),
+                ),
+            ),
+        )
+        support = CoordinateRelation.point_map(
+            source,
+            source,
+            (
+                (source_bounds, (source_index,)),
+                (((10, 5, 6, 1),), (source_index,)),
+            ),
+        )
+
+        counts = relation.target_count_by_source(source_support=support)
+
+        self.assertIsNotNone(counts)
+        assert counts is not None
+        self.assertEqual(
+            counts.materialize(),
+            (
+                frozenset((0,)),
+                frozenset(),
+                frozenset((2,)),
+                frozenset(),
+                frozenset((4,)),
+                frozenset((0,)),
+            ),
+        )
+
+    def test_target_count_with_symbolic_support_including_empty(self) -> None:
+        count = sympy.Symbol("count", integer=True, nonnegative=True)
+        source = CoordinateDomain(
+            (10,),
+            ((10, count),),
+            kind="site",
+            _allow_empty=True,
+        )
+        target = CoordinateDomain(
+            (20,),
+            ((20, count),),
+            kind="site",
+            _allow_empty=True,
+        )
+        source_index = coordinate_axis_symbol(10)
+        source_bounds = ((10, 0, count, 1),)
+        relation = CoordinateRelation(
+            source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    source_bounds,
+                    ((20, sympy.Integer(0), source_index, 1),),
+                ),
+            ),
+        )
+        support = CoordinateRelation.point_map(
+            source,
+            source,
+            ((source_bounds, (source_index,)),),
+        )
+
+        counts = relation.target_count_by_source(source_support=support)
+
+        self.assertIsNotNone(counts)
+        assert counts is not None
+        for concrete_count in (0, 1, 5):
+            with self.subTest(count=concrete_count):
+                concrete = counts.substitute_parameters({count: concrete_count})
+                self.assertEqual(
+                    concrete.materialize(),
+                    tuple(frozenset((index,)) for index in range(concrete_count)),
+                )
+
+    def test_target_count_with_support_rejects_overlapping_targets(self) -> None:
+        source = CoordinateDomain((10,), ((10, 3),), kind="site")
+        target = CoordinateDomain((20,), ((20, 4),), kind="site")
+        source_bounds = ((10, 0, 3, 1),)
+        relation = CoordinateRelation(
+            source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    source_bounds,
+                    ((20, sympy.Integer(0), sympy.Integer(3), 1),),
+                ),
+                _CoordinateRelationPiece(
+                    source_bounds,
+                    ((20, sympy.Integer(2), sympy.Integer(4), 1),),
+                ),
+            ),
+        )
+        support = CoordinateRelation.identity(source, source)
+
+        self.assertIsNone(relation.target_count_by_source(source_support=support))
+
+    def test_target_count_rejects_invalid_or_overlapping_source_support(self) -> None:
+        source = CoordinateDomain((10,), ((10, 4),), kind="site")
+        target = CoordinateDomain((20,), ((20, 4),), kind="site")
+        source_index = coordinate_axis_symbol(10)
+        relation = CoordinateRelation(
+            source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 0, 4, 1),),
+                    ((20, sympy.Integer(0), source_index, 1),),
+                ),
+            ),
+        )
+        nonidentity_support = CoordinateRelation.point_map(
+            source,
+            source,
+            (
+                (
+                    ((10, 0, 4, 1),),
+                    (sympy.Mod(source_index + 1, 4),),
+                ),
+            ),
+        )
+        overlapping_support = CoordinateRelation.point_map(
+            source,
+            source,
+            (
+                (((10, 0, 3, 1),), (source_index,)),
+                (((10, 2, 4, 1),), (source_index,)),
+            ),
+        )
+        piecewise_relation = CoordinateRelation(
+            source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 0, 2, 1),),
+                    ((20, sympy.Integer(0), sympy.Integer(1), 1),),
+                ),
+                _CoordinateRelationPiece(
+                    ((10, 2, 4, 1),),
+                    ((20, sympy.Integer(0), sympy.Integer(2), 1),),
+                ),
+            ),
+        )
+        crossing_support = CoordinateRelation.point_map(
+            source,
+            source,
+            ((((10, 1, 3, 1),), (source_index,)),),
+        )
+
+        self.assertIsNone(
+            relation.target_count_by_source(source_support=nonidentity_support)
+        )
+        self.assertIsNone(
+            relation.target_count_by_source(source_support=overlapping_support)
+        )
+        self.assertIsNone(
+            piecewise_relation.target_count_by_source(source_support=crossing_support)
+        )
+        with mock.patch(
+            "helion._compiler.tile_dependency._relation_product_is_within_budget",
+            return_value=False,
+        ):
+            self.assertIsNone(
+                relation.target_count_by_source(
+                    source_support=CoordinateRelation.identity(source, source)
+                )
+            )
+
     def test_symbolic_muse_group_widths_keep_affine_fan_in(self) -> None:
         producer_block = 256
         for groups, group_width in ((16, 1248), (13, 1536)):

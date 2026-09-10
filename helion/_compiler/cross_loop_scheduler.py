@@ -2467,6 +2467,27 @@ def _occupied_slot_identity(
     )
 
 
+def _occupied_schedule_identity(
+    worker_schedule: WorkerSchedule,
+) -> CoordinateRelation | None:
+    """Return identity on every slot occupied by the worker schedule."""
+    placement_domain = worker_schedule.placement_domain
+    occupied_pieces: dict[_CoordinateRelationPiece, None] = {}
+    for segment in worker_schedule.segments:
+        occupied = _occupied_slot_identity(segment)
+        if occupied is None or occupied.source_domain != placement_domain:
+            return None
+        for piece in occupied.pieces:
+            occupied_pieces.setdefault(piece, None)
+            if len(occupied_pieces) > tile_dependency._MAX_RELATION_PIECES:
+                return None
+    return CoordinateRelation(
+        source_domain=placement_domain,
+        target_domain=placement_domain,
+        pieces=tuple(occupied_pieces),
+    )
+
+
 def _occupied_same_strand_precedence(
     worker_schedule: WorkerSchedule,
 ) -> CoordinateRelation | None:
@@ -2483,17 +2504,10 @@ def _occupied_same_strand_precedence(
     if placement_domain.kind != "worker" or len(placement_domain.axis_order) != 3:
         return None
     launch_stage_axis, worker_axis, wave_axis = placement_domain.axis_order
-    occupied_pieces: dict[_CoordinateRelationPiece, None] = {}
-    for segment in worker_schedule.segments:
-        occupied = _occupied_slot_identity(segment)
-        if occupied is None or occupied.source_domain != placement_domain:
-            return None
-        for piece in occupied.pieces:
-            occupied_pieces.setdefault(piece, None)
-            if len(occupied_pieces) > tile_dependency._MAX_RELATION_PIECES:
-                return None
-
-    total_piece_count = len(occupied_pieces)
+    occupied_identity = _occupied_schedule_identity(worker_schedule)
+    if occupied_identity is None:
+        return None
+    total_piece_count = len(occupied_identity.pieces)
     if (
         not tile_dependency._relation_product_is_within_budget(
             total_piece_count,
@@ -2527,15 +2541,35 @@ def _occupied_same_strand_precedence(
             ),
         ),
     )
-    occupied_identity = CoordinateRelation(
-        source_domain=placement_domain,
-        target_domain=placement_domain,
-        pieces=tuple(occupied_pieces),
-    )
     predecessors_by_successor = occupied_identity.then(strict_predecessors)
     if predecessors_by_successor is None:
         return None
     return occupied_identity.overlapping_sources(predecessors_by_successor)
+
+
+def _occupied_strand_ordinal(
+    worker_schedule: WorkerSchedule,
+) -> CoordinateRelation | None:
+    """Map each occupied slot to its one-based position on its strand.
+
+    Unoccupied placement slots remain outside the result support.  Distinct
+    predecessor accounting is delegated to ``target_count_by_source`` before
+    its scalar result is shifted by one.
+    """
+    predecessors = _occupied_same_strand_precedence(worker_schedule)
+    if predecessors is None:
+        return None
+    occupied_identity = _occupied_schedule_identity(worker_schedule)
+    if occupied_identity is None:
+        return None
+    predecessor_counts = predecessors.target_count_by_source(
+        source_support=occupied_identity,
+    )
+    return (
+        None
+        if predecessor_counts is None
+        else predecessor_counts.pointwise_add_scalar(offset=1)
+    )
 
 
 @cache

@@ -393,6 +393,51 @@ def _materialized_same_strand_edges(
     return frozenset(represented_edges)
 
 
+def _expected_occupied_strand_ordinals(
+    schedule: WorkerSchedule,
+) -> dict[tuple[int, ...], int]:
+    """Return the exhaustive one-based ordinal for every occupied slot."""
+    placements = _placed_tasks_by_slot(schedule)
+    result: dict[tuple[int, ...], int] = {}
+    for source_slot in placements:
+        source_stage, source_worker, source_wave = source_slot
+        result[source_slot] = sum(
+            target_stage == source_stage
+            and target_worker == source_worker
+            and target_wave <= source_wave
+            for target_stage, target_worker, target_wave in placements
+        )
+    return result
+
+
+def _materialized_occupied_strand_ordinals(
+    schedule: WorkerSchedule,
+    ordinals: CoordinateRelation,
+) -> dict[tuple[int, ...], int]:
+    """Materialize the scalar ordinal relation for small differential tests."""
+    placements = _placed_tasks_by_slot(schedule)
+    placement_domain = schedule.placement_domain
+    if (
+        ordinals.source_domain != placement_domain
+        or len(ordinals.target_domain.axis_order) != 1
+    ):
+        raise AssertionError("strand ordinals use incompatible domains")
+    result: dict[tuple[int, ...], int] = {}
+    for source_index in range(placement_domain.size):
+        source_coordinates = placement_domain.coordinates(source_index)
+        source_slot = tuple(
+            source_coordinates[axis] for axis in placement_domain.axis_order
+        )
+        targets = ordinals.target_coordinates(source_coordinates)
+        if source_slot in placements:
+            if len(targets) != 1:
+                raise AssertionError("occupied slot has no unique strand ordinal")
+            result[source_slot] = next(iter(targets))[0]
+        elif targets:
+            raise AssertionError("empty slot has a strand ordinal")
+    return result
+
+
 def task_at(
     schedule: WorkerSchedule,
     worker: int,
@@ -3012,6 +3057,202 @@ class TestCrossLoopScheduler(TestCase):
         ):
             self.assertIsNone(
                 cross_loop_scheduler._occupied_same_strand_precedence(schedule)
+            )
+
+    def test_occupied_strand_ordinal_matches_small_oracle(self) -> None:
+        for worker_count, task_counts in itertools.product(
+            range(1, 4),
+            itertools.product(range(4), repeat=2),
+        ):
+            with self.subTest(
+                worker_count=worker_count,
+                task_counts=task_counts,
+            ):
+                domains = tuple(
+                    CoordinateDomain(
+                        (axis,),
+                        ((axis, task_count),),
+                        ((axis, 1),),
+                        kind="site",
+                        identity=root,
+                        _allow_empty=True,
+                    )
+                    for root, (axis, task_count) in enumerate(
+                        zip((10, 20), task_counts, strict=True)
+                    )
+                )
+                first_slot = 0
+                segments: list[WorkerScheduleSegment] = []
+                for root, (domain, task_count) in enumerate(
+                    zip(domains, task_counts, strict=True)
+                ):
+                    if task_count:
+                        segments.append(
+                            _segment(
+                                root,
+                                pid_task_order(domain, domain.axis_order),
+                                workers=(0, worker_count),
+                                dispatch_offset=first_slot,
+                            )
+                        )
+                    first_slot += task_count
+                schedule = _schedule(worker_count, *segments)
+
+                with _forbid_schedule_enumeration():
+                    ordinals = cross_loop_scheduler._occupied_strand_ordinal(
+                        schedule
+                    )
+
+                self.assertIsNotNone(ordinals)
+                assert ordinals is not None
+                self.assertEqual(
+                    _materialized_occupied_strand_ordinals(schedule, ordinals),
+                    _expected_occupied_strand_ordinals(schedule),
+                )
+
+    def test_occupied_strand_ordinal_handles_holes_and_split_segments(
+        self,
+    ) -> None:
+        first_domain, second_domain = _identify_root_domains(
+            (_domain((10, 6, 1)), _domain((20, 4, 1)))
+        )
+        first_order = pid_task_order(first_domain, first_domain.axis_order)
+        first_prefix = _task_order_slice(first_order, 0, 4)
+        first_suffix = _task_order_slice(first_order, 4, 2)
+        self.assertIsNotNone(first_prefix)
+        self.assertIsNotNone(first_suffix)
+        assert first_prefix is not None and first_suffix is not None
+        schedule = _schedule(
+            4,
+            _segment(0, first_prefix, workers=(0, 4), dispatch_offset=0),
+            _segment(
+                1,
+                pid_task_order(second_domain, second_domain.axis_order),
+                workers=(0, 4),
+                dispatch_offset=4,
+            ),
+            _segment(0, first_suffix, workers=(0, 2), dispatch_offset=4),
+        )
+
+        with _forbid_schedule_enumeration():
+            ordinals = cross_loop_scheduler._occupied_strand_ordinal(schedule)
+
+        self.assertIsNotNone(ordinals)
+        assert ordinals is not None
+        actual = _materialized_occupied_strand_ordinals(schedule, ordinals)
+        self.assertEqual(actual, _expected_occupied_strand_ordinals(schedule))
+        self.assertLess(len(actual), schedule.placement_domain.size)
+        self.assertEqual(max(actual.values()), 3)
+
+    def test_occupied_strand_ordinal_substitution_parity(self) -> None:
+        extra_waves = sympy.Symbol(
+            "extra_waves",
+            integer=True,
+            nonnegative=True,
+        )
+        worker_count = 4
+        symbolic_domain = CoordinateDomain(
+            (10,),
+            ((10, worker_count * (extra_waves + 1)),),
+            ((10, 1),),
+            kind="site",
+            identity=0,
+        )
+        symbolic_domains = (symbolic_domain,)
+        symbolic_schedule = cross_loop_scheduler._build_root_major_worker_schedule(
+            symbolic_domains,
+            _default_root_task_orders(symbolic_domains),
+            worker_count,
+        )
+        with _forbid_schedule_enumeration():
+            symbolic_ordinals = cross_loop_scheduler._occupied_strand_ordinal(
+                symbolic_schedule
+            )
+        self.assertIsNotNone(symbolic_ordinals)
+        assert symbolic_ordinals is not None
+
+        for concrete_waves in (0, 1, 4):
+            with self.subTest(extra_waves=concrete_waves):
+                substitutions = {extra_waves: concrete_waves}
+                concrete_domains = tuple(
+                    domain.substitute_parameters(substitutions)
+                    for domain in symbolic_domains
+                )
+                concrete_schedule = (
+                    cross_loop_scheduler._build_root_major_worker_schedule(
+                        concrete_domains,
+                        _default_root_task_orders(concrete_domains),
+                        worker_count,
+                    )
+                )
+                specialized_ordinals = symbolic_ordinals.substitute_parameters(
+                    substitutions
+                )
+                with _forbid_schedule_enumeration():
+                    concrete_ordinals = (
+                        cross_loop_scheduler._occupied_strand_ordinal(
+                            concrete_schedule
+                        )
+                    )
+                self.assertIsNotNone(concrete_ordinals)
+                assert concrete_ordinals is not None
+                expected = _expected_occupied_strand_ordinals(concrete_schedule)
+                self.assertEqual(
+                    _materialized_occupied_strand_ordinals(
+                        concrete_schedule,
+                        specialized_ordinals,
+                    ),
+                    expected,
+                )
+                self.assertEqual(
+                    _materialized_occupied_strand_ordinals(
+                        concrete_schedule,
+                        concrete_ordinals,
+                    ),
+                    expected,
+                )
+
+    def test_occupied_strand_ordinal_empty_and_budget_decline(self) -> None:
+        empty_schedule = _schedule(3)
+        with _forbid_schedule_enumeration():
+            empty_ordinals = cross_loop_scheduler._occupied_strand_ordinal(
+                empty_schedule
+            )
+        self.assertIsNotNone(empty_ordinals)
+        assert empty_ordinals is not None
+        self.assertEqual(
+            _materialized_occupied_strand_ordinals(
+                empty_schedule,
+                empty_ordinals,
+            ),
+            {},
+        )
+
+        (domain,) = _identify_root_domains((_domain((10, 5, 1)),))
+        schedule = _schedule(
+            3,
+            _segment(
+                0,
+                pid_task_order(domain, domain.axis_order),
+                workers=(0, 3),
+                dispatch_offset=0,
+            ),
+        )
+        with mock.patch.object(
+            tile_dependency,
+            "_relation_product_is_within_budget",
+            return_value=False,
+        ):
+            self.assertIsNone(
+                cross_loop_scheduler._occupied_strand_ordinal(schedule)
+            )
+        with mock.patch.object(
+            CoordinateRelation,
+            "target_count_by_source",
+            return_value=None,
+        ):
+            self.assertIsNone(
+                cross_loop_scheduler._occupied_strand_ordinal(schedule)
             )
 
     def test_strict_root_slot_progress_accepts_only_earlier_slots(self) -> None:

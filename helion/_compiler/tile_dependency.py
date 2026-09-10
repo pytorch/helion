@@ -4075,17 +4075,27 @@ class CoordinateRelation:
             )
         )
 
-    def target_count_by_source(self) -> CoordinateRelation | None:
-        """Return the exact number of distinct targets for every source.
+    def target_count_by_source(
+        self,
+        *,
+        source_support: CoordinateRelation | None = None,
+    ) -> CoordinateRelation | None:
+        """Return the exact number of distinct targets for selected sources.
 
         The result is another single-valued ``CoordinateRelation`` whose one
         target coordinate is the cardinality.  This keeps aggregation inside
         the relation algebra while avoiding a separate scalar-expression IR.
         Source boxes are partitioned only at existing structural boundaries.
         Overlapping target boxes must be identical or provably disjoint.
+
+        By default the result covers every source, including zero-target
+        fibers.  ``source_support`` may instead provide an exact partial
+        identity selecting the source coordinates whose counts are needed.
+        Its boxes must form a bounded partition on which this relation's
+        active pieces are fixed; unsupported symbolic intersections decline.
         """
         positional_product = self._positional_product
-        if positional_product is not None:
+        if positional_product is not None and source_support is None:
             _positional_axes, residual = positional_product
             residual_counts = residual.target_count_by_source()
             return (
@@ -4093,22 +4103,96 @@ class CoordinateRelation:
                 if residual_counts is None
                 else residual_counts.lift_source(self.source_domain)
             )
-        cells = _relation_source_cells(self, include_domain=True)
-        if cells is None:
-            return None
+        if source_support is None:
+            cells = _relation_source_cells(self, include_domain=True)
+            if cells is None:
+                return None
+            active_pieces_by_cell = tuple(
+                (
+                    bounds,
+                    tuple(
+                        piece
+                        for piece in self.pieces
+                        if _source_box_covers(piece.source_bounds_items, bounds)
+                    ),
+                )
+                for bounds in cells
+            )
+        else:
+            if (
+                source_support.source_domain != self.source_domain
+                or source_support.target_domain != self.source_domain
+                or len(self.pieces) > _MAX_RELATION_PIECES
+                or len(source_support.pieces) > _MAX_RELATION_PIECES
+                or not _relation_product_is_within_budget(
+                    len(self.pieces),
+                    len(source_support.pieces),
+                )
+                or not _is_identity_on_source_support(source_support)
+            ):
+                return None
+            support_cells = tuple(
+                dict.fromkeys(
+                    piece.source_bounds_items
+                    for piece in _nonempty_relation_pieces(source_support)
+                )
+            )
+            if (
+                not _relation_product_is_within_budget(
+                    len(support_cells),
+                    len(support_cells),
+                )
+                or not _relation_product_is_within_budget(
+                    len(support_cells),
+                    len(self.pieces),
+                    len(self.pieces),
+                )
+                or any(
+                    _source_box_cardinality(bounds, domain=self.source_domain) is None
+                    for bounds in support_cells
+                )
+                or any(
+                    not _source_bounds_are_disjoint(left, right)
+                    for left_index, left in enumerate(support_cells)
+                    for right in support_cells[left_index + 1 :]
+                )
+            ):
+                return None
+            selected_cells: list[
+                tuple[
+                    tuple[
+                        tuple[int, IntegerExpression, IntegerExpression, int], ...
+                    ],
+                    tuple[_CoordinateRelationPiece, ...],
+                ]
+            ] = []
+            for bounds in support_cells:
+                selected_pieces: list[_CoordinateRelationPiece] = []
+                for piece in self.pieces:
+                    if _source_bounds_equal(piece.source_bounds_items, bounds) or (
+                        _source_box_covers(piece.source_bounds_items, bounds)
+                    ):
+                        selected_pieces.append(piece)
+                    elif not _source_bounds_are_disjoint(
+                        piece.source_bounds_items,
+                        bounds,
+                    ):
+                        return None
+                selected_cells.append((bounds, tuple(selected_pieces)))
+            active_pieces_by_cell = tuple(selected_cells)
         value_axis = 0
         value_domain = CoordinateDomain(
             axis_order=(value_axis,),
-            axis_counts_items=((value_axis, self.target_domain.size + 1),),
+            axis_counts_items=(
+                (value_axis, sympy.simplify(self.target_domain.size_expr + 1)),
+            ),
             kind="value",
         )
         pieces: list[_CoordinateRelationPiece] = []
-        for bounds in cells:
+        for bounds, active_pieces in active_pieces_by_cell:
             active_targets = tuple(
                 dict.fromkeys(
-                    piece.target_ranges
-                    for piece in self.pieces
-                    if _source_box_covers(piece.source_bounds_items, bounds)
+                    piece.target_ranges for piece in active_pieces
                 )
             )
             if any(
