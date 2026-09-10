@@ -1,13 +1,15 @@
 """Concrete test oracle for the scheduler's unit-weight max-plus objective.
 
 The helpers deliberately materialize schedule and readiness relations and must
-remain test-only.  Root bodies are atomic; nested-site timing is rejected.
-Single-body final-arrival ownership is modeled exactly, while correlated
-multi-body ownership remains an explicit gap.
+remain test-only.  The named model cases are compact topology-shaped motifs,
+not extracted benchmark graphs.  Root bodies are atomic; nested-site timing is
+rejected.  Single-body final-arrival ownership is modeled exactly, while
+correlated multi-body ownership remains an explicit gap.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
 from typing import TypeAlias
 
@@ -18,10 +20,12 @@ from helion._compiler.cross_loop_scheduler import ReadinessGraph
 from helion._compiler.cross_loop_scheduler import ReadinessProducer
 from helion._compiler.cross_loop_scheduler import WorkerSchedule
 from helion._compiler.cross_loop_scheduler import WorkerScheduleSegment
+from helion._compiler.cross_loop_scheduler import derive_final_arrival_continuations
 from helion._compiler.tile_dependency import CoordinateDomain
 from helion._compiler.tile_dependency import CoordinateRelation
 from helion._compiler.tile_dependency import _CoordinateRelationPiece
 from helion._compiler.tile_dependency import _remember_exact_converse
+from helion._compiler.tile_dependency import coordinate_axis_symbol
 from helion._compiler.tile_dependency import pid_task_order
 from helion._testing import TestCase
 
@@ -387,6 +391,10 @@ def _continuation_scores(
     schedule_without_consumer: WorkerSchedule,
     continuation: FinalArrivalContinuation,
 ) -> tuple[tuple[_Node, _Score], ...]:
+    if continuation not in derive_final_arrival_continuations(graph):
+        raise _OracleInputError(
+            "continuation is not eligible under production semantics"
+        )
     event = graph.event(continuation.event_id)
     consumer = event.consumers[continuation.consumer_index]
     consumer_nodes = frozenset(
@@ -639,11 +647,54 @@ class TestConcreteMaxPlusOracle(TestCase):
         )
 
     def test_multi_body_continuation_is_an_explicit_gap(self) -> None:
-        graph = _readiness_graph(
-            (1, 2),
-            (((((0, 0),)), ((1, 0), (1, 1))),),
+        producer_domain, consumer_domain = _domains((2, 2))
+        key_domain = CoordinateDomain(
+            (0,),
+            ((0, 2),),
+            kind="event",
+            identity=0,
         )
-        candidate = _schedule(graph, {(0, 0): (0, 0)}, worker_count=2)
+        key = coordinate_axis_symbol(0)
+        consumer_task = coordinate_axis_symbol(101)
+        graph = ReadinessGraph(
+            (
+                pid_task_order(producer_domain, producer_domain.axis_order),
+                pid_task_order(consumer_domain, consumer_domain.axis_order),
+            ),
+            (
+                ReadinessEvent(
+                    (
+                        ReadinessProducer(
+                            0,
+                            CoordinateRelation.point_map(
+                                key_domain,
+                                producer_domain,
+                                ((((0, 0, 2, 1),), (key,)),),
+                            ),
+                        ),
+                    ),
+                    (
+                        ReadinessConsumer(
+                            1,
+                            CoordinateRelation.point_map(
+                                consumer_domain,
+                                key_domain,
+                                ((((101, 0, 2, 1),), (consumer_task,)),),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        self.assertEqual(
+            derive_final_arrival_continuations(graph),
+            (FinalArrivalContinuation(0, 0),),
+        )
+        candidate = _schedule(
+            graph,
+            {(0, 0): (0, 0), (0, 1): (1, 0)},
+            worker_count=2,
+        )
         with self.assertRaisesRegex(_ContinuationOracleGap, "multi-body"):
             _score_continuation(
                 graph,
@@ -651,7 +702,80 @@ class TestConcreteMaxPlusOracle(TestCase):
                 FinalArrivalContinuation(0, 0),
             )
 
-    def test_flashmla_fan_in_early_release_improves_completion(self) -> None:
+    def test_continuation_requires_production_eligibility(self) -> None:
+        root_barrier = _readiness_graph(
+            (1, 1),
+            ((((0, 0),), ((1, 0),)),),
+        )
+        root_barrier_schedule = _schedule(
+            root_barrier,
+            {(0, 0): (0, 0)},
+            worker_count=2,
+        )
+
+        multiple_consumers = _readiness_graph(
+            (1, 1, 1, 1),
+            (((((0, 0), (1, 0))), ((2, 0), (3, 0))),),
+        )
+        multiple_consumer_schedule = _schedule(
+            multiple_consumers,
+            {(0, 0): (0, 0), (1, 0): (1, 0), (3, 0): (1, 1)},
+            worker_count=2,
+        )
+
+        nonbijective_consumer = _readiness_graph(
+            (1, 1, 2),
+            (((((0, 0), (1, 0))), ((2, 0), (2, 1))),),
+        )
+        nonbijective_schedule = _schedule(
+            nonbijective_consumer,
+            {(0, 0): (0, 0), (1, 0): (1, 0)},
+            worker_count=2,
+        )
+
+        nested_producer = _readiness_graph(
+            (1, 1, 1),
+            (((((0, 0), (1, 0))), ((2, 0),)),),
+        )
+        (nested_event,) = nested_producer.events
+        nested_producer = ReadinessGraph(
+            nested_producer.root_task_orders,
+            (
+                dataclasses.replace(
+                    nested_event,
+                    producers=(
+                        dataclasses.replace(
+                            nested_event.producers[0],
+                            producer_site_id=7,
+                        ),
+                        nested_event.producers[1],
+                    ),
+                ),
+            ),
+        )
+        nested_schedule = _schedule(
+            nested_producer,
+            {(0, 0): (0, 0), (1, 0): (1, 0)},
+            worker_count=2,
+        )
+
+        for name, graph, schedule in (
+            ("root_barrier", root_barrier, root_barrier_schedule),
+            ("multiple_consumers", multiple_consumers, multiple_consumer_schedule),
+            ("nonbijective_consumer", nonbijective_consumer, nonbijective_schedule),
+            ("nested_producer", nested_producer, nested_schedule),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(derive_final_arrival_continuations(graph), ())
+                with self.assertRaisesRegex(_OracleInputError, "production semantics"):
+                    _continuation_scores(
+                        graph,
+                        schedule,
+                        FinalArrivalContinuation(0, 0),
+                    )
+
+    def test_flashmla_topology_motif_early_release_improves_completion(self) -> None:
+        # A compact fan-in/reduction/down motif, not an extracted model graph.
         producers = tuple((0, task) for task in range(4))
         graph = _readiness_graph(
             (4, 1, 1, 1, 1, 1, 1),
@@ -692,7 +816,8 @@ class TestConcreteMaxPlusOracle(TestCase):
             _score_resident(graph, early_release), _score_resident(graph, baseline)
         )
 
-    def test_qwen_chain_branch_ordering_and_resident_join(self) -> None:
+    def test_qwen_topology_motif_ordering_and_resident_join(self) -> None:
+        # A compact attention/residual/join motif, not an extracted model graph.
         graph = _readiness_graph(
             (1, 1, 1, 1, 1, 1),
             (
@@ -748,7 +873,8 @@ class TestConcreteMaxPlusOracle(TestCase):
         # the join (the compact analogue of Qwen root 13) resident.
         self.assertEqual(continuation_score, good_score)
 
-    def test_gemma_routed_expert_reduction_stays_resident(self) -> None:
+    def test_gemma_topology_motif_expert_reduction_stays_resident(self) -> None:
+        # A compact routed-expert/reduction motif, not an extracted model graph.
         graph = _readiness_graph(
             (1, 1, 1, 1, 1, 1),
             (
@@ -886,7 +1012,7 @@ class TestConcreteMaxPlusOracle(TestCase):
         self.assertEqual(_score_resident(graph, spread), (5, 1))
         self.assertEqual(_score_resident(graph, completion_first), (4, 2))
 
-    def test_muse_unit_objective_exposes_grouping_gap(self) -> None:
+    def test_muse_simplified_motif_exposes_grouping_gap(self) -> None:
         # Two fan-in groups, each followed by activation and down-projection.
         graph = _readiness_graph(
             (1, 1, 1, 1, 1, 1, 1, 1),
