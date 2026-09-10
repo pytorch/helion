@@ -2488,40 +2488,6 @@ def _occupied_schedule_identity(
     )
 
 
-def _occupied_same_strand_precedence(
-    worker_schedule: WorkerSchedule,
-) -> CoordinateRelation | None:
-    """Map each occupied slot to all occupied earlier same-strand slots.
-
-    The result remains entirely in the placement domain.  Callers recover
-    roots and logical tasks only through the authoritative segment
-    ``task_order`` relations.
-
-    Work is bounded by roots and relation pieces.  Unsupported relation
-    composition or a common relation-budget overflow declines the whole view.
-    """
-    placement_domain = worker_schedule.placement_domain
-    occupied_identity = _occupied_schedule_identity(worker_schedule)
-    if occupied_identity is None:
-        return None
-    total_piece_count = len(occupied_identity.pieces)
-    if (
-        not tile_dependency._relation_product_is_within_budget(
-            total_piece_count,
-            total_piece_count,
-        )
-    ):
-        return None
-
-    strict_predecessors = _strict_same_strand_precedence(placement_domain)
-    if strict_predecessors is None:
-        return None
-    predecessors_by_successor = occupied_identity.then(strict_predecessors)
-    if predecessors_by_successor is None:
-        return None
-    return occupied_identity.overlapping_sources(predecessors_by_successor)
-
-
 def _strict_same_strand_precedence(
     placement_domain: CoordinateDomain,
 ) -> CoordinateRelation | None:
@@ -2553,6 +2519,58 @@ def _strict_same_strand_precedence(
                 ),
             ),
         ),
+    )
+
+
+def _occupied_same_strand_precedence_between(
+    successor_occupied_identity: CoordinateRelation,
+    predecessor_occupied_identity: CoordinateRelation,
+) -> CoordinateRelation | None:
+    """Map occupied successor slots to occupied earlier predecessor slots."""
+    placement_domain = successor_occupied_identity.source_domain
+    if (
+        placement_domain != successor_occupied_identity.target_domain
+        or placement_domain != predecessor_occupied_identity.source_domain
+        or placement_domain != predecessor_occupied_identity.target_domain
+        or placement_domain.kind != "worker"
+        or len(placement_domain.axis_order) != 3
+        or len(successor_occupied_identity.pieces)
+        > tile_dependency._MAX_RELATION_PIECES
+        or len(predecessor_occupied_identity.pieces)
+        > tile_dependency._MAX_RELATION_PIECES
+        or not tile_dependency._relation_product_is_within_budget(
+            len(successor_occupied_identity.pieces),
+            len(predecessor_occupied_identity.pieces),
+        )
+    ):
+        return None
+    strict_predecessors = _strict_same_strand_precedence(placement_domain)
+    if strict_predecessors is None:
+        return None
+    predecessors_by_successor = successor_occupied_identity.then(strict_predecessors)
+    if predecessors_by_successor is None:
+        return None
+    return predecessor_occupied_identity.overlapping_sources(predecessors_by_successor)
+
+
+def _occupied_same_strand_precedence(
+    worker_schedule: WorkerSchedule,
+) -> CoordinateRelation | None:
+    """Map each occupied slot to all occupied earlier same-strand slots.
+
+    The result remains entirely in the placement domain.  Callers recover
+    roots and logical tasks only through the authoritative segment
+    ``task_order`` relations.
+
+    Work is bounded by roots and relation pieces.  Unsupported relation
+    composition or a common relation-budget overflow declines the whole view.
+    """
+    occupied_identity = _occupied_schedule_identity(worker_schedule)
+    if occupied_identity is None:
+        return None
+    return _occupied_same_strand_precedence_between(
+        occupied_identity,
+        occupied_identity,
     )
 
 
@@ -7232,6 +7250,169 @@ def _segment_dependency_support_overlaps(
     return not producer_support.has_disjoint_source_support(producers_reaching_consumer)
 
 
+def _deterministic_topological_order(
+    successors: list[set[int]],
+) -> tuple[int, ...] | None:
+    """Return the stable minimum-first order of a finite DAG."""
+    indegree = [0] * len(successors)
+    for node_successors in successors:
+        for successor in node_successors:
+            indegree[successor] += 1
+    ready = [node for node, degree in enumerate(indegree) if degree == 0]
+    heapq.heapify(ready)
+    order: list[int] = []
+    while ready:
+        node = heapq.heappop(ready)
+        order.append(node)
+        for successor in sorted(successors[node]):
+            indegree[successor] -= 1
+            if indegree[successor] == 0:
+                heapq.heappush(ready, successor)
+    return tuple(order) if len(order) == len(successors) else None
+
+
+def _all_resident_root_topological_order(
+    worker_schedule: WorkerSchedule,
+    readiness_graph: ReadinessGraph,
+) -> tuple[int, ...] | None:
+    """Return an acyclic root quotient for resident max-plus evaluation.
+
+    Every possibly nonempty root-level readiness edge and every cross-root
+    occupied same-strand edge is represented.  Conditional support is treated
+    as present, giving one parameter-independent order for the whole compiled
+    guard.  Unsupported relation proofs and cyclic quotients decline.
+    """
+    root_count = len(readiness_graph.root_task_orders)
+    if any(
+        segment.root < 0 or segment.root >= root_count
+        for segment in worker_schedule.segments
+    ) or not _validate_worker_schedule_tasks(
+        worker_schedule,
+        readiness_graph.root_task_orders,
+    ):
+        return None
+
+    def may_be_nonempty(relation: CoordinateRelation) -> bool | None:
+        if len(relation.pieces) > tile_dependency._MAX_RELATION_PIECES:
+            return None
+        for piece in relation.pieces:
+            source_cardinality = tile_dependency._source_box_cardinality(
+                piece.source_bounds_items,
+                domain=relation.source_domain,
+            )
+            if source_cardinality is not None and source_cardinality.is_zero is True:
+                continue
+            target_ranges = tile_dependency._clip_target_box_to_domain(
+                piece.target_ranges,
+                target_domain=relation.target_domain,
+                source_domain=relation.source_domain,
+                source_bounds=piece.source_bounds_items,
+            )
+            if not tile_dependency._target_box_is_empty_for_all_sources(
+                target_ranges,
+                source_domain=relation.source_domain,
+                source_bounds=piece.source_bounds_items,
+                target_domain=relation.target_domain,
+            ):
+                return True
+        return False
+
+    occupied_by_root: list[list[CoordinateRelation]] = [
+        [] for _ in range(root_count)
+    ]
+    for segment in worker_schedule.segments:
+        occupied = _occupied_slot_identity(segment)
+        if occupied is None:
+            return None
+        occupied_may_be_nonempty = may_be_nonempty(occupied)
+        if occupied_may_be_nonempty is None or (
+            occupied_may_be_nonempty and segment.launch_stage != _RESIDENT_LAUNCH_STAGE
+        ):
+            return None
+        if occupied_may_be_nonempty:
+            occupied_by_root[segment.root].append(occupied)
+    successors: list[set[int]] = [set() for _ in range(root_count)]
+    edge_attempt_count = 0
+
+    def account_edge_attempt() -> bool:
+        nonlocal edge_attempt_count
+        edge_attempt_count += 1
+        return edge_attempt_count <= _MAX_GLOBAL_LIST_EDGES
+
+    root_domains = readiness_graph.root_domains
+    for event in readiness_graph.events:
+        for producer in event.producers:
+            if (
+                producer.producer_site_id is not None
+                or producer.producer_root < 0
+                or producer.producer_root >= root_count
+                or producer.producers_by_key.target_domain
+                != root_domains[producer.producer_root]
+            ):
+                return None
+        for consumer in event.consumers:
+            if (
+                consumer.consumer_site_id is not None
+                or consumer.consumer_root < 0
+                or consumer.consumer_root >= root_count
+                or consumer.keys_by_consumer.source_domain
+                != root_domains[consumer.consumer_root]
+            ):
+                return None
+            for producer in event.producers:
+                if not account_edge_attempt():
+                    return None
+                consumer_may_be_nonempty = may_be_nonempty(consumer.keys_by_consumer)
+                producer_may_be_nonempty = may_be_nonempty(producer.producers_by_key)
+                if consumer_may_be_nonempty is None or producer_may_be_nonempty is None:
+                    return None
+                if not consumer_may_be_nonempty or not producer_may_be_nonempty:
+                    continue
+                producers_by_consumer = consumer.keys_by_consumer.then(
+                    producer.producers_by_key
+                )
+                if producers_by_consumer is None:
+                    return None
+                dependency_may_be_nonempty = may_be_nonempty(producers_by_consumer)
+                if dependency_may_be_nonempty is None:
+                    return None
+                if not dependency_may_be_nonempty:
+                    continue
+                if producer.producer_root == consumer.consumer_root:
+                    return None
+                successors[producer.producer_root].add(consumer.consumer_root)
+
+    occupied_roots = tuple(
+        (root, segments)
+        for root, segments in enumerate(occupied_by_root)
+        if segments
+    )
+    for producer_root, producer_segments in occupied_roots:
+        for consumer_root, consumer_segments in occupied_roots:
+            if consumer_root == producer_root:
+                continue
+            if not account_edge_attempt():
+                return None
+            for successor_occupied in consumer_segments:
+                for predecessor_occupied in producer_segments:
+                    precedence = _occupied_same_strand_precedence_between(
+                        successor_occupied,
+                        predecessor_occupied,
+                    )
+                    if precedence is None:
+                        return None
+                    edge_may_be_nonempty = may_be_nonempty(precedence)
+                    if edge_may_be_nonempty is None:
+                        return None
+                    if edge_may_be_nonempty:
+                        successors[producer_root].add(consumer_root)
+                        break
+                if consumer_root in successors[producer_root]:
+                    break
+
+    return _deterministic_topological_order(successors)
+
+
 def _has_acyclic_symbolic_segment_precedence(
     worker_schedule: WorkerSchedule,
     readiness_graph: ReadinessGraph,
@@ -7347,20 +7528,7 @@ def _has_acyclic_symbolic_segment_precedence(
                             return False
                         successors[producer_index].add(consumer_index)
 
-    indegree = [0] * len(segments)
-    for segment_successors in successors:
-        for successor in segment_successors:
-            indegree[successor] += 1
-    ready = [index for index, degree in enumerate(indegree) if degree == 0]
-    visited = 0
-    while ready:
-        index = ready.pop()
-        visited += 1
-        for successor in successors[index]:
-            indegree[successor] -= 1
-            if indegree[successor] == 0:
-                ready.append(successor)
-    return visited == len(segments)
+    return _deterministic_topological_order(successors) is not None
 
 
 def _schedule_is_progress_safe(
@@ -7632,24 +7800,12 @@ def _root_schema_criticality(
 ) -> tuple[tuple[int, int], ...] | None:
     """Return shape-independent ``(slack, -top)`` classes for root DAGs."""
     successors = [set() for _ in range(root_count)]
-    indegree = [0] * root_count
     for producer, consumer in edges:
         if producer == consumer:
             continue
-        if consumer not in successors[producer]:
-            successors[producer].add(consumer)
-            indegree[consumer] += 1
-    ready = [root for root, degree in enumerate(indegree) if degree == 0]
-    heapq.heapify(ready)
-    order: list[int] = []
-    while ready:
-        root = heapq.heappop(ready)
-        order.append(root)
-        for consumer in sorted(successors[root]):
-            indegree[consumer] -= 1
-            if indegree[consumer] == 0:
-                heapq.heappush(ready, consumer)
-    if len(order) != root_count:
+        successors[producer].add(consumer)
+    order = _deterministic_topological_order(successors)
+    if order is None:
         # A cyclic quotient needs the affine SCC-rank proof from Phase 4.
         return None
 

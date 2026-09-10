@@ -438,6 +438,57 @@ def _materialized_occupied_strand_ordinals(
     return result
 
 
+def _materialized_root_quotient_order(
+    schedule: WorkerSchedule,
+    readiness_graph: ReadinessGraph,
+) -> tuple[int, ...] | None:
+    """Return the deterministic root quotient of one concrete tiny problem."""
+    root_count = len(readiness_graph.root_domains)
+    edges = {
+        (producer_root, consumer_root)
+        for producer_root, _producer_task, consumer_root, _consumer_task in (
+            _expected_same_strand_edges(schedule)
+        )
+        if producer_root != consumer_root
+    }
+    for event in readiness_graph.events:
+        for consumer in event.consumers:
+            if consumer.consumer_site_id is not None:
+                raise ValueError("the root quotient oracle requires root consumers")
+            keys_by_consumer = consumer.keys_by_consumer.materialize()
+            for producer in event.producers:
+                if producer.producer_site_id is not None:
+                    raise ValueError("the root quotient oracle requires root producers")
+                producers_by_key = producer.producers_by_key.materialize()
+                if any(
+                    producers_by_key[key]
+                    for required_keys in keys_by_consumer
+                    for key in required_keys
+                ):
+                    edge = (producer.producer_root, consumer.consumer_root)
+                    if edge[0] == edge[1]:
+                        return None
+                    edges.add(edge)
+
+    successors = [set() for _ in range(root_count)]
+    indegree = [0] * root_count
+    for producer, consumer in edges:
+        if consumer not in successors[producer]:
+            successors[producer].add(consumer)
+            indegree[consumer] += 1
+    ready = {root for root, degree in enumerate(indegree) if degree == 0}
+    order: list[int] = []
+    while ready:
+        root = min(ready)
+        ready.remove(root)
+        order.append(root)
+        for consumer in sorted(successors[root]):
+            indegree[consumer] -= 1
+            if indegree[consumer] == 0:
+                ready.add(consumer)
+    return tuple(order) if len(order) == root_count else None
+
+
 def task_at(
     schedule: WorkerSchedule,
     worker: int,
@@ -839,6 +890,103 @@ def _readiness_graph(
     return ReadinessGraph(
         root_task_orders=_default_root_task_orders(root_domains),
         events=events,
+    )
+
+
+def _pointwise_root_readiness_event(
+    root_domains: tuple[CoordinateDomain, ...],
+    producer_root: int,
+    consumer_root: int,
+    event_id: int,
+) -> ReadinessEvent:
+    """Build one same-index root-level event for small quotient tests."""
+    producer_domain = root_domains[producer_root]
+    consumer_domain = root_domains[consumer_root]
+    if (
+        len(producer_domain.axis_order) != 1
+        or len(consumer_domain.axis_order) != 1
+        or producer_domain.size_expr != consumer_domain.size_expr
+    ):
+        raise ValueError("pointwise test readiness requires equal 1-D roots")
+    event_domain = CoordinateDomain(
+        axis_order=(0,),
+        axis_counts_items=((0, producer_domain.size_expr),),
+        kind="event",
+        identity=event_id,
+        _allow_empty=producer_domain.size_expr.is_zero is not False,
+    )
+    consumer_axis = consumer_domain.axis_order[0]
+    producer = ReadinessProducer(
+        producer_root=producer_root,
+        producers_by_key=_full_point_map(
+            event_domain,
+            producer_domain,
+            coordinate_axis_symbol(0),
+        ),
+    )
+    consumer = ReadinessConsumer(
+        consumer_root=consumer_root,
+        keys_by_consumer=_full_point_map(
+            consumer_domain,
+            event_domain,
+            coordinate_axis_symbol(consumer_axis),
+        ),
+    )
+    return ReadinessEvent((producer,), (consumer,))
+
+
+def _singleton_root_problem(
+    root_slots: tuple[tuple[int, int], ...],
+    readiness_edges: frozenset[tuple[int, int]],
+    *,
+    worker_count: int = 2,
+    launch_stage: int = 1,
+) -> tuple[ReadinessGraph, WorkerSchedule]:
+    """Build a normalized one-task-per-root problem at explicit slots."""
+    root_domains = _identify_root_domains(
+        tuple(_domain((10 + 10 * root, 1)) for root in range(len(root_slots)))
+    )
+    wave_count = max((wave for _worker, wave in root_slots), default=0) + 1
+    placement_domain = CoordinateDomain(
+        axis_order=(-3, -2, -1),
+        axis_counts_items=((-3, 2), (-2, worker_count), (-1, wave_count)),
+        kind="worker",
+    )
+    segments = tuple(
+        WorkerScheduleSegment(
+            root=root,
+            task_order=CoordinateRelation.point_map(
+                placement_domain,
+                root_domains[root],
+                (
+                    (
+                        (
+                            (-3, launch_stage, launch_stage + 1, 1),
+                            (-2, worker, worker + 1, 1),
+                            (-1, wave, wave + 1, 1),
+                        ),
+                        (sympy.Integer(0),),
+                    ),
+                ),
+            ),
+            worker_begin=0,
+            worker_count=worker_count,
+            dispatch_offset=0,
+        )
+        for root, (worker, wave) in enumerate(root_slots)
+    )
+    events = tuple(
+        _pointwise_root_readiness_event(
+            root_domains,
+            producer,
+            consumer,
+            event_id,
+        )
+        for event_id, (producer, consumer) in enumerate(sorted(readiness_edges))
+    )
+    return _readiness_graph(root_domains, *events), WorkerSchedule(
+        worker_count,
+        segments,
     )
 
 
