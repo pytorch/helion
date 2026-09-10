@@ -5133,9 +5133,12 @@ class CoordinateRelation:
         has_unclipped_coordinate_targets = (
             _has_unclipped_coordinate_point_targets(self)
         )
-        has_in_domain_point_targets = _has_proved_in_domain_point_targets(self)
         source_targets_are_unclipped = (
-            has_unclipped_coordinate_targets or has_in_domain_point_targets
+            has_unclipped_coordinate_targets
+            or (
+                has_partial_producer_source
+                and _has_proved_in_domain_point_targets(self)
+            )
         )
         other_has_in_domain_point_targets: bool | None = None
         for producer_piece in self.pieces:
