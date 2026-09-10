@@ -8253,6 +8253,86 @@ def _single_ordinal_digit(
     return stride, source_count // stride
 
 
+def _infer_mixed_radix_digit_strides(
+    relation: CoordinateRelation,
+    piece: _CoordinateRelationPiece,
+    source_axis: int,
+    target_axes: tuple[int, ...],
+    target_expressions: Mapping[int, sympy.Expr],
+    target_extents: Mapping[int, tuple[int, int]],
+) -> dict[int, int] | None:
+    """Infer one exact mixed-radix chain without searching axis orders.
+
+    Localize the varying source interval to a zero-based ordinal, recognize
+    every target expression as one structural digit of that ordinal, and then
+    require the recognized strides/radices to form the unique complete chain
+    ``1, r0, r0*r1, ...``. Duplicate strides are ambiguous and unsupported;
+    missing strides are not mixed-radix. Work is linearithmic in relation rank
+    and independent of the number of source points.
+    """
+    source_bounds = {
+        axis: (begin, end, step)
+        for axis, begin, end, step in piece.source_bounds_items
+    }
+    source_begin, source_end, source_step = source_bounds[source_axis]
+    source_count = source_end - source_begin
+    if source_step != 1 or source_count <= 1 or not target_axes:
+        return None
+    if (
+        math.prod(
+            target_extents[axis][1] - target_extents[axis][0]
+            for axis in target_axes
+        )
+        != source_count
+    ):
+        return None
+
+    source_symbol = coordinate_axis_symbol(source_axis)
+    local_source_bounds = tuple(
+        (
+            (axis, 0, source_count, 1)
+            if axis == source_axis
+            else (axis, begin, end, step)
+        )
+        for axis, begin, end, step in piece.source_bounds_items
+    )
+    source_substitution = {source_symbol: source_symbol + source_begin}
+    digits: list[tuple[int, int, int]] = []
+    for target_axis in target_axes:
+        minimum, target_end = target_extents[target_axis]
+        radix = target_end - minimum
+        if radix <= 1:
+            return None
+        local_expression = _simplify_logical_expression(
+            cast(
+                "sympy.Expr",
+                (target_expressions[target_axis] - minimum).xreplace(  # pyrefly: ignore[unsupported-operation]
+                    source_substitution
+                ),
+            ),
+            domain=relation.source_domain,
+            source_bounds=local_source_bounds,
+        )
+        digit = _single_ordinal_digit(
+            local_expression,
+            source_symbol=source_symbol,
+            source_count=source_count,
+        )
+        if digit is None or digit[1] != radix:
+            return None
+        stride, _recognized_radix = digit
+        digits.append((stride, target_axis, radix))
+
+    expected_stride = 1
+    digit_strides: dict[int, int] = {}
+    for stride, target_axis, radix in sorted(digits):
+        if stride != expected_stride:
+            return None
+        digit_strides[target_axis] = stride
+        expected_stride *= radix
+    return digit_strides if expected_stride == source_count else None
+
+
 def _piecewise_woven_mixed_radix_converse(
     relation: CoordinateRelation,
 ) -> CoordinateRelation | None:
@@ -8608,8 +8688,7 @@ def _piecewise_single_source_mixed_radix_converse(
         if len(varying_source_axes) != 1:
             return None
         (source_axis,) = varying_source_axes
-        source_begin, source_end, _source_step = source_bounds[source_axis]
-        source_symbol = coordinate_axis_symbol(source_axis)
+        source_begin, _source_end, _source_step = source_bounds[source_axis]
         target_expressions: dict[int, sympy.Expr] = {}
         target_extents: dict[int, tuple[int, int]] = {}
         for target_axis, begin, end, step in piece.target_ranges:
@@ -8650,36 +8729,14 @@ def _piecewise_single_source_mixed_radix_converse(
             for axis in relation.target_domain.axis_order
             if target_extents[axis][1] - target_extents[axis][0] > 1
         )
-        if len(varying_target_axes) > 6:
-            return None
-        source_count = source_end - source_begin
-        if (
-            math.prod(
-                target_extents[axis][1] - target_extents[axis][0]
-                for axis in relation.target_domain.axis_order
-            )
-            != source_count
-        ):
-            return None
-
-        digit_strides: dict[int, int] | None = None
-        for axis_order in itertools.permutations(varying_target_axes):
-            candidate_strides: dict[int, int] = {}
-            stride = 1
-            reconstructed: sympy.Expr = sympy.Integer(source_begin)
-            for target_axis in axis_order:
-                minimum, end = target_extents[target_axis]
-                candidate_strides[target_axis] = stride
-                reconstructed += (target_expressions[target_axis] - minimum) * stride  # pyrefly: ignore[unsupported-operation]
-                stride *= end - minimum
-            difference = _simplify_logical_expression(
-                reconstructed - source_symbol,  # pyrefly: ignore[unsupported-operation]
-                domain=relation.source_domain,
-                source_bounds=piece.source_bounds_items,
-            )
-            if difference == 0:
-                digit_strides = candidate_strides
-                break
+        digit_strides = _infer_mixed_radix_digit_strides(
+            relation,
+            piece,
+            source_axis,
+            varying_target_axes,
+            target_expressions,
+            target_extents,
+        )
         if digit_strides is None:
             return None
 
@@ -8821,45 +8878,24 @@ def _piecewise_source_grouped_mixed_radix_converse(
                 inverse_by_source_axis[source_axis] = sympy.Integer(source_begin)
                 continue
             target_axes = tuple(target_axes_by_source.get(source_axis, ()))
-            if not target_axes or len(target_axes) > 6:
+            if not target_axes:
                 return None
-            if (
-                math.prod(
-                    target_extents[axis][1] - target_extents[axis][0]
-                    for axis in target_axes
-                )
-                != source_count
-            ):
+            digit_strides = _infer_mixed_radix_digit_strides(
+                relation,
+                piece,
+                source_axis,
+                target_axes,
+                target_expressions,
+                target_extents,
+            )
+            if digit_strides is None:
                 return None
-            source_symbol = coordinate_axis_symbol(source_axis)
-            inverse: sympy.Expr | None = None
-            for axis_order in itertools.permutations(target_axes):
-                stride = 1
-                reconstructed: sympy.Expr = sympy.Integer(source_begin)
-                for target_axis in axis_order:
-                    minimum, target_end = target_extents[target_axis]
-                    reconstructed += (  # pyrefly: ignore[unsupported-operation]
-                        target_expressions[target_axis] - minimum  # pyrefly: ignore[unsupported-operation]
-                    ) * stride
-                    stride *= target_end - minimum
-                difference = _simplify_logical_expression(
-                    reconstructed - source_symbol,  # pyrefly: ignore[unsupported-operation]
-                    domain=relation.source_domain,
-                    source_bounds=piece.source_bounds_items,
-                )
-                if difference != 0:
-                    continue
-                inverse = sympy.Integer(source_begin)
-                stride = 1
-                for target_axis in axis_order:
-                    minimum, target_end = target_extents[target_axis]
-                    inverse += (  # pyrefly: ignore[unsupported-operation]
-                        coordinate_axis_symbol(target_axis) - minimum  # pyrefly: ignore[unsupported-operation]
-                    ) * stride
-                    stride *= target_end - minimum
-                break
-            if inverse is None:
-                return None
+            inverse: sympy.Expr = sympy.Integer(source_begin)
+            for target_axis, stride in digit_strides.items():
+                minimum, _target_end = target_extents[target_axis]
+                inverse += (  # pyrefly: ignore[unsupported-operation]
+                    coordinate_axis_symbol(target_axis) - minimum  # pyrefly: ignore[unsupported-operation]
+                ) * stride
             inverse_by_source_axis[source_axis] = inverse
 
         target_box = tuple(

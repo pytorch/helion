@@ -31,6 +31,12 @@ from helion._compiler.tile_dependency import _dense_linear_overlap_relation
 from helion._compiler.tile_dependency import _dense_mixed_radix_converse
 from helion._compiler.tile_dependency import _layout_is_injective
 from helion._compiler.tile_dependency import _logical_expression_bounds
+from helion._compiler.tile_dependency import (
+    _piecewise_single_source_mixed_radix_converse,
+)
+from helion._compiler.tile_dependency import (
+    _piecewise_source_grouped_mixed_radix_converse,
+)
 from helion._compiler.tile_dependency import _relation_source_cells
 from helion._compiler.tile_dependency import _simplify_logical_expression
 from helion._compiler.tile_dependency import _symbolic_linear_access_relation
@@ -598,6 +604,130 @@ class TestTileDependency(TestCase):
         # box would make the inverse multi-valued, so this specialized proof
         # must decline it.
         self.assertIsNone(relation(0).converse())
+
+    def test_mixed_radix_stride_inference_handles_reordered_digits(self) -> None:
+        ordinal = coordinate_axis_symbol(10)
+        source = CoordinateDomain((10,), ((10, 256),), kind="task_order")
+        target = CoordinateDomain(
+            tuple(range(20, 28)),
+            tuple((axis, 2) for axis in range(20, 28)),
+            kind="site",
+        )
+        reordered = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (
+                    ((10, 0, 256, 1),),
+                    (
+                        sympy.floor(ordinal / 128),
+                        sympy.Mod(sympy.floor(ordinal / 64), 2),
+                        sympy.Mod(sympy.floor(ordinal / 32), 2),
+                        sympy.Mod(sympy.floor(ordinal / 16), 2),
+                        sympy.Mod(sympy.floor(ordinal / 8), 2),
+                        sympy.Mod(sympy.floor(ordinal / 4), 2),
+                        sympy.Mod(sympy.floor(ordinal / 2), 2),
+                        sympy.Mod(ordinal, 2),
+                    ),
+                ),
+            ),
+        )
+
+        inner = coordinate_axis_symbol(10)
+        outer = coordinate_axis_symbol(11)
+        grouped_source = CoordinateDomain(
+            (10, 11),
+            ((10, 6), (11, 4)),
+            kind="task_order",
+        )
+        grouped_target = CoordinateDomain(
+            (20, 21, 22, 23),
+            ((20, 3), (21, 2), (22, 2), (23, 2)),
+            kind="site",
+        )
+        grouped = CoordinateRelation.point_map(
+            grouped_source,
+            grouped_target,
+            (
+                (
+                    ((10, 0, 6, 1), (11, 0, 4, 1)),
+                    (
+                        sympy.floor(inner / 2),
+                        sympy.Mod(inner, 2),
+                        sympy.floor(outer / 2),
+                        sympy.Mod(outer, 2),
+                    ),
+                ),
+            ),
+        )
+
+        with mock.patch.object(
+            itertools,
+            "permutations",
+            side_effect=AssertionError("mixed-radix proof must not search orders"),
+        ):
+            converses = (
+                _piecewise_single_source_mixed_radix_converse(reordered),
+                _piecewise_source_grouped_mixed_radix_converse(grouped),
+            )
+        for relation, converse in zip(
+            (reordered, grouped),
+            converses,
+            strict=True,
+        ):
+            self.assertIsNotNone(converse)
+            assert converse is not None
+            expected: list[set[int]] = [
+                set() for _ in range(relation.target_domain.size)
+            ]
+            for source_index, target_indices in enumerate(relation.materialize()):
+                for target_index in target_indices:
+                    expected[target_index].add(source_index)
+            self.assertEqual(
+                converse.materialize(),
+                tuple(frozenset(indices) for indices in expected),
+            )
+
+    def test_mixed_radix_stride_inference_declines_invalid_chains(self) -> None:
+        ordinal = coordinate_axis_symbol(10)
+
+        def relation(
+            source_count: int,
+            target_counts: tuple[int, int],
+            expressions: tuple[sympy.Expr, sympy.Expr],
+        ) -> CoordinateRelation:
+            return CoordinateRelation.point_map(
+                CoordinateDomain(
+                    (10,),
+                    ((10, source_count),),
+                    kind="task_order",
+                ),
+                CoordinateDomain(
+                    (20, 21),
+                    tuple(zip((20, 21), target_counts, strict=True)),
+                    kind="site",
+                ),
+                ((((10, 0, source_count, 1),), expressions),),
+            )
+
+        ambiguous = relation(
+            4,
+            (2, 2),
+            (sympy.Mod(ordinal, 2), sympy.Mod(ordinal, 2)),
+        )
+        non_mixed_radix = relation(
+            6,
+            (2, 3),
+            (sympy.Mod(ordinal + 1, 2), sympy.floor(ordinal / 2)),
+        )
+        for malformed in (ambiguous, non_mixed_radix):
+            with self.subTest(relation=malformed):
+                self.assertIsNone(
+                    _piecewise_single_source_mixed_radix_converse(malformed)
+                )
+                self.assertIsNone(
+                    _piecewise_source_grouped_mixed_radix_converse(malformed)
+                )
 
     def test_woven_mixed_radix_converse_is_exact_and_symbolic(self) -> None:
         ordinal = coordinate_axis_symbol(10)
