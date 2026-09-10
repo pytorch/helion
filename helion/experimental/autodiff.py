@@ -87,9 +87,6 @@ class GraphAnalyzer:
         kernel_input_names: list[str] | None = None,
     ) -> None:
         self.forward_graph = forward_graph
-        # Device the kernel is compiled for.  Used whenever a synthesized
-        # helper tensor (unit carry, dummy ys, materialized ``aten.full``)
-        # cannot recover a device from a node's ``meta["val"]``.
         self.device = device
         self.scalar_values = scalar_values or {}
         # Aligns compute-graph outputs with grad_outs (return-order).
