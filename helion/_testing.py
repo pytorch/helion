@@ -227,6 +227,11 @@ def is_cuda() -> bool:
     return _get_triton_backend() == "cuda" and torch.cuda.is_available()
 
 
+def is_xpu() -> bool:
+    """Return True if running on XPU (Intel GPU)."""
+    return _get_triton_backend() == "xpu" and torch.xpu.is_available()
+
+
 PROJECT_ROOT: Path = Path(__file__).parent.parent
 EXAMPLES_DIR: Path = PROJECT_ROOT / "examples"
 PRETUNED_KERNELS_DIR: Path = PROJECT_ROOT / "pretuned_kernels"
@@ -515,7 +520,9 @@ def onlyBackends(
 def skipUnlessTensorDescriptor(reason: str) -> Callable[[Callable], Callable]:
     """Skip test unless tensor descriptors are supported."""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
-    return skipIfFn(lambda: not supports_tensor_descriptor(), reason)
+    return skipIfFn(
+        lambda: not (is_cuda() or is_xpu()) or not supports_tensor_descriptor(), reason
+    )
 
 
 def skipUnlessTf32Supported(
