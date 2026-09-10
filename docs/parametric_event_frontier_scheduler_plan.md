@@ -97,7 +97,7 @@ cross-workload exit gates below.
 
 ### Current implementation marker: close the symbolic proof layer
 
-Commits through `c906defd` are the current compiler checkpoint. The existing immutable
+Commits through `5c36fed9` are the current compiler checkpoint. The existing immutable
 `CoordinateRelation` remains the only schedule/dependency truth. It now retains
 derived exact converses through proved construction and transformation,
 represents ragged grouped L2 order with one forward piece and a two-piece
@@ -171,6 +171,19 @@ and tests forbid concretizing those runtime axes. In other words, bijectivity
 is proved once as relation provenance rather than rediscovered independently
 by the scheduler and code generator.
 
+The first post-placement nested-frontier derivation is also implemented. It
+factors only outer axes whose removal and lift-back reproduce the original
+readiness relation exactly, maximizes any retained fibers with the existing
+relation extremum, and takes the exact preimage of waves strictly before the
+consumer's admission wave. It accepts only one contiguous prefix. The
+Qwen-shaped proof derives `(0, 74, 96)` without materialization or endpoint
+sampling and takes about 0.60 seconds cold and 0.29 seconds warm independent of
+the nested extent. Independent brute-force and randomized review found exact
+agreement and conservative decline. This is not yet all of Phase 4A.4: the
+current caller still supplies one scalar consumer wave, and the concrete
+monotone binary search remains only as a migration fallback until symbolic
+task-varying admission reaches parity.
+
 The common list-schedule acceptance gate now derives exact per-root task mass
 and makespan horizon from authoritative schedule relations. A minimum-wave
 capacity proof handles runtime-empty packed schedules; nonminimal schedules use
@@ -187,7 +200,7 @@ those facts once and codegen renders them. Independent review found one
 production construction path and no serialization path that could bypass this
 validation; any future plan serialization must add validated restoration.
 The integrated tile-dependency and scheduler suites at this checkpoint pass
-276 tests with 110 subtests.
+281 tests with 119 subtests.
 
 A proposed shortcut that routed the old equal-width repeated recurrence through
 the common list-scheduler entry was reviewed and rejected; it is not part of
