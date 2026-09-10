@@ -2013,7 +2013,7 @@ class _WorkerScheduleChronologyError(ValueError):
 def _validate_normalized_worker_schedule(
     worker_count: int,
     segments: tuple[WorkerScheduleSegment, ...],
-) -> tuple[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr], ...] | None:
+) -> None:
     """Prove exact ownership from the authoritative schedule relations."""
     if not segments:
         return None
@@ -2067,10 +2067,6 @@ def _validate_normalized_worker_schedule(
                 raise ValueError("worker schedule root relation exceeds proof budget")
         if not combined.is_bijection_from_source_support():
             raise ValueError("worker schedule does not own each logical task once")
-    return _parametric_root_major_schedule_geometry_from_parts(
-        worker_count,
-        segments,
-    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2166,12 +2162,10 @@ class WorkerSchedule:
             for segment in input_segments
         )
         object.__setattr__(self, "segments", normalized_segments)
-        root_major_geometry = _validate_normalized_worker_schedule(
+        _validate_normalized_worker_schedule(
             self.worker_count,
             normalized_segments,
         )
-        if root_major_geometry is not None:
-            _remember_root_major_schedule_geometry(self, root_major_geometry)
 
         # The dense compatibility fields are still used by the legacy concrete
         # renderer.  Check their tuple chronology only when this instance was
@@ -3080,7 +3074,22 @@ def _build_root_major_worker_schedule(
                 dispatch_offset=0,
             )
         )
-    return WorkerSchedule(worker_count=worker_count, segments=tuple(segments))
+    worker_schedule = WorkerSchedule(
+        worker_count=worker_count,
+        segments=tuple(segments),
+    )
+    _remember_root_major_schedule_geometry(
+        worker_schedule,
+        tuple(
+            (segment, root_first_slot, segment.task_order.target_domain.size_expr)
+            for segment, root_first_slot in zip(
+                worker_schedule.segments,
+                root_first_slots,
+                strict=True,
+            )
+        ),
+    )
+    return worker_schedule
 
 
 def build_baseline_worker_schedule(

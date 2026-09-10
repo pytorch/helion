@@ -998,21 +998,28 @@ class TestExactConverseSemantics(TestCase):
         self.assertIsNotNone(crossed_right.converse())
         self.assertFalse(crossed_left.has_disjoint_source_support(crossed_right))
 
-        WorkerSchedule(
-            6,
-            (
-                WorkerScheduleSegment(0, left, 0, 4, 0),
-                WorkerScheduleSegment(1, adjacent, 4, 2, 0),
+        with mock.patch.object(
+            cross_loop_scheduler,
+            "_parametric_root_major_schedule_geometry_from_parts",
+            side_effect=AssertionError(
+                "derived geometry must not replace relation validation"
             ),
-        )
-        with self.assertRaisesRegex(ValueError, "support overlaps"):
+        ):
             WorkerSchedule(
                 6,
                 (
                     WorkerScheduleSegment(0, left, 0, 4, 0),
-                    WorkerScheduleSegment(1, overlap, 3, 2, 0),
+                    WorkerScheduleSegment(1, adjacent, 4, 2, 0),
                 ),
             )
+            with self.assertRaisesRegex(ValueError, "support overlaps"):
+                WorkerSchedule(
+                    6,
+                    (
+                        WorkerScheduleSegment(0, left, 0, 4, 0),
+                        WorkerScheduleSegment(1, overlap, 3, 2, 0),
+                    ),
+                )
 
     def test_schedule_bijection_rejects_padded_and_out_of_domain_support(
         self,

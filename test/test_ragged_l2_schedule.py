@@ -9,6 +9,7 @@ import sympy
 from torch.utils._sympy.functions import FloorDiv
 
 from helion._compiler import cross_loop_scheduler
+from helion._compiler import tile_dependency
 from helion._compiler.tile_dependency import CoordinateDomain
 from helion._compiler.tile_dependency import CoordinateRelation
 from helion._compiler.tile_dependency import coordinate_axis_symbol
@@ -114,6 +115,23 @@ def _assert_exact_bijection(
 
 
 class TestRaggedL2Schedule(TestCase):
+    def test_nested_quotient_remainder_identity_is_simplified_first(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        first = sympy.Symbol("first", integer=True, nonnegative=True)
+        second = sympy.Symbol("second", integer=True, nonnegative=True)
+        dividend = (
+            3 * batch
+            + 2 * second
+            + 6 * FloorDiv(first, 2)
+            + sympy.Mod(first, 2)
+        )
+        expression = 7 * FloorDiv(dividend, 7) + sympy.Mod(dividend, 7)
+
+        self.assertEqual(
+            tile_dependency._simplify_integer_quotients(expression),
+            tile_dependency._simplify_integer_quotients(dividend),
+        )
+
     def test_ragged_l2_dynamic_outer_matches_existing_traversal(self) -> None:
         batch = sympy.Symbol("batch", integer=True, nonnegative=True)
         domain = _domain(
@@ -240,13 +258,33 @@ class TestRaggedL2Schedule(TestCase):
                 l2_group_size=2,
             ),
         )
-        schedule = cross_loop_scheduler._build_root_major_worker_schedule(
-            (prefix, l2_domain),
-            task_orders,
-            worker_count,
-        )
+        with (
+            mock.patch.object(
+                cross_loop_scheduler,
+                "_parametric_root_major_schedule_geometry_from_parts",
+                side_effect=AssertionError(
+                    "root-major geometry must be retained after validation"
+                ),
+            ),
+            mock.patch.object(
+                tile_dependency,
+                "_ordinalized_source_supports_are_disjoint",
+                side_effect=AssertionError(
+                    "dense source intervals must prove packed disjointness"
+                ),
+            ),
+        ):
+            schedule = cross_loop_scheduler._build_root_major_worker_schedule(
+                (prefix, l2_domain),
+                task_orders,
+                worker_count,
+            )
 
         self.assertEqual(len(schedule.segments), 2)
+        self.assertIn(
+            cross_loop_scheduler._DERIVED_ROOT_MAJOR_GEOMETRY_ATTRIBUTE,
+            schedule.__dict__,
+        )
         self.assertLessEqual(len(schedule.segments[0].task_order.pieces), 3)
         self.assertLessEqual(len(schedule.segments[1].task_order.pieces), 3)
         for name, rebuilt in (

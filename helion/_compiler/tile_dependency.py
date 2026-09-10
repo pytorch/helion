@@ -4724,12 +4724,29 @@ def _dense_linear_source_support_interval(
     if lower is None or upper_inclusive is None:
         return None
     upper = sympy.simplify(upper_inclusive + 1)
+    capacity_is_sufficient = _is_provably_nonnegative(
+        sympy.simplify(active_domain_size - upper),
+        None,
+    )
+    if not capacity_is_sufficient and len(active_axes) == 2:
+        try:
+            inner_count = _concrete_integer(
+                relation.source_domain.axis_count_expressions[active_axes[0]],
+                description="linearized support inner-axis count",
+            )
+        except ValueError:
+            pass
+        else:
+            capacity_is_sufficient = _flattened_capacity_is_sufficient(
+                sympy.sympify(
+                    relation.source_domain.axis_count_expressions[active_axes[1]]
+                ),
+                inner_count,
+                upper,
+            )
     if not (
         _is_provably_nonnegative(lower, None)
-        and _is_provably_nonnegative(
-            sympy.simplify(active_domain_size - upper),
-            None,
-        )
+        and capacity_is_sufficient
         and _integer_partition_expressions_equal(
             sympy.simplify(upper - lower),
             relation.target_domain.size_expr,
@@ -6315,17 +6332,97 @@ def _static_quotient_difference(
     return base, denominator, offset
 
 
+def _exact_quotient_remainder_replacement(
+    expression: sympy.Expr,
+    *,
+    structural: bool,
+) -> sympy.Expr | None:
+    """Collapse one exact ``d * (x // d) + x % d`` pair in an addition."""
+    if expression.func != sympy.Add:
+        return None
+    terms = expression.args
+    for modulo_index, term in enumerate(terms):
+        modulo_coefficient, modulo = term.as_coeff_Mul()
+        if not isinstance(modulo, sympy.Mod) or len(modulo.args) != 2:
+            continue
+        dividend, modulus = modulo.args
+        if (
+            modulo_coefficient.is_number is not True
+            or dividend.is_integer is not True  # pyrefly: ignore[missing-attribute]
+            or modulus.free_symbols
+            or modulus.is_integer is not True  # pyrefly: ignore[missing-attribute]
+            or int(modulus) <= 0  # pyrefly: ignore[bad-argument-type]
+        ):
+            continue
+        quotient_match = next(
+            (
+                (index, quotient_numerator)
+                for index, candidate in enumerate(terms)
+                if index != modulo_index
+                for candidate_coefficient, candidate_primitive in (
+                    candidate.as_coeff_Mul(),
+                )
+                if (
+                    quotient := _static_integer_quotient(
+                        cast("sympy.Expr", candidate_primitive)
+                    )
+                )
+                is not None
+                for quotient_numerator, quotient_denominator in (quotient,)
+                if quotient_denominator == int(modulus)
+                and (
+                    candidate_coefficient == modulo_coefficient * modulus
+                    if structural
+                    else sympy.simplify(
+                        candidate_coefficient - modulo_coefficient * modulus
+                    )
+                    == 0
+                )
+                and (
+                    quotient_numerator == dividend
+                    if structural
+                    else sympy.simplify(
+                        sympy.Mod(quotient_numerator, modulus) - modulo
+                    )
+                    == 0
+                )
+            ),
+            None,
+        )
+        if quotient_match is None:
+            continue
+        quotient_index, quotient_numerator = quotient_match
+        return sympy.Add(
+            *(
+                candidate
+                for index, candidate in enumerate(terms)
+                if index not in (modulo_index, quotient_index)
+            ),
+            modulo_coefficient * quotient_numerator,
+        )
+    return None
+
+
 def _simplify_integer_quotients(expression: sympy.Expr) -> sympy.Expr:
     """Canonicalize exact integer quotient/remainder identities."""
+    result = sympy.sympify(expression)
+    while (
+        collapsed := _exact_quotient_remainder_replacement(
+            result,
+            structural=True,
+        )
+    ) is not None:
+        result = collapsed
+
     replacements = {
         node: sympy.floor(numerator / denominator)  # pyrefly: ignore[bad-argument-type, unsupported-operation]
-        for node in sympy.preorder_traversal(expression)
+        for node in sympy.preorder_traversal(result)
         if (quotient := _static_integer_quotient(cast("sympy.Expr", node)))
         is not None
         for numerator, denominator in (quotient,)
         if node.func == FloorDiv
     }
-    result = sympy.simplify(expression.xreplace(replacements))
+    result = sympy.simplify(result.xreplace(replacements))
     exact_differences = {
         node: sympy.Integer(1)
         for node in sympy.preorder_traversal(result)
@@ -6383,57 +6480,10 @@ def _simplify_integer_quotients(expression: sympy.Expr) -> sympy.Expr:
         if replacement is not None:
             result = sympy.simplify(replacement)
             continue
-        for modulo_index, term in enumerate(terms):
-            modulo_coefficient, modulo = term.as_coeff_Mul()
-            if not isinstance(modulo, sympy.Mod) or len(modulo.args) != 2:
-                continue
-            dividend, modulus = modulo.args
-            if (
-                modulo_coefficient.is_number is not True
-                or dividend.is_integer is not True  # pyrefly: ignore[missing-attribute]
-                or modulus.free_symbols
-                or modulus.is_integer is not True  # pyrefly: ignore[missing-attribute]
-                or int(modulus) <= 0  # pyrefly: ignore[bad-argument-type]
-            ):
-                continue
-            quotient_match = next(
-                (
-                    (index, quotient_numerator)
-                    for index, candidate in enumerate(terms)
-                    if index != modulo_index
-                    for candidate_coefficient, candidate_primitive in (
-                        candidate.as_coeff_Mul(),
-                    )
-                    if (
-                        quotient := _static_integer_quotient(
-                            cast("sympy.Expr", candidate_primitive)
-                        )
-                    )
-                    is not None
-                    for quotient_numerator, quotient_denominator in (quotient,)
-                    if quotient_denominator == int(modulus)
-                    and sympy.simplify(
-                        candidate_coefficient - modulo_coefficient * modulus
-                    )
-                    == 0
-                    and sympy.simplify(
-                        sympy.Mod(quotient_numerator, modulus) - modulo
-                    )
-                    == 0
-                ),
-                None,
-            )
-            if quotient_match is not None:
-                quotient_index, quotient_numerator = quotient_match
-                replacement = sympy.Add(
-                    *(
-                        candidate
-                        for index, candidate in enumerate(terms)
-                        if index not in (modulo_index, quotient_index)
-                    ),
-                    modulo_coefficient * quotient_numerator,
-                )
-                break
+        replacement = _exact_quotient_remainder_replacement(
+            result,
+            structural=False,
+        )
         if replacement is None:
             break
         result = sympy.simplify(replacement)
