@@ -5411,37 +5411,39 @@ def derive_final_arrival_continuations(
             )
         ):
             continue
-        if any(
-            not _supports_readiness_counter_lowering(readiness_producer)
-            for readiness_producer in event.producers
-        ):
+        lowering_relations = _counter_lowering_relations(event)
+        if lowering_relations is None:
             continue
+        lowered_producers, lowered_consumers = lowering_relations
         consumer_index = 0
-        readiness_consumer = event.consumers[consumer_index]
+        (readiness_consumer,) = lowered_consumers
         if readiness_consumer.consumer_site_id is not None:
             continue
-        fan_in = _uniform_arrival_count(event.producers)
-        if fan_in is None or fan_in <= 0:
+        candidate_plan = ReadinessCounterPlan(
+            producers=lowered_producers,
+            consumers=(readiness_consumer,),
+            continuation_consumer_index=consumer_index,
+        )
+        if not _supports_exact_counter_plan_lowering(
+            candidate_plan,
+            readiness_graph.root_domains,
+        ):
             continue
-        converse_consumer = readiness_consumer.keys_by_consumer.converse()
-        if (
-            not readiness_consumer.covered_obligations.issuperset(
-                required_obligations_by_root.get(readiness_consumer.consumer_root, ())
-            )
-            or not readiness_consumer.keys_by_consumer.is_total_function()
-            or converse_consumer is None
-            or not converse_consumer.is_total_function()
+        if not readiness_consumer.covered_obligations.issuperset(
+            required_obligations_by_root.get(readiness_consumer.consumer_root, ())
         ):
             continue
         producer_relations = _merge_relations_by_root(
             tuple(
-                (readiness_producer.producer_root, publication)
-                for readiness_producer in event.producers
-                if (publication := readiness_producer.keys_by_producer) is not None
+                (
+                    readiness_producer.producer_root,
+                    cast("CoordinateRelation", readiness_producer.keys_by_producer),
+                )
+                for readiness_producer in lowered_producers
             )
         )
         if producer_relations is None or len(producer_relations) != len(
-            {item.producer_root for item in event.producers}
+            {item.producer_root for item in lowered_producers}
         ):
             continue
 

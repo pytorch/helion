@@ -6490,6 +6490,115 @@ class TestCrossLoopScheduler(TestCase):
         )
         self.assertEqual(choose_readiness_counters(readiness_graph, ()), ())
 
+    def test_final_arrival_candidates_use_lowered_event_relations(self) -> None:
+        producer_domain = _domain((10, 2), identity=0)
+        readiness_key_domain = _domain((0, 4), kind="event", identity=0)
+        readiness_key = coordinate_axis_symbol(0)
+        producer = ReadinessProducer(
+            producer_root=0,
+            producers_by_key=_full_point_map(
+                readiness_key_domain,
+                producer_domain,
+                sympy.floor(readiness_key / 2),
+            ),
+        )
+        obligation = (0, None, None)
+
+        self.assertFalse(
+            cross_loop_scheduler._supports_readiness_counter_lowering(producer)
+        )
+        for consumer_count, expected_candidate in ((2, True), (4, False)):
+            with self.subTest(consumer_count=consumer_count):
+                consumer_domain = _domain((20, consumer_count), identity=1)
+                consumer = ReadinessConsumer(
+                    consumer_root=1,
+                    keys_by_consumer=(
+                        CoordinateRelation(
+                            consumer_domain,
+                            readiness_key_domain,
+                            (
+                                _CoordinateRelationPiece(
+                                    ((20, 0, 2, 1),),
+                                    (
+                                        (
+                                            0,
+                                            2 * coordinate_axis_symbol(20),
+                                            2 * coordinate_axis_symbol(20) + 1,
+                                            1,
+                                        ),
+                                    ),
+                                ),
+                                _CoordinateRelationPiece(
+                                    ((20, 0, 2, 1),),
+                                    (
+                                        (
+                                            0,
+                                            2 * coordinate_axis_symbol(20) + 1,
+                                            2 * coordinate_axis_symbol(20) + 2,
+                                            1,
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        )
+                        if consumer_count == 2
+                        else _full_point_map(
+                            consumer_domain,
+                            readiness_key_domain,
+                            coordinate_axis_symbol(20),
+                        )
+                    ),
+                    covered_obligations=frozenset((obligation,)),
+                )
+                semantic_converse = consumer.keys_by_consumer.converse()
+                semantic_is_bijection = (
+                    consumer.keys_by_consumer.is_total_function()
+                    and semantic_converse is not None
+                    and semantic_converse.is_total_function()
+                )
+                self.assertNotEqual(semantic_is_bijection, expected_candidate)
+
+                event = ReadinessEvent((producer,), (consumer,))
+                lowering_relations = cross_loop_scheduler._counter_lowering_relations(
+                    event
+                )
+                self.assertIsNotNone(lowering_relations)
+                assert lowering_relations is not None
+                lowered_producers, lowered_consumers = lowering_relations
+                (lowered_consumer,) = lowered_consumers
+                lowered_converse = lowered_consumer.keys_by_consumer.converse()
+                self.assertEqual(
+                    lowered_consumer.keys_by_consumer.is_total_function()
+                    and lowered_converse is not None
+                    and lowered_converse.is_total_function(),
+                    expected_candidate,
+                )
+                candidate_plan = ReadinessCounterPlan(
+                    producers=lowered_producers,
+                    consumers=lowered_consumers,
+                    continuation_consumer_index=0,
+                )
+                readiness_graph = _readiness_graph(
+                    (producer_domain, consumer_domain),
+                    event,
+                )
+
+                self.assertEqual(
+                    cross_loop_scheduler._supports_exact_counter_plan_lowering(
+                        candidate_plan,
+                        readiness_graph.root_domains,
+                    ),
+                    expected_candidate,
+                )
+                self.assertEqual(
+                    derive_final_arrival_continuations(readiness_graph),
+                    (
+                        (FinalArrivalContinuation(event_id=0, consumer_index=0),)
+                        if expected_candidate
+                        else ()
+                    ),
+                )
+
     def test_final_arrival_root_event_must_cover_nested_obligations(self) -> None:
         producer_domain = _domain((10, 4), identity=0)
         consumer_domain = _domain((20, 2), identity=1)
