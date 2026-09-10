@@ -125,7 +125,18 @@ jobs:
             # Default to nightly
             # On OSDC, route nightly through the pypi-cache /whl proxy (deps stay reachable behind the egress firewall) and clear the cache index vars so it wins over the cache default; off OSDC PYPI_CACHE_WHL_URL is unset so we hit download.pytorch.org.
             PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
-            UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U --pre torch --index-url "${PYTORCH_INDEX%/whl/*}/whl/nightly/${{ matrix.runtime-version }}"
+            NIGHTLY_INDEX="${PYTORCH_INDEX%/whl/*}/whl/nightly/${{ matrix.runtime-version }}"
+            UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U --pre torch --index-url "$NIGHTLY_INDEX"
+            if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
+              # Current NVSHMEM wheels no longer contain libnvshmem_device.bc, which
+              # PyTorch's Triton API still requires. Keep Torch's ABI-matched host
+              # library and install only the older wheel's device bitcode separately.
+              NVSHMEM_DEVICE_ROOT="$RUNNER_TEMP/nvshmem-device"
+              UV_DEFAULT_INDEX= UV_INDEX= uv pip install --target "$NVSHMEM_DEVICE_ROOT" --no-deps nvidia-nvshmem-cu13==3.4.5 --index-url "$NIGHTLY_INDEX"
+              export NVSHMEM_LIB_DIR="$NVSHMEM_DEVICE_ROOT/nvidia/nvshmem/lib"
+              echo "NVSHMEM_LIB_DIR=$NVSHMEM_LIB_DIR" >> "$GITHUB_ENV"
+              python -c "from torch.distributed._symmetric_memory._nvshmem_triton import NvshmemLibFinder; print(f'NVSHMEM device library: {NvshmemLibFinder.find_device_library()}')"
+            fi
           fi
 
       - name: Install PyTorch (CPU nightly, pinned for TorchTPU)
