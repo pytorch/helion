@@ -133,8 +133,8 @@ jobs:
               # library and install only the older wheel's device bitcode separately.
               NVSHMEM_DEVICE_ROOT="$RUNNER_TEMP/nvshmem-device"
               UV_DEFAULT_INDEX= UV_INDEX= uv pip install --target "$NVSHMEM_DEVICE_ROOT" --no-deps nvidia-nvshmem-cu13==3.4.5 --index-url "$NIGHTLY_INDEX"
-              export NVSHMEM_LIB_DIR="$NVSHMEM_DEVICE_ROOT/nvidia/nvshmem/lib"
-              echo "NVSHMEM_LIB_DIR=$NVSHMEM_LIB_DIR" >> "$GITHUB_ENV"
+              NVSHMEM_LIB_DIR="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')/nvidia/nvshmem/lib"
+              cp "$NVSHMEM_DEVICE_ROOT/nvidia/nvshmem/lib/libnvshmem_device.bc" "$NVSHMEM_LIB_DIR/"
               python -c "from torch.distributed._symmetric_memory._nvshmem_triton import NvshmemLibFinder; print(f'NVSHMEM device library: {NvshmemLibFinder.find_device_library()}')"
             fi
           fi
