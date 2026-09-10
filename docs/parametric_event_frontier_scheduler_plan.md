@@ -97,7 +97,7 @@ cross-workload exit gates below.
 
 ### Current implementation marker: close the symbolic proof layer
 
-Commits through `977adfc8` are the current compiler checkpoint. The existing immutable
+Commits through `c906defd` are the current compiler checkpoint. The existing immutable
 `CoordinateRelation` remains the only schedule/dependency truth. It now retains
 derived exact converses through proved construction and transformation,
 represents ragged grouped L2 order with one forward piece and a two-piece
@@ -161,6 +161,34 @@ Independent review signs off on these proof primitives after adversarial
 correlated-expression, runtime-zero, wrapping-modulo, and positive-stride
 checks. The current full tile suite passes 136 tests with 57 subtests.
 
+Schedule-derived nested counter partitions now retain their exact inverse at
+the point where full coverage, ordered positive segments, and symbolic endpoint
+identities are proved. Existing generic converses remain canonical whenever
+they are representable; the retained partition proof is used only for an
+individual producer arm whose ordinary converse declines. This preserves the
+historical concrete 3/1 normalization while allowing symbolic outer B/Q axes,
+and tests forbid concretizing those runtime axes. In other words, bijectivity
+is proved once as relation provenance rather than rediscovered independently
+by the scheduler and code generator.
+
+The common list-schedule acceptance gate now derives exact per-root task mass
+and makespan horizon from authoritative schedule relations. A minimum-wave
+capacity proof handles runtime-empty packed schedules; nonminimal schedules use
+the ordinary placement/frontier relation and decline if an exact maximum is
+not representable. Exact ties accept the candidate, an unproved comparison
+retains the resident schedule, and no recurrence-specific bypass remains.
+Independent review confirmed that candidate coverage validation precedes this
+cardinality comparison and that sparse/trailing-wave cases match the concrete
+oracle.
+
+Code generation also no longer reruns counter legality or continuation
+ownership checks after `StaticPipelinePlan` construction. The plan validates
+those facts once and codegen renders them. Independent review found one
+production construction path and no serialization path that could bypass this
+validation; any future plan serialization must add validated restoration.
+The integrated tile-dependency and scheduler suites at this checkpoint pass
+276 tests with 110 subtests.
+
 A proposed shortcut that routed the old equal-width repeated recurrence through
 the common list-scheduler entry was reviewed and rejected; it is not part of
 this branch. For `L=3`, `W=4`, and `N=5`, that recurrence occupies
@@ -170,9 +198,23 @@ comparison merely because its relation has a compact rendering. The review
 also showed that schedule geometry alone can falsely classify independent or
 root-barrier roots as a recurrence. Any retained recurrence rendering must be
 certified from both the final schedule relation and its actual readiness plans.
-The next scheduler prerequisite is a symbolic, relation-based no-regression
-comparison, followed by a tail-packed event-frontier proposal—not another
-parameter-specific recurrence entry point.
+The symbolic, relation-based no-regression comparison is now complete. The
+current implementation marker is the tail-packed symbolic event-frontier
+proposal—not another parameter-specific recurrence entry point—followed by
+removal of the remaining parameter-only action filters.
+
+The latest architecture review narrows that first proposal deliberately. It
+may preserve full translated fan-in-one producer/consumer cohorts and pack
+only their incomplete tails when the `ReadinessGraph` proves one common
+positional key relation. It must run for constants and parameters, validate
+same-wave progress, and decline barriers, nested waits, forks/joins, and wider
+fan-in. In particular, it must not turn the F64/C16 MLA relation into the
+known-slow key-major stream; equal unit-wave horizon is not evidence that two
+dense schedules have equal body performance. This slice is a prerequisite,
+not policy unification. The merge order is: tail packing, post-placement
+nested quotient, joint continuation/resident choice, source-ticket action,
+single finalization/validation, and only then deletion of the top-level
+constant/parameterized branch.
 
 Then continue Phase 4A.2 by replacing the remaining parameter-only admission
 filters with one exact action-legality decision, followed by the single joint
