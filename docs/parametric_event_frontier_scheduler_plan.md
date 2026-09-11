@@ -112,6 +112,72 @@ Architecture decision (2026-09-10):
   host-generated schedules, runtime instruction tensors, and device work
   queues are not prerequisites.
 
+Architecture pivot (2026-09-11, reviewed):
+
+- Scheduling policy and affine compression are now strictly separate. There
+  is one deterministic list-policy transition:
+
+  ```text
+  action = choose_next_action(static_context, state)
+  next_state = apply_action(static_context, state, action)
+  ```
+
+  These are local implementation functions over existing roots,
+  `ReadinessGraph`, `CoordinateRelation`, and `WorkerSchedule`; they are not
+  new compiler objects or retained IR.
+- An uncommitted aligned-repeat experiment proved that a compact rectangular
+  worker relation can encode repeated cohort decisions, but its scheduler
+  side is rejected. It recognized one multi-producer event, ran a private
+  candidate scan, reconstructed priority bounds, and returned early through a
+  special schedule builder. It demonstrated the relation encoding and exposed
+  useful counterexamples, but it did not prove equivalence to the ordinary
+  chooser. Retaining it would create a second policy whose complexity grows
+  with every new motif. The motif descriptor, private selector, hand-written
+  invariant priority, and motif-specific repacker must not be retained.
+- Affine lifting is only a compression proof over the ordinary transition.
+  For an exact affine translation `T_k`, it must prove semantically, not by raw
+  expression spelling:
+
+  ```text
+  choose_next_action(T_k(state)) == T_k(action)
+  apply_action(T_k(state), T_k(action)) == T_k(next_state)
+  ```
+
+  The proof includes every input observed by the chooser and every outside
+  competitor. The affine layer may neither rediscover readiness nor reproduce
+  the priority tuple.
+- Dynamic state is ephemeral and contains only root/cohort cursors, exact
+  assigned-prefix depth partitions, emitted slot mass, active key/frontier
+  relations, any pending released cohorts used by the selected policy, and an
+  in-progress committed-run endpoint. Wave, lane phase, fit, and canonical
+  rejoin are derived from that state. Static topology, configured orders,
+  semantic cohorts, worker count, depth limit, and proof budgets remain shared
+  immutable inputs. Proof-budget counters are not state because proof history
+  must never change a scheduling decision.
+- The ordinary chooser must support the next exact cohort of a partially
+  emitted root. The current shortcuts that immediately append a partial
+  root's suffix or coalesce a whole root before ranking are transitional;
+  coalescing becomes a post-choice period-one affine compression.
+- Priority simplification is deliberately decoupled from this refactor. The
+  initially unified chooser retains the fields needed to reproduce the frozen
+  FlashMLA B9, Nemotron, and DeepSeek-V3 schedule traces. Candidate-lookahead
+  removal, causal-frontier generations, and simpler closure/continuation-only
+  priorities are ablations of that one chooser, not alternate schedulers or
+  production knobs. This separation lets the compiler delete motif special
+  cases without guessing away measured performance.
+- Review found a real cross-workload tension. Globally draining the oldest
+  causal generation prepares both MoE branches, but can delay a zero-slack
+  chain behind a wide slack sibling. Criticality-first avoids that synthetic
+  failure but can descend the routed MoE branch before preparing shared work.
+  No fixed generation-versus-criticality ordering is therefore promoted to a
+  semantic rule without frozen-graph and GPU ablation. The existing
+  `cross_loop_pipeline_depth` remains an eligibility bound and must not be
+  reinterpreted as a hidden priority selector.
+- `WorkerScheduleSegment.task_order` remains the only emitted schedule truth.
+  Codegen may use proved dense or affine loop bounds as strength reductions,
+  but must evaluate the authoritative relation and must not classify a
+  schedule into a second semantic path.
+
 ## Active implementation checklist
 
 This is the authoritative next roadmap. Later historical phase descriptions
@@ -128,27 +194,81 @@ task in those records is not active work.
 - [ ] Remove the abandoned symbolic max-plus evaluator tasks and production
   hooks. Retain the concrete oracle only in tests and retain generic relation
   operations only where another correctness proof consumes them.
-- [ ] Derive one finite root/event priority table directly from the existing
-  `ReadinessGraph`: least unit-weight slack, greatest structural depth, best
-  released-consumer class, event closure, active-cohort continuation,
-  launch-stage order, and canonical root/cohort order. No priority component
-  may contain a runtime extent or symbolic remaining-work comparison.
-- [ ] Derive exact readiness-equivalent cohorts and maximal candidate runs from
-  the existing `CoordinateRelation`s. A per-wave candidate/emission interval
-  ends at the ready prefix, event-key boundary, relation-piece boundary,
-  worker-wave capacity, or root end. Selecting an eligible whole cohort commits
-  its complete run; that run may span several emission intervals without
-  reranking or interleaving. Do not invent a smaller cohort to fill a lane
-  tail.
-- [ ] Build the deterministic list policy over maximal affine cohort runs.
-  Correctness and proof-budget checks are hard constraints; how far otherwise
-  legal ready work may move ahead of canonical order is controlled only by the
-  cross-loop pipeline-stage knob below, not by a growing collection of
-  profitability rules.
-- [ ] Lift guard-uniform repeated decisions by affine translation induction and
-  emit them directly as existing `WorkerScheduleSegment.task_order` relation
-  pieces. Use bounded prefix/full-group/tail pieces; add no Run, Repeat,
-  Region, instruction-stream, or schedule-program abstraction.
+- [ ] Remove the uncommitted motif-specific affine experiment before building
+  on it: delete `_aligned_affine_repeat_task_order_relation`,
+  `_repack_aligned_affine_repeat_schedule`, `_bounded_relation_schedule_geometry`,
+  `aligned_repeat_descriptor`, `try_aligned_affine_repeat`,
+  `eligible_priority_records`, `invariant_priority_bound`, and their
+  schedule-classifying codegen path. Retain only generic relation/proof
+  improvements that have an independent consumer and pass their original
+  tests.
+- [ ] Factor exactly one local `choose_next_action(static_context, state)` from
+  the existing finite walk. It must evaluate the canonical action and every
+  competitor through the same readiness, fit, non-displacement, depth,
+  priority, unknown-fact, and tie rules. There is no affine, concrete,
+  parameterized, local, or workload-specific selector beside it. The function
+  is pure: it may not mutate cursors or caches, and cumulative proof work may
+  not affect its result.
+- [ ] Factor one local `apply_action(static_context, state, action)` that
+  advances the exact root cursor/depth partition and emitted slot mass,
+  derives exact claimed publications and frontier changes from
+  `ReadinessGraph`, and records the committed run. Runtime completion remains
+  counter-authoritative. No unselected candidate's hypothetical successor
+  state is installed.
+- [ ] Generalize the existing first-cohort helpers to derive the exact cohort
+  at the current symbolic cursor. A partial root re-enters
+  `choose_next_action`; it is never silently converted to its complete suffix.
+  Derive exact readiness-equivalent cohorts and action boundaries from the
+  existing `CoordinateRelation`s. Every current-cursor admission and closure
+  view must agree; an unresolved view vetoes the optimized choice. Do not
+  invent a smaller cohort to fill a lane tail.
+- [ ] In tests only, run the unified chooser without compression on bounded
+  concrete substitutions. This is the policy oracle for affine lifting and
+  must recover the intended A0/B0 event behavior without introducing a
+  production constant/symbolic split. A whole-root action is ordinary only
+  when its next exact cohort is already the whole root; otherwise combining
+  repeated sub-root actions is post-choice compression.
+- [ ] Detect a positive affine translation only after ordinary transitions
+  have been selected. Prove complete normalized-state equivariance, including
+  all outside competitors, active/pending frontiers, lane phase, causal depth,
+  relation-piece position, and exact canonical-rejoin state. Invoke the same
+  chooser on the translated state; never reconstruct its priority in the
+  induction proof. Invoke the chooser only between complete committed actions;
+  otherwise the committed root and endpoint are part of the translated state.
+- [ ] Compress proved repetitions directly into existing
+  `WorkerScheduleSegment.task_order` relations using bounded
+  prefix/full-repeat/tail pieces. The pure relation encoder receives selected
+  actions, the selected roots' authoritative task-order relations, and affine
+  deltas only; it may not branch on root identity, topology, events, model, or
+  priority. Add no Run, Repeat, Region, instruction-stream, or schedule-program
+  abstraction.
+- [ ] Render every accepted relation from `WorkerScheduleSegment.task_order`.
+  Dense and affine loop-bound recognizers are optional codegen strength
+  reductions over that same relation, never schedule validation or policy.
+  Prove same-worker chronology before codegen and execute each mapped task
+  exactly once.
+- [ ] Keep the current specified priority fields in the first unified chooser,
+  verify its frozen schedule traces, then
+  ablate it behind the same function in this order: canonical only; exact
+  active completion/continuation; actual released-frontier handling; causal
+  generation; static criticality; and the full current tuple. These are
+  compiler experiments, not user-visible or autotuned knobs. Remove a field
+  only after frozen graph traces and GPU measurements show that FlashMLA B9,
+  Nemotron, and DeepSeek-V3 retain their wins and the critical-chain control
+  does not regress.
+- [ ] Differentially compare each compressed relation with repeated
+  uncompressed `choose`/`apply` execution and the complete final state after
+  bounded substitution, including `{0, 1, W-1, W, W+1}` where legal. If a
+  symbolic repetition cannot continue without enumerating its runtime count,
+  discard the proposal and retain `C`.
+- [ ] Preflight proof work from roots, events, ranks, and relation pieces.
+  Per-call budgets are immutable inputs rather than cumulative state, so two
+  semantically equal scheduler states cannot choose differently because one
+  was reached after more proof attempts.
+- [ ] Audit every new dense-support certificate before retaining it. In
+  particular, `_packed_root_major_task_order_relation` may memoize a dense
+  interval only after proving total source support, exact cardinality, and the
+  exact converse—not merely a bijection from its represented support.
 - [ ] Make canonical packed root-major behavior the conservative outcome of
   the same scheduler. An unresolved priority tie uses canonical order; unknown
   readiness, ownership, or progress rejects the optimized proposal.
@@ -178,7 +298,8 @@ task in those records is not active work.
   after B4/B9 parity is demonstrated.
 - [ ] Run substitution and bounded concrete-oracle tests before GPU work. Proof
   and construction time must scale with roots, events, relation pieces, and a
-  finite motif, never with `B`, `Q`, task count, worker count, or wave count.
+  finite control schema, never with `B`, `Q`, task count, worker count, or wave
+  count.
 - [ ] Roll out GPU validation in this order: FlashMLA; Qwen; Gemma; Muse;
   Nemotron; DeepSeek-V3. Require numerical parity, one-cubin reuse where
   declared, cold-L2 controls, resource reports, and Gantts at each step.
@@ -1216,13 +1337,17 @@ are extensionally identical. A narrower constant guard may prove an ownership
 choice that cannot be made uniformly over a broader polymorphic guard; both
 must still be outputs of this one policy.
 
-## Guiding scheduling principle
+## Baseline scheduling policy under ablation
 
-> Among all provably admissible cohorts, protect the shape-independent
-> unit-weight precedence critical path; at equal criticality, close the active
-> readiness event and immediately admit its consumers without displacing
-> unfinished ancestors; never leave a worker idle while an eligible complete
-> candidate fits the remaining lanes.
+The policy below is the current performance-supported baseline that the first
+unified chooser must reproduce. It is not an independently implemented path,
+and its individual priority fields are subject to the pivot's frozen-trace,
+synthetic-counterexample, and GPU ablations.
+
+> Among all provably admissible cohorts, initially preserve the specified
+> shape-independent unit-weight precedence and exact event-frontier ordering;
+> never leave a worker idle while an eligible complete candidate fits the
+> remaining lanes.
 
 This principle has three ordered parts:
 
@@ -1245,11 +1370,15 @@ priority without pretending to predict instruction latency, register pressure,
 bandwidth, or occupancy. Those resource effects remain empirical performance
 gates, not scheduler inputs.
 
-The dynamic-shape refactor must preserve this decision rule under symbolic
-substitution. It may summarize repeated decisions with affine/floor/modulo
-pieces or decline to canonical order when a comparison is unprovable, but it
-must not replace the rule with a parameterized-only recurrence, sink-only
-continuation policy, or sampled-shape schedule.
+The dynamic-shape refactor must preserve whichever single chooser is selected
+under symbolic substitution. Initially that is the baseline above so the
+refactor cannot erase measured behavior. Later priority simplification changes
+only that pure chooser after passing the required ablations; it does not change
+affine proof, representation, or lowering. The scheduler may summarize
+repeated decisions with affine/floor/modulo pieces or decline to canonical
+order when a comparison is unprovable, but it must not replace the chooser
+with a parameterized-only recurrence, sink-only continuation policy, or
+sampled-shape schedule.
 
 `CoordinateDomain` and `CoordinateRelation` are parameter-aware on this branch.
 For one
@@ -1914,31 +2043,32 @@ key fiber, including every nested wait. Affine translations of that family
 across keys may share one relation piece, but each key fiber remains an atomic
 cohort for noncanonical dependent movement.
 
-For each admissible root frontier, propose the largest interval ending at:
+For each admissible root frontier, propose exactly its next complete cohort,
+ending no later than:
 
 ```text
 min(
     admissible_end,
     every outgoing event-key boundary,
     next relation-piece boundary,
-    cursor + remaining worker slots,
     task-domain end,
 )
 ```
 
-This is the largest interval over which readiness, priority, event
-contributions, and task mapping are unchanged and affine. It is not a tunable
-chunk-size heuristic. Canonical placement and incomparable ready roots may end
-at worker-wave capacity. If that capacity cuts a dependency-released cohort, a
-noncanonical pull rounds back to the last exact cohort boundary; if no complete
-cohort fits, that candidate is ineligible while a blocking ancestor remains.
-After every ancestor that it could displace is assigned, the scheduler may
-select the whole cohort as one committed multi-wave run. Per-wave relation
-pieces may clip its representation, but no other candidate may interleave
-before the cohort is fully assigned. The compiler never invents a
-shape-specific partial cohort just to fill a hole.
+This is the atomic action ranked by the one chooser. The boundaries prove that
+readiness, event contributions, and task mapping are uniform within it; they
+do not authorize a larger pre-ranked run. If worker capacity cuts a
+dependency-released cohort, remaining lanes affect eligibility and emission
+clipping, not the cohort boundary. If the whole cohort fits, it is eligible. If
+it does not fit, it is ineligible while a blocking ancestor remains; after
+every ancestor that it could displace is assigned, the whole cohort may become
+one committed multi-wave action. Per-wave relation pieces may clip its
+representation, but no other candidate may interleave before the cohort is
+fully assigned. Combining several translated cohorts—or an entire root—occurs
+only after chooser/apply equivariance proves the repeated decision. The
+compiler never invents a shape-specific partial cohort merely to fill a hole.
 
-### Event-aware critical-path priority
+### Initial event-aware critical-path chooser
 
 For each candidate interval, apply its exact claimed contributions to the
 existing readiness events and derive:
@@ -1978,11 +2108,13 @@ Candidate intervals still end whenever a readiness contribution or
 source-ticket frontier changes; those expressions bound the run but do not
 rank it.
 
-This is the single priority policy for concrete and symbolic inputs. A newly
+This is the initial baseline chooser for concrete and symbolic inputs. A newly
 completed event releases its consumer into the same ready set with pull depth
 one greater than the moved work needed to release it. The configured
 `cross_loop_pipeline_depth` decides whether that candidate is eligible; no
-separate parameterized policy decides whether it deserves to run.
+separate parameterized policy decides whether it deserves to run. Removing or
+reordering these fields is subject to the pivot's frozen-trace and GPU gates;
+such a change replaces this one pure chooser rather than adding another path.
 
 ### Work conservation
 
@@ -1998,11 +2130,13 @@ or retain the canonical tail.
 First construct the validated configured all-resident baseline `C`, including
 every progress-required wave-aligned boundary and before any newly derived
 readiness-major permutation. At depth one, return `C` exactly. At larger
-configured depths, walk its root-run frontiers in order. Once a run has been
-selected, finish its maximal affine portion before opening another run; this
-is the **committed run**. At the committed run's
-terminal hole or boundary, the canonical successor competes with legal
-ready-list alternatives. Assign the first noncanonical winner pull depth two,
+configured depths, walk its exact cohort frontiers in order. Once an atomic
+cohort action has been selected, finish that complete action before opening
+another; this is the **committed run**. A larger affine portion is emitted only
+after repeated ordinary chooser/apply transitions are proved equivariant. At
+the committed run's terminal hole or boundary, the canonical successor
+competes with legal ready-list alternatives. Assign the first noncanonical
+winner pull depth two,
 propagate `max(2, 1 + max(predecessor pull depth))` through work made early by
 that pull, and choose the highest-priority candidate whose depth is within the
 configured bound. Independent work advanced past canonical order also begins
@@ -2061,24 +2195,29 @@ resident coverage. With no provably lowerable fine-grained prerequisite there
 is no early-admission opportunity, so the scheduler retains canonical compact
 order without stepping through its frontiers.
 
-### Parametric repetition without symbolic priority
+### Parametric repetition by chooser equivariance
 
-The scheduler may execute a bounded concrete control trace over relation cells,
-not runtime tasks. When the normalized state repeats by an affine translation,
-lift the repeated trace only after proving for every repetition:
+The scheduler may execute a bounded control trace over relation cells, not
+runtime tasks. When the complete normalized state repeats by an affine
+translation `T_k`, lift the repeated trace only after proving for every
+repetition:
 
-- identical active relation pieces and static priority outcome;
-- identical readiness and event-cohort structure;
-- identical worker-lane ownership pattern;
-- affine positive deltas for root cursors and event frontiers; and
-- exact progress to the next symbolic boundary.
+- `choose_next_action(T_k(state)) == T_k(action)` using the ordinary chooser;
+- `apply_action(static_context, T_k(state), T_k(action)) == T_k(next_state)`;
+- exact translation of every active relation piece, readiness/event cohort,
+  pending frontier, outside competitor, depth partition, and committed-run
+  boundary;
+- identical worker-lane phase and ownership pattern; and
+- affine positive deltas with exact progress to the next symbolic boundary.
 
 Emit the lifted prefix, full repetitions, and tail directly as partial
 `WorkerScheduleSegment.task_order` relations using existing affine,
 floor-division, modulo, and clipping operations. A runtime-dependent period,
 unresolved winner, nonlinear cursor update, or proof-budget overflow retains
-canonical packed order. This is finite-motif induction, not cyclic dependency-
-graph support and not a Run/Repeat IR.
+canonical packed order. This is finite-state affine induction over the one
+ordinary transition, not cyclic dependency-graph support and not a Run/Repeat
+IR. The affine proof may not substitute a hand-built priority theorem for an
+invocation of the chooser.
 
 ### Deferred: cyclic recurrence extraction
 
@@ -2817,7 +2956,7 @@ is arithmetic from those facts. **Expected** behavior is what the proposed
 scheduler should produce and remains subject to CPU schedule dumps and GPU
 measurement.
 
-### One constraint hierarchy, not per-kernel priorities
+### One constraint hierarchy; baseline priority under ablation
 
 The probes do pull in different directions if “priority” is allowed to move
 arbitrary ready CTAs. FlashMLA and the MoEs benefit from earlier downstream
@@ -2840,11 +2979,15 @@ move before consulting priority:
    the root/event quotient. Different keys inside an ancestor-related root do
    not create an exception; this distinction rejects Muse's failed deep
    pipeline.
-5. Among the candidates left by rules 1--4, use static structural criticality,
-   released-consumer class, event closure, active-cohort continuation,
-   launch-stage order, and canonical order.
+5. Among the candidates left by rules 1--4, the initial unified chooser uses
+   static structural criticality, released-consumer class, event closure,
+   active-cohort continuation, launch-stage order, and canonical order. The
+   pivot's ablation may simplify this tuple only after the frozen controls;
+   rules 1--4 remain hard constraints.
 
-This hierarchy is consistent with every measured **resident-placement** win.
+The hard hierarchy and initial baseline tuple are consistent with every
+measured **resident-placement** win, but that evidence does not establish that
+every priority field is necessary.
 Continuations are not a priority exception: they change execution ownership
 rather than resident ordering and remain behind the separate local dominance
 gate. Canonical source order still carries useful unmodeled information in
@@ -3765,6 +3908,12 @@ This phase replaces the discarded symbolic max-plus evaluator. It operates on
 the existing roots, readiness events, and coordinate relations; it introduces
 no retained graph, schedule, region, or instruction abstraction.
 
+The 2026-09-11 chooser-equivariance pivot above supersedes any wording in the
+historical checkpoints below that treats a recognized motif, a hand-built
+priority bound, or a separate affine candidate scan as production policy.
+Those checkpoints remain evidence about relation capabilities and failure
+modes, not permission to keep two schedulers.
+
 - [x] Compute finite unit-weight `top`, `bottom`, slack, and canonical
   priority classes directly from the possibly-nonempty acyclic root/event
   topology. Cache them only as derived properties of `ReadinessGraph`.
@@ -3773,13 +3922,24 @@ no retained graph, schedule, region, or instruction abstraction.
   producer task order. Keep configured order in `C`; an exact-bijection
   readiness-major replacement is a depth-2-or-higher proposal and must also
   pass the committed-run/non-displacement gate.
-- [ ] Track only symbolic root cursors, exact admissible prefixes, active cohort
-  identity, event frontiers, relation-piece boundaries, and remaining lanes.
-  These are ephemeral local variables, not another semantic object.
-- [ ] Form maximal affine candidate intervals and rank them only by static
-  structural class, released-consumer class, event closure, active-cohort
-  continuation, launch stage, and canonical order. Runtime expressions may
-  bound a run but may not rank candidates.
+- [ ] Track only symbolic root cursors, depth-partitioned exact assigned
+  prefixes, emitted slot mass, active/pending key-scoped frontiers,
+  relation-piece boundaries, and an in-progress committed-run endpoint. These
+  are ephemeral local variables, not another semantic object. Derive wave,
+  lane phase, readiness, and canonical rejoin from them.
+- [ ] Implement one exact chooser over that state. Initially preserve the
+  current specified priority fields, pending frozen-trace verification:
+  launch-stage inlet, static structural class, exact released-consumer
+  behavior, event closure, active-cohort continuation, and canonical order.
+  This prevents the refactor from silently changing B9 or MoE policy. Runtime
+  expressions may bound a run but may not rank candidates. Unknown readiness
+  or a relevant unknown comparison retains the canonical action.
+- [ ] Keep priority replaceable as one pure function. In particular, test the
+  simpler causal-frontier family without altering scheduling, affine proof, or
+  lowering: exact active/released cohorts, optional persistent causal
+  generation, static criticality, and canonical tie order. Neither globally
+  generation-first nor globally criticality-first is assumed correct; their
+  documented fork/chain and MoE conflict is an ablation gate.
 - [ ] Add `cross_loop_pipeline_depth` as the only scheduler-specific
   `IntegerFragment`, with the unconditional candidate set `{1,2,3,4}` and
   default 1. Do not inspect topology to prune or deduplicate its values.
@@ -3791,17 +3951,20 @@ no retained graph, schedule, region, or instruction abstraction.
   reset it only at an exact rejoin with the canonical frontiers. Reject a pull
   deeper than the configured value. One depth is uniform over the complete
   symbolic guard.
-- [ ] Fill an abstract wave while a complete eligible candidate fits. Place a
-  dependent cohort in an earlier wave only when its complete exact event-key
-  fiber fits proved idle committed-run tail lanes or every ancestor it could
-  block is already assigned. In the latter case, make the whole fiber one
-  committed multi-wave run; per-wave relation pieces may clip its encoding but
-  no candidate may interleave before it finishes. Permit broader interleaving
-  only between semantically incomparable roots in the root/event quotient.
-- [ ] Detect a guard-uniform affine translation of the finite control state and
-  lift it into bounded prefix/full-repeat/tail relation pieces. Prove the
-  priority winner, readiness pattern, lane pattern, and positive cursor/frontier
-  delta for every repetition. Decline runtime-dependent periods or winners.
+- [ ] Fill an abstract wave by repeatedly calling the one chooser while a
+  complete eligible candidate fits. Place a dependent cohort in an earlier
+  wave only when its complete exact event-key fiber fits proved idle
+  committed-run tail lanes or every ancestor it could block is already
+  assigned. In the latter case, make the whole fiber one committed multi-wave
+  run; per-wave relation pieces may clip its encoding but no candidate may
+  interleave before it finishes. Permit broader interleaving only between
+  semantically incomparable roots in the root/event quotient.
+- [ ] Detect a guard-uniform affine translation of the complete finite control
+  state and lift it into bounded prefix/full-repeat/tail relation pieces. Prove
+  `choose(T_k(S)) = T_k(choose(S))` and the corresponding `apply` equality for
+  every repetition. This subsumes priority-winner invariance; the affine layer
+  must not inspect or restate priority fields. Decline runtime-dependent
+  periods, winners, or outside competitors.
 - [ ] Emit the result directly as existing
   `WorkerScheduleSegment.task_order` relations. Require exact disjoint
   coverage, exact converses, acyclic progress, resident capacity, and bounded
@@ -3904,15 +4067,17 @@ because the existing inverse/coverage proof is not bounded in practice. That
 capability decline is transitional and must be removed by affine phase/repeat
 lifting, not turned into a priority rule.
 
-Implementation checkpoint (2026-09-11, first maximal affine run): an untouched
-strict-cohort root is coalesced into one whole-root action when every semantic
-predecessor is complete, its cohort-major traversal is exact, its task count is
-provably positive, and it has no producer role. Under those conditions all of
-its cohorts are ready, executing one cannot release another task or alter
-closure/active-event priority, and the candidate set is unchanged. Therefore
-a first cohort that strictly wins would win every translated decision; the
-whole root is the exact maximal run. This is an induction over existing
-relations, not a task-count heuristic.
+Historical transitional checkpoint (2026-09-11, pre-ranking maximal affine
+run; scheduled for replacement): an untouched strict-cohort root is coalesced
+into one whole-root action when every semantic predecessor is complete, its
+cohort-major traversal is exact, its task count is provably positive, and it
+has no producer role. Under those conditions all of its cohorts are ready,
+executing one cannot release another task or alter closure/active-event
+priority, and the candidate set is unchanged. Therefore a first cohort that
+strictly wins would win every translated decision; the whole root is the exact
+maximal run. The proof remains useful evidence, but the pre-ranking coalescing
+mechanism conflicts with the chooser-equivariance pivot and must become the
+period-one case of post-choice compression.
 
 The dynamic leading-cohort fixture now emits `P, C, X` for both W=4 and a
 runtime-varying W=3 packed phase, with one symbolic `C` segment substituting
@@ -3923,12 +4088,23 @@ the full producer root and therefore does not authorize the rejected
 
 Immediate continuation of this phase:
 
-1. lift repeated cohort decisions and runtime-varying packed phase into affine
-   relation pieces so an arbitrary symbolic next fiber is never host-iterated;
-2. retain conditionally empty moved roots together with their synthetic
+1. discard the uncommitted aligned-event motif scheduler while preserving only
+   independently useful relation fixes;
+2. extract the single ordinary chooser and transition from the finite walk,
+   then remove the partial-root suffix and pre-ranking whole-root shortcuts;
+3. add exact current-cursor cohort relations and an uncompressed substitution
+   oracle;
+4. lift repeated ordinary transitions through complete-state affine
+   equivariance, including runtime-varying packed phase, so no symbolic next
+   fiber is host-iterated;
+5. retain conditionally empty moved roots together with their synthetic
    publication occurrence;
-3. expose the public depth knob and remove the legacy policy split only after
-   the affine relation path is proved and compact.
+6. freeze and compare B9/Nemotron/DeepSeek schedule traces before simplifying
+   priority, then run the critical-chain and wide-sibling counterexamples;
+7. expose the public depth knob and remove the legacy policy split only after
+   the affine relation path is proved compact and the retained chooser
+   reproduces the frozen schedule and GPU controls. Priority ablations proceed
+   independently and gate only a later change to that chooser.
 
 Exit gate: constant and symbolic instances with extensionally equal guards,
 orders, readiness, worker count, and capacity facts select the same cohort
@@ -4220,7 +4396,12 @@ The redesign is complete when:
 23. cold compile-time comparison with current main shows analysis, relation
     normalization, code generation, and Triton compilation remain within the
     numeric budget and do not enumerate runtime extents, workers, waves, or
-    CTAs.
+    CTAs;
+24. affine compression invokes the same chooser and transition as ordinary
+    scheduling, proves complete-state equivariance, and contains no
+    event-shape or model-specific selector; and
+25. changing or simplifying the one priority function requires no change to
+    affine proof, schedule representation, counter lowering, or codegen.
 
 The governing invariant is:
 
