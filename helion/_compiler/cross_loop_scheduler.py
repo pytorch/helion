@@ -10381,6 +10381,38 @@ def _bounded_cohort_list_schedule(
     def completed_roots() -> frozenset[int]:
         return frozenset(root for root in canonical_roots if root_is_complete(root))
 
+    def maximal_action(
+        root: int,
+        completed: frozenset[int],
+    ) -> tuple[sympy.Expr, bool] | None:
+        """Coalesce one guard-uniform family of already-ready cohorts.
+
+        Once every semantic predecessor is complete, an untouched consumer-only
+        root has no remaining admission frontier.  With no producer role its
+        execution cannot release another candidate or change event-closure or
+        active-cohort priority either.  Every cohort therefore makes the same
+        list-scheduling decision, and their exact agreed traversal is one
+        maximal affine whole-root run.  Producer roots retain the ordinary
+        single-cohort boundary because their output frontier can change there.
+        """
+        cohort = classified_cohort(root)
+        if cohort is None:
+            return None
+        width, completes_root = cohort
+        root_count = root_counts[root]
+        if (
+            not completes_root
+            and _equal_integer_expressions(root_cursors[root], 0)
+            and predecessors[root] <= completed
+            and root not in producer_role_roots
+            and tile_dependency._is_provably_nonnegative(
+                sympy.simplify(root_count - 1),
+                None,
+            )
+        ):
+            return root_count, True
+        return width, completes_root
+
     def exactly_rejoined_canonical_frontier() -> bool:
         """Prove cursor-vector and packed-mass equality with one prefix of C."""
         canonical_mass: sympy.Expr = sympy.Integer(0)
@@ -10436,7 +10468,7 @@ def _bounded_cohort_list_schedule(
             )
             continue
         completed = completed_roots()
-        canonical_cohort = classified_cohort(canonical_next)
+        canonical_cohort = maximal_action(canonical_next, completed)
         canonical_ready = (
             True
             if predecessors[canonical_next] <= completed
@@ -10524,7 +10556,7 @@ def _bounded_cohort_list_schedule(
             root_count = root_counts[root]
             if root_count.is_zero is True:
                 continue
-            cohort = classified_cohort(root)
+            cohort = maximal_action(root, completed)
             if cohort is None:
                 # A ready unclassified root may outrank a represented action.
                 # Keep the complete boundary canonical rather than deleting a

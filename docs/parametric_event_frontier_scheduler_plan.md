@@ -3904,6 +3904,23 @@ because the existing inverse/coverage proof is not bounded in practice. That
 capability decline is transitional and must be removed by affine phase/repeat
 lifting, not turned into a priority rule.
 
+Implementation checkpoint (2026-09-11, first maximal affine run): an untouched
+strict-cohort root is coalesced into one whole-root action when every semantic
+predecessor is complete, its cohort-major traversal is exact, its task count is
+provably positive, and it has no producer role. Under those conditions all of
+its cohorts are ready, executing one cannot release another task or alter
+closure/active-event priority, and the candidate set is unchanged. Therefore
+a first cohort that strictly wins would win every translated decision; the
+whole root is the exact maximal run. This is an induction over existing
+relations, not a task-count heuristic.
+
+The dynamic leading-cohort fixture now emits `P, C, X` for both W=4 and a
+runtime-varying W=3 packed phase, with one symbolic `C` segment substituting
+identically at B={0,1,3,4}. A companion `P -> C -> D` fixture proves that `C`
+is not coalesced when its per-key output frontier changes. This slice preserves
+the full producer root and therefore does not authorize the rejected
+`P_k, C_k` interleaving through an unfinished producer (the Muse failure mode).
+
 Immediate continuation of this phase:
 
 1. lift repeated cohort decisions and runtime-varying packed phase into affine

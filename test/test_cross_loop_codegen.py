@@ -750,7 +750,7 @@ class TestCrossLoopCodegenHelpers(TestCase):
 class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_parameterized_renderer_lowers_repeated_root_segments(self) -> None:
+    def test_parameterized_renderer_coalesces_invariant_ready_root(self) -> None:
         worker_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
         if worker_count != 148:
             self.skipTest("the W148 tail fixture requires a 148-SM GPU")
@@ -803,7 +803,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                     )
                     torch.testing.assert_close(neutral, neutral_input * 3)
 
-        self.assertEqual(selected_roots, (0, 2, 1, 2))
+        self.assertEqual(selected_roots, (0, 2, 1))
         self.assertNotIn("tile_dependency_root_barrier", generated_code)
         self.assertEqual(
             generated_code.count("def tile_dependency_root_2_scheduled_task"),
@@ -815,7 +815,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             if "tile_dependency_root_2_scheduled_task(" in line
             and not line.startswith("def ")
         ]
-        self.assertEqual(len(consumer_calls), 2)
+        self.assertEqual(len(consumer_calls), 1)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
