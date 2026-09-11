@@ -23,6 +23,7 @@ from torch.fx import Graph
 from torch.fx.node import Node
 from torch.fx.node import map_arg
 
+from ..compile_environment import CompileEnvironment
 from ..cute.cute_mma import _trace_to_load_tensor
 from ..device_ir import DeviceIR
 from ..device_ir import ForLoopGraphInfo
@@ -532,9 +533,20 @@ def _append_mpp_graph(device_ir: DeviceIR, candidate: _Candidate) -> int:
             out_tensor=candidate.store_view.tensor,
             out_dtype=candidate.store_view.tensor.dtype,
             needs_store_barrier=candidate.reload_value_node is not None,
+            m_block_id=_index_block_id(candidate.lhs_view.indices[0]),
+            n_block_id=_index_block_id(candidate.rhs_view.indices[1]),
         )
     )
     return graph_id
+
+
+def _index_block_id(index: object) -> int | None:
+    """Return the tile block ID carried by an FX load/store index."""
+    if isinstance(index, Node):
+        index = index.meta.get("val")
+    if not CompileEnvironment.has_current():
+        return index if isinstance(index, int) else None
+    return CompileEnvironment.current().resolve_block_id(index)
 
 
 def _store_output_view(store_node: Node | None) -> _MPPStoreView | None:
