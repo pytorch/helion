@@ -115,9 +115,11 @@ jobs:
             # --precision (see below), drop --cudagraph and
             # --latency-measure-mode triton_do_bench (CUDA/Triton-only; TPU uses
             # the wall-clock _do_bench_tpu path). Shapes are tritonbench's own,
-            # count-capped by --num-inputs; per-kernel shape args (e.g. embedding
-            # --B/--T/--D/--v-range) are supplied via inputs.env-vars / custom
-            # args where a default shape exceeds TPU vmem.
+            # sampled equally-spaced across the full range by --num-inputs /
+            # --input-sample-mode (not just the smallest first-k, so the
+            # dashboard covers small/mid/large); per-kernel shape args (e.g.
+            # embedding --B/--T/--D/--v-range) are supplied via inputs.env-vars /
+            # custom args where a default shape exceeds TPU vmem.
             #
             # Precision follows the canonical helion examples per kernel: bf16
             # for gemm/softmax/layer_norm/rms_norm (examples/rms_norm.py runs
@@ -131,6 +133,21 @@ jobs:
             case "$kernel" in
               kl_div|welford) PRECISION=fp32 ;;
             esac
+            # Most kernels sample 6 shapes equally-spaced across their range.
+            # Two exceptions take the feasible low end via first-k instead of
+            # spanning to the top:
+            #   - kl_div: at fp32 its reduction reaches V=131072, which OOMs TPU
+            #     vmem and autotunes for hours.
+            #   - rms_norm / rms_norm-bwd: their largest shape (H=32768) sits
+            #     ~66KB over the 32MB scoped-vmem ceiling and helion's autotuner
+            #     bails (no working config found). Drop that top shape (keep
+            #     H<=16384) until the helion autotuner handles it.
+            NUM_INPUTS=6
+            SAMPLE_MODE=equally-spaced-k
+            case "$kernel" in
+              kl_div) NUM_INPUTS=4; SAMPLE_MODE=first-k ;;
+              rms_norm|rms_norm-bwd) NUM_INPUTS=5; SAMPLE_MODE=first-k ;;
+            esac
             ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 HELION_MEASURE_COMPILE_TIME=1 \
               python benchmarks/run.py \
                 --op $kernel \
@@ -139,7 +156,8 @@ jobs:
                 --helion-backend pallas \
                 --metrics speedup,accuracy,latency \
                 --measure-compile-time \
-                --num-inputs 2 \
+                --num-inputs $NUM_INPUTS \
+                --input-sample-mode $SAMPLE_MODE \
                 --only $IMPLS \
                 --only-match-mode prefix-with-baseline \
                 --baseline $BASELINE \
