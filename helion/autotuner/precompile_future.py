@@ -238,10 +238,15 @@ def _register_source_module(name: str, file: str) -> None:
     module = importlib.util.module_from_spec(spec)
     # Register BEFORE exec so self-references / decorators resolve by name.
     sys.modules[name] = module
-    # Leave a best-effort partial module rather than crashing the worker; if the
-    # import is actually needed the generated exec will surface a clear error.
-    with contextlib.suppress(Exception):
+    try:
         spec.loader.exec_module(module)
+    except BaseException:
+        # Never leave a partially initialized module behind.  A long-lived
+        # benchmark worker may otherwise let a later generated wrapper import
+        # the broken module successfully and fail only when it reads a missing
+        # global, incorrectly making a valid candidate look broken.
+        sys.modules.pop(name, None)
+        raise
 
 
 def _load_compiled_fn(fn_spec: SerializedCompiledFunction) -> CompiledConfig:

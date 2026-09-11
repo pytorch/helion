@@ -2360,6 +2360,39 @@ class TestCrossLoopScheduler(TestCase):
             frozenset(),
         )
 
+    def test_idle_tail_capacity_changes_exact_readiness_strategy(self) -> None:
+        dependency_graph = _dependency_graph(
+            [[10], [20]],
+            _access(root=0, kind="store", shape=(256,), block_ids=(10,)),
+            _access(root=1, kind="load", shape=(256,), block_ids=(20,)),
+        )
+        kwargs = {
+            "dependency_graph": dependency_graph,
+            "root_domains": (
+                _domain((10, 16, 16)),
+                _domain((20, 8, 32)),
+            ),
+            "axis_geometry": {10: (16, 16), 20: (8, 32)},
+        }
+
+        tail_overlap = _configured_static_pipeline_plan(
+            **kwargs,
+            worker_count=14,
+        )
+        full_wave = _configured_static_pipeline_plan(
+            **kwargs,
+            worker_count=16,
+        )
+
+        (tail_counter,) = tail_overlap.readiness_counters
+        (full_wave_counter,) = full_wave.readiness_counters
+        self.assertIsNone(tail_counter.continuation_consumer)
+        self.assertIsNotNone(placement(tail_overlap.worker_schedule, 1, 0))
+        self.assertIsNotNone(full_wave_counter.continuation_consumer)
+        self.assertIsNone(placement(full_wave.worker_schedule, 1, 0))
+        self.assertEqual(tail_overlap.root_barrier_edges, frozenset())
+        self.assertEqual(full_wave.root_barrier_edges, frozenset())
+
     def test_nested_split_nested_loop_at_readiness_follow_worker_readiness(
         self,
     ) -> None:

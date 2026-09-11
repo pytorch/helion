@@ -17,10 +17,16 @@ Lives in ``helion/_compiler/cute/fuse_two_pass_loads.py``.
 
 from __future__ import annotations
 
+import ast
+
 import pytest
 import torch
 
 import helion
+from helion._compiler.cute.fuse_two_pass_loads import fuse_two_pass_loads
+from helion._compiler.cute.persistent_branch_vec import (
+    vectorize_branch_local_persistent_fragments,
+)
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
@@ -30,6 +36,467 @@ import helion.language as hl
 
 cutlass = pytest.importorskip("cutlass")
 cute = pytest.importorskip("cutlass.cute")
+
+
+def _nested_persistent_sweeps() -> list[ast.stmt]:
+    """Three guarded persistent sweeps with one later-origin load."""
+    return ast.parse(
+        """
+if active:
+    for synthetic_lane_7 in range(8):
+        a0 = (x.iterator + slot + synthetic_lane_7).load()
+    for synthetic_lane_7 in range(8):
+        slot_copy_0 = slot
+        a1 = (x.iterator + slot_copy_0 + synthetic_lane_7).load()
+        b1 = (y.iterator + slot_copy_0 + synthetic_lane_7).load()
+    for synthetic_lane_7 in range(8):
+        slot_copy_1 = slot
+        a2 = (x.iterator + slot_copy_1 + synthetic_lane_7).load()
+        b2 = (y.iterator + slot_copy_1 + synthetic_lane_7).load()
+"""
+    ).body
+
+
+def test_nested_persistent_sweeps_register_reload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("HELION_FUSER_MODE", raising=False)
+    result = fuse_two_pass_loads(
+        _nested_persistent_sweeps(),
+        tensor_dtypes={"x": "cutlass.Float32", "y": "cutlass.Float32"},
+        reload_modes={7: "register"},
+    )
+    code = ast.unparse(ast.Module(body=result, type_ignores=[]))
+
+    # Allocations stay at kernel scope rather than under the dynamic guard.
+    assert len(result) == 3
+    assert all(isinstance(stmt, ast.Assign) for stmt in result[:2])
+    assert isinstance(result[2], ast.If)
+    assert code.count("cute.make_rmem_tensor(8, cutlass.Float32)") == 2
+    # A is loaded only in sweep one.  B is first loaded in sweep two, cached
+    # there, and reused in sweep three despite the copy aliases.
+    assert code.count(".load()") == 2
+    assert "a2 = _fuse_cache_0" in code
+    assert "b2 = _fuse_cache_1" in code
+
+
+def test_nested_persistent_sweeps_gmem_reload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("HELION_FUSER_MODE", raising=False)
+    result = fuse_two_pass_loads(
+        _nested_persistent_sweeps(),
+        tensor_dtypes={"x": "cutlass.Float32", "y": "cutlass.Float32"},
+        reload_modes={7: "gmem"},
+    )
+    code = ast.unparse(ast.Module(body=result, type_ignores=[]))
+
+    assert "_fuse_cache_" not in code
+    assert code.count(".load()") == 5
+
+
+@pytest.mark.parametrize("prove_x_y_disjoint", (False, True))
+def test_persistent_sweep_cache_invalidated_by_intervening_store(
+    monkeypatch: pytest.MonkeyPatch,
+    prove_x_y_disjoint: bool,
+) -> None:
+    monkeypatch.delenv("HELION_FUSER_MODE", raising=False)
+    body = ast.parse(
+        """
+if active:
+    for synthetic_lane_7 in range(8):
+        a0 = (x.iterator + synthetic_lane_7).load()
+        b0 = (y.iterator + synthetic_lane_7).load()
+    (x.iterator + slot).store(replacement)
+    for synthetic_lane_7 in range(8):
+        a1 = (x.iterator + synthetic_lane_7).load()
+        b1 = (y.iterator + synthetic_lane_7).load()
+    for synthetic_lane_7 in range(8):
+        a2 = (x.iterator + synthetic_lane_7).load()
+        b2 = (y.iterator + synthetic_lane_7).load()
+"""
+    ).body
+
+    result = fuse_two_pass_loads(
+        body,
+        tensor_dtypes={"x": "cutlass.Float32", "y": "cutlass.Float32"},
+        reload_modes={7: "register"},
+        proven_disjoint_tensor_pairs=(
+            {frozenset(("x", "y"))} if prove_x_y_disjoint else None
+        ),
+    )
+    code = ast.unparse(ast.Module(body=result, type_ignores=[]))
+
+    # The x store always invalidates x.  A distinct argument name is not an
+    # aliasing proof: y can cross the write only when the caller supplies a
+    # runtime-backed disjointness fact.
+    assert code.count("(x.iterator + synthetic_lane_7).load()") == 2
+    assert "a1 = (x.iterator + synthetic_lane_7).load()" in code
+    assert "a2 = _fuse_cache_" in code
+    expected_y_loads = 1 if prove_x_y_disjoint else 2
+    assert code.count("(y.iterator + synthetic_lane_7).load()") == expected_y_loads
+    if prove_x_y_disjoint:
+        assert "b1 = _fuse_cache_" in code
+    else:
+        assert "b1 = (y.iterator + synthetic_lane_7).load()" in code
+    assert "b2 = _fuse_cache_" in code
+
+
+def test_auto_reload_stops_at_disjoint_write_phase_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("HELION_FUSER_MODE", raising=False)
+    body = ast.parse(
+        """
+for synthetic_lane_7 in range(8):
+    before = (x.iterator + synthetic_lane_7).load()
+(out.iterator + slot).store(replacement)
+for synthetic_lane_7 in range(8):
+    after = (x.iterator + synthetic_lane_7).load()
+"""
+    ).body
+
+    result = fuse_two_pass_loads(
+        body,
+        tensor_dtypes={"x": "cutlass.Float32", "out": "cutlass.Float32"},
+        reload_modes={7: "auto"},
+        proven_disjoint_tensor_pairs={frozenset(("x", "out"))},
+    )
+    code = ast.unparse(ast.Module(body=result, type_ignores=[]))
+
+    assert "_fuse_cache_" not in code
+    assert code.count("(x.iterator + synthetic_lane_7).load()") == 2
+
+
+@pytest.mark.parametrize(
+    "atomic",
+    (
+        "cute.arch.atomic_add(x.iterator + slot, replacement)",
+        "_cute_atomic_add(x.iterator + slot, replacement)",
+        "_cute_atomic_add(opaque_ptr, replacement)",
+    ),
+)
+def test_persistent_sweep_cache_invalidated_by_intervening_atomic(
+    monkeypatch: pytest.MonkeyPatch,
+    atomic: str,
+) -> None:
+    monkeypatch.delenv("HELION_FUSER_MODE", raising=False)
+    body = ast.parse(
+        f"""
+if active:
+    for synthetic_lane_7 in range(8):
+        before = (x.iterator + synthetic_lane_7).load()
+    {atomic}
+    for synthetic_lane_7 in range(8):
+        after = (x.iterator + synthetic_lane_7).load()
+"""
+    ).body
+
+    result = fuse_two_pass_loads(
+        body,
+        tensor_dtypes={"x": "cutlass.Float32"},
+        reload_modes={7: "register"},
+    )
+    code = ast.unparse(ast.Module(body=result, type_ignores=[]))
+
+    assert "_fuse_cache_" not in code
+    assert code.count("(x.iterator + synthetic_lane_7).load()") == 2
+
+
+@pytest.mark.parametrize(
+    ("reload_mode", "expected_loads", "expect_cache"),
+    (("auto", 2, False), ("register", 1, True)),
+)
+def test_branch_local_exact_fragment_vector_load_store(
+    monkeypatch: pytest.MonkeyPatch,
+    reload_mode: str,
+    expected_loads: int,
+    expect_cache: bool,
+) -> None:
+    monkeypatch.delenv("HELION_FUSER_MODE", raising=False)
+    body = ast.parse(
+        """
+if active:
+    for synthetic_lane_7 in cutlass.range_constexpr(8):
+        lane_index = lane_base + cutlass.Int32(synthetic_lane_7)
+        before = _helion_persistent_branch_vec_load(7, 8, 'cutlass.BFloat16', '', x.iterator + cutlass.Int32(slot) * cutlass.Int32(x.layout.stride[0]) + cutlass.Int32(lane_index) * cutlass.Int32(x.layout.stride[1]), (x.iterator + cutlass.Int32(slot) * cutlass.Int32(x.layout.stride[0]) + cutlass.Int32(lane_index) * cutlass.Int32(x.layout.stride[1])).load() if active_index and lane_index < 128 else cutlass.BFloat16(0))
+    (out.iterator + slot).store(result)
+    for synthetic_lane_7 in cutlass.range_constexpr(8):
+        slot_copy = slot
+        lane_index_copy = lane_base + cutlass.Int32(synthetic_lane_7)
+        after = _helion_persistent_branch_vec_load(7, 8, 'cutlass.BFloat16', '', x.iterator + cutlass.Int32(slot_copy) * cutlass.Int32(x.layout.stride[0]) + cutlass.Int32(lane_index_copy) * cutlass.Int32(x.layout.stride[1]), (x.iterator + cutlass.Int32(slot_copy) * cutlass.Int32(x.layout.stride[0]) + cutlass.Int32(lane_index_copy) * cutlass.Int32(x.layout.stride[1])).load() if active_index and lane_index_copy < 128 else cutlass.BFloat16(0))
+        updated = after + delta
+        _helion_persistent_branch_vec_store(7, 8, 'cutlass.BFloat16', x.iterator + cutlass.Int32(slot_copy) * cutlass.Int32(x.layout.stride[0]) + cutlass.Int32(lane_index_copy) * cutlass.Int32(x.layout.stride[1]), cutlass.BFloat16(updated), active_index and lane_index_copy < 128)
+"""
+    ).body
+    fused = fuse_two_pass_loads(
+        body,
+        tensor_dtypes={
+            "x": "cutlass.BFloat16",
+            "out": "cutlass.BFloat16",
+        },
+        reload_modes={7: reload_mode},
+        proven_disjoint_tensor_pairs={frozenset(("x", "out"))},
+    )
+    result = vectorize_branch_local_persistent_fragments(fused)
+    code = ast.unparse(ast.Module(body=result, type_ignores=[]))
+
+    # The producer sweep snapshots all lanes before the consumer writes any of
+    # them. The exact-fragment marker proves that consumer iteration i cannot
+    # affect iteration j, so the final read reuses that register snapshot.
+    assert code.count("cute.arch.load(x.iterator") == expected_loads
+    assert ("cute.make_rmem_tensor(8, cutlass.BFloat16)" in code) is expect_cache
+    assert ("after = _fuse_cache_0" in code) is expect_cache
+    assert "_cute_store_u16_vec(x.iterator" in code
+    assert ").store(cutlass.BFloat16(updated))" not in code
+    assert "if active_index and" in code
+    assert "_helion_persistent_branch_vec_" not in code
+
+
+@pytest.mark.parametrize(
+    "consumer",
+    (
+        (
+            "_helion_persistent_branch_vec_store(7, 8, 'cutlass.BFloat16', "
+            "x.iterator + lane_index + 1, updated, None)"
+        ),
+        "cute.arch.atomic_add(x.iterator + lane_index, updated)",
+    ),
+    ids=("shifted-store", "atomic"),
+)
+def test_inplace_snapshot_fusion_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    consumer: str,
+) -> None:
+    monkeypatch.delenv("HELION_FUSER_MODE", raising=False)
+    body = ast.parse(
+        f"""
+for synthetic_lane_7 in cutlass.range_constexpr(8):
+    lane_index = lane_base + cutlass.Int32(synthetic_lane_7)
+    before = _helion_persistent_branch_vec_load(7, 8, 'cutlass.BFloat16', '', x.iterator + lane_index, (x.iterator + lane_index).load())
+for synthetic_lane_7 in cutlass.range_constexpr(8):
+    lane_index = lane_base + cutlass.Int32(synthetic_lane_7)
+    after = _helion_persistent_branch_vec_load(7, 8, 'cutlass.BFloat16', '', x.iterator + lane_index, (x.iterator + lane_index).load())
+    updated = after + delta
+    {consumer}
+"""
+    ).body
+
+    result = fuse_two_pass_loads(
+        body,
+        tensor_dtypes={"x": "cutlass.BFloat16"},
+        reload_modes={7: "register"},
+    )
+    code = ast.unparse(ast.Module(body=result, type_ignores=[]))
+
+    assert code.count("_helion_persistent_branch_vec_load") == 2
+    assert "_fuse_cache_" not in code
+
+
+def test_inplace_snapshot_fusion_rejects_store_before_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("HELION_FUSER_MODE", raising=False)
+    body = ast.parse(
+        """
+for synthetic_lane_7 in cutlass.range_constexpr(8):
+    lane_index = lane_base + cutlass.Int32(synthetic_lane_7)
+    before = _helion_persistent_branch_vec_load(7, 8, 'cutlass.BFloat16', '', x.iterator + lane_index, (x.iterator + lane_index).load())
+for synthetic_lane_7 in cutlass.range_constexpr(8):
+    lane_index = lane_base + cutlass.Int32(synthetic_lane_7)
+    _helion_persistent_branch_vec_store(7, 8, 'cutlass.BFloat16', x.iterator + lane_index, replacement, None)
+    after = _helion_persistent_branch_vec_load(7, 8, 'cutlass.BFloat16', '', x.iterator + lane_index, (x.iterator + lane_index).load())
+"""
+    ).body
+
+    result = fuse_two_pass_loads(
+        body,
+        tensor_dtypes={"x": "cutlass.BFloat16"},
+        reload_modes={7: "register"},
+    )
+    code = ast.unparse(ast.Module(body=result, type_ignores=[]))
+
+    assert code.count("_helion_persistent_branch_vec_load") == 2
+    assert "_fuse_cache_" not in code
+
+
+def test_branch_local_shifted_exact_markers_stay_scalar() -> None:
+    body = ast.parse(
+        """
+for synthetic_lane_7 in cutlass.range_constexpr(8):
+    lane_index = lane_base + cutlass.Int32(synthetic_lane_7)
+    before = _helion_persistent_branch_vec_load(7, 8, 'cutlass.BFloat16', '', x.iterator + lane_index, (x.iterator + lane_index).load())
+    updated = before + 1
+    _helion_persistent_branch_vec_store(7, 8, 'cutlass.BFloat16', x.iterator + lane_index + 1, cutlass.BFloat16(updated), None)
+"""
+    ).body
+    result = vectorize_branch_local_persistent_fragments(body)
+    code = ast.unparse(ast.Module(body=result, type_ignores=[]))
+
+    assert "cute.arch.load(x.iterator" not in code
+    assert "(x.iterator + lane_index).load()" in code
+    assert "_cute_store_u16_vec(x.iterator" not in code
+    assert "(x.iterator + lane_index + 1).store" in code
+    assert "_helion_persistent_branch_vec_" not in code
+
+
+@pytest.mark.parametrize("write_kind", ("store", "atomic"))
+@pytest.mark.parametrize("prove_x_y_disjoint", (False, True))
+def test_branch_local_vector_load_treats_later_write_as_backedge_barrier(
+    write_kind: str,
+    prove_x_y_disjoint: bool,
+) -> None:
+    write = (
+        "(y.iterator + lane_index + 1).store(replacement)"
+        if write_kind == "store"
+        else "cute.arch.atomic_add(y.iterator + lane_index + 1, replacement)"
+    )
+    body = ast.parse(
+        f"""
+for synthetic_lane_7 in cutlass.range_constexpr(8):
+    lane_index = lane_base + cutlass.Int32(synthetic_lane_7)
+    value = _helion_persistent_branch_vec_load(7, 8, 'cutlass.BFloat16', '', x.iterator + lane_index, (x.iterator + lane_index).load())
+    {write}
+"""
+    ).body
+    result = vectorize_branch_local_persistent_fragments(
+        body,
+        proven_disjoint_tensor_pairs=(
+            {frozenset(("x", "y"))} if prove_x_y_disjoint else None
+        ),
+    )
+    code = ast.unparse(ast.Module(body=result, type_ignores=[]))
+
+    assert code.count("cute.arch.load(x.iterator") == (1 if prove_x_y_disjoint else 0)
+    assert code.count("(x.iterator + lane_index).load()") == (
+        0 if prove_x_y_disjoint else 1
+    )
+    assert "_helion_persistent_branch_vec_" not in code
+
+
+@pytest.mark.parametrize("prove_x_y_disjoint", (False, True))
+def test_branch_local_vector_store_treats_earlier_load_as_backedge_barrier(
+    prove_x_y_disjoint: bool,
+) -> None:
+    body = ast.parse(
+        """
+for synthetic_lane_7 in cutlass.range_constexpr(8):
+    lane_index = lane_base + cutlass.Int32(synthetic_lane_7)
+    observed = (x.iterator + lane_index - 1).load() if synthetic_lane_7 > 0 else cutlass.BFloat16(0)
+    replacement = observed + 1
+    _helion_persistent_branch_vec_store(7, 8, 'cutlass.BFloat16', y.iterator + lane_index, cutlass.BFloat16(replacement), None)
+"""
+    ).body
+    result = vectorize_branch_local_persistent_fragments(
+        body,
+        proven_disjoint_tensor_pairs=(
+            {frozenset(("x", "y"))} if prove_x_y_disjoint else None
+        ),
+    )
+    code = ast.unparse(ast.Module(body=result, type_ignores=[]))
+
+    assert ("_cute_store_u16_vec(y.iterator" in code) is prove_x_y_disjoint
+    assert (").store(cutlass.BFloat16(replacement))" in code) is not prove_x_y_disjoint
+    assert "_helion_persistent_branch_vec_" not in code
+
+
+@pytest.mark.parametrize("write_kind", ("store", "atomic"))
+@pytest.mark.parametrize("prove_x_y_disjoint", (False, True))
+def test_branch_local_vector_store_treats_other_write_as_backedge_barrier(
+    write_kind: str,
+    prove_x_y_disjoint: bool,
+) -> None:
+    other_write = (
+        "(x.iterator + lane_index + 1).store(replacement)"
+        if write_kind == "store"
+        else "cute.arch.atomic_add(x.iterator + lane_index + 1, replacement)"
+    )
+    body = ast.parse(
+        f"""
+for synthetic_lane_7 in cutlass.range_constexpr(8):
+    lane_index = lane_base + cutlass.Int32(synthetic_lane_7)
+    replacement = cutlass.BFloat16(synthetic_lane_7)
+    _helion_persistent_branch_vec_store(7, 8, 'cutlass.BFloat16', y.iterator + lane_index, replacement, None)
+    {other_write}
+"""
+    ).body
+    result = vectorize_branch_local_persistent_fragments(
+        body,
+        proven_disjoint_tensor_pairs=(
+            {frozenset(("x", "y"))} if prove_x_y_disjoint else None
+        ),
+    )
+    code = ast.unparse(ast.Module(body=result, type_ignores=[]))
+
+    assert ("_cute_store_u16_vec(y.iterator" in code) is prove_x_y_disjoint
+    assert (
+        "(y.iterator + lane_index).store(replacement)" in code
+    ) is not prove_x_y_disjoint
+    assert "_helion_persistent_branch_vec_" not in code
+
+
+def test_non_copy_rename_is_not_address_equivalence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("HELION_FUSER_MODE", raising=False)
+    body = ast.parse(
+        """
+for synthetic_lane_7 in range(8):
+    before = (x.iterator + index + synthetic_lane_7).load()
+for synthetic_lane_7 in range(8):
+    index_1 = index + 1
+    after = (x.iterator + index_1 + synthetic_lane_7).load()
+"""
+    ).body
+    result = fuse_two_pass_loads(
+        body,
+        tensor_dtypes={"x": "cutlass.Float32"},
+        reload_modes={7: "register"},
+    )
+    code = ast.unparse(ast.Module(body=result, type_ignores=[]))
+
+    assert "_fuse_cache_" not in code
+    assert code.count(".load()") == 2
+
+
+@pytest.mark.parametrize("prove_x_y_disjoint", (False, True))
+@pytest.mark.parametrize("write_kind", ("store", "atomic"))
+def test_consumer_loop_write_is_a_backedge_barrier(
+    monkeypatch: pytest.MonkeyPatch,
+    prove_x_y_disjoint: bool,
+    write_kind: str,
+) -> None:
+    monkeypatch.delenv("HELION_FUSER_MODE", raising=False)
+    write = (
+        "(y.iterator + synthetic_lane_7).store(after)"
+        if write_kind == "store"
+        else "cute.arch.atomic_add(y.iterator + synthetic_lane_7, after)"
+    )
+    body = ast.parse(
+        f"""
+for synthetic_lane_7 in range(8):
+    before = (x.iterator + synthetic_lane_7).load()
+for synthetic_lane_7 in range(8):
+    after = (x.iterator + synthetic_lane_7).load()
+    {write}
+"""
+    ).body
+    result = fuse_two_pass_loads(
+        body,
+        tensor_dtypes={"x": "cutlass.Float32", "y": "cutlass.Float32"},
+        reload_modes={7: "register"},
+        proven_disjoint_tensor_pairs=(
+            {frozenset(("x", "y"))} if prove_x_y_disjoint else None
+        ),
+    )
+    code = ast.unparse(ast.Module(body=result, type_ignores=[]))
+
+    # The consumer's store executes before its next loop iteration.  Reusing
+    # the producer cache is therefore legal only with an explicit x/y
+    # disjointness proof.
+    assert code.count("(x.iterator + synthetic_lane_7).load()") == (
+        1 if prove_x_y_disjoint else 2
+    )
 
 
 @pytest.fixture(autouse=True)

@@ -100,6 +100,7 @@ from helion.autotuner.local_cache import StrictLocalAutotuneCache
 from helion.autotuner.local_cache import _cute_flash_search_policy_hash
 from helion.autotuner.logger import AutotuneLogEntry
 from helion.autotuner.logger import AutotuningLogger
+from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.metrics import KernelMetadata
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.random_search import RandomSearch
@@ -983,7 +984,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         "fork" not in mp.get_all_start_methods(),
         reason="fork start method is unavailable on this platform",
     )
-    def test_fork_precompile_avoids_cuda_reinit(self):
+    def test_fork_precompile_avoids_device_reinit(self):
         settings = Settings(
             autotune_precompile="fork",
             autotune_log_level=logging.CRITICAL,
@@ -993,6 +994,7 @@ class TestAutotuneIgnoreErrors(TestCase):
 
         parent_pid = os.getpid()
         lazy_calls: list[int] = []
+        device_module = torch.get_device_module(DEVICE)
 
         def fake_lazy_init() -> None:
             lazy_calls.append(os.getpid())
@@ -1009,7 +1011,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         def fake_compiled_fn(
             *fn_args: object, _launcher: Callable[..., object]
         ) -> None:
-            torch.cuda._lazy_init()
+            device_module._lazy_init()  # pyrefly: ignore[missing-attribute]
             _launcher("fake_kernel", (1,), *fn_args)
 
         with (
@@ -1017,7 +1019,7 @@ class TestAutotuneIgnoreErrors(TestCase):
                 "helion.autotuner.precompile_future.make_precompiler",
                 side_effect=fake_make_precompiler,
             ),
-            patch("torch.cuda._lazy_init", side_effect=fake_lazy_init),
+            patch.object(device_module, "_lazy_init", side_effect=fake_lazy_init),
         ):
             future = search.benchmark_provider._create_precompile_future(
                 "cfg", fake_compiled_fn
@@ -10049,12 +10051,14 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             use_isolated: bool = True,
             confirm_suspicious: bool = True,
             use_interleaved: bool = True,
+            candidate_private_args: bool = False,
         ) -> None:
             self.assertIn("Final verification", desc)
             self.assertEqual(target_ms, 5000.0)
             self.assertFalse(use_isolated)
             self.assertFalse(confirm_suspicious)
             self.assertTrue(use_interleaved)
+            self.assertFalse(candidate_private_args)
             for member in members:
                 member.perfs.append(10.0 if member is stable else 12.0)
 
@@ -10235,7 +10239,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             use_isolated: bool = True,
             confirm_suspicious: bool = True,
             use_interleaved: bool = True,
+            candidate_private_args: bool = False,
         ) -> None:
+            self.assertFalse(candidate_private_args)
             for member in members:
                 member.perfs.append(10.04 if member is pinned else 10.0)
 
@@ -10275,7 +10281,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             use_isolated: bool = True,
             confirm_suspicious: bool = True,
             use_interleaved: bool = True,
+            candidate_private_args: bool = False,
         ) -> None:
+            self.assertFalse(candidate_private_args)
             for member in members:
                 member.perfs.append(10.04 if member is pinned else 10.0)
 
@@ -10336,12 +10344,14 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             use_isolated: bool = True,
             confirm_suspicious: bool = True,
             use_interleaved: bool = True,
+            candidate_private_args: bool = False,
         ) -> None:
             self.assertIn("Final verification", desc)
             self.assertEqual(target_ms, 5000.0)
             self.assertTrue(use_isolated)
             self.assertTrue(confirm_suspicious)
             self.assertFalse(use_interleaved)
+            self.assertTrue(candidate_private_args)
             for member in members:
                 member.perfs.append(9.5 if member is member_a else 10.0)
 
@@ -10564,6 +10574,141 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(member_a.perfs, [100.0, 51.0])
         self.assertEqual(member_b.perfs, [101.0, 52.0])
         self.assertEqual(clear.call_count, 2)
+
+    def test_rebenchmark_isolates_mutated_args_when_worker_unavailable(self) -> None:
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        original = torch.zeros(1)
+        search.args = (original,)
+        search.log = AutotuningLogger(settings)
+        search.best_perf_so_far = 100.0
+        search.benchmark_provider = SimpleNamespace(
+            mutated_arg_indices=[0],
+            benchmark_isolated=lambda _fns, *, warmup, rep, desc: None,
+        )
+        search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
+        observed_pointers: dict[str, list[int]] = {"a": [], "b": []}
+
+        def fn_a(value: torch.Tensor) -> None:
+            observed_pointers["a"].append(value.data_ptr())
+            value.add_(1)
+
+        def fn_b(value: torch.Tensor) -> None:
+            observed_pointers["b"].append(value.data_ptr())
+            value.add_(1)
+
+        def steady_bench(
+            fn: Callable[[], object],
+            *,
+            warmup: int,
+            rep: int,
+            return_mode: str,
+            process_group_name: str | None = None,
+        ) -> float:
+            fn()
+            return 50.0
+
+        search.config_spec = SimpleNamespace(
+            backend=SimpleNamespace(get_do_bench=lambda: steady_bench)
+        )
+        member_a = PopulationMember(fn_a, [100.0], (), helion.Config(num_warps=4))
+        member_b = PopulationMember(fn_b, [101.0], (), helion.Config(num_warps=8))
+
+        with patch(
+            "helion.autotuner.base_search._clone_args",
+            side_effect=lambda args, process_group_name, idx_to_clone: tuple(
+                value.clone()
+                if idx_to_clone is None or index in idx_to_clone
+                else value
+                for index, value in enumerate(args)
+            ),
+        ) as clone_args:
+            search.rebenchmark(
+                [member_a, member_b],
+                target_ms=1000.0,
+                use_isolated=True,
+                confirm_suspicious=False,
+                use_interleaved=False,
+                candidate_private_args=True,
+            )
+
+        self.assertEqual(clone_args.call_count, 3)
+        self.assertTrue(
+            all(
+                call.kwargs["idx_to_clone"] is None
+                for call in clone_args.call_args_list
+            )
+        )
+        self.assertNotEqual(observed_pointers["a"], observed_pointers["b"])
+        self.assertNotEqual(observed_pointers["a"], [original.data_ptr()])
+        self.assertNotEqual(observed_pointers["b"], [original.data_ptr()])
+        self.assertTrue(torch.equal(original, torch.zeros_like(original)))
+
+    def test_rebenchmark_falls_back_when_isolated_wrapper_is_unloadable(self) -> None:
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.settings = settings
+        provider.log = Mock()
+        provider.mutated_arg_indices = []
+        provider._autotune_metrics = AutotuneMetrics()
+        provider._subprocess_wrapper_unloadable = False
+        provider._subprocess_benchmark_enabled = lambda: True
+        isolated_calls = 0
+
+        def unloadable_wrapper(
+            _fn: object,
+            *,
+            warmup: int,
+            rep: int,
+        ) -> None:
+            nonlocal isolated_calls
+            isolated_calls += 1
+            provider._subprocess_wrapper_unloadable = True
+            return None
+
+        provider._run_subprocess_benchmark_job = unloadable_wrapper
+
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.args = ()
+        search.log = AutotuningLogger(settings)
+        search.best_perf_so_far = 100.0
+        search.benchmark_provider = provider
+        search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
+        in_process_calls = 0
+
+        def steady_bench(
+            fn: Callable[[], object],
+            *,
+            warmup: int,
+            rep: int,
+            return_mode: str,
+            process_group_name: str | None = None,
+        ) -> float:
+            nonlocal in_process_calls
+            fn()
+            in_process_calls += 1
+            return 50.0 + in_process_calls
+
+        search.config_spec = SimpleNamespace(
+            backend=SimpleNamespace(get_do_bench=lambda: steady_bench)
+        )
+        member_a = PopulationMember(lambda: None, [100.0], (), helion.Config())
+        member_b = PopulationMember(lambda: None, [101.0], (), helion.Config())
+
+        search.rebenchmark(
+            [member_a, member_b],
+            target_ms=1000.0,
+            use_isolated=True,
+            confirm_suspicious=False,
+            use_interleaved=False,
+        )
+
+        self.assertEqual(isolated_calls, 1)
+        self.assertEqual(in_process_calls, 2)
+        self.assertEqual(member_a.perfs, [100.0, 51.0])
+        self.assertEqual(member_b.perfs, [101.0, 52.0])
 
     def test_final_rebenchmark_respects_custom_benchmark_fn(
         self,
@@ -15655,8 +15800,6 @@ class TestSelectedSourceMetrics(TestCase):
         population_search: bool = True,
         source_tracking_enabled: bool = True,
     ) -> tuple[BaseSearch, helion.Config]:
-        from helion.autotuner.metrics import AutotuneMetrics
-
         config = helion.Config(block_sizes=[64])
         fn = SimpleNamespace(source_hash="selected-source")
         search_type = PopulationBasedSearch if population_search else BaseSearch

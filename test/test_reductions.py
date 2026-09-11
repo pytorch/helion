@@ -531,6 +531,21 @@ class TestReductions(RefEagerTestBase, TestCase):
         # produced a shape mismatch (issue #2643).
         bound = rms_over_arange.bind((qkv,))
         self.assertEqual(bound.env.config_spec.reduction_loops.valid_block_ids(), [])
+        if _get_backend() == "cute":
+            reduction_blocks = [
+                block_id
+                for block_id, block in enumerate(bound.env.block_sizes)
+                if block.reduction
+            ]
+            self.assertEqual(len(reduction_blocks), 1)
+            reduction_block = reduction_blocks[0]
+            for spec in (
+                bound.env.config_spec.num_threads,
+                bound.env.config_spec.cute_vector_widths,
+                bound.env.config_spec.cute_lane_layouts,
+                bound.env.config_spec.cute_reduction_reloads,
+            ):
+                self.assertIn(reduction_block, spec.valid_block_ids())
 
         _code, output = code_and_output(rms_over_arange, (qkv,))
         expected = qkv.to(torch.float32).pow(2).sum(dim=-1)

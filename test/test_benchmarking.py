@@ -4281,7 +4281,6 @@ def test_attention_bound_varied_b200_compiler_seed_order_and_population(
     expected_raw_count,
     expected_effective_count,
 ):
-    from torch._inductor.runtime.hints import DeviceProperties
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     import helion
@@ -4289,51 +4288,29 @@ def test_attention_bound_varied_b200_compiler_seed_order_and_population(
     from helion._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILY_KEY
     from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_DISC_KEY
     from helion._compiler.cute.cute_flash import flash_structural_leaf_from_config
+    from helion._hardware import HardwareInfo
+    from helion._testing import patch_cute_mma_support
 
     attention_example = importlib.import_module("examples.attention")
+    compat_module = importlib.import_module("helion._compat")
     compile_environment = importlib.import_module(
         "helion._compiler.compile_environment"
     )
+    hardware_module = importlib.import_module("helion._hardware")
     kernel_module = importlib.import_module("helion.runtime.kernel")
+    loops_module = importlib.import_module("helion.language.loops")
     runtime_module = importlib.import_module("helion.runtime")
     source_kernel = getattr(attention_example, kernel_name)
     kernel = helion.kernel(source_kernel.fn, static_shapes=True, backend="cute")
-    fake_device_properties = DeviceProperties(
-        type="cuda",
-        index=0,
-        multi_processor_count=148,
-        cc=100,
-        major=10,
-        regs_per_multiprocessor=65536,
-        max_threads_per_multi_processor=2048,
-        max_threads_per_block=1024,
-        warp_size=32,
+    cached_hardware_decisions = (
+        compat_module._target_device_capability,
+        compat_module._supports_tensor_descriptor,
+        compat_module._min_dot_size,
+        compat_module._is_hip,
+        loops_module.use_tileir_tunables,
+        hardware_module.get_hardware_info,
     )
-    fake_cuda_properties = SimpleNamespace(
-        name="NVIDIA B200",
-        major=10,
-        minor=0,
-        multi_processor_count=148,
-        regs_per_multiprocessor=65536,
-        max_threads_per_multi_processor=2048,
-        max_threads_per_block=1024,
-        warp_size=32,
-        total_memory=192 * 1024**3,
-    )
-    monkeypatch.setattr(
-        DeviceProperties,
-        "create",
-        classmethod(lambda _cls, _device: fake_device_properties),
-    )
-    monkeypatch.setattr(
-        torch.cuda, "get_device_capability", lambda _device=None: (10, 0)
-    )
-    monkeypatch.setattr(
-        torch.cuda, "get_device_properties", lambda _device=None: fake_cuda_properties
-    )
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    cache_info = tuple(fn.cache_info() for fn in cached_hardware_decisions)
     monkeypatch.setattr(
         kernel_module, "target_device_capability", lambda _device: (10, 0)
     )
@@ -4345,8 +4322,27 @@ def test_attention_bound_varied_b200_compiler_seed_order_and_population(
     monkeypatch.setattr(
         runtime_module, "get_num_sm", lambda _device, reserved_sms=0: 148
     )
+    monkeypatch.setattr(loops_module, "use_tileir_tunables", lambda: False)
+    monkeypatch.setattr(loops_module, "_supports_warp_specialize", lambda: True)
+    monkeypatch.setattr(compat_module, "_supports_tensor_descriptor", lambda: True)
+    monkeypatch.setattr(
+        compat_module,
+        "_min_dot_size",
+        lambda _device, _lhs, _rhs: (16, 16, 16),
+    )
+    monkeypatch.setattr(compat_module, "_is_hip", lambda: False)
+    monkeypatch.setattr(
+        hardware_module,
+        "get_hardware_info",
+        lambda _device=None: HardwareInfo(
+            device_kind="cuda",
+            hardware_name="NVIDIA B200",
+            runtime_version="13.0",
+            compute_capability="sm100",
+        ),
+    )
 
-    with FakeTensorMode():
+    with patch_cute_mma_support(), FakeTensorMode():
         q = torch.empty(
             shape,
             device="cuda",  # @ignore-device-lint
@@ -4400,11 +4396,13 @@ def test_attention_bound_varied_b200_compiler_seed_order_and_population(
     if kernel_name == "causal_attention_output" and shape == (2, 32, 65536, 64):
         assert any(
             raw.config is not None
-            and raw.config.config.get("cute_vector_widths") == [1, 1, 1]
+            and raw.config.config.get("cute_vector_widths")
+            == [1] * len(spec.cute_vector_widths)
             and normalized.config is not None
             and "cute_vector_widths" not in normalized.config.config
             for raw, normalized in zip(raw_projections, projections, strict=True)
         )
+    assert tuple(fn.cache_info() for fn in cached_hardware_decisions) == cache_info
 
 
 def test_attention_compiler_seed_generation_zero_requires_terminal_evidence():
