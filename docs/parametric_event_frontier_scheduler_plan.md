@@ -385,6 +385,24 @@ The next implementation step is exact readiness-equivalent cohort-order
 candidate derivation from semantic relations, followed by bounded whole-cohort
 placement. No benchmark or codegen path depends on this incomplete entry yet.
 
+That candidate-derivation step is now implemented locally. Configured task
+order is composed with semantic readiness in its native multidimensional
+coordinates; it is never flattened before the dependency proof. One-key
+fibers and separable set-valued fan-out are represented as an exact
+`order -> cohort -> event keys` factorization, with the converse of the first
+relation remaining the only `cohort -> order` truth. Dynamic full-domain
+fibers now use a symbolic fast path in the existing target enumerator, and the
+same clipped range drives both its cardinality and decoding.
+
+These relations are ordering candidates only. Original per-arm readiness
+relations remain authoritative for admission, arrival multiplicity, closure,
+and progress. A root is kept canonical if any of its candidate relations is
+unsupported; whole-root barriers, repeated same-root producer arms, nested
+producer sites, ambiguous multi-piece intra-cohort order, nonuniform
+readiness-major tails, and aggregate proof-budget exhaustion all decline. The
+next code change is therefore bounded resident placement over these candidates,
+not another readiness or schedule representation.
+
 ### Priority 1: finish the symbolic dependency refactor
 
 - [x] Canonicalize every `TileAccess` shape, stride, and storage-offset value

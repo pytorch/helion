@@ -3828,6 +3828,81 @@ class TestTileDependency(TestCase):
         assert tail_converse is not None
         self.assertIsNone(tail_converse.enumerate_targets_by_source())
 
+    def test_target_enumeration_accepts_symbolic_full_domain_fibers(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        cohorts = CoordinateDomain(
+            (0,),
+            ((0, batch),),
+            kind="event",
+            _allow_empty=True,
+        )
+        order = CoordinateDomain(
+            (10, 11),
+            ((10, batch), (11, 2)),
+            kind="task_order",
+            _allow_empty=True,
+        )
+        cohort = coordinate_axis_symbol(0)
+        order_points_by_cohort = CoordinateRelation(
+            cohorts,
+            order,
+            (
+                _CoordinateRelationPiece(
+                    ((0, 0, batch, 1),),
+                    (
+                        (10, cohort, cohort + 1, 1),
+                        (11, sympy.Integer(0), sympy.Integer(2), 1),
+                    ),
+                ),
+            ),
+        )
+
+        with (
+            mock.patch.object(
+                CoordinateRelation,
+                "materialize",
+                side_effect=AssertionError("symbolic enumeration must not materialize"),
+            ),
+            mock.patch.object(
+                CoordinateRelation,
+                "targets",
+                side_effect=AssertionError("symbolic enumeration must not enumerate"),
+            ),
+        ):
+            task_order = order_points_by_cohort.enumerate_targets_by_source()
+            self.assertIsNotNone(task_order)
+            assert task_order is not None
+            self.assertTrue(task_order.is_bijection_from_source_support())
+
+        for concrete_batch in (0, 1, 3):
+            concrete = task_order.substitute_parameters({batch: concrete_batch})
+            self.assertEqual(
+                sorted(next(iter(targets)) for targets in concrete.materialize()),
+                list(range(2 * concrete_batch)),
+            )
+
+    def test_symbolic_target_enumeration_declines_clipped_strided_range(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        source = CoordinateDomain(
+            (0,),
+            ((0, batch),),
+            kind="event",
+            _allow_empty=True,
+        )
+        target = CoordinateDomain((10,), ((10, 3),), kind="site")
+        relation = CoordinateRelation(
+            source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    ((0, 0, batch, 1),),
+                    ((10, -1, 3, 2),),
+                ),
+            ),
+        )
+
+        self.assertIsNone(relation.enumerate_targets_by_source())
+
     def test_symbolic_dependency_preserves_unequal_tile_range(self) -> None:
         elements = 65_536
         plan = build_tile_dependency_graph(

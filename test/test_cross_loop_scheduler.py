@@ -2333,6 +2333,509 @@ class TestCrossLoopScheduler(TestCase):
                         )
                         self.assertIs(scheduled, canonical)
 
+    def test_readiness_cohort_relation_preserves_dynamic_native_order(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        task_domain = _identify_root_domains(
+            (_domain((10, batch, 1), (11, 3, 1)),)
+        )[0]
+        task_order = pid_task_order(task_domain, (11, 10))
+        key_domain = CoordinateDomain(
+            axis_order=(0, 1),
+            axis_counts_items=((0, batch), (1, 2)),
+            kind="event",
+            identity=0,
+            _allow_empty=True,
+        )
+        keys_by_task = _full_point_map(
+            task_domain,
+            key_domain,
+            coordinate_axis_symbol(10),
+            sympy.floor(coordinate_axis_symbol(11) / 2),
+        )
+
+        with _forbid_schedule_enumeration():
+            cohort = (
+                cross_loop_scheduler._readiness_equivalent_cohort_relation(
+                    task_order,
+                    keys_by_task,
+                )
+            )
+        self.assertIsNotNone(cohort)
+        assert cohort is not None
+        cohort_by_order, event_keys_by_cohort = cohort
+        order_points_by_cohort = cohort_by_order.converse()
+        self.assertIsNotNone(order_points_by_cohort)
+        assert order_points_by_cohort is not None
+        self.assertEqual(
+            event_keys_by_cohort,
+            CoordinateRelation.identity(key_domain, key_domain),
+        )
+        self.assertEqual(order_points_by_cohort, cohort_by_order.converse())
+        self.assertIsNone(
+            cross_loop_scheduler._cohort_major_task_order(
+                task_order,
+                cohort_by_order,
+            )
+        )
+
+        task_keys = task_order.then(keys_by_task)
+        self.assertIsNotNone(task_keys)
+        assert task_keys is not None
+        for concrete_batch in (0, 1, 3):
+            with self.subTest(concrete_batch=concrete_batch):
+                substitutions = {batch: concrete_batch}
+                self.assertEqual(
+                    cohort_by_order.substitute_parameters(
+                        substitutions
+                    ).materialize(),
+                    task_keys.substitute_parameters(substitutions).materialize(),
+                )
+                concrete_inverse = order_points_by_cohort.substitute_parameters(
+                    substitutions
+                )
+                self.assertEqual(
+                    tuple(len(points) for points in concrete_inverse.materialize()),
+                    (2,) * concrete_batch + (1,) * concrete_batch,
+                )
+
+    def test_readiness_cohort_relation_factors_fixed_fanout(self) -> None:
+        task_count = sympy.Symbol(
+            "task_count",
+            integer=True,
+            nonnegative=True,
+        )
+        task_domain = _identify_root_domains(
+            (_domain((10, task_count, 1)),)
+        )[0]
+        task_order = pid_task_order(task_domain, (10,))
+        key_domain = CoordinateDomain(
+            axis_order=(0,),
+            axis_counts_items=((0, 2 * task_count),),
+            kind="event",
+            identity=0,
+            _allow_empty=True,
+        )
+        task = coordinate_axis_symbol(10)
+        keys_by_task = CoordinateRelation(
+            source_domain=task_domain,
+            target_domain=key_domain,
+            pieces=(
+                _CoordinateRelationPiece(
+                    source_bounds_items=((10, 0, task_count, 1),),
+                    target_ranges=((0, 2 * task, 2 * task + 2, 1),),
+                ),
+            ),
+        )
+
+        with _forbid_schedule_enumeration():
+            cohort = (
+                cross_loop_scheduler._readiness_equivalent_cohort_relation(
+                    task_order,
+                    keys_by_task,
+                )
+            )
+        self.assertIsNotNone(cohort)
+        assert cohort is not None
+        cohort_by_order, event_keys_by_cohort = cohort
+        order_points_by_cohort = cohort_by_order.converse()
+        self.assertIsNotNone(order_points_by_cohort)
+        assert order_points_by_cohort is not None
+        self.assertTrue(cohort_by_order.is_total_function())
+        candidate_order = cross_loop_scheduler._cohort_major_task_order(
+            task_order,
+            cohort_by_order,
+        )
+        self.assertIsNotNone(candidate_order)
+        assert candidate_order is not None
+
+        for concrete_count in (0, 1, 3):
+            with self.subTest(concrete_count=concrete_count):
+                substitutions = {task_count: concrete_count}
+                concrete_keys = event_keys_by_cohort.substitute_parameters(
+                    substitutions
+                )
+                self.assertEqual(
+                    concrete_keys.materialize(),
+                    tuple(
+                        frozenset((2 * index, 2 * index + 1))
+                        for index in range(concrete_count)
+                    ),
+                )
+                self.assertEqual(
+                    tuple(
+                        len(points)
+                        for points in order_points_by_cohort.substitute_parameters(
+                            substitutions
+                        ).materialize()
+                    ),
+                    (1,) * concrete_count,
+                )
+                concrete_order = candidate_order.substitute_parameters(substitutions)
+                self.assertTrue(concrete_order.is_bijection_from_source_support())
+                self.assertEqual(
+                    sorted(
+                        next(iter(tasks))
+                        for tasks in concrete_order.materialize()
+                    ),
+                    list(range(concrete_count)),
+                )
+
+    def test_readiness_cohort_relation_declines_partial_task_support(self) -> None:
+        task_domain = _identify_root_domains((_domain((10, 3, 1)),))[0]
+        task_order = pid_task_order(task_domain, (10,))
+        key_domain = _domain((0, 3), kind="event", identity=0)
+        task = coordinate_axis_symbol(10)
+        partial_keys = CoordinateRelation.point_map(
+            task_domain,
+            key_domain,
+            ((((10, 0, 2, 1),), (task,)),),
+        )
+
+        with _forbid_schedule_enumeration():
+            self.assertIsNone(
+                cross_loop_scheduler._readiness_equivalent_cohort_relation(
+                    task_order,
+                    partial_keys,
+                )
+            )
+
+    def test_cohort_major_order_declines_piece_order_dependent_fibers(self) -> None:
+        task_domain = _identify_root_domains((_domain((10, 4, 1)),))[0]
+        task_order = pid_task_order(task_domain, (10,))
+        key_domain = _domain((0, 2), kind="event", identity=0)
+        pieces = (
+            (((10, 0, 1, 1),), (sympy.Integer(0),)),
+            (((10, 3, 4, 1),), (sympy.Integer(0),)),
+            (((10, 1, 3, 1),), (sympy.Integer(1),)),
+        )
+
+        for ordered_pieces in (pieces, (pieces[1], pieces[0], pieces[2])):
+            with self.subTest(ordered_pieces=ordered_pieces):
+                keys_by_task = CoordinateRelation.point_map(
+                    task_domain,
+                    key_domain,
+                    ordered_pieces,
+                )
+                cohort = (
+                    cross_loop_scheduler._readiness_equivalent_cohort_relation(
+                        task_order,
+                        keys_by_task,
+                    )
+                )
+                self.assertIsNotNone(cohort)
+                assert cohort is not None
+                self.assertIsNone(
+                    cross_loop_scheduler._cohort_major_task_order(
+                        task_order,
+                        cohort[0],
+                    )
+                )
+
+    def test_semantic_cohort_candidates_use_uncontracted_readiness_graph(self) -> None:
+        task_count = sympy.Symbol(
+            "task_count",
+            integer=True,
+            nonnegative=True,
+        )
+        producer_domain, consumer_domain = _identify_root_domains(
+            (
+                _domain((10, task_count, 1)),
+                _domain((20, task_count, 1), (21, 2, 1)),
+            )
+        )
+        key_domain = CoordinateDomain(
+            axis_order=(0,),
+            axis_counts_items=((0, task_count),),
+            kind="event",
+            identity=0,
+            _allow_empty=True,
+        )
+        producer_task = coordinate_axis_symbol(10)
+        producer_keys = _full_point_map(
+            producer_domain,
+            key_domain,
+            producer_task,
+        )
+        event = ReadinessEvent(
+            producers=(
+                _readiness_producer_from_publication(
+                    producer_root=0,
+                    publication=producer_keys,
+                ),
+            ),
+            consumers=(
+                ReadinessConsumer(
+                    consumer_root=1,
+                    keys_by_consumer=_full_point_map(
+                        consumer_domain,
+                        key_domain,
+                        coordinate_axis_symbol(20),
+                    ),
+                ),
+            ),
+        )
+        graph = _readiness_graph((producer_domain, consumer_domain), event)
+
+        with _forbid_schedule_enumeration():
+            cohort_relations = (
+                cross_loop_scheduler._semantic_readiness_cohort_relations(
+                    graph
+                )
+            )
+        self.assertIsNotNone(cohort_relations)
+        assert cohort_relations is not None
+        admission, closure, unsupported_admission, unsupported_closure = (
+            cohort_relations
+        )
+
+        self.assertEqual(unsupported_admission, frozenset())
+        self.assertEqual(unsupported_closure, frozenset())
+        self.assertEqual(len(admission), 1)
+        self.assertEqual(admission[0][:3], (1, 0, 0))
+        self.assertEqual(len(closure), 1)
+        self.assertEqual(closure[0][:2], (0, 0))
+        admission_order = cross_loop_scheduler._cohort_major_task_order(
+            graph.root_task_orders[1],
+            admission[0][3],
+        )
+        self.assertIsNotNone(admission_order)
+        assert admission_order is not None
+        self.assertTrue(admission_order.is_bijection_from_source_support())
+        closure_event_keys = closure[0][3]
+        self.assertEqual(
+            closure_event_keys.substitute_parameters(
+                {task_count: 3}
+            ).materialize(),
+            (
+                frozenset((0,)),
+                frozenset((1,)),
+                frozenset((2,)),
+            ),
+        )
+
+    def test_root_barrier_event_has_no_fine_grained_cohort_candidate(self) -> None:
+        producer_domain, consumer_domain = _identify_root_domains(
+            (_domain((10, 2, 1)), _domain((20, 2, 1)))
+        )
+        key_domain = _domain((0, 1), kind="event", identity=0)
+        event = ReadinessEvent(
+            producers=(
+                ReadinessProducer(
+                    0,
+                    CoordinateRelation(
+                        key_domain,
+                        producer_domain,
+                        (
+                            _CoordinateRelationPiece(
+                                ((0, 0, 1, 1),),
+                                ((10, 0, 2, 1),),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            consumers=(
+                ReadinessConsumer(
+                    1,
+                    _full_point_map(
+                        consumer_domain,
+                        key_domain,
+                        sympy.Integer(0),
+                    ),
+                ),
+            ),
+        )
+        self.assertEqual(event.root_barrier_producer_root, 0)
+
+        with _forbid_schedule_enumeration():
+            cohort_relations = (
+                cross_loop_scheduler._semantic_readiness_cohort_relations(
+                    _readiness_graph((producer_domain, consumer_domain), event)
+                )
+            )
+        self.assertEqual(
+            cohort_relations,
+            ((), (), frozenset((1,)), frozenset((0,))),
+        )
+
+    def test_unsupported_admission_event_keeps_entire_root_conservative(self) -> None:
+        root_domains = _identify_root_domains(
+            tuple(_domain((10 + 10 * root, 2, 1)) for root in range(3))
+        )
+        supported = _pointwise_root_readiness_event(root_domains, 0, 2, 0)
+        unsupported_base = _pointwise_root_readiness_event(root_domains, 1, 2, 1)
+        consumer_domain = root_domains[2]
+        consumer_axis = consumer_domain.axis_order[0]
+        unsupported = ReadinessEvent(
+            unsupported_base.producers,
+            (
+                dataclasses.replace(
+                    unsupported_base.consumers[0],
+                    keys_by_consumer=CoordinateRelation.point_map(
+                        consumer_domain,
+                        unsupported_base.readiness_key_domain,
+                        (
+                            (
+                                ((consumer_axis, 0, 1, 1),),
+                                (sympy.Integer(0),),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        with _forbid_schedule_enumeration():
+            cohort_relations = (
+                cross_loop_scheduler._semantic_readiness_cohort_relations(
+                    _readiness_graph(root_domains, supported, unsupported)
+                )
+            )
+        self.assertIsNotNone(cohort_relations)
+        assert cohort_relations is not None
+        admission, _closure, unsupported_admission, _unsupported_closure = (
+            cohort_relations
+        )
+        self.assertEqual(admission, ())
+        self.assertEqual(unsupported_admission, frozenset((2,)))
+
+    def test_semantic_cohort_candidates_respect_aggregate_piece_budget(self) -> None:
+        root_domains = _identify_root_domains(
+            (_domain((10, 2, 1)), _domain((20, 2, 1)))
+        )
+        event = _pointwise_root_readiness_event(root_domains, 0, 1, 0)
+
+        with (
+            _forbid_schedule_enumeration(),
+            mock.patch.object(tile_dependency, "_MAX_RELATION_PIECES", 3),
+        ):
+            self.assertIsNone(
+                cross_loop_scheduler._semantic_readiness_cohort_relations(
+                    _readiness_graph(root_domains, event)
+                )
+            )
+
+        with (
+            _forbid_schedule_enumeration(),
+            mock.patch.object(
+                tile_dependency,
+                "_MAX_RELATION_PRODUCT_STATES",
+                1,
+            ),
+        ):
+            self.assertIsNone(
+                cross_loop_scheduler._semantic_readiness_cohort_relations(
+                    _readiness_graph(root_domains, event)
+                )
+            )
+
+    def test_repeated_producer_root_has_no_closure_order_candidate(self) -> None:
+        producer_domain, consumer_domain = _identify_root_domains(
+            (_domain((10, 2, 1)), _domain((20, 1, 1)))
+        )
+        key_domain = _domain((0, 1), kind="event", identity=0)
+        first_arm = ReadinessProducer(
+            0,
+            CoordinateRelation(
+                key_domain,
+                producer_domain,
+                (
+                    _CoordinateRelationPiece(
+                        ((0, 0, 1, 1),),
+                        ((10, 0, 2, 1),),
+                    ),
+                ),
+            ),
+        )
+        second_arm = ReadinessProducer(
+            0,
+            _full_point_map(
+                key_domain,
+                producer_domain,
+                sympy.Integer(1),
+            ),
+        )
+        event = ReadinessEvent(
+            (first_arm, second_arm),
+            (
+                ReadinessConsumer(
+                    1,
+                    _full_point_map(
+                        consumer_domain,
+                        key_domain,
+                        sympy.Integer(0),
+                    ),
+                ),
+            ),
+        )
+
+        with _forbid_schedule_enumeration():
+            cohort_relations = (
+                cross_loop_scheduler._semantic_readiness_cohort_relations(
+                    _readiness_graph((producer_domain, consumer_domain), event)
+                )
+            )
+        self.assertIsNotNone(cohort_relations)
+        assert cohort_relations is not None
+        _admission, closure, _unsupported_admission, unsupported_closure = (
+            cohort_relations
+        )
+        self.assertEqual(closure, ())
+        self.assertEqual(unsupported_closure, frozenset((0,)))
+
+    def test_nested_consumer_cohort_retains_every_checkpoint(self) -> None:
+        producer_domain, consumer_domain = _identify_root_domains(
+            (_domain((10, 2, 1)), _domain((20, 1, 1)))
+        )
+        consumer_site = _domain(
+            (20, 1, 1),
+            (21, 2, 1),
+            identity=7,
+        )
+        key_domain = _domain((0, 2), kind="event", identity=0)
+        event = ReadinessEvent(
+            producers=(
+                _readiness_producer_from_publication(
+                    producer_root=0,
+                    publication=_full_point_map(
+                        producer_domain,
+                        key_domain,
+                        coordinate_axis_symbol(10),
+                    ),
+                ),
+            ),
+            consumers=(
+                ReadinessConsumer(
+                    consumer_root=1,
+                    consumer_site_id=7,
+                    keys_by_consumer=_full_point_map(
+                        consumer_site,
+                        key_domain,
+                        coordinate_axis_symbol(21),
+                    ),
+                ),
+            ),
+        )
+
+        with _forbid_schedule_enumeration():
+            cohort_relations = (
+                cross_loop_scheduler._semantic_readiness_cohort_relations(
+                    _readiness_graph((producer_domain, consumer_domain), event)
+                )
+            )
+        self.assertIsNotNone(cohort_relations)
+        assert cohort_relations is not None
+        admission, _closure, unsupported_admission, _unsupported_closure = (
+            cohort_relations
+        )
+        self.assertEqual(unsupported_admission, frozenset())
+        self.assertEqual(len(admission), 1)
+        event_keys_by_cohort = admission[0][4]
+        self.assertEqual(
+            event_keys_by_cohort.materialize(),
+            (frozenset((0, 1)),),
+        )
+
     def test_parametric_cohort_depth_one_preserves_permuted_multi_axis_order(
         self,
     ) -> None:
@@ -2372,6 +2875,48 @@ class TestCrossLoopScheduler(TestCase):
                         {batch: concrete_batch}
                     )
                     self.assertTrue(specialized.is_bijection_from_source_support())
+
+    def test_parametric_cohort_declines_noncanonical_input_before_derivation(
+        self,
+    ) -> None:
+        root_domain = _identify_root_domains((_domain((10, 4, 1)),))[0]
+        reference_order = pid_task_order(root_domain, (10,))
+        order_domain = reference_order.source_domain
+        reversed_order = CoordinateRelation.point_map(
+            order_domain,
+            root_domain,
+            (
+                (
+                    ((10, 0, 4, 1),),
+                    (3 - coordinate_axis_symbol(10),),
+                ),
+            ),
+        )
+        graph = ReadinessGraph((reference_order,), ())
+        noncanonical = cross_loop_scheduler._build_root_major_worker_schedule(
+            (root_domain,),
+            (reversed_order,),
+            worker_count=2,
+        )
+
+        with (
+            _forbid_schedule_enumeration(),
+            mock.patch.object(
+                cross_loop_scheduler,
+                "_semantic_readiness_cohort_relations",
+                side_effect=AssertionError(
+                    "noncanonical input must decline before cohort derivation"
+                ),
+            ),
+        ):
+            self.assertIs(
+                cross_loop_scheduler._parametric_cohort_list_schedule(
+                    graph,
+                    noncanonical,
+                    pipeline_depth=2,
+                ),
+                noncanonical,
+            )
 
     def test_root_major_progress_handles_forward_backward_and_empty_guards(
         self,

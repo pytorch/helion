@@ -4874,7 +4874,19 @@ class CoordinateRelation:
         target boxes are disjoint and every source has the same static target
         cardinality.  No source or target instance is materialized.
         """
-        cells = _relation_source_cells(self, include_domain=True)
+        full_source_bounds = tuple(
+            (axis, 0, self.source_domain.axis_count_expressions[axis], 1)
+            for axis in self.source_domain.axis_order
+        )
+        # The generic source-cell partitioner deliberately declines symbolic
+        # cut ordering. A single full-domain piece needs no such ordering and
+        # is the common dynamic cohort case (Identity(B) x fixed inner fiber).
+        cells = (
+            (full_source_bounds,)
+            if len(self.pieces) == 1
+            and self.pieces[0].source_bounds_items == full_source_bounds
+            else _relation_source_cells(self, include_domain=True)
+        )
         if cells is None:
             return None
         cell_targets: list[
@@ -4916,6 +4928,12 @@ class CoordinateRelation:
                 ]
             ] = []
             for target_ranges in active_targets:
+                target_ranges = _clip_target_box_to_domain(
+                    target_ranges,
+                    target_domain=self.target_domain,
+                    source_domain=self.source_domain,
+                    source_bounds=bounds,
+                )
                 cardinality = _target_box_cardinality(
                     target_ranges,
                     target_domain=self.target_domain,

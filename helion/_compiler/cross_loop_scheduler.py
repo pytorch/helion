@@ -8396,6 +8396,297 @@ def _readiness_root_criticality(
     return _root_schema_criticality(len(readiness_graph.root_domains), edges)
 
 
+def _readiness_equivalent_cohort_relation(
+    task_order: CoordinateRelation,
+    keys_by_task: CoordinateRelation,
+) -> tuple[CoordinateRelation, CoordinateRelation] | None:
+    """Factor one configured task traversal into exact readiness cohorts.
+
+    The returned relations are ``order -> cohort`` and ``cohort -> event
+    keys``. The exact ``cohort -> order`` relation is the first relation's
+    memoized converse, not a second source of truth. Their composition retains
+    the complete semantic key set of every task. A scalar key is already a
+    sufficient cohort identity; a separable set-valued fan-out is factored
+    through the existing producer-set quotient. Native configured order
+    coordinates are intentionally preserved here: flattening a dynamic
+    mixed-radix order can obscure an otherwise exact symbolic converse.
+    """
+    if task_order.target_domain != keys_by_task.source_domain:
+        return None
+    task_keys = task_order.then(keys_by_task)
+    if task_keys is None:
+        return None
+
+    if task_keys.is_single_valued():
+        if not task_keys.is_total_function():
+            return None
+        order_points_by_cohort = task_keys.converse()
+        if order_points_by_cohort is None:
+            return None
+        cohort_by_order = task_keys
+        event_keys_by_cohort = CoordinateRelation.identity(
+            task_keys.target_domain,
+            task_keys.target_domain,
+        )
+    else:
+        normalized = task_keys.coalesce_adjacent_source_boxes()
+        full_source_bounds = tuple(
+            (axis, 0, normalized.source_domain.axis_count_expressions[axis], 1)
+            for axis in normalized.source_domain.axis_order
+        )
+        affecting_axes = normalized.source_axes_affecting_targets()
+        if (
+            len(normalized.pieces) == 1
+            and normalized.pieces[0].source_bounds_items == full_source_bounds
+            and affecting_axes is not None
+            and not affecting_axes
+        ):
+            cohort_domain = CoordinateDomain((), (), kind="event")
+            cohort_by_order = CoordinateRelation.total(
+                normalized.source_domain,
+                cohort_domain,
+            )
+            event_keys_by_cohort = CoordinateRelation(
+                cohort_domain,
+                normalized.target_domain,
+                (
+                    _CoordinateRelationPiece(
+                        source_bounds_items=(),
+                        target_ranges=normalized.pieces[0].target_ranges,
+                    ),
+                ),
+            )
+        else:
+            quotient = normalized.producer_set_quotient()
+            if quotient is None:
+                return None
+            cohort_by_order, event_keys_by_cohort = quotient
+        order_points_by_cohort = cohort_by_order.converse()
+        if order_points_by_cohort is None:
+            return None
+        recomposed = cohort_by_order.then(event_keys_by_cohort)
+        if recomposed is None or (
+            recomposed.coalesce_adjacent_source_boxes()
+            != task_keys.coalesce_adjacent_source_boxes()
+        ):
+            return None
+
+    if (
+        cohort_by_order.source_domain != task_order.source_domain
+        or not cohort_by_order.is_total_function()
+        or order_points_by_cohort.source_domain
+        != cohort_by_order.target_domain
+        or order_points_by_cohort.target_domain != task_order.source_domain
+        or event_keys_by_cohort.source_domain != cohort_by_order.target_domain
+        or event_keys_by_cohort.target_domain != keys_by_task.target_domain
+    ):
+        return None
+    return cohort_by_order, event_keys_by_cohort
+
+
+def _semantic_readiness_cohort_relations(
+    readiness_graph: ReadinessGraph,
+) -> tuple[
+    tuple[
+        tuple[
+            int,
+            int,
+            int,
+            CoordinateRelation,
+            CoordinateRelation,
+        ],
+        ...,
+    ],
+    tuple[
+        tuple[
+            int,
+            int,
+            CoordinateRelation,
+            CoordinateRelation,
+        ],
+        ...,
+    ],
+    frozenset[int],
+    frozenset[int],
+] | None:
+    """Derive admission and event-closure cohorts from semantic readiness.
+
+    Admission entries are ``(root, event, consumer, order->cohort,
+    cohort->keys)``. Closure entries omit the consumer index. The final two
+    sets name roots for which at least one semantic event could not produce an
+    exact candidate; all candidates for those roots are removed. These tuples
+    are ephemeral ordering candidates, not readiness proofs and not a second
+    graph or schedule representation. Merged producer relations in particular
+    never prove event closure or arrival multiplicity. Every original
+    ``ReadinessGraph`` arm remains the sole authority for final admission,
+    progress, counts, and synchronization.
+    """
+    admission: list[
+        tuple[
+            int,
+            int,
+            int,
+            CoordinateRelation,
+            CoordinateRelation,
+        ]
+    ] = []
+    closure: list[
+        tuple[
+            int,
+            int,
+            CoordinateRelation,
+            CoordinateRelation,
+        ]
+    ] = []
+    unsupported_admission_roots: set[int] = set()
+    unsupported_closure_roots: set[int] = set()
+    derived_piece_count = 0
+    relation_product_states = 0
+
+    def account_composition(
+        task_order: CoordinateRelation,
+        keys_by_task: CoordinateRelation,
+    ) -> bool:
+        nonlocal relation_product_states
+        relation_product_states += len(task_order.pieces) * len(
+            keys_by_task.pieces
+        )
+        return (
+            relation_product_states
+            <= tile_dependency._MAX_RELATION_PRODUCT_STATES
+        )
+
+    for event in readiness_graph.events:
+        if event.root_barrier_producer_root is not None:
+            unsupported_admission_roots.update(
+                consumer.consumer_root for consumer in event.consumers
+            )
+            unsupported_closure_roots.update(
+                producer.producer_root for producer in event.producers
+            )
+            continue
+        for consumer_index, consumer in enumerate(event.consumers):
+            keys_by_task = _keys_by_consumer_root_task(
+                readiness_graph,
+                consumer,
+            )
+            if keys_by_task is None:
+                unsupported_admission_roots.add(consumer.consumer_root)
+                continue
+            task_order = readiness_graph.root_task_orders[consumer.consumer_root]
+            if not account_composition(task_order, keys_by_task):
+                return None
+            cohort = _readiness_equivalent_cohort_relation(
+                task_order,
+                keys_by_task,
+            )
+            if cohort is None:
+                unsupported_admission_roots.add(consumer.consumer_root)
+                continue
+            derived_piece_count += sum(len(relation.pieces) for relation in cohort)
+            if derived_piece_count > tile_dependency._MAX_RELATION_PIECES:
+                return None
+            admission.append(
+                (
+                    consumer.consumer_root,
+                    event.event_id,
+                    consumer_index,
+                    *cohort,
+                )
+            )
+
+        producer_root_counts: dict[int, int] = {}
+        for producer in event.producers:
+            producer_root_counts[producer.producer_root] = (
+                producer_root_counts.get(producer.producer_root, 0) + 1
+            )
+        unsupported_event_closure_roots = {
+            producer.producer_root
+            for producer in event.producers
+            if producer.producer_site_id is not None
+            or producer_root_counts[producer.producer_root] != 1
+        }
+        unsupported_closure_roots.update(unsupported_event_closure_roots)
+
+        static_producers = _readiness_static_producers(
+            readiness_graph,
+            event.producers,
+            {},
+        )
+        if static_producers is None:
+            unsupported_closure_roots.update(
+                producer.producer_root for producer in event.producers
+            )
+            continue
+        for producer_root, keys_by_task in static_producers:
+            if producer_root in unsupported_event_closure_roots:
+                continue
+            task_order = readiness_graph.root_task_orders[producer_root]
+            if not account_composition(task_order, keys_by_task):
+                return None
+            cohort = _readiness_equivalent_cohort_relation(
+                task_order,
+                keys_by_task,
+            )
+            if cohort is None:
+                unsupported_closure_roots.add(producer_root)
+                continue
+            derived_piece_count += sum(len(relation.pieces) for relation in cohort)
+            if derived_piece_count > tile_dependency._MAX_RELATION_PIECES:
+                return None
+            closure.append((producer_root, event.event_id, *cohort))
+    return (
+        tuple(item for item in admission if item[0] not in unsupported_admission_roots),
+        tuple(item for item in closure if item[0] not in unsupported_closure_roots),
+        frozenset(unsupported_admission_roots),
+        frozenset(unsupported_closure_roots),
+    )
+
+
+def _cohort_major_task_order(
+    task_order: CoordinateRelation,
+    cohort_by_order: CoordinateRelation,
+) -> CoordinateRelation | None:
+    """Enumerate whole uniform cohorts while preserving their configured order.
+
+    Cohort discovery stays in native task-order coordinates. Scalarization is
+    performed only here, after exact readiness equivalence is known. The
+    existing enumerator intentionally declines a nonuniform tail; the future
+    prefix/full-group/tail builder can extend this strength reduction without
+    changing the cohort relation or widening that tail.
+    """
+    if cohort_by_order.source_domain != task_order.source_domain:
+        return None
+    order_points_by_cohort = cohort_by_order.converse()
+    if (
+        order_points_by_cohort is None
+        or len(order_points_by_cohort.pieces) != 1
+    ):
+        # The existing enumerator concatenates multiple active target boxes in
+        # representation order. Until a canonical box-order proof exists,
+        # accepting several pieces would make extensionally equal relations
+        # select different intra-cohort task orders.
+        return None
+    enumerated_order_points = order_points_by_cohort.enumerate_targets_by_source()
+    candidate = (
+        None
+        if enumerated_order_points is None
+        else enumerated_order_points.then(task_order)
+    )
+    if (
+        candidate is None
+        or candidate.target_domain != task_order.target_domain
+        or not _equal_integer_expressions(
+            candidate.source_domain.size_expr,
+            task_order.source_domain.size_expr,
+        )
+        or not candidate.is_bijection_from_source_support()
+        or len(candidate.pieces) > tile_dependency._MAX_RELATION_PIECES
+    ):
+        return None
+    return candidate
+
+
 def _parametric_cohort_list_schedule(
     readiness_graph: ReadinessGraph,
     canonical_schedule: WorkerSchedule,
@@ -8431,9 +8722,30 @@ def _parametric_cohort_list_schedule(
     if pipeline_depth == 1:
         return canonical_schedule
 
+    if any(
+        not root_schedule_matches_reference(
+            canonical_schedule.segments_for_root(root),
+            reference_task_order,
+        )
+        for root, reference_task_order in enumerate(
+            readiness_graph.root_task_orders
+        )
+    ):
+        return canonical_schedule
+
     # Cyclic root/event quotients are outside this milestone.  Higher depths
     # must conservatively alias C rather than invoking a second scheduler.
     if _readiness_root_criticality(readiness_graph) is None:
+        return canonical_schedule
+
+    # Derive candidates from the uncontracted semantic graph. The first
+    # resident placement patch consumes these facts; deriving them here now
+    # fixes the proof boundary and prevents a later return to emitted-counter
+    # or continuation-specific topology.
+    cohort_relations = _semantic_readiness_cohort_relations(readiness_graph)
+    if cohort_relations is None or (
+        not cohort_relations[0] and not cohort_relations[1]
+    ):
         return canonical_schedule
 
     # Subsequent Phase 4A.3 patches add legal whole-cohort pulls here.  Until a
