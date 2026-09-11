@@ -249,8 +249,9 @@ class WorkerScheduleSegment:
 
         if task_count.free_symbols:
             # Prove the compatibility fields directly against an exact dense
-            # ordinalization of the authoritative placement support.  This is
-            # bounded by relation pieces and never samples runtime task counts.
+            # ordinalization of the authoritative placement support.  Codegen
+            # still consumes these fields, so authoritative ownership alone
+            # must not make a stale dense dispatch certificate renderable.
             support_relation = CoordinateRelation.point_map(
                 self.task_order.source_domain,
                 ordinal_domain,
@@ -1506,23 +1507,11 @@ def _task_order_slice(
     if ordinal_begin.is_integer is not True or task_count.is_integer is not True:
         return None
 
-    # Preserve the established bounded construction for wholly concrete
-    # relations.  In particular, manually assembled piecewise orders can use
-    # its relation-box fallback without changing their representation.
-    if (
+    wholly_concrete = (
         not task_order.parameter_symbols
         and not ordinal_begin.free_symbols
         and not task_count.free_symbols
-    ):
-        if not isinstance(ordinal_begin, sympy.Integer) or not isinstance(
-            task_count, sympy.Integer
-        ):
-            return None
-        return _concrete_task_order_slice(
-            task_order,
-            int(ordinal_begin),
-            int(task_count),
-        )
+    )
 
     ordinal_count = task_order.source_domain.size_expr
     if (
@@ -1540,6 +1529,38 @@ def _task_order_slice(
         ordinal_count,
     ):
         return task_order if task_order.converse() is not None else None
+
+    # Preserve the established concrete spelling for an empty slice.  Empty
+    # runtime remainders are represented by the symbolic relation and vanish
+    # after substitution; the public concrete helper has historically
+    # declined a caller-requested empty interval.
+    if wholly_concrete and task_count.is_zero is True:
+        if not isinstance(ordinal_begin, sympy.Integer) or not isinstance(
+            task_count, sympy.Integer
+        ):
+            return None
+        return _concrete_task_order_slice(
+            task_order,
+            int(ordinal_begin),
+            int(task_count),
+        )
+
+    # Keep the established concrete representation when it can express the
+    # slice. If it declines, continue through the same exact symbolic
+    # relation path used by a polymorphic compile rather than making that
+    # decline a separate scheduling policy.
+    if wholly_concrete:
+        if not isinstance(ordinal_begin, sympy.Integer) or not isinstance(
+            task_count, sympy.Integer
+        ):
+            return None
+        concrete_slice = _concrete_task_order_slice(
+            task_order,
+            int(ordinal_begin),
+            int(task_count),
+        )
+        if concrete_slice is not None:
+            return concrete_slice
 
     slice_axis = (
         max(
@@ -1571,43 +1592,129 @@ def _task_order_slice(
         tile_dependency._remember_exact_converse(result, converse)
         return result
 
+    # Preserve an aligned static-inner/symbolic-outer slice in its native
+    # coordinates. Besides keeping the forward relation compact, this gives
+    # its inverse explicit logical support. A flattened inverse whose support
+    # exists only through target clipping cannot be safely composed into a
+    # later packed placement without a general multi-axis preimage proof.
+    source_axes = task_order.source_domain.axis_order
+    if len(source_axes) == 2:
+        inner_axis, outer_axis = source_axes
+        inner_count_expression = task_order.source_domain.axis_count_expressions[
+            inner_axis
+        ]
+        if (
+            not inner_count_expression.free_symbols
+            and inner_count_expression.is_integer is True
+            and int(inner_count_expression) > 0
+        ):
+            inner_count = int(inner_count_expression)
+            begin_remainder = sympy.simplify(sympy.Mod(ordinal_begin, inner_count))
+            count_remainder = sympy.simplify(sympy.Mod(task_count, inner_count))
+            if begin_remainder == 0 and count_remainder == 0:
+                outer_begin = sympy.simplify(FloorDiv(ordinal_begin, inner_count))
+                outer_count = sympy.simplify(FloorDiv(task_count, inner_count))
+                outer_end = sympy.simplify(outer_begin + outer_count)
+                source_counts = task_order.source_domain.axis_count_expressions
+                if tile_dependency._is_provably_nonnegative(
+                    sympy.simplify(source_counts[outer_axis] - outer_end),
+                    None,
+                ):
+                    local_ordinal = coordinate_axis_symbol(slice_axis)
+                    slice_to_source = CoordinateRelation.point_map(
+                        slice_domain,
+                        task_order.source_domain,
+                        (
+                            (
+                                ((slice_axis, 0, task_count, 1),),
+                                (
+                                    sympy.Mod(local_ordinal, inner_count),
+                                    outer_begin
+                                    + cast(
+                                        "sympy.Expr",
+                                        FloorDiv(local_ordinal, inner_count),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    )
+                    source_to_slice = CoordinateRelation.point_map(
+                        task_order.source_domain,
+                        slice_domain,
+                        (
+                            (
+                                (
+                                    (inner_axis, 0, inner_count, 1),
+                                    (outer_axis, outer_begin, outer_end, 1),
+                                ),
+                                (
+                                    coordinate_axis_symbol(inner_axis)
+                                    + inner_count
+                                    * (
+                                        coordinate_axis_symbol(outer_axis)
+                                        - outer_begin
+                                    ),
+                                ),
+                            ),
+                        ),
+                    )
+                    tile_dependency._remember_exact_converse(
+                        slice_to_source,
+                        source_to_slice,
+                    )
+                    result = slice_to_source.then(task_order)
+                    task_order_inverse = task_order.converse()
+                    result_inverse = (
+                        None
+                        if task_order_inverse is None
+                        else task_order_inverse.then(source_to_slice)
+                    )
+                    if result is not None and result_inverse is not None:
+                        tile_dependency._remember_exact_converse(
+                            result,
+                            result_inverse,
+                        )
+                        return result
+
     ordinal_domain = _task_order_ordinal_domain(task_order)
     flat_task_order = _flat_task_order_relation(task_order, ordinal_domain)
-    if flat_task_order is None:
-        return None
-    (ordinal_axis,) = ordinal_domain.axis_order
-    slice_ordinal = coordinate_axis_symbol(slice_axis)
-    ordinal = coordinate_axis_symbol(ordinal_axis)
-    slice_to_ordinal = CoordinateRelation.point_map(
-        slice_domain,
-        ordinal_domain,
-        (
+    if flat_task_order is not None:
+        (ordinal_axis,) = ordinal_domain.axis_order
+        slice_ordinal = coordinate_axis_symbol(slice_axis)
+        ordinal = coordinate_axis_symbol(ordinal_axis)
+        slice_to_ordinal = CoordinateRelation.point_map(
+            slice_domain,
+            ordinal_domain,
             (
-                ((slice_axis, 0, task_count, 1),),
-                (slice_ordinal + ordinal_begin,),  # pyrefly: ignore[unsupported-operation]
+                (
+                    ((slice_axis, 0, task_count, 1),),
+                    (slice_ordinal + ordinal_begin,),  # pyrefly: ignore[unsupported-operation]
+                ),
             ),
-        ),
-    )
-    # Keep the inverse's source box rectangular and let the slice target
-    # domain clip ordinals outside the selected interval.  This is the exact
-    # converse of the translation above, and lets ordinary point composition
-    # restrict mixed-radix logical coordinates without expanding a symbolic
-    # prefix into runtime-many Cartesian boxes.
-    ordinal_to_slice = CoordinateRelation.point_map(
-        ordinal_domain,
-        slice_domain,
-        (
+        )
+        # Keep the inverse's source box rectangular and let the slice target
+        # domain clip ordinals outside the selected interval. This is the exact
+        # converse of the translation above, and ordinary point composition
+        # restricts any supported task-order representation through the same
+        # path for constant and symbolic bounds.
+        ordinal_to_slice = CoordinateRelation.point_map(
+            ordinal_domain,
+            slice_domain,
             (
-                ((ordinal_axis, 0, ordinal_count, 1),),
-                (ordinal - ordinal_begin,),  # pyrefly: ignore[unsupported-operation]
+                (
+                    ((ordinal_axis, 0, ordinal_count, 1),),
+                    (ordinal - ordinal_begin,),  # pyrefly: ignore[unsupported-operation]
+                ),
             ),
-        ),
-    )
-    tile_dependency._remember_exact_converse(slice_to_ordinal, ordinal_to_slice)
-    result = slice_to_ordinal.then(flat_task_order)
-    if result is None or tile_dependency._memoized_exact_converse(result) is None:
-        return None
-    return result
+        )
+        tile_dependency._remember_exact_converse(slice_to_ordinal, ordinal_to_slice)
+        result = slice_to_ordinal.then(flat_task_order)
+        if result is not None and tile_dependency._memoized_exact_converse(
+            result
+        ) is not None:
+            return result
+
+    return None
 
 
 def _equal_integer_expressions(
@@ -1881,13 +1988,63 @@ def _packed_root_major_task_order_relation(
     task_order: CoordinateRelation,
     first_slot: sympy.Expr,
     worker_count: int,
+    *,
+    ordinal_begin: int | sympy.Expr = 0,
+    task_count: int | sympy.Expr | None = None,
 ) -> CoordinateRelation | None:
-    """Compose packed schedule slots with one configured logical traversal."""
+    """Compose packed slots with a complete or sliced logical traversal."""
     if (
         not task_order.is_bijection_from_source_support()
         or task_order.converse() is None
     ):
         return None
+    ordinal_begin = sympy.simplify(sympy.sympify(ordinal_begin))
+    full_task_count = task_order.source_domain.size_expr
+    task_count = (
+        full_task_count
+        if task_count is None
+        else sympy.simplify(sympy.sympify(task_count))
+    )
+    if (
+        ordinal_begin.is_integer is not True
+        or task_count.is_integer is not True
+        or not tile_dependency._is_provably_nonnegative(ordinal_begin, None)
+        or not tile_dependency._is_provably_nonnegative(task_count, None)
+        or not tile_dependency._is_provably_nonnegative(
+            sympy.simplify(full_task_count - ordinal_begin - task_count),
+            None,
+        )
+    ):
+        return None
+    is_full_traversal = _equal_integer_expressions(
+        ordinal_begin,
+        0,
+    ) and _equal_integer_expressions(task_count, full_task_count)
+    if not is_full_traversal:
+        sliced_order = _task_order_slice(task_order, ordinal_begin, task_count)
+        if sliced_order is None:
+            return None
+        packed_local = _parametric_root_major_relation(
+            schedule_domain,
+            sliced_order.source_domain,
+            first_slot,
+            worker_count,
+            sliced_order.source_domain.axis_order,
+        )
+        composed = None if packed_local is None else packed_local.then(sliced_order)
+        cardinality = (
+            None if composed is None else composed.source_support_cardinality()
+        )
+        inverse = None if composed is None else composed.converse()
+        if (
+            composed is None
+            or cardinality is None
+            or not _equal_integer_expressions(cardinality, task_count)
+            or inverse is None
+            or not inverse.is_single_valued()
+        ):
+            return None
+        return composed
     packed_source = _parametric_root_major_relation(
         schedule_domain,
         task_order.source_domain,
@@ -7590,9 +7747,47 @@ def _has_symbolic_worker_rank(
         # slot construction.  Distinct occupied slots on one worker have
         # distinct, increasing waves even when a root count is symbolic.
         return True
+    # A split root no longer has unique root-major geometry, but its segments
+    # may still be consecutive intervals in the same packed slot stream.  The
+    # authoritative placement relations prove those intervals directly.  In
+    # tuple order, nonoverlapping increasing intervals imply that two tasks on
+    # the same resident worker have strictly increasing waves.
+    packed_end: sympy.Expr | None = None
+    packed_intervals_are_ordered = True
+    for segment in worker_schedule.segments:
+        if segment.launch_stage != _RESIDENT_LAUNCH_STAGE:
+            packed_intervals_are_ordered = False
+            break
+        _launch_stage_axis, worker_axis, wave_axis = (
+            segment.task_order.source_domain.axis_order
+        )
+        interval = tile_dependency._dense_linear_source_support_interval(
+            segment.task_order,
+            (worker_axis, wave_axis),
+        )
+        if interval is None:
+            packed_intervals_are_ordered = False
+            break
+        begin, end = interval
+        if packed_end is not None and not tile_dependency._is_provably_nonnegative(
+            sympy.simplify(begin - packed_end),
+            None,
+        ):
+            packed_intervals_are_ordered = False
+            break
+        packed_end = end
+    if packed_intervals_are_ordered:
+        return True
     prior_runs: list[tuple[int, int, int]] = []
     for segment in worker_schedule.segments:
-        for begin, end, first_step, last_step in segment.worker_step_runs():
+        try:
+            worker_step_runs = segment.worker_step_runs()
+        except (TypeError, ValueError):
+            # This is the concrete compatibility fallback. Unsupported
+            # symbolic support must decline rather than escape the proof as a
+            # Python range/conversion error.
+            return False
+        for begin, end, first_step, last_step in worker_step_runs:
             if any(
                 max(begin, prior_begin) < min(end, prior_end)
                 and first_step <= prior_last_step
@@ -7607,12 +7802,45 @@ def _segments_share_worker(
     left: WorkerScheduleSegment,
     right: WorkerScheduleSegment,
 ) -> bool:
-    """Return whether two symbolic segment occurrences share a worker."""
-    return any(
-        max(left_begin, right_begin) < min(left_end, right_end)
-        for left_begin, left_end in left.worker_intervals()
-        for right_begin, right_end in right.worker_intervals()
-    )
+    """Return whether two segment occurrences may share a resident worker.
+
+    Segment-precedence construction needs a conservative may-overlap answer,
+    not concrete worker intervals.  Project each authoritative placement box
+    onto its worker axis; an unsupported symbolic intersection therefore adds
+    a harmless chronology edge instead of forcing runtime extents through the
+    legacy concrete diagnostic path.
+    """
+    left_axes = left.task_order.source_domain.axis_order
+    right_axes = right.task_order.source_domain.axis_order
+    if len(left_axes) != 3 or left_axes != right_axes:
+        return True
+    _launch_stage_axis, worker_axis, _wave_axis = left_axes
+    for left_piece in left.task_order.pieces:
+        left_bound = next(
+            (
+                bound
+                for bound in left_piece.source_bounds_items
+                if bound[0] == worker_axis
+            ),
+            None,
+        )
+        if left_bound is None:
+            return True
+        for right_piece in right.task_order.pieces:
+            right_bound = next(
+                (
+                    bound
+                    for bound in right_piece.source_bounds_items
+                    if bound[0] == worker_axis
+                ),
+                None,
+            )
+            if right_bound is None or not tile_dependency._source_bounds_are_disjoint(
+                (left_bound,),
+                (right_bound,),
+            ):
+                return True
+    return False
 
 
 @cache
@@ -7621,36 +7849,35 @@ def _segment_dependency_support_overlaps(
     keys_by_producer: CoordinateRelation,
     consumer_segment: WorkerScheduleSegment,
     keys_by_consumer: CoordinateRelation,
-) -> bool | None:
-    """Prove whether two segment occurrences can share a readiness key.
+) -> bool:
+    """Return whether two segment occurrences may share a readiness key.
 
     The finite graph below contains segment occurrences, never logical CTAs.
     These compositions restrict the canonical producer/consumer relations by
-    each segment's symbolic task support.  A failure to derive an exact
-    relation declines the candidate instead of guessing from materialized
-    points.
+    each segment's symbolic task support.  Failure to prove disjointness is a
+    conservative overlap: it adds a precedence edge and can reject a schedule,
+    but can never admit a deadlock.
     """
-    consumer_order = consumer_segment.logical_task_order
-    producer_order = producer_segment.logical_task_order
-    if consumer_order is None or producer_order is None:
-        return None
-    consumer_segment_keys = consumer_order.then(keys_by_consumer)
+    consumer_to_schedule = consumer_segment.task_order.converse()
+    producer_support = producer_segment.task_order.converse()
+    consumer_support = (
+        None
+        if consumer_to_schedule is None
+        else consumer_to_schedule.then(consumer_segment.task_order)
+    )
+    if consumer_support is None or producer_support is None:
+        return True
+    consumer_segment_keys = consumer_support.then(keys_by_consumer)
     consumers_by_key = (
         None if consumer_segment_keys is None else consumer_segment_keys.converse()
     )
     producers_reaching_consumer = (
         None if consumers_by_key is None else keys_by_producer.then(consumers_by_key)
     )
-    # Restrict by the same exact traversal certificate used for global
-    # exact-once validation; only its logical source support matters here.
-    producer_support = _logical_task_to_order_ordinal(
-        producer_order,
-        _task_order_ordinal_domain(producer_order),
-    )
     if producers_reaching_consumer is None or producer_support is None:
-        return None
+        return True
     if producer_support.source_domain != producers_reaching_consumer.source_domain:
-        return None
+        return True
     return not producer_support.has_disjoint_source_support(producers_reaching_consumer)
 
 
@@ -7974,8 +8201,6 @@ def _has_acyclic_symbolic_segment_precedence(
                         segments[consumer_index],
                         consumer_keys,
                     )
-                    if overlaps is None:
-                        return False
                     if overlaps:
                         if producer_index == consumer_index:
                             return False
@@ -8729,7 +8954,13 @@ def _agreed_cohort_major_root_orders(
     readiness_graph: ReadinessGraph,
     *,
     include_reference: bool = False,
-) -> tuple[dict[int, CoordinateRelation], frozenset[int]] | None:
+) -> (
+    tuple[
+        dict[int, CoordinateRelation],
+        dict[int, sympy.Expr],
+    ]
+    | None
+):
     """Return exact root orders when every semantic cohort view agrees.
 
     This is the first placement policy supported by the parametric scheduler:
@@ -8737,10 +8968,12 @@ def _agreed_cohort_major_root_orders(
     the same canonical slot support. Conflicting or unrenderable cohort views
     keep that root canonical. Reference-equivalent orders are omitted unless
     ``include_reference`` is requested by a later whole-root placement proof.
-    The second result identifies roots whose complete traversal is exactly one
-    readiness cohort in every semantic view. Roots absent from all semantic
-    events are one neutral cohort; an unsupported event role is never neutral.
-    No readiness decision is made here.
+    The second result gives the uniform first-cohort width when all views
+    induce the same task partition. A whole-root cohort is represented by its
+    ordinary root size rather than exposed as a parallel classification.
+    Roots absent from all semantic events are one neutral cohort; an
+    unsupported event role is never neutral. No readiness decision is made
+    here.
     """
     cohort_relations = _semantic_readiness_cohort_relations(readiness_graph)
     if cohort_relations is None:
@@ -8753,21 +8986,51 @@ def _agreed_cohort_major_root_orders(
     for root, _event_id, cohort_by_order, _keys in closure:
         cohorts_by_root.setdefault(root, []).append(cohort_by_order)
 
-    candidate_orders_by_root: dict[int, list[CoordinateRelation]] = {}
+    candidate_orders_by_root: dict[
+        int,
+        list[tuple[CoordinateRelation, int, CoordinateRelation]],
+    ] = {}
     declined_roots = set(unsupported_roots)
     for root, root_cohorts in cohorts_by_root.items():
         reference = readiness_graph.root_task_orders[root]
         for cohort_by_order in root_cohorts:
+            converse = cohort_by_order.converse()
             candidate = _cohort_major_task_order(reference, cohort_by_order)
-            if candidate is None:
+            cohort_width_expression = (
+                None
+                if candidate is None or not candidate.source_domain.axis_order
+                else candidate.source_domain.axis_count_expressions[
+                    candidate.source_domain.axis_order[0]
+                ]
+            )
+            cohort_width = (
+                None
+                if cohort_width_expression is None
+                or cohort_width_expression.free_symbols
+                or cohort_width_expression.is_integer is not True
+                else int(cohort_width_expression)
+            )
+            same_cohort = (
+                None if converse is None else cohort_by_order.then(converse)
+            )
+            if (
+                candidate is None
+                or cohort_width is None
+                or cohort_width <= 0
+                or same_cohort is None
+            ):
                 declined_roots.add(root)
                 break
-            candidate_orders_by_root.setdefault(root, []).append(candidate)
+            candidate_orders_by_root.setdefault(root, []).append(
+                (candidate, cohort_width, same_cohort)
+            )
 
     result: dict[int, CoordinateRelation] = {}
-    for root, candidates in candidate_orders_by_root.items():
-        if root in declined_roots or not candidates:
+    cohort_widths: dict[int, sympy.Expr] = {}
+    for root, records in candidate_orders_by_root.items():
+        if root in declined_roots or not records:
             continue
+        candidates = tuple(candidate for candidate, _width, _partition in records)
         reference = readiness_graph.root_task_orders[root]
         if any(
             not _task_orders_are_extensionally_equal(candidates[0], candidate)
@@ -8780,6 +9043,17 @@ def _agreed_cohort_major_root_orders(
         )
         if include_reference or differs_from_reference:
             result[root] = candidates[0]
+        reference_width = records[0][1]
+        reference_partition = records[0][2]
+        if all(
+            width == reference_width
+            and (
+                partition == reference_partition
+                or partition.is_pointwise_equal_to(reference_partition)
+            )
+            for _candidate, width, partition in records[1:]
+        ):
+            cohort_widths[root] = sympy.Integer(reference_width)
 
     relevant_roots = {
         root
@@ -8808,7 +9082,9 @@ def _agreed_cohort_major_root_orders(
         for root in range(len(readiness_graph.root_domains))
         if root not in relevant_roots
     )
-    return result, frozenset(whole_root_cohorts)
+    for root in whole_root_cohorts:
+        cohort_widths[root] = readiness_graph.root_domains[root].size_expr
+    return result, cohort_widths
 
 
 def _root_major_schedule_matches_configured_orders(
@@ -8865,6 +9141,31 @@ def _repack_root_major_schedule(
     task_orders: dict[int, CoordinateRelation],
 ) -> WorkerSchedule | None:
     """Repack one root permutation with exact configured-or-derived orders."""
+    return _repack_packed_schedule(
+        readiness_graph,
+        canonical_schedule,
+        tuple(
+            (
+                root,
+                sympy.Integer(0),
+                task_orders.get(
+                    root,
+                    readiness_graph.root_task_orders[root],
+                ).source_domain.size_expr,
+            )
+            for root in root_order
+        ),
+        task_orders,
+    )
+
+
+def _repack_packed_schedule(
+    readiness_graph: ReadinessGraph,
+    canonical_schedule: WorkerSchedule,
+    root_runs: tuple[tuple[int, sympy.Expr, sympy.Expr], ...],
+    task_orders: dict[int, CoordinateRelation],
+) -> WorkerSchedule | None:
+    """Pack exact slices of configured root traversals into one slot stream."""
     geometry = _parametric_root_major_schedule_geometry(canonical_schedule)
     if geometry is None:
         return None
@@ -8875,19 +9176,38 @@ def _repack_root_major_schedule(
         segment.root: first_slot
         for segment, first_slot, _task_count in geometry
     }
-    if len(segment_by_root) != len(geometry) or set(root_order) != set(segment_by_root):
+    if len(segment_by_root) != len(geometry) or any(
+        root not in segment_by_root for root, _begin, _count in root_runs
+    ):
         return None
     new_segments: list[WorkerScheduleSegment] = []
     new_geometry: list[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr]] = []
     total_piece_count = 0
     first_slot: sympy.Expr = sympy.Integer(0)
-    for root in root_order:
+    seen_run_roots: set[int] = set()
+    remember_unique_geometry = True
+    for root, ordinal_begin, task_count in root_runs:
+        ordinal_begin = sympy.simplify(ordinal_begin)
+        task_count = sympy.simplify(task_count)
+        if task_count.is_zero is True:
+            continue
         segment = segment_by_root[root]
         task_order = task_orders.get(root, readiness_graph.root_task_orders[root])
-        task_count = task_order.target_domain.size_expr
-        if root not in task_orders and _equal_integer_expressions(
-            first_slot,
-            original_first_slot[root],
+        full_task_count = task_order.source_domain.size_expr
+        is_full_run = _equal_integer_expressions(
+            ordinal_begin,
+            0,
+        ) and _equal_integer_expressions(task_count, full_task_count)
+        if root in seen_run_roots or not is_full_run:
+            remember_unique_geometry = False
+        seen_run_roots.add(root)
+        if (
+            is_full_run
+            and root not in task_orders
+            and _equal_integer_expressions(
+                first_slot,
+                original_first_slot[root],
+            )
         ):
             new_segment = segment
         else:
@@ -8896,6 +9216,8 @@ def _repack_root_major_schedule(
                 task_order,
                 first_slot,
                 canonical_schedule.worker_count,
+                ordinal_begin=ordinal_begin,
+                task_count=task_count,
             )
             if replacement is None:
                 return None
@@ -8918,25 +9240,27 @@ def _repack_root_major_schedule(
         readiness_graph.root_task_orders,
     ):
         return None
-    _remember_root_major_schedule_geometry(result, tuple(new_geometry))
+    if remember_unique_geometry and set(seen_run_roots) == set(segment_by_root):
+        _remember_root_major_schedule_geometry(result, tuple(new_geometry))
     return result
 
 
-def _single_root_tail_pull(
+def _single_cohort_tail_pull(
     readiness_graph: ReadinessGraph,
     canonical_schedule: WorkerSchedule,
     replacement_orders: dict[int, CoordinateRelation],
     *,
-    whole_root_cohorts: frozenset[int],
+    cohort_widths: dict[int, sympy.Expr],
     root_edges: frozenset[tuple[int, int]],
     root_criticality: tuple[tuple[int, int], ...],
 ) -> WorkerSchedule | None:
-    """Move one complete higher-priority root into a proved static tail.
+    """Move one complete higher-priority cohort into a proved packed tail.
 
-    The moved root is one exact readiness cohort and may cross only
-    incomparable roots whose runs have not yet started. This is one bounded
-    list-scheduling decision at a completed-root frontier; runtime quantities
-    never participate in its priority ordering.
+    The cohort may cross only incomparable roots whose runs have not yet
+    started. Runtime extents may bound its exact remainder but never rank it.
+    A partial cohort action is selected only when its base class strictly beats
+    every competitor's optimistic release class, so an unproved key release
+    cannot change the winner.
     """
     geometry = _parametric_root_major_schedule_geometry(canonical_schedule)
     if geometry is None:
@@ -9002,37 +9326,73 @@ def _single_root_tail_pull(
             1,
         )
 
+    def optimistic_action_priority(root: int) -> tuple[int, int, int, int]:
+        """Return the best priority any first cohort of ``root`` could earn."""
+        base = root_criticality[root]
+        release_class = min(
+            (root_criticality[consumer] for consumer in successors[root]),
+            default=base,
+        )
+        return (*min(base, release_class), 0, 0)
+
     for boundary in range(len(geometry) - 1):
         _segment, first_slot, task_count = geometry[boundary]
         prefix_end = sympy.simplify(first_slot + task_count)
-        if prefix_end.free_symbols or prefix_end.is_integer is not True:
+        occupied_lanes_expression = sympy.simplify(
+            sympy.Mod(prefix_end, canonical_schedule.worker_count)
+        )
+        if (
+            occupied_lanes_expression.free_symbols
+            or occupied_lanes_expression.is_integer is not True
+        ):
             continue
-        occupied_lanes = int(prefix_end) % canonical_schedule.worker_count
+        occupied_lanes = int(occupied_lanes_expression)
         if occupied_lanes == 0:
             continue
         remaining_lanes = canonical_schedule.worker_count - occupied_lanes
         assigned = frozenset(canonical_roots[: boundary + 1])
         canonical_next = canonical_roots[boundary + 1]
-        if (
-            canonical_next not in whole_root_cohorts
-            or not predecessors[canonical_next] <= assigned
+        if canonical_next not in cohort_widths or not (
+            predecessors[canonical_next] <= assigned
         ):
             continue
-        canonical_count = sympy.simplify(
+        canonical_width = sympy.simplify(cohort_widths[canonical_next])
+        canonical_root_count = sympy.simplify(
             readiness_graph.root_domains[canonical_next].size_expr
         )
         if (
-            canonical_count.free_symbols
-            or canonical_count.is_integer is not True
-            or int(canonical_count) <= 0
+            canonical_width.free_symbols
+            or canonical_width.is_integer is not True
+            or int(canonical_width) <= 0
+            or not tile_dependency._is_provably_nonnegative(
+                sympy.simplify(canonical_root_count - canonical_width),
+                None,
+            )
         ):
             continue
-        canonical_priority = action_priority(
+        canonical_completes_in_tail = _equal_integer_expressions(
+            canonical_width,
+            canonical_root_count,
+        ) and int(canonical_width) <= remaining_lanes
+        canonical_known_priority = action_priority(
             canonical_next,
             assigned,
-            completes_root=int(canonical_count) <= remaining_lanes,
+            completes_root=canonical_completes_in_tail,
         )
-        candidates: list[tuple[tuple[int, int, int, int], int, int]] = []
+        canonical_priority_floor = (
+            canonical_known_priority
+            if canonical_completes_in_tail
+            else optimistic_action_priority(canonical_next)
+        )
+        candidates: list[
+            tuple[
+                tuple[int, int, int, int],
+                tuple[int, int, int, int],
+                int,
+                int,
+                int,
+            ]
+        ] = []
         unsupported_competitor = False
         for candidate_index in range(boundary + 2, len(canonical_roots)):
             root = canonical_roots[candidate_index]
@@ -9051,51 +9411,99 @@ def _single_root_tail_pull(
             # Unsupported cohort structure or a guard-dependent fit therefore
             # declines this boundary instead of creating a constant-only
             # priority policy.
-            if root not in whole_root_cohorts:
+            cohort_width = cohort_widths.get(root)
+            if cohort_width is None:
                 unsupported_competitor = True
                 break
+            cohort_width = sympy.simplify(cohort_width)
             if (
-                root_count.free_symbols
-                or root_count.is_integer is not True
-                or int(root_count) <= 0
+                cohort_width.free_symbols
+                or cohort_width.is_integer is not True
+                or int(cohort_width) <= 0
+                or not tile_dependency._is_provably_nonnegative(
+                    sympy.simplify(root_count - cohort_width),
+                    None,
+                )
             ):
                 unsupported_competitor = True
                 break
-            if int(root_count) > remaining_lanes:
+            width = int(cohort_width)
+            if width > remaining_lanes:
                 continue
+            completes_root = _equal_integer_expressions(cohort_width, root_count)
+            known_priority = action_priority(
+                root,
+                assigned,
+                completes_root=completes_root,
+            )
             candidates.append(
                 (
-                    action_priority(root, assigned, completes_root=True),
+                    known_priority,
+                    (
+                        known_priority
+                        if completes_root
+                        else optimistic_action_priority(root)
+                    ),
                     candidate_index,
                     root,
+                    width,
                 )
             )
         if unsupported_competitor:
             continue
         if not candidates:
             continue
-        best_priority = min(priority for priority, _index, _root in candidates)
-        best_candidates = tuple(
-            (candidate_index, root)
-            for priority, candidate_index, root in candidates
-            if priority == best_priority
+        guaranteed_winners = tuple(
+            (root, width)
+            for (
+                priority,
+                _priority_floor,
+                candidate_index,
+                root,
+                width,
+            ) in candidates
+            if priority < canonical_priority_floor
+            and all(
+                priority < other_floor
+                for (
+                    _other_priority,
+                    other_floor,
+                    other_index,
+                    _other_root,
+                    _other_width,
+                ) in candidates
+                if other_index != candidate_index
+            )
         )
         # Active-cohort, launch-stage, and event-key fields are not represented
-        # by this whole-root strength reduction. Decline an unresolved tie
+        # by this first-cohort strength reduction. Decline an unresolved tie
         # rather than inventing a branch-specific tie-break.
-        if len(best_candidates) != 1 or not best_priority < canonical_priority:
+        if len(guaranteed_winners) != 1:
             continue
-        (candidate_index, root) = best_candidates[0]
-        reordered = (
-            *canonical_roots[: boundary + 1],
-            root,
-            *canonical_roots[boundary + 1 : candidate_index],
-            *canonical_roots[candidate_index + 1 :],
-        )
-        return _repack_root_major_schedule(
+        root, width = guaranteed_winners[0]
+        root_runs: list[tuple[int, sympy.Expr, sympy.Expr]] = []
+        for root_index, run_root in enumerate(canonical_roots):
+            task_order = replacement_orders.get(
+                run_root,
+                readiness_graph.root_task_orders[run_root],
+            )
+            run_task_count = task_order.source_domain.size_expr
+            if root_index == boundary + 1:
+                root_runs.append((root, sympy.Integer(0), sympy.Integer(width)))
+            if run_root == root:
+                root_runs.append(
+                    (
+                        root,
+                        sympy.Integer(width),
+                        sympy.simplify(run_task_count - width),
+                    )
+                )
+            else:
+                root_runs.append((run_root, sympy.Integer(0), run_task_count))
+        return _repack_packed_schedule(
             readiness_graph,
             canonical_schedule,
-            reordered,
+            tuple(root_runs),
             replacement_orders,
         )
     return None
@@ -9194,7 +9602,7 @@ def _parametric_cohort_list_schedule(
     )
     if cohort_candidates is None:
         return canonical_schedule
-    agreed_orders, whole_root_cohorts = cohort_candidates
+    agreed_orders, cohort_widths = cohort_candidates
     replacements = {
         root: task_order
         for root, task_order in agreed_orders.items()
@@ -9211,26 +9619,28 @@ def _parametric_cohort_list_schedule(
             canonical_schedule,
             replacements,
         )
-        if replacement_candidate is None:
+        if replacement_candidate is None or not _semantic_schedule_is_progress_safe(
+            replacement_candidate,
+            readiness_graph,
+        ):
             return canonical_schedule
         candidate = replacement_candidate
 
-    tail_candidate = _single_root_tail_pull(
+    tail_candidate = _single_cohort_tail_pull(
         readiness_graph,
         canonical_schedule,
         replacements,
-        whole_root_cohorts=whole_root_cohorts,
+        cohort_widths=cohort_widths,
         root_edges=root_edges,
         root_criticality=root_criticality,
     )
-    if tail_candidate is not None:
-        candidate = tail_candidate
-    if candidate is canonical_schedule:
-        return canonical_schedule
-    if not _semantic_schedule_is_progress_safe(candidate, readiness_graph):
-        return canonical_schedule
+    if tail_candidate is not None and _semantic_schedule_is_progress_safe(
+        tail_candidate,
+        readiness_graph,
+    ):
+        return tail_candidate
 
-    # Root-local cohort-major traversal and one complete root tail pull are
+    # Root-local cohort-major traversal and one complete cohort tail pull are
     # depth-two actions. Depths three and four intentionally alias them until
     # dependent repeated pulls are implemented by the same bounded policy.
     return candidate

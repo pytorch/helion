@@ -876,7 +876,7 @@ class CoordinateRelation:
                     target_domain=target_domain,
                     pieces=(),
                 )
-            pieces = tuple(
+            substituted_pieces = tuple(
                 _CoordinateRelationPiece(
                     source_bounds_items=tuple(
                         (
@@ -904,6 +904,19 @@ class CoordinateRelation:
                     ),
                 )
                 for piece in relation.pieces
+            )
+            # A symbolic run may disappear for one legal shape (for example,
+            # the suffix after pulling the only cohort).  Normalize those
+            # concretely empty source boxes here so every downstream proof
+            # sees the same semantic relation instead of an impossible raw
+            # occurrence.
+            pieces = tuple(
+                piece
+                for piece in substituted_pieces
+                if all(
+                    end > begin
+                    for _axis, begin, end, _step in piece.source_bounds_items
+                )
             )
             return CoordinateRelation(
                 source_domain=source_domain,
@@ -5572,22 +5585,35 @@ def _dense_linear_source_support_interval(
 ) -> tuple[sympy.Expr, sympy.Expr] | None:
     """Prove that semantic source support is one dense row-major interval.
 
-    A total exact converse and a point-valued forward map give exactly one
-    distinct source point per target.  If every represented source point lies
-    in a linear hull with that same cardinality, the support must fill the
-    hull.  This handles packed first/middle/tail boxes without reconstructing
-    a separate source-ordinal relation.
+    A single-valued exact converse and a point-valued forward map give exactly
+    one distinct source point per represented target.  If every represented
+    source point lies in a linear hull with that same support cardinality, the
+    support must fill the hull.  The converse need not cover the relation's
+    complete target domain: sliced task orders intentionally own only a subset
+    of one root.  This handles packed first/middle/tail boxes without
+    reconstructing a separate source-ordinal relation.
     """
     converse = _memoized_exact_converse(relation)
+    support_cardinality = relation.source_support_cardinality()
     if (
         converse is None
-        or not converse.is_total_function()
+        or not converse.is_single_valued()
         or not relation.is_single_valued()
         or not relation.pieces
+        or support_cardinality is None
     ):
         return None
 
     if any(axis not in relation.source_domain.axis_order for axis in active_axes):
+        return None
+    if any(
+        _fixed_source_axis_value(relation, axis) is None
+        for axis in relation.source_domain.axis_order
+        if axis not in active_axes
+    ):
+        # Cardinality is counted in the full source domain. A varying omitted
+        # axis could make duplicate projected coordinates look like a dense
+        # interval on ``active_axes``.
         return None
     active_strides: dict[int, sympy.Expr] = {}
     active_domain_size: sympy.Expr = sympy.Integer(1)
@@ -5626,6 +5652,10 @@ def _dense_linear_source_support_interval(
                 ordinal,
                 domain=converse.source_domain,
                 source_bounds=piece.source_bounds_items,
+                # A partial converse can have a static logical source domain
+                # while its placement coordinates still contain host-backed
+                # shape parameters from the forward relation.
+                parameter_symbols=relation.parameter_symbols,
             )
         )
     if any(hull is None for hull in hulls):
@@ -5691,7 +5721,7 @@ def _dense_linear_source_support_interval(
         and capacity_is_sufficient
         and _integer_partition_expressions_equal(
             sympy.simplify(upper - lower),
-            relation.target_domain.size_expr,
+            support_cardinality,
         )
     ):
         return None
@@ -6304,6 +6334,72 @@ def _source_support_ordinalization(
         if inverse_relation.is_total_function():
             _remember_exact_converse(ordinalization, inverse_relation)
         return ordinalization
+
+    # One complete static-width row interval.  Split symbolic roots commonly
+    # leave exactly this shape: all inner lanes over ``[runtime_begin,
+    # runtime_end)``.  Its local ordinal and inverse are affine in the outer
+    # bounds, so prove it directly instead of expanding the interval into a
+    # symbolic number of rows.
+    if len(pieces) == 1:
+        (piece,) = pieces
+        piece_bounds = {
+            axis: (begin, end, step)
+            for axis, begin, end, step in piece.source_bounds_items
+        }
+        for inner_axis in relation.source_domain.axis_order:
+            try:
+                inner_count = _concrete_integer(
+                    source_counts[inner_axis],
+                    description="ordinalization inner-axis count",
+                )
+            except ValueError:
+                continue
+            if inner_count <= 0 or not _source_bounds_equal(
+                ((inner_axis, *piece_bounds[inner_axis]),),
+                ((inner_axis, 0, inner_count, 1),),
+            ):
+                continue
+            inner = coordinate_axis_symbol(inner_axis)
+            for outer_axis in relation.source_domain.axis_order:
+                if outer_axis == inner_axis:
+                    continue
+                outer_begin, outer_end, outer_step = piece_bounds[outer_axis]
+                fixed = _fixed_source_coordinates(
+                    relation,
+                    piece,
+                    frozenset((inner_axis, outer_axis)),
+                )
+                if (
+                    fixed is None
+                    or outer_step != 1
+                    or not _is_provably_nonnegative(outer_begin, None)
+                    or not _is_provably_nonnegative(
+                        sympy.simplify(outer_end - outer_begin),
+                        None,
+                    )
+                    or not _integer_partition_expressions_equal(
+                        target_count,
+                        sympy.simplify(inner_count * (outer_end - outer_begin)),
+                    )
+                ):
+                    continue
+                outer = coordinate_axis_symbol(outer_axis)
+                point_expression = _simplify_integer_quotients(
+                    sympy.simplify(
+                        (outer - outer_begin) * inner_count + inner
+                    )
+                )
+                absolute_ordinal = _simplify_integer_quotients(
+                    sympy.simplify(ordinal + outer_begin * inner_count)
+                )
+                return finish(
+                    point_expression,
+                    {
+                        **fixed,
+                        inner_axis: sympy.Mod(absolute_ordinal, inner_count),
+                        outer_axis: sympy.floor(absolute_ordinal / inner_count),
+                    },
+                )
 
     # A bounded partition of one row-major interval.
     for inner_axis in relation.source_domain.axis_order:
@@ -11425,22 +11521,47 @@ def _single_axis_floor_point(
     )
 
 
-def _ceil_div(numerator: int, denominator: int) -> int:
-    return -((-numerator) // denominator)
+def _ceil_div(
+    numerator: IntegerExpression,
+    denominator: int,
+) -> sympy.Expr:
+    """Return exact integer ceil division for concrete or symbolic numerators."""
+    return _normalize_integer_rounding(
+        -FloorDiv(-sympy.sympify(numerator), denominator)
+    )
 
 
 def _point_expression_preimage(
     expression: sympy.Expr,
     *,
-    lower: int,
-    upper: int,
+    lower: IntegerExpression,
+    upper: IntegerExpression,
     domain: CoordinateDomain,
-) -> tuple[int, int, int] | bool | None:
-    """Invert one point expression over a constant half-open target interval."""
+) -> tuple[int, sympy.Expr, sympy.Expr] | bool | None:
+    """Invert one point expression over an exact half-open target interval."""
+    lower = sympy.sympify(lower)
+    upper = sympy.sympify(upper)
     if not expression.free_symbols:
         if expression.is_integer is not True:  # pyrefly: ignore[missing-attribute]
             return None
-        return lower <= int(expression) < upper
+        value = sympy.sympify(expression)
+        if _is_provably_nonnegative(
+            sympy.simplify(value - lower),
+            None,
+        ) and _is_provably_nonnegative(
+            sympy.simplify(upper - 1 - value),
+            None,
+        ):
+            return True
+        if _is_provably_nonnegative(
+            sympy.simplify(lower - 1 - value),
+            None,
+        ) or _is_provably_nonnegative(
+            sympy.simplify(value - upper),
+            None,
+        ):
+            return False
+        return None
     affine = _single_axis_interval(
         expression,
         expression + 1,  # pyrefly: ignore[unsupported-operation]
@@ -11712,6 +11833,15 @@ def _compose_point_relations(
             )
     pieces: dict[_CoordinateRelationPiece, None] = {}
     unclipped_point_support: bool | None = None
+    following_domain_bounds = tuple(
+        (
+            axis,
+            sympy.Integer(0),
+            following.source_domain.axis_count_expressions[axis],
+            1,
+        )
+        for axis in following.source_domain.axis_order
+    )
     for first_piece in first.pieces:
         first_targets = {
             axis: begin for axis, begin, _end, _step in first_piece.target_ranges
@@ -11721,12 +11851,20 @@ def _compose_point_relations(
             for axis, expression in first_targets.items()
         }
         for following_piece in following.pieces:
+            following_source_bounds = _intersect_source_boxes(
+                following_piece.source_bounds_items,
+                following_domain_bounds,
+            )
+            if following_source_bounds is None:
+                return None
+            if following_source_bounds is False:
+                continue
             bounds = {
                 axis: [begin, end, step]
                 for axis, begin, end, step in first_piece.source_bounds_items
             }
             valid = True
-            for axis, begin, end, step in following_piece.source_bounds_items:
+            for axis, begin, end, step in following_source_bounds:
                 if step != 1:
                     return None
                 if (
@@ -11801,12 +11939,18 @@ def _compose_point_relations(
                     continue
                 source_axis, preimage_begin, preimage_end = preimage
                 source_begin, source_end, source_step = bounds[source_axis]
-                restricted_begin = max(source_begin, preimage_begin)
-                restricted_end = min(source_end, preimage_end)
-                restricted_begin += (source_begin - restricted_begin) % source_step
-                if restricted_begin >= restricted_end:
+                restricted_begin = sympy.Max(source_begin, preimage_begin)
+                restricted_end = sympy.Min(source_end, preimage_end)
+                restricted_begin = _normalize_integer_rounding(
+                    restricted_begin
+                    + sympy.Mod(source_begin - restricted_begin, source_step)
+                )
+                remaining = sympy.simplify(restricted_end - restricted_begin)
+                if remaining.is_nonpositive is True:
                     valid = False
                     break
+                if not _is_provably_nonnegative(remaining, None):
+                    return None
                 bounds[source_axis] = [
                     restricted_begin,
                     restricted_end,

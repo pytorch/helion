@@ -2762,7 +2762,7 @@ class TestCrossLoopScheduler(TestCase):
 
         self.assertIsNotNone(cohort_candidates)
         assert cohort_candidates is not None
-        replacements, _whole_root_cohorts = cohort_candidates
+        replacements, _cohort_widths = cohort_candidates
         self.assertNotIn(2, replacements)
         self.assertIs(scheduled, canonical)
 
@@ -2854,7 +2854,7 @@ class TestCrossLoopScheduler(TestCase):
 
         self.assertIsNotNone(cohort_candidates)
         assert cohort_candidates is not None
-        replacements, _whole_root_cohorts = cohort_candidates
+        replacements, _cohort_widths = cohort_candidates
         self.assertNotIn(2, replacements)
         self.assertIs(scheduled, canonical)
 
@@ -2907,7 +2907,7 @@ class TestCrossLoopScheduler(TestCase):
 
         self.assertIsNotNone(cohort_candidates)
         assert cohort_candidates is not None
-        self.assertIn(2, cohort_candidates[1])
+        self.assertEqual(cohort_candidates[1].get(2), 2)
         self.assertIsNot(scheduled, canonical)
         self.assertIsNotNone(geometry)
         assert geometry is not None
@@ -2945,6 +2945,331 @@ class TestCrossLoopScheduler(TestCase):
             )
         )
 
+    def test_parametric_cohort_schedule_pulls_one_complete_subroot_cohort(
+        self,
+    ) -> None:
+        root_domains = _identify_root_domains(
+            (
+                _domain((10, 2, 1)),
+                _domain((20, 4, 1)),
+                _domain((30, 4, 1)),
+            )
+        )
+        key_domain = _domain((0, 2), kind="event", identity=0)
+        graph = _readiness_graph(
+            root_domains,
+            ReadinessEvent(
+                producers=(
+                    ReadinessProducer(
+                        producer_root=0,
+                        producers_by_key=_full_point_map(
+                            key_domain,
+                            root_domains[0],
+                            coordinate_axis_symbol(0),
+                        ),
+                    ),
+                ),
+                consumers=(
+                    ReadinessConsumer(
+                        consumer_root=2,
+                        keys_by_consumer=_full_point_map(
+                            root_domains[2],
+                            key_domain,
+                            FloorDiv(coordinate_axis_symbol(30), 2),
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        for worker_count, expected_roots in (
+            (4, (0, 2, 1, 2)),
+            (3, (0, 1, 2)),
+        ):
+            with self.subTest(worker_count=worker_count):
+                canonical = cross_loop_scheduler._build_root_major_worker_schedule(
+                    graph.root_domains,
+                    graph.root_task_orders,
+                    worker_count=worker_count,
+                )
+                with _forbid_schedule_enumeration():
+                    cohort_candidates = (
+                        cross_loop_scheduler._agreed_cohort_major_root_orders(
+                            graph,
+                            include_reference=True,
+                        )
+                    )
+                    scheduled = (
+                        cross_loop_scheduler._parametric_cohort_list_schedule(
+                            graph,
+                            canonical,
+                            pipeline_depth=2,
+                        )
+                    )
+
+                self.assertIsNotNone(cohort_candidates)
+                assert cohort_candidates is not None
+                self.assertEqual(cohort_candidates[1].get(2), 2)
+                self.assertEqual(
+                    tuple(segment.root for segment in scheduled.segments),
+                    expected_roots,
+                )
+                self.assertTrue(
+                    _validate_worker_schedule_tasks(
+                        scheduled,
+                        graph.root_task_orders,
+                    )
+                )
+                self.assertTrue(
+                    cross_loop_scheduler._semantic_schedule_is_progress_safe(
+                        scheduled,
+                        graph,
+                    )
+                )
+                self.assertEqual(
+                    cross_loop_scheduler._resident_schedule_occupied_wave_count(
+                        scheduled
+                    ),
+                    cross_loop_scheduler._resident_schedule_occupied_wave_count(
+                        canonical
+                    ),
+                )
+                if worker_count == 4:
+                    self.assertEqual(
+                        tuple(segment.task_count for segment in scheduled.segments),
+                        (2, 2, 4, 2),
+                    )
+
+    def test_parametric_cohort_schedule_pulls_dynamic_leading_cohort(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        (
+            producer_domain,
+            neutral_domain,
+            consumer_domain,
+        ) = _identify_root_domains(
+            (
+                _domain((10, 2 * batch + 1, 1), (11, 2, 1)),
+                _domain((20, 4, 1)),
+                _domain((30, 2 * batch + 1, 1), (31, 2, 1)),
+            )
+        )
+        key_domain = CoordinateDomain(
+            axis_order=(0,),
+            axis_counts_items=((0, 2 * batch + 1),),
+            kind="event",
+            identity=0,
+        )
+        producers_by_key = CoordinateRelation(
+            key_domain,
+            producer_domain,
+            (
+                _CoordinateRelationPiece(
+                    ((0, 0, 2 * batch + 1, 1),),
+                    (
+                        (
+                            10,
+                            coordinate_axis_symbol(0),
+                            coordinate_axis_symbol(0) + 1,
+                            1,
+                        ),
+                        (11, 0, 2, 1),
+                    ),
+                ),
+            ),
+        )
+        graph = _readiness_graph(
+            (
+                producer_domain,
+                neutral_domain,
+                consumer_domain,
+            ),
+            ReadinessEvent(
+                producers=(ReadinessProducer(0, producers_by_key),),
+                consumers=(
+                    ReadinessConsumer(
+                        consumer_root=2,
+                        keys_by_consumer=_full_point_map(
+                            consumer_domain,
+                            key_domain,
+                            coordinate_axis_symbol(30),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        canonical = cross_loop_scheduler._build_root_major_worker_schedule(
+            graph.root_domains,
+            graph.root_task_orders,
+            worker_count=4,
+        )
+
+        with _forbid_schedule_enumeration():
+            cohort_candidates = (
+                cross_loop_scheduler._agreed_cohort_major_root_orders(
+                    graph,
+                    include_reference=True,
+                )
+            )
+            scheduled = cross_loop_scheduler._parametric_cohort_list_schedule(
+                graph,
+                canonical,
+                pipeline_depth=2,
+            )
+
+        self.assertIsNotNone(cohort_candidates)
+        assert cohort_candidates is not None
+        self.assertEqual(cohort_candidates[1].get(2), 2)
+        self.assertEqual(
+            tuple(segment.root for segment in scheduled.segments),
+            (0, 2, 1, 2),
+        )
+        self.assertEqual(
+            tuple(segment.task_count_expr for segment in scheduled.segments),
+            (
+                4 * batch + 2,
+                sympy.Integer(2),
+                sympy.Integer(4),
+                4 * batch,
+            ),
+        )
+        self.assertTrue(
+            _validate_worker_schedule_tasks(scheduled, graph.root_task_orders)
+        )
+        self.assertTrue(
+            cross_loop_scheduler._semantic_schedule_is_progress_safe(
+                scheduled,
+                graph,
+            )
+        )
+
+        for concrete_batch in (0, 1, 3, 4):
+            with self.subTest(concrete_batch=concrete_batch):
+                substitutions = {batch: concrete_batch}
+                concrete_relations = tuple(
+                    segment.task_order.substitute_parameters(substitutions)
+                    for segment in scheduled.segments
+                )
+                self.assertEqual(
+                    tuple(
+                        relation.source_support_cardinality()
+                        for relation in concrete_relations
+                    ),
+                    (
+                        4 * concrete_batch + 2,
+                        2,
+                        4,
+                        4 * concrete_batch,
+                    ),
+                )
+                consumer_tasks: list[int] = []
+                for relation in (concrete_relations[1], concrete_relations[3]):
+                    for targets in relation.materialize():
+                        consumer_tasks.extend(targets)
+                concrete_domain = consumer_domain.substitute_parameters(substitutions)
+                self.assertEqual(
+                    sorted(consumer_tasks),
+                    list(range(concrete_domain.size)),
+                )
+                inverse_supports: list[set[int]] = []
+                for relation in (concrete_relations[1], concrete_relations[3]):
+                    inverse = relation.converse()
+                    self.assertIsNotNone(inverse)
+                    assert inverse is not None
+                    inverse_supports.append(
+                        {
+                            logical_task
+                            for logical_task, placements in enumerate(
+                                inverse.materialize()
+                            )
+                            if placements
+                        }
+                    )
+                self.assertEqual(
+                    inverse_supports[0],
+                    {0, 2 * concrete_batch + 1},
+                )
+                self.assertFalse(inverse_supports[0] & inverse_supports[1])
+                self.assertEqual(
+                    inverse_supports[0] | inverse_supports[1],
+                    set(range(concrete_domain.size)),
+                )
+
+                concrete_events = tuple(
+                    ReadinessEvent(
+                        producers=tuple(
+                            dataclasses.replace(
+                                producer,
+                                producers_by_key=(
+                                    producer.producers_by_key.substitute_parameters(
+                                        substitutions
+                                    )
+                                ),
+                            )
+                            for producer in event.producers
+                        ),
+                        consumers=tuple(
+                            dataclasses.replace(
+                                consumer,
+                                keys_by_consumer=(
+                                    consumer.keys_by_consumer.substitute_parameters(
+                                        substitutions
+                                    )
+                                ),
+                            )
+                            for consumer in event.consumers
+                        ),
+                    )
+                    for event in graph.events
+                )
+                concrete_graph = ReadinessGraph(
+                    root_task_orders=tuple(
+                        task_order.substitute_parameters(substitutions)
+                        for task_order in graph.root_task_orders
+                    ),
+                    events=concrete_events,
+                )
+                concrete_canonical = (
+                    cross_loop_scheduler._build_root_major_worker_schedule(
+                        concrete_graph.root_domains,
+                        concrete_graph.root_task_orders,
+                        worker_count=4,
+                    )
+                )
+                concrete_scheduled = (
+                    cross_loop_scheduler._parametric_cohort_list_schedule(
+                        concrete_graph,
+                        concrete_canonical,
+                        pipeline_depth=2,
+                    )
+                )
+                nonempty_symbolic_segments = tuple(
+                    dataclasses.replace(segment, task_order=relation)
+                    for segment, relation in zip(
+                        scheduled.segments,
+                        concrete_relations,
+                        strict=True,
+                    )
+                    if relation.pieces
+                )
+                substituted_schedule = WorkerSchedule(
+                    4,
+                    nonempty_symbolic_segments,
+                )
+                self.assertEqual(
+                    tuple(segment.root for segment in substituted_schedule.segments),
+                    tuple(segment.root for segment in concrete_scheduled.segments),
+                )
+                self.assertEqual(
+                    tuple(
+                        segment.task_order.materialize()
+                        for segment in substituted_schedule.segments
+                    ),
+                    tuple(
+                        segment.task_order.materialize()
+                        for segment in concrete_scheduled.segments
+                    ),
+                )
+
     def test_parametric_cohort_schedule_keeps_canonical_priority_ties(self) -> None:
         root_domains = _identify_root_domains(
             tuple(_domain((10 + 10 * root, 2, 1)) for root in range(3))
@@ -2975,10 +3300,11 @@ class TestCrossLoopScheduler(TestCase):
 
         self.assertIsNotNone(cohort_candidates)
         assert cohort_candidates is not None
-        self.assertTrue({1, 2} <= cohort_candidates[1])
+        self.assertEqual(cohort_candidates[1].get(1), 2)
+        self.assertEqual(cohort_candidates[1].get(2), 2)
         self.assertIs(scheduled, canonical)
 
-    def test_parametric_cohort_schedule_does_not_skip_multiple_cohort_competitor(
+    def test_parametric_cohort_schedule_keeps_canonical_across_equal_cohorts(
         self,
     ) -> None:
         root_domains = _identify_root_domains(
@@ -3015,12 +3341,130 @@ class TestCrossLoopScheduler(TestCase):
 
         self.assertIsNotNone(cohort_candidates)
         assert cohort_candidates is not None
-        self.assertNotIn(2, cohort_candidates[1])
-        self.assertIn(3, cohort_candidates[1])
-        # Root 3 would strictly beat canonical root 1 if root 2 disappeared
-        # from the ready set. Root 2's unsupported next cohort therefore
-        # vetoes this bounded proposal rather than being silently skipped.
+        self.assertEqual(cohort_candidates[1].get(2), 1)
+        self.assertEqual(cohort_candidates[1].get(3), 2)
+        # Both ready roots have the same static criticality. Their cohort
+        # widths differ, but width is an eligibility constraint rather than a
+        # priority heuristic, so the unresolved tie retains canonical order.
         self.assertIs(scheduled, canonical)
+
+    def test_parametric_cohort_schedule_respects_competitor_optimistic_floor(
+        self,
+    ) -> None:
+        root_domains = _identify_root_domains(
+            tuple(
+                _domain((10 + 10 * root, 4 if root == 1 else 2, 1))
+                for root in range(7)
+            )
+        )
+        base_edges = ((0, 2), (2, 5), (3, 4))
+        for guarded, expected_second_root in ((False, 2), (True, 1)):
+            with self.subTest(guarded=guarded):
+                edges = (*base_edges, *(((4, 6),) if guarded else ()))
+                graph = _readiness_graph(
+                    root_domains,
+                    *(
+                        _pointwise_root_readiness_event(
+                            root_domains,
+                            producer,
+                            consumer,
+                            event_id,
+                        )
+                        for event_id, (producer, consumer) in enumerate(edges)
+                    ),
+                )
+                canonical = (
+                    cross_loop_scheduler._build_root_major_worker_schedule(
+                        graph.root_domains,
+                        graph.root_task_orders,
+                        worker_count=4,
+                    )
+                )
+
+                with _forbid_schedule_enumeration():
+                    cohort_candidates = (
+                        cross_loop_scheduler._agreed_cohort_major_root_orders(
+                            graph,
+                            include_reference=True,
+                        )
+                    )
+                    scheduled = (
+                        cross_loop_scheduler._parametric_cohort_list_schedule(
+                            graph,
+                            canonical,
+                            pipeline_depth=2,
+                        )
+                    )
+
+                self.assertIsNotNone(cohort_candidates)
+                assert cohort_candidates is not None
+                self.assertEqual(cohort_candidates[1].get(2), 1)
+                self.assertEqual(cohort_candidates[1].get(3), 1)
+                self.assertEqual(scheduled.segments[1].root, expected_second_root)
+                # Adding only B's deeper successor makes B's best possible
+                # release class tie A's pessimistic known class. A may no
+                # longer win by pretending that competing release cannot occur.
+                if guarded:
+                    self.assertIs(scheduled, canonical)
+
+    def test_parametric_cohort_schedule_respects_canonical_optimistic_floor(
+        self,
+    ) -> None:
+        root_domains = _identify_root_domains(
+            tuple(
+                _domain((10 + 10 * root, size, 1))
+                for root, size in enumerate((2, 4, 2, 4, 2, 4))
+            )
+        )
+        base_edges = ((0, 2), (2, 4), (1, 3))
+        for guarded, expected_second_root in ((False, 2), (True, 1)):
+            with self.subTest(guarded=guarded):
+                edges = (*base_edges, *(((3, 5),) if guarded else ()))
+                graph = _readiness_graph(
+                    root_domains,
+                    *(
+                        _pointwise_root_readiness_event(
+                            root_domains,
+                            producer,
+                            consumer,
+                            event_id,
+                        )
+                        for event_id, (producer, consumer) in enumerate(edges)
+                    ),
+                )
+                canonical = (
+                    cross_loop_scheduler._build_root_major_worker_schedule(
+                        graph.root_domains,
+                        graph.root_task_orders,
+                        worker_count=4,
+                    )
+                )
+
+                with _forbid_schedule_enumeration():
+                    cohort_candidates = (
+                        cross_loop_scheduler._agreed_cohort_major_root_orders(
+                            graph,
+                            include_reference=True,
+                        )
+                    )
+                    scheduled = (
+                        cross_loop_scheduler._parametric_cohort_list_schedule(
+                            graph,
+                            canonical,
+                            pipeline_depth=2,
+                        )
+                    )
+
+                self.assertIsNotNone(cohort_candidates)
+                assert cohort_candidates is not None
+                self.assertEqual(cohort_candidates[1].get(1), 1)
+                self.assertEqual(cohort_candidates[1].get(2), 1)
+                self.assertEqual(scheduled.segments[1].root, expected_second_root)
+                # The canonical cohort's current class is unchanged enough to
+                # lose to A, but its possible downstream release is now as
+                # critical as A. The strict proof therefore keeps C.
+                if guarded:
+                    self.assertIs(scheduled, canonical)
 
     def test_parametric_cohort_schedule_skips_classified_oversize_competitor(
         self,
@@ -3064,7 +3508,8 @@ class TestCrossLoopScheduler(TestCase):
 
         self.assertIsNotNone(cohort_candidates)
         assert cohort_candidates is not None
-        self.assertTrue({2, 3} <= cohort_candidates[1])
+        self.assertEqual(cohort_candidates[1].get(2), 3)
+        self.assertEqual(cohort_candidates[1].get(3), 2)
         self.assertIsNotNone(geometry)
         assert geometry is not None
         self.assertEqual(
@@ -3140,7 +3585,8 @@ class TestCrossLoopScheduler(TestCase):
         )
         self.assertIsNotNone(cohort_candidates)
         assert cohort_candidates is not None
-        self.assertTrue({1, 2} <= cohort_candidates[1])
+        self.assertEqual(cohort_candidates[1].get(1), 2)
+        self.assertEqual(cohort_candidates[1].get(2), 2)
         scheduled_geometry = (
             cross_loop_scheduler._parametric_root_major_schedule_geometry(scheduled)
         )
@@ -3228,7 +3674,8 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(root_edges, frozenset({(0, 3)}))
         self.assertIsNotNone(cohort_candidates)
         assert cohort_candidates is not None
-        self.assertTrue({1, 2} <= cohort_candidates[1])
+        self.assertEqual(cohort_candidates[1].get(1), 4)
+        self.assertEqual(cohort_candidates[1].get(2), 2)
         # Root 2 publishes only key 0 while every consumer waits on key 1. It
         # cannot win a tie merely because its arm shares an event container.
         self.assertIs(scheduled, canonical)
@@ -7161,7 +7608,15 @@ class TestCrossLoopScheduler(TestCase):
             "_MAX_RELATION_PIECES",
             15,
         ):
-            self.assertIsNone(_task_order_slice(task_order, 1, 1184))
+            unaligned = _task_order_slice(task_order, 1, 1184)
+        self.assertIsNotNone(unaligned)
+        assert unaligned is not None
+        self.assertLessEqual(len(unaligned.pieces), 15)
+        self.assertIsNotNone(unaligned.converse())
+        self.assertEqual(
+            unaligned.materialize(),
+            task_order.materialize()[1:1185],
+        )
         schedule = WorkerSchedule(
             1184,
             (

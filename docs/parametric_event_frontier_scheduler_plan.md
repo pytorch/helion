@@ -447,19 +447,56 @@ exception. Root edges and criticality are derived once, reachability is
 precomputed once, and rebuilding is bounded by the same aggregate relation
 budget used by `WorkerSchedule`.
 
-The lowerable CPU controls now distinguish a real pull, an equal-class tie, a
-multi-cohort decline, and the case where the canonical successor inherits the
-class of a newly released join consumer. The latter has a paired graph without
-the join in which the noncanonical root does move, preventing a conservative
-decline from passing the test accidentally. A disjoint-key control proves that
-an unrelated producer arm cannot receive event-closure credit. A CUDA test
-executes packed root order `(1, 0, 2)` through the parameterized relation
-renderer and final publication bookkeeping. The pointwise multi-cohort decline
-and the current one-pull/depth-alias behavior are migration guards, not final
-scheduling requirements. The next placement step is to represent and rank one
-exact sub-root cohort interval, including consumer-key-scoped event closure,
-then replace static fit with a guard-uniform symbolic fit proof before adding
-repeated pulls and exposing the depth knob.
+The lowerable CPU controls now distinguish a real pull, an equal-class tie,
+the case where the canonical successor inherits the class of a newly released
+join consumer, and independent optimistic priority floors for both the
+canonical action and every competing ready cohort. Paired controls remove only
+the downstream release responsible for each floor and then require the pull;
+this prevents a generic tie or conservative decline from passing accidentally.
+A disjoint-key control proves that an unrelated producer arm cannot receive
+event-closure credit. A CUDA test executes packed whole-root order `(1, 0, 2)`
+through the parameterized relation renderer and final publication bookkeeping.
+
+The first exact sub-root placement slice is also implemented in the scheduler
+and relation tests. Every semantic view must agree on the same cohort
+partition; its uniform first-fiber cardinality is the only width fact retained.
+At a proved static partial-wave boundary, one complete cohort may move ahead of
+incomparable roots when its pessimistic known priority strictly beats the
+optimistic lower bound of the canonical successor and every other ready
+competitor. Width controls eligibility only and never ranking. Root-local
+readiness-major permutations are independently progress-validated, then
+composed transactionally into the tail refinement; if that refinement fails,
+the accepted root-local proposal remains instead of rolling all the way back
+to `C`.
+
+The resulting order is represented only as repeated existing
+`WorkerScheduleSegment.task_order` relations, for example
+`P ; C[0:Wc] ; U ; C[Wc:]`. Exact aligned slices retain explicit inverse
+support, adjacent packed intervals are proved from their authoritative
+relations, and concrete specialization at `B={0,1,3,4}` selects the same
+semantic order after pruning a zero-support suffix. Relation substitution now
+removes such concretely empty pieces. Composition clips raw boxes to their
+declared domain before taking a preimage; the previous hand-built partial
+packed inverse was rejected because copying an implicitly clipped inverse into
+a larger target domain would falsely give the segment ownership of the whole
+root. No CTA, worker, wave, key, or shape enumeration is used for acceptance.
+
+This sub-root schedule is deliberately not wired into production yet. The
+current parameterized codegen still requires unique one-segment-per-root
+root-major geometry, while the concrete fallback renders legacy dense
+compatibility fields. The next implementation transaction is therefore a
+relation-driven segment renderer: derive each segment's exact packed slot
+interval from `task_order`, stride that interval by resident worker count, and
+evaluate the same `task_order` relation for the logical CTA. It must make a
+runtime-empty suffix an empty loop and either derive exact final root-barrier
+publishers for repeated roots or conservatively decline those pulls. After CPU
+AST tests and concrete/symbolic rendering parity, wire this one scheduler into
+`build_static_pipeline_plan`; only then expose `cross_loop_pipeline_depth`.
+Consumer-key-scoped closure, repeated pulls, affine recurrence lifting, and
+the depth knob remain subsequent milestones. Exact segment tuple shape,
+depth-2/3/4 aliasing, one-root-per-parameterized-schedule, and the old
+pointwise multi-cohort decline are migration details rather than final policy
+requirements.
 
 ### Priority 1: finish the symbolic dependency refactor
 
@@ -3672,10 +3709,10 @@ This phase replaces the discarded symbolic max-plus evaluator. It operates on
 the existing roots, readiness events, and coordinate relations; it introduces
 no retained graph, schedule, region, or instruction abstraction.
 
-- [ ] Compute finite unit-weight `top`, `bottom`, slack, and canonical
+- [x] Compute finite unit-weight `top`, `bottom`, slack, and canonical
   priority classes directly from the possibly-nonempty acyclic root/event
   topology. Cache them only as derived properties of `ReadinessGraph`.
-- [ ] Derive each root's exact readiness-equivalent cohort-order candidates by
+- [x] Derive each root's exact readiness-equivalent cohort-order candidates by
   composing consumer order, readiness keys, producer arms, and the configured
   producer task order. Keep configured order in `C`; an exact-bijection
   readiness-major replacement is a depth-2-or-higher proposal and must also

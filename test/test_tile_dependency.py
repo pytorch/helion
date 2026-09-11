@@ -29,6 +29,7 @@ from helion._compiler.tile_dependency import TileDependencyKind
 from helion._compiler.tile_dependency import _coalesce_adjacent_target_boxes
 from helion._compiler.tile_dependency import _CoordinateRelationPiece
 from helion._compiler.tile_dependency import _dense_linear_overlap_relation
+from helion._compiler.tile_dependency import _dense_linear_source_support_interval
 from helion._compiler.tile_dependency import _dense_mixed_radix_converse
 from helion._compiler.tile_dependency import _layout_is_injective
 from helion._compiler.tile_dependency import _logical_expression_bounds
@@ -44,7 +45,9 @@ from helion._compiler.tile_dependency import _simplify_logical_expression
 from helion._compiler.tile_dependency import _symbolic_linear_access_relation
 from helion._compiler.tile_dependency import _symbolic_producers_by_consumer
 from helion._compiler.tile_dependency import _target_box_expression_extreme
-from helion._compiler.tile_dependency import _target_box_expression_extreme_proof_uncached
+from helion._compiler.tile_dependency import (
+    _target_box_expression_extreme_proof_uncached,
+)
 from helion._compiler.tile_dependency import allocation_regions_may_overlap
 from helion._compiler.tile_dependency import build_tile_dependency_graph
 from helion._compiler.tile_dependency import coordinate_axis_symbol
@@ -410,6 +413,37 @@ class TestTileDependency(TestCase):
                 concrete.materialize(),
                 tuple(frozenset((index,)) for index in range(expected_count)),
             )
+
+    def test_relation_substitution_prunes_empty_conditional_piece(self) -> None:
+        count = sympy.Symbol("count", integer=True, nonnegative=True)
+        source = CoordinateDomain((10,), ((10, 4),), kind="worker")
+        target = CoordinateDomain((20,), ((20, 4),), kind="site")
+        coordinate = coordinate_axis_symbol(10)
+        relation = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (
+                    ((10, 0, count, 1),),
+                    (coordinate,),
+                ),
+            ),
+        )
+
+        empty = relation.substitute_parameters({count: 0})
+        nonempty = relation.substitute_parameters({count: 3})
+
+        self.assertFalse(empty.pieces)
+        self.assertEqual(empty.materialize(), (frozenset(),) * 4)
+        self.assertEqual(
+            nonempty.materialize(),
+            (
+                frozenset((0,)),
+                frozenset((1,)),
+                frozenset((2,)),
+                frozenset(),
+            ),
+        )
 
     def test_piecewise_dense_point_converse_is_exact_transpose(self) -> None:
         inner = coordinate_axis_symbol(10)
@@ -1880,6 +1914,37 @@ class TestTileDependency(TestCase):
             ((((10, 0, 3, 1),), (source_coordinate + 1,)),),
         )
         self.assertIsNone(clipped.then(following))
+
+    def test_composition_clips_semantically_empty_intermediate_boxes(self) -> None:
+        source = CoordinateDomain((10,), ((10, 3),), identity=0)
+        intermediate = CoordinateDomain((20,), ((20, 3),), identity=1)
+        target = CoordinateDomain((30,), ((30, 1),), identity=2)
+        source_coordinate = coordinate_axis_symbol(10)
+        first = CoordinateRelation.point_map(
+            source,
+            intermediate,
+            ((((10, 0, 3, 1),), (source_coordinate + 3,)),),
+        )
+        following = CoordinateRelation(
+            intermediate,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    ((20, 3, 6, 1),),
+                    ((30, sympy.Integer(0), sympy.Integer(1), 1),),
+                ),
+            ),
+        )
+
+        composed = first.then(following)
+
+        self.assertIsNotNone(composed)
+        assert composed is not None
+        self.assertFalse(composed.pieces)
+        self.assertEqual(
+            composed.materialize(),
+            (frozenset(), frozenset(), frozenset()),
+        )
 
     def test_partial_identity_composes_with_full_set_relation(self) -> None:
         extent = sympy.Symbol("extent", integer=True, nonnegative=True)
@@ -7457,6 +7522,153 @@ class TestTileDependency(TestCase):
                 concrete = relation.substitute_parameters(substitutions)
                 self.assertEqual(concrete.source_support_cardinality(), expected_count)
                 self.assertTrue(concrete.is_bijection_from_source_support())
+
+    def test_partial_bijection_dense_interval_and_ordinalization_are_exact(
+        self,
+    ) -> None:
+        rows = sympy.Symbol("rows", integer=True, nonnegative=True)
+        stage_axis, worker_axis, wave_axis = 10, 11, 12
+        schedule = CoordinateDomain(
+            (stage_axis, worker_axis, wave_axis),
+            ((stage_axis, 2), (worker_axis, 4), (wave_axis, rows + 2)),
+            kind="worker",
+        )
+        logical = CoordinateDomain(
+            (20,),
+            ((20, 4 * rows + 4),),
+            kind="site",
+        )
+        worker = coordinate_axis_symbol(worker_axis)
+        wave = coordinate_axis_symbol(wave_axis)
+        logical_task = coordinate_axis_symbol(20)
+        support_bounds = (
+            (stage_axis, 1, 2, 1),
+            (worker_axis, 0, 4, 1),
+            (wave_axis, 1, rows + 1, 1),
+        )
+        relation = CoordinateRelation.point_map(
+            schedule,
+            logical,
+            (
+                (
+                    support_bounds,
+                    (4 * (wave - 1) + worker,),
+                ),
+            ),
+        )
+        converse = CoordinateRelation.point_map(
+            logical,
+            schedule,
+            (
+                (
+                    ((20, 0, 4 * rows, 1),),
+                    (
+                        sympy.Integer(1),
+                        sympy.Mod(logical_task, 4),
+                        FloorDiv(logical_task, 4) + 1,
+                    ),
+                ),
+            ),
+        )
+        _remember_exact_converse(relation, converse)
+        ordinal_domain = CoordinateDomain(
+            (30,),
+            ((30, 4 * rows),),
+            kind="task_order",
+            _allow_empty=True,
+        )
+        support = CoordinateRelation.point_map(
+            schedule,
+            ordinal_domain,
+            ((support_bounds, (sympy.Integer(0),)),),
+        )
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("partial support proof must not enumerate"),
+        ):
+            self.assertEqual(
+                _dense_linear_source_support_interval(
+                    relation,
+                    (worker_axis, wave_axis),
+                ),
+                (sympy.Integer(4), 4 * rows + 4),
+            )
+            ordinalization = support._ordinalized_source_support
+            self.assertIsNotNone(ordinalization)
+            assert ordinalization is not None
+            self.assertIsNotNone(ordinalization.converse())
+
+        hole_target = CoordinateDomain((40,), ((40, 2),), kind="site")
+        hole = CoordinateRelation.point_map(
+            schedule,
+            hole_target,
+            (
+                (
+                    (
+                        (stage_axis, 1, 2, 1),
+                        (worker_axis, 0, 1, 1),
+                        (wave_axis, 1, 2, 1),
+                    ),
+                    (sympy.Integer(0),),
+                ),
+                (
+                    (
+                        (stage_axis, 1, 2, 1),
+                        (worker_axis, 2, 3, 1),
+                        (wave_axis, 1, 2, 1),
+                    ),
+                    (sympy.Integer(1),),
+                ),
+            ),
+        )
+        hole_inverse = CoordinateRelation.point_map(
+            hole_target,
+            schedule,
+            (
+                (((40, 0, 1, 1),), (sympy.Integer(1), 0, 1)),
+                (((40, 1, 2, 1),), (sympy.Integer(1), 2, 1)),
+            ),
+        )
+        _remember_exact_converse(hole, hole_inverse)
+        self.assertIsNone(
+            _dense_linear_source_support_interval(
+                hole,
+                (worker_axis, wave_axis),
+            )
+        )
+
+        projected_source = CoordinateDomain(
+            (50, 51),
+            ((50, 2), (51, 3)),
+            kind="worker",
+        )
+        projected_target = CoordinateDomain((60,), ((60, 3),), kind="site")
+        omitted = coordinate_axis_symbol(50)
+        projected = CoordinateRelation.point_map(
+            projected_source,
+            projected_target,
+            (
+                (((50, 0, 2, 1), (51, 0, 1, 1)), (omitted,)),
+                (
+                    ((50, 0, 1, 1), (51, 2, 3, 1)),
+                    (sympy.Integer(2),),
+                ),
+            ),
+        )
+        projected_inverse = CoordinateRelation.point_map(
+            projected_target,
+            projected_source,
+            (
+                (((60, 0, 2, 1),), (coordinate_axis_symbol(60), 0)),
+                (((60, 2, 3, 1),), (sympy.Integer(0), 2)),
+            ),
+        )
+        _remember_exact_converse(projected, projected_inverse)
+        self.assertIsNone(
+            _dense_linear_source_support_interval(projected, (51,))
+        )
 
     def test_event_frontier_partial_bijection_is_symbolic(self) -> None:
         count = sympy.Symbol("count", integer=True, nonnegative=True)
