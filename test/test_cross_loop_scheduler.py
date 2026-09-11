@@ -1102,6 +1102,133 @@ def _whole_consumer_join_readiness_event(
     )
 
 
+def _partial_release_chain_problem(
+    *,
+    consumer_cohort_width: int,
+    consumer_cohort_count: int = 2,
+    leading_task_count: int = 5,
+) -> tuple[ReadinessGraph, WorkerSchedule, tuple[ReadinessCounterPlan, ...]]:
+    """Build a generic chain whose first consumer cohort reaches a tail hole."""
+    if (
+        consumer_cohort_width <= 0
+        or consumer_cohort_count <= 0
+        or leading_task_count <= 0
+    ):
+        raise ValueError("cohort geometry must be positive")
+    root_domains = _identify_root_domains(
+        (
+            _domain((10, leading_task_count, 1)),
+            _domain((20, 4, 1)),
+            _domain((30, 4, 1)),
+            _domain((40, consumer_cohort_count * consumer_cohort_width, 1)),
+            _domain((50, 4, 1)),
+        )
+    )
+
+    def subset_event(
+        producer_root: int,
+        consumer_begin: int,
+        consumer_end: int,
+        event_id: int,
+    ) -> ReadinessEvent:
+        key_domain = _domain((0, 1), kind="event", identity=event_id)
+        producer_domain = root_domains[producer_root]
+        consumer_domain = root_domains[2]
+        return ReadinessEvent(
+            producers=(
+                ReadinessProducer(
+                    producer_root,
+                    CoordinateRelation(
+                        key_domain,
+                        producer_domain,
+                        (
+                            _CoordinateRelationPiece(
+                                ((0, 0, 1, 1),),
+                                (
+                                    (
+                                        producer_domain.axis_order[0],
+                                        sympy.Integer(0),
+                                        producer_domain.size_expr,
+                                        1,
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            consumers=(
+                ReadinessConsumer(
+                    2,
+                    CoordinateRelation(
+                        consumer_domain,
+                        key_domain,
+                        (
+                            _CoordinateRelationPiece(
+                                (
+                                    (
+                                        consumer_domain.axis_order[0],
+                                        consumer_begin,
+                                        consumer_end,
+                                        1,
+                                    ),
+                                ),
+                                ((0, 0, 1, 1),),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+    first_release = subset_event(0, 0, 2, 0)
+    second_release = subset_event(1, 2, 4, 1)
+    key_domain = _domain((0, 2), kind="event", identity=2)
+    key = coordinate_axis_symbol(0)
+    consumer_task = coordinate_axis_symbol(40)
+    downstream = ReadinessEvent(
+        producers=(
+            ReadinessProducer(
+                2,
+                CoordinateRelation(
+                    key_domain,
+                    root_domains[2],
+                    (
+                        _CoordinateRelationPiece(
+                            ((0, 0, 2, 1),),
+                            ((30, 2 * key, 2 * key + 2, 1),),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        consumers=(
+            ReadinessConsumer(
+                3,
+                _full_point_map(
+                    root_domains[3],
+                    key_domain,
+                    sympy.floor(consumer_task / consumer_cohort_width),
+                ),
+            ),
+        ),
+    )
+    graph = _readiness_graph(
+        root_domains,
+        first_release,
+        second_release,
+        downstream,
+    )
+    plans = tuple(
+        ReadinessCounterPlan(event.producers, event.consumers) for event in graph.events
+    )
+    return (
+        graph,
+        _baseline_worker_schedule(graph.root_domains, worker_count=4),
+        plans,
+    )
+
+
 def _singleton_root_problem(
     root_slots: tuple[tuple[int, int], ...],
     readiness_edges: frozenset[tuple[int, int]],
@@ -2241,6 +2368,246 @@ class TestCrossLoopScheduler(TestCase):
             )
         validate_worker_schedule(readiness_graph, scheduled)
 
+    def test_global_list_schedule_does_not_split_cohort_into_terminal_hole(
+        self,
+    ) -> None:
+        graph, baseline, plans = _partial_release_chain_problem(
+            consumer_cohort_width=2,
+        )
+
+        scheduled = _global_unit_list_schedule(
+            graph,
+            baseline,
+            plans,
+            frozenset(),
+            pipeline_depth=3,
+        )
+
+        self.assertIsNotNone(scheduled)
+        assert scheduled is not None
+        terminal_wave = placement(scheduled, 0, 4)[1]
+        # The first producer cohort consumes two of the root's three terminal
+        # holes and releases a two-task consumer cohort.  The one remaining
+        # lane cannot justify splitting that dependent cohort while the next
+        # producer cohort is still unassigned.
+        self.assertEqual(
+            {placement(scheduled, 2, task)[1] for task in (0, 1)},
+            {terminal_wave},
+        )
+        self.assertTrue(
+            all(placement(scheduled, 2, task)[1] > terminal_wave for task in (2, 3))
+        )
+        self.assertTrue(
+            all(placement(scheduled, 3, task)[1] > terminal_wave for task in (0, 1))
+        )
+        # The producer arm that will release the next upstream cohort may use
+        # the lane; preserving atomicity does not require leaving it idle.
+        self.assertTrue(
+            any(placement(scheduled, 1, task)[1] == terminal_wave for task in range(4))
+        )
+        validate_worker_schedule(graph, scheduled)
+
+    def test_global_list_schedule_admits_complete_cohort_into_terminal_hole(
+        self,
+    ) -> None:
+        graph, baseline, plans = _partial_release_chain_problem(
+            consumer_cohort_width=1,
+        )
+
+        scheduled = _global_unit_list_schedule(
+            graph,
+            baseline,
+            plans,
+            frozenset(),
+            pipeline_depth=3,
+        )
+
+        self.assertIsNotNone(scheduled)
+        assert scheduled is not None
+        terminal_wave = placement(scheduled, 0, 4)[1]
+        producer_workers = {placement(scheduled, 2, task)[0] for task in (0, 1)}
+        consumer_placement = placement(scheduled, 3, 0)
+        self.assertEqual(
+            {placement(scheduled, 2, task)[1] for task in (0, 1)},
+            {terminal_wave},
+        )
+        self.assertEqual(consumer_placement[1], terminal_wave)
+        self.assertNotIn(consumer_placement[0], producer_workers)
+        self.assertTrue(
+            all(placement(scheduled, 2, task)[1] > terminal_wave for task in (2, 3))
+        )
+        validate_worker_schedule(graph, scheduled)
+
+    def test_global_list_schedule_commits_oversized_ready_cohort_across_waves(
+        self,
+    ) -> None:
+        graph, baseline, plans = _partial_release_chain_problem(
+            consumer_cohort_width=5,
+        )
+
+        scheduled = _global_unit_list_schedule(
+            graph,
+            baseline,
+            plans,
+            frozenset(),
+            pipeline_depth=3,
+        )
+
+        self.assertIsNotNone(scheduled)
+        assert scheduled is not None
+
+        def slot(root: int, task: int) -> int:
+            task_placement = placement(scheduled, root, task)
+            self.assertIsNotNone(task_placement)
+            assert task_placement is not None
+            worker, wave = task_placement
+            return wave * scheduled.worker_count + worker
+
+        producer_slots = [
+            slot(root, task)
+            for root in (0, 1, 2)
+            for task in range(graph.root_domains[root].size)
+        ]
+        consumer_slots = [slot(3, task) for task in range(5)]
+        self.assertGreater(consumer_slots[0], max(producer_slots))
+        self.assertEqual(
+            consumer_slots,
+            list(range(consumer_slots[0], consumer_slots[0] + 5)),
+        )
+        self.assertNotEqual(
+            consumer_slots[0] // scheduled.worker_count,
+            consumer_slots[-1] // scheduled.worker_count,
+        )
+        self.assertTrue(
+            all(
+                not consumer_slots[0] <= slot(4, task) <= consumer_slots[-1]
+                for task in range(graph.root_domains[4].size)
+            )
+        )
+        validate_worker_schedule(graph, scheduled)
+
+    def test_global_list_schedule_does_not_spill_ready_suffix_past_ancestor(
+        self,
+    ) -> None:
+        graph, baseline, plans = _partial_release_chain_problem(
+            consumer_cohort_width=5,
+            consumer_cohort_count=1,
+        )
+
+        scheduled = cross_loop_scheduler._event_frontier_list_schedule(
+            graph,
+            baseline,
+            plans,
+            frozenset(),
+            pipeline_depth=3,
+        )
+
+        self.assertIsNotNone(scheduled)
+        assert scheduled is not None
+
+        def slot(root: int, task: int) -> int:
+            worker, wave = placement(scheduled, root, task)
+            return wave * scheduled.worker_count + worker
+
+        # The entire consumer suffix is ready after producer tasks 0 and 1,
+        # but it is wider than the three-lane tail. Starting it there would
+        # push the unfinished producer into a later wave. Finish the ancestor,
+        # then commit the consumer suffix across waves.
+        producer_slots = [slot(2, task) for task in range(4)]
+        consumer_slots = [slot(3, task) for task in range(5)]
+        self.assertGreater(consumer_slots[0], max(producer_slots))
+        self.assertEqual(
+            consumer_slots,
+            list(range(consumer_slots[0], consumer_slots[0] + 5)),
+        )
+        validate_worker_schedule(graph, scheduled)
+
+    def test_global_list_schedule_does_not_treat_order_pieces_as_cohorts(
+        self,
+    ) -> None:
+        graph, _baseline, plans = _partial_release_chain_problem(
+            consumer_cohort_width=4,
+            leading_task_count=4,
+        )
+        reference_order = graph.root_task_orders[3]
+        (order_axis,) = reference_order.source_domain.axis_order
+        (task_axis,) = reference_order.target_domain.axis_order
+        order_index = coordinate_axis_symbol(order_axis)
+        split_order = CoordinateRelation(
+            reference_order.source_domain,
+            reference_order.target_domain,
+            (
+                _CoordinateRelationPiece(
+                    ((order_axis, 0, 2, 1),),
+                    ((task_axis, order_index, order_index + 1, 1),),
+                ),
+                _CoordinateRelationPiece(
+                    ((order_axis, 2, 8, 1),),
+                    ((task_axis, order_index, order_index + 1, 1),),
+                ),
+            ),
+        )
+        self.assertEqual(len(split_order.pieces), 2)
+        consumer_cohort = cross_loop_scheduler._readiness_equivalent_cohort_relation(
+            split_order,
+            graph.events[-1].consumers[0].keys_by_consumer,
+        )
+        self.assertIsNotNone(consumer_cohort)
+        assert consumer_cohort is not None
+        self.assertEqual(
+            cross_loop_scheduler._cohort_interval_end_at_cursor(
+                consumer_cohort[0],
+                0,
+            ),
+            4,
+        )
+        graph = dataclasses.replace(
+            graph,
+            root_task_orders=(
+                *graph.root_task_orders[:3],
+                split_order,
+                *graph.root_task_orders[4:],
+            ),
+        )
+        baseline = _baseline_worker_schedule(
+            graph.root_domains,
+            worker_count=4,
+            root_task_orders=graph.root_task_orders,
+        )
+
+        scheduled = _global_unit_list_schedule(
+            graph,
+            baseline,
+            plans,
+            frozenset(),
+            pipeline_depth=3,
+        )
+
+        self.assertIsNotNone(scheduled)
+        assert scheduled is not None
+        producer_cohort_wave = placement(scheduled, 2, 0)[1]
+        # The first producer cohort leaves two lanes, exactly the width of the
+        # first relation piece but only half the semantic consumer cohort. The
+        # other upstream root fills those lanes; the four-task consumer
+        # stays atomic and begins later.
+        self.assertEqual(
+            {placement(scheduled, 2, task)[1] for task in (0, 1)},
+            {producer_cohort_wave},
+        )
+        self.assertTrue(
+            all(
+                placement(scheduled, 2, task)[1] > producer_cohort_wave
+                for task in (2, 3)
+            )
+        )
+        self.assertTrue(
+            all(
+                placement(scheduled, 3, task)[1] > producer_cohort_wave
+                for task in range(8)
+            )
+        )
+        validate_worker_schedule(graph, scheduled)
+
     def test_global_list_schedule_validates_pipeline_depth(self) -> None:
         (domain,) = _identify_root_domains((_domain((10, 1, 1)),))
         graph = _readiness_graph((domain,))
@@ -2844,6 +3211,34 @@ class TestCrossLoopScheduler(TestCase):
                     task_order,
                     partial_keys,
                 )
+            )
+
+    def test_cohort_interval_end_handles_partial_point_fibers(self) -> None:
+        task_domain = _identify_root_domains((_domain((10, 6, 1)),))[0]
+        task_order = pid_task_order(task_domain, (10,))
+        key_domain = _domain((0, 1), kind="event", identity=0)
+        partial_keys = CoordinateRelation.point_map(
+            task_domain,
+            key_domain,
+            (
+                (((10, 1, 3, 1),), (sympy.Integer(0),)),
+                (((10, 3, 5, 1),), (sympy.Integer(0),)),
+            ),
+        )
+        ordered_keys = task_order.then(partial_keys)
+        self.assertIsNotNone(ordered_keys)
+        assert ordered_keys is not None
+
+        with _forbid_schedule_enumeration():
+            self.assertEqual(
+                tuple(
+                    cross_loop_scheduler._cohort_interval_end_at_cursor(
+                        ordered_keys,
+                        cursor,
+                    )
+                    for cursor in range(6)
+                ),
+                (1, 5, 5, 5, 5, 6),
             )
 
     def test_readiness_cohort_relation_declines_invalid_constant_fiber(self) -> None:
@@ -3786,7 +4181,7 @@ class TestCrossLoopScheduler(TestCase):
         )
         validate_worker_schedule(graph, scheduled)
 
-    def test_event_frontier_defers_newly_released_join_to_next_wave(self) -> None:
+    def test_event_frontier_fills_tail_with_newly_released_join(self) -> None:
         first_domain, second_domain, consumer_domain, independent_domain = (
             _identify_root_domains(
                 (
@@ -3847,8 +4242,8 @@ class TestCrossLoopScheduler(TestCase):
 
         self.assertIsNotNone(scheduled)
         assert scheduled is not None
-        self.assertEqual(placement(scheduled, 3, 0)[1], 0)
-        self.assertEqual(placement(scheduled, 2, 0)[1], 1)
+        self.assertEqual(placement(scheduled, 2, 0), (4, 0))
+        self.assertEqual(placement(scheduled, 3, 0)[1], 1)
         self.assertTrue(
             all(
                 placement(scheduled, root, task)[1] == 0
@@ -3880,7 +4275,17 @@ class TestCrossLoopScheduler(TestCase):
         self.assertIsNotNone(scheduled)
         assert scheduled is not None
         self.assertEqual(placement(scheduled, 0, 5)[1], 1)
-        self.assertEqual(placement(scheduled, 1, 0)[1], 2)
+        # The barrier consumer may wait in the producer's terminal wave on a
+        # disjoint worker; the segment-precedence proof rejects cyclic cases.
+        self.assertEqual(placement(scheduled, 1, 0), (2, 1))
+        self.assertTrue(
+            cross_loop_scheduler._schedule_is_progress_safe(
+                scheduled,
+                graph,
+                (),
+                frozenset(((0, 1),)),
+            )
+        )
         validate_worker_schedule(graph, scheduled)
 
     def test_event_frontier_uses_every_nested_iteration_key(self) -> None:
@@ -3942,7 +4347,15 @@ class TestCrossLoopScheduler(TestCase):
         self.assertIsNotNone(scheduled)
         assert scheduled is not None
         self.assertEqual(placement(scheduled, 0, 3)[1], 1)
-        self.assertEqual(placement(scheduled, 1, 0)[1], 2)
+        self.assertEqual(placement(scheduled, 1, 0), (1, 1))
+        self.assertTrue(
+            cross_loop_scheduler._schedule_is_progress_safe(
+                scheduled,
+                graph,
+                (plan,),
+                frozenset(),
+            )
+        )
         validate_worker_schedule(graph, scheduled)
 
     def test_global_list_schedule_contracts_final_arrival_continuation(self) -> None:
@@ -4037,8 +4450,20 @@ class TestCrossLoopScheduler(TestCase):
         assert scheduled is not None
         self.assertEqual(scheduled.segments_for_root(1), ())
         self.assertEqual(placement(scheduled, 0, 0), (0, 0))
-        self.assertEqual(placement(scheduled, 2, 0), (2, 0))
-        self.assertEqual(placement(scheduled, 3, 0), (0, 1))
+        # Each continuation runs on its final producer strand, allowing the
+        # corresponding sink to fill a later lane in the same wave. Exact
+        # event cohorts need not wait for the unrelated producer key.
+        self.assertEqual(
+            {placement(scheduled, root, task)[1] for root in (0, 3) for task in (0, 1)},
+            {0},
+        )
+        self.assertTrue(
+            all(
+                placement(scheduled, 0, task)[0] < placement(scheduled, 3, task)[0]
+                for task in (0, 1)
+            )
+        )
+        self.assertEqual(placement(scheduled, 2, 0), (0, 1))
         with _forbid_schedule_enumeration():
             self.assertTrue(
                 cross_loop_scheduler._schedule_is_progress_safe(

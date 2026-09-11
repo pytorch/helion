@@ -11211,6 +11211,105 @@ def _scalar_relation_constant_prefix_end(
     return low
 
 
+def _cohort_interval_end_at_cursor(
+    cohort_by_order: CoordinateRelation,
+    cursor: int,
+) -> int | None:
+    """Return the exact end of the cohort containing one concrete cursor.
+
+    The proof is relational rather than piece-boundary based: all order points
+    mapping to the cursor's cohort must form one dense interval.  This lets an
+    exact cohort cross incidental adjacent pieces in the task-order spelling.
+    """
+    if (
+        len(cohort_by_order.source_domain.axis_order) != 1
+        or cursor < 0
+        or cursor >= cohort_by_order.source_domain.size
+    ):
+        return None
+    (order_axis,) = cohort_by_order.source_domain.axis_order
+    marker_domain = _singleton_relation_domain()
+    selected_cohort = CoordinateRelation.point_map(
+        marker_domain,
+        cohort_by_order.source_domain,
+        (((), (sympy.Integer(cursor),)),),
+    ).then(cohort_by_order)
+    selected_is_nonempty = (
+        None if selected_cohort is None else _relation_may_be_nonempty(selected_cohort)
+    )
+    if selected_is_nonempty is None:
+        return None
+    if not selected_is_nonempty:
+        # Absence from a partial event relation is itself one exact readiness
+        # class. Find the next semantic support boundary without enumerating
+        # source points; adjacent relation pieces do not matter here.
+        canonical = cohort_by_order.canonical_single_valued()
+        if canonical is None:
+            return None
+        next_support = cohort_by_order.source_domain.size
+        for piece in canonical.pieces:
+            if len(piece.source_bounds_items) != 1:
+                return None
+            axis, begin, end, step = piece.source_bounds_items[0]
+            begin = sympy.sympify(begin)
+            end = sympy.sympify(end)
+            if (
+                axis != order_axis
+                or step != 1
+                or begin.free_symbols
+                or end.free_symbols
+                or begin.is_integer is not True
+                or end.is_integer is not True
+            ):
+                return None
+            concrete_begin = int(begin)
+            concrete_end = int(end)
+            if concrete_begin <= cursor < concrete_end:
+                return None
+            if concrete_begin > cursor:
+                next_support = min(next_support, concrete_begin)
+        return next_support
+    orders_by_cohort = cohort_by_order.converse()
+    cohort_points = (
+        None
+        if selected_cohort is None or orders_by_cohort is None
+        else selected_cohort.then(orders_by_cohort)
+    )
+    cohort_membership = None if cohort_points is None else cohort_points.converse()
+    cohort_interval = (
+        None
+        if cohort_membership is None
+        else tile_dependency._dense_linear_source_support_interval(
+            cohort_membership,
+            (order_axis,),
+        )
+    )
+    cohort_count = (
+        None
+        if cohort_membership is None
+        else cohort_membership.source_support_cardinality()
+    )
+    if cohort_interval is None or cohort_count is None:
+        return None
+    cohort_begin, cohort_end = (sympy.sympify(value) for value in cohort_interval)
+    cohort_count = sympy.sympify(cohort_count)
+    if (
+        cohort_begin.free_symbols
+        or cohort_end.free_symbols
+        or cohort_count.free_symbols
+        or cohort_begin.is_integer is not True
+        or cohort_end.is_integer is not True
+        or cohort_count.is_integer is not True
+        or not _equal_integer_expressions(cohort_end - cohort_begin, cohort_count)
+    ):
+        return None
+    concrete_begin = int(cohort_begin)
+    concrete_end = int(cohort_end)
+    if not concrete_begin <= cursor < concrete_end:
+        return None
+    return concrete_end
+
+
 def _event_frontier_list_schedule(
     readiness_graph: ReadinessGraph,
     worker_schedule: WorkerSchedule,
@@ -11276,6 +11375,46 @@ def _event_frontier_list_schedule(
         root_orders[root] = order
 
     external_frontiers: dict[int, CoordinateRelation] = {}
+    cohort_relations_by_root: dict[int, list[CoordinateRelation]] = {
+        root: [] for root in scheduled_roots
+    }
+    unsupported_cohort_roots: set[int] = set()
+
+    def record_cohort_relation(
+        root: int,
+        task_order: CoordinateRelation,
+        keys_by_task: CoordinateRelation,
+    ) -> None:
+        """Record one exact executable readiness partition for ``root``."""
+        if root in excluded_roots or root in unsupported_cohort_roots:
+            return
+        cohort = _readiness_equivalent_cohort_relation(
+            task_order,
+            keys_by_task,
+        )
+        if cohort is None:
+            # A partial point-valued event still has exact fibers. Unsupported
+            # source points form the complementary readiness class; the
+            # interval query handles that class structurally. Set-valued
+            # partial relations remain canonical-only.
+            cohort_by_order = task_order.then(keys_by_task)
+            canonical = (
+                None
+                if cohort_by_order is None
+                else cohort_by_order.canonical_single_valued()
+            )
+            converse = None if canonical is None else canonical.converse()
+            if canonical is None or converse is None:
+                unsupported_cohort_roots.add(root)
+                cohort_relations_by_root[root].clear()
+                return
+            tile_dependency._remember_exact_converse(canonical, converse)
+            cohort_by_order = canonical
+        else:
+            cohort_by_order, _event_keys_by_cohort = cohort
+        if cohort_by_order not in cohort_relations_by_root[root]:
+            cohort_relations_by_root[root].append(cohort_by_order)
+
     for root, logical_frontier in external_source_frontiers:
         order = root_orders.get(root)
         ordered_frontier = None if order is None else order.then(logical_frontier)
@@ -11284,6 +11423,32 @@ def _event_frontier_list_schedule(
         ):
             return None
         external_frontiers[root] = ordered_frontier
+        ordinal_identity = CoordinateRelation.identity(
+            order.source_domain,
+            order.source_domain,
+        )
+        record_cohort_relation(root, ordinal_identity, ordered_frontier)
+
+    # Event-closure actions come from the same frozen counter plans consumed
+    # by codegen, including plans whose only consumer became a continuation.
+    # This is an ephemeral partition of each configured task order, not a
+    # second dependency graph or correctness proof.
+    for plan in readiness_counters:
+        static_relations = _readiness_static_producers(
+            readiness_graph,
+            plan.producers,
+            continuation_by_root,
+        )
+        if static_relations is None:
+            return worker_schedule
+        for producer_root, keys_by_producer in static_relations:
+            producer_order = root_orders.get(producer_root)
+            if producer_order is not None:
+                record_cohort_relation(
+                    producer_root,
+                    producer_order,
+                    keys_by_producer,
+                )
 
     incoming_frontiers: dict[int, list[tuple[int, CoordinateRelation]]] = {
         root: [] for root in scheduled_roots
@@ -11357,6 +11522,12 @@ def _event_frontier_list_schedule(
         consumer = prerequisite.counter_consumer
         assert plan is not None and consumer is not None
         consumer_keys = _keys_by_consumer_root_task(readiness_graph, consumer)
+        if consumer_keys is not None:
+            record_cohort_relation(
+                consumer_root,
+                consumer_order,
+                consumer_keys,
+            )
         ordered_consumer_keys = (
             None if consumer_keys is None else consumer_order.then(consumer_keys)
         )
@@ -11410,28 +11581,6 @@ def _event_frontier_list_schedule(
     if criticality is None:
         return None
 
-    order_piece_ends: dict[int, tuple[int, ...]] = {}
-    for root, order in root_orders.items():
-        canonical = order.canonical_single_valued()
-        if canonical is None:
-            return None
-        (ordinal_axis,) = canonical.source_domain.axis_order
-        if any(
-            axis != ordinal_axis or step != 1
-            for piece in canonical.pieces
-            for axis, _begin, _end, step in piece.source_bounds_items
-        ):
-            return None
-        order_piece_ends[root] = tuple(
-            sorted(
-                {
-                    end
-                    for piece in canonical.pieces
-                    for _axis, _begin, end, _step in piece.source_bounds_items
-                }
-            )
-        )
-
     cursors = dict.fromkeys(scheduled_roots, 0)
     root_ends = {root: root_orders[root].source_domain.size for root in scheduled_roots}
     active_pull_depths: dict[int, int] = {}
@@ -11471,45 +11620,18 @@ def _event_frontier_list_schedule(
                 return False
         return True
 
-    def admissible_prefix_end(
-        root: int,
-        begin: int,
-        limit: int,
-        producer_cursors: dict[int, int],
-    ) -> int | None:
-        if begin >= limit:
-            return begin
-        whole = interval_is_admissible(root, begin, limit, producer_cursors)
-        if whole is None:
-            return None
-        if whole:
-            return limit
-        first = interval_is_admissible(root, begin, begin + 1, producer_cursors)
-        if first is None or not first:
-            return begin if first is False else None
-        low = begin + 1
-        high = limit
-        while low + 1 < high:
-            middle = (low + high) // 2
-            prefix = interval_is_admissible(
-                root,
-                begin,
-                middle,
-                producer_cursors,
+    def exact_cohort_end(root: int, cursor: int) -> int | None:
+        """Intersect every frozen incoming/outgoing readiness partition."""
+        end = root_ends[root]
+        for cohort_by_order in cohort_relations_by_root[root]:
+            relation_end = _cohort_interval_end_at_cursor(
+                cohort_by_order,
+                cursor,
             )
-            if prefix is None:
+            if relation_end is None:
                 return None
-            if prefix:
-                low = middle
-            else:
-                high = middle
-        return low
-
-    def next_piece_end(root: int, cursor: int) -> int | None:
-        return next(
-            (end for end in order_piece_ends[root] if cursor < end),
-            None,
-        )
+            end = min(end, relation_end)
+        return end
 
     def continues_active_event(root: int) -> bool | None:
         """Return whether ``root`` contributes to an already-active join."""
@@ -11542,89 +11664,122 @@ def _event_frontier_list_schedule(
 
     placed_runs: list[_PlacedRun] = []
     committed_root: int | None = None
+    committed_end: int | None = None
     worker_step = 0
     while any(cursors[root] < root_ends[root] for root in scheduled_roots):
-        wave_start_cursors = dict(cursors)
         next_worker = 0
         while next_worker < worker_schedule.worker_count:
+            if committed_root is not None:
+                assert committed_end is not None
+                cursor = cursors[committed_root]
+                count = min(
+                    committed_end - cursor,
+                    worker_schedule.worker_count - next_worker,
+                )
+                if count <= 0:
+                    return None
+                placed_runs.append(
+                    _PlacedRun(
+                        root=committed_root,
+                        source_begin=cursor,
+                        task_count=count,
+                        worker_begin=next_worker,
+                        worker_count=count,
+                        worker_step=worker_step,
+                    )
+                )
+                cursors[committed_root] += count
+                next_worker += count
+                if cursors[committed_root] == committed_end:
+                    committed_root = None
+                    committed_end = None
+                    if exactly_rejoined_canonical_frontier():
+                        active_pull_depths.clear()
+                continue
+
             candidates: list[
                 tuple[
                     tuple[int, int, int, int, int, int, int, int, int],
                     int,
                     int,
-                    bool,
+                    int | None,
                     int,
                 ]
             ] = []
             for root in scheduled_roots:
-                if committed_root is not None and root != committed_root:
-                    continue
                 cursor = cursors[root]
                 if cursor >= root_ends[root]:
                     continue
+                canonical_root = canonical_next_root()
                 suffix_is_admissible = interval_is_admissible(
                     root,
                     cursor,
                     root_ends[root],
-                    wave_start_cursors,
+                    cursors,
                 )
                 if suffix_is_admissible is None:
                     return None
-                piece_end = next_piece_end(root, cursor)
-                if piece_end is None:
-                    return None
-                limit = min(
-                    root_ends[root],
-                    piece_end,
-                    cursor + worker_schedule.worker_count - next_worker,
-                )
-                if external_frontier := external_frontiers.get(root):
-                    external_end = _scalar_relation_constant_prefix_end(
-                        external_frontier,
-                        cursor,
-                        limit,
+                # A fully admissible remaining suffix is already one
+                # committed run. Outgoing event boundaries affect its
+                # priority but never fragment it and let a newly released
+                # descendant displace the unfinished run. Exact cohorts are
+                # action boundaries only for incrementally admitted roots.
+                action_end = (
+                    root_ends[root]
+                    if suffix_is_admissible
+                    else (
+                        None
+                        if root in unsupported_cohort_roots
+                        else exact_cohort_end(root, cursor)
                     )
-                    if external_end is None:
-                        return None
-                    limit = min(limit, external_end)
-                # An entirely ready suffix is one committed run.  Outgoing
-                # event frontiers may affect its priority, but may not split
-                # it and let newly released work displace the unfinished run.
-                # TODO(helion): Replace the temporary partial-prefix walk
-                # below when the concrete scheduler selects complete
-                # readiness-equivalent cohorts directly.
-                if not suffix_is_admissible:
-                    for consumer_root in scheduled_roots:
-                        consumer_cursor = cursors[consumer_root]
-                        if consumer_cursor >= root_ends[consumer_root]:
-                            continue
-                        for producer_root, frontier in incoming_frontiers[
-                            consumer_root
-                        ]:
-                            if producer_root != root:
-                                continue
-                            required = _scalar_relation_maximum_on_interval(
-                                frontier,
-                                consumer_cursor,
-                                consumer_cursor + 1,
-                            )
-                            if required is None:
-                                return None
-                            has_value, value = required
-                            if has_value and cursor <= value:
-                                limit = min(limit, value + 1)
-                candidate_end = admissible_prefix_end(
+                )
+                if action_end is None:
+                    # An unsupported partition remains eligible only as its
+                    # canonical, fully-ready suffix.  Exact roots elsewhere
+                    # can still use event-frontier placement.
+                    if root != canonical_root or not suffix_is_admissible:
+                        continue
+                    action_end = root_ends[root]
+                action_is_admissible = interval_is_admissible(
                     root,
                     cursor,
-                    limit,
-                    wave_start_cursors,
+                    action_end,
+                    cursors,
                 )
-                if candidate_end is None:
+                if action_is_admissible is None:
                     return None
-                if candidate_end == cursor:
+                if not action_is_admissible:
                     continue
 
-                canonical_root = canonical_next_root()
+                remaining_workers = worker_schedule.worker_count - next_worker
+                action_size = action_end - cursor
+                commit_end: int | None = None
+                if action_size > remaining_workers:
+                    blocking_roots: set[int] = set()
+                    for producer_root, frontier in incoming_frontiers[root]:
+                        required = _scalar_relation_maximum_on_interval(
+                            frontier,
+                            cursor,
+                            action_end,
+                        )
+                        if required is None:
+                            return None
+                        if required[0]:
+                            blocking_roots.add(producer_root)
+                    if any(
+                        cursors[producer_root] < root_ends[producer_root]
+                        for producer_root in blocking_roots
+                    ):
+                        # Do not insert a prefix of one readiness-equivalent
+                        # dependent cohort into a terminal hole while an
+                        # ancestor remains assignable. The whole cohort may
+                        # span waves once those blockers are complete.
+                        continue
+                    commit_end = action_end
+                    candidate_end = cursor + remaining_workers
+                else:
+                    candidate_end = action_end
+
                 if root == canonical_root:
                     pull_depth = 1
                 elif root in active_pull_depths:
@@ -11712,18 +11867,19 @@ def _event_frontier_list_schedule(
                         priority,
                         root,
                         candidate_end,
-                        suffix_is_admissible,
+                        commit_end,
                         pull_depth,
                     )
                 )
 
             if not candidates:
                 break
-            _priority, root, candidate_end, commits_suffix, pull_depth = min(candidates)
+            _priority, root, candidate_end, commit_end, pull_depth = min(candidates)
             cursor = cursors[root]
             count = candidate_end - cursor
-            if committed_root is None and commits_suffix:
+            if commit_end is not None:
                 committed_root = root
+                committed_end = commit_end
             if pull_depth > 1:
                 active_pull_depths[root] = pull_depth
             placed_runs.append(
@@ -11737,8 +11893,9 @@ def _event_frontier_list_schedule(
                 )
             )
             cursors[root] = candidate_end
-            if committed_root == root and candidate_end == root_ends[root]:
+            if committed_root == root and candidate_end == committed_end:
                 committed_root = None
+                committed_end = None
             if exactly_rejoined_canonical_frontier():
                 active_pull_depths.clear()
             next_worker += count
@@ -11826,7 +11983,6 @@ def _event_frontier_list_schedule(
         readiness_counters,
         root_barrier_edges,
         transient_source_root=transient_source_root,
-        require_strict_rank=True,
     ):
         return None
     return result

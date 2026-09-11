@@ -361,10 +361,20 @@ sections are not active work.
 - [ ] Preserve one immutable executable-prerequisite view derived from
   `ReadinessGraph` after ownership is frozen. The scheduler consumes that view;
   final counters/barriers and codegen do not repartition it.
-- [ ] Make depth one return `C` exactly for the frozen ownership plan.
-  At greater depths, implement complete-cohort admission, committed-run
-  atomicity, non-displacement, genuine terminal-hole filling, independent-root
-  backfill, and exact canonical ties.
+- [x] Make depth one return `C` exactly for the frozen ownership plan. At
+  greater depths, allow a consumer released by producer assignments earlier
+  in the same wave to fill remaining lanes only after the ordinary exact
+  segment-precedence proof establishes acyclic progress; a strict earlier-wave
+  rank is sufficient but no longer required.
+- [x] Keep an incrementally admitted readiness-equivalent cohort atomic: do
+  not insert only the prefix that fits a terminal hole while one of its
+  blocking producer roots remains unfinished. Once its blockers are complete,
+  a selected oversized cohort is committed across waves without interleaving.
+- [x] Derive complete-cohort boundaries by intersecting every exact incoming
+  and outgoing relation in the frozen executable counter plan. A partial
+  point-valued relation treats unsupported intervals as an explicit empty-key
+  class, and semantic fibers may cross incidental relation-piece boundaries.
+- [ ] Finish independent-root backfill and exact canonical ties.
 - [x] Wire `cross_loop_pipeline_depth` through the public config fragment,
   autotuner, plan builder, and lowering. Offer `{1,2,3,4}` without topology-
   dependent pruning; duplicate schedules are acceptable.
@@ -2511,11 +2521,13 @@ its producers have physically completed; the emitted wait gates its body.
 ### Candidate interval
 
 A readiness-equivalent cohort is not a set of tasks that merely happen to have
-the same scalar release rank. It is the maximal affine family in one existing
-relation piece whose members have the same exact prerequisite event family and
-key fiber, including every nested wait. Affine translations of that family
-across keys may share one relation piece, but each key fiber remains an atomic
-cohort for noncanonical dependent movement.
+the same scalar release rank. It is the maximal contiguous configured-order
+family whose members have the same exact key fiber in every frozen incoming
+and outgoing event relation, including every nested wait. An empty fiber in a
+partial point-valued relation is a real class. A semantic cohort may cross
+incidental adjacent relation pieces; conversely, one relation piece may encode
+many translated key fibers. Each resulting intersection fiber remains an
+atomic cohort for noncanonical dependent movement.
 
 For each admissible root frontier, propose exactly its next complete cohort,
 ending no later than:
@@ -2523,15 +2535,14 @@ ending no later than:
 ```text
 min(
     admissible_end,
-    every outgoing event-key boundary,
-    next relation-piece boundary,
+    every exact incoming/outgoing event-fiber boundary,
     task-domain end,
 )
 ```
 
 This is the atomic action ranked by the one chooser. The boundaries prove that
-readiness, event contributions, and task mapping are uniform within it; they
-do not authorize a larger pre-ranked run. If worker capacity cuts a
+readiness and event contributions are uniform within it; syntactic relation
+piece boundaries never define an action. If worker capacity cuts a
 dependency-released cohort, remaining lanes affect eligibility and emission
 clipping, not the cohort boundary. If the whole cohort fits, it is eligible. If
 it does not fit, it is ineligible while a blocking ancestor remains; after
