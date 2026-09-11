@@ -1298,7 +1298,7 @@ def _conservative_static_arm_problem() -> tuple[
         graph,
         _baseline_worker_schedule(
             root_domains,
-            worker_count=6,
+            worker_count=12,
             root_task_orders=root_task_orders,
         ),
         plans,
@@ -3101,16 +3101,15 @@ class TestCrossLoopScheduler(TestCase):
             max(affected_producer_slots),
         )
 
-        # Failure to derive the unrelated arm's frontier would discard this
-        # proposal. Its exact producer and consumer instead fill the two tail
-        # lanes of the affected producer's two resident waves.
-        affected_producer_waves = {placement(proposal, 0, task)[1] for task in range(8)}
-        self.assertTrue(
-            all(
-                placement(proposal, root, task)[1] in affected_producer_waves
-                for root in (1, 2)
-                for task in range(2)
-            )
+        # Widening the one unsupported arm must not disable the unrelated
+        # exact chain. Its consumer moves up from the baseline's next wave and
+        # shares a wave with its own producer.
+        exact_producer_wave = placement(proposal, 1, 0)[1]
+        exact_consumer_wave = placement(proposal, 2, 0)[1]
+        self.assertEqual(exact_consumer_wave, exact_producer_wave)
+        self.assertLess(
+            exact_consumer_wave,
+            placement(baseline, 2, 0)[1],
         )
 
         final_plan = cross_loop_scheduler.StaticPipelinePlan(
