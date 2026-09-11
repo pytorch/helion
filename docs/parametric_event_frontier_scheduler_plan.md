@@ -558,6 +558,27 @@ FlashMLA result and demonstrates at least one reproducible end-to-end win; if
 it does not, remove or quarantine the unused experimental scheduler rather
 than extending it with cyclic/SCC machinery.
 
+Implementation checkpoint (2026-09-10): the performance half of this gate is
+positive, but the symbolic objective evaluator is not yet acceptable. On the
+canonical static ragged B4/Q4/H16 FlashMLA boundary, the existing acyclic
+event-frontier schedule measures 61.312 us cold-L2 versus 67.456 us for the
+matched three-launch Helion baseline. The dynamic F64/C16 fan-out path reuses
+one cubin across B1/B2/B4/B9 and measures 57.216/59.424/100.112/173.968 us
+versus 100.192/100.224/145.248/245.600 us for matched standalone. Thus the
+acyclic machinery has real end-to-end value and should not be abandoned.
+
+The first relation-only max-plus scorer prototype was nevertheless removed
+before production wiring. It matched all 192 small concrete oracle cases, but
+the canonical symbolic `(3, N, 2)` schedule took about 48 seconds and declined
+while reducing its inclusive same-strand prefix. Re-expressing that prefix in
+the proved packed global-rank domain did not solve the problem: ordinary
+extrema still encountered parameter-conditionally active value pieces. Do not
+add a generic fiber-emptiness splitter or revive the discarded scorer
+scaffolding. The remaining prerequisite is one bounded, general ranked-prefix
+operation over the existing `CoordinateRelation`; if that cannot be stated
+and proved without a new schedule abstraction or model-specific cases, retain
+the current conservative symbolic policy and stop this optimization slice.
+
 ### Priority 3: resume the paused validation and performance work
 
 - [ ] Revalidate canonical ragged FlashMLA B4 against matched standalone
@@ -2895,6 +2916,16 @@ ownership a production decision. They are derived views over the existing
   scalar acyclic prefix evaluator is still outstanding. Cyclic affine
   recurrence support is explicitly deferred and is not an exit criterion.
 
+  A discarded prototype subsequently evaluated the full recurrence exactly
+  on all 192 small concrete oracle cases, but it did not pass the symbolic
+  gate. The canonical `(3, N, 2)` packed case reduced to three disjoint source
+  groups and still declined on parameter-conditionally active prefix fibers
+  after roughly 42--48 seconds. A packed-rank reformulation hit the same
+  semantic boundary. All scorer-specific helpers and tests were removed; do
+  not restore them piecemeal. The next attempt, if any, must begin with the
+  single bounded ranked-prefix operation named above and must pass this case
+  before adding an evaluator.
+
 - [x] Let the existing extrema implementation consume a partial scalar-value
   relation when, and only when, its value support provably covers every target
   reachable by the relation being reduced. Keep the public extrema API and its
@@ -2925,6 +2956,15 @@ ownership a production decision. They are derived views over the existing
   after ordinal construction. Independent review covered 220,181 exhaustive
   strided support combinations and 2,500 randomized additions without an
   unsound acceptance.
+
+  A follow-up lets the same extrema implementation consume pairwise-disjoint
+  exact source groups even when their union is only a partial carrier. The
+  proof is semantic rather than provenance-based and charges symbolic
+  pairwise comparisons to the existing relation-piece budget before invoking
+  SymPy. Oversized 128/256-group cases decline before partitioning. The full
+  tile-dependency suite passes 177 tests with 78 subtests. This closes a
+  general partial-support gap but deliberately does not infer conditional
+  prefix-fiber activation.
 - [x] Add one private exact-or-decline partition of a resident slot-to-slot
   dependency relation into same-owner and cross-owner edges. Ownership is the
   existing `(launch_stage, worker)` projection of the two endpoints. Preserve
