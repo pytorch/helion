@@ -1860,14 +1860,14 @@ If `c` is parameter-dependent, this mapping is admitted only through the
 canonical runtime mixed-radix constructor and its exact lemmas described
 above. It is not treated as a generic affine expression.
 
-The compiler emits such a piece only after proving translation equivalence:
-
-- the same winning structural priority;
-- the same readiness signature;
-- the same root sequence;
-- the same worker mapping;
-- the same event-contribution pattern; and
-- the same affine state delta for every repetition under the guard.
+The compiler emits such a piece only after the ordinary scheduler transition
+itself proves translation equivalence.  The affine layer invokes the same
+`choose_next_action` and `apply_action` used for every non-repeated decision
+and proves that translating the complete input state translates both their
+action and successor state.  Readiness, priority, outside competitors, event
+contributions, worker phase, and ownership are therefore covered through the
+shared transition; the repeater neither restates those fields nor maintains a
+second invariant-priority test.
 
 Comparisons are partitioned only at symbolically derived affine or
 quasi-affine crossings. Piece growth is bounded. If translation equivalence is
