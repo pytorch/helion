@@ -231,6 +231,13 @@ sections are not active work.
 - [ ] Keep the concrete max-plus/list-schedule oracle test-only. Delete no
   historical measurement or postmortem; relabel it rather than treating it as
   an acceptance gate.
+- [ ] Audit the scheduler and codegen tests before adapting implementation.
+  Delete tests whose only contract is dynamic-`B` affine repetition, symbolic
+  cursor state, parameterized renderer selection, or an obsolete exact segment
+  spelling. Retain or rewrite tests around semantic invariants: exact task
+  coverage, dependency progress, fixed-capacity waits/publications, canonical
+  fallback, deterministic priority, committed-run non-displacement, bounded
+  compilation, and numerical parity.
 
 ### Phase S1: make fixed schedule capacity explicit
 
