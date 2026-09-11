@@ -279,6 +279,7 @@ def _runtime_settings(**overrides: object) -> SimpleNamespace:
         "autotune_baseline_accuracy_check_fn": None,
         "autotune_benchmark_fn": None,
         "autotune_config_filter": None,
+        "autotune_config_overrides": {},
         "autotune_search_acf": [],
         "autotune_accuracy_check": True,
         "autotune_baseline_atol": None,
@@ -468,6 +469,110 @@ class TestMultiShapeRuntime(unittest.TestCase):
         for bound in bounds:
             bound.compile_config.assert_called_once_with(winner)
             bound.set_config.assert_called_once_with(winner)
+
+    def _structurally_mismatched_kernel(
+        self, settings: SimpleNamespace
+    ) -> tuple[Kernel[object], _RuntimeBackend]:
+        backend = _RuntimeBackend()
+        bounds = [
+            _RuntimeBoundKernel(backend, settings),
+            _RuntimeBoundKernel(backend, settings),
+        ]
+        bounds[0].config_spec.structural_fingerprint = Mock(  # pyrefly: ignore[bad-assignment]
+            return_value=(
+                ("block_sizes", 2),
+                ("indexing", 5),
+                ("atomic_indexing", 1),
+                ("load_eviction_policies", 2),
+            )
+        )
+        bounds[1].config_spec.structural_fingerprint = Mock(  # pyrefly: ignore[bad-assignment]
+            return_value=(
+                ("block_sizes", 2),
+                ("indexing", 14),
+                ("atomic_indexing", 4),
+                ("load_eviction_policies", 8),
+            )
+        )
+        kernel = object.__new__(Kernel)
+        kernel.settings = settings  # pyrefly: ignore [bad-assignment]
+        kernel._annotations = [object]
+        kernel.normalize_args = Mock(side_effect=lambda *args: tuple(args))
+        kernel.bind = Mock(side_effect=bounds)
+        kernel._base_specialization_key = Mock(
+            side_effect=[("groups", 1), ("groups", 4)]
+        )
+        kernel._get_bound_kernel_cache_key = Mock(
+            side_effect=[
+                SimpleNamespace(
+                    specialization_key=("groups", 1),
+                    extra_results=(),
+                    compiler_seed_results=(),
+                ),
+                SimpleNamespace(
+                    specialization_key=("groups", 4),
+                    extra_results=(),
+                    compiler_seed_results=(),
+                ),
+            ]
+        )
+        return kernel, backend
+
+    @patch("helion.runtime.kernel.target_device_capability", return_value=(9, 0))
+    @patch("helion.runtime.kernel._current_device_index", return_value=0)
+    @patch("helion.runtime.kernel.dist.is_initialized", return_value=False)
+    def test_pinned_fields_may_have_different_structures(
+        self,
+        distributed: object,
+        current: object,
+        capability: object,
+    ) -> None:
+        settings = _runtime_settings(
+            autotune_config_overrides={
+                "indexing": "pointer",
+                "atomic_indexing": "pointer",
+                "load_eviction_policies": "",
+            }
+        )
+        kernel, backend = self._structurally_mismatched_kernel(settings)
+
+        winner = kernel.autotune_multi(
+            [("one-group",), ("four-groups",)], cache_tag="varying-groups-v1"
+        )
+
+        self.assertEqual(winner.config, {"block_sizes": [64], "num_warps": 4})
+        self.assertEqual(len(backend.autotune_calls), 1)
+
+    @patch("helion.runtime.kernel.target_device_capability", return_value=(9, 0))
+    @patch("helion.runtime.kernel._current_device_index", return_value=0)
+    @patch("helion.runtime.kernel.dist.is_initialized", return_value=False)
+    def test_non_scalar_overrides_do_not_hide_structural_mismatches(
+        self,
+        distributed: object,
+        current: object,
+        capability: object,
+    ) -> None:
+        for name, overrides in (
+            ("unpinned", {}),
+            (
+                "sequence",
+                {
+                    "indexing": ["pointer"],
+                    "atomic_indexing": "pointer",
+                    "load_eviction_policies": "",
+                },
+            ),
+        ):
+            with self.subTest(name=name):
+                kernel, backend = self._structurally_mismatched_kernel(
+                    _runtime_settings(autotune_config_overrides=overrides)
+                )
+                with self.assertRaisesRegex(exc.InvalidAPIUsage, r"arg_sets\[1\]"):
+                    kernel.autotune_multi(
+                        [("one-group",), ("four-groups",)],
+                        cache_tag="varying-groups-v1",
+                    )
+                self.assertEqual(backend.autotune_calls, [])
 
 
 class _Log:
