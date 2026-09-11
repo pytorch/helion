@@ -42,72 +42,6 @@ import helion.language as hl
 
 
 @helion.kernel(
-    static_shapes=False,
-    autotune_effort="none",
-    persistent_reserved_sms=0,
-)
-def dynamic_cohort_fanout(x: torch.Tensor) -> torch.Tensor:
-    batch, query, width = x.size()
-    hl.specialize(width)
-    hl.specialize(x.stride(0))
-    hl.specialize(x.stride(1))
-    hl.specialize(x.stride(2))
-    tmp = torch.empty((batch, query), dtype=x.dtype, device=x.device)
-    out = torch.empty_like(x)
-
-    for producer_batch, producer_query in hl.tile([batch, query], block_size=[1, 1]):
-        tmp[producer_batch, producer_query] = x[producer_batch, producer_query, 0] + 1
-    for consumer_batch, consumer_query, consumer_column in hl.tile(
-        [batch, query, width], block_size=[1, 1, 1]
-    ):
-        out[consumer_batch, consumer_query, consumer_column] = (
-            tmp[consumer_batch, consumer_query]
-            + x[consumer_batch, consumer_query, consumer_column]
-        )
-    return out
-
-
-@helion.kernel(
-    static_shapes=False,
-    autotune_effort="none",
-    persistent_reserved_sms=0,
-    triton_do_not_specialize=True,
-)
-def dynamic_split_cohort_fanout(
-    x: torch.Tensor,
-    neutral_input: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    rows, width = x.size()
-    hl.specialize(width)
-    hl.specialize(x.stride(0))
-    hl.specialize(x.stride(1))
-    hl.specialize(neutral_input.size(0))
-    hl.specialize(neutral_input.stride(0))
-    expanded_rows = 74 * rows + 73
-    tmp = torch.empty((expanded_rows, width), dtype=x.dtype, device=x.device)
-    neutral = torch.empty_like(neutral_input)
-    out = torch.empty_like(tmp)
-
-    for producer_row, producer_column in hl.tile(
-        [expanded_rows, width], block_size=[1, 1]
-    ):
-        tmp[producer_row, producer_column] = (
-            x[producer_row.index % rows, producer_column] + 1
-        )
-    for neutral_index in hl.tile(neutral_input.size(0), block_size=1):
-        neutral[neutral_index] = neutral_input[neutral_index] * 3
-    for consumer_row, consumer_column in hl.tile(
-        [expanded_rows, width], block_size=[1, 1]
-    ):
-        out[consumer_row, consumer_column] = (
-            tmp[consumer_row, 0]
-            + tmp[consumer_row, 1]
-            + x[consumer_row.index % rows, consumer_column]
-        )
-    return out, neutral
-
-
-@helion.kernel(
     static_shapes=True,
     autotune_effort="none",
 )
@@ -748,128 +682,6 @@ class TestCrossLoopCodegenHelpers(TestCase):
 
 @onlyBackends(["triton"])
 class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
-    @skipIfNotCUDA()
-    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_parameterized_renderer_coalesces_invariant_ready_root(self) -> None:
-        worker_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
-        if worker_count != 148:
-            self.skipTest("the W148 tail fixture requires a 148-SM GPU")
-        original_builder = cross_loop_codegen.build_static_pipeline_plan
-        selected_roots: tuple[int, ...] | None = None
-
-        def build_split_cohort_plan(**kwargs: Any):
-            nonlocal selected_roots
-            kwargs["continuation_ineligible_roots"] = frozenset(
-                range(len(kwargs["root_task_orders"]))
-            )
-            kwargs["allow_transient_source"] = False
-            kwargs["cross_loop_pipeline_depth"] = 2
-            finalized = original_builder(**kwargs)
-            selected_roots = tuple(
-                segment.root for segment in finalized.worker_schedule.segments
-            )
-            return finalized
-
-        exemplar = torch.randn((3, 2), device=DEVICE)
-        neutral_exemplar = torch.randn((4,), device=DEVICE)
-        bound = dynamic_split_cohort_fanout.bind((exemplar, neutral_exemplar))
-        config = helion.Config(
-            pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
-            num_sm_multiplier=1,
-            num_warps=1,
-        )
-        with mock.patch.object(
-            cross_loop_codegen,
-            "build_static_pipeline_plan",
-            side_effect=build_split_cohort_plan,
-        ):
-            generated_code = bound.to_code(config)
-            compiled = bound.compile_config(config)
-            # One compiled kernel must preserve worker/wave wraparound across
-            # several runtime batches; it may not be hidden by specialization.
-            for batch in (1, 3, 4, 75):
-                with self.subTest(batch=batch):
-                    x = torch.randn((batch, 2), device=DEVICE)
-                    neutral_input = torch.randn((4,), device=DEVICE)
-                    output = compiled(x, neutral_input)
-                    out, neutral = output
-                    source_rows = x[
-                        torch.arange(74 * batch + 73, device=DEVICE) % batch
-                    ]
-                    torch.testing.assert_close(
-                        out,
-                        source_rows.sum(dim=1, keepdim=True) + 2 + source_rows,
-                    )
-                    torch.testing.assert_close(neutral, neutral_input * 3)
-
-        self.assertEqual(selected_roots, (0, 2, 1))
-        self.assertNotIn("tile_dependency_root_barrier", generated_code)
-        self.assertEqual(
-            generated_code.count("def tile_dependency_root_2_scheduled_task"),
-            1,
-        )
-        consumer_calls = [
-            line
-            for line in generated_code.splitlines()
-            if "tile_dependency_root_2_scheduled_task(" in line
-            and not line.startswith("def ")
-        ]
-        self.assertEqual(len(consumer_calls), 1)
-
-    @skipIfNotCUDA()
-    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_parameterized_renderer_honors_cohort_major_task_order(self) -> None:
-        original_builder = cross_loop_codegen.build_static_pipeline_plan
-        selected_noncanonical_order = False
-
-        def build_cohort_plan(**kwargs: Any):
-            nonlocal selected_noncanonical_order
-            plan = original_builder(**kwargs)
-            readiness_graph = cross_loop_scheduler.build_readiness_graph(
-                dependency_graph=kwargs["dependency_graph"],
-                root_task_orders=kwargs["root_task_orders"],
-                site_domains=kwargs["site_domains"],
-                publishable_site_ids=kwargs.get("publishable_site_ids"),
-                prove_nonnegative=kwargs.get("prove_nonnegative"),
-            )
-            candidate = cross_loop_scheduler._parametric_cohort_list_schedule(
-                readiness_graph,
-                plan.worker_schedule,
-                pipeline_depth=2,
-            )
-            assert candidate is not None
-            selected_noncanonical_order = candidate != plan.worker_schedule
-            return dataclasses.replace(plan, worker_schedule=candidate)
-
-        worker_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
-        # Start the consumer at the last lane so its second scheduled ordinal
-        # wraps to worker zero. The packed relation then contains a negative
-        # FloorDiv numerator, exercising mathematical rather than truncating
-        # division in the renderer.
-        x = torch.randn(
-            (worker_count - 1, 3, 2),
-            device=DEVICE,
-            dtype=torch.float32,
-        )
-        with mock.patch.object(
-            cross_loop_codegen,
-            "build_static_pipeline_plan",
-            side_effect=build_cohort_plan,
-        ):
-            code, out = code_and_output(
-                dynamic_cohort_fanout,
-                (x,),
-                pid_type="persistent_blocked",
-                cross_loop_schedule="static_pipeline",
-                num_sm_multiplier=1,
-                num_warps=1,
-            )
-
-        self.assertTrue(selected_noncanonical_order)
-        torch.testing.assert_close(out, (x[:, :, :1] + 1) + x)
-        self.assertIn("tile_dependency_scheduled_logical_task", code)
-
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_nested_producer_iterations_publish_readiness(self) -> None:
@@ -1805,15 +1617,18 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_codegen_rejects_transient_source_cache_drift(self) -> None:
+    def test_plan_rejects_transient_source_ownership_drift(self) -> None:
         x = torch.arange(128, device=DEVICE, dtype=torch.float32)
         original_build = cross_loop_codegen.build_static_pipeline_plan
 
-        for extra_source in (False, True):
-            with self.subTest(extra_source=extra_source):
+        for claimed_source, error in (
+            (None, "a source-stage segment requires source ownership"),
+            (1, "source ownership requires one matching stage-zero segment"),
+        ):
+            with self.subTest(claimed_source=claimed_source):
 
-                def build_with_cache_drift(
-                    *, extra_source: bool = extra_source, **kwargs: Any
+                def build_with_ownership_drift(
+                    *, claimed_source: int | None = claimed_source, **kwargs: Any
                 ):
                     kwargs["allow_transient_source"] = False
                     plan = original_build(**kwargs)
@@ -1823,28 +1638,21 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                         0,
                     )
                     assert staged is not None
-                    if extra_source:
-                        staged = _with_transient_source_schedule_segment(
-                            staged,
-                            kwargs["root_task_orders"],
-                            1,
-                        )
-                        assert staged is not None
                     return dataclasses.replace(
                         plan,
                         worker_schedule=staged,
-                        transient_source_root=0 if extra_source else None,
+                        transient_source_root=claimed_source,
                     )
 
                 with (
                     mock.patch.object(
                         cross_loop_codegen,
                         "build_static_pipeline_plan",
-                        side_effect=build_with_cache_drift,
+                        side_effect=build_with_ownership_drift,
                     ),
                     self.assertRaisesRegex(
                         exc.InternalError,
-                        "launch-stage-zero|transient source",
+                        error,
                     ),
                 ):
                     code_and_output(

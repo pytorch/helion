@@ -743,6 +743,10 @@ def emit_cross_loop_schedule(
             and CompileEnvironment.current().settings.persistent_reserved_sms == 0
             and device_function.config.get("num_sm_multiplier", 1) == 1
         ),
+        cross_loop_pipeline_depth=cast(
+            "int",
+            device_function.config.get("cross_loop_pipeline_depth", 1),
+        ),
     )
     if static_pipeline_plan.root_task_orders != root_task_orders:
         raise AssertionError("pipeline plan changed the configured root task orders")

@@ -52,6 +52,7 @@ class Config(Mapping[str, object]):
         num_stages: int | None = None,
         pid_type: PidTypeLiteral | None = None,
         cross_loop_schedule: CrossLoopScheduleLiteral | None = None,
+        cross_loop_pipeline_depth: int | None = None,
         num_sm_multiplier: int | None = None,
         maxnreg: MaxnregLiteral | None = None,
         indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
@@ -92,6 +93,9 @@ class Config(Mapping[str, object]):
                 compiler-inferred cross-loop dependencies. ``"barrier"`` uses
                 grid synchronization; ``"static_pipeline"`` uses the static
                 dependency schedule. Unsupported kernels reject this field.
+            cross_loop_pipeline_depth: Maximum causal depth for static
+                cross-loop pipeline scheduling. Valid values are 1 through 4;
+                depth 1 preserves the canonical/local placement.
             num_sm_multiplier: Positive integer multiplier for the number of SMs
                 in persistent kernels. The autotuner searches powers of two, but
                 explicit configs may select intermediate occupancy points.
@@ -143,6 +147,7 @@ class Config(Mapping[str, object]):
             "atomic_indexing": atomic_indexing,
             "pid_type": pid_type,
             "cross_loop_schedule": cross_loop_schedule,
+            "cross_loop_pipeline_depth": cross_loop_pipeline_depth,
             "num_sm_multiplier": num_sm_multiplier,
             "maxnreg": maxnreg,
             "advanced_controls_file": advanced_controls_file,
@@ -296,6 +301,10 @@ class Config(Mapping[str, object]):
             "CrossLoopScheduleLiteral",
             self.config.get("cross_loop_schedule", "barrier"),
         )
+
+    @property
+    def cross_loop_pipeline_depth(self) -> int:
+        return cast("int", self.config.get("cross_loop_pipeline_depth", 1))
 
     @property
     def xcd_remap(self) -> bool:

@@ -389,6 +389,7 @@ class TestConfigAPI(TestCase):
             "num_stages",
             "pid_type",
             "cross_loop_schedule",
+            "cross_loop_pipeline_depth",
             "indexing",
         }
 
@@ -405,6 +406,7 @@ class TestConfigAPI(TestCase):
         from helion.autotuner.config_generation import ConfigGeneration
 
         self.assertEqual(helion.Config().cross_loop_schedule, "barrier")
+        self.assertEqual(helion.Config().cross_loop_pipeline_depth, 1)
         self.assertEqual(
             helion.Config(cross_loop_schedule="static_pipeline").cross_loop_schedule,
             "static_pipeline",
@@ -413,7 +415,9 @@ class TestConfigAPI(TestCase):
         with patch("helion._compat.is_hip", return_value=False):
             spec = ConfigSpec(backend=TritonBackend())
             self.assertTrue(spec.supports_config_key("cross_loop_schedule"))
+            self.assertTrue(spec.supports_config_key("cross_loop_pipeline_depth"))
             self.assertNotIn("cross_loop_schedule", spec._flat_fields())
+            self.assertNotIn("cross_loop_pipeline_depth", spec._flat_fields())
             with self.assertRaisesRegex(
                 exc.InvalidConfig,
                 "only for kernels with compiler-inferred cross-loop dependencies",
@@ -426,13 +430,23 @@ class TestConfigAPI(TestCase):
             assert isinstance(field, EnumFragment)
             self.assertIs(field, spec.cross_loop_schedule)
             self.assertEqual(field.choices, ("barrier", "static_pipeline"))
+            depth_field = spec._flat_fields()["cross_loop_pipeline_depth"]
+            self.assertEqual(
+                (depth_field.low, depth_field.high, depth_field.default()),
+                (1, 4, 1),
+            )
             self.assertEqual(
                 spec.default_config()["cross_loop_schedule"],
                 "barrier",
             )
+            self.assertEqual(
+                spec.default_config()["cross_loop_pipeline_depth"],
+                1,
+            )
 
             static_config = spec.default_config()
             static_config.config["cross_loop_schedule"] = "static_pipeline"
+            static_config.config["cross_loop_pipeline_depth"] = 3
             spec.normalize(static_config)
             generation = ConfigGeneration(spec)
             round_trip = generation.unflatten(generation.flatten(static_config))
@@ -440,6 +454,7 @@ class TestConfigAPI(TestCase):
                 round_trip["cross_loop_schedule"],
                 "static_pipeline",
             )
+            self.assertEqual(round_trip["cross_loop_pipeline_depth"], 3)
 
             with self.assertRaisesRegex(
                 exc.InvalidConfig,
@@ -449,10 +464,28 @@ class TestConfigAPI(TestCase):
                     helion.Config.from_dict({"cross_loop_schedule": "unknown"})
                 )
 
+            for invalid_depth in (0, 5, True, "2"):
+                with (
+                    self.subTest(invalid_depth=invalid_depth),
+                    self.assertRaisesRegex(
+                        exc.InvalidConfig,
+                        "must be an integer between 1 and 4",
+                    ),
+                ):
+                    spec.normalize(
+                        helion.Config.from_dict(
+                            {
+                                "cross_loop_schedule": "static_pipeline",
+                                "cross_loop_pipeline_depth": invalid_depth,
+                            }
+                        )
+                    )
+
     def test_cross_loop_schedule_is_not_supported_on_amd(self) -> None:
         with patch("helion._compat.is_hip", return_value=True):
             spec = ConfigSpec(backend=TritonBackend())
             self.assertFalse(spec.supports_config_key("cross_loop_schedule"))
+            self.assertFalse(spec.supports_config_key("cross_loop_pipeline_depth"))
             with self.assertRaisesRegex(
                 exc.InvalidConfig,
                 "is not supported by backend",
@@ -467,6 +500,7 @@ class TestConfigAPI(TestCase):
                 num_sm=1,
             )
             self.assertFalse(spec.supports_config_key("cross_loop_schedule"))
+            self.assertFalse(spec.supports_config_key("cross_loop_pipeline_depth"))
 
     def test_warp_specialization_uses_effective_launcher_warp_count(self) -> None:
         backend = TritonBackend()

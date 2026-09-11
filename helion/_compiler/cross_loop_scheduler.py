@@ -6335,59 +6335,252 @@ def choose_final_arrival_continuations(
     return tuple(result)
 
 
+def _fixed_width_publication_key_quotient(
+    readiness_producer: ReadinessProducer,
+) -> tuple[CoordinateRelation, CoordinateRelation] | None:
+    """Coarsen fixed-width publication groups with empty tail groups.
+
+    The ordinary producer-set quotient starts from ``key -> producers`` and
+    intentionally declines partial producer support.  A joined event may have
+    another arm covering that tail, however.  In that case an exact
+    ``producer -> [C * key, C * key + C)`` publication proves the common
+    ``semantic_key -> floor(semantic_key / C)`` quotient directly.  The
+    returned producer relation includes zero-arrival quotient keys through its
+    ordinary target-count derivation; no task or key is enumerated here.
+    """
+    publication = readiness_producer.keys_by_producer
+    if publication is None or len(publication.pieces) != 1:
+        return None
+    (piece,) = publication.pieces
+    if piece.source_bounds_items != tuple(
+        (
+            axis,
+            0,
+            publication.source_domain.axis_count_expressions[axis],
+            1,
+        )
+        for axis in publication.source_domain.axis_order
+    ):
+        return None
+
+    quotient_axes: list[int] = []
+    quotient_counts: list[tuple[int, sympy.Expr]] = []
+    semantic_key_expressions: list[sympy.Expr] = []
+    producer_key_expressions: list[sympy.Expr] = []
+    used_source_axes: set[int] = set()
+    for key_axis, begin, end, step in piece.target_ranges:
+        key_count = sympy.sympify(
+            publication.target_domain.axis_count_expressions[key_axis]
+        )
+        if (
+            step == 1
+            and sympy.simplify(begin) == 0
+            and _equal_integer_expressions(end, key_count)
+        ):
+            # This producer spans the whole semantic-key axis, so that axis is
+            # conservatively collapsed out of its quotient identity.
+            continue
+        interval = tile_dependency._single_axis_interval(
+            begin,
+            end,
+            domain=publication.source_domain,
+        )
+        if interval is None or step != 1:
+            return None
+        source_axis, stride, offset, width = interval
+        source_count = sympy.sympify(
+            publication.source_domain.axis_count_expressions[source_axis]
+        )
+        if (
+            source_axis in used_source_axes
+            or offset != 0
+            or width <= 0
+            or stride != width
+            or not tile_dependency._is_provably_nonnegative(
+                sympy.simplify(key_count - width * source_count),
+                None,
+            )
+        ):
+            return None
+        quotient_count = _ceildiv_nonnegative_expression(key_count, width)
+        used_source_axes.add(source_axis)
+        quotient_axes.append(key_axis)
+        quotient_counts.append((key_axis, quotient_count))
+        semantic_key_expressions.append(
+            sympy.floor(coordinate_axis_symbol(key_axis) / width)
+        )
+        producer_key_expressions.append(coordinate_axis_symbol(source_axis))
+
+    if not quotient_axes:
+        return None
+    quotient_domain = CoordinateDomain(
+        axis_order=tuple(quotient_axes),
+        axis_counts_items=tuple(quotient_counts),
+        kind="event",
+        _allow_empty=any(count.is_zero is True for _axis, count in quotient_counts),
+    )
+    keys_by_semantic_key = CoordinateRelation.point_map(
+        publication.target_domain,
+        quotient_domain,
+        (
+            (
+                tuple(
+                    (
+                        axis,
+                        0,
+                        publication.target_domain.axis_count_expressions[axis],
+                        1,
+                    )
+                    for axis in publication.target_domain.axis_order
+                ),
+                tuple(semantic_key_expressions),
+            ),
+        ),
+    )
+    keys_by_producer = CoordinateRelation.point_map(
+        publication.source_domain,
+        quotient_domain,
+        ((piece.source_bounds_items, tuple(producer_key_expressions)),),
+    )
+    producers_by_key = keys_by_producer.converse()
+    semantic_keys_by_quotient = keys_by_semantic_key.converse()
+    reconstructed_publication = (
+        None
+        if semantic_keys_by_quotient is None
+        else keys_by_producer.then(semantic_keys_by_quotient)
+    )
+    if (
+        not keys_by_semantic_key.is_total_function()
+        or not keys_by_producer.is_total_function()
+        or producers_by_key is None
+        or reconstructed_publication is None
+        or reconstructed_publication.coalesce_adjacent_source_boxes()
+        != publication.coalesce_adjacent_source_boxes()
+    ):
+        return None
+    return keys_by_semantic_key, producers_by_key
+
+
+def _lower_readiness_event_through_key_quotient(
+    event: ReadinessEvent,
+    keys_by_semantic_key: CoordinateRelation,
+    known_producers_by_key: dict[int, CoordinateRelation],
+) -> tuple[tuple[ReadinessProducer, ...], tuple[ReadinessConsumer, ...]] | None:
+    """Lower every arm of one semantic event through one common key quotient."""
+    quotient_key_domain = dataclasses.replace(
+        _canonical_readiness_key_domain(keys_by_semantic_key.target_domain),
+        identity=event.event_id,
+    )
+    canonical_keys_by_semantic_key = keys_by_semantic_key.rename_target_axes(
+        quotient_key_domain
+    )
+    if (
+        canonical_keys_by_semantic_key is None
+        or not canonical_keys_by_semantic_key.is_total_function()
+    ):
+        return None
+    semantic_keys_by_quotient: CoordinateRelation | None = None
+    lowered_producers: list[ReadinessProducer] = []
+    for producer_index, semantic_producer in enumerate(event.producers):
+        producers_by_key = known_producers_by_key.get(producer_index)
+        if producers_by_key is not None:
+            producers_by_key = producers_by_key.rename_source_axes(quotient_key_domain)
+        else:
+            publication = semantic_producer.keys_by_producer
+            publication = (
+                None
+                if publication is None
+                else publication.then(canonical_keys_by_semantic_key)
+            )
+            producers_by_key = None if publication is None else publication.converse()
+            if producers_by_key is None:
+                if semantic_keys_by_quotient is None:
+                    semantic_keys_by_quotient = (
+                        canonical_keys_by_semantic_key.converse()
+                    )
+                producers_by_key = (
+                    None
+                    if semantic_keys_by_quotient is None
+                    else semantic_keys_by_quotient.then(
+                        semantic_producer.producers_by_key
+                    )
+                )
+                # For total q, the semantic relation is contained in its
+                # common-quotient relaxation: R ⊆ q ; q^-1 ; R. Consumers
+                # therefore wait on a conservative superset of every original
+                # producer arm, while the exact lowered relation supplies the
+                # counter's publication and arrival multiplicity.
+        if producers_by_key is None:
+            return None
+        lowered_producer = dataclasses.replace(
+            semantic_producer,
+            producers_by_key=producers_by_key.coalesce_adjacent_source_boxes(),
+        )
+        if not _supports_readiness_counter_lowering(lowered_producer):
+            return None
+        lowered_producers.append(lowered_producer)
+
+    lowered_consumers: list[ReadinessConsumer] = []
+    for consumer in event.consumers:
+        keys_by_consumer = consumer.keys_by_consumer.then(
+            canonical_keys_by_semantic_key
+        )
+        if keys_by_consumer is None:
+            return None
+        lowered_consumers.append(
+            dataclasses.replace(consumer, keys_by_consumer=keys_by_consumer)
+        )
+    return tuple(lowered_producers), tuple(lowered_consumers)
+
+
 def _counter_lowering_relations(
     event: ReadinessEvent,
 ) -> tuple[tuple[ReadinessProducer, ...], tuple[ReadinessConsumer, ...]] | None:
     """Return an exact lowerable representation of one semantic event.
 
-    The readiness graph retains its finest exact key space.  A single producer
-    whose publication is not a function may still admit the established
-    producer-set quotient as a counter-rendering strength reduction.  Derive
-    that quotient from the event's authoritative relation rather than replacing
-    the event in the graph.
+    The readiness graph retains its finest exact key space. A producer whose
+    publication is not a function may still induce one common conservative
+    quotient for every arm of the event. Derive that quotient from the
+    authoritative relations rather than splitting or replacing the semantic
+    event in the graph.
     """
     if all(
         _supports_readiness_counter_lowering(readiness_producer)
         for readiness_producer in event.producers
     ):
         return event.producers, event.consumers
-    if len(event.producers) != 1:
-        return None
-    (semantic_producer,) = event.producers
-    normalized_producers_by_key = (
-        semantic_producer.producers_by_key.coalesce_adjacent_source_boxes()
-    )
-    quotient = normalized_producers_by_key.producer_set_quotient()
-    if quotient is None:
-        return None
-    quotient_keys_by_semantic_key, quotient_producers_by_key = quotient
-    quotient_key_domain = dataclasses.replace(
-        _canonical_readiness_key_domain(quotient_keys_by_semantic_key.target_domain),
-        identity=event.event_id,
-    )
-    quotient_keys_by_semantic_key = quotient_keys_by_semantic_key.rename_target_axes(
-        quotient_key_domain
-    )
-    quotient_producers_by_key = quotient_producers_by_key.rename_source_axes(
-        quotient_key_domain
-    )
-    if quotient_keys_by_semantic_key is None or quotient_producers_by_key is None:
-        return None
-    lowered_producer = dataclasses.replace(
-        semantic_producer,
-        producers_by_key=quotient_producers_by_key,
-    )
-    if not _supports_readiness_counter_lowering(lowered_producer):
-        return None
-    lowered_consumers: list[ReadinessConsumer] = []
-    for consumer in event.consumers:
-        keys_by_consumer = consumer.keys_by_consumer.then(quotient_keys_by_semantic_key)
-        if keys_by_consumer is None:
-            return None
-        lowered_consumers.append(
-            dataclasses.replace(consumer, keys_by_consumer=keys_by_consumer)
+    candidates: list[tuple[CoordinateRelation, dict[int, CoordinateRelation]]] = []
+    for producer_index, semantic_producer in enumerate(event.producers):
+        if _supports_readiness_counter_lowering(semantic_producer):
+            continue
+        normalized_producers_by_key = (
+            semantic_producer.producers_by_key.coalesce_adjacent_source_boxes()
         )
-    return (lowered_producer,), tuple(lowered_consumers)
+        quotient = normalized_producers_by_key.producer_set_quotient()
+        if quotient is not None:
+            keys_by_semantic_key, producers_by_key = quotient
+            candidates.append(
+                (keys_by_semantic_key, {producer_index: producers_by_key})
+            )
+        else:
+            publication_quotient = _fixed_width_publication_key_quotient(
+                semantic_producer
+            )
+            if publication_quotient is not None:
+                keys_by_semantic_key, producers_by_key = publication_quotient
+                candidates.append(
+                    (keys_by_semantic_key, {producer_index: producers_by_key})
+                )
+
+    for keys_by_semantic_key, known_producers_by_key in candidates:
+        lowered = _lower_readiness_event_through_key_quotient(
+            event,
+            keys_by_semantic_key,
+            known_producers_by_key,
+        )
+        if lowered is not None:
+            return lowered
+    return None
 
 
 def choose_readiness_counters(
@@ -7127,7 +7320,14 @@ def order_continuation_producers_by_readiness_key(
         elif segment.root not in inserted_roots:
             segments.extend(replacement)
             inserted_roots.add(segment.root)
-    return WorkerSchedule(worker_schedule.worker_count, tuple(segments))
+    try:
+        return WorkerSchedule(worker_schedule.worker_count, tuple(segments))
+    except ValueError:
+        # Readiness-major ordering is only a scheduling optimization.  An
+        # exact continuation does not depend on our ability to flatten that
+        # alternate traversal, so preserve the authoritative input schedule
+        # when normalization cannot prove the proposed permutation.
+        return worker_schedule
 
 
 _MAX_GLOBAL_LIST_EDGES = 2_000_000
@@ -8848,6 +9048,11 @@ def _schedule_is_progress_safe(
             )
             if frontier is None:
                 strictly_ranked = False
+                continue
+            frontier_nonempty = _relation_may_be_nonempty(frontier)
+            if frontier_nonempty is False:
+                # A producer arm whose keys are disjoint from this consumer
+                # contributes no wait and therefore no rank obligation.
                 continue
             if frontier.is_pointwise_strictly_less_than_where_defined(consumer_steps):
                 continue
@@ -11071,8 +11276,11 @@ def _event_frontier_list_schedule(
     root_barrier_edges: frozenset[tuple[int, int]],
     *,
     transient_source_root: int | None = None,
+    pipeline_depth: int = 2,
 ) -> WorkerSchedule | None:
     """List-schedule concrete root/event frontiers without a per-CTA DAG."""
+    if type(pipeline_depth) is not int or not 2 <= pipeline_depth <= 4:
+        raise ValueError("event-frontier pipeline depth must be between 2 and 4")
     continuations = _emitted_final_arrival_continuations(
         readiness_graph,
         readiness_counters,
@@ -11140,6 +11348,10 @@ def _event_frontier_list_schedule(
     incoming_frontiers: dict[int, list[tuple[int, CoordinateRelation]]] = {
         root: [] for root in scheduled_roots
     }
+    incoming_frontier_groups: dict[
+        int,
+        list[tuple[tuple[int, CoordinateRelation], ...]],
+    ] = {root: [] for root in scheduled_roots}
     schema_edges: set[tuple[int, int]] = set()
     for prerequisite in _emitted_prerequisites(
         readiness_counters,
@@ -11166,8 +11378,8 @@ def _event_frontier_list_schedule(
             )
             if static_relations is None:
                 return None
+            frontier_group: list[tuple[int, CoordinateRelation]] = []
             for static_root, _relation in static_relations:
-                schema_edges.add((static_root, consumer_root))
                 if static_root in excluded_roots:
                     continue
                 producer_order = root_orders.get(static_root)
@@ -11191,7 +11403,14 @@ def _event_frontier_list_schedule(
                         ),
                     ),
                 )
+                frontier_nonempty = _relation_may_be_nonempty(frontier)
+                if frontier_nonempty is False:
+                    continue
+                schema_edges.add((static_root, consumer_root))
                 incoming_frontiers[consumer_root].append((static_root, frontier))
+                frontier_group.append((static_root, frontier))
+            if frontier_group:
+                incoming_frontier_groups[consumer_root].append(tuple(frontier_group))
             continue
 
         plan = prerequisite.counter_plan
@@ -11208,8 +11427,8 @@ def _event_frontier_list_schedule(
         )
         if ordered_consumer_keys is None or static_relations is None:
             return None
+        frontier_group = []
         for producer_root, keys_by_producer in static_relations:
-            schema_edges.add((producer_root, consumer_root))
             if producer_root in excluded_roots:
                 continue
             producer_order = root_orders.get(producer_root)
@@ -11235,7 +11454,14 @@ def _event_frontier_list_schedule(
             )
             if frontier is None or frontier.canonical_single_valued() is None:
                 return None
+            frontier_nonempty = _relation_may_be_nonempty(frontier)
+            if frontier_nonempty is False:
+                continue
+            schema_edges.add((producer_root, consumer_root))
             incoming_frontiers[consumer_root].append((producer_root, frontier))
+            frontier_group.append((producer_root, frontier))
+        if frontier_group:
+            incoming_frontier_groups[consumer_root].append(tuple(frontier_group))
 
     criticality = _root_schema_criticality(
         len(readiness_graph.root_domains),
@@ -11268,6 +11494,27 @@ def _event_frontier_list_schedule(
 
     cursors = dict.fromkeys(scheduled_roots, 0)
     root_ends = {root: root_orders[root].source_domain.size for root in scheduled_roots}
+    active_pull_depths: dict[int, int] = {}
+
+    def canonical_next_root() -> int | None:
+        return next(
+            (root for root in scheduled_roots if cursors[root] < root_ends[root]),
+            None,
+        )
+
+    def exactly_rejoined_canonical_frontier() -> bool:
+        """Return whether root cursors describe one exact source-order prefix."""
+        reached_partial_root = False
+        for root in scheduled_roots:
+            cursor = cursors[root]
+            if not reached_partial_root and cursor == root_ends[root]:
+                continue
+            if not reached_partial_root:
+                reached_partial_root = True
+                continue
+            if cursor != 0:
+                return False
+        return True
 
     def interval_is_admissible(
         root: int,
@@ -11324,7 +11571,37 @@ def _event_frontier_list_schedule(
             None,
         )
 
+    def continues_active_event(root: int) -> bool | None:
+        """Return whether ``root`` contributes to an already-active join."""
+        for consumer_root in scheduled_roots:
+            consumer_cursor = cursors[consumer_root]
+            if consumer_cursor >= root_ends[consumer_root]:
+                continue
+            for frontier_group in incoming_frontier_groups[consumer_root]:
+                candidate_is_blocking = False
+                has_satisfied_arm = False
+                has_blocking_arm = False
+                for producer_root, frontier in frontier_group:
+                    required = _scalar_relation_maximum_on_interval(
+                        frontier,
+                        consumer_cursor,
+                        consumer_cursor + 1,
+                    )
+                    if required is None:
+                        return None
+                    has_value, value = required
+                    if not has_value:
+                        continue
+                    satisfied = value < cursors[producer_root]
+                    has_satisfied_arm |= satisfied
+                    has_blocking_arm |= not satisfied
+                    candidate_is_blocking |= producer_root == root and not satisfied
+                if candidate_is_blocking and has_satisfied_arm and has_blocking_arm:
+                    return True
+        return False
+
     placed_runs: list[_PlacedRun] = []
+    committed_root: int | None = None
     worker_step = 0
     while any(cursors[root] < root_ends[root] for root in scheduled_roots):
         wave_start_cursors = dict(cursors)
@@ -11332,15 +11609,27 @@ def _event_frontier_list_schedule(
         while next_worker < worker_schedule.worker_count:
             candidates: list[
                 tuple[
-                    tuple[int, int, int, int, int, int, int, int],
+                    tuple[int, int, int, int, int, int, int, int, int],
                     int,
+                    int,
+                    bool,
                     int,
                 ]
             ] = []
             for root in scheduled_roots:
+                if committed_root is not None and root != committed_root:
+                    continue
                 cursor = cursors[root]
                 if cursor >= root_ends[root]:
                     continue
+                suffix_is_admissible = interval_is_admissible(
+                    root,
+                    cursor,
+                    root_ends[root],
+                    wave_start_cursors,
+                )
+                if suffix_is_admissible is None:
+                    return None
                 piece_end = next_piece_end(root, cursor)
                 if piece_end is None:
                     return None
@@ -11358,28 +11647,32 @@ def _event_frontier_list_schedule(
                     if external_end is None:
                         return None
                     limit = min(limit, external_end)
-                # Stop at the next producer frontier needed by any current
-                # consumer cohort.  This is the exact event boundary that
-                # lets another arm close a join in the remaining wave slots;
-                # it is derived from the emitted prerequisite relation rather
-                # than from a configurable chunk size.
-                for consumer_root in scheduled_roots:
-                    consumer_cursor = cursors[consumer_root]
-                    if consumer_cursor >= root_ends[consumer_root]:
-                        continue
-                    for producer_root, frontier in incoming_frontiers[consumer_root]:
-                        if producer_root != root:
+                # An entirely ready suffix is one committed run.  Outgoing
+                # event frontiers may affect its priority, but may not split
+                # it and let newly released work displace the unfinished run.
+                # TODO(helion): Replace the temporary partial-prefix walk
+                # below when the concrete scheduler selects complete
+                # readiness-equivalent cohorts directly.
+                if not suffix_is_admissible:
+                    for consumer_root in scheduled_roots:
+                        consumer_cursor = cursors[consumer_root]
+                        if consumer_cursor >= root_ends[consumer_root]:
                             continue
-                        required = _scalar_relation_maximum_on_interval(
-                            frontier,
-                            consumer_cursor,
-                            consumer_cursor + 1,
-                        )
-                        if required is None:
-                            return None
-                        has_value, value = required
-                        if has_value and cursor <= value:
-                            limit = min(limit, value + 1)
+                        for producer_root, frontier in incoming_frontiers[
+                            consumer_root
+                        ]:
+                            if producer_root != root:
+                                continue
+                            required = _scalar_relation_maximum_on_interval(
+                                frontier,
+                                consumer_cursor,
+                                consumer_cursor + 1,
+                            )
+                            if required is None:
+                                return None
+                            has_value, value = required
+                            if has_value and cursor <= value:
+                                limit = min(limit, value + 1)
                 candidate_end = admissible_prefix_end(
                     root,
                     cursor,
@@ -11389,6 +11682,32 @@ def _event_frontier_list_schedule(
                 if candidate_end is None:
                     return None
                 if candidate_end == cursor:
+                    continue
+
+                canonical_root = canonical_next_root()
+                if root == canonical_root:
+                    pull_depth = 1
+                elif root in active_pull_depths:
+                    # Continuing an already-pulled root is the same causal
+                    # action, not a fresh dependency level.
+                    pull_depth = active_pull_depths[root]
+                else:
+                    claim_depth = 1
+                    for producer_root, frontier in incoming_frontiers[root]:
+                        required = _scalar_relation_maximum_on_interval(
+                            frontier,
+                            cursor,
+                            candidate_end,
+                        )
+                        if required is None:
+                            return None
+                        if required[0]:
+                            claim_depth = max(
+                                claim_depth,
+                                active_pull_depths.get(producer_root, 1),
+                            )
+                    pull_depth = max(2, claim_depth + 1)
+                if pull_depth > pipeline_depth:
                     continue
 
                 hypothetical_cursors = dict(cursors)
@@ -11424,6 +11743,9 @@ def _event_frontier_list_schedule(
                     criticality[consumer_root] == effective
                     for consumer_root in released_roots
                 )
+                continues_active = continues_active_event(root)
+                if continues_active is None:
+                    return None
                 external_release = -1
                 if external_frontier := external_frontiers.get(root):
                     external_maximum = _scalar_relation_maximum_on_interval(
@@ -11440,17 +11762,30 @@ def _event_frontier_list_schedule(
                     effective[1],
                     0 if effective == base else 1,
                     0 if closes_effective_event else 1,
+                    0 if continues_active else 1,
                     external_release,
                     root,
                     cursor,
                 )
-                candidates.append((priority, root, candidate_end))
+                candidates.append(
+                    (
+                        priority,
+                        root,
+                        candidate_end,
+                        suffix_is_admissible,
+                        pull_depth,
+                    )
+                )
 
             if not candidates:
                 break
-            _priority, root, candidate_end = min(candidates)
+            _priority, root, candidate_end, commits_suffix, pull_depth = min(candidates)
             cursor = cursors[root]
             count = candidate_end - cursor
+            if committed_root is None and commits_suffix:
+                committed_root = root
+            if pull_depth > 1:
+                active_pull_depths[root] = pull_depth
             placed_runs.append(
                 _PlacedRun(
                     root=root,
@@ -11462,6 +11797,10 @@ def _event_frontier_list_schedule(
                 )
             )
             cursors[root] = candidate_end
+            if committed_root == root and candidate_end == root_ends[root]:
+                committed_root = None
+            if exactly_rejoined_canonical_frontier():
+                active_pull_depths.clear()
             next_worker += count
         if next_worker == 0:
             return None
@@ -11664,13 +12003,11 @@ def _global_unit_list_schedule(
     root_barrier_edges: frozenset[tuple[int, int]],
     *,
     transient_source_root: int | None = None,
+    pipeline_depth: int = 2,
 ) -> WorkerSchedule | None:
     """Apply event-frontier list scheduling without materializing CTA nodes."""
-    if transient_source_root is None and not _emitted_prerequisites(
-        readiness_counters,
-        root_barrier_edges,
-    ):
-        return worker_schedule
+    if type(pipeline_depth) is not int or not 1 <= pipeline_depth <= 4:
+        raise ValueError("pipeline depth must be an integer between 1 and 4")
     if transient_source_root is not None:
         source_schedule = _with_transient_source_schedule_segment(
             worker_schedule,
@@ -11680,12 +12017,20 @@ def _global_unit_list_schedule(
         if source_schedule is None:
             return None
         worker_schedule = source_schedule
+    if pipeline_depth == 1:
+        return worker_schedule
+    if transient_source_root is None and not _emitted_prerequisites(
+        readiness_counters,
+        root_barrier_edges,
+    ):
+        return worker_schedule
     candidate = _event_frontier_list_schedule(
         readiness_graph,
         worker_schedule,
         readiness_counters,
         root_barrier_edges,
         transient_source_root=transient_source_root,
+        pipeline_depth=pipeline_depth,
     )
     if candidate is None or transient_source_root is not None:
         return candidate
@@ -12243,6 +12588,7 @@ def _try_finalize_pipeline_proposal(
     allow_counter_fallback: bool,
     allow_global_schedule: bool,
     allow_transient_source: bool,
+    pipeline_depth: int,
 ) -> StaticPipelinePlan | None:
     """Commit one schedule proposal only after all emitted proofs agree.
 
@@ -12313,6 +12659,7 @@ def _try_finalize_pipeline_proposal(
                 readiness_counters,
                 root_barrier_edges,
                 transient_source_root=transient_candidate,
+                pipeline_depth=pipeline_depth,
             )
             if transient_schedule is not None and _has_valid_transient_source_schedule(
                 transient_schedule,
@@ -12329,6 +12676,7 @@ def _try_finalize_pipeline_proposal(
             worker_schedule,
             readiness_counters,
             root_barrier_edges,
+            pipeline_depth=pipeline_depth,
         )
     if globally_scheduled is not None:
         worker_schedule = globally_scheduled
@@ -12388,64 +12736,6 @@ def build_static_pipeline_plan(
         prove_nonnegative=prove_nonnegative,
     )
     continuation_candidates = derive_final_arrival_continuations(readiness_graph)
-
-    # First production foothold for the unified policy: propose the same
-    # all-resident cohort schedule for constant and parameterized domains.
-    # Ownership and nested placement are still handled by the legacy paths
-    # below.  A common ownership-policy gate first avoids competing with the
-    # legacy transient-source proposal; semantic event/site checks then accept
-    # only cases where continuation or nested placement cannot compete.  None
-    # of these checks uses a free-symbol or model-shaped special case.
-    if cross_loop_pipeline_depth > 1 and not allow_transient_source:
-        eligible_continuation_candidates = tuple(
-            continuation
-            for continuation in continuation_candidates
-            if readiness_graph.event(continuation.event_id)
-            .consumers[continuation.consumer_index]
-            .consumer_root
-            not in continuation_ineligible_roots
-        )
-        has_nested_endpoint = any(
-            producer.producer_site_id is not None
-            for event in readiness_graph.events
-            for producer in event.producers
-        ) or any(
-            consumer.consumer_site_id is not None
-            for event in readiness_graph.events
-            for consumer in event.consumers
-        )
-        if not eligible_continuation_candidates and not has_nested_endpoint:
-            try:
-                canonical_schedule = _build_root_major_worker_schedule(
-                    root_domains,
-                    root_task_orders,
-                    worker_count,
-                )
-            except ValueError:
-                canonical_schedule = None
-            if canonical_schedule is not None:
-                candidate_counters = choose_readiness_counters(readiness_graph, ())
-                candidate_schedule = _parametric_cohort_list_schedule(
-                    readiness_graph,
-                    canonical_schedule,
-                    pipeline_depth=cross_loop_pipeline_depth,
-                )
-                if (
-                    candidate_schedule is not None
-                    and candidate_schedule != canonical_schedule
-                ):
-                    proposal = _try_finalize_pipeline_proposal(
-                        dependency_graph=dependency_graph,
-                        readiness_graph=readiness_graph,
-                        worker_schedule=candidate_schedule,
-                        continuations=(),
-                        candidate_readiness_counters=candidate_counters,
-                        allow_counter_fallback=False,
-                        allow_global_schedule=False,
-                        allow_transient_source=False,
-                    )
-                    if proposal is not None:
-                        return proposal
 
     if parameterized_roots:
         try:
@@ -12527,6 +12817,7 @@ def build_static_pipeline_plan(
             allow_counter_fallback=False,
             allow_global_schedule=False,
             allow_transient_source=False,
+            pipeline_depth=cross_loop_pipeline_depth,
         )
         if proposal is not None:
             return proposal
@@ -12542,6 +12833,7 @@ def build_static_pipeline_plan(
             allow_counter_fallback=True,
             allow_global_schedule=False,
             allow_transient_source=False,
+            pipeline_depth=cross_loop_pipeline_depth,
         )
         if fallback is None:
             raise exc.InvalidConfig(
@@ -12590,6 +12882,7 @@ def build_static_pipeline_plan(
             allow_counter_fallback=False,
             allow_global_schedule=True,
             allow_transient_source=allow_transient_source,
+            pipeline_depth=cross_loop_pipeline_depth,
         )
     if proposal is not None:
         return proposal
@@ -12608,6 +12901,7 @@ def build_static_pipeline_plan(
         allow_counter_fallback=True,
         allow_global_schedule=False,
         allow_transient_source=False,
+        pipeline_depth=cross_loop_pipeline_depth,
     )
     if fallback is None:
         raise exc.InvalidConfig(

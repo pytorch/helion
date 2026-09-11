@@ -78,7 +78,7 @@ class TritonBackend(Backend):
         return host_str
 
     def supports_config_key(self, key: str) -> bool:
-        if key == "cross_loop_schedule":
+        if key in ("cross_loop_schedule", "cross_loop_pipeline_depth"):
             from ..._compat import is_hip
 
             return self.name == "triton" and not is_hip()
