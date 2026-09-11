@@ -2118,5 +2118,566 @@ class TestMetalReductions(unittest.TestCase):
                 self._check(row_prod, (x,), x.prod(-1), rtol=1e-2, atol=1e-2)
 
 
+# ---------------------------------------------------------------------------
+# Autotuning
+# ---------------------------------------------------------------------------
+
+#: Autotuning compiles and benchmarks each candidate inline, so keep the tests
+#: to a small budget and small tensors.
+_AUTOTUNE_KWARGS = {"autotune_effort": "quick", "autotune_budget_seconds": 5}
+
+
+@_requires_darwin
+class TestMetalAutotune(unittest.TestCase):
+    """Autotuning is enabled for Metal; these pin the plumbing it needs."""
+
+    def test_benchmark_hooks_are_batched(self) -> None:
+        from helion._compiler.metal.autotune import do_bench_metal
+        from helion._compiler.metal.autotune import interleaved_bench_metal
+        from helion._compiler.metal.backend import MetalBackend
+
+        backend = MetalBackend()
+        self.assertIs(backend.get_do_bench(), do_bench_metal)
+        self.assertIs(backend.get_interleaved_bench(), interleaved_bench_metal)
+        self.assertFalse(backend.supports_precompile())
+
+    def test_interleaved_bench_batches_each_candidate_separately(self) -> None:
+        """A cheap candidate must not be measured at an expensive one's batch.
+
+        ``_time_batch_ms`` already returns a per-call time, so a shared batch
+        equalizes nothing -- it just drags every candidate down to the slowest
+        one's batch size, which is where per-sample overhead is least
+        amortized.  One expensive candidate in the list used to collapse the
+        batch to 1 for all of them, i.e. batching switched off.
+        """
+        from helion._compiler.metal.autotune import do_bench_metal
+        from helion._compiler.metal.autotune import interleaved_bench_metal
+
+        small = torch.randn(512, 512, device=DEVICE)
+        big = torch.randn(2048, 2048, device=DEVICE)
+        cheap = lambda: small + 1.0  # noqa: E731
+        pricey = lambda: torch.mm(big, big)  # noqa: E731
+
+        truth = float(do_bench_metal(pricey)) / float(do_bench_metal(cheap))
+        t_cheap, t_pricey = interleaved_bench_metal([cheap, pricey], repeat=5)
+        measured = t_pricey / t_cheap
+
+        self.assertGreater(measured, 1.0)
+        # Generous, because the point is the order of magnitude: a shared batch
+        # reported ~1.2x where the true gap was ~7x.
+        self.assertGreater(measured, truth / 3.0)
+
+    def test_identical_candidates_measure_the_same(self) -> None:
+        """The self-test: N copies of one kernel must rank as a tie.
+
+        This needs no reference timing -- the true ratio is exactly 1 by
+        construction -- which makes it the one calibration check here that
+        cannot be undermined by a drifting baseline.  It is also a direct
+        probe of the bug this function had: sharing one batch across
+        candidates handed them different amounts of per-sample overhead, and
+        any per-candidate asymmetry (batch, position in the round) shows up
+        here as spread.
+
+        The operand size is load-bearing.  At 1024x1024 a call costs ~0.03ms, so
+        the batch saturates at ``_MAX_BATCH`` and ``repeat`` stops controlling
+        anything: every candidate is summarized from the ``_MIN_ROUNDS`` floor of
+        three samples, and the assertion becomes a coin flip on a busy machine.
+        At 4096x4096 a call is ~0.9ms, the batch lands around 22, and ``repeat``
+        buys ~18 rounds -- enough for the ``min`` to mean something.
+
+        Best of three attempts even so, because this is wall-clock on a shared
+        GPU.  The defect it exists to catch is not subtle: sharing one batch
+        across candidates mismeasured a 7.4x difference as 1.2x and collapsed one
+        candidate's batch to a single call, which fails all three attempts.
+        """
+        from helion._compiler.metal.autotune import interleaved_bench_metal
+
+        x = torch.randn(4096, 4096, device=DEVICE)
+        y = torch.randn(4096, 4096, device=DEVICE)
+        same = lambda: x + y  # noqa: E731
+
+        for count in (2, 4):
+            with self.subTest(candidates=count):
+                spreads = []
+                for _ in range(3):
+                    times = interleaved_bench_metal([same] * count, repeat=400)
+                    self.assertEqual(len(times), count)
+                    spreads.append(max(times) / min(times))
+                self.assertLess(min(spreads), 1.25, f"spreads={spreads}")
+
+    def test_interleaved_repeat_is_a_call_budget_not_a_round_count(self) -> None:
+        """``repeat`` counts calls in the shared benchmarks, not rounds.
+
+        Callers derive it as ``target_ms / per_call_ms`` and the shared
+        implementations invoke each candidate once per round.  A round here is
+        a whole batch, so spending ``repeat`` rounds overshoots the requested
+        budget by the batch size -- which is what made final-pick verification
+        take longer than the search it was verifying.
+        """
+        from helion._compiler.metal import autotune as metal_autotune
+
+        batches: list[int] = []
+
+        def spy(fn: object, batch: int) -> float:
+            batches.append(batch)
+            return 1.0
+
+        def run(repeat: int) -> int:
+            """Timed rounds for ``repeat``, with warmup and probing stubbed out."""
+            batches.clear()
+            with (
+                patch.object(metal_autotune, "_warm_up", lambda fn: None),
+                patch.object(metal_autotune, "_estimate_per_call_ms", lambda fn: 1.0),
+                patch.object(metal_autotune, "_time_batch_ms", spy),
+            ):
+                metal_autotune.interleaved_bench_metal([lambda: None], repeat=repeat)
+            return len(batches)
+
+        # 1ms per call against a 20ms sample target -> batch of 20.
+        batch = int(metal_autotune._SAMPLE_TARGET_MS)
+        self.assertEqual(run(1000), 1000 // batch)
+        self.assertEqual(set(batches), {batch})
+        # The floor applies when the budget is smaller than a single batch.
+        self.assertEqual(run(1), metal_autotune._MIN_ROUNDS)
+
+    def test_interleaved_honors_max_total_ms(self) -> None:
+        """The rebenchmark path always passes ``max_total_ms``.
+
+        ``BaseSearch.rebenchmark`` binds it via ``functools.partial``
+        before calling the backend hook, so a hook that does not accept
+        it fails every final verification with a TypeError.
+        """
+        import functools
+
+        from helion._compiler.metal import autotune as metal_autotune
+
+        batches: list[int] = []
+
+        def spy(fn: object, batch: int) -> float:
+            batches.append(batch)
+            return 1.0
+
+        def run(bench_fn: object, *args: object, **kwargs: object) -> object:
+            batches.clear()
+            with (
+                patch.object(metal_autotune, "_warm_up", lambda fn: None),
+                patch.object(metal_autotune, "_estimate_per_call_ms", lambda fn: 1.0),
+                patch.object(metal_autotune, "_time_batch_ms", spy),
+            ):
+                return bench_fn(*args, **kwargs)  # type: ignore[operator]
+
+        # 1ms per call -> batch of 20 -> 20ms per round; a 100ms budget
+        # buys 5 rounds out of the 50 that ``repeat`` alone would allow,
+        # invoked the way the caller invokes it.
+        bench = functools.partial(
+            metal_autotune.interleaved_bench_metal, max_total_ms=100.0
+        )
+        self.assertEqual(run(bench, [lambda: None], repeat=1000), [1.0])
+        self.assertEqual(len(batches), 5)
+        # No budget: the repeat-derived count stands.
+        run(metal_autotune.interleaved_bench_metal, [lambda: None], repeat=1000)
+        self.assertEqual(len(batches), 50)
+
+    def test_warmup_budget_is_spent_in_whole_batches(self) -> None:
+        """``warmup`` is a millisecond budget, like ``rep``.
+
+        It used to run ``warmup / sample_ms`` *single* calls, so it actually
+        covered ``warmup / batch`` ms -- a 25ms request bought under 3ms of
+        warmup, and the 1000ms the rebenchmark path asks for bought ~10ms.
+        """
+        from helion._compiler.metal import autotune as metal_autotune
+
+        calls = 0
+
+        def counted() -> None:
+            nonlocal calls
+            calls += 1
+
+        seen: list[int] = []
+        real_time_batch_ms = metal_autotune._time_batch_ms
+
+        def spy(fn: object, batch: int) -> float:
+            seen.append(batch)
+            return real_time_batch_ms(fn, batch)
+
+        with patch.object(metal_autotune, "_time_batch_ms", spy):
+            metal_autotune.do_bench_metal(counted, warmup=25, rep=100)
+
+        # Every timed loop -- estimate, warmup and rep -- goes through
+        # _time_batch_ms, so no call is left un-batched.
+        self.assertTrue(seen)
+        self.assertEqual(calls, sum(seen) + 1)  # +1 for the initial correctness call
+        self.assertGreater(max(seen), 1)
+
+    def test_rejects_an_unknown_return_mode(self) -> None:
+        """Summarizing is delegated to the shared fallback, so only the
+        argument check is Metal's to make."""
+        from helion._compiler.metal.autotune import do_bench_metal
+
+        with self.assertRaises(AssertionError):
+            do_bench_metal(lambda: None, return_mode="bogus")
+
+    def test_unsupported_config_is_a_search_miss_not_a_crash(self) -> None:
+        from helion._compiler.metal.backend import MetalBackend
+
+        backend = MetalBackend()
+        self.assertEqual(
+            backend.classify_autotune_exception(exc.BackendUnsupported("metal", "x")),
+            "debug",
+        )
+        self.assertEqual(
+            backend.classify_autotune_exception(SyntaxError("bad MSL")), "warn"
+        )
+        # Anything else is still one bad candidate, not a reason to stop.  With
+        # no catch-all the shared fallback is classify_triton_exception, which
+        # answers "raise" for messages it does not recognize -- and it
+        # recognizes no MPS message, so an unfamiliar driver error would kill
+        # the search.
+        self.assertEqual(
+            backend.classify_autotune_exception(RuntimeError("some MPS error")), "warn"
+        )
+        # ...but an interrupt is not a search miss.
+        self.assertIsNone(backend.classify_autotune_exception(KeyboardInterrupt()))
+
+    def test_num_threads_is_clamped_to_a_divisor_of_the_block_size(self) -> None:
+        """The shared loop strategy needs block_size % num_threads == 0.
+
+        num_threads is drawn from the tensor extent, not the chosen block size,
+        so the search space contains combinations that cannot compile. They are
+        clamped rather than skipped, which keeps the whole space usable.
+        """
+
+        @helion.kernel(
+            backend="metal",
+            configs=[helion.Config(block_sizes=[64], num_threads=[1024])],
+        )
+        def scaled_copy(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * 2.0
+            return out
+
+        x = torch.randn(4096, device=DEVICE)
+        torch.testing.assert_close(scaled_copy(x), x * 2.0)
+        # Pin the value, not just "it compiled": the clamp picks the largest
+        # divisor of the block size that is <= the requested count, and since
+        # both are powers of two an over-large request always lands on exactly
+        # the block size.  Asserting correctness alone would pass for any legal
+        # divisor, including 1.
+        self.assertIn("_block_dims=(64, 1, 1)", scaled_copy.bind((x,)).to_code())
+
+    def test_autotuned_elementwise_1d_is_correct(self) -> None:
+        @helion.kernel(backend="metal", **_AUTOTUNE_KWARGS)
+        def vector_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        x = torch.randn(8192, device=DEVICE)
+        y = torch.randn(8192, device=DEVICE)
+        torch.testing.assert_close(vector_add(x, y), x + y)
+
+    def test_autotuned_elementwise_2d_is_correct(self) -> None:
+        """2D tiling is where autotuning actually pays: the default
+        ``block_sizes=[32, 32]`` is rarely the best tile shape."""
+
+        @helion.kernel(backend="metal", **_AUTOTUNE_KWARGS)
+        def add2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tm, tn in hl.tile([x.size(0), x.size(1)]):
+                out[tm, tn] = x[tm, tn] + y[tm, tn]
+            return out
+
+        x = torch.randn(256, 256, device=DEVICE)
+        y = torch.randn(256, 256, device=DEVICE)
+        torch.testing.assert_close(add2d(x, y), x + y)
+
+    def test_autotuned_reduction_is_correct(self) -> None:
+        @helion.kernel(backend="metal", **_AUTOTUNE_KWARGS)
+        def row_sum(x: torch.Tensor) -> torch.Tensor:
+            n, _ = x.size()
+            out = torch.empty([n], dtype=x.dtype, device=x.device)
+            for tile_n in hl.tile(n):
+                out[tile_n] = torch.sum(x[tile_n, :], dim=-1)
+            return out
+
+        x = torch.randn(256, 512, device=DEVICE)
+        torch.testing.assert_close(row_sum(x), x.sum(-1), rtol=1e-3, atol=1e-3)
+
+    def test_autotuned_softmax_is_correct(self) -> None:
+        """Two reductions over one dimension, each with its own scratch."""
+
+        @helion.kernel(backend="metal", **_AUTOTUNE_KWARGS)
+        def softmax(x: torch.Tensor) -> torch.Tensor:
+            n, _ = x.size()
+            out = torch.empty_like(x)
+            for tile_n in hl.tile(n):
+                values = x[tile_n, :]
+                amax = torch.amax(values, dim=1, keepdim=True)
+                exp_v = torch.exp(values - amax)
+                out[tile_n, :] = exp_v / torch.sum(exp_v, dim=1, keepdim=True)
+            return out
+
+        x = torch.randn(128, 512, device=DEVICE)
+        torch.testing.assert_close(
+            softmax(x), torch.softmax(x, dim=-1), rtol=1e-3, atol=1e-3
+        )
+
+    def test_reduction_loops_is_searchable(self) -> None:
+        """The reduction span is the knob worth tuning, so it must be in the space."""
+
+        @helion.kernel(backend="metal", autotune_effort="none")
+        def row_sum(x: torch.Tensor) -> torch.Tensor:
+            n, _ = x.size()
+            out = torch.empty([n], dtype=x.dtype, device=x.device)
+            for tile_n in hl.tile(n):
+                out[tile_n] = torch.sum(x[tile_n, :], dim=-1)
+            return out
+
+        spec = row_sum.bind((torch.randn(256, 1024, device=DEVICE),)).config_spec
+        self.assertTrue(spec.reduction_loops.valid_block_ids())
+        self.assertIn("reduction_loops", spec.default_config().config)
+
+    def test_explicit_tile_threads_do_not_starve_a_reduction(self) -> None:
+        """Autotuning sets num_threads explicitly, unlike the default config.
+
+        A persistent reduction needs one live thread per element, and Metal has
+        no lane-loop fallback to cover a shortfall the way CuTe does, so a
+        tile that claims the whole threadgroup used to make the config
+        unbuildable.  The tile's thread count is capped instead.
+        """
+
+        @helion.kernel(
+            backend="metal",
+            configs=[
+                helion.Config(
+                    block_sizes=[64], num_threads=[1024], reduction_loops=[None]
+                )
+            ],
+        )
+        def row_sum(x: torch.Tensor) -> torch.Tensor:
+            n, _ = x.size()
+            out = torch.empty([n], dtype=x.dtype, device=x.device)
+            for tile_n in hl.tile(n):
+                out[tile_n] = torch.sum(x[tile_n, :], dim=-1)
+            return out
+
+        x = torch.randn(256, 1024, device=DEVICE)
+        torch.testing.assert_close(row_sum(x), x.sum(-1), rtol=1e-3, atol=1e-3)
+
+    def test_autotuned_matmul_is_correct(self) -> None:
+        """Matmul is where tuning matters most: the default 16x16x16 tile
+        badly underuses MPP's cooperative matmul."""
+
+        @helion.kernel(backend="metal", **_AUTOTUNE_KWARGS)
+        def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _k, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        x = torch.randn(128, 128, device=DEVICE)
+        y = torch.randn(128, 128, device=DEVICE)
+        torch.testing.assert_close(matmul(x, y), x @ y, rtol=1e-3, atol=1e-3)
+
+    def test_oversized_threadgroup_is_a_search_miss(self) -> None:
+        """An over-budget threadgroup is routine, not noteworthy.
+
+        Metal only rejects one when it builds the pipeline state, so it arrives
+        as a RuntimeError from the launcher.  It is the same category as
+        BackendUnsupported -- the config does not fit -- and it is common, so it
+        is classified alongside the other expected misses rather than warned
+        about.
+        """
+        from helion._compiler.metal.backend import MetalBackend
+        from helion._compiler.metal.backend import _is_threadgroup_too_large
+
+        backend = MetalBackend()
+        err = RuntimeError(
+            "Failed to created pipeline state object, error: Specified total "
+            "max threads per threadgroup (8192) exceeds the maximum total "
+            "threads per threadgroup supported (1024)"
+        )
+        self.assertTrue(_is_threadgroup_too_large(err))
+        self.assertFalse(_is_threadgroup_too_large(RuntimeError("unrelated")))
+
+        # The recognizer has to change the outcome, or it is dead code behind
+        # the catch-all: recognized -> "debug", unrecognized -> "warn".
+        self.assertEqual(backend.classify_autotune_exception(err), "debug")
+        self.assertEqual(
+            backend.classify_autotune_exception(RuntimeError("unrelated")), "warn"
+        )
+
+    def test_accuracy_check_guards_the_mpp_matmul(self) -> None:
+        """Matmul autotuning depends on candidate validation being on.
+
+        ``mpp::tensor_ops::matmul2d`` returns silently wrong results for
+        strongly asymmetric tiles at low ``execution_simdgroups<N>`` -- 8:1
+        needs N>=2 and 1:8 needs N>=4 on an M4 Pro -- with no compile or
+        runtime error.  That predates this backend and reproduces in plain MSL
+        with no Helion involved.  Those tile shapes are exactly what a tuner
+        reaches for on non-square problems, so the search relies on
+        ``autotune_accuracy_check`` rejecting them.
+        """
+        from helion.runtime.settings import Settings
+
+        self.assertTrue(Settings().autotune_accuracy_check)
+
+    def test_effort_none_uses_the_default_config(self) -> None:
+        @helion.kernel(backend="metal", autotune_effort="none")
+        def scaled(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * 3.0
+            return out
+
+        x = torch.randn(1024, device=DEVICE)
+        torch.testing.assert_close(scaled(x), x * 3.0)
+        bound = scaled.bind((x,))
+        self.assertEqual(bound._config, bound.config_spec.default_config())
+
+    def test_explicit_threads_with_a_rolled_reduction_are_correct(self) -> None:
+        """Regression: this config silently returned a wrong sum.
+
+        Clamping ``num_threads`` to a divisor of the block size let configs
+        compile that the loop strategy had previously rejected.  For a *rolled*
+        reduction that was not a win: the tile then claimed enough of the
+        threadgroup that ``adjust_reduction_thread_count`` shrank the reduction
+        span below the chunk size, so each iteration reduced only the first
+        ``span`` of its 64 elements.  No error -- just a plausible wrong
+        answer.  Only the autotuner produced these, because they need an
+        explicit tile ``num_threads`` and an explicit ``reduction_loops``
+        together, which no hand-written test config combined.
+        """
+
+        @helion.kernel(
+            backend="metal",
+            configs=[
+                helion.Config(block_sizes=[32], num_threads=[256], reduction_loops=[64])
+            ],
+        )
+        def row_sum(x: torch.Tensor) -> torch.Tensor:
+            m, _ = x.size()
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tm in hl.tile(m):
+                out[tm] = x[tm, :].sum(-1)
+            return out
+
+        x = torch.randn(64, 256, device=DEVICE)
+        torch.testing.assert_close(row_sum(x), x.sum(-1), rtol=3e-3, atol=3e-3)
+
+    def test_autotune_budget_bounded_restored_and_bypassed(self) -> None:
+        """The search budget defaults, passes through, and is restored.
+
+        ``autotune()`` mutates shared settings, so it must leave them as
+        found; the 300 s default must apply unless the caller sets a budget
+        or asks for full effort.  The spy stands in for the real search, so
+        this tests the settings handling without running one.
+        """
+        from typing import TYPE_CHECKING
+        from typing import Any
+
+        from helion._compiler import backend as compiler_backend
+        from helion._compiler.metal.backend import _DEFAULT_AUTOTUNE_BUDGET_SECONDS
+        from helion._compiler.metal.backend import MetalBackend
+
+        if TYPE_CHECKING:
+            from helion.runtime.config import Config
+            from helion.runtime.kernel import BoundKernel
+
+        seen: list[object] = []
+
+        def spy(
+            backend: MetalBackend,
+            bound_kernel: BoundKernel[Any],
+            *args: object,
+            **kwargs: object,
+        ) -> Config:
+            seen.append(bound_kernel.settings.autotune_budget_seconds)
+            return bound_kernel.config_spec.default_config()
+
+        x = torch.randn(1024, device=DEVICE)
+        for effort, budget, expected in [
+            ("quick", None, _DEFAULT_AUTOTUNE_BUDGET_SECONDS),
+            ("full", None, None),
+            ("quick", 7, 7),
+        ]:
+            with self.subTest(effort=effort, budget=budget):
+
+                @helion.kernel(
+                    backend="metal",
+                    autotune_effort=effort,
+                    autotune_budget_seconds=budget,
+                )
+                def scaled(x: torch.Tensor) -> torch.Tensor:
+                    out = torch.empty_like(x)
+                    for tile in hl.tile(x.size(0)):
+                        out[tile] = x[tile] * 3.0
+                    return out
+
+                bound = scaled.bind((x,))
+                seen.clear()
+                with patch.object(compiler_backend.Backend, "autotune", spy):
+                    MetalBackend().autotune(bound, (x,))
+                self.assertEqual(seen, [expected])
+                self.assertEqual(bound.settings.autotune_budget_seconds, budget)
+
+    def test_oversized_explicit_threadgroup_rejected_before_codegen(self) -> None:
+        """Explicit counts that cannot launch raise instead of compiling.
+
+        Metal refuses an oversized threadgroup only at pipeline-state build,
+        so without this pre-check the config would cost a full MSL compile
+        first.  128 (MPP) * 64 (explicit) exceeds the 1024-thread limit.
+        """
+
+        @helion.kernel(
+            backend="metal",
+            configs=[helion.Config(block_sizes=[64, 64, 32], num_threads=[32, 64])],
+        )
+        def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _k, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        x = torch.randn(128, 128, device=DEVICE)
+        y = torch.randn(128, 128, device=DEVICE)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "threadgroup"):
+            matmul(x, y)
+
+    def test_signature_key_covers_constexpr_values(self) -> None:
+        """The shader memo must recompile when a constexpr changes.
+
+        Non-tensor launch arguments (e.g. a rolled reduction's
+        ``_REDUCTION_BLOCK_*``) are baked into the shader, so two launches
+        differing only in one must not share a compiled shader; launches
+        differing only in tensor *values* must.  Asserts the key contract
+        directly, without compiling anything.
+        """
+        from helion._compiler.metal.metal_jit import _MetalKernel
+
+        def dummy() -> None: ...
+
+        kernel = _MetalKernel(dummy)
+        x = torch.randn(16, device=DEVICE)
+        base = kernel._signature_key((x, 1024))
+        self.assertEqual(base, kernel._signature_key((torch.zeros_like(x), 1024)))
+        self.assertNotEqual(base, kernel._signature_key((x, 512)))
+        self.assertNotEqual(base, kernel._signature_key((x.to(torch.int32), 1024)))
+        kernel.required_threads_per_threadgroup = (128, 1, 1)
+        self.assertNotEqual(base, kernel._signature_key((x, 1024)))
+
+
 if __name__ == "__main__":
     unittest.main()

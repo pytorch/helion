@@ -56,6 +56,21 @@ class _MetalKernel:
         self._name = fn.__name__
         self.msl_source: str | None = None
         self.required_threads_per_threadgroup: tuple[int, int, int] | None = None
+        self._compiled: dict[object, tuple[object, str]] = {}
+
+    def _signature_key(self, args: tuple[object, ...]) -> tuple[object, ...]:
+        """Everything the generated MSL depends on, besides the (fixed) body.
+
+        The body AST and module globals are constant for a given generated
+        module, so only the argument shapes/dtypes, the values of non-tensor
+        (constexpr) arguments, and the launcher-supplied threadgroup size can
+        change the emitted source.
+        """
+        arg_keys = tuple(
+            (arg.dtype, arg.ndim) if isinstance(arg, torch.Tensor) else (type(arg), arg)
+            for arg in args
+        )
+        return (self.required_threads_per_threadgroup, arg_keys)
 
     def __call__(self, *args: object) -> tuple[object, str]:
         """Return (compiled_lib, kernel_name) for the launcher.
@@ -63,7 +78,15 @@ class _MetalKernel:
         Args are the kernel arguments (tensors and scalars) — used to
         infer dtypes for the MSL kernel signature.
 
+        Results are memoized: re-deriving the MSL means re-parsing the source
+        AST and re-running ``torch.mps.compile_shader``'s header embedding, a
+        few milliseconds that would otherwise be paid on every launch.
         """
+        key = self._signature_key(args)
+        cached = self._compiled.get(key)
+        if cached is not None:
+            return cached
+
         # Parse the function source to get the AST
         source = inspect.getsource(self._fn)
         source = textwrap.dedent(source)
@@ -85,7 +108,9 @@ class _MetalKernel:
 
         # Compile MSL to a Metal shader library
         lib = torch.mps.compile_shader(self.msl_source)  # type: ignore[attr-defined]
-        return lib, self._name
+        result = (lib, self._name)
+        self._compiled[key] = result
+        return result
 
 
 def _generate_msl(
@@ -145,6 +170,8 @@ def _generate_msl(
             # A host-side constexpr the launcher passes positionally (e.g. a
             # rolled reduction's ``_REDUCTION_BLOCK_*``).  ``default_metal_launcher``
             # only binds tensors as buffers, so bake the value into the shader.
+            # ``_MetalKernel._signature_key`` includes these values, so a
+            # different one recompiles rather than reusing a stale shader.
             scalar_preamble.append(f"    {_constexpr_decl(name, arg)}")
             continue
         if arg.dtype not in DTYPE_TO_METAL:
