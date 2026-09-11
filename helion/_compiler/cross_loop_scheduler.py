@@ -11747,8 +11747,31 @@ def _event_frontier_list_schedule(
             if committed_root is not None:
                 assert committed_end is not None
                 cursor = cursors[committed_root]
+                remaining = committed_end - cursor
+                if next_worker == 0:
+                    # No candidate may interleave before ``committed_end``.
+                    # Collapse every interior full wave arithmetically while
+                    # retaining one terminal wave for the ordinary lane-fill
+                    # transition below.  This changes only representation and
+                    # keeps compile work independent of the committed span.
+                    interior_wave_count = (remaining - 1) // worker_schedule.worker_count
+                    if interior_wave_count > 0:
+                        count = interior_wave_count * worker_schedule.worker_count
+                        placed_runs.append(
+                            _PlacedRun(
+                                root=committed_root,
+                                source_begin=cursor,
+                                task_count=count,
+                                worker_begin=0,
+                                worker_count=worker_schedule.worker_count,
+                                worker_step=worker_step,
+                            )
+                        )
+                        cursors[committed_root] += count
+                        worker_step += interior_wave_count
+                        continue
                 count = min(
-                    committed_end - cursor,
+                    remaining,
                     worker_schedule.worker_count - next_worker,
                 )
                 if count <= 0:

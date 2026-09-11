@@ -2640,6 +2640,107 @@ class TestCrossLoopScheduler(TestCase):
         )
         validate_worker_schedule(graph, scheduled)
 
+    def test_event_frontier_fast_forwards_large_committed_suffix(self) -> None:
+        def schedule(
+            consumer_count: int,
+        ) -> tuple[WorkerSchedule, int]:
+            root_domains = _identify_root_domains(
+                (
+                    _domain((10, 1, 1)),
+                    _domain((20, consumer_count, 1)),
+                )
+            )
+            event = _whole_root_readiness_event(
+                root_domains,
+                producer_root=0,
+                consumer_root=1,
+                event_id=0,
+            )
+            graph = _readiness_graph(root_domains, event)
+            plan = ReadinessCounterPlan(event.producers, event.consumers)
+            prepared = _schedule(
+                4,
+                _segment(
+                    0,
+                    graph.root_task_orders[0],
+                    workers=(0, 4),
+                    dispatch_offset=0,
+                ),
+                _segment(
+                    1,
+                    graph.root_task_orders[1],
+                    workers=(0, 4),
+                    dispatch_offset=1,
+                ),
+            )
+            placed_run_type = cross_loop_scheduler._PlacedRun
+            with (
+                _forbid_schedule_enumeration(),
+                mock.patch.object(
+                    cross_loop_scheduler,
+                    "_PlacedRun",
+                    wraps=placed_run_type,
+                ) as placed_run_spy,
+            ):
+                result = cross_loop_scheduler._event_frontier_list_schedule(
+                    graph,
+                    prepared,
+                    (plan,),
+                    frozenset(),
+                    pipeline_depth=2,
+                )
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertIsNot(result, prepared)
+            return result, placed_run_spy.call_count
+
+        small_count = 13
+        large_count = 16_385
+        small, small_run_count = schedule(small_count)
+        large, large_run_count = schedule(large_count)
+
+        # The committed consumer suffix has the same prefix/interior/tail
+        # structure in both schedules. Its construction work must therefore
+        # be independent of the number of full waves in the interior.
+        self.assertEqual(large_run_count, small_run_count)
+        self.assertLessEqual(large_run_count, 4)
+        self.assertEqual(
+            [
+                (
+                    segment.root,
+                    segment.worker_begin,
+                    segment.worker_count,
+                    segment.dispatch_offset,
+                )
+                for segment in large.segments
+            ],
+            [
+                (
+                    segment.root,
+                    segment.worker_begin,
+                    segment.worker_count,
+                    segment.dispatch_offset,
+                )
+                for segment in small.segments
+            ],
+        )
+        for task in (0, 1, 2, 3, small_count - 1):
+            self.assertEqual(
+                placement(large, 1, task),
+                placement(small, 1, task),
+            )
+        self.assertEqual(
+            placement(large, 1, large_count - 1),
+            (
+                large_count % large.worker_count,
+                large_count // large.worker_count,
+            ),
+        )
+        self.assertEqual(
+            large.worker_step_domain.size,
+            (large_count + large.worker_count) // large.worker_count,
+        )
+
     def test_global_list_schedule_does_not_spill_ready_suffix_past_ancestor(
         self,
     ) -> None:

@@ -389,6 +389,10 @@ sections are not active work.
 - [ ] Carry the existing event-aware structural priority into this one finite
   selector. Priority ablations are later compiler experiments, not production
   paths or knobs.
+- [x] Fast-forward the interior full waves of a committed run arithmetically.
+  No candidate can interleave before the committed endpoint, so preserve one
+  terminal wave for the ordinary lane-fill transition and make construction
+  work independent of the committed CTA span.
 - [ ] Add an explicit compile-work budget in roots, frontier relation pieces,
   candidate scans, waves, and emitted runs. Static capacity permits a finite
   walk but does not permit unbounded per-CTA expansion; Muse's former long
