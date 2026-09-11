@@ -730,6 +730,7 @@ def emit_cross_loop_schedule(
         site_domains=site_domains,
         worker_count=configured_worker_count,
         publishable_site_ids=publishable_site_ids,
+        continuation_ineligible_roots=kernel_scope_roots,
         prove_nonnegative=CompileEnvironment.current().known_nonnegative,
         allow_transient_source=(
             CompileEnvironment.current().backend_name == "triton"

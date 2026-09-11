@@ -7,6 +7,7 @@ import itertools
 import pickle
 from typing import TYPE_CHECKING
 from typing import Literal
+from typing import cast
 from unittest import mock
 
 import sympy
@@ -2191,6 +2192,311 @@ class TestCrossLoopScheduler(TestCase):
         # whose class matches A's but whose canonical root order comes first.
         self.assertEqual(task_at(scheduled, 0, 0), (0, 0))
         validate_worker_schedule(graph, scheduled)
+
+    def test_readiness_root_criticality_is_symbolic_and_semantic(self) -> None:
+        task_count = sympy.Symbol(
+            "task_count",
+            integer=True,
+            nonnegative=True,
+        )
+        root_domains = _identify_root_domains(
+            tuple(_domain((10 + 10 * root, task_count, 1)) for root in range(4))
+        )
+        graph = _readiness_graph(
+            root_domains,
+            _pointwise_root_readiness_event(root_domains, 0, 1, 0),
+            _pointwise_root_readiness_event(root_domains, 1, 2, 1),
+            _pointwise_root_readiness_event(root_domains, 0, 3, 2),
+        )
+
+        with _forbid_schedule_enumeration():
+            edges = cross_loop_scheduler._readiness_root_edges(graph)
+            criticality = cross_loop_scheduler._readiness_root_criticality(graph)
+
+        self.assertEqual(edges, frozenset(((0, 1), (1, 2), (0, 3))))
+        self.assertEqual(
+            criticality,
+            (
+                (0, -1),
+                (0, -2),
+                (0, -3),
+                (1, -2),
+            ),
+        )
+
+    def test_readiness_root_criticality_declines_cycles(self) -> None:
+        root_domains = _identify_root_domains(
+            (_domain((10, 1, 1)), _domain((20, 1, 1)))
+        )
+        graph = _readiness_graph(
+            root_domains,
+            _pointwise_root_readiness_event(root_domains, 0, 1, 0),
+            _pointwise_root_readiness_event(root_domains, 1, 0, 1),
+        )
+
+        with _forbid_schedule_enumeration():
+            self.assertEqual(
+                cross_loop_scheduler._readiness_root_edges(graph),
+                frozenset(((0, 1), (1, 0))),
+            )
+            self.assertIsNone(
+                cross_loop_scheduler._readiness_root_criticality(graph)
+            )
+
+    def test_readiness_root_edges_respects_relation_product_budget(self) -> None:
+        root_domains = _identify_root_domains(
+            (
+                _domain((10, 2, 1)),
+                _domain((20, 2, 1)),
+                _domain((30, 2, 1)),
+            )
+        )
+        key_domain = _domain((0, 2), kind="event", identity=0)
+
+        def producer(root: int) -> ReadinessProducer:
+            return ReadinessProducer(
+                root,
+                CoordinateRelation.point_map(
+                    key_domain,
+                    root_domains[root],
+                    tuple(
+                        (
+                            ((0, key, key + 1, 1),),
+                            (coordinate_axis_symbol(0),),
+                        )
+                        for key in range(2)
+                    ),
+                ),
+            )
+
+        consumer = ReadinessConsumer(
+            2,
+            _full_point_map(
+                root_domains[2],
+                key_domain,
+                coordinate_axis_symbol(30),
+            ),
+        )
+        producer_arms = (producer(0), producer(1))
+        graph = _readiness_graph(
+            root_domains,
+            ReadinessEvent(producer_arms, (consumer,)),
+        )
+        with (
+            _forbid_schedule_enumeration(),
+            mock.patch.object(tile_dependency, "_MAX_RELATION_PRODUCT_STATES", 3),
+        ):
+            for arm in producer_arms:
+                self.assertIsNotNone(
+                    cross_loop_scheduler._readiness_root_edges(
+                        _readiness_graph(
+                            root_domains,
+                            ReadinessEvent((arm,), (consumer,)),
+                        )
+                    )
+                )
+            self.assertIsNone(cross_loop_scheduler._readiness_root_edges(graph))
+
+    def test_parametric_cohort_depth_one_preserves_canonical_schedule(self) -> None:
+        symbolic_count = sympy.Symbol(
+            "symbolic_count",
+            integer=True,
+            nonnegative=True,
+        )
+        for task_count in (1, 3, 4, 5, symbolic_count):
+            with self.subTest(task_count=task_count):
+                root_domains = _identify_root_domains(
+                    (
+                        _domain((10, task_count, 1)),
+                        _domain((20, task_count, 1)),
+                    )
+                )
+                graph = _readiness_graph(
+                    root_domains,
+                    _pointwise_root_readiness_event(root_domains, 0, 1, 0),
+                )
+                with _forbid_schedule_enumeration():
+                    canonical = (
+                        cross_loop_scheduler._build_root_major_worker_schedule(
+                            graph.root_domains,
+                            graph.root_task_orders,
+                            worker_count=4,
+                        )
+                    )
+                    for pipeline_depth in range(1, 5):
+                        scheduled = (
+                            cross_loop_scheduler._parametric_cohort_list_schedule(
+                                graph,
+                                canonical,
+                                pipeline_depth=pipeline_depth,
+                            )
+                        )
+                        self.assertIs(scheduled, canonical)
+
+    def test_parametric_cohort_depth_one_preserves_permuted_multi_axis_order(
+        self,
+    ) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        root_domains = _identify_root_domains(
+            (
+                _domain((10, batch, 1), (11, 3, 1)),
+                _domain((20, batch, 1), (21, 3, 1)),
+            )
+        )
+        root_task_orders = _default_root_task_orders(
+            root_domains,
+            ((11, 10), (21, 20)),
+        )
+        graph = ReadinessGraph(root_task_orders=root_task_orders, events=())
+
+        with _forbid_schedule_enumeration():
+            canonical = cross_loop_scheduler._build_root_major_worker_schedule(
+                graph.root_domains,
+                graph.root_task_orders,
+                worker_count=4,
+            )
+            for pipeline_depth in range(1, 5):
+                self.assertIs(
+                    cross_loop_scheduler._parametric_cohort_list_schedule(
+                        graph,
+                        canonical,
+                        pipeline_depth=pipeline_depth,
+                    ),
+                    canonical,
+                )
+
+        for concrete_batch in (0, 1, 3, 4, 5):
+            with self.subTest(concrete_batch=concrete_batch):
+                for segment in canonical.segments:
+                    specialized = segment.task_order.substitute_parameters(
+                        {batch: concrete_batch}
+                    )
+                    self.assertTrue(specialized.is_bijection_from_source_support())
+
+    def test_root_major_progress_handles_forward_backward_and_empty_guards(
+        self,
+    ) -> None:
+        task_count = sympy.Symbol(
+            "task_count",
+            integer=True,
+            nonnegative=True,
+        )
+        root_domains = _identify_root_domains(
+            (
+                _domain((10, task_count, 1)),
+                _domain((20, task_count, 1)),
+            )
+        )
+        schedule = cross_loop_scheduler._build_root_major_worker_schedule(
+            root_domains,
+            _default_root_task_orders(root_domains),
+            worker_count=4,
+        )
+        forward = _pointwise_root_readiness_event(root_domains, 0, 1, 0)
+        backward = _pointwise_root_readiness_event(root_domains, 1, 0, 0)
+
+        with _forbid_schedule_enumeration():
+            self.assertTrue(
+                cross_loop_scheduler._schedule_is_progress_safe(
+                    schedule,
+                    _readiness_graph(root_domains, forward),
+                    (ReadinessCounterPlan(forward.producers, forward.consumers),),
+                    frozenset(),
+                )
+            )
+            self.assertFalse(
+                cross_loop_scheduler._schedule_is_progress_safe(
+                    schedule,
+                    _readiness_graph(root_domains, backward),
+                    (ReadinessCounterPlan(backward.producers, backward.consumers),),
+                    frozenset(),
+                )
+            )
+
+    def test_progress_rejects_final_arrival_continuation_cycle(self) -> None:
+        root_domains = _identify_root_domains(
+            (_domain((10, 1, 1)), _domain((20, 1, 1)))
+        )
+        forward = _pointwise_root_readiness_event(root_domains, 0, 1, 0)
+        backward = _pointwise_root_readiness_event(root_domains, 1, 0, 1)
+        graph = _readiness_graph(root_domains, forward, backward)
+        plans = (
+            ReadinessCounterPlan(
+                forward.producers,
+                forward.consumers,
+                continuation_consumer_index=0,
+            ),
+            ReadinessCounterPlan(
+                backward.producers,
+                backward.consumers,
+                continuation_consumer_index=0,
+            ),
+        )
+
+        with _forbid_schedule_enumeration():
+            self.assertFalse(
+                cross_loop_scheduler._schedule_is_progress_safe(
+                    _schedule(1),
+                    graph,
+                    plans,
+                    frozenset(),
+                )
+            )
+
+    def test_plan_construction_decline_retries_all_resident_without_rescheduling(
+        self,
+    ) -> None:
+        dependency_graph = _dependency_graph([[10], [20]])
+        root_domains = _identify_root_domains(
+            (_domain((10, 3, 1)), _domain((20, 2, 1)))
+        )
+
+        with (
+            mock.patch.object(
+                cross_loop_scheduler,
+                "build_worker_schedule",
+                side_effect=ValueError("speculative placement declined"),
+            ),
+            mock.patch.object(
+                cross_loop_scheduler,
+                "_global_unit_list_schedule",
+                side_effect=AssertionError("fallback must not reschedule"),
+            ),
+            _forbid_schedule_enumeration(),
+        ):
+            plan = _configured_static_pipeline_plan(
+                dependency_graph=dependency_graph,
+                root_domains=root_domains,
+                axis_geometry=_axis_geometry(root_domains),
+                worker_count=4,
+            )
+
+        self.assertEqual(
+            tuple(segment.root for segment in plan.worker_schedule.segments),
+            (0, 1),
+        )
+        self.assertEqual(plan.readiness_counters, ())
+        self.assertEqual(plan.root_barrier_edges, frozenset())
+
+    def test_parametric_cohort_schedule_validates_depth(self) -> None:
+        root_domains = _identify_root_domains((_domain((10, 1, 1)),))
+        graph = _readiness_graph(root_domains)
+        canonical = cross_loop_scheduler._build_root_major_worker_schedule(
+            graph.root_domains,
+            graph.root_task_orders,
+            worker_count=1,
+        )
+
+        for pipeline_depth in (0, 5, True, "2"):
+            with self.subTest(pipeline_depth=pipeline_depth), self.assertRaisesRegex(
+                ValueError,
+                "must be an integer between 1 and 4",
+            ):
+                cross_loop_scheduler._parametric_cohort_list_schedule(
+                    graph,
+                    canonical,
+                    pipeline_depth=cast("int", pipeline_depth),
+                )
 
     def test_global_list_schedule_finishes_nearly_ready_event(self) -> None:
         producer_domain, consumer_domain = _identify_root_domains(
@@ -6046,14 +6352,19 @@ class TestCrossLoopScheduler(TestCase):
             )
         with self.assertRaisesRegex(ValueError, "exceeds its epoch bound"):
             dataclasses.replace(publications[0], maximum_arrival_count=3)
+        readiness_graph = _readiness_graph(root_domains)
         self.assertTrue(
-            cross_loop_scheduler._parameterized_prerequisites_follow_root_order(
+            cross_loop_scheduler._schedule_is_progress_safe(
+                schedule,
+                readiness_graph,
                 (),
                 frozenset(((0, 1),)),
             )
         )
         self.assertFalse(
-            cross_loop_scheduler._parameterized_prerequisites_follow_root_order(
+            cross_loop_scheduler._schedule_is_progress_safe(
+                schedule,
+                readiness_graph,
                 (),
                 frozenset(((1, 0),)),
             )

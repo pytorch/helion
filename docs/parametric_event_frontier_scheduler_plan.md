@@ -363,6 +363,28 @@ source-stage actions through that same policy, and one final
 validation/lowering pass before deleting the top-level
 constant/parameterized branch.
 
+The first Phase 4A.2 transaction is now implemented locally. Constant and
+parameterized proposals share one finalization boundary for renderer
+retention, coverage, emitted continuation identity, exact task ownership,
+progress, and final publication occurrence. A rejected optimized proposal is
+retried exactly once from the all-resident schedule without reapplying the old
+global/transient scheduler. During this migration, the historical dynamic
+sink/fan-in/positional continuation policy remains unchanged: candidate
+legality is common, but ownership must not broaden until the post-placement
+dominance proof exists. Kernel-scope roots are explicitly ineligible for
+continuation ownership.
+
+The Phase 4A.3 entry now accepts the authoritative all-resident schedule `C`,
+derives guard-uniform semantic root criticality directly from
+`ReadinessGraph`, and proves that depth one returns the identical schedule
+object for concrete, symbolic, permuted multi-axis, runtime-empty, and tail
+shapes without enumeration. Higher depths still conservatively alias `C`;
+the public autotune field is intentionally deferred until a production call
+can consume it and at least one higher depth can change the accepted schedule.
+The next implementation step is exact readiness-equivalent cohort-order
+candidate derivation from semantic relations, followed by bounded whole-cohort
+placement. No benchmark or codegen path depends on this incomplete entry yet.
+
 ### Priority 1: finish the symbolic dependency refactor
 
 - [x] Canonicalize every `TileAccess` shape, stride, and storage-offset value

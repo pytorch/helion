@@ -4025,6 +4025,7 @@ def build_worker_schedule(
     continuation_candidates: tuple[FinalArrivalContinuation, ...],
     *,
     worker_count: int,
+    continuation_ineligible_roots: frozenset[int] = frozenset(),
 ) -> tuple[
     WorkerSchedule,
     tuple[FinalArrivalContinuation, ...],
@@ -4046,7 +4047,7 @@ def build_worker_schedule(
         readiness_graph,
         continuation_candidates,
         baseline,
-        excluded_roots=nested_wait_roots,
+        excluded_roots=nested_wait_roots | continuation_ineligible_roots,
     )
     ordered = order_continuation_producers_by_readiness_key(
         readiness_graph,
@@ -4574,31 +4575,43 @@ def _emitted_prerequisites(
     return tuple(result)
 
 
-def _parameterized_prerequisites_follow_root_order(
+def _root_major_prerequisites_follow_root_order(
+    worker_schedule: WorkerSchedule,
+    readiness_graph: ReadinessGraph,
     readiness_counters: tuple[ReadinessCounterPlan, ...],
     root_barrier_edges: frozenset[tuple[int, int]],
+    continuation_by_root: dict[int, FinalArrivalContinuation],
 ) -> bool:
-    """Prove every emitted wait points forward in packed root order.
-
-    Together with full resident-worker admission, this is the progress
-    certificate for sharing a physical wave at root boundaries: a waiting
-    task cannot precede any task that may release it on the same strand.
-    """
+    """Prove packed-root progress after contracting continuation ownership."""
+    scheduled_roots = {segment.root for segment in worker_schedule.segments}
     for prerequisite in _emitted_prerequisites(
         readiness_counters,
         root_barrier_edges,
     ):
         if prerequisite.barrier_producer_root is not None:
-            producer_roots = (prerequisite.barrier_producer_root,)
+            producer_root = prerequisite.barrier_producer_root
+            producer_domain = readiness_graph.root_domains[producer_root]
+            static_relations = _static_producer_relations(
+                readiness_graph,
+                root=producer_root,
+                site_id=None,
+                readiness_keys=CoordinateRelation.identity(
+                    producer_domain,
+                    producer_domain,
+                ),
+                continuation_by_root=continuation_by_root,
+            )
         else:
             assert prerequisite.counter_plan is not None
-            producer_roots = tuple(
-                producer.producer_root
-                for producer in prerequisite.counter_plan.producers
+            static_relations = _readiness_static_producers(
+                readiness_graph,
+                prerequisite.counter_plan.producers,
+                continuation_by_root,
             )
-        if any(
-            producer_root >= prerequisite.consumer_root
-            for producer_root in producer_roots
+        if static_relations is None or any(
+            producer_root not in scheduled_roots
+            or producer_root >= prerequisite.consumer_root
+            for producer_root, _relation in static_relations
         ):
             return False
     return True
@@ -5670,12 +5683,12 @@ def choose_final_arrival_continuations(
     *,
     excluded_roots: frozenset[int] = frozenset(),
 ) -> tuple[FinalArrivalContinuation, ...]:
-    """Choose final-arrival execution from complete exact task readiness.
+    """Choose reachable final-arrival execution from exact task readiness.
 
-    A statically one-task family has no task-level parallelism to expose, so it
-    remains in the static schedule.  A parameterized family may be empty, one
-    task, or many tasks at runtime; final-arrival ownership is exact in every
-    case and must not be selected from one sampled extent.
+    Candidate derivation is the legality boundary.  The exact singleton filter
+    remains a migration-time selection policy until post-placement dominance
+    replaces this chooser; it is applied identically to constant and symbolic
+    expressions rather than treating parameterization as eligibility.
     """
     has_possible_worker_by_root = {
         root: bool(worker_schedule.segments_for_root(root))
@@ -5695,15 +5708,17 @@ def choose_final_arrival_continuations(
 
     result: list[FinalArrivalContinuation] = []
     for continuation in reachable_candidates:
-        readiness_consumer = readiness_graph.event(continuation.event_id).consumers[
-            continuation.consumer_index
-        ]
-        consumer_root = readiness_consumer.consumer_root
-        if consumer_root in excluded_roots:
+        consumer_root = (
+            readiness_graph.event(continuation.event_id)
+            .consumers[continuation.consumer_index]
+            .consumer_root
+        )
+        if consumer_root in excluded_roots or _equal_integer_expressions(
+            readiness_graph.root_domains[consumer_root].size_expr,
+            1,
+        ):
             continue
-        domain = readiness_graph.root_domains[consumer_root]
-        if not _equal_integer_expressions(domain.size_expr, 1):
-            result.append(continuation)
+        result.append(continuation)
     return tuple(result)
 
 
@@ -7568,6 +7583,11 @@ def _has_symbolic_worker_rank(
     worker_schedule: WorkerSchedule,
 ) -> bool:
     """Prove every resident strand edge strictly increases worker step."""
+    if _parametric_root_major_schedule_geometry(worker_schedule) is not None:
+        # The remembered geometry is created only by the exact globally packed
+        # slot construction.  Distinct occupied slots on one worker have
+        # distinct, increasing waves even when a root count is symbolic.
+        return True
     prior_runs: list[tuple[int, int, int]] = []
     for segment in worker_schedule.segments:
         for begin, end, first_step, last_step in segment.worker_step_runs():
@@ -7632,6 +7652,59 @@ def _segment_dependency_support_overlaps(
     return not producer_support.has_disjoint_source_support(producers_reaching_consumer)
 
 
+def _relation_may_be_nonempty(
+    relation: CoordinateRelation,
+) -> bool | None:
+    """Prove whether a bounded relation can have any supported source point.
+
+    ``True`` deliberately includes parameter-conditional support: topology is
+    uniform over the complete compiled guard, so an edge that exists for any
+    legal parameter value belongs to the finite scheduler schema.  ``False``
+    is returned only for support proved empty for the whole guard.  Unsupported
+    clipping declines instead of sampling a convenient nonempty shape.
+    """
+    if len(relation.pieces) > tile_dependency._MAX_RELATION_PIECES:
+        return None
+    domain_bounds = tuple(
+        (
+            axis,
+            sympy.Integer(0),
+            relation.source_domain.axis_count_expressions[axis],
+            1,
+        )
+        for axis in relation.source_domain.axis_order
+    )
+    for piece in relation.pieces:
+        source_bounds = tile_dependency._intersect_source_boxes(
+            piece.source_bounds_items,
+            domain_bounds,
+        )
+        if source_bounds is None:
+            return None
+        if source_bounds is False:
+            continue
+        source_cardinality = tile_dependency._source_box_cardinality(
+            source_bounds,
+            domain=relation.source_domain,
+        )
+        if source_cardinality is not None and source_cardinality.is_zero is True:
+            continue
+        target_ranges = tile_dependency._clip_target_box_to_domain(
+            piece.target_ranges,
+            target_domain=relation.target_domain,
+            source_domain=relation.source_domain,
+            source_bounds=source_bounds,
+        )
+        if not tile_dependency._target_box_is_empty_for_all_sources(
+            target_ranges,
+            source_domain=relation.source_domain,
+            source_bounds=source_bounds,
+            target_domain=relation.target_domain,
+        ):
+            return True
+    return False
+
+
 def _deterministic_topological_order(
     successors: list[set[int]],
 ) -> tuple[int, ...] | None:
@@ -7674,48 +7747,6 @@ def _all_resident_root_topological_order(
     ):
         return None
 
-    def may_be_nonempty(relation: CoordinateRelation) -> bool | None:
-        if len(relation.pieces) > tile_dependency._MAX_RELATION_PIECES:
-            return None
-        domain_bounds = tuple(
-            (
-                axis,
-                sympy.Integer(0),
-                relation.source_domain.axis_count_expressions[axis],
-                1,
-            )
-            for axis in relation.source_domain.axis_order
-        )
-        for piece in relation.pieces:
-            source_bounds = tile_dependency._intersect_source_boxes(
-                piece.source_bounds_items,
-                domain_bounds,
-            )
-            if source_bounds is None:
-                return None
-            if source_bounds is False:
-                continue
-            source_cardinality = tile_dependency._source_box_cardinality(
-                source_bounds,
-                domain=relation.source_domain,
-            )
-            if source_cardinality is not None and source_cardinality.is_zero is True:
-                continue
-            target_ranges = tile_dependency._clip_target_box_to_domain(
-                piece.target_ranges,
-                target_domain=relation.target_domain,
-                source_domain=relation.source_domain,
-                source_bounds=source_bounds,
-            )
-            if not tile_dependency._target_box_is_empty_for_all_sources(
-                target_ranges,
-                source_domain=relation.source_domain,
-                source_bounds=source_bounds,
-                target_domain=relation.target_domain,
-            ):
-                return True
-        return False
-
     root_major_geometry = _parametric_root_major_schedule_geometry(worker_schedule)
     occupied_by_root: list[list[CoordinateRelation]] | None = None
     if root_major_geometry is None:
@@ -7724,7 +7755,7 @@ def _all_resident_root_topological_order(
             occupied = _occupied_slot_identity(segment)
             if occupied is None:
                 return None
-            occupied_may_be_nonempty = may_be_nonempty(occupied)
+            occupied_may_be_nonempty = _relation_may_be_nonempty(occupied)
             if occupied_may_be_nonempty is None or (
                 occupied_may_be_nonempty
                 and segment.launch_stage != _RESIDENT_LAUNCH_STAGE
@@ -7763,8 +7794,12 @@ def _all_resident_root_topological_order(
             for producer in event.producers:
                 if not account_edge_attempt():
                     return None
-                consumer_may_be_nonempty = may_be_nonempty(consumer.keys_by_consumer)
-                producer_may_be_nonempty = may_be_nonempty(producer.producers_by_key)
+                consumer_may_be_nonempty = _relation_may_be_nonempty(
+                    consumer.keys_by_consumer
+                )
+                producer_may_be_nonempty = _relation_may_be_nonempty(
+                    producer.producers_by_key
+                )
                 if consumer_may_be_nonempty is None or producer_may_be_nonempty is None:
                     return None
                 if not consumer_may_be_nonempty or not producer_may_be_nonempty:
@@ -7774,7 +7809,9 @@ def _all_resident_root_topological_order(
                 )
                 if producers_by_consumer is None:
                     return None
-                dependency_may_be_nonempty = may_be_nonempty(producers_by_consumer)
+                dependency_may_be_nonempty = _relation_may_be_nonempty(
+                    producers_by_consumer
+                )
                 if dependency_may_be_nonempty is None:
                     return None
                 if not dependency_may_be_nonempty:
@@ -7815,7 +7852,7 @@ def _all_resident_root_topological_order(
                         )
                         if precedence is None:
                             return None
-                        edge_may_be_nonempty = may_be_nonempty(precedence)
+                        edge_may_be_nonempty = _relation_may_be_nonempty(precedence)
                         if edge_may_be_nonempty is None:
                             return None
                         if edge_may_be_nonempty:
@@ -7973,6 +8010,19 @@ def _schedule_is_progress_safe(
     continuation_by_root = _continuations_by_consumer_root(
         readiness_graph, continuations
     )
+    for continuation in continuations:
+        lowering_relations = _counter_lowering_relations(
+            readiness_graph.event(continuation.event_id)
+        )
+        if lowering_relations is None or _readiness_static_producers(
+            readiness_graph,
+            lowering_relations[0],
+            continuation_by_root,
+        ) is None:
+            # Every continuation chain must terminate at statically owned work;
+            # exact counter ownership alone does not rule out a continuation
+            # cycle with no resident initiator.
+            return False
     continuation_roots = frozenset(continuation_by_root)
     excluded_roots = continuation_roots | (
         frozenset()
@@ -8000,6 +8050,14 @@ def _schedule_is_progress_safe(
         prerequisite.consumer_root in excluded_roots for prerequisite in prerequisites
     ):
         return False
+    if _parametric_root_major_schedule_geometry(worker_schedule) is not None:
+        return _root_major_prerequisites_follow_root_order(
+            worker_schedule,
+            readiness_graph,
+            readiness_counters,
+            root_barrier_edges,
+            continuation_by_root,
+        )
     task_steps = _task_step_relations(
         worker_schedule,
         readiness_graph,
@@ -8058,11 +8116,17 @@ def _schedule_is_progress_safe(
         plan = prerequisite.counter_plan
         consumer = prerequisite.counter_consumer
         assert plan is not None and consumer is not None
-        consumer_keys = (
-            _keys_by_consumer_root_task(readiness_graph, consumer)
-            if require_strict_rank or consumer.consumer_site_id is None
-            else _keys_at_first_consumer_checkpoint(readiness_graph, consumer)
-        )
+        all_consumer_keys = _keys_by_consumer_root_task(readiness_graph, consumer)
+        consumer_keys = all_consumer_keys
+        if (
+            consumer_keys is None
+            and not require_strict_rank
+            and consumer.consumer_site_id is not None
+        ):
+            consumer_keys = _keys_at_first_consumer_checkpoint(
+                readiness_graph,
+                consumer,
+            )
         if consumer_keys is None:
             return False
         static_relations = _readiness_static_producers(
@@ -8100,24 +8164,27 @@ def _schedule_is_progress_safe(
             if frontier.is_pointwise_strictly_less_than_where_defined(consumer_steps):
                 continue
             strictly_ranked = False
-        if not strictly_ranked and require_strict_rank:
+        covers_every_checkpoint = all_consumer_keys is not None
+        if require_strict_rank and (
+            not covers_every_checkpoint or not strictly_ranked
+        ):
             return False
         if not require_strict_rank and (
-            consumer.consumer_site_id is not None or not strictly_ranked
+            not covers_every_checkpoint or not strictly_ranked
         ):
             # A nested consumer can wait again after admission.  The global
-            # segment graph includes all checkpoints, whereas the scalar fast
-            # path above intentionally checks only entry readiness.
+            # segment graph includes all checkpoints when their exact
+            # root-task projection or strict-rank proof is unavailable.
             needs_segment_precedence_proof = True
-    return not needs_segment_precedence_proof or (
-        _has_acyclic_symbolic_segment_precedence(
-            worker_schedule,
-            readiness_graph,
-            readiness_counters,
-            root_barrier_edges,
-            continuation_by_root=continuation_by_root,
-            excluded_roots=excluded_roots,
-        )
+    if not needs_segment_precedence_proof:
+        return True
+    return _has_acyclic_symbolic_segment_precedence(
+        worker_schedule,
+        readiness_graph,
+        readiness_counters,
+        root_barrier_edges,
+        continuation_by_root=continuation_by_root,
+        excluded_roots=excluded_roots,
     )
 
 
@@ -8247,6 +8314,132 @@ def _root_schema_criticality(
         (horizon - top[root] - bottom[root] + 1, -top[root])
         for root in range(root_count)
     )
+
+
+def _readiness_root_edges(
+    readiness_graph: ReadinessGraph,
+) -> frozenset[tuple[int, int]] | None:
+    """Project exact possibly-nonempty readiness onto the finite root schema.
+
+    The returned edges are derived directly from the semantic readiness graph,
+    before counter quotienting, continuation ownership, or barrier fallback.
+    Parameter-conditional edges remain present so one compiled guard receives
+    one topology and one static priority table.  Unsupported relation
+    composition declines rather than constructing a sampled CTA graph.
+    """
+    root_count = len(readiness_graph.root_domains)
+    edges: set[tuple[int, int]] = set()
+    relation_product_states = 0
+    nonempty_by_relation: dict[CoordinateRelation, bool] = {}
+
+    def relation_may_be_nonempty(relation: CoordinateRelation) -> bool | None:
+        known = nonempty_by_relation.get(relation)
+        if known is not None:
+            return known
+        result = _relation_may_be_nonempty(relation)
+        if result is not None:
+            nonempty_by_relation[relation] = result
+        return result
+
+    for event in readiness_graph.events:
+        for producer in event.producers:
+            if not 0 <= producer.producer_root < root_count:
+                return None
+            producer_may_be_nonempty = relation_may_be_nonempty(
+                producer.producers_by_key
+            )
+            if producer_may_be_nonempty is None:
+                return None
+            if not producer_may_be_nonempty:
+                continue
+            for consumer in event.consumers:
+                relation_product_states += (
+                    len(consumer.keys_by_consumer.pieces)
+                    * len(producer.producers_by_key.pieces)
+                )
+                if (
+                    relation_product_states
+                    > tile_dependency._MAX_RELATION_PRODUCT_STATES
+                ):
+                    return None
+                if not 0 <= consumer.consumer_root < root_count:
+                    return None
+                consumer_may_be_nonempty = relation_may_be_nonempty(
+                    consumer.keys_by_consumer
+                )
+                if consumer_may_be_nonempty is None:
+                    return None
+                if not consumer_may_be_nonempty:
+                    continue
+                producers_by_consumer = consumer.keys_by_consumer.then(
+                    producer.producers_by_key
+                )
+                if producers_by_consumer is None:
+                    return None
+                dependency_may_be_nonempty = _relation_may_be_nonempty(
+                    producers_by_consumer
+                )
+                if dependency_may_be_nonempty is None:
+                    return None
+                if dependency_may_be_nonempty:
+                    edges.add((producer.producer_root, consumer.consumer_root))
+    return frozenset(edges)
+
+
+def _readiness_root_criticality(
+    readiness_graph: ReadinessGraph,
+) -> tuple[tuple[int, int], ...] | None:
+    """Return the guard-uniform unit-weight priority class of every root."""
+    edges = _readiness_root_edges(readiness_graph)
+    if edges is None or any(producer == consumer for producer, consumer in edges):
+        return None
+    return _root_schema_criticality(len(readiness_graph.root_domains), edges)
+
+
+def _parametric_cohort_list_schedule(
+    readiness_graph: ReadinessGraph,
+    canonical_schedule: WorkerSchedule,
+    *,
+    pipeline_depth: int,
+) -> WorkerSchedule | None:
+    """Build the one resident cohort schedule from an authoritative baseline.
+
+    This is the migration entry for Phase 4A.3.  Its input is deliberately an
+    already configured, all-resident canonical schedule ``C``; callers must
+    invoke it before readiness-major movement or continuation ownership.  A
+    depth is an upper bound on noncanonical causal pulls, so every value may
+    conservatively produce ``C``.  The initial implementation establishes the
+    shared depth-one and acyclic-decline semantics before adding symbolic
+    cohort movement behind the same entry.
+    """
+    if type(pipeline_depth) is not int or not 1 <= pipeline_depth <= 4:
+        raise ValueError(
+            "cross-loop pipeline depth must be an integer between 1 and 4"
+        )
+    if any(
+        segment.launch_stage != _RESIDENT_LAUNCH_STAGE
+        for segment in canonical_schedule.segments
+    ) or not _validate_worker_schedule_tasks(
+        canonical_schedule,
+        readiness_graph.root_task_orders,
+    ):
+        return None
+
+    # Depth one is the exact configured baseline, not a reconstruction.  This
+    # identity is load-bearing: it preserves configured intra-root order and
+    # every progress-required boundary in C.
+    if pipeline_depth == 1:
+        return canonical_schedule
+
+    # Cyclic root/event quotients are outside this milestone.  Higher depths
+    # must conservatively alias C rather than invoking a second scheduler.
+    if _readiness_root_criticality(readiness_graph) is None:
+        return canonical_schedule
+
+    # Subsequent Phase 4A.3 patches add legal whole-cohort pulls here.  Until a
+    # pull has all readiness, non-displacement, progress, and relation-budget
+    # proofs, a larger configured depth intentionally aliases depth one.
+    return canonical_schedule
 
 
 def _scalar_relation_maximum_on_interval(
@@ -9494,189 +9687,74 @@ def _finalize_emitted_synchronization(
     return retained, root_barrier_edges
 
 
-def build_static_pipeline_plan(
+def _try_finalize_pipeline_proposal(
     *,
     dependency_graph: TileDependencyGraph,
-    root_task_orders: tuple[CoordinateRelation, ...],
-    site_domains: tuple[CoordinateDomain | None, ...],
-    worker_count: int,
-    publishable_site_ids: frozenset[int] | None = None,
-    allow_transient_source: bool = False,
-    prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
-) -> StaticPipelinePlan:
-    """Derive all generic readiness strategies without inspecting root bodies."""
-    root_domains = tuple(task_order.target_domain for task_order in root_task_orders)
-    readiness_graph = build_readiness_graph(
-        dependency_graph=dependency_graph,
-        root_task_orders=root_task_orders,
-        site_domains=site_domains,
-        publishable_site_ids=publishable_site_ids,
-        prove_nonnegative=prove_nonnegative,
-    )
-    continuation_candidates = derive_final_arrival_continuations(readiness_graph)
-    if any(domain.parameter_symbols for domain in root_domains):
-        try:
-            worker_schedule = _build_root_major_worker_schedule(
-                root_domains,
-                root_task_orders,
-                worker_count,
-            )
-        except ValueError as error:
-            raise exc.InvalidConfig(
-                "cross_loop_schedule='static_pipeline' cannot represent this "
-                "parameterized root schedule"
-            ) from error
-        continuation_candidates = choose_final_arrival_continuations(
-            readiness_graph,
-            continuation_candidates,
-            worker_schedule,
-        )
-        sink_roots = frozenset(range(len(root_domains))) - frozenset(
-            edge.producer_root for edge in dependency_graph.edges
-        )
-        selected_continuations: list[FinalArrivalContinuation] = []
-        for continuation in continuation_candidates:
-            event = readiness_graph.event(continuation.event_id)
-            readiness_consumer = event.consumers[continuation.consumer_index]
-            provisional_plan = ReadinessCounterPlan(
-                producers=event.producers,
-                consumers=(readiness_consumer,),
-                continuation_consumer_index=0,
-            )
-            fan_in = _parameterized_uniform_counter_fan_in(provisional_plan)
-            if readiness_consumer.consumer_root in sink_roots and (
-                fan_in is not None and fan_in > 1
-            ):
-                selected_continuations.append(continuation)
-        continuations = tuple(selected_continuations)
-        selected_counters = choose_readiness_counters(
-            readiness_graph,
-            continuations,
-        )
-        readiness_counters = tuple(
-            plan
-            for plan in selected_counters
-            if _supports_current_parameterized_renderer(plan, root_domains)
-        )
-        if sum(
-            plan.continuation_consumer_index is not None for plan in readiness_counters
-        ) != len(continuations):
-            # Continuation ownership is atomic: if any selected sink cannot be
-            # represented by the emitted counter subset, retain every root in
-            # the conservative schedule.
-            continuations = ()
-            readiness_counters = tuple(
-                plan
-                for plan in choose_readiness_counters(readiness_graph, ())
-                if _supports_current_parameterized_renderer(plan, root_domains)
-            )
-        readiness_counters, root_barrier_edges = _finalize_emitted_synchronization(
-            dependency_graph=dependency_graph,
-            root_domains=root_domains,
-            readiness_counters=readiness_counters,
-        )
-        if not _parameterized_prerequisites_follow_root_order(
-            readiness_counters,
-            root_barrier_edges,
-        ):
-            raise AssertionError(
-                "parameterized schedule has a backward root prerequisite"
-            )
-        continuation_roots = frozenset(
-            readiness_consumer.consumer_root
-            for plan in readiness_counters
-            if (readiness_consumer := plan.continuation_consumer) is not None
-        )
-        if continuation_roots:
-            worker_schedule = _build_root_major_worker_schedule(
-                root_domains,
-                root_task_orders,
-                worker_count,
-                excluded_roots=continuation_roots,
-            )
-        return StaticPipelinePlan(
-            worker_schedule=worker_schedule,
-            root_task_orders=root_task_orders,
-            readiness_counters=readiness_counters,
-            root_barrier_edges=root_barrier_edges,
-            transient_source_root=None,
-        )
+    readiness_graph: ReadinessGraph,
+    worker_schedule: WorkerSchedule,
+    continuations: tuple[FinalArrivalContinuation, ...],
+    candidate_readiness_counters: tuple[ReadinessCounterPlan, ...],
+    allow_counter_fallback: bool,
+    allow_global_schedule: bool,
+    allow_transient_source: bool,
+) -> StaticPipelinePlan | None:
+    """Commit one schedule proposal only after all emitted proofs agree.
+
+    Proposal construction may differ with representable schedule geometry, but
+    ownership, renderer retention, synchronization coverage, progress, and
+    final publication all pass through this transaction for both constant and
+    parameterized domains.  A speculative action may not survive the loss of
+    any counter it was planned against.  The all-resident retry may instead
+    coarsen unsupported counters to root barriers before proving progress, but
+    never reapplies speculative global scheduling.
+    """
+    root_domains = readiness_graph.root_domains
+    if not allow_counter_fallback and _current_renderer_lowerable_counters(
+        candidate_readiness_counters,
+        root_domains,
+    ) != candidate_readiness_counters:
+        return None
 
     try:
-        (
-            worker_schedule,
-            continuations,
-            nested_loop_counters,
-        ) = build_worker_schedule(
-            readiness_graph,
-            continuation_candidates,
-            worker_count=worker_count,
-        )
-    except ValueError as error:
-        raise exc.InvalidConfig(
-            f"the num_sm_multiplier grid of {worker_count} workers does not "
-            "admit a progress-safe cross-loop schedule"
-        ) from error
-
-    nested_loop_obligations = frozenset(
-        obligation
-        for plan in nested_loop_counters
-        for readiness_consumer in plan.consumers
-        for obligation in readiness_consumer.covered_obligations
-    )
-    candidate_readiness_counters = (
-        *choose_readiness_counters(
-            readiness_graph,
-            continuations,
-            excluded_obligations=nested_loop_obligations,
-        ),
-        *nested_loop_counters,
-    )
-    dropped_unlowerable_counter = (
-        _current_renderer_lowerable_counters(
-            candidate_readiness_counters,
-            root_domains,
-        )
-        != candidate_readiness_counters
-    )
-    # Recompute coverage from the mechanisms that will actually be emitted.
-    # Dependency analysis may prove a finer relation than the selected emitter
-    # can materialize. Such a relation must monotonically coarsen to root
-    # barrier; retaining a task-ready classification without an emitter
-    # would remove the dependency entirely.
-    readiness_counters, root_barrier_edges = _finalize_emitted_synchronization(
-        dependency_graph=dependency_graph,
-        root_domains=root_domains,
-        readiness_counters=candidate_readiness_counters,
-    )
-    if dropped_unlowerable_counter:
-        # Local placement may have used the finer event before finalization.
-        # Once that event falls back to a stronger whole-root barrier, restart
-        # from the conservative root-major schedule so the replacement cannot
-        # introduce a same-worker cycle.
-        worker_schedule = build_baseline_worker_schedule(
-            root_domains,
-            root_task_orders,
-            worker_count,
-        )
-        continuations = ()
         readiness_counters, root_barrier_edges = _finalize_emitted_synchronization(
             dependency_graph=dependency_graph,
             root_domains=root_domains,
-            readiness_counters=choose_readiness_counters(readiness_graph, ()),
+            readiness_counters=candidate_readiness_counters,
         )
+    except (ValueError, exc.CrossLoopSchedulingError):
+        return None
+
+    emitted_continuations = _emitted_final_arrival_continuations(
+        readiness_graph,
+        readiness_counters,
+    )
+    if (
+        emitted_continuations is None
+        or len(emitted_continuations) != len(continuations)
+        or frozenset(emitted_continuations) != frozenset(continuations)
+    ):
+        return None
+    continuation_roots = frozenset(
+        readiness_graph.event(continuation.event_id)
+        .consumers[continuation.consumer_index]
+        .consumer_root
+        for continuation in continuations
+    )
+
     transient_source_root: int | None = None
-    globally_scheduled = None
-    if not continuations:
-        transient_candidate = (
-            _transient_source_candidate(
-                readiness_graph,
-                readiness_counters,
-                root_barrier_edges,
-                worker_count=worker_count,
-            )
-            if allow_transient_source
-            else None
+    globally_scheduled: WorkerSchedule | None = None
+    parameterized_roots = any(domain.parameter_symbols for domain in root_domains)
+    if (
+        allow_global_schedule
+        and allow_transient_source
+        and not continuations
+        and not parameterized_roots
+    ):
+        transient_candidate = _transient_source_candidate(
+            readiness_graph,
+            readiness_counters,
+            root_barrier_edges,
+            worker_count=worker_schedule.worker_count,
         )
         if transient_candidate is not None:
             transient_schedule = _global_unit_list_schedule(
@@ -9695,7 +9773,7 @@ def build_static_pipeline_plan(
             ):
                 globally_scheduled = transient_schedule
                 transient_source_root = transient_candidate
-    if globally_scheduled is None:
+    if globally_scheduled is None and allow_global_schedule and not parameterized_roots:
         globally_scheduled = _global_unit_list_schedule(
             readiness_graph,
             worker_schedule,
@@ -9704,23 +9782,223 @@ def build_static_pipeline_plan(
         )
     if globally_scheduled is not None:
         worker_schedule = globally_scheduled
-    if dropped_unlowerable_counter and not _schedule_is_progress_safe(
+
+    if not _validate_worker_schedule_tasks(
+        worker_schedule,
+        readiness_graph.root_task_orders,
+        excluded_roots=continuation_roots,
+    ) or not _schedule_is_progress_safe(
         worker_schedule,
         readiness_graph,
         readiness_counters,
         root_barrier_edges,
         transient_source_root=transient_source_root,
     ):
-        raise AssertionError(
-            "replay-unsafe counter fallback did not preserve schedule progress"
+        return None
+
+    try:
+        return StaticPipelinePlan(
+            worker_schedule=worker_schedule,
+            root_task_orders=readiness_graph.root_task_orders,
+            readiness_counters=readiness_counters,
+            root_barrier_edges=root_barrier_edges,
+            transient_source_root=transient_source_root,
         )
-    return StaticPipelinePlan(
-        worker_schedule=worker_schedule,
+    except (ValueError, exc.CrossLoopSchedulingError):
+        # Final occurrence and publication cardinality are part of the same
+        # speculative transaction as ownership removal.
+        return None
+
+
+def build_static_pipeline_plan(
+    *,
+    dependency_graph: TileDependencyGraph,
+    root_task_orders: tuple[CoordinateRelation, ...],
+    site_domains: tuple[CoordinateDomain | None, ...],
+    worker_count: int,
+    publishable_site_ids: frozenset[int] | None = None,
+    continuation_ineligible_roots: frozenset[int] = frozenset(),
+    allow_transient_source: bool = False,
+    prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
+) -> StaticPipelinePlan:
+    """Derive all generic readiness strategies without inspecting root bodies."""
+    root_domains = tuple(task_order.target_domain for task_order in root_task_orders)
+    readiness_graph = build_readiness_graph(
+        dependency_graph=dependency_graph,
         root_task_orders=root_task_orders,
-        readiness_counters=readiness_counters,
-        root_barrier_edges=root_barrier_edges,
-        transient_source_root=transient_source_root,
+        site_domains=site_domains,
+        publishable_site_ids=publishable_site_ids,
+        prove_nonnegative=prove_nonnegative,
     )
+    continuation_candidates = derive_final_arrival_continuations(readiness_graph)
+    if any(domain.parameter_symbols for domain in root_domains):
+        try:
+            baseline_schedule = _build_root_major_worker_schedule(
+                root_domains,
+                root_task_orders,
+                worker_count,
+            )
+        except ValueError as error:
+            raise exc.InvalidConfig(
+                "cross_loop_schedule='static_pipeline' cannot represent this "
+                "parameterized root schedule"
+            ) from error
+        continuation_candidates = choose_final_arrival_continuations(
+            readiness_graph,
+            continuation_candidates,
+            baseline_schedule,
+            excluded_roots=continuation_ineligible_roots
+            | frozenset(
+                readiness_consumer.consumer_root
+                for event in readiness_graph.events
+                for readiness_consumer in event.consumers
+                if readiness_consumer.consumer_site_id is not None
+            ),
+        )
+        # Preserve the current ownership policy until post-placement local
+        # dominance is available. Candidate derivation above is common
+        # legality; this raw-event renderer/sink/fan-in gate is deliberately
+        # only a migration policy and must be deleted with the policy split.
+        sink_roots = frozenset(range(len(root_domains))) - frozenset(
+            edge.producer_root for edge in dependency_graph.edges
+        )
+        selected_continuations: list[FinalArrivalContinuation] = []
+        for continuation in continuation_candidates:
+            event = readiness_graph.event(continuation.event_id)
+            readiness_consumer = event.consumers[continuation.consumer_index]
+            provisional_plan = ReadinessCounterPlan(
+                producers=event.producers,
+                consumers=(readiness_consumer,),
+                continuation_consumer_index=0,
+            )
+            fan_in = _parameterized_uniform_counter_fan_in(provisional_plan)
+            if (
+                readiness_consumer.consumer_root in sink_roots
+                and fan_in is not None
+                and fan_in > 1
+            ):
+                selected_continuations.append(continuation)
+        continuations = tuple(selected_continuations)
+        continuation_roots = frozenset(
+            readiness_graph.event(continuation.event_id)
+            .consumers[continuation.consumer_index]
+            .consumer_root
+            for continuation in continuations
+        )
+        try:
+            worker_schedule = (
+                baseline_schedule
+                if not continuation_roots
+                else _build_root_major_worker_schedule(
+                    root_domains,
+                    root_task_orders,
+                    worker_count,
+                    excluded_roots=continuation_roots,
+                )
+            )
+        except ValueError:
+            worker_schedule = baseline_schedule
+            continuations = ()
+        proposal = _try_finalize_pipeline_proposal(
+            dependency_graph=dependency_graph,
+            readiness_graph=readiness_graph,
+            worker_schedule=worker_schedule,
+            continuations=continuations,
+            candidate_readiness_counters=choose_readiness_counters(
+                readiness_graph,
+                continuations,
+            ),
+            allow_counter_fallback=False,
+            allow_global_schedule=False,
+            allow_transient_source=False,
+        )
+        if proposal is not None:
+            return proposal
+        fallback = _try_finalize_pipeline_proposal(
+            dependency_graph=dependency_graph,
+            readiness_graph=readiness_graph,
+            worker_schedule=baseline_schedule,
+            continuations=(),
+            candidate_readiness_counters=choose_readiness_counters(
+                readiness_graph,
+                (),
+            ),
+            allow_counter_fallback=True,
+            allow_global_schedule=False,
+            allow_transient_source=False,
+        )
+        if fallback is None:
+            raise exc.InvalidConfig(
+                "cross_loop_schedule='static_pipeline' cannot prove a "
+                "progress-safe parameterized plan"
+            )
+        return fallback
+
+    try:
+        (
+            worker_schedule,
+            continuations,
+            nested_loop_counters,
+        ) = build_worker_schedule(
+            readiness_graph,
+            continuation_candidates,
+            worker_count=worker_count,
+            continuation_ineligible_roots=continuation_ineligible_roots,
+        )
+    except ValueError:
+        # Local placement is speculative just like counter retention and
+        # ownership. A construction-time proof decline must reach the same
+        # all-resident retry rather than escaping the transaction early.
+        proposal = None
+    else:
+        nested_loop_obligations = frozenset(
+            obligation
+            for plan in nested_loop_counters
+            for readiness_consumer in plan.consumers
+            for obligation in readiness_consumer.covered_obligations
+        )
+        candidate_readiness_counters = (
+            *choose_readiness_counters(
+                readiness_graph,
+                continuations,
+                excluded_obligations=nested_loop_obligations,
+            ),
+            *nested_loop_counters,
+        )
+        proposal = _try_finalize_pipeline_proposal(
+            dependency_graph=dependency_graph,
+            readiness_graph=readiness_graph,
+            worker_schedule=worker_schedule,
+            continuations=continuations,
+            candidate_readiness_counters=candidate_readiness_counters,
+            allow_counter_fallback=False,
+            allow_global_schedule=True,
+            allow_transient_source=allow_transient_source,
+        )
+    if proposal is not None:
+        return proposal
+
+    fallback_schedule = build_baseline_worker_schedule(
+        root_domains,
+        root_task_orders,
+        worker_count,
+    )
+    fallback = _try_finalize_pipeline_proposal(
+        dependency_graph=dependency_graph,
+        readiness_graph=readiness_graph,
+        worker_schedule=fallback_schedule,
+        continuations=(),
+        candidate_readiness_counters=choose_readiness_counters(readiness_graph, ()),
+        allow_counter_fallback=True,
+        allow_global_schedule=False,
+        allow_transient_source=False,
+    )
+    if fallback is None:
+        raise exc.InvalidConfig(
+            f"the num_sm_multiplier grid of {worker_count} workers does not "
+            "admit a progress-safe cross-loop schedule"
+        )
+    return fallback
 
 
 def _validate_schedule_coverage(
