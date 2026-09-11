@@ -1864,6 +1864,31 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, x + 1)
         self.assertNotIn("tl.debug_barrier()", code)
 
+    @skipIfNotTriton("automatic RAW barriers are Triton codegen-specific")
+    def test_sequential_loops_device_local_carry_has_no_barrier(self):
+        @helion.kernel(autotune_effort="none")
+        def two_pass_sum(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                total = hl.zeros([tile_m], dtype=torch.float32)
+                for tile_n in hl.tile(n):
+                    total += x[tile_m, tile_n].sum(dim=1)
+                for tile_n in hl.tile(n):
+                    out[tile_m, tile_n] = x[tile_m, tile_n] + total[:, None]
+            return out
+
+        x = torch.randn(32, 64, dtype=torch.float32, device=DEVICE)
+        code, result = code_and_output(
+            two_pass_sum,
+            (x,),
+            block_sizes=[8, 16, 16],
+            num_warps=4,
+            num_stages=1,
+        )
+        torch.testing.assert_close(result, x + x.sum(dim=1, keepdim=True))
+        self.assertNotIn("tl.debug_barrier()", code)
+
     @skipIfNotTriton(
         "tl.debug_barrier() is only emitted in Triton device codegen (not Pallas/JAX)"
     )
