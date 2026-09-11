@@ -481,17 +481,45 @@ packed inverse was rejected because copying an implicitly clipped inverse into
 a larger target domain would falsely give the segment ownership of the whole
 root. No CTA, worker, wave, key, or shape enumeration is used for acceptance.
 
-This sub-root schedule is deliberately not wired into production yet. The
-current parameterized codegen still requires unique one-segment-per-root
-root-major geometry, while the concrete fallback renders legacy dense
-compatibility fields. The next implementation transaction is therefore a
-relation-driven segment renderer: derive each segment's exact packed slot
-interval from `task_order`, stride that interval by resident worker count, and
-evaluate the same `task_order` relation for the logical CTA. It must make a
-runtime-empty suffix an empty loop and either derive exact final root-barrier
-publishers for repeated roots or conservatively decline those pulls. After CPU
-AST tests and concrete/symbolic rendering parity, wire this one scheduler into
-`build_static_pipeline_plan`; only then expose `cross_loop_pipeline_depth`.
+The relation-driven repeated-root renderer is now implemented locally. It
+derives every segment's dense packed slot interval from the authoritative
+`task_order`, strides that interval by resident worker count, maps each live
+slot back through that same relation, and invokes the existing shared root
+body. One compiled kernel has executed the injected `P ; C[0:2] ; U ; C[2:]`
+schedule correctly at B={1,3,4,75}; this covers a runtime-empty suffix and a
+worker-wave wrap. Fine-grained counters remain the readiness authority. A
+repeated parameterized plan that still needs a root barrier is rejected before
+code generation until publication ownership can be derived from the same
+relations.
+
+Packed construction now retains private proof certificates for exact dense
+source support, cardinality, and single-valuedness. These are caches, not
+semantic fields: equality, hashing, and correctness do not depend on them.
+Cache loss falls back to bounded relation proof and may conservatively decline
+an optional optimized schedule; finalized schedules remain compiler-local
+between selection and rendering rather than crossing a serialization boundary.
+This avoids
+re-expanding the constructor's three `Min`/`Mod`/`FloorDiv` boxes during every
+pairwise ownership check; the first renderer test fell from an unbounded
+multi-minute proof to an 86-second full generate/compile/run test. The exact
+support, disjointness, inverse, total-cardinality, and relation-budget checks
+remain mandatory.
+
+`_task_order_slice` now also proves the leading fixed-width cohort and its
+remainder for arbitrary-rank mixed-radix traversals. The remainder is an
+O(rank) partition by the slowest nonzero outer digit, with an explicit exact
+native-coordinate inverse; no runtime extent, CTA, worker, or wave is
+enumerated. CPU substitution tests cover an H-fastest `H2 x B x Q` PID-order
+traversal. This removes the rank-two-only construction blocker, but it does
+not yet cover equivalent L2-grouped task orders: an exact `H15 x B x Q`
+group-size-two control still declines safely and remains a prerequisite before
+claiming Qwen/Gemma coverage.
+
+The next implementation transaction is production wiring: invoke this same
+cohort proposal from `build_static_pipeline_plan`, finalize it transactionally
+with the existing counter/progress checks, and fall back to canonical packed
+order through that same path. Only after a higher depth changes a real accepted
+plan should `cross_loop_pipeline_depth` become a public autotune field.
 Consumer-key-scoped closure, repeated pulls, affine recurrence lifting, and
 the depth knob remain subsequent milestones. Exact segment tuple shape,
 depth-2/3/4 aliasing, one-root-per-parameterized-schedule, and the old

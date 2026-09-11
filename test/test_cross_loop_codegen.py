@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import itertools
 from types import SimpleNamespace
 from typing import Any
 from typing import cast
@@ -65,6 +66,39 @@ def dynamic_cohort_fanout(x: torch.Tensor) -> torch.Tensor:
             + x[consumer_batch, consumer_query, consumer_column]
         )
     return out
+
+
+@helion.kernel(
+    static_shapes=False,
+    autotune_effort="none",
+    persistent_reserved_sms=0,
+    triton_do_not_specialize=True,
+)
+def dynamic_split_cohort_fanout(
+    x: torch.Tensor,
+    neutral_input: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows, width = x.size()
+    hl.specialize(width)
+    hl.specialize(x.stride(0))
+    hl.specialize(x.stride(1))
+    hl.specialize(neutral_input.size(0))
+    hl.specialize(neutral_input.stride(0))
+    tmp = torch.empty_like(x)
+    neutral = torch.empty_like(neutral_input)
+    out = torch.empty_like(x)
+
+    for producer_row, producer_column in hl.tile([rows, width], block_size=[1, 1]):
+        tmp[producer_row, producer_column] = x[producer_row, producer_column] + 1
+    for neutral_index in hl.tile(neutral_input.size(0), block_size=1):
+        neutral[neutral_index] = neutral_input[neutral_index] * 3
+    for consumer_row, consumer_column in hl.tile([rows, width], block_size=[1, 1]):
+        out[consumer_row, consumer_column] = (
+            tmp[consumer_row, 0]
+            + tmp[consumer_row, 1]
+            + x[consumer_row, consumer_column]
+        )
+    return out, neutral
 
 
 @helion.kernel(
@@ -708,6 +742,125 @@ class TestCrossLoopCodegenHelpers(TestCase):
 
 @onlyBackends(["triton"])
 class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_parameterized_renderer_lowers_repeated_root_segments(self) -> None:
+        original_builder = cross_loop_codegen.build_static_pipeline_plan
+        selected_roots: tuple[int, ...] | None = None
+
+        def build_split_cohort_plan(**kwargs: Any):
+            nonlocal selected_roots
+            kwargs["continuation_ineligible_roots"] = frozenset(
+                range(len(kwargs["root_task_orders"]))
+            )
+            kwargs["allow_transient_source"] = False
+            original_plan = original_builder(**kwargs)
+            readiness_graph = cross_loop_scheduler.build_readiness_graph(
+                dependency_graph=kwargs["dependency_graph"],
+                root_task_orders=kwargs["root_task_orders"],
+                site_domains=kwargs["site_domains"],
+                publishable_site_ids=kwargs.get("publishable_site_ids"),
+                prove_nonnegative=kwargs.get("prove_nonnegative"),
+            )
+            canonical = cross_loop_scheduler._build_root_major_worker_schedule(
+                readiness_graph.root_domains,
+                readiness_graph.root_task_orders,
+                original_plan.worker_schedule.worker_count,
+            )
+            cohort_candidates = cross_loop_scheduler._agreed_cohort_major_root_orders(
+                readiness_graph,
+                include_reference=True,
+            )
+            assert cohort_candidates is not None
+            task_orders, cohort_widths = cohort_candidates
+            assert cohort_widths[2] == 2
+            configured_orders = tuple(
+                itertools.starmap(
+                    task_orders.get,
+                    enumerate(readiness_graph.root_task_orders),
+                )
+            )
+            producer_count = configured_orders[0].source_domain.size_expr
+            neutral_count = configured_orders[1].source_domain.size_expr
+            consumer_count = configured_orders[2].source_domain.size_expr
+            candidate = cross_loop_scheduler._repack_packed_schedule(
+                readiness_graph,
+                canonical,
+                (
+                    (0, 0, producer_count),
+                    (2, 0, 2),
+                    (1, 0, neutral_count),
+                    (2, 2, consumer_count - 2),
+                ),
+                task_orders,
+            )
+            assert candidate is not None
+            finalized = cross_loop_scheduler._try_finalize_pipeline_proposal(
+                dependency_graph=kwargs["dependency_graph"],
+                readiness_graph=readiness_graph,
+                worker_schedule=candidate,
+                continuations=(),
+                candidate_readiness_counters=(
+                    cross_loop_scheduler.choose_readiness_counters(
+                        readiness_graph,
+                        (),
+                    )
+                ),
+                allow_counter_fallback=False,
+                allow_global_schedule=False,
+                allow_transient_source=False,
+            )
+            assert finalized is not None
+            assert not finalized.root_barrier_edges
+            selected_roots = tuple(
+                segment.root for segment in finalized.worker_schedule.segments
+            )
+            return finalized
+
+        exemplar = torch.randn((3, 2), device=DEVICE)
+        neutral_exemplar = torch.randn((4,), device=DEVICE)
+        bound = dynamic_split_cohort_fanout.bind((exemplar, neutral_exemplar))
+        config = helion.Config(
+            pid_type="persistent_blocked",
+            cross_loop_schedule="static_pipeline",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+        with mock.patch.object(
+            cross_loop_codegen,
+            "build_static_pipeline_plan",
+            side_effect=build_split_cohort_plan,
+        ):
+            generated_code = bound.to_code(config)
+            compiled = bound.compile_config(config)
+            # One compiled kernel must preserve the empty-suffix boundary and
+            # worker/wave wraparound; neither may be hidden by specialization.
+            for batch in (1, 3, 4, 75):
+                with self.subTest(batch=batch):
+                    x = torch.randn((batch, 2), device=DEVICE)
+                    neutral_input = torch.randn((4,), device=DEVICE)
+                    output = compiled(x, neutral_input)
+                    out, neutral = output
+                    torch.testing.assert_close(
+                        out,
+                        x.sum(dim=1, keepdim=True) + 2 + x,
+                    )
+                    torch.testing.assert_close(neutral, neutral_input * 3)
+
+        self.assertEqual(selected_roots, (0, 2, 1, 2))
+        self.assertNotIn("tile_dependency_root_barrier", generated_code)
+        self.assertEqual(
+            generated_code.count("def tile_dependency_root_2_scheduled_task"),
+            1,
+        )
+        consumer_calls = [
+            line
+            for line in generated_code.splitlines()
+            if "tile_dependency_root_2_scheduled_task(" in line
+            and not line.startswith("def ")
+        ]
+        self.assertEqual(len(consumer_calls), 2)
+
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_parameterized_renderer_honors_cohort_major_task_order(self) -> None:
@@ -1413,15 +1566,11 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 {},
             )
             assert permuted is not None
-            geometry = (
-                cross_loop_scheduler._parametric_root_major_schedule_geometry(
-                    permuted
-                )
+            geometry = cross_loop_scheduler._parametric_root_major_schedule_geometry(
+                permuted
             )
             assert geometry is not None
-            selected_roots = tuple(
-                segment.root for segment, _first, _count in geometry
-            )
+            selected_roots = tuple(segment.root for segment, _first, _count in geometry)
             return dataclasses.replace(plan, worker_schedule=permuted)
 
         with mock.patch.object(

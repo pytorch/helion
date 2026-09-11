@@ -27,6 +27,7 @@ from .cross_loop_scheduler import WorkerInterval
 from .cross_loop_scheduler import WorkerScheduleSegment
 from .cross_loop_scheduler import _normalize_intervals
 from .cross_loop_scheduler import _packed_root_major_task_order_relation
+from .cross_loop_scheduler import _packed_schedule_segment_geometry
 from .cross_loop_scheduler import _parametric_root_major_schedule_geometry
 from .cross_loop_scheduler import _root_schedule_traversal
 from .cross_loop_scheduler import _transient_source_schedule_segment
@@ -39,6 +40,7 @@ from .program_id import typed_program_id
 from .tile_dependency import TILE_DEPENDENCY_SITE_ID_ATTR
 from .tile_dependency import CoordinateDomain
 from .tile_dependency import CoordinateRelation
+from .tile_dependency import _memoized_exact_converse
 from .tile_dependency import coordinate_axis_symbol
 from .tile_dependency import instantiate_coordinate_domains
 from .tile_dependency import nested_logical_axes
@@ -752,7 +754,16 @@ def emit_cross_loop_schedule(
     parameterized_root_major_geometry = _parametric_root_major_schedule_geometry(
         static_pipeline_plan.worker_schedule
     )
-    has_parameterized_schedule = parameterized_root_major_geometry is not None
+    parameterized_schedule_geometry = (
+        parameterized_root_major_geometry
+        if parameterized_root_major_geometry is not None
+        else _packed_schedule_segment_geometry(static_pipeline_plan.worker_schedule)
+    )
+    uses_relation_segment_renderer = (
+        parameterized_root_major_geometry is None
+        and parameterized_schedule_geometry is not None
+    )
+    has_parameterized_schedule = parameterized_schedule_geometry is not None
     parameterized_segment_geometry_by_root = (
         {
             segment.root: (segment, first_position, task_count)
@@ -763,7 +774,15 @@ def emit_cross_loop_schedule(
         if parameterized_root_major_geometry is not None
         else {}
     )
-    if parameterized_root_domains and parameterized_root_major_geometry is None:
+    parameterized_segment_geometry_by_identity = (
+        {
+            id(segment): (segment, first_position, task_count)
+            for segment, first_position, task_count in parameterized_schedule_geometry
+        }
+        if parameterized_schedule_geometry is not None
+        else {}
+    )
+    if parameterized_root_domains and parameterized_schedule_geometry is None:
         raise exc.InvalidConfig(
             "cross_loop_schedule='static_pipeline' cannot lower this "
             "parameterized worker schedule"
@@ -773,6 +792,11 @@ def emit_cross_loop_schedule(
     ) and static_pipeline_plan.transient_source_root is not None:
         raise AssertionError("parameterized lowering received an unsupported plan")
     root_barrier_edges = static_pipeline_plan.root_barrier_edges
+    if uses_relation_segment_renderer and root_barrier_edges:
+        raise exc.InvalidConfig(
+            "cross_loop_schedule='static_pipeline' cannot yet lower root "
+            "barriers for a split parameterized root"
+        )
     nested_loop_counter_plans = tuple(
         plan
         for plan in all_readiness_counter_plans
@@ -1220,7 +1244,12 @@ def emit_cross_loop_schedule(
     root_schedule_traversals = {}
     scheduled_task_roots: set[int] = set()
     if has_parameterized_schedule:
-        for segment, first_position, _task_count in parameterized_root_major_geometry:
+        assert parameterized_schedule_geometry is not None
+        for segment, first_position, _task_count in parameterized_schedule_geometry:
+            if uses_relation_segment_renderer:
+                # Relation-segment dispatch maps each global slot to the
+                # configured PID before entering the shared root body.
+                continue
             reference = _packed_root_major_task_order_relation(
                 static_pipeline_plan.worker_schedule.placement_domain,
                 root_task_orders[segment.root],
@@ -1497,18 +1526,23 @@ def emit_cross_loop_schedule(
         allow_exact_partial: bool = False,
     ) -> tuple[dict[int, str], str]:
         """Render an at-most-one-valued relation without task tables."""
-        canonical = relation.canonical_single_valued()
-        if (
-            canonical is None
-            and allow_exact_partial
-            and relation.is_bijection_from_source_support()
-        ):
-            # Some exact parameterized partitions cannot be rewritten into
-            # disjoint symbolic boxes even though the relation has already
-            # proved that overlapping guards agree. Rendering those original
-            # pieces is semantics-preserving; the membership predicates below
-            # still select only a source-supported value.
+        # A finalized worker schedule has already proved every segment to be
+        # an exact at-most-one-valued map.  Preserve that proof boundary:
+        # canonicalizing its symbolic packed boxes again is both redundant and
+        # can make code generation scale with nested Min/Max expression size.
+        if allow_exact_partial:
+            inverse = _memoized_exact_converse(relation)
+            if (
+                not relation.is_single_valued()
+                or inverse is None
+                or not inverse.is_single_valued()
+            ):
+                raise AssertionError(
+                    "raw relation rendering requires a proved partial bijection"
+                )
             canonical = relation
+        else:
+            canonical = relation.canonical_single_valued()
         if canonical is None or not canonical.pieces:
             raise AssertionError("event relation is not single-valued")
         memberships: list[str] = []
@@ -2303,16 +2337,14 @@ def emit_cross_loop_schedule(
         ]
 
     static_segments_by_root: dict[int, tuple[WorkerScheduleSegment, ...]] = {}
-    parameterized_schedule_geometry = parameterized_root_major_geometry
     for root in range(len(root_domains)):
         segments = static_pipeline_plan.worker_schedule.segments_for_root(root)
         if not segments:
             continue
         if parameterized_schedule_geometry is not None:
-            if (
-                len(segments) != 1
-                or root not in parameterized_segment_geometry_by_root
-                or parameterized_segment_geometry_by_root[root][0] != segments[0]
+            if any(
+                id(segment) not in parameterized_segment_geometry_by_identity
+                for segment in segments
             ):
                 raise exc.InvalidConfig(
                     "cross_loop_schedule='static_pipeline' does not support "
@@ -2368,6 +2400,12 @@ def emit_cross_loop_schedule(
         segment: WorkerScheduleSegment,
         *,
         task_order_begin: int | None,
+        parameterized_segment_geometry: tuple[
+            WorkerScheduleSegment,
+            sympy.Expr,
+            sympy.Expr,
+        ]
+        | None,
         root_barrier_publication_site: RootBarrierPublication | None,
     ) -> list[ast.stmt]:
         """Lower one run at its authoritative position in the segment stream."""
@@ -2377,11 +2415,31 @@ def emit_cross_loop_schedule(
         if segment not in static_segments_by_root.get(root, ()):
             raise AssertionError("static segment is not owned by its root")
         task_dispatch: list[ast.stmt]
-        execution_plan = root_publication_plans[root]
-        participant_order = execution_plan.participant_order
+        execution_plan = root_publication_plans.get(root)
+        participant_order = (
+            None if execution_plan is None else execution_plan.participant_order
+        )
         if participant_order is None:
-            segment_workers = segment.worker_intervals()
-            segment_membership = worker_membership_condition(segment_workers)
+            if uses_relation_segment_renderer:
+                assert parameterized_segment_geometry is not None
+                _geometry_segment, first_slot, task_count = (
+                    parameterized_segment_geometry
+                )
+                first_slot_text = device_function.sympy_expr(first_slot)
+                task_count_text = device_function.sympy_expr(task_count)
+                first_lane = f"(({first_slot_text}) % {launch_worker_count})"
+                local_begin = (
+                    f"(({worker}) + {launch_worker_count} - ({first_lane})) % "
+                    f"{launch_worker_count}"
+                )
+                # This is the exact support of the worker's strided slice of
+                # the segment.  In particular, a symbolic empty suffix does
+                # not execute root-entry bookkeeping.
+                segment_workers = None
+                segment_membership = f"({local_begin}) < ({task_count_text})"
+            else:
+                segment_workers = segment.worker_intervals()
+                segment_membership = worker_membership_condition(segment_workers)
         else:
             if len(participant_order.source_domain.axis_order) != 1:
                 raise AssertionError("participant order must have one worker axis")
@@ -2390,10 +2448,8 @@ def emit_cross_loop_schedule(
                 participant_order,
                 {participant_worker_axis: worker},
             )
-        if parameterized_root_major_geometry is not None:
-            geometry_segment, first_slot, task_count = (
-                parameterized_segment_geometry_by_root[root]
-            )
+        if parameterized_segment_geometry is not None:
+            geometry_segment, first_slot, task_count = parameterized_segment_geometry
             if segment != geometry_segment or task_order_begin is not None:
                 raise AssertionError(
                     "parameterized segment disagrees with its proved relation"
@@ -2401,29 +2457,77 @@ def emit_cross_loop_schedule(
             task_count_text = device_function.sympy_expr(task_count)
             first_slot_text = device_function.sympy_expr(first_slot)
             case_offset_text = case_offset_strings[root]
-            local_task_begin = (
-                f"(({worker}) + {segment.worker_count} - "
-                f"(({first_slot_text}) % {segment.worker_count})) % "
-                f"{segment.worker_count}"
+            first_lane = f"(({first_slot_text}) % {launch_worker_count})"
+            local_begin = (
+                f"(({worker}) + {launch_worker_count} - ({first_lane})) % "
+                f"{launch_worker_count}"
             )
-            task_dispatch = [
-                create(
-                    ast.For,
-                    target=create(
-                        ast.Name,
-                        id=strategy.virtual_pid_var,
-                        ctx=ast.Store(),
-                    ),
-                    iter=expr_from_string(
-                        f"tl.range(({case_offset_text}) + ({local_task_begin}), "
-                        f"({case_offset_text}) + ({task_count_text}), "
-                        f"{segment.worker_count})"
-                    ),
-                    body=shared_scheduled_task_body(root),
-                    orelse=[],
-                    type_comment=None,
+            if uses_relation_segment_renderer:
+                launch_stage_axis, worker_axis, wave_axis = (
+                    segment.task_order.source_domain.axis_order
                 )
-            ]
+                segment_slot = device_function.new_var(
+                    "tile_dependency_schedule_slot", dce=True
+                )
+                logical_coordinates, relation_membership = relation_point_coordinates(
+                    segment.task_order,
+                    {
+                        launch_stage_axis: str(_RESIDENT_LAUNCH_STAGE),
+                        worker_axis: worker,
+                        wave_axis: (f"(({segment_slot}) // {launch_worker_count})"),
+                    },
+                    allow_exact_partial=True,
+                )
+                pid_task = pid_task_for_logical_coordinates(root, logical_coordinates)
+                loop_body = [
+                    statement_from_string(
+                        f"{strategy.virtual_pid_var} = "
+                        f"({case_offset_text}) + ({pid_task})"
+                    ),
+                    *shared_scheduled_task_body(root),
+                ]
+                if relation_membership != "True":
+                    loop_body = [
+                        create(
+                            ast.If,
+                            test=expr_from_string(relation_membership),
+                            body=loop_body,
+                            orelse=[],
+                        )
+                    ]
+                task_dispatch = [
+                    create(
+                        ast.For,
+                        target=create(ast.Name, id=segment_slot, ctx=ast.Store()),
+                        iter=expr_from_string(
+                            f"tl.range(({first_slot_text}) + ({local_begin}), "
+                            f"({first_slot_text}) + ({task_count_text}), "
+                            f"{launch_worker_count})"
+                        ),
+                        body=loop_body,
+                        orelse=[],
+                        type_comment=None,
+                    )
+                ]
+            else:
+                task_dispatch = [
+                    create(
+                        ast.For,
+                        target=create(
+                            ast.Name,
+                            id=strategy.virtual_pid_var,
+                            ctx=ast.Store(),
+                        ),
+                        iter=expr_from_string(
+                            f"tl.range(({case_offset_text}) + ({local_begin}), "
+                            f"({case_offset_text}) + ({task_count_text}), "
+                            f"{launch_worker_count})"
+                        ),
+                        body=shared_scheduled_task_body(root),
+                        orelse=[],
+                        type_comment=None,
+                    )
+                ]
         elif (
             segment.task_count == 1
             and root_domains[root].size == 1
@@ -2461,9 +2565,12 @@ def emit_cross_loop_schedule(
         incoming_roots = root_barrier_incoming.get(root, ())
         if (
             participant_order is None
-            and segment_workers == ((0, launch_worker_count),)
             and not incoming_roots
             and root_barrier_publication_site is None
+            and (
+                segment_workers == ((0, launch_worker_count),)
+                or (uses_relation_segment_renderer and segment_membership == "True")
+            )
         ):
             return task_dispatch
 
@@ -2520,11 +2627,19 @@ def emit_cross_loop_schedule(
         root = segment.root
         if root == transient_source_root:
             continue
-        if parameterized_root_major_geometry is not None:
+        if parameterized_schedule_geometry is not None:
+            segment_geometry = parameterized_segment_geometry_by_identity.get(
+                id(segment)
+            )
+            if segment_geometry is None:
+                raise AssertionError(
+                    "parameterized segment has no proved packed interval"
+                )
             resident_body.extend(
                 static_segment_body(
                     segment,
                     task_order_begin=None,
+                    parameterized_segment_geometry=segment_geometry,
                     root_barrier_publication_site=publication_by_segment.get(
                         segment_index
                     ),
@@ -2546,6 +2661,7 @@ def emit_cross_loop_schedule(
             static_segment_body(
                 segment,
                 task_order_begin=task_order_begin,
+                parameterized_segment_geometry=None,
                 root_barrier_publication_site=publication_by_segment.get(segment_index),
             )
         )
