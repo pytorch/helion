@@ -3822,6 +3822,52 @@ no retained graph, schedule, region, or instruction abstraction.
   runtime-empty roots, and deliberately unresolved symbolic winners. Exercise
   all four depth values even when multiple values produce the same relation.
 
+Implementation checkpoint (2026-09-11): the former one-shot tail pull has
+been replaced by one bounded walk over the finite unique-root schema. The walk
+keeps only local root cursors/assigned roots, active causal depths, emitted
+slot mass, and a run list; it repacks once into the existing
+`WorkerSchedule`. Whole-root cohorts may span waves. Independent pulls start
+at depth 2, dependent pulls use one plus the maximum active predecessor depth,
+and depth resets only when the assigned-root cursor vector exactly equals the
+corresponding canonical prefix. Tests cover the depth-1--4 chain, independent
+pulls, a join, a full-wave boundary, a true rejoin, exact canonical ties, and
+positive symbolic whole-root substitution. Construction is bounded by the
+finite root schema and the common relation budgets; no task, wave, shape, or
+runtime extent is enumerated.
+
+This is deliberately an incremental checkpoint, not completion of Phase
+4A.3. A strict sub-root cohort is still one terminal action. An oversized
+strict cohort vetoes the boundary instead of disappearing or becoming a
+multi-wave committed run. Event closure and active-cohort continuation remain
+neutral unless their omission is provably irrelevant (for example, a whole
+root with no producer role); ties involving producer roles retain `C` until
+key-scoped frontiers exist. A possibly empty moved root also retains `C` until
+the optimized proposal carries its synthetic publication occurrence. These
+tests encode safe migration declines and must be revised when the missing
+proofs land; they are not the final scheduling policy.
+
+The supporting relation/lowering fixes remain general. A total
+`CoordinateRelation` now derives its exact converse and symbolic target count
+once, enabling a positive symbolic whole root to be both an intermediate
+producer and consumer in a depth-3 chain. Root-barrier lowering uses the same
+packed schedule relation: a unique symbolic producer gets the existing
+participant-order relation even when another root repeats; a parameter-free
+split producer uses the exact final-worker interval partition; a symbolically
+split producer still declines. Invalid constant fibers with out-of-domain or
+conditionally empty targets are rejected before a converse is memoized.
+
+Immediate continuation of this phase:
+
+1. carry exact consumer-key frontiers through the finite walk and use them for
+   event closure and active-cohort continuation;
+2. commit a complete strict sub-root cohort across waves, rather than treating
+   it as a tail-only action, while preserving its atomicity;
+3. retain conditionally empty moved roots together with their synthetic
+   publication occurrence;
+4. detect guard-uniform affine repetition and lift it into bounded relation
+   pieces; and
+5. only then expose the public depth knob and remove the legacy policy split.
+
 Exit gate: constant and symbolic instances with extensionally equal guards,
 orders, readiness, worker count, and capacity facts select the same cohort
 policy; dynamic repetitions remain bounded relation pieces; Qwen and Gemma

@@ -2443,6 +2443,38 @@ class CoordinateRelation:
                 ),
             )
             return converse, target_counts
+        if self.is_total():
+            converse = CoordinateRelation.total(
+                self.target_domain,
+                self.source_domain,
+            )
+            _remember_exact_converse(self, converse)
+            target_count = self.target_domain.size_expr
+            value_axis = 0
+            value_domain = CoordinateDomain(
+                axis_order=(value_axis,),
+                axis_counts_items=((value_axis, target_count + 1),),
+                kind="value",
+            )
+            target_counts = CoordinateRelation.point_map(
+                self.source_domain,
+                value_domain,
+                (
+                    (
+                        tuple(
+                            (
+                                axis,
+                                0,
+                                self.source_domain.axis_count_expressions[axis],
+                                1,
+                            )
+                            for axis in self.source_domain.axis_order
+                        ),
+                        (target_count,),
+                    ),
+                ),
+            )
+            return converse, target_counts
         separable_partition = self._separable_fixed_width_partition()
         if separable_partition is not None:
             partition_axes, _full_target_axes, fan_in = separable_partition

@@ -1182,6 +1182,46 @@ class TestTileDependency(TestCase):
                 ),
             )
 
+    def test_symbolic_total_relation_derives_inverse_and_target_count(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        key_domain = CoordinateDomain(
+            (0,),
+            ((0, 1),),
+            kind="event",
+            identity=0,
+        )
+        producer_domain = CoordinateDomain(
+            (10,),
+            ((10, 2 * batch),),
+            kind="site",
+            identity=0,
+            _allow_empty=True,
+        )
+        relation = CoordinateRelation.total(key_domain, producer_domain)
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("symbolic proof must not enumerate"),
+        ):
+            converse, target_counts = relation.derive_converse_and_target_counts()
+
+        self.assertIsNotNone(converse)
+        self.assertIsNotNone(target_counts)
+        assert converse is not None and target_counts is not None
+        self.assertEqual(converse, relation.converse())
+        for concrete_batch in (0, 1, 3):
+            with self.subTest(concrete_batch=concrete_batch):
+                substitutions = {batch: concrete_batch}
+                self.assertEqual(
+                    converse.substitute_parameters(substitutions).materialize(),
+                    (frozenset((0,)),) * (2 * concrete_batch),
+                )
+                self.assertEqual(
+                    target_counts.substitute_parameters(substitutions).materialize(),
+                    (frozenset((2 * concrete_batch,)),),
+                )
+
     def test_symbolic_repeated_fiber_producer_set_quotient(self) -> None:
         key_count = sympy.Symbol("key_count", integer=True, nonnegative=True)
         consumers_per_key = 16
