@@ -3835,15 +3835,13 @@ positive symbolic whole-root substitution. Construction is bounded by the
 finite root schema and the common relation budgets; no task, wave, shape, or
 runtime extent is enumerated.
 
-This is deliberately an incremental checkpoint, not completion of Phase
-4A.3. A strict sub-root cohort is still one terminal action. An oversized
-strict cohort vetoes the boundary instead of disappearing or becoming a
-multi-wave committed run. Event closure and active-cohort continuation remain
-neutral unless their omission is provably irrelevant (for example, a whole
-root with no producer role); ties involving producer roles retain `C` until
-key-scoped frontiers exist. A possibly empty moved root also retains `C` until
-the optimized proposal carries its synthetic publication occurrence. These
-tests encode safe migration declines and must be revised when the missing
+This was deliberately an incremental checkpoint, not completion of Phase
+4A.3. At that checkpoint a strict sub-root cohort was one terminal action;
+event closure and active-cohort continuation were neutral unless their
+omission was provably irrelevant. Ties involving producer roles retained `C`
+until key-scoped frontiers existed. A possibly empty moved root still retains
+`C` until the optimized proposal carries its synthetic publication occurrence.
+Those tests encoded safe migration declines and are revised as the missing
 proofs land; they are not the final scheduling policy.
 
 The supporting relation/lowering fixes remain general. A total
@@ -3884,17 +3882,36 @@ progress, canonical fallback on unknown facts, and bounded symbolic
 construction remain mandatory. General active continuation for a partially
 completed single producer arm is still unproved, and no test implies otherwise.
 
+Implementation checkpoint (2026-09-11, bounded cursors): the selected strict
+first cohort is a committed run rather than a tail-sized fragment. It remains
+contiguous when its constant width crosses a worker-wave boundary; no smaller
+cohort is invented. The same finite walk now continues with one ephemeral
+cursor per root as its sole ownership state. Each cursor is limited to zero,
+one proved leading cohort width, or the root end. Claims are derived directly
+from those states, completion is `cursor == root_count`, and a root can emit at
+most one leading run plus one exact suffix. Thus the final schedule has at
+most `2R` runs and is still repacked once into `WorkerSchedule`.
+
+Causal depth resets only when the complete cursor vector and emitted packed
+mass equal one exact prefix of `C`; landing on a worker-wave boundary is not a
+rejoin. A partially emitted root's unrepresented next fiber remains a real
+competitor and vetoes further noncanonical selection until the root reaches
+its canonical position and emits its exact suffix. A dependent cohort may
+cross an unfinished ancestor only in genuinely unused lanes of an already
+occupied committed wave; the start of a fresh wave is not tail capacity.
+Runtime-varying packed phase for a strict split currently vetoes the boundary
+because the existing inverse/coverage proof is not bounded in practice. That
+capability decline is transitional and must be removed by affine phase/repeat
+lifting, not turned into a priority rule.
+
 Immediate continuation of this phase:
 
-1. generalize the current first-fiber proof to symbolic root cursors so the
-   same exact frontier advances after each committed cohort;
-2. commit a complete strict sub-root cohort across waves, rather than treating
-   it as a tail-only action, while preserving its atomicity;
-3. retain conditionally empty moved roots together with their synthetic
+1. lift repeated cohort decisions and runtime-varying packed phase into affine
+   relation pieces so an arbitrary symbolic next fiber is never host-iterated;
+2. retain conditionally empty moved roots together with their synthetic
    publication occurrence;
-4. detect guard-uniform affine repetition and lift it into bounded relation
-   pieces; and
-5. only then expose the public depth knob and remove the legacy policy split.
+3. expose the public depth knob and remove the legacy policy split only after
+   the affine relation path is proved and compact.
 
 Exit gate: constant and symbolic instances with extensionally equal guards,
 orders, readiness, worker count, and capacity facts select the same cohort

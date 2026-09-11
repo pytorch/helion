@@ -9645,8 +9645,7 @@ def _covered_relation_target_depth(
         + depth_count * claim_piece_count * required_piece_count
     )
     if (
-        claim_piece_count + required_piece_count
-        > tile_dependency._MAX_RELATION_PIECES
+        claim_piece_count + required_piece_count > tile_dependency._MAX_RELATION_PIECES
         or proof_work > tile_dependency._MAX_RELATION_PRODUCT_STATES
     ):
         return None
@@ -9656,9 +9655,7 @@ def _covered_relation_target_depth(
         for claim, claim_depth in claims:
             if claim_depth != depth:
                 continue
-            accumulated = (
-                claim if accumulated is None else accumulated.union(claim)
-            )
+            accumulated = claim if accumulated is None else accumulated.union(claim)
             if accumulated is None:
                 return None
             accumulated = accumulated.coalesce_adjacent_target_boxes()
@@ -9935,10 +9932,11 @@ def _bounded_cohort_list_schedule(
     """Move a bounded sequence of higher-priority readiness cohorts.
 
     Whole-root cohorts may form a causal pipeline across canonical boundaries.
-    A strict sub-root prefix may fill one proved terminal tail, after which this
-    first finite-schema implementation stops.  The emitted run list and causal
-    depths are ephemeral; the returned ``WorkerSchedule`` remains the only
-    retained schedule representation.
+    A strict sub-root prefix is one atomic committed run, possibly spanning
+    worker waves. Its next fiber is not reconsidered until the exact suffix
+    and canonical-frontier rejoin. The emitted run list and causal depths are
+    ephemeral; the returned ``WorkerSchedule`` remains the only retained
+    schedule representation.
     """
     geometry = _parametric_root_major_schedule_geometry(canonical_schedule)
     if geometry is None:
@@ -9952,6 +9950,10 @@ def _bounded_cohort_list_schedule(
     canonical_roots = tuple(
         segment.root for segment, _first_slot, _task_count in geometry
     )
+    # Every priority-scan iteration emits the initial full-or-prefix action of
+    # one previously untouched root, hence there are at most R scans. A pulled
+    # prefix may later add one suffix-only iteration, so there are at most 2R
+    # emitted runs while priority work remains bounded by R^3.
     if not tile_dependency._relation_product_is_within_budget(
         len(canonical_roots),
         len(canonical_roots),
@@ -9972,9 +9974,7 @@ def _bounded_cohort_list_schedule(
         for event in readiness_graph.events
         for producer in event.producers
     )
-    admission, closure, unsupported_admission, unsupported_closure = (
-        semantic_cohorts
-    )
+    admission, closure, unsupported_admission, unsupported_closure = semantic_cohorts
     admission_by_root: dict[
         int,
         list[tuple[int, int, CoordinateRelation]],
@@ -10023,8 +10023,7 @@ def _bounded_cohort_list_schedule(
         (event_id, event_keys)
         for _root, event_id, _consumer, _cohort, event_keys in admission
     ) + tuple(
-        (event_id, event_keys)
-        for _root, event_id, _cohort, event_keys in closure
+        (event_id, event_keys) for _root, event_id, _cohort, event_keys in closure
     )
     frontier_work = 0
     for event_id, event_keys_by_cohort in frontier_records:
@@ -10042,8 +10041,7 @@ def _bounded_cohort_list_schedule(
         frontier_requirements[cache_key] = requirements
         if event_keys is not None:
             record_work += len(event_keys.pieces) * sum(
-                len(producer.producers_by_key.pieces)
-                for producer in event.producers
+                len(producer.producers_by_key.pieces) for producer in event.producers
             )
         if requirements is not None:
             record_work += sum(len(required.pieces) for required in requirements)
@@ -10106,36 +10104,52 @@ def _bounded_cohort_list_schedule(
         *,
         candidate_root: int | None = None,
         candidate_tasks: CoordinateRelation | None = None,
-    ) -> tuple[tuple[tuple[CoordinateRelation, int], ...], ...]:
+    ) -> tuple[tuple[tuple[CoordinateRelation, int], ...], ...] | None:
         result: list[tuple[tuple[CoordinateRelation, int], ...]] = []
         for producer in event.producers:
             claims: list[tuple[CoordinateRelation, int]] = []
-            if producer.producer_root in assigned:
+            producer_root = producer.producer_root
+            cursor = root_cursors[producer_root]
+            if _equal_integer_expressions(cursor, root_counts[producer_root]):
                 claims.append(
                     (
-                        full_root_tasks[producer.producer_root],
-                        active_pull_depths.get(producer.producer_root, 1),
+                        full_root_tasks[producer_root],
+                        active_pull_depths.get(producer_root, 1),
                     )
                 )
-            if (
-                producer.producer_root == candidate_root
-                and candidate_tasks is not None
-            ):
+            elif not _equal_integer_expressions(cursor, 0):
+                cohort = classified_cohort(producer_root)
+                if cohort is None or not _equal_integer_expressions(
+                    cursor,
+                    cohort[0],
+                ):
+                    return None
+                partial_tasks = first_action_tasks(producer_root)
+                if partial_tasks is None:
+                    return None
+                claims.append(
+                    (
+                        partial_tasks,
+                        active_pull_depths.get(producer_root, 1),
+                    )
+                )
+            if producer_root == candidate_root and candidate_tasks is not None:
                 claims.append((candidate_tasks, 1))
             result.append(tuple(claims))
         return tuple(result)
 
-    def root_frontier_ready(
+    def root_frontier_state(
         root: int,
         *,
         candidate_root: int | None = None,
         candidate_tasks: CoordinateRelation | None = None,
-    ) -> bool | None:
+    ) -> tuple[bool | None, int]:
         if root in unsupported_admission or root not in cohort_widths:
             # Coordinate zero is a shared consumer action only after every
             # semantic admission view proved the same cohort partition.
-            return None
+            return None, 1
         unknown = False
+        maximum_claim_depth = 1
         for event_id, consumer_index, event_keys_by_cohort in admission_by_root.get(
             root,
             (),
@@ -10147,28 +10161,31 @@ def _bounded_cohort_list_schedule(
                 or not 0 <= consumer_index < len(event.consumers)
                 or event.consumers[consumer_index].consumer_root != root
             ):
-                return None
-            requirements = frontier_requirements.get(
-                (event_id, event_keys_by_cohort)
-            )
+                return None, 1
+            requirements = frontier_requirements.get((event_id, event_keys_by_cohort))
             if requirements is None:
-                return None
+                return None, 1
+            claims = event_claims(
+                event,
+                candidate_root=candidate_root,
+                candidate_tasks=candidate_tasks,
+            )
+            if claims is None:
+                return None, 1
             state = _event_key_frontier_state(
                 requirements,
-                event_claims(
-                    event,
-                    candidate_root=candidate_root,
-                    candidate_tasks=candidate_tasks,
-                ),
+                claims,
             )
             if state is None:
-                return None
-            ready, _active, _depth = state
+                return None, 1
+            ready, _active, depth = state
             if ready is False:
-                return False
+                return False, maximum_claim_depth
             if ready is None:
                 unknown = True
-        return None if unknown else True
+            else:
+                maximum_claim_depth = max(maximum_claim_depth, depth)
+        return (None if unknown else True), maximum_claim_depth
 
     def output_frontier_flags(
         root: int,
@@ -10202,24 +10219,26 @@ def _bounded_cohort_list_schedule(
                 active_unknown = True
                 continue
             event = readiness_graph.event(event_id)
-            requirements = frontier_requirements.get(
-                (event_id, event_keys_by_cohort)
-            )
+            requirements = frontier_requirements.get((event_id, event_keys_by_cohort))
             if requirements is None:
                 closure_unknown = True
                 active_unknown = True
                 continue
-            before = _event_key_frontier_state(
-                requirements,
-                event_claims(event),
+            before_claims = event_claims(event)
+            after_claims = event_claims(
+                event,
+                candidate_root=root,
+                candidate_tasks=candidate_tasks,
             )
-            after = _event_key_frontier_state(
-                requirements,
-                event_claims(
-                    event,
-                    candidate_root=root,
-                    candidate_tasks=candidate_tasks,
-                ),
+            before = (
+                None
+                if before_claims is None
+                else _event_key_frontier_state(requirements, before_claims)
+            )
+            after = (
+                None
+                if after_claims is None
+                else _event_key_frontier_state(requirements, after_claims)
             )
             if before is None or after is None:
                 closure_unknown = True
@@ -10237,9 +10256,7 @@ def _bounded_cohort_list_schedule(
                 closure_unknown = True
         return (
             True if closes else (None if closure_unknown else False),
-            True
-            if continues_active
-            else (None if active_unknown else False),
+            True if continues_active else (None if active_unknown else False),
         )
 
     def action_priority_bounds(
@@ -10258,11 +10275,11 @@ def _bounded_cohort_list_schedule(
         for consumer in successors[root]:
             if consumer in assigned_roots:
                 continue
-            before = root_frontier_ready(consumer)
-            after = (
-                None
+            before, _before_depth = root_frontier_state(consumer)
+            after, _after_depth = (
+                (None, 1)
                 if candidate_tasks is None
-                else root_frontier_ready(
+                else root_frontier_state(
                     consumer,
                     candidate_root=root,
                     candidate_tasks=candidate_tasks,
@@ -10301,8 +10318,7 @@ def _bounded_cohort_list_schedule(
             0
             if unknown_releases
             or any(
-                root_criticality[consumer] == release_class
-                for consumer in newly_ready
+                root_criticality[consumer] == release_class for consumer in newly_ready
             )
             else 1,
             0 if closes is not False else 1,
@@ -10347,8 +10363,11 @@ def _bounded_cohort_list_schedule(
             return None
         return width, False
 
-    remaining = list(canonical_roots)
-    assigned: set[int] = set()
+    # Cursors are the sole task-ownership state of this finite walk.  This
+    # bounded slice admits at most one leading strict cohort per root; a later
+    # noncanonical cohort remains an explicit unsupported competitor until the
+    # root reaches its canonical position and its exact suffix is emitted.
+    root_cursors = {root: sympy.Integer(0) for root in canonical_roots}
     root_runs: list[tuple[int, sympy.Expr, sympy.Expr]] = []
     # A root appears here only while its noncanonical movement has not rejoined
     # the corresponding prefix of C.  Values are causal depths, not move counts.
@@ -10356,35 +10375,84 @@ def _bounded_cohort_list_schedule(
     emitted_slots: sympy.Expr = sympy.Integer(0)
     changed = False
 
-    def append_full_root(root: int, *, pull_depth: int) -> None:
+    def root_is_complete(root: int) -> bool:
+        return _equal_integer_expressions(root_cursors[root], root_counts[root])
+
+    def completed_roots() -> frozenset[int]:
+        return frozenset(root for root in canonical_roots if root_is_complete(root))
+
+    def exactly_rejoined_canonical_frontier() -> bool:
+        """Prove cursor-vector and packed-mass equality with one prefix of C."""
+        canonical_mass: sympy.Expr = sympy.Integer(0)
+        reached_frontier = False
+        for root in canonical_roots:
+            cursor = root_cursors[root]
+            if not reached_frontier and root_is_complete(root):
+                canonical_mass = sympy.simplify(canonical_mass + root_counts[root])
+                continue
+            if not reached_frontier:
+                canonical_mass = sympy.simplify(canonical_mass + cursor)
+                reached_frontier = True
+                continue
+            if not _equal_integer_expressions(cursor, 0):
+                return False
+        return _equal_integer_expressions(emitted_slots, canonical_mass)
+
+    def append_committed_run(
+        root: int,
+        task_count: sympy.Expr,
+        *,
+        pull_depth: int,
+    ) -> None:
         nonlocal emitted_slots, changed
-        task_count = root_counts[root]
-        root_runs.append((root, sympy.Integer(0), task_count))
+        cursor = root_cursors[root]
+        root_runs.append((root, cursor, task_count))
+        root_cursors[root] = sympy.simplify(cursor + task_count)
         emitted_slots = sympy.simplify(emitted_slots + task_count)
-        assigned.add(root)
         if pull_depth > 1:
             active_pull_depths[root] = pull_depth
             changed = True
-        # A whole-root permutation has exactly rejoined C when the roots in its
-        # emitted prefix are the same canonical prefix. Equal root sets imply
-        # equal packed mass because every root is represented exactly once.
-        canonical_prefix = frozenset(canonical_roots[: len(assigned)])
-        if frozenset(assigned) == canonical_prefix:
+        # Wave alignment alone is not a rejoin: every root cursor and the
+        # packed mass must match one exact prefix of the configured schedule.
+        if exactly_rejoined_canonical_frontier():
             active_pull_depths.clear()
 
-    if not remaining:
+    pending = tuple(root for root in canonical_roots if not root_is_complete(root))
+    if not pending:
         return None
-    append_full_root(remaining.pop(0), pull_depth=1)
-    while remaining:
-        canonical_next = remaining[0]
+    first_root = pending[0]
+    append_committed_run(first_root, root_counts[first_root], pull_depth=1)
+    while True:
+        pending = tuple(root for root in canonical_roots if not root_is_complete(root))
+        if not pending:
+            break
+        canonical_next = pending[0]
+        canonical_cursor = root_cursors[canonical_next]
+        if not _equal_integer_expressions(canonical_cursor, 0):
+            append_committed_run(
+                canonical_next,
+                sympy.simplify(root_counts[canonical_next] - canonical_cursor),
+                pull_depth=1,
+            )
+            continue
+        completed = completed_roots()
         canonical_cohort = classified_cohort(canonical_next)
-        if canonical_cohort is None or not predecessors[canonical_next] <= assigned:
-            append_full_root(remaining.pop(0), pull_depth=1)
+        canonical_ready = (
+            True
+            if predecessors[canonical_next] <= completed
+            else root_frontier_state(canonical_next)[0]
+        )
+        if canonical_cohort is None or canonical_ready is not True:
+            append_committed_run(
+                canonical_next,
+                root_counts[canonical_next],
+                pull_depth=1,
+            )
             continue
         canonical_width, canonical_is_whole = canonical_cohort
         _canonical_priority, canonical_priority_floor = action_priority_bounds(
             canonical_next,
-            frozenset(assigned),
+            completed,
             completes_root=canonical_is_whole,
         )
 
@@ -10395,6 +10463,7 @@ def _bounded_cohort_list_schedule(
             occupied_lanes_expression.free_symbols
             or occupied_lanes_expression.is_integer is not True
         ):
+            occupied_lanes = None
             remaining_lanes = None
         else:
             occupied_lanes = int(occupied_lanes_expression)
@@ -10415,16 +10484,43 @@ def _bounded_cohort_list_schedule(
             ]
         ] = []
         unsupported_competitor = False
-        for candidate_index in range(1, len(remaining)):
-            root = remaining[candidate_index]
-            if not predecessors[root] <= assigned:
+        for candidate_index in range(1, len(pending)):
+            root = pending[candidate_index]
+            if not _equal_integer_expressions(root_cursors[root], 0):
+                # The next readiness fiber of a partially emitted root is a
+                # real competitor.  Until arbitrary symbolic fiber extraction
+                # exists, never let it disappear from the priority set.
+                unsupported_competitor = True
+                break
+            if predecessors[root] <= completed:
+                ready = True
+                claim_depth = max(
+                    (
+                        active_pull_depths[producer]
+                        for producer in predecessors[root]
+                        if producer in active_pull_depths
+                    ),
+                    default=1,
+                )
+            else:
+                ready, claim_depth = root_frontier_state(root)
+            if ready is False:
                 continue
-            crossed_roots = remaining[:candidate_index]
-            if any(
-                crossed in descendants[root] or root in descendants[crossed]
-                for crossed in crossed_roots
-            ):
+            if ready is None:
+                # Preserve the earlier root-level behavior for wholly
+                # unassigned producers.  A partial producer may already have
+                # released this fiber; an unresolved answer must then veto a
+                # lower-priority move rather than be treated as not ready.
+                has_partial_predecessor = any(
+                    not _equal_integer_expressions(root_cursors[producer], 0)
+                    and not root_is_complete(producer)
+                    for producer in predecessors[root]
+                )
+                if has_partial_predecessor:
+                    unsupported_competitor = True
+                    break
                 continue
+            crossed_roots = pending[:candidate_index]
             root_count = root_counts[root]
             if root_count.is_zero is True:
                 continue
@@ -10436,30 +10532,40 @@ def _bounded_cohort_list_schedule(
                 unsupported_competitor = True
                 break
             width, completes_root = cohort
-            if not completes_root and (
-                remaining_lanes is None or int(width) > remaining_lanes
-            ):
-                # This first finite runner cannot yet commit a strict sub-root
-                # cohort across a wave boundary.  It remains a real ready
-                # competitor, so omitting it could let a lower-priority fitting
-                # action win.  Retain the canonical boundary until the
-                # key-scoped frontier can represent the complete run.
+            if not completes_root and occupied_lanes is None:
+                # Splitting a root at a runtime-varying packed lane phase makes
+                # the current slice's converse/coverage proof non-affine and
+                # potentially expensive. Keep this real competitor canonical
+                # until affine repeat lifting represents the varying phase
+                # directly; never silently rank a different candidate instead.
                 unsupported_competitor = True
                 break
-            predecessor_depth = max(
-                (
-                    active_pull_depths[producer]
-                    for producer in predecessors[root]
-                    if producer in active_pull_depths
-                ),
-                default=1,
+            tail_fits = remaining_lanes is not None and (
+                tile_dependency._is_provably_nonnegative(
+                    sympy.simplify(remaining_lanes - width),
+                    None,
+                )
             )
-            pull_depth = max(2, predecessor_depth + 1)
+            uses_committed_tail = (
+                occupied_lanes is not None and occupied_lanes != 0 and tail_fits
+            )
+            crosses_descendant = any(
+                crossed in descendants[root] for crossed in crossed_roots
+            )
+            if crosses_descendant:
+                continue
+            has_unfinished_ancestor = any(
+                root in descendants[ancestor] and not root_is_complete(ancestor)
+                for ancestor in canonical_roots
+            )
+            if has_unfinished_ancestor and not uses_committed_tail:
+                continue
+            pull_depth = max(2, claim_depth + 1)
             if pull_depth > pipeline_depth:
                 continue
             known_priority, priority_floor = action_priority_bounds(
                 root,
-                frozenset(assigned),
+                completed,
                 completes_root=completes_root,
             )
             candidates.append(
@@ -10474,7 +10580,11 @@ def _bounded_cohort_list_schedule(
                 )
             )
         if unsupported_competitor:
-            append_full_root(remaining.pop(0), pull_depth=1)
+            append_committed_run(
+                canonical_next,
+                root_counts[canonical_next],
+                pull_depth=1,
+            )
             continue
         guaranteed_winners: list[tuple[int, int, sympy.Expr, bool, int]] = []
         for (
@@ -10517,38 +10627,21 @@ def _bounded_cohort_list_schedule(
         # Width and runtime extent never resolve a priority tie. Any unresolved
         # partial-action tie retains the canonical action.
         if len(guaranteed_winners) != 1:
-            append_full_root(remaining.pop(0), pull_depth=1)
+            append_committed_run(
+                canonical_next,
+                root_counts[canonical_next],
+                pull_depth=1,
+            )
             continue
         candidate_index, root, width, completes_root, pull_depth = guaranteed_winners[0]
         if completes_root:
-            remaining.pop(candidate_index)
-            append_full_root(root, pull_depth=pull_depth)
+            append_committed_run(root, root_counts[root], pull_depth=pull_depth)
             continue
 
-        # A strict sub-root cohort may fill one proved tail, but this first
-        # finite root-schema pass does not recursively expose another dynamic
-        # cohort frontier. Preserve the remaining canonical root order and
-        # repack the complete proposal once.
-        root_runs.append((root, sympy.Integer(0), width))
-        for run_root in remaining:
-            if run_root == root:
-                root_runs.append(
-                    (
-                        root,
-                        width,
-                        sympy.simplify(root_counts[root] - width),
-                    )
-                )
-            else:
-                root_runs.append((run_root, sympy.Integer(0), root_counts[run_root]))
-        if not _worker_schedule_piece_budget_is_valid(len(root_runs)):
-            return None
-        return _repack_packed_schedule(
-            readiness_graph,
-            canonical_schedule,
-            tuple(root_runs),
-            replacement_orders,
-        )
+        # Commit the complete exact fiber as one run, including across a wave
+        # boundary.  No candidate is reconsidered until its cursor advances by
+        # the full cohort width.
+        append_committed_run(root, width, pull_depth=pull_depth)
 
     if not changed or not _worker_schedule_piece_budget_is_valid(len(root_runs)):
         return None
