@@ -358,7 +358,7 @@ sections are not active work.
   fold `order_continuation_producers_by_readiness_key` into the same
   transactional root-local preparation. The selector consumes prepared `C`
   without changing root traversal.
-- [ ] Preserve one immutable executable-prerequisite view derived from
+- [x] Preserve one immutable executable-prerequisite view derived from
   `ReadinessGraph` after ownership is frozen. The scheduler consumes that view;
   final counters/barriers and codegen do not repartition it.
 - [x] Make depth one return `C` exactly for the frozen ownership plan. At
@@ -374,6 +374,10 @@ sections are not active work.
   and outgoing relation in the frozen executable counter plan. A partial
   point-valued relation treats unsupported intervals as an explicit empty-key
   class, and semantic fibers may cross incidental relation-piece boundaries.
+- [x] When one exact scalar admission frontier is not representable, widen
+  only that contracted static producer arm to whole-root completion. Retain
+  the exact counter for final progress and codegen; do not disable exact
+  scheduling for unrelated arms or introduce a canonical-only root path.
 - [ ] Finish independent-root backfill and exact canonical ties.
 - [x] Wire `cross_loop_pipeline_depth` through the public config fragment,
   autotuner, plan builder, and lowering. Offer `{1,2,3,4}` without topology-
@@ -392,6 +396,16 @@ sections are not active work.
 
 ### Phase S3: post-placement synchronization validation and cleanup
 
+- [x] Render root barriers for concrete split relation schedules from the
+  cached `RootBarrierPublicationPlan`. Publication supports are disjoint,
+  cover every participating worker exactly once, and occur at each worker's
+  final producer-root occurrence; codegen never re-derives ownership.
+- [x] Treat scalar worker-rank analysis as the cheap progress certificate,
+  not a second dependency language. If an exact forward producer relation has
+  no representable converse, retain that relation and prove progress with the
+  conservative symbolic segment-precedence graph. Missing dependency
+  semantics still decline; inability to invert an optional proof projection
+  does not.
 - [ ] Start with the frozen root-entry coarsening for nested consumers.
   Preserve true nested producer publications, use the ordinary root-barrier
   fallback on an unproved coarsening, and benchmark Qwen before retaining any

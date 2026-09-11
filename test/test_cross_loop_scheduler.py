@@ -1229,6 +1229,82 @@ def _partial_release_chain_problem(
     )
 
 
+def _conservative_static_arm_problem() -> tuple[
+    ReadinessGraph,
+    WorkerSchedule,
+    tuple[ReadinessCounterPlan, ...],
+]:
+    """Build one unrenderable frontier beside an independent exact chain."""
+    root_domains = _identify_root_domains(
+        (
+            _domain((10, 8, 1)),
+            _domain((20, 2, 1)),
+            _domain((30, 2, 1)),
+            _domain((40, 2, 1), (41, 2, 1)),
+        )
+    )
+    key_domain = _domain((0, 2), (1, 2), kind="event", identity=0)
+    key_outer = coordinate_axis_symbol(0)
+    key_inner = coordinate_axis_symbol(1)
+    producer = ReadinessProducer(
+        producer_root=0,
+        producers_by_key=CoordinateRelation(
+            key_domain,
+            root_domains[0],
+            (
+                _CoordinateRelationPiece(
+                    ((0, 0, 2, 1), (1, 0, 2, 1)),
+                    (
+                        (
+                            10,
+                            4 * key_inner + 2 * key_outer,
+                            4 * key_inner + 2 * key_outer + 2,
+                            1,
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    affected_event = ReadinessEvent(
+        producers=(producer,),
+        consumers=(
+            ReadinessConsumer(
+                consumer_root=3,
+                keys_by_consumer=_full_point_map(
+                    root_domains[3],
+                    key_domain,
+                    coordinate_axis_symbol(40),
+                    coordinate_axis_symbol(41),
+                ),
+            ),
+        ),
+    )
+    exact_event = _pointwise_root_readiness_event(
+        root_domains,
+        producer_root=1,
+        consumer_root=2,
+        event_id=1,
+    )
+    root_task_orders = _default_root_task_orders(root_domains)
+    graph = ReadinessGraph(
+        root_task_orders=root_task_orders,
+        events=(affected_event, exact_event),
+    )
+    plans = tuple(
+        ReadinessCounterPlan(event.producers, event.consumers) for event in graph.events
+    )
+    return (
+        graph,
+        _baseline_worker_schedule(
+            root_domains,
+            worker_count=6,
+            root_task_orders=root_task_orders,
+        ),
+        plans,
+    )
+
+
 def _singleton_root_problem(
     root_slots: tuple[tuple[int, int], ...],
     readiness_edges: frozenset[tuple[int, int]],
@@ -2957,6 +3033,118 @@ class TestCrossLoopScheduler(TestCase):
                 )
         validate_worker_schedule(control_graph, control)
         validate_worker_schedule(graph, scheduled)
+
+    def test_global_list_schedule_widens_only_unrenderable_static_arm(self) -> None:
+        graph, baseline, plans = _conservative_static_arm_problem()
+        producer_traversal = _root_schedule_traversal(
+            baseline.segments_for_root(0),
+            graph.root_task_orders[0],
+        )
+        self.assertIsNotNone(producer_traversal)
+        assert producer_traversal is not None
+        producer_order = producer_traversal.scheduled_ordinal_to_logical_task
+        self.assertIsNotNone(producer_order)
+        assert producer_order is not None
+        keys_by_producer = plans[0].producers[0].keys_by_producer
+        self.assertIsNotNone(keys_by_producer)
+        assert keys_by_producer is not None
+        # The exact forward dependency is lowerable, but this fan-out arm has
+        # no representable converse for the cheaper scalar-rank certificate.
+        # Progress must therefore use the same forward relation in the
+        # conservative segment-precedence certificate.
+        self.assertIsNone(keys_by_producer.converse())
+        ordered_producer_keys = producer_order.then(keys_by_producer)
+        self.assertIsNotNone(ordered_producer_keys)
+        assert ordered_producer_keys is not None
+        ordinal_identity = CoordinateRelation.identity(
+            producer_order.source_domain,
+            producer_order.source_domain,
+        )
+        self.assertIsNone(
+            cross_loop_scheduler._maximum_value_by_key(
+                ordered_producer_keys,
+                ordinal_identity,
+            )
+        )
+        self.assertTrue(
+            all(
+                cross_loop_scheduler._supports_exact_counter_plan_lowering(
+                    plan,
+                    graph.root_domains,
+                )
+                for plan in plans
+            )
+        )
+
+        proposal = cross_loop_scheduler._event_frontier_list_schedule(
+            graph,
+            baseline,
+            plans,
+            frozenset(),
+            pipeline_depth=2,
+        )
+
+        self.assertIsNotNone(proposal)
+        assert proposal is not None
+
+        def slot(root: int, task: int) -> int:
+            task_placement = placement(proposal, root, task)
+            self.assertIsNotNone(task_placement)
+            assert task_placement is not None
+            worker, wave = task_placement
+            return wave * proposal.worker_count + worker
+
+        affected_producer_slots = [slot(0, task) for task in range(8)]
+        affected_consumer_slots = [slot(3, task) for task in range(4)]
+        self.assertGreater(
+            min(affected_consumer_slots),
+            max(affected_producer_slots),
+        )
+
+        # Failure to derive the unrelated arm's frontier would discard this
+        # proposal. Its exact producer and consumer instead fill the two tail
+        # lanes of the affected producer's two resident waves.
+        affected_producer_waves = {placement(proposal, 0, task)[1] for task in range(8)}
+        self.assertTrue(
+            all(
+                placement(proposal, root, task)[1] in affected_producer_waves
+                for root in (1, 2)
+                for task in range(2)
+            )
+        )
+
+        final_plan = cross_loop_scheduler.StaticPipelinePlan(
+            worker_schedule=proposal,
+            root_task_orders=graph.root_task_orders,
+            readiness_counters=plans,
+            root_barrier_edges=frozenset(),
+        )
+        self.assertEqual(final_plan.readiness_counters, plans)
+        self.assertEqual(final_plan.root_barrier_edges, frozenset())
+        with mock.patch.object(
+            cross_loop_scheduler,
+            "_has_acyclic_symbolic_segment_precedence",
+            wraps=cross_loop_scheduler._has_acyclic_symbolic_segment_precedence,
+        ) as segment_precedence_proof:
+            self.assertTrue(
+                cross_loop_scheduler._schedule_is_progress_safe(
+                    final_plan.worker_schedule,
+                    graph,
+                    final_plan.readiness_counters,
+                    final_plan.root_barrier_edges,
+                )
+            )
+        segment_precedence_proof.assert_called_once()
+        self.assertFalse(
+            cross_loop_scheduler._schedule_is_progress_safe(
+                final_plan.worker_schedule,
+                graph,
+                final_plan.readiness_counters,
+                final_plan.root_barrier_edges,
+                require_strict_rank=True,
+            )
+        )
+        validate_worker_schedule(graph, final_plan.worker_schedule)
 
     def test_readiness_root_criticality_is_symbolic_and_semantic(self) -> None:
         task_count = sympy.Symbol(
@@ -7768,6 +7956,79 @@ class TestCrossLoopScheduler(TestCase):
             ),
             ((0, ((2, 4),)), (2, ((0, 2),))),
         )
+
+    def test_relation_schedule_root_publication_uses_final_worker_occurrence(
+        self,
+    ) -> None:
+        root_domains = _identify_root_domains(
+            (
+                _domain((10, 6, 1)),
+                _domain((20, 2, 1)),
+                _domain((30, 2, 1)),
+            )
+        )
+        graph = _readiness_graph(root_domains)
+        canonical = cross_loop_scheduler._build_root_major_worker_schedule(
+            root_domains,
+            graph.root_task_orders,
+            worker_count=4,
+        )
+        schedule = cross_loop_scheduler._repack_packed_schedule(
+            graph,
+            canonical,
+            (
+                (0, sympy.Integer(0), sympy.Integer(4)),
+                (1, sympy.Integer(0), sympy.Integer(2)),
+                (0, sympy.Integer(4), sympy.Integer(2)),
+                (2, sympy.Integer(0), sympy.Integer(2)),
+            ),
+            {},
+        )
+        self.assertIsNotNone(schedule)
+        assert schedule is not None
+        self.assertIsNone(
+            cross_loop_scheduler._parametric_root_major_schedule_geometry(schedule)
+        )
+        self.assertIsNotNone(
+            cross_loop_scheduler._packed_schedule_segment_geometry(schedule)
+        )
+        plan = cross_loop_scheduler.StaticPipelinePlan(
+            worker_schedule=schedule,
+            root_task_orders=graph.root_task_orders,
+            readiness_counters=(),
+            root_barrier_edges=frozenset(((0, 2),)),
+        )
+
+        publication = plan.root_barrier_publication_plans[0]
+        self.assertIsNotNone(publication)
+        assert publication is not None
+        self.assertEqual(publication.participant_intervals, ((0, 4),))
+        self.assertEqual(publication.resident_arrival_count, 4)
+        self.assertEqual(
+            tuple(
+                (item.segment_index, item.worker_intervals)
+                for item in publication.publications
+            ),
+            ((0, ((0, 2),)), (2, ((2, 4),))),
+        )
+
+        publication_segment_by_worker: dict[int, int] = {}
+        for item in publication.publications:
+            for begin, end in item.worker_intervals:
+                for worker in range(begin, end):
+                    self.assertNotIn(worker, publication_segment_by_worker)
+                    publication_segment_by_worker[worker] = item.segment_index
+        self.assertEqual(set(publication_segment_by_worker), set(range(4)))
+        for worker, publication_segment in publication_segment_by_worker.items():
+            final_occurrence = max(
+                segment_index
+                for segment_index, segment in enumerate(schedule.segments)
+                if segment.root == 0
+                and any(
+                    begin <= worker < end for begin, end in segment.worker_intervals()
+                )
+            )
+            self.assertEqual(publication_segment, final_occurrence)
 
     def test_root_publication_plan_owns_continuation_arrival_count(self) -> None:
         producer_domain, continuation_domain = _identify_root_domains(

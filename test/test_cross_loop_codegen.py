@@ -1551,6 +1551,102 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_relation_renderer_lowers_split_root_barrier_publications(self) -> None:
+        x = torch.arange(8192, device=DEVICE, dtype=torch.float32)
+        original_build = cross_loop_codegen.build_static_pipeline_plan
+        selected_publications = None
+        selected_worker_count = None
+
+        def build_with_relation_split_producer(**kwargs: Any):
+            nonlocal selected_publications, selected_worker_count
+            kwargs["allow_transient_source"] = False
+            plan = original_build(**kwargs)
+            readiness_graph = cross_loop_scheduler.build_readiness_graph(
+                dependency_graph=kwargs["dependency_graph"],
+                root_task_orders=kwargs["root_task_orders"],
+                site_domains=kwargs["site_domains"],
+                publishable_site_ids=kwargs.get("publishable_site_ids"),
+                prove_nonnegative=kwargs.get("prove_nonnegative"),
+            )
+            worker_count = plan.worker_schedule.worker_count
+            selected_worker_count = worker_count
+            producer_count = readiness_graph.root_domains[0].size
+            suffix_count = max(1, worker_count // 2)
+            self.assertGreater(producer_count, worker_count + suffix_count)
+            prefix_count = producer_count - suffix_count
+            canonical = cross_loop_scheduler._build_root_major_worker_schedule(
+                readiness_graph.root_domains,
+                readiness_graph.root_task_orders,
+                worker_count,
+            )
+            split = cross_loop_scheduler._repack_packed_schedule(
+                readiness_graph,
+                canonical,
+                (
+                    (0, 0, prefix_count),
+                    (0, prefix_count, suffix_count),
+                    (
+                        1,
+                        0,
+                        readiness_graph.root_domains[1].size_expr,
+                    ),
+                ),
+                {},
+            )
+            assert split is not None
+            self.assertIsNone(
+                cross_loop_scheduler._parametric_root_major_schedule_geometry(split)
+            )
+            self.assertIsNotNone(
+                cross_loop_scheduler._packed_schedule_segment_geometry(split)
+            )
+            forced = dataclasses.replace(
+                plan,
+                worker_schedule=split,
+                readiness_counters=tuple(
+                    counter
+                    for counter in plan.readiness_counters
+                    if all(
+                        producer.producer_root != 0 for producer in counter.producers
+                    )
+                ),
+                root_barrier_edges=plan.root_barrier_edges | frozenset(((0, 1),)),
+            )
+            selected_publications = forced.root_barrier_publication_plans[0]
+            return forced
+
+        with mock.patch.object(
+            cross_loop_codegen,
+            "build_static_pipeline_plan",
+            side_effect=build_with_relation_split_producer,
+        ):
+            code, out = code_and_output(
+                offset_affine_chain,
+                (x,),
+                block_sizes=[16, 16],
+                pid_type="persistent_blocked",
+                cross_loop_schedule="static_pipeline",
+                num_sm_multiplier=1,
+                num_warps=1,
+            )
+
+        self.assertIsNotNone(selected_publications)
+        assert selected_publications is not None
+        self.assertEqual(
+            selected_publications.resident_arrival_count,
+            selected_worker_count,
+        )
+        self.assertEqual(len(selected_publications.publications), 2)
+        torch.testing.assert_close(out, (x[32:] + 1) * 2)
+        self.assertIn("tile_dependency_schedule_slot", code)
+        self.assertIn("tile_dependency_root_barrier_wait", code)
+        self.assertEqual(
+            code.count("tl.atomic_add(tile_dependency_state"),
+            2,
+        )
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_transient_source_publishes_one_root_arrival_per_ticket(self) -> None:
         x = torch.arange(128, device=DEVICE, dtype=torch.float32)
         original_build = cross_loop_codegen.build_static_pipeline_plan

@@ -796,11 +796,6 @@ def emit_cross_loop_schedule(
     ) and static_pipeline_plan.transient_source_root is not None:
         raise AssertionError("parameterized lowering received an unsupported plan")
     root_barrier_edges = static_pipeline_plan.root_barrier_edges
-    if uses_relation_segment_renderer and root_barrier_edges:
-        raise exc.InvalidConfig(
-            "cross_loop_schedule='static_pipeline' cannot yet lower root "
-            "barriers for a split parameterized root"
-        )
     nested_loop_counter_plans = tuple(
         plan
         for plan in all_readiness_counter_plans

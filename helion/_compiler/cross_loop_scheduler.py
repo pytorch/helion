@@ -8974,7 +8974,13 @@ def _schedule_is_progress_safe(
                 continue
             producers_by_key = keys_by_producer.converse()
             if producers_by_key is None:
-                return False
+                # Scalar worker-step ranking needs the converse projection,
+                # but the exact segment-precedence certificate below consumes
+                # the authoritative forward relation directly.  Declining the
+                # cheaper rank proof must therefore request that certificate,
+                # not reject an otherwise representable dependency.
+                strictly_ranked = False
+                continue
             producer_steps = task_steps[producer_root]
             consumer_steps = task_steps[consumer.consumer_root]
             if producer_steps is None or consumer_steps is None:
@@ -11457,6 +11463,31 @@ def _event_frontier_list_schedule(
         int,
         list[tuple[tuple[int, CoordinateRelation], ...]],
     ] = {root: [] for root in scheduled_roots}
+
+    def whole_static_root_frontier(
+        consumer_order: CoordinateRelation,
+        producer_order: CoordinateRelation,
+    ) -> CoordinateRelation:
+        """Require one contracted static root to be completely assigned."""
+        return CoordinateRelation.point_map(
+            consumer_order.source_domain,
+            producer_order.source_domain,
+            (
+                (
+                    tuple(
+                        (
+                            axis,
+                            0,
+                            consumer_order.source_domain.axis_counts[axis],
+                            1,
+                        )
+                        for axis in consumer_order.source_domain.axis_order
+                    ),
+                    (sympy.Integer(producer_order.source_domain.size - 1),),
+                ),
+            ),
+        )
+
     schema_edges: set[tuple[int, int]] = set()
     for prerequisite in _emitted_prerequisites(
         readiness_counters,
@@ -11490,23 +11521,9 @@ def _event_frontier_list_schedule(
                 producer_order = root_orders.get(static_root)
                 if producer_order is None:
                     return None
-                frontier = CoordinateRelation.point_map(
-                    consumer_order.source_domain,
-                    producer_order.source_domain,
-                    (
-                        (
-                            tuple(
-                                (
-                                    axis,
-                                    0,
-                                    consumer_order.source_domain.axis_counts[axis],
-                                    1,
-                                )
-                                for axis in consumer_order.source_domain.axis_order
-                            ),
-                            (sympy.Integer(producer_order.source_domain.size - 1),),
-                        ),
-                    ),
+                frontier = whole_static_root_frontier(
+                    consumer_order,
+                    producer_order,
                 )
                 frontier_nonempty = _relation_may_be_nonempty(frontier)
                 if frontier_nonempty is False:
@@ -11564,7 +11581,15 @@ def _event_frontier_list_schedule(
                 )
             )
             if frontier is None or frontier.canonical_single_valued() is None:
-                return None
+                # Widen only this contracted producer arm to the same
+                # whole-root upper frontier used for barrier admission. The
+                # frozen exact counter remains the final progress/codegen
+                # authority, so this may delay a proposal but can never admit
+                # its consumer early or disable unrelated exact arms.
+                frontier = whole_static_root_frontier(
+                    consumer_order,
+                    producer_order,
+                )
             frontier_nonempty = _relation_may_be_nonempty(frontier)
             if frontier_nonempty is False:
                 continue
