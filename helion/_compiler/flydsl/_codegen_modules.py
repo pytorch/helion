@@ -8,5 +8,6 @@ they extend.
 from __future__ import annotations
 
 from . import memory_ops  # noqa: F401
+from . import reduce_ops  # noqa: F401
 from . import tracing_ops  # noqa: F401
 from . import view_ops  # noqa: F401
