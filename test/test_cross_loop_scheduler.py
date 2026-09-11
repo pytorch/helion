@@ -1405,6 +1405,65 @@ def _conservative_static_arm_problem() -> tuple[
     )
 
 
+def _branching_continuation_problem() -> tuple[
+    ReadinessGraph,
+    WorkerSchedule,
+    tuple[ReadinessCounterPlan, ...],
+]:
+    """Build a reconvergent continuation diamond with two static leaves."""
+    root_domains = _identify_root_domains(
+        tuple(_domain((10 + 10 * root, 1, 1)) for root in range(8))
+    )
+    event_specs = (
+        ((0, 1), 2),
+        ((0, 1), 3),
+        ((2, 3), 4),
+        ((2, 3), 5),
+        ((4, 5), 6),
+        ((6,), 7),
+    )
+    events = tuple(
+        (
+            _whole_consumer_join_readiness_event(
+                root_domains,
+                producer_roots,
+                consumer_root,
+                event_id,
+            )
+            if len(producer_roots) > 1
+            else _whole_root_readiness_event(
+                root_domains,
+                producer_roots[0],
+                consumer_root,
+                event_id,
+            )
+        )
+        for event_id, (producer_roots, consumer_root) in enumerate(event_specs)
+    )
+    graph = _readiness_graph(root_domains, *events)
+    plans = tuple(
+        ReadinessCounterPlan(
+            event.producers,
+            event.consumers,
+            continuation_consumer_index=(0 if event_id < len(events) - 1 else None),
+        )
+        for event_id, event in enumerate(events)
+    )
+    prepared = _schedule(
+        2,
+        *(
+            _segment(
+                root,
+                graph.root_task_orders[root],
+                workers=(0, 2),
+                dispatch_offset=slot,
+            )
+            for slot, root in enumerate((0, 1, 7))
+        ),
+    )
+    return graph, prepared, plans
+
+
 def _singleton_root_problem(
     root_slots: tuple[tuple[int, int], ...],
     readiness_edges: frozenset[tuple[int, int]],
@@ -3469,7 +3528,7 @@ class TestCrossLoopScheduler(TestCase):
         validate_worker_schedule(control_graph, control)
         validate_worker_schedule(graph, scheduled)
 
-    def test_global_list_schedule_widens_only_unrenderable_static_arm(self) -> None:
+    def test_global_list_schedule_uses_exact_static_fanout_frontier(self) -> None:
         graph, baseline, plans = _conservative_static_arm_problem()
         producer_traversal = _root_schedule_traversal(
             baseline.segments_for_root(0),
@@ -3483,11 +3542,9 @@ class TestCrossLoopScheduler(TestCase):
         keys_by_producer = plans[0].producers[0].keys_by_producer
         self.assertIsNotNone(keys_by_producer)
         assert keys_by_producer is not None
-        # The exact forward dependency is lowerable, but this fan-out arm has
-        # no representable converse for the cheaper scalar-rank certificate.
-        # Progress must therefore use the same forward relation in the
-        # conservative segment-precedence certificate.
-        self.assertIsNone(keys_by_producer.converse())
+        # Publication derivation retains its authoritative inverse, so this
+        # fan-out arm now has the exact scalar frontier used by scheduling.
+        self.assertIsNotNone(keys_by_producer.converse())
         ordered_producer_keys = producer_order.then(keys_by_producer)
         self.assertIsNotNone(ordered_producer_keys)
         assert ordered_producer_keys is not None
@@ -3495,7 +3552,7 @@ class TestCrossLoopScheduler(TestCase):
             producer_order.source_domain,
             producer_order.source_domain,
         )
-        self.assertIsNone(
+        self.assertIsNotNone(
             cross_loop_scheduler._maximum_value_by_key(
                 ordered_producer_keys,
                 ordinal_identity,
@@ -3536,9 +3593,9 @@ class TestCrossLoopScheduler(TestCase):
             max(affected_producer_slots),
         )
 
-        # Widening the one unsupported arm must not disable the unrelated
-        # exact chain. Its consumer moves up from the baseline's next wave and
-        # shares a wave with its own producer.
+        # The exact fan-out frontier must not disable the unrelated chain. Its
+        # consumer moves up from the baseline's next wave and shares a wave
+        # with its own producer.
         exact_producer_wave = placement(proposal, 1, 0)[1]
         exact_consumer_wave = placement(proposal, 2, 0)[1]
         self.assertEqual(exact_consumer_wave, exact_producer_wave)
@@ -4979,6 +5036,343 @@ class TestCrossLoopScheduler(TestCase):
             )
         )
         validate_worker_schedule(graph, scheduled)
+
+    def test_merge_relations_by_root_batches_exact_disjoint_union(self) -> None:
+        source_domain = _domain((10, 4, 1), identity=0)
+        target_domain = _domain((0, 4), kind="event", identity=0)
+        source = coordinate_axis_symbol(10)
+        relations = tuple(
+            CoordinateRelation.point_map(
+                source_domain,
+                target_domain,
+                (
+                    (
+                        ((10, begin, end, 1),),
+                        (source,),
+                    ),
+                ),
+            )
+            for begin, end in ((0, 2), (2, 4))
+        )
+        converses = tuple(relation.converse() for relation in relations)
+        self.assertTrue(all(converse is not None for converse in converses))
+        expected = relations[0].union(relations[1])
+        self.assertIsNotNone(expected)
+        assert expected is not None
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "union",
+            side_effect=AssertionError("batch merge used sequential union"),
+        ):
+            merged = cross_loop_scheduler._merge_relations_by_root(
+                ((7, relations[0]), (7, relations[1])),
+            )
+
+        self.assertIsNotNone(merged)
+        assert merged is not None
+        self.assertEqual(tuple(root for root, _relation in merged), (7,))
+        merged_relation = merged[0][1]
+        self.assertEqual(merged_relation.materialize(), expected.materialize())
+        merged_converse = tile_dependency._memoized_exact_converse(merged_relation)
+        self.assertIsNotNone(merged_converse)
+        assert merged_converse is not None
+        expected_converse = expected.converse()
+        self.assertIsNotNone(expected_converse)
+        assert expected_converse is not None
+        self.assertEqual(
+            merged_converse.materialize(),
+            expected_converse.materialize(),
+        )
+        with mock.patch.object(cross_loop_scheduler, "_MAX_GLOBAL_LIST_WORK", 5):
+            forward_only = cross_loop_scheduler._merge_relations_by_root(
+                ((7, relations[0]), (7, relations[1])),
+            )
+        self.assertIsNotNone(forward_only)
+        assert forward_only is not None
+        self.assertEqual(forward_only[0][1].materialize(), expected.materialize())
+        self.assertIsNone(tile_dependency._memoized_exact_converse(forward_only[0][1]))
+
+    def test_static_producer_preflight_handles_wide_ordinary_producers(
+        self,
+    ) -> None:
+        producer_count = 257
+        root_domains = _identify_root_domains(
+            tuple(_domain((10 + root, 1, 1)) for root in range(producer_count + 1))
+        )
+        event = _whole_consumer_join_readiness_event(
+            root_domains,
+            tuple(range(producer_count)),
+            producer_count,
+            0,
+        )
+        graph = _readiness_graph(root_domains, event)
+        queries = cross_loop_scheduler._readiness_producer_queries(event.producers)
+        self.assertIsNotNone(queries)
+        assert queries is not None
+
+        with _forbid_schedule_enumeration():
+            preflight = cross_loop_scheduler._static_producer_contraction_preflight(
+                graph,
+                queries,
+                {},
+                cross_loop_scheduler._MAX_GLOBAL_LIST_WORK,
+            )
+        self.assertIsNotNone(preflight)
+        assert preflight is not None
+        self.assertGreater(preflight, len(queries))
+        with _forbid_schedule_enumeration():
+            contracted = cross_loop_scheduler._contract_static_producer_relations(
+                graph,
+                queries,
+                {},
+                preflight=preflight,
+            )
+            declined = cross_loop_scheduler._static_producer_contraction_preflight(
+                graph,
+                queries,
+                {},
+                preflight - 1,
+            )
+
+        self.assertIsNotNone(contracted)
+        assert contracted is not None
+        self.assertEqual(
+            tuple(root for root, _relation in contracted),
+            tuple(range(producer_count)),
+        )
+        self.assertEqual(contracted[0][1], queries[0][2])
+        self.assertEqual(contracted[-1][1], queries[-1][2])
+        self.assertIsNone(declined)
+
+    def test_static_producer_contraction_memoizes_reconvergent_diamond(
+        self,
+    ) -> None:
+        graph, _prepared, plans = _branching_continuation_problem()
+        continuations = cross_loop_scheduler._emitted_final_arrival_continuations(
+            graph,
+            plans,
+        )
+        self.assertIsNotNone(continuations)
+        assert continuations is not None
+        continuation_by_root = cross_loop_scheduler._continuations_by_consumer_root(
+            graph,
+            continuations,
+        )
+        queries = cross_loop_scheduler._readiness_producer_queries(
+            plans[-1].producers,
+        )
+        self.assertIsNotNone(queries)
+        assert queries is not None
+        preflight = cross_loop_scheduler._static_producer_contraction_preflight(
+            graph,
+            queries,
+            continuation_by_root,
+            cross_loop_scheduler._MAX_GLOBAL_LIST_WORK,
+        )
+        self.assertIsNotNone(preflight)
+        assert preflight is not None
+        merge_relations = cross_loop_scheduler._merge_relations_by_root
+
+        with (
+            _forbid_schedule_enumeration(),
+            mock.patch.object(
+                cross_loop_scheduler,
+                "_merge_relations_by_root",
+                wraps=merge_relations,
+            ) as merge_spy,
+        ):
+            contracted = cross_loop_scheduler._contract_static_producer_relations(
+                graph,
+                queries,
+                continuation_by_root,
+                preflight=preflight,
+            )
+
+        self.assertIsNotNone(contracted)
+        assert contracted is not None
+        self.assertEqual(tuple(root for root, _relation in contracted), (0, 1))
+        # Five unique continuation nodes plus the final producer-set merge are
+        # computed once. The two reconvergent paths through roots 2 and 3 do
+        # not repeat their relation unions inside this local transaction.
+        self.assertEqual(merge_spy.call_count, 6)
+
+    def test_static_producer_contraction_is_converse_cache_invariant(self) -> None:
+        graph, _prepared, _plans = _branching_continuation_problem()
+        cold_graph = pickle.loads(pickle.dumps(graph))
+        warm_graph = pickle.loads(pickle.dumps(graph))
+        continuation_by_root = {
+            2: FinalArrivalContinuation(0, 0),
+            3: FinalArrivalContinuation(1, 0),
+            4: FinalArrivalContinuation(2, 0),
+            5: FinalArrivalContinuation(3, 0),
+            6: FinalArrivalContinuation(4, 0),
+        }
+        self.assertTrue(
+            all(
+                tile_dependency._memoized_exact_converse(producer.producers_by_key)
+                is None
+                for event in cold_graph.events
+                for producer in event.producers
+            )
+        )
+        for event in warm_graph.events:
+            for producer in event.producers:
+                self.assertIsNotNone(producer.producers_by_key.converse())
+            for consumer in event.consumers:
+                self.assertIsNotNone(consumer.keys_by_consumer.converse())
+
+        cold_queries = cross_loop_scheduler._readiness_producer_queries(
+            cold_graph.events[-1].producers,
+        )
+        warm_queries = cross_loop_scheduler._readiness_producer_queries(
+            warm_graph.events[-1].producers,
+        )
+        self.assertIsNotNone(cold_queries)
+        self.assertIsNotNone(warm_queries)
+        assert cold_queries is not None and warm_queries is not None
+        self.assertEqual(cold_queries, warm_queries)
+        # Query resolution deterministically seeds the authoritative
+        # publication inverse even when no unrelated earlier proof warmed it.
+        self.assertTrue(
+            all(
+                tile_dependency._memoized_exact_converse(readiness_keys) is not None
+                for _root, _site_id, readiness_keys in cold_queries
+            )
+        )
+
+        with _forbid_schedule_enumeration():
+            cold_preflight = (
+                cross_loop_scheduler._static_producer_contraction_preflight(
+                    cold_graph,
+                    cold_queries,
+                    continuation_by_root,
+                    cross_loop_scheduler._MAX_GLOBAL_LIST_WORK,
+                )
+            )
+            warm_preflight = (
+                cross_loop_scheduler._static_producer_contraction_preflight(
+                    warm_graph,
+                    warm_queries,
+                    continuation_by_root,
+                    cross_loop_scheduler._MAX_GLOBAL_LIST_WORK,
+                )
+            )
+        self.assertIsNotNone(cold_preflight)
+        self.assertIsNotNone(warm_preflight)
+        assert cold_preflight is not None and warm_preflight is not None
+        self.assertEqual(cold_preflight, warm_preflight)
+
+        with _forbid_schedule_enumeration():
+            cold_contracted = cross_loop_scheduler._contract_static_producer_relations(
+                cold_graph,
+                cold_queries,
+                continuation_by_root,
+                preflight=cold_preflight,
+            )
+            warm_contracted = cross_loop_scheduler._contract_static_producer_relations(
+                warm_graph,
+                warm_queries,
+                continuation_by_root,
+                preflight=warm_preflight,
+            )
+        self.assertEqual(cold_contracted, warm_contracted)
+        self.assertIsNotNone(cold_contracted)
+        assert cold_contracted is not None
+        self.assertEqual(
+            tuple((root, relation.materialize()) for root, relation in cold_contracted),
+            ((0, (frozenset((0,)),)), (1, (frozenset((0,)),))),
+        )
+
+    def test_static_producer_contraction_handles_deep_one_piece_chain(
+        self,
+    ) -> None:
+        continuation_count = 1_001
+        root_domains = _identify_root_domains(
+            tuple(_domain((10 + root, 1, 1)) for root in range(continuation_count + 2))
+        )
+        events = tuple(
+            _whole_root_readiness_event(
+                root_domains,
+                producer_root=consumer_root - 1,
+                consumer_root=consumer_root,
+                event_id=consumer_root - 1,
+            )
+            for consumer_root in range(1, continuation_count + 2)
+        )
+        graph = _readiness_graph(root_domains, *events)
+        continuation_by_root = {
+            root: FinalArrivalContinuation(root - 1, 0)
+            for root in range(1, continuation_count + 1)
+        }
+        queries = cross_loop_scheduler._readiness_producer_queries(
+            events[-1].producers,
+        )
+        self.assertIsNotNone(queries)
+        assert queries is not None
+
+        with _forbid_schedule_enumeration():
+            preflight = cross_loop_scheduler._static_producer_contraction_preflight(
+                graph,
+                queries,
+                continuation_by_root,
+                cross_loop_scheduler._MAX_GLOBAL_LIST_WORK,
+            )
+        self.assertIsNotNone(preflight)
+        assert preflight is not None
+        self.assertLess(preflight, cross_loop_scheduler._MAX_GLOBAL_LIST_WORK)
+        merge_relations = cross_loop_scheduler._merge_relations_by_root
+        with (
+            _forbid_schedule_enumeration(),
+            mock.patch.object(
+                cross_loop_scheduler,
+                "_merge_relations_by_root",
+                wraps=merge_relations,
+            ) as merge_spy,
+        ):
+            contracted = cross_loop_scheduler._contract_static_producer_relations(
+                graph,
+                queries,
+                continuation_by_root,
+                preflight=preflight,
+            )
+
+        self.assertIsNotNone(contracted)
+        assert contracted is not None
+        self.assertEqual(tuple(root for root, _relation in contracted), (0,))
+        self.assertEqual(merge_spy.call_count, continuation_count + 1)
+        self.assertIsNotNone(contracted[0][1].converse())
+
+    def test_event_frontier_continuation_budget_declines_transactionally(
+        self,
+    ) -> None:
+        graph, prepared, plans = _branching_continuation_problem()
+
+        with (
+            _forbid_schedule_enumeration(),
+            mock.patch.object(cross_loop_scheduler, "_MAX_GLOBAL_LIST_WORK", 64),
+            mock.patch.object(
+                cross_loop_scheduler,
+                "_contract_static_producer_relations",
+                side_effect=AssertionError("contraction ran after preflight decline"),
+            ) as contraction_spy,
+            mock.patch.object(
+                cross_loop_scheduler,
+                "_root_schema_criticality",
+                side_effect=AssertionError("chooser ran after contraction decline"),
+            ) as criticality,
+        ):
+            scheduled = cross_loop_scheduler._event_frontier_list_schedule(
+                graph,
+                prepared,
+                plans,
+                frozenset(),
+                pipeline_depth=2,
+            )
+
+        self.assertIs(scheduled, prepared)
+        contraction_spy.assert_not_called()
+        criticality.assert_not_called()
 
     def test_global_list_schedule_contracts_final_arrival_continuation(self) -> None:
         producer_domain, continuation_domain, independent_domain, sink_domain = (

@@ -398,11 +398,22 @@ sections are not active work.
   bound, and incoming/grouped/external frontier pieces. Reject the complete
   proposal before cursor mutation when the saturating common work budget is
   exceeded; a budget never removes one candidate or changes priority.
-- [ ] Extend that immutable preflight over prerequisite construction and
-  continuation contraction, including a saturating path/arm bound and cached
-  repeated contractions. Static capacity permits a finite walk but not
-  unbounded relation or continuation expansion; Muse's former long compile is
-  a required negative control.
+- [x] Bound continuation contraction itself and the event-frontier phase's
+  complete frozen request set. Batch same-root relation unions structurally in
+  linear piece work; preflight forward and exact-converse composition mass
+  with saturating path/arm accounting; walk both topology and exact queries
+  iteratively; and memoize reconvergent queries only inside one contraction
+  transaction. This applies with or without continuations and introduces no
+  retained DAG or process-global cache. A budget failure rejects the entire
+  proposal before cursor mutation.
+- [ ] Apply the same collect/deduplicate/preflight/locally-cache pattern at the
+  start of root-local preparation and progress-validation phases. Their
+  individual contraction queries are now finite and transactionally bounded,
+  and the event-frontier selector has an aggregate bound, but the complete
+  pipeline does not yet have one aggregate contraction-work certificate.
+  Keep this as a shared-function cleanup rather than threading a new
+  proposal-global cache/IR through every pass. Muse's former long compile is a
+  required negative control.
 - [ ] Coalesce adjacent same-root runs after selection, keep the structural
   occupied-wave non-regression check, and validate exact coverage, chronology,
   resident progress, and publication ownership once from the final
@@ -416,6 +427,22 @@ standalone at 55.38 us. Gemma B2 aliases depth one, while ragged Qwen B2 depth
 two is valid but about 4 us slower than depth one. These are the intended
 autotuning semantics: depth changes eligibility, and the compiler does not add
 a model-shaped profitability veto.
+
+Implementation checkpoint (2026-09-11, bounded contraction): continuation
+contraction now uses an iterative topology certificate and transaction-local
+memo rather than recursive path expansion or a process-global cache. Both
+forward and canonical exact-converse piece growth are charged without
+multiplying the two orientations together, so a
+one-piece chain is linear while genuine fan-out grows with its path/arm mass.
+Same-root unions are one structural batch operation, not a quadratic sequence
+of coverage queries. Tests cover a 1,001-continuation chain, a reconvergent
+diamond, cold/warm converse-proof invariance, wide ordinary fan-in without any
+continuation, exact batch-union semantics, cycles, mixed arms, and aggregate
+transactional fallback. The scheduler suite passes 217 tests and 292 subtests;
+codegen/config/oracle passes 141 tests and 130 subtests. Short cold-L2 guards
+retain canonical ragged FlashMLA B4 at 63.47 us versus 67.58 us standalone,
+Gemma B1 m3 at 51.20 us versus 55.28 us standalone, and Qwen B1 list/local
+parity at 96.35/96.19 us. This checkpoint contains no workload recognizer.
 
 ### Phase S3: post-placement synchronization validation and cleanup
 

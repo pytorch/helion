@@ -4719,7 +4719,18 @@ class ReadinessProducer:
         self,
     ) -> tuple[CoordinateRelation | None, CoordinateRelation | None]:
         """Derive publication and arrival counts from one target-set proof."""
-        return self.producers_by_key.derive_converse_and_target_counts()
+        publication, arrival_counts = (
+            self.producers_by_key.derive_converse_and_target_counts()
+        )
+        if publication is not None:
+            # ``producers_by_key`` is the authoritative inverse by
+            # construction.  Seed the derived proof once here so every user
+            # sees the same capability regardless of unrelated cache warmth.
+            tile_dependency._remember_exact_converse(
+                publication,
+                self.producers_by_key,
+            )
+        return publication, arrival_counts
 
     @property
     def keys_by_producer(self) -> CoordinateRelation | None:
@@ -5288,17 +5299,376 @@ class _NestedLoopReadiness:
 def _merge_relations_by_root(
     relations: tuple[tuple[int, CoordinateRelation], ...],
 ) -> tuple[tuple[int, CoordinateRelation], ...] | None:
-    merged: dict[int, CoordinateRelation] = {}
+    """Batch exact unions by root in linear structural work.
+
+    Sequential ``CoordinateRelation.union`` repeatedly asks whether the
+    growing prefix covers the next relation.  Besides being unnecessary for
+    correctness, that turns a wide readiness event into quadratic symbolic
+    work.  A relation is already the union of its pieces, so concatenate and
+    deduplicate those pieces once.  Exact converses are derived proof state;
+    retain one only when every input already has one and its batch union fits
+    the ordinary relation-piece bound.
+    """
+    grouped: dict[int, list[CoordinateRelation]] = {}
+    work = 0
     for root, relation in relations:
-        previous = merged.get(root)
-        if previous is None:
-            merged[root] = relation
-            continue
-        union = previous.union(relation)
-        if union is None:
+        work += 1 + len(relation.pieces)
+        if work > _MAX_GLOBAL_LIST_WORK:
             return None
+        grouped.setdefault(root, []).append(relation)
+
+    merged: dict[int, CoordinateRelation] = {}
+    for root, group in grouped.items():
+        first = group[0]
+        if any(
+            relation.source_domain != first.source_domain
+            or relation.target_domain != first.target_domain
+            for relation in group[1:]
+        ):
+            return None
+        if len(group) == 1 or all(relation == first for relation in group[1:]):
+            merged[root] = first
+            continue
+        total = next((relation for relation in group if relation.is_total()), None)
+        if total is not None:
+            merged[root] = total
+            continue
+
+        pieces: dict[_CoordinateRelationPiece, None] = {}
+        for relation in group:
+            pieces.update(dict.fromkeys(relation.pieces))
+            if len(pieces) > tile_dependency._MAX_RELATION_PIECES:
+                return None
+        union = CoordinateRelation(
+            source_domain=first.source_domain,
+            target_domain=first.target_domain,
+            pieces=tuple(pieces),
+        )
+
+        converses = tuple(
+            tile_dependency._memoized_exact_converse(relation) for relation in group
+        )
+        if all(converse is not None for converse in converses):
+            converse_pieces: dict[_CoordinateRelationPiece, None] = {}
+            converse_fits = True
+            for converse in converses:
+                assert converse is not None
+                work += len(converse.pieces)
+                if work > _MAX_GLOBAL_LIST_WORK:
+                    converse_fits = False
+                    break
+                converse_pieces.update(dict.fromkeys(converse.pieces))
+                if len(converse_pieces) > tile_dependency._MAX_RELATION_PIECES:
+                    converse_fits = False
+                    break
+            if converse_fits:
+                converse_union = CoordinateRelation(
+                    source_domain=first.target_domain,
+                    target_domain=first.source_domain,
+                    pieces=tuple(converse_pieces),
+                )
+                tile_dependency._remember_exact_converse(union, converse_union)
         merged[root] = union
     return tuple(sorted(merged.items()))
+
+
+def _static_producer_contraction_preflight(
+    readiness_graph: ReadinessGraph,
+    queries: tuple[tuple[int, int | None, CoordinateRelation], ...],
+    continuation_by_root: dict[int, FinalArrivalContinuation],
+    work_limit: int,
+) -> int | None:
+    """Certify finite continuation contraction work before composing relations."""
+    if work_limit < 0 or len(queries) > work_limit:
+        return None
+    root_count = len(readiness_graph.root_domains)
+    saturated = work_limit + 1
+    # Each pair is (work, output piece mass) for the more expensive of the
+    # forward and exact-converse orientations per input piece.
+    summaries: dict[int, tuple[int, int]] = {}
+
+    def saturating_sum(left: int, right: int) -> int:
+        if left > work_limit - right:
+            return saturated
+        return left + right
+
+    def saturating_product(left: int, right: int) -> int:
+        if left == 0 or right == 0:
+            return 0
+        if left > work_limit // right:
+            return saturated
+        return left * right
+
+    # Compute the topology certificate iteratively.  A legal chain can be much
+    # deeper than Python's recursion limit while remaining cheap and compact.
+    topology_state: dict[int, int] = {}
+    topology_work = 0
+    topology_stack = [(root, False) for root, _site_id, _keys in reversed(queries)]
+    while topology_stack:
+        root, children_visited = topology_stack.pop()
+        if root in summaries:
+            continue
+        if not 0 <= root < root_count:
+            return None
+        continuation = continuation_by_root.get(root)
+        if continuation is None:
+            summaries[root] = (1, 1)
+            topology_state[root] = 2
+            continue
+        if children_visited:
+            if not 0 <= continuation.event_id < len(readiness_graph.events):
+                return None
+            event = readiness_graph.event(continuation.event_id)
+            if not 0 <= continuation.consumer_index < len(event.consumers):
+                return None
+            consumer = event.consumers[continuation.consumer_index]
+            consumers_by_key = consumer.keys_by_consumer.converse()
+            if consumer.consumer_root != root or consumers_by_key is None:
+                return None
+            forward_consumer_factor = max(1, len(consumers_by_key.pieces))
+            consumer_converse = tile_dependency._memoized_exact_converse(
+                consumers_by_key
+            )
+            reverse_consumer_factor = (
+                0
+                if consumer_converse is None
+                else max(1, len(consumer_converse.pieces))
+            )
+            consumer_factor = max(
+                forward_consumer_factor,
+                reverse_consumer_factor,
+            )
+            work = 1 + consumer_factor
+            output_mass = 0
+            for producer in event.producers:
+                publication = producer.keys_by_producer
+                child = summaries.get(producer.producer_root)
+                if publication is None or child is None:
+                    return None
+                forward_arm_factor = saturating_product(
+                    forward_consumer_factor,
+                    max(1, len(publication.pieces)),
+                )
+                publication_converse = tile_dependency._memoized_exact_converse(
+                    publication
+                )
+                reverse_arm_factor = (
+                    0
+                    if reverse_consumer_factor == 0 or publication_converse is None
+                    else saturating_product(
+                        reverse_consumer_factor,
+                        max(1, len(publication_converse.pieces)),
+                    )
+                )
+                composition_factor = max(forward_arm_factor, reverse_arm_factor)
+                propagation_factor = max(
+                    forward_arm_factor,
+                    0 if producer.producer_site_id is not None else reverse_arm_factor,
+                )
+                child_work, child_mass = child
+                work = saturating_sum(work, composition_factor)
+                work = saturating_sum(
+                    work,
+                    saturating_product(propagation_factor, child_work),
+                )
+                output_mass = saturating_sum(
+                    output_mass,
+                    saturating_product(propagation_factor, child_mass),
+                )
+                if work > work_limit or output_mass > work_limit:
+                    return None
+            # Batch merge scans each expanded relation and piece once.
+            work = saturating_sum(work, len(event.producers))
+            work = saturating_sum(work, output_mass)
+            if work > work_limit or output_mass > work_limit:
+                return None
+            summaries[root] = (work, max(1, output_mass))
+            topology_state[root] = 2
+            continue
+        if topology_state.get(root) == 1:
+            return None
+        if not 0 <= continuation.event_id < len(readiness_graph.events):
+            return None
+        event = readiness_graph.event(continuation.event_id)
+        if not 0 <= continuation.consumer_index < len(event.consumers):
+            return None
+        consumer = event.consumers[continuation.consumer_index]
+        if consumer.consumer_root != root:
+            return None
+        consumers_by_key = consumer.keys_by_consumer.converse()
+        if consumers_by_key is None:
+            return None
+        topology_work = saturating_sum(
+            topology_work,
+            1 + max(1, len(consumers_by_key.pieces)),
+        )
+        if topology_work > work_limit:
+            return None
+        for producer in event.producers:
+            publication = producer.keys_by_producer
+            if publication is None:
+                return None
+            topology_work = saturating_sum(
+                topology_work,
+                1 + max(1, len(publication.pieces)),
+            )
+            if topology_work > work_limit:
+                return None
+        topology_state[root] = 1
+        topology_stack.append((root, True))
+        for producer in reversed(event.producers):
+            child_root = producer.producer_root
+            if topology_state.get(child_root) == 1:
+                return None
+            if child_root not in summaries:
+                topology_stack.append((child_root, False))
+
+    total_work = saturating_sum(len(queries), topology_work)
+    for root, _site_id, readiness_keys in queries:
+        summary = summaries.get(root)
+        if summary is None:
+            return None
+        input_mass = max(1, len(readiness_keys.pieces))
+        readiness_converse = tile_dependency._memoized_exact_converse(readiness_keys)
+        reverse_input_mass = (
+            0
+            if _site_id is not None or readiness_converse is None
+            else max(1, len(readiness_converse.pieces))
+        )
+        total_work = saturating_sum(
+            total_work,
+            saturating_product(
+                input_mass + reverse_input_mass,
+                summary[0],
+            ),
+        )
+        # The top-level batch union scans each expanded forward/reverse piece.
+        total_work = saturating_sum(
+            total_work,
+            saturating_product(
+                input_mass + reverse_input_mass,
+                summary[1],
+            ),
+        )
+    if total_work > work_limit:
+        return None
+    return total_work
+
+
+def _contract_static_producer_relations(
+    readiness_graph: ReadinessGraph,
+    queries: tuple[tuple[int, int | None, CoordinateRelation], ...],
+    continuation_by_root: dict[int, FinalArrivalContinuation],
+    *,
+    preflight: int | None = None,
+) -> tuple[tuple[int, CoordinateRelation], ...] | None:
+    """Contract continuation ownership with one bounded local transaction.
+
+    The preflight uses only the frozen readiness topology and exact relation
+    piece counts.  Composition growth is ``q * p`` while traversal and merge
+    work are additive, so a one-piece chain costs O(depth), not exponentially.
+    Exact query results are memoized only for this transaction: autotuning
+    cannot retain composed path relations globally, and a failed capability
+    proof cannot become stale after another proof memoizes a converse.
+    """
+    if preflight is None:
+        preflight = _static_producer_contraction_preflight(
+            readiness_graph,
+            queries,
+            continuation_by_root,
+            _MAX_GLOBAL_LIST_WORK,
+        )
+    if preflight is None:
+        return None
+
+    memo: dict[
+        tuple[int, int | None, CoordinateRelation],
+        tuple[tuple[int, CoordinateRelation], ...] | None,
+    ] = {}
+
+    query_keys = tuple(queries)
+    pending: dict[
+        tuple[int, int | None, CoordinateRelation],
+        tuple[tuple[int, int | None, CoordinateRelation], ...],
+    ] = {}
+    contraction_stack = [(key, False) for key in reversed(query_keys)]
+    while contraction_stack:
+        key, children_visited = contraction_stack.pop()
+        if key in memo:
+            continue
+        root, site_id, readiness_keys = key
+        if children_visited:
+            child_keys = pending.pop(key)
+            expanded = []
+            for child_key in child_keys:
+                upstream = memo.get(child_key)
+                if upstream is None:
+                    memo[key] = None
+                    break
+                expanded.extend(upstream)
+            else:
+                memo[key] = _merge_relations_by_root(tuple(expanded))
+            continue
+        root_domain = readiness_graph.root_domains[root]
+        root_keys = (
+            readiness_keys
+            if site_id is None
+            else readiness_keys.project_source(root_domain)
+        )
+        if root_keys is None:
+            memo[key] = None
+            continue
+        continuation = continuation_by_root.get(root)
+        if continuation is None:
+            memo[key] = ((root, root_keys),)
+            continue
+        if not 0 <= continuation.event_id < len(readiness_graph.events):
+            memo[key] = None
+            continue
+        event = readiness_graph.event(continuation.event_id)
+        if not 0 <= continuation.consumer_index < len(event.consumers):
+            memo[key] = None
+            continue
+        consumer = event.consumers[continuation.consumer_index]
+        consumers_by_key = consumer.keys_by_consumer.converse()
+        if consumer.consumer_root != root or consumers_by_key is None:
+            memo[key] = None
+            continue
+        key_to_target = consumers_by_key.then(root_keys)
+        if key_to_target is None:
+            memo[key] = None
+            continue
+        child_keys: list[tuple[int, int | None, CoordinateRelation]] = []
+        for producer in event.producers:
+            publication = producer.keys_by_producer
+            if publication is None:
+                memo[key] = None
+                break
+            upstream_keys = publication.then(key_to_target)
+            if upstream_keys is None:
+                memo[key] = None
+                break
+            child_keys.append(
+                (
+                    producer.producer_root,
+                    producer.producer_site_id,
+                    upstream_keys,
+                )
+            )
+        else:
+            pending[key] = tuple(child_keys)
+            contraction_stack.append((key, True))
+            for child_key in reversed(child_keys):
+                if child_key not in memo:
+                    contraction_stack.append((child_key, False))
+
+    expanded: list[tuple[int, CoordinateRelation]] = []
+    for key in query_keys:
+        static_relations = memo.get(key)
+        if static_relations is None:
+            return None
+        expanded.extend(static_relations)
+    return _merge_relations_by_root(tuple(expanded))
 
 
 def _static_producer_relations(
@@ -5308,48 +5678,13 @@ def _static_producer_relations(
     site_id: int | None,
     readiness_keys: CoordinateRelation,
     continuation_by_root: dict[int, FinalArrivalContinuation],
-    visiting: frozenset[int] = frozenset(),
 ) -> tuple[tuple[int, CoordinateRelation], ...] | None:
     """Contract continuations to relations from statically scheduled roots."""
-    root_domain = readiness_graph.root_domains[root]
-    root_keys = (
-        readiness_keys
-        if site_id is None
-        else readiness_keys.project_source(root_domain)
+    return _contract_static_producer_relations(
+        readiness_graph,
+        ((root, site_id, readiness_keys),),
+        continuation_by_root,
     )
-    if root_keys is None:
-        return None
-    continuation = continuation_by_root.get(root)
-    if continuation is None:
-        return ((root, root_keys),)
-    if root in visiting:
-        return None
-    continuation_event = readiness_graph.event(continuation.event_id)
-    continuation_consumer = continuation_event.consumers[continuation.consumer_index]
-    converse_consumer = continuation_consumer.keys_by_consumer.converse()
-    key_to_target = (
-        None if converse_consumer is None else converse_consumer.then(root_keys)
-    )
-    if key_to_target is None:
-        return None
-    expanded: list[tuple[int, CoordinateRelation]] = []
-    for readiness_producer in continuation_event.producers:
-        publication = readiness_producer.keys_by_producer
-        upstream_keys = None if publication is None else publication.then(key_to_target)
-        if upstream_keys is None:
-            return None
-        upstream = _static_producer_relations(
-            readiness_graph,
-            root=readiness_producer.producer_root,
-            site_id=readiness_producer.producer_site_id,
-            readiness_keys=upstream_keys,
-            continuation_by_root=continuation_by_root,
-            visiting=visiting | frozenset((root,)),
-        )
-        if upstream is None:
-            return None
-        expanded.extend(upstream)
-    return _merge_relations_by_root(tuple(expanded))
 
 
 def _event_static_producers(
@@ -5364,28 +5699,41 @@ def _event_static_producers(
     )
 
 
+def _readiness_producer_queries(
+    producers: tuple[ReadinessProducer, ...],
+) -> tuple[tuple[int, int | None, CoordinateRelation], ...] | None:
+    """Resolve the exact publication operands for one producer tuple."""
+    if len(producers) > _MAX_GLOBAL_LIST_WORK:
+        return None
+    queries: list[tuple[int, int | None, CoordinateRelation]] = []
+    for producer in producers:
+        publication = producer.keys_by_producer
+        if publication is None:
+            return None
+        queries.append(
+            (
+                producer.producer_root,
+                producer.producer_site_id,
+                publication,
+            )
+        )
+    return tuple(queries)
+
+
 def _readiness_static_producers(
     readiness_graph: ReadinessGraph,
     producers: tuple[ReadinessProducer, ...],
     continuation_by_root: dict[int, FinalArrivalContinuation],
 ) -> tuple[tuple[int, CoordinateRelation], ...] | None:
     """Contract a producer set through final-arrival continuation roots."""
-    expanded: list[tuple[int, CoordinateRelation]] = []
-    for readiness_producer in producers:
-        publication = readiness_producer.keys_by_producer
-        if publication is None:
-            return None
-        static_relations = _static_producer_relations(
-            readiness_graph,
-            root=readiness_producer.producer_root,
-            site_id=readiness_producer.producer_site_id,
-            readiness_keys=publication,
-            continuation_by_root=continuation_by_root,
-        )
-        if static_relations is None:
-            return None
-        expanded.extend(static_relations)
-    return _merge_relations_by_root(tuple(expanded))
+    queries = _readiness_producer_queries(producers)
+    if queries is None:
+        return None
+    return _contract_static_producer_relations(
+        readiness_graph,
+        queries,
+        continuation_by_root,
+    )
 
 
 def _transitive_static_prerequisite_roots(
@@ -11346,23 +11694,6 @@ def _event_frontier_list_schedule(
         if transient_source_root is None
         else frozenset((transient_source_root,))
     )
-    if external_source_frontiers is None:
-        external_source_frontiers = (
-            ()
-            if transient_source_root is None
-            else _external_source_frontiers(
-                readiness_graph,
-                worker_schedule,
-                readiness_counters,
-                root_barrier_edges,
-                transient_source_root,
-            )
-        )
-    if external_source_frontiers is None:
-        # Source ownership is already frozen and progress-valid.  Failure to
-        # derive the optional source-aware ordering frontier declines only the
-        # cross-root placement refinement, not that ownership decision.
-        return worker_schedule
     prepared_schedule = worker_schedule
     expected_scheduled_roots = frozenset(
         root
@@ -11417,6 +11748,116 @@ def _event_frontier_list_schedule(
         if len(order.source_domain.axis_order) != 1 or not order.is_total_function():
             return None
         root_orders[root] = order
+
+    # Freeze and preflight every continuation-contraction request used by the
+    # proposal before composing any of them.  The same exact query is then
+    # contracted once and shared by cohort discovery and frontier placement.
+    # The optional transient-source analysis still owns its cached result, so
+    # account its calls as additional work before invoking it.
+    plan_queries: dict[
+        tuple[ReadinessProducer, ...],
+        tuple[tuple[int, int | None, CoordinateRelation], ...],
+    ] = {}
+    for plan in readiness_counters:
+        queries = _readiness_producer_queries(plan.producers)
+        if queries is None:
+            return worker_schedule
+        plan_queries.setdefault(plan.producers, queries)
+    barrier_queries: dict[
+        int,
+        tuple[tuple[int, int | None, CoordinateRelation], ...],
+    ] = {}
+    for producer_root, _consumer_root in root_barrier_edges:
+        producer_domain = readiness_graph.root_domains[producer_root]
+        identity = CoordinateRelation.identity(producer_domain, producer_domain)
+        tile_dependency._remember_exact_converse(identity, identity)
+        barrier_queries.setdefault(
+            producer_root,
+            (
+                (
+                    producer_root,
+                    None,
+                    identity,
+                ),
+            ),
+        )
+    main_queries = tuple(
+        dict.fromkeys((*plan_queries.values(), *barrier_queries.values()))
+    )
+    contraction_preflights: dict[
+        tuple[tuple[int, int | None, CoordinateRelation], ...],
+        int,
+    ] = {}
+    contraction_work = 0
+
+    def account_contraction(
+        queries: tuple[tuple[int, int | None, CoordinateRelation], ...],
+    ) -> bool:
+        nonlocal contraction_work
+        preflight = contraction_preflights.get(queries)
+        if preflight is None:
+            preflight = _static_producer_contraction_preflight(
+                readiness_graph,
+                queries,
+                continuation_by_root,
+                _MAX_GLOBAL_LIST_WORK,
+            )
+            if preflight is None:
+                return False
+            contraction_preflights[queries] = preflight
+        work = preflight
+        if contraction_work > _MAX_GLOBAL_LIST_WORK - work:
+            return False
+        contraction_work += work
+        return True
+
+    if any(not account_contraction(queries) for queries in main_queries):
+        return worker_schedule
+    if external_source_frontiers is None and transient_source_root is not None:
+        for prerequisite in _emitted_prerequisites(
+            readiness_counters,
+            root_barrier_edges,
+        ):
+            if prerequisite.barrier_producer_root is not None:
+                queries = barrier_queries[prerequisite.barrier_producer_root]
+            else:
+                assert prerequisite.counter_plan is not None
+                queries = plan_queries[prerequisite.counter_plan.producers]
+            if not account_contraction(queries):
+                return worker_schedule
+
+    contracted_relations: dict[
+        tuple[tuple[int, int | None, CoordinateRelation], ...],
+        tuple[tuple[int, CoordinateRelation], ...],
+    ] = {}
+    for queries in main_queries:
+        static_relations = _contract_static_producer_relations(
+            readiness_graph,
+            queries,
+            continuation_by_root,
+            preflight=contraction_preflights[queries],
+        )
+        if static_relations is None:
+            return worker_schedule
+        contracted_relations[queries] = static_relations
+
+    if external_source_frontiers is None:
+        external_source_frontiers = (
+            ()
+            if transient_source_root is None
+            else _external_source_frontiers(
+                readiness_graph,
+                worker_schedule,
+                readiness_counters,
+                root_barrier_edges,
+                transient_source_root,
+            )
+        )
+    if external_source_frontiers is None:
+        # Source ownership is already frozen and progress-valid.  Failure to
+        # derive the optional source-aware ordering frontier declines only the
+        # cross-root placement refinement, not that ownership decision.
+        return worker_schedule
 
     external_frontiers: dict[int, CoordinateRelation] = {}
     cohort_relations_by_root: dict[int, list[CoordinateRelation]] = {
@@ -11489,13 +11930,7 @@ def _event_frontier_list_schedule(
     # This is an ephemeral partition of each configured task order, not a
     # second dependency graph or correctness proof.
     for plan in readiness_counters:
-        static_relations = _readiness_static_producers(
-            readiness_graph,
-            plan.producers,
-            continuation_by_root,
-        )
-        if static_relations is None:
-            return worker_schedule
+        static_relations = contracted_relations[plan_queries[plan.producers]]
         for producer_root, keys_by_producer in static_relations:
             producer_order = root_orders.get(producer_root)
             if producer_order is not None:
@@ -11550,19 +11985,7 @@ def _event_frontier_list_schedule(
             return None
         if prerequisite.barrier_producer_root is not None:
             producer_root = prerequisite.barrier_producer_root
-            producer_domain = readiness_graph.root_domains[producer_root]
-            static_relations = _static_producer_relations(
-                readiness_graph,
-                root=producer_root,
-                site_id=None,
-                readiness_keys=CoordinateRelation.identity(
-                    producer_domain,
-                    producer_domain,
-                ),
-                continuation_by_root=continuation_by_root,
-            )
-            if static_relations is None:
-                return None
+            static_relations = contracted_relations[barrier_queries[producer_root]]
             frontier_group: list[tuple[int, CoordinateRelation]] = []
             for static_root, _relation in static_relations:
                 if static_root in excluded_roots:
@@ -11597,12 +12020,8 @@ def _event_frontier_list_schedule(
         ordered_consumer_keys = (
             None if consumer_keys is None else consumer_order.then(consumer_keys)
         )
-        static_relations = _readiness_static_producers(
-            readiness_graph,
-            plan.producers,
-            continuation_by_root,
-        )
-        if ordered_consumer_keys is None or static_relations is None:
+        static_relations = contracted_relations[plan_queries[plan.producers]]
+        if ordered_consumer_keys is None:
             return None
         frontier_group = []
         for producer_root, keys_by_producer in static_relations:
