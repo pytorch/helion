@@ -4633,13 +4633,35 @@ class CoordinateRelation:
             pieces_by_source_bounds.setdefault(piece.source_bounds_items, []).append(
                 piece
             )
+        source_groups = tuple(pieces_by_source_bounds.items())
+        source_boxes = tuple(bounds for bounds, _pieces in source_groups)
+        source_group_comparison_count = (
+            len(source_boxes)
+            * (len(source_boxes) - 1)
+            // 2
+            * len(self.source_domain.axis_order)
+        )
         if _source_boxes_partition_domain(
-            tuple(pieces_by_source_bounds),
+            source_boxes,
             self.source_domain,
         ):
             active_pieces_by_cell = tuple(
                 (bounds, tuple(active_pieces))
-                for bounds, active_pieces in pieces_by_source_bounds.items()
+                for bounds, active_pieces in source_groups
+            )
+        elif source_group_comparison_count > _MAX_RELATION_PIECES:
+            return None
+        elif all(
+            _source_bounds_are_disjoint(left, right)
+            for index, left in enumerate(source_boxes)
+            for right in source_boxes[index + 1 :]
+        ):
+            # Pairwise-disjoint groups are already exact source cells even
+            # when their union is only a partial symbolic support.  There is
+            # no need to partition the unused rectangular carrier around it.
+            active_pieces_by_cell = tuple(
+                (bounds, tuple(active_pieces))
+                for bounds, active_pieces in source_groups
             )
         else:
             cells = _relation_source_cells(self, include_domain=True)

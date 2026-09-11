@@ -4811,6 +4811,122 @@ class TestTileDependency(TestCase):
         assert concrete_maximum is not None
         self.assertEqual(concrete_maximum.materialize(), (frozenset((0,)),))
 
+    def test_extrema_accept_pairwise_disjoint_partial_source_groups(self) -> None:
+        extent = sympy.Symbol(
+            "partial_extrema_source_extent",
+            integer=True,
+            nonnegative=True,
+        )
+        source = CoordinateDomain(
+            (10,),
+            ((10, extent + 2),),
+            kind="event",
+        )
+        target = CoordinateDomain((20,), ((20, 3),), kind="site")
+        value = CoordinateDomain((30,), ((30, 3),), kind="value")
+        target_coordinate = coordinate_axis_symbol(20)
+        required = CoordinateRelation(
+            source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 0, 1, 1),),
+                    ((20, 0, 2, 1),),
+                ),
+                _CoordinateRelationPiece(
+                    ((10, extent + 1, extent + 2, 1),),
+                    ((20, 1, 3, 1),),
+                ),
+            ),
+        )
+        value_by_target = CoordinateRelation.point_map(
+            target,
+            value,
+            (
+                (
+                    ((20, 0, 3, 1),),
+                    (target_coordinate,),
+                ),
+            ),
+        )
+
+        maximum = required.max_target_value_by_source(value_by_target)
+        joint = required.extreme_target_value_and_attainers_by_source(
+            value_by_target,
+            maximize=True,
+        )
+
+        self.assertIsNotNone(maximum)
+        self.assertIsNotNone(joint)
+        assert maximum is not None and joint is not None
+        for concrete_extent in (0, 1, 4):
+            substitutions = {extent: concrete_extent}
+            expected_values = tuple(
+                frozenset((1,))
+                if index == 0
+                else frozenset((2,))
+                if index == concrete_extent + 1
+                else frozenset()
+                for index in range(concrete_extent + 2)
+            )
+            expected_attainers = tuple(
+                frozenset((1,))
+                if index == 0
+                else frozenset((2,))
+                if index == concrete_extent + 1
+                else frozenset()
+                for index in range(concrete_extent + 2)
+            )
+            self.assertEqual(
+                maximum.substitute_parameters(substitutions).materialize(),
+                expected_values,
+            )
+            concrete_joint = tuple(
+                relation.substitute_parameters(substitutions).materialize()
+                for relation in joint
+            )
+            self.assertEqual(
+                concrete_joint,
+                (expected_values, expected_attainers),
+            )
+
+    def test_partial_source_group_extrema_respect_proof_budget(self) -> None:
+        value = CoordinateDomain((30,), ((30, 1),), kind="value")
+        for group_count in (128, 256):
+            with self.subTest(group_count=group_count):
+                source = CoordinateDomain(
+                    (10,),
+                    ((10, 2 * group_count),),
+                    kind="event",
+                )
+                target = CoordinateDomain((20,), ((20, 1),), kind="site")
+                required = CoordinateRelation(
+                    source,
+                    target,
+                    tuple(
+                        _CoordinateRelationPiece(
+                            ((10, 2 * index, 2 * index + 1, 1),),
+                            ((20, 0, 1, 1),),
+                        )
+                        for index in range(group_count)
+                    ),
+                )
+                values = CoordinateRelation.point_map(
+                    target,
+                    value,
+                    ((((20, 0, 1, 1),), (sympy.Integer(0),)),),
+                )
+
+                with mock.patch(
+                    "helion._compiler.tile_dependency._relation_source_cells",
+                    side_effect=AssertionError(
+                        "oversized partial source proof must decline before partition"
+                    ),
+                ):
+                    self.assertIsNone(
+                        required.max_target_value_by_source(values)
+                    )
+
     def test_target_value_extreme_retains_complete_plateaus(self) -> None:
         source = CoordinateDomain((), (), kind="event")
         target = CoordinateDomain((20,), ((20, 4),), kind="site")
