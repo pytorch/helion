@@ -2659,6 +2659,20 @@ class WalkDeviceAST(NodeVisitor):
     def visit_Constant(self, node: ast.Constant) -> object:
         return node.value
 
+    def visit_SetComp(self, node: ast.SetComp) -> tuple[object, ...]:
+        assert isinstance(node, ExtendedAST)
+        generator = node.generators[0]
+        assert isinstance(generator.iter, ExtendedAST)
+        iter_type = generator.iter._type_info
+
+        if not isinstance(iter_type, SequenceType):
+            raise exc.StatementNotSupported(
+                "Set comprehensions over non-sequence types are not supported"
+            )
+
+        results = self._handle_comprehension_unrolling(node.elt, generator)
+        return tuple(dict.fromkeys(results))
+
 
 class LiftTensorArgs:
     values: dict[str, object]

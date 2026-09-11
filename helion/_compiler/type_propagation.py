@@ -191,6 +191,13 @@ CMP_ALWAYS_BOOL: tuple[type[ast.AST], ...] = (
 )
 
 
+def _clear_type_info(n: ast.AST) -> None:
+    if isinstance(n, ExtendedAST):
+        n._type_info = None
+    for child in ast.iter_child_nodes(n):
+        _clear_type_info(child)
+
+
 def _unsupported(
     python_type: type[object],
 ) -> Callable[[TypePropagation, ast.AST], NoReturn]:
@@ -1218,13 +1225,6 @@ class TypePropagation(ast.NodeVisitor):
 
         result_elements: dict[str | int, TypeInfo] = {}
 
-        def clear_type_info(n: ast.AST) -> None:
-            """Clear _type_info on AST nodes to allow re-visiting with different values."""
-            if isinstance(n, ExtendedAST):
-                n._type_info = None
-            for child in ast.iter_child_nodes(n):
-                clear_type_info(child)
-
         for element_type in iterable_elements:
             self.push_scope()
             try:
@@ -1232,8 +1232,8 @@ class TypePropagation(ast.NodeVisitor):
                 for if_clause in generator.ifs:
                     self.visit(if_clause)
                 # Clear type info before visiting to avoid merging with previous iteration
-                clear_type_info(node.key)
-                clear_type_info(node.value)
+                _clear_type_info(node.key)
+                _clear_type_info(node.value)
                 key_type = self.visit(node.key)
                 value_type = self.visit(node.value)
                 # Get the literal key value by evaluating with proxy
@@ -1253,9 +1253,49 @@ class TypePropagation(ast.NodeVisitor):
 
         return DictType(self.origin(), result_elements)
 
-    # TODO(jansel): need to implement these
     # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
-    visit_SetComp: _VisitMethod = _not_supported
+    def visit_SetComp(self, node: ast.SetComp) -> TypeInfo:
+        if len(node.generators) != 1:
+            raise exc.StatementNotSupported(
+                "Set comprehensions with multiple generators are not supported"
+            )
+
+        generator = node.generators[0]
+        if generator.ifs:
+            raise exc.StatementNotSupported(
+                "Set comprehensions with conditions are not supported"
+            )
+
+        iter_type = self.visit(generator.iter)
+        try:
+            iterable_elements = iter_type.unpack()
+        except NotImplementedError:
+            raise exc.StatementNotSupported(
+                "Set comprehensions over non-unpackable iterables are not supported"
+            ) from None
+
+        seen: set[object] = set()
+        result_elements: list[TypeInfo] = []
+        for element_type in iterable_elements:
+            self.push_scope()
+            try:
+                self._assign(generator.target, element_type)
+                _clear_type_info(node.elt)
+                elt_type = self.visit(node.elt)
+                value = elt_type.proxy()
+                try:
+                    is_new = value not in seen
+                except TypeError:
+                    raise exc.StatementNotSupported(
+                        "Set comprehension elements must be hashable"
+                    ) from None
+                if is_new:
+                    seen.add(value)
+                    result_elements.append(elt_type)
+            finally:
+                self.pop_scope()
+
+        return SequenceType(self.origin(), result_elements)
 
     # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
     def visit_FunctionDef(self, node: ast.FunctionDef) -> TypeInfo:
