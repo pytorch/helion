@@ -3856,10 +3856,38 @@ split producer uses the exact final-worker interval partition; a symbolically
 split producer still declines. Invalid constant fibers with out-of-domain or
 conditionally empty targets are rejected before a converse is memoized.
 
+Implementation checkpoint (2026-09-11, key-scoped priority): the finite walk
+now evaluates the first exact event-key fiber from the same semantic cohort
+relations used to derive root order. Each fiber is composed once with the
+authoritative `ReadinessEvent.producers_by_key` relations, then assigned root
+task sets are checked for exact coverage or exact disjointness. Those proofs
+drive released-consumer class, event closure, and active multi-arm event
+continuation in the existing lexicographic priority. Conditional fibers and
+partially covered single producer arms remain unknown and therefore cannot win
+an optimized move. Consumer fibers participate only when all of their
+admission views agree on the same cohort partition.
+
+This is a priority-only milestone. It adds no graph, retained frontier object,
+or schedule representation: cohort tuples, claims, and priority bounds exist
+only during the finite walk, and `WorkerSchedule` remains the output. Semantic
+cohorts are derived once and shared by ordering and placement. First-key
+producer requirements are also derived once. A single aggregate preflight
+bounds roots squared times total frontier relation work, while each coverage
+query separately bounds union/coalescing/coverage work. Production code never
+enumerates a task, key, wave, or runtime extent.
+
+Tests that formerly required a conservative result solely because exact
+closure/release state had not landed now assert the newly proved schedule plus
+semantic progress. This retires migration behavior rather than weakening the
+stable contracts: exact coverage, no duplicate or omitted work, dependency
+progress, canonical fallback on unknown facts, and bounded symbolic
+construction remain mandatory. General active continuation for a partially
+completed single producer arm is still unproved, and no test implies otherwise.
+
 Immediate continuation of this phase:
 
-1. carry exact consumer-key frontiers through the finite walk and use them for
-   event closure and active-cohort continuation;
+1. generalize the current first-fiber proof to symbolic root cursors so the
+   same exact frontier advances after each committed cohort;
 2. commit a complete strict sub-root cohort across waves, rather than treating
    it as a tail-only action, while preserving its atomicity;
 3. retain conditionally empty moved roots together with their synthetic

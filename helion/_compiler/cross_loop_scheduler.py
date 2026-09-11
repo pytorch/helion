@@ -9176,34 +9176,30 @@ def _readiness_equivalent_cohort_relation(
     return cohort_by_order, event_keys_by_cohort
 
 
+_ReadinessAdmissionCohort = tuple[
+    int,
+    int,
+    int,
+    CoordinateRelation,
+    CoordinateRelation,
+]
+_ReadinessClosureCohort = tuple[
+    int,
+    int,
+    CoordinateRelation,
+    CoordinateRelation,
+]
+_SemanticReadinessCohorts = tuple[
+    tuple[_ReadinessAdmissionCohort, ...],
+    tuple[_ReadinessClosureCohort, ...],
+    frozenset[int],
+    frozenset[int],
+]
+
+
 def _semantic_readiness_cohort_relations(
     readiness_graph: ReadinessGraph,
-) -> (
-    tuple[
-        tuple[
-            tuple[
-                int,
-                int,
-                int,
-                CoordinateRelation,
-                CoordinateRelation,
-            ],
-            ...,
-        ],
-        tuple[
-            tuple[
-                int,
-                int,
-                CoordinateRelation,
-                CoordinateRelation,
-            ],
-            ...,
-        ],
-        frozenset[int],
-        frozenset[int],
-    ]
-    | None
-):
+) -> _SemanticReadinessCohorts | None:
     """Derive admission and event-closure cohorts from semantic readiness.
 
     Admission entries are ``(root, event, consumer, order->cohort,
@@ -9411,6 +9407,7 @@ def _agreed_cohort_major_root_orders(
     readiness_graph: ReadinessGraph,
     *,
     include_reference: bool = False,
+    semantic_cohorts: _SemanticReadinessCohorts | None = None,
 ) -> (
     tuple[
         dict[int, CoordinateRelation],
@@ -9432,7 +9429,11 @@ def _agreed_cohort_major_root_orders(
     unsupported event role is never neutral. No readiness decision is made
     here.
     """
-    cohort_relations = _semantic_readiness_cohort_relations(readiness_graph)
+    cohort_relations = (
+        semantic_cohorts
+        if semantic_cohorts is not None
+        else _semantic_readiness_cohort_relations(readiness_graph)
+    )
     if cohort_relations is None:
         return None
     admission, closure, unsupported_admission, unsupported_closure = cohort_relations
@@ -9540,6 +9541,227 @@ def _agreed_cohort_major_root_orders(
     for root in whole_root_cohorts:
         cohort_widths[root] = readiness_graph.root_domains[root].size_expr
     return result, cohort_widths
+
+
+def _singleton_relation_domain() -> CoordinateDomain:
+    """Return the anonymous one-point carrier used by finite proof queries."""
+    return CoordinateDomain((), (), kind="value")
+
+
+def _first_cohort_event_keys(
+    event_keys_by_cohort: CoordinateRelation,
+) -> CoordinateRelation | None:
+    """Return the exact event-key set of canonical cohort coordinate zero.
+
+    The result maps one anonymous point to the selected keys.  Keeping keys on
+    the target side avoids requiring a symbolic converse for a set-valued
+    fiber; callers compose it directly with the authoritative key-to-producer
+    relation.
+    """
+    marker_domain = _singleton_relation_domain()
+    first_cohort = CoordinateRelation.point_map(
+        marker_domain,
+        event_keys_by_cohort.source_domain,
+        (
+            (
+                (),
+                tuple(
+                    sympy.Integer(0)
+                    for _axis in event_keys_by_cohort.source_domain.axis_order
+                ),
+            ),
+        ),
+    )
+    result = first_cohort.then(event_keys_by_cohort)
+    if result is None or not result.has_total_source():
+        return None
+    return result
+
+
+def _first_cohort_tasks(
+    task_order: CoordinateRelation,
+    cohort_by_order: CoordinateRelation,
+) -> CoordinateRelation | None:
+    """Return one anonymous point mapped to the first exact task cohort."""
+    order_points_by_cohort = cohort_by_order.converse()
+    if (
+        order_points_by_cohort is None
+        or cohort_by_order.source_domain != task_order.source_domain
+    ):
+        return None
+    marker_domain = _singleton_relation_domain()
+    first_cohort = CoordinateRelation.point_map(
+        marker_domain,
+        cohort_by_order.target_domain,
+        (
+            (
+                (),
+                tuple(
+                    sympy.Integer(0)
+                    for _axis in cohort_by_order.target_domain.axis_order
+                ),
+            ),
+        ),
+    )
+    order_points = first_cohort.then(order_points_by_cohort)
+    result = None if order_points is None else order_points.then(task_order)
+    if result is None or not result.has_total_source():
+        return None
+    return result
+
+
+def _covered_relation_target_depth(
+    claims: tuple[tuple[CoordinateRelation, int], ...],
+    required: CoordinateRelation,
+) -> tuple[bool, int] | None:
+    """Prove whether assigned target sets cover one exact requirement.
+
+    Claims and ``required`` share the anonymous source point.  A successful
+    result carries the greatest causal depth needed by a covering union.
+    Partial overlap that is neither exact coverage nor exact disjointness is
+    deliberately unrepresentable and returns ``None``.
+    """
+    if required.source_domain.axis_order:
+        return None
+    required_nonempty = _relation_may_be_nonempty(required)
+    if required_nonempty is None:
+        return None
+    if not required_nonempty:
+        return True, 1
+    if not required.has_total_source():
+        return None
+    if any(
+        claim.source_domain != required.source_domain
+        or claim.target_domain != required.target_domain
+        or depth < 1
+        for claim, depth in claims
+    ):
+        return None
+    claim_piece_count = sum(len(claim.pieces) for claim, _depth in claims)
+    required_piece_count = len(required.pieces)
+    depth_count = len({depth for _claim, depth in claims})
+    proof_work = max(1, len(required.target_domain.axis_order)) * (
+        (len(claims) + 1) * claim_piece_count * claim_piece_count
+        + depth_count * claim_piece_count * required_piece_count
+    )
+    if (
+        claim_piece_count + required_piece_count
+        > tile_dependency._MAX_RELATION_PIECES
+        or proof_work > tile_dependency._MAX_RELATION_PRODUCT_STATES
+    ):
+        return None
+
+    accumulated: CoordinateRelation | None = None
+    for depth in sorted({depth for _claim, depth in claims}):
+        for claim, claim_depth in claims:
+            if claim_depth != depth:
+                continue
+            accumulated = (
+                claim if accumulated is None else accumulated.union(claim)
+            )
+            if accumulated is None:
+                return None
+            accumulated = accumulated.coalesce_adjacent_target_boxes()
+        if accumulated.covers(required):
+            return True, depth
+
+    for claim, _depth in claims:
+        overlap = claim.overlapping_sources(required)
+        if overlap is None:
+            return None
+        overlap_nonempty = _relation_may_be_nonempty(overlap)
+        if overlap_nonempty is None:
+            return None
+        if overlap_nonempty:
+            return None
+    return False, 1
+
+
+def _event_key_producer_requirements(
+    event: ReadinessEvent,
+    event_keys: CoordinateRelation,
+) -> tuple[CoordinateRelation, ...] | None:
+    """Resolve one exact key fiber to each authoritative producer task set."""
+    if (
+        event_keys.source_domain.axis_order
+        or event_keys.target_domain != event.readiness_key_domain
+        or not event_keys.has_total_source()
+    ):
+        return None
+    relation_product_states = 0
+    requirements: list[CoordinateRelation] = []
+    for producer in event.producers:
+        relation_product_states += len(event_keys.pieces) * len(
+            producer.producers_by_key.pieces
+        )
+        if relation_product_states > tile_dependency._MAX_RELATION_PRODUCT_STATES:
+            return None
+        required_tasks = event_keys.then(producer.producers_by_key)
+        if required_tasks is None:
+            return None
+        requirements.append(required_tasks)
+    return tuple(requirements)
+
+
+def _event_key_frontier_state(
+    requirements: tuple[CoordinateRelation, ...],
+    claims_by_producer: tuple[
+        tuple[tuple[CoordinateRelation, int], ...],
+        ...,
+    ],
+) -> tuple[bool | None, bool | None, int] | None:
+    """Return readiness, activity, and maximum claim depth for one key fiber.
+
+    Active means that at least one participating producer arm is complete and
+    at least one is not. The caller adds one to the returned depth when
+    deriving a consumer action's pull depth. An unprovable partial overlap or
+    conditionally empty arm is represented by None rather than guessed.
+    """
+    if len(claims_by_producer) != len(requirements):
+        return None
+    covered_count = 0
+    missing_count = 0
+    unknown_count = 0
+    max_claim_depth = 1
+    for required_tasks, claims in zip(
+        requirements,
+        claims_by_producer,
+        strict=True,
+    ):
+        required_nonempty = _relation_may_be_nonempty(required_tasks)
+        if required_nonempty is None:
+            return None
+        if not required_nonempty:
+            continue
+        if not required_tasks.has_total_source():
+            unknown_count += 1
+            continue
+        status = _covered_relation_target_depth(claims, required_tasks)
+        if status is None:
+            unknown_count += 1
+            continue
+        covered, depth = status
+        if covered:
+            covered_count += 1
+            max_claim_depth = max(max_claim_depth, depth)
+        else:
+            missing_count += 1
+
+    ready: bool | None
+    if missing_count:
+        ready = False
+    elif unknown_count:
+        ready = None
+    else:
+        ready = True
+    active: bool | None
+    if covered_count and missing_count:
+        active = True
+    elif unknown_count:
+        active = None
+    else:
+        active = False
+    return ready, active, max_claim_depth
 
 
 def _root_major_schedule_matches_configured_orders(
@@ -9704,6 +9926,7 @@ def _bounded_cohort_list_schedule(
     canonical_schedule: WorkerSchedule,
     replacement_orders: dict[int, CoordinateRelation],
     *,
+    semantic_cohorts: _SemanticReadinessCohorts,
     cohort_widths: dict[int, sympy.Expr],
     root_edges: frozenset[tuple[int, int]],
     root_criticality: tuple[tuple[int, int], ...],
@@ -9749,6 +9972,25 @@ def _bounded_cohort_list_schedule(
         for event in readiness_graph.events
         for producer in event.producers
     )
+    admission, closure, unsupported_admission, unsupported_closure = (
+        semantic_cohorts
+    )
+    admission_by_root: dict[
+        int,
+        list[tuple[int, int, CoordinateRelation]],
+    ] = {}
+    for root, event_id, consumer_index, _cohort_by_order, event_keys in admission:
+        admission_by_root.setdefault(root, []).append(
+            (event_id, consumer_index, event_keys)
+        )
+    closure_by_root: dict[
+        int,
+        list[tuple[int, CoordinateRelation, CoordinateRelation]],
+    ] = {}
+    for root, event_id, cohort_by_order, event_keys_by_cohort in closure:
+        closure_by_root.setdefault(root, []).append(
+            (event_id, cohort_by_order, event_keys_by_cohort)
+        )
     descendants: dict[int, frozenset[int]] = {}
     for root in canonical_roots:
         pending = list(successors[root])
@@ -9761,23 +10003,275 @@ def _bounded_cohort_list_schedule(
             pending.extend(successors[descendant])
         descendants[root] = frozenset(reachable)
 
-    def action_priority(
+    first_action_tasks_cache: dict[int, CoordinateRelation | None] = {}
+    first_event_keys_cache: dict[CoordinateRelation, CoordinateRelation | None] = {}
+    frontier_requirements: dict[
+        tuple[int, CoordinateRelation],
+        tuple[CoordinateRelation, ...] | None,
+    ] = {}
+
+    def first_event_keys(
+        event_keys_by_cohort: CoordinateRelation,
+    ) -> CoordinateRelation | None:
+        if event_keys_by_cohort not in first_event_keys_cache:
+            first_event_keys_cache[event_keys_by_cohort] = _first_cohort_event_keys(
+                event_keys_by_cohort
+            )
+        return first_event_keys_cache[event_keys_by_cohort]
+
+    frontier_records = tuple(
+        (event_id, event_keys)
+        for _root, event_id, _consumer, _cohort, event_keys in admission
+    ) + tuple(
+        (event_id, event_keys)
+        for _root, event_id, _cohort, event_keys in closure
+    )
+    frontier_work = 0
+    for event_id, event_keys_by_cohort in frontier_records:
+        cache_key = (event_id, event_keys_by_cohort)
+        if cache_key in frontier_requirements:
+            continue
+        record_work = 0
+        event_keys = first_event_keys(event_keys_by_cohort)
+        event = readiness_graph.event(event_id)
+        requirements = (
+            None
+            if event_keys is None
+            else _event_key_producer_requirements(event, event_keys)
+        )
+        frontier_requirements[cache_key] = requirements
+        if event_keys is not None:
+            record_work += len(event_keys.pieces) * sum(
+                len(producer.producers_by_key.pieces)
+                for producer in event.producers
+            )
+        if requirements is not None:
+            record_work += sum(len(required.pieces) for required in requirements)
+        # An empty symbolic fiber still costs one record visit in every
+        # priority evaluation. Do not let zero pieces hide unbounded metadata.
+        frontier_work += max(1, record_work)
+        if frontier_work > tile_dependency._MAX_RELATION_PRODUCT_STATES:
+            return None
+    frontier_work += sum(
+        max(
+            1,
+            len(cohort_by_order.pieces)
+            * len(readiness_graph.root_task_orders[root].pieces),
+        )
+        for root, _event_id, cohort_by_order, _event_keys in closure
+    )
+    if not tile_dependency._relation_product_is_within_budget(
+        len(canonical_roots),
+        len(canonical_roots),
+        max(1, frontier_work),
+    ):
+        return None
+
+    def first_action_tasks(root: int) -> CoordinateRelation | None:
+        if root in first_action_tasks_cache:
+            return first_action_tasks_cache[root]
+        result: CoordinateRelation | None = None
+        for _event_id, cohort_by_order, _event_keys in closure_by_root.get(root, ()):
+            candidate = _first_cohort_tasks(
+                readiness_graph.root_task_orders[root],
+                cohort_by_order,
+            )
+            if candidate is None or (
+                result is not None
+                and not (result.covers(candidate) and candidate.covers(result))
+            ):
+                first_action_tasks_cache[root] = None
+                return None
+            result = candidate
+        first_action_tasks_cache[root] = result
+        return result
+
+    full_root_tasks = {
+        root: CoordinateRelation.total(
+            _singleton_relation_domain(),
+            readiness_graph.root_domains[root],
+        )
+        for root in canonical_roots
+    }
+
+    def action_task_set(
         root: int,
-        assigned: frozenset[int],
         *,
         completes_root: bool,
-    ) -> tuple[int, int, int, int]:
-        base = root_criticality[root]
-        if not completes_root:
-            return (*base, 1, 1)
-        assigned_after = assigned | {root}
-        newly_ready = tuple(
-            consumer
-            for consumer in canonical_roots
-            if consumer not in assigned
-            and predecessors[consumer] <= assigned_after
-            and not predecessors[consumer] <= assigned
+    ) -> CoordinateRelation | None:
+        return full_root_tasks[root] if completes_root else first_action_tasks(root)
+
+    def event_claims(
+        event: ReadinessEvent,
+        *,
+        candidate_root: int | None = None,
+        candidate_tasks: CoordinateRelation | None = None,
+    ) -> tuple[tuple[tuple[CoordinateRelation, int], ...], ...]:
+        result: list[tuple[tuple[CoordinateRelation, int], ...]] = []
+        for producer in event.producers:
+            claims: list[tuple[CoordinateRelation, int]] = []
+            if producer.producer_root in assigned:
+                claims.append(
+                    (
+                        full_root_tasks[producer.producer_root],
+                        active_pull_depths.get(producer.producer_root, 1),
+                    )
+                )
+            if (
+                producer.producer_root == candidate_root
+                and candidate_tasks is not None
+            ):
+                claims.append((candidate_tasks, 1))
+            result.append(tuple(claims))
+        return tuple(result)
+
+    def root_frontier_ready(
+        root: int,
+        *,
+        candidate_root: int | None = None,
+        candidate_tasks: CoordinateRelation | None = None,
+    ) -> bool | None:
+        if root in unsupported_admission or root not in cohort_widths:
+            # Coordinate zero is a shared consumer action only after every
+            # semantic admission view proved the same cohort partition.
+            return None
+        unknown = False
+        for event_id, consumer_index, event_keys_by_cohort in admission_by_root.get(
+            root,
+            (),
+        ):
+            event_keys = first_event_keys(event_keys_by_cohort)
+            event = readiness_graph.event(event_id)
+            if (
+                event_keys is None
+                or not 0 <= consumer_index < len(event.consumers)
+                or event.consumers[consumer_index].consumer_root != root
+            ):
+                return None
+            requirements = frontier_requirements.get(
+                (event_id, event_keys_by_cohort)
+            )
+            if requirements is None:
+                return None
+            state = _event_key_frontier_state(
+                requirements,
+                event_claims(
+                    event,
+                    candidate_root=candidate_root,
+                    candidate_tasks=candidate_tasks,
+                ),
+            )
+            if state is None:
+                return None
+            ready, _active, _depth = state
+            if ready is False:
+                return False
+            if ready is None:
+                unknown = True
+        return None if unknown else True
+
+    def output_frontier_flags(
+        root: int,
+        *,
+        completes_root: bool,
+    ) -> tuple[bool | None, bool | None]:
+        if root not in producer_role_roots:
+            return False, False
+        if root in unsupported_closure:
+            return None, None
+        records = closure_by_root.get(root, ())
+        expected_events = {
+            event.event_id
+            for event in readiness_graph.events
+            if any(producer.producer_root == root for producer in event.producers)
+        }
+        if {event_id for event_id, _cohort, _keys in records} != expected_events:
+            return None, None
+        candidate_tasks = action_task_set(root, completes_root=completes_root)
+        if candidate_tasks is None:
+            return None, None
+
+        closes = False
+        continues_active = False
+        closure_unknown = False
+        active_unknown = False
+        for event_id, _cohort_by_order, event_keys_by_cohort in records:
+            event_keys = first_event_keys(event_keys_by_cohort)
+            if event_keys is None:
+                closure_unknown = True
+                active_unknown = True
+                continue
+            event = readiness_graph.event(event_id)
+            requirements = frontier_requirements.get(
+                (event_id, event_keys_by_cohort)
+            )
+            if requirements is None:
+                closure_unknown = True
+                active_unknown = True
+                continue
+            before = _event_key_frontier_state(
+                requirements,
+                event_claims(event),
+            )
+            after = _event_key_frontier_state(
+                requirements,
+                event_claims(
+                    event,
+                    candidate_root=root,
+                    candidate_tasks=candidate_tasks,
+                ),
+            )
+            if before is None or after is None:
+                closure_unknown = True
+                active_unknown = True
+                continue
+            before_ready, before_active, _before_depth = before
+            after_ready, _after_active, _after_depth = after
+            if before_active is True:
+                continues_active = True
+            elif before_active is None:
+                active_unknown = True
+            if before_ready is False and after_ready is True:
+                closes = True
+            elif before_ready is None or after_ready is None:
+                closure_unknown = True
+        return (
+            True if closes else (None if closure_unknown else False),
+            True
+            if continues_active
+            else (None if active_unknown else False),
         )
+
+    def action_priority_bounds(
+        root: int,
+        assigned_roots: frozenset[int],
+        *,
+        completes_root: bool,
+    ) -> tuple[
+        tuple[int, int, int, int, int],
+        tuple[int, int, int, int, int],
+    ]:
+        base = root_criticality[root]
+        candidate_tasks = action_task_set(root, completes_root=completes_root)
+        newly_ready: list[int] = []
+        unknown_releases: list[int] = []
+        for consumer in successors[root]:
+            if consumer in assigned_roots:
+                continue
+            before = root_frontier_ready(consumer)
+            after = (
+                None
+                if candidate_tasks is None
+                else root_frontier_ready(
+                    consumer,
+                    candidate_root=root,
+                    candidate_tasks=candidate_tasks,
+                )
+            )
+            if before is None or after is None:
+                unknown_releases.append(consumer)
+            elif not before and after:
+                newly_ready.append(consumer)
         release_class = min(
             (root_criticality[consumer] for consumer in newly_ready),
             default=base,
@@ -9786,24 +10280,35 @@ def _bounded_cohort_list_schedule(
         releases_effective_class = any(
             root_criticality[consumer] == effective_class for consumer in newly_ready
         )
-        # Exact event closure and active-cohort continuation are key-scoped,
-        # not root-set properties. Keep closure neutral until the next slice
-        # tracks those frontiers; a root with no producer role is the one case
-        # where both omitted fields are proved uniformly false.
-        return (
+        closes, continues_active = output_frontier_flags(
+            root,
+            completes_root=completes_root,
+        )
+        upper = (
             *effective_class,
             0 if releases_effective_class else 1,
-            1,
+            0 if closes is True else 1,
+            0 if continues_active is True else 1,
         )
-
-    def optimistic_action_priority(root: int) -> tuple[int, int, int, int]:
-        """Return the best priority any first cohort of ``root`` could earn."""
-        base = root_criticality[root]
         release_class = min(
-            (root_criticality[consumer] for consumer in successors[root]),
-            default=base,
+            (
+                effective_class,
+                *(root_criticality[consumer] for consumer in unknown_releases),
+            ),
         )
-        return (*min(base, release_class), 0, 0)
+        floor = (
+            *release_class,
+            0
+            if unknown_releases
+            or any(
+                root_criticality[consumer] == release_class
+                for consumer in newly_ready
+            )
+            else 1,
+            0 if closes is not False else 1,
+            0 if continues_active is not False else 1,
+        )
+        return upper, floor
 
     root_counts = {
         root: sympy.simplify(
@@ -9877,15 +10382,10 @@ def _bounded_cohort_list_schedule(
             append_full_root(remaining.pop(0), pull_depth=1)
             continue
         canonical_width, canonical_is_whole = canonical_cohort
-        canonical_known_priority = action_priority(
+        _canonical_priority, canonical_priority_floor = action_priority_bounds(
             canonical_next,
             frozenset(assigned),
             completes_root=canonical_is_whole,
-        )
-        canonical_priority_floor = (
-            canonical_known_priority
-            if canonical_is_whole
-            else optimistic_action_priority(canonical_next)
         )
 
         occupied_lanes_expression = sympy.simplify(
@@ -9905,8 +10405,8 @@ def _bounded_cohort_list_schedule(
             )
         candidates: list[
             tuple[
-                tuple[int, int, int, int],
-                tuple[int, int, int, int],
+                tuple[int, int, int, int, int],
+                tuple[int, int, int, int, int],
                 int,
                 int,
                 sympy.Expr,
@@ -9957,7 +10457,7 @@ def _bounded_cohort_list_schedule(
             pull_depth = max(2, predecessor_depth + 1)
             if pull_depth > pipeline_depth:
                 continue
-            known_priority = action_priority(
+            known_priority, priority_floor = action_priority_bounds(
                 root,
                 frozenset(assigned),
                 completes_root=completes_root,
@@ -9965,11 +10465,7 @@ def _bounded_cohort_list_schedule(
             candidates.append(
                 (
                     known_priority,
-                    (
-                        known_priority
-                        if completes_root
-                        else optimistic_action_priority(root)
-                    ),
+                    priority_floor,
                     candidate_index,
                     root,
                     width,
@@ -9990,14 +10486,7 @@ def _bounded_cohort_list_schedule(
             completes_root,
             pull_depth,
         ) in candidates:
-            if completes_root and canonical_is_whole:
-                beats_canonical = priority < canonical_known_priority
-            else:
-                # A partial action may release an unrepresented event, so an
-                # exact action must strictly beat its optimistic floor.  The
-                # same rule applies when the proposed winner is itself partial.
-                beats_canonical = priority < canonical_priority_floor
-            if not beats_canonical:
+            if priority >= canonical_priority_floor:
                 continue
             beats_competitors = True
             for (
@@ -10006,23 +10495,19 @@ def _bounded_cohort_list_schedule(
                 other_index,
                 _other_root,
                 _other_width,
-                other_completes_root,
+                _other_completes_root,
                 _other_pull_depth,
             ) in candidates:
                 if other_index == candidate_index:
                     continue
-                if completes_root and other_completes_root:
-                    if priority > other_priority or (
-                        priority == other_priority
-                        and (
-                            root in producer_role_roots
-                            or _other_root in producer_role_roots
-                            or candidate_index > other_index
-                        )
-                    ):
-                        beats_competitors = False
-                        break
-                elif priority >= other_floor:
+                if priority > other_floor or (
+                    priority == other_floor
+                    and not (
+                        priority == _priority_floor
+                        and other_priority == other_floor
+                        and candidate_index < other_index
+                    )
+                ):
                     beats_competitors = False
                     break
             if beats_competitors:
@@ -10162,9 +10647,13 @@ def _parametric_cohort_list_schedule(
     # resident placement patch consumes these facts; deriving them here now
     # fixes the proof boundary and prevents a later return to emitted-counter
     # or continuation-specific topology.
+    semantic_cohorts = _semantic_readiness_cohort_relations(readiness_graph)
+    if semantic_cohorts is None:
+        return canonical_schedule
     cohort_candidates = _agreed_cohort_major_root_orders(
         readiness_graph,
         include_reference=True,
+        semantic_cohorts=semantic_cohorts,
     )
     if cohort_candidates is None:
         return canonical_schedule
@@ -10196,6 +10685,7 @@ def _parametric_cohort_list_schedule(
         readiness_graph,
         canonical_schedule,
         replacements,
+        semantic_cohorts=semantic_cohorts,
         cohort_widths=cohort_widths,
         root_edges=root_edges,
         root_criticality=root_criticality,

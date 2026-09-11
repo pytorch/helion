@@ -2582,6 +2582,257 @@ class TestCrossLoopScheduler(TestCase):
                     (2,) * concrete_batch + (1,) * concrete_batch,
                 )
 
+    def test_first_cohort_frontier_is_symbolic_and_exact(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        graph = _dynamic_leading_cohort_readiness_graph(batch)
+
+        with _forbid_schedule_enumeration():
+            semantic = cross_loop_scheduler._semantic_readiness_cohort_relations(
+                graph
+            )
+            self.assertIsNotNone(semantic)
+            assert semantic is not None
+            admission, closure, unsupported_admission, unsupported_closure = semantic
+            self.assertEqual(unsupported_admission, frozenset())
+            self.assertEqual(unsupported_closure, frozenset())
+            consumer_record = next(record for record in admission if record[0] == 2)
+            producer_record = next(record for record in closure if record[0] == 0)
+            consumer_keys = cross_loop_scheduler._first_cohort_event_keys(
+                consumer_record[4]
+            )
+            producer_tasks = cross_loop_scheduler._first_cohort_tasks(
+                graph.root_task_orders[0],
+                producer_record[2],
+            )
+            self.assertIsNotNone(consumer_keys)
+            self.assertIsNotNone(producer_tasks)
+            assert consumer_keys is not None and producer_tasks is not None
+            requirements = cross_loop_scheduler._event_key_producer_requirements(
+                graph.events[0],
+                consumer_keys,
+            )
+            self.assertIsNotNone(requirements)
+            assert requirements is not None
+            before = cross_loop_scheduler._event_key_frontier_state(
+                requirements,
+                ((),),
+            )
+            after = cross_loop_scheduler._event_key_frontier_state(
+                requirements,
+                (((producer_tasks, 2),),),
+            )
+
+        self.assertEqual(before, (False, False, 1))
+        self.assertEqual(after, (True, False, 2))
+        for concrete_batch in (0, 1, 3):
+            with self.subTest(concrete_batch=concrete_batch):
+                substitutions = {batch: concrete_batch}
+                self.assertEqual(
+                    consumer_keys.substitute_parameters(substitutions).materialize(),
+                    (frozenset((0,)),),
+                )
+                self.assertEqual(
+                    producer_tasks.substitute_parameters(substitutions).materialize(),
+                    (frozenset((0, 2 * concrete_batch + 1)),),
+                )
+
+    def test_event_key_frontier_tracks_active_join_and_union_depth(self) -> None:
+        producer_a, producer_b, consumer = _identify_root_domains(
+            (
+                _domain((10, 2, 1)),
+                _domain((20, 2, 1)),
+                _domain((30, 2, 1)),
+            )
+        )
+        key_domain = _domain((0, 2), kind="event", identity=0)
+        event = ReadinessEvent(
+            producers=(
+                ReadinessProducer(
+                    0,
+                    _full_point_map(
+                        key_domain,
+                        producer_a,
+                        coordinate_axis_symbol(0),
+                    ),
+                ),
+                ReadinessProducer(
+                    1,
+                    _full_point_map(
+                        key_domain,
+                        producer_b,
+                        coordinate_axis_symbol(0),
+                    ),
+                ),
+            ),
+            consumers=(
+                ReadinessConsumer(
+                    2,
+                    _full_point_map(
+                        consumer,
+                        key_domain,
+                        coordinate_axis_symbol(30),
+                    ),
+                ),
+            ),
+        )
+        marker = cross_loop_scheduler._singleton_relation_domain()
+        both_keys = CoordinateRelation.total(marker, key_domain)
+        all_a = CoordinateRelation.total(marker, producer_a)
+        b0 = CoordinateRelation(
+            marker,
+            producer_b,
+            (_CoordinateRelationPiece((), ((20, 0, 1, 1),)),),
+        )
+        b1 = CoordinateRelation(
+            marker,
+            producer_b,
+            (_CoordinateRelationPiece((), ((20, 1, 2, 1),)),),
+        )
+        requirements = cross_loop_scheduler._event_key_producer_requirements(
+            event,
+            both_keys,
+        )
+        self.assertIsNotNone(requirements)
+        assert requirements is not None
+
+        with _forbid_schedule_enumeration():
+            active = cross_loop_scheduler._event_key_frontier_state(
+                requirements,
+                (((all_a, 2),), ()),
+            )
+            partial = cross_loop_scheduler._event_key_frontier_state(
+                requirements,
+                (((all_a, 2),), ((b0, 3),)),
+            )
+            closed = cross_loop_scheduler._event_key_frontier_state(
+                requirements,
+                (((all_a, 2),), ((b0, 3), (b1, 2))),
+            )
+
+        self.assertEqual(active, (False, True, 2))
+        self.assertEqual(partial, (None, None, 2))
+        self.assertEqual(closed, (True, False, 3))
+        with _forbid_schedule_enumeration():
+            single_arm_requirements = (
+                cross_loop_scheduler._event_key_producer_requirements(
+                    dataclasses.replace(event, producers=(event.producers[1],)),
+                    both_keys,
+                )
+            )
+            self.assertIsNotNone(single_arm_requirements)
+            assert single_arm_requirements is not None
+            single_arm_partial = cross_loop_scheduler._event_key_frontier_state(
+                single_arm_requirements,
+                (((b0, 3),),),
+            )
+        # One partially covered arm does not prove that an event is active;
+        # the missing target-set difference remains a conservative unknown.
+        self.assertEqual(single_arm_partial, (None, None, 1))
+
+        key0 = CoordinateRelation(
+            marker,
+            key_domain,
+            (_CoordinateRelationPiece((), ((0, 0, 1, 1),)),),
+        )
+        a0 = CoordinateRelation(
+            marker,
+            producer_a,
+            (_CoordinateRelationPiece((), ((10, 0, 1, 1),)),),
+        )
+        disjoint_event = dataclasses.replace(
+            event,
+            producers=(
+                event.producers[0],
+                ReadinessProducer(
+                    1,
+                    CoordinateRelation.point_map(
+                        key_domain,
+                        producer_b,
+                        (
+                            (
+                                ((0, 1, 2, 1),),
+                                (coordinate_axis_symbol(0),),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        with _forbid_schedule_enumeration():
+            disjoint_requirements = (
+                cross_loop_scheduler._event_key_producer_requirements(
+                    disjoint_event,
+                    key0,
+                )
+            )
+            self.assertIsNotNone(disjoint_requirements)
+            assert disjoint_requirements is not None
+            disjoint = cross_loop_scheduler._event_key_frontier_state(
+                disjoint_requirements,
+                (((a0, 2),), ()),
+            )
+        self.assertEqual(disjoint, (True, False, 2))
+
+        with (
+            _forbid_schedule_enumeration(),
+            mock.patch.object(tile_dependency, "_MAX_RELATION_PRODUCT_STATES", 1),
+        ):
+            self.assertIsNone(
+                cross_loop_scheduler._event_key_producer_requirements(
+                    event,
+                    both_keys,
+                )
+            )
+
+        producer_count = sympy.Symbol(
+            "producer_count",
+            integer=True,
+            nonnegative=True,
+        )
+        conditional_producer, singleton_consumer = _identify_root_domains(
+            (
+                _domain((40, producer_count, 1)),
+                _domain((50, 1, 1)),
+            )
+        )
+        singleton_key = _domain((0, 1), kind="event", identity=1)
+        conditional_event = ReadinessEvent(
+            producers=(
+                ReadinessProducer(
+                    0,
+                    _full_point_map(
+                        singleton_key,
+                        conditional_producer,
+                        sympy.Integer(0),
+                    ),
+                ),
+            ),
+            consumers=(
+                ReadinessConsumer(
+                    1,
+                    _full_point_map(
+                        singleton_consumer,
+                        singleton_key,
+                        sympy.Integer(0),
+                    ),
+                ),
+            ),
+        )
+        with _forbid_schedule_enumeration():
+            conditional_requirements = (
+                cross_loop_scheduler._event_key_producer_requirements(
+                    conditional_event,
+                    CoordinateRelation.total(marker, singleton_key),
+                )
+            )
+            self.assertIsNotNone(conditional_requirements)
+            assert conditional_requirements is not None
+            conditional = cross_loop_scheduler._event_key_frontier_state(
+                conditional_requirements,
+                ((),),
+            )
+        self.assertEqual(conditional, (None, None, 1))
+
     def test_readiness_cohort_relation_factors_fixed_fanout(self) -> None:
         task_count = sympy.Symbol(
             "task_count",
@@ -3503,7 +3754,7 @@ class TestCrossLoopScheduler(TestCase):
             )
         )
 
-    def test_parametric_cohort_schedule_requires_key_scoped_event_closure(
+    def test_parametric_cohort_schedule_uses_key_scoped_event_closure(
         self,
     ) -> None:
         root_domains = _identify_root_domains(
@@ -3532,13 +3783,64 @@ class TestCrossLoopScheduler(TestCase):
                 pipeline_depth=2,
             )
 
-        # A and B have identical structural/release classes after P. B closes
-        # the P+B event while A only opens A+R, but that distinction must come
-        # from exact key frontiers rather than a root-set approximation. This
-        # finite-root slice therefore keeps the complete boundary canonical.
+        # A and B have identical structural classes after P. Root 3 closes the
+        # active P+root3 event while root 2 only opens root2+root5, so the exact
+        # key frontier selects root 3. Root 4 is then the next legal depth-two
+        # action; the remaining order is deterministic and progress-safe.
         self.assertEqual(
-            _materialized_root_slot_stream(scheduled)[:6],
-            (0, 0, 1, 1, 1, 1),
+            _materialized_root_slot_stream(scheduled),
+            (0, 0, 3, 3, 4, 4, 2, 2, 5, 5, 1, 1, 1, 1, 6, 6, 7, 7),
+        )
+        self.assertTrue(
+            cross_loop_scheduler._semantic_schedule_is_progress_safe(
+                scheduled,
+                graph,
+            )
+        )
+
+    def test_parametric_cohort_schedule_continues_active_event_fiber(self) -> None:
+        root_domains = _identify_root_domains(
+            tuple(
+                _domain((10 + 10 * root, 4 if root == 1 else 2, 1))
+                for root in range(8)
+            )
+        )
+        graph = _readiness_graph(
+            root_domains,
+            _whole_root_readiness_event(root_domains, 0, 2, 0),
+            _whole_root_readiness_event(root_domains, 0, 3, 1),
+            _whole_consumer_join_readiness_event(
+                root_domains,
+                (0, 3, 4),
+                6,
+                2,
+            ),
+            _whole_consumer_join_readiness_event(
+                root_domains,
+                (2, 5),
+                7,
+                3,
+            ),
+        )
+        canonical = cross_loop_scheduler._build_root_major_worker_schedule(
+            graph.root_domains,
+            graph.root_task_orders,
+            worker_count=4,
+        )
+
+        with _forbid_schedule_enumeration():
+            scheduled = cross_loop_scheduler._parametric_cohort_list_schedule(
+                graph,
+                canonical,
+                pipeline_depth=2,
+            )
+
+        # Both candidates have equal structural class and release no consumer.
+        # Root 3 continues P's active event fiber, while root 2 opens a new
+        # fiber, so root 3 wins despite its later canonical root number.
+        self.assertEqual(
+            tuple(segment.root for segment in scheduled.segments)[:2],
+            (0, 3),
         )
         self.assertTrue(
             cross_loop_scheduler._semantic_schedule_is_progress_safe(
@@ -3632,33 +3934,45 @@ class TestCrossLoopScheduler(TestCase):
         self.assertIsNotNone(root_criticality)
         assert root_edges is not None
         assert root_criticality is not None
+        semantic_cohorts = (
+            cross_loop_scheduler._semantic_readiness_cohort_relations(graph)
+        )
+        self.assertIsNotNone(semantic_cohorts)
+        assert semantic_cohorts is not None
         original_budget_check = tile_dependency._relation_product_is_within_budget
 
-        def budget_check(*factor_sizes: int) -> bool:
-            if factor_sizes == (5, 5, 5):
-                return False
-            return original_budget_check(*factor_sizes)
+        for blocked_work in ((5, 5, 5), (5, 5, 9)):
+            with self.subTest(blocked_work=blocked_work):
 
-        with (
-            _forbid_schedule_enumeration(),
-            mock.patch.object(
-                tile_dependency,
-                "_relation_product_is_within_budget",
-                side_effect=budget_check,
-            ) as checked_budget,
-        ):
-            scheduled = cross_loop_scheduler._bounded_cohort_list_schedule(
-                graph,
-                canonical,
-                replacements,
-                cohort_widths=cohort_widths,
-                root_edges=root_edges,
-                root_criticality=root_criticality,
-                pipeline_depth=4,
-            )
+                def budget_check(
+                    *factor_sizes: int,
+                    _blocked_work: tuple[int, ...] = blocked_work,
+                ) -> bool:
+                    if factor_sizes == _blocked_work:
+                        return False
+                    return original_budget_check(*factor_sizes)
 
-        self.assertIsNone(scheduled)
-        self.assertIn(mock.call(5, 5, 5), checked_budget.call_args_list)
+                with (
+                    _forbid_schedule_enumeration(),
+                    mock.patch.object(
+                        tile_dependency,
+                        "_relation_product_is_within_budget",
+                        side_effect=budget_check,
+                    ) as checked_budget,
+                ):
+                    scheduled = cross_loop_scheduler._bounded_cohort_list_schedule(
+                        graph,
+                        canonical,
+                        replacements,
+                        semantic_cohorts=semantic_cohorts,
+                        cohort_widths=cohort_widths,
+                        root_edges=root_edges,
+                        root_criticality=root_criticality,
+                        pipeline_depth=4,
+                    )
+
+                self.assertIsNone(scheduled)
+                self.assertIn(mock.call(*blocked_work), checked_budget.call_args_list)
 
     def test_parametric_cohort_schedule_pulls_one_complete_subroot_cohort(
         self,
@@ -4063,7 +4377,7 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(cohort_candidates[1].get(2), 2)
         self.assertIs(scheduled, canonical)
 
-    def test_parametric_cohort_schedule_keeps_canonical_across_equal_cohorts(
+    def test_parametric_cohort_schedule_uses_canonical_root_across_equal_cohorts(
         self,
     ) -> None:
         root_domains = _identify_root_domains(
@@ -4100,12 +4414,21 @@ class TestCrossLoopScheduler(TestCase):
         assert cohort_candidates is not None
         self.assertEqual(cohort_candidates[1].get(2), 1)
         self.assertEqual(cohort_candidates[1].get(3), 2)
-        # Both ready roots have the same static criticality. Their cohort
-        # widths differ, but width is an eligibility constraint rather than a
-        # priority heuristic, so the unresolved tie retains canonical order.
-        self.assertIs(scheduled, canonical)
+        # Both ready roots have the same exact priority. Width does not break
+        # the tie; canonical root order selects root 2, whose first cohort is
+        # the atomic action represented by this bounded slice.
+        self.assertEqual(
+            tuple(segment.root for segment in scheduled.segments),
+            (0, 2, 1, 2, 3),
+        )
+        self.assertTrue(
+            cross_loop_scheduler._semantic_schedule_is_progress_safe(
+                scheduled,
+                graph,
+            )
+        )
 
-    def test_parametric_cohort_schedule_respects_competitor_optimistic_floor(
+    def test_parametric_cohort_schedule_resolves_competitor_release_frontier(
         self,
     ) -> None:
         root_domains = _identify_root_domains(
@@ -4114,7 +4437,7 @@ class TestCrossLoopScheduler(TestCase):
             )
         )
         base_edges = ((0, 2), (2, 5), (3, 4))
-        for guarded, expected_second_root in ((False, 2), (True, 1)):
+        for guarded in (False, True):
             with self.subTest(guarded=guarded):
                 edges = (*base_edges, *(((4, 6),) if guarded else ()))
                 graph = _readiness_graph(
@@ -4152,11 +4475,10 @@ class TestCrossLoopScheduler(TestCase):
                 assert cohort_candidates is not None
                 self.assertEqual(cohort_candidates[1].get(2), 1)
                 self.assertEqual(cohort_candidates[1].get(3), 1)
-                self.assertEqual(scheduled.segments[1].root, expected_second_root)
-                # Adding only B's deeper successor makes B's best possible
-                # release class tie A's pessimistic known class. A may no
-                # longer win by pretending that competing release cannot occur.
-                # The bounded pass may still make an independent later move.
+                self.assertEqual(scheduled.segments[1].root, 2)
+                # The deeper successor changes root 3's optimistic topology
+                # floor, but its first cohort does not release that successor.
+                # Exact key-frontier state therefore preserves root 2's win.
                 self.assertTrue(
                     cross_loop_scheduler._semantic_schedule_is_progress_safe(
                         scheduled,
@@ -4164,7 +4486,7 @@ class TestCrossLoopScheduler(TestCase):
                     )
                 )
 
-    def test_parametric_cohort_schedule_respects_canonical_optimistic_floor(
+    def test_parametric_cohort_schedule_resolves_canonical_release_frontier(
         self,
     ) -> None:
         root_domains = _identify_root_domains(
@@ -4174,7 +4496,7 @@ class TestCrossLoopScheduler(TestCase):
             )
         )
         base_edges = ((0, 2), (2, 4), (1, 3))
-        for guarded, expected_second_root in ((False, 2), (True, 1)):
+        for guarded in (False, True):
             with self.subTest(guarded=guarded):
                 edges = (*base_edges, *(((3, 5),) if guarded else ()))
                 graph = _readiness_graph(
@@ -4212,12 +4534,16 @@ class TestCrossLoopScheduler(TestCase):
                 assert cohort_candidates is not None
                 self.assertEqual(cohort_candidates[1].get(1), 1)
                 self.assertEqual(cohort_candidates[1].get(2), 1)
-                self.assertEqual(scheduled.segments[1].root, expected_second_root)
-                # The canonical cohort's current class is unchanged enough to
-                # lose to A, but its possible downstream release is now as
-                # critical as A. The strict proof therefore keeps C.
-                if guarded:
-                    self.assertIs(scheduled, canonical)
+                self.assertEqual(scheduled.segments[1].root, 2)
+                # The deeper successor changes the canonical cohort's
+                # optimistic topology floor, but its current key fiber does
+                # not release it. Exact frontier state keeps root 2 ahead.
+                self.assertTrue(
+                    cross_loop_scheduler._semantic_schedule_is_progress_safe(
+                        scheduled,
+                        graph,
+                    )
+                )
 
     def test_parametric_cohort_schedule_admits_whole_root_across_wave_boundary(
         self,
