@@ -53,9 +53,6 @@ from helion._compiler.cross_loop_scheduler import (
 from helion._compiler.cross_loop_scheduler import choose_final_arrival_continuations
 from helion._compiler.cross_loop_scheduler import choose_readiness_counters
 from helion._compiler.cross_loop_scheduler import derive_final_arrival_continuations
-from helion._compiler.cross_loop_scheduler import (
-    order_continuation_producers_by_readiness_key,
-)
 from helion._compiler.cross_loop_scheduler import place_nested_loop_consumers
 from helion._compiler.tile_dependency import CoordinateDomain
 from helion._compiler.tile_dependency import CoordinateRelation
@@ -1559,9 +1556,16 @@ class TestCrossLoopScheduler(TestCase):
                 consumers=sink_event.consumers,
             ),
         )
+        source_schedule = cross_loop_scheduler._with_transient_source_schedule_segment(
+            baseline,
+            readiness_graph.root_task_orders,
+            0,
+        )
+        self.assertIsNotNone(source_schedule)
+        assert source_schedule is not None
         scheduled = _global_unit_list_schedule(
             readiness_graph,
-            baseline,
+            source_schedule,
             readiness_counters,
             frozenset(),
             transient_source_root=0,
@@ -1744,11 +1748,18 @@ class TestCrossLoopScheduler(TestCase):
             ReadinessCounterPlan(event.producers, event.consumers)
             for event in (source_event, early_event, late_event)
         )
+        source_schedule = cross_loop_scheduler._with_transient_source_schedule_segment(
+            _baseline_worker_schedule(graph.root_domains, worker_count=2),
+            graph.root_task_orders,
+            0,
+        )
+        self.assertIsNotNone(source_schedule)
+        assert source_schedule is not None
 
         with _forbid_schedule_enumeration():
             scheduled = _global_unit_list_schedule(
                 graph,
-                _baseline_worker_schedule(graph.root_domains, worker_count=2),
+                source_schedule,
                 counters,
                 frozenset(),
                 transient_source_root=0,
@@ -1805,13 +1816,22 @@ class TestCrossLoopScheduler(TestCase):
                 readiness_counters = (
                     ReadinessCounterPlan(event.producers, event.consumers),
                 )
-                with _forbid_schedule_enumeration():
-                    scheduled = _global_unit_list_schedule(
-                        readiness_graph,
+                source_schedule = (
+                    cross_loop_scheduler._with_transient_source_schedule_segment(
                         _baseline_worker_schedule(
                             readiness_graph.root_domains,
                             worker_count=2,
                         ),
+                        readiness_graph.root_task_orders,
+                        0,
+                    )
+                )
+                self.assertIsNotNone(source_schedule)
+                assert source_schedule is not None
+                with _forbid_schedule_enumeration():
+                    scheduled = _global_unit_list_schedule(
+                        readiness_graph,
+                        source_schedule,
                         readiness_counters,
                         frozenset(),
                         transient_source_root=0,
@@ -2182,6 +2202,7 @@ class TestCrossLoopScheduler(TestCase):
             frozenset(),
             pipeline_depth=1,
         )
+        # This fixture's configured traversal is already its prepared C.
         self.assertIs(depth_one, baseline)
 
         scheduled = _global_unit_list_schedule(
@@ -2256,13 +2277,20 @@ class TestCrossLoopScheduler(TestCase):
             for event in graph.events
         )
         baseline = _baseline_worker_schedule(graph.root_domains, worker_count=4)
+        prepared = cross_loop_scheduler._consumer_major_producer_order(
+            graph,
+            baseline,
+            plans,
+            frozenset(),
+            excluded_roots=frozenset(),
+        )
 
         schedules: dict[int, WorkerSchedule] = {}
         with _forbid_schedule_enumeration():
             for pipeline_depth in range(1, 5):
                 scheduled = _global_unit_list_schedule(
                     graph,
-                    baseline,
+                    prepared,
                     plans,
                     frozenset(),
                     pipeline_depth=pipeline_depth,
@@ -2271,7 +2299,7 @@ class TestCrossLoopScheduler(TestCase):
                 assert scheduled is not None
                 schedules[pipeline_depth] = scheduled
 
-        self.assertIs(schedules[1], baseline)
+        self.assertIs(schedules[1], prepared)
         for pipeline_depth, schedule in schedules.items():
             validate_worker_schedule(graph, schedule)
             first_wave = {root: placement(schedule, root, 0)[1] for root in range(5)}
@@ -3302,7 +3330,7 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(plan.readiness_counters, ())
         self.assertEqual(plan.root_barrier_edges, frozenset())
 
-    def test_event_frontier_orders_root_tasks_to_finish_ready_event(self) -> None:
+    def test_event_frontier_preserves_prepared_readiness_order(self) -> None:
         producer_domain, consumer_domain = _identify_root_domains(
             (
                 _domain((10, 2, 1), (11, 2, 1)),
@@ -3348,10 +3376,17 @@ class TestCrossLoopScheduler(TestCase):
         graph = _readiness_graph((producer_domain, consumer_domain), event)
         plan = ReadinessCounterPlan(event.producers, event.consumers)
         baseline = _baseline_worker_schedule(graph.root_domains, worker_count=2)
+        prepared = cross_loop_scheduler._consumer_major_producer_order(
+            graph,
+            baseline,
+            (plan,),
+            frozenset(),
+            excluded_roots=frozenset(),
+        )
 
         proposed = cross_loop_scheduler._event_frontier_list_schedule(
             graph,
-            baseline,
+            prepared,
             (plan,),
             frozenset(),
         )
@@ -3387,7 +3422,7 @@ class TestCrossLoopScheduler(TestCase):
         # without increasing the occupied-wave horizon.
         scheduled = _global_unit_list_schedule(
             graph,
-            baseline,
+            prepared,
             (plan,),
             frozenset(),
         )
@@ -3552,9 +3587,16 @@ class TestCrossLoopScheduler(TestCase):
                     for event in events
                 )
                 baseline = _baseline_worker_schedule(domains, worker_count=4)
-                candidate = cross_loop_scheduler._event_frontier_list_schedule(
+                prepared = cross_loop_scheduler._consumer_major_producer_order(
                     graph,
                     baseline,
+                    plans,
+                    frozenset(),
+                    excluded_roots=frozenset(),
+                )
+                candidate = cross_loop_scheduler._event_frontier_list_schedule(
+                    graph,
+                    prepared,
                     plans,
                     frozenset(),
                 )
@@ -3562,8 +3604,8 @@ class TestCrossLoopScheduler(TestCase):
                 assert candidate is not None
                 expected = (
                     candidate
-                    if old_horizon(candidate) <= old_horizon(baseline)
-                    else baseline
+                    if old_horizon(candidate) <= old_horizon(prepared)
+                    else prepared
                 )
                 with (
                     _forbid_schedule_enumeration(),
@@ -3575,7 +3617,7 @@ class TestCrossLoopScheduler(TestCase):
                 ):
                     actual = _global_unit_list_schedule(
                         graph,
-                        baseline,
+                        prepared,
                         plans,
                         frozenset(),
                     )
@@ -11898,9 +11940,11 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(schedule.dense_assignment(0), (1, 4, 2, 2))
         self.assertIsNone(schedule.contiguous_global_interval(0))
 
-    def test_continuation_producers_preserve_key_major_order(self) -> None:
+    def test_root_local_preparation_orders_continuation_producers_atomically(
+        self,
+    ) -> None:
         root_domains = (
-            _domain((10, 4, 1)),
+            _domain((10, 2, 1), (11, 2, 1)),
             _domain((20, 2, 1)),
         )
         producer_domain, consumer_domain = _identify_root_domains(root_domains)
@@ -11917,7 +11961,7 @@ class TestCrossLoopScheduler(TestCase):
                         publication=_full_point_map(
                             producer_domain,
                             readiness_key_domain,
-                            sympy.floor(producer_axis / 2),
+                            producer_axis,
                         ),
                     ),
                 ),
@@ -11936,15 +11980,23 @@ class TestCrossLoopScheduler(TestCase):
             readiness_graph.root_domains,
             worker_count=2,
         )
-        continuations = derive_final_arrival_continuations(readiness_graph)
-
-        schedule = order_continuation_producers_by_readiness_key(
+        event = readiness_graph.events[0]
+        continuation_plan = ReadinessCounterPlan(
+            event.producers,
+            event.consumers,
+            continuation_consumer_index=0,
+        )
+        resident = baseline.without_roots(frozenset((1,)))
+        schedule = cross_loop_scheduler._consumer_major_producer_order(
             readiness_graph,
-            baseline,
-            continuations,
+            resident,
+            (continuation_plan,),
+            frozenset(),
+            excluded_roots=frozenset((1,)),
         )
 
-        self.assertEqual(task_order(schedule, 0), (0, 1, 2, 3))
+        self.assertEqual(task_order(resident, 0), (0, 1, 2, 3))
+        self.assertEqual(task_order(schedule, 0), (0, 2, 1, 3))
 
         # Root-local ordering is one speculative transaction. Failure to
         # normalize the alternate exact traversal must retain the canonical
@@ -11954,12 +12006,116 @@ class TestCrossLoopScheduler(TestCase):
             "WorkerSchedule",
             side_effect=ValueError("unsupported alternate traversal"),
         ):
-            declined = order_continuation_producers_by_readiness_key(
+            declined = cross_loop_scheduler._consumer_major_producer_order(
                 readiness_graph,
-                baseline,
-                continuations,
+                resident,
+                (continuation_plan,),
+                frozenset(),
+                excluded_roots=frozenset((1,)),
             )
-        self.assertIs(declined, baseline)
+        self.assertIs(declined, resident)
+
+    def test_unsafe_root_local_preparation_retains_frozen_ownership(self) -> None:
+        producer_domain, consumer_domain = _identify_root_domains(
+            (_domain((10, 2, 1)), _domain((20, 1, 1)))
+        )
+        key_domain = _domain((0, 1), kind="event", identity=0)
+        zero = sympy.Integer(0)
+        event = ReadinessEvent(
+            producers=(
+                ReadinessProducer(
+                    0,
+                    _full_point_map(key_domain, producer_domain, zero),
+                ),
+            ),
+            consumers=(
+                ReadinessConsumer(
+                    1,
+                    _full_point_map(consumer_domain, key_domain, zero),
+                ),
+            ),
+        )
+        graph = _readiness_graph((producer_domain, consumer_domain), event)
+        canonical = _schedule(
+            2,
+            _segment(
+                0,
+                _one_dimensional_task_range(producer_domain, 0, 1),
+                workers=(0, 1),
+                dispatch_offset=0,
+            ),
+            _segment(
+                1,
+                graph.root_task_orders[1],
+                workers=(1, 1),
+                dispatch_offset=0,
+            ),
+            _segment(
+                0,
+                _one_dimensional_task_range(producer_domain, 1, 1),
+                workers=(1, 1),
+                dispatch_offset=1,
+            ),
+        )
+        unsafe_permutation = _schedule(
+            2,
+            _segment(
+                0,
+                _one_dimensional_task_range(producer_domain, 1, 1),
+                workers=(0, 1),
+                dispatch_offset=0,
+            ),
+            _segment(
+                1,
+                graph.root_task_orders[1],
+                workers=(1, 1),
+                dispatch_offset=0,
+            ),
+            _segment(
+                0,
+                _one_dimensional_task_range(producer_domain, 0, 1),
+                workers=(1, 1),
+                dispatch_offset=1,
+            ),
+        )
+        plan = ReadinessCounterPlan(event.producers, event.consumers)
+        self.assertTrue(
+            cross_loop_scheduler._schedule_is_progress_safe(
+                canonical,
+                graph,
+                (plan,),
+                frozenset(),
+            )
+        )
+        self.assertFalse(
+            cross_loop_scheduler._schedule_is_progress_safe(
+                unsafe_permutation,
+                graph,
+                (plan,),
+                frozenset(),
+            )
+        )
+
+        with mock.patch.object(
+            cross_loop_scheduler,
+            "_consumer_major_producer_order",
+            return_value=unsafe_permutation,
+        ):
+            selected = cross_loop_scheduler._try_finalize_pipeline_proposal(
+                dependency_graph=_dependency_graph([[10], [20]]),
+                readiness_graph=graph,
+                worker_schedule=canonical,
+                continuations=(),
+                candidate_readiness_counters=(plan,),
+                allow_counter_fallback=False,
+                allow_global_schedule=True,
+                allow_transient_source=False,
+                pipeline_depth=1,
+            )
+
+        self.assertIsNotNone(selected)
+        assert selected is not None
+        self.assertIs(selected.worker_schedule, canonical)
 
     def test_worker_schedule_detects_dependency_order_cycle(self) -> None:
         graph = _dependency_graph(

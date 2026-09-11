@@ -106,9 +106,11 @@ schedule used to analyze continuation dominance `C`; that schedule is only
 the analysis seed `A`. Root-local preparation may replace one configured
 traversal with an exact bijective readiness-major traversal inside that root's
 eventual canonical slots; it may not move worker/wave ownership or interleave
-roots. All root-local replacements are one transaction: if any selected
-replacement is conflicting, unproved, over budget, or not lowerable, discard
-the complete replacement proposal and retain the configured traversals. The
+roots. Conflicting or unproved candidate orders reject that root before
+selection. The remaining selected root replacements are committed together:
+if any selected replacement is over budget, not lowerable in its owned slots,
+or makes the combined schedule fail progress, discard the complete replacement
+proposal and retain the configured traversals. The
 accepted traversals are represented only by `WorkerScheduleSegment.task_order`
 when `C` is built; they are not copied into `ReadinessGraph` or a new order
 object. `C` is not the output of `place_nested_loop_consumers`,
@@ -125,6 +127,14 @@ order. Whole-root barriers provide no fine traversal. Final-arrival producer
 ordering uses this same outgoing-event rule; it is not a separate pass. Every
 accepted replacement must be a total exact bijection over the same logical
 domain and cardinality and remain within the relation budget.
+
+Launch-stage ownership does not depend on the optional source-frontier ordering
+proof. If that frontier is not representable, retain the source-owned canonical
+schedule with configured resident traversals and decline deeper source-aware
+placement. Do not silently turn the source back into resident work. Final
+commit tries, in order, the placed candidate, prepared `C`, and the unprepared
+frozen-ownership base; every fallback within one proposal retains identical
+continuation/source ownership and prerequisite semantics.
 
 `_event_frontier_list_schedule` consumes the prepared `C` and never invokes a
 second root-ordering transform. Depth one returns that `C` exactly. If list
@@ -313,13 +323,24 @@ sections are not active work.
   nested consumers. Select and freeze launch-stage source ownership from that
   immutable prerequisite view before final placement. During migration allow
   at most one all-resident analysis followed by one rebuild.
+- [x] Before scheduling, lower every retained multi-producer event through one
+  common conservative key quotient when its original key space is not
+  renderable. The selected quotient covers every retained consumer and
+  original obligation; its fan-in sums exact publication occurrences from
+  every arm, including nonuniform tails. A continuation survives only when its
+  consumer-to-quotient-key relation remains exact one-to-one with exact-once
+  final ownership. Otherwise retain the consumer and use the conservative
+  barrier fallback. Scheduling consumes this executable quotient while event
+  identity still comes from the one semantic `ReadinessEvent`.
 - [ ] Transactionally select root-local traversals from the frozen
   `ReadinessGraph` and prerequisite view, then construct deterministic
   canonical schedule `C` for that frozen ownership plan. Root-local setup may
-  change only an exact bijective traversal within already-owned slots; a
-  conflict or proof/lowering failure keeps every configured traversal. No
-  legacy local pass may independently move or interleave roots in the end
-  state, and no prepared-order copy is stored in `ReadinessGraph`.
+  change only an exact bijective traversal within already-owned slots. A
+  conflict or candidate-proof failure keeps that root's configured traversal;
+  failure to install, lower, or validate the combined selected set rolls back
+  every selected replacement. No legacy local pass may independently move or
+  interleave roots in the end state, and no prepared-order copy is stored in
+  `ReadinessGraph`.
 - [ ] Add a fixed-slot synchronization test harness. Vary runtime sequence
   lengths, page-table values, active masks, empty/full useful-work ranges, and
   route IDs while asserting an identical schedule/counter dump, every
@@ -331,7 +352,7 @@ sections are not active work.
 
 ### Phase S2: one finite event-frontier placement
 
-- [ ] Refactor the existing concrete path so `_event_frontier_list_schedule`
+- [x] Refactor the existing concrete path so `_event_frontier_list_schedule`
   is the sole cross-root placement decision. Move
   `_consumer_major_producer_order` out of the depth-dependent selector and
   fold `order_continuation_producers_by_readiness_key` into the same
@@ -373,14 +394,11 @@ sections are not active work.
   participants/sites and epoch layout. Counter keys/fan-ins, root-barrier
   edges, continuation identity, and source ownership are already frozen and
   may not be repartitioned.
-- [ ] Preserve a multi-producer join as one semantic `ReadinessEvent`. At
-  lowering time, first seek one common conservative quotient of its key domain
-  under which every producer arm has an exact publication relation and the
-  consumer relation still covers every original obligation. Sum the exact
-  per-arm cardinalities into that quotient's possibly nonuniform fan-in and
-  retain one counter/event group for scheduling priority. If no such common
-  quotient is representable, retain conservative whole-root barriers. Do not
-  split or duplicate the event in `ReadinessGraph` merely to fit a renderer.
+- [ ] Preserve the already-frozen multi-producer common quotient through
+  post-placement publication lowering. Derive physical publishers and epoch
+  stride from exact per-arm publication occurrences and their static maximum
+  fan-in. If that physical derivation fails, reject the optimized proposal;
+  never repartition or split the event after scheduling.
 - [ ] Validate final counters, root barriers, participants, replay bounds, and
   complete progress once from `ReadinessGraph` plus the accepted
   `WorkerSchedule`. An unknown proof rejects the complete optimized proposal;
