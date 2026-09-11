@@ -11463,9 +11463,16 @@ def build_static_pipeline_plan(
     continuation_ineligible_roots: frozenset[int] = frozenset(),
     allow_transient_source: bool = False,
     prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
+    cross_loop_pipeline_depth: int = 1,
 ) -> StaticPipelinePlan:
     """Derive all generic readiness strategies without inspecting root bodies."""
+    if (
+        type(cross_loop_pipeline_depth) is not int
+        or not 1 <= cross_loop_pipeline_depth <= 4
+    ):
+        raise ValueError("cross-loop pipeline depth must be an integer between 1 and 4")
     root_domains = tuple(task_order.target_domain for task_order in root_task_orders)
+    parameterized_roots = any(domain.parameter_symbols for domain in root_domains)
     readiness_graph = build_readiness_graph(
         dependency_graph=dependency_graph,
         root_task_orders=root_task_orders,
@@ -11474,7 +11481,66 @@ def build_static_pipeline_plan(
         prove_nonnegative=prove_nonnegative,
     )
     continuation_candidates = derive_final_arrival_continuations(readiness_graph)
-    if any(domain.parameter_symbols for domain in root_domains):
+
+    # First production foothold for the unified policy: propose the same
+    # all-resident cohort schedule for constant and parameterized domains.
+    # Ownership and nested placement are still handled by the legacy paths
+    # below.  A common ownership-policy gate first avoids competing with the
+    # legacy transient-source proposal; semantic event/site checks then accept
+    # only cases where continuation or nested placement cannot compete.  None
+    # of these checks uses a free-symbol or model-shaped special case.
+    if cross_loop_pipeline_depth > 1 and not allow_transient_source:
+        eligible_continuation_candidates = tuple(
+            continuation
+            for continuation in continuation_candidates
+            if readiness_graph.event(continuation.event_id)
+            .consumers[continuation.consumer_index]
+            .consumer_root
+            not in continuation_ineligible_roots
+        )
+        has_nested_endpoint = any(
+            producer.producer_site_id is not None
+            for event in readiness_graph.events
+            for producer in event.producers
+        ) or any(
+            consumer.consumer_site_id is not None
+            for event in readiness_graph.events
+            for consumer in event.consumers
+        )
+        if not eligible_continuation_candidates and not has_nested_endpoint:
+            try:
+                canonical_schedule = _build_root_major_worker_schedule(
+                    root_domains,
+                    root_task_orders,
+                    worker_count,
+                )
+            except ValueError:
+                canonical_schedule = None
+            if canonical_schedule is not None:
+                candidate_counters = choose_readiness_counters(readiness_graph, ())
+                candidate_schedule = _parametric_cohort_list_schedule(
+                    readiness_graph,
+                    canonical_schedule,
+                    pipeline_depth=cross_loop_pipeline_depth,
+                )
+                if (
+                    candidate_schedule is not None
+                    and candidate_schedule != canonical_schedule
+                ):
+                    proposal = _try_finalize_pipeline_proposal(
+                        dependency_graph=dependency_graph,
+                        readiness_graph=readiness_graph,
+                        worker_schedule=candidate_schedule,
+                        continuations=(),
+                        candidate_readiness_counters=candidate_counters,
+                        allow_counter_fallback=False,
+                        allow_global_schedule=False,
+                        allow_transient_source=False,
+                    )
+                    if proposal is not None:
+                        return proposal
+
+    if parameterized_roots:
         try:
             baseline_schedule = _build_root_major_worker_schedule(
                 root_domains,

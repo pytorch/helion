@@ -1027,6 +1027,82 @@ def _whole_consumer_subset_readiness_event(
     )
 
 
+def _dynamic_leading_cohort_readiness_graph(
+    batch: int | sympy.Expr,
+) -> ReadinessGraph:
+    """Build the rank-three repeated-root fixture used by scheduler tests."""
+    (
+        producer_domain,
+        neutral_domain,
+        consumer_domain,
+    ) = _identify_root_domains(
+        (
+            _domain(
+                (10, 2 * batch + 1, 1),
+                (11, 1, 1),
+                (12, 2, 1),
+            ),
+            _domain((20, 4, 1)),
+            _domain(
+                (30, 2 * batch + 1, 1),
+                (31, 1, 1),
+                (32, 2, 1),
+            ),
+        )
+    )
+    key_domain = CoordinateDomain(
+        axis_order=(0, 1),
+        axis_counts_items=((0, 2 * batch + 1), (1, 1)),
+        kind="event",
+        identity=0,
+    )
+    producers_by_key = CoordinateRelation(
+        key_domain,
+        producer_domain,
+        (
+            _CoordinateRelationPiece(
+                ((0, 0, 2 * batch + 1, 1), (1, 0, 1, 1)),
+                (
+                    (
+                        10,
+                        coordinate_axis_symbol(0),
+                        coordinate_axis_symbol(0) + 1,
+                        1,
+                    ),
+                    (
+                        11,
+                        coordinate_axis_symbol(1),
+                        coordinate_axis_symbol(1) + 1,
+                        1,
+                    ),
+                    (12, 0, 2, 1),
+                ),
+            ),
+        ),
+    )
+    return _readiness_graph(
+        (
+            producer_domain,
+            neutral_domain,
+            consumer_domain,
+        ),
+        ReadinessEvent(
+            producers=(ReadinessProducer(0, producers_by_key),),
+            consumers=(
+                ReadinessConsumer(
+                    consumer_root=2,
+                    keys_by_consumer=_full_point_map(
+                        consumer_domain,
+                        key_domain,
+                        coordinate_axis_symbol(30),
+                        coordinate_axis_symbol(31),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
 def _whole_consumer_join_readiness_event(
     root_domains: tuple[CoordinateDomain, ...],
     producer_roots: tuple[int, ...],
@@ -3036,76 +3112,8 @@ class TestCrossLoopScheduler(TestCase):
 
     def test_parametric_cohort_schedule_pulls_dynamic_leading_cohort(self) -> None:
         batch = sympy.Symbol("batch", integer=True, nonnegative=True)
-        (
-            producer_domain,
-            neutral_domain,
-            consumer_domain,
-        ) = _identify_root_domains(
-            (
-                _domain(
-                    (10, 2 * batch + 1, 1),
-                    (11, 1, 1),
-                    (12, 2, 1),
-                ),
-                _domain((20, 4, 1)),
-                _domain(
-                    (30, 2 * batch + 1, 1),
-                    (31, 1, 1),
-                    (32, 2, 1),
-                ),
-            )
-        )
-        key_domain = CoordinateDomain(
-            axis_order=(0, 1),
-            axis_counts_items=((0, 2 * batch + 1), (1, 1)),
-            kind="event",
-            identity=0,
-        )
-        producers_by_key = CoordinateRelation(
-            key_domain,
-            producer_domain,
-            (
-                _CoordinateRelationPiece(
-                    ((0, 0, 2 * batch + 1, 1), (1, 0, 1, 1)),
-                    (
-                        (
-                            10,
-                            coordinate_axis_symbol(0),
-                            coordinate_axis_symbol(0) + 1,
-                            1,
-                        ),
-                        (
-                            11,
-                            coordinate_axis_symbol(1),
-                            coordinate_axis_symbol(1) + 1,
-                            1,
-                        ),
-                        (12, 0, 2, 1),
-                    ),
-                ),
-            ),
-        )
-        graph = _readiness_graph(
-            (
-                producer_domain,
-                neutral_domain,
-                consumer_domain,
-            ),
-            ReadinessEvent(
-                producers=(ReadinessProducer(0, producers_by_key),),
-                consumers=(
-                    ReadinessConsumer(
-                        consumer_root=2,
-                        keys_by_consumer=_full_point_map(
-                            consumer_domain,
-                            key_domain,
-                            coordinate_axis_symbol(30),
-                            coordinate_axis_symbol(31),
-                        ),
-                    ),
-                ),
-            ),
-        )
+        graph = _dynamic_leading_cohort_readiness_graph(batch)
+        consumer_domain = graph.root_domains[2]
         canonical = cross_loop_scheduler._build_root_major_worker_schedule(
             graph.root_domains,
             graph.root_task_orders,
@@ -4284,6 +4292,110 @@ class TestCrossLoopScheduler(TestCase):
         )
         self.assertEqual(plan.readiness_counters, ())
         self.assertEqual(plan.root_barrier_edges, frozenset())
+
+    def test_plan_builder_accepts_same_cohort_policy_for_constant_and_symbolic(
+        self,
+    ) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        plans: dict[int | sympy.Expr, cross_loop_scheduler.StaticPipelinePlan] = {}
+        dependency_graph = _dependency_graph([[10, 11, 12], [20], [30, 31, 32]])
+        for extent in (1, batch):
+            with self.subTest(extent=extent):
+                graph = _dynamic_leading_cohort_readiness_graph(extent)
+                with (
+                    mock.patch.object(
+                        cross_loop_scheduler,
+                        "build_readiness_graph",
+                        return_value=graph,
+                    ),
+                    _forbid_schedule_enumeration(),
+                ):
+                    plan = _build_static_pipeline_plan(
+                        dependency_graph=dependency_graph,
+                        root_task_orders=graph.root_task_orders,
+                        site_domains=(),
+                        worker_count=4,
+                        continuation_ineligible_roots=frozenset((2,)),
+                        allow_transient_source=False,
+                        cross_loop_pipeline_depth=2,
+                    )
+                self.assertEqual(
+                    tuple(segment.root for segment in plan.worker_schedule.segments),
+                    (0, 2, 1, 2),
+                )
+                plans[extent] = plan
+
+        concrete = plans[1].worker_schedule
+        parameterized = plans[batch].worker_schedule
+        self.assertEqual(len(concrete.segments), len(parameterized.segments))
+        for concrete_segment, parameterized_segment in zip(
+            concrete.segments,
+            parameterized.segments,
+            strict=True,
+        ):
+            self.assertEqual(concrete_segment.root, parameterized_segment.root)
+            self.assertEqual(
+                concrete_segment.task_order.materialize(),
+                parameterized_segment.task_order.substitute_parameters(
+                    {batch: 1}
+                ).materialize(),
+            )
+
+    def test_plan_builder_rebuilds_canonical_after_cohort_decline(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        graph = _dynamic_leading_cohort_readiness_graph(batch)
+        dependency_graph = _dependency_graph([[10, 11, 12], [20], [30, 31, 32]])
+        original_finalizer = cross_loop_scheduler._try_finalize_pipeline_proposal
+        declined_schedule: WorkerSchedule | None = None
+
+        def decline_first_proposal(**kwargs):
+            nonlocal declined_schedule
+            if declined_schedule is None:
+                declined_schedule = kwargs["worker_schedule"]
+                return None
+            return original_finalizer(**kwargs)
+
+        with (
+            mock.patch.object(
+                cross_loop_scheduler,
+                "build_readiness_graph",
+                return_value=graph,
+            ),
+            mock.patch.object(
+                cross_loop_scheduler,
+                "_try_finalize_pipeline_proposal",
+                side_effect=decline_first_proposal,
+            ),
+            _forbid_schedule_enumeration(),
+        ):
+            fallback = _build_static_pipeline_plan(
+                dependency_graph=dependency_graph,
+                root_task_orders=graph.root_task_orders,
+                site_domains=(),
+                worker_count=4,
+                continuation_ineligible_roots=frozenset((2,)),
+                allow_transient_source=False,
+                cross_loop_pipeline_depth=2,
+            )
+
+        self.assertIsNotNone(declined_schedule)
+        assert declined_schedule is not None
+        self.assertEqual(
+            tuple(segment.root for segment in declined_schedule.segments),
+            (0, 2, 1, 2),
+        )
+        canonical = cross_loop_scheduler._build_root_major_worker_schedule(
+            graph.root_domains,
+            graph.root_task_orders,
+            worker_count=4,
+        )
+        self.assertEqual(fallback.worker_schedule, canonical)
+        self.assertTrue(
+            _validate_worker_schedule_tasks(
+                fallback.worker_schedule,
+                graph.root_task_orders,
+            )
+        )
 
     def test_parametric_cohort_schedule_validates_depth(self) -> None:
         root_domains = _identify_root_domains((_domain((10, 1, 1)),))

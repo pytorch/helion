@@ -515,11 +515,26 @@ not yet cover equivalent L2-grouped task orders: an exact `H15 x B x Q`
 group-size-two control still declines safely and remains a prerequisite before
 claiming Qwen/Gemma coverage.
 
-The next implementation transaction is production wiring: invoke this same
-cohort proposal from `build_static_pipeline_plan`, finalize it transactionally
-with the existing counter/progress checks, and fall back to canonical packed
-order through that same path. Only after a higher depth changes a real accepted
-plan should `cross_loop_pipeline_depth` become a public autotune field.
+The first production-wiring foothold is now implemented. Before either legacy
+constant/parameterized policy branch, `build_static_pipeline_plan` can run the
+same all-resident cohort proposal at an internal depth and finalize a changed
+schedule once through the existing counter, coverage, ownership, and progress
+transaction. It is currently gated to the semantic subset with no eligible
+continuation or nested endpoint, and to callers that have disabled the legacy
+transient-source proposal. That last gate is deliberately common to constant
+and symbolic inputs: the current transient implementation is concrete-only,
+so silently treating a symbolic proof failure as permission to reorder would
+reintroduce the policy split. A CUDA integration test reaches the repeated-root
+renderer through this production entry by explicitly disabling that competing
+migration proposal; it is not yet evidence that ordinary codegen selects the
+foothold. Default depth remains one and the field is not exposed publicly while
+the legacy ownership/placement split remains reachable.
+
+The next transaction is to broaden that resident schedule path and implement
+post-placement local continuation dominance so the temporary capability gate
+and old shape-specific branches can be removed. Only after a higher depth
+changes a real accepted plan under the unified path should
+`cross_loop_pipeline_depth` become a public autotune field.
 Consumer-key-scoped closure, repeated pulls, affine recurrence lifting, and
 the depth knob remain subsequent milestones. Exact segment tuple shape,
 depth-2/3/4 aliasing, one-root-per-parameterized-schedule, and the old
