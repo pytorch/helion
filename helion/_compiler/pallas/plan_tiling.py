@@ -135,22 +135,26 @@ def _collect_local_access_keys(graph: torch.fx.Graph) -> set[str | int]:
     return local_access_keys
 
 
-def _collect_control_flow_parent_ids(graphs: list[GraphInfo]) -> dict[int, int]:
+def control_flow_child_graph_ids(node: torch.fx.Node) -> tuple[object, ...]:
+    """The graph ids ``node`` traces into, or ``()`` if it is not control flow."""
     from ...language import _tracing_ops
 
+    if _tracing_ops.is_for_loop_target(node.target):
+        return node.args[:1]
+    if node.target is _tracing_ops._if:
+        return node.args[1:3]
+    if node.target is _tracing_ops._while_loop:
+        return node.args[:2]
+    return ()
+
+
+def _collect_control_flow_parent_ids(graphs: list[GraphInfo]) -> dict[int, int]:
     parent_ids: dict[int, int] = {}
     for graph_info in graphs:
         for node in graph_info.graph.nodes:
             if node.op != "call_function":
                 continue
-            child_ids: tuple[object, ...] = ()
-            if _tracing_ops.is_for_loop_target(node.target):
-                child_ids = node.args[:1]
-            elif node.target is _tracing_ops._if:
-                child_ids = node.args[1:3]
-            elif node.target is _tracing_ops._while_loop:
-                child_ids = node.args[:2]
-            for child_id in child_ids:
+            for child_id in control_flow_child_graph_ids(node):
                 if isinstance(child_id, int):
                     parent_ids.setdefault(child_id, graph_info.graph_id)
     return parent_ids
