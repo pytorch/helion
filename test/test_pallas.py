@@ -5666,6 +5666,37 @@ class TestPallas(TestCase):
         self.assertIn("_hbm_arg_indices=", code)
         torch.testing.assert_close(result, x * r)
 
+    def test_nested_pipeline_blockspec_records_dynamic_row_padding(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def nested_pipeline_copy(
+            offsets: torch.Tensor, x: torch.Tensor
+        ) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty_like(x)
+            for group in hl.grid(offsets.size(0) - 1):
+                begin = offsets[group]
+                end = offsets[group + 1]
+                for tile_m in hl.tile(begin, end):
+                    for tile_n in hl.tile(n):
+                        out[tile_m, tile_n] = x[tile_m, tile_n] * 2
+            return out
+
+        offsets = torch.tensor([0, 13, 25], device=DEVICE, dtype=torch.int32)
+        x = torch.randn(25, 128, device=DEVICE, dtype=torch.bfloat16)
+        code = nested_pipeline_copy.bind((offsets, x)).to_code(
+            helion.Config(
+                block_sizes=[16, 128],
+                pallas_loop_type="emit_pipeline",
+            )
+        )
+        pad_dims = re.search(r"_ds_pad_dims=(\[.*?\])", code)
+        self.assertIsNotNone(pad_dims, "expected _ds_pad_dims in the launcher call")
+        # Entries are (arg index, dim, block size, extra pad). The row dim of
+        # both the input (arg 1) and the output (arg 2) is sliced only by the
+        # nested pipeline, whose dynamic begin needs block_size - 1 = 15 rows.
+        self.assertIn("(1, 0, 16, 15)", pad_dims.group(1))
+        self.assertIn("(2, 0, 16, 15)", pad_dims.group(1))
+
     def test_pipeline_begin_aligned_skips_pad(self) -> None:
         # A block-aligned inner begin (the outer tile's offset) needs no boundary
         # pad, so _ds_pad_dims must report extra_pad == 0 rather than block_size-1.
