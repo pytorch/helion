@@ -90,12 +90,113 @@ Implementation checkpoint (2026-09-09):
   require work. Cyclic dependency scheduling is outside the current milestone;
   those cases retain the conservative fallback.
 
+Architecture decision (2026-09-10):
+
+- Production scheduling will use one **parametric cohort list scheduler**. It
+  is a genuine readiness-driven list scheduler, but its list items are exact
+  affine event cohorts rather than materialized CTAs.
+- Priority is a finite, shape-independent property of the existing root/event
+  topology. Runtime shape expressions determine cohort existence, ready-prefix
+  length, packed offsets, and tails; they never participate in a comparison
+  that chooses one root over another.
+- The production symbolic max-plus evaluator is abandoned. The concrete
+  max-plus implementation remains a test-only diagnostic oracle. The generic
+  exact relation primitives built while investigating it remain because they
+  also serve ownership, progress, frontier, and counter proofs.
+- Resident execution is the default. Final-arrival continuation is admitted
+  only after a separate local dominance proof covers every possible publisher
+  strand and proves that downstream frontiers cannot move later.
+- Static extents are constants flowing through this same policy. There will be
+  no constant/parameterized or local/global scheduling-policy split.
+- The first milestone is acyclic and dynamic-first. Cyclic/SCC scheduling,
+  host-generated schedules, runtime instruction tensors, and device work
+  queues are not prerequisites.
+
 ## Active implementation checklist
 
-This is the ordered handoff list after the 2026-09-09 interruption. Complete
-Priority 1 before resuming scheduler-policy or performance work. A checked box
-means the code exists and its focused unit tests pass; it does not replace the
-cross-workload exit gates below.
+This is the authoritative next roadmap. Later historical phase descriptions
+record how the current branch was reached, but an unchecked symbolic max-plus
+task in those records is not active work.
+
+### Next roadmap: parametric cohort list scheduling
+
+- [ ] Freeze the exact current controls for canonical and dynamic FlashMLA,
+  both Qwen source forms, both Gemma source forms, Muse B1/B2/B4,
+  DeepSeek-V3 MoE, Nemotron MoE, Qwen FFN, and the full DeepSeek MLA negative
+  control. Record worker count, task/cohort counts, exact schedule relations,
+  counters/barriers, resources, cold-L2 latency, and aligned Gantts.
+- [ ] Remove the abandoned symbolic max-plus evaluator tasks and production
+  hooks. Retain the concrete oracle only in tests and retain generic relation
+  operations only where another correctness proof consumes them.
+- [ ] Derive one finite root/event priority table directly from the existing
+  `ReadinessGraph`: least unit-weight slack, greatest structural depth, best
+  released-consumer class, event closure, active-cohort continuation,
+  launch-stage order, and canonical root/cohort order. No priority component
+  may contain a runtime extent or symbolic remaining-work comparison.
+- [ ] Derive exact readiness-equivalent cohorts and maximal candidate runs from
+  the existing `CoordinateRelation`s. A per-wave candidate/emission interval
+  ends at the ready prefix, event-key boundary, relation-piece boundary,
+  worker-wave capacity, or root end. Selecting an eligible whole cohort commits
+  its complete run; that run may span several emission intervals without
+  reranking or interleaving. Do not invent a smaller cohort to fill a lane
+  tail.
+- [ ] Build the deterministic list policy over maximal affine cohort runs.
+  Correctness and proof-budget checks are hard constraints; how far otherwise
+  legal ready work may move ahead of canonical order is controlled only by the
+  cross-loop pipeline-stage knob below, not by a growing collection of
+  profitability rules.
+- [ ] Lift guard-uniform repeated decisions by affine translation induction and
+  emit them directly as existing `WorkerScheduleSegment.task_order` relation
+  pieces. Use bounded prefix/full-group/tail pieces; add no Run, Repeat,
+  Region, instruction-stream, or schedule-program abstraction.
+- [ ] Make canonical packed root-major behavior the conservative outcome of
+  the same scheduler. An unresolved priority tie uses canonical order; unknown
+  readiness, ownership, or progress rejects the optimized proposal.
+- [ ] Expose one scheduler-specific autotune knob:
+  `cross_loop_pipeline_depth`, an integer in the fixed range 1--4.
+  Depth one preserves the validated canonical all-resident schedule, including
+  any wave alignment required by the progress proof. A cohort
+  pulled ahead of canonical order starts depth two; work whose early admission
+  depends on pulled work is one plus the maximum predecessor depth. Depth
+  resets only when placement exactly rejoins the canonical frontier. The knob
+  changes eligibility, never readiness, priority, or counter semantics, and
+  does not directly select ownership; one value applies to the whole
+  polymorphic guard. Always
+  offer the same four values; duplicate schedules are acceptable, just as for
+  existing Triton knobs.
+- [ ] Complete the resident-only scheduler first. Then add the narrow local
+  continuation-dominance proof; do not revive global symbolic completion
+  scoring to choose ownership.
+- [ ] Derive nested frontiers, counters, root barriers, active participants,
+  and replay bounds exactly once from the accepted `WorkerSchedule`. Codegen
+  renders those decisions and does not rediscover them.
+- [ ] Remove the top-level constant/parameterized policy split and the
+  concrete/local versus symbolic/global policy split. Constants are normalized
+  as `sympy.Integer` and traverse the same scheduler.
+- [ ] Re-express source-first FlashMLA admission as an ordinary launch-stage
+  relation and delete the duplicate `transient_source_root` identity only
+  after B4/B9 parity is demonstrated.
+- [ ] Run substitution and bounded concrete-oracle tests before GPU work. Proof
+  and construction time must scale with roots, events, relation pieces, and a
+  finite motif, never with `B`, `Q`, task count, worker count, or wave count.
+- [ ] Roll out GPU validation in this order: FlashMLA; Qwen; Gemma; Muse;
+  Nemotron; DeepSeek-V3. Require numerical parity, one-cubin reuse where
+  declared, cold-L2 controls, resource reports, and Gantts at each step.
+- [ ] Keep resource tuning separate from scheduling policy. Tune worker count,
+  `num_sm_multiplier`, warps, range stages, register limits, and tile choices,
+  but do not feed measured latency or a model name into priority.
+- [ ] Audit dynamic metadata last. Host-backed `B`, `Q`, and sequence extents
+  participate in relation bounds. Device `seq_lens`, expert histograms, and
+  compacted worklists remain canonical masked work unless a later measurement
+  justifies a separate device-claiming project.
+- [ ] Finish with a cleanup audit and independent architecture review: one
+  dependency graph, one readiness graph, one scheduler, one worker schedule,
+  one finalization pass, and one source of truth for every counter/barrier.
+
+### Completed foundation and remaining proof prerequisites
+
+A checked box below means the code exists and its focused unit tests pass; it
+does not replace the roadmap or cross-workload gates above.
 
 ### Current implementation marker: close the symbolic proof layer
 
@@ -253,16 +354,14 @@ already supplies topology-shaped FlashMLA, Qwen, Gemma, and Muse positive and
 negative controls. Those compact fixtures are an early objective check, not a
 substitute for extracting the real model graphs; the real-graph and symbolic-
 substitution gates below remain mandatory before production ownership changes.
-The active implementation point is therefore the acyclic relation-level
-max-plus evaluator, compared exhaustively against the concrete oracle without
-yet changing scheduling policy. Then continue with the real-model gate, joint
-continuation/resident choice, post-placement nested quotients, source-ticket
-actions through that same policy, one final validation/lowering pass, and
-deletion of the top-level constant/parameterized branch.
-
-Then continue Phase 4A.2 by replacing the remaining parameter-only admission
-filters with one exact action-legality decision, followed by the single joint
-event-frontier policy in Phase 4A.3.
+The active implementation point is now the parametric cohort list scheduler in
+the roadmap above. The generic relation primitives remain available, but the
+symbolic max-plus scorer and its ranked-prefix prerequisite are no longer
+production work. Continue Phase 4A.2 by replacing parameter-only action gates,
+then implement resident cohort placement, post-placement nested quotients,
+source-stage actions through that same policy, and one final
+validation/lowering pass before deleting the top-level
+constant/parameterized branch.
 
 ### Priority 1: finish the symbolic dependency refactor
 
@@ -341,10 +440,11 @@ constant or a guarded host-backed expression:
 ```text
 TileDependencyGraph
     -> one ReadinessGraph
-    -> one event-frontier scheduling and ownership policy
+    -> one parametric cohort list policy
        (each early-admission action proves its existing synchronization lowering)
        with conservative root-major fallback
     -> one WorkerSchedule
+    -> optional local continuation dominance over that resident placement
     -> schedule-frontier quotient for nested waits
     -> one counter/root-barrier finalization pass
     -> one RootBarrierPublicationPlan derivation
@@ -353,16 +453,17 @@ TileDependencyGraph
     -> post-compile residency gate before cache acceptance or launch
 ```
 
-The ordering is deliberate. Continuation eligibility must be known before
-scheduling, but ownership is selected by the event-frontier scheduler when an
-event releases its consumer and before that consumer receives any resident
-slot. A final-arrival continuation is therefore an execution action of the
-same scheduling policy, not an independent pre-pass or a later rewrite. Exact
-semantic readiness is already available from `ReadinessGraph`, so scheduling
-does not need emitted counters to be finalized. Conversely, a nested counter
-partition may depend on the final producer and consumer wave relation. It
-therefore cannot be coarsened or finalized before placement. Qwen's useful
-74/22 frontier is the concrete counterexample to the old ordering.
+The ordering is deliberate. Continuation eligibility may be derived before
+scheduling, but every consumer first receives a resident placement. Only then
+can a local proof compare every possible final-publisher strand with that exact
+resident occurrence and remove the consumer when inline ownership dominates.
+A final-arrival continuation is therefore an ownership strength reduction of
+the accepted schedule, not a second scheduler. Exact semantic readiness is
+already available from `ReadinessGraph`, so scheduling does not need emitted
+counters to be finalized. Conversely, a nested counter partition may depend on
+the final producer and consumer wave relation. It therefore cannot be
+coarsened or finalized before placement. Qwen's useful 74/22 frontier is the
+concrete counterexample to the old ordering.
 
 - [x] Build `ReadinessGraph` once before any concrete/parameterized rendering
   choice.
@@ -378,20 +479,14 @@ therefore cannot be coarsened or finalized before placement. Qwen's useful
   filtered graph, capability object, or alternate policy. A schedule-dependent
   nested mechanism is attempted transactionally: if its final quotient cannot
   lower, reject the entire optimized proposal once.
-- [ ] From one complete provisional all-resident schedule, let the one
-  event-frontier scheduler compare each eligible continuation with resident
-  ownership. Charge each inline body, including a chain, as one unit after its
-  final producer on every possible final-producer strand. Compare the
-  guard-wide lexicographic objective `(unit completion makespan,
-  critical-path resident handoff depth)` and commit at most one continuation
-  globally.
-  Inline may win a proved primary tie only by strictly reducing the maximum
-  handoff depth among primary-critical terminal paths; prefer resident on an
-  unproved comparison or a full objective tie. The decision is
-  atomic for the whole event family and compiled guard. Never run a separate
-  continuation-selection pass before or after scheduling. The selected
-  candidate remains the existing ephemeral `FinalArrivalContinuation` until
-  the final `ReadinessCounterPlan` records it.
+- [ ] Keep every eligible consumer resident while constructing the first
+  unified cohort schedule. After resident placement is final, admit a
+  continuation only when one local dominance proof covers every possible
+  final-publisher strand, proves strand-injective ownership with no accumulated
+  inline chain, completes the body no later than its resident occurrence, and
+  leaves every downstream release frontier no later. Resident wins any
+  unproved case. The selected candidate remains the existing ephemeral
+  `FinalArrivalContinuation` until the final `ReadinessCounterPlan` records it.
 - [ ] Replace the permanent single-producer parameterized-counter gate with
   the same exact publication/cardinality/replay certificate used for all
   domains. Keep stricter continuation requirements only where execution
@@ -493,65 +588,103 @@ Input aliases, views, and `torch.empty(..., out=input)` therefore cannot make
 runtime strides look static. This is a prerequisite for comparing symbolic and
 exact-shape schedules without silently changing the generated kernel body.
 
-### Priority 2B: validate the scheduling objective before policy wiring
+### Post-mortem: symbolic max-plus
 
-Do not wait for the complete symbolic continuation lowering to discover
-whether the unit-work objective makes the right decisions. Add a test-only
-concrete max-plus oracle over the actual model-shaped `ReadinessGraph` and
-`WorkerSchedule` relations. Materialization is allowed only inside this oracle;
-production scheduling must remain bounded by roots, relation pieces, and
-symbolic expressions.
+Symbolic max-plus was attempted for a principled reason. A unit-duration
+longest-path objective over readiness and same-strand edges can distinguish two
+legal schedules that have the same occupied worker-wave horizon. That matters
+for a resident consumer waiting on another worker and for a continuation body
+serialized after the final publisher. It also supplied a clean secondary
+handoff objective without introducing measured kernel latencies or a
+model-specific rule. The concrete oracle correctly ranked small FlashMLA,
+Qwen, Gemma, and Muse motifs and found real mistakes in early ownership
+reasoning.
 
-- [x] Evaluate the exact task DAG with one unit of completion cost per body and
-  a secondary cross-worker handoff count. Check the implementation against
-  exhaustive tiny DAGs before using model-shaped cases.
-- [ ] Score the current all-resident schedule, the previously successful
-  FlashMLA event-aware schedule, and each single continuation alternative over
-  the complete downstream horizon. The oracle must count an inline body once,
-  use the maximum over all event producers, and retain all possible final-
-  publisher alternatives.
-- [ ] Run the oracle on the checked-in source structures for ragged FlashMLA
-  B4, both Qwen forms, both Gemma 4 A4B forms, and Muse/Glimmer FFN. It must
-  predict the known qualitative decisions: immediate FlashMLA reduction
-  release improves the topology; Qwen retains its good attention ordering and
-  resident root 13; Gemma keeps the expert reduction resident when inlining
-  lengthens the critical path; and Muse completes a fan-in group and releases
-  its consumer instead of spreading equal-priority producers across every
-  group. Add DeepSeek and Nemotron once their exact graphs are available.
-- [ ] For every symbolic case accepted by the production evaluator, substitute
-  `0`, `1`, boundary-minus-one, boundary, boundary-plus-one, and representative
-  larger extents and require exact agreement with this oracle. Constants and
-  runtime shapes must not select different policies merely because one path
-  uses Python integers and the other uses SymPy expressions.
-- [ ] If the objective fails to rank any already measured win or negative
-  control correctly, revise the objective before wiring it into production.
-  Do not compensate with a model/root-ID heuristic.
+The production symbolic formulation was nevertheless the wrong abstraction:
 
-  Implementation checkpoint (2026-09-10): the test-only oracle materializes
-  exact root-level readiness edges and immediate occupied same-strand edges,
-  then evaluates the lexicographic longest path. It rejects missing ownership
-  and cycles, does not impose global slot order, shares production continuation
-  eligibility, retains all causally maximal singleton publishers as mutually
-  exclusive alternatives, and counts the inline body once. Independent checks
-  covered 1,000 randomized resident graphs, 300 multi-key graphs, 500 singleton
-  continuation cases, and a multi-axis domain. Compact topology-shaped motifs
-  rank FlashMLA early release, Qwen ordering/resident join, Gemma's resident
-  reduction, and multiplicity-preserving Muse group completion correctly. A
-  deliberately over-serialized Muse caricature remains as a negative control.
-  Correlated multi-body continuations, extraction of the actual model graphs,
-  and symbolic-substitution parity remain explicit follow-up work.
+- Bellman evaluation requires an inclusive prefix maximum along every occupied
+  worker strand. With a runtime extent, the set of active prefix fibers is
+  itself parameter-conditional.
+- The exact relation grammar can represent the final packed schedule compactly
+  while still being unable to partition every intermediate max winner without
+  nonrectangular or rapidly multiplying pieces.
+- The canonical symbolic `(3, N, 2)` case matched all 192 tested concrete
+  substitutions, yet the relation-level scorer spent roughly 42--48 seconds
+  on conditional prefix fibers and declined. Rewriting the recurrence in a
+  packed global-rank domain encountered the same semantic boundary.
+- Continuations make the recurrence harder: every causally possible final
+  publisher is a mutually exclusive owner alternative, and an inline chain
+  changes the same-strand recurrence downstream.
+- Even a successful exact unit-work score would not predict instruction
+  latency, register pressure, shared-memory residency, bandwidth contention,
+  or the cost of a heterogeneous root body. It would be expensive exactness
+  for an intentionally incomplete performance model.
 
-This is an early scheduling signal, not a GPU performance model. It validates
-dependency overlap, critical-path completion, ownership, and handoff logic; it
-does not predict register pressure, shared resource contention, instruction
-mix, or constituent body speed. Those remain the later cold-L2 performance
-gate rather than inputs to scheduling policy.
+Therefore production must not add a generic fiber-emptiness splitter, ranked-
+prefix operation, symbolic Bellman evaluator, or another schedule IR merely to
+finish this score. The useful work is retained selectively:
+
+- the concrete max-plus evaluator remains a bounded test oracle and debugging
+  aid;
+- exact extrema/attainers, partial-support coverage, same-strand precedence,
+  and scalar pullback remain only where ordinary ownership, readiness,
+  frontier, or progress proofs consume them; and
+- disagreements between the concrete oracle and the structural scheduler are
+  recorded as diagnostics and GPU ablation targets, not repaired with another
+  symbolic objective or a model/root-ID exception.
+
+The replacement is the parametric cohort list policy below: static topology
+chooses priority, exact readiness determines which cohorts exist, and symbolic
+expressions determine only run boundaries and placement. This deliberately
+trades exact unit-work optimality for bounded compilation, one-cubin reuse,
+and a policy that can actually run on dynamic shapes.
+
+#### Reuse and cleanup inventory
+
+Keep as production foundation:
+
+- symbolic `TileAccess`, `CoordinateDomain`, and `CoordinateRelation` layout
+  and dependency semantics, including exact converses and multi-axis forms;
+- one semantic `ReadinessGraph`, exact fan-in/fan-out, bounded nonuniform
+  arrival counts, replay-safe epochs, and active-owner barrier publication;
+- authoritative `WorkerScheduleSegment.task_order`, globally packed symbolic
+  placement, runtime-bounded codegen, and post-compile residency checks;
+- exact coverage, disjointness, global-slot/same-wave progress, nested-frontier
+  derivation, and Qwen's generic mixed-radix/fixed-width proof; and
+- launch-stage source relations, performance probes, Gantt instrumentation,
+  and the concrete list/max-plus test oracles.
+
+Reconfigure rather than replace:
+
+- reuse root-schema criticality and concrete ready-list semantics at affine
+  cohort granularity;
+- make canonical root-major packing the stable ordering outcome of the same
+  scheduler rather than a parameter-only path;
+- make continuation eligibility common but ownership resident-first; and
+- derive source identity from launch-stage support instead of retaining
+  `transient_source_root` as duplicate truth.
+
+Delete or quarantine after a call-site audit:
+
+- symbolic-score-only occupied-strand ordinals, handoff partitions, resident
+  max-plus quotients, and their tests when no ordinary progress/frontier proof
+  consumes them;
+- any scorer-specific partial-support operation with no other correctness
+  caller; and
+- obsolete parameterized recognizers, duplicated continuation selection,
+  codegen-side counter/barrier reconstruction, and model-shaped scheduling
+  escape hatches.
+
+No production symbolic Bellman evaluator was committed. The cleanup is
+therefore a narrow removal of unused proof scaffolding; the dependency,
+readiness, placement, synchronization, and lowering refactors remain the bulk
+of the implementation.
 
 ### Acyclic go/no-go gate
 
 Cyclic event-graph optimization is not on the immediate roadmap. Finish the
-single acyclic evaluator and use it to select schedules for the real FlashMLA,
-Qwen, Gemma, and Muse graphs. Then run the existing correctness checks,
+single acyclic cohort scheduler and use it to select schedules for the real
+FlashMLA, Qwen, Gemma, and Muse graphs. Then run the existing correctness checks,
 cubin-reuse checks, cold-L2 benchmarks, and standalone comparisons. Proceed to
 the remaining lowering cleanup only if this acyclic path preserves the known
 FlashMLA result and demonstrates at least one reproducible end-to-end win; if
@@ -559,7 +692,7 @@ it does not, remove or quarantine the unused experimental scheduler rather
 than extending it with cyclic/SCC machinery.
 
 Implementation checkpoint (2026-09-10): the performance half of this gate is
-positive, but the symbolic objective evaluator is not yet acceptable. On the
+positive, and the symbolic objective evaluator has been rejected. On the
 canonical static ragged B4/Q4/H16 FlashMLA boundary, the existing acyclic
 event-frontier schedule measures 61.312 us cold-L2 versus 67.456 us for the
 matched three-launch Helion baseline. The dynamic F64/C16 fan-out path reuses
@@ -567,17 +700,15 @@ one cubin across B1/B2/B4/B9 and measures 57.216/59.424/100.112/173.968 us
 versus 100.192/100.224/145.248/245.600 us for matched standalone. Thus the
 acyclic machinery has real end-to-end value and should not be abandoned.
 
-The first relation-only max-plus scorer prototype was nevertheless removed
+The first relation-only max-plus scorer prototype was removed
 before production wiring. It matched all 192 small concrete oracle cases, but
 the canonical symbolic `(3, N, 2)` schedule took about 48 seconds and declined
 while reducing its inclusive same-strand prefix. Re-expressing that prefix in
 the proved packed global-rank domain did not solve the problem: ordinary
 extrema still encountered parameter-conditionally active value pieces. Do not
-add a generic fiber-emptiness splitter or revive the discarded scorer
-scaffolding. The remaining prerequisite is one bounded, general ranked-prefix
-operation over the existing `CoordinateRelation`; if that cannot be stated
-and proved without a new schedule abstraction or model-specific cases, retain
-the current conservative symbolic policy and stop this optimization slice.
+add a generic fiber-emptiness splitter, a ranked-prefix operation solely for
+that scorer, or revive the discarded scaffolding. Static topology priority and
+exact affine cohort boundaries replace this optimization slice.
 
 ### Priority 3: resume the paused validation and performance work
 
@@ -824,10 +955,11 @@ List scheduling orders tasks that remain resident: a producer publishes, a
 resident worker reaches the consumer, waits, and executes it. A continuation
 changes ownership: the producer observing the final arrival immediately calls
 the consumer body, so that consumer has no resident slot to schedule. They are
-separate execution mechanisms selected by one scheduling policy: when an event
-closes, the scheduler either takes the eligible inline action or assigns the
-consumer to a resident frontier. Both consume the same readiness event and
-neither defines a second dependency graph.
+separate execution mechanisms in one finalization pipeline. The cohort
+scheduler first assigns every consumer to a resident frontier; afterward, the
+local dominance proof may remove one resident occurrence and replace it with
+the eligible inline action. Both consume the same readiness event and neither
+defines a second dependency graph or priority policy.
 
 Body/resource tuning is also separate from scheduling. `num_warps`,
 `maxnreg`, block sizes, range staging, flattening, loop order, L2 grouping, and
@@ -845,38 +977,41 @@ The single production pipeline is:
       exact memory/dataflow obligations
 2. ReadinessGraph
       exact producer sets and consumer requirements
-3. Event-frontier scheduling and ownership
-      every early-admission action proves its existing synchronization lowering;
-      atomically compare resident placement with charged inline execution;
-      produce one WorkerSchedule plus at most one selected continuation
-4. Schedule-frontier quotient
+3. Parametric cohort list scheduling
+      rank root/event kinds by finite topology;
+      let symbolic extents determine only ready prefixes and run boundaries;
+      produce one resident WorkerSchedule
+4. Optional local continuation dominance
+      retain resident ownership unless every possible publisher proves that
+      inline execution cannot delay this body or any downstream frontier
+5. Schedule-frontier quotient
       coarsen nested waits against the final schedule, when exact
-5. Synchronization finalization
+6. Synchronization finalization
       retained counters, continuation identity, and root-barrier fallback
-6. RootBarrierPublicationPlan
+7. RootBarrierPublicationPlan
       exact publishers, arrival counts, bounds, and empty-root owner
-7. Symbolic validation
+8. Symbolic validation
       ownership, coverage, progress, configured-capacity bound, and replay safety
-8. Code generation and backend compilation
+9. Code generation and backend compilation
       renderer and proved strength reductions only
-9. Post-compile residency gate
+10. Post-compile residency gate
       verify actual cubin occupancy before cache acceptance or launch
 ```
 
 There is no capability graph or preliminary synchronization plan. The
 scheduler reads the one `ReadinessGraph`; when considering early admission or
-inline ownership, it proves that the event's existing relations can lower the
-required counter/publication. From a complete provisional resident placement,
-it then makes ownership and placement one atomic decision: inline execution is
-charged on every causally possible final-publisher strand and resident
-execution retains its proved slot. Final synchronization is constructed only
-after placement supplies the information needed to quotient nested waits. No
-provisional counter plan is a source of truth.
+cohort movement, it proves that the event's existing relations can lower the
+required counter/publication. It constructs the complete resident schedule
+first. A later continuation candidate may remove a resident occurrence only
+through the narrow local dominance proof; otherwise ownership stays resident.
+Final synchronization is constructed only after placement supplies the
+information needed to quotient nested waits. No provisional counter plan is a
+source of truth.
 
-There is one bounded fallback, not a second policy. If the optimized schedule,
-schedule-frontier quotient, or progress proof declines, discard that proposal
-and construct the all-resident conservative root-major `WorkerSchedule`, derive
-synchronization for that schedule, and validate it. Its same-wave boundary
+There is one bounded conservative outcome, not a second policy. If an optimized
+cohort move, schedule-frontier quotient, or progress proof declines, the same
+scheduler retains canonical packed root-major order for that proposal, derives
+synchronization, and validates it. Its same-wave boundary
 waits use the common assigned-producer/no-same-strand-future/acyclic/full-
 residency proof; if that proof declines, wave-align the affected boundary.
 Do not alternate between placement and mechanism selection until a heuristic
@@ -892,23 +1027,27 @@ must still be outputs of this one policy.
 
 ## Guiding scheduling principle
 
-> Among all provably admissible work, protect the unit-weight precedence
-> critical path; at equal criticality, finish the readiness event closest to
-> completion and immediately admit its consumers; never leave a worker idle
-> while admissible work exists.
+> Among all provably admissible cohorts, protect the shape-independent
+> unit-weight precedence critical path; at equal criticality, close the active
+> readiness event and immediately admit its consumers without displacing
+> unfinished ancestors; never leave a worker idle while an eligible complete
+> candidate fits the remaining lanes.
 
 This principle has three ordered parts:
 
 1. **Legality:** `TileDependencyGraph` and the exact `ReadinessGraph`
    determine which work may be assigned and which runtime wait protects it.
 2. **Priority:** unit-weight `top`/`bottom`/slack protect structurally critical
-   chains. Event-closing lookahead and remaining-producer count break ties so a
-   nearly complete fan-in is finished instead of spreading equal-priority work
-   across many keys. For ownership choices with equal proved completion
-   makespan, minimize cross-owner readiness handoff depth on the
-   primary-critical terminal paths.
-3. **Work conservation:** every worker slot receives admissible work when any
-   exists; newly released consumers enter the same ready frontier immediately.
+   chains. A run that releases a better structural class inherits that class;
+   event closure and active-cohort continuation then break equal-class ties.
+   Runtime extents, symbolic remaining-work counts, measured latency, and
+   continuation handoff scores never choose between roots.
+3. **Work conservation:** every worker slot receives eligible work when a
+   complete candidate fits. Newly released consumers enter the ready frontier
+   immediately, but dependent work uses only proved tail capacity unless every
+   unfinished ancestor is already assigned. Independent roots may backfill one
+   another. Exact cohort and committed-run constraints may deliberately leave
+   an otherwise unusable lane idle.
 
 Unit weight is intentional. It supplies a stable, shape-polymorphic precedence
 priority without pretending to predict instruction latency, register pressure,
@@ -988,8 +1127,11 @@ Region type, but it leaves Helion with fewer concepts and one source of truth.
 - No model names, root IDs, or benchmark shapes in compiler policy.
 - No measured, profiled, shape-specific latency, register, bandwidth, or
   resource cost model. Unit root/task weight is the explicit structural model
-  used for critical-path priority and no-regression comparison.
-- No catalogue of schedules and no public scheduling-policy selector.
+  used for critical-path priority; runtime measurements select only ordinary
+  autotune configuration values.
+- No catalogue of schedules and no public scheduling-policy selector. The one
+  permitted scheduler-specific scalar is `cross_loop_pipeline_depth` in the
+  fixed range 1--4.
 - No public admission-width knob.
 - No host-generated schedule or instruction tensor.
 - No host/device synchronization to construct a schedule.
@@ -1509,10 +1651,7 @@ consumer scheduled ordinal
 ```
 
 Union all producer arms directly from the uncontracted readiness graph. At
-this point ownership candidates are ephemeral; neither a continuation
-contraction nor a final counter plan exists. When the scheduler evaluates one
-event-family action, derive the resident and inline alternatives from these
-same orders and commit any selected contraction atomically with placement.
+this point every consumer remains resident and no final counter plan exists.
 Flatten the consumer/key/local-producer coordinates through the canonical
 mixed-radix constructors; do not enumerate concrete tasks.
 
@@ -1530,12 +1669,17 @@ Unresolved nested, overlapping, partial, nonuniform, or conflicting fibers
 retain the root's canonical order. A root barrier supplies readiness but no
 fine-grained ordering candidate.
 
-The canonical order is the configured/autotuned intra-root order for that
-kernel. The scheduler does not erase it merely to make source forms look alike;
-it replaces it only when the relation composition above proves an exact
-readiness-major permutation. Different source/configuration forms may therefore
-start from different canonical orders while still using the same scheduling
-policy.
+The canonical schedule `C` is the validated configured/autotuned all-resident
+root and intra-root order for that kernel, including any wave-aligned boundary
+required when same-wave progress cannot be proved, and before this scheduler
+derives any new readiness-major permutation. Depth 1 reproduces `C` exactly.
+The scheduler does not erase configured order merely to make source forms look alike. The
+relation composition above proposes an exact readiness-major permutation as a
+noncanonical depth-2-or-higher move, and only when the resulting placement
+does not interrupt a committed ancestor run. The common fixed priority orders
+the remaining legal candidates, and configured depth is the only profitability
+cap. Different source/configuration forms may therefore start from different
+`C` schedules while traversing the same scheduling policy.
 
 This is a local composition of cached `CoordinateRelation`s, not another graph
 or task-order abstraction.
@@ -1572,6 +1716,13 @@ its producers have physically completed; the emitted wait gates its body.
 
 ### Candidate interval
 
+A readiness-equivalent cohort is not a set of tasks that merely happen to have
+the same scalar release rank. It is the maximal affine family in one existing
+relation piece whose members have the same exact prerequisite event family and
+key fiber, including every nested wait. Affine translations of that family
+across keys may share one relation piece, but each key fiber remains an atomic
+cohort for noncanonical dependent movement.
+
 For each admissible root frontier, propose the largest interval ending at:
 
 ```text
@@ -1586,7 +1737,15 @@ min(
 
 This is the largest interval over which readiness, priority, event
 contributions, and task mapping are unchanged and affine. It is not a tunable
-chunk-size heuristic.
+chunk-size heuristic. Canonical placement and incomparable ready roots may end
+at worker-wave capacity. If that capacity cuts a dependency-released cohort, a
+noncanonical pull rounds back to the last exact cohort boundary; if no complete
+cohort fits, that candidate is ineligible while a blocking ancestor remains.
+After every ancestor that it could displace is assigned, the scheduler may
+select the whole cohort as one committed multi-wave run. Per-wave relation
+pieces may clip its representation, but no other candidate may interleave
+before the cohort is fully assigned. The compiler never invents a
+shape-specific partial cohort just to fill a hole.
 
 ### Event-aware critical-path priority
 
@@ -1595,7 +1754,8 @@ existing readiness events and derive:
 
 - which events become complete;
 - which consumer cohorts consequently become admissible; and
-- for each incomplete outgoing event, the exact remaining producer frontier.
+- whether the candidate continues or closes the currently active canonical
+  event cohort.
 
 Let an interval that newly releases consumer cohorts inherit their best
 structural class:
@@ -1609,47 +1769,125 @@ If no consumer becomes admissible, use the candidate root's base class. Choose
 candidate intervals lexicographically by:
 
 1. lowest effective structural slack and greatest structural depth;
-2. work already admissible at that class before work that can only release it;
+2. a newly admissible consumer at that class;
 3. completion of a readiness event;
-4. fewest exact producer claims remaining for an outgoing event;
-5. immediate inlet from an exact earlier launch stage and earliest required
-   source ticket; and
-6. canonical root, key, and task order.
+4. continuation of the active canonical event cohort before opening an
+   untouched equal-class cohort;
+5. immediate inlet from an exact earlier launch stage; and
+6. canonical root, event key, and configured task order.
 
 The criticality class protects the structural critical path. Event inheritance
-and remaining-claim tie-breaking prevent equal-class producer work from being
-spread across many fan-in groups while an almost-ready consumer waits. Neither
-uses measured cycles. A symbolic comparison is used only when current guards
-prove its ordering; otherwise the canonical tie-break applies. Candidate
-intervals end whenever a readiness contribution or source-ticket frontier
-changes.
+and active-cohort closure prevent equal-class producer work from being spread
+across many fan-in groups while an already-started event waits. Every priority
+field is a finite topology integer or an exact boolean. `B`, `Q`, sequence
+extent, symbolic root size, symbolic remaining claims, and worker-tail length
+never rank two candidates. A guard-dependent priority winner uses the
+canonical tie-break unless one outcome is proved over the complete guard.
+Candidate intervals still end whenever a readiness contribution or
+source-ticket frontier changes; those expressions bound the run but do not
+rank it.
 
-This is the single policy for concrete and symbolic inputs. A newly completed
-event releases its consumer immediately into the same ready set; no separate
-parameterized policy decides whether that consumer deserves to run.
+This is the single priority policy for concrete and symbolic inputs. A newly
+completed event releases its consumer into the same ready set with pull depth
+one greater than the moved work needed to release it. The configured
+`cross_loop_pipeline_depth` decides whether that candidate is eligible; no
+separate parameterized policy decides whether it deserves to run.
 
 ### Work conservation
 
 Select intervals until every worker slot in the abstract wave is filled or no
-admissible work remains. Preferring a ready downstream root does not create a
-barrier: after assigning its available tasks, remaining workers receive other
-admissible roots.
+eligible complete candidate fits. An admissible dependent cohort that would be
+split by the remaining lanes is deferred while a blocking ancestor remains;
+once all such ancestors are assigned, it may begin only as an atomic committed
+run that continues across subsequent waves.
+Preferring a ready downstream root does not create a barrier: after assigning
+its complete available cohorts, remaining workers receive other eligible roots
+or retain the canonical tail.
 
-For schedules with identical resident task coverage, reject a proposal whose
-final occupied unit-task wave is later than the conservative schedule's. For a
-continuation candidate, compare complete logical completion ranks after adding
-one unit for every inline body on the final-producer strand against the
-earliest admissible resident completion. Include the whole continuation chain
-and every possible final-arrival winner, not only its first consumer or one
-chosen strand. On a proved primary tie, compare the maximum number of resident
-readiness handoffs along primary-critical terminal paths; continuation may win
-only by strictly reducing that depth. Prefer resident ownership when either
-comparison is unproved or the full pair ties. This remains a structural
-topology objective, not a measured makespan or latency estimate. A source-ticket
-proposal is compared separately because it intentionally changes resident
-coverage. With no provably lowerable
-fine-grained prerequisite there is no early-admission opportunity, so the
-canonical compact order is returned without stepping through its frontiers.
+First construct the validated configured all-resident baseline `C`, including
+every progress-required wave-aligned boundary and before any newly derived
+readiness-major permutation. At depth one, return `C` exactly. At larger
+configured depths, walk its root-run frontiers in order. Once a run has been
+selected, finish its maximal affine portion before opening another run; this
+is the **committed run**. At the committed run's
+terminal hole or boundary, the canonical successor competes with legal
+ready-list alternatives. Assign the first noncanonical winner pull depth two,
+propagate `max(2, 1 + max(predecessor pull depth))` through work made early by
+that pull, and choose the highest-priority candidate whose depth is within the
+configured bound. Independent work advanced past canonical order also begins
+at depth two. Pull depth persists across worker-wave boundaries and resets to
+one only when all affected root frontiers exactly rejoin `C`. Depth is
+ephemeral scheduler state and is not stored as another schedule
+representation.
+
+For every configured depth, this produces one deterministic proposal:
+
+1. derive the static priority table once from the existing readiness graph;
+2. start from the same canonical packed schedule and exact symbolic frontiers;
+3. discard candidates that fail readiness, progress, ownership, residency,
+   relation-budget, committed-run, or structural non-displacement checks;
+4. discard otherwise legal candidates whose pull depth exceeds the configured
+   value;
+5. include the eligible canonical successor in that same fixed-priority set at
+   depth 1, choose the highest-priority candidate, and let canonical order win
+   an exact tie; and
+6. emit a noncanonical run only when it strictly outranks the canonical
+   successor (or the successor is ineligible); otherwise emit the canonical
+   run.
+
+There is no second compiler decision asking whether that legal pull is likely
+to be fast. In particular, predicted makespan, occupied-wave horizon, handoff
+count, locality estimates, body/resource estimates, and model-specific
+thresholds do not accept or reject the proposal. Comparing the resulting
+depths is the autotuner's job.
+
+Dependent movement is non-displacing with respect to the committed run. A
+complete consumer cohort may occupy lanes proved unused by that run, including
+its final partial wave, and may beat the canonical successor at that boundary.
+It may not interrupt the committed run or push any unfinished ancestor into a
+later occupied wave merely to create earlier visible overlap. Interleaving
+beyond such holes is allowed only between roots proved incomparable in the
+root/event quotient; different keys inside ancestor-related roots do not
+suffice. Never split one readiness-equivalent consumer cohort solely to fill a
+smaller hole. Once all blocking ancestors are assigned, a larger selected
+cohort may span waves, but it becomes the next committed run and remains atomic
+until fully placed.
+
+Occupied-wave horizon, first-admission frontiers, handoff counts, and the
+concrete max-plus score are diagnostics across depth values, not production
+profitability gates. Exact coverage, readiness, progress, residency, and
+relation budgets remain hard. The autotuner decides whether the extra legal
+overlap at a larger depth repays added waits, fragmentation, locality loss, or
+body contention.
+
+Resident ownership is the default. A continuation may be selected only after
+the resident schedule is complete and one local proof establishes exact
+final-publisher alternatives, strand-injective ownership, no accumulated
+inline chain, execution no later than the resident occurrence for every
+winner, and no later downstream frontier. An unproved case remains resident.
+A source-stage action is compared separately because it intentionally changes
+resident coverage. With no provably lowerable fine-grained prerequisite there
+is no early-admission opportunity, so the scheduler retains canonical compact
+order without stepping through its frontiers.
+
+### Parametric repetition without symbolic priority
+
+The scheduler may execute a bounded concrete control trace over relation cells,
+not runtime tasks. When the normalized state repeats by an affine translation,
+lift the repeated trace only after proving for every repetition:
+
+- identical active relation pieces and static priority outcome;
+- identical readiness and event-cohort structure;
+- identical worker-lane ownership pattern;
+- affine positive deltas for root cursors and event frontiers; and
+- exact progress to the next symbolic boundary.
+
+Emit the lifted prefix, full repetitions, and tail directly as partial
+`WorkerScheduleSegment.task_order` relations using existing affine,
+floor-division, modulo, and clipping operations. A runtime-dependent period,
+unresolved winner, nonlinear cursor update, or proof-budget overflow retains
+canonical packed order. This is finite-motif induction, not cyclic dependency-
+graph support and not a Run/Repeat IR.
 
 ### Deferred: cyclic recurrence extraction
 
@@ -1801,41 +2039,30 @@ parameterized extents and requires:
 - exact downstream publication after contracting this consumer into its
   producer chain.
 
-After constructing a complete provisional all-resident schedule, compare each
-eligible continuation action against that placement using the lexicographic
-pair of complete unit-weight completion makespan and critical-path resident
-handoff depth. A possible final publisher is a causal maximum of the event's
-producer tasks, not merely the producer with greatest wave or completion.
-Every inline alternative receives the event maximum over all required
-producers and then charges one unit for the consumer body on that publisher's
-strand; an inline chain costs one unit per body, including all later work on
-the affected strand. A resident cross-owner readiness wait adds one handoff at
-its point on a primary-critical terminal path. Inline may win only when its
-primary makespan is proved no worse and, on a primary tie, its maximum handoff
-depth is strictly lower. Prefer resident ownership on an unproved comparison
-or a full pair tie. At most one consumer globally may own a final arrival, and
-one choice must hold for the whole event family and compiled guard. If a
-continuation wins, omit the consumer from resident placement and contract
-downstream readiness in that same atomic scheduling action. Otherwise it
-remains ordinary resident work. A parameter symbol, sink status, sampled task
-count, or `fan_in > 1` is not an eligibility or priority rule.
+After constructing the complete all-resident cohort schedule, keep resident
+ownership unless a local dominance proof succeeds for the entire event family.
+A possible final publisher is a causal maximum of the event's producer tasks,
+not merely the producer with greatest wave. For every possible winner, prove:
 
-The secondary handoff objective is necessary rather than optional decoration:
-for a fixed provisional placement, resident and inline ownership can have the
-same unit-weight makespan even though inline execution removes a cross-owner
-synchronization boundary. A rule that gave resident ownership every such tie
-could therefore miss a structural benefit. Handoff depth is derived solely
-from readiness topology and ownership, contains no measured latency, and
-distinguishes intermediate work that would delay a producer strand from
-terminal work that removes a synchronization edge at equal makespan. This is
-not a claim that arbitrary or greedily constructed resident placement always
-dominates inline execution.
+- publisher ownership is strand-injective across simultaneously live keys;
+- the same strand cannot accumulate an inline chain;
+- the consumer completes no later than its resident occurrence; and
+- every contracted downstream release frontier is no later.
+
+Only then may the consumer be removed from resident placement and contracted
+into its producer chain. Any missing alternative, correlated winner, nested
+timing dependence, or unproved comparison keeps the consumer resident. A
+parameter symbol, sink status, sampled task count, or `fan_in > 1` is not an
+eligibility or priority rule. The concrete max-plus oracle may report whether
+an interesting continuation would have helped at a substituted shape, but it
+does not select production ownership.
 
 The selected identity is copied exactly once into the final counter plan after
 the schedule is accepted. Proposal, proof, and diagnostics consume that same
 selection; codegen only renders it. There is no second continuation pass.
 
-This is distinct from resident placement but not from the scheduling decision.
+This is distinct from resident placement but remains part of finalizing the
+same schedule.
 Resident placement reserves a future worker/wave slot and emits a wait before
 the body. A continuation uses no resident slot: the producer observing the
 final arrival calls the consumer immediately. Gemma demonstrates why these
@@ -2355,9 +2582,15 @@ gate split-K main
     -> keyed down reduction
 ```
 
-The critical structural behavior is to finish one activation slice's gate
-fan-in, assign its reduction/activation, and expose its down projection before
-spreading equal-priority gate progress across every slice.
+The earlier hypothesis was to finish one activation slice's gate fan-in and
+immediately pipeline reduction/activation/down before spreading gate progress.
+The measured 77-segment N64 experiment disproves that as a general policy: it
+interleaved downstream work through an unfinished gate root and regressed
+235.376 versus 175.984 us local. The safe structural behavior is narrower:
+preserve the committed gate producer run, then place complete reduction and
+activation cohorts only in its genuine terminal tail. Event closure chooses
+among already-safe tail candidates; it does not manufacture capacity by
+postponing later gate work.
 
 Use matched bodies and resource settings:
 
@@ -2368,10 +2601,10 @@ Use matched bodies and resource settings:
 - freshly tuned standalone as the final performance target.
 
 The previous normalization reduced a concrete proposal from thousands of
-fragments to 77 segments, but validation still took minutes. The parameterized
-schedule relation should express the repeated key pattern with a bounded
-number of pieces, and proof time must scale with those pieces rather than CTA
-or segment-pair count.
+fragments to 77 segments, but that aggressive schedule was also materially
+slower. The parameterized schedule relation should preserve the compact
+five-root pattern with a bounded number of pieces, and proof time must scale
+with those pieces rather than CTA or segment-pair count.
 
 Current dynamic B1/B2 measurements are 1579.104/3110.080 us persistent versus
 1649.600/3244.000 us matched standalone with the exact 32/16 tail and one
@@ -2384,6 +2617,503 @@ Muse is also a resource-contention control. Earlier legal overlap can lose
 when two bandwidth-heavy stages contend. Record that as a body/resource result;
 do not add a Muse-specific scheduling exception or silently tune priorities
 from timings.
+
+## Expected scheduler traces and cross-probe conflict audit
+
+This section de-risks the policy before implementation. **Recorded** facts are
+present in a probe, generated schedule, or timing journal. **Derived** geometry
+is arithmetic from those facts. **Expected** behavior is what the proposed
+scheduler should produce and remains subject to CPU schedule dumps and GPU
+measurement.
+
+### One constraint hierarchy, not per-kernel priorities
+
+The probes do pull in different directions if “priority” is allowed to move
+arbitrary ready CTAs. FlashMLA and the MoEs benefit from earlier downstream
+work; Qwen, Muse, and full MLA show that legal overlap can lose when it
+fragments or narrows a producer gang. The unifying rule is to constrain the
+move before consulting priority:
+
+1. Exact readiness, ownership, acyclicity, publication lowering, and resident
+   capacity are mandatory.
+2. Preserve the configured task order and every committed ancestor/root run.
+   A hole is unused capacity in that committed run's terminal wave; it is not
+   capacity created by postponing producer tasks.
+3. Any noncanonical pull-forward of dependent work may enter such a hole only
+   as a complete **readiness-equivalent cohort**: one exact event-key fiber
+   with the same prerequisite event family across every nested wait. Merely
+   reaching the same scalar release rank does not merge two cohorts. Canonical
+   packed placement may retain an already-proved partial tail; the scheduler
+   may not manufacture a new partial cohort merely to occupy a smaller hole.
+4. Broader displacement is allowed only between roots proved incomparable in
+   the root/event quotient. Different keys inside an ancestor-related root do
+   not create an exception; this distinction rejects Muse's failed deep
+   pipeline.
+5. Among the candidates left by rules 1--4, use static structural criticality,
+   released-consumer class, event closure, active-cohort continuation,
+   launch-stage order, and canonical order.
+
+This hierarchy is consistent with every measured **resident-placement** win.
+Continuations are not a priority exception: they change execution ownership
+rather than resident ordering and remain behind the separate local dominance
+gate. Canonical source order still carries useful unmodeled information in
+FlashMLA and Qwen. The scheduler preserves it unless an exact readiness-major
+permutation and the hierarchy above prove a replacement.
+
+Three tensions remain explicit rather than becoming hidden tie-breakers:
+
+- Canonical request/task order encodes useful locality in FlashMLA, Qwen, and
+  Muse. The compiler can preserve or exactly transform it, but a topology-only
+  priority cannot rediscover “long request first” from device metadata.
+- Continuation profitability is not resident list priority. If the local
+  dominance proof cannot preserve fixed Qwen, Gemma, Muse, and DeepSeek
+  controls, stop and reconsider ownership separately rather than weakening the
+  placement hierarchy.
+- Topology cannot predict shared-resource or bandwidth contention. If Muse or
+  full MLA regresses at a deeper pipeline setting, the autotuner must select
+  depth 1 for that configuration or polymorphic guard. Do not narrow the
+  candidate domain, change priority, or add a workload-specific exception in
+  response to that measurement.
+
+If a future measured resident-placement winner genuinely violates this
+hierarchy, the alternatives are: (a) a stronger general dominance proof over
+the existing schedule relations, or (b) a later device-side ready-work claimer
+for data-dependent tasks. A catalogue of model-specific priorities, sampled
+shape schedules, or host-generated per-invocation instruction tensors is not
+an acceptable intermediate fix.
+
+### One generic autotuned scheduling knob
+
+The scheduler exposes exactly one new scheduling knob:
+`cross_loop_pipeline_depth`. It is analogous to Triton's `num_stages`, not an
+admission width, priority selector, or catalogue index.
+
+Start from the validated configured all-resident canonical `WorkerSchedule`,
+including every progress-required wave alignment and before newly derived
+readiness-major movement or continuations:
+
+- depth 1 permits no noncanonical pull-forward and preserves all natural
+  canonical tail packing;
+- a cohort moved earlier than its canonical occurrence has pull depth 2;
+- if that early admission depends on another moved cohort, its depth is one
+  plus the maximum moved-predecessor depth;
+- incomparable branch work moved ahead of canonical order starts at depth 2;
+- joins take the maximum incoming depth, and depth is not reset merely because
+  an intermediate moved root was assigned;
+- pull depth persists across worker waves and resets to 1 only when every
+  affected root cursor and packed lane position exactly rejoins the canonical
+  schedule; and
+- conditionally empty symbolic roots still belong to the finite schema; their
+  runtime emptiness affects fit, never the configured depth or priority.
+
+“Ahead of canonical order” is defined against `C`'s stable packed ordinal
+`wave * worker_count + worker`, not against physical chronology. A different
+same-wave worker position is therefore still a noncanonical transformation and
+requires depth at least 2, even though it does not execute earlier in time.
+Only the global `wave` coordinate and same-strand order carry execution
+chronology. The packed ordinal exists solely to identify deviation from and
+exact rejoining with `C`.
+
+Readiness, progress, committed-run non-displacement, whole-cohort movement,
+and exact lowering are checked before this cap. The knob changes only how far
+an otherwise legal list-scheduling proposal may pull work forward. One
+compile-time value is part of the configuration/cache identity and applies to
+the entire dynamic-shape guard; it is never selected separately for each `B`
+or `Q` at runtime.
+
+This is the only new scheduler-specific tuning dimension. Existing Triton and
+persistent-resource knobs such as block sizes, `num_warps`, range stages,
+`maxnreg`, and `num_sm_multiplier` remain independent. The fixed autotune
+domain is always the fixed set `{1, 2, 3, 4}`, with default one when tuning
+is disabled. Do not derive or prune this range from topology, and do not remove
+duplicate outcomes: as with `num_stages`, two values are allowed to lower to
+the same program. Do not add admission width, priority weights, chunk size, or
+per-root knobs.
+
+This fixed-domain rule is deliberate. `num_stages` is represented as an
+ordinary `IntegerFragment`: the autotuner is allowed to measure values that
+later prove equivalent or unhelpful for a particular loop. Pipeline depth must
+behave the same way. The readiness topology determines the schedule produced
+*at* a value; it does not determine which values exist in the search space.
+The compiler therefore needs no “useful maximum depth” heuristic and no
+schedule-equivalence pass in config generation.
+
+For an ordinary fixed-shape specialization, the normal autotuner offers all
+four values alongside the kernel's existing resource configuration; its search
+strategy need not exhaust the Cartesian product. For a
+declared polymorphic kernel, one value must serve the whole guard. Use the
+existing `autotune_multi` mechanism over representative shapes, with a
+normalized worst-case objective (`aggregation="max"`, normally
+`relative_to="baseline"`) for acceptance, so B1/B2/B4 cannot silently select
+different schedule depths while claiming one-cubin reuse. A pretuned kernel
+records the chosen scalar in its ordinary `Config`; the compiler never
+contains a model-to-depth table.
+
+The division of responsibility is intentionally sharp. The compiler still
+proves semantic legality and preserves the structural envelope that makes one
+depth denote one stable family of schedules. The autotuner decides whether to
+open any noncanonical event pipeline at all and how many causally successive
+pulls are worthwhile. Thus the knob absorbs the uncertain decisions exposed by
+the probes—extra synchronization, locality loss, and body/resource contention—
+without turning priorities, widths, or per-root policies into tunables.
+The knob does not select continuation ownership directly. Because the common
+continuation-dominance proof runs after resident placement, different depths
+may expose different legal ownership outcomes through that same proof; there
+is still no second ownership policy or ownership knob.
+
+Committed-run non-displacement and readiness-cohort atomicity are deliberately
+conservative search-language restrictions, not claims that all other orders
+would be semantically incorrect. They remain hard at every depth because
+relaxing either would introduce a second admission-width/fragmentation policy
+that one depth scalar cannot express. The known winning schedules obey both;
+the autotuner chooses only among the legal depths inside this fixed envelope.
+
+The expected settings below are hypotheses to validate, not defaults or
+special cases:
+
+| probe | likely depth | reason |
+| --- | ---: | --- |
+| canonical FlashMLA B4 | 1 | source admission supplies the win; resident radix/final placement is already canonical |
+| canonical FlashMLA B9 | likely 3 | moved request-local work can release one additional early final cohort |
+| dynamic FlashMLA F64/C16 | 1 | canonical packed C16 tails already win; deeper/key-major pulling lost |
+| FlashMLA Q1 | 1 | one full producer wave exposes no useful readiness frontier |
+| FlashMLA Q2 | 1 for resident scheduling | its benefit is continuation ownership, not list depth |
+| Qwen3 pretuned/dynamic | 1, with 2 as the only plausible challenger | preserve the chain and 74/22 placement; broader dependent repacking lost |
+| Gemma 4 A4B | 1 | canonical root-6 reductions already fit the terminal root-5 tail; ownership remains separate |
+| Muse/Glimmer | 1 | larger depths should alias while the known harmful fragmentation remains illegal |
+| Nemotron MoE | 4 | shared up (2) → activation (3) → shared down (4) fills the routed-up tail |
+| DeepSeek-V3 MoE | likely 4 | analogous three-level branch preparation; resident-only confirmation remains required |
+| full DeepSeek MLA / dense FFN | 1 | preserve full producer gangs; scheduling has little useful slack |
+
+The autotuner, not the table, chooses the value. The table only demonstrates
+that one scalar describes the observed cross-kernel tension. Cold-L2 rollout
+must confirm the expected choice and record when several values alias.
+
+### Canonical FlashMLA Q4, B4
+
+Recorded geometry on B200 is `W=148`, one resident CTA per SM, with sequence
+lengths `[1696, 1730, 4641, 45118]`:
+
+```text
+attention/source tasks by request: 14 + 14 + 37 + 353 = 418
+radix-16 groups by request:          1 +  1 +  3 +  23 = 28
+first-stage radix tasks:             28 * Q4 = 112
+final tasks:                          4 * Q4 = 16
+resident tasks:                     112 + 16 = 128 <= W
+physical ticket roles:              418 source + 148 resident
+```
+
+The conceptual source packing is two full 148-task waves plus a 122-task tail,
+but the successful program must **not** treat the 26 apparent lanes as a
+shared resident wave. Source tickets `[0,418)` execute one wait-free attention
+task and retire. Only after all source tickets have been allocated do tickets
+`[418,566)` enter the 148-strand resident program at resident wave zero.
+
+Expected scheduler steps:
+
+1. Preserve the exact source ticket order and launch stage. No resident action
+   may delay issuance of an unassigned source ticket.
+2. Preserve the configured radix order, which begins with the long request's
+   22 full groups and then covers the short-request and tail roots. This order
+   is source/configuration information; topology priority does not infer which
+   device `seq_len` is longest.
+3. Build exact attention-to-radix cohorts. Resident tasks are assigned once;
+   their waits make each radix body runnable when its own producers finish.
+4. Use event closure only to order already-safe resident cohorts. Do not model
+   an “early width” of 26 or move a resident task onto a source strand.
+5. Accept only if source admission and every previously earlier event frontier
+   are preserved.
+
+This predicts the clean two-role schedule that measured about 61.31 us versus
+67.46 us matched standalone. The older policy that explicitly filled all 26
+conceptual source-tail lanes measured about 71.5 us; the hierarchy rejects it
+before priority is considered.
+
+### Canonical FlashMLA Q4, B9
+
+Recorded geometry uses the same `W=148`:
+
+```text
+source tasks: [92,111,80,67,50,56,119,33,76] = 684
+radix groups: [ 6,  7, 5, 5, 4, 4,  8, 3, 5] = 47
+radix tasks: 47 * Q4 = 188
+final tasks: 9 * Q4 = 36
+resident tasks: 224 = 148 + 76
+```
+
+Source tickets have four full groups of 148 and a 92-task tail. The resident
+program has one full wave and a 76-task tail. Its request-specific radix roots
+are mutually independent until their final request reductions.
+
+Expected scheduler steps:
+
+1. Protect all 684 source tickets exactly as for B4.
+2. Put the request-local first-stage radix roots in one resident ready list.
+   Split runs only at exact request/query readiness boundaries.
+3. A cohort enters the ready list only when its required source-ticket
+   frontier is satisfied. Among simultaneously admissible cohorts, use the
+   static structural class, event closure, and canonical request/key order;
+   never rank two cohorts by their numeric ticket-frontier values.
+4. Honor the resulting global segment order in codegen, so a ready request is
+   not hidden behind all tasks of a blocked numerical root.
+5. Never alter source issue order to improve resident order.
+
+The measured trace had 184 of 188 radix tasks ready, 170 started, and 107
+finished before attention ended. The four request-7 tail reducers previously
+waited 14.8--28.2 us after becoming ready; the successful order removes that
+head-of-line delay and measures about 90.0 us versus 100.13 us standalone.
+
+### Dynamic FlashMLA F64/C16
+
+This is the cleanest symbolic placement case. With `W=148`, each runtime
+request contributes 64 producer tasks and one complete 16-task consumer
+cohort. `B` controls only repetition and packed offsets:
+
+| B | producer placement | safe consumer tail placement |
+| ---: | --- | --- |
+| 1 | wave 0 workers 0--63 | cohort 0 on 64--79 |
+| 2 | wave 0 workers 0--127 | canonical packing uses workers 128--147, then wave 1 workers 0--11 |
+| 4 | wave 0 full; wave 1 producers 0--107 | canonical packing uses all 40 tail lanes, then continues consumers in wave 2 |
+| 9 | three full waves; wave 3 producers 0--131 | one cohort on 132--147; eight cohorts next wave |
+
+The scheduler preserves producer order and cuts candidates at every
+64-producer event boundary. Depth-one canonical packing retains its already-
+proved partial consumer tails. Any additional pull-forward must move a complete
+16-consumer cohort into actual tail lanes. The rejected key-major order
+`[64 producers, 16 consumers]` per request
+moves the last B4 producer from wave 1 to wave 2 and the last B9 producer from
+wave 3 to wave 4; it measured roughly 120.5/266.0 us. Non-displacement rejects
+that proposal immediately.
+
+Current one-cubin B1/B2/B4/B9 results are
+57.216/59.424/100.112/173.968 us versus
+100.192/100.224/145.248/245.600 us standalone.
+
+The B1/S65536/Q1 control has 128 producers in one `W=148` wave and one
+fan-in-128 consumer frontier. There is no early cohort to schedule; source
+tickets add overhead and must decline. Q2 already has a useful local
+final-arrival pattern and is a continuation gate, not evidence for broader
+resident reordering.
+
+### Qwen3 decode
+
+At multiplier eight, `W=1184`; the fifteen root sizes are:
+
+```text
+[32B, 32B, 768B, 10B, 8B, 1024B, 512B, 32B, 32B,
+ 512B, 32B, 32B, 1536B, 96B, 512B]
+```
+
+The recorded B1 graph has 5,170 logical tasks and 5,106 resident tasks after
+two existing continuations. It is almost entirely a chain. Consequently the
+priority table has little useful freedom and the correct result is mostly the
+configured local order plus exact handoffs.
+
+Expected scheduler steps:
+
+1. Preserve the configured root-5 attention order (`[2,1,0]` in the pretuned
+   source and request-major `[2,0,1]` in the ragged source) unless relation
+   composition proves an exact readiness-major replacement.
+2. Advance the exact root 5→6 fan-in-8, 6→7 fan-in-16, and 7→8 fan-in-1
+   cohorts without interrupting unfinished producer runs.
+3. Pack roots from their symbolic prefix offsets. In the historical B1
+   relation, that arithmetic puts root 13's 96 tasks on workers 576--671 and
+   root 14's 512 tasks on workers 672--1183 in the same wave.
+4. After placement, derive root 14's nested wait partition from the exact
+   schedule. It yields 74 earlier producers followed by 22 later producers;
+   neither number belongs in priority policy.
+5. Keep root 13 resident unless continuation dominance is proved. Preserve
+   existing safe continuations only through the same ownership proof.
+
+Collapsing 74/22 to one fan-in-96 wait costs about 2 us. Moving the placement
+as well costs roughly another 4 us. Conversely, a global proposal reduced 14
+abstract waves to 13 but measured about 98.2 us versus 94.1 us local because it
+only repacked dependent roots. The non-displacement/incomparability rules
+reject that proposal despite its smaller wave count.
+
+For the one-cubin B1/B2 source, the same topology table is reused while `B`
+scales all root/cohort bounds. Device `context_lens` masks bodies; it cannot
+change priority or task counts. The current 109.456/133.024 us versus
+106.368/126.976 us exact-shape controls and 111.5-second compile remain
+separate rendering/proof gates, not a reason for a Qwen priority.
+
+### Gemma 4 A4B MoE
+
+At tuned multiplier three, `W=444`; root counts and packed intervals are:
+
+```text
+r0 router       16B   [0,16B)
+r1 group top-k   4B   [16B,20B)
+r2 route merge    B   [20B,21B)
+r3 gate/up      352B  [21B,373B)
+r4 activation   48B   [373B,421B)
+r5 down         352B  [421B,773B)
+r6 reduction     11B  [773B,784B)
+r7 post-norm      B   [784B,785B)
+```
+
+The graph is effectively a chain, so topology priority again makes no broad
+reordering choice. Packing and exact readiness do the useful work:
+
+```text
+B1 wave 0: r0 16 | r1 4 | r2 1 | r3 352 | r4 48 | r5 23
+   wave 1: r5 329 | r6 11 | idle 104
+
+B2 wave 0: r0 32 | r1 8 | r2 2 | r3 402
+   wave 1: r3 302 | r4 96 | r5 46
+   wave 2: r5 444
+   wave 3: r5 214 | r6 22 | idle 208
+```
+
+The exact `(B,11)` root 5→6 event has fan-in 32. Every resident root-6 task
+fits the genuine terminal root-5 tail without moving a down-projection task.
+The scheduler therefore keeps root 6 resident. At W296 the same causal A/B
+measured 61.408/77.792 us resident versus 63.568/83.936 us inline; the full
+inline chain was slower still. Root 7 remains a separate continuation decision.
+
+The fixed B1 pretuned kernel currently chooses a root-6 continuation and
+measures 49.120 us, while the best exact packed resident-root-6 control is
+51.168 us, but those are not a clean ownership-only A/B. A generic terminal-
+publisher proof may legitimately choose differently under the narrower B1/W592
+guard; this remains an explicit validation gate rather than a static/dynamic
+policy exception.
+
+### Muse/Glimmer FFN
+
+For the current dynamic N32 configuration, `W=1184`, one warp, two stages:
+
+```text
+r0 gate split-K       19968B
+r1 gate reduction       640B   fan-in 32, final N64 keys fan-in 16
+r2 SiLU/multiply         16B   fan-in 40
+r3 down split-K        3328B   fan-in 1 from r2
+r4 final reduction      104B   fan-in 32
+```
+
+The current four-resident-root plus final-continuation packing is:
+
+```text
+B1 waves 0--15: r0 full
+   wave 16: r0 0--1023 | r1 1024--1183
+   wave 17: r1 0--479 | r2 480--495 | r3 496--1183
+   waves 18--19: r3 full
+   wave 20: r3 0--271
+
+B2 waves 0--32: r0 full
+   wave 33: r0 0--863 | r1 864--1183
+   wave 34: r1 0--959 | r2 960--991 | r3 992--1183
+   waves 35--39: r3 full
+   wave 40: r3 0--543
+
+B4 waves 0--66: r0 full
+   wave 67: r0 0--543 | r1 544--1183
+   wave 68: r1 full
+   wave 69: r1 0--735 | r2 736--799 | r3 800--1183
+   waves 70--79: r3 full
+   wave 80: r3 0--1087
+```
+
+The scheduler should preserve the complete r0 producer run, admit r1 only in
+its terminal tail, then admit r2/r3 only in r1's terminal tail. `B` changes
+only the interval endpoints. It must not pipeline one completed slice's r2/r3
+through later r0 slices: the measured 77-segment N64 schedule did exactly that
+and regressed 235.376 versus 175.984 us local. A conservative five-segment
+event plan measured 172.064 versus 173.968 us local.
+
+Current all-exact dynamic B1/B2 is 1579.104/3110.080 us versus
+1649.600/3244.000 us matched standalone, but this does not prove that event-
+priority beats root-major. B4, exact-shape, event-order, and resident-r4 A/Bs
+remain required. Muse is the key proof that different event keys do not by
+themselves license fragmentation of an ancestor root.
+
+### Nemotron MoE
+
+For the recorded B1/m4 schedule, `W=592` and root task counts are:
+
+```text
+norm 1, router 128, top-k 1,
+routed-up 928, routed activation 64, routed-down 168,
+shared-up 116, shared activation 15, shared-down 168, final-add 11
+```
+
+The winning order is:
+
+```text
+norm -> router + shared-up -> top-k + shared activation
+     -> routed-up wave 0: 592
+     -> routed-up wave 1: 336 | shared-down 168 | idle 88
+     -> routed activation -> routed-down -> final add
+```
+
+The shared and routed branches are root-level incomparable before final-add.
+Advancing shared-up/activation makes the complete 168-task shared-down family
+available for the routed-up tail's 256 holes. No routed-up task moves later.
+This is exactly the hierarchy's broad-interleaving case and measured 98.304 us
+versus 120.864 us with the proposal disabled.
+
+At B2 the routed-up family is `1856 = 3*592 + 80`, leaving 512 terminal lanes;
+the scaled 336-task shared-down family still fits. The same symbolic priority
+and B-scaled bounds should therefore recover the placement. Current dynamic
+260.128/337.952 us versus 188.448/243.712 us standalone is dominated by
+128-byte spills/body lowering, not the absence of a structural opportunity.
+
+### DeepSeek-V3 MoE
+
+For the recorded static B1/m4 schedule, `W=592`:
+
+```text
+router 128, top-k 1,
+routed W13 2048, routed SwiGLU 64, routed W2 1792, reduction 28,
+shared W13 256, shared SwiGLU 8, shared W2 224, final add 28
+```
+
+Useful capacity is deterministic:
+
+```text
+routed W13: 2048 = 3*592 + 272, leaving 320 lanes
+shared W13: 256
+shared W2:  224
+routed W2:  1792 = 3*592 + 16, leaving 576 lanes
+```
+
+Expected steps are to place router work beside independent shared-W13 work,
+advance shared SwiGLU when ready, put the complete shared-W2 family in a routed
+W13 terminal hole, then run the routed suffix and final join. The recorded
+ten-segment plan with three continuations measured 171.808 us versus 182.176 us
+with global scheduling disabled. Exact segment offsets were not retained, so
+the specific shared-W2 hole above is a geometry-derived hypothesis that must be
+checked in the new schedule dump.
+
+At dynamic W1184, the same holes exist for B1 and grow with B2, but the current
+kernel is R255 with 354-byte spills and measures 542.752/886.816 us versus
+340.000/564.704 us standalone. The list policy can recover branch placement;
+it cannot repair that resource/code-shape loss. Device-created expert
+histograms likewise remain outside static scheduling.
+
+### Full DeepSeek MLA and dense-chain controls
+
+The full MLA B1/context-8192 control uses `W=256`. Important masses are Q-B
+1536 (six full waves), q-down 512 (two waves), attention partial 256 (one full
+wave), attention reduction 64, V-up 256 (one full wave), and O projection 896
+(three waves plus 128). The scheduler should retain exact q-down readiness,
+which saves about 2 us, but otherwise preserve full producer gangs:
+
+- attention's 256 tasks release within roughly 0.288 us, so fine-grained
+  reduction admission adds overhead rather than useful overlap;
+- V-up exactly fills W256, so placing 64 reducers first and narrowing V-up to
+  192 lanes creates a second V wave and loses about 2 us; and
+- aggressive HLFET measures 128.960 us versus 128.928 us source/non-delay.
+
+The remaining full-MLA gap is resource-driven: cache preference alone moved
+157.50→127.06 us, and padding O-projection shared allocation from 128 to
+56,320/94,208/169,984 bytes moved 36.672→40.768/46.912/69.440 us. The priority
+policy must decline rather than claim a scheduling fix.
+
+The isolated Qwen FFN is `1536 W13 -> 96 activation -> 512 W2`; it has no
+independent branch or terminal hole for a complete downstream gang. Canonical
+order is therefore the expected list result. These negative controls are as
+important as the wins: they ensure “ready” is not mistaken for “profitable to
+move.”
 
 ## Measurement and observability
 
@@ -2461,10 +3191,12 @@ For each workload separate:
 5. body slowdown from the shared resource envelope; and
 6. compile-time/generated-code overhead.
 
-## Implementation sequence
+## Historical implementation sequence and detailed current phases
 
-The ordering below incorporates the reviewer's recommendation to validate the
-scheduling representation before generalizing the entire relation algebra.
+Phases 0--4 record the implementation sequence that produced the current
+foundation. Phase 4A expands the active cohort-list work. The ordered checklist
+at the top of this document governs what happens next if wording here appears
+to conflict with it.
 
 ### Phase 0: freeze evidence
 
@@ -2494,7 +3226,8 @@ new compiler data type.
 
 - Replace concrete CTA-node scheduling with root/event frontier intervals.
 - Compute unit-weight structural criticality directly from `ReadinessGraph` and
-  combine it with event-release and remaining-claim priority.
+  combine it with released-consumer, event-closing, active-cohort, and stable
+  canonical priority.
 - Emit the result directly as existing segment relation pieces.
 - Compare against the small concrete oracle.
 - Validate FlashMLA, Muse, and Nemotron before dynamic-domain work.
@@ -2508,7 +3241,7 @@ piece counts remain bounded, and no production CTA DAG exists.
 - Prove exact ownership and resident admission symbolically. Root-entry and
   nested waits use the same strict-before fast path or same-wave strand/
   precedence/capacity proof.
-- Use every exact nested key and the structurally selected continuation
+- Use every exact nested key and any local-dominance-selected continuation
   contraction; validate the finalized counter identity after placement.
 - Bypass and then delete the quadratic segment-pair validator.
 - Make materialization raise if called inside acceptance.
@@ -2835,241 +3568,74 @@ Exit gate: the legality result is invariant under extensionally equal
 normalized relations and guards, no ownership has yet changed, and scheduling
 cannot accept an action whose eventual publication is unproved.
 
-#### Phase 4A.3: jointly schedule resident and inline work once
+#### Phase 4A.3: build the parametric cohort list schedule
 
-Complete these relation-level prerequisites before making continuation
-ownership a production decision. They are derived views over the existing
-`WorkerSchedule` and `ReadinessGraph`, not new plan or IR state:
+This phase replaces the discarded symbolic max-plus evaluator. It operates on
+the existing roots, readiness events, and coordinate relations; it introduces
+no retained graph, schedule, region, or instruction abstraction.
 
-- [x] Derive occupied same-strand precedence from
-  `WorkerScheduleSegment.task_order`. Construct occupied slot identity from
-  each segment and relate slots with the same `(launch_stage, worker)` and a
-  strictly earlier wave. It is acceptable initially to retain all strict
-  predecessors; immediate-predecessor selection is only a later strength
-  reduction. Iterate over roots and relation pieces, never workers, waves, or
-  logical CTAs.
-- [x] Extend the existing exact extremum machinery to return both the extremal
-  value and the exact relation containing every target coordinate that attains
-  it. Preserve value/witness correlation across ties, empty domains, dominance
-  proofs, and parameter-dependent crossings for the whole compiled guard. A
-  single attaining corner or a bare `sympy.Max` is insufficient. Implement
-  this as an exact-or-decline operation on `CoordinateRelation`, returning
-  `(value_by_source, attaining_targets_by_source)` and sharing the candidate
-  collection used by `max_target_value_by_source`; do not add an extrema IR.
-  Constant plateaus retain the whole target box, affine extrema retain the
-  exact extremal face, and floor/static-quotient extrema retain the complete
-  preimage plateau. Cross-piece winners require a bounded exact partition of
-  the existing source domain. If a winner changes only with an unresolved
-  parameter, or its level set is non-rectangular in the current relation
-  grammar, decline for the whole guard rather than sampling or dropping tied
-  witnesses. Charge candidate comparison and partition products to the common
-  relation budgets.
+- [ ] Compute finite unit-weight `top`, `bottom`, slack, and canonical
+  priority classes directly from the possibly-nonempty acyclic root/event
+  topology. Cache them only as derived properties of `ReadinessGraph`.
+- [ ] Derive each root's exact readiness-equivalent cohort-order candidates by
+  composing consumer order, readiness keys, producer arms, and the configured
+  producer task order. Keep configured order in `C`; an exact-bijection
+  readiness-major replacement is a depth-2-or-higher proposal and must also
+  pass the committed-run/non-displacement gate.
+- [ ] Track only symbolic root cursors, exact admissible prefixes, active cohort
+  identity, event frontiers, relation-piece boundaries, and remaining lanes.
+  These are ephemeral local variables, not another semantic object.
+- [ ] Form maximal affine candidate intervals and rank them only by static
+  structural class, released-consumer class, event closure, active-cohort
+  continuation, launch stage, and canonical order. Runtime expressions may
+  bound a run but may not rank candidates.
+- [ ] Add `cross_loop_pipeline_depth` as the only scheduler-specific
+  `IntegerFragment`, with the unconditional candidate set `{1,2,3,4}` and
+  default 1. Do not inspect topology to prune or deduplicate its values.
+- [ ] Construct depth 1 as the validated configured all-resident schedule,
+  including any progress-required wave alignment and before any derived
+  readiness-major transformation. Assign
+  depth 2 to the first noncanonical pull, propagate one plus the maximum pulled
+  predecessor depth through newly early work, preserve depth across waves, and
+  reset it only at an exact rejoin with the canonical frontiers. Reject a pull
+  deeper than the configured value. One depth is uniform over the complete
+  symbolic guard.
+- [ ] Fill an abstract wave while a complete eligible candidate fits. Place a
+  dependent cohort in an earlier wave only when its complete exact event-key
+  fiber fits proved idle committed-run tail lanes or every ancestor it could
+  block is already assigned. In the latter case, make the whole fiber one
+  committed multi-wave run; per-wave relation pieces may clip its encoding but
+  no candidate may interleave before it finishes. Permit broader interleaving
+  only between semantically incomparable roots in the root/event quotient.
+- [ ] Detect a guard-uniform affine translation of the finite control state and
+  lift it into bounded prefix/full-repeat/tail relation pieces. Prove the
+  priority winner, readiness pattern, lane pattern, and positive cursor/frontier
+  delta for every repetition. Decline runtime-dependent periods or winners.
+- [ ] Emit the result directly as existing
+  `WorkerScheduleSegment.task_order` relations. Require exact disjoint
+  coverage, exact converses, acyclic progress, resident capacity, and bounded
+  relation complexity. Record occupied horizon and admission frontiers as
+  diagnostics; autotuning, not a compiler profitability proof, compares them.
+- [ ] Keep all consumers resident for the first complete implementation.
+  Evaluate continuation only afterward with the local all-publishers dominance
+  rule. Never call a symbolic completion scorer.
+- [ ] Keep the concrete CTA list scheduler and max-plus evaluator in tests only:
+  substitute small dynamic bounds, compare coverage/readiness and qualitative
+  choices, and use disagreements to select GPU ablations.
+- [ ] Enforce the common 4,096-piece and 65,536-product budgets before
+  constructing intermediates. Production compilation must not enumerate
+  runtime tasks, keys, workers, waves, or shapes.
+- [ ] Test exact-or-decline behavior on FlashMLA fan-out, Qwen's mixed-radix
+  74/22 frontier, Gemma's producer-tail reduction, Muse's 32/16 tail,
+  Nemotron/DeepSeek fork-join packing, an independent graph, a dense chain,
+  runtime-empty roots, and deliberately unresolved symbolic winners. Exercise
+  all four depth values even when multiple values produce the same relation.
 
-  Implementation checkpoint (2026-09-10):
-  `CoordinateRelation.extreme_target_value_and_attainers_by_source` now shares
-  candidate collection with the existing scalar maximum and returns the exact
-  extremal value plus every attaining target. It handles constant plateaus,
-  affine faces, bounded common-axis winner partitions, and static quotient
-  plateaus while declining unrepresentable crossings. Candidate boxes are
-  clipped with exactly the same clamp-then-stride semantics as relation
-  materialization before either legacy or joint extrema are evaluated.
-  Independent differential review covered oversized and negative bounds,
-  strides, symbolic substitutions, empty intersections, and proof budgets.
-- [x] Add one generic exact weighted scalar pullback to the existing relation
-  algebra. Optional target and source potentials are composed around the
-  shared exact-extrema implementation, so candidate collection, source-cell
-  partitioning, clipping, and all-attainer preservation remain single-source.
-  Independent review covered 456,976 concrete lattice intersections, 50,850
-  symbolic substitutions, and randomized pointwise-add and end-to-end
-  weighted-extrema oracles with no mismatches.
-- [x] Derive the occupied strand ordinal
-  `q(s) = 1 + |{t: t <strand s}|` from the exact same-strand relation. Holes
-  and unoccupied waves contribute nothing. This is an ephemeral scalar
-  `CoordinateRelation`, not another schedule field.
-
-  Implementation checkpoint (2026-09-10): arbitrary schedules count the
-  exact occupied-predecessor relation. A schedule already proved to be the
-  canonical dense packed prefix uses the full same-strand predecessor relation
-  as an algebraic strength reduction, but still delegates cardinality to
-  `target_count_by_source`; it does not introduce another scheduling policy.
-  Symbolic `N`, `4*N+1`, and `(3,N,2)` schedules produce three-piece ordinal
-  relations, and boundary substitutions plus randomized packed, holed, split,
-  and staged schedules agree with exhaustive materialization.
-- [ ] Add one bounded exact-or-decline acyclic ranked-prefix proof to the
-  existing relation algebra. Process the finite root quotient in topological
-  order and encode the resulting scalar maps with existing affine/floor/modulo
-  relation pieces; do not add recurrence state or schedule IR. Any cyclic
-  quotient, nonrectangular partition, or proof-budget overflow declines to the
-  conservative schedule in this milestone.
-
-  Implementation checkpoint (2026-09-10): the acyclic all-resident root
-  quotient is complete. It includes every possibly nonempty root-level
-  readiness edge and every required cross-root same-strand ordering edge,
-  rejects nested/nonresident/cyclic cases, and uses the same deterministic
-  topological helper as existing acyclicity and criticality checks. The
-  canonical symbolic `(3, N, 2)` packed schedule now proves order `(0, 1, 2)`
-  in about 0.08 seconds rather than declining after about 5 seconds. Source
-  support is clipped to its domain before nonemptiness testing, fixing phantom
-  edges. Independent randomized review found no unsound accepts; the packed
-  strength reduction is intentionally conservative and may decline a reverse
-  readiness edge between roots that occupy disjoint workers in one wave. The
-  scalar acyclic prefix evaluator is still outstanding. Cyclic affine
-  recurrence support is explicitly deferred and is not an exit criterion.
-
-  A discarded prototype subsequently evaluated the full recurrence exactly
-  on all 192 small concrete oracle cases, but it did not pass the symbolic
-  gate. The canonical `(3, N, 2)` packed case reduced to three disjoint source
-  groups and still declined on parameter-conditionally active prefix fibers
-  after roughly 42--48 seconds. A packed-rank reformulation hit the same
-  semantic boundary. All scorer-specific helpers and tests were removed; do
-  not restore them piecemeal. The next attempt, if any, must begin with the
-  single bounded ranked-prefix operation named above and must pass this case
-  before adding an evaluator.
-
-- [x] Let the existing extrema implementation consume a partial scalar-value
-  relation when, and only when, its value support provably covers every target
-  reachable by the relation being reduced. Keep the public extrema API and its
-  candidate/winner/attainer machinery unchanged: normalize the value support
-  once, intersect it with each clipped reachable target box, prove those
-  intersections disjoint, and prove their exact cardinality equals the whole
-  reachable box. Missing coverage, conditional nonemptiness, overlap that
-  cannot be normalized, or budget overflow must decline. This is required
-  because schedule scores are defined exactly on occupied slots; filling the
-  rectangular placement domain or rebuilding `q` from wave arithmetic would
-  introduce a second source of truth.
-- [x] Reuse that same exact support-cover proof in
-  `CoordinateRelation.pointwise_add_scalar`: a partial right operand is legal
-  exactly when its canonical single-valued support covers the left operand's
-  support; extra right-hand support is irrelevant. Preserve the left support,
-  validate both values and the sum on every intersection, and retain the
-  existing total-right-operand fast path. This lets the Bellman evaluator do
-  shifted `q` arithmetic directly on occupied slots, rather than adding more
-  symbolic `task -> slot -> q` preimage cases or filling holes with fabricated
-  values.
-
-  Implementation checkpoint (2026-09-10): scalar addition and extrema now
-  share one bounded exact-support-cover proof. The pre-existing total-map path
-  remains unchanged; only a relation proved partial enters canonical partial
-  support handling, where proved-empty pieces are discarded before value
-  validation. The canonical symbolic `(3, N, 2)` occupied-ordinal addition
-  stays symbolic, produces three pieces, and takes about five seconds cold
-  after ordinal construction. Independent review covered 220,181 exhaustive
-  strided support combinations and 2,500 randomized additions without an
-  unsound acceptance.
-
-  A follow-up lets the same extrema implementation consume pairwise-disjoint
-  exact source groups even when their union is only a partial carrier. The
-  proof is semantic rather than provenance-based and charges symbolic
-  pairwise comparisons to the existing relation-piece budget before invoking
-  SymPy. Oversized 128/256-group cases decline before partitioning. The full
-  tile-dependency suite passes 177 tests with 78 subtests. This closes a
-  general partial-support gap but deliberately does not infer conditional
-  prefix-fiber activation.
-- [x] Add one private exact-or-decline partition of a resident slot-to-slot
-  dependency relation into same-owner and cross-owner edges. Ownership is the
-  existing `(launch_stage, worker)` projection of the two endpoints. Preserve
-  symbolic guards and strides, require the two outputs to be disjoint and to
-  cover the original clipped edge relation, and charge all splits to the
-  common relation budgets. This pair-dependent partition is the only extra
-  operation needed for the handoff component; separable source/target scalar
-  potentials cannot represent endpoint inequality.
-
-  Implementation checkpoint (2026-09-10): extrema now canonicalize a partial
-  scalar map once and accept it only after the disjoint intersections with
-  each clipped reachable target box have exactly the same cardinality as that
-  box. Scalar values are validated against their carrier even when the partial
-  map is already canonical. Independent review covered 6,000 randomized
-  max/min calls plus symbolic zero and tail substitutions. The private
-  resident-handoff partition proves both endpoints are in the resident stage,
-  classifies uniform owner relations, and splits only the exact dense full-
-  worker mixed form into `{w}`, `[0,w)`, and `(w,W)`. It does not enumerate
-  workers or CTAs; unsupported modular or conditional partitions decline.
-  Independent review covered 5,000 concrete relations and symbolic tails with
-  no partition, coverage, or owner mismatches.
-
-  Implementation checkpoint (2026-09-10): root-level readiness now lifts from
-  the authoritative per-segment `task_order` relations into an exact
-  consumer-slot-to-producer-slot relation. Segment unions preserve their
-  remembered converse proofs; no dispatch geometry or second DAG is rebuilt.
-  The shared `overlapping_sources` operation gained a bounded semantic
-  point-in-domain certificate and now checks consumer nonemptiness before its
-  full-target shortcut. This admits independently partial packed tails while
-  declining clipped or conditional false edges. Symbolic `(3, N, 2)` boundary
-  substitutions, 10,000 randomized overlap cases, and the full relation/oracle
-  suites pass.
-
-- [ ] Evaluate the lexicographic objective `(completion, handoffs)` with that
-  prefix proof over same-strand precedence and semantic readiness edges. For
-  each body `s`, let `R(s)` be the greatest readiness-predecessor score,
-  `I(s) = R(s) + (1, 0) - (q(s), 0)`, and
-  `D(s) = max((0, 0), max_{t <=strand s} I(t))`; then the body score is
-  `(q(s), 0) + D(s)`. Every body contributes `(1, 0)`. A resident readiness
-  edge contributes `(0, 1)` exactly when producer and consumer owners differ,
-  and only among predecessors tied for maximum completion. Existing extremum
-  and all-attainer relations perform each Bellman pullback; the new prefix
-  proof supplies only the runtime-length closure they cannot express. The
-  evaluator is ephemeral and adds no serialized schedule representation.
-  For an acyclic piece quotient, the pair may be encoded as the scalar
-  `K*completion + handoffs`, with static `K = quotient_node_count + 1`, only
-  after proving a path cannot revisit a charged node and therefore
-  `handoffs < K`.
-- [ ] Before this evaluator changes production ownership, run the Priority 2B
-  concrete oracle on the real FlashMLA, Qwen, Gemma, and Muse graphs. Require
-  the objective to reproduce the known positive and negative scheduling
-  choices, then require symbolic-substitution parity on every accepted case.
-- [ ] Represent an inline consumer body exactly once. Its possible
-  final-producer winners are the causally maximal producer on each strand,
-  followed by removal of producers proved to precede another candidate for
-  the same key. They are mutually exclusive ownership alternatives, not
-  simultaneous copies of the body on every producer strand and not simply
-  the producers with maximum wave or completion. Each alternative receives
-  the event maximum over all required producers, executes after its publisher,
-  and contributes the body once. Propagate each alternative through the
-  complete downstream graph and compare the guard-wide worst result with
-  resident placement.
-
-The scalar global-slot relation used by tail-packing is a sufficient acyclic
-progress rank, not this objective. In particular, a producer and waiting
-consumer on different workers in the same wave occupy one resident wave but
-take two unit completion steps. Root-schema depth and occupied-wave horizon
-therefore cannot substitute for the max-plus evaluator.
-
-- Feed the one exact `ReadinessGraph` into one event-frontier policy; reject an
-  early-admission candidate unless its required synchronization lowering is
-  proved.
-- From one complete provisional all-resident schedule, compare each legal
-  continuation alternative after charging one unit per inline body on every
-  possible final-producer strand. This is not an online decision made before
-  downstream placement exists. Compare complete completion horizon first and
-  critical-path resident handoff depth second; prefer resident on an unproved
-  comparison or a full objective tie, and require one choice for the whole
-  compiled guard.
-- Commit at most one continuation consumer globally, remove its resident
-  coverage, and contract downstream readiness atomically. Score the resident
-  plan once and each single-continuation proposal independently; this avoids
-  an implicit exponential assignment problem. No other pass reselects it.
-- Preserve the configured intra-root order unless an exact readiness-major
-  permutation is proved.
-- Emit the result directly as `WorkerScheduleSegment.task_order` relations.
-- Use root-major ordering as the sole conservative fallback.
-- Treat source-ticket admission as another action of this same policy, derived
-  from the launch-stage-zero schedule relation. Do not retain a concrete-only
-  transient-source selector as a second production policy.
-- Keep the old concrete placement algorithm only as a small differential test
-  oracle; remove it from production after parity.
-
-The unit-body objective treats a root body atomically. A nested-site wait is a
-legality/frontier constraint, but it is not a separate timed body phase until
-the compiler has an exact phase model. Any ownership comparison that would
-depend on nested-site timing declines rather than silently assigning it a
-cost.
-
-Exit gate: the policy contains no parameter-presence branch, model/root ID,
-sampled shape, latency estimate, or host-generated runtime schedule. Gemma B2
-chooses resident expert reduction and recovers the measured continuation loss;
-an exact B1 compile may choose inline only when its narrower guard and final
-schedule prove the structural comparison. Qwen retains resident root 13 and
-the post-placement 74/22 frontier.
+Exit gate: constant and symbolic instances with extensionally equal guards,
+orders, readiness, worker count, and capacity facts select the same cohort
+policy; dynamic repetitions remain bounded relation pieces; Qwen and Gemma
+retain configured orders where a readiness-major replacement is not proved;
+and no max-plus, model name, sampled shape, or measured latency is consulted.
 
 #### Phase 4A.4: derive nested frontiers from the accepted schedule
 
@@ -3175,11 +3741,11 @@ source extents remain outside the accepted subset.
 Roll out in this order:
 
 1. FlashMLA B4, Q1/Q2, and B9;
-2. Muse/Glimmer FFN;
-3. Qwen3 B1 and mixed-context B greater than one;
-4. Gemma A4B B1/B2 and varied expert IDs;
-5. DeepSeek-V3 routed/shared probe; and
-6. Nemotron routed-first probe.
+2. Qwen3 B1 and mixed-context B greater than one;
+3. Gemma A4B B1/B2 and varied expert IDs;
+4. Muse/Glimmer FFN;
+5. Nemotron routed-first probe; and
+6. DeepSeek-V3 routed/shared probe.
 
 Each step requires correctness, compilation-time, code-size, cold-L2, and
 Gantt gates before proceeding.
@@ -3208,6 +3774,22 @@ ownership proof, and one scheduler remain.
 
 ## File-level change map
 
+### `helion/runtime/config.py`
+
+- Add `cross_loop_pipeline_depth` as one ordinary integer config field with
+  default 1 and document that it affects only `static_pipeline` scheduling.
+- Include it in normal config serialization, equality, display, cache identity,
+  and pretuned configs; add no per-root or runtime-shape form.
+
+### `helion/autotuner/config_spec.py`
+
+- Register the field in the existing valid/configurable key tables.
+- When cross-loop static-pipeline scheduling is available, expose the fixed
+  `IntegerFragment(1, 4, 1)` unconditionally. Do not inspect topology, prune
+  aliases, or synthesize a different bound for a particular kernel.
+- Reuse normal candidate generation and `autotune_multi`; add no scheduler-
+  specific search or objective implementation.
+
 ### `helion/_compiler/tile_dependency.py`
 
 - Generalize existing domain extents and relation guards.
@@ -3235,9 +3817,10 @@ ownership proof, and one scheduler remain.
 - Concrete schedule relation equivalence.
 - Parameter substitution and exact inverses.
 - Event-completion priority and multi-event fan-in.
-- Constant/symbolic continuation-selection parity under extensionally equal
-  guards/orders/worker facts, plus a narrower-guard case that legitimately
-  proves a different choice, a charged chain, and an ineligible competitor.
+- Constant/symbolic local continuation-dominance parity under extensionally
+  equal guards/orders/worker facts, plus a narrower-guard case that
+  legitimately proves a different choice, a correlated publisher chain that
+  declines, and an ineligible competitor.
 - No duplicate/omitted tasks.
 - Root-entry and nested first-checkpoint admission, same-wave cross-strand
   progress, and same-strand future-producer rejection.
@@ -3252,6 +3835,8 @@ ownership proof, and one scheduler remain.
 - Relation-budget rejection before intermediate Cartesian products are built.
 - Post-compile residency rejection before cache acceptance or launch.
 - Small concrete oracle comparison.
+- Config default/range, serialization/cache identity, pretuned round trip, and
+  all four pipeline-depth values even when several lower identically.
 - All six performance probe families.
 
 ## Risks and honest boundaries
@@ -3303,10 +3888,10 @@ The redesign is complete when:
 8. production scheduling and proof never materialize all CTAs;
 9. every logical task executes exactly once;
 10. every dependency remains covered and every wait has a progress proof;
-11. continuation ownership and resident placement are selected atomically by
-    the same structural rule for constant and symbolic domains; inline bodies
-    are charged on every possible producer strand, handoff depth breaks only a
-    proved makespan tie, and resident wins unproved or full-objective ties;
+11. resident placement is selected first for constant and symbolic domains;
+    continuation ownership changes it only through the same local dominance
+    proof over every possible publisher strand, and resident wins every
+    unproved case;
 12. nested counter partitions are exact quotients of the accepted schedule and
     are never derived from a schedule that a later pass mutates;
 13. source tickets use a source-first allocator and capacity certificate;
@@ -3314,13 +3899,19 @@ The redesign is complete when:
     local/global policy split; extensionally identical normalized policy inputs
     yield the same decisions, while a narrower guard may expose additional
     proofs through the same algorithm;
-15. priority uses the documented unit-weight structural model and contains no
-    measured/profiled latency, resource estimate, or model-specific rule;
+15. priority uses the documented unit-weight structural model and exact
+    booleans only; runtime extents, symbolic remaining-work comparisons,
+    measured/profiled latency, resource estimates, and model-specific rules
+    are absent; `cross_loop_pipeline_depth` in the fixed range 1--4 is the only
+    scheduler-specific autotune dimension; all four values are offered without
+    topology pruning or alias removal, depth 1 reproduces canonical placement,
+    and one value governs a complete polymorphic guard;
 16. FlashMLA B4/B9 retain performance and Q1/Q2 do not regress;
 17. both untouched pretuned and mechanically related symbolic B1/B2 source
     forms of Qwen3 and Gemma retain performance through the same policy;
 18. DeepSeek-V3 and Nemotron retain branch-packing wins;
-19. Muse compiles compactly and exposes event-completion behavior;
+19. Muse compiles compactly, retains its 32/16 tail, and rejects fragmentation
+    of its committed gate producer run;
 20. all primary timings are cold-L2 flushed against matched standalone Helion;
 21. standalone-above/persistent-below Gantt charts explain every remaining
     performance gap;
