@@ -7249,7 +7249,9 @@ def derive_final_arrival_continuations(
     return tuple(result)
 
 
-_MAX_GLOBAL_LIST_EDGES = 2_000_000
+# One aggregate symbolic-work cap covers both proposal preflight and the final
+# conservative segment-precedence certificate.
+_MAX_GLOBAL_LIST_WORK = 2_000_000
 _MAX_GLOBAL_LIST_SEGMENTS = 4096
 
 
@@ -8597,7 +8599,7 @@ def _all_resident_root_topological_order(
     def account_edge_attempt() -> bool:
         nonlocal edge_attempt_count
         edge_attempt_count += 1
-        return edge_attempt_count <= _MAX_GLOBAL_LIST_EDGES
+        return edge_attempt_count <= _MAX_GLOBAL_LIST_WORK
 
     root_domains = readiness_graph.root_domains
     for event in readiness_graph.events:
@@ -8719,7 +8721,7 @@ def _has_acyclic_symbolic_segment_precedence(
     def add_edge(producer_index: int, consumer_index: int) -> bool:
         nonlocal edge_attempt_count
         edge_attempt_count += 1
-        if edge_attempt_count > _MAX_GLOBAL_LIST_EDGES:
+        if edge_attempt_count > _MAX_GLOBAL_LIST_WORK:
             return False
         if producer_index == consumer_index:
             return False
@@ -8732,7 +8734,7 @@ def _has_acyclic_symbolic_segment_precedence(
     for earlier_index, earlier in enumerate(segments):
         for later_index in range(earlier_index + 1, len(segments)):
             edge_attempt_count += 1
-            if edge_attempt_count > _MAX_GLOBAL_LIST_EDGES:
+            if edge_attempt_count > _MAX_GLOBAL_LIST_WORK:
                 return False
             if _segments_share_worker(earlier, segments[later_index]):
                 successors[earlier_index].add(later_index)
@@ -8792,7 +8794,7 @@ def _has_acyclic_symbolic_segment_precedence(
                 producer_segment = segments[producer_index]
                 for consumer_index in consumer_indices:
                     edge_attempt_count += 1
-                    if edge_attempt_count > _MAX_GLOBAL_LIST_EDGES:
+                    if edge_attempt_count > _MAX_GLOBAL_LIST_WORK:
                         return False
                     overlaps = _segment_dependency_support_overlaps(
                         producer_segment,
@@ -11454,22 +11456,33 @@ def _event_frontier_list_schedule(
             cohort_by_order = canonical
         else:
             cohort_by_order, _event_keys_by_cohort = cohort
+        canonical_cohort = cohort_by_order.canonical_single_valued()
+        if canonical_cohort is None:
+            unsupported_cohort_roots.add(root)
+            cohort_relations_by_root[root].clear()
+            return
+        cohort_by_order = canonical_cohort
         if cohort_by_order not in cohort_relations_by_root[root]:
             cohort_relations_by_root[root].append(cohort_by_order)
 
     for root, logical_frontier in external_source_frontiers:
         order = root_orders.get(root)
         ordered_frontier = None if order is None else order.then(logical_frontier)
-        if ordered_frontier is None or not _scalar_relation_is_nondecreasing(
-            ordered_frontier
+        canonical_frontier = (
+            None
+            if ordered_frontier is None
+            else ordered_frontier.canonical_single_valued()
+        )
+        if canonical_frontier is None or not _scalar_relation_is_nondecreasing(
+            canonical_frontier
         ):
             return None
-        external_frontiers[root] = ordered_frontier
+        external_frontiers[root] = canonical_frontier
         ordinal_identity = CoordinateRelation.identity(
             order.source_domain,
             order.source_domain,
         )
-        record_cohort_relation(root, ordinal_identity, ordered_frontier)
+        record_cohort_relation(root, ordinal_identity, canonical_frontier)
 
     # Event-closure actions come from the same frozen counter plans consumed
     # by codegen, including plans whose only consumer became a continuation.
@@ -11616,7 +11629,10 @@ def _event_frontier_list_schedule(
                     producer_frontier_by_key,
                 )
             )
-            if frontier is None or frontier.canonical_single_valued() is None:
+            canonical_frontier = (
+                None if frontier is None else frontier.canonical_single_valued()
+            )
+            if canonical_frontier is None:
                 # Widen only this contracted producer arm to the same
                 # whole-root upper frontier used for barrier admission. The
                 # frozen exact counter remains the final progress/codegen
@@ -11626,6 +11642,8 @@ def _event_frontier_list_schedule(
                     consumer_order,
                     producer_order,
                 )
+            else:
+                frontier = canonical_frontier
             frontier_nonempty = _relation_may_be_nonempty(frontier)
             if frontier_nonempty is False:
                 continue
@@ -11634,6 +11652,107 @@ def _event_frontier_list_schedule(
             frontier_group.append((producer_root, frontier))
         if frontier_group:
             incoming_frontier_groups[consumer_root].append(tuple(frontier_group))
+
+    # Bound the complete chooser walk before mutating a cursor.  This is an
+    # immutable upper bound derived from the same canonical cohort/frontier
+    # relations consumed below; budget state never removes one candidate or
+    # changes a priority winner.  Roots with no resident admission frontier
+    # are one whole-suffix action regardless of CTA count.
+    root_count = len(scheduled_roots)
+    if not tile_dependency._relation_product_is_within_budget(
+        root_count,
+        root_count,
+        root_count,
+    ):
+        return worker_schedule
+    action_bound = 0
+    relation_piece_work = 0
+
+    def account_relation_piece_work(work: int) -> bool:
+        nonlocal relation_piece_work
+        if work < 0 or relation_piece_work > _MAX_GLOBAL_LIST_WORK - work:
+            return False
+        relation_piece_work += work
+        return True
+
+    for root in scheduled_roots:
+        task_count = root_orders[root].source_domain.size
+        if task_count == 0:
+            continue
+        cohort_relations = cohort_relations_by_root[root]
+        root_action_bound = 1
+        if (
+            incoming_frontiers[root]
+            and root not in unsupported_cohort_roots
+            and cohort_relations
+        ):
+            for cohort_relation in cohort_relations:
+                piece_count = max(1, len(cohort_relation.pieces))
+                converse = cohort_relation.converse()
+                if converse is None or not account_relation_piece_work(
+                    (piece_count + 1) * (max(1, len(converse.pieces)) + 1)
+                ):
+                    return worker_schedule
+                used_key_count = converse.source_support_cardinality()
+                used_key_count_expression = (
+                    None if used_key_count is None else sympy.sympify(used_key_count)
+                )
+                if used_key_count_expression is None or (
+                    used_key_count_expression.free_symbols
+                    or used_key_count_expression.is_integer is not True
+                    or used_key_count_expression.is_nonnegative is not True
+                ):
+                    used_key_count_expression = cohort_relation.target_domain.size_expr
+                used_key_count_expression = sympy.sympify(used_key_count_expression)
+                used_keys = (
+                    task_count
+                    if used_key_count_expression.free_symbols
+                    or used_key_count_expression.is_integer is not True
+                    or used_key_count_expression.is_nonnegative is not True
+                    else min(task_count, int(used_key_count_expression))
+                )
+                interval_bound = (
+                    used_keys
+                    if cohort_relation.has_total_source()
+                    else min(task_count, 2 * used_keys + 1)
+                )
+                root_action_bound = min(
+                    task_count,
+                    root_action_bound + max(1, interval_bound) - 1,
+                )
+        action_bound += root_action_bound
+        if action_bound > tile_dependency._MAX_RELATION_PIECES:
+            return worker_schedule
+
+    for frontiers in incoming_frontiers.values():
+        if not account_relation_piece_work(
+            sum(max(1, len(frontier.pieces)) for _producer, frontier in frontiers)
+        ):
+            return worker_schedule
+    for frontier_groups in incoming_frontier_groups.values():
+        if not account_relation_piece_work(
+            sum(
+                max(1, len(frontier.pieces))
+                for group in frontier_groups
+                for _producer, frontier in group
+            )
+        ):
+            return worker_schedule
+    if not account_relation_piece_work(
+        sum(max(1, len(frontier.pieces)) for frontier in external_frontiers.values())
+    ):
+        return worker_schedule
+
+    estimated_work = 1
+    for factor in (
+        4,
+        2 * action_bound + 1,
+        max(1, root_count),
+        max(1, root_count + relation_piece_work),
+    ):
+        if factor and estimated_work > _MAX_GLOBAL_LIST_WORK // factor:
+            return worker_schedule
+        estimated_work *= factor
 
     criticality = _root_schema_criticality(
         len(readiness_graph.root_domains),
@@ -11754,7 +11873,9 @@ def _event_frontier_list_schedule(
                     # retaining one terminal wave for the ordinary lane-fill
                     # transition below.  This changes only representation and
                     # keeps compile work independent of the committed span.
-                    interior_wave_count = (remaining - 1) // worker_schedule.worker_count
+                    interior_wave_count = (
+                        remaining - 1
+                    ) // worker_schedule.worker_count
                     if interior_wave_count > 0:
                         count = interior_wave_count * worker_schedule.worker_count
                         placed_runs.append(
@@ -12036,14 +12157,24 @@ def _event_frontier_list_schedule(
                 )
                 continue
         merged_runs.append(run)
-    if len(merged_runs) > _MAX_GLOBAL_LIST_SEGMENTS:
+    retained_source_segments = (
+        ()
+        if transient_source_root is None
+        else prepared_schedule.segments_for_root(transient_source_root)
+    )
+    if len(merged_runs) + len(
+        retained_source_segments
+    ) > _MAX_GLOBAL_LIST_SEGMENTS or not (
+        _worker_schedule_piece_budget_is_valid(
+            len(merged_runs)
+            + sum(
+                len(segment.task_order.pieces) for segment in retained_source_segments
+            )
+        )
+    ):
         return None
 
-    segments: list[WorkerScheduleSegment] = (
-        []
-        if transient_source_root is None
-        else list(prepared_schedule.segments_for_root(transient_source_root))
-    )
+    segments: list[WorkerScheduleSegment] = list(retained_source_segments)
     for run in merged_runs:
         task_order = _task_order_slice(
             root_orders[run.root],

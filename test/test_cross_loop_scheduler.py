@@ -2741,6 +2741,98 @@ class TestCrossLoopScheduler(TestCase):
             (large_count + large.worker_count) // large.worker_count,
         )
 
+    def test_event_frontier_preflight_declines_before_chooser(self) -> None:
+        root_domains = _identify_root_domains(
+            (
+                _domain((10, 1, 1)),
+                _domain((20, 4, 1)),
+            )
+        )
+        event = _whole_root_readiness_event(root_domains, 0, 1, 0)
+        graph = _readiness_graph(root_domains, event)
+        plan = ReadinessCounterPlan(event.producers, event.consumers)
+        prepared = _schedule(
+            4,
+            _segment(
+                0,
+                graph.root_task_orders[0],
+                workers=(0, 4),
+                dispatch_offset=0,
+            ),
+            _segment(
+                1,
+                graph.root_task_orders[1],
+                workers=(0, 4),
+                dispatch_offset=1,
+            ),
+        )
+
+        with (
+            _forbid_schedule_enumeration(),
+            mock.patch.object(cross_loop_scheduler, "_MAX_GLOBAL_LIST_WORK", 1),
+            mock.patch.object(
+                cross_loop_scheduler,
+                "_root_schema_criticality",
+                side_effect=AssertionError("chooser ran after preflight decline"),
+            ) as criticality,
+        ):
+            scheduled = cross_loop_scheduler._event_frontier_list_schedule(
+                graph,
+                prepared,
+                (plan,),
+                frozenset(),
+                pipeline_depth=2,
+            )
+
+        self.assertIs(scheduled, prepared)
+        criticality.assert_not_called()
+
+    def test_event_frontier_preflights_too_many_admission_cohorts(self) -> None:
+        cohort_count = tile_dependency._MAX_RELATION_PIECES + 1
+        root_domains = _identify_root_domains(
+            (
+                _domain((10, cohort_count, 1)),
+                _domain((20, cohort_count, 1)),
+            )
+        )
+        event = _pointwise_root_readiness_event(root_domains, 0, 1, 0)
+        graph = _readiness_graph(root_domains, event)
+        plan = ReadinessCounterPlan(event.producers, event.consumers)
+        prepared = _schedule(
+            4,
+            _segment(
+                0,
+                graph.root_task_orders[0],
+                workers=(0, 4),
+                dispatch_offset=0,
+            ),
+            _segment(
+                1,
+                graph.root_task_orders[1],
+                workers=(0, 4),
+                dispatch_offset=cohort_count,
+            ),
+        )
+
+        with (
+            _forbid_schedule_enumeration(),
+            mock.patch.object(
+                cross_loop_scheduler,
+                "_root_schema_criticality",
+                side_effect=AssertionError("chooser ran after preflight decline"),
+            ) as criticality,
+        ):
+            scheduled = cross_loop_scheduler._event_frontier_list_schedule(
+                graph,
+                prepared,
+                (plan,),
+                frozenset(),
+                pipeline_depth=2,
+            )
+
+        self.assertIs(scheduled, prepared)
+        criticality.assert_not_called()
+
     def test_global_list_schedule_does_not_spill_ready_suffix_past_ancestor(
         self,
     ) -> None:
@@ -6359,7 +6451,7 @@ class TestCrossLoopScheduler(TestCase):
             _forbid_schedule_enumeration(),
             mock.patch.object(
                 cross_loop_scheduler,
-                "_MAX_GLOBAL_LIST_EDGES",
+                "_MAX_GLOBAL_LIST_WORK",
                 0,
             ),
         ):
@@ -10640,7 +10732,7 @@ class TestCrossLoopScheduler(TestCase):
             )
             with mock.patch.object(
                 cross_loop_scheduler,
-                "_MAX_GLOBAL_LIST_EDGES",
+                "_MAX_GLOBAL_LIST_WORK",
                 2,
             ):
                 self.assertFalse(
