@@ -857,7 +857,10 @@ class MetalBackend(Backend):
         # Only adjust the loop strategy for the root grid.  MPPGraphInfo emits
         # the cooperative K-loop internally; nested/device loops should keep
         # their normal Metal/CuTe strategy.
-        if not device_ir.grid_block_ids or block_ids != device_ir.grid_block_ids[0]:
+        # Any root grid, not just the first: rewrite_mpp_graphs scans every
+        # RootGraphInfo, so a matmul in a later top-level hl.tile still gets
+        # MPP lowering and still needs its thread budget reserved.
+        if block_ids not in device_ir.grid_block_ids:
             return config
         if len(block_ids) < 2:
             return config

@@ -359,6 +359,12 @@ def _ast_int_value(node: ast.AST) -> int:
     return node.value
 
 
+def _ast_name_value(node: ast.AST) -> str:
+    """Extract a bare variable name from AST node."""
+    assert isinstance(node, ast.Name)
+    return node.id
+
+
 def _extract_mpp_setup_params(node: ast.Call) -> MPPSetupParams:
     """Extract parameters from ``_metal_mpp_setup(...)`` call.
 
@@ -367,7 +373,8 @@ def _extract_mpp_setup_params(node: ast.Call) -> MPPSetupParams:
       2-4: M, N, K,        5-7: TILE_M, TILE_N, TILE_K,
       8: NUM_SG,           9: in_dtype,       10: acc_dtype,
       11: bias tensor name (or ""),  12: bias metal dtype (or ""),
-      13: FX node name of the MMA op (or "").
+      13: FX node name of the MMA op (or ""),
+      14: M tile-offset variable,  15: N tile-offset variable (bare names).
 
     Output tensor name and dtype are deliberately carried by the explicit
     ``_metal_mpp_coop_store(setup, out_name, out_dtype)`` marker instead of
@@ -379,8 +386,8 @@ def _extract_mpp_setup_params(node: ast.Call) -> MPPSetupParams:
     will store to the same destination shape/dtype path.
     """
     args = node.args
-    assert len(args) == 14, (
-        f"_metal_mpp_setup expects 14 positional args, got {len(args)}"
+    assert len(args) == 16, (
+        f"_metal_mpp_setup expects 16 positional args, got {len(args)}"
     )
     return MPPSetupParams(
         lhs=_ast_str_value(args[0]),
@@ -397,6 +404,8 @@ def _extract_mpp_setup_params(node: ast.Call) -> MPPSetupParams:
         bias=_ast_str_value(args[11]) or None,
         bias_dtype=_ast_str_value(args[12]) or None,
         fx_name=_ast_str_value(args[13]) or None,
+        m_offset=_ast_name_value(args[14]),
+        n_offset=_ast_name_value(args[15]),
     )
 
 
@@ -409,9 +418,9 @@ def _emit_mpp_setup(
     """Emit MPP matmul2d setup MSL.
 
     Declares the input tensor handles (``_A`` / ``_B``), the
-    ``matmul2d_descriptor`` and operator, the threadgroup-id → tile
-    decomposition, the operand slices, and the cooperative_tensor
-    accumulator.  The output tensor handle (``_C``) is declared by
+    ``matmul2d_descriptor`` and operator, the per-axis tile indices, the
+    operand slices, and the cooperative_tensor accumulator.  The output
+    tensor handle (``_C``) is declared by
     :func:`_emit_mpp_coop_store` because its name and dtype are sourced
     from the trailing ``tl.store(out_ptr, ...)`` rather than the setup.
     """
@@ -429,8 +438,6 @@ def _emit_mpp_setup(
     Ds_var = _scoped_mpp_name(setup_name, "_Ds")
     desc_var = _scoped_mpp_name(setup_name, "_desc")
     op_var = _scoped_mpp_name(setup_name, "_op")
-    gm_var = _scoped_mpp_name(setup_name, "_gm")
-    flat_id_var = _scoped_mpp_name(setup_name, "_flat_id")
     ty_var = _scoped_mpp_name(setup_name, "_ty")
     tx_var = _scoped_mpp_name(setup_name, "_tx")
     As_var = _scoped_mpp_name(setup_name, "_As")
@@ -463,11 +470,10 @@ def _emit_mpp_setup(
             f"{pad}    false, false, false, matmul2d_descriptor::mode::{mm_mode});",
             f"{pad}matmul2d<{desc_var}, execution_simdgroups<{NUM_SG_var}>> {op_var};",
             "",
-            f"{pad}// Decompose flat threadgroup ID into 2D tile indices",
-            f"{pad}uint {gm_var} = ({M_var} + {TILE_M_var} - 1) / {TILE_M_var};",
-            f"{pad}uint {flat_id_var} = tgid[0];",
-            f"{pad}uint {ty_var} = {flat_id_var} % {gm_var};",
-            f"{pad}uint {tx_var} = {flat_id_var} / {gm_var};",
+            # Tile indices from the branch-local tile offsets.  Each top-level
+            # loop computes its own offsets from its rebased program IDs.
+            f"{pad}uint {ty_var} = ({params.m_offset} / {TILE_M_var});",
+            f"{pad}uint {tx_var} = ({params.n_offset} / {TILE_N_var});",
             "",
             # The setup slices only define the cooperative_tensor type.  Keep
             # their extents static so MPP can allocate the cooperative tile
