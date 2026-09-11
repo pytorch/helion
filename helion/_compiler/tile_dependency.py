@@ -64,6 +64,123 @@ def _relation_product_is_within_budget(*factor_sizes: int) -> bool:
     return True
 
 
+def _positive_integer_shift_is_nonnegative(expression: sympy.Expr) -> bool:
+    """Prove a bounded polynomial nonnegative over positive integer symbols.
+
+    Replacing each positive integer parameter ``p`` by ``p0 + 1`` is an exact
+    reparameterization of its domain.  SymPy can then prove expressions such
+    as ``15 * B * Q - 11`` nonnegative from the nonnegative shifted symbols.
+    Bound the possible expanded polynomial before constructing it so proof
+    cost depends only on compile-time expression structure, never an extent.
+    """
+    positive_symbols = tuple(
+        sorted(
+            (
+                symbol
+                for symbol in expression.free_symbols
+                if symbol.is_integer is True and symbol.is_positive is True
+            ),
+            key=str,
+        )
+    )
+    if not positive_symbols:
+        return False
+    expression_node_count = sum(
+        1
+        for _node in itertools.islice(
+            sympy.preorder_traversal(expression),
+            _MAX_RELATION_PRODUCT_STATES + 1,
+        )
+    )
+    if expression_node_count > _MAX_RELATION_PRODUCT_STATES:
+        return False
+
+    all_symbols = tuple(sorted(expression.free_symbols, key=str))
+    positive_symbol_set = frozenset(positive_symbols)
+
+    def shifted_term_bound(node: sympy.Basic) -> int | None:
+        """Bound terms created by the shift without expanding ``node``."""
+        if not node.free_symbols:
+            return 1
+        if isinstance(node, sympy.Symbol):
+            return 2 if node in positive_symbol_set else 1
+        if isinstance(node, sympy.Add):
+            total = 0
+            for child in node.args:
+                child_bound = shifted_term_bound(child)
+                if (
+                    child_bound is None
+                    or total > _MAX_RELATION_PRODUCT_STATES - child_bound
+                ):
+                    return None
+                total += child_bound
+            return total
+        if isinstance(node, sympy.Mul):
+            product = 1
+            for child in node.args:
+                child_bound = shifted_term_bound(child)
+                if child_bound is None or not _relation_product_is_within_budget(
+                    product,
+                    child_bound,
+                ):
+                    return None
+                product *= child_bound
+            return product
+        if isinstance(node, sympy.Pow):
+            base, exponent = node.args
+            if (
+                not isinstance(exponent, sympy.Integer)
+                or exponent.is_nonnegative is not True
+            ):
+                return None
+            base_bound = shifted_term_bound(base)
+            if base_bound is None or base_bound == 1:
+                return base_bound
+            if exponent > _MAX_RELATION_PRODUCT_STATES:
+                return None
+            result = base_bound ** int(exponent)
+            return result if result <= _MAX_RELATION_PRODUCT_STATES else None
+        return None
+
+    if shifted_term_bound(expression) is None:
+        return False
+    try:
+        # Include unshifted symbols as generators rather than allowing SymPy
+        # to hide an arbitrarily large symbolic polynomial in a coefficient.
+        polynomial = sympy.Poly(expression, *all_symbols)
+    except sympy.PolynomialError:
+        return False
+    degrees: list[int] = []
+    for symbol in all_symbols:
+        degree = polynomial.degree(symbol)
+        if not isinstance(degree, int) or degree < 0:
+            return False
+        degrees.append(degree)
+    if not _relation_product_is_within_budget(*(degree + 1 for degree in degrees)):
+        return False
+    shifted_symbols = tuple(
+        sympy.Dummy(
+            f"{symbol.name}_minus_one",
+            integer=True,
+            nonnegative=True,
+        )
+        for symbol in positive_symbols
+    )
+    shifted = sympy.expand(
+        expression.xreplace(
+            {
+                symbol: shifted_symbol + 1
+                for symbol, shifted_symbol in zip(
+                    positive_symbols,
+                    shifted_symbols,
+                    strict=True,
+                )
+            }
+        )
+    )
+    return shifted.is_nonnegative is True
+
+
 def _is_provably_nonnegative(
     expression: sympy.Expr,
     prove_nonnegative: Callable[[sympy.Expr], bool] | None,
@@ -128,6 +245,8 @@ def _is_provably_nonnegative(
             and quotient_simplified.is_nonnegative is True
         ):
             return True
+    if _positive_integer_shift_is_nonnegative(expression):
+        return True
     interval = _bounded_parameter_expression_interval(expression)
     return (interval is not None and interval[0].is_nonnegative is True) or (
         prove_nonnegative is not None and prove_nonnegative(expression)
@@ -462,7 +581,7 @@ class CoordinateDomain:
         )
         object.__setattr__(self, "axis_counts_items", normalized_counts)
         for _axis, expression in normalized_counts:
-            if expression.is_nonnegative is not True or (  # pyrefly: ignore[missing-attribute]
+            if not _is_provably_nonnegative(expression, None) or (
                 expression.is_zero is True and not self._allow_empty
             ):
                 raise ValueError("coordinate-domain axis counts must be positive")
@@ -5596,7 +5715,10 @@ def _memoized_source_support_cardinality(
     if cardinality is None:
         return None
     cardinality = sympy.sympify(cardinality)
-    if cardinality.is_integer is not True or cardinality.is_nonnegative is not True:
+    if cardinality.is_integer is not True or not _is_provably_nonnegative(
+        cardinality,
+        None,
+    ):
         raise AssertionError("invalid source-support cardinality certificate")
     return cardinality
 
@@ -5610,7 +5732,7 @@ def _remember_source_support_cardinality(
         cardinality,
         description="source-support cardinality certificate",
     )
-    if cardinality_expr.is_nonnegative is not True:
+    if not _is_provably_nonnegative(cardinality_expr, None):
         raise ValueError("source-support cardinality must be nonnegative")
     existing = _memoized_source_support_cardinality(relation)
     if existing is not None and not _integer_partition_expressions_equal(

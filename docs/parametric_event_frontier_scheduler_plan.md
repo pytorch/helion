@@ -474,8 +474,10 @@ The resulting order is represented only as repeated existing
 `P ; C[0:Wc] ; U ; C[Wc:]`. Exact aligned slices retain explicit inverse
 support, adjacent packed intervals are proved from their authoritative
 relations, and concrete specialization at `B={0,1,3,4}` selects the same
-semantic order after pruning a zero-support suffix. Relation substitution now
-removes such concretely empty pieces. Composition clips raw boxes to their
+semantic order after pruning a zero-support suffix. That runtime-empty suffix
+is covered by CPU substitution; the compiled CUDA fixture covers B={1,3,4,75}
+and worker-wave wraparound. Relation substitution now removes such concretely
+empty pieces. Composition clips raw boxes to their
 declared domain before taking a preimage; the previous hand-built partial
 packed inverse was rejected because copying an implicitly clipped inverse into
 a larger target domain would falsely give the segment ownership of the whole
@@ -486,8 +488,8 @@ derives every segment's dense packed slot interval from the authoritative
 `task_order`, strides that interval by resident worker count, maps each live
 slot back through that same relation, and invokes the existing shared root
 body. One compiled kernel has executed the injected `P ; C[0:2] ; U ; C[2:]`
-schedule correctly at B={1,3,4,75}; this covers a runtime-empty suffix and a
-worker-wave wrap. Fine-grained counters remain the readiness authority. A
+schedule correctly at B={1,3,4,75}; this covers worker-wave wraparound without
+shape specialization. Fine-grained counters remain the readiness authority. A
 repeated parameterized plan that still needs a root barrier is rejected before
 code generation until publication ownership can be derived from the same
 relations.
@@ -510,10 +512,16 @@ remainder for arbitrary-rank mixed-radix traversals. The remainder is an
 O(rank) partition by the slowest nonzero outer digit, with an explicit exact
 native-coordinate inverse; no runtime extent, CTA, worker, or wave is
 enumerated. CPU substitution tests cover an H-fastest `H2 x B x Q` PID-order
-traversal. This removes the rank-two-only construction blocker, but it does
-not yet cover equivalent L2-grouped task orders: an exact `H15 x B x Q`
-group-size-two control still declines safely and remains a prerequisite before
-claiming Qwen/Gemma coverage.
+traversal. The same construction now covers grouped rank-N orders after
+strengthening the shared nonnegativity proof for bounded polynomials over
+positive integer shape parameters. The proof rewrites each parameter as
+`p0 + 1`, first bounds the possible expansion structurally, and accepts only
+when SymPy proves the shifted expression nonnegative. It is used consistently
+by coordinate domains and derived support-cardinality certificates. An exact
+group-size-two `H5 x 3 x B x Q` control now slices and packs `[0,15)` plus
+`[15,15BQ)`, with the latter empty at B=Q=1; merely nonnegative B/Q still
+decline because a fixed 15-task prefix would be invalid at zero. This closes
+the grouped-rank proof prerequisite without an L2- or model-specific branch.
 
 The first production-wiring foothold is now implemented. Before either legacy
 constant/parameterized policy branch, `build_static_pipeline_plan` can run the
@@ -530,13 +538,18 @@ migration proposal; it is not yet evidence that ordinary codegen selects the
 foothold. Default depth remains one and the field is not exposed publicly while
 the legacy ownership/placement split remains reachable.
 
-The next transaction is to broaden that resident schedule path and implement
-post-placement local continuation dominance so the temporary capability gate
-and old shape-specific branches can be removed. Only after a higher depth
-changes a real accepted plan under the unified path should
+The next transaction replaces the one-shot tail helper with one finite,
+ephemeral cursor/run walk over `C`. It can make several whole-cohort decisions,
+recompute newly ready roots after each committed run, propagate causal depth,
+and repack exactly once into the existing `WorkerSchedule`; it introduces no
+retained state or second graph. A leading sub-root cohort remains terminal
+until consumer-key-scoped frontier state is implemented. Post-placement local
+continuation dominance follows that resident transaction so the temporary
+capability gate and old shape-specific branches can be removed. Only after a
+higher depth changes a real accepted plan under the unified path should
 `cross_loop_pipeline_depth` become a public autotune field.
-Consumer-key-scoped closure, repeated pulls, affine recurrence lifting, and
-the depth knob remain subsequent milestones. Exact segment tuple shape,
+Consumer-key-scoped closure, affine recurrence lifting, and the public depth
+knob remain subsequent milestones. Exact segment tuple shape,
 depth-2/3/4 aliasing, one-root-per-parameterized-schedule, and the old
 pointwise multi-cohort decline are migration details rather than final policy
 requirements.

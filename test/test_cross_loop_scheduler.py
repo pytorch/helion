@@ -7556,6 +7556,169 @@ class TestCrossLoopScheduler(TestCase):
                     expected,
                 )
 
+    def test_task_order_slice_preserves_grouped_rank_three_leading_cohort(
+        self,
+    ) -> None:
+        batch = sympy.Symbol("batch", integer=True, positive=True)
+        query = sympy.Symbol("query", integer=True, positive=True)
+        domain = CoordinateDomain(
+            (10, 11, 12, 13),
+            ((10, 5), (11, 3), (12, batch), (13, query)),
+            identity=0,
+        )
+        task_order = pid_task_order(
+            domain,
+            domain.axis_order,
+            l2_group_size=2,
+        )
+        cohort_count = sympy.Integer(15)
+        task_count = task_order.source_domain.size_expr
+        worker_count = 148
+        first_slot = sympy.Integer(11)
+        schedule_domain = cross_loop_scheduler._worker_schedule_domain(
+            worker_count,
+            cross_loop_scheduler._ceildiv_nonnegative_expression(
+                first_slot + task_count,
+                worker_count,
+            ),
+            (-3, -2, -1),
+        )
+
+        with _forbid_schedule_enumeration():
+            prefix = _task_order_slice(task_order, 0, cohort_count)
+            suffix = _task_order_slice(
+                task_order,
+                cohort_count,
+                task_count - cohort_count,
+            )
+            packed_prefix = cross_loop_scheduler._packed_root_major_task_order_relation(
+                schedule_domain,
+                task_order,
+                first_slot,
+                worker_count,
+                ordinal_begin=0,
+                task_count=cohort_count,
+            )
+            packed_suffix = cross_loop_scheduler._packed_root_major_task_order_relation(
+                schedule_domain,
+                task_order,
+                first_slot + cohort_count,
+                worker_count,
+                ordinal_begin=cohort_count,
+                task_count=task_count - cohort_count,
+            )
+
+        self.assertIsNotNone(prefix)
+        self.assertIsNotNone(suffix)
+        self.assertIsNotNone(packed_prefix)
+        self.assertIsNotNone(packed_suffix)
+        assert prefix is not None and suffix is not None
+        assert packed_prefix is not None and packed_suffix is not None
+        self.assertEqual(prefix.source_support_cardinality(), cohort_count)
+        self.assertEqual(
+            suffix.source_support_cardinality(),
+            task_count - cohort_count,
+        )
+        self.assertTrue(prefix.is_total_function())
+        self.assertTrue(suffix.is_total_function())
+        prefix_inverse = prefix.converse()
+        suffix_inverse = suffix.converse()
+        self.assertIsNotNone(prefix_inverse)
+        self.assertIsNotNone(suffix_inverse)
+        assert prefix_inverse is not None and suffix_inverse is not None
+        self.assertTrue(prefix_inverse.is_single_valued())
+        self.assertTrue(suffix_inverse.is_single_valued())
+        with _forbid_schedule_enumeration():
+            WorkerSchedule(
+                worker_count,
+                (
+                    WorkerScheduleSegment(0, packed_prefix, 0, worker_count, 0),
+                    WorkerScheduleSegment(0, packed_suffix, 0, worker_count, 0),
+                ),
+            )
+
+        for concrete_batch, concrete_query in ((1, 1), (1, 2), (2, 1), (2, 3)):
+            with self.subTest(batch=concrete_batch, query=concrete_query):
+                substitutions = {batch: concrete_batch, query: concrete_query}
+                expected = task_order.substitute_parameters(substitutions).materialize()
+                concrete_prefix = prefix.substitute_parameters(
+                    substitutions
+                ).materialize()
+                concrete_suffix = suffix.substitute_parameters(
+                    substitutions
+                ).materialize()
+                self.assertEqual(concrete_prefix, expected[:15])
+                self.assertEqual(concrete_suffix, expected[15:])
+                self.assertEqual(concrete_prefix + concrete_suffix, expected)
+
+        zero_capable_batch = sympy.Symbol(
+            "zero_capable_batch",
+            integer=True,
+            nonnegative=True,
+        )
+        zero_capable_query = sympy.Symbol(
+            "zero_capable_query",
+            integer=True,
+            nonnegative=True,
+        )
+        zero_capable_domain = CoordinateDomain(
+            (20, 21, 22, 23),
+            (
+                (20, 5),
+                (21, 3),
+                (22, zero_capable_batch),
+                (23, zero_capable_query),
+            ),
+            identity=1,
+        )
+        zero_capable_order = pid_task_order(
+            zero_capable_domain,
+            zero_capable_domain.axis_order,
+            l2_group_size=2,
+        )
+        with _forbid_schedule_enumeration():
+            self.assertIsNone(_task_order_slice(zero_capable_order, 0, 15))
+
+    def test_task_order_slice_preflights_rank_three_cohort_piece_budget(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, positive=True)
+        query = sympy.Symbol("query", integer=True, positive=True)
+        domain = CoordinateDomain(
+            (10, 11, 12),
+            ((10, batch), (11, query), (12, 2)),
+            identity=0,
+        )
+        task_order = pid_task_order(domain, (12, 10, 11))
+        original_budget_check = tile_dependency._relation_product_is_within_budget
+
+        def reject_rank_three_suffix(*factor_sizes: int) -> bool:
+            if factor_sizes == (2, 3):
+                return False
+            return original_budget_check(*factor_sizes)
+
+        with (
+            mock.patch.object(
+                tile_dependency,
+                "_relation_product_is_within_budget",
+                side_effect=reject_rank_three_suffix,
+            ) as budget_check,
+            mock.patch.object(
+                cross_loop_scheduler,
+                "_flat_domain_index_expression",
+                side_effect=AssertionError(
+                    "over-budget cohort must decline before slab construction"
+                ),
+            ),
+            _forbid_schedule_enumeration(),
+        ):
+            self.assertIsNotNone(
+                _task_order_slice(
+                    task_order,
+                    2,
+                    2 * batch * query - 2,
+                )
+            )
+        self.assertIn(mock.call(2, 3), budget_check.call_args_list)
+
     def test_packed_relation_reuses_constructive_interval_proof(self) -> None:
         batch = sympy.Symbol("batch", integer=True, positive=True)
         worker_count = 148

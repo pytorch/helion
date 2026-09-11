@@ -31,6 +31,7 @@ from helion._compiler.tile_dependency import _CoordinateRelationPiece
 from helion._compiler.tile_dependency import _dense_linear_overlap_relation
 from helion._compiler.tile_dependency import _dense_linear_source_support_interval
 from helion._compiler.tile_dependency import _dense_mixed_radix_converse
+from helion._compiler.tile_dependency import _is_provably_nonnegative
 from helion._compiler.tile_dependency import _layout_is_injective
 from helion._compiler.tile_dependency import _logical_expression_bounds
 from helion._compiler.tile_dependency import (
@@ -39,6 +40,7 @@ from helion._compiler.tile_dependency import (
 from helion._compiler.tile_dependency import (
     _piecewise_source_grouped_mixed_radix_converse,
 )
+from helion._compiler.tile_dependency import _positive_integer_shift_is_nonnegative
 from helion._compiler.tile_dependency import _relation_source_cells
 from helion._compiler.tile_dependency import _remember_exact_converse
 from helion._compiler.tile_dependency import _simplify_logical_expression
@@ -335,6 +337,75 @@ class TestTileDependency(TestCase):
         noninteger = sympy.Symbol("noninteger", nonnegative=True)
         with self.assertRaisesRegex(ValueError, "must be an integer expression"):
             CoordinateDomain((10,), ((10, noninteger),))
+
+    def test_positive_integer_shift_proves_bounded_polynomials(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, positive=True)
+        query = sympy.Symbol("query", integer=True, positive=True)
+
+        for expression in (
+            15 * batch * query - 15,
+            15 * batch * query - 11,
+            15 * batch * query - 15 * batch + 3,
+        ):
+            with self.subTest(expression=expression):
+                self.assertTrue(_is_provably_nonnegative(expression, None))
+
+        self.assertFalse(
+            _is_provably_nonnegative(
+                15 * batch * query - 15 * batch - 1,
+                None,
+            )
+        )
+        zero_capable_batch = sympy.Symbol(
+            "zero_capable_batch",
+            integer=True,
+            nonnegative=True,
+        )
+        self.assertFalse(_is_provably_nonnegative(15 * zero_capable_batch - 15, None))
+
+        accepted_domain = CoordinateDomain(
+            (10,),
+            ((10, 15 * batch * query - 15),),
+        )
+        self.assertEqual(accepted_domain.size_expr, 15 * batch * query - 15)
+        zero_domain = accepted_domain.substitute_parameters({batch: 1, query: 1})
+        self.assertEqual(zero_domain.shape_expr, (0,))
+        self.assertTrue(zero_domain._allow_empty)
+        with self.assertRaisesRegex(ValueError, "axis counts must be positive"):
+            CoordinateDomain(
+                (10,),
+                ((10, 15 * zero_capable_batch - 15),),
+            )
+        with self.assertRaisesRegex(ValueError, "axis counts must be positive"):
+            CoordinateDomain(
+                (10,),
+                ((10, 15 * batch * query - 15 * batch - 1),),
+            )
+
+        with mock.patch(
+            "helion._compiler.tile_dependency._relation_product_is_within_budget",
+            return_value=False,
+        ):
+            self.assertFalse(
+                _positive_integer_shift_is_nonnegative(
+                    15 * batch * query - 11,
+                )
+            )
+        with mock.patch.object(
+            sympy,
+            "Poly",
+            side_effect=AssertionError("over-budget shift must not build a polynomial"),
+        ):
+            self.assertFalse(
+                _positive_integer_shift_is_nonnegative((batch + query) ** 9)
+            )
+            ordinary_x = sympy.Symbol("ordinary_x", integer=True)
+            ordinary_y = sympy.Symbol("ordinary_y", integer=True)
+            self.assertFalse(
+                _positive_integer_shift_is_nonnegative(
+                    (batch + 1) * (ordinary_x + ordinary_y) ** 100_000
+                )
+            )
 
     def test_symbolic_coordinate_domain_substitution(self) -> None:
         width = 8
@@ -3664,7 +3735,7 @@ class TestTileDependency(TestCase):
         )
 
         self.assertTrue(relation.is_single_valued())
-        self.assertIsNone(relation.canonical_single_valued())
+        self.assertEqual(relation.canonical_single_valued(), relation)
         self.assertTrue(relation.has_total_source())
         self.assertTrue(relation.is_total_function())
         self.assertEqual(

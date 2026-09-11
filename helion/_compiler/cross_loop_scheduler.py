@@ -1639,7 +1639,15 @@ def _task_order_slice(
                 ordinal_begin + task_count,
                 ordinal_count,
             )
-            if is_leading_cohort or is_after_leading_cohort:
+            slice_piece_count = 1 if is_leading_cohort else len(source_axes) - 1
+            if (
+                (is_leading_cohort or is_after_leading_cohort)
+                and slice_piece_count <= tile_dependency._MAX_RELATION_PIECES
+                and tile_dependency._relation_product_is_within_budget(
+                    slice_piece_count,
+                    len(source_axes),
+                )
+            ):
                 source_strides: dict[int, sympy.Expr] = {}
                 stride: sympy.Expr = sympy.Integer(1)
                 for axis in source_axes:
@@ -1851,6 +1859,12 @@ def _task_order_slice(
                                 )
                                 tile_dependency._remember_single_valued(result)
                                 tile_dependency._remember_single_valued(result_inverse)
+                                tile_dependency._remember_dense_source_support_interval(
+                                    result,
+                                    (slice_axis,),
+                                    0,
+                                    task_count,
+                                )
                                 return result
 
     if len(source_axes) == 2:
