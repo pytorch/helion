@@ -429,9 +429,37 @@ one-cubin substitution across `Q`. A zero-`Q` replay currently faults in the
 pre-existing canonical parameterized lowering as well, so runtime-empty
 rank-two execution remains an explicit later gate rather than a claim of this
 slice.
-The next placement change is a bounded whole-root tail pull across only roots
-proved incomparable by the root/event quotient; it must use the same segment
-relations and renderer rather than adding a recurrence-specific path.
+
+The first bounded placement change is now implemented locally. At a completed
+root boundary with a statically known partial wave, the canonical successor
+and every later ready, incomparable candidate are scored by the same
+`(effective criticality, releases consumer at that class)` prefix. The
+event-closure field remains neutral in this root-only strength reduction:
+closure is a property of consumer-relevant event keys, not merely of a set of
+producer roots, and will be enabled by the next cohort-frontier slice. A later
+root moves only when it is the unique strict winner, its whole root is proved
+to be one exact cohort in every semantic readiness view, and it fits the
+remaining lanes. A root absent from every semantic event is one neutral
+whole-root cohort; a root hidden by an unsupported event is not.
+Unclassified or symbolically sized ready competitors veto the proposal rather
+than disappearing from the priority set. Static empty roots are the only safe
+exception. Root edges and criticality are derived once, reachability is
+precomputed once, and rebuilding is bounded by the same aggregate relation
+budget used by `WorkerSchedule`.
+
+The lowerable CPU controls now distinguish a real pull, an equal-class tie, a
+multi-cohort decline, and the case where the canonical successor inherits the
+class of a newly released join consumer. The latter has a paired graph without
+the join in which the noncanonical root does move, preventing a conservative
+decline from passing the test accidentally. A disjoint-key control proves that
+an unrelated producer arm cannot receive event-closure credit. A CUDA test
+executes packed root order `(1, 0, 2)` through the parameterized relation
+renderer and final publication bookkeeping. The pointwise multi-cohort decline
+and the current one-pull/depth-alias behavior are migration guards, not final
+scheduling requirements. The next placement step is to represent and rank one
+exact sub-root cohort interval, including consumer-key-scoped event closure,
+then replace static fit with a guard-uniform symbolic fit proof before adding
+repeated pulls and exposing the depth knob.
 
 ### Priority 1: finish the symbolic dependency refactor
 

@@ -1378,6 +1378,76 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_codegen_lowers_packed_nonmonotonic_root_order(self) -> None:
+        x = torch.arange(128, device=DEVICE, dtype=torch.float32).reshape(2, 64)
+        original_build = cross_loop_codegen.build_static_pipeline_plan
+        selected_roots: tuple[int, ...] | None = None
+
+        def build_with_packed_root_permutation(**kwargs: Any):
+            nonlocal selected_roots
+            kwargs["continuation_ineligible_roots"] = frozenset(
+                range(len(kwargs["root_task_orders"]))
+            )
+            plan = original_build(**kwargs)
+            readiness_graph = cross_loop_scheduler.build_readiness_graph(
+                dependency_graph=kwargs["dependency_graph"],
+                root_task_orders=kwargs["root_task_orders"],
+                site_domains=kwargs["site_domains"],
+                publishable_site_ids=kwargs.get("publishable_site_ids"),
+                prove_nonnegative=kwargs.get("prove_nonnegative"),
+            )
+            canonical = cross_loop_scheduler._build_root_major_worker_schedule(
+                readiness_graph.root_domains,
+                readiness_graph.root_task_orders,
+                plan.worker_schedule.worker_count,
+            )
+            root_order = (
+                1,
+                0,
+                *range(2, len(readiness_graph.root_domains)),
+            )
+            permuted = cross_loop_scheduler._repack_root_major_schedule(
+                readiness_graph,
+                canonical,
+                root_order,
+                {},
+            )
+            assert permuted is not None
+            geometry = (
+                cross_loop_scheduler._parametric_root_major_schedule_geometry(
+                    permuted
+                )
+            )
+            assert geometry is not None
+            selected_roots = tuple(
+                segment.root for segment, _first, _count in geometry
+            )
+            return dataclasses.replace(plan, worker_schedule=permuted)
+
+        with mock.patch.object(
+            cross_loop_codegen,
+            "build_static_pipeline_plan",
+            side_effect=build_with_packed_root_permutation,
+        ):
+            code, out = code_and_output(
+                cartesian_affine_join,
+                (x,),
+                block_sizes=[1, 16, 1, 16, 1, 32],
+                pid_type="persistent_blocked",
+                cross_loop_schedule="static_pipeline",
+                num_sm_multiplier=1,
+                num_warps=1,
+            )
+
+        self.assertEqual(selected_roots, (1, 0, 2))
+        torch.testing.assert_close(out, x * 2)
+        self.assertLess(
+            code.index("def tile_dependency_root_1"),
+            code.index("def tile_dependency_root_0"),
+        )
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_codegen_lowers_permuted_root_across_interleaved_segments(self) -> None:
         x = torch.arange(128, device=DEVICE, dtype=torch.float32).reshape(2, 64)
         original_build = cross_loop_codegen.build_static_pipeline_plan

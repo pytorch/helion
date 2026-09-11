@@ -1983,17 +1983,17 @@ def _parametric_root_major_schedule_geometry_from_parts(
 
     first_slot: sympy.Expr = sympy.Integer(0)
     result: list[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr]] = []
-    previous_root = -1
+    seen_roots: set[int] = set()
     for segment in segments:
         relation = segment.task_order
         target_domain = relation.target_domain
         if (
-            segment.root <= previous_root
+            segment.root in seen_roots
             or segment.worker_begin != 0
             or segment.worker_count != worker_count
         ):
             return None
-        previous_root = segment.root
+        seen_roots.add(segment.root)
         task_count = target_domain.size_expr
         statically_empty = task_count.is_zero is True and not relation.pieces
         if statically_empty:
@@ -2032,6 +2032,16 @@ class _WorkerScheduleChronologyError(ValueError):
     """Raised when segment tuple order disagrees with a resident strand."""
 
 
+def _worker_schedule_piece_budget_is_valid(piece_count: int) -> bool:
+    """Apply the one aggregate relation budget used by every schedule."""
+    return piece_count <= tile_dependency._MAX_RELATION_PIECES and (
+        tile_dependency._relation_product_is_within_budget(
+            piece_count,
+            piece_count,
+        )
+    )
+
+
 def _validate_normalized_worker_schedule(
     worker_count: int,
     segments: tuple[WorkerScheduleSegment, ...],
@@ -2051,12 +2061,7 @@ def _validate_normalized_worker_schedule(
     if any(segment.task_order.source_domain != schedule_domain for segment in segments):
         raise ValueError("worker schedule segments do not share one domain")
     total_piece_count = sum(len(segment.task_order.pieces) for segment in segments)
-    if total_piece_count > tile_dependency._MAX_RELATION_PIECES or not (
-        tile_dependency._relation_product_is_within_budget(
-            total_piece_count,
-            total_piece_count,
-        )
-    ):
+    if not _worker_schedule_piece_budget_is_valid(total_piece_count):
         raise ValueError("worker schedule exceeds the symbolic relation budget")
 
     for index, segment in enumerate(segments):
@@ -4579,7 +4584,15 @@ def _root_major_prerequisites_follow_root_order(
     continuation_by_root: dict[int, FinalArrivalContinuation],
 ) -> bool:
     """Prove packed-root progress after contracting continuation ownership."""
-    scheduled_roots = {segment.root for segment in worker_schedule.segments}
+    geometry = _parametric_root_major_schedule_geometry(worker_schedule)
+    if geometry is None:
+        return False
+    root_position = {
+        segment.root: position
+        for position, (segment, _first_slot, _task_count) in enumerate(geometry)
+    }
+    if len(root_position) != len(geometry):
+        return False
     for prerequisite in _emitted_prerequisites(
         readiness_counters,
         root_barrier_edges,
@@ -4605,8 +4618,10 @@ def _root_major_prerequisites_follow_root_order(
                 continuation_by_root,
             )
         if static_relations is None or any(
-            producer_root not in scheduled_roots
-            or producer_root >= prerequisite.consumer_root
+            producer_root not in root_position
+            or prerequisite.consumer_root not in root_position
+            or root_position[producer_root]
+            >= root_position[prerequisite.consumer_root]
             for producer_root, _relation in static_relations
         ):
             return False
@@ -8669,15 +8684,63 @@ def _cohort_major_task_order(
     return candidate
 
 
+def _task_orders_are_extensionally_equal(
+    left: CoordinateRelation,
+    right: CoordinateRelation,
+) -> bool:
+    """Compare two complete traversals through one logical-to-ordinal view."""
+    if left.target_domain != right.target_domain or not _equal_integer_expressions(
+        left.source_domain.size_expr,
+        right.source_domain.size_expr,
+    ):
+        return False
+    ordinal_axis = (
+        max(
+            (
+                *left.source_domain.axis_order,
+                *left.target_domain.axis_order,
+                *right.source_domain.axis_order,
+                *right.target_domain.axis_order,
+            ),
+            default=0,
+        )
+        + 1
+    )
+    ordinal_domain = CoordinateDomain(
+        axis_order=(ordinal_axis,),
+        axis_counts_items=((ordinal_axis, left.source_domain.size_expr),),
+        kind="task_order",
+        _allow_empty=left.source_domain.size_expr.is_zero is True,
+    )
+    left_ordinal = _logical_task_to_order_ordinal(left, ordinal_domain)
+    right_ordinal = _logical_task_to_order_ordinal(right, ordinal_domain)
+    return (
+        left_ordinal is not None
+        and right_ordinal is not None
+        and (
+            left_ordinal == right_ordinal
+            or left_ordinal.is_pointwise_equal_to(right_ordinal)
+            or left_ordinal.is_pointwise_equal_on_same_support(right_ordinal)
+        )
+    )
+
+
 def _agreed_cohort_major_root_orders(
     readiness_graph: ReadinessGraph,
-) -> dict[int, CoordinateRelation] | None:
-    """Return exact noncanonical root orders when every candidate agrees.
+    *,
+    include_reference: bool = False,
+) -> tuple[dict[int, CoordinateRelation], frozenset[int]] | None:
+    """Return exact root orders when every semantic cohort view agrees.
 
     This is the first placement policy supported by the parametric scheduler:
     a whole root may permute its logical traversal while retaining precisely
     the same canonical slot support. Conflicting or unrenderable cohort views
-    keep that root canonical. No readiness decision is made here.
+    keep that root canonical. Reference-equivalent orders are omitted unless
+    ``include_reference`` is requested by a later whole-root placement proof.
+    The second result identifies roots whose complete traversal is exactly one
+    readiness cohort in every semantic view. Roots absent from all semantic
+    events are one neutral cohort; an unsupported event role is never neutral.
+    No readiness decision is made here.
     """
     cohort_relations = _semantic_readiness_cohort_relations(readiness_graph)
     if cohort_relations is None:
@@ -8706,36 +8769,46 @@ def _agreed_cohort_major_root_orders(
         if root in declined_roots or not candidates:
             continue
         reference = readiness_graph.root_task_orders[root]
-        ordinal_domain = _task_order_ordinal_domain(reference)
-        reference_ordinal = _logical_task_to_reference_ordinal(
-            reference,
-            ordinal_domain,
-        )
-        candidate_ordinals = tuple(
-            _logical_task_to_order_ordinal(candidate, ordinal_domain)
-            for candidate in candidates
-        )
-        if reference_ordinal is None or any(
-            ordinal is None for ordinal in candidate_ordinals
-        ):
-            continue
-        first_ordinal = candidate_ordinals[0]
-        assert first_ordinal is not None
         if any(
-            ordinal != first_ordinal
-            and not ordinal.is_pointwise_equal_to(first_ordinal)
-            and not ordinal.is_pointwise_equal_on_same_support(first_ordinal)
-            for ordinal in candidate_ordinals[1:]
-            if ordinal is not None
+            not _task_orders_are_extensionally_equal(candidates[0], candidate)
+            for candidate in candidates[1:]
         ):
             continue
-        if (
-            first_ordinal != reference_ordinal
-            and not first_ordinal.is_pointwise_equal_to(reference_ordinal)
-            and not first_ordinal.is_pointwise_equal_on_same_support(reference_ordinal)
-        ):
+        differs_from_reference = not _task_orders_are_extensionally_equal(
+            candidates[0],
+            reference,
+        )
+        if include_reference or differs_from_reference:
             result[root] = candidates[0]
-    return result
+
+    relevant_roots = {
+        root
+        for event in readiness_graph.events
+        for root in (
+            *(producer.producer_root for producer in event.producers),
+            *(consumer.consumer_root for consumer in event.consumers),
+        )
+    }
+    whole_root_cohorts = {
+        root
+        for root, root_cohorts in cohorts_by_root.items()
+        if root not in unsupported_roots
+        and all(
+            (converse := cohort.converse()) is not None
+            and (cardinality := converse.source_support_cardinality()) is not None
+            and _equal_integer_expressions(
+                cardinality,
+                1,
+            )
+            for cohort in root_cohorts
+        )
+    }
+    whole_root_cohorts.update(
+        root
+        for root in range(len(readiness_graph.root_domains))
+        if root not in relevant_roots
+    )
+    return result, frozenset(whole_root_cohorts)
 
 
 def _root_major_schedule_matches_configured_orders(
@@ -8744,7 +8817,12 @@ def _root_major_schedule_matches_configured_orders(
 ) -> bool:
     """Prove packed schedule ``C`` was built from the configured root orders."""
     geometry = _parametric_root_major_schedule_geometry(worker_schedule)
-    if geometry is None or len(geometry) != len(root_task_orders):
+    if (
+        geometry is None
+        or len(geometry) != len(root_task_orders)
+        or tuple(segment.root for segment, _first_slot, _count in geometry)
+        != tuple(range(len(root_task_orders)))
+    ):
         return False
     seen_roots: set[int] = set()
     for segment, first_slot, _task_count in geometry:
@@ -8772,26 +8850,62 @@ def _replace_root_orders_on_canonical_support(
     geometry = _parametric_root_major_schedule_geometry(canonical_schedule)
     if geometry is None:
         return None
+    return _repack_root_major_schedule(
+        readiness_graph,
+        canonical_schedule,
+        tuple(segment.root for segment, _first_slot, _task_count in geometry),
+        replacements,
+    )
+
+
+def _repack_root_major_schedule(
+    readiness_graph: ReadinessGraph,
+    canonical_schedule: WorkerSchedule,
+    root_order: tuple[int, ...],
+    task_orders: dict[int, CoordinateRelation],
+) -> WorkerSchedule | None:
+    """Repack one root permutation with exact configured-or-derived orders."""
+    geometry = _parametric_root_major_schedule_geometry(canonical_schedule)
+    if geometry is None:
+        return None
+    segment_by_root = {
+        segment.root: segment for segment, _first_slot, _task_count in geometry
+    }
+    original_first_slot = {
+        segment.root: first_slot
+        for segment, first_slot, _task_count in geometry
+    }
+    if len(segment_by_root) != len(geometry) or set(root_order) != set(segment_by_root):
+        return None
     new_segments: list[WorkerScheduleSegment] = []
     new_geometry: list[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr]] = []
-    for segment, first_slot, task_count in geometry:
-        replacement_order = replacements.get(segment.root)
-        if replacement_order is None:
+    total_piece_count = 0
+    first_slot: sympy.Expr = sympy.Integer(0)
+    for root in root_order:
+        segment = segment_by_root[root]
+        task_order = task_orders.get(root, readiness_graph.root_task_orders[root])
+        task_count = task_order.target_domain.size_expr
+        if root not in task_orders and _equal_integer_expressions(
+            first_slot,
+            original_first_slot[root],
+        ):
             new_segment = segment
         else:
             replacement = _packed_root_major_task_order_relation(
                 canonical_schedule.placement_domain,
-                replacement_order,
+                task_order,
                 first_slot,
                 canonical_schedule.worker_count,
             )
-            if replacement is None or not replacement.has_same_source_support(
-                segment.task_order
-            ):
+            if replacement is None:
                 return None
             new_segment = dataclasses.replace(segment, task_order=replacement)
+        total_piece_count += len(new_segment.task_order.pieces)
+        if not _worker_schedule_piece_budget_is_valid(total_piece_count):
+            return None
         new_segments.append(new_segment)
         new_geometry.append((new_segment, first_slot, task_count))
+        first_slot = sympy.simplify(first_slot + task_count)
     try:
         result = WorkerSchedule(
             canonical_schedule.worker_count,
@@ -8806,6 +8920,185 @@ def _replace_root_orders_on_canonical_support(
         return None
     _remember_root_major_schedule_geometry(result, tuple(new_geometry))
     return result
+
+
+def _single_root_tail_pull(
+    readiness_graph: ReadinessGraph,
+    canonical_schedule: WorkerSchedule,
+    replacement_orders: dict[int, CoordinateRelation],
+    *,
+    whole_root_cohorts: frozenset[int],
+    root_edges: frozenset[tuple[int, int]],
+    root_criticality: tuple[tuple[int, int], ...],
+) -> WorkerSchedule | None:
+    """Move one complete higher-priority root into a proved static tail.
+
+    The moved root is one exact readiness cohort and may cross only
+    incomparable roots whose runs have not yet started. This is one bounded
+    list-scheduling decision at a completed-root frontier; runtime quantities
+    never participate in its priority ordering.
+    """
+    geometry = _parametric_root_major_schedule_geometry(canonical_schedule)
+    if geometry is None:
+        return None
+    if len(root_criticality) != len(readiness_graph.root_domains):
+        return None
+    canonical_roots = tuple(
+        segment.root for segment, _first_slot, _task_count in geometry
+    )
+    predecessors = {
+        root: frozenset(
+            producer for producer, consumer in root_edges if consumer == root
+        )
+        for root in canonical_roots
+    }
+    successors = {root: set() for root in canonical_roots}
+    for producer, consumer in root_edges:
+        successors[producer].add(consumer)
+    descendants: dict[int, frozenset[int]] = {}
+    for root in canonical_roots:
+        pending = list(successors[root])
+        reachable: set[int] = set()
+        while pending:
+            descendant = pending.pop()
+            if descendant in reachable:
+                continue
+            reachable.add(descendant)
+            pending.extend(successors[descendant])
+        descendants[root] = frozenset(reachable)
+
+    def action_priority(
+        root: int,
+        assigned: frozenset[int],
+        *,
+        completes_root: bool,
+    ) -> tuple[int, int, int, int]:
+        base = root_criticality[root]
+        if not completes_root:
+            return (*base, 1, 1)
+        assigned_after = assigned | {root}
+        newly_ready = tuple(
+            consumer
+            for consumer in canonical_roots
+            if consumer not in assigned
+            and predecessors[consumer] <= assigned_after
+            and not predecessors[consumer] <= assigned
+        )
+        release_class = min(
+            (root_criticality[consumer] for consumer in newly_ready),
+            default=base,
+        )
+        effective_class = min(base, release_class)
+        releases_effective_class = any(
+            root_criticality[consumer] == effective_class
+            for consumer in newly_ready
+        )
+        # Exact event closure is key/cohort scoped, not a root-set property.
+        # Keep this field neutral until the next interval slice tracks those
+        # frontiers; consumer admission above is already exact at root level.
+        return (
+            *effective_class,
+            0 if releases_effective_class else 1,
+            1,
+        )
+
+    for boundary in range(len(geometry) - 1):
+        _segment, first_slot, task_count = geometry[boundary]
+        prefix_end = sympy.simplify(first_slot + task_count)
+        if prefix_end.free_symbols or prefix_end.is_integer is not True:
+            continue
+        occupied_lanes = int(prefix_end) % canonical_schedule.worker_count
+        if occupied_lanes == 0:
+            continue
+        remaining_lanes = canonical_schedule.worker_count - occupied_lanes
+        assigned = frozenset(canonical_roots[: boundary + 1])
+        canonical_next = canonical_roots[boundary + 1]
+        if (
+            canonical_next not in whole_root_cohorts
+            or not predecessors[canonical_next] <= assigned
+        ):
+            continue
+        canonical_count = sympy.simplify(
+            readiness_graph.root_domains[canonical_next].size_expr
+        )
+        if (
+            canonical_count.free_symbols
+            or canonical_count.is_integer is not True
+            or int(canonical_count) <= 0
+        ):
+            continue
+        canonical_priority = action_priority(
+            canonical_next,
+            assigned,
+            completes_root=int(canonical_count) <= remaining_lanes,
+        )
+        candidates: list[tuple[tuple[int, int, int, int], int, int]] = []
+        unsupported_competitor = False
+        for candidate_index in range(boundary + 2, len(canonical_roots)):
+            root = canonical_roots[candidate_index]
+            if not predecessors[root] <= assigned:
+                continue
+            crossed_roots = canonical_roots[boundary + 1 : candidate_index]
+            if any(
+                crossed in descendants[root] or root in descendants[crossed]
+                for crossed in crossed_roots
+            ):
+                continue
+            root_count = sympy.simplify(readiness_graph.root_domains[root].size_expr)
+            if root_count.is_zero is True:
+                continue
+            # A skipped ready competitor could outrank the represented action.
+            # Unsupported cohort structure or a guard-dependent fit therefore
+            # declines this boundary instead of creating a constant-only
+            # priority policy.
+            if root not in whole_root_cohorts:
+                unsupported_competitor = True
+                break
+            if (
+                root_count.free_symbols
+                or root_count.is_integer is not True
+                or int(root_count) <= 0
+            ):
+                unsupported_competitor = True
+                break
+            if int(root_count) > remaining_lanes:
+                continue
+            candidates.append(
+                (
+                    action_priority(root, assigned, completes_root=True),
+                    candidate_index,
+                    root,
+                )
+            )
+        if unsupported_competitor:
+            continue
+        if not candidates:
+            continue
+        best_priority = min(priority for priority, _index, _root in candidates)
+        best_candidates = tuple(
+            (candidate_index, root)
+            for priority, candidate_index, root in candidates
+            if priority == best_priority
+        )
+        # Active-cohort, launch-stage, and event-key fields are not represented
+        # by this whole-root strength reduction. Decline an unresolved tie
+        # rather than inventing a branch-specific tie-break.
+        if len(best_candidates) != 1 or not best_priority < canonical_priority:
+            continue
+        (candidate_index, root) = best_candidates[0]
+        reordered = (
+            *canonical_roots[: boundary + 1],
+            root,
+            *canonical_roots[boundary + 1 : candidate_index],
+            *canonical_roots[candidate_index + 1 :],
+        )
+        return _repack_root_major_schedule(
+            readiness_graph,
+            canonical_schedule,
+            reordered,
+            replacement_orders,
+        )
+    return None
 
 
 def _semantic_schedule_is_progress_safe(
@@ -8876,34 +9169,70 @@ def _parametric_cohort_list_schedule(
     ):
         return canonical_schedule
 
-    # Cyclic root/event quotients are outside this milestone.  Higher depths
-    # must conservatively alias C rather than invoking a second scheduler.
-    if _readiness_root_criticality(readiness_graph) is None:
+    # Derive the finite topology and its guard-uniform priority table once.
+    # Cyclic root/event quotients are outside this milestone, so higher depths
+    # conservatively alias C rather than invoking a second scheduler.
+    root_edges = _readiness_root_edges(readiness_graph)
+    if root_edges is None or any(
+        producer == consumer for producer, consumer in root_edges
+    ):
+        return canonical_schedule
+    root_criticality = _root_schema_criticality(
+        len(readiness_graph.root_domains),
+        root_edges,
+    )
+    if root_criticality is None:
         return canonical_schedule
 
     # Derive candidates from the uncontracted semantic graph. The first
     # resident placement patch consumes these facts; deriving them here now
     # fixes the proof boundary and prevents a later return to emitted-counter
     # or continuation-specific topology.
-    replacements = _agreed_cohort_major_root_orders(readiness_graph)
-    if not replacements:
+    cohort_candidates = _agreed_cohort_major_root_orders(
+        readiness_graph,
+        include_reference=True,
+    )
+    if cohort_candidates is None:
         return canonical_schedule
+    agreed_orders, whole_root_cohorts = cohort_candidates
+    replacements = {
+        root: task_order
+        for root, task_order in agreed_orders.items()
+        if not _task_orders_are_extensionally_equal(
+            task_order,
+            readiness_graph.root_task_orders[root],
+        )
+    }
 
-    candidate = _replace_root_orders_on_canonical_support(
+    candidate = canonical_schedule
+    if replacements:
+        replacement_candidate = _replace_root_orders_on_canonical_support(
+            readiness_graph,
+            canonical_schedule,
+            replacements,
+        )
+        if replacement_candidate is None:
+            return canonical_schedule
+        candidate = replacement_candidate
+
+    tail_candidate = _single_root_tail_pull(
         readiness_graph,
         canonical_schedule,
         replacements,
+        whole_root_cohorts=whole_root_cohorts,
+        root_edges=root_edges,
+        root_criticality=root_criticality,
     )
-    if candidate is None or not _semantic_schedule_is_progress_safe(
-        candidate,
-        readiness_graph,
-    ):
+    if tail_candidate is not None:
+        candidate = tail_candidate
+    if candidate is canonical_schedule:
+        return canonical_schedule
+    if not _semantic_schedule_is_progress_safe(candidate, readiness_graph):
         return canonical_schedule
 
-    # Root-local cohort-major traversal changes no occupied slot, so its first
-    # noncanonical action has depth two and rejoins C at the root boundary.
-    # Depths three and four intentionally alias it until dependent pulls are
-    # implemented by the same bounded policy.
+    # Root-local cohort-major traversal and one complete root tail pull are
+    # depth-two actions. Depths three and four intentionally alias them until
+    # dependent repeated pulls are implemented by the same bounded policy.
     return candidate
 
 

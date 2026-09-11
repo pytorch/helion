@@ -980,6 +980,88 @@ def _pointwise_root_readiness_event(
     return ReadinessEvent((producer,), (consumer,))
 
 
+def _whole_consumer_subset_readiness_event(
+    root_domains: tuple[CoordinateDomain, ...],
+    producer_root: int,
+    consumer_root: int,
+    event_id: int,
+) -> ReadinessEvent:
+    """Build one lowerable event whose consumer is one complete cohort."""
+    producer_domain = root_domains[producer_root]
+    consumer_domain = root_domains[consumer_root]
+    if (
+        producer_domain.size_expr.free_symbols
+        or producer_domain.size_expr.is_integer is not True
+        or int(producer_domain.size_expr) <= 1
+    ):
+        raise ValueError("subset-producer test event needs at least two tasks")
+    (producer_axis,) = producer_domain.axis_order
+    event_domain = _domain((0, 1), kind="event", identity=event_id)
+    producers_by_key = CoordinateRelation(
+        event_domain,
+        producer_domain,
+        (
+            _CoordinateRelationPiece(
+                ((0, 0, 1, 1),),
+                ((producer_axis, sympy.Integer(0), sympy.Integer(1), 1),),
+            ),
+        ),
+    )
+    return ReadinessEvent(
+        producers=(
+            ReadinessProducer(
+                producer_root=producer_root,
+                producers_by_key=producers_by_key,
+            ),
+        ),
+        consumers=(
+            ReadinessConsumer(
+                consumer_root=consumer_root,
+                keys_by_consumer=_full_point_map(
+                    consumer_domain,
+                    event_domain,
+                    sympy.Integer(0),
+                ),
+            ),
+        ),
+    )
+
+
+def _whole_consumer_join_readiness_event(
+    root_domains: tuple[CoordinateDomain, ...],
+    producer_roots: tuple[int, ...],
+    consumer_root: int,
+    event_id: int,
+) -> ReadinessEvent:
+    """Build a one-cohort consumer released by complete producer roots."""
+    if len(producer_roots) < 2:
+        raise ValueError("join test event needs at least two producer roots")
+    event_domain = _domain((0, 1), kind="event", identity=event_id)
+    return ReadinessEvent(
+        producers=tuple(
+            _readiness_producer_from_publication(
+                producer_root,
+                _full_point_map(
+                    root_domains[producer_root],
+                    event_domain,
+                    sympy.Integer(0),
+                ),
+            )
+            for producer_root in producer_roots
+        ),
+        consumers=(
+            ReadinessConsumer(
+                consumer_root=consumer_root,
+                keys_by_consumer=_full_point_map(
+                    root_domains[consumer_root],
+                    event_domain,
+                    sympy.Integer(0),
+                ),
+            ),
+        ),
+    )
+
+
 def _singleton_root_problem(
     root_slots: tuple[tuple[int, int], ...],
     readiness_edges: frozenset[tuple[int, int]],
@@ -2669,15 +2751,18 @@ class TestCrossLoopScheduler(TestCase):
                 graph.root_task_orders,
                 worker_count=4,
             )
-            replacements = cross_loop_scheduler._agreed_cohort_major_root_orders(graph)
+            cohort_candidates = (
+                cross_loop_scheduler._agreed_cohort_major_root_orders(graph)
+            )
             scheduled = cross_loop_scheduler._parametric_cohort_list_schedule(
                 graph,
                 canonical,
                 pipeline_depth=2,
             )
 
-        self.assertIsNotNone(replacements)
-        assert replacements is not None
+        self.assertIsNotNone(cohort_candidates)
+        assert cohort_candidates is not None
+        replacements, _whole_root_cohorts = cohort_candidates
         self.assertNotIn(2, replacements)
         self.assertIs(scheduled, canonical)
 
@@ -2758,17 +2843,432 @@ class TestCrossLoopScheduler(TestCase):
                 graph.root_task_orders,
                 worker_count=4,
             )
-            replacements = cross_loop_scheduler._agreed_cohort_major_root_orders(graph)
+            cohort_candidates = (
+                cross_loop_scheduler._agreed_cohort_major_root_orders(graph)
+            )
             scheduled = cross_loop_scheduler._parametric_cohort_list_schedule(
                 graph,
                 canonical,
                 pipeline_depth=2,
             )
 
-        self.assertIsNotNone(replacements)
-        assert replacements is not None
+        self.assertIsNotNone(cohort_candidates)
+        assert cohort_candidates is not None
+        replacements, _whole_root_cohorts = cohort_candidates
         self.assertNotIn(2, replacements)
         self.assertIs(scheduled, canonical)
+
+    def test_parametric_cohort_schedule_pulls_one_ready_critical_root(
+        self,
+    ) -> None:
+        root_domains = _identify_root_domains(
+            (
+                _domain((10, 2, 1)),
+                _domain((20, 4, 1)),
+                _domain((30, 2, 1)),
+                _domain((40, 2, 1)),
+            )
+        )
+        graph = _readiness_graph(
+            root_domains,
+            _whole_consumer_subset_readiness_event(root_domains, 0, 2, 0),
+        )
+        canonical = cross_loop_scheduler._build_root_major_worker_schedule(
+            graph.root_domains,
+            graph.root_task_orders,
+            worker_count=4,
+        )
+
+        with _forbid_schedule_enumeration():
+            cohort_candidates = (
+                cross_loop_scheduler._agreed_cohort_major_root_orders(
+                    graph,
+                    include_reference=True,
+                )
+            )
+            self.assertIs(
+                cross_loop_scheduler._parametric_cohort_list_schedule(
+                    graph,
+                    canonical,
+                    pipeline_depth=1,
+                ),
+                canonical,
+            )
+            scheduled = cross_loop_scheduler._parametric_cohort_list_schedule(
+                graph,
+                canonical,
+                pipeline_depth=2,
+            )
+            geometry = (
+                cross_loop_scheduler._parametric_root_major_schedule_geometry(
+                    scheduled
+                )
+            )
+
+        self.assertIsNotNone(cohort_candidates)
+        assert cohort_candidates is not None
+        self.assertIn(2, cohort_candidates[1])
+        self.assertIsNot(scheduled, canonical)
+        self.assertIsNotNone(geometry)
+        assert geometry is not None
+        self.assertEqual(
+            tuple(segment.root for segment, _first_slot, _count in geometry),
+            (0, 2, 1, 3),
+        )
+        self.assertEqual(
+            tuple(first_slot for _segment, first_slot, _count in geometry),
+            (0, 2, 4, 8),
+        )
+        self.assertEqual(
+            cross_loop_scheduler._resident_schedule_occupied_wave_count(scheduled),
+            cross_loop_scheduler._resident_schedule_occupied_wave_count(canonical),
+        )
+        self.assertTrue(
+            cross_loop_scheduler._semantic_schedule_is_progress_safe(
+                scheduled,
+                graph,
+            )
+        )
+
+        bad_order = cross_loop_scheduler._repack_root_major_schedule(
+            graph,
+            canonical,
+            (2, 0, 1, 3),
+            {},
+        )
+        self.assertIsNotNone(bad_order)
+        assert bad_order is not None
+        self.assertFalse(
+            cross_loop_scheduler._semantic_schedule_is_progress_safe(
+                bad_order,
+                graph,
+            )
+        )
+
+    def test_parametric_cohort_schedule_keeps_canonical_priority_ties(self) -> None:
+        root_domains = _identify_root_domains(
+            tuple(_domain((10 + 10 * root, 2, 1)) for root in range(3))
+        )
+        graph = _readiness_graph(
+            root_domains,
+            _whole_consumer_subset_readiness_event(root_domains, 0, 1, 0),
+            _whole_consumer_subset_readiness_event(root_domains, 0, 2, 1),
+        )
+        canonical = cross_loop_scheduler._build_root_major_worker_schedule(
+            graph.root_domains,
+            graph.root_task_orders,
+            worker_count=4,
+        )
+
+        with _forbid_schedule_enumeration():
+            cohort_candidates = (
+                cross_loop_scheduler._agreed_cohort_major_root_orders(
+                    graph,
+                    include_reference=True,
+                )
+            )
+            scheduled = cross_loop_scheduler._parametric_cohort_list_schedule(
+                graph,
+                canonical,
+                pipeline_depth=2,
+            )
+
+        self.assertIsNotNone(cohort_candidates)
+        assert cohort_candidates is not None
+        self.assertTrue({1, 2} <= cohort_candidates[1])
+        self.assertIs(scheduled, canonical)
+
+    def test_parametric_cohort_schedule_does_not_skip_multiple_cohort_competitor(
+        self,
+    ) -> None:
+        root_domains = _identify_root_domains(
+            (
+                _domain((10, 2, 1)),
+                _domain((20, 4, 1)),
+                _domain((30, 2, 1)),
+                _domain((40, 2, 1)),
+            )
+        )
+        graph = _readiness_graph(
+            root_domains,
+            _pointwise_root_readiness_event(root_domains, 0, 2, 0),
+            _whole_consumer_subset_readiness_event(root_domains, 0, 3, 1),
+        )
+        canonical = cross_loop_scheduler._build_root_major_worker_schedule(
+            graph.root_domains,
+            graph.root_task_orders,
+            worker_count=4,
+        )
+
+        with _forbid_schedule_enumeration():
+            cohort_candidates = (
+                cross_loop_scheduler._agreed_cohort_major_root_orders(
+                    graph,
+                    include_reference=True,
+                )
+            )
+            scheduled = cross_loop_scheduler._parametric_cohort_list_schedule(
+                graph,
+                canonical,
+                pipeline_depth=2,
+            )
+
+        self.assertIsNotNone(cohort_candidates)
+        assert cohort_candidates is not None
+        self.assertNotIn(2, cohort_candidates[1])
+        self.assertIn(3, cohort_candidates[1])
+        # Root 3 would strictly beat canonical root 1 if root 2 disappeared
+        # from the ready set. Root 2's unsupported next cohort therefore
+        # vetoes this bounded proposal rather than being silently skipped.
+        self.assertIs(scheduled, canonical)
+
+    def test_parametric_cohort_schedule_skips_classified_oversize_competitor(
+        self,
+    ) -> None:
+        root_domains = _identify_root_domains(
+            (
+                _domain((10, 2, 1)),
+                _domain((20, 4, 1)),
+                _domain((30, 3, 1)),
+                _domain((40, 2, 1)),
+            )
+        )
+        graph = _readiness_graph(
+            root_domains,
+            _whole_consumer_subset_readiness_event(root_domains, 0, 2, 0),
+            _whole_consumer_subset_readiness_event(root_domains, 0, 3, 1),
+        )
+        canonical = cross_loop_scheduler._build_root_major_worker_schedule(
+            graph.root_domains,
+            graph.root_task_orders,
+            worker_count=4,
+        )
+
+        with _forbid_schedule_enumeration():
+            cohort_candidates = (
+                cross_loop_scheduler._agreed_cohort_major_root_orders(
+                    graph,
+                    include_reference=True,
+                )
+            )
+            scheduled = cross_loop_scheduler._parametric_cohort_list_schedule(
+                graph,
+                canonical,
+                pipeline_depth=2,
+            )
+            geometry = (
+                cross_loop_scheduler._parametric_root_major_schedule_geometry(
+                    scheduled
+                )
+            )
+
+        self.assertIsNotNone(cohort_candidates)
+        assert cohort_candidates is not None
+        self.assertTrue({2, 3} <= cohort_candidates[1])
+        self.assertIsNotNone(geometry)
+        assert geometry is not None
+        self.assertEqual(
+            tuple(segment.root for segment, _first, _count in geometry),
+            (0, 3, 1, 2),
+        )
+
+    def test_parametric_cohort_schedule_credits_released_consumer(self) -> None:
+        root_domains = _identify_root_domains(
+            tuple(_domain((10 + 10 * root, 2, 1)) for root in range(5))
+        )
+        producer_to_candidate = _whole_consumer_subset_readiness_event(
+            root_domains,
+            0,
+            2,
+            0,
+        )
+        control_graph = _readiness_graph(
+            root_domains,
+            producer_to_candidate,
+        )
+        release_graph = _readiness_graph(
+            root_domains,
+            producer_to_candidate,
+            _whole_consumer_join_readiness_event(
+                root_domains,
+                (0, 1),
+                4,
+                1,
+            ),
+        )
+        control = cross_loop_scheduler._build_root_major_worker_schedule(
+            control_graph.root_domains,
+            control_graph.root_task_orders,
+            worker_count=4,
+        )
+        canonical = cross_loop_scheduler._build_root_major_worker_schedule(
+            release_graph.root_domains,
+            release_graph.root_task_orders,
+            worker_count=4,
+        )
+
+        with _forbid_schedule_enumeration():
+            control_schedule = (
+                cross_loop_scheduler._parametric_cohort_list_schedule(
+                    control_graph,
+                    control,
+                    pipeline_depth=2,
+                )
+            )
+            cohort_candidates = (
+                cross_loop_scheduler._agreed_cohort_major_root_orders(
+                    release_graph,
+                    include_reference=True,
+                )
+            )
+            scheduled = cross_loop_scheduler._parametric_cohort_list_schedule(
+                release_graph,
+                canonical,
+                pipeline_depth=2,
+            )
+
+        control_geometry = (
+            cross_loop_scheduler._parametric_root_major_schedule_geometry(
+                control_schedule
+            )
+        )
+        self.assertIsNotNone(control_geometry)
+        assert control_geometry is not None
+        self.assertEqual(
+            tuple(segment.root for segment, _first, _count in control_geometry),
+            (0, 2, 1, 3, 4),
+        )
+        self.assertIsNotNone(cohort_candidates)
+        assert cohort_candidates is not None
+        self.assertTrue({1, 2} <= cohort_candidates[1])
+        scheduled_geometry = (
+            cross_loop_scheduler._parametric_root_major_schedule_geometry(scheduled)
+        )
+        self.assertIsNotNone(scheduled_geometry)
+        assert scheduled_geometry is not None
+        # Root 2 wins in the paired control. With the join present, root 2's
+        # own class ties the class of root 4 released by canonical root 1;
+        # releasing the consumer keeps root 1 ahead. A later legal pull does
+        # not weaken that event-aware choice.
+        self.assertEqual(
+            tuple(
+                segment.root
+                for segment, _first, _count in scheduled_geometry[:3]
+            ),
+            (0, 1, 2),
+        )
+        self.assertTrue(
+            cross_loop_scheduler._semantic_schedule_is_progress_safe(
+                scheduled,
+                release_graph,
+            )
+        )
+
+    def test_parametric_cohort_schedule_ignores_disjoint_event_keys(self) -> None:
+        root_domains = _identify_root_domains(
+            (
+                _domain((10, 2, 1)),
+                _domain((20, 4, 1)),
+                _domain((30, 2, 1)),
+                _domain((40, 2, 1)),
+            )
+        )
+        event_domain = _domain((0, 2), kind="event", identity=0)
+        event = ReadinessEvent(
+            producers=(
+                _readiness_producer_from_publication(
+                    0,
+                    _full_point_map(
+                        root_domains[0],
+                        event_domain,
+                        sympy.Integer(1),
+                    ),
+                ),
+                _readiness_producer_from_publication(
+                    2,
+                    _full_point_map(
+                        root_domains[2],
+                        event_domain,
+                        sympy.Integer(0),
+                    ),
+                ),
+            ),
+            consumers=(
+                ReadinessConsumer(
+                    consumer_root=3,
+                    keys_by_consumer=_full_point_map(
+                        root_domains[3],
+                        event_domain,
+                        sympy.Integer(1),
+                    ),
+                ),
+            ),
+        )
+        graph = _readiness_graph(root_domains, event)
+        canonical = cross_loop_scheduler._build_root_major_worker_schedule(
+            graph.root_domains,
+            graph.root_task_orders,
+            worker_count=4,
+        )
+
+        with _forbid_schedule_enumeration():
+            root_edges = cross_loop_scheduler._readiness_root_edges(graph)
+            cohort_candidates = (
+                cross_loop_scheduler._agreed_cohort_major_root_orders(
+                    graph,
+                    include_reference=True,
+                )
+            )
+            scheduled = cross_loop_scheduler._parametric_cohort_list_schedule(
+                graph,
+                canonical,
+                pipeline_depth=2,
+            )
+
+        self.assertEqual(root_edges, frozenset({(0, 3)}))
+        self.assertIsNotNone(cohort_candidates)
+        assert cohort_candidates is not None
+        self.assertTrue({1, 2} <= cohort_candidates[1])
+        # Root 2 publishes only key 0 while every consumer waits on key 1. It
+        # cannot win a tie merely because its arm shares an event container.
+        self.assertIs(scheduled, canonical)
+
+    def test_parametric_cohort_schedule_declines_permuted_input_baseline(
+        self,
+    ) -> None:
+        root_domains = _identify_root_domains(
+            tuple(_domain((10 + 10 * root, 1, 1)) for root in range(3))
+        )
+        graph = _readiness_graph(root_domains)
+        canonical = cross_loop_scheduler._build_root_major_worker_schedule(
+            graph.root_domains,
+            graph.root_task_orders,
+            worker_count=4,
+        )
+        permuted = cross_loop_scheduler._repack_root_major_schedule(
+            graph,
+            canonical,
+            (1, 0, 2),
+            {},
+        )
+        self.assertIsNotNone(permuted)
+        assert permuted is not None
+
+        with (
+            _forbid_schedule_enumeration(),
+            mock.patch.object(
+                cross_loop_scheduler,
+                "_semantic_readiness_cohort_relations",
+                side_effect=AssertionError("noncanonical baseline reached derivation"),
+            ),
+        ):
+            scheduled = cross_loop_scheduler._parametric_cohort_list_schedule(
+                graph,
+                permuted,
+                pipeline_depth=2,
+            )
+
+        self.assertIs(scheduled, permuted)
 
     def test_readiness_cohort_relation_declines_partial_task_support(self) -> None:
         task_domain = _identify_root_domains((_domain((10, 3, 1)),))[0]
