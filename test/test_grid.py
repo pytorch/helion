@@ -165,7 +165,6 @@ class TestGrid(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
 
-    @skipIfMetal("BUG: hl.grid begin/end broken with PerThreadNDTileStrategy on Metal")
     def test_grid_begin_end(self):
         @helion.kernel(autotune_effort="none")
         def grid_begin_end(x: torch.Tensor) -> torch.Tensor:
@@ -186,7 +185,6 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(grid_begin_end, (x,))
         torch.testing.assert_close(result, grid_begin_end_pytorch(x))
 
-    @skipIfMetal("BUG: hl.grid begin/end broken with PerThreadNDTileStrategy on Metal")
     def test_grid_begin_end_step(self):
         @helion.kernel(autotune_effort="none")
         def grid_begin_end_step(x: torch.Tensor) -> torch.Tensor:
@@ -207,7 +205,6 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(grid_begin_end_step, (x,))
         torch.testing.assert_close(result, grid_begin_end_step_pytorch(x))
 
-    @skipIfMetal("BUG: hl.grid begin/end broken with PerThreadNDTileStrategy on Metal")
     def test_grid_end_step_kwarg(self):
         @helion.kernel(autotune_effort="none")
         def grid_end_step_kwarg(x: torch.Tensor) -> torch.Tensor:
@@ -227,6 +224,38 @@ class TestGrid(RefEagerTestBase, TestCase):
         x = torch.randn([16], device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(grid_end_step_kwarg, (x,))
         torch.testing.assert_close(result, grid_end_step_kwarg_pytorch(x))
+
+    def test_grid_step_indivisible_trip_count(self):
+        # The trip count is not a multiple of the step, so a launch that groups
+        # `step` threads per program leaves surplus threads whose index runs
+        # past `end`.
+        @helion.kernel(autotune_effort="none")
+        def grid_step_10_4(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for i in hl.grid(0, 10, 4):
+                out[i] = x[i] * 2
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def grid_step_3_17_5(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for i in hl.grid(3, 17, 5):
+                out[i] = x[i] * 2
+            return out
+
+        def pytorch_ref(x: torch.Tensor, begin: int, end: int, step: int):
+            out = torch.zeros_like(x)
+            for i in range(begin, end, step):
+                out[i] = x[i] * 2
+            return out
+
+        x = torch.randn([10], device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(grid_step_10_4, (x,))
+        torch.testing.assert_close(result, pytorch_ref(x, 0, 10, 4))
+
+        x = torch.randn([17], device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(grid_step_3_17_5, (x,))
+        torch.testing.assert_close(result, pytorch_ref(x, 3, 17, 5))
 
     def test_grid_multidim_begin_end(self):
         @helion.kernel(autotune_effort="none")
@@ -293,7 +322,6 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(tile_begin_end, (x,), block_size=4)
         torch.testing.assert_close(result, tile_begin_end_pytorch(x))
 
-    @skipIfMetal("Metal does not support loop_index_expr for grid loops")
     def test_range_as_grid_basic(self):
         """Test that range() works as an alias for hl.grid() in device code."""
 
@@ -314,7 +342,6 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(range_kernel, (x,))
         torch.testing.assert_close(result, expected)
 
-    @skipIfMetal("Metal does not support loop_index_expr for grid loops")
     def test_range_with_begin_end(self):
         """Test that range(begin, end) works as alias for hl.grid(begin, end)."""
 
@@ -335,7 +362,6 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(range_begin_end_kernel, (x,))
         torch.testing.assert_close(result, expected)
 
-    @skipIfMetal("Metal does not support loop_index_expr for grid loops")
     @xfailIfPallas(
         "range(begin, end, step) lowers to _for_loop_step which has no "
         "emit_pipeline codegen"
@@ -362,7 +388,6 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(range_step_kernel, (x,))
         torch.testing.assert_close(result, expected)
 
-    @skipIfMetal("Metal does not support loop_index_expr for grid loops")
     def test_range_with_tensor_size(self):
         """Test that range(tensor.size(dim)) works with dynamic tensor dimensions."""
 
