@@ -21,6 +21,7 @@ import torch
 
 from ... import exc
 from ...language import _tracing_ops
+from ...language import matmul_ops
 from ...language import memory_ops
 from ...language import reduce_ops
 from ..compile_environment import CompileEnvironment
@@ -397,13 +398,13 @@ def _forward_propagate(graph_info: GraphInfo) -> None:
         if result is None:
             continue
         layout, input_node = result
-        # Shape-collapsing reductions (e.g. ``aten.amax``/``aten.sum``) cover
-        # fewer elements than their input.  Forward inheriting the input layout
-        # would describe the wrong tile, so leave the output flexible and let
-        # backward propagation pick a layout that matches the reduced tile.
-        if _is_reduction_target(node.target) and not _numels_match(
-            _node_tile_numel(node), _node_tile_numel(input_node)
-        ):
+        if _layout_has_zero_values(layout):
+            continue
+        # Shape-changing operations cover a different tile from this input.
+        # Forward inheriting its layout would describe the wrong tile, so leave
+        # the output flexible and let another full-sized operand or a consumer
+        # choose it.  This covers reductions as well as broadcast expansion.
+        if _is_shape_changing_passthrough_user(input_node, node):
             continue
         inherited = layout.with_tag(LayoutTag.INHERITED)
         constraint.preferred_input = inherited
@@ -451,7 +452,7 @@ def _backward_propagate(graph_info: GraphInfo) -> None:
 
         # All users agree on the same layout?
         first = user_layouts[0]
-        if all(first.is_compatible(ul) for ul in user_layouts[1:]):
+        if all(_layouts_compatible(first, ul) for ul in user_layouts[1:]):
             inherited = first.with_tag(LayoutTag.INHERITED)
             if _is_passthrough_layout_node(node):
                 constraint.preferred_input = inherited
@@ -496,8 +497,12 @@ def _insert_layout_changes(graph_info: GraphInfo) -> None:
             if user_lc is None or user_lc.input_layout is None:
                 continue
             consumer_layout = user_lc.input_layout
+            if _layout_has_zero_values(producer_layout) or _layout_has_zero_values(
+                consumer_layout
+            ):
+                continue
 
-            if producer_layout.is_compatible(consumer_layout):
+            if _layouts_compatible(producer_layout, consumer_layout):
                 continue
 
             # Only insert a layout change when both layouts describe the
@@ -569,17 +574,20 @@ def _validate_layout_contracts(graph_info: GraphInfo) -> None:
             user_lc = user.meta.get(META_KEY)
             if user_lc is None or user_lc.input_layout is None:
                 continue
-            if user.target is reduce_ops._reduce:
+            if _is_reduction_target(user.target):
                 # Reduction lowering still has custom fallbacks for arbitrary
                 # producer layouts, so a missed relayout here is not fatal.
                 continue
-            if _is_shape_reducing_user(node, user):
-                # Shape-collapsing reductions (e.g. ``aten.amax``/``aten.sum``)
-                # consume the producer's full tile and own the layout transition
-                # to the reduced output themselves (warp/shared reduce), so a
-                # producer/consumer layout difference here is expected.
+            if _is_shape_changing_passthrough_user(node, user):
+                # Reductions and broadcast operations own their tile-shape
+                # transition, so a producer/consumer layout difference at that
+                # boundary is expected.
                 continue
             consumer_layout = user_lc.input_layout
+            if _layout_has_zero_values(producer_layout) or _layout_has_zero_values(
+                consumer_layout
+            ):
+                continue
             if (
                 producer_layout.tag is LayoutTag.MMA_ACCUMULATOR
                 and node.op == "call_function"
@@ -595,7 +603,15 @@ def _validate_layout_contracts(graph_info: GraphInfo) -> None:
                 # scalar fallback, both of which own the accumulator transition
                 # directly instead of requiring an explicit relayout node.
                 continue
-            if producer_layout.is_compatible(consumer_layout):
+            if _layouts_compatible(producer_layout, consumer_layout):
+                continue
+            if consumer_layout.tag is LayoutTag.INHERITED and _only_reaches_reduction(
+                user
+            ):
+                # Backward propagation deliberately keeps a reduction-only
+                # pointwise path from imposing its layout on a producer that
+                # also feeds a non-reduction consumer. The eventual reduction
+                # owns that layout transition, so this mismatch is expected.
                 continue
             raise exc.BackendUnsupported(
                 "cute",
@@ -635,15 +651,10 @@ def _first_input_layout_node(
 def _collect_user_layouts(node: torch.fx.Node) -> list[ThreadLayout]:
     """Collect preferred/resolved consumer input layouts from all users.
 
-    A reduction user that never received a proper reduction-axis layout and
-    instead picked up a *degenerate scalar* layout from its own consumer
-    (covering far fewer elements than the producer's own tile) cannot legally
-    describe *node*'s full tile.  Adopting such a layout would corrupt the
-    producer (every thread reading a single reduced element instead of its
-    slice of the full tile), so those reduction users are skipped.  A
-    correctly-seeded reduction keeps a full reduction-axis input layout — at
-    least as large as the producer's tile — so it is retained and continues to
-    drive the producer onto the shared reduction layout.
+    A shape-changing user cannot impose its output layout on a differently
+    sized operand.  This includes a reduction that inherited its scalar output
+    layout and a pointwise op that broadcasts a smaller input.  A reduction
+    with an explicitly seeded reduction-axis input layout remains authoritative.
     """
     layouts: list[ThreadLayout] = []
     for user in node.users:
@@ -653,8 +664,16 @@ def _collect_user_layouts(node: torch.fx.Node) -> list[ThreadLayout]:
         layout = lc.input_layout or lc.preferred_input
         if layout is None:
             continue
+        if _layout_has_zero_values(layout):
+            continue
+        if layout.tag is LayoutTag.INHERITED and _only_reaches_reduction(user):
+            continue
+        if _is_shape_changing_passthrough_user(node, user) and not (
+            _is_reduction_target(user.target) and layout.tag is LayoutTag.REDUCTION
+        ):
+            continue
         if _is_reduction_target(user.target) and _reduction_layout_is_degenerate(
-            node, layout
+            node, user, layout
         ):
             continue
         layouts.append(layout)
@@ -667,10 +686,16 @@ _ATEN_REDUCTION_TARGETS = frozenset(
         torch.ops.aten.sum.default,
         torch.ops.aten.amax.default,
         torch.ops.aten.amin.default,
+        torch.ops.aten.prod.default,
         torch.ops.aten.prod.dim_int,
+        torch.ops.aten.mean.default,
         torch.ops.aten.mean.dim,
+        torch.ops.aten.max.default,
         torch.ops.aten.max.dim,
+        torch.ops.aten.min.default,
         torch.ops.aten.min.dim,
+        torch.ops.aten.argmax.default,
+        torch.ops.aten.argmin.default,
     }
 )
 
@@ -680,8 +705,34 @@ def _is_reduction_target(target: object) -> bool:
     return target is reduce_ops._reduce or target in _ATEN_REDUCTION_TARGETS
 
 
+def _only_reaches_reduction(
+    node: torch.fx.Node,
+    *,
+    _visited: set[torch.fx.Node] | None = None,
+) -> bool:
+    """True when every path through *node* terminates at a reduction.
+
+    An inherited layout on such a pointwise path is an implementation detail
+    of the reduction input, not a useful vote for a producer which also feeds a
+    non-reduction consumer.
+    """
+    if _is_reduction_target(node.target):
+        return True
+    if not _is_passthrough_layout_node(node) or not node.users:
+        return False
+    visited = set() if _visited is None else _visited
+    if node in visited:
+        return False
+    visited.add(node)
+    return all(
+        _only_reaches_reduction(user, _visited=visited.copy()) for user in node.users
+    )
+
+
 def _reduction_layout_is_degenerate(
-    node: torch.fx.Node, reduction_layout: ThreadLayout
+    node: torch.fx.Node,
+    user: torch.fx.Node,
+    reduction_layout: ThreadLayout,
 ) -> bool:
     """True if a reduction user's input layout is degenerate w.r.t. *node*.
 
@@ -692,15 +743,21 @@ def _reduction_layout_is_degenerate(
     consumer) covers strictly fewer elements than the producer's tile — that is
     the only case backward propagation must ignore.
 
-    Comparing the two thread/value layouts (rather than the fake-tensor numels)
-    keeps this provable: both layouts are built from concrete thread counts and
-    block sizes, whereas a node's fake-tensor numel may be symbolic and would
-    spuriously flag every reduction as degenerate.
+    Prefer comparing the two thread/value layouts, which are normally concrete.
+    Dynamic kernels can retain symbolic layout extents, though, and an inherited
+    output layout is not a semantic reduction-axis constraint.  In that case,
+    use the producer/output shapes to recognize a shape-collapsing reduction.
+    Explicitly seeded reduction layouts remain authoritative.
     """
     producer_layout = _node_layout(node) or _first_input_layout(node)
     if producer_layout is None:
         return False
-    return _known_lt(reduction_layout.tile_numel(), producer_layout.tile_numel())
+    if _known_lt(reduction_layout.tile_numel(), producer_layout.tile_numel()):
+        return True
+    return (
+        reduction_layout.tag is not LayoutTag.REDUCTION
+        and _is_shape_changing_passthrough_user(node, user)
+    )
 
 
 def _node_layout(node: torch.fx.Node) -> ThreadLayout | None:
@@ -711,25 +768,41 @@ def _node_layout(node: torch.fx.Node) -> ThreadLayout | None:
     return lc.output_layout or lc.preferred_output
 
 
-def _is_shape_reducing_user(node: torch.fx.Node, user: torch.fx.Node) -> bool:
-    """True if *user* is a reduction consuming a smaller tile than *node*.
+def _is_shape_changing_passthrough_user(
+    node: torch.fx.Node, user: torch.fx.Node
+) -> bool:
+    """True if a passthrough *user* changes *node*'s tile element count.
 
-    A reduction (e.g. ``aten.amax``/``aten.sum``) collapses one or more of
-    *node*'s dims, so the user's tensor has fewer elements.  Such users own
-    the layout transition from the producer's full tile to the reduced output
-    in their own lowering, so an edge-level layout mismatch is expected.
+    Reductions collapse a tile and broadcasting expands one.  Their lowerings
+    own that shape transition, so the user's output layout must not propagate
+    backward onto the differently sized operand and an edge-layout mismatch is
+    expected at that boundary.
     """
-    if not _is_reduction_target(user.target):
+    is_reduction = _is_reduction_target(user.target)
+    if not is_reduction and not _is_passthrough_layout_node(user):
         return False
-    node_numel = _node_tile_numel(node)
-    user_numel = _node_tile_numel(user)
-    if node_numel is None or user_numel is None:
+    node_val = node.meta.get("val")
+    user_val = user.meta.get("val")
+    if not isinstance(node_val, torch.Tensor) or not isinstance(user_val, torch.Tensor):
         return False
-    if isinstance(node_numel, int) and isinstance(user_numel, int):
-        return user_numel < node_numel
-    # Symbolic: a reduction either preserves or shrinks the tile, so treat it
-    # as reducing whenever the numels are not provably equal.
-    return not _numels_match(node_numel, user_numel)
+    if is_reduction:
+        return not _numels_match(node_val.numel(), user_val.numel())
+
+    # Pointwise broadcasting only expands singleton or missing leading dims.
+    # Prove that transition dimension-by-dimension so unrelated symbolic
+    # shapes are not conservatively classified as broadcasts.
+    if user_val.ndim < node_val.ndim:
+        return False
+    padded_input_shape = (1,) * (user_val.ndim - node_val.ndim) + tuple(node_val.shape)
+    expanded = False
+    for input_size, output_size in zip(padded_input_shape, user_val.shape, strict=True):
+        if _symbolic_equal(input_size, output_size):
+            continue
+        if _symbolic_equal(input_size, 1):
+            expanded = True
+            continue
+        return False
+    return expanded
 
 
 def _node_tile_numel(node: torch.fx.Node) -> SymIntLike | None:
@@ -753,9 +826,7 @@ def _numels_match(a: SymIntLike | None, b: SymIntLike | None) -> bool:
     """
     if a is None or b is None:
         return True
-    if isinstance(a, int) and isinstance(b, int):
-        return a == b
-    return CompileEnvironment.current().known_equal(a, b)
+    return _symbolic_equal(a, b)
 
 
 def _known_lt(a: SymIntLike, b: SymIntLike) -> bool:
@@ -768,6 +839,40 @@ def _known_lt(a: SymIntLike, b: SymIntLike) -> bool:
     if isinstance(a, int) and isinstance(b, int):
         return a < b
     return False
+
+
+def _layouts_compatible(a: ThreadLayout, b: ThreadLayout) -> bool:
+    """Compare layouts without guarding on data-dependent SymInts."""
+    return all(
+        len(lhs) == len(rhs) and all(map(_symbolic_equal, lhs, rhs))
+        for lhs, rhs in (
+            (a.thread_shape, b.thread_shape),
+            (a.thread_stride, b.thread_stride),
+            (a.value_shape, b.value_shape),
+            (a.value_stride, b.value_stride),
+        )
+    )
+
+
+def _symbolic_equal(a: SymIntLike, b: SymIntLike) -> bool:
+    """Return only proven equality, without evaluating symbolic ``==``."""
+    if a is b:
+        return True
+    if isinstance(a, int) and isinstance(b, int):
+        return a == b
+    if not CompileEnvironment.has_current():
+        return False
+    return CompileEnvironment.current().known_equal(a, b)
+
+
+def _layout_has_zero_values(layout: ThreadLayout) -> bool:
+    """True for an over-provisioned symbolic layout with no local values.
+
+    Such layouts arise when mutually-exclusive branches share the widest
+    thread axis and a narrower branch masks the surplus lanes.  They do not
+    provide a meaningful pointwise propagation contract for that branch.
+    """
+    return _symbolic_equal(layout.num_values(), 0)
 
 
 def _constraint_for_node(node: torch.fx.Node) -> LayoutConstraint:
@@ -783,7 +888,13 @@ def _is_passthrough_layout_node(node: torch.fx.Node) -> bool:
         return False
     if node.target is memory_ops.load or node.target is memory_ops.store:
         return False
-    if node.target is reduce_ops._reduce:
+    if _is_reduction_target(node.target):
+        return False
+    if _is_helion_contraction(node):
+        # A contraction's output coordinates are not a one-to-one passthrough
+        # of either operand.  In particular, inheriting the lhs layout across
+        # (M, K) @ (K, N) assigns the result the K layout even though it is
+        # shaped (M, N).  The contraction lowering owns this layout boundary.
         return False
     return not _tracing_ops.is_for_loop_target(node.target)
 
@@ -793,7 +904,16 @@ def _is_output_flexible_layout_node(node: torch.fx.Node) -> bool:
         return False
     if node.target is memory_ops.store or node.target is reduce_ops._reduce:
         return False
+    if _is_helion_contraction(node):
+        # Until hl.dot has an explicit input/output layout contract, do not let
+        # a downstream consumer manufacture one through backward propagation.
+        return False
     return not _tracing_ops.is_for_loop_target(node.target)
+
+
+def _is_helion_contraction(node: torch.fx.Node) -> bool:
+    """Return whether *node* changes coordinates through a Helion contraction."""
+    return node.target in (matmul_ops.dot, matmul_ops.dot_scaled)
 
 
 def _tile_numels_match(a: ThreadLayout, b: ThreadLayout) -> bool:
@@ -804,14 +924,7 @@ def _tile_numels_match(a: ThreadLayout, b: ThreadLayout) -> bool:
     (e.g. reductions) produce outputs with fewer elements, so the
     producer's tile_numel differs from the consumer's.
     """
-    na, nb = a.tile_numel(), b.tile_numel()
-    if isinstance(na, int) and isinstance(nb, int):
-        return na == nb
-    # Symbolic comparison — conservative: only match when provably equal.
-    try:
-        return bool(na == nb)
-    except (TypeError, RuntimeError):
-        return False
+    return _symbolic_equal(a.tile_numel(), b.tile_numel())
 
 
 def _values_are_scalar(a: ThreadLayout, b: ThreadLayout) -> bool:
@@ -834,10 +947,4 @@ def _thread_counts_match(a: ThreadLayout, b: ThreadLayout) -> bool:
     so it requires every writing thread to have a corresponding reading
     thread (and vice-versa).
     """
-    na, nb = a.num_threads(), b.num_threads()
-    if isinstance(na, int) and isinstance(nb, int):
-        return na == nb
-    try:
-        return bool(na == nb)
-    except (TypeError, RuntimeError):
-        return False
+    return _symbolic_equal(a.num_threads(), b.num_threads())

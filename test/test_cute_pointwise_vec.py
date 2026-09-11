@@ -117,6 +117,14 @@ def _div1d_fastmath(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="cute", static_shapes=True)
+def _div1d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(out.size()):
+        out[tile] = x[tile] / y[tile]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
 def _add_explicit_evict(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(x.size(0)):
@@ -381,6 +389,14 @@ class TestCutePointwiseVec(TestCase):
         code, out = code_and_output(_div1d_fastmath, (x, y), block_sizes=[1024])
         self.assertIn("cute.math.div", code)
         torch.testing.assert_close(out, x / y, rtol=1e-4, atol=1e-4)
+
+    def test_default_div_does_not_depend_on_torch_fastmath_context(self) -> None:
+        """Default division reads Helion's setting, not a private Torch symbol."""
+        x = torch.randn(2**14, device=DEVICE, dtype=torch.float32)
+        y = torch.rand(2**14, device=DEVICE, dtype=torch.float32) + 0.5
+        code, out = code_and_output(_div1d, (x, y), block_sizes=[1024])
+        self.assertNotIn("cute.math.div", code)
+        torch.testing.assert_close(out, x / y)
 
     def test_seed_eviction_list_sized_from_spec_slots(self) -> None:
         """Regression: a load carrying an explicit ``hl.load(...,

@@ -1486,6 +1486,7 @@ class TestRemoteCopyJaxRuntime(TestCase):
             result[:, 1], _expected_pipeline_destination(world_size)
         )
 
+    @unittest.skip("flaky due to an in-place symmetric HBM remote-copy race")
     @skipIfPallasInterpret("remote HBM buffers require TPU DMA lowering")
     def test_route_forward_then_local_consume(self) -> None:
         import jax

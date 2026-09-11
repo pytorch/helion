@@ -49,7 +49,7 @@ if _get_backend() == "pallas" and is_pallas_interpret():
     )
 
 try:
-    import jax  # noqa: F401
+    import jax
     import jax.numpy as jnp
     import numpy as np
 
@@ -2641,10 +2641,8 @@ class TestWorklistJaxExport(unittest.TestCase):
     eager result.
     """
 
-    def test_jax_fn_under_jit_matches_eager(self):
-        import jax
-        import jax.numpy as jnp
-
+    def test_jax_fn_under_x64_jit_matches_eager(self) -> None:
+        """A compact worklist kernel runs under an outer x64 JIT."""
         B, H, KV, D, block = 8, 2, 16, 16, 16
         qo = _offsets([10, 23, 7, 40, 0, 16, 33, 5])
         lq = int(qo[-1])
@@ -2658,7 +2656,11 @@ class TestWorklistJaxExport(unittest.TestCase):
             static_shapes=True,
             backend="pallas",
         )
-        out = jax.block_until_ready(jax.jit(kernel.jax_fn)(q, k, v, qod))
+        # Regression: an outer x64 JIT around a compact worklist kernel whose
+        # nested pl.kernel has a dynamic grid bound.
+        with jax.enable_x64(True):
+            out = jax.block_until_ready(jax.jit(kernel.jax_fn)(q, k, v, qod))
+            self.assertTrue(jax.config.jax_enable_x64)
         # jnp reference (dense-KV GDPA) at the kernel's bf16 precision -- stays in
         # JAX, no torch round-trip.
         bounds = qo.tolist()

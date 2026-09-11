@@ -63,6 +63,7 @@ from .._compiler.cute.cute_flash import flash_effective_config_values
 from .._compiler.cute.cute_flash import flash_env_fingerprint
 from .._compiler.cute.cute_flash import flash_exp2_packet_is_compound
 from .._compiler.cute.cute_flash import resolve_flash_config
+from .._compiler.cute.cutedsl_compat import fixed_l2_evict_last_store_policy_supported
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_STRATEGY_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_TUNABLE_KEYS
@@ -765,6 +766,26 @@ def shrink_block_sizes_for_numel_constraints(
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
 VALID_CROSS_LOOP_SCHEDULES = ("barrier", "static_pipeline")
+CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY = "cute_chunk_recurrence_dv_partitions"
+CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY = "cute_chunk_recurrence_register_cap"
+VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS = (None, 72, 76, 80)
+CUTE_CHUNK_PREPARE_SCHEDULE_KEY = "cute_chunk_prepare_schedule"
+VALID_CUTE_CHUNK_PREPARE_SCHEDULES = (
+    "split_alias_cpc1",
+    "split_alias_cpc2",
+    "split_alias_cpc3",
+    "split_alias_cpc4",
+    "split_alias_cpc5",
+)
+
+
+def _cute_chunk_recurrence_config_is_safe(
+    dv_partitions: object, register_cap: object
+) -> bool:
+    """Reject register caps on the TMEM schedule's dynamic register protocol."""
+
+    return dv_partitions != 2 or register_cap is None
+
 
 # Upper bound (power of two) that a matmul tile dimension's block size may reach
 # even when the dimension itself is smaller. Applied only to dimensions that
@@ -813,10 +834,20 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     | frozenset(FLASH_CONFIG_KEYS)
     | {
         "cross_loop_schedule",
+        CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
+        CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
+        CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         "num_threads",
         "cute_vector_widths",
         "cute_lane_layouts",
         "cute_reduction_reloads",
+        "cute_async_load_stages",
+        "cute_async_load_lookahead",
+        "cute_async_load_group_rows",
+        "cute_async_load_cache",
+        "cute_async_store_policy",
+        "cute_bf16x2_recurrence",
+        "cute_proven_bounds",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
         "load_cache_modifiers",
@@ -843,6 +874,9 @@ VALID_KEYS: frozenset[str] = frozenset(
         "range_flattens",
         "static_ranges",
         "cross_loop_schedule",
+        CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
+        CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
+        CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         "num_warps",
         "num_stages",
         "pid_type",
@@ -860,6 +894,13 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_vector_widths",
         "cute_lane_layouts",
         "cute_reduction_reloads",
+        "cute_async_load_stages",
+        "cute_async_load_lookahead",
+        "cute_async_load_group_rows",
+        "cute_async_load_cache",
+        "cute_async_store_policy",
+        "cute_bf16x2_recurrence",
+        "cute_proven_bounds",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
         *BACKEND_TUNABLE_KEYS,
@@ -911,6 +952,13 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "pid_type",
         "num_sm_multiplier",
         "maxnreg",
+        "cute_async_load_stages",
+        "cute_async_load_lookahead",
+        "cute_async_load_group_rows",
+        "cute_async_load_cache",
+        "cute_async_store_policy",
+        "cute_bf16x2_recurrence",
+        "cute_proven_bounds",
     }
 )
 
@@ -995,6 +1043,10 @@ class ConfigSpec:
         self.max_reduction_threads = backend.max_reduction_threads()
         self.max_reduction_loop = backend.max_reduction_loop()
         self.reduction_loop_force_threshold = self.max_reduction_threads
+        # Every reduction block, including static/non-rollable persistent
+        # dimensions that have no ReductionLoopSpec.  DeviceIR fills this
+        # before configs are normalized.
+        self.reduction_block_ids: set[int] = set()
         self.cute_indexed_reduction_block_ids: set[int] = set()
         self.user_defined_tunables = (
             {} if user_defined_tunables is None else dict(user_defined_tunables)
@@ -1034,6 +1086,11 @@ class ConfigSpec:
         self.cute_reduction_reloads: BlockIdSequence[CuteReductionReloadSpec] = (
             BlockIdSequence()
         )
+        # Device-IR facts enable this only for plausible in-place 16-bit state
+        # updates. Generated-AST matching is stricter and remains authoritative.
+        self.cute_async_load_pipeline_enabled = False
+        self.cute_bf16x2_recurrence_enabled = False
+        self.cute_proven_bounds_enabled = False
         self.range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = (
             BlockIdSequence()
         )
@@ -1094,6 +1151,17 @@ class ConfigSpec:
         # Populated only after DeviceIR proves that this kernel contains an
         # implicit cross-root dependency supported by the CUDA Triton backend.
         self.cross_loop_schedule: EnumFragment | None = None
+        # Enabled only when the exact five-factor BT16 recurrence carrier is
+        # detected. Choice ordering makes the geometry seed the no-autotune
+        # default while leaving both legal schedules in cold/full search.
+        self.cute_chunk_recurrence_dv_partitions: EnumFragment | None = None
+        # Enabled by the same exact recurrence matcher. The backend turns the
+        # selected value into a ptxas max-register constraint; unrelated CuTe
+        # kernels never see this search dimension.
+        self.cute_chunk_recurrence_register_cap: EnumFragment | None = None
+        # Enabled only when the exact five-factor BT16 chunk-prepare carrier is
+        # detected. Choice order defines the default and ranked seed order.
+        self.cute_chunk_prepare_schedule: EnumFragment | None = None
         self._cute_tcgen05_config = CuteTcgen05Config(self)
         # CuTe flash-attention autotune surface gating.
         # Default False so the flash knobs never appear in the search surface
@@ -1833,6 +1901,22 @@ class ConfigSpec:
             spec.autotuner_min = target
             spec.max_size = target
 
+    def enable_cute_chunk_recurrence_search(self, *, preferred_partitions: int) -> None:
+        """Expose the exact BT16 recurrence schedule as CuTe search knobs."""
+
+        if preferred_partitions not in (2, 4):
+            raise ValueError(
+                "unsupported chunk-recurrence DV partition count: "
+                f"{preferred_partitions}"
+            )
+        alternate = 4 if preferred_partitions == 2 else 2
+        self.cute_chunk_recurrence_dv_partitions = EnumFragment(
+            choices=(preferred_partitions, alternate)
+        )
+        self.cute_chunk_recurrence_register_cap = EnumFragment(
+            choices=VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS
+        )
+
     def enable_cute_attention_generic_fallback(
         self, *, block_size_targets: Mapping[int, int] | None = None
     ) -> None:
@@ -1850,6 +1934,31 @@ class ConfigSpec:
         ) in self._cute_attention_generic_fallback_block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
             spec.autotuner_min = max(spec.autotuner_min, target)
+
+    def enable_cute_chunk_prepare_schedule_search(
+        self, *, preferred_schedule: str
+    ) -> None:
+        """Expose the exact BT16 prepare shared-memory schedule knob."""
+
+        if not self.supports_config_key(CUTE_CHUNK_PREPARE_SCHEDULE_KEY):
+            raise InvalidConfig(
+                f"{CUTE_CHUNK_PREPARE_SCHEDULE_KEY} is not supported by backend "
+                f"{self.backend_name!r}"
+            )
+        if preferred_schedule not in VALID_CUTE_CHUNK_PREPARE_SCHEDULES:
+            raise ValueError(
+                f"unsupported chunk-prepare schedule: {preferred_schedule!r}"
+            )
+        self.cute_chunk_prepare_schedule = EnumFragment(
+            choices=(
+                preferred_schedule,
+                *(
+                    schedule
+                    for schedule in VALID_CUTE_CHUNK_PREPARE_SCHEDULES
+                    if schedule != preferred_schedule
+                ),
+            )
+        )
 
     def _pre_normalize_cute_flash_block_sizes(self, config: dict[str, object]) -> None:
         if not self.cute_flash_search_enabled or "block_sizes" not in config:
@@ -2217,6 +2326,150 @@ class ConfigSpec:
             )
         self.cross_loop_schedule = EnumFragment(VALID_CROSS_LOOP_SCHEDULES)
 
+    def enable_cute_async_load_pipeline(self) -> None:
+        """Expose the narrow CuTe async state-load search dimensions."""
+        if self.backend_name != "cute":
+            raise InvalidConfig("async state-load pipelining requires CuTe")
+        self.cute_async_load_pipeline_enabled = True
+
+    @property
+    def cute_l2_evict_last_store_policy_supported(self) -> bool:
+        """Whether the fixed async-store policy is valid for this target."""
+
+        return fixed_l2_evict_last_store_policy_supported(
+            self.target_device_capability,
+            torch.version.cuda,
+        )
+
+    def enable_cute_bf16x2_recurrence(self) -> None:
+        """Expose native packed-BF16 recurrence lowering to the tuner."""
+        if self.backend_name != "cute":
+            raise InvalidConfig("packed BF16 recurrence lowering requires CuTe")
+        self.cute_bf16x2_recurrence_enabled = True
+
+    def enable_cute_proven_bounds(self) -> None:
+        """Expose proof-driven CuTe bounds cleanup to the tuner."""
+        if self.backend_name != "cute":
+            raise InvalidConfig("proven bounds cleanup requires CuTe")
+        self.cute_proven_bounds_enabled = True
+
+    def _normalize_cute_async_load_pipeline(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        keys = (
+            "cute_async_load_stages",
+            "cute_async_load_lookahead",
+            "cute_async_load_group_rows",
+            "cute_async_load_cache",
+            "cute_async_store_policy",
+        )
+        if not self.cute_async_load_pipeline_enabled:
+            supplied = [key for key in keys if key in config]
+            if supplied and not fix_invalid:
+                raise InvalidConfig(
+                    "CuTe async state-load knobs require a compatible in-place "
+                    "vector state update"
+                )
+            for key in supplied:
+                config.pop(key, None)
+            return
+
+        defaults: dict[str, object] = {
+            "cute_async_load_stages": 0,
+            "cute_async_load_lookahead": 4,
+            "cute_async_load_group_rows": 2,
+            "cute_async_load_cache": "cg",
+            "cute_async_store_policy": "default",
+        }
+        choices: dict[str, tuple[object, ...]] = {
+            "cute_async_load_stages": (0, 3, 4, 5),
+            "cute_async_load_lookahead": (2, 3, 4),
+            "cute_async_load_group_rows": (2, 4),
+            "cute_async_load_cache": ("cg", "ca"),
+            "cute_async_store_policy": ("default", "l2_evict_last"),
+        }
+        integer_keys = frozenset(
+            {
+                "cute_async_load_stages",
+                "cute_async_load_lookahead",
+                "cute_async_load_group_rows",
+            }
+        )
+        lookahead_was_supplied = "cute_async_load_lookahead" in config
+        for key in keys:
+            value = config.setdefault(key, defaults[key])
+            if value not in choices[key] or (
+                key in integer_keys and type(value) is not int
+            ):
+                if fix_invalid:
+                    config[key] = defaults[key]
+                else:
+                    raise InvalidConfig(
+                        f"{key} must be one of {choices[key]!r}, got {value!r}"
+                    )
+        if (
+            config["cute_async_store_policy"] == "l2_evict_last"
+            and not self.cute_l2_evict_last_store_policy_supported
+        ):
+            # Old pinned configs remain loadable on other targets/toolchains,
+            # where the transform has always failed closed to the default path.
+            config["cute_async_store_policy"] = "default"
+        stages = cast("int", config["cute_async_load_stages"])
+        if stages > 0 and not lookahead_was_supplied:
+            config["cute_async_load_lookahead"] = min(
+                cast("int", defaults["cute_async_load_lookahead"]), stages - 1
+            )
+        lookahead = cast("int", config["cute_async_load_lookahead"])
+        if stages == 0:
+            for key in keys[1:]:
+                config[key] = defaults[key]
+        elif lookahead >= stages:
+            if fix_invalid:
+                config["cute_async_load_lookahead"] = stages - 1
+            else:
+                raise InvalidConfig(
+                    "cute_async_load_lookahead must be smaller than "
+                    "cute_async_load_stages"
+                )
+
+    def _normalize_cute_bf16x2_recurrence(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_bf16x2_recurrence"
+        if not self.cute_bf16x2_recurrence_enabled:
+            if key in config and not fix_invalid:
+                raise InvalidConfig(
+                    "cute_bf16x2_recurrence requires a compatible BF16 recurrence"
+                )
+            config.pop(key, None)
+            return
+        value = config.setdefault(key, False)
+        if not isinstance(value, bool):
+            if fix_invalid:
+                config[key] = False
+            else:
+                raise InvalidConfig(f"{key} must be a boolean, got {value!r}")
+        elif config.get("cute_async_load_stages", 0) == 0:
+            config[key] = False
+
+    def _normalize_cute_proven_bounds(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_proven_bounds"
+        if not self.cute_proven_bounds_enabled:
+            if key in config and not fix_invalid:
+                raise InvalidConfig(
+                    "cute_proven_bounds requires exact CuTe launch and tensor facts"
+                )
+            config.pop(key, None)
+            return
+        value = config.setdefault(key, False)
+        if not isinstance(value, bool):
+            if fix_invalid:
+                config[key] = False
+            else:
+                raise InvalidConfig(f"{key} must be a boolean, got {value!r}")
+
     def supported_config_keys(self) -> frozenset[str]:
         return frozenset(key for key in VALID_KEYS if self.supports_config_key(key))
 
@@ -2355,6 +2608,45 @@ class ConfigSpec:
                     "with compiler-inferred cross-loop dependencies"
                 )
 
+        if (
+            CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY in config
+            and self.cute_chunk_recurrence_dv_partitions is None
+            and self.supports_config_key(CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY)
+        ):
+            if _fix_invalid:
+                config.pop(CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY)
+            else:
+                raise InvalidConfig(
+                    f"{CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY} is available only "
+                    "for matched BT16 chunk-recurrence kernels"
+                )
+
+        if (
+            CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY in config
+            and self.cute_chunk_recurrence_register_cap is None
+            and self.supports_config_key(CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY)
+        ):
+            if _fix_invalid:
+                config.pop(CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY)
+            else:
+                raise InvalidConfig(
+                    f"{CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY} is available only "
+                    "for matched BT16 chunk-recurrence kernels"
+                )
+
+        if (
+            CUTE_CHUNK_PREPARE_SCHEDULE_KEY in config
+            and self.cute_chunk_prepare_schedule is None
+            and self.supports_config_key(CUTE_CHUNK_PREPARE_SCHEDULE_KEY)
+        ):
+            if _fix_invalid:
+                config.pop(CUTE_CHUNK_PREPARE_SCHEDULE_KEY)
+            else:
+                raise InvalidConfig(
+                    f"{CUTE_CHUNK_PREPARE_SCHEDULE_KEY} is available only for "
+                    "matched BT16 chunk-prepare kernels"
+                )
+
         if unsupported := self.unsupported_config_keys(config):
             # Separate backend-specific keys (e.g. AMD tunables, TileIR tunables)
             # from common keys (e.g. num_warps, num_stages, indexing).
@@ -2376,6 +2668,9 @@ class ConfigSpec:
             self._cute_tcgen05_config.prepare_normalization(
                 config, fix_invalid=_fix_invalid
             )
+            self._normalize_cute_async_load_pipeline(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_bf16x2_recurrence(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_proven_bounds(config, fix_invalid=_fix_invalid)
         provided_keys = set(config)
         if _fix_invalid:
             self._pre_normalize_cute_flash_block_sizes(config)
@@ -2407,6 +2702,29 @@ class ConfigSpec:
             config[name] = mapping._normalize(
                 name, config.get(name, ()), flatten=flatten
             )
+
+        if self.backend_name == "cute":
+            # A persistent reduction with exactly one vector fragment per
+            # thread has only one physical assignment, so blocked/strided are
+            # identical.  Canonicalize the inactive choice to avoid duplicate
+            # autotuner candidates.  Looped reductions retain both layouts.
+            lane_layouts = config.get("cute_lane_layouts")
+            reduction_loops = cast(
+                "list[int | None]", config.get("reduction_loops", []) or []
+            )
+            if isinstance(lane_layouts, list):
+                canonical_layouts = list(lane_layouts)
+                for index, layout_spec in enumerate(self.cute_lane_layouts):
+                    block_id = layout_spec.block_id
+                    if (
+                        block_id in self.reduction_block_ids
+                        and self.reduction_loops.config_get(
+                            reduction_loops, block_id, None
+                        )
+                        is None
+                    ):
+                        canonical_layouts[index] = "blocked"
+                config["cute_lane_layouts"] = canonical_layouts
 
         # Clamp inner block sizes that are bounded by an outer block
         # (e.g. ``hl.tile(outer.begin, outer.end)``): at this point the
@@ -2531,18 +2849,21 @@ class ConfigSpec:
             nt_list = cast("list[int]", config.get("num_threads", []) or [])
             bs_list = cast("list[int]", config.get("block_sizes", []) or [])
             # ``num_threads`` also carries per-rolled-rdim slots (the
-            # reduction's own thread count); only NON-reduction tile axes
-            # consume the budget the reduction competes for.  Tile slots
-            # are registered in ``block_sizes`` order, so pairing the i-th
-            # num_threads slot with block_sizes[i] stays valid for them.
-            reduction_block_ids = {spec.block_id for spec in self.reduction_loops}
+            # reduction's own thread count), plus static persistent-rdim slots
+            # that have no ``reduction_loops`` entry.  Only NON-reduction tile
+            # axes consume the budget the reduction competes for.  Resolve all
+            # values by block id because the two sequences need not share an
+            # order.
+            reduction_block_ids = self.reduction_block_ids | {
+                spec.block_id for spec in self.reduction_loops
+            }
             other_threads = 1
-            for i, nt_spec in enumerate(self.num_threads):
+            for nt_spec in self.num_threads:
                 if nt_spec.block_id in reduction_block_ids:
                     continue
-                nt = nt_list[i] if i < len(nt_list) else 0
+                nt = self.num_threads.config_get(nt_list, nt_spec.block_id, 0)
                 if not isinstance(nt, int) or nt <= 0:
-                    bs = bs_list[i] if i < len(bs_list) else 1
+                    bs = self.block_sizes.config_get(bs_list, nt_spec.block_id, 1)
                     nt = bs if isinstance(bs, int) and bs > 1 else 1
                 if nt > 1:
                     other_threads *= nt
@@ -2684,6 +3005,81 @@ class ConfigSpec:
                         "cross_loop_schedule must be one of "
                         f"{cross_loop_schedule_fragment.choices!r}, got "
                         f"{cross_loop_schedule!r}"
+                    )
+        recurrence_dv_fragment = self.cute_chunk_recurrence_dv_partitions
+        if recurrence_dv_fragment is not None:
+            recurrence_dv_partitions = config.setdefault(
+                CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
+                recurrence_dv_fragment.default(),
+            )
+            if (
+                type(recurrence_dv_partitions) is not int
+                or recurrence_dv_partitions not in recurrence_dv_fragment.choices
+            ):
+                if _fix_invalid:
+                    config[CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY] = (
+                        recurrence_dv_fragment.default()
+                    )
+                else:
+                    raise InvalidConfig(
+                        f"{CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY} must be one of "
+                        f"{recurrence_dv_fragment.choices!r}, got "
+                        f"{recurrence_dv_partitions!r}"
+                    )
+        recurrence_register_cap_fragment = self.cute_chunk_recurrence_register_cap
+        if recurrence_register_cap_fragment is not None:
+            recurrence_register_cap = config.setdefault(
+                CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
+                recurrence_register_cap_fragment.default(),
+            )
+            if (
+                (
+                    recurrence_register_cap is not None
+                    and type(recurrence_register_cap) is not int
+                )
+                or recurrence_register_cap
+                not in recurrence_register_cap_fragment.choices
+            ):
+                if _fix_invalid:
+                    config[CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY] = (
+                        recurrence_register_cap_fragment.default()
+                    )
+                else:
+                    raise InvalidConfig(
+                        f"{CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY} must be one of "
+                        f"{recurrence_register_cap_fragment.choices!r}, got "
+                        f"{recurrence_register_cap!r}"
+                    )
+            if recurrence_dv_fragment is not None and not (
+                _cute_chunk_recurrence_config_is_safe(
+                    config[CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY],
+                    config[CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY],
+                )
+            ):
+                if _fix_invalid:
+                    config[CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY] = None
+                else:
+                    raise InvalidConfig(
+                        f"{CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY} must be None for "
+                        f"{CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY}=2 because the "
+                        "TMEM schedule dynamically reallocates registers"
+                    )
+        prepare_schedule_fragment = self.cute_chunk_prepare_schedule
+        if prepare_schedule_fragment is not None:
+            prepare_schedule = config.setdefault(
+                CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
+                prepare_schedule_fragment.default(),
+            )
+            if prepare_schedule not in prepare_schedule_fragment.choices:
+                if _fix_invalid:
+                    config[CUTE_CHUNK_PREPARE_SCHEDULE_KEY] = (
+                        prepare_schedule_fragment.default()
+                    )
+                else:
+                    raise InvalidConfig(
+                        f"{CUTE_CHUNK_PREPARE_SCHEDULE_KEY} must be one of "
+                        f"{prepare_schedule_fragment.choices!r}, got "
+                        f"{prepare_schedule!r}"
                     )
         if self.backend_name == "cute":
             self._cute_tcgen05_config.normalize_pre_pid_type(
@@ -3382,6 +3778,47 @@ class ConfigSpec:
                     and len(self.cute_reduction_reloads) > 0
                 ):
                     fields["cute_reduction_reloads"] = self.cute_reduction_reloads
+                if self.cute_async_load_pipeline_enabled:
+                    fields["cute_async_load_stages"] = EnumFragment(
+                        choices=(0, 3, 4, 5)
+                    )
+                    fields["cute_async_load_lookahead"] = EnumFragment(
+                        choices=(4, 2, 3)
+                    )
+                    fields["cute_async_load_group_rows"] = EnumFragment(choices=(2, 4))
+                    fields["cute_async_load_cache"] = EnumFragment(choices=("cg", "ca"))
+                    fields["cute_async_store_policy"] = EnumFragment(
+                        choices=(
+                            ("default", "l2_evict_last")
+                            if self.cute_l2_evict_last_store_policy_supported
+                            else ("default",)
+                        )
+                    )
+                if self.cute_bf16x2_recurrence_enabled:
+                    fields["cute_bf16x2_recurrence"] = BooleanFragment()
+                if self.cute_proven_bounds_enabled:
+                    fields["cute_proven_bounds"] = BooleanFragment()
+                # CuTe's SIMT search normally has no pid_type coordinate.  A
+                # metadata-specialized compiler seed may nevertheless prove one
+                # exact 3-D ``xyz`` launch safe after the earlier, deliberately
+                # conservative grid-size gate rejected it.  Preserve that seed
+                # through flatten/unflatten while keeping ``xyz`` out of random
+                # search when it is absent from ``allowed_pid_types``.
+                if self.supports_config_key("pid_type") and any(
+                    seed.config.get("pid_type") == "xyz"
+                    for seed in self.compiler_seed_configs
+                ):
+                    searchable_pid_types = tuple(
+                        pid_type
+                        for pid_type in self.allowed_pid_types
+                        if pid_type in ("flat", "xyz")
+                    )
+                    if searchable_pid_types:
+                        choices = tuple(dict.fromkeys((*searchable_pid_types, "xyz")))
+                        fields["pid_type"] = EnumFragment(
+                            choices,
+                            search_choices=searchable_pid_types,
+                        )
                 # Thread-block cluster width for SIMT reduction kernels:
                 # splits a whole-extent lane-looped axis across cluster
                 # CTAs (register-resident slices) with a DSM cluster
@@ -3414,6 +3851,18 @@ class ConfigSpec:
             ):
                 fields["epilogue_subtile"] = EnumFragment(
                     choices=self.epilogue_subtile_autotune_choices
+                )
+            if self.cute_chunk_recurrence_dv_partitions is not None:
+                fields[CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY] = (
+                    self.cute_chunk_recurrence_dv_partitions
+                )
+            if self.cute_chunk_recurrence_register_cap is not None:
+                fields[CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY] = (
+                    self.cute_chunk_recurrence_register_cap
+                )
+            if self.cute_chunk_prepare_schedule is not None:
+                fields[CUTE_CHUNK_PREPARE_SCHEDULE_KEY] = (
+                    self.cute_chunk_prepare_schedule
                 )
             fields.update(self.user_defined_tunables)
             return fields
@@ -4008,15 +4457,15 @@ _CUTE_REDUCTION_RELOAD_CHOICES: tuple[str, ...] = ("auto", "register", "gmem")
 
 
 class CuteReductionReloadSpec(_BlockIdItem):
-    """Where a multi-sweep rolled reduction keeps the values it re-reads.
+    """Where a multi-sweep reduction keeps the values it re-reads.
 
-    LayerNorm/RMSNorm-style kernels sweep the same input several times
-    (reduce, then consume).  ``"register"`` caches the first sweep's loads
-    in a per-thread register fragment (fastest when the per-thread slice
-    is small; spills to local memory when it is not).  ``"gmem"`` re-loads
-    from global memory on later sweeps (the row is usually still resident
-    in L2, and no registers are burned).  ``"auto"`` (default) keeps the
-    legacy size heuristic in ``fuse_two_pass_loads``.
+    Rolled or persistent LayerNorm/RMSNorm-style kernels sweep the same input
+    several times (reduce, then consume).  ``"register"`` caches the earliest
+    sweep's loads in a per-thread register fragment (fastest when the
+    per-thread slice is small; spills to local memory when it is not).
+    ``"gmem"`` re-loads from global memory on later sweeps (the row is usually
+    still resident in L2, and no registers are burned).  ``"auto"`` (default)
+    keeps the legacy size heuristic in ``fuse_two_pass_loads``.
     """
 
     def __init__(self, *, block_id: int) -> None:

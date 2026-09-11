@@ -19,7 +19,23 @@ from .precompile_future import _load_compiled_fn
 from .precompile_future import _unload_compiled_fn
 
 if TYPE_CHECKING:
+    from ..runtime.kernel import CompiledConfig
     from .precompile_future import SerializedCompiledFunction
+
+
+class CompiledFunctionLoadError(Exception):
+    """The benchmark worker could not reconstruct a generated wrapper."""
+
+
+def _load_compiled_fn_for_worker(
+    fn_spec: SerializedCompiledFunction,
+) -> CompiledConfig:
+    try:
+        return _load_compiled_fn(fn_spec)
+    except Exception as error:
+        raise CompiledFunctionLoadError(
+            f"{type(error).__qualname__}: {error}"
+        ) from error
 
 
 @dataclasses.dataclass
@@ -36,7 +52,7 @@ class BenchmarkJob:
         # Subprocess inherits parent stderr; capture so Triton runtime
         # diagnostics don't leak to the user's terminal.
         with capture_output():
-            fn = _load_compiled_fn(self.fn_spec)
+            fn = _load_compiled_fn_for_worker(self.fn_spec)
             try:
                 args = load_trusted_kernel_args(self.args_path)
                 bench = do_bench_generic if self.use_wall_clock else do_bench
@@ -81,7 +97,7 @@ class AccuracyCheckJob:
     def __call__(self) -> AccuracyCheckResult:
         # Keep compile/launch diagnostics out of the autotune progress stream.
         with capture_output():
-            fn = _load_compiled_fn(self.fn_spec)
+            fn = _load_compiled_fn_for_worker(self.fn_spec)
             try:
                 args = load_trusted_kernel_args(self.args_path)
                 baseline_output = _load_trusted_baseline_output(self.baseline_path)

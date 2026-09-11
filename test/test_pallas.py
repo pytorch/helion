@@ -7735,8 +7735,8 @@ class TestPallasJaxFn(TestCase):
 
         return jax, jnp
 
-    def test_jax_fn_emit_pipeline(self) -> None:
-        """jax_fn drives an emit_pipeline kernel inside ``jax.jit``."""
+    def test_jax_fn_emit_pipeline_with_x64(self) -> None:
+        """jax_fn drives an emit_pipeline kernel under JAX x64 and ``jax.jit``."""
         jax, jnp = self._import_jax()
 
         @helion.kernel(
@@ -7768,7 +7768,11 @@ class TestPallasJaxFn(TestCase):
         b = jnp.full((128, 128), 0.5, dtype=jnp.float32)
         scale = 2.0
 
-        result = float(f(a, b, scale))
+        # Applications may enable x64 globally before tracing Helion kernels.
+        # Pallas indices must remain int32 without changing that setting.
+        with jax.enable_x64(True):
+            result = float(f(a, b, scale))
+            self.assertTrue(jax.config.jax_enable_x64)
 
         # Reference: same prologue/epilogue, eager addition
         ref_a = a * scale

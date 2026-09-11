@@ -1388,6 +1388,43 @@ def _ensure_torch_tpu_cpu_export_info() -> None:
     _ensure_cpu_tpu_info(get_tpu_device_name())
 
 
+def _is_64bit_int(x: object) -> TypeGuard[_TorchTensorOrJaxArray]:
+    if not _is_torch_tensor_or_jax_array(x):
+        return False
+    dtype = x.dtype
+    kind = getattr(dtype, "kind", None)
+    return kind in ("i", "u") and getattr(dtype, "itemsize", 0) == 8
+
+
+def _x64_scoped_jit_fn(jit_fn: Callable[..., object]) -> Callable[..., object]:
+    """Trace a Helion Pallas kernel with JAX x64 disabled.
+
+    Pallas grid, DMA-slice, and tiling arithmetic are int32. Python integer
+    literals become int64 when global JAX x64 is enabled, which makes otherwise
+    valid Pallas index expressions fail type checking. Scope only the Helion
+    kernel trace to x32, leaving the surrounding JAX program's x64 setting
+    unchanged.
+    """
+
+    import jax
+
+    @functools.wraps(jit_fn)
+    def wrapper(*args: object, **kwargs: object) -> object:
+        wide = [a for a in (*args, *kwargs.values()) if _is_64bit_int(a)]
+        if wide:
+            raise RuntimeError(
+                "Helion cannot launch a Pallas kernel that carries 64-bit "
+                f"integer data ({', '.join(str(a.dtype) for a in wide)}): "
+                "the kernel is traced with jax_enable_x64 off (so that Pallas's "
+                "int32 index arithmetic stays consistent), which would silently "
+                "truncate those inputs to 32-bit. Narrow them before the kernel."
+            )
+        with jax.enable_x64(False):
+            return jit_fn(*args, **kwargs)
+
+    return wrapper
+
+
 def _pallas_apply_ds_padding(
     args: tuple[object, ...],
     _output_indices: list[int],
@@ -1557,7 +1594,7 @@ def _pallas_pl_kernel_jit_fn(
     input_output_aliases: dict[int, int],
     interpret: bool,
     collective_id: int | None,
-) -> object:
+) -> Callable[..., object]:
     """Build the ``pl.kernel`` jit_fn that drives the Helion device kernel.
 
     The kernel body receives ANY-space refs ``[inputs..., outputs...,
@@ -1631,12 +1668,15 @@ def _pallas_pl_kernel_jit_fn(
                 out_specs=pipe_out_specs,
             )(*pipe_any)
 
-        return pl.kernel(  # type: ignore[union-attr]
-            interpret_kernel_body,
-            out_shape_arg,
-            mesh=mesh,
-            interpret=True,
-            **{scratch_kw: scratch_shapes},
+        return cast(
+            "Callable[..., object]",
+            pl.kernel(  # type: ignore[union-attr]
+                interpret_kernel_body,
+                out_shape_arg,
+                mesh=mesh,
+                interpret=True,
+                **{scratch_kw: scratch_shapes},
+            ),
         )
 
     kernel_out_shapes = [out_shape_seq[pos] for pos in kernel_output_positions]
@@ -1648,7 +1688,7 @@ def _pallas_pl_kernel_jit_fn(
     else:
         kernel_out_shape = tuple(kernel_out_shapes)
 
-    def make_kernel(alias_refs: Mapping[int, object]) -> object:
+    def make_kernel(alias_refs: Mapping[int, object]) -> Callable[..., object]:
         def kernel_body(*refs: object) -> None:
             input_refs = iter(refs[: len(kernel_input_positions)])
             output_start = len(kernel_input_positions)
@@ -1697,12 +1737,15 @@ def _pallas_pl_kernel_jit_fn(
         kernel_kwargs["compiler_params"] = pltpu.CompilerParams(  # type: ignore[union-attr]
             **compiler_params
         )
-        return pl.kernel(  # type: ignore[union-attr]
-            kernel_body,
-            kernel_out_shape,
-            mesh=mesh,
-            interpret=interpret,
-            **kernel_kwargs,
+        return cast(
+            "Callable[..., object]",
+            pl.kernel(  # type: ignore[union-attr]
+                kernel_body,
+                kernel_out_shape,
+                mesh=mesh,
+                interpret=interpret,
+                **kernel_kwargs,
+            ),
         )
 
     if not hbm_alias_input_positions:
@@ -1716,7 +1759,7 @@ def _pallas_pl_kernel_jit_fn(
             for position in hbm_alias_input_positions
         }
         kernel_inputs = [inputs[position] for position in kernel_input_positions]
-        kernel = cast("Callable[..., object]", make_kernel(alias_refs))
+        kernel = make_kernel(alias_refs)
         kernel_results = kernel(*kernel_inputs)
         if not kernel_output_positions:
             kernel_results_seq: list[object] = []
@@ -1962,6 +2005,7 @@ def _pallas_compile_jit_fn(
             interpret=interpret,
             collective_id=_collective_id,
         )
+        jit_fn = _x64_scoped_jit_fn(jit_fn)
 
     return _PallasCompileResult(
         jit_fn=jit_fn,
@@ -2601,12 +2645,22 @@ def _pallas_compile_compact_jit_fn(
     n_io = n_inputs + n_outputs
     pass_positions = hbm_in_positions | {n_inputs + p for p in hbm_out_positions}
     pipe_positions = [p for p in range(n_io) if p not in pass_positions]
+    num_launch_scalar_prefetch = num_scalar_prefetch + 1
 
     def jit_fn(*jax_inputs: object) -> object:
         offsets = [jax_inputs[tp] for tp in offset_tpos]
         metadata = build_worklist(*offsets)
-        num_work = metadata.num_work  # type: ignore[attr-defined]
-        scalar_prefetch = [getattr(metadata, f) for f in metadata_fields]
+        # Keep the dynamic grid bound explicit rather than closing over the
+        # scalar. ``pl.kernel`` turns closed-over scalars into SMEM refs with a
+        # default BlockSpec; when an enclosing jit has x64 enabled, JAX can
+        # retrace that default index map after our x32 scope and emit an i64
+        # transform that Mosaic rejects. A one-element int32 buffer follows the
+        # same explicit ANY -> SMEM path as the other worklist metadata.
+        num_work = jnp.reshape(metadata.num_work, (1,))  # type: ignore[attr-defined]
+        scalar_prefetch = [
+            num_work,
+            *(getattr(metadata, f) for f in metadata_fields),
+        ]
 
         # The BlockSpec index maps and the generated kernel read the
         # worklist tables from SMEM.
@@ -2617,13 +2671,17 @@ def _pallas_compile_compact_jit_fn(
         all_scratch: list[object] = [*scratch_shapes, *smem_types]
 
         def kernel_body(*refs: object) -> None:
-            scalar_any = refs[:num_scalar_prefetch]
-            io_any = refs[num_scalar_prefetch : num_scalar_prefetch + n_io]
-            rest = refs[num_scalar_prefetch + n_io :]
+            scalar_any = refs[:num_launch_scalar_prefetch]
+            io_any = refs[
+                num_launch_scalar_prefetch : num_launch_scalar_prefetch + n_io
+            ]
+            rest = refs[num_launch_scalar_prefetch + n_io :]
             kernel_scratch = rest[:n_kernel_scratch]
             scalar_smem = rest[n_kernel_scratch:]
             for src, dst in zip(scalar_any, scalar_smem, strict=True):
                 pltpu.sync_copy(src, dst)  # type: ignore[union-attr]
+            num_work_smem = scalar_smem[0]
+            metadata_smem = scalar_smem[1:]
 
             in_specs, out_specs = _pallas_compact_in_out_specs(
                 pl,
@@ -2636,7 +2694,7 @@ def _pallas_compile_compact_jit_fn(
                 smem_set,
                 hbm_set,
                 owner_ref_pos,
-                tuple(scalar_smem),
+                tuple(metadata_smem),
                 aligned_set,
                 tile_start_ref_pos,
                 compact_block,
@@ -2656,7 +2714,7 @@ def _pallas_compile_compact_jit_fn(
                 merged = list(io_any)
                 for p, block in zip(pipe_positions, block_refs, strict=True):
                     merged[p] = block
-                reordered_kernel(*scalar_smem, *merged, *kernel_scratch)  # type: ignore[operator]
+                reordered_kernel(*metadata_smem, *merged, *kernel_scratch)  # type: ignore[operator]
 
             # Correctness relies on emit_pipeline running grid steps
             # sequentially in ascending order (a later work item re-writes
@@ -2666,7 +2724,7 @@ def _pallas_compile_compact_jit_fn(
             pltpu.emit_pipeline(  # type: ignore[union-attr]
                 pipeline_body,
                 # num_work may be 0 (empty batch): zero steps, empty output.
-                grid=(num_work,),
+                grid=(num_work_smem[0],),  # type: ignore[index]
                 in_specs=pipe_in_specs,
                 out_specs=pipe_out_specs,
             )(*pipe_any)
@@ -2694,7 +2752,7 @@ def _pallas_compile_compact_jit_fn(
         return call(*scalar_prefetch, *jax_inputs)
 
     return _PallasCompileResult(
-        jit_fn=jit_fn,
+        jit_fn=_x64_scoped_jit_fn(jit_fn),
         tensor_arg_indices=tensor_arg_indices,
         output_only_indices=output_only_indices,
         arg_to_tensor_pos=arg_to_tensor_pos,

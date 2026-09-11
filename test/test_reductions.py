@@ -14,6 +14,7 @@ from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfCute
+from helion._testing import skipIfMetal
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfPallas
@@ -69,7 +70,7 @@ def reduce_kernel(
     return out
 
 
-@onlyBackends(["triton", "cute", "pallas"])
+@onlyBackends(["triton", "cute", "pallas", "metal"])
 class TestReductions(RefEagerTestBase, TestCase):
     @skipIfPallas("non-power-of-2 reduction dims not supported on Pallas")
     def test_strided_threaded_reduction_non_sum_ops(self):
@@ -171,6 +172,9 @@ class TestReductions(RefEagerTestBase, TestCase):
                 if _get_backend() == "cute":
                     self.assertIn("_cute_grouped_reduce_shared_two_stage", code)
 
+    @skipIfMetal(
+        "Metal SIMD reductions need the reduced dim to be the fastest-varying thread axis"
+    )
     def test_2d_tile_inner_dim_reduction_to_scalar(self):
         """Reduce the inner dim of a single 2D ``hl.tile([o, d])`` into a per-row scalar.
 
@@ -246,6 +250,7 @@ class TestReductions(RefEagerTestBase, TestCase):
 
     @skipIfPallas("complex layernorm with fp16, not relevant to Pallas")
     @skipIfRefEager("Does not call assert_close")
+    @skipIfMetal("hl.arange needs a Metal prims.iota lowering")
     def test_broken_layernorm(self):
         @helion.kernel(autotune_effort="none")
         def layer_norm_fwd(
@@ -493,6 +498,7 @@ class TestReductions(RefEagerTestBase, TestCase):
             layer_norm_reduction, args, block_size=32, reduction_loop=4
         )
 
+    @skipIfMetal("hl.arange needs a Metal prims.iota lowering")
     def test_reduction_over_arange_dim_stays_persistent(self):
         """Issue #2643: a reduction over an ``hl.arange()`` axis must not be
         registered as a rollable (looped) reduction.
@@ -525,11 +531,27 @@ class TestReductions(RefEagerTestBase, TestCase):
         # produced a shape mismatch (issue #2643).
         bound = rms_over_arange.bind((qkv,))
         self.assertEqual(bound.env.config_spec.reduction_loops.valid_block_ids(), [])
+        if _get_backend() == "cute":
+            reduction_blocks = [
+                block_id
+                for block_id, block in enumerate(bound.env.block_sizes)
+                if block.reduction
+            ]
+            self.assertEqual(len(reduction_blocks), 1)
+            reduction_block = reduction_blocks[0]
+            for spec in (
+                bound.env.config_spec.num_threads,
+                bound.env.config_spec.cute_vector_widths,
+                bound.env.config_spec.cute_lane_layouts,
+                bound.env.config_spec.cute_reduction_reloads,
+            ):
+                self.assertIn(reduction_block, spec.valid_block_ids())
 
         _code, output = code_and_output(rms_over_arange, (qkv,))
         expected = qkv.to(torch.float32).pow(2).sum(dim=-1)
         torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
 
+    @skipIfMetal("hl.arange needs a Metal prims.iota lowering")
     def test_reduction_over_arange_dim_size_coincides_with_slice(self):
         """Issue #2643 variant: an ``hl.arange()`` reduction whose size
         coincides with a slice reduction of the same size in the same loop.
@@ -564,6 +586,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         expected = x.to(torch.float32).sum(-1) + x.to(torch.float32).pow(2).sum(-1)
         torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
 
+    @skipIfMetal("hl.arange needs a Metal prims.iota lowering")
     def test_arange_reduction_with_synthetic_lanes(self):
         """A persistent ``hl.arange()`` reduction whose extent exceeds the live
         thread count must accumulate across synthetic lanes.
@@ -832,6 +855,9 @@ class TestReductions(RefEagerTestBase, TestCase):
         code, out = code_and_output(unsqueeze_sum, (x,))
         torch.testing.assert_close(out, x.float(), rtol=1e-4, atol=1e-4)
 
+    @skipIfMetal(
+        "Metal passes symbolic sizes as float scalars; integer floor_divide fails"
+    )
     def test_size1_reduction_keepdim_sum(self):
         """Second sum over a keepdim=True result should reduce rank (issue #1423).
 
@@ -860,6 +886,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         ref = x.float().sum(0)
         torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
 
+    @skipIfMetal("argreduce after matmul needs a Metal scalar aten.addmm lowering")
     def test_argmax_on_tile_after_matmul(self):
         """Test that argmax on a matmul tile returns the correct row indices."""
 
@@ -894,6 +921,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, ref)
 
     @skipIfPallas("Pallas TPU argreduce cannot write int64 keepdim outputs")
+    @skipIfMetal("argreduce after matmul needs a Metal scalar aten.addmm lowering")
     def test_argmax_on_tile_after_matmul_keepdim(self):
         @helion.kernel(autotune_effort="none")
         def matmul_argmax_keepdim(
@@ -927,6 +955,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, ref)
 
     @skipIfPallas("nested torch.matmul argreduce lowering is unsupported on Pallas")
+    @skipIfMetal("argreduce after matmul needs a Metal scalar aten.addmm lowering")
     def test_argmax_on_tile_after_torch_matmul(self):
         @helion.kernel(autotune_effort="none")
         def torch_matmul_argmax(
@@ -954,6 +983,7 @@ class TestReductions(RefEagerTestBase, TestCase):
 
     @skipIfPallas("barrier and persistent_blocked not supported on Pallas")
     @skipIfTileIR("TileIR does not support barrier operations")
+    @skipIfMetal("hl.barrier() requires a persistent pid_type, unsupported on Metal")
     def test_reduction_loop_with_multiple_rdims(self):
         """Test that reduction_loops works when there are multiple reduction dimensions."""
 

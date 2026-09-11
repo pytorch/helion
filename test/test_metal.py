@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import sys
 import unittest
 from unittest.mock import patch
@@ -1294,6 +1295,827 @@ class TestMetalMatmul(unittest.TestCase):
                 torch.testing.assert_close(
                     kernel(x, y, bias), expected, rtol=2e-3, atol=2e-3
                 )
+
+
+# ---------------------------------------------------------------------------
+# Kernel definitions - reductions
+# ---------------------------------------------------------------------------
+
+_REDUCTION_CONFIG = [helion.Config(block_sizes=[16])]
+
+
+@helion.kernel(backend="metal", configs=_REDUCTION_CONFIG)
+def row_sum(x: torch.Tensor) -> torch.Tensor:
+    m, _ = x.shape
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        out[tile_m] = x[tile_m, :].sum(-1)
+    return out
+
+
+@helion.kernel(backend="metal", configs=_REDUCTION_CONFIG)
+def row_amax(x: torch.Tensor) -> torch.Tensor:
+    m, _ = x.shape
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        out[tile_m] = torch.amax(x[tile_m, :], dim=-1)
+    return out
+
+
+@helion.kernel(backend="metal", configs=_REDUCTION_CONFIG)
+def row_amin(x: torch.Tensor) -> torch.Tensor:
+    m, _ = x.shape
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        out[tile_m] = torch.amin(x[tile_m, :], dim=-1)
+    return out
+
+
+@helion.kernel(backend="metal", configs=_REDUCTION_CONFIG)
+def row_prod(x: torch.Tensor) -> torch.Tensor:
+    m, _ = x.shape
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        out[tile_m] = torch.prod(x[tile_m, :], dim=-1)
+    return out
+
+
+@helion.kernel(backend="metal", configs=_REDUCTION_CONFIG)
+def row_mean(x: torch.Tensor) -> torch.Tensor:
+    m, _ = x.shape
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        out[tile_m] = torch.mean(x[tile_m, :], dim=-1)
+    return out
+
+
+@helion.kernel(backend="metal", configs=_REDUCTION_CONFIG)
+def row_argmax(x: torch.Tensor) -> torch.Tensor:
+    m, _ = x.shape
+    out = torch.empty([m], dtype=torch.int64, device=x.device)
+    for tile_m in hl.tile(m):
+        out[tile_m] = torch.argmax(x[tile_m, :], dim=-1)
+    return out
+
+
+@helion.kernel(backend="metal", configs=_REDUCTION_CONFIG)
+def row_argmin(x: torch.Tensor) -> torch.Tensor:
+    m, _ = x.shape
+    out = torch.empty([m], dtype=torch.int64, device=x.device)
+    for tile_m in hl.tile(m):
+        out[tile_m] = torch.argmin(x[tile_m, :], dim=-1)
+    return out
+
+
+@helion.kernel(backend="metal", configs=_REDUCTION_CONFIG)
+def softmax_decomposed(x: torch.Tensor) -> torch.Tensor:
+    m, _ = x.shape
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        values = x[tile_m, :]
+        amax = torch.amax(values, dim=1, keepdim=True)
+        exp_v = torch.exp(values - amax)
+        out[tile_m, :] = exp_v / torch.sum(exp_v, dim=1, keepdim=True)
+    return out
+
+
+@helion.kernel(backend="metal", configs=_REDUCTION_CONFIG)
+def rms_norm_fwd(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    m, _ = x.shape
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        x_tile = x[tile_m, :].to(torch.float32)
+        mean_sq = torch.mean(x_tile * x_tile, dim=-1, keepdim=True)
+        normalized = x_tile * torch.rsqrt(mean_sq + 1e-5)
+        out[tile_m, :] = (normalized * weight[:].to(torch.float32)).to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="metal", configs=_REDUCTION_CONFIG)
+def layer_norm_fwd(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    m, n = x.shape
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        acc = x[tile_m, :].to(torch.float32)
+        mean = torch.sum(acc, dim=-1, keepdim=True) / n
+        centered = acc - mean
+        var = torch.sum(centered * centered, dim=-1, keepdim=True) / n
+        normalized = centered * torch.rsqrt(var + 1e-5)
+        out[tile_m, :] = (normalized * weight[:] + bias[:]).to(x.dtype)
+    return out
+
+
+@helion.kernel(
+    backend="metal",
+    configs=_REDUCTION_CONFIG,
+    ignore_warnings=[exc.TensorOperationInWrapper],
+)
+def cross_entropy(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    n, v = logits.shape
+    losses = torch.zeros([n], dtype=torch.float32, device=logits.device)
+    logits_flat = logits.view(-1)
+    for tile_n in hl.tile(n):
+        flat_indices = tile_n.index * v + labels[tile_n]
+        correct = hl.load(logits_flat, [flat_indices]).to(torch.float32)
+        row = logits[tile_n, :].to(torch.float32)
+        row_max = torch.amax(row, dim=-1)
+        shifted = row - row_max[:, None]
+        logsumexp = torch.log(torch.sum(torch.exp(shifted), dim=-1))
+        losses[tile_n] = logsumexp + row_max - correct
+    return losses
+
+
+@helion.kernel(backend="metal", configs=[helion.Config(block_sizes=[4, 2])])
+def sum_in_device_loop(x: torch.Tensor) -> torch.Tensor:
+    """Reduction inside a device loop, so its scratch buffer is reused.
+
+    The inner ``hl.tile(k)`` becomes a serial device loop, and the reduction
+    over the trailing dim runs once per iteration against the same
+    ``threadgroup`` scratch array.
+    """
+    m, k, _ = x.shape
+    out = torch.empty([m, k], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(m):
+        for tile_k in hl.tile(k):
+            out[tile_m, tile_k] = x[tile_m, tile_k, :].to(torch.float32).sum(-1)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Reduction tests
+# ---------------------------------------------------------------------------
+
+
+@_requires_darwin
+class TestMetalReductions(unittest.TestCase):
+    """Reductions across all three Metal cross-thread reduction tiers.
+
+    The tier is chosen by the reduction's thread span (see
+    ``helion/_compiler/metal/reduction.py``):
+
+    ==============  ==========================================================
+    span            emission
+    ==============  ==========================================================
+    ``< 32``        ``helion_red::seg_*``, a shuffle butterfly over the segment
+    ``== 32``       ``c10::metal::simd_*``
+    ``> 32``        ``helion_red::tg_*`` + a ``threadgroup`` scratch buffer
+    ==============  ==========================================================
+
+    Spans above one threadgroup (1024) are rolled into a ``for`` loop over the
+    reduction dim by ``reduction_loops``.
+    """
+
+    def _check(
+        self,
+        kernel: helion.Kernel,
+        args: tuple[object, ...],
+        expected: torch.Tensor,
+        *,
+        rtol: float = 1e-4,
+        atol: float = 1e-4,
+    ) -> None:
+        result = kernel(*args)
+        torch.testing.assert_close(result, expected, rtol=rtol, atol=atol)
+
+    # -- span tiers ---------------------------------------------------------
+
+    def test_sum_sub_simdgroup_span(self) -> None:
+        """n=8: several reduction groups share one SIMD group."""
+        x = torch.randn(64, 8, device=DEVICE)
+        self._check(row_sum, (x,), x.sum(-1))
+
+    def test_sum_exact_simdgroup_span(self) -> None:
+        x = torch.randn(64, 32, device=DEVICE)
+        self._check(row_sum, (x,), x.sum(-1))
+
+    def test_sum_multi_simdgroup_span(self) -> None:
+        """n=256: 8 SIMD groups per reduction, via threadgroup scratch."""
+        x = torch.randn(64, 256, device=DEVICE)
+        self._check(row_sum, (x,), x.sum(-1))
+
+    def test_sum_full_threadgroup_span(self) -> None:
+        x = torch.randn(32, 1024, device=DEVICE)
+        self._check(row_sum, (x,), x.sum(-1), rtol=1e-3, atol=1e-3)
+
+    def test_sum_non_power_of_2(self) -> None:
+        """The padded lanes must be masked to the identity."""
+        x = torch.randn(64, 1000, device=DEVICE)
+        self._check(row_sum, (x,), x.sum(-1), rtol=1e-3, atol=1e-3)
+
+    def test_sum_rolled_reduction(self) -> None:
+        """n > 1024 rolls into a loop with a per-thread accumulator."""
+        x = torch.randn(64, 4096, device=DEVICE)
+        self._check(row_sum, (x,), x.sum(-1), rtol=1e-3, atol=1e-3)
+
+    def test_sum_deeply_rolled_reduction(self) -> None:
+        x = torch.randn(4, 65536, device=DEVICE)
+        self._check(row_sum, (x,), x.sum(-1), rtol=1e-2, atol=1e-2)
+
+    def test_sum_single_row(self) -> None:
+        """One row: the whole threadgroup cooperates on a single reduction."""
+        x = torch.randn(1, 8192, device=DEVICE)
+        self._check(row_sum, (x,), x.sum(-1), rtol=1e-3, atol=1e-3)
+
+    # -- reduction kinds ----------------------------------------------------
+
+    def test_amax(self) -> None:
+        x = torch.randn(33, 257, device=DEVICE)
+        self._check(row_amax, (x,), x.amax(-1))
+
+    def test_amax_propagates_nan(self) -> None:
+        x = torch.randn(8, 64, device=DEVICE)
+        x[3, 17] = float("nan")
+        result = row_amax(x)
+        self.assertTrue(torch.isnan(result[3]).item())
+        torch.testing.assert_close(result[:3], x[:3].amax(-1))
+
+    def test_amin(self) -> None:
+        x = torch.randn(33, 100, device=DEVICE)
+        self._check(row_amin, (x,), x.amin(-1))
+
+    def test_prod(self) -> None:
+        x = torch.rand(16, 16, device=DEVICE) + 0.5
+        self._check(row_prod, (x,), x.prod(-1))
+
+    def test_mean(self) -> None:
+        x = torch.randn(32, 512, device=DEVICE)
+        self._check(row_mean, (x,), x.mean(-1))
+
+    def test_argmax_sub_simdgroup_span(self) -> None:
+        x = torch.randn(32, 16, device=DEVICE)
+        self._check(row_argmax, (x,), x.argmax(-1))
+
+    def test_argmax_exact_simdgroup_span(self) -> None:
+        x = torch.randn(32, 32, device=DEVICE)
+        self._check(row_argmax, (x,), x.argmax(-1))
+
+    def test_argmax_multi_simdgroup_span(self) -> None:
+        x = torch.randn(32, 256, device=DEVICE)
+        self._check(row_argmax, (x,), x.argmax(-1))
+
+    def test_argmax_ties_take_lowest_index(self) -> None:
+        x = torch.zeros(4, 64, device=DEVICE)
+        x[:, 5] = 1.0
+        x[:, 40] = 1.0
+        self._check(row_argmax, (x,), x.argmax(-1))
+
+    def test_rolled_argreductions_take_lowest_global_index(self) -> None:
+        """The final cross-lane reduction must compare carried indices.
+
+        With a 4096-element row, lanes locally reduce four chunks.  Indices 1
+        and 1024 are therefore carried by different lanes in reverse index
+        order; selecting the first winning lane incorrectly returns 1024.
+        """
+        expected = torch.ones(4, dtype=torch.int64, device=DEVICE)
+        for kernel, name, extremum in (
+            (row_argmax, "argmax", 1.0),
+            (row_argmin, "argmin", -1.0),
+        ):
+            with self.subTest(kernel=name, case="tie"):
+                x = torch.zeros(4, 4096, device=DEVICE)
+                x[:, 1] = extremum
+                x[:, 1024] = extremum
+                self._check(kernel, (x,), expected)
+
+            with self.subTest(kernel=name, case="nan"):
+                x = torch.zeros(4, 4096, device=DEVICE)
+                x[:, 1] = float("nan")
+                x[:, 1024] = float("nan")
+                self._check(kernel, (x,), expected)
+
+    def test_argmin(self) -> None:
+        x = torch.randn(32, 256, device=DEVICE)
+        self._check(row_argmin, (x,), x.argmin(-1))
+
+    # -- dtypes -------------------------------------------------------------
+
+    def test_sum_float16(self) -> None:
+        # Helion and torch both accumulate in fp32 and round once, so the only
+        # slack needed is a rounding boundary flipped by summation order.
+        x = torch.randn(32, 128, dtype=torch.float16, device=DEVICE)
+        self._check(row_sum, (x,), x.sum(-1), rtol=5e-3, atol=5e-3)
+
+    def test_sum_bfloat16(self) -> None:
+        x = torch.randn(32, 128, dtype=torch.bfloat16, device=DEVICE)
+        self._check(row_sum, (x,), x.sum(-1), rtol=2e-2, atol=2e-2)
+
+    def test_sum_int32(self) -> None:
+        x = torch.randint(-50, 50, (32, 128), dtype=torch.int32, device=DEVICE)
+        self._check(row_sum, (x,), x.sum(-1).to(torch.int32))
+
+    def test_sum_int64(self) -> None:
+        """Metal has no 64-bit SIMD shuffle; c10::metal works around it."""
+        x = torch.randint(-50, 50, (32, 128), dtype=torch.int64, device=DEVICE)
+        self._check(row_sum, (x,), x.sum(-1))
+
+    def test_amax_int64(self) -> None:
+        x = torch.randint(-(10**12), 10**12, (32, 128), device=DEVICE)
+        self._check(row_amax, (x,), x.amax(-1))
+
+    def test_int64_extrema_are_not_polluted_by_a_zero_fill(self) -> None:
+        """An int64 extremum must not be clamped towards zero.
+
+        The cross-SIMD-group tier re-reduces the per-SIMD-group partials, and
+        ``c10::metal::threadgroup_*`` does that with only ``span / 32`` lanes
+        live.  Metal has no 64-bit SIMD reduction, so c10 emulates ``long``
+        with ``simd_shuffle_and_fill_down`` and a fill of 0 -- which is the
+        identity for sum and for nothing else, so every one of these returned
+        0.  Sign-uniform data is what makes the fill visible; a two-sided
+        range hides it, since the true extremum is then almost surely on the
+        same side of zero as the fill.
+        """
+        for n in (64, 100, 128, 256, 512, 1024):
+            with self.subTest(n=n):
+                neg = torch.randint(-(10**12), -1, (8, n), device=DEVICE)
+                self._check(row_amax, (neg,), neg.amax(-1))
+                pos = torch.randint(1, 10**12, (8, n), device=DEVICE)
+                self._check(row_amin, (pos,), pos.amin(-1))
+                ones = torch.ones(8, n, dtype=torch.int64, device=DEVICE)
+                self._check(row_prod, (ones,), ones.prod(-1))
+
+    def test_rolled_int64_amax(self) -> None:
+        """A rolled int64 reduction emits ``iinfo(int64).min`` as its identity."""
+        x = torch.randint(-(10**12), -1, (8, 4096), device=DEVICE)
+        self._check(row_amax, (x,), x.amax(-1))
+
+    # -- composite kernels --------------------------------------------------
+
+    def test_softmax(self) -> None:
+        x = torch.randn(32, 256, device=DEVICE)
+        self._check(softmax_decomposed, (x,), torch.softmax(x, dim=-1))
+
+    def test_softmax_rolled(self) -> None:
+        x = torch.randn(8, 4096, device=DEVICE)
+        self._check(softmax_decomposed, (x,), torch.softmax(x, dim=-1))
+
+    def test_rms_norm(self) -> None:
+        x = torch.randn(32, 256, device=DEVICE)
+        weight = torch.randn(256, device=DEVICE)
+        expected = torch.nn.functional.rms_norm(x, (256,), weight, eps=1e-5)
+        self._check(rms_norm_fwd, (x, weight), expected, rtol=1e-3, atol=1e-3)
+
+    def test_layer_norm_two_reductions(self) -> None:
+        """Mean and variance must not share a threadgroup scratch buffer."""
+        x = torch.randn(32, 256, device=DEVICE)
+        weight = torch.randn(256, device=DEVICE)
+        bias = torch.randn(256, device=DEVICE)
+        expected = torch.nn.functional.layer_norm(x, (256,), weight, bias, 1e-5)
+        for _ in range(20):
+            # The historical scratch-aliasing race was non-deterministic.
+            self._check(
+                layer_norm_fwd, (x, weight, bias), expected, rtol=1e-3, atol=1e-3
+            )
+
+    def test_cross_entropy(self) -> None:
+        logits = torch.randn(64, 512, device=DEVICE)
+        labels = torch.randint(0, 512, (64,), device=DEVICE)
+        expected = torch.nn.functional.cross_entropy(
+            logits.float(), labels, reduction="none"
+        )
+        self._check(cross_entropy, (logits, labels), expected, rtol=1e-3, atol=1e-3)
+
+    def test_reduction_in_device_loop(self) -> None:
+        """Scratch reuse across device-loop iterations needs a leading barrier."""
+        x = torch.randn(16, 6, 128, device=DEVICE)
+        for _ in range(20):
+            self._check(sum_in_device_loop, (x,), x.sum(-1), rtol=1e-3, atol=1e-3)
+
+    # -- numeric edge cases across every tier -------------------------------
+
+    _TIERS = (
+        (8, "segmented"),
+        (32, "simd_group"),
+        (256, "threadgroup"),
+        (4096, "rolled"),
+    )
+
+    def test_nan_and_inf_across_tiers(self) -> None:
+        for n, tier in self._TIERS:
+            with self.subTest(n=n, tier=tier):
+                x = torch.randn(16, n, device=DEVICE)
+                x[0, n // 2] = float("nan")
+                for kernel, ref in (
+                    (row_sum, x.sum(-1)),
+                    (row_amax, x.amax(-1)),
+                    (row_amin, x.amin(-1)),
+                    (row_argmax, x.argmax(-1)),
+                    (row_argmin, x.argmin(-1)),
+                ):
+                    result = kernel(x)
+                    torch.testing.assert_close(
+                        result, ref, rtol=1e-3, atol=1e-3, equal_nan=True
+                    )
+                # +inf and -inf in the same row must sum to NaN, not cancel.
+                z = torch.full((16, n), float("inf"), device=DEVICE)
+                z[:, 1] = -float("inf")
+                torch.testing.assert_close(row_sum(z), z.sum(-1), equal_nan=True)
+
+    def test_argmax_edge_positions_across_tiers(self) -> None:
+        for n, tier in self._TIERS:
+            with self.subTest(n=n, tier=tier):
+                # All-equal: torch returns the lowest index.
+                flat = torch.zeros(16, n, device=DEVICE)
+                torch.testing.assert_close(row_argmax(flat), flat.argmax(-1))
+                # The extremum in the last lane of the last SIMD group.
+                last = torch.zeros(16, n, device=DEVICE)
+                last[:, n - 1] = 1.0
+                torch.testing.assert_close(row_argmax(last), last.argmax(-1))
+
+    def test_non_power_of_two_extents_at_tier_boundaries(self) -> None:
+        for n in (7, 31, 33, 63, 65, 1023, 1025, 1500):
+            with self.subTest(n=n):
+                x = torch.randn(16, n, device=DEVICE)
+                torch.testing.assert_close(row_sum(x), x.sum(-1), rtol=1e-3, atol=1e-3)
+                torch.testing.assert_close(row_amax(x), x.amax(-1))
+
+    def test_int32_sum_wraps_like_torch(self) -> None:
+        for n, tier in self._TIERS:
+            with self.subTest(n=n, tier=tier):
+                x = torch.full((16, n), 2**20, dtype=torch.int32, device=DEVICE)
+                torch.testing.assert_close(row_sum(x), x.sum(-1).to(torch.int32))
+
+    # -- codegen ------------------------------------------------------------
+
+    def test_codegen_uses_c10_metal_helpers(self) -> None:
+        """Cross-SIMD-group reductions go through Inductor's reduction_utils.
+
+        Both stages call ``c10::metal::simd_*``; the cross-SIMD-group combine
+        around them is Helion's, because c10's runs its second stage with a
+        partially populated SIMD group (see ``msl_reduction``).
+        """
+        x = torch.randn(64, 256, device=DEVICE)
+        msl = _get_msl(row_sum, (x,))
+        self.assertIn("#include <c10/metal/reduction_utils.h>", msl)
+        self.assertIn("::c10::metal::simd_##NAME", msl)
+        self.assertNotIn("::c10::metal::threadgroup_", msl)
+        self.assertIn("helion_red::tg_sum(", msl)
+        self.assertIn("threadgroup float _red_scratch", msl)
+        self.assertIn("[[simdgroup_index_in_threadgroup]]", msl)
+
+    def test_codegen_simdgroup_span_needs_no_shared_memory(self) -> None:
+        x = torch.randn(64, 32, device=DEVICE)
+        msl = _get_msl(row_sum, (x,))
+        self.assertIn("helion_red::simd_sum", msl)
+        self.assertNotIn("threadgroup float _red_scratch", msl)
+        self.assertNotIn("simdgroup_index_in_threadgroup", msl)
+
+    def test_codegen_sub_simdgroup_span_uses_segmented_butterfly(self) -> None:
+        x = torch.randn(64, 8, device=DEVICE)
+        msl = _get_msl(row_sum, (x,))
+        self.assertIn("helion_red::seg_sum", msl)
+        self.assertNotIn("threadgroup float _red_scratch", msl)
+        self.assertNotIn("simdgroup_index_in_threadgroup", msl)
+
+    def test_codegen_two_reductions_get_distinct_scratch(self) -> None:
+        x = torch.randn(32, 256, device=DEVICE)
+        weight = torch.randn(256, device=DEVICE)
+        bias = torch.randn(256, device=DEVICE)
+        msl = _get_msl(layer_norm_fwd, (x, weight, bias))
+        self.assertIn("threadgroup float _red_scratch[", msl)
+        self.assertIn("threadgroup float _red_scratch_1[", msl)
+
+    def test_codegen_elementwise_kernel_has_no_reduction_preamble(self) -> None:
+        x = torch.randn(1024, device=DEVICE)
+        msl = _get_msl(copy_kernel, (x,))
+        self.assertNotIn("reduction_utils.h", msl)
+        self.assertNotIn("helion_red", msl)
+        self.assertNotIn("simdgroup_index_in_threadgroup", msl)
+
+    def test_reduction_owns_thread_axis_zero(self) -> None:
+        """The whole shared tier rests on this invariant.
+
+        ``helion_red::tg_*`` passes ``tid[0]`` as the thread's index *within*
+        its reduction group and sizes the scratch slice as ``span / 32`` SIMD
+        groups.  Both are only sound if thread-block dim 0 is exactly the
+        reduction span -- i.e. the reduction owns axis 0 and no tile axis
+        shares it.
+        """
+        import re
+
+        for block, n in itertools.product([1, 2, 8, 16, 64, 256], [64, 256, 1024]):
+            with self.subTest(block=block, n=n):
+                kernel = helion.kernel(
+                    row_sum.fn,
+                    backend="metal",
+                    configs=[helion.Config(block_sizes=[block])],
+                )
+                msl = _get_msl(kernel, (torch.randn(256, n, device=DEVICE),))
+                dims = re.search(
+                    r"required_threads_per_threadgroup\((\d+), (\d+), (\d+)\)", msl
+                )
+                call = re.search(
+                    r"helion_red::tg_\w+\([^,]+, [^,]+, tid\[(\d)\], (\d+)\)", msl
+                )
+                self.assertIsNotNone(dims)
+                self.assertIsNotNone(call, "expected the threadgroup reduction tier")
+                assert dims is not None and call is not None
+                self.assertEqual(call.group(1), "0", "reduction must own thread axis 0")
+                self.assertEqual(
+                    int(dims.group(1)),
+                    int(call.group(2)),
+                    "thread-block dim 0 must equal the reduction span",
+                )
+
+    def test_narrow_integer_and_bool_sums(self) -> None:
+        """Sub-32-bit ints and bool must reduce in a promoted accumulator.
+
+        ``c10::metal::threadgroup_sum`` takes ``threadgroup opmath_t<T>*``, and
+        c10 promotes char/short/uchar to int; passing the storage type made the
+        shader fail to compile above the SIMD width.
+        """
+        for dtype in (torch.int8, torch.int16, torch.uint8, torch.bool):
+            for n in (16, 32, 64, 256, 4096):  # 4096 exercises the rolled path
+                with self.subTest(dtype=dtype, n=n):
+                    if dtype is torch.bool:
+                        x = torch.randint(0, 2, (4, n), device=DEVICE).bool()
+                    elif dtype is torch.uint8:
+                        x = torch.randint(0, 4, (4, n), dtype=dtype, device=DEVICE)
+                    else:
+                        x = torch.randint(-3, 3, (4, n), dtype=dtype, device=DEVICE)
+                    result = row_sum(x)
+                    torch.testing.assert_close(result, x.sum(-1).to(result.dtype))
+
+    def test_narrow_integer_amax(self) -> None:
+        for dtype in (torch.int8, torch.int16, torch.uint8):
+            for n in (32, 256):
+                with self.subTest(dtype=dtype, n=n):
+                    x = torch.randint(0, 100, (4, n), dtype=dtype, device=DEVICE)
+                    torch.testing.assert_close(row_amax(x), x.amax(-1))
+
+    # -- shapes the aliasing and budget guards must not reject ---------------
+
+    def test_reduction_under_dynamic_shapes(self) -> None:
+        """Every reduction kernel has a full slice, so the guard sees a SymInt.
+
+        ``_reject_aliased_slice_dims`` used to key a dict on ``tensor.size(dim)``,
+        which is unhashable under dynamic shapes -- so any Metal kernel with a
+        ``:`` failed to compile at all.
+        """
+
+        @helion.kernel(backend="metal", autotune_effort="none", static_shapes=False)
+        def dyn_row_sum(x: torch.Tensor) -> torch.Tensor:
+            m, _ = x.size()
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m] = x[tile_m, :].sum(-1)
+            return out
+
+        for shape in ((64, 128), (48, 96)):
+            with self.subTest(shape=shape):
+                x = torch.randn(*shape, device=DEVICE)
+                torch.testing.assert_close(
+                    dyn_row_sum(x), x.sum(-1), rtol=3e-3, atol=3e-3
+                )
+
+    def test_repeated_size_one_slices_are_allowed(self) -> None:
+        """Length-1 full slices are indexed by a constant, so they cannot alias.
+
+        They never reach ``allocate_reduction_dimension`` and claim no thread
+        axis, but the equal-length check counted them anyway and rejected a
+        kernel that compiles correctly.
+        """
+
+        @helion.kernel(backend="metal", configs=[helion.Config(block_sizes=[16])])
+        def scale(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m, :, :] = x[tile_m, :, :] * 2.0
+            return out
+
+        x = torch.randn(64, 1, 1, device=DEVICE)
+        torch.testing.assert_close(scale(x), x * 2.0)
+
+    def test_explicit_block_size_with_a_reduction_reports_a_backend_error(self) -> None:
+        """A tile axis with no ``num_threads`` knob must not crash the budget pass.
+
+        ``hl.tile(n, block_size=<int>)`` allocates no ``NumThreadsSpec``, so the
+        reduction thread budget has nowhere to write a cap.  It used to index
+        the spec map anyway and raise a bare ``KeyError`` out of compilation;
+        16 rows x a 128-wide reduction genuinely exceeds a threadgroup, so the
+        right outcome is a Helion diagnostic naming the way out.
+        """
+
+        @helion.kernel(backend="metal", autotune_effort="none")
+        def fixed_tile_row_sum(x: torch.Tensor) -> torch.Tensor:
+            m, _ = x.size()
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(x.size(0), block_size=16):
+                out[tile_m] = x[tile_m, :].sum(-1)
+            return out
+
+        x = torch.randn(64, 128, device=DEVICE)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "reduction_loops"):
+            fixed_tile_row_sum(x)
+
+    # -- unsupported --------------------------------------------------------
+
+    def test_two_equal_size_reduction_dims_are_rejected(self) -> None:
+        """Equal-size reduction dims share a block id, hence a thread index.
+
+        ``allocate_reduction_dimension`` caches by size, so both trailing axes
+        of an ``[m, n, n]`` tensor get one index variable.  A tile-level backend
+        keeps them apart by broadcasting; Metal would collapse them onto one
+        thread and reduce the diagonal, so the kernel must be rejected.
+        """
+
+        @helion.kernel(backend="metal", configs=[helion.Config(block_sizes=[1])])
+        def two_reduce_dims(x: torch.Tensor) -> torch.Tensor:
+            m, _, _ = x.shape
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m] = x[tile_m, :, :].sum(-1).sum(-1)
+            return out
+
+        with self.assertRaisesRegex(exc.BackendUnsupported, "full slice of length 8"):
+            two_reduce_dims(torch.randn(3, 8, 8, device=DEVICE))
+
+    def test_equal_size_slices_without_a_reduction_are_rejected(self) -> None:
+        """Equal-length full slices alias even with no reduction op present.
+
+        ``out[tile, :, :] = a[tile, :, None] * b[None, None, :]`` has two
+        reduction *dimensions* but no reduction, so the check has to live at
+        the access rather than at the reduction lowering.
+        """
+
+        @helion.kernel(backend="metal", configs=[helion.Config(block_sizes=[1])])
+        def outer_product(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            m, n = a.shape
+            (n2,) = b.shape
+            out = torch.empty([m, n, n2], dtype=a.dtype, device=a.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :, :] = a[tile_m, :, None] * b[None, None, :]
+            return out
+
+        a = torch.randn(3, 8, device=DEVICE)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "full slice of length 8"):
+            outer_product(a, torch.randn(8, device=DEVICE))
+        with self.assertRaisesRegex(exc.BackendUnsupported, "2 reduction dimensions"):
+            outer_product(a, torch.randn(16, device=DEVICE))
+
+    def test_broadcast_aliased_reduction_is_rejected(self) -> None:
+        """Aliasing built by broadcasting two separately-loaded values.
+
+        No single access carries two equal full slices, and both axes are the
+        *same* rdim so the dimension count stays at 1 -- neither access-level
+        guard can see this.  Only the reduction-level check, which inspects the
+        shape of the value being reduced, catches it.  Left unguarded these
+        computed ``dot(a[m], b)`` and broadcast it across the whole output row.
+        """
+
+        @helion.kernel(backend="metal", configs=[helion.Config(block_sizes=[1])])
+        def bcast_two_loads(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            m, n = a.shape
+            out = torch.empty([m, n], dtype=a.dtype, device=a.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = (a[tile_m, :, None] * b[None, None, :]).sum(-1)
+            return out
+
+        @helion.kernel(backend="metal", configs=[helion.Config(block_sizes=[1])])
+        def self_outer(x: torch.Tensor) -> torch.Tensor:
+            m, _ = x.shape
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                row = x[tile_m, :]
+                out[tile_m] = (row[:, :, None] * row[:, None, :]).sum(-1).sum(-1)
+            return out
+
+        with self.assertRaisesRegex(exc.BackendUnsupported, "share one"):
+            bcast_two_loads(
+                torch.randn(3, 8, device=DEVICE), torch.randn(8, device=DEVICE)
+            )
+        with self.assertRaisesRegex(exc.BackendUnsupported, "share one"):
+            self_outer(torch.randn(5, 8, device=DEVICE))
+
+    def test_two_unequal_reduction_dims_are_rejected(self) -> None:
+        """Distinct sizes give distinct block ids, i.e. two reduction axes."""
+
+        @helion.kernel(backend="metal", configs=[helion.Config(block_sizes=[1])])
+        def two_reduce_dims(x: torch.Tensor) -> torch.Tensor:
+            m, _, _ = x.shape
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m] = x[tile_m, :, :].sum(-1).sum(-1)
+            return out
+
+        with self.assertRaisesRegex(exc.BackendUnsupported, "2 reduction dimensions"):
+            two_reduce_dims(torch.randn(3, 8, 16, device=DEVICE))
+
+    def test_strided_reduce_group_is_rejected(self) -> None:
+        """Reducing a thread axis above a sibling axis would mix rows."""
+
+        @helion.kernel(backend="metal", autotune_effort="none", static_shapes=True)
+        def inner_dim_sum(w: torch.Tensor) -> torch.Tensor:
+            o, d = w.shape
+            d = hl.specialize(d)
+            out = torch.empty([o], dtype=torch.float32, device=w.device)
+            d_block = hl.register_block_size(
+                helion.next_power_of_2(d), helion.next_power_of_2(d)
+            )
+            for tile_o, tile_d in hl.tile([o, d], block_size=[None, d_block]):
+                out[tile_o] = torch.sum(w[tile_o, tile_d].to(torch.float32), dim=-1)
+            return out
+
+        w = torch.randn(512, 128, device=DEVICE)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "strided by"):
+            inner_dim_sum(w)
+
+    def test_device_loop_lane_reduction_is_rejected(self) -> None:
+        """A reduction carried by a device-loop lane must not under-reduce."""
+
+        @helion.kernel(
+            backend="metal",
+            configs=[helion.Config(block_sizes=[1, 2048], num_threads=[1, 1024])],
+        )
+        def inner_tile_sum(x: torch.Tensor) -> torch.Tensor:
+            m, k = x.shape
+            out = torch.empty([m], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                for tile_k in hl.tile(k):
+                    out[tile_m] = x[tile_m, tile_k].to(torch.float32).sum(dim=1)
+            return out
+
+        x = torch.randn(1, 2048, device=DEVICE)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "lane-loop reductions"):
+            inner_tile_sum(x)
+
+    def test_a_starved_reduction_loop_raises_instead_of_truncating(self) -> None:
+        """The thread-budget passes keep the span wide enough; assert it anyway.
+
+        A reduction loop whose span is narrower than its chunk reduces only
+        part of each chunk and returns a plausible wrong answer.  The budget
+        passes make that unreachable, so this forces the condition directly --
+        the point is that the invariant is checked rather than trusted, since
+        it silently broke once already.
+        """
+        from helion._compiler.metal.backend import MetalBackend
+
+        @helion.kernel(
+            backend="metal",
+            configs=[helion.Config(block_sizes=[8], reduction_loops=[64])],
+        )
+        def row_sum(x: torch.Tensor) -> torch.Tensor:
+            m, _ = x.size()
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tm in hl.tile(m):
+                out[tm] = x[tm, :].sum(-1)
+            return out
+
+        x = torch.randn(64, 256, device=DEVICE)
+        torch.testing.assert_close(row_sum(x), x.sum(-1), rtol=3e-3, atol=3e-3)
+
+        # Starve the reduction: hand it half the threads its chunk needs.
+        with (
+            patch.object(
+                MetalBackend,
+                "adjust_reduction_thread_count",
+                lambda self, requested, existing: min(requested, 32),
+            ),
+            self.assertRaisesRegex(exc.BackendUnsupported, "reduction loop"),
+        ):
+            helion.kernel(
+                row_sum.fn,
+                backend="metal",
+                configs=[helion.Config(block_sizes=[8], reduction_loops=[64])],
+            )(x)
+
+    def test_block_reduction_over_a_user_tile(self) -> None:
+        """Reducing a user tile exercises resolve_group's second loop.
+
+        With a single tile axis on ``tid[0]``, each block is contiguous, so
+        the per-tile sum reduces through the ``seg_`` tier and broadcasts
+        back over the tile.
+        """
+        for block in (8, 32):
+            with self.subTest(block=block):
+
+                @helion.kernel(
+                    backend="metal",
+                    configs=[helion.Config(block_sizes=[block])],
+                )
+                def block_broadcast_sum(x: torch.Tensor) -> torch.Tensor:
+                    n = x.shape[0]
+                    out = torch.empty([n], dtype=x.dtype, device=x.device)
+                    for tile_n in hl.tile(n):
+                        out[tile_n] = x[tile_n].sum()
+                    return out
+
+                x = torch.randn(64, device=DEVICE)
+                self._check(
+                    block_broadcast_sum,
+                    (x,),
+                    x.unflatten(-1, (-1, block)).sum(-1).repeat_interleave(block),
+                    rtol=1e-3,
+                    atol=1e-3,
+                )
+
+    def test_prod_across_tiers(self) -> None:
+        """Well-conditioned values: a wide prod would overflow in fp32."""
+        for n in (32, 256, 4096):
+            with self.subTest(n=n):
+                x = 1 + 0.01 * torch.randn(16, n, device=DEVICE)
+                self._check(row_prod, (x,), x.prod(-1), rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":
