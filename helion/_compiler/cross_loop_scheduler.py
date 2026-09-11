@@ -11362,11 +11362,47 @@ def _event_frontier_list_schedule(
         # cross-root placement refinement, not that ownership decision.
         return worker_schedule
     prepared_schedule = worker_schedule
-    scheduled_roots = tuple(
+    expected_scheduled_roots = frozenset(
         root
         for root in range(len(readiness_graph.root_domains))
         if root not in excluded_roots
     )
+    segment_position: dict[int, int] = {}
+    for index, segment in enumerate(prepared_schedule.segments):
+        if segment.root in expected_scheduled_roots:
+            segment_position.setdefault(segment.root, index)
+    canonical_entries: list[tuple[int, int, int]] = []
+    for root in expected_scheduled_roots:
+        root_intervals: list[tuple[int, int]] = []
+        for segment in prepared_schedule.segments_for_root(root):
+            interval = segment.resident_slot_interval
+            if interval is None:
+                return None
+            begin, end = (sympy.sympify(value) for value in interval)
+            if (
+                begin.free_symbols
+                or end.free_symbols
+                or begin.is_integer is not True
+                or end.is_integer is not True
+            ):
+                return None
+            root_intervals.append((int(begin), int(end)))
+        root_intervals.sort()
+        if not root_intervals or root not in segment_position:
+            return None
+        root_begin = root_intervals[0][0]
+        root_end = root_begin
+        for begin, end in root_intervals:
+            if begin != root_end:
+                return None
+            root_end = end
+        if root_end - root_begin != readiness_graph.root_domains[root].size:
+            return None
+        canonical_entries.append((root_begin, segment_position[root], root))
+    scheduled_roots = tuple(
+        root for _slot, _segment_index, root in sorted(canonical_entries)
+    )
+    canonical_rank = {root: rank for rank, root in enumerate(scheduled_roots)}
     root_orders: dict[int, CoordinateRelation] = {}
     for root in scheduled_roots:
         traversal = _root_schedule_traversal(
@@ -11605,6 +11641,20 @@ def _event_frontier_list_schedule(
     )
     if criticality is None:
         return None
+    successors = {root: set() for root in scheduled_roots}
+    for producer_root, consumer_root in schema_edges:
+        successors[producer_root].add(consumer_root)
+    descendants: dict[int, frozenset[int]] = {}
+    for root in scheduled_roots:
+        pending = list(successors[root])
+        reachable: set[int] = set()
+        while pending:
+            descendant = pending.pop()
+            if descendant in reachable:
+                continue
+            reachable.add(descendant)
+            pending.extend(successors[descendant])
+        descendants[root] = frozenset(reachable)
 
     cursors = dict.fromkeys(scheduled_roots, 0)
     root_ends = {root: root_orders[root].source_domain.size for root in scheduled_roots}
@@ -11780,25 +11830,21 @@ def _event_frontier_list_schedule(
                 action_size = action_end - cursor
                 commit_end: int | None = None
                 if action_size > remaining_workers:
-                    blocking_roots: set[int] = set()
-                    for producer_root, frontier in incoming_frontiers[root]:
-                        required = _scalar_relation_maximum_on_interval(
-                            frontier,
-                            cursor,
-                            action_end,
-                        )
-                        if required is None:
-                            return None
-                        if required[0]:
-                            blocking_roots.add(producer_root)
+                    crossed_roots = (
+                        crossed_root
+                        for crossed_root in scheduled_roots[: canonical_rank[root]]
+                        if cursors[crossed_root] < root_ends[crossed_root]
+                    )
                     if any(
-                        cursors[producer_root] < root_ends[producer_root]
-                        for producer_root in blocking_roots
+                        root in descendants[crossed_root]
+                        or crossed_root in descendants[root]
+                        for crossed_root in crossed_roots
                     ):
-                        # Do not insert a prefix of one readiness-equivalent
-                        # dependent cohort into a terminal hole while an
-                        # ancestor remains assignable. The whole cohort may
-                        # span waves once those blockers are complete.
+                        # A dependent cohort may occupy a proved terminal
+                        # hole, but a cross-wave commit may overtake only
+                        # unfinished roots that are incomparable in the frozen
+                        # root/event quotient.  This includes transitive, not
+                        # merely direct, ancestry.
                         continue
                     commit_end = action_end
                     candidate_end = cursor + remaining_workers
@@ -11884,7 +11930,7 @@ def _event_frontier_list_schedule(
                     0 if closes_effective_event else 1,
                     0 if continues_active else 1,
                     external_release,
-                    root,
+                    canonical_rank[root],
                     cursor,
                 )
                 candidates.append(

@@ -378,7 +378,11 @@ sections are not active work.
   only that contracted static producer arm to whole-root completion. Retain
   the exact counter for final progress and codegen; do not disable exact
   scheduling for unrelated arms or introduce a canonical-only root path.
-- [ ] Finish independent-root backfill and exact canonical ties.
+- [x] Finish independent-root backfill and exact canonical ties. Derive the
+  canonical root order from each root's exact resident interval in prepared
+  `C`, never from root numbering. A multi-wave noncanonical commit may cross
+  unfinished roots only when the frozen root/event quotient proves them
+  incomparable; complete terminal-hole actions remain eligible.
 - [x] Wire `cross_loop_pipeline_depth` through the public config fragment,
   autotuner, plan builder, and lowering. Offer `{1,2,3,4}` without topology-
   dependent pruning; duplicate schedules are acceptable.
@@ -393,6 +397,15 @@ sections are not active work.
   occupied-wave non-regression check, and validate exact coverage, chronology,
   resident progress, and publication ownership once from the final
   `WorkerSchedule`.
+
+Current fixed-capacity guards after the canonical-tie/transitive-
+non-displacement change: canonical ragged FlashMLA B4 remains faster than its
+matched standalone boundary (63.39 vs 67.46 us); Gemma4 A4B B1 depth two
+genuinely changes the schedule and improves 53.18 to 51.17 us, also beating
+standalone at 55.38 us. Gemma B2 aliases depth one, while ragged Qwen B2 depth
+two is valid but about 4 us slower than depth one. These are the intended
+autotuning semantics: depth changes eligibility, and the compiler does not add
+a model-shaped profitability veto.
 
 ### Phase S3: post-placement synchronization validation and cleanup
 

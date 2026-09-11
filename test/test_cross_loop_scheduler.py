@@ -1102,6 +1102,106 @@ def _whole_consumer_join_readiness_event(
     )
 
 
+def _transient_source_inlet_problem(
+    source_count: int,
+) -> tuple[ReadinessGraph, tuple[ReadinessCounterPlan, ...]]:
+    """Build two source-ticket inlets followed by symmetric sinks."""
+    if source_count < 3:
+        raise ValueError("source count must leave a nonempty late inlet")
+    source, early, late, early_sink, late_sink = _identify_root_domains(
+        (
+            _domain((10, source_count, 1)),
+            _domain((20, 1, 1)),
+            _domain((30, 2, 1)),
+            _domain((40, 1, 1)),
+            _domain((50, 1, 1)),
+        )
+    )
+    source_key_domain = _domain((0, 2), kind="event", identity=0)
+    source_event = ReadinessEvent(
+        producers=(
+            ReadinessProducer(
+                producer_root=0,
+                producers_by_key=CoordinateRelation(
+                    source_key_domain,
+                    source,
+                    (
+                        _CoordinateRelationPiece(
+                            ((0, 0, 1, 1),),
+                            ((10, sympy.Integer(0), sympy.Integer(2), 1),),
+                        ),
+                        _CoordinateRelationPiece(
+                            ((0, 1, 2, 1),),
+                            ((10, sympy.Integer(2), sympy.Integer(source_count), 1),),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        consumers=(
+            ReadinessConsumer(
+                consumer_root=1,
+                keys_by_consumer=_full_point_map(
+                    early,
+                    source_key_domain,
+                    sympy.Integer(0),
+                ),
+            ),
+            ReadinessConsumer(
+                consumer_root=2,
+                keys_by_consumer=_full_point_map(
+                    late,
+                    source_key_domain,
+                    sympy.Integer(1),
+                ),
+            ),
+        ),
+    )
+
+    def sink_event(
+        producer_root: int,
+        producer_domain: CoordinateDomain,
+        consumer_root: int,
+        consumer_domain: CoordinateDomain,
+        identity: int,
+    ) -> ReadinessEvent:
+        key_domain = _domain((0, 1), kind="event", identity=identity)
+        return ReadinessEvent(
+            producers=(
+                ReadinessProducer(
+                    producer_root=producer_root,
+                    producers_by_key=CoordinateRelation.total(
+                        key_domain,
+                        producer_domain,
+                    ),
+                ),
+            ),
+            consumers=(
+                ReadinessConsumer(
+                    consumer_root=consumer_root,
+                    keys_by_consumer=_full_point_map(
+                        consumer_domain,
+                        key_domain,
+                        sympy.Integer(0),
+                    ),
+                ),
+            ),
+        )
+
+    events = (
+        source_event,
+        sink_event(1, early, 3, early_sink, 1),
+        sink_event(2, late, 4, late_sink, 2),
+    )
+    graph = _readiness_graph(
+        (source, early, late, early_sink, late_sink),
+        *events,
+    )
+    return graph, tuple(
+        ReadinessCounterPlan(event.producers, event.consumers) for event in events
+    )
+
+
 def _partial_release_chain_problem(
     *,
     consumer_cohort_width: int,
@@ -1859,98 +1959,7 @@ class TestCrossLoopScheduler(TestCase):
             )
 
     def test_transient_source_inlets_precede_downstream_waits(self) -> None:
-        source, early, late, early_sink, late_sink = _identify_root_domains(
-            (
-                _domain((10, 4, 1)),
-                _domain((20, 1, 1)),
-                _domain((30, 2, 1)),
-                _domain((40, 1, 1)),
-                _domain((50, 1, 1)),
-            )
-        )
-        source_key_domain = _domain((0, 2), kind="event", identity=0)
-        source_event = ReadinessEvent(
-            producers=(
-                ReadinessProducer(
-                    producer_root=0,
-                    producers_by_key=CoordinateRelation(
-                        source_key_domain,
-                        source,
-                        (
-                            _CoordinateRelationPiece(
-                                ((0, 0, 1, 1),),
-                                ((10, sympy.Integer(0), sympy.Integer(2), 1),),
-                            ),
-                            _CoordinateRelationPiece(
-                                ((0, 1, 2, 1),),
-                                ((10, sympy.Integer(2), sympy.Integer(4), 1),),
-                            ),
-                        ),
-                    ),
-                ),
-            ),
-            consumers=(
-                ReadinessConsumer(
-                    consumer_root=1,
-                    keys_by_consumer=_full_point_map(
-                        early,
-                        source_key_domain,
-                        sympy.Integer(0),
-                    ),
-                ),
-                ReadinessConsumer(
-                    consumer_root=2,
-                    keys_by_consumer=_full_point_map(
-                        late,
-                        source_key_domain,
-                        sympy.Integer(1),
-                    ),
-                ),
-            ),
-        )
-
-        def sink_event(
-            producer_root: int,
-            producer_domain: CoordinateDomain,
-            consumer_root: int,
-            consumer_domain: CoordinateDomain,
-            identity: int,
-        ) -> ReadinessEvent:
-            key_domain = _domain((0, 1), kind="event", identity=identity)
-            return ReadinessEvent(
-                producers=(
-                    ReadinessProducer(
-                        producer_root=producer_root,
-                        producers_by_key=CoordinateRelation.total(
-                            key_domain,
-                            producer_domain,
-                        ),
-                    ),
-                ),
-                consumers=(
-                    ReadinessConsumer(
-                        consumer_root=consumer_root,
-                        keys_by_consumer=_full_point_map(
-                            consumer_domain,
-                            key_domain,
-                            sympy.Integer(0),
-                        ),
-                    ),
-                ),
-            )
-
-        early_event = sink_event(1, early, 3, early_sink, 1)
-        late_event = sink_event(2, late, 4, late_sink, 2)
-        graph = _readiness_graph(
-            (source, early, late, early_sink, late_sink),
-            source_event,
-            early_event,
-            late_event,
-        )
-        counters = tuple(
-            ReadinessCounterPlan(event.producers, event.consumers)
-            for event in (source_event, early_event, late_event)
-        )
+        graph, counters = _transient_source_inlet_problem(4)
         source_schedule = cross_loop_scheduler._with_transient_source_schedule_segment(
             _baseline_worker_schedule(graph.root_domains, worker_count=2),
             graph.root_task_orders,
@@ -1978,6 +1987,75 @@ class TestCrossLoopScheduler(TestCase):
                 graph.root_task_orders,
             )
         )
+
+    def test_event_frontier_handles_trailing_transient_source_waves(self) -> None:
+        graph, counters = _transient_source_inlet_problem(9)
+        dispatch_offset = 0
+        resident_segments: list[WorkerScheduleSegment] = []
+        # Put the late inlet first in C. The source frontier should prove that
+        # the early inlet is the strict first candidate rather than silently
+        # returning C when launch-stage-zero padding extends the wave domain.
+        for root in (2, 1, 4, 3):
+            resident_segments.append(
+                _segment(
+                    root,
+                    graph.root_task_orders[root],
+                    workers=(0, 2),
+                    dispatch_offset=dispatch_offset,
+                )
+            )
+            dispatch_offset += graph.root_domains[root].size
+        resident_schedule = _schedule(2, *resident_segments)
+        source_schedule = cross_loop_scheduler._with_transient_source_schedule_segment(
+            resident_schedule,
+            graph.root_task_orders,
+            0,
+        )
+        self.assertIsNotNone(source_schedule)
+        assert source_schedule is not None
+        self.assertGreater(
+            source_schedule.worker_step_domain.size,
+            resident_schedule.worker_step_domain.size,
+        )
+        self.assertEqual(task_at(source_schedule, 0, 0), (2, 0))
+
+        with _forbid_schedule_enumeration():
+            scheduled = cross_loop_scheduler._event_frontier_list_schedule(
+                graph,
+                source_schedule,
+                counters,
+                frozenset(),
+                transient_source_root=0,
+                pipeline_depth=2,
+            )
+
+        self.assertIsNotNone(scheduled)
+        assert scheduled is not None
+        self.assertIsNot(scheduled, source_schedule)
+        self.assertEqual(task_at(scheduled, 0, 0), (1, 0))
+        self.assertEqual(
+            scheduled.segments_for_root(0),
+            source_schedule.segments_for_root(0),
+        )
+        with _forbid_schedule_enumeration():
+            self.assertTrue(
+                cross_loop_scheduler._schedule_is_progress_safe(
+                    scheduled,
+                    graph,
+                    counters,
+                    frozenset(),
+                    transient_source_root=0,
+                )
+            )
+            self.assertTrue(
+                _has_valid_transient_source_schedule(
+                    scheduled,
+                    graph,
+                    0,
+                    counters,
+                    frozenset(),
+                )
+            )
 
     def test_transient_source_ticket_proof_is_independent_of_wave_remainder(
         self,
@@ -2598,6 +2676,94 @@ class TestCrossLoopScheduler(TestCase):
         )
         validate_worker_schedule(graph, scheduled)
 
+    def test_global_list_schedule_does_not_spill_past_transitive_ancestor(
+        self,
+    ) -> None:
+        graph, _baseline, _plans = _partial_release_chain_problem(
+            consumer_cohort_width=1,
+            consumer_cohort_count=1,
+        )
+        descendant_domain = _domain((60, 5, 1), identity=5)
+        root_task_orders = (
+            *graph.root_task_orders,
+            pid_task_order(descendant_domain, descendant_domain.axis_order),
+        )
+        root_domains = tuple(
+            task_order.target_domain for task_order in root_task_orders
+        )
+        final_event = _whole_root_readiness_event(
+            root_domains,
+            producer_root=3,
+            consumer_root=5,
+            event_id=3,
+        )
+        graph = ReadinessGraph(
+            root_task_orders=root_task_orders,
+            events=(*graph.events, final_event),
+        )
+        plans = tuple(
+            ReadinessCounterPlan(event.producers, event.consumers)
+            for event in graph.events
+        )
+        dispatch_offset = 0
+        prepared_segments: list[WorkerScheduleSegment] = []
+        for root, root_domain in enumerate(root_domains):
+            prepared_segments.append(
+                _segment(
+                    root,
+                    root_task_orders[root],
+                    workers=(0, 4),
+                    dispatch_offset=dispatch_offset,
+                )
+            )
+            dispatch_offset += root_domain.size
+        prepared = _schedule(
+            4,
+            *prepared_segments,
+        )
+
+        scheduled = cross_loop_scheduler._event_frontier_list_schedule(
+            graph,
+            prepared,
+            plans,
+            frozenset(),
+            pipeline_depth=4,
+        )
+
+        self.assertIsNotNone(scheduled)
+        assert scheduled is not None
+
+        def slot(root: int, task: int) -> int:
+            task_placement = placement(scheduled, root, task)
+            self.assertIsNotNone(task_placement)
+            assert task_placement is not None
+            worker, wave = task_placement
+            return wave * scheduled.worker_count + worker
+
+        terminal_wave = placement(scheduled, 0, 4)[1]
+        self.assertEqual(
+            {placement(scheduled, 2, task)[1] for task in (0, 1)},
+            {terminal_wave},
+        )
+        self.assertEqual(placement(scheduled, 3, 0)[1], terminal_wave)
+
+        # Root 3 completes and releases root 5 in the terminal wave, but the
+        # five-task action cannot fit that wave. Unlike the independent root
+        # backfill exercised above, root 5 is transitively downstream of the
+        # still-unfinished roots 1 and 2. It must not become a committed run
+        # across later waves until those crossed ancestors are assigned.
+        transitive_ancestor_slots = [
+            slot(root, task)
+            for root in (1, 2)
+            for task in range(graph.root_domains[root].size)
+        ]
+        descendant_slots = [slot(5, task) for task in range(5)]
+        self.assertGreater(
+            min(descendant_slots),
+            max(transitive_ancestor_slots),
+        )
+        validate_worker_schedule(graph, scheduled)
+
     def test_global_list_schedule_does_not_treat_order_pieces_as_cohorts(
         self,
     ) -> None:
@@ -2863,6 +3029,82 @@ class TestCrossLoopScheduler(TestCase):
         # A0 releases only the slack side branch C.  That must not outrank B0,
         # whose class matches A's but whose canonical root order comes first.
         self.assertEqual(task_at(scheduled, 0, 0), (0, 0))
+        validate_worker_schedule(graph, scheduled)
+
+    def test_global_list_schedule_exact_tie_preserves_prepared_root_order(
+        self,
+    ) -> None:
+        root_domains = _identify_root_domains(
+            tuple(_domain((10 + 10 * root, 1, 1)) for root in range(4))
+        )
+        graph = _readiness_graph(
+            root_domains,
+            _whole_root_readiness_event(root_domains, 0, 2, 0),
+            _whole_root_readiness_event(root_domains, 1, 3, 1),
+        )
+        plans = tuple(
+            ReadinessCounterPlan(event.producers, event.consumers)
+            for event in graph.events
+        )
+        prepared_root_order = (1, 0, 3, 2)
+        prepared = _schedule(
+            1,
+            *(
+                _segment(
+                    root,
+                    graph.root_task_orders[root],
+                    workers=(0, 1),
+                    dispatch_offset=worker_step,
+                )
+                for worker_step, root in enumerate(prepared_root_order)
+            ),
+        )
+        criticality = cross_loop_scheduler._root_schema_criticality(
+            len(root_domains),
+            frozenset(((0, 2), (1, 3))),
+        )
+        self.assertIsNotNone(criticality)
+        assert criticality is not None
+        self.assertEqual(criticality[0], criticality[1])
+        self.assertEqual(criticality[2], criticality[3])
+        self.assertTrue(
+            cross_loop_scheduler._schedule_is_progress_safe(
+                prepared,
+                graph,
+                plans,
+                frozenset(),
+            )
+        )
+        self.assertIs(
+            _global_unit_list_schedule(
+                graph,
+                prepared,
+                plans,
+                frozenset(),
+                pipeline_depth=1,
+            ),
+            prepared,
+        )
+
+        scheduled = cross_loop_scheduler._event_frontier_list_schedule(
+            graph,
+            prepared,
+            plans,
+            frozenset(),
+            pipeline_depth=2,
+        )
+
+        self.assertIsNotNone(scheduled)
+        assert scheduled is not None
+        # Both first actions have identical static priority and symmetrically
+        # release one child. The prepared packed order, not numeric root ID,
+        # is therefore the final deterministic tie-breaker. Once root 1 wins
+        # that tie, its newly released child strictly outranks root 0.
+        self.assertEqual(task_at(scheduled, 0, 0), (1, 0))
+        self.assertEqual(
+            [task_at(scheduled, 0, worker_step)[0] for worker_step in range(4)],
+            [1, 3, 0, 2],
+        )
         validate_worker_schedule(graph, scheduled)
 
     def test_global_list_schedule_prioritizes_a_released_consumer(self) -> None:
