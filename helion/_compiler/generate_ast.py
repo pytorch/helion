@@ -1366,6 +1366,13 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 return expr_from_string(origin.host_str())
         return node
 
+    def visit_SetComp(self, node: ast.SetComp) -> ast.AST:
+        visited = self.generic_visit(node)
+        assert isinstance(visited, ast.SetComp)
+        gen_exp = ast.GeneratorExp(elt=visited.elt, generators=visited.generators)
+        ast.copy_location(gen_exp, node)
+        return expr_from_string("tuple(dict.fromkeys({genexp}))", genexp=gen_exp)
+
     def visit_Call(self, node: ast.Call) -> ast.AST:
         from .type_info import CallableType
         from .type_info import SequenceType
