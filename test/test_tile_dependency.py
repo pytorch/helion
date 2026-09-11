@@ -7634,6 +7634,50 @@ class TestTileDependency(TestCase):
                 self.assertEqual(concrete.source_support_cardinality(), expected_count)
                 self.assertTrue(concrete.is_bijection_from_source_support())
 
+    def test_singleton_set_converse_preserves_exact_symbolic_support(self) -> None:
+        count = sympy.Symbol("count", integer=True, positive=True)
+        marker = CoordinateDomain((), (), kind="value")
+        order = CoordinateDomain(
+            (10,),
+            ((10, 2 * count + 2),),
+            kind="task_order",
+        )
+        selected = CoordinateRelation(
+            marker,
+            order,
+            (
+                _CoordinateRelationPiece(
+                    (),
+                    ((10, 2 * count, 2 * count + 2, 1),),
+                ),
+            ),
+        )
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("symbolic support proof must not enumerate"),
+        ):
+            membership = selected.converse()
+            self.assertIsNotNone(membership)
+            assert membership is not None
+            self.assertEqual(membership.source_support_cardinality(), 2)
+            self.assertEqual(
+                _dense_linear_source_support_interval(membership, (10,)),
+                (2 * count, 2 * count + 2),
+            )
+
+        clipped = CoordinateRelation(
+            marker,
+            CoordinateDomain(
+                (10,),
+                ((10, count),),
+                kind="task_order",
+            ),
+            (_CoordinateRelationPiece((), ((10, -1, count, 2),)),),
+        )
+        self.assertIsNone(clipped.converse())
+
     def test_partial_bijection_dense_interval_and_ordinalization_are_exact(
         self,
     ) -> None:

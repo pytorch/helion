@@ -9548,6 +9548,182 @@ def _singleton_relation_domain() -> CoordinateDomain:
     return CoordinateDomain((), (), kind="value")
 
 
+def _current_cohort_at_cursor(
+    selected_task_order: CoordinateRelation,
+    semantic_task_order: CoordinateRelation,
+    cohort_by_semantic_order: CoordinateRelation,
+    cursor: int | sympy.Expr,
+) -> tuple[CoordinateRelation, CoordinateRelation, sympy.Expr] | None:
+    """Return the exact complete cohort beginning at a selected-order cursor.
+
+    The first returned relation maps one anonymous point to the cohort
+    coordinate, the second maps that point to the cohort's logical tasks, and
+    the final expression is their exact cardinality.  ``cursor`` belongs to
+    ``selected_task_order``; ``cohort_by_semantic_order`` belongs to the
+    authoritative configured traversal.  Going through logical tasks rebases
+    those coordinate systems without treating either one's source coordinates
+    as the other's.
+
+    A cohort is accepted only when all of its tasks are exactly the contiguous
+    selected-order interval beginning at ``cursor``.  This proves both that
+    the cursor lies on a cohort boundary and that committing the returned
+    count neither repeats nor skips a task.  The construction is relational
+    and bounded by the ordinary relation-operation limits; runtime task or key
+    extents are never enumerated.
+    """
+    cursor = sympy.simplify(sympy.sympify(cursor))
+    task_count = sympy.simplify(selected_task_order.source_domain.size_expr)
+    allowed_parameters = (
+        selected_task_order.parameter_symbols
+        | semantic_task_order.parameter_symbols
+        | cohort_by_semantic_order.parameter_symbols
+    )
+    semantic_inverse = semantic_task_order.converse()
+    if (
+        selected_task_order.target_domain != semantic_task_order.target_domain
+        or cohort_by_semantic_order.source_domain != semantic_task_order.source_domain
+        or not _equal_integer_expressions(
+            task_count,
+            semantic_task_order.source_domain.size_expr,
+        )
+        or cursor.is_integer is not True
+        or not cursor.free_symbols <= allowed_parameters
+        or not tile_dependency._is_provably_nonnegative(cursor, None)
+        or not tile_dependency._is_provably_nonnegative(
+            sympy.simplify(task_count - cursor - 1),
+            None,
+        )
+        or semantic_inverse is None
+        or not selected_task_order.is_bijection_from_source_support()
+        or not semantic_task_order.is_bijection_from_source_support()
+        or not cohort_by_semantic_order.is_total_function()
+        or not tile_dependency._relation_product_is_within_budget(
+            len(selected_task_order.pieces),
+            len(semantic_inverse.pieces),
+            len(cohort_by_semantic_order.pieces),
+        )
+    ):
+        return None
+
+    selected_to_semantic_order = selected_task_order.then(semantic_inverse)
+    cohort_by_selected_order = (
+        None
+        if selected_to_semantic_order is None
+        else selected_to_semantic_order.then(cohort_by_semantic_order)
+    )
+    if (
+        cohort_by_selected_order is None
+        or not cohort_by_selected_order.is_total_function()
+    ):
+        return None
+
+    marker_domain = _singleton_relation_domain()
+    selected_order_coordinates: list[sympy.Expr] = []
+    remaining_ordinal = cursor
+    selected_order_axes = selected_task_order.source_domain.axis_order
+    selected_order_counts = selected_task_order.source_domain.axis_count_expressions
+    for index, axis in enumerate(selected_order_axes):
+        axis_count = sympy.sympify(selected_order_counts[axis])
+        if index == len(selected_order_axes) - 1:
+            selected_order_coordinates.append(remaining_ordinal)
+            continue
+        if tile_dependency._is_provably_nonnegative(
+            sympy.simplify(axis_count - remaining_ordinal - 1),
+            None,
+        ):
+            selected_order_coordinates.append(remaining_ordinal)
+            remaining_ordinal = sympy.Integer(0)
+            continue
+        quotient = cast("sympy.Expr", FloorDiv(remaining_ordinal, axis_count))
+        selected_order_coordinates.append(
+            sympy.simplify(remaining_ordinal - quotient * axis_count)
+        )
+        remaining_ordinal = quotient
+    marker_to_selected_order = CoordinateRelation.point_map(
+        marker_domain,
+        selected_task_order.source_domain,
+        (((), tuple(selected_order_coordinates)),),
+    )
+    selected_cohort = marker_to_selected_order.then(cohort_by_selected_order)
+    if (
+        selected_cohort is None
+        or selected_cohort.source_domain != marker_domain
+        or selected_cohort.target_domain != cohort_by_semantic_order.target_domain
+        or not selected_cohort.is_total_function()
+    ):
+        return None
+
+    selected_order_points = cohort_by_selected_order.overlapping_sources(
+        selected_cohort
+    )
+    if (
+        selected_order_points is None
+        or selected_order_points.source_domain != marker_domain
+        or selected_order_points.target_domain != selected_task_order.source_domain
+        or not selected_order_points.has_total_source()
+    ):
+        return None
+    selected_order_membership = selected_order_points.converse()
+    cohort_count = (
+        None
+        if selected_order_membership is None
+        else selected_order_membership.source_support_cardinality()
+    )
+    cohort_interval = (
+        None
+        if selected_order_membership is None
+        else tile_dependency._dense_linear_source_support_interval(
+            selected_order_membership,
+            selected_task_order.source_domain.axis_order,
+        )
+    )
+    if cohort_count is None or cohort_interval is None:
+        return None
+    cohort_count = sympy.simplify(sympy.sympify(cohort_count))
+    cohort_begin, cohort_end = cohort_interval
+    if (
+        cohort_count.is_integer is not True
+        or not tile_dependency._is_provably_nonnegative(cohort_count - 1, None)
+        or not _equal_integer_expressions(cohort_begin, cursor)
+        or not _equal_integer_expressions(cohort_end, cursor + cohort_count)
+    ):
+        return None
+
+    cohort_inverse = cohort_by_semantic_order.converse()
+    if cohort_inverse is None:
+        return None
+    semantic_order_points = selected_cohort.then(cohort_inverse)
+    cohort_tasks = (
+        None
+        if semantic_order_points is None
+        else semantic_order_points.then(semantic_task_order)
+    )
+    if cohort_tasks is None or not cohort_tasks.has_total_source():
+        return None
+    return selected_cohort, cohort_tasks, sympy.simplify(cohort_count)
+
+
+def _cohort_event_keys(
+    selected_cohort: CoordinateRelation,
+    event_keys_by_cohort: CoordinateRelation,
+) -> CoordinateRelation | None:
+    """Map one exact selected cohort to its authoritative event-key set."""
+    if (
+        selected_cohort.source_domain.axis_order
+        or selected_cohort.target_domain != event_keys_by_cohort.source_domain
+        or not selected_cohort.is_total_function()
+        or not tile_dependency._relation_product_is_within_budget(
+            len(selected_cohort.pieces),
+            len(event_keys_by_cohort.pieces),
+        )
+    ):
+        return None
+    result = selected_cohort.then(event_keys_by_cohort)
+    if result is None or not result.has_total_source():
+        return None
+    return result
+
+
 def _first_cohort_event_keys(
     event_keys_by_cohort: CoordinateRelation,
 ) -> CoordinateRelation | None:
@@ -9572,10 +9748,7 @@ def _first_cohort_event_keys(
             ),
         ),
     )
-    result = first_cohort.then(event_keys_by_cohort)
-    if result is None or not result.has_total_source():
-        return None
-    return result
+    return _cohort_event_keys(first_cohort, event_keys_by_cohort)
 
 
 def _first_cohort_tasks(
@@ -9583,31 +9756,16 @@ def _first_cohort_tasks(
     cohort_by_order: CoordinateRelation,
 ) -> CoordinateRelation | None:
     """Return one anonymous point mapped to the first exact task cohort."""
-    order_points_by_cohort = cohort_by_order.converse()
-    if (
-        order_points_by_cohort is None
-        or cohort_by_order.source_domain != task_order.source_domain
-    ):
-        return None
-    marker_domain = _singleton_relation_domain()
-    first_cohort = CoordinateRelation.point_map(
-        marker_domain,
-        cohort_by_order.target_domain,
-        (
-            (
-                (),
-                tuple(
-                    sympy.Integer(0)
-                    for _axis in cohort_by_order.target_domain.axis_order
-                ),
-            ),
-        ),
+    selected_task_order = (
+        _cohort_major_task_order(task_order, cohort_by_order) or task_order
     )
-    order_points = first_cohort.then(order_points_by_cohort)
-    result = None if order_points is None else order_points.then(task_order)
-    if result is None or not result.has_total_source():
-        return None
-    return result
+    current = _current_cohort_at_cursor(
+        selected_task_order,
+        task_order,
+        cohort_by_order,
+        0,
+    )
+    return None if current is None else current[1]
 
 
 def _covered_relation_target_depth(

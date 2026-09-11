@@ -2350,6 +2350,43 @@ class CoordinateRelation:
                 pieces=(),
             )
             return _remember_exact_converse(self, converse)
+        if (
+            not self.source_domain.axis_order
+            and self.has_total_source()
+            and len(self.pieces) <= _MAX_RELATION_PIECES
+            and all(
+                piece.source_bounds_items == ()
+                and _source_bounds_are_symbolically_within_domain(
+                    piece.target_ranges,
+                    self.target_domain,
+                )
+                and all(
+                    (
+                        sympy.sympify(begin).free_symbols
+                        | sympy.sympify(end).free_symbols
+                    )
+                    <= self.parameter_symbols
+                    for _axis, begin, end, _step in piece.target_ranges
+                )
+                for piece in self.pieces
+            )
+        ):
+            # The source is one anonymous point, so swapping each target box
+            # into source support is the exact inverse even when that point
+            # names a set. This is the bounded symbolic fiber used by
+            # scheduling proofs; no target coordinate is enumerated.
+            converse = CoordinateRelation(
+                source_domain=self.target_domain,
+                target_domain=self.source_domain,
+                pieces=tuple(
+                    _CoordinateRelationPiece(
+                        source_bounds_items=piece.target_ranges,
+                        target_ranges=(),
+                    )
+                    for piece in self.pieces
+                ),
+            )
+            return _remember_exact_converse(self, converse)
         if (converse := _coordinate_permutation_converse(self)) is not None:
             return _remember_exact_converse(self, converse)
         if self.is_positional_bijection():
@@ -5890,12 +5927,12 @@ def _dense_linear_source_support_interval(
 ) -> tuple[sympy.Expr, sympy.Expr] | None:
     """Prove that semantic source support is one dense row-major interval.
 
-    A single-valued exact converse and a point-valued forward map give exactly
-    one distinct source point per represented target.  If every represented
-    source point lies in a linear hull with that same support cardinality, the
-    support must fill the hull.  The converse need not cover the relation's
-    complete target domain: sliced task orders intentionally own only a subset
-    of one root.  This handles packed first/middle/tail boxes without
+    An exact converse and a point-valued forward map identify the represented
+    source support without enumeration. If every represented source point lies
+    in a linear hull with that same support cardinality, the support must fill
+    the hull. The converse need not cover the relation's complete target
+    domain: sliced task orders intentionally own only a subset of one root.
+    This handles packed first/middle/tail boxes and anonymous set fibers without
     reconstructing a separate source-ordinal relation.
     """
     if (
@@ -5908,7 +5945,6 @@ def _dense_linear_source_support_interval(
     support_cardinality = relation.source_support_cardinality()
     if (
         converse is None
-        or not converse.is_single_valued()
         or not relation.is_single_valued()
         or not relation.pieces
         or support_cardinality is None
@@ -5935,6 +5971,33 @@ def _dense_linear_source_support_interval(
         )
     hulls: list[tuple[sympy.Expr, sympy.Expr] | None] = []
     for piece in converse.pieces:
+        if not converse.source_domain.axis_order:
+            if (
+                tuple(axis for axis, _begin, _end, _step in piece.target_ranges)
+                != relation.source_domain.axis_order
+                or any(step != 1 for _axis, _begin, _end, step in piece.target_ranges)
+                or not _source_bounds_are_symbolically_within_domain(
+                    piece.target_ranges,
+                    relation.source_domain,
+                )
+            ):
+                return None
+            ordinal = sympy.simplify(
+                sum(
+                    coordinate_axis_symbol(axis) * active_strides[axis]
+                    for axis in active_axes
+                )
+            )
+            hulls.append(
+                _logical_expression_bounds(
+                    ordinal,
+                    domain=relation.source_domain,
+                    source_bounds=piece.target_ranges,
+                    parameter_symbols=relation.parameter_symbols,
+                )
+            )
+            continue
+
         if any(
             step != 1
             or not _integer_partition_expressions_equal(
@@ -12195,6 +12258,7 @@ def _compose_point_relations(
                         target_begin,
                         domain=first.source_domain,
                         source_bounds=first_piece.source_bounds_items,
+                        parameter_symbols=first.parameter_symbols,
                     )
                     if (
                         target_bounds is not None
@@ -12220,6 +12284,7 @@ def _compose_point_relations(
                     first_targets[axis],
                     domain=first.source_domain,
                     source_bounds=first_piece.source_bounds_items,
+                    parameter_symbols=first.parameter_symbols,
                 )
                 if expression_bounds is not None:
                     minimum, maximum = expression_bounds

@@ -2634,6 +2634,120 @@ class TestCrossLoopScheduler(TestCase):
                     (frozenset((0, 2 * concrete_batch + 1)),),
                 )
 
+    def test_current_cohort_rebases_selected_order_at_symbolic_cursor(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        graph = _dynamic_leading_cohort_readiness_graph(batch)
+        semantic = cross_loop_scheduler._semantic_readiness_cohort_relations(graph)
+        self.assertIsNotNone(semantic)
+        assert semantic is not None
+        producer_record = next(record for record in semantic[1] if record[0] == 0)
+        semantic_order = graph.root_task_orders[0]
+        cohort_by_semantic_order = producer_record[2]
+        event_keys_by_cohort = producer_record[3]
+        selected_order = cross_loop_scheduler._cohort_major_task_order(
+            semantic_order,
+            cohort_by_semantic_order,
+        )
+        self.assertIsNotNone(selected_order)
+        assert selected_order is not None
+
+        with _forbid_schedule_enumeration():
+            current = cross_loop_scheduler._current_cohort_at_cursor(
+                selected_order,
+                semantic_order,
+                cohort_by_semantic_order,
+                2 * batch,
+            )
+            self.assertIsNotNone(current)
+            assert current is not None
+            selected_cohort, cohort_tasks, cohort_count = current
+            event_keys = cross_loop_scheduler._cohort_event_keys(
+                selected_cohort,
+                event_keys_by_cohort,
+            )
+            self.assertIsNotNone(event_keys)
+            self.assertEqual(cohort_count, 2)
+            self.assertIsNone(
+                cross_loop_scheduler._current_cohort_at_cursor(
+                    selected_order,
+                    semantic_order,
+                    cohort_by_semantic_order,
+                    2 * batch + 1,
+                )
+            )
+            self.assertIsNone(
+                cross_loop_scheduler._current_cohort_at_cursor(
+                    selected_order,
+                    semantic_order,
+                    cohort_by_semantic_order,
+                    4 * batch + 2,
+                )
+            )
+            unrelated = sympy.Symbol("unrelated", integer=True, nonnegative=True)
+            self.assertIsNone(
+                cross_loop_scheduler._current_cohort_at_cursor(
+                    selected_order,
+                    semantic_order,
+                    cohort_by_semantic_order,
+                    unrelated,
+                )
+            )
+            # The semantic traversal does not place this two-task fiber
+            # contiguously. A cursor action therefore requires the selected
+            # cohort-major traversal rather than silently mixing coordinates.
+            self.assertIsNone(
+                cross_loop_scheduler._current_cohort_at_cursor(
+                    semantic_order,
+                    semantic_order,
+                    cohort_by_semantic_order,
+                    0,
+                )
+            )
+
+        assert event_keys is not None
+        for concrete_batch in (0, 1, 3):
+            with self.subTest(concrete_batch=concrete_batch):
+                substitutions = {batch: concrete_batch}
+                self.assertEqual(
+                    selected_cohort.substitute_parameters(substitutions).materialize(),
+                    (frozenset((concrete_batch,)),),
+                )
+                self.assertEqual(
+                    event_keys.substitute_parameters(substitutions).materialize(),
+                    (frozenset((concrete_batch,)),),
+                )
+                self.assertEqual(
+                    cohort_tasks.substitute_parameters(substitutions).materialize(),
+                    (
+                        frozenset(
+                            (
+                                concrete_batch,
+                                3 * concrete_batch + 1,
+                            )
+                        ),
+                    ),
+                )
+
+        concrete_batch = 3
+        substitutions = {batch: concrete_batch}
+        concrete = cross_loop_scheduler._current_cohort_at_cursor(
+            selected_order.substitute_parameters(substitutions),
+            semantic_order.substitute_parameters(substitutions),
+            cohort_by_semantic_order.substitute_parameters(substitutions),
+            2 * concrete_batch,
+        )
+        self.assertIsNotNone(concrete)
+        assert concrete is not None
+        self.assertEqual(
+            concrete[0].materialize(),
+            selected_cohort.substitute_parameters(substitutions).materialize(),
+        )
+        self.assertEqual(
+            concrete[1].materialize(),
+            cohort_tasks.substitute_parameters(substitutions).materialize(),
+        )
+        self.assertEqual(concrete[2], cohort_count)
+
     def test_event_key_frontier_tracks_active_join_and_union_depth(self) -> None:
         producer_a, producer_b, consumer = _identify_root_domains(
             (
