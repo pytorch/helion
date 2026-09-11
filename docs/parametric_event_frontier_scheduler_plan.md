@@ -1,12 +1,391 @@
-# Unified parametric event-frontier scheduler
+# Unified fixed-capacity event-frontier scheduler
 
 ## Status
 
 This is the end-state plan and implementation ledger for Helion's cross-loop
 scheduler. It incorporates the experiments from FlashMLA, Qwen3 decode, Gemma
-4 A4B MoE, DeepSeek-V3 MoE, Nemotron MoE, and Muse/Glimmer FFN.
+4 A4B MoE, DeepSeek-V3 MoE, Nemotron MoE, and Muse/Glimmer FFN. The filename is
+retained for continuity; parametric schedule cardinality is no longer an
+immediate milestone.
 
-Implementation checkpoint (2026-09-09):
+## Authoritative architecture decision (2026-09-11, reviewed)
+
+The immediate optimized path specializes **schedule capacity**. This is a
+deliberate scope reduction from the dynamic-`B` design below, not a claim that
+serving inputs are static.
+
+The compiled configuration fixes:
+
+- the padded request-capacity bucket `B_capacity`, not the active request
+  count;
+- one uniform query-slot width `Q` (`Q=1` decode or one configured speculative
+  width);
+- worker count, tile geometry, `num_splits`, and every other root/task capacity;
+- each root task identity and configured task order;
+- readiness-key domains, producer fan-ins, publication sites, source-ticket
+  count, and schedule ownership; and
+- every compiler-managed intermediate address dimension used to prove
+  producer/consumer ownership.
+
+The following remain ordinary runtime tensor values:
+
+- `seq_lens[B_capacity]`;
+- fixed-shape KV page/block metadata;
+- the active-request mask;
+- per-request attention loop bounds and useful-work masks; and
+- MoE route IDs, route masks, and immutable expert-weight selection.
+
+Runtime values may select read addresses, bound loops *inside* an already
+scheduled task, or suppress useful arithmetic. They may not change task
+existence, task ownership, readiness keys, waits, publications, continuation
+ownership, participant count, or schedule order. They also may not remap a
+compiler-managed intermediate write through an unproved indirect index. If
+runtime metadata would change any schedule-affecting fact, the source must use
+a fixed-capacity masked representation or a matching specialization. With
+fixed physical slots but an unproved fine producer/consumer mapping, the
+compiler may retain canonical static order and a whole-root barrier. If task
+existence, task identity, ownership, readiness keys, or fan-in itself varies at
+runtime, a barrier is insufficient: `static_pipeline` must use a fixed-capacity
+rewrite or decline.
+
+Runtime KV page/block metadata is directly safe for read-only cache addressing.
+A fused KV-cache update followed by attention through runtime page/slot
+indirection needs an explicit static request-key dependency or a conservative
+root barrier. If the compiler cannot establish even that coarse alias/hazard,
+persistent fusion declines.
+
+Every statically counted slot participates in synchronization even when it is
+inactive or its useful range is empty:
+
+```text
+wait(static prerequisites)
+if runtime_active:
+    execute useful body
+publish(each statically assigned completion exactly once)
+```
+
+Publication is outside early-return and useful-work masking, occurs after all
+possible writes, and remains replay-safe across epochs. If a consumer can be
+active while one producer slot is inactive, that producer writes the exact
+reduction identity or the consumer masks that input. An inactive consumer
+still executes its assigned waits before publishing downstream completion.
+
+This contract matches the uniform CUDA-graph decode fast path: engines already
+select a capacity bucket and pad inactive requests. It does **not** yet cover
+mixed prefill/decode, adaptive per-request `Q`, runtime-created compacted
+worklists, runtime-varying FlashMLA split counts, or route-aware scheduling.
+
+### One compiler pipeline
+
+The end state is:
+
+```text
+TileDependencyGraph
+    -> ReadinessGraph
+    -> optional one-shot all-resident ownership analysis
+    -> freeze continuation ownership
+    -> freeze exact counter/root-barrier prerequisites and nested entry waits
+    -> select and freeze launch-stage source ownership from that view
+    -> exact root-local order/admission setup
+    -> one finite event-frontier placement
+    -> WorkerSchedule
+    -> derive publication participants/sites and epoch layout; validate once
+    -> existing static codegen
+```
+
+`ReadinessGraph` remains the sole dependency truth and `WorkerSchedule` the
+sole emitted placement truth. The scheduler may build bounded transient
+frontier tables from those relations, but it does not construct another
+semantic CTA DAG. Codegen renders the finalized schedule and synchronization;
+it never rediscovers placement or readiness.
+
+The canonical schedule `C` is a deterministic source/root-major fallback for
+the already-frozen ownership plan. Root-local setup may replace one traversal
+with an exact bijective readiness-major traversal inside that root's existing
+slots; it may not move worker/wave ownership or interleave roots. `C` is not
+the output of `place_nested_loop_consumers`, `place_ready_families`, or another
+readiness-driven placement policy. During migration the old local path may
+supply `C` once as explicit technical debt, but the end state removes that
+dependency.
+
+The existing concrete `_event_frontier_list_schedule` is the starting point
+for the sole cross-root placement policy, not something to enable unchanged.
+Its current surrounding pipeline still contains competing placement decisions,
+and its current candidate loop can fragment an unfinished producer at every
+frontier. The unified static scheduler must enforce:
+
+1. depth one returns `C`'s resident placement exactly, preserving any already-
+   frozen continuation or launch-stage source ownership;
+2. depth greater than one moves dependent work only as complete readiness-
+   equivalent cohorts;
+3. dependent work may fill genuine unused lanes in a committed run's terminal
+   wave, but may not postpone the unfinished ancestor that created that hole;
+4. once all blocking ancestors are complete, a selected cohort may span waves
+   and remains atomic until placed;
+5. independent roots may backfill more broadly;
+6. exact readiness, unit-weight criticality, event release/closure, active
+   event continuation, and canonical order provide the one deterministic
+   priority; and
+7. `cross_loop_pipeline_depth` in `{1,2,3,4}` is the only scheduler-specific
+   autotune knob and changes eligibility, never correctness or priority.
+
+Operationally, a fully admissible selected root's remaining canonical suffix
+is one committed run. An incrementally admitted root's next complete
+readiness-equivalent cohort is one committed run. Closing an outgoing event
+never truncates either run. Only the committed run's true terminal partial wave
+creates holes for dependent work. This explicitly replaces the current
+concrete scheduler's producer clipping at every consumer frontier.
+
+The non-displacement and complete-cohort rules are the general protection
+against the harmful Muse-style many-segment schedule. A segment cap and a
+non-regressing unit-wave horizon are retained as guards, but neither substitutes
+for those rules. No latency, register, bandwidth, model-name, or profiled cost
+model enters scheduling.
+
+Root-local readiness ordering is setup for this one scheduler, not a second
+cross-root policy. Nested waits/publications, final-arrival continuation, and a
+launch-stage source remain synchronization/ownership capabilities. Their
+identities are chosen at most once before the final placement invocation (or,
+during migration, by one all-resident analysis followed by one rebuild), then
+frozen. There is no iterative ownership/schedule fixed point and no reselection
+in codegen.
+
+### Nested-loop scope
+
+Nested iterations are not scheduler actions; their owning CTA is atomic. The
+first implementation should coarsen each nested consumer to one exact root-entry
+prerequisite derived from `ReadinessGraph`, emit one entry wait, and preserve
+producer publications at their true nested sites. If exact coarsening or
+lowering fails, retain the ordinary root-barrier fallback.
+
+Qwen's historical 74/22 frontier is diagnostic evidence that nested readiness
+and placement can matter, not an ABI or an acceptance invariant. First measure
+the simpler root-entry form. If it remains numerically correct and the
+persistent kernel beats matched standalone, delete/defer schedule-derived
+nested splitting. Only if that performance gate fails may the common scheduler
+derive a finer static checkpoint; any such frontier must come from the final
+schedule and semantic relations, with no literals or Qwen-specific policy.
+
+### Mandatory functional MoE support
+
+MoE is in the immediate milestone even though route-aware optimization is not.
+The preferred representation has a compile-time `(token_capacity, top_k_slot,
+tile...)` task domain. Runtime `expert_id` selects immutable expert weights;
+the compiler-managed intermediate remains indexed by the static token/route
+slot, so producer/consumer readiness is independent of expert choice.
+Duplicate routes are distinct slots, and inactive slots mask useful work but
+still execute their static waits and publications. The combine stage consumes
+a fixed slot order.
+
+An expert-major source may alternatively use fixed `(expert, capacity_slot)`
+tasks and masks. Runtime histograms/offsets may obscure which fixed producer
+slot feeds which fixed consumer slot; canonical order plus a whole-root barrier
+is sufficient only when task existence, task identity, physical ownership, and
+fan-in remain fixed. If sorting or compaction changes any of those facts, a
+barrier cannot repair ownership and the optimized path declines. Runtime
+expert IDs used only for read-only weight selection do not create a cross-root
+hazard.
+
+This defines the required functional path for the fixed token/route-slot,
+single-device or local-expert forms used by the Gemma4, DeepSeek, and Nemotron
+probes. Runtime expert compaction, expert-aware priority, dynamic EP/all-to-all
+claims, and route-driven load balancing remain deferred.
+
+### FlashMLA fixed-capacity qualification
+
+Production FlashMLA metadata commonly derives per-request split/tile schedules
+from runtime `seq_lens`. That metadata cannot directly determine this finite
+compile-time schedule. FlashMLA enters the milestone through either:
+
+- a fixed split-and-tile-capacity signature selected from metadata already
+  visible on the host, requiring no device-to-host synchronization and guarded
+  so every runtime request remains within its assigned slot capacity; or
+- a fixed maximum split domain whose empty slots execute neutral/masked work
+  and still publish.
+
+All scheduler-facing metadata is fixed by that choice: source tile count and
+order, reduction task count, readiness keys, and reduction fan-in—not merely
+the scalar `num_splits`.
+
+The existing B4 and B9 measurements used length-derived task counts/order and
+therefore remain historical controls, not automatic performance guarantees for
+the fixed-capacity rewrite. Runtime length permutations within one compiled
+capacity must leave the schedule and counters unchanged and must not deadlock.
+
+## Active implementation checklist
+
+This is the only authoritative roadmap. Unchecked tasks in later historical
+sections are not active work.
+
+### Phase S0: preserve evidence and discard superseded WIP
+
+- [ ] Record the current compiler commit, lowered schedules, counter/barrier
+  plans, resource reports, cold-L2 timings, and aligned Gantts for FlashMLA,
+  Qwen, Gemma, Muse, Nemotron, and DeepSeek controls before changing policy.
+- [ ] Discard the interrupted uncommitted symbolic chooser/apply rewrite. Do
+  not stage, rewrite, or remove user-owned benchmark/probe changes.
+- [ ] Remove affine-repetition, translated-state, dynamic-`B` one-cubin, and
+  parameterized-renderer work from the active implementation path. Retain
+  generic relation primitives only when an independent dependency, ownership,
+  counter, or static validation proof consumes them.
+- [ ] Keep the concrete max-plus/list-schedule oracle test-only. Delete no
+  historical measurement or postmortem; relabel it rather than treating it as
+  an acceptance gate.
+
+### Phase S1: make fixed schedule capacity explicit
+
+- [ ] Gate the optimized scheduler on concrete schedule-affecting facts after
+  ordinary specialization: root/task/tile/split extents and orders,
+  readiness-key sizes, fan-ins, source-ticket count, worker geometry, and
+  ownership. With fixed slots but an unproved fine mapping, retain canonical
+  static order and a whole-root barrier. Runtime-varying task/key/fan-in/
+  ownership cardinality requires a matching specialization or fixed-capacity
+  rewrite; otherwise decline `static_pipeline`.
+- [ ] Treat `B_capacity` and uniform `Q` like ordinary specialized Helion
+  dimensions. Compile B1/B2/B4/B9 or the serving capture buckets separately;
+  cross-`B` cubin reuse is future work rather than an exit gate.
+- [ ] Select final-arrival continuation ownership once, then freeze exact
+  counter/root-barrier prerequisites, including the initial root-entry form of
+  nested consumers. Select and freeze launch-stage source ownership from that
+  immutable prerequisite view before final placement. During migration allow
+  at most one all-resident analysis followed by one rebuild.
+- [ ] Construct deterministic canonical schedule `C` for that frozen ownership
+  plan. Root-local order setup may change only an exact bijective traversal
+  within already-owned slots; no legacy local pass may independently move or
+  interleave roots in the end state.
+- [ ] Add a fixed-slot synchronization test harness. Vary runtime sequence
+  lengths, page-table values, active masks, empty/full useful-work ranges, and
+  route IDs while asserting an identical schedule/counter dump, every
+  plan-assigned wait and publication occurrence executes exactly once, and
+  every root-barrier participant publishes exactly once.
+- [ ] Prove active-consumer data is defined under every producer/consumer mask
+  combination through an exact neutral write or matching read mask. Exercise
+  all-inactive input and repeated epoch replay.
+
+### Phase S2: one finite event-frontier placement
+
+- [ ] Refactor the existing concrete path so `_event_frontier_list_schedule`
+  is the sole cross-root placement decision. Fold
+  `_consumer_major_producer_order` into exact root-local setup rather than an
+  independently accepted schedule.
+- [ ] Preserve one immutable executable-prerequisite view derived from
+  `ReadinessGraph` after ownership is frozen. The scheduler consumes that view;
+  final counters/barriers and codegen do not repartition it.
+- [ ] Make depth one return `C` exactly for the frozen ownership plan.
+  At greater depths, implement complete-cohort admission, committed-run
+  atomicity, non-displacement, genuine terminal-hole filling, independent-root
+  backfill, and exact canonical ties.
+- [ ] Wire `cross_loop_pipeline_depth` through the public config fragment,
+  autotuner, plan builder, and lowering. Offer `{1,2,3,4}` without topology-
+  dependent pruning; duplicate schedules are acceptable.
+- [ ] Carry the existing event-aware structural priority into this one finite
+  selector. Priority ablations are later compiler experiments, not production
+  paths or knobs.
+- [ ] Add an explicit compile-work budget in roots, frontier relation pieces,
+  candidate scans, waves, and emitted runs. Static capacity permits a finite
+  walk but does not permit unbounded per-CTA expansion; Muse's former long
+  compile is a required negative control.
+- [ ] Coalesce adjacent same-root runs after selection, keep the structural
+  occupied-wave non-regression check, and validate exact coverage, chronology,
+  resident progress, and publication ownership once from the final
+  `WorkerSchedule`.
+
+### Phase S3: post-placement synchronization validation and cleanup
+
+- [ ] Start with the frozen root-entry coarsening for nested consumers.
+  Preserve true nested producer publications, use the ordinary root-barrier
+  fallback on an unproved coarsening, and benchmark Qwen before retaining any
+  finer nested placement machinery.
+- [ ] Treat Qwen 74/22, its collapsed-frontier ablation, and its relocated
+  placement as diagnostics only. Accept any generic exact schedule that is
+  numerically correct and beats matched standalone; a small regression from
+  the historical best is acceptable.
+- [ ] After placement, derive only schedule-dependent publication
+  participants/sites and epoch layout. Counter keys/fan-ins, root-barrier
+  edges, continuation identity, and source ownership are already frozen and
+  may not be repartitioned.
+- [ ] Validate final counters, root barriers, participants, replay bounds, and
+  complete progress once from `ReadinessGraph` plus the accepted
+  `WorkerSchedule`. An unknown proof rejects the complete optimized proposal;
+  codegen only renders it.
+- [ ] After parity, remove obsolete local placement passes and the
+  constant/parameterized policy split. Keep only synchronization derivation
+  that still has a final-plan consumer.
+
+### Phase S4: mandatory runtime-data probes
+
+- [ ] FlashMLA: create a fixed split-capacity source or guarded specialization.
+  Validate B4 first, then Q1/Q2 and specialized B9. Within each binary, vary
+  ragged lengths within every slot guard, permute page tables, mask requests,
+  and exercise empty split slots. Swap the longest request's position only for
+  a slot-symmetric maximum-capacity binary; otherwise dispatch to the matching
+  guarded binary. Compare persistent against matched standalone and
+  ThunderKittens where the boundary/numerics match.
+- [ ] Qwen3 decode: compile each B/Q capacity separately, retain runtime
+  context lengths/block tables, and require the generalized persistent
+  schedule to beat matched standalone. Do not require historical segment
+  order or 74/22 spelling.
+- [ ] Gemma4 A4B: represent the eight assignment slots per token statically.
+  Vary all-same, skewed/duplicate, all-distinct, and random expert IDs plus
+  active masks. Require route-invariant schedule/counters, numerical parity,
+  replay safety, and no deadlock for functional support. Require better-than-
+  standalone persistent performance only before enabling the optimized
+  placement by default.
+- [ ] DeepSeek-V3 and Nemotron MoE: add or confirm a fixed token/route-slot
+  source before claiming support. Exercise the same route matrix. Use coarse
+  barriers around runtime-compacted/expert-major boundaries, and permit branch
+  packing only where static roots remain proved incomparable. Require the
+  schedule and counter dump to remain invariant across route values, plus
+  numerical parity, replay safety, and no deadlock.
+- [ ] Muse/Glimmer: retain the exact 32/16 tail and no-fragmentation controls;
+  require bounded compilation, numerical parity, and a persistent-vs-
+  standalone comparison at each specialized B.
+- [ ] Keep the full DeepSeek MLA path as a resource/occupancy negative control;
+  scheduling must not hide a register, shared-memory, or body-latency loss.
+
+### Phase S5: performance and cleanup gates
+
+- [ ] For every positive probe, report cold-L2 latency, resources, compile
+  time, exact schedule/counter dump, and standalone-over-persistent Gantt. A
+  generalized schedule may be slightly slower than a historical specialized
+  result, but it must beat matched standalone before becoming the default.
+- [ ] Tune ordinary resource knobs independently: worker count,
+  `num_sm_multiplier`, warps, range stages, register limits, and tile choices.
+  None enters list priority.
+- [ ] Remove the production parametric cohort stack, symbolic cursor/repeat
+  state, and affine-lifting hooks after confirming they have no independent
+  consumer. Audit `_packed_schedule_segment_geometry` and its relation renderer
+  separately: retain their generic concrete packed-schedule use and remove only
+  runtime-bound/schedule-classifying branches. Preserve tested relation support
+  used by dependency or static-schedule correctness.
+- [ ] Finish with an independent architecture audit: one dependency graph, one
+  readiness graph, one cross-root placement policy, one authoritative worker
+  schedule, one synchronization/ownership finalization, and no model/root/
+  shape literals in compiler policy.
+
+### Explicitly deferred
+
+- one cubin or one schedule across changing `B_capacity`/`Q`;
+- affine repetition and runtime-varying schedule cardinality;
+- device/host-generated instruction schedules and CLC work stealing;
+- runtime FlashMLA split generation;
+- runtime expert compaction, histogram-driven task counts, or route-aware
+  priority;
+- mixed prefill/decode and adaptive per-request speculative width; and
+- schedule adaptation or load balancing based on actual `seq_lens` or routes.
+
+These are future optimizations. They may reuse the same `ReadinessGraph`,
+`WorkerSchedule`, and validation contracts, but they are not prerequisites for
+the fixed-capacity milestone.
+
+## Historical implementation record (non-authoritative)
+
+Everything below records experiments, measurements, and already-landed proof
+machinery. It explains how the branch reached the current decision. Its older
+architecture declarations and unchecked boxes do not override the roadmap
+above.
+
+Historical implementation checkpoint (2026-09-09):
 
 - Architecture review is reopened. The current tree has one dependency and
   schedule representation, but it does **not** yet have one scheduling policy:
@@ -90,7 +469,7 @@ Implementation checkpoint (2026-09-09):
   require work. Cyclic dependency scheduling is outside the current milestone;
   those cases retain the conservative fallback.
 
-Architecture decision (2026-09-10):
+Superseded architecture decision (2026-09-10, historical):
 
 - Production scheduling will use one **parametric cohort list scheduler**. It
   is a genuine readiness-driven list scheduler, but its list items are exact
@@ -112,7 +491,7 @@ Architecture decision (2026-09-10):
   host-generated schedules, runtime instruction tensors, and device work
   queues are not prerequisites.
 
-Architecture pivot (2026-09-11, reviewed):
+Superseded dynamic-shape pivot (2026-09-11, historical):
 
 - Scheduling policy and affine compression are now strictly separate. There
   is one deterministic list-policy transition:
@@ -178,13 +557,13 @@ Architecture pivot (2026-09-11, reviewed):
   but must evaluate the authoritative relation and must not classify a
   schedule into a second semantic path.
 
-## Active implementation checklist
+## Superseded dynamic-shape checklist (historical)
 
-This is the authoritative next roadmap. Later historical phase descriptions
-record how the current branch was reached, but an unchecked symbolic max-plus
-task in those records is not active work.
+This checklist records the abandoned dynamic-cardinality direction. Its
+unchecked items are not active work and do not override the fixed-capacity
+roadmap above.
 
-### Next roadmap: parametric cohort list scheduling
+### Former roadmap: parametric cohort list scheduling
 
 - [ ] Freeze the exact current controls for canonical and dynamic FlashMLA,
   both Qwen source forms, both Gemma source forms, Muse B1/B2/B4,
