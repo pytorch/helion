@@ -706,6 +706,7 @@ def test_worker_revalidates_cuda_libraries_after_all_rows(
                 deepgemm_root=None,
                 quack_root=None,
                 cutlass_root=None,
+                timing_protocol=campaign.DEFAULT_TIMING_PROTOCOL,
             )
         )
         == 0
@@ -1050,7 +1051,9 @@ def test_campaign_validates_each_worker_before_launching_the_next(
     with pytest.raises(RuntimeError, match=error):
         campaign._run_campaign(
             argparse.Namespace(
-                cuda_visible_devices="0", output_dir=tmp_path / "campaign"
+                cuda_visible_devices="0",
+                output_dir=tmp_path / "campaign",
+                timing_protocol=campaign.DEFAULT_TIMING_PROTOCOL,
             )
         )
 
@@ -1081,7 +1084,11 @@ def test_campaign_records_compact_per_run_telemetry(
 
     assert (
         campaign._run_campaign(
-            argparse.Namespace(cuda_visible_devices="0", output_dir=output_dir)
+            argparse.Namespace(
+                cuda_visible_devices="0",
+                output_dir=output_dir,
+                timing_protocol=campaign.DEFAULT_TIMING_PROTOCOL,
+            )
         )
         == 0
     )
