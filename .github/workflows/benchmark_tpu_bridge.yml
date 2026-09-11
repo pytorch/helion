@@ -91,12 +91,26 @@ jobs:
           popd
           popd
 
+      # Backstop under the 6h job limit: a job cancelled at that limit skips
+      # every remaining step, so the results collected so far are lost. Failing
+      # the step instead keeps the upload below reachable. Kept well under 6h
+      # because setup builds torch_tpu from source, which is only fast on a
+      # remote-cache hit.
       - name: Run TPU Benchmark (bridge)
+        timeout-minutes: 240
         run: |
           rm -rf /tmp/torchinductor_*/ || true
           source .venv/bin/activate
           TEST_REPORTS_DIR=$(pwd)/test/test-reports
           mkdir -p "$TEST_REPORTS_DIR"
+
+          # Wall-clock the kernel loop may consume, leaving room under the
+          # step's timeout-minutes to still report and upload. Per-kernel caps
+          # are clamped to what remains so a few slow kernels cannot starve the
+          # rest.
+          SWEEP_BUDGET_S=$(( 200 * 60 ))
+          sweep_start=$SECONDS
+          incomplete_kernels=()
 
           KERNEL_LIST="${{ inputs.kernels }}"
           for kernel in ${KERNEL_LIST//,/ }; do
@@ -131,7 +145,31 @@ jobs:
             case "$kernel" in
               kl_div|welford) PRECISION=fp32 ;;
             esac
+            # Cap each kernel at HELION_BENCHMARK_KERNEL_TIMEOUT. The bridge
+            # shells out to tritonbench's runner, which never reads that
+            # variable (only run_tpu.py does), so enforce it here with
+            # `timeout`. A kernel whose autotune runs long is abandoned and the
+            # sweep moves on, instead of consuming the whole job's budget and
+            # taking every other kernel's results down with it.
+            # --kill-after escalates to SIGKILL: a run wedged inside an XLA
+            # compile does not necessarily service SIGTERM.
+            #
+            # Resolve the duration in a subshell that has env-vars applied.
+            # Bash expands a command's arguments before applying that command's
+            # own scoped assignments, so writing `env-vars timeout "$VAR"`
+            # directly would always use the job default and silently drop a
+            # caller's override.
+            kernel_timeout=$(${{ inputs.env-vars }} bash -c 'printf %s "$HELION_BENCHMARK_KERNEL_TIMEOUT"')
+            remaining=$(( SWEEP_BUDGET_S - (SECONDS - sweep_start) ))
+            if (( remaining <= 60 )); then
+              echo "⏭️ $kernel skipped: sweep budget exhausted"
+              incomplete_kernels+=("$kernel(skipped)")
+              continue
+            fi
+            (( kernel_timeout > remaining )) && kernel_timeout=$remaining
+            kernel_status=0
             ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 HELION_MEASURE_COMPILE_TIME=1 \
+              timeout --kill-after=60 "$kernel_timeout" \
               python benchmarks/run.py \
                 --op $kernel \
                 --device tpu \
@@ -147,8 +185,22 @@ jobs:
                 --rtol 1e-2 \
                 --output "$TEST_REPORTS_DIR/helionbench.json" \
                 --append-to-output \
-                --keep-going
-            echo "✅ $kernel"
+                --keep-going || kernel_status=$?
+            # 124 = timeout fired; 137 = SIGKILL, either timeout's escalation or
+            # an OOM kill, so report the code rather than asserting a cause.
+            if (( kernel_status == 124 || kernel_status == 137 )); then
+              echo "⏱️ $kernel did not finish within ${kernel_timeout}s (exit $kernel_status)"
+              incomplete_kernels+=("$kernel")
+            elif (( kernel_status != 0 )); then
+              echo "❌ $kernel exited $kernel_status"
+              incomplete_kernels+=("$kernel")
+            else
+              echo "✅ $kernel"
+            fi
+            # Reap any survivor still holding the chip; otherwise every later
+            # kernel fails to acquire it. Bracket the pattern so the match
+            # cannot hit this shell.
+            pkill -9 -f "[b]enchmarks/run.py" || true
           done
 
           if [[ ! -s "$TEST_REPORTS_DIR/helionbench.json" ]]; then
@@ -157,8 +209,22 @@ jobs:
           fi
           cat "$TEST_REPORTS_DIR/helionbench.json"
 
+          # Fail once the results are on disk: the upload step runs regardless,
+          # so the kernels that did finish still reach the dashboard, but a
+          # dropped kernel stays visible instead of passing as a green run with
+          # a silently missing column.
+          if (( ${#incomplete_kernels[@]} > 0 )); then
+            echo "❌ did not complete: ${incomplete_kernels[*]}"
+            exit 1
+          fi
+
+      # Upload whatever the sweep produced, including when a kernel timed out or
+      # failed above: results are appended per kernel, so a partial sweep still
+      # carries every kernel that finished.
       - name: Upload the benchmark results to GitHub
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: benchmark-results-${{ inputs.alias }}
           path: test/test-reports
+          if-no-files-found: warn
