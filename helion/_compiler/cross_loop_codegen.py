@@ -7,6 +7,7 @@ from typing import cast
 import sympy
 import torch
 from torch.utils._sympy.functions import CeilDiv
+from torch.utils._sympy.functions import FloorDiv
 from torch.utils._sympy.functions import Max as SymbolicMax
 from torch.utils._sympy.functions import Min as SymbolicMin
 
@@ -16,6 +17,7 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .cross_loop_scheduler import _RESIDENT_LAUNCH_STAGE
 from .cross_loop_scheduler import _SOURCE_LAUNCH_STAGE
 from .cross_loop_scheduler import ReadinessConsumer
 from .cross_loop_scheduler import ReadinessCounterPlan
@@ -24,6 +26,7 @@ from .cross_loop_scheduler import RootBarrierPublication
 from .cross_loop_scheduler import WorkerInterval
 from .cross_loop_scheduler import WorkerScheduleSegment
 from .cross_loop_scheduler import _normalize_intervals
+from .cross_loop_scheduler import _packed_root_major_task_order_relation
 from .cross_loop_scheduler import _parametric_root_major_schedule_geometry
 from .cross_loop_scheduler import _root_schedule_traversal
 from .cross_loop_scheduler import _transient_source_schedule_segment
@@ -750,6 +753,16 @@ def emit_cross_loop_schedule(
         static_pipeline_plan.worker_schedule
     )
     has_parameterized_schedule = parameterized_root_major_geometry is not None
+    parameterized_segment_geometry_by_root = (
+        {
+            segment.root: (segment, first_position, task_count)
+            for segment, first_position, task_count in (
+                parameterized_root_major_geometry
+            )
+        }
+        if parameterized_root_major_geometry is not None
+        else {}
+    )
     if parameterized_root_domains and parameterized_root_major_geometry is None:
         raise exc.InvalidConfig(
             "cross_loop_schedule='static_pipeline' cannot lower this "
@@ -1206,7 +1219,22 @@ def emit_cross_loop_schedule(
     }
     root_schedule_traversals = {}
     scheduled_task_roots: set[int] = set()
-    if not has_parameterized_schedule:
+    if has_parameterized_schedule:
+        for segment, first_position, _task_count in parameterized_root_major_geometry:
+            reference = _packed_root_major_task_order_relation(
+                static_pipeline_plan.worker_schedule.placement_domain,
+                root_task_orders[segment.root],
+                first_position,
+                launch_worker_count,
+            )
+            if reference is None:
+                raise exc.InvalidConfig(
+                    "cross_loop_schedule='static_pipeline' cannot render the "
+                    f"configured traversal for parameterized root {segment.root}"
+                )
+            if segment.task_order != reference:
+                scheduled_task_roots.add(segment.root)
+    else:
         for root, task_order in enumerate(root_task_orders):
             segments = static_pipeline_plan.worker_schedule.segments_for_root(root)
             if not segments:
@@ -1309,8 +1337,63 @@ def emit_cross_loop_schedule(
     def relation_expression(
         expression: sympy.Expr,
         coordinates: dict[int, str],
+        *,
+        nonempty_domain: CoordinateDomain | None = None,
     ) -> str:
         """Render the restricted coordinate-relation expression grammar."""
+
+        def render(child: sympy.Expr) -> str:
+            return relation_expression(
+                child,
+                coordinates,
+                nonempty_domain=nonempty_domain,
+            )
+
+        def positive_when_domain_nonempty(divisor: sympy.Expr) -> bool:
+            if divisor.is_positive is True:
+                return True
+            if (
+                nonempty_domain is None
+                or divisor.is_nonnegative is not True
+                or not divisor.free_symbols <= nonempty_domain.parameter_symbols
+            ):
+                return False
+            domain_size = sympy.sympify(nonempty_domain.size_expr)
+            quotient = sympy.cancel(domain_size / divisor)
+            return (
+                quotient.is_integer is True
+                and quotient.is_nonnegative is True
+                and sympy.simplify(domain_size - divisor * quotient) == 0
+            )
+
+        def floor_division(
+            numerator: sympy.Expr,
+            denominator: sympy.Expr,
+        ) -> str:
+            if denominator.is_integer is not True or not (
+                positive_when_domain_nonempty(denominator)
+            ):
+                raise AssertionError(
+                    "logical floor division requires a proved positive divisor"
+                )
+            numerator_text = render(numerator)
+            if isinstance(denominator, sympy.Integer):
+                divisor = str(int(denominator))
+            else:
+                # ``nonempty_domain`` proves this factor is positive at every
+                # executed point. Clamping only defines the inactive empty-
+                # domain case, which the surrounding schedule never executes.
+                denominator_text = render(denominator)
+                divisor = f"tl.maximum(({denominator_text}), 1)"
+            if numerator.is_nonnegative is True:
+                return f"(({numerator_text}) // {divisor})"
+            # Triton integer division truncates toward zero. First remove the
+            # Euclidean remainder so the dividend is exactly divisible; this
+            # preserves mathematical floor for either sign.
+            signed_remainder = f"(({numerator_text}) % ({divisor}))"
+            remainder = f"((({signed_remainder}) + {divisor}) % {divisor})"
+            return f"((({numerator_text}) - ({remainder})) // {divisor})"
+
         if isinstance(expression, sympy.Integer):
             return str(int(expression))
         if expression.func in (sympy.Min, sympy.Max, SymbolicMin, SymbolicMax):
@@ -1319,13 +1402,11 @@ def emit_cross_loop_schedule(
                 if expression.func in (sympy.Min, SymbolicMin)
                 else "tl.maximum"
             )
-            rendered = relation_expression(
-                cast("sympy.Expr", expression.args[0]), coordinates
-            )
+            rendered = render(cast("sympy.Expr", expression.args[0]))
             for argument in expression.args[1:]:
                 rendered = (
                     f"{function}(({rendered}), "
-                    f"({relation_expression(cast('sympy.Expr', argument), coordinates)}))"
+                    f"({render(cast('sympy.Expr', argument))}))"
                 )
             return rendered
         coordinate_symbols = frozenset(
@@ -1349,33 +1430,30 @@ def emit_cross_loop_schedule(
             return f"({device_function.sympy_expr(expression)})"
         if isinstance(expression, sympy.Add):
             return " + ".join(
-                f"({relation_expression(cast('sympy.Expr', term), coordinates)})"
+                f"({render(cast('sympy.Expr', term))})"
                 for term in expression.as_ordered_terms()
             )
         if isinstance(expression, sympy.Mul):
             return " * ".join(
-                f"({relation_expression(factor, coordinates)})"
-                for factor in expression.as_ordered_factors()
+                f"({render(factor)})" for factor in expression.as_ordered_factors()
             )
+        if expression.func in (FloorDiv, CeilDiv):
+            numerator, denominator = map(sympy.sympify, expression.args)
+            if expression.func is FloorDiv:
+                return floor_division(numerator, denominator)
+            return f"(-({floor_division(-numerator, denominator)}))"
         if expression.func in (sympy.floor, sympy.ceiling):
             numerator, denominator = sympy.fraction(sympy.together(expression.args[0]))
-            if not isinstance(denominator, sympy.Integer) or denominator <= 0:
-                raise AssertionError(
-                    "logical floor/ceiling requires a positive static divisor"
-                )
-            numerator_expr = relation_expression(numerator, coordinates)
             if expression.func == sympy.floor:
-                return f"(({numerator_expr}) // {int(denominator)})"
-            return f"(-((-({numerator_expr})) // {int(denominator)}))"
+                return floor_division(numerator, denominator)
+            return f"(-({floor_division(-numerator, denominator)}))"
         if isinstance(expression, sympy.Mod):
             numerator, denominator = expression.args
             if not isinstance(denominator, sympy.Integer) or denominator <= 0:
                 raise AssertionError(
                     "logical modulo requires a positive static divisor"
                 )
-            numerator_text = relation_expression(
-                cast("sympy.Expr", numerator), coordinates
-            )
+            numerator_text = render(cast("sympy.Expr", numerator))
             signed_remainder = f"(({numerator_text}) % {int(denominator)})"
             if numerator.is_nonnegative is True:
                 return signed_remainder
@@ -1415,9 +1493,22 @@ def emit_cross_loop_schedule(
     def relation_point_coordinates(
         relation: CoordinateRelation,
         source_coordinates: dict[int, str],
+        *,
+        allow_exact_partial: bool = False,
     ) -> tuple[dict[int, str], str]:
         """Render an at-most-one-valued relation without task tables."""
         canonical = relation.canonical_single_valued()
+        if (
+            canonical is None
+            and allow_exact_partial
+            and relation.is_bijection_from_source_support()
+        ):
+            # Some exact parameterized partitions cannot be rewritten into
+            # disjoint symbolic boxes even though the relation has already
+            # proved that overlapping guards agree. Rendering those original
+            # pieces is semantics-preserving; the membership predicates below
+            # still select only a source-supported value.
+            canonical = relation
         if canonical is None or not canonical.pieces:
             raise AssertionError("event relation is not single-valued")
         memberships: list[str] = []
@@ -1438,11 +1529,20 @@ def emit_cross_loop_schedule(
                     != 1
                 ):
                     raise AssertionError("event relation target is not one point")
-                value = relation_expression(begin, source_coordinates)
+                value = relation_expression(
+                    begin,
+                    source_coordinates,
+                    nonempty_domain=(
+                        relation.target_domain if allow_exact_partial else None
+                    ),
+                )
                 piece_values[axis] = value
                 target_count = relation_expression(
                     sympy.sympify(canonical.target_domain.axis_count_expressions[axis]),
                     source_coordinates,
+                    nonempty_domain=(
+                        relation.target_domain if allow_exact_partial else None
+                    ),
                 )
                 target_memberships.extend(
                     (
@@ -1948,6 +2048,25 @@ def emit_cross_loop_schedule(
         """Map one root-local task-order index to its logical task ID."""
         if root not in scheduled_task_roots:
             return None
+        if parameterized_root_major_geometry is not None:
+            segment, first_position, _task_count = (
+                parameterized_segment_geometry_by_root[root]
+            )
+            launch_stage_axis, worker_axis, wave_axis = (
+                segment.task_order.source_domain.axis_order
+            )
+            first_position_text = device_function.sympy_expr(first_position)
+            global_slot = f"(({first_position_text}) + ({task_order_index}))"
+            task_coordinates, _membership = relation_point_coordinates(
+                segment.task_order,
+                {
+                    launch_stage_axis: str(_RESIDENT_LAUNCH_STAGE),
+                    worker_axis: f"(({global_slot}) % {segment.worker_count})",
+                    wave_axis: f"(({global_slot}) // {segment.worker_count})",
+                },
+                allow_exact_partial=True,
+            )
+            return logical_task_from_coordinates(root, task_coordinates)
         traversal = root_schedule_traversals[root]
         forward = traversal.scheduled_ordinal_to_logical_task
         if forward is not None:
@@ -2185,14 +2304,6 @@ def emit_cross_loop_schedule(
 
     static_segments_by_root: dict[int, tuple[WorkerScheduleSegment, ...]] = {}
     parameterized_schedule_geometry = parameterized_root_major_geometry
-    parameterized_segment_geometry_by_root = (
-        {
-            segment.root: (segment, first_position, task_count)
-            for segment, first_position, task_count in parameterized_schedule_geometry
-        }
-        if parameterized_schedule_geometry is not None
-        else {}
-    )
     for root in range(len(root_domains)):
         segments = static_pipeline_plan.worker_schedule.segments_for_root(root)
         if not segments:
@@ -2429,17 +2540,13 @@ def emit_cross_loop_schedule(
             certified_segment != segment
             or task_order_end - task_order_begin != segment.task_count
         ):
-            raise AssertionError(
-                "segment stream disagrees with its proved traversal"
-            )
+            raise AssertionError("segment stream disagrees with its proved traversal")
         next_segment_range_by_root[root] = range_index + 1
         resident_body.extend(
             static_segment_body(
                 segment,
                 task_order_begin=task_order_begin,
-                root_barrier_publication_site=publication_by_segment.get(
-                    segment_index
-                ),
+                root_barrier_publication_site=publication_by_segment.get(segment_index),
             )
         )
     if any(

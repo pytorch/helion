@@ -939,9 +939,10 @@ def _normalize_dense_schedule_segment(
             logical_order.target_domain,
             tuple(schedule_pieces),
         )
-        logical_to_ordinal = tile_dependency._memoized_exact_converse(
-            flat_logical_order
-        ) or flat_logical_order.converse()
+        logical_to_ordinal = (
+            tile_dependency._memoized_exact_converse(flat_logical_order)
+            or flat_logical_order.converse()
+        )
         schedule_inverse = (
             None
             if logical_to_ordinal is None
@@ -1365,9 +1366,7 @@ def _concrete_task_order_slice(
             period = stride * axis_count
             boundary = (begin // period + 1) * period
             boundary_count = max(0, (begin + count - 1 - boundary) // period + 1)
-            if boundary_count > tile_dependency._MAX_RELATION_PIECES - len(
-                source_cuts
-            ):
+            if boundary_count > tile_dependency._MAX_RELATION_PIECES - len(source_cuts):
                 return None
             while boundary < begin + count:
                 source_cuts.add(boundary - begin)
@@ -1706,71 +1705,75 @@ def _parametric_root_major_relation(
         (
             (
                 (
-                    launch_stage_axis,
-                    _RESIDENT_LAUNCH_STAGE,
-                    _RESIDENT_LAUNCH_STAGE + 1,
-                    1,
+                    (
+                        launch_stage_axis,
+                        _RESIDENT_LAUNCH_STAGE,
+                        _RESIDENT_LAUNCH_STAGE + 1,
+                        1,
+                    ),
+                    (worker_axis, 0, worker_count, 1),
+                    (
+                        wave_axis,
+                        first_wave,
+                        sympy.simplify(first_wave + aligned_full_waves),
+                        1,
+                    ),
                 ),
-                (worker_axis, 0, worker_count, 1),
-                (
-                    wave_axis,
-                    first_wave,
-                    sympy.simplify(first_wave + aligned_full_waves),
-                    1,
-                ),
+                target_coordinates,
             ),
-            target_coordinates,
-        ),
-    ) if is_wave_aligned else (
-        (
+        )
+        if is_wave_aligned
+        else (
             (
                 (
-                    launch_stage_axis,
-                    _RESIDENT_LAUNCH_STAGE,
-                    _RESIDENT_LAUNCH_STAGE + 1,
-                    1,
+                    (
+                        launch_stage_axis,
+                        _RESIDENT_LAUNCH_STAGE,
+                        _RESIDENT_LAUNCH_STAGE + 1,
+                        1,
+                    ),
+                    (
+                        worker_axis,
+                        first_worker,
+                        first_worker + first_count,
+                        1,
+                    ),
+                    (
+                        wave_axis,
+                        first_wave,
+                        sympy.simplify(first_wave + 1),
+                        1,
+                    ),
                 ),
-                (
-                    worker_axis,
-                    first_worker,
-                    first_worker + first_count,
-                    1,
-                ),
-                (
-                    wave_axis,
-                    first_wave,
-                    sympy.simplify(first_wave + 1),
-                    1,
-                ),
+                target_coordinates,
             ),
-            target_coordinates,
-        ),
-        (
             (
                 (
-                    launch_stage_axis,
-                    _RESIDENT_LAUNCH_STAGE,
-                    _RESIDENT_LAUNCH_STAGE + 1,
-                    1,
+                    (
+                        launch_stage_axis,
+                        _RESIDENT_LAUNCH_STAGE,
+                        _RESIDENT_LAUNCH_STAGE + 1,
+                        1,
+                    ),
+                    (worker_axis, 0, worker_count, 1),
+                    (wave_axis, middle_wave_begin, middle_wave_end, 1),
                 ),
-                (worker_axis, 0, worker_count, 1),
-                (wave_axis, middle_wave_begin, middle_wave_end, 1),
+                target_coordinates,
             ),
-            target_coordinates,
-        ),
-        (
             (
                 (
-                    launch_stage_axis,
-                    _RESIDENT_LAUNCH_STAGE,
-                    _RESIDENT_LAUNCH_STAGE + 1,
-                    1,
+                    (
+                        launch_stage_axis,
+                        _RESIDENT_LAUNCH_STAGE,
+                        _RESIDENT_LAUNCH_STAGE + 1,
+                        1,
+                    ),
+                    (worker_axis, 0, tail_count, 1),
+                    (wave_axis, middle_wave_end, final_wave_end, 1),
                 ),
-                (worker_axis, 0, tail_count, 1),
-                (wave_axis, middle_wave_end, final_wave_end, 1),
+                target_coordinates,
             ),
-            target_coordinates,
-        ),
+        )
     )
     relation = CoordinateRelation.point_map(
         schedule_domain,
@@ -1893,9 +1896,8 @@ def _packed_root_major_task_order_relation(
         task_order.source_domain.axis_order,
     )
     if (
-        (composed := packed_source.then(task_order)) is not None
-        and tile_dependency._memoized_exact_converse(composed) is not None
-    ):
+        composed := packed_source.then(task_order)
+    ) is not None and tile_dependency._memoized_exact_converse(composed) is not None:
         return composed
 
     # Piecewise orders such as L2 grouping may guard only an interval of their
@@ -2105,8 +2107,7 @@ class WorkerSchedule:
     def __getstate__(self) -> dict[str, object]:
         """Serialize semantic fields only, never derived geometry caches."""
         return {
-            field.name: getattr(self, field.name)
-            for field in dataclasses.fields(self)
+            field.name: getattr(self, field.name) for field in dataclasses.fields(self)
         }
 
     def __setstate__(self, state: dict[str, object]) -> None:
@@ -2118,7 +2119,9 @@ class WorkerSchedule:
         if self.worker_count <= 0:
             raise ValueError(f"worker_count must be positive, got {self.worker_count}")
         input_segments = self.segments
-        has_legacy_segments = any(not segment.is_normalized for segment in input_segments)
+        has_legacy_segments = any(
+            not segment.is_normalized for segment in input_segments
+        )
         normalized_axes = {
             segment.task_order.source_domain.axis_order
             for segment in input_segments
@@ -2451,8 +2454,7 @@ def _occupied_slot_identity(
             (
                 piece.source_bounds_items,
                 tuple(
-                    coordinate_axis_symbol(axis)
-                    for axis in schedule_domain.axis_order
+                    coordinate_axis_symbol(axis) for axis in schedule_domain.axis_order
                 ),
             )
             for piece in occupied.pieces
@@ -2460,11 +2462,7 @@ def _occupied_slot_identity(
     )
     if occupied is task_order:
         return identity
-    return (
-        identity
-        if occupied.is_pointwise_equal_on_same_support(identity)
-        else None
-    )
+    return identity if occupied.is_pointwise_equal_on_same_support(identity) else None
 
 
 def _occupied_schedule_identity(
@@ -4263,9 +4261,7 @@ def _validate_root_task_orders(
                 and task_order.target_domain.size_expr.is_zero is not True
             )
         ):
-            raise ValueError(
-                "each root task order must have compatible typed domains"
-            )
+            raise ValueError("each root task order must have compatible typed domains")
         if (
             task_order.source_domain.identity != identity
             or (identity is not None and identity in root_identities)
@@ -5026,12 +5022,8 @@ def _segmented_nested_loop_counter(
                         if axis == nested_axis
                         else (
                             axis,
-                            coordinate_axis_symbol(
-                                outer_event_axis_by_source[axis]
-                            ),
-                            coordinate_axis_symbol(
-                                outer_event_axis_by_source[axis]
-                            )
+                            coordinate_axis_symbol(outer_event_axis_by_source[axis]),
+                            coordinate_axis_symbol(outer_event_axis_by_source[axis])
                             + 1,
                             1,
                         )
@@ -5180,9 +5172,7 @@ def _uniform_nested_readiness_frontier(
     if (
         reduced is None
         or recomposed is None
-        or not recomposed.is_pointwise_equal_on_same_support(
-            ready_after_worker_step
-        )
+        or not recomposed.is_pointwise_equal_on_same_support(ready_after_worker_step)
         or not reduced.is_total_function()
     ):
         return None
@@ -5208,9 +5198,7 @@ def _uniform_nested_readiness_frontier(
             target_domain=reduced_domain,
             pieces=(
                 _CoordinateRelationPiece(
-                    source_bounds_items=(
-                        (nested_axis, 0, counts[nested_axis], 1),
-                    ),
+                    source_bounds_items=((nested_axis, 0, counts[nested_axis], 1),),
                     target_ranges=tuple(
                         (
                             (axis, nested_iteration, nested_iteration + 1, 1)
@@ -5225,9 +5213,7 @@ def _uniform_nested_readiness_frontier(
         frontier = retained_iterations_by_nested.max_target_value_by_source(reduced)
     canonical = None if frontier is None else frontier.canonical_single_valued()
     return (
-        canonical
-        if canonical is not None and canonical.is_total_function()
-        else None
+        canonical if canonical is not None and canonical.is_total_function() else None
     )
 
 
@@ -5260,9 +5246,7 @@ def _nested_ready_prefix_boundaries(
         return (sympy.Integer(0), nested_extent)
 
     (wave_axis,) = frontier.target_domain.axis_order
-    wave_count = sympy.sympify(
-        frontier.target_domain.axis_count_expressions[wave_axis]
-    )
+    wave_count = sympy.sympify(frontier.target_domain.axis_count_expressions[wave_axis])
     if tile_dependency._is_provably_nonnegative(
         wave_count - consumer_worker_step,
         None,
@@ -5289,9 +5273,7 @@ def _nested_ready_prefix_boundaries(
     )
     ready_iterations = frontier.then(ready_values)
     ready_iterations = (
-        None
-        if ready_iterations is None
-        else ready_iterations.canonical_single_valued()
+        None if ready_iterations is None else ready_iterations.canonical_single_valued()
     )
     if ready_iterations is None:
         return None
@@ -5309,9 +5291,10 @@ def _nested_ready_prefix_boundaries(
     else:
         return None
 
-    if sympy.simplify(split_iteration) == 0 or sympy.simplify(
-        split_iteration - nested_extent
-    ) == 0:
+    if (
+        sympy.simplify(split_iteration) == 0
+        or sympy.simplify(split_iteration - nested_extent) == 0
+    ):
         return (sympy.Integer(0), nested_extent)
     if not tile_dependency._is_provably_nonnegative(
         split_iteration - 1,
@@ -5336,11 +5319,7 @@ def _concrete_nested_ready_prefix_boundaries(
 
     def ready(nested_iteration: int) -> bool | None:
         value_bounds = frontier.value_bounds({nested_axis: nested_iteration})
-        return (
-            None
-            if value_bounds is None
-            else value_bounds[1] < consumer_worker_step
-        )
+        return None if value_bounds is None else value_bounds[1] < consumer_worker_step
 
     first_ready = ready(0)
     last_ready = ready(nested_extent - 1)
@@ -5601,7 +5580,9 @@ class StaticPipelinePlan:
                     "worker schedule segment disagrees with its configured root domain"
                 )
         for producer_root, consumer_root in self.root_barrier_edges:
-            if not (0 <= producer_root < root_count and 0 <= consumer_root < root_count):
+            if not (
+                0 <= producer_root < root_count and 0 <= consumer_root < root_count
+            ):
                 raise ValueError("root-barrier edge references an unknown root")
 
         continuation_roots: set[int] = set()
@@ -5615,10 +5596,13 @@ class StaticPipelinePlan:
                 if consumer_index == counter.continuation_consumer_index:
                     continuation_roots.add(consumer.consumer_root)
 
-        if _current_renderer_lowerable_counters(
-            self.readiness_counters,
-            root_domains,
-        ) != self.readiness_counters:
+        if (
+            _current_renderer_lowerable_counters(
+                self.readiness_counters,
+                root_domains,
+            )
+            != self.readiness_counters
+        ):
             raise ValueError("readiness counter is unsupported by the current renderer")
 
         scheduled_roots = {segment.root for segment in self.worker_schedule.segments}
@@ -5640,7 +5624,9 @@ class StaticPipelinePlan:
             or len(source_segments) != 1
             or source_segments[0].root != self.transient_source_root
         ):
-            raise ValueError("source ownership requires one matching stage-zero segment")
+            raise ValueError(
+                "source ownership requires one matching stage-zero segment"
+            )
 
         # Freeze the sole root-publication derivation with the selected plan.
         # Code generation consumes this cache and must not reconstruct owner
@@ -5653,9 +5639,7 @@ class StaticPipelinePlan:
     ) -> tuple[RootBarrierPublicationPlan | None, ...]:
         """Return the finalized publication plan for every applicable root."""
         root_count = len(self.root_task_orders)
-        producer_roots = {
-            producer for producer, _consumer in self.root_barrier_edges
-        }
+        producer_roots = {producer for producer, _consumer in self.root_barrier_edges}
         publication_roots = producer_roots | {
             segment.root for segment in self.worker_schedule.segments
         }
@@ -6677,10 +6661,13 @@ def _logical_task_to_order_ordinal(
     elif len(task_order.source_domain.axis_order) == 1:
         (local_axis,) = task_order.source_domain.axis_order
         (ordinal_axis,) = ordinal_domain.axis_order
-        if _equal_integer_expressions(
-            ordinal_begin,
-            0,
-        ) and logical_to_local.target_domain == ordinal_domain:
+        if (
+            _equal_integer_expressions(
+                ordinal_begin,
+                0,
+            )
+            and logical_to_local.target_domain == ordinal_domain
+        ):
             result = logical_to_local
         else:
             result = CoordinateRelation(
@@ -8014,11 +8001,15 @@ def _schedule_is_progress_safe(
         lowering_relations = _counter_lowering_relations(
             readiness_graph.event(continuation.event_id)
         )
-        if lowering_relations is None or _readiness_static_producers(
-            readiness_graph,
-            lowering_relations[0],
-            continuation_by_root,
-        ) is None:
+        if (
+            lowering_relations is None
+            or _readiness_static_producers(
+                readiness_graph,
+                lowering_relations[0],
+                continuation_by_root,
+            )
+            is None
+        ):
             # Every continuation chain must terminate at statically owned work;
             # exact counter ownership alone does not rule out a continuation
             # cycle with no resident initiator.
@@ -8165,9 +8156,7 @@ def _schedule_is_progress_safe(
                 continue
             strictly_ranked = False
         covers_every_checkpoint = all_consumer_keys is not None
-        if require_strict_rank and (
-            not covers_every_checkpoint or not strictly_ranked
-        ):
+        if require_strict_rank and (not covers_every_checkpoint or not strictly_ranked):
             return False
         if not require_strict_rank and (
             not covers_every_checkpoint or not strictly_ranked
@@ -8353,9 +8342,8 @@ def _readiness_root_edges(
             if not producer_may_be_nonempty:
                 continue
             for consumer in event.consumers:
-                relation_product_states += (
-                    len(consumer.keys_by_consumer.pieces)
-                    * len(producer.producers_by_key.pieces)
+                relation_product_states += len(consumer.keys_by_consumer.pieces) * len(
+                    producer.producers_by_key.pieces
                 )
                 if (
                     relation_product_states
@@ -8474,8 +8462,7 @@ def _readiness_equivalent_cohort_relation(
     if (
         cohort_by_order.source_domain != task_order.source_domain
         or not cohort_by_order.is_total_function()
-        or order_points_by_cohort.source_domain
-        != cohort_by_order.target_domain
+        or order_points_by_cohort.source_domain != cohort_by_order.target_domain
         or order_points_by_cohort.target_domain != task_order.source_domain
         or event_keys_by_cohort.source_domain != cohort_by_order.target_domain
         or event_keys_by_cohort.target_domain != keys_by_task.target_domain
@@ -8486,29 +8473,32 @@ def _readiness_equivalent_cohort_relation(
 
 def _semantic_readiness_cohort_relations(
     readiness_graph: ReadinessGraph,
-) -> tuple[
+) -> (
     tuple[
         tuple[
-            int,
-            int,
-            int,
-            CoordinateRelation,
-            CoordinateRelation,
+            tuple[
+                int,
+                int,
+                int,
+                CoordinateRelation,
+                CoordinateRelation,
+            ],
+            ...,
         ],
-        ...,
-    ],
-    tuple[
         tuple[
-            int,
-            int,
-            CoordinateRelation,
-            CoordinateRelation,
+            tuple[
+                int,
+                int,
+                CoordinateRelation,
+                CoordinateRelation,
+            ],
+            ...,
         ],
-        ...,
-    ],
-    frozenset[int],
-    frozenset[int],
-] | None:
+        frozenset[int],
+        frozenset[int],
+    ]
+    | None
+):
     """Derive admission and event-closure cohorts from semantic readiness.
 
     Admission entries are ``(root, event, consumer, order->cohort,
@@ -8548,13 +8538,8 @@ def _semantic_readiness_cohort_relations(
         keys_by_task: CoordinateRelation,
     ) -> bool:
         nonlocal relation_product_states
-        relation_product_states += len(task_order.pieces) * len(
-            keys_by_task.pieces
-        )
-        return (
-            relation_product_states
-            <= tile_dependency._MAX_RELATION_PRODUCT_STATES
-        )
+        relation_product_states += len(task_order.pieces) * len(keys_by_task.pieces)
+        return relation_product_states <= tile_dependency._MAX_RELATION_PRODUCT_STATES
 
     for event in readiness_graph.events:
         if event.root_barrier_producer_root is not None:
@@ -8658,10 +8643,7 @@ def _cohort_major_task_order(
     if cohort_by_order.source_domain != task_order.source_domain:
         return None
     order_points_by_cohort = cohort_by_order.converse()
-    if (
-        order_points_by_cohort is None
-        or len(order_points_by_cohort.pieces) != 1
-    ):
+    if order_points_by_cohort is None or len(order_points_by_cohort.pieces) != 1:
         # The existing enumerator concatenates multiple active target boxes in
         # representation order. Until a canonical box-order proof exists,
         # accepting several pieces would make extensionally equal relations
@@ -8687,6 +8669,174 @@ def _cohort_major_task_order(
     return candidate
 
 
+def _agreed_cohort_major_root_orders(
+    readiness_graph: ReadinessGraph,
+) -> dict[int, CoordinateRelation] | None:
+    """Return exact noncanonical root orders when every candidate agrees.
+
+    This is the first placement policy supported by the parametric scheduler:
+    a whole root may permute its logical traversal while retaining precisely
+    the same canonical slot support. Conflicting or unrenderable cohort views
+    keep that root canonical. No readiness decision is made here.
+    """
+    cohort_relations = _semantic_readiness_cohort_relations(readiness_graph)
+    if cohort_relations is None:
+        return None
+    admission, closure, unsupported_admission, unsupported_closure = cohort_relations
+    unsupported_roots = unsupported_admission | unsupported_closure
+    cohorts_by_root: dict[int, list[CoordinateRelation]] = {}
+    for root, _event_id, _consumer_index, cohort_by_order, _keys in admission:
+        cohorts_by_root.setdefault(root, []).append(cohort_by_order)
+    for root, _event_id, cohort_by_order, _keys in closure:
+        cohorts_by_root.setdefault(root, []).append(cohort_by_order)
+
+    candidate_orders_by_root: dict[int, list[CoordinateRelation]] = {}
+    declined_roots = set(unsupported_roots)
+    for root, root_cohorts in cohorts_by_root.items():
+        reference = readiness_graph.root_task_orders[root]
+        for cohort_by_order in root_cohorts:
+            candidate = _cohort_major_task_order(reference, cohort_by_order)
+            if candidate is None:
+                declined_roots.add(root)
+                break
+            candidate_orders_by_root.setdefault(root, []).append(candidate)
+
+    result: dict[int, CoordinateRelation] = {}
+    for root, candidates in candidate_orders_by_root.items():
+        if root in declined_roots or not candidates:
+            continue
+        reference = readiness_graph.root_task_orders[root]
+        ordinal_domain = _task_order_ordinal_domain(reference)
+        reference_ordinal = _logical_task_to_reference_ordinal(
+            reference,
+            ordinal_domain,
+        )
+        candidate_ordinals = tuple(
+            _logical_task_to_order_ordinal(candidate, ordinal_domain)
+            for candidate in candidates
+        )
+        if reference_ordinal is None or any(
+            ordinal is None for ordinal in candidate_ordinals
+        ):
+            continue
+        first_ordinal = candidate_ordinals[0]
+        assert first_ordinal is not None
+        if any(
+            ordinal != first_ordinal
+            and not ordinal.is_pointwise_equal_to(first_ordinal)
+            and not ordinal.is_pointwise_equal_on_same_support(first_ordinal)
+            for ordinal in candidate_ordinals[1:]
+            if ordinal is not None
+        ):
+            continue
+        if (
+            first_ordinal != reference_ordinal
+            and not first_ordinal.is_pointwise_equal_to(reference_ordinal)
+            and not first_ordinal.is_pointwise_equal_on_same_support(reference_ordinal)
+        ):
+            result[root] = candidates[0]
+    return result
+
+
+def _root_major_schedule_matches_configured_orders(
+    worker_schedule: WorkerSchedule,
+    root_task_orders: tuple[CoordinateRelation, ...],
+) -> bool:
+    """Prove packed schedule ``C`` was built from the configured root orders."""
+    geometry = _parametric_root_major_schedule_geometry(worker_schedule)
+    if geometry is None or len(geometry) != len(root_task_orders):
+        return False
+    seen_roots: set[int] = set()
+    for segment, first_slot, _task_count in geometry:
+        root = segment.root
+        if not 0 <= root < len(root_task_orders) or root in seen_roots:
+            return False
+        seen_roots.add(root)
+        expected = _packed_root_major_task_order_relation(
+            worker_schedule.placement_domain,
+            root_task_orders[root],
+            first_slot,
+            worker_schedule.worker_count,
+        )
+        if expected is None or segment.task_order != expected:
+            return False
+    return len(seen_roots) == len(root_task_orders)
+
+
+def _replace_root_orders_on_canonical_support(
+    readiness_graph: ReadinessGraph,
+    canonical_schedule: WorkerSchedule,
+    replacements: dict[int, CoordinateRelation],
+) -> WorkerSchedule | None:
+    """Apply root-local permutations without moving any occupied slot."""
+    geometry = _parametric_root_major_schedule_geometry(canonical_schedule)
+    if geometry is None:
+        return None
+    new_segments: list[WorkerScheduleSegment] = []
+    new_geometry: list[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr]] = []
+    for segment, first_slot, task_count in geometry:
+        replacement_order = replacements.get(segment.root)
+        if replacement_order is None:
+            new_segment = segment
+        else:
+            replacement = _packed_root_major_task_order_relation(
+                canonical_schedule.placement_domain,
+                replacement_order,
+                first_slot,
+                canonical_schedule.worker_count,
+            )
+            if replacement is None or not replacement.has_same_source_support(
+                segment.task_order
+            ):
+                return None
+            new_segment = dataclasses.replace(segment, task_order=replacement)
+        new_segments.append(new_segment)
+        new_geometry.append((new_segment, first_slot, task_count))
+    try:
+        result = WorkerSchedule(
+            canonical_schedule.worker_count,
+            tuple(new_segments),
+        )
+    except ValueError:
+        return None
+    if not _validate_worker_schedule_tasks(
+        result,
+        readiness_graph.root_task_orders,
+    ):
+        return None
+    _remember_root_major_schedule_geometry(result, tuple(new_geometry))
+    return result
+
+
+def _semantic_schedule_is_progress_safe(
+    worker_schedule: WorkerSchedule,
+    readiness_graph: ReadinessGraph,
+) -> bool:
+    """Check resident progress against every uncontracted semantic event."""
+    counters: list[ReadinessCounterPlan] = []
+    root_barrier_edges: set[tuple[int, int]] = set()
+    for event in readiness_graph.events:
+        barrier_producer = event.root_barrier_producer_root
+        if barrier_producer is not None:
+            root_barrier_edges.update(
+                (barrier_producer, consumer.consumer_root)
+                for consumer in event.consumers
+            )
+        else:
+            counters.append(
+                ReadinessCounterPlan(
+                    producers=event.producers,
+                    consumers=event.consumers,
+                )
+            )
+    return _schedule_is_progress_safe(
+        worker_schedule,
+        readiness_graph,
+        tuple(counters),
+        frozenset(root_barrier_edges),
+    )
+
+
 def _parametric_cohort_list_schedule(
     readiness_graph: ReadinessGraph,
     canonical_schedule: WorkerSchedule,
@@ -8704,9 +8854,7 @@ def _parametric_cohort_list_schedule(
     cohort movement behind the same entry.
     """
     if type(pipeline_depth) is not int or not 1 <= pipeline_depth <= 4:
-        raise ValueError(
-            "cross-loop pipeline depth must be an integer between 1 and 4"
-        )
+        raise ValueError("cross-loop pipeline depth must be an integer between 1 and 4")
     if any(
         segment.launch_stage != _RESIDENT_LAUNCH_STAGE
         for segment in canonical_schedule.segments
@@ -8722,14 +8870,9 @@ def _parametric_cohort_list_schedule(
     if pipeline_depth == 1:
         return canonical_schedule
 
-    if any(
-        not root_schedule_matches_reference(
-            canonical_schedule.segments_for_root(root),
-            reference_task_order,
-        )
-        for root, reference_task_order in enumerate(
-            readiness_graph.root_task_orders
-        )
+    if not _root_major_schedule_matches_configured_orders(
+        canonical_schedule,
+        readiness_graph.root_task_orders,
     ):
         return canonical_schedule
 
@@ -8742,16 +8885,26 @@ def _parametric_cohort_list_schedule(
     # resident placement patch consumes these facts; deriving them here now
     # fixes the proof boundary and prevents a later return to emitted-counter
     # or continuation-specific topology.
-    cohort_relations = _semantic_readiness_cohort_relations(readiness_graph)
-    if cohort_relations is None or (
-        not cohort_relations[0] and not cohort_relations[1]
+    replacements = _agreed_cohort_major_root_orders(readiness_graph)
+    if not replacements:
+        return canonical_schedule
+
+    candidate = _replace_root_orders_on_canonical_support(
+        readiness_graph,
+        canonical_schedule,
+        replacements,
+    )
+    if candidate is None or not _semantic_schedule_is_progress_safe(
+        candidate,
+        readiness_graph,
     ):
         return canonical_schedule
 
-    # Subsequent Phase 4A.3 patches add legal whole-cohort pulls here.  Until a
-    # pull has all readiness, non-displacement, progress, and relation-budget
-    # proofs, a larger configured depth intentionally aliases depth one.
-    return canonical_schedule
+    # Root-local cohort-major traversal changes no occupied slot, so its first
+    # noncanonical action has depth two and rejoins C at the root boundary.
+    # Depths three and four intentionally alias it until dependent pulls are
+    # implemented by the same bounded policy.
+    return candidate
 
 
 def _scalar_relation_maximum_on_interval(
@@ -9816,6 +9969,7 @@ def _supports_exact_counter_plan_lowering(
     These are immutable plan facts shared by static and parameterized
     schedules.  Renderer-specific restrictions do not belong here.
     """
+
     def endpoint_has_supported_domain(
         root: int,
         site_id: int | None,
@@ -9853,17 +10007,18 @@ def _supports_exact_counter_plan_lowering(
         ) or not _supports_readiness_counter_lowering(producer):
             return False
     for consumer in plan.consumers:
-        if not endpoint_has_supported_domain(
-            consumer.consumer_root,
-            consumer.consumer_site_id,
-            consumer.keys_by_consumer.source_domain,
-        ) or consumer.keys_by_consumer.canonical_single_valued() is None:
+        if (
+            not endpoint_has_supported_domain(
+                consumer.consumer_root,
+                consumer.consumer_site_id,
+                consumer.keys_by_consumer.source_domain,
+            )
+            or consumer.keys_by_consumer.canonical_single_valued() is None
+        ):
             return False
 
     nested_consumers = tuple(
-        consumer
-        for consumer in plan.consumers
-        if consumer.consumer_site_id is not None
+        consumer for consumer in plan.consumers if consumer.consumer_site_id is not None
     )
     if nested_consumers and (
         len(plan.consumers) != 1 or continuation_index is not None
@@ -10021,10 +10176,14 @@ def _try_finalize_pipeline_proposal(
     never reapplies speculative global scheduling.
     """
     root_domains = readiness_graph.root_domains
-    if not allow_counter_fallback and _current_renderer_lowerable_counters(
-        candidate_readiness_counters,
-        root_domains,
-    ) != candidate_readiness_counters:
+    if (
+        not allow_counter_fallback
+        and _current_renderer_lowerable_counters(
+            candidate_readiness_counters,
+            root_domains,
+        )
+        != candidate_readiness_counters
+    ):
         return None
 
     try:

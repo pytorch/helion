@@ -12,6 +12,7 @@ import torch
 import helion
 from helion import exc
 from helion._compiler import cross_loop_codegen
+from helion._compiler import cross_loop_scheduler
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cross_loop_codegen import _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
 from helion._compiler.cross_loop_codegen import _ast_fingerprint
@@ -38,6 +39,32 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 import helion.language as hl
+
+
+@helion.kernel(
+    static_shapes=False,
+    autotune_effort="none",
+    persistent_reserved_sms=0,
+)
+def dynamic_cohort_fanout(x: torch.Tensor) -> torch.Tensor:
+    batch, query, width = x.size()
+    hl.specialize(width)
+    hl.specialize(x.stride(0))
+    hl.specialize(x.stride(1))
+    hl.specialize(x.stride(2))
+    tmp = torch.empty((batch, query), dtype=x.dtype, device=x.device)
+    out = torch.empty_like(x)
+
+    for producer_batch, producer_query in hl.tile([batch, query], block_size=[1, 1]):
+        tmp[producer_batch, producer_query] = x[producer_batch, producer_query, 0] + 1
+    for consumer_batch, consumer_query, consumer_column in hl.tile(
+        [batch, query, width], block_size=[1, 1, 1]
+    ):
+        out[consumer_batch, consumer_query, consumer_column] = (
+            tmp[consumer_batch, consumer_query]
+            + x[consumer_batch, consumer_query, consumer_column]
+        )
+    return out
 
 
 @helion.kernel(
@@ -681,6 +708,59 @@ class TestCrossLoopCodegenHelpers(TestCase):
 
 @onlyBackends(["triton"])
 class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_parameterized_renderer_honors_cohort_major_task_order(self) -> None:
+        original_builder = cross_loop_codegen.build_static_pipeline_plan
+        selected_noncanonical_order = False
+
+        def build_cohort_plan(**kwargs: Any):
+            nonlocal selected_noncanonical_order
+            plan = original_builder(**kwargs)
+            readiness_graph = cross_loop_scheduler.build_readiness_graph(
+                dependency_graph=kwargs["dependency_graph"],
+                root_task_orders=kwargs["root_task_orders"],
+                site_domains=kwargs["site_domains"],
+                publishable_site_ids=kwargs.get("publishable_site_ids"),
+                prove_nonnegative=kwargs.get("prove_nonnegative"),
+            )
+            candidate = cross_loop_scheduler._parametric_cohort_list_schedule(
+                readiness_graph,
+                plan.worker_schedule,
+                pipeline_depth=2,
+            )
+            assert candidate is not None
+            selected_noncanonical_order = candidate != plan.worker_schedule
+            return dataclasses.replace(plan, worker_schedule=candidate)
+
+        worker_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+        # Start the consumer at the last lane so its second scheduled ordinal
+        # wraps to worker zero. The packed relation then contains a negative
+        # FloorDiv numerator, exercising mathematical rather than truncating
+        # division in the renderer.
+        x = torch.randn(
+            (worker_count - 1, 3, 2),
+            device=DEVICE,
+            dtype=torch.float32,
+        )
+        with mock.patch.object(
+            cross_loop_codegen,
+            "build_static_pipeline_plan",
+            side_effect=build_cohort_plan,
+        ):
+            code, out = code_and_output(
+                dynamic_cohort_fanout,
+                (x,),
+                pid_type="persistent_blocked",
+                cross_loop_schedule="static_pipeline",
+                num_sm_multiplier=1,
+                num_warps=1,
+            )
+
+        self.assertTrue(selected_noncanonical_order)
+        torch.testing.assert_close(out, (x[:, :, :1] + 1) + x)
+        self.assertIn("tile_dependency_scheduled_logical_task", code)
+
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_nested_producer_iterations_publish_readiness(self) -> None:

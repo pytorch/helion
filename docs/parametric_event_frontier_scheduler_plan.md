@@ -400,8 +400,38 @@ and progress. A root is kept canonical if any of its candidate relations is
 unsupported; whole-root barriers, repeated same-root producer arms, nested
 producer sites, ambiguous multi-piece intra-cohort order, nonuniform
 readiness-major tails, and aggregate proof-budget exhaustion all decline. The
-next code change is therefore bounded resident placement over these candidates,
-not another readiness or schedule representation.
+first bounded placement slice is now implemented locally. Every exact cohort
+view of a root must agree extensionally on one full readiness-major traversal;
+that traversal replaces only the logical-task map over the root's identical
+canonical packed slot support. Depth one returns the identical baseline;
+depths two through four currently select the same first noncanonical action.
+The candidate is accepted only after exact ownership and progress proofs over
+the original uncontracted semantic events. Conflicting views or one unsupported
+event keep the complete root canonical.
+
+The parameterized renderer now evaluates the accepted
+`WorkerScheduleSegment.task_order` relation directly at each proved packed
+slot. It does not reconstruct a second dense traversal. Exact symbolic
+partitions that cannot be canonicalized into disjoint boxes are renderable only
+when the relation has already proved a support bijection. Runtime divisors are
+allowed only when they are target-domain parameter expressions that exactly
+factor the target-domain size; the bijection then proves they are positive on
+every executed point. Empty-domain evaluation is clamped safely, and signed
+division uses Euclidean-floor semantics rather than Triton's truncation.
+
+CPU substitution tests cover zero, aligned, and unaligned dynamic extents,
+depth aliasing, conflicting cohort views, and unsupported-event veto. A CUDA
+regression forces a `W-1` producer prefix and a rank-two dynamic key so the
+consumer traversal crosses a worker-wave boundary, exercises both a negative
+floor-division numerator and dynamic divisors, and checks numerical output.
+It validates rendering at one positive rank-two shape; it does not yet prove
+one-cubin substitution across `Q`. A zero-`Q` replay currently faults in the
+pre-existing canonical parameterized lowering as well, so runtime-empty
+rank-two execution remains an explicit later gate rather than a claim of this
+slice.
+The next placement change is a bounded whole-root tail pull across only roots
+proved incomparable by the root/event quotient; it must use the same segment
+relations and renderer rather than adding a recurrence-specific path.
 
 ### Priority 1: finish the symbolic dependency refactor
 
