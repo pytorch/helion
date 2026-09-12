@@ -29,7 +29,7 @@ from helion._compiler.cross_loop_scheduler import WorkerScheduleSegment
 from helion._compiler.cross_loop_scheduler import _event_ready_after_worker_steps
 from helion._compiler.cross_loop_scheduler import _flat_task_order_relation
 from helion._compiler.cross_loop_scheduler import _global_unit_list_schedule
-from helion._compiler.cross_loop_scheduler import _has_valid_transient_source_schedule
+from helion._compiler.cross_loop_scheduler import _has_valid_source_ticket_schedule
 from helion._compiler.cross_loop_scheduler import _nested_loop_entry_counter
 from helion._compiler.cross_loop_scheduler import _root_schedule_traversal
 from helion._compiler.cross_loop_scheduler import _segmented_nested_loop_counter
@@ -859,7 +859,7 @@ def _whole_consumer_join_readiness_event(
     )
 
 
-def _transient_source_inlet_problem(
+def _source_ticket_inlet_problem(
     source_count: int,
 ) -> tuple[ReadinessGraph, tuple[ReadinessCounterPlan, ...]]:
     """Build two source-ticket inlets followed by symmetric sinks."""
@@ -1851,7 +1851,7 @@ class TestCrossLoopScheduler(TestCase):
             cross_loop_scheduler._scalar_relation_is_nondecreasing(reversed_boundary)
         )
 
-    def test_transient_source_has_launch_stage_zero_relation(
+    def test_source_ticket_has_launch_stage_zero_relation(
         self,
     ) -> None:
         producer_domain, branch_domain, sink_domain = _identify_root_domains(
@@ -1936,7 +1936,7 @@ class TestCrossLoopScheduler(TestCase):
                 consumers=sink_event.consumers,
             ),
         )
-        source_schedule = cross_loop_scheduler._with_transient_source_schedule_segment(
+        source_schedule = cross_loop_scheduler._with_source_ticket_schedule_segment(
             baseline,
             readiness_graph.root_task_orders,
             0,
@@ -1968,7 +1968,7 @@ class TestCrossLoopScheduler(TestCase):
                 )
             )
             self.assertTrue(
-                _has_valid_transient_source_schedule(
+                _has_valid_source_ticket_schedule(
                     scheduled,
                     readiness_graph.root_task_orders,
                     readiness_counters,
@@ -2032,9 +2032,9 @@ class TestCrossLoopScheduler(TestCase):
                 ),
             )
 
-    def test_transient_source_inlets_precede_downstream_waits(self) -> None:
-        graph, counters = _transient_source_inlet_problem(4)
-        source_schedule = cross_loop_scheduler._with_transient_source_schedule_segment(
+    def test_source_ticket_inlets_precede_downstream_waits(self) -> None:
+        graph, counters = _source_ticket_inlet_problem(4)
+        source_schedule = cross_loop_scheduler._with_source_ticket_schedule_segment(
             _baseline_worker_schedule(graph.root_domains, worker_count=2),
             graph.root_task_orders,
             0,
@@ -2062,8 +2062,8 @@ class TestCrossLoopScheduler(TestCase):
         )
 
     def test_progress_rejects_a_second_launch_stage_source(self) -> None:
-        graph, counters = _transient_source_inlet_problem(4)
-        schedule = cross_loop_scheduler._with_transient_source_schedule_segment(
+        graph, counters = _source_ticket_inlet_problem(4)
+        schedule = cross_loop_scheduler._with_source_ticket_schedule_segment(
             _baseline_worker_schedule(graph.root_domains, worker_count=2),
             graph.root_task_orders,
             0,
@@ -2097,7 +2097,7 @@ class TestCrossLoopScheduler(TestCase):
                 )
             )
             self.assertFalse(
-                _has_valid_transient_source_schedule(
+                _has_valid_source_ticket_schedule(
                     invalid,
                     graph.root_task_orders,
                     counters,
@@ -2113,8 +2113,8 @@ class TestCrossLoopScheduler(TestCase):
                 )
             )
 
-    def test_event_frontier_handles_trailing_transient_source_waves(self) -> None:
-        graph, counters = _transient_source_inlet_problem(9)
+    def test_event_frontier_handles_trailing_source_ticket_waves(self) -> None:
+        graph, counters = _source_ticket_inlet_problem(9)
         dispatch_offset = 0
         resident_segments: list[WorkerScheduleSegment] = []
         # Put the late inlet first in C. The source frontier should prove that
@@ -2131,7 +2131,7 @@ class TestCrossLoopScheduler(TestCase):
             )
             dispatch_offset += graph.root_domains[root].size
         resident_schedule = _schedule(2, *resident_segments)
-        source_schedule = cross_loop_scheduler._with_transient_source_schedule_segment(
+        source_schedule = cross_loop_scheduler._with_source_ticket_schedule_segment(
             resident_schedule,
             graph.root_task_orders,
             0,
@@ -2171,7 +2171,7 @@ class TestCrossLoopScheduler(TestCase):
                 )
             )
             self.assertTrue(
-                _has_valid_transient_source_schedule(
+                _has_valid_source_ticket_schedule(
                     scheduled,
                     graph.root_task_orders,
                     counters,
@@ -2179,7 +2179,7 @@ class TestCrossLoopScheduler(TestCase):
                 )
             )
 
-    def test_transient_source_ticket_proof_is_independent_of_wave_remainder(
+    def test_source_ticket_proof_is_independent_of_wave_remainder(
         self,
     ) -> None:
         for source_count in (1, 2, 3, 4, 9, 10_000):
@@ -2220,7 +2220,7 @@ class TestCrossLoopScheduler(TestCase):
                     ReadinessCounterPlan(event.producers, event.consumers),
                 )
                 source_schedule = (
-                    cross_loop_scheduler._with_transient_source_schedule_segment(
+                    cross_loop_scheduler._with_source_ticket_schedule_segment(
                         _baseline_worker_schedule(
                             readiness_graph.root_domains,
                             worker_count=2,
@@ -2241,9 +2241,14 @@ class TestCrossLoopScheduler(TestCase):
 
                     self.assertIsNotNone(scheduled)
                     assert scheduled is not None
+                    source_segment = (
+                        cross_loop_scheduler._source_ticket_schedule_segment(scheduled)
+                    )
+                    self.assertIsNotNone(source_segment)
+                    assert source_segment is not None
                     self.assertIsNotNone(
-                        cross_loop_scheduler._source_ticket_order(
-                            scheduled,
+                        cross_loop_scheduler._source_segment_ticket_order(
+                            source_segment,
                         )
                     )
                     self.assertTrue(
@@ -2263,7 +2268,7 @@ class TestCrossLoopScheduler(TestCase):
                 self.assertEqual(len(scheduled.segments_for_root(0)), 1)
                 self.assertEqual(placement(scheduled, 1, 0), (0, 0))
 
-    def test_transient_source_selection_requires_oversubscription(self) -> None:
+    def test_source_ticket_selection_requires_oversubscription(self) -> None:
         for source_count, expected in ((2, None), (3, 0), (4, 0), (9, 0)):
             with self.subTest(source_count=source_count):
                 source_domain, consumer_domain = _identify_root_domains(
@@ -2315,7 +2320,7 @@ class TestCrossLoopScheduler(TestCase):
                     ReadinessCounterPlan(event.producers, event.consumers),
                 )
                 self.assertEqual(
-                    cross_loop_scheduler._transient_source_candidate(
+                    cross_loop_scheduler._source_ticket_candidate(
                         readiness_graph,
                         readiness_counters,
                         frozenset(),
@@ -2324,12 +2329,11 @@ class TestCrossLoopScheduler(TestCase):
                     expected,
                 )
 
-    def test_invalid_transient_source_candidate_is_rejected_before_freeze(self) -> None:
+    def test_invalid_source_ticket_candidate_is_rejected_before_freeze(self) -> None:
         root_domains = _identify_root_domains(
             (_domain((10, 3, 1)), _domain((20, 2, 1)))
         )
-        graph = _readiness_graph(root_domains)
-        baseline = _baseline_worker_schedule(root_domains, worker_count=2)
+        dependency_graph = _dependency_graph([[10], [20]])
 
         def progress_safe(
             worker_schedule: WorkerSchedule,
@@ -2337,21 +2341,19 @@ class TestCrossLoopScheduler(TestCase):
             **_kwargs: object,
         ) -> bool:
             return (
-                cross_loop_scheduler._transient_source_schedule_segment(
-                    worker_schedule
-                )
+                cross_loop_scheduler._source_ticket_schedule_segment(worker_schedule)
                 is None
             )
 
         with (
             mock.patch.object(
                 cross_loop_scheduler,
-                "_transient_source_candidate",
+                "_source_ticket_candidate",
                 return_value=0,
             ),
             mock.patch.object(
                 cross_loop_scheduler,
-                "_has_valid_transient_source_schedule",
+                "_has_valid_source_ticket_schedule",
                 return_value=True,
             ),
             mock.patch.object(
@@ -2360,21 +2362,18 @@ class TestCrossLoopScheduler(TestCase):
                 side_effect=progress_safe,
             ),
         ):
-            plan = cross_loop_scheduler._try_finalize_pipeline_proposal(
-                readiness_graph=graph,
-                worker_count=baseline.worker_count,
-                readiness_counters=(),
-                root_barrier_edges=frozenset(),
-                allow_transient_source=True,
-                pipeline_depth=1,
+            plan = _configured_static_pipeline_plan(
+                dependency_graph=dependency_graph,
+                root_domains=root_domains,
+                axis_geometry={10: (3, 1), 20: (2, 1)},
+                worker_count=2,
+                supports_source_ticket_launch=True,
             )
 
         self.assertIsNotNone(plan)
         assert plan is not None
         self.assertIsNone(
-            cross_loop_scheduler._transient_source_schedule_segment(
-                plan.worker_schedule
-            )
+            cross_loop_scheduler._source_ticket_schedule_segment(plan.worker_schedule)
         )
         self.assertEqual(
             tuple(segment.root for segment in plan.worker_schedule.segments),
@@ -2388,54 +2387,38 @@ class TestCrossLoopScheduler(TestCase):
         root_domains = _identify_root_domains(
             (_domain((10, 3, 1)), _domain((20, 2, 1)))
         )
+        dependency_graph = _dependency_graph([[10], [20]])
         graph = _readiness_graph(root_domains)
-        baseline = _baseline_worker_schedule(root_domains, worker_count=2)
 
         with (
             mock.patch.object(
                 cross_loop_scheduler,
-                "_transient_source_candidate",
+                "_source_ticket_candidate",
                 return_value=0,
             ),
             mock.patch.object(
                 cross_loop_scheduler,
-                "_has_valid_transient_source_schedule",
+                "_has_valid_source_ticket_schedule",
                 return_value=True,
             ),
             mock.patch.object(
                 cross_loop_scheduler,
-                "_external_source_frontiers",
+                "_source_ticket_frontiers",
                 return_value=None,
             ),
-            mock.patch.object(
-                cross_loop_scheduler,
-                "_consumer_major_producer_order",
-                side_effect=AssertionError(
-                    "unproved source frontier must retain configured traversals"
-                ),
-            ) as prepare,
-            mock.patch.object(
-                cross_loop_scheduler,
-                "_global_unit_list_schedule",
-                side_effect=AssertionError(
-                    "unproved source frontier must skip cross-root placement"
-                ),
-            ) as place,
         ):
-            plan = cross_loop_scheduler._try_finalize_pipeline_proposal(
-                readiness_graph=graph,
-                worker_count=baseline.worker_count,
-                readiness_counters=(),
-                root_barrier_edges=frozenset(),
-                allow_transient_source=True,
-                pipeline_depth=2,
+            plan = _configured_static_pipeline_plan(
+                dependency_graph=dependency_graph,
+                root_domains=root_domains,
+                axis_geometry={10: (3, 1), 20: (2, 1)},
+                worker_count=2,
+                supports_source_ticket_launch=True,
+                cross_loop_pipeline_depth=2,
             )
 
         self.assertIsNotNone(plan)
         assert plan is not None
-        prepare.assert_not_called()
-        place.assert_not_called()
-        source_segment = cross_loop_scheduler._transient_source_schedule_segment(
+        source_segment = cross_loop_scheduler._source_ticket_schedule_segment(
             plan.worker_schedule
         )
         self.assertIsNotNone(source_segment)
@@ -2450,7 +2433,7 @@ class TestCrossLoopScheduler(TestCase):
             graph.root_task_orders[1].materialize(),
         )
 
-    def test_transient_source_signal_declines_full_frontiers(self) -> None:
+    def test_source_ticket_signal_declines_full_frontiers(self) -> None:
         source_domain, consumer_domain = _identify_root_domains(
             (
                 _domain((10, 5, 1)),
@@ -2491,7 +2474,7 @@ class TestCrossLoopScheduler(TestCase):
                 dispatch_offset=0,
             ),
         )
-        schedule = cross_loop_scheduler._with_transient_source_schedule_segment(
+        schedule = cross_loop_scheduler._with_source_ticket_schedule_segment(
             schedule,
             readiness_graph.root_task_orders,
             0,
@@ -2510,7 +2493,7 @@ class TestCrossLoopScheduler(TestCase):
                 )
             )
             self.assertIsNone(
-                cross_loop_scheduler._transient_source_candidate(
+                cross_loop_scheduler._source_ticket_candidate(
                     readiness_graph,
                     (full_plan,),
                     frozenset(),
@@ -2518,7 +2501,7 @@ class TestCrossLoopScheduler(TestCase):
                 )
             )
             self.assertTrue(
-                _has_valid_transient_source_schedule(
+                _has_valid_source_ticket_schedule(
                     schedule,
                     readiness_graph.root_task_orders,
                     (full_plan,),
@@ -2526,7 +2509,7 @@ class TestCrossLoopScheduler(TestCase):
                 )
             )
             self.assertTrue(
-                _has_valid_transient_source_schedule(
+                _has_valid_source_ticket_schedule(
                     schedule,
                     readiness_graph.root_task_orders,
                     (),
@@ -2556,7 +2539,7 @@ class TestCrossLoopScheduler(TestCase):
                 )
             )
             self.assertIsNone(
-                cross_loop_scheduler._transient_source_candidate(
+                cross_loop_scheduler._source_ticket_candidate(
                     readiness_graph,
                     (partial_plan,),
                     frozenset(((0, 1),)),
@@ -2564,7 +2547,7 @@ class TestCrossLoopScheduler(TestCase):
                 )
             )
             self.assertTrue(
-                _has_valid_transient_source_schedule(
+                _has_valid_source_ticket_schedule(
                     schedule,
                     readiness_graph.root_task_orders,
                     (partial_plan,),
@@ -2572,7 +2555,7 @@ class TestCrossLoopScheduler(TestCase):
                 )
             )
 
-    def test_transient_source_combines_producer_arms_before_subset_proof(
+    def test_source_ticket_combines_producer_arms_before_subset_proof(
         self,
     ) -> None:
         source_domain, consumer_domain = _identify_root_domains(
@@ -2623,7 +2606,7 @@ class TestCrossLoopScheduler(TestCase):
                 )
             )
             self.assertIsNone(
-                cross_loop_scheduler._transient_source_candidate(
+                cross_loop_scheduler._source_ticket_candidate(
                     readiness_graph,
                     (plan,),
                     frozenset(),
@@ -3124,7 +3107,6 @@ class TestCrossLoopScheduler(TestCase):
                 plans,
                 frozenset(),
                 pipeline_depth=2,
-                external_source_frontiers=(),
             )
             self.assertIsNotNone(candidate)
             assert candidate is not None
@@ -8503,14 +8485,14 @@ class TestCrossLoopScheduler(TestCase):
         assert traversal is not None
         self.assertFalse(traversal.matches_reference)
 
-    def test_transient_ticket_order_is_a_symbolic_bijection(self) -> None:
+    def test_source_ticket_order_is_a_symbolic_bijection(self) -> None:
         (domain,) = _identify_root_domains((_domain((10, 5, 1)),))
         reference = pid_task_order(domain, domain.axis_order)
         readiness_graph = ReadinessGraph(
             root_task_orders=(reference,),
             events=(),
         )
-        schedule = cross_loop_scheduler._with_transient_source_schedule_segment(
+        schedule = cross_loop_scheduler._with_source_ticket_schedule_segment(
             _baseline_worker_schedule(readiness_graph.root_domains, worker_count=2),
             readiness_graph.root_task_orders,
             0,
@@ -8519,8 +8501,12 @@ class TestCrossLoopScheduler(TestCase):
         assert schedule is not None
 
         with _forbid_schedule_enumeration():
-            logical_to_ticket = cross_loop_scheduler._source_ticket_order(
-                schedule,
+            source_segment = cross_loop_scheduler._source_ticket_schedule_segment(
+                schedule
+            )
+            assert source_segment is not None
+            logical_to_ticket = cross_loop_scheduler._source_segment_ticket_order(
+                source_segment
             )
         self.assertIsNotNone(logical_to_ticket)
         assert logical_to_ticket is not None
@@ -8529,7 +8515,7 @@ class TestCrossLoopScheduler(TestCase):
             (0, 1, 2, 3, 4),
         )
 
-    def test_transient_ticket_order_preserves_l2_pid_mapping(self) -> None:
+    def test_source_ticket_order_preserves_l2_pid_mapping(self) -> None:
         (domain,) = _identify_root_domains((_domain((10, 4, 1), (11, 3, 1)),))
         reference = pid_task_order(
             domain,
@@ -8540,7 +8526,7 @@ class TestCrossLoopScheduler(TestCase):
             root_task_orders=(reference,),
             events=(),
         )
-        schedule = cross_loop_scheduler._with_transient_source_schedule_segment(
+        schedule = cross_loop_scheduler._with_source_ticket_schedule_segment(
             _baseline_worker_schedule(readiness_graph.root_domains, worker_count=2),
             readiness_graph.root_task_orders,
             0,
@@ -8549,8 +8535,12 @@ class TestCrossLoopScheduler(TestCase):
         assert schedule is not None
 
         with _forbid_schedule_enumeration():
-            logical_to_ticket = cross_loop_scheduler._source_ticket_order(
-                schedule,
+            source_segment = cross_loop_scheduler._source_ticket_schedule_segment(
+                schedule
+            )
+            assert source_segment is not None
+            logical_to_ticket = cross_loop_scheduler._source_segment_ticket_order(
+                source_segment
             )
         self.assertIsNotNone(logical_to_ticket)
         assert logical_to_ticket is not None
@@ -8568,10 +8558,10 @@ class TestCrossLoopScheduler(TestCase):
             tuple(range(domain.size)),
         )
 
-    def test_transient_ticket_order_keeps_uncoalesced_woven_proof(self) -> None:
+    def test_source_ticket_order_keeps_uncoalesced_woven_proof(self) -> None:
         (domain,) = _identify_root_domains((_domain((10, 2, 1), (11, 256, 1)),))
         reference = pid_task_order(domain, domain.axis_order)
-        schedule = cross_loop_scheduler._with_transient_source_schedule_segment(
+        schedule = cross_loop_scheduler._with_source_ticket_schedule_segment(
             _baseline_worker_schedule((domain,), worker_count=148),
             (reference,),
             0,
@@ -8580,11 +8570,12 @@ class TestCrossLoopScheduler(TestCase):
         assert schedule is not None
 
         with _forbid_schedule_enumeration():
-            source_segment = cross_loop_scheduler._transient_source_schedule_segment(
+            source_segment = cross_loop_scheduler._source_ticket_schedule_segment(
                 schedule,
             )
-            logical_to_ticket = cross_loop_scheduler._source_ticket_order(
-                schedule,
+            assert source_segment is not None
+            logical_to_ticket = cross_loop_scheduler._source_segment_ticket_order(
+                source_segment,
             )
 
         self.assertIsNotNone(source_segment)
@@ -8598,13 +8589,13 @@ class TestCrossLoopScheduler(TestCase):
         assert traversal is not None
         self.assertTrue(traversal.matches_reference)
 
-    def test_transient_ticket_order_preserves_existing_segment_permutation(
+    def test_source_ticket_order_preserves_existing_segment_permutation(
         self,
     ) -> None:
         (domain,) = _identify_root_domains((_domain((10, 2, 1), (11, 3, 1)),))
         reference = pid_task_order(domain, (10, 11))
         permuted = pid_task_order(domain, (11, 10))
-        schedule = cross_loop_scheduler._with_transient_source_schedule_segment(
+        schedule = cross_loop_scheduler._with_source_ticket_schedule_segment(
             _baseline_worker_schedule((domain,), worker_count=2),
             (permuted,),
             0,
@@ -8613,7 +8604,7 @@ class TestCrossLoopScheduler(TestCase):
         assert schedule is not None
         source_relation = schedule.segments_for_root(0)[0].task_order
 
-        retained = cross_loop_scheduler._with_transient_source_schedule_segment(
+        retained = cross_loop_scheduler._with_source_ticket_schedule_segment(
             schedule,
             (reference,),
             0,
@@ -8624,8 +8615,12 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(retained.segments_for_root(0)[0].task_order, source_relation)
         with _forbid_schedule_enumeration():
             self.assertTrue(_validate_worker_schedule_tasks(retained, (reference,)))
-            logical_to_ticket = cross_loop_scheduler._source_ticket_order(
-                retained,
+            source_segment = cross_loop_scheduler._source_ticket_schedule_segment(
+                retained
+            )
+            assert source_segment is not None
+            logical_to_ticket = cross_loop_scheduler._source_segment_ticket_order(
+                source_segment,
             )
         self.assertIsNotNone(logical_to_ticket)
         assert logical_to_ticket is not None
@@ -8712,32 +8707,32 @@ class TestCrossLoopScheduler(TestCase):
             _segment(2, root_orders[2], workers=(0, 2), dispatch_offset=2),
             _segment(1, root_orders[1], workers=(1, 1), dispatch_offset=2),
         )
-        transient_safe = _schedule(
+        source_ticket_safe = _schedule(
             2,
             _segment(1, root_orders[1], workers=(0, 1), dispatch_offset=0),
             _segment(2, root_orders[2], workers=(0, 2), dispatch_offset=2),
         )
-        transient_late_resident_arm = _schedule(
+        source_ticket_late_resident_arm = _schedule(
             2,
             _segment(2, root_orders[2], workers=(0, 2), dispatch_offset=0),
             _segment(1, root_orders[1], workers=(1, 1), dispatch_offset=1),
         )
-        transient_safe = cross_loop_scheduler._with_transient_source_schedule_segment(
-            transient_safe,
+        source_ticket_safe = cross_loop_scheduler._with_source_ticket_schedule_segment(
+            source_ticket_safe,
             root_orders,
             0,
         )
-        transient_late_resident_arm = (
-            cross_loop_scheduler._with_transient_source_schedule_segment(
-                transient_late_resident_arm,
+        source_ticket_late_resident_arm = (
+            cross_loop_scheduler._with_source_ticket_schedule_segment(
+                source_ticket_late_resident_arm,
                 root_orders,
                 0,
             )
         )
-        self.assertIsNotNone(transient_safe)
-        self.assertIsNotNone(transient_late_resident_arm)
-        assert transient_safe is not None
-        assert transient_late_resident_arm is not None
+        self.assertIsNotNone(source_ticket_safe)
+        self.assertIsNotNone(source_ticket_late_resident_arm)
+        assert source_ticket_safe is not None
+        assert source_ticket_late_resident_arm is not None
 
         with _forbid_schedule_enumeration():
             self.assertTrue(
@@ -8758,7 +8753,7 @@ class TestCrossLoopScheduler(TestCase):
             )
             self.assertTrue(
                 cross_loop_scheduler._schedule_is_progress_safe(
-                    transient_safe,
+                    source_ticket_safe,
                     readiness_graph,
                     (plan,),
                     frozenset(),
@@ -8766,7 +8761,7 @@ class TestCrossLoopScheduler(TestCase):
             )
             self.assertFalse(
                 cross_loop_scheduler._schedule_is_progress_safe(
-                    transient_late_resident_arm,
+                    source_ticket_late_resident_arm,
                     readiness_graph,
                     (plan,),
                     frozenset(),
@@ -9766,7 +9761,7 @@ class TestCrossLoopScheduler(TestCase):
                 worker_count=scratch.worker_count,
                 readiness_counters=exact,
                 root_barrier_edges=frozenset(),
-                allow_transient_source=False,
+                source_ticket_root=None,
                 pipeline_depth=1,
             )
 
@@ -9848,7 +9843,7 @@ class TestCrossLoopScheduler(TestCase):
                 worker_count=scratch.worker_count,
                 readiness_counters=exact,
                 root_barrier_edges=frozenset(),
-                allow_transient_source=False,
+                source_ticket_root=None,
                 pipeline_depth=1,
             )
 
@@ -9909,13 +9904,13 @@ class TestCrossLoopScheduler(TestCase):
                 dispatch_offset=0,
             ),
         )
-        transient_source = cross_loop_scheduler._with_transient_source_schedule_segment(
+        source_ticket = cross_loop_scheduler._with_source_ticket_schedule_segment(
             oversubscribed_resident,
             graph.root_task_orders,
             0,
         )
-        self.assertIsNotNone(transient_source)
-        assert transient_source is not None
+        self.assertIsNotNone(source_ticket)
+        assert source_ticket is not None
 
         with _forbid_schedule_enumeration():
             prior_wave_compact = (
@@ -9932,10 +9927,10 @@ class TestCrossLoopScheduler(TestCase):
                     exact,
                 )
             )
-            transient_source_compact = (
+            source_ticket_compact = (
                 cross_loop_scheduler._compact_nested_loop_counters_for_schedule(
                     graph,
-                    transient_source,
+                    source_ticket,
                     exact,
                 )
             )
@@ -9960,12 +9955,12 @@ class TestCrossLoopScheduler(TestCase):
         # before an outstanding source task has begun and thereby deadlock it.
         # This case deliberately has 32 source tasks but only eight resident
         # workers, matching the oversubscribed source condition used by MLA.
-        self.assertEqual(transient_source_compact, (entry,))
+        self.assertEqual(source_ticket_compact, (entry,))
         self.assertTrue(
             cross_loop_scheduler._schedule_is_progress_safe(
-                transient_source,
+                source_ticket,
                 graph,
-                transient_source_compact,
+                source_ticket_compact,
                 frozenset(),
             )
         )
@@ -12065,7 +12060,7 @@ class TestCrossLoopScheduler(TestCase):
                 worker_count=baseline.worker_count,
                 readiness_counters=(plan,),
                 root_barrier_edges=frozenset(),
-                allow_transient_source=False,
+                source_ticket_root=None,
                 pipeline_depth=1,
             )
 

@@ -4221,7 +4221,7 @@ special cases:
 
 | probe | likely depth | reason |
 | --- | ---: | --- |
-| canonical FlashMLA B4 | 1 | source admission supplies the win; resident radix/final placement is already canonical |
+| canonical FlashMLA B4 | 2 | source-ticket admission plus one event-frontier pull recovers the compact radix/final placement |
 | canonical FlashMLA B9 | likely 3 | moved request-local work can release one additional early final cohort |
 | dynamic FlashMLA F64/C16 | 1 | canonical packed C16 tails already win; deeper/key-major pulling lost |
 | FlashMLA Q1 | 1 | one full producer wave exposes no useful readiness frontier |
@@ -5355,9 +5355,41 @@ resident and selects root 7, as predicted by the same proof. The obsolete
 scratch placement functions and seven direct policy tests have been removed;
 exact nested-readiness and nested-counter lowering remain independently tested.
 The source-ticket capability is deliberately retained: FlashMLA needs its
-wait-free oversubscribed source launch. The next cleanup removes only its
-separate naming and argument plumbing, then gates the change on the canonical
-B4/B9 FlashMLA artifacts.
+wait-free oversubscribed source launch. The checkpoint below records the
+removal of its separate naming and argument plumbing and the canonical B4
+gate; B9 remains the next source-ticket performance gate.
+
+Implementation checkpoint (2026-09-12, source-ticket cleanup): the capability
+is now named and selected as source-ticket launch ownership rather than a
+"transient source" policy. `supports_source_ticket_launch` is only a backend
+capability; the exact source root is selected once beside continuation
+ownership, encoded solely by the launch-stage-zero `WorkerScheduleSegment`,
+and never stored separately in the final plan. Source frontiers are derived
+internally from `WorkerSchedule + ReadinessGraph` as priority-only facts; the
+threaded `external_source_frontiers` arguments and redundant schedule-to-ticket
+wrapper are gone. The common finalizer validates the resulting proposal once
+and falls back atomically to `A`.
+
+The canonical fixed-capacity ragged B4/Q4/H16 gate also corrected the expected
+autotuned depth. Depth 1 preserves the conservative root-major schedule and is
+slow (106.432 us); depth 2 emits the previously validated event-frontier source
+exactly, including generated-source SHA256
+`2e15bfdb7d544d46521fe7e650c1ba05b64c47c62e50948846f58ff031b42444`,
+P=418, W=148, K=22/F=16, R80, 42 spills, and 49,160 bytes shared. On physical
+GPU 0 it measures 63.328 us cold-L2 versus 67.488 us matched three-launch
+Helion (1.066x), with bit-exact persistent/standalone output across canonical
+and alternate ragged lengths, page-permutation invariance, and one cubin across
+all metadata cases. This is an ordinary `cross_loop_pipeline_depth=2` choice,
+not a model-specific compiler rule.
+
+The cleanup's final continuation gate also covers uneven L2-remapped tails.
+Publisher ownership remains derived solely from the accepted worker-schedule
+relation; the proof may eliminate task or wave first when either exact
+factorization is representable. This makes B=3 and B=4 grouped L2 schedules
+both select their continuation without enumeration or a shape-specific rule,
+while preserving the established grouped-MoE and chained-continuation
+decisions. The combined scheduler/codegen gate passes 235 tests and 90
+subtests.
 
 ### Phase 6: cross-workload rollout
 

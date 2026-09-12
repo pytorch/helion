@@ -24,9 +24,7 @@ from helion._compiler.cross_loop_codegen import _triton_root_requires_kernel_sco
 from helion._compiler.cross_loop_scheduler import WorkerSchedule
 from helion._compiler.cross_loop_scheduler import WorkerScheduleSegment
 from helion._compiler.cross_loop_scheduler import _task_order_slice
-from helion._compiler.cross_loop_scheduler import (
-    _with_transient_source_schedule_segment,
-)
+from helion._compiler.cross_loop_scheduler import _with_source_ticket_schedule_segment
 from helion._compiler.device_function import DeviceFunction
 from helion._compiler.tile_dependency import TILE_DEPENDENCY_SITE_ID_ATTR
 from helion._compiler.tile_dependency import CoordinateRelation
@@ -1363,9 +1361,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
     def test_continuation_follows_each_roots_pid_order(self) -> None:
         # Keep this a continuation test rather than selecting the independent
         # oversubscribed source-ticket capability.
-        x = torch.arange(4 * 256, device=DEVICE, dtype=torch.float32).reshape(
-            4, 256
-        )
+        x = torch.arange(4 * 256, device=DEVICE, dtype=torch.float32).reshape(4, 256)
         code, out = code_and_output(
             cartesian_affine_chain,
             (x,),
@@ -1625,7 +1621,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         original_build = cross_loop_codegen.build_static_pipeline_plan
 
         def build_with_split_producer(**kwargs: Any):
-            kwargs["allow_transient_source"] = False
+            kwargs["supports_source_ticket_launch"] = False
             plan = original_build(**kwargs)
             segments = {
                 segment.root: segment for segment in plan.worker_schedule.segments
@@ -1737,7 +1733,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
         def build_with_relation_split_producer(**kwargs: Any):
             nonlocal selected_publications, selected_worker_count
-            kwargs["allow_transient_source"] = False
+            kwargs["supports_source_ticket_launch"] = False
             plan = original_build(**kwargs)
             readiness_graph = cross_loop_scheduler.build_readiness_graph(
                 dependency_graph=kwargs["dependency_graph"],
@@ -1844,12 +1840,12 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_transient_source_publishes_one_root_arrival_per_ticket(self) -> None:
+    def test_source_ticket_publishes_one_root_arrival_per_ticket(self) -> None:
         x = torch.arange(128, device=DEVICE, dtype=torch.float32)
         original_build = cross_loop_codegen.build_static_pipeline_plan
 
-        def build_with_transient_source(**kwargs: Any):
-            kwargs["allow_transient_source"] = False
+        def build_with_source_ticket(**kwargs: Any):
+            kwargs["supports_source_ticket_launch"] = False
             plan = original_build(**kwargs)
             resident_segments = []
             for segment in plan.worker_schedule.segments:
@@ -1870,7 +1866,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 worker_count=plan.worker_schedule.worker_count,
                 segments=tuple(resident_segments),
             )
-            staged_schedule = _with_transient_source_schedule_segment(
+            staged_schedule = _with_source_ticket_schedule_segment(
                 resident_schedule,
                 kwargs["root_task_orders"],
                 0,
@@ -1884,7 +1880,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         with mock.patch.object(
             cross_loop_codegen,
             "build_static_pipeline_plan",
-            side_effect=build_with_transient_source,
+            side_effect=build_with_source_ticket,
         ):
             code, out = code_and_output(
                 offset_affine_chain,
@@ -1909,12 +1905,12 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_transient_source_lowers_its_authoritative_permutation(self) -> None:
+    def test_source_ticket_lowers_its_authoritative_permutation(self) -> None:
         x = torch.arange(128, device=DEVICE, dtype=torch.float32).reshape(2, 64)
         original_build = cross_loop_codegen.build_static_pipeline_plan
 
         def build_with_permuted_source(**kwargs: Any):
-            kwargs["allow_transient_source"] = False
+            kwargs["supports_source_ticket_launch"] = False
             plan = original_build(**kwargs)
             root_task_orders = kwargs["root_task_orders"]
             source_domain = root_task_orders[0].target_domain
@@ -1922,7 +1918,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 source_domain,
                 tuple(reversed(source_domain.axis_order)),
             )
-            staged = _with_transient_source_schedule_segment(
+            staged = _with_source_ticket_schedule_segment(
                 plan.worker_schedule,
                 (permuted_source, *root_task_orders[1:]),
                 0,
@@ -1998,7 +1994,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_single_wave_source_does_not_use_transient_tickets(self) -> None:
+    def test_single_wave_source_does_not_use_source_tickets(self) -> None:
         x = torch.arange(2048, device=DEVICE, dtype=torch.float32).reshape(1, 2048)
         code, out = code_and_output(
             streamed_singleton_reduction,
