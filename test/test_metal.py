@@ -1170,15 +1170,17 @@ class TestMetalMatmul(unittest.TestCase):
 
         from helion._compiler.metal.msl_ast_walker import _extract_mpp_setup_params
 
+        # The original 14-arg marker shape is stale once tile-offset names are
+        # added.
         expr = pyast.parse(
             '_metal_mpp_setup("x", "y", 64, 64, 64, 32, 32, 32, 4, '
-            '"float", "float", "", "", "acc", "out", "float")'
+            '"float", "float", "", "", "acc")'
         )
         stmt = expr.body[0]
         self.assertIsInstance(stmt, pyast.Expr)
         call = stmt.value
         self.assertIsInstance(call, pyast.Call)
-        with self.assertRaisesRegex(AssertionError, "expects 14 positional args"):
+        with self.assertRaisesRegex(AssertionError, "expects 16 positional args"):
             _extract_mpp_setup_params(call)
 
     def test_mpp_emission_scopes_symbols_by_setup_name(self) -> None:
@@ -1189,11 +1191,11 @@ class TestMetalMatmul(unittest.TestCase):
 
         code = (
             '_mpp_setup = _metal_mpp_setup("x", "y", 64, 64, 64, 32, 32, 32, 4, '
-            '"float", "float", "", "", "acc")\n'
+            '"float", "float", "", "", "acc", offset_0, offset_1)\n'
             "_metal_mpp_k_step(_mpp_setup, 0)\n"
             '_metal_mpp_coop_store(_mpp_setup, "out0", "float")\n'
             '_mpp_setup_1 = _metal_mpp_setup("a", "b", 64, 64, 64, 32, 32, 32, 4, '
-            '"float", "float", "", "", "acc_1")\n'
+            '"float", "float", "", "", "acc_1", offset_0, offset_1)\n'
             "_metal_mpp_k_step(_mpp_setup_1, 0)\n"
             '_metal_mpp_coop_store(_mpp_setup_1, "out1", "float")\n'
         )
@@ -2513,6 +2515,83 @@ class TestMetalAutotune(unittest.TestCase):
         self.assertEqual(
             backend.classify_autotune_exception(RuntimeError("unrelated")), "warn"
         )
+
+    def _mpp_matmul(self, bm: int, bn: int, bk: int, warps: int) -> helion.Kernel:
+        @helion.kernel(
+            backend="metal",
+            configs=[helion.Config(block_sizes=[bm, bn, bk], num_warps=warps)],
+        )
+        def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _k, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        return matmul
+
+    def test_mpp_grid_axes_come_from_matmul_indices(self) -> None:
+        """An unrelated same-sized grid axis must not stand in for M."""
+
+        @helion.kernel(
+            backend="metal",
+            configs=[helion.Config(block_sizes=[32, 16, 8, 16], num_warps=4)],
+        )
+        def extra_grid_axis(
+            a: torch.Tensor, b: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, k = a.size()
+            _k, n = b.size()
+            side = torch.empty([m], dtype=a.dtype, device=a.device)
+            out = torch.empty([m, n], dtype=a.dtype, device=a.device)
+            for extra, tm, tn in hl.tile([m, m, n]):
+                side[extra] = a[extra, 0]
+                acc = hl.zeros([tm, tn], dtype=torch.float32)
+                for tk in hl.tile(k):
+                    acc = torch.addmm(acc, a[tm, tk], b[tk, tn])
+                out[tm, tn] = acc
+            return out, side
+
+        a = torch.randn(32, 32, device=DEVICE)
+        b = torch.randn(32, 24, device=DEVICE)
+        out, side = extra_grid_axis(a, b)
+        torch.testing.assert_close(out, a @ b, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(side, a[:, 0])
+
+    def test_matmul_in_a_later_root_grid_is_correct(self) -> None:
+        """A later grid uses its rebased tile offsets, not the raw launch ID."""
+
+        @helion.kernel(backend="metal", autotune_effort="none")
+        def two_grids(
+            a: torch.Tensor, b: torch.Tensor, z: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, k = a.size()
+            _k, n = b.size()
+            side = torch.empty_like(z)
+            out = torch.empty([m, n], dtype=a.dtype, device=a.device)
+            for tz in hl.tile(z.size(0)):
+                side[tz] = z[tz] + 1.0
+            for tm, tn in hl.tile([m, n]):
+                acc = hl.zeros([tm, tn], dtype=torch.float32)
+                for tk in hl.tile(k):
+                    acc = torch.addmm(acc, a[tm, tk], b[tk, tn])
+                out[tm, tn] = acc
+            return out, side
+
+        a = torch.randn(128, 128, device=DEVICE)
+        b = torch.randn(128, 128, device=DEVICE)
+        z = torch.randn(64, device=DEVICE)
+        out, side = two_grids(a, b, z)
+        torch.testing.assert_close(out, a @ b, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(side, z + 1.0)
+
+        msl = _get_msl(two_grids, (a, b, z))
+        self.assertIn("_ty = (offset_", msl)
+        self.assertIn("_tx = (offset_", msl)
 
     def test_accuracy_check_guards_the_mpp_matmul(self) -> None:
         """Matmul autotuning depends on candidate validation being on.
