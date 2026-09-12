@@ -850,9 +850,6 @@ class TestExactConverseSemantics(TestCase):
             resident_arrival_count=2,
             continuation_arrival_count=0,
             source_stage_arrival_count=0,
-            real_arrival_count=2,
-            effective_arrival_count=2,
-            maximum_arrival_count=4,
         )
 
         invalid_orders = {

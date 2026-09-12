@@ -1107,6 +1107,9 @@ CPU tests plus 272 subtests and 62 CUDA/codegen tests plus 16 subtests, with one
 expected skip. Source tickets remain one topology-selected execution
 capability, not a workload path; their intentionally source-stage-only scope
 and the deferred internal ticketed-phase generalization are stated explicitly.
+A follow-up removes test-only schedule materialization methods and stores only
+the three primitive root-publication owner counts; real arrivals and replay
+stride are now derived from those facts rather than duplicated in the plan.
 
 ### Explicitly deferred
 

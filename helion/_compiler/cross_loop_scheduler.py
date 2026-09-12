@@ -537,29 +537,6 @@ class WorkerScheduleSegment:
             raise IndexError(task_order_index)
         return self.dispatch_offset + task_order_index
 
-    def occupies(self, worker: int, worker_step: int) -> bool:
-        """Return whether this segment occupies one resident worker step."""
-        if self.is_normalized:
-            launch_stage_axis, worker_axis, wave_axis = (
-                self.task_order.source_domain.axis_order
-            )
-            targets = self.task_order.target_coordinates(
-                {
-                    launch_stage_axis: _RESIDENT_LAUNCH_STAGE,
-                    worker_axis: worker,
-                    wave_axis: worker_step,
-                }
-            )
-            if len(targets) > 1:
-                raise AssertionError("one schedule slot maps to multiple tasks")
-            return bool(targets)
-        worker_offset = worker - self.worker_begin
-        if not 0 <= worker_offset < self.worker_count or worker_step < 0:
-            return False
-        dispatch_index = worker_step * self.worker_count + worker_offset
-        task_order_index = dispatch_index - self.dispatch_offset
-        return 0 <= task_order_index < self.task_count
-
     def worker_step_bounds(self, worker: int) -> tuple[int, int] | None:
         """Return this segment's first and last resident step on one worker."""
         if self.is_normalized and self.launch_stage != _RESIDENT_LAUNCH_STAGE:
@@ -574,14 +551,6 @@ class WorkerScheduleSegment:
             return None
         last = first + (end - 1 - first) // self.worker_count * self.worker_count
         return first // self.worker_count, last // self.worker_count
-
-    def workers(self) -> frozenset[int]:
-        """Materialize active resident workers for diagnostics and tests."""
-        return frozenset(
-            worker
-            for begin, end in self.worker_intervals()
-            for worker in range(begin, end)
-        )
 
     def worker_step_runs(self) -> tuple[tuple[int, int, int, int], ...]:
         """Return resident ``(worker begin, end, first step, last step)`` runs.
@@ -3200,9 +3169,9 @@ class RootBarrierPublicationPlan:
 
     ``participant_order`` is an exact worker-to-dense-owner relation when the
     participant cohort depends on runtime parameters.  Concrete schedules use
-    ``participant_intervals`` as a proved strength reduction.  Every emission
-    site contributes ``unit_contribution``; code generation must consume the
-    counts and support here rather than reconstructing schedule geometry.
+    ``participant_intervals`` as a proved strength reduction. Every emission
+    site contributes one arrival; code generation must consume the counts and
+    support here rather than reconstructing schedule geometry.
     """
 
     root: int
@@ -3212,23 +3181,8 @@ class RootBarrierPublicationPlan:
     resident_arrival_count: int | sympy.Expr
     continuation_arrival_count: int | sympy.Expr
     source_stage_arrival_count: int
-    real_arrival_count: int | sympy.Expr
-    effective_arrival_count: int | sympy.Expr
-    maximum_arrival_count: int
-    unit_contribution: int = 1
 
     def __post_init__(self) -> None:
-        if self.unit_contribution != 1:
-            raise ValueError("root barriers require unit publication contributions")
-        expected_real = sympy.simplify(
-            sympy.Add(
-                sympy.sympify(self.resident_arrival_count),
-                sympy.sympify(self.continuation_arrival_count),
-                self.source_stage_arrival_count,
-            )
-        )
-        if not _equal_integer_expressions(self.real_arrival_count, expected_real):
-            raise ValueError("root-barrier real arrival count is inconsistent")
         if any(
             sympy.sympify(count).is_nonnegative is not True
             for count in (
@@ -3240,23 +3194,6 @@ class RootBarrierPublicationPlan:
             )
         ):
             raise ValueError("root-barrier arrival counts must be nonnegative")
-        expected_effective = SymbolicMax(
-            sympy.Integer(1), sympy.sympify(self.real_arrival_count)
-        )
-        if not _equal_integer_expressions(
-            self.effective_arrival_count,
-            expected_effective,
-        ):
-            raise ValueError(
-                "root-barrier effective arrival count must be max(real, 1)"
-            )
-        if self.maximum_arrival_count <= 0:
-            raise ValueError("root-barrier maximum arrival count must be positive")
-        if not _is_provably_at_most(
-            self.effective_arrival_count,
-            self.maximum_arrival_count,
-        ):
-            raise ValueError("root-barrier arrival count exceeds its epoch bound")
         if self.participant_order is None:
             return
         if self.continuation_arrival_count != 0 or self.source_stage_arrival_count:
@@ -3270,6 +3207,24 @@ class RootBarrierPublicationPlan:
             raise ValueError("participant order does not cover effective arrivals")
         if not self.participant_order.is_bijection_from_source_support():
             raise ValueError("participant order is not an exact support bijection")
+
+    @property
+    def real_arrival_count(self) -> int | sympy.Expr:
+        """Return the exact number of physical publishers."""
+        return _concrete_or_symbolic_integer(
+            sympy.Add(
+                sympy.sympify(self.resident_arrival_count),
+                sympy.sympify(self.continuation_arrival_count),
+                self.source_stage_arrival_count,
+            )
+        )
+
+    @property
+    def effective_arrival_count(self) -> int | sympy.Expr:
+        """Return the replay stride, including one slot for an empty root."""
+        return _concrete_or_symbolic_integer(
+            SymbolicMax(sympy.Integer(1), sympy.sympify(self.real_arrival_count))
+        )
 
     @property
     def parameter_symbols(self) -> frozenset[sympy.Symbol]:
@@ -3293,29 +3248,12 @@ def _concrete_or_symbolic_integer(expression: int | sympy.Expr) -> int | sympy.E
     return int(simplified) if isinstance(simplified, sympy.Integer) else simplified
 
 
-def _is_provably_at_most(expression: int | sympy.Expr, upper_bound: int) -> bool:
-    """Prove a small integer-expression upper bound without sampling it."""
-    expression = sympy.simplify(sympy.sympify(expression))
-    difference = sympy.simplify(sympy.Integer(upper_bound) - expression)
-    if difference.is_nonnegative is True:
-        return True
-    if expression.func in (sympy.Min, SymbolicMin):
-        return any(
-            _is_provably_at_most(argument, upper_bound) for argument in expression.args
-        )
-    if expression.func in (sympy.Max, SymbolicMax):
-        return all(
-            _is_provably_at_most(argument, upper_bound) for argument in expression.args
-        )
-    return False
-
-
 def _root_major_participant_order_from_geometry(
     segment: WorkerScheduleSegment,
     first_slot: sympy.Expr,
     task_count: sympy.Expr,
     worker_count: int,
-) -> tuple[CoordinateRelation, int | sympy.Expr, int | sympy.Expr] | None:
+) -> tuple[CoordinateRelation, int | sympy.Expr] | None:
     """Project a previously proved root-major placement to dense arrivals."""
     if not _equal_integer_expressions(
         segment.task_order.target_domain.size_expr,
@@ -3393,7 +3331,7 @@ def _root_major_participant_order_from_geometry(
         participant_order,
         workers_by_participant,
     )
-    return participant_order, real_arrival_count, effective_arrival_count
+    return participant_order, real_arrival_count
 
 
 @cache
@@ -3467,7 +3405,7 @@ def root_barrier_publication_plan(
             )
             if participant is None:
                 raise ValueError("root-major participant support is not proved")
-            participant_order, real_arrival_count, effective_arrival_count = participant
+            participant_order, real_arrival_count = participant
             if continuation_arrival_count != 0 or source_stage_arrival_count:
                 raise ValueError(
                     "relation-derived resident ownership overlaps another execution role"
@@ -3480,9 +3418,6 @@ def root_barrier_publication_plan(
                 resident_arrival_count=real_arrival_count,
                 continuation_arrival_count=0,
                 source_stage_arrival_count=0,
-                real_arrival_count=real_arrival_count,
-                effective_arrival_count=effective_arrival_count,
-                maximum_arrival_count=worker_schedule.worker_count,
             )
         if not matching:
             if continuation_arrival_count == 0 and source_stage_arrival_count == 0:
@@ -3546,7 +3481,6 @@ def root_barrier_publication_plan(
         raise ValueError(
             "root-barrier publication requires a proved positive bounded owner set"
         )
-    maximum_arrival_count = int(real_arrival_count)
     return RootBarrierPublicationPlan(
         root=root,
         participant_intervals=later_workers,
@@ -3555,9 +3489,6 @@ def root_barrier_publication_plan(
         resident_arrival_count=resident_arrival_count,
         continuation_arrival_count=continuation_arrival_count,
         source_stage_arrival_count=source_stage_arrival_count,
-        real_arrival_count=real_arrival_count,
-        effective_arrival_count=real_arrival_count,
-        maximum_arrival_count=maximum_arrival_count,
     )
 
 

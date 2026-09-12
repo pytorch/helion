@@ -2000,7 +2000,6 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(source_publication.source_stage_arrival_count, 5)
         self.assertEqual(source_publication.real_arrival_count, 5)
         self.assertEqual(source_publication.effective_arrival_count, 5)
-        self.assertEqual(source_publication.maximum_arrival_count, 5)
         self.assertEqual(placement(scheduled, 1, 0), (0, 0))
         self.assertEqual(placement(scheduled, 2, 0), (0, 1))
 
@@ -7752,7 +7751,6 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(publication.source_stage_arrival_count, 0)
         self.assertEqual(publication.real_arrival_count, 3)
         self.assertEqual(publication.effective_arrival_count, 3)
-        self.assertEqual(publication.maximum_arrival_count, 3)
 
     def test_baseline_preserves_piecewise_configured_orders(self) -> None:
         l2_domain = _domain((10, 4, 1), (11, 3, 1), identity=0)

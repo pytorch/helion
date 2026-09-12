@@ -966,7 +966,7 @@ def emit_cross_loop_schedule(
             result.append(
                 statement_from_string(
                     f"tl.atomic_add({barrier_counter}, "
-                    f"{publication_plan.unit_contribution}, "
+                    "1, "
                     "sem='release', scope='gpu')"
                 )
             )
