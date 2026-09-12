@@ -60,15 +60,20 @@ acceptance.
 | Nemotron MoE | 77.856 us | 77.856 us | 61.504 us standalone |
 
 Current production validation after the unified lowering uses 500 cold-L2
-samples after a 10-second warmup on GPU4 (GPU1 for the static controls):
+samples after a 10-second warmup on GPU4 (GPU1 for Qwen/Gemma and the MoE
+endpoints):
 
 | workload | unified persistent | same-run control | preserved facts |
 | --- | ---: | ---: | --- |
 | FlashMLA B4/Q4/H16 | **61.280 us** | 67.552 us standalone | bit-exact replay, K22/F16, R80/spill6/49,160B |
 | FlashMLA B9 ragged | **91.936 us** | 106.224 us standalone | bit-exact replay, all 18 counters, R80/spill6/49,160B |
+| FlashMLA Q1, B1/S65536/H16 | **38.688 us** | **38.688 us standalone** | bit-exact replay, static/static, fan-in-128 root barrier, R192/spill0/169,984B |
+| FlashMLA Q2, B64/S512/H16 | **32.640 us** | **32.640 us standalone** | bit-exact replay, static/static, direct continuation, R255/spill24/169,984B |
 | Muse FFN m8 | **161.632 us** | 173.840 us standalone | five outputs bit-exact, R160/spill0/16,640B |
 | Qwen3 pretuned B1/S8192 | **102.400 us** | 102.400 us pre-refactor golden | byte-identical Triton/SASS, R255/spill22/17,408B |
+| Qwen3 ragged B2, S=[2048,8192] | **126.944 us** | 128.960 us same-source static control | bit-exact, identical cubin/resources, R255/spill22/17,408B |
 | Gemma4 A4B pretuned B1 | **49.056 us** | 55.168 us standalone | byte-identical Triton/SASS, R128/spill0/34,816B |
+| Gemma4 A4B B2, 15 routed experts | 69.568 us | 67.552 us standalone | bit-exact, tuned m3, R116/spill0/34,816B |
 | DeepSeek-V3 MoE, all elastic | 170.016 us | 159.552 us standalone | 11 outputs/replay correct, R150/spill0/52,224B |
 | Nemotron MoE, all elastic | 79.680 us | 63.216 us standalone | output/replay correct, R96/spill0/34,816B |
 
@@ -89,6 +94,13 @@ Nemotron all-static at 104.320 us, so elastic improves those canonical static
 endpoints by 12.096 us and 24.640 us respectively.  Their remaining gaps to
 standalone are constituent-body/resource work; the scheduler does not hide
 them by changing numerics or fusion.
+
+The canonical Q1 and Q2 cases deliberately exercise different synchronization
+mechanisms under the same `static/static` root policy.  Q1 publishes a
+fan-in-128 root barrier; Q2 contracts its second root into a direct same-CTA
+continuation.  Both exactly match their two-launch standalone boundary and
+pass 20 alternating-input CUDA Graph replays.  This rules out selecting an
+executor merely because one synchronization form happened to favor it.
 
 In all six comparisons, elastic execution erased the list order's benefit.
 Canonical order tied it at B4/DeepSeek/Nemotron and beat it at B9/Muse.  The
@@ -613,7 +625,7 @@ dispatch overhead.  They never change this root-level meaning.
 - Therefore delete the fixed-loop/T+W design from the roadmap rather than
   retaining it beside the fast path.
 
-### Phase 0b: validate the one-shot packet executor — in progress
+### Phase 0b: validate the one-shot packet executor — complete
 
 - Treat the archived FlashMLA B4/B9 and Muse m8 one-shot results as the positive
   all-elastic controls, then reproduce them through production packet lowering.
@@ -757,7 +769,7 @@ Add focused tests for:
 - all-static lowered-code compatibility; and
 - absence of the deleted config keys and special-source symbols.
 
-### Phase 7: performance and observability validation — in progress
+### Phase 7: performance and observability validation — complete
 
 Run every case with same-source standalone, correctness, resources, compile
 time, and cold-L2 medians.  Generate standalone-on-top/persistent-on-bottom
@@ -767,6 +779,7 @@ Gantt charts for MLA B4 and B9.
 | --- | --- |
 | FlashMLA B4/Q4/H16 | all-elastic vs archived 61.31 us, matched standalone 67.46 us, and the recorded ThunderKittens baseline |
 | FlashMLA B9 ragged | all-elastic vs archived 88.06 us and matched standalone 100.29 us |
+| FlashMLA Q1/Q2 canonical endpoints | static/static against the matched two-launch boundary, covering both a root barrier and a direct continuation |
 | Qwen3 checked-in pretuned decode | all-static vs a pre-refactor golden from the identical entrypoint/source; compare clean-main's different fixed-context source only as context, not as a hash/timing identity gate |
 | Qwen3 batched/dynamic probe | all-static vs the fresh same-source `static_shapes=False` golden (~100.32 us GPU0 or ~104.35 us GPU7, not the historical 94-us source); same cubin across expected runtime metadata |
 | Gemma4 A4B pretuned B1 | all-static vs clean-main ~49--51-us control |
